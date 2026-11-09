@@ -48,6 +48,7 @@ package.json  pnpm-workspace.yaml  tsconfig.base.json  vitest.workspace.ts  .git
 packages/core/src/          ids.ts  model/  naming.ts  audit.ts  changelog.ts
                             governance/{schema.ts,merge.ts,engine.ts,profiles/*.yaml}
                             import/{identifiers.ts,filename-patterns.ts,confidence.ts,dedupe.ts}
+                            verify/{evidence.ts,checks.ts,recheck.ts}
                             citation/{csl-map.ts,render.ts}
 packages/library/src/       fs/atomic.ts  crypto/{format.ts,keys.ts}  library.ts registry.ts lock.ts
                             repo/{projects.ts,sources.ts,assets.ts,collections.ts,fieldwork.ts,mutate.ts}
@@ -57,18 +58,20 @@ packages/library/src/       fs/atomic.ts  crypto/{format.ts,keys.ts}  library.ts
                             import/{resolve.ts,attach.ts,bulk/{scan.ts,batch.ts,run.ts,undo.ts},
                                     refman.ts,zotero-rdf.ts,calibre.ts,zotero-local.ts,zotero-web.ts,
                                     watch.ts,device.ts}
-                            export/{bibliography.ts,refman-export.ts}  worker-client.ts
+                            capture/{platforms.ts,link-capture.ts,snapshot.ts,errors.ts,profile-capture.ts,profile-snapshot.ts}
+                            export/{bibliography.ts,refman-export.ts,backup.ts,project-export.ts}  retention.ts  worker-client.ts
 apps/library-service/src/   server.ts  routes/*.ts
-apps/cli/src/index.ts
+apps/cli/src/               index.ts  commands/*.ts
+apps/browser-extension/     manifest.json  src/{background.ts,popup/,content/}
 packages/ui/src/            theme/  api/  screens/  components/
 apps/desktop/               src-tauri/ (Rust shell), index.html → packages/ui
-services/media-worker/      pyproject.toml  ao_worker/{app.py,jobs.py,image_proxy.py,video_proxy.py,ocr.py}  tests/
+services/media-worker/      pyproject.toml  ao_worker/{app.py,jobs.py,transcribe.py,hallucination.py,download.py,image_proxy.py,video_proxy.py,ocr.py}  tests/
 tests/fixtures/             generators (scripts) + small committed fixtures
 e2e/                        Playwright specs
 docs/adr/  docs/governance/  scripts/{fetch-csl.mjs,fetch-fixtures.mjs,test-report.mjs}
 ```
 
-Package names: `@ao/core`, `@ao/library`, `@ao/ui`, `@ao/library-service`, `@ao/cli`, `@ao/desktop`. Tests are colocated as `*.test.ts(x)`.
+Package names: `@ao/core`, `@ao/library`, `@ao/ui`, `@ao/library-service`, `@ao/cli`, `@ao/desktop`, `@ao/browser-extension`. Tests are colocated as `*.test.ts(x)`.
 
 ---
 
