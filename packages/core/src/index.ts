@@ -32,6 +32,7 @@ export {
   PUBLIC_METADATA_SERVICES,
   RESIDENCY_KINDS,
   parseGovernance,
+  parseGovernanceWithWarnings,
 } from "./governance/schema.js";
 export type {
   GovernanceConfig,

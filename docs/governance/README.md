@@ -23,7 +23,15 @@ If a project asks for something looser than a profile allows, the stricter value
 
 ### Exceptions
 
-A project may record an **exception** for one specific control (for example `encryption.atRest`). An exception needs a written reason, who approved it, and when. With a non-empty reason, the looser value is allowed and no violation is raised for that control. An exception applies to that one control only. An exception with a blank reason has no effect.
+A project may record an **exception** for one specific control (for example `encryption.atRest`). An exception must state the **exact looser value** being approved, a written reason, who approved it (`by`), and when (`at`, an ISO 8601 UTC time such as `2026-01-01T09:30:00Z`). A missing value, approver, or time is an error when the file is loaded.
+
+An exception covers only the approved value, for that one control:
+
+- For an ordered setting, the project may go down to the approved value and no further. An exception approving `optional` encryption lets `optional` stand; `off` is still a violation.
+- For a list, only the items named in the approved value may stay beyond what the profile allows; everything else is removed and reported. For outside services, the vendor-agreement check still applies to any service not named in the exception.
+- For a yes/no requirement, the approved value must equal the value the project chose.
+
+An exception with a blank reason has no effect. An exception naming a control that does not exist is reported as a warning and waives nothing.
 
 ### Presence checks
 
@@ -32,6 +40,10 @@ Some profile requirements cannot be made stricter automatically because the soft
 ### Outside services (vendors)
 
 Processing steps (OCR, translation, transcription, and so on) are either `local` (on the researcher's own device) or an outside vendor listed under `vendors`, with flags for whether a Business Associate Agreement (`baa`) or Data Processing Agreement (`dpa`) is in place. A vendor name that is not declared is an error when the file is loaded. Public bibliographic lookup services (Crossref, OpenAlex, Open Library, Library of Congress) used for metadata lookup receive only bibliographic identifiers and are exempt from the vendor-agreement requirement.
+
+## Enforcement status
+
+At present the workbench computes the effective policy and the list of violations. Actually blocking actions (for example refusing a capture until a protocol is recorded) lands with the policy engine, the next task. Where the profile pages say the app "blocks" something, that describes the behavior the policy engine will enforce.
 
 ## The profiles
 

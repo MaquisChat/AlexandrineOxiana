@@ -1,5 +1,6 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { Provenance } from "../model/source.js";
 
 export const PROFILES = ["irb", "gdpr", "hipaa", "dmp"] as const;
 export type Profile = (typeof PROFILES)[number];
@@ -25,20 +26,20 @@ export const PROCESSING_OPS = [
 ] as const;
 export type ProcessingOp = (typeof PROCESSING_OPS)[number];
 
-/** Same values as Provenance.captureMethod. */
-export const CAPTURE_METHODS = [
-  "official_api",
-  "browser_capture",
-  "downloader",
-  "manual_upload",
-  "zotero_import",
-  "device_import",
-  "refman_import",
-  "calibre_import",
-] as const;
+/** Derived from Provenance.captureMethod so the two can never drift. */
+export const CAPTURE_METHODS = Provenance.shape.captureMethod.options;
 
 /** Public bibliographic services: exempt from the vendors list for metadata_lookup only. */
 export const PUBLIC_METADATA_SERVICES = ["crossref", "openalex", "openlibrary", "loc"] as const;
+
+/** Control paths that hold dates. Only DATE_PATHS take part in "earliest wins". */
+export const ALL_DATE_FIELDS = [
+  "retention.rawDataDestroyAfter",
+  "protocol.approvedFrom",
+  "protocol.expires",
+  "dmp.embargoUntil",
+] as const;
+export const DATE_PATHS: ReadonlySet<string> = new Set(["retention.rawDataDestroyAfter", "protocol.expires"]);
 
 export const ENCRYPTION_LEVELS = ["required", "optional", "off"] as const;
 export const LOCATION_LEVELS = ["strip", "coarsen", "keep"] as const;
@@ -50,15 +51,24 @@ const isoDate = z
 
 const processingList = z.array(z.string().min(1));
 
+const isoUtc = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/, "must be an ISO 8601 UTC timestamp, e.g. 2026-01-01T09:30:00Z")
+  .refine((x) => !Number.isNaN(Date.parse(x)), "not a real timestamp");
+
+/** `value` is the exact looser value being approved; it must be present (it may be null). */
 const ExceptionSchema = z
   .object({
     control: z.string().min(1),
-    value: z.unknown().optional(),
+    value: z.unknown(),
     reason: z.string(),
-    by: z.string().optional(),
-    at: z.string().optional(),
+    by: z.string().refine((x) => x.trim() !== "", "approver name must not be blank"),
+    at: isoUtc,
   })
-  .strict();
+  .strict()
+  .superRefine((e, ctx) => {
+    if (!("value" in e)) ctx.addIssue({ code: "custom", path: ["value"], message: "required: the looser value being approved" });
+  });
 
 const VendorSchema = z
   .object({
@@ -113,7 +123,13 @@ export const PartialGovernanceSchema = z
   .partial();
 
 export type Vendor = z.infer<typeof VendorSchema>;
-export type GovernanceException = z.infer<typeof ExceptionSchema>;
+export interface GovernanceException {
+  control: string;
+  value: unknown;
+  reason: string;
+  by: string;
+  at: string;
+}
 
 export interface GovernanceConfig {
   profiles: Profile[];
@@ -237,6 +253,16 @@ export function parsePartial(yamlText: string, label: string): Record<string, un
 }
 
 export function parseGovernance(yamlText: string): GovernanceConfig {
+  return parseGovernanceWithWarnings(yamlText).config;
+}
+
+function leafPaths(o: unknown, prefix = ""): string[] {
+  if (!isObj(o)) return [];
+  return Object.entries(o).flatMap(([k, v]) => (isObj(v) ? leafPaths(v, `${prefix}${k}.`) : [`${prefix}${k}`]));
+}
+
+/** Same as parseGovernance, plus non-fatal warnings (e.g. exceptions naming unknown controls). */
+export function parseGovernanceWithWarnings(yamlText: string): { config: GovernanceConfig; warnings: string[] } {
   const raw = parsePartial(yamlText, "governance.yaml");
   const r = PartialGovernanceSchema.safeParse(raw);
   if (!r.success) {
@@ -260,5 +286,9 @@ export function parseGovernance(yamlText: string): GovernanceConfig {
     });
   }
   if (issues.length) throw new GovernanceParseError(`governance.yaml is invalid:\n${issues.join("\n")}`, issues);
-  return cfg;
+  const known = new Set(leafPaths(DEFAULT_GOVERNANCE));
+  const warnings = cfg.exceptions
+    .map((e, i) => (known.has(e.control) ? null : `exceptions.${i}.control: "${e.control}" is not a known control path; it waives nothing`))
+    .filter((w): w is string => w !== null);
+  return { config: cfg, warnings };
 }

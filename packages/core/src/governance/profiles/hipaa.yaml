@@ -2,10 +2,13 @@
 encryption:
   atRest: required
 residency:
-  allowed: [device, removable, network, own_server]
+  allowed: [device, removable, network, own_server, cloud_folder]
 audit:
   enabled: true
 sharing:
   locationMetadata: strip
+# cloud_folder (an institution-approved synced folder) stays allowed only when the project
+# lists at least one entry under residency.approvedCloudFolders. Public "cloud" is never allowed.
+cloudFolderNeedsApproval: true
 # Every external (non-local) vendor must have a signed business associate agreement.
 vendorRequires: [baa]

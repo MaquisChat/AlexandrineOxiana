@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { effectivePolicy } from "./merge.js";
-import { parseGovernance, GovernanceParseError } from "./schema.js";
+import { parseGovernance, parseGovernanceWithWarnings, GovernanceParseError } from "./schema.js";
 
 const cfg = (yaml: string) => parseGovernance(yaml);
 const H = "profiles: [hipaa]\nsharing: { locationMetadata: strip }\n";
-const exc = (control: string, reason = "approved by IRB amendment 3") =>
-  `exceptions:\n  - { control: "${control}", reason: "${reason}", by: pi, at: "2026-01-01" }\n`;
+const exc = (control: string, value: string, reason = "approved by IRB amendment 3") =>
+  `exceptions:\n  - { control: "${control}", value: ${value}, reason: "${reason}", by: pi, at: "2026-01-01T09:30:00Z" }\n`;
 
 describe("parseGovernance", () => {
   it("fills defaults from an empty file", () => {
@@ -48,14 +48,14 @@ describe("effectivePolicy: spec scenarios", () => {
   });
   it("an exception with a reason lets the looser value stand", () => {
     const { policy, violations } = effectivePolicy(
-      cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest")),
+      cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "optional")),
     );
     expect(policy.encryption.atRest).toBe("optional");
     expect(violations).toHaveLength(0);
   });
   it("an exception with an empty or blank reason does not waive", () => {
     const { violations } = effectivePolicy(
-      cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "  ")),
+      cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "optional", "  ")),
     );
     expect(violations).toHaveLength(1);
   });
@@ -163,7 +163,7 @@ describe("effectivePolicy: lattice rules", () => {
 describe("effectivePolicy: exception scope", () => {
   it("an exception waives only its own control path", () => {
     const r = effectivePolicy(
-      cfg("profiles: [hipaa]\nencryption: { atRest: optional }\nsharing: { locationMetadata: keep }\n" + exc("encryption.atRest")),
+      cfg("profiles: [hipaa]\nencryption: { atRest: optional }\nsharing: { locationMetadata: keep }\n" + exc("encryption.atRest", "optional")),
     );
     expect(r.policy.encryption.atRest).toBe("optional");
     expect(r.policy.sharing.locationMetadata).toBe("strip");
@@ -171,7 +171,7 @@ describe("effectivePolicy: exception scope", () => {
   });
   it("an exception on a sibling path or parent does not waive", () => {
     for (const c of ["encryption", "sharing.locationMetadata", "encryption.atRest.x"]) {
-      const r = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + exc(c)));
+      const r = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + exc(c, "optional")));
       expect(r.policy.encryption.atRest).toBe("required");
     }
   });
@@ -179,14 +179,14 @@ describe("effectivePolicy: exception scope", () => {
     const r = effectivePolicy(
       cfg(
         H + "vendors: [{ id: deepl }]\nprocessing: { translation: [local, deepl], ocr: [local] }\n" +
-          exc("processing.translation"),
+          exc("processing.translation", "[local, deepl]"),
       ),
     );
     expect(r.policy.processing.translation).toEqual(["local", "deepl"]);
     expect(r.violations).toEqual([]);
   });
   it("an exception waives a dmp presence violation for that path only", () => {
-    const r = effectivePolicy(cfg("profiles: [dmp]\n" + exc("dmp.repository")));
+    const r = effectivePolicy(cfg("profiles: [dmp]\n" + exc("dmp.repository", "null")));
     expect(r.violations.map((v) => v.control)).not.toContain("dmp.repository");
     expect(r.violations.map((v) => v.control)).toContain("dmp.formats");
   });
@@ -220,5 +220,100 @@ describe("effectivePolicy never throws", () => {
     const before = JSON.stringify(c);
     effectivePolicy(c);
     expect(JSON.stringify(c)).toBe(before);
+  });
+});
+
+describe("literal brief scenario", () => {
+  it("profiles:[hipaa] + encryption optional: the encryption violation is among the results", () => {
+    const { policy, violations } = effectivePolicy(cfg("profiles: [hipaa]\nencryption: { atRest: optional }"));
+    expect(policy.encryption.atRest).toBe("required");
+    expect(violations).toContainEqual(expect.objectContaining({ control: "encryption.atRest", profile: "hipaa" }));
+  });
+});
+
+describe("hipaa cloud folders", () => {
+  const r = (extra: string) => effectivePolicy(cfg(H + extra));
+  it("approvedCloudFolders empty: cloud_folder and cloud removed", () => {
+    const x = r("residency: { allowed: [device, cloud_folder, cloud] }");
+    expect(x.policy.residency.allowed).toEqual(["device"]);
+    expect(x.violations).toHaveLength(1);
+  });
+  it("approvedCloudFolders non-empty: cloud_folder kept, cloud still removed", () => {
+    const x = r('residency: { allowed: [device, cloud_folder, cloud], approvedCloudFolders: ["onedrive:university-tenant"] }');
+    expect(x.policy.residency.allowed).toEqual(["device", "cloud_folder"]);
+    expect(x.violations).toHaveLength(1);
+    expect(r('residency: { allowed: [device, cloud_folder], approvedCloudFolders: ["onedrive:u"] }').violations).toEqual([]);
+  });
+  it("non-hipaa profiles do not restrict cloud_folder", () => {
+    const x = effectivePolicy(cfg("profiles: [irb]\nresidency: { allowed: [cloud_folder, cloud] }"));
+    expect(x.policy.residency.allowed).toEqual(["cloud_folder", "cloud"]);
+  });
+});
+
+describe("exception value semantics", () => {
+  it("ordered: optional is approved but off is still a violation", () => {
+    const ok = effectivePolicy(cfg(H + "encryption: { atRest: optional }\n" + exc("encryption.atRest", "optional")));
+    expect(ok.policy.encryption.atRest).toBe("optional");
+    expect(ok.violations).toEqual([]);
+    const off = effectivePolicy(cfg(H + "encryption: { atRest: off }\n" + exc("encryption.atRest", "optional")));
+    expect(off.policy.encryption.atRest).toBe("optional");
+    expect(off.violations).toHaveLength(1);
+    expect(off.violations[0]).toMatchObject({ control: "encryption.atRest", actual: "off", required: "optional" });
+  });
+  it("list: only items in value survive", () => {
+    const y =
+      "profiles: [hipaa]\nsharing: { locationMetadata: strip }\nresidency: { allowed: [device, network, cloud, own_server] }\n" +
+      exc("residency.allowed", "[device, cloud]");
+    const x = effectivePolicy(cfg(y));
+    expect(x.policy.residency.allowed).toEqual(["device", "network", "cloud", "own_server"]);
+    const y2 = y.replace("[device, cloud]", "[device]");
+    const x2 = effectivePolicy(cfg(y2));
+    expect(x2.policy.residency.allowed).toEqual(["device", "network", "own_server"]);
+    expect(x2.violations).toHaveLength(1);
+  });
+  it("processing list: vendor check still applies to items not in value", () => {
+    const base = H + "vendors: [{ id: deepl }, { id: other }]\nprocessing: { translation: [local, deepl, other] }\n";
+    const x = effectivePolicy(cfg(base + exc("processing.translation", "[local, deepl]")));
+    expect(x.policy.processing.translation).toEqual(["local", "deepl"]);
+    expect(x.violations).toHaveLength(1);
+  });
+  it("boolean: value must equal the loosened value", () => {
+    const ok = effectivePolicy(cfg("profiles: [gdpr]\naudit: { enabled: false }\n" + exc("audit.enabled", "false")));
+    expect(ok.policy.audit.enabled).toBe(false);
+    expect(ok.violations).toEqual([]);
+    const bad = effectivePolicy(cfg("profiles: [gdpr]\naudit: { enabled: false }\n" + exc("audit.enabled", "true")));
+    expect(bad.policy.audit.enabled).toBe(true);
+    expect(bad.violations).toHaveLength(1);
+  });
+});
+
+describe("exception shape", () => {
+  const e = (body: string) => `exceptions:\n  - { control: audit.enabled, ${body} }`;
+  it("value is required (null allowed), error names the path", () => {
+    expect(() => cfg(e('reason: r, by: pi, at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.value/);
+    expect(() => cfg(e('value: null, reason: r, by: pi, at: "2026-01-01T00:00:00Z"'))).not.toThrow();
+  });
+  it("by must be non-blank", () => {
+    expect(() => cfg(e('value: false, reason: r, by: "  ", at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.by/);
+    expect(() => cfg(e('value: false, reason: r, at: "2026-01-01T00:00:00Z"'))).toThrow(/exceptions\.0\.by/);
+  });
+  it("at must be ISO 8601 UTC", () => {
+    expect(() => cfg(e("value: false, reason: r, by: pi, at: \"2026-01-01\""))).toThrow(/exceptions\.0\.at/);
+    expect(() => cfg(e('value: false, reason: r, by: pi, at: "2026-01-01T00:00:00+02:00"'))).toThrow(/exceptions\.0\.at/);
+    expect(() => cfg(e("value: false, reason: r, by: pi"))).toThrow(/exceptions\.0\.at/);
+  });
+});
+
+describe("parseGovernanceWithWarnings", () => {
+  it("warns on unknown control paths and keeps the same config", () => {
+    const y = exc("encryption.atrest", "optional");
+    const { config, warnings } = parseGovernanceWithWarnings(y);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/exceptions\.0\.control.*encryption\.atrest/);
+    expect(config).toEqual(parseGovernance(y));
+  });
+  it("no warnings for known paths, including processing.<op>", () => {
+    expect(parseGovernanceWithWarnings(exc("processing.translation", "[local]")).warnings).toEqual([]);
+    expect(parseGovernanceWithWarnings(exc("encryption.atRest", "optional")).warnings).toEqual([]);
   });
 });

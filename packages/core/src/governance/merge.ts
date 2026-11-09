@@ -1,10 +1,12 @@
 import { PROFILE_MINIMUMS, PROFILE_RULES } from "./profiles/index.js";
 import {
+  DATE_PATHS,
   ENCRYPTION_LEVELS,
   LOCATION_LEVELS,
   PROCESSING_OPS,
   PUBLIC_METADATA_SERVICES,
   type GovernanceConfig,
+  type GovernanceException,
   type PartialGovernance,
   type Profile,
 } from "./schema.js";
@@ -26,7 +28,6 @@ const ORDERS: Record<string, readonly string[]> = {
   "encryption.atRest": [...ENCRYPTION_LEVELS].reverse(), // off < optional < required
   "sharing.locationMetadata": [...LOCATION_LEVELS].reverse(), // keep < coarsen < strip
 };
-const DATE_PATHS = new Set(["retention.rawDataDestroyAfter", "protocol.expires"]);
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -63,28 +64,43 @@ function leaves(o: unknown, prefix = ""): Array<[string, unknown]> {
 
 const time = (s: unknown): number => (typeof s === "string" ? Date.parse(s) : Number.NaN);
 
-/** Strictest of (actual, required) for one control, and whether `actual` was looser. */
-function tighten(path: string, actual: unknown, required: unknown): { value: unknown; loosened: boolean } {
+/**
+ * Strictest of (actual, required) for one control, and whether `actual` was looser.
+ * An exception lowers the bar only to the exact value it approved.
+ */
+function tighten(
+  path: string,
+  actual: unknown,
+  required: unknown,
+  exc?: GovernanceException,
+): { value: unknown; loosened: boolean } {
   const order = ORDERS[path];
   if (order) {
+    let req = required;
+    if (exc && order.indexOf(exc.value as string) >= 0 && order.indexOf(exc.value as string) < order.indexOf(req as string)) {
+      req = exc.value;
+    }
     const ra = order.indexOf(actual as string);
-    const rr = order.indexOf(required as string);
-    return ra >= rr ? { value: actual, loosened: false } : { value: required, loosened: true };
+    const rr = order.indexOf(req as string);
+    return ra >= rr ? { value: actual, loosened: false } : { value: req, loosened: true };
   }
   if (DATE_PATHS.has(path)) {
-    if (actual === null || actual === undefined) return { value: required, loosened: false };
-    if (required === null || required === undefined) return { value: actual, loosened: false };
-    return time(required) < time(actual)
-      ? { value: required, loosened: true }
-      : { value: actual, loosened: false };
+    let req = required;
+    if (exc && time(exc.value) > time(req)) req = exc.value;
+    if (actual === null || actual === undefined) return { value: req, loosened: false };
+    if (req === null || req === undefined) return { value: actual, loosened: false };
+    return time(req) < time(actual) ? { value: req, loosened: true } : { value: actual, loosened: false };
   }
   if (typeof required === "boolean") {
+    // The exception must approve exactly the value the project chose.
+    if (exc && exc.value === actual) return { value: actual, loosened: false };
     if (required && actual !== true) return { value: true, loosened: true };
     return { value: actual, loosened: false };
   }
   if (Array.isArray(required)) {
     const cur = Array.isArray(actual) ? actual : [];
-    const kept = cur.filter((x) => required.includes(x));
+    const approved = exc && Array.isArray(exc.value) ? exc.value : [];
+    const kept = cur.filter((x) => required.includes(x) || approved.includes(x));
     return { value: kept, loosened: kept.length !== cur.length };
   }
   // Plain values (strings, null): fill where empty, otherwise keep the project's value.
@@ -99,14 +115,13 @@ function tighten(path: string, actual: unknown, required: unknown): { value: unk
 export function applyMinimum(
   cfg: GovernanceConfig,
   minimum: PartialGovernance,
-  skip: (control: string) => boolean = () => false,
+  exceptionFor: (control: string) => GovernanceException | undefined = () => undefined,
 ): { value: GovernanceConfig; loosened: string[]; required: Record<string, unknown> } {
   const value = structuredClone(cfg) as unknown as Record<string, unknown>;
   const loosened: string[] = [];
   const required: Record<string, unknown> = {};
   for (const [path, req] of leaves(minimum)) {
-    if (skip(path)) continue;
-    const r = tighten(path, getPath(cfg, path), req);
+    const r = tighten(path, getPath(cfg, path), req, exceptionFor(path));
     setPath(value, path, r.value);
     if (r.loosened) {
       loosened.push(path);
@@ -124,28 +139,35 @@ const isEmpty = (v: unknown): boolean =>
  * Never throws on a parsed config.
  */
 export function effectivePolicy(cfg: GovernanceConfig): EffectivePolicy {
-  const waived = new Set(
-    (cfg.exceptions ?? [])
-      .filter((e) => typeof e.reason === "string" && e.reason.trim() !== "")
-      .map((e) => e.control),
-  );
-  const isWaived = (c: string) => waived.has(c);
+  // Only exceptions with a written reason count, and only for their exact control path.
+  const excs = new Map<string, GovernanceException>();
+  for (const e of cfg.exceptions ?? []) {
+    if (typeof e.reason === "string" && e.reason.trim() !== "" && !excs.has(e.control)) excs.set(e.control, e);
+  }
+  const exceptionFor = (c: string) => excs.get(c);
 
   let policy = structuredClone(cfg) as GovernanceConfig;
   const violations: Violation[] = [];
 
   for (const profile of cfg.profiles ?? []) {
-    const minimum = PROFILE_MINIMUMS[profile];
+    const baseMinimum = PROFILE_MINIMUMS[profile];
     const rules = PROFILE_RULES[profile];
-    if (!minimum || !rules) continue;
+    if (!baseMinimum || !rules) continue;
+    let minimum = baseMinimum;
+    if (rules.cloudFolderNeedsApproval && (cfg.residency?.approvedCloudFolders ?? []).length === 0 && minimum.residency?.allowed) {
+      minimum = {
+        ...minimum,
+        residency: { ...minimum.residency, allowed: minimum.residency.allowed.filter((k) => k !== "cloud_folder") },
+      };
+    }
 
     // Violations are judged against what the project itself asked for.
-    const against = applyMinimum(cfg, minimum, isWaived);
+    const against = applyMinimum(cfg, minimum, exceptionFor);
     for (const control of against.loosened) {
       violations.push({ control, required: against.required[control], actual: getPath(cfg, control), profile });
     }
     // The policy folds in the same minimum on top of what earlier profiles produced.
-    policy = applyMinimum(policy, minimum, isWaived).value;
+    policy = applyMinimum(policy, minimum, exceptionFor).value;
 
     // Vendor agreements: external vendors lacking a required agreement are dropped.
     if (rules.vendorRequires.length > 0) {
@@ -154,9 +176,11 @@ export function effectivePolicy(cfg: GovernanceConfig): EffectivePolicy {
       );
       for (const op of PROCESSING_OPS) {
         const control = `processing.${op}`;
-        if (isWaived(control)) continue;
+        const exc = exceptionFor(control);
+        const approved = exc && Array.isArray(exc.value) ? (exc.value as unknown[]) : [];
         const allowed = (id: string) =>
           id === "local" ||
+          approved.includes(id) ||
           ok.has(id) ||
           (op === "metadata_lookup" && (PUBLIC_METADATA_SERVICES as readonly string[]).includes(id));
         const original = cfg.processing?.[op] ?? [];
@@ -170,7 +194,7 @@ export function effectivePolicy(cfg: GovernanceConfig): EffectivePolicy {
 
     // Presence checks: the software cannot make these stricter, only report them.
     for (const control of rules.require) {
-      if (!isWaived(control) && isEmpty(getPath(cfg, control))) {
+      if (!exceptionFor(control) && isEmpty(getPath(cfg, control))) {
         violations.push({ control, required: "must be set (non-empty)", actual: getPath(cfg, control), profile });
       }
     }
