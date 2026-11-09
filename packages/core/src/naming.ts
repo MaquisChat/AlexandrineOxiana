@@ -148,7 +148,7 @@ export function derivedFileName(
 /** Splits a name into stem and extension tail (`.vtt`, `.tar.gz`, `.vtt.enc`, ...). */
 function splitName(name: string, isFile: boolean): { stem: string; tail: string } {
   if (!isFile) return { stem: name, tail: "" };
-  const m = /(\.tar\.(?:gz|bz2|xz)|\.[A-Za-z0-9]{1,5})?(\.enc)?$/.exec(name);
+  const m = /(\.tar\.(?:gz|bz2|xz)|\.[A-Za-z0-9]{1,10})?(\.enc)?$/.exec(name);
   const tail = m?.[0] ?? "";
   if (tail === "" || tail.length >= name.length) return { stem: name, tail: "" };
   return { stem: name.slice(0, name.length - tail.length), tail };

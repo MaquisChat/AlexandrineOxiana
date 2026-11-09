@@ -291,8 +291,13 @@ describe("withCollisionSuffix extensions", () => {
     );
   });
 
-  it("only treats short alphanumeric tails as extensions", () => {
-    expect(withCollisionSuffix("a.verylongext", (n) => n === "a.verylongext")).toBe("a.verylongext (2)");
+  it("treats up to 10 alphanumerics as an extension, more is not", () => {
+    expect(withCollisionSuffix("a.markdown", (n) => n === "a.markdown")).toBe("a (2).markdown");
+    expect(withCollisionSuffix("x.webarchive.enc", (n) => n === "x.webarchive.enc")).toBe(
+      "x (2).webarchive.enc",
+    );
+    expect(withCollisionSuffix("a.tenletters", (n) => n === "a.tenletters")).toBe("a (2).tenletters");
+    expect(withCollisionSuffix("a.elevenchars", (n) => n === "a.elevenchars")).toBe("a.elevenchars (2)");
   });
 });
 
@@ -306,12 +311,12 @@ describe("template substitution", () => {
 
 describe("pseudonymize fails closed", () => {
   it("matches NFD text against NFC keys", () => {
-    expect(pseudonymize("x @josé y", new Map([["@josé", "P-001"]]))).toBe("x P-001 y");
-    expect(pseudonymize("x @josé y", new Map([["@josé", "P-001"]]))).toBe("x P-001 y");
+    expect(pseudonymize("x @jose\u0301 y", new Map([["@jos\u00e9", "P-001"]]))).toBe("x P-001 y");
+    expect(pseudonymize("x @jos\u00e9 y", new Map([["@jose\u0301", "P-001"]]))).toBe("x P-001 y");
   });
 
   it("does not match a handle followed by a combining mark", () => {
-    expect(pseudonymize("@josé", new Map([["@jose", "P-001"]]))).toBe("@josé");
+    expect(pseudonymize("@jose\u0301", new Map([["@jose", "P-001"]]))).toBe("@jos\u00e9");
   });
 
   it("ignores empty keys", () => {
