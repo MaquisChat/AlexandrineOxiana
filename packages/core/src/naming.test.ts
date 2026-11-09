@@ -238,3 +238,106 @@ describe("encName", () => {
     expect(encName("x.vtt")).toBe("x.vtt.enc");
   });
 });
+
+describe("255-byte limit on final on-disk names", () => {
+  const long = {
+    sourceName: "字".repeat(300),
+    kind: "caption",
+    lang: "es-to-en",
+    tool: "whisper-large-v3",
+    modified: new Date("2026-11-09T20:02:00Z"),
+    ext: "vtt",
+    tz: "UTC",
+  };
+
+  it("survives .enc and collision suffixes", () => {
+    const name = derivedFileName(long);
+    const enc = encName(name);
+    expect(bytes(name)).toBeLessThanOrEqual(246);
+    expect(bytes(enc)).toBeLessThanOrEqual(255);
+    for (const taken of [new Set([enc]), new Set([enc, withCollisionSuffix(enc, (n) => n === enc)])]) {
+      const out = withCollisionSuffix(enc, (n) => taken.has(n));
+      expect(bytes(out)).toBeLessThanOrEqual(255);
+      expect(out.endsWith(".vtt.enc")).toBe(true);
+    }
+    const many = new Set([enc]);
+    for (let i = 2; i < 10; i++) many.add(withCollisionSuffix(enc, (n) => many.has(n)));
+    const ten = withCollisionSuffix(enc, (n) => many.has(n));
+    expect(ten).toContain(" (10).vtt.enc");
+    expect(bytes(ten)).toBeLessThanOrEqual(255);
+  });
+
+  it("encName and withCollisionSuffix re-shrink arbitrary over-long names", () => {
+    const raw = `${"x".repeat(251)}.vtt`;
+    expect(bytes(encName(raw))).toBeLessThanOrEqual(255);
+    expect(encName(raw).endsWith(".vtt.enc")).toBe(true);
+    expect(bytes(withCollisionSuffix(raw, (n) => n === raw))).toBeLessThanOrEqual(255);
+  });
+
+  it("keeps original file names within the reserved budget", () => {
+    expect(bytes(originalFileName(`${"字".repeat(300)} [a1b2]`, "pdf"))).toBeLessThanOrEqual(246);
+  });
+});
+
+describe("withCollisionSuffix extensions", () => {
+  it("treats .tar.gz as one extension", () => {
+    expect(withCollisionSuffix("a.tar.gz", (n) => n === "a.tar.gz")).toBe("a (2).tar.gz");
+    expect(withCollisionSuffix("a.tar.xz.enc", (n) => n === "a.tar.xz.enc")).toBe("a (2).tar.xz.enc");
+  });
+
+  it("does not split folder names when isFile is false", () => {
+    expect(withCollisionSuffix("Report v2.0", (n) => n === "Report v2.0", { isFile: false })).toBe(
+      "Report v2.0 (2)",
+    );
+  });
+
+  it("only treats short alphanumeric tails as extensions", () => {
+    expect(withCollisionSuffix("a.verylongext", (n) => n === "a.verylongext")).toBe("a.verylongext (2)");
+  });
+});
+
+describe("template substitution", () => {
+  it("does not rewrite placeholders inside substituted values", () => {
+    expect(sourceFolderName({ shortTitle: "About {id} and {creator}", shortId: "a1b2" })).toBe(
+      "Unknown - About {id} and {creator} [a1b2]",
+    );
+  });
+});
+
+describe("pseudonymize fails closed", () => {
+  it("matches NFD text against NFC keys", () => {
+    expect(pseudonymize("x @josé y", new Map([["@josé", "P-001"]]))).toBe("x P-001 y");
+    expect(pseudonymize("x @josé y", new Map([["@josé", "P-001"]]))).toBe("x P-001 y");
+  });
+
+  it("does not match a handle followed by a combining mark", () => {
+    expect(pseudonymize("@josé", new Map([["@jose", "P-001"]]))).toBe("@josé");
+  });
+
+  it("ignores empty keys", () => {
+    expect(pseudonymize("abc @a", new Map([["", "X"], ["@a", "P-1"]]))).toBe("abc P-1");
+    expect(pseudonymize("abc", new Map([["", "X"]]))).toBe("abc");
+  });
+
+  it("replaces handles that only match through regex case folding", () => {
+    // U+017F (long s) folds to "s" under /iu but toLowerCase() leaves it unchanged.
+    expect(pseudonymize("@maſ", new Map([["@mas", "P-9"]]))).toBe("P-9");
+  });
+});
+
+describe("sanitizeSegment bidi controls", () => {
+  it("strips overrides and isolates but keeps LRM/RLM", () => {
+    expect(sanitizeSegment("a‮b⁦c⁩d‪e")).toBe("abcde");
+    expect(sanitizeSegment("a‎b‏c")).toBe("a‎b‏c");
+  });
+});
+
+describe("originalFileName hardening", () => {
+  it("prefixes reserved stems", () => {
+    expect(originalFileName("CON [a1b2]", "pdf")).toBe("_CON.pdf");
+  });
+
+  it("sanitizes the extension", () => {
+    expect(originalFileName("A [a1b2]", ".p/df")).toBe("A.p-df");
+  });
+});
