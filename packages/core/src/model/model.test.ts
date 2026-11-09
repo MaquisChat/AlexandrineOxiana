@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  Anchor,
   Annotation,
   Asset,
   ImportBatch,
@@ -138,17 +139,41 @@ describe("Anchor / Annotation", () => {
   it("parses each anchor kind", () => {
     const base = { id: newId(), sourceId: newId(), kind: "highlight", author: "me", createdAt: now };
     const anchors = [
-      { kind: "text-range", assetId: newId(), start: 0, end: 5, quote: "hello", prefix: "", suffix: "" },
-      { kind: "pdf", assetId: newId(), page: 1, rects: [{ x: 0, y: 0, w: 1, h: 1 }] },
-      { kind: "epub-cfi", assetId: newId(), cfi: "epubcfi(/6/4)" },
-      { kind: "time-range", assetId: newId(), startMs: 0, endMs: 1000 },
-      { kind: "image-region", assetId: newId(), shape: "rect", points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] },
-      { kind: "transcript-segment", assetId: newId(), segmentIds: ["s1"] },
+      { id: newId(), kind: "text-range", assetId: newId(), start: 0, end: 5, quote: "hello", prefix: "", suffix: "" },
+      { id: newId(), kind: "pdf", assetId: newId(), page: 1, rects: [{ x: 0, y: 0, w: 1, h: 1 }] },
+      { id: newId(), kind: "epub-cfi", assetId: newId(), cfi: "epubcfi(/6/4)" },
+      { id: newId(), kind: "time-range", assetId: newId(), startMs: 0, endMs: 1000 },
+      { id: newId(), kind: "image-region", assetId: newId(), shape: "rect", points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] },
+      { id: newId(), kind: "transcript-segment", assetId: newId(), segmentIds: ["s1"] },
     ];
     for (const a of anchors) {
       expect(Annotation.safeParse({ ...base, anchors: [a] }).success, a.kind).toBe(true);
     }
     expect(Annotation.safeParse({ ...base, anchors: [{ kind: "bogus" }] }).success).toBe(false);
+  });
+
+  it("requires anchor id and lets a translation anchor reference the original", () => {
+    const orig = { id: newId(), kind: "text-range", assetId: newId(), start: 0, end: 5, quote: "hola" };
+    const tr = { id: newId(), kind: "text-range", assetId: newId(), start: 0, end: 4, quote: "hi", originalAnchorId: orig.id };
+    expect(Anchor.parse(tr).originalAnchorId).toBe(orig.id);
+    const { id: _omit, ...noId } = orig;
+    expect(Anchor.safeParse(noId).success).toBe(false);
+  });
+
+  it("rejects inverted ranges and bad shapes", () => {
+    const a = newId();
+    const mk = (o: object) => Anchor.safeParse({ id: newId(), assetId: a, ...o }).success;
+    expect(mk({ kind: "text-range", start: 5, end: 1, quote: "x" })).toBe(false);
+    expect(mk({ kind: "text-range", start: 3, end: 3, quote: "" })).toBe(true);
+    expect(mk({ kind: "time-range", startMs: 10, endMs: 5 })).toBe(false);
+    expect(mk({ kind: "time-range", startMs: 5, endMs: 5 })).toBe(true);
+    expect(mk({ kind: "pdf", page: 1, rects: [] })).toBe(false);
+    const p = (x: number) => ({ x, y: x });
+    expect(mk({ kind: "image-region", shape: "rect", points: [p(0)] })).toBe(false);
+    expect(mk({ kind: "image-region", shape: "rect", points: [p(0), p(1), p(2)] })).toBe(false);
+    expect(mk({ kind: "image-region", shape: "rect", points: [p(0), p(1)] })).toBe(true);
+    expect(mk({ kind: "image-region", shape: "polygon", points: [p(0), p(1)] })).toBe(false);
+    expect(mk({ kind: "image-region", shape: "polygon", points: [p(0), p(1), p(2)] })).toBe(true);
   });
 });
 
