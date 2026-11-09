@@ -1,9 +1,18 @@
 import { mkdir, readFile, readdir } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { newId } from "@ao/core";
 import type { Deps } from "./deps.js";
 import { writeFileAtomic } from "./fs/atomic.js";
-import { acquireLock, peekLock, releaseLock, startHeartbeat } from "./lock.js";
+import {
+  LockNotWritableError,
+  NOT_WRITABLE_CODES,
+  acquireLock,
+  peekLock,
+  readLock,
+  releaseLock,
+  startHeartbeat,
+  type LockInfo,
+} from "./lock.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -23,7 +32,7 @@ export interface Library {
   name: string;
   root: string;
   mode: "read-write" | "read-only";
-  readOnlyReason?: "locked-by-other-device" | "newer-format" | "offline";
+  readOnlyReason?: "locked-by-other-device" | "newer-format" | "offline" | "not-writable";
   close(): Promise<void>;
 }
 
@@ -45,6 +54,20 @@ export class FolderNotEmptyError extends Error {
     this.name = "FolderNotEmptyError";
   }
 }
+export class LibraryNotWritableError extends Error {
+  constructor(root: string) {
+    super(`Library folder is not writable: ${root}`);
+    this.name = "LibraryNotWritableError";
+  }
+}
+export interface OpenOptions {
+  /** Called when a read-write handle loses its lock (see startHeartbeat). */
+  onLockLost?: (holder: LockInfo | null) => void;
+}
+
+/** Roots opened read-write by this process (guards a same-process double open). */
+const openRoots = new Set<string>();
+
 export class AlreadyALibraryError extends Error {
   constructor(root: string) {
     super(`Folder already contains a library: ${root}`);
@@ -65,21 +88,33 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-export async function createLibrary(root: string, name: string, deps: Deps): Promise<Library> {
+export async function createLibrary(
+  root: string,
+  name: string,
+  deps: Deps,
+  opts: OpenOptions = {},
+): Promise<Library> {
   if (await exists(metaPath(root))) throw new AlreadyALibraryError(root);
-  await mkdir(root, { recursive: true });
-  if ((await readdir(root)).length > 0) throw new FolderNotEmptyError(root);
-  for (const d of SUBDIRS) await mkdir(join(root, d), { recursive: true });
-  const at = deps.clock().toISOString();
-  const meta: LibraryJson = {
-    libraryId: newId(),
-    name,
-    formatVersion: FORMAT_VERSION,
-    createdAt: at,
-    locationHistory: [{ at, hint: hintFor(root, deps) }],
-  };
-  await writeFileAtomic(metaPath(root), JSON.stringify(meta, null, 2));
-  return openLibrary(root, deps);
+  try {
+    await mkdir(root, { recursive: true });
+    if ((await readdir(root)).length > 0) throw new FolderNotEmptyError(root);
+    for (const d of SUBDIRS) await mkdir(join(root, d), { recursive: true });
+    const at = deps.clock().toISOString();
+    const meta: LibraryJson = {
+      libraryId: newId(),
+      name,
+      formatVersion: FORMAT_VERSION,
+      createdAt: at,
+      locationHistory: [{ at, hint: hintFor(root, deps) }],
+    };
+    await writeFileAtomic(metaPath(root), JSON.stringify(meta, null, 2));
+  } catch (err) {
+    if (NOT_WRITABLE_CODES.has((err as NodeJS.ErrnoException).code ?? "")) throw new LibraryNotWritableError(root);
+    throw err;
+  }
+  const lib = await openLibrary(root, deps, opts);
+  if (lib.readOnlyReason === "not-writable") throw new LibraryNotWritableError(root);
+  return lib;
 }
 
 async function readMeta(root: string): Promise<LibraryJson> {
@@ -117,11 +152,13 @@ async function readMeta(root: string): Promise<LibraryJson> {
   };
 }
 
-export async function openLibrary(root: string, deps: Deps): Promise<Library> {
+export async function openLibrary(root: string, deps: Deps, opts: OpenOptions = {}): Promise<Library> {
   const meta = await readMeta(root);
-  const base = { id: meta.libraryId, name: meta.name, root };
+  const key = resolve(root);
   const readOnly = (reason: NonNullable<Library["readOnlyReason"]>): Library => ({
-    ...base,
+    id: meta.libraryId,
+    name: meta.name,
+    root,
     mode: "read-only",
     readOnlyReason: reason,
     close: async () => {},
@@ -132,34 +169,76 @@ export async function openLibrary(root: string, deps: Deps): Promise<Library> {
     await note(root, meta, deps);
     return readOnly("newer-format");
   }
+  // Same-process double open: the lock on disk is ours, so the lock rules
+  // alone would let a second handle through.
+  const onDisk = await readLock(root);
+  if (openRoots.has(key) && onDisk !== null && onDisk !== "corrupt" && onDisk.deviceId === deps.deviceId && onDisk.pid === deps.pid) {
+    await note(root, meta, deps);
+    return readOnly("locked-by-other-device");
+  }
   if (await peekLock(root, deps)) {
     await note(root, meta, deps);
     return readOnly("locked-by-other-device");
   }
-  const got = await acquireLock(root, deps);
+  let got: Awaited<ReturnType<typeof acquireLock>>;
+  try {
+    got = await acquireLock(root, deps);
+  } catch (err) {
+    if (err instanceof LockNotWritableError) {
+      await note(root, meta, deps);
+      return readOnly("not-writable");
+    }
+    throw err;
+  }
   if (!got.acquired) {
     await note(root, meta, deps);
     return readOnly("locked-by-other-device");
   }
 
-  const stopHeartbeat = startHeartbeat(root, deps);
-  const hint = hintFor(root, deps);
-  const history = meta.locationHistory;
-  if (history[history.length - 1]?.hint !== hint) {
-    history.push({ at: deps.clock().toISOString(), hint });
-    meta.locationHistory = history.slice(-MAX_HISTORY);
-    await writeFileAtomic(metaPath(root), JSON.stringify(meta, null, 2));
+  openRoots.add(key);
+  const state: { mode: Library["mode"]; reason?: Library["readOnlyReason"] } = { mode: "read-write" };
+  let hb: ReturnType<typeof startHeartbeat> | undefined;
+  try {
+    hb = startHeartbeat(root, deps, (holder) => {
+      // Lock lost: demote this handle to read-only and tell the caller.
+      state.mode = "read-only";
+      state.reason = "locked-by-other-device";
+      openRoots.delete(key);
+      opts.onLockLost?.(holder);
+    });
+    // Re-read: library.json may have changed while we waited for the lock.
+    const fresh = await readMeta(root);
+    const hint = hintFor(root, deps);
+    const history = fresh.locationHistory;
+    if (history[history.length - 1]?.hint !== hint) {
+      history.push({ at: deps.clock().toISOString(), hint });
+      fresh.locationHistory = history.slice(-MAX_HISTORY);
+      await writeFileAtomic(metaPath(root), JSON.stringify(fresh, null, 2));
+    }
+    await note(root, fresh, deps);
+  } catch (err) {
+    openRoots.delete(key);
+    await hb?.stop();
+    await releaseLock(root, deps).catch(() => {});
+    throw err;
   }
-  await note(root, meta, deps);
 
   let closed = false;
   return {
-    ...base,
-    mode: "read-write",
+    id: meta.libraryId,
+    name: meta.name,
+    root,
+    get mode() {
+      return state.mode;
+    },
+    get readOnlyReason() {
+      return state.reason;
+    },
     async close() {
       if (closed) return;
       closed = true;
-      stopHeartbeat();
+      openRoots.delete(key);
+      await hb?.stop();
       await releaseLock(root, deps);
     },
   };

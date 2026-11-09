@@ -36,12 +36,13 @@ export {
   CorruptLibraryError,
   FORMAT_VERSION,
   FolderNotEmptyError,
+  LibraryNotWritableError,
   NotALibraryError,
   createLibrary,
   openLibrary,
 } from "./library.js";
-export type { Library, LibraryJson } from "./library.js";
-export { HEARTBEAT_MS, STALE_MS, acquireLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
+export type { Library, LibraryJson, OpenOptions } from "./library.js";
+export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
 export type { LockInfo } from "./lock.js";
 export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";

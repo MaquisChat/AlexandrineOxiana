@@ -1,11 +1,12 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AlreadyALibraryError,
   CorruptLibraryError,
   FolderNotEmptyError,
+  LibraryNotWritableError,
   NotALibraryError,
   createLibrary,
   forgetLibrary,
@@ -16,6 +17,21 @@ import {
   type Deps,
 } from "./index.js";
 import { acquireLock } from "./lock.js";
+
+vi.mock("./fs/atomic.js", async (orig) => {
+  const actual = await orig<typeof import("./fs/atomic.js")>();
+  return { ...actual, writeFileAtomic: vi.fn(actual.writeFileAtomic) };
+});
+import * as atomic from "./fs/atomic.js";
+const realWrite = (await vi.importActual<typeof import("./fs/atomic.js")>("./fs/atomic.js")).writeFileAtomic;
+/** Makes writeFileAtomic fail with `code` for paths ending in `suffix`. */
+function failWrites(suffix: string, code: string) {
+  vi.mocked(atomic.writeFileAtomic).mockImplementation(async (p, d) => {
+    if (String(p).endsWith(suffix)) throw Object.assign(new Error(code), { code });
+    return realWrite(p, d);
+  });
+}
+const tick = (i: number) => (timers[i]!.fn as unknown as () => Promise<void>)();
 
 let tmp: string;
 let root: string;
@@ -51,6 +67,7 @@ beforeEach(async () => {
   now = Date.parse("2026-11-09T10:00:00Z");
   alive = new Set([100, 200]);
   timers = [];
+  vi.mocked(atomic.writeFileAtomic).mockImplementation(realWrite);
 });
 afterEach(() => rm(tmp, { recursive: true, force: true }));
 
@@ -196,8 +213,7 @@ describe("lock", () => {
     expect(timers).toHaveLength(1);
     expect(timers[0]!.ms).toBe(30_000);
     now += 30_000;
-    timers[0]!.fn();
-    await new Promise((r) => setTimeout(r, 50));
+    await tick(0);
     const lock = JSON.parse(await readFile(join(root, ".lock"), "utf8"));
     expect(lock.heartbeatAt).toBe(new Date(now).toISOString());
     // heartbeat keeps others out beyond 121 s of the original open
@@ -280,5 +296,124 @@ describe("registry", () => {
     await lib.close();
     const [e] = await listLibraries(deps);
     expect(e).toMatchObject({ libraryId: lib.id, name: "Mine", lastKnownPaths: [root] });
+  });
+});
+
+describe("fix round 1", () => {
+  it("heartbeat demotes the handle when another device took the lock, without clobbering", async () => {
+    const lost: unknown[] = [];
+    const a = await createLibrary(root, "Mine", mkDeps(), { onLockLost: (h) => lost.push(h) });
+    now += 121_000; // A stopped heartbeating (e.g. laptop asleep)
+    await openLibrary(root, depsB());
+    now += 30_000;
+    await tick(0);
+    expect(a.mode).toBe("read-only");
+    expect(a.readOnlyReason).toBe("locked-by-other-device");
+    expect(lost).toHaveLength(1);
+    expect((lost[0] as { deviceId: string }).deviceId).toBe("dev-B");
+    expect(timers[0]!.cleared).toBe(true);
+    expect(JSON.parse(await readFile(join(root, ".lock"), "utf8")).deviceId).toBe("dev-B");
+    await a.close();
+    expect(JSON.parse(await readFile(join(root, ".lock"), "utf8")).deviceId).toBe("dev-B");
+  });
+
+  it("heartbeat that cannot write for more than 120 s demotes with holder null", async () => {
+    const lost: unknown[] = [];
+    const a = await createLibrary(root, "Mine", mkDeps(), { onLockLost: (h) => lost.push(h) });
+    failWrites(".lock", "EIO");
+    for (let i = 0; i < 5; i++) {
+      now += 30_000;
+      await tick(0);
+    }
+    expect(lost).toEqual([null]);
+    expect(a.mode).toBe("read-only");
+    expect(a.readOnlyReason).toBe("locked-by-other-device");
+  });
+
+  it("releases the lock and stops the heartbeat when open fails after acquiring it", async () => {
+    await (await createLibrary(root, "Mine", mkDeps())).close();
+    const before = timers.length;
+    failWrites("library.json", "EIO");
+    await expect(openLibrary(root, mkDeps({ hostname: "host-Z" }))).rejects.toThrow();
+    await expect(stat(join(root, ".lock"))).rejects.toThrow();
+    expect(timers.length).toBe(before + 1);
+    expect(timers[before]!.cleared).toBe(true);
+    vi.mocked(atomic.writeFileAtomic).mockImplementation(realWrite);
+    expect((await openLibrary(root, mkDeps())).mode).toBe("read-write");
+  });
+
+  it("opens read-only with not-writable when the lock cannot be written; writes nothing", async () => {
+    await (await createLibrary(root, "Mine", mkDeps())).close();
+    const before = await snapshot(root);
+    failWrites(".lock", "EROFS");
+    const lib = await openLibrary(root, mkDeps());
+    expect(lib.mode).toBe("read-only");
+    expect(lib.readOnlyReason).toBe("not-writable");
+    expect(await snapshot(root)).toEqual(before);
+  });
+
+  it("createLibrary throws LibraryNotWritableError on a non-writable root", async () => {
+    failWrites("library.json", "EACCES");
+    await expect(createLibrary(root, "X", mkDeps())).rejects.toBeInstanceOf(LibraryNotWritableError);
+  });
+
+  it("a second open of the same root in this process is read-only", async () => {
+    const a = await createLibrary(root, "Mine", mkDeps());
+    const b = await openLibrary(root, mkDeps());
+    expect(b.mode).toBe("read-only");
+    expect(b.readOnlyReason).toBe("locked-by-other-device");
+    await b.close();
+    await a.close();
+    expect((await openLibrary(root, mkDeps())).mode).toBe("read-write");
+  });
+
+  it("retries once when the lock vanishes during the settle window", async () => {
+    await createLibrary(root, "Mine", mkDeps());
+    now += 121_000;
+    const p = acquireLock(root, { ...depsB(), settleMs: 100 });
+    for (let i = 0; i < 200; i++) {
+      const l = JSON.parse(await readFile(join(root, ".lock"), "utf8"));
+      if (l.deviceId === "dev-B") break;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await rm(join(root, ".lock"));
+    expect((await p).acquired).toBe(true);
+    expect(JSON.parse(await readFile(join(root, ".lock"), "utf8")).deviceId).toBe("dev-B");
+  });
+
+  it("registry: unparseable file is kept as .corrupt-<stamp> and replaced", async () => {
+    const deps = mkDeps();
+    await mkdir(deps.appConfigDir, { recursive: true });
+    await writeFile(join(deps.appConfigDir, "libraries.json"), "{broken");
+    expect(await listLibraries(deps)).toEqual([]);
+    await registerLibrary({ libraryId: "L1", name: "One", path: "/a" }, deps);
+    const names = await readdir(deps.appConfigDir);
+    expect(names).toContain("libraries.json.corrupt-20261109-100000");
+    expect(await readFile(join(deps.appConfigDir, "libraries.json.corrupt-20261109-100000"), "utf8")).toBe("{broken");
+    expect((await listLibraries(deps)).map((l) => l.libraryId)).toEqual(["L1"]);
+  });
+
+  it("registry: malformed entries are dropped, valid ones kept, never throws", async () => {
+    const deps = mkDeps();
+    await mkdir(deps.appConfigDir, { recursive: true });
+    const good = { libraryId: "G", name: "Good", lastKnownPaths: ["/g"], lastOpenedAt: "2026-01-01T00:00:00.000Z" };
+    await writeFile(join(deps.appConfigDir, "libraries.json"), JSON.stringify([good, { libraryId: 3 }, null]));
+    expect(await listLibraries(deps)).toEqual([good]);
+    await registerLibrary({ libraryId: "L1", name: "One", path: "/a" }, deps);
+    expect((await readdir(deps.appConfigDir)).some((n) => n.includes(".corrupt-"))).toBe(true);
+    expect((await listLibraries(deps)).map((l) => l.libraryId).sort()).toEqual(["G", "L1"]);
+    await writeFile(join(deps.appConfigDir, "libraries.json"), '{"not":"array"}');
+    expect(await listLibraries(deps)).toEqual([]);
+  });
+
+  it("listLibraries returns the most recently opened first", async () => {
+    const deps = mkDeps();
+    await registerLibrary({ libraryId: "L1", name: "One", path: "/a" }, deps);
+    now += 1000;
+    await registerLibrary({ libraryId: "L2", name: "Two", path: "/b" }, deps);
+    expect((await listLibraries(deps)).map((l) => l.libraryId)).toEqual(["L2", "L1"]);
+    now += 1000;
+    await recordLocation("L1", "/c", deps);
+    expect((await listLibraries(deps)).map((l) => l.libraryId)).toEqual(["L1", "L2"]);
   });
 });
