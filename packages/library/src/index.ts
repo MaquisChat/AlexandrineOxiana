@@ -46,3 +46,5 @@ export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, re
 export type { LockInfo } from "./lock.js";
 export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
+
+export * from "./repo/index.js";

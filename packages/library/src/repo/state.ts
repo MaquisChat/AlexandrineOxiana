@@ -1,0 +1,245 @@
+/** Repository state: the open library, its projects, and helpers every repo module uses. */
+import * as fsp from "node:fs/promises";
+import { join } from "node:path";
+import {
+  ConsentRecord,
+  Collection,
+  Participant,
+  Project,
+  Session,
+  Tag,
+  type SourceFile,
+  type AuditEvent,
+} from "@ao/core";
+import type { KeyRing } from "../crypto/keys.js";
+import type { Library } from "../library.js";
+import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from "./audit-store.js";
+import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
+import { absPath, readMaybe } from "./io.js";
+
+/** Search-index port (Task 12). Called last in a mutation, after files, change log and audit. */
+export interface IndexSink {
+  indexSource(sf: SourceFile, extractedText?: string): void | Promise<void>;
+  removeSource(id: string): void | Promise<void>;
+  indexProject(p: Project): void | Promise<void>;
+}
+
+export const NOOP_INDEX: IndexSink = { indexSource() {}, removeSource() {}, indexProject() {} };
+
+export interface RepoOptions {
+  index?: IndexSink;
+  /** IANA zone used for policy calendar dates and derived-file timestamps (R17). */
+  tz?: string;
+  clock?: () => Date;
+  actor?: string;
+  device?: string;
+  /** scrypt cost for new key files. Tests only; production uses the default 2^17. */
+  scryptN?: number;
+  /** Events per audit segment. Tests only; production uses 10,000. */
+  auditSegmentSize?: number;
+}
+
+/** `<Project>/project.json`. */
+export interface ProjectJson {
+  formatVersion: 1;
+  project: Project;
+  collections: Collection[];
+  tags: Tag[];
+  participants: Participant[];
+  sessions: Session[];
+  consents: ConsentRecord[];
+}
+
+export function parseProjectJson(v: unknown): ProjectJson {
+  const o = v as Record<string, unknown> | null;
+  if (!o || typeof o !== "object" || o.formatVersion !== 1) throw new Error("project.json: unsupported formatVersion");
+  return {
+    formatVersion: 1,
+    project: Project.parse(o.project),
+    collections: Collection.array().parse(o.collections ?? []),
+    tags: Tag.array().parse(o.tags ?? []),
+    participants: Participant.array().parse(o.participants ?? []),
+    sessions: Session.array().parse(o.sessions ?? []),
+    consents: ConsentRecord.array().parse(o.consents ?? []),
+  };
+}
+
+/** `<Project>/manifest.json` (encrypted projects): structure only, nothing identifying. */
+export interface ManifestEntry {
+  id: string;
+  type: string;
+  issuedYear?: string;
+  /** Library-relative source folder (already pseudonymized). */
+  folder: string;
+  /** Library-relative file paths (already pseudonymized, `.enc`-suffixed). */
+  files: string[];
+}
+export interface Manifest {
+  formatVersion: 1;
+  sources: ManifestEntry[];
+}
+
+export interface ProjectState {
+  project: Project;
+  /** Library-relative project folder, e.g. `Projects/My Project`. */
+  rel: string;
+  data: ProjectJson;
+  audit: AuditStore;
+  /** Source id → library-relative folder. */
+  sources: Map<string, string>;
+  manifest: Manifest;
+}
+
+export class RepoCore {
+  readonly projects = new Map<string, ProjectState>();
+  readonly integrityWarnings: IntegrityWarning[] = [];
+  /** Index failures after a committed mutation (the index is rebuildable; the mutation stands). */
+  readonly indexErrors: Array<{ op: string; error: unknown }> = [];
+  readonly anchors: AnchorStore;
+  readonly index: IndexSink;
+  readonly tz: string;
+  readonly clock: () => Date;
+  readonly actor: string;
+  readonly device: string;
+  readonly scryptN: number | undefined;
+  readonly auditSegmentSize: number | undefined;
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    readonly library: Library,
+    readonly keyRing: KeyRing,
+    opts: RepoOptions,
+  ) {
+    this.anchors = AnchorStore.forConfigDir(library.appConfigDir);
+    this.index = opts.index ?? NOOP_INDEX;
+    this.tz = opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+    this.clock = opts.clock ?? (() => new Date());
+    this.actor = opts.actor ?? "local-user";
+    this.device = opts.device ?? library.deviceId;
+    this.scryptN = opts.scryptN;
+    this.auditSegmentSize = opts.auditSegmentSize;
+  }
+
+  get root(): string {
+    return this.library.root;
+  }
+
+  abs(rel: string): string {
+    return absPath(this.root, rel);
+  }
+
+  assertWritable(): void {
+    if (this.library.mode !== "read-write") throw new ReadOnlyLibraryError(this.library.readOnlyReason);
+  }
+
+  /** Runs write operations one at a time, so audit sequence numbers and files never interleave. */
+  serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.catch(() => {});
+    return run;
+  }
+
+  state(projectId: string): ProjectState {
+    const st = this.projects.get(projectId);
+    if (!st) throw new NotFoundError("Project", projectId);
+    return st;
+  }
+
+  encrypted(st: ProjectState): boolean {
+    return st.project.encryption.enabled;
+  }
+
+  /** The project's data key; throws ProjectLockedError when encrypted and not unlocked. */
+  key(st: ProjectState): { key: Uint8Array; keyId: string } {
+    const keyId = st.project.encryption.keyId;
+    const key = keyId ? this.keyRing.get(keyId) : undefined;
+    if (!keyId || !key) throw new ProjectLockedError(st.project.id);
+    return { key, keyId };
+  }
+
+  assertUnlocked(st: ProjectState): void {
+    if (this.encrypted(st)) this.key(st);
+  }
+
+  anchorKey(projectId: string): string {
+    return `${this.library.id}/${projectId}`;
+  }
+
+  /** Base fields of an audit event for this repo. */
+  auditBase(st: ProjectState, at: string): Pick<AuditEvent, "at" | "actor" | "device" | "projectId"> {
+    return { at, actor: this.actor, device: this.device, projectId: st.project.id };
+  }
+
+  /** Appends one audit event and records the new head as the external anchor. */
+  async auditNow(st: ProjectState, input: AuditInput): Promise<void> {
+    await st.audit.append(input);
+    await this.updateAnchor(st, input.at);
+  }
+
+  /** Best effort: a failed anchor write must not undo a committed mutation; the next open re-checks. */
+  async updateAnchor(st: ProjectState, at: string): Promise<void> {
+    if (!st.audit.head) return;
+    try {
+      await this.anchors.set(this.anchorKey(st.project.id), st.audit.head, at);
+    } catch {
+      // ignored: the anchor lives outside the library and is advisory
+    }
+  }
+}
+
+/** Reads every project folder under `Projects/` (skipping staging folders that start with "."). */
+export async function loadProjects(core: RepoCore): Promise<Array<{ st: ProjectState; events: Array<AuditEvent | null>; verify: Awaited<ReturnType<typeof AuditStore.load>>["verify"] }>> {
+  const projectsDir = join(core.root, "Projects");
+  let names: string[] = [];
+  try {
+    names = await fsp.readdir(projectsDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  const out = [];
+  for (const name of names.sort()) {
+    if (name.startsWith(".")) continue;
+    const raw = await readMaybe(join(projectsDir, name, "project.json"));
+    if (!raw) continue;
+    const data = parseProjectJson(JSON.parse(raw.toString("utf8")));
+    const rel = `Projects/${name}`;
+    const { store, events, verify } = await AuditStore.load(join(projectsDir, name, "audit"), core.auditSegmentSize);
+    const st: ProjectState = {
+      project: { ...data.project, folder: rel },
+      rel,
+      data,
+      audit: store,
+      sources: new Map(),
+      manifest: { formatVersion: 1, sources: [] },
+    };
+    await loadSourceIndex(core, st);
+    out.push({ st, events, verify });
+  }
+  return out;
+}
+
+/** Source id → folder, from manifest.json (encrypted) or by reading each source.json. */
+async function loadSourceIndex(core: RepoCore, st: ProjectState): Promise<void> {
+  if (core.encrypted(st)) {
+    const raw = await readMaybe(core.abs(`${st.rel}/manifest.json`));
+    if (raw) st.manifest = JSON.parse(raw.toString("utf8")) as Manifest;
+    for (const e of st.manifest.sources) st.sources.set(e.id, e.folder);
+    return;
+  }
+  let names: string[] = [];
+  try {
+    names = await fsp.readdir(core.abs(`${st.rel}/Sources`));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  for (const name of names) {
+    const raw = await readMaybe(core.abs(`${st.rel}/Sources/${name}/source.json`));
+    if (!raw) continue;
+    try {
+      const j = JSON.parse(raw.toString("utf8")) as { source?: { id?: unknown } };
+      if (typeof j.source?.id === "string") st.sources.set(j.source.id, `${st.rel}/Sources/${name}`);
+    } catch {
+      // unreadable source.json: left for "rebuild from folder" to report
+    }
+  }
+}

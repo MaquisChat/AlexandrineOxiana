@@ -33,6 +33,10 @@ export interface Library {
   root: string;
   mode: "read-write" | "read-only";
   readOnlyReason?: "locked-by-other-device" | "newer-format" | "offline" | "not-writable";
+  /** App-level config folder (outside the library), from Deps; holds the registry and audit anchors. */
+  appConfigDir: string;
+  /** This device's id, from Deps; recorded in audit events and change log entries. */
+  deviceId: string;
   close(): Promise<void>;
 }
 
@@ -161,6 +165,8 @@ export async function openLibrary(root: string, deps: Deps, opts: OpenOptions = 
     root,
     mode: "read-only",
     readOnlyReason: reason,
+    appConfigDir: deps.appConfigDir,
+    deviceId: deps.deviceId,
     close: async () => {},
   });
 
@@ -234,6 +240,8 @@ export async function openLibrary(root: string, deps: Deps, opts: OpenOptions = 
     get readOnlyReason() {
       return state.reason;
     },
+    appConfigDir: deps.appConfigDir,
+    deviceId: deps.deviceId,
     async close() {
       if (closed) return;
       closed = true;
