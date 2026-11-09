@@ -418,7 +418,8 @@ Ongoing, automated discovery of new sources — articles, books, web pages, and 
 
 **Where agents run**
 
-- On the desktop while the app is open (missed runs catch up on next launch), or on the sync server for always-on monitoring (Phase 5), subject to residency rules.
+- **Phase 2:** on the desktop while the app is open (missed runs catch up on next launch).
+- **Phase 5:** additionally on the sync server for always-on monitoring, subject to residency rules.
 - **AgentProvider** is provider-agnostic. The default cloud provider is Claude (via the Anthropic API, using tool use for the search tools; default model Claude Opus 5.5, with the option to choose a smaller, cheaper model for high-volume screening). Local open models (e.g., via Ollama) are supported for projects that must keep all processing on-device.
 
 **Integration with external AI assistants (MCP server)**
@@ -582,10 +583,10 @@ Full keyboard navigation, screen-reader labels, reduced-motion setting, and visi
 Each phase ends with something usable and has its own implementation plan.
 
 1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **appearance basics** (light/dark/system theme, design tokens, Goudy Old Style default typeface with fallbacks, multilingual font fallback, text size); **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
-2. **Capture & media** — browser capture extension and web snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); YouTube; Instagram, including **Instagram profile archive** with incremental re-capture and monitoring; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search; **research watches** (literature, YouTube, Instagram profiles/hashtags, websites) and the **Research Inbox**.
+2. **Capture & media** — browser capture extension and web snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); YouTube; Instagram, including **Instagram profile archive** with incremental re-capture and monitoring; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search; **research watches** (literature, YouTube, Instagram profiles/hashtags, websites), the **Research Inbox**, and **research agents running on the desktop** (research brief, multilingual query expansion, screening, snowballing, digests, search log and PRISMA-style report).
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
-5. **Hybrid & agents** — **research agents** (research brief, multilingual query expansion, screening, snowballing, digests, search log and PRISMA-style report), always-on watches and agents on the server, **MCP server** for external AI assistants; sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
+5. **Hybrid & agents** — always-on watches and research agents on the server, **MCP server** for external AI assistants; sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
 6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok, including **TikTok profile archive**; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
 
 ---
@@ -615,7 +616,7 @@ Each phase ends with something usable and has its own implementation plan.
 | Appearance | Light/dark/system + high contrast; token-based theming; default typeface Goudy Old Style (installed copy, else Sorts Mill Goudy); per-area typefaces, multilingual fallback; separate export styles |
 | Library location | Movable across folders, drives, network and cloud storage, in the app (copy → verify → switch, governance-checked) or outside it (reconnect by library id); relative paths only |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
-| Research watches & agents | Watches + Research Inbox in Phase 2; AI research agents, server-side scheduling and MCP server in Phase 5; human acceptance required by default; governed model provider (local model option); full run logs, search-strategy export, PRISMA-style report; budgets |
+| Research watches & agents | Watches, Research Inbox and desktop-run AI research agents in Phase 2; server-side always-on runs and MCP server in Phase 5; human acceptance required by default; governed model provider (local model option); full run logs, search-strategy export, PRISMA-style report; budgets |
 | Profile archive | Whole Instagram (Phase 2) and TikTok (Phase 6) profiles as linked, citable sources; incremental capture, monitoring, removed-item tracking; comments off by default; no bypass of access controls |
 | Website archive | Phase 2; scoped whole-site crawl; full-page screenshots per page at chosen viewports; WACZ archive; robots.txt respected by default; re-capture with change comparison |
 | Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
