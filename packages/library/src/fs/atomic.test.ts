@@ -1,0 +1,181 @@
+import { createHash, randomBytes } from "node:crypto";
+import * as realFs from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { newId } from "@ao/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { decryptStream, encryptStream } from "../crypto/format.js";
+import { generateDataKey } from "../crypto/keys.js";
+import { cleanupTempFiles, copyFileAtomic, writeFileAtomic } from "./atomic.js";
+
+// Wrap rename/unlink so individual tests can make them fail; by default they
+// delegate to the real implementation.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: vi.fn(actual.rename),
+    unlink: vi.fn(actual.unlink),
+  };
+});
+
+const { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } = realFs;
+const HOUR = 60 * 60 * 1000;
+
+function sha256(b: Buffer): string {
+  return createHash("sha256").update(b).digest("hex");
+}
+
+describe("atomic file writes", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ao-atomic-"));
+  });
+  afterEach(async () => {
+    vi.mocked(realFs.rename).mockClear();
+    vi.mocked(realFs.unlink).mockClear();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  describe("writeFileAtomic", () => {
+    it("writes strings and bytes, replacing an existing file", async () => {
+      const p = join(dir, "a.json");
+      await writeFileAtomic(p, "first");
+      expect(await readFile(p, "utf8")).toBe("first");
+      await writeFileAtomic(p, new Uint8Array([1, 2, 3]));
+      expect([...(await readFile(p))]).toEqual([1, 2, 3]);
+      expect(await readdir(dir)).toEqual(["a.json"]);
+    });
+
+    it("a crash before rename leaves the original intact and only a *.tmp-* file, which cleanup removes after 1 hour", async () => {
+      const p = join(dir, "data.json");
+      await writeFile(p, "original");
+      // Simulated crash: rename never happens and the process gets no chance to clean up.
+      vi.mocked(realFs.rename).mockRejectedValueOnce(new Error("simulated crash"));
+      vi.mocked(realFs.unlink).mockResolvedValueOnce(undefined);
+      await expect(writeFileAtomic(p, "replacement")).rejects.toThrow("simulated crash");
+
+      expect(await readFile(p, "utf8")).toBe("original");
+      const entries = (await readdir(dir)).sort();
+      expect(entries).toHaveLength(2);
+      const tmp = entries.find((e) => e !== "data.json")!;
+      expect(tmp).toMatch(/^data\.json\.tmp-[0-9a-f]+$/);
+      expect(await readFile(join(dir, tmp), "utf8")).toBe("replacement");
+
+      const mtime = (await stat(join(dir, tmp))).mtimeMs;
+      // Not yet an hour old: kept.
+      expect(await cleanupTempFiles(dir, { now: () => mtime + HOUR - 1000 })).toBe(0);
+      expect(await readdir(dir)).toContain(tmp);
+      // Older than an hour: removed.
+      expect(await cleanupTempFiles(dir, { now: () => mtime + HOUR + 1000 })).toBe(1);
+      expect(await readdir(dir)).toEqual(["data.json"]);
+      expect(await readFile(p, "utf8")).toBe("original");
+    });
+
+    it("removes its temp file when a write fails in-process", async () => {
+      const p = join(dir, "b.txt");
+      await writeFile(p, "original");
+      vi.mocked(realFs.rename).mockRejectedValueOnce(new Error("EIO"));
+      await expect(writeFileAtomic(p, "new")).rejects.toThrow("EIO");
+      expect(await readdir(dir)).toEqual(["b.txt"]);
+      expect(await readFile(p, "utf8")).toBe("original");
+    });
+
+    it("uses a unique temp name per write", async () => {
+      const p = join(dir, "c.txt");
+      await Promise.all(Array.from({ length: 10 }, (_, i) => writeFileAtomic(p, `v${i}`)));
+      expect(await readdir(dir)).toEqual(["c.txt"]);
+      expect(await readFile(p, "utf8")).toMatch(/^v\d$/);
+    });
+  });
+
+  describe("cleanupTempFiles", () => {
+    it("only removes old *.tmp-* files", async () => {
+      const now = Date.now();
+      const old = new Date(now - 2 * HOUR);
+      for (const name of ["x.tmp-abc", "y.json", "tmp-z", "y.json.tmp-0f"]) {
+        await writeFile(join(dir, name), "");
+        await utimes(join(dir, name), old, old);
+      }
+      await writeFile(join(dir, "fresh.tmp-1"), "");
+      expect(await cleanupTempFiles(dir, { now: () => now })).toBe(2);
+      expect((await readdir(dir)).sort()).toEqual(["fresh.tmp-1", "tmp-z", "y.json"]);
+    });
+
+    it("returns 0 for a missing directory", async () => {
+      expect(await cleanupTempFiles(join(dir, "nope"))).toBe(0);
+    });
+  });
+
+  describe("copyFileAtomic", () => {
+    it("copies and returns the sha256 and size of the content", async () => {
+      const src = join(dir, "src.bin");
+      const dest = join(dir, "dest.bin");
+      const data = randomBytes(2.5 * 1024 * 1024);
+      await writeFile(src, data);
+      const r = await copyFileAtomic(src, dest);
+      expect(r).toEqual({ sha256: sha256(data), bytes: data.length });
+      expect((await readFile(dest)).equals(data)).toBe(true);
+      expect((await readdir(dir)).sort()).toEqual(["dest.bin", "src.bin"]);
+    });
+
+    it("with a transform, hashes the source plaintext and writes the transformed bytes", async () => {
+      const src = join(dir, "plain.txt");
+      const dest = join(dir, "plain.txt.enc");
+      const data = randomBytes(1024 * 1024 + 17);
+      await writeFile(src, data);
+      const key = generateDataKey();
+      const keyId = newId();
+      const r = await copyFileAtomic(src, dest, {
+        transform: (r) => r.pipe(encryptStream(key, keyId)),
+      });
+      expect(r).toEqual({ sha256: sha256(data), bytes: data.length });
+      const written = await readFile(dest);
+      expect(written.equals(data)).toBe(false);
+      expect(sha256(written)).not.toBe(r.sha256);
+
+      const back: Buffer[] = [];
+      const d = decryptStream(() => key);
+      d.on("data", (c: Buffer) => back.push(c));
+      await new Promise<void>((resolve, reject) => {
+        d.on("end", resolve).on("error", reject);
+        d.end(written);
+      });
+      expect(Buffer.concat(back).equals(data)).toBe(true);
+    });
+
+    it("hashes an empty file", async () => {
+      const src = join(dir, "empty");
+      await writeFile(src, "");
+      const r = await copyFileAtomic(src, join(dir, "empty2"));
+      expect(r).toEqual({ sha256: sha256(Buffer.alloc(0)), bytes: 0 });
+    });
+
+    it("leaves dest untouched and no temp file when the source is missing", async () => {
+      const dest = join(dir, "dest");
+      await writeFile(dest, "keep");
+      await expect(copyFileAtomic(join(dir, "missing"), dest)).rejects.toThrow();
+      expect(await readFile(dest, "utf8")).toBe("keep");
+      expect(await readdir(dir)).toEqual(["dest"]);
+    });
+
+    it("leaves dest untouched and no temp file when the transform fails", async () => {
+      const src = join(dir, "src");
+      const dest = join(dir, "dest");
+      await writeFile(src, "data");
+      await writeFile(dest, "keep");
+      const { Transform } = await import("node:stream");
+      const failing = () =>
+        new Transform({
+          transform(_c, _e, cb) {
+            cb(new Error("transform boom"));
+          },
+        });
+      await expect(copyFileAtomic(src, dest, { transform: (r) => r.pipe(failing()) })).rejects.toThrow(
+        "transform boom",
+      );
+      expect(await readFile(dest, "utf8")).toBe("keep");
+      expect((await readdir(dir)).sort()).toEqual(["dest", "src"]);
+    });
+  });
+});
