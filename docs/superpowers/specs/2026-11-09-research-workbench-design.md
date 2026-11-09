@@ -406,6 +406,34 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 
 ---
 
+## 8A. Interface appearance and typography
+
+The interface is customizable per user, from a single **Appearance** settings page. Settings are stored per user and device (optionally synced) as a human-readable theme file, so themes can be shared with collaborators or created by them.
+
+### 8A.1 Theme
+
+- **Light, dark, and follow system** (default: follow system), plus a **high-contrast** variant of each.
+- All colors are defined as named **design tokens** (background, surface, text, muted text, lines, accent, status colors, code colors). Light and dark are two token sets; users can adjust the accent color or load a custom theme file. The UI never uses hard-coded colors, so every screen supports every theme.
+- **Qualitative-code colors** come from palettes that remain distinguishable for common color-vision deficiencies and in both light and dark themes; users can assign custom colors per code.
+- Every theme is checked automatically for text contrast (WCAG AA minimum: 4.5:1 for body text); a custom theme that fails is flagged before it is applied.
+
+### 8A.2 Typeface
+
+- **Default interface typeface: Goudy Old Style.** Goudy Old Style is a commercial font. The app uses the user's installed copy when present (it ships with some editions of Microsoft Office and is available for purchase); otherwise it falls back to **Sorts Mill Goudy**, a free (SIL Open Font License) revival bundled with the app, and then to Garamond/Georgia.
+- **Separately configurable typefaces** for: interface, reading view (PDF/EPUB/web text reflow), transcripts and translations, notes and memos, and monospace (file names, hashes, citation keys). Any font installed on the system, any bundled open font, or a user-supplied font file (TTF/OTF/WOFF2) may be chosen.
+- **Multilingual fallback:** each typeface choice has a per-script fallback chain (e.g., Noto Sans/Serif families for Cyrillic, Greek, Arabic, Hebrew, Devanagari, CJK, and others), so text in any language renders correctly even when the chosen typeface lacks those characters. Right-to-left scripts are laid out correctly in transcripts, translations, and annotations.
+- **Size and spacing:** global text size scale, line spacing, and interface density (comfortable / compact). Optional readability fonts (e.g., Atkinson Hyperlegible, OpenDyslexic) offered as presets.
+
+### 8A.3 Export appearance
+
+Quote cards, screenshots with captions, clips with burned-in subtitles, and verification reports have their own **export style** (typeface, colors, layout), independent of the interface theme, so that presentation materials stay consistent regardless of the user's working theme. Export styles can be saved as presets.
+
+### 8A.4 Accessibility
+
+Full keyboard navigation, screen-reader labels, reduced-motion setting, and visible focus indicators in all themes. Font and theme choices never reduce functionality.
+
+---
+
 ## 9. Reliability, errors, and data safety
 
 - Originals never modified; all changes are new versions/derived assets.
@@ -426,6 +454,7 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 - **Library move/reconnect tests:** in-app move with interruption and resume, hash verification failure (old copy kept), move blocked by residency rules, reconnect after an external move/rename, rebuild of a missing index, missing-file relinking, drive disconnect/reconnect, lock-file behavior with two devices, cloud placeholder files.
 - **Bulk import tests:** metadata-resolution order and confidence scoring, duplicate detection and merge policies, interrupt-and-resume, incremental Zotero re-import, batch undo, and a large synthetic library (10,000+ items) for performance.
 - **End-to-end tests** driving the real app: import → capture → transcribe → translate → code → cite → export.
+- **Theme and typography tests:** every screen rendered in light, dark, and high-contrast themes; automated contrast checks; font fallback rendering for non-Latin scripts and right-to-left text.
 - **Plain-language test report** generated after each build so the owner can confirm what works without reading code.
 
 ---
@@ -434,12 +463,12 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 
 Each phase ends with something usable and has its own implementation plan.
 
-1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
+1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **appearance basics** (light/dark/system theme, design tokens, Goudy Old Style default typeface with fallbacks, multilingual font fallback, text size); **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
 2. **Capture & media** — browser capture extension and web snapshots; YouTube; Instagram; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search.
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
 5. **Hybrid** — sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
-6. **Later** — collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
+6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
 
 ---
 
@@ -465,6 +494,7 @@ Each phase ends with something usable and has its own implementation plan.
 | Shadow libraries | Not supported; legitimate access chain + manual attach instead |
 | Zotero import | Phase 1 priority |
 | File naming | Human-readable; derived files include date modified; database rebuildable from files |
+| Appearance | Light/dark/system + high contrast; token-based theming; default typeface Goudy Old Style (installed copy, else Sorts Mill Goudy); per-area typefaces, multilingual fallback; separate export styles |
 | Library location | Movable across folders, drives, network and cloud storage, in the app (copy → verify → switch, governance-checked) or outside it (reconnect by library id); relative paths only |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
 | Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
