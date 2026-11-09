@@ -245,22 +245,24 @@ The library must be movable between storage locations and storage media — inte
 | **ISBN lookup** | Open Library, Library of Congress; WorldCat where available. | 1 |
 | **Device media import** | iPhone and camera photos/video (Section 5.3). | 1 |
 | **Web page** | Browser extension or pasted URL; full snapshot (HTML + rendered PDF/image), readable text, metadata via Zotero's open-source translators; optional Internet Archive save request. | 2 |
-| **YouTube** | Official YouTube Data API for metadata and captions where permitted; media download via yt-dlp as a separate, per-project-enableable method. | 2 |
-| **Instagram** | Official Graph API for owned/managed accounts; oEmbed for public metadata; browser-extension "capture what I'm viewing" and yt-dlp fallback for other public posts, labeled as non-API capture in provenance. | 2 |
+| **Social media link capture (downloader)** — *first-order method* | Paste a post, reel, short, video, playlist, or profile URL from YouTube, Instagram, or TikTok; media, captions/subtitles, thumbnails, and the platform's metadata JSON are saved via yt-dlp (video) and gallery-dl (photos, carousels, highlights). Can use the researcher's own logged-in browser session for content visible only when signed in. | 1 |
+| **Browser capture** — *first-order method* | Browser extension (Chrome/Edge/Firefox) "capture what I'm viewing": post media, caption, handle, timestamp, engagement counts, full-page screenshot and HTML snapshot; profile pages captured as the researcher scrolls. | 1 |
+| **YouTube official API** (optional) | YouTube Data API for metadata and captions where permitted; YouTube Researcher Program where approved. For projects whose protocol requires official routes. | 2 |
+| **Instagram official API** (optional) | Graph API for owned/managed accounts; Business Discovery for public business/creator accounts; Meta Content Library where approved. | 2 |
 | **Legitimate access chain** | Institutional EZproxy + OpenURL link resolver; open-access lookup (Unpaywall, OpenAlex, CORE, Semantic Scholar, arXiv/SSRN/SocArXiv, PubMed Central, DOAJ, DOAB); books via HathiTrust, Internet Archive/Open Library (incl. controlled digital lending), Project Gutenberg, Google Books previews; interlibrary-loan request generator. | 5 |
-| **TikTok** | Research API slot + browser capture mode. | 6 |
-| **Profile archive** | Whole Instagram profile (Phase 2) or TikTok profile (Phase 6) captured as a set of linked sources; incremental re-capture and optional monitoring (Section 5.5). | 2 / 6 |
+| **TikTok official API** (optional) | Research API (requires approved academic access). | 2 |
+| **Profile archive** | Whole YouTube channel, Instagram profile, or TikTok profile captured by downloader/browser as a set of linked sources, with incremental re-capture and removed-item tracking (Phase 1); scheduled monitoring and official-API routes (Phase 2) (Section 5.5). | 1 / 2 |
 | **Website archive** | Crawl a whole website within defined scope; full-page screenshot of every page plus a replayable WACZ web archive (Section 5.6). | 2 |
 
 **Out of scope by decision:** integrations with shadow libraries (e.g., Anna's Archive, LibGen). Files a user already holds can always be attached manually.
 
-**Platform terms:** non-API capture of social media may conflict with platform terms of service. Capture methods are therefore separate, individually enableable per project, and always recorded in provenance, so the researcher and their IRB make an explicit, documented choice.
+**Platform terms:** downloader and browser capture are the primary methods because the researcher needs them immediately and they work for any public content the researcher can see. They may conflict with platform terms of service, and using the researcher's own logged-in session puts that account at some risk if a platform detects automated access. Capture methods are therefore separate, individually enableable per project, shown with a one-time explanation when enabled, and always recorded in provenance (method, tool, and tool version), so the researcher and their IRB make an explicit, documented choice. The capture tools update independently of the app because sites change often; failed or partial captures are kept and labeled with the reason (login required, rate limited, removed, geo-blocked, extractor error).
 
 ### 5.2 Media pipeline (Python worker)
 
 1. **Store original** — hash, encrypt if required, record provenance.
 2. **Detect language** — per segment, handling code-switching.
-3. **Transcribe** — local faster-whisper by default; cloud providers (e.g., OpenAI, Deepgram, Google) only if governance permits. Output: timestamped segments, speaker diarization where available, confidence scores.
+3. **Transcribe** (Phase 1) — local faster-whisper by default with voice-activity detection; cloud providers (e.g., OpenAI, Deepgram, Google) only if governance permits. Output: timestamped segments with per-segment language, confidence scores, and **hallucination flags** (Section 5.8); speaker diarization where available (Phase 2).
 4. **Translate** — to the project's target language(s). Local NLLB/Marian by default; DeepL, Google, or LLM translation if permitted. Each translated segment links to its source segment and timestamps.
 5. **Human review** — edit transcripts/translations or add a human translation alongside the machine one; versions kept.
 6. **Index** — full-text search across all languages, originals and translations.
@@ -337,10 +339,11 @@ Captures an entire public profile as a structured, citable collection.
 
 **Capture methods** (chosen per project and recorded in provenance, Section 5.1):
 
-| Platform | Official route | Non-API route |
+| Platform | Primary route (Phase 1) | Optional official route (Phase 2) |
 |---|---|---|
-| Instagram | Graph API for owned/managed accounts (full); Business Discovery API for public business/creator accounts (metadata and media for posts) | Browser-extension capture of the profile as the researcher views it (auto-scroll, saves what is displayed); downloader fallback |
-| TikTok | Research API (requires approved academic access): user info and videos | Browser-extension capture; downloader fallback (yt-dlp supports profile pages) |
+| Instagram | Downloader (gallery-dl for posts, carousels, reels, highlights; yt-dlp for reels) with incremental archive; browser-extension capture of the profile as the researcher views it | Graph API for owned/managed accounts; Business Discovery API for public business/creator accounts; Meta Content Library where approved |
+| TikTok | Downloader (yt-dlp profile pages) with incremental archive; browser-extension capture | Research API (approved academic access) |
+| YouTube | Downloader (yt-dlp channel/playlist pages) with incremental archive | YouTube Data API; YouTube Researcher Program where approved |
 
 **Incremental capture and monitoring**
 
@@ -426,6 +429,23 @@ Ongoing, automated discovery of new sources — articles, books, web pages, and 
 
 - The app exposes the library through a **Model Context Protocol (MCP) server**, so external AI assistants and agent tools (e.g., Claude Desktop, Claude Code, or other MCP clients) can search the library, read permitted metadata and text, propose candidates to the Research Inbox, and fetch citations.
 - Access is per project and read-mostly by default; writes are limited to adding Inbox candidates and notes. All access is governed and audited like any other actor, and identifiable data is never exposed beyond what the project's sharing rules allow.
+
+### 5.8 Verification recheck (hallucination check)
+
+Every time metadata is filled or changed by anything other than the researcher typing it — capture, import, lookup, OCR, transcription, translation, or (later) an agent — an automatic **recheck** runs before the item is accepted. Its purpose is to catch invented, mismatched, or unsupported values ("hallucinations") from AI models, heuristics, or wrong lookup matches.
+
+**Field-level evidence.** Each metadata field records where its value came from (embedded file metadata, a named lookup service, the platform's metadata JSON, the captured page, the file name, an AI model, Zotero/reference import, or the user) and, where possible, the supporting quote or JSON path.
+
+**Checks (per field):**
+
+- **Grounding:** the value must be traceable to captured evidence — e.g., a title appears in the document's first pages or the platform caption; an author's family name appears in the document or a second source; a post date equals the platform's timestamp; a handle and post ID equal those in the platform JSON and the URL.
+- **Cross-source agreement:** values from two independent sources are compared (e.g., Crossref vs. the PDF's text; downloader JSON vs. the browser-captured page). Disagreement is a **conflict**.
+- **Identifier integrity:** DOIs must resolve and the resolved record's title must match the document; ISBNs must pass checksum and match the looked-up title.
+- **AI-produced values** (from any language model) must carry a supporting quote that is found in the evidence; otherwise they are **unverified**. Machine translations are labeled as such and never treated as fact about the source.
+
+**Statuses:** *verified* (grounded or confirmed by two sources), *single-source* (one trustworthy source, acceptable), *unverified*, *conflict*, *user-confirmed*. Any *unverified* or *conflict* field sends the item to the review queue regardless of its confidence score, and the field is visibly badged until resolved. The researcher can run "Recheck" on any item or on a whole project at any time.
+
+**Transcripts and translations:** transcription segments are checked for known speech-recognition hallucination patterns — text produced over silence or music (no-speech probability vs. voice-activity detection), repetition loops, very low confidence, and stock phrases speech models are known to invent (e.g., "thanks for watching" over silence). Flagged segments are highlighted for review and never silently cited; translations with anomalous length ratios or untranslated spans are flagged the same way.
 
 ---
 
@@ -582,12 +602,12 @@ Full keyboard navigation, screen-reader labels, reduced-motion setting, and visi
 
 Each phase ends with something usable and has its own implementation plan.
 
-1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **appearance basics** (light/dark/system theme, design tokens, Goudy Old Style default typeface with fallbacks, multilingual font fallback, text size); **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
-2. **Capture & media** — browser capture extension and web snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); YouTube; Instagram, including **Instagram profile archive** with incremental re-capture and monitoring; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search; **research watches** (literature, YouTube, Instagram profiles/hashtags, websites), the **Research Inbox**, and **research agents running on the desktop** (research brief, multilingual query expansion, screening, snowballing, digests, search log and PRISMA-style report).
+1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; **capture fast track: downloader and browser capture of YouTube, Instagram, and TikTok posts, videos, playlists, and whole profiles (incremental, removed-item tracking), local transcription with hallucination flags, a capture command-line tool usable before the full interface, and the browser extension**; **verification recheck** of all filled metadata and transcripts (Section 5.8); "Rebuild library from folder"; **appearance basics** (light/dark/system theme, design tokens, Goudy Old Style default typeface with fallbacks, multilingual font fallback, text size); **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
+2. **Capture & media** — web page snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); optional official-API capture (YouTube Data API/Researcher Program, Instagram Graph/Meta Content Library, TikTok Research API); scheduled profile monitoring; translation (manual trigger with optional automation); speaker diarization; multilingual transcript viewer/editor; cross-language search; **research watches** (literature, YouTube, Instagram profiles/hashtags, websites), the **Research Inbox**, and **research agents running on the desktop** (research brief, multilingual query expansion, screening, snowballing, digests, search log and PRISMA-style report).
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
 5. **Hybrid & agents** — always-on watches and research agents on the server, **MCP server** for external AI assistants; sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
-6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok, including **TikTok profile archive**; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
+6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
 
 ---
 
@@ -609,7 +629,9 @@ Each phase ends with something usable and has its own implementation plan.
 | Code style | Conventional, well-documented; foundations professional-grade, features start simple |
 | Governance | All nine controls, per project; IRB, GDPR, HIPAA, DMP profiles; verification report |
 | Qualitative coding | Core coding in first build; full analysis suite later, designed for now |
-| Transcription/translation trigger | Manual per item, optional per-project automation |
+| Transcription/translation trigger | Manual per item, optional per-project automation; transcription in Phase 1, translation in Phase 2 |
+| Social media capture | Downloader (yt-dlp, gallery-dl) and browser capture are first-order methods in Phase 1 for YouTube, Instagram, TikTok; official APIs optional in Phase 2 |
+| Verification recheck | Automatic recheck after any non-user metadata fill; field-level evidence and statuses; unverified/conflict fields force review; transcript hallucination flags |
 | Shadow libraries | Not supported; legitimate access chain + manual attach instead |
 | Zotero import | Phase 1 priority |
 | File naming | Human-readable; derived files include date modified; database rebuildable from files |
@@ -617,7 +639,7 @@ Each phase ends with something usable and has its own implementation plan.
 | Library location | Movable across folders, drives, network and cloud storage, in the app (copy → verify → switch, governance-checked) or outside it (reconnect by library id); relative paths only |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
 | Research watches & agents | Watches, Research Inbox and desktop-run AI research agents in Phase 2; server-side always-on runs and MCP server in Phase 5; human acceptance required by default; governed model provider (local model option); full run logs, search-strategy export, PRISMA-style report; budgets |
-| Profile archive | Whole Instagram (Phase 2) and TikTok (Phase 6) profiles as linked, citable sources; incremental capture, monitoring, removed-item tracking; comments off by default; no bypass of access controls |
+| Profile archive | Whole YouTube, Instagram, and TikTok profiles (Phase 1, downloader/browser) as linked, citable sources; incremental capture, monitoring, removed-item tracking; comments off by default; no bypass of access controls |
 | Website archive | Phase 2; scoped whole-site crawl; full-page screenshots per page at chosen viewports; WACZ archive; robots.txt respected by default; re-capture with change comparison |
 | Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
 | Collections and tags | Added to data model (hierarchical collections; workspace/project tags), distinct from qualitative codes |
