@@ -228,6 +228,17 @@ describe("effective policy and failure", () => {
     expect(bad({ action: "move", move: {} as never })).toMatch(/^Policy could not be evaluated/);
     expect(bad({ action: "store", store: { identifiable: true, hasLocation: false, legalBasis: 5 as never } })).toMatch(/^Policy could not be evaluated/);
   });
+  it("denies a malformed now or tz on every action", () => {
+    const fail = (r: object) => denyReason(evaluate(cfg(), { ...req({ action: "view" }), ...r } as any));
+    expect(fail({ now: 2020 })).toMatch(/^Policy could not be evaluated/);
+    expect(fail({ now: "2026-11-09" })).toMatch(/^Policy could not be evaluated/);
+    expect(fail({ now: "2026-13-09T00:00:00Z" })).toMatch(/^Policy could not be evaluated/);
+    expect(fail({ tz: 5 })).toMatch(/^Policy could not be evaluated/);
+  });
+  it("denies a protocol date that is not a real calendar date", () => {
+    const c = { ...cfg(), protocol: { ...cfg().protocol, expires: "2026-02-31" } };
+    expect(denyReason(evaluate(c, req({ action: "view" })))).toMatch(/^Policy could not be evaluated/);
+  });
   it("denies a malformed scalar in the policy", () => {
     const view = req({ action: "view" });
     const c = cfg();

@@ -81,7 +81,7 @@ function assertShape(p: GovernanceConfig): void {
   };
   const date = (v: unknown, path: string) => {
     if (v === null) return;
-    if (typeof v !== "string" || Number.isNaN(Date.parse(v))) throw new Error(`${path} must be a date or null`);
+    if (!validDate(v)) throw new Error(`${path} must be a real date or null`);
   };
   oneOf(p.encryption.atRest, ENCRYPTION_LEVELS, "encryption.atRest");
   oneOf(p.sharing.locationMetadata, LOCATION_LEVELS, "sharing.locationMetadata");
@@ -94,6 +94,20 @@ function assertShape(p: GovernanceConfig): void {
   date(p.protocol.expires, "protocol.expires");
   date(p.protocol.approvedFrom, "protocol.approvedFrom");
 }
+
+/** True for YYYY-MM-DD that is a real calendar date, or any other string Date can parse. */
+function validDate(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (m) {
+    const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    const t = new Date(Date.UTC(y, mo - 1, d));
+    return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d;
+  }
+  return !Number.isNaN(Date.parse(v));
+}
+
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/;
 
 const str = (v: unknown, what: string): string => {
   if (typeof v !== "string") throw new Error(`${what} must be a string`);
@@ -113,9 +127,9 @@ function localDate(nowIso: string, tz: string): string {
 
 /** Date part of a protocol date: date-only as written, otherwise the UTC date of the instant. */
 function datePart(d: string): string {
+  if (!validDate(d)) throw new Error(`invalid protocol date "${d}"`);
   if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
   const t = Date.parse(d);
-  if (Number.isNaN(t)) throw new Error(`invalid protocol date "${d}"`);
   return new Date(t).toISOString().slice(0, 10);
 }
 
@@ -204,6 +218,10 @@ function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Poli
 }
 
 function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
+  if (typeof req.now !== "string" || !ISO_UTC.test(req.now) || Number.isNaN(Date.parse(req.now))) {
+    throw new Error("now must be an ISO 8601 UTC timestamp (e.g. 2026-11-09T09:30:00Z)");
+  }
+  if (req.tz !== undefined) str(req.tz, "tz");
   const { policy, violations } = effectivePolicy(cfg);
   assertShape(policy);
   const warnings = violations.map(
