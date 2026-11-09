@@ -144,6 +144,7 @@ Append-only, hash-chained (each event includes the hash of the previous one). Fi
 
 ```
 <Library>/
+  library.json                        # library identity (library id, format version); no secrets
   library.sqlite                      # index; rebuildable
   Projects/
     Instagram Discourse 2026/
@@ -182,12 +183,44 @@ Append-only, hash-chained (each event includes the hash of the previous one). Fi
 - Each source folder's `source.json` contains everything needed to reconstruct that source (metadata, provenance, annotations, codes, memos, derivation records).
 - **"Rebuild library from folder"** regenerates `library.sqlite` from the files.
 - Copying a project folder to another machine and opening it restores the project.
+- **All paths stored inside the library are relative to the library root.** No absolute paths are stored in the database, `source.json`, or any other library file (the only exception is the path of a *linked* file outside the library, Section 5.4, which is stored both absolute and relative-to-library and can be relinked). The library is identified by the **library id** in `library.json`, never by its location.
 
 ### 4.4 Governance interaction with file names
 
 - In projects flagged as containing identifiable data, the governance engine **pseudonymizes file and folder names** (e.g., `@handle` → `P-014`), keeping the mapping in an encrypted key file.
 - Encrypted files keep their readable name with `.enc` appended (e.g., `… modified 2026-11-09 1502.vtt.enc`).
 - When encryption is enabled, `source.json` is encrypted too; the project keeps an unencrypted, non-identifying `manifest.json` (IDs, types, dates, file names) so that structure remains readable.
+
+### 4.5 Moving the library and reconnecting to it
+
+The library must be movable between storage locations and storage media — internal disk, another folder, external drive/SSD/USB, network storage (NAS/SMB), a cloud-synced folder (iCloud Drive, OneDrive, Dropbox, Google Drive), or the project's own sync server/cloud storage — **either from inside the app or by moving the folder outside the app**.
+
+**Moving inside the app ("Move library…")**
+
+1. Choose a destination: a folder on any mounted storage, a cloud-synced folder, or (Phase 5) the sync server / an S3-compatible cloud bucket.
+2. **Governance check per project:** the destination must satisfy each project's residency rules (e.g., a HIPAA or local-only project may not be moved into a consumer cloud-synced folder unless that destination is listed as approved). If some projects are not permitted, the user may exclude them (they stay at, or are moved to, a permitted location) or cancel.
+3. **Copy → verify → switch:** files are copied (resumable if interrupted), every file's hash is verified at the destination, the app switches to the new location, and only then — after explicit confirmation — is the old copy deleted. Nothing is deleted if any verification fails.
+4. The move is recorded in the audit log (from, to, projects, verification result) and appears in the verification report as a change of storage location.
+
+**Moving outside the app (reconnection)**
+
+- The app remembers each library's id and last known locations. On startup, if the library is not at its last known location, the app shows **"Library not found"** with options:
+  - **Locate library…** — browse to the library folder (or its `library.json`);
+  - **Search for library** — scan mounted drives and common cloud-synced folders for a `library.json` with the matching library id;
+  - **Open a different library** or **create a new one**.
+- **On reconnect** the app verifies the library id, checks the format version, runs an integrity check (structure and a sample of file hashes; full check optional), rebuilds `library.sqlite` from the files if it is missing or out of date (Section 4.3), and records the new location in the audit log.
+- **Partially moved or missing files** are listed in a **missing-files report**; the user can point to a folder where the app searches for them by hash and name and relinks them. Linked (non-copied) files outside the library are relinked the same way.
+- **Removable or network storage that is temporarily unavailable:** the app shows the library as *offline* rather than failing, prevents edits that would be lost, and reconnects automatically when the drive or network returns.
+
+**Encryption keys** are never stored in plain form inside the library. After a move or reconnect, encrypted projects require the user's key/passphrase (or key-recovery file) to open, so a moved or copied library remains protected.
+
+**Cloud-synced folders and multiple devices**
+
+- A **lock file** in the library records which device has it open. If another device holds the lock, the app opens the library read-only and explains why, avoiding database corruption from two devices writing through a file-sync service at once.
+- "Online-only"/placeholder files (iCloud, OneDrive, Dropbox on-demand files) are detected and downloaded on demand, with a clear status, rather than treated as missing.
+- For true simultaneous multi-device use, the app recommends the built-in sync server (Section 2.3), which is designed for it; a cloud-synced folder is supported for storage and moving between machines.
+
+**Multiple libraries:** the app can register and switch between several libraries (e.g., one per grant, or one on an encrypted external drive for sensitive fieldwork).
 
 ---
 
@@ -381,6 +414,7 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 - Platform failures (rate limits, downloader breakage, expired auth) shown clearly with retry; partial captures kept and labeled incomplete.
 - Governance fails closed.
 - Database corruption/loss recoverable via "Rebuild library from folder".
+- Library moved, renamed, or on a disconnected drive: "Library not found" / offline handling and reconnection (Section 4.5); no data loss or crash.
 
 ---
 
@@ -389,6 +423,7 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 - **Unit tests** for core: governance rules (each profile × each action), citation output against reference outputs for major styles (APA, Chicago, MLA, ASA, Harvard), file-naming rules (including non-Latin scripts and OS limits), audit hash-chain integrity, change-log conflict resolution.
 - **Fixture projects** with synthetic data for each compliance profile, generating sample verification reports.
 - **Import fixtures:** sample Zotero library, sample iPhone (HEIC, Live Photo, HEVC) and camera (RAW, MP4) files, sample PDFs/EPUBs.
+- **Library move/reconnect tests:** in-app move with interruption and resume, hash verification failure (old copy kept), move blocked by residency rules, reconnect after an external move/rename, rebuild of a missing index, missing-file relinking, drive disconnect/reconnect, lock-file behavior with two devices, cloud placeholder files.
 - **Bulk import tests:** metadata-resolution order and confidence scoring, duplicate detection and merge policies, interrupt-and-resume, incremental Zotero re-import, batch undo, and a large synthetic library (10,000+ items) for performance.
 - **End-to-end tests** driving the real app: import → capture → transcribe → translate → code → cite → export.
 - **Plain-language test report** generated after each build so the owner can confirm what works without reading code.
@@ -399,11 +434,11 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 
 Each phase ends with something usable and has its own implementation plan.
 
-1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder". Change log recorded (sync designed, not yet active).
+1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
 2. **Capture & media** — browser capture extension and web snapshots; YouTube; Instagram; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search.
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
-5. **Hybrid** — sync server, web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
+5. **Hybrid** — sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
 6. **Later** — collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
 
 ---
@@ -430,6 +465,7 @@ Each phase ends with something usable and has its own implementation plan.
 | Shadow libraries | Not supported; legitimate access chain + manual attach instead |
 | Zotero import | Phase 1 priority |
 | File naming | Human-readable; derived files include date modified; database rebuildable from files |
+| Library location | Movable across folders, drives, network and cloud storage, in the app (copy → verify → switch, governance-checked) or outside it (reconnect by library id); relative paths only |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
 | Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
 | Collections and tags | Added to data model (hierarchical collections; workspace/project tags), distinct from qualitative codes |
