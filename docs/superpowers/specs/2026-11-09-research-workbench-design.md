@@ -121,7 +121,16 @@ Points to one or more anchors. Kinds: highlight, note, coded segment, clip, scre
 - **Session** — a fieldwork event (date, place, participants), linking field media and field notes.
 - **Consent record** — form/document, scope, date, expiry, withdrawal status.
 
-### 3.7 Audit event
+### 3.7 Collections and tags
+
+- **Collection** — hierarchical (parent → child) grouping of sources within a project. A source may be in several collections. Zotero collections and imported folder structures map here.
+- **Tag** — free label, scoped to the workspace or to a project, with optional color. Tags are distinct from qualitative codes (Section 7): tags organize the library; codes are analytic and attach to anchors.
+
+### 3.8 Import batch
+
+Every bulk import (Section 5.4) is recorded as an **import batch**: source of import, options chosen, start/end time, counts, per-item results, and the governance decisions applied. Every source, asset, collection, and tag created by the batch references its batch id, so the batch can be reported on or undone as a unit.
+
+### 3.9 Audit event
 
 Append-only, hash-chained (each event includes the hash of the previous one). Fields: actor, device, action, entity, project, governance decision and reason, timestamp.
 
@@ -189,7 +198,8 @@ Append-only, hash-chained (each event includes the hash of the previous one). Fi
 | Provider | Method | Phase |
 |---|---|---|
 | **Drag-and-drop attach** | Drop PDFs, EPUBs, images, audio, video onto the library or a source. Extract embedded metadata and DOIs/ISBNs from text; propose a match or create a new source; hash, store, encrypt per rules; provenance `manual_upload`. Optional OCR for scanned PDFs. | 1 |
-| **Zotero import** | From the local Zotero data folder or the Zotero Web API: items, collections, tags, notes, attachments, PDF annotations, citation keys (incl. Better BibTeX). Provenance `zotero_import`. Also Zotero export. | 1 |
+| **Zotero import** | From the local Zotero data folder or the Zotero Web API: items, collections, tags, notes, attachments, PDF annotations, citation keys (incl. Better BibTeX). Provenance `zotero_import`. Also Zotero export. Runs through the Bulk Import tool (Section 5.4). | 1 |
+| **Bulk Import** | Mass import of Zotero libraries, folders of files, ZIP archives, BibTeX/RIS/CSL-JSON exports, and Calibre libraries (Section 5.4). | 1 |
 | **DOI lookup** | Crossref / OpenAlex metadata. | 1 |
 | **ISBN lookup** | Open Library, Library of Congress; WorldCat where available. | 1 |
 | **Device media import** | iPhone and camera photos/video (Section 5.3). | 1 |
@@ -225,6 +235,47 @@ Append-only, hash-chained (each event includes the hash of the previous one). Fi
 - **Location is sensitive:** per project, governance keeps, coarsens (to city level), or strips GPS in derived and exported copies; originals keep it only if residency/encryption rules allow.
 - **Fieldwork linking:** field media link to sessions, participants, consent records, and field notes; cited as the researcher's own field material.
 - **Deduplication** by file hash.
+
+### 5.4 Bulk Import tool
+
+A wizard (and an equivalent command-line tool for experienced collaborators) for importing whole libraries at once.
+
+**Import sources**
+
+- **Zotero:** local data folder (reads a *copy* of `zotero.sqlite`, so Zotero may stay open and is never modified), Zotero Web API (personal and group libraries), or Zotero export files (Zotero RDF, CSL-JSON, BibTeX with files).
+- **Folder:** recursive scan of a folder and its subfolders, including ZIP archives. File types: PDF, EPUB, MOBI/AZW3 (metadata only), DOCX, HTML, images, audio, video — including iPhone/camera folders (handled per Section 5.3).
+- **Reference-manager exports:** BibTeX, RIS, CSL-JSON (e.g., Mendeley, EndNote, Paperpile), with linked files resolved where paths are present.
+- **Calibre library:** reads `metadata.db` / `metadata.opf` and book files.
+
+**Wizard steps**
+
+1. **Choose source and target project.** The target project's governance applies from the start (e.g., if online lookup is not permitted, no titles/DOIs leave the device; if identifiability rules apply, file names are pseudonymized on import).
+2. **Scan (dry run; nothing changes).** Inventory: item count, file types, total size, likely duplicates (within the import and against the existing library), items already imported, unreadable/encrypted files.
+3. **Identify each item.** Metadata resolution in order, stopping when confident:
+   1. existing reference metadata (Zotero, BibTeX/RIS, Calibre),
+   2. embedded file metadata (PDF Info/XMP, EPUB OPF, EXIF),
+   3. DOI/ISBN/arXiv ID found in the first pages of text (OCR if needed and enabled),
+   4. sidecar files next to the item (`.bib`, `.ris`, `.opf`, `.json`),
+   5. file-name patterns (e.g., `Author - Year - Title`, `Author_Year_Title`; user-definable),
+   6. online lookup (Crossref, OpenAlex, Open Library) — only if governance permits.
+   Each result receives a **confidence score** and records which method produced it (stored in provenance).
+4. **Review.** Items above a confidence threshold are accepted automatically; the rest go to a review queue with side-by-side file preview, candidate matches, and bulk editing (e.g., set type, add tag, assign collection to a selection).
+5. **Options (per import):**
+   - **File handling: copy into the library (default)** or link in place. Linked files are outside encryption and retention control; they are marked as linked, and the verification report flags them.
+   - **Structure:** folders → collections (default), folders → tags, or ignore folder structure.
+   - **Duplicates:** detection by identical hash, same DOI/ISBN, or fuzzy match on title + first creator + year; policy **merge** (add files/metadata to existing source), **skip**, or **keep both**; uncertain matches go to review.
+   - **Post-processing queues:** OCR for scanned PDFs; transcription for audio/video (off by default, consistent with manual triggering).
+6. **Run.** Background job with progress, pause/resume, and checkpointing so it survives crashes and restarts. Streams items rather than loading everything into memory; parallel file processing; online lookups rate-limited and cached. Designed for libraries of tens of thousands of items.
+7. **Report and undo.** An **import report** (counts by outcome, failures with reasons, items still needing review, governance decisions applied) is saved to the project and written to the audit log. Because each import is a batch (Section 3.8), **the whole batch can be undone** in one action (sources, files, collections, and tags created by that batch are removed; merges into pre-existing sources are reverted).
+
+**Zotero specifics**
+
+- Imports collection hierarchy, tags (including colored tags), notes (HTML → Markdown), stored and linked attachments, Zotero-reader annotations (highlights, notes, image annotations) as anchors and annotations, Better BibTeX citation keys, related-item links, and item dates added/modified.
+- Preserves Zotero item keys, enabling **incremental re-import**: running the import again brings in only new or changed items, so the researcher can keep using Zotero during the transition.
+
+**Watched folder (optional)**
+
+A folder that is monitored; files dropped into it are imported automatically into a chosen project with saved options. Items below the confidence threshold wait in the review queue.
 
 ---
 
@@ -338,6 +389,7 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 - **Unit tests** for core: governance rules (each profile × each action), citation output against reference outputs for major styles (APA, Chicago, MLA, ASA, Harvard), file-naming rules (including non-Latin scripts and OS limits), audit hash-chain integrity, change-log conflict resolution.
 - **Fixture projects** with synthetic data for each compliance profile, generating sample verification reports.
 - **Import fixtures:** sample Zotero library, sample iPhone (HEIC, Live Photo, HEVC) and camera (RAW, MP4) files, sample PDFs/EPUBs.
+- **Bulk import tests:** metadata-resolution order and confidence scoring, duplicate detection and merge policies, interrupt-and-resume, incremental Zotero re-import, batch undo, and a large synthetic library (10,000+ items) for performance.
 - **End-to-end tests** driving the real app: import → capture → transcribe → translate → code → cite → export.
 - **Plain-language test report** generated after each build so the owner can confirm what works without reading code.
 
@@ -347,7 +399,7 @@ From any anchor: **quote card** (text + citation), **screenshot** with citation 
 
 Each phase ends with something usable and has its own implementation plan.
 
-1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder". Change log recorded (sync designed, not yet active).
+1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder". Change log recorded (sync designed, not yet active).
 2. **Capture & media** — browser capture extension and web snapshots; YouTube; Instagram; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search.
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
@@ -379,3 +431,5 @@ Each phase ends with something usable and has its own implementation plan.
 | Zotero import | Phase 1 priority |
 | File naming | Human-readable; derived files include date modified; database rebuildable from files |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
+| Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
+| Collections and tags | Added to data model (hierarchical collections; workspace/project tags), distinct from qualitative codes |
