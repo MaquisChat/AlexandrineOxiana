@@ -16,6 +16,7 @@ import type { Library } from "../library.js";
 import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from "./audit-store.js";
 import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import { absPath, readMaybe } from "./io.js";
+import type { InternalOptions } from "./seams.js";
 
 /** Search-index port (Task 12). Called last in a mutation, after files, change log and audit. */
 export interface IndexSink {
@@ -33,10 +34,6 @@ export interface RepoOptions {
   clock?: () => Date;
   actor?: string;
   device?: string;
-  /** scrypt cost for new key files. Tests only; production uses the default 2^17. */
-  scryptN?: number;
-  /** Events per audit segment. Tests only; production uses 10,000. */
-  auditSegmentSize?: number;
 }
 
 /** `<Project>/project.json`. */
@@ -108,7 +105,7 @@ export class RepoCore {
   constructor(
     readonly library: Library,
     readonly keyRing: KeyRing,
-    opts: RepoOptions,
+    opts: RepoOptions & InternalOptions,
   ) {
     this.anchors = AnchorStore.forConfigDir(library.appConfigDir);
     this.index = opts.index ?? NOOP_INDEX;

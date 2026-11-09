@@ -9,7 +9,7 @@ import { writeFileAtomic } from "../fs/atomic.js";
 import { appendChanges } from "./changelog-store.js";
 import { NotFoundError } from "./errors.js";
 import { readMaybe } from "./io.js";
-import { runMutation, type MutateRequest } from "./mutate.js";
+import { CHANGE_LOG_MODE, runMutation, type MutateRequest } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { editSource, readSourceFile, storeRequest } from "./sources.js";
 import type { RepoCore } from "./state.js";
@@ -154,7 +154,7 @@ export async function createTag(core: RepoCore, scope: string, name: string, col
     try {
       const at = core.clock().toISOString();
       const changes = diffToChanges(null, tag, { at, author: core.actor, device: core.device, projectId: "workspace", entity: { type: "tag", id: tag.id } });
-      await appendChanges(join(core.root, "changes"), changes);
+      await appendChanges(join(core.root, "changes"), changes, undefined, CHANGE_LOG_MODE);
     } catch (err) {
       if (old) await writeFileAtomic(path, old);
       else await fsp.rm(path, { force: true });

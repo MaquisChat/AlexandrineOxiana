@@ -46,14 +46,18 @@ export interface SessionInput {
   place?: string;
   participantIds?: string[];
   notes?: string;
+  /** Legal basis for holding place/notes (required by most profiles when they are given). */
+  legalBasis?: string;
 }
 
 export async function createSession(core: RepoCore, projectId: string, input: SessionInput): Promise<Session> {
   core.assertWritable();
+  // Where fieldwork happened and what was noted there can identify people.
+  const identifiable = !!input.place?.trim() || !!input.notes?.trim();
   return runMutation(
     core,
     projectId,
-    { action: "store", store: { identifiable: false, hasLocation: false } },
+    { action: "store", store: { identifiable, hasLocation: false, ...(input.legalBasis ? { legalBasis: input.legalBasis } : {}) } },
     async (tx) => {
       const data = await readFullData(core, tx.state);
       for (const id of input.participantIds ?? []) {

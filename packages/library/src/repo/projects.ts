@@ -11,7 +11,7 @@ import {
   withCollisionSuffix,
   type Project,
 } from "@ao/core";
-import { writeFileAtomic } from "../fs/atomic.js";
+import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import {
   WrongPassphraseError,
   createRecoveryFile,
@@ -26,7 +26,7 @@ import { AuditStore } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
 import { GovernanceViolationError, PolicyDeniedError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
-import type { Tx } from "./mutate.js";
+import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
 import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
@@ -86,6 +86,7 @@ export async function createProject(
       tz: core.tz,
       store: { identifiable: false, hasLocation: false },
     });
+    // Not audited: the project and its audit log do not exist yet, and nothing has been written.
     if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "store");
 
     const projectsDir = join(core.root, "Projects");
@@ -138,7 +139,7 @@ export async function createProject(
       const seal = keyMaterial
         ? (json: string) => sealLine(keyMaterial!.key, keyMaterial!.keyId, id, json)
         : undefined;
-      await appendChanges(join(staging, "changes"), changes, seal);
+      await appendChanges(join(staging, "changes"), changes, seal, seal ? undefined : CHANGE_LOG_MODE);
       const audit = new AuditStore(join(staging, "audit"), null, core.auditSegmentSize);
       await audit.append({
         at,
@@ -151,7 +152,7 @@ export async function createProject(
         details: { op: "project.create", encrypted: enc.enabled },
       });
 
-      await fsp.rename(staging, join(projectsDir, folderName));
+      await renameWithRetry(staging, join(projectsDir, folderName));
       audit.dir = join(projectsDir, folderName, "audit");
       if (keyMaterial) core.keyRing.add(keyMaterial.keyId, keyMaterial.key);
       const st: ProjectState = { project, rel, data, audit, sources: new Map(), manifest: { formatVersion: 1, sources: [] } };
@@ -256,7 +257,7 @@ export async function readFullData(core: RepoCore, st: ProjectState, allowLocked
 /**
  * Writes project.json. In encrypted projects, participant details and session
  * place/notes go to fieldwork.json.enc and never into project.json. Unencrypted
- * project.json holding participant details is written 0600 (R19).
+ * project.json holding participant details or session place/notes is written 0600 (R19).
  */
 export async function writeProjectData(core: RepoCore, tx: Tx, full: ProjectJson): Promise<void> {
   const st = tx.state;
@@ -280,7 +281,10 @@ export async function writeProjectData(core: RepoCore, tx: Tx, full: ProjectJson
       await tx.writeFile(`${st.rel}/fieldwork.json.enc`, JSON.stringify(secrets), { encrypt: true });
     }
   }
-  const identifying = !core.encrypted(st) && plain.participants.some((p) => p.details && Object.keys(p.details).length > 0);
+  const identifying =
+    !core.encrypted(st) &&
+    (plain.participants.some((p) => p.details && Object.keys(p.details).length > 0) ||
+      plain.sessions.some((s) => !!s.place?.trim() || !!s.notes?.trim()));
   await tx.writeFile(`${st.rel}/project.json`, JSON.stringify(plain, null, 2), identifying ? { mode: 0o600 } : {});
   tx.onCommit(() => {
     st.data = plain;

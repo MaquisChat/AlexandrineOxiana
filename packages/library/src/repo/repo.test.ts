@@ -22,10 +22,12 @@ import {
   PolicyDeniedError,
   ProjectLockedError,
   ReadOnlyLibraryError,
-  openRepo,
   type IndexSink,
   type Repo,
 } from "./index.js";
+import { SimulatedCrash, openTestRepo, seams, type InternalOptions } from "./testing.js";
+import { AnchorStore } from "./audit-store.js";
+import type { RepoOptions } from "./state.js";
 
 const FAST = 2 ** 10;
 const NOW = "2026-11-09T14:30:00.000Z";
@@ -69,8 +71,9 @@ function mkDeps(): Deps {
   };
 }
 
-async function repoFor(over: Parameters<typeof openRepo>[2] = {}, library: Library = lib): Promise<Repo> {
-  return openRepo(library, ring, { clock: () => now, tz: "UTC", actor: "tester", scryptN: FAST, ...over });
+type Opts = RepoOptions & InternalOptions;
+async function repoFor(over: Opts = {}, library: Library = lib): Promise<Repo> {
+  return openTestRepo(library, ring, { clock: () => now, tz: "UTC", actor: "tester", scryptN: FAST, ...over });
 }
 
 function draft(over: Partial<SourceDraft> = {}): SourceDraft {
@@ -280,7 +283,7 @@ function derivedInput(parent: string) {
 }
 
 describe("encrypted project", () => {
-  async function setup(over: Parameters<typeof openRepo>[2] = {}) {
+  async function setup(over: Opts = {}) {
     const repo = await repoFor(over);
     const created = await repo.createProject({
       name: "Secret",
@@ -353,6 +356,22 @@ describe("encrypted project", () => {
       { provenance: provenance({ captureMethod: "downloader", identifiable: true, legal: { status: "consented", basis: "consent" } }) },
     );
     await repo.addDerivedAsset(project.id, sf.source.id, { ...derivedInput(sf.assets[0]!.id), fromPath: mp4 });
+    // Given name alone, and a researcher (interviewer) who is not a participant.
+    const interview = await repo.createSource(
+      project.id,
+      draft({
+        type: "interview",
+        title: { variants: [{ lang: "es", kind: "original", value: "Entrevista con Maria" }] },
+        creators: [
+          { given: "Ana", family: "Ruiz", role: "interviewer" },
+          { given: "Maria", family: "Lopez", role: "interviewee" },
+        ],
+        issued: "2026-03-20",
+      }),
+      pdfFile(),
+      { provenance: provenance({ identifiable: true, legal: { status: "consented", basis: "consent" } }) },
+    );
+    expect(interview.source.folder).toMatch(/Sources\/2026-03-20 P-002 - Entrevista con P-002 \[[0-9a-z]{4,}\]$/);
     const names = await walk(join(lib.root, "Projects"));
     expect(names.length).toBeGreaterThan(5);
     for (const n of names) expect(n.toLowerCase()).not.toContain("maria");
@@ -365,9 +384,10 @@ describe("encrypted project", () => {
     }
     // The pseudonym map is encrypted and maps the handle to the participant code.
     const map = JSON.parse((await decrypt(join(dir, "keys/pseudonyms.json.enc"))).toString("utf8"));
-    expect(map).toEqual({ formatVersion: 1, map: { "@maria.cocina": "P-001" } });
+    expect(map).toEqual({ formatVersion: 1, map: { "@maria.cocina": "P-001", "Maria Lopez": "P-002" } });
     const fw = await repo.getFieldwork(project.id);
-    expect(fw.participants.map((p) => p.code)).toEqual(["P-001"]);
+    expect(fw.participants.map((p) => p.code)).toEqual(["P-001", "P-002"]);
+    expect(interview.source.participantIds).toEqual([fw.participants[1]!.id]);
     expect(sf.source.participantIds).toEqual([fw.participants[0]!.id]);
   });
 
@@ -401,6 +421,16 @@ describe("encrypted project", () => {
     const fw = JSON.parse((await decrypt(join(dir, "fieldwork.json.enc"))).toString("utf8"));
     expect(fw.participants[p1.id]).toEqual({ name: "Rosa Quispe" });
     expect((await repo.getFieldwork(project.id)).participants[0]!.details).toEqual({ name: "Rosa Quispe" });
+    // Session place/notes are identifying: governed as such and kept out of project.json.
+    await expect(repo.createSession(project.id, { date: "2026-03-14", place: "Calle Ocho 12" })).rejects.toBeInstanceOf(
+      PolicyDeniedError,
+    );
+    const s = await repo.createSession(project.id, { date: "2026-03-14", place: "Calle Ocho 12", notes: "met Rosa", legalBasis: "consent" });
+    const pj = await readFile(join(dir, "project.json"), "utf8");
+    expect(pj).not.toMatch(/Calle Ocho|met Rosa/);
+    const fw2 = JSON.parse((await decrypt(join(dir, "fieldwork.json.enc"))).toString("utf8"));
+    expect(fw2.sessions[s.id]).toEqual({ place: "Calle Ocho 12", notes: "met Rosa" });
+    expect((await repo.getFieldwork(project.id)).sessions[0]).toMatchObject({ place: "Calle Ocho 12", notes: "met Rosa" });
   });
 });
 
@@ -483,6 +513,25 @@ describe("governance", () => {
     const d = await repo.addDerivedAsset(project.id, sf.source.id, derivedInput(sf.assets[0]!.id));
     expect((await stat(join(lib.root, d.path))).mode & 0o777).toBe(0o600);
     expect((await stat(join(lib.root, project.folder, "changes/2026-11.jsonl"))).mode & 0o777).toBe(0o600);
+    // Sessions with a place make project.json identifying (0600).
+    expect((await stat(join(lib.root, project.folder, "project.json"))).mode & 0o777).not.toBe(0o600);
+    await repo.createSession(project.id, { date: "2026-03-14", place: "Lima", legalBasis: "consent" });
+    expect((await stat(join(lib.root, project.folder, "project.json"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("writes every unencrypted change log 0600, even without identifiable data (R19)", async () => {
+    if (process.platform === "win32") return;
+    const repo = await repoFor();
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const changes = join(lib.root, project.folder, "changes/2026-11.jsonl");
+    expect((await stat(changes)).mode & 0o777).toBe(0o600);
+    await repo.createSource(project.id, draft(), pdfFile(), { provenance: provenance() });
+    expect((await stat(changes)).mode & 0o777).toBe(0o600);
+    now = new Date("2026-12-01T10:00:00.000Z"); // a new month file, created by a mutation
+    await repo.createSource(project.id, draft(), pdfFile(), { provenance: provenance() });
+    expect((await stat(join(lib.root, project.folder, "changes/2026-12.jsonl"))).mode & 0o777).toBe(0o600);
+    await repo.createTag("workspace", "x");
+    expect((await stat(join(lib.root, "changes/2026-12.jsonl"))).mode & 0o777).toBe(0o600);
   });
 });
 
@@ -637,12 +686,14 @@ describe("collections, tags, fieldwork", () => {
   });
 
   it("creates participants, sessions and consent, and links sources", async () => {
+    // Session place/notes are identifying, so use a project governed for identifiable data.
+    pid = (await repo.createProject({ name: "Field", governanceYaml: IDENT_PLAIN_GOV, encryption: { enabled: false } })).project.id;
     const p = await repo.createParticipant(pid, {});
     const q = await repo.createParticipant(pid, { code: "P-010" });
     const r = await repo.createParticipant(pid, {});
     expect([p.code, q.code, r.code]).toEqual(["P-001", "P-010", "P-011"]);
     await expect(repo.createParticipant(pid, { code: "P-010" })).rejects.toThrow(/already/);
-    const s = await repo.createSession(pid, { date: "2026-03-14", place: "Lima", participantIds: [p.id] });
+    const s = await repo.createSession(pid, { date: "2026-03-14", place: "Lima", participantIds: [p.id], legalBasis: "consent" });
     const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
     const sf = await repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() });
     const linked = await repo.linkSourceToFieldwork(pid, sf.source.id, { participantIds: [p.id], sessionId: s.id });
@@ -722,5 +773,111 @@ describe("external audit anchor (R12)", () => {
     expect(verifyChain(await auditEvents(dir)).ok).toBe(true);
     const again = await repoFor({ auditSegmentSize: 3 });
     expect(again.integrityWarnings).toEqual([]);
+  });
+});
+
+describe("crash recovery (write-ahead marker)", () => {
+  let repo: Repo;
+  let pid: string;
+  let dir: string;
+  beforeEach(async () => {
+    repo = await repoFor();
+    pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    dir = join(lib.root, "Projects/P");
+  });
+  afterEach(() => {
+    seams.crashAt = undefined;
+  });
+
+  const markers = async () => (await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("txn-"));
+
+  it("rolls back a create interrupted after the change log, before the audit append", async () => {
+    const changesBefore = await readFile(join(dir, "changes/2026-11.jsonl"), "utf8");
+    const auditBefore = await auditEvents(dir);
+    seams.crashAt = "before-audit";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    // The "dead" process left unaudited data live, plus its marker.
+    expect(await readdir(join(dir, "Sources"))).toHaveLength(1);
+    expect(await markers()).toHaveLength(1);
+
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([{ projectId: pid, kind: "rolled-back-incomplete-write", detail: expect.any(String) }]);
+    expect(await readdir(join(dir, "Sources"))).toEqual([]);
+    expect(again.listSourceIds(pid)).toEqual([]);
+    expect(await readFile(join(dir, "changes/2026-11.jsonl"), "utf8")).toBe(changesBefore);
+    expect(await auditEvents(dir)).toEqual(auditBefore);
+    expect(await readdir(join(lib.root, ".tmp"))).toEqual([]);
+  });
+
+  it("truncates a partially appended audit (between the capture and store events)", async () => {
+    const auditBefore = await auditEvents(dir);
+    seams.crashAt = "between-audit";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    expect(await auditEvents(dir)).toHaveLength(auditBefore.length + 1);
+    const again = await repoFor();
+    expect(again.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    const events = await auditEvents(dir);
+    expect(events).toEqual(auditBefore);
+    expect(verifyChain(events).ok).toBe(true);
+    expect(await readdir(join(dir, "Sources"))).toEqual([]);
+  });
+
+  it("restores replaced and trashed files of interrupted updates and deletes", async () => {
+    const sf = await repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() });
+    const jsonPath = join(lib.root, sf.source.folder, "source.json");
+    const before = await readFile(jsonPath, "utf8");
+    seams.crashAt = "before-audit";
+    await expect(repo.updateSource(pid, sf.source.id, { publisher: "X" })).rejects.toBeInstanceOf(SimulatedCrash);
+    expect(await readFile(jsonPath, "utf8")).not.toBe(before);
+    await repoFor();
+    expect(await readFile(jsonPath, "utf8")).toBe(before);
+
+    const r2 = await repoFor();
+    seams.crashAt = "before-changes";
+    await expect(r2.deleteSource(pid, sf.source.id)).rejects.toBeInstanceOf(SimulatedCrash);
+    expect(await readdir(join(dir, "Sources"))).toEqual([]);
+    const r3 = await repoFor();
+    expect(r3.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    expect(await readFile(jsonPath, "utf8")).toBe(before);
+    expect((await r3.getSource(pid, sf.source.id)).source.id).toBe(sf.source.id);
+    expect(await readdir(join(lib.root, ".tmp"))).toEqual([]);
+  });
+
+  it("keeps a committed change whose marker was not yet deleted", async () => {
+    seams.crashAt = "before-marker-delete";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([]);
+    expect(again.listSourceIds(pid)).toHaveLength(1);
+    expect(await markers()).toEqual([]);
+    const allows = (await auditEvents(dir)).filter((e) => (e.details as { txn?: string }).txn);
+    expect(allows.map((e) => e.action)).toEqual(["capture", "store"]);
+    expect(new Set(allows.map((e) => (e.details as { txn: string }).txn)).size).toBe(1);
+  });
+});
+
+describe("anchors file corruption (R12)", () => {
+  it("warns, keeps the corrupt file aside and re-records the anchors", async () => {
+    const repo = await repoFor();
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const path = join(tmp, "config/audit-anchors.json");
+    await writeFile(path, "{ not json");
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([{ projectId: "*", kind: "anchors-unreadable", detail: expect.any(String) }]);
+    const aside = (await readdir(join(tmp, "config"))).filter((n) => n.startsWith("audit-anchors.json.corrupt-"));
+    expect(aside).toHaveLength(1);
+    expect(await readFile(join(tmp, "config", aside[0]!), "utf8")).toBe("{ not json");
+    const fresh = JSON.parse(await readFile(path, "utf8"));
+    expect(fresh.anchors[`${lib.id}/${project.id}`].seq).toBe(1);
+  });
+
+  it("never overwrites an unparseable or wrong-shape anchors file", async () => {
+    const store = AnchorStore.forConfigDir(join(tmp, "config2"));
+    await mkdir(join(tmp, "config2"));
+    for (const bad of ["garbage", JSON.stringify({ formatVersion: 1, anchors: { k: { seq: "x" } } })]) {
+      await writeFile(store.path, bad);
+      await expect(store.set("k", { seq: 1, hash: "a".repeat(64) }, NOW)).rejects.toThrow(/anchors/);
+      expect(await readFile(store.path, "utf8")).toBe(bad);
+    }
   });
 });

@@ -1,11 +1,11 @@
 /** `openRepo` and the `Repo` facade: one per open library. */
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { Asset, Collection, ConsentRecord, Participant, Project, Session, SourceDraft, SourceFile, Tag } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { addDerivedAsset, type DerivedAssetInput } from "./assets.js";
-import { checkAnchor, type IntegrityWarning } from "./audit-store.js";
+import { AnchorsUnreadableError, checkAnchor, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
   createConsent,
@@ -29,7 +29,9 @@ import {
   type SourceInputFile,
   type SourcePatch,
 } from "./sources.js";
+import type { InternalOptions } from "./seams.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
+import { recoverTransactions } from "./txn.js";
 
 export class Repo {
   constructor(private readonly core: RepoCore) {}
@@ -123,34 +125,75 @@ export class Repo {
   }
 }
 
-/** Removes leftovers of interrupted work: project staging folders and trashed source folders. */
+/** Removes leftovers of interrupted work: project staging folders, trashed folders, orphan backup copies. */
 async function sweep(core: RepoCore): Promise<void> {
-  const clear = async (dir: string, prefix: string) => {
+  const clear = async (dir: string, match: (n: string) => boolean) => {
     let names: string[] = [];
     try {
       names = await fsp.readdir(dir);
     } catch {
       return;
     }
-    for (const n of names) if (n.startsWith(prefix)) await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
+    for (const n of names) if (match(n)) await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
   };
-  await clear(join(core.root, "Projects"), ".creating-");
-  await clear(join(core.root, ".tmp"), "trash-");
+  await clear(join(core.root, "Projects"), (n) => n.startsWith(".creating-"));
+  // Runs after recoverTransactions, so no live marker still references these.
+  await clear(join(core.root, ".tmp"), (n) => n.startsWith("trash-") || /^txn-.*\.orig-\d+$/.test(n));
+}
+
+/** Reads the anchors; an unreadable file is reported, moved aside (when writable) and replaced. */
+async function readAnchors(core: RepoCore, writable: boolean) {
+  try {
+    return await core.anchors.readAll();
+  } catch (err) {
+    if (!(err instanceof AnchorsUnreadableError)) throw err;
+    let detail = `${err.message}; audit heads could not be compared and are re-recorded from the current logs`;
+    if (writable) {
+      try {
+        const aside = await core.anchors.moveAside(core.clock().toISOString());
+        detail += ` (old file kept as ${basename(aside)})`;
+      } catch {
+        detail += " (the old file could not be moved aside and is left in place)";
+      }
+    }
+    core.integrityWarnings.push({ projectId: "*", kind: "anchors-unreadable", detail });
+    return {};
+  }
 }
 
 /**
- * Opens the repository for a library. Verifies every project's audit chain and
- * compares its head with the external anchor (R12): a broken chain, a different
- * event at the anchored position, or a shorter log is reported in
- * `integrityWarnings` and, when writable, recorded as an `audit.anchor-mismatch`
- * event. Projects without an anchor get one.
+ * Opens the repository for a library. When writable, first finishes or rolls
+ * back writes interrupted by a crash (write-ahead markers, see txn.ts), each
+ * rollback reported as `rolled-back-incomplete-write`. Then verifies every
+ * project's audit chain and compares its head with the external anchor (R12):
+ * a broken chain, a different event at the anchored position, or a shorter log
+ * is reported in `integrityWarnings` and, when writable, recorded as an
+ * `audit.anchor-mismatch` event. Projects without an anchor get one.
  */
-export async function openRepo(library: Library, keyRing: KeyRing, opts: RepoOptions = {}): Promise<Repo> {
+export function openRepo(library: Library, keyRing: KeyRing, opts: RepoOptions = {}): Promise<Repo> {
+  const { index, tz, clock, actor, device } = opts;
+  return openRepoInternal(library, keyRing, { index, tz, clock, actor, device });
+}
+
+/** openRepo plus internal (test-only) options; reached from tests through testing.ts. */
+export async function openRepoInternal(
+  library: Library,
+  keyRing: KeyRing,
+  opts: RepoOptions & InternalOptions,
+): Promise<Repo> {
   const core = new RepoCore(library, keyRing, opts);
   const writable = library.mode === "read-write";
+  const recovered = writable ? await recoverTransactions(core.root) : [];
   if (writable) await sweep(core);
   const loaded = await loadProjects(core);
-  const anchors = await core.anchors.readAll();
+  const anchors = await readAnchors(core, writable);
+  for (const r of recovered.filter((x) => x.rolledBack)) {
+    core.integrityWarnings.push({
+      projectId: r.projectId,
+      kind: "rolled-back-incomplete-write",
+      detail: `a change interrupted before it was audited (transaction ${r.txn}) was rolled back`,
+    });
+  }
   for (const { st, events, verify } of loaded) {
     core.projects.set(st.project.id, st);
     const anchor = anchors[core.anchorKey(st.project.id)];

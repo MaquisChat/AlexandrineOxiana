@@ -7,19 +7,23 @@
  *      (R17). Conditions the project cannot honour (encrypt / pseudonymize
  *      without project encryption) turn the decision into a deny. A deny is
  *      audited and thrown as PolicyDeniedError; nothing else is written.
- *   2. `fn(tx)` writes files to their final names, each atomically. The tx
- *      journals every file/folder it creates, replaces or moves to the trash.
- *   3. the change log is appended (fsync).
- *   4. the "allow" audit event(s) are appended (fsync): the commit point.
- *   If 2–4 fail, appended audit lines and change log lines are truncated away
- *   and the journal is rolled back in reverse, so no partial state remains and
- *   no "allow" event exists for a change that did not happen.
+ *   2. `fn(tx)` writes files to their final names, each atomically. Before
+ *      each step (file created/replaced, folder created, folder trashed) it is
+ *      recorded in the write-ahead marker `.tmp/txn-<id>.json` (see txn.ts).
+ *   3. the change log is appended (fsync), recorded in the marker first.
+ *   4. the "allow" audit event(s), carrying `details.txn = <id>`, are all
+ *      appended (fsync): the commit point. Then the marker is deleted.
+ *   If 2–4 fail in-process, every marker step is undone in reverse (audit and
+ *   change log lines truncated away, files removed or restored), so no partial
+ *   state remains and no "allow" event exists for a change that did not happen.
+ *   If the process dies instead, the marker survives and openRepo finishes or
+ *   rolls back the transaction (recoverTransactions), with a warning.
  *   5. after commit: external audit anchor, in-memory state, trash purge, and
  *      finally the index sink (R22). Failures here never undo the commit.
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   diffToChanges,
   evaluate,
@@ -31,11 +35,13 @@ import {
   type PolicyRequest,
 } from "@ao/core";
 import { encryptStream } from "../crypto/format.js";
-import { copyFileAtomic, writeFileAtomic } from "../fs/atomic.js";
+import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import type { AuditInput } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
 import { PolicyDeniedError } from "./errors.js";
-import { encryptBytes, exists, readMaybe, sealLine } from "./io.js";
+import { encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
+import { SimulatedCrash, maybeCrash } from "./seams.js";
+import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
 /** A policy request without the fields the repository fills in (projectId; actor, now and tz by default). */
@@ -55,12 +61,6 @@ export interface FileOptions {
   /** POSIX mode, e.g. 0o600 for unencrypted identifiable files (R19). */
   mode?: number;
 }
-
-type JournalEntry =
-  | { kind: "created"; abs: string }
-  | { kind: "replaced"; abs: string; old: Buffer; mode?: number }
-  | { kind: "dir"; abs: string }
-  | { kind: "trashed"; from: string; to: string };
 
 export interface Tx {
   readonly projectId: string;
@@ -94,7 +94,6 @@ export interface Tx {
 }
 
 class TxImpl implements Tx {
-  readonly journal: JournalEntry[] = [];
   readonly changes: Change[] = [];
   readonly commitHooks: Array<() => void> = [];
   readonly indexHooks: Array<(sink: IndexSink) => void | Promise<void>> = [];
@@ -106,6 +105,7 @@ class TxImpl implements Tx {
     readonly state: ProjectState,
     readonly conditions: Condition[],
     readonly now: Date,
+    readonly log: TxnLog,
   ) {}
 
   get projectId() {
@@ -134,8 +134,13 @@ class TxImpl implements Tx {
   }
 
   async mkdir(rel: string): Promise<void> {
-    const first = await fsp.mkdir(this.core.abs(rel), { recursive: true });
-    if (first) this.journal.push({ kind: "dir", abs: first });
+    const abs = this.core.abs(rel);
+    // Record the outermost folder this call will create, before creating it.
+    let first: string | undefined;
+    for (let cur = abs; !(await exists(cur)); cur = dirname(cur)) first = cur;
+    if (!first) return;
+    await this.log.createdDir(first);
+    await fsp.mkdir(abs, { recursive: true });
   }
 
   private async payload(data: Uint8Array | string, opts: FileOptions): Promise<Uint8Array | string> {
@@ -147,20 +152,15 @@ class TxImpl implements Tx {
   async writeFile(rel: string, data: Uint8Array | string, opts: FileOptions = {}): Promise<void> {
     const abs = this.core.abs(rel);
     const bytes = await this.payload(data, opts);
-    const old = await readMaybe(abs);
-    if (old) {
-      const mode = (await fsp.stat(abs)).mode & 0o777;
-      this.journal.push({ kind: "replaced", abs, old, mode });
-    } else {
-      this.journal.push({ kind: "created", abs });
-    }
+    if (await exists(abs)) await this.log.replaced(abs, (await fsp.stat(abs)).mode & 0o777);
+    else await this.log.created(abs);
     await writeFileAtomic(abs, bytes, { mode: opts.mode });
   }
 
   async copyFile(src: string, rel: string, opts: FileOptions = {}): Promise<{ sha256: string; bytes: number }> {
     const abs = this.core.abs(rel);
     if (await exists(abs)) throw new Error(`refusing to overwrite ${rel}`);
-    this.journal.push({ kind: "created", abs });
+    await this.log.created(abs);
     if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode });
     const { key, keyId } = this.key();
     return copyFileAtomic(src, abs, { mode: opts.mode, transform: (r) => r.pipe(encryptStream(key, keyId)) });
@@ -171,8 +171,8 @@ class TxImpl implements Tx {
     const dir = join(this.core.root, ".tmp");
     await fsp.mkdir(dir, { recursive: true });
     const to = join(dir, `trash-${randomBytes(8).toString("hex")}`);
-    await fsp.rename(from, to);
-    this.journal.push({ kind: "trashed", from, to });
+    await this.log.trashed(from, to);
+    await renameWithRetry(from, to);
     this.trashed.push(to);
   }
 
@@ -193,21 +193,10 @@ class TxImpl implements Tx {
   index(fn: (sink: IndexSink) => void | Promise<void>): void {
     this.indexHooks.push(fn);
   }
-
-  /** Undo every journaled step in reverse. Best effort: keeps going past individual failures. */
-  async rollback(): Promise<void> {
-    for (const j of [...this.journal].reverse()) {
-      try {
-        if (j.kind === "created") await fsp.rm(j.abs, { force: true });
-        else if (j.kind === "replaced") await writeFileAtomic(j.abs, j.old, { mode: j.mode });
-        else if (j.kind === "dir") await fsp.rm(j.abs, { recursive: true, force: true });
-        else await fsp.rename(j.to, j.from);
-      } catch {
-        // continue: leave as much as possible restored
-      }
-    }
-  }
 }
+
+/** Change log files in unencrypted projects are always owner-only (R19). */
+export const CHANGE_LOG_MODE = 0o600;
 
 function denyOf(reason: string, warnings: string[] = []): PolicyDecision {
   return { result: "deny", reason, warnings };
@@ -287,10 +276,11 @@ export async function runMutation<T>(
     }
 
     // 2–4. Files, change log, audit (commit point); roll everything back on failure.
-    const tx = new TxImpl(core, st, conditions, now);
+    const headBefore = st.audit.head;
+    const log = new TxnLog(core.root, projectId, st.rel, allowed.length);
+    const tx = new TxImpl(core, st, conditions, now, log);
     if (opts.entity) tx.entity(opts.entity.type, opts.entity.id);
-    const auditUndos: Array<() => Promise<void>> = [];
-    let undoChanges: (() => Promise<void>) | undefined;
+    const onPlan = (u: AppendUndo) => log.append(u);
     let result: T;
     try {
       result = await fn(tx);
@@ -300,25 +290,29 @@ export async function runMutation<T>(
             return (json: string) => sealLine(key, keyId, projectId, json);
           })()
         : undefined;
-      // Unencrypted change logs of identifiable projects hold entity values in the clear (R19).
-      const mode = !seal && cfg!.identifiability.containsIdentifiable ? 0o600 : undefined;
-      undoChanges = await appendChanges(core.abs(`${st.rel}/changes`), tx.changes, seal, mode);
-      for (const { req, d } of allowed) {
-        const { undo } = await st.audit.append({
+      maybeCrash("before-changes");
+      // Unencrypted change logs hold entity values in the clear: always 0600 (R19).
+      await appendChanges(core.abs(`${st.rel}/changes`), tx.changes, seal, seal ? undefined : CHANGE_LOG_MODE, onPlan);
+      maybeCrash("before-audit");
+      for (const [i, { req, d }] of allowed.entries()) {
+        if (i > 0) maybeCrash("between-audit");
+        await st.audit.append({
           ...core.auditBase(st, at),
           action: req.action,
           entity: tx.auditEntity,
           decision: auditDecision(d),
-          details: { op, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
-        });
-        auditUndos.push(undo);
+          details: { op, txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
+        }, onPlan);
       }
+      maybeCrash("before-marker-delete");
     } catch (err) {
-      for (const u of auditUndos.reverse()) await u().catch(() => {});
-      await undoChanges?.().catch(() => {});
-      await tx.rollback();
+      if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
+      await log.undo();
+      st.audit.head = headBefore;
+      await log.finish().catch(() => {});
       throw err;
     }
+    await log.finish().catch(() => {}); // a leftover marker is resolved as committed on next open
 
     // 5. Committed.
     await core.updateAnchor(st, at);

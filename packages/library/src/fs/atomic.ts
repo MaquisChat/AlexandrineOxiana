@@ -45,14 +45,15 @@ const RETRY_DELAYS_MS = [20, 40, 80, 160, 320];
  * Windows rename retry. Antivirus scanners, indexers and sync clients briefly
  * hold files open there, making rename fail with EPERM/EACCES/EBUSY. We retry
  * up to 5 times (20 → 320 ms backoff, ~620 ms in all), only on win32 or when a
- * test sets `force`. Elsewhere those codes are real permission errors.
+ * test sets `force`. Elsewhere those codes are real permission errors. Also
+ * used for directory renames (trash, rollback, project staging).
  */
 export const _renameRetry = {
   force: false,
   sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
-async function renameWithRetry(from: string, to: string): Promise<void> {
+export async function renameWithRetry(from: string, to: string): Promise<void> {
   const retry = process.platform === "win32" || _renameRetry.force;
   for (let attempt = 0; ; attempt++) {
     try {

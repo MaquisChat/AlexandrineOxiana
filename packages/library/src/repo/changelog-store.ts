@@ -15,6 +15,7 @@ export async function appendChanges(
   changes: Change[],
   seal?: (json: string) => string,
   mode?: number,
+  onPlan?: (u: AppendUndo) => Promise<void>,
 ): Promise<() => Promise<void>> {
   const byMonth = new Map<string, string[]>();
   for (const c of changes) {
@@ -31,7 +32,7 @@ export async function appendChanges(
   try {
     if (byMonth.size > 0) await fsp.mkdir(dir, { recursive: true });
     for (const [month, lines] of byMonth) {
-      undos.push(await appendDurable(join(dir, `${month}.jsonl`), `${lines.join("\n")}\n`, mode));
+      undos.push(await appendDurable(join(dir, `${month}.jsonl`), `${lines.join("\n")}\n`, mode, onPlan));
     }
   } catch (err) {
     await undo();

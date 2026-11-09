@@ -205,13 +205,15 @@ export async function createSource(
           await savePseudonyms(tx, map);
           await writeProjectData(core, tx, data);
         }
-        creator = codes[0] ?? (draft.creators.length ? "Unknown" : undefined);
-        // Every name form of each creator (handle, literal, family, given family) maps to its code.
+        creator = codes.find((c) => c !== undefined) ?? (draft.creators.length ? "Unknown" : undefined);
+        // Every name form of each creator (handle with and without "@", literal, family, given,
+        // "given family") maps to its code; pseudonymize() matches the longest first.
         const text = new Map(map);
         draft.creators.forEach((c, i) => {
           const code = codes[i];
           if (!code) return;
-          for (const n of [c.handle, c.literal, c.family, [c.given, c.family].filter(Boolean).join(" ")]) {
+          const bare = c.handle?.replace(/^@+/, "");
+          for (const n of [c.handle, bare, c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) {
             if (n?.trim() && !text.has(n.trim())) text.set(n.trim(), code);
           }
         });

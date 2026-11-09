@@ -8,8 +8,8 @@
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import { writeFileAtomic } from "../fs/atomic.js";
-import { appendDurable, readMaybe, stripUndefined, undoAppend } from "./io.js";
+import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { appendDurable, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
 const SEGMENT = /^(\d{4,})\.jsonl$/;
@@ -18,8 +18,9 @@ export type Head = { seq: number; hash: string };
 export type AuditInput = Omit<AuditEvent, "hash" | "prevHash" | "seq">;
 
 export interface IntegrityWarning {
+  /** A project id, or "*" for library-level problems (e.g. an unreadable anchors file). */
   projectId: string;
-  kind: "chain-broken" | "head-mismatch" | "truncated";
+  kind: "chain-broken" | "head-mismatch" | "truncated" | "anchors-unreadable" | "rolled-back-incomplete-write";
   detail: string;
 }
 
@@ -74,11 +75,14 @@ export class AuditStore {
   }
 
   /** Seals and durably appends one event. Returns an undo that removes it again. */
-  async append(input: AuditInput): Promise<{ event: AuditEvent; undo: () => Promise<void> }> {
+  async append(
+    input: AuditInput,
+    onPlan?: (u: AppendUndo) => Promise<void>,
+  ): Promise<{ event: AuditEvent; undo: () => Promise<void> }> {
     const event = sealEvent(stripUndefined(input), this.head);
     await fsp.mkdir(this.dir, { recursive: true });
     const prevHead = this.head;
-    const u = await appendDurable(join(this.dir, this.segmentName(event.seq)), `${JSON.stringify(event)}\n`);
+    const u = await appendDurable(join(this.dir, this.segmentName(event.seq)), `${JSON.stringify(event)}\n`, undefined, onPlan);
     this.head = { seq: event.seq, hash: event.hash };
     return {
       event,
@@ -95,7 +99,7 @@ export function checkAnchor(
   events: Array<AuditEvent | null>,
   verify: AuditVerifyResult,
   anchor: Head | undefined,
-): { kind: IntegrityWarning["kind"]; detail: string } | null {
+): { kind: "chain-broken" | "head-mismatch" | "truncated"; detail: string } | null {
   if (!verify.ok) {
     return { kind: "chain-broken", detail: `audit chain breaks at event ${verify.brokenAt + 1} (${verify.reason}); the audit log changed outside the app` };
   }
@@ -116,25 +120,52 @@ interface AnchorsJson {
   anchors: Record<string, Head & { at: string }>;
 }
 
+/** The anchors file exists but cannot be parsed or has the wrong shape. */
+export class AnchorsUnreadableError extends Error {
+  override name = "AnchorsUnreadableError";
+}
+
+type Anchors = AnchorsJson["anchors"];
+
+function validAnchors(v: unknown): v is AnchorsJson {
+  if (!v || typeof v !== "object") return false;
+  const a = (v as Partial<AnchorsJson>).anchors;
+  if (!a || typeof a !== "object" || Array.isArray(a)) return false;
+  return Object.values(a).every(
+    (h) => !!h && typeof h === "object" && Number.isSafeInteger((h as Head).seq) && typeof (h as Head).hash === "string",
+  );
+}
+
 /** `<appConfigDir>/audit-anchors.json`, keyed by `libraryId/projectId`. */
 export class AnchorStore {
-  constructor(private readonly path: string) {}
+  constructor(readonly path: string) {}
 
   static forConfigDir(appConfigDir: string): AnchorStore {
     return new AnchorStore(join(appConfigDir, "audit-anchors.json"));
   }
 
-  async readAll(): Promise<AnchorsJson["anchors"]> {
+  /** Throws AnchorsUnreadableError when the file exists but is unparseable or the wrong shape. */
+  async readAll(): Promise<Anchors> {
     const raw = await readMaybe(this.path);
     if (!raw) return {};
+    let j: unknown;
     try {
-      const j = JSON.parse(raw.toString("utf8")) as Partial<AnchorsJson>;
-      return j && typeof j.anchors === "object" && j.anchors !== null ? j.anchors : {};
+      j = JSON.parse(raw.toString("utf8"));
     } catch {
-      return {};
+      throw new AnchorsUnreadableError("audit-anchors.json is not valid JSON");
     }
+    if (!validAnchors(j)) throw new AnchorsUnreadableError("audit-anchors.json has an unexpected shape");
+    return j.anchors;
   }
 
+  /** Moves an unreadable anchors file aside (never deleted: it is evidence). Returns the new path. */
+  async moveAside(stamp: string): Promise<string> {
+    const to = `${this.path}.corrupt-${stamp.replace(/[:.]/g, "-")}`;
+    await renameWithRetry(this.path, to);
+    return to;
+  }
+
+  /** Records a head. Refuses (throws) rather than overwrite an unreadable file. */
   async set(key: string, head: Head, at: string): Promise<void> {
     const anchors = await this.readAll();
     anchors[key] = { seq: head.seq, hash: head.hash, at };

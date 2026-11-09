@@ -71,8 +71,16 @@ export interface AppendUndo {
   created: boolean;
 }
 
-/** Appends `text` and fsyncs. On failure the file is truncated back before rethrowing. */
-export async function appendDurable(path: string, text: string, mode?: number): Promise<AppendUndo> {
+/**
+ * Appends `text` and fsyncs. On failure the file is truncated back before rethrowing.
+ * `onPlan` receives the undo information before anything is written (write-ahead marker).
+ */
+export async function appendDurable(
+  path: string,
+  text: string,
+  mode?: number,
+  onPlan?: (u: AppendUndo) => Promise<void>,
+): Promise<AppendUndo> {
   let prevSize = 0;
   let created = false;
   try {
@@ -82,6 +90,7 @@ export async function appendDurable(path: string, text: string, mode?: number): 
     created = true;
   }
   const undo = { path, prevSize, created };
+  await onPlan?.(undo);
   const fh = await fsp.open(path, "a", mode);
   try {
     if (mode !== undefined && process.platform !== "win32") await fh.chmod(mode);

@@ -60,7 +60,8 @@ export function assignCodes(
   const participantIds: string[] = [];
   const lookup = (key: string) => [...map.entries()].find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1];
   for (const c of creators) {
-    const key = creatorKey(c);
+    // The interviewer is the researcher, not a research participant.
+    const key = c.role === "interviewer" ? undefined : creatorKey(c);
     if (!key) {
       codes.push(undefined);
       continue;
