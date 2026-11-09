@@ -15,7 +15,7 @@ const conditions = (d: ReturnType<typeof evaluate>) => (d.result === "allow_with
 
 describe("capture", () => {
   const cap = (method: string, platform?: string) =>
-    req({ action: "capture", capture: { method: method as never, ...(platform ? { platform } : {}) } });
+    req({ action: "capture", capture: { method: method as never, ...(platform !== undefined ? { platform } : {}) } });
   it("denies a method that is not enabled", () => {
     expect(denyReason(evaluate(cfg(), cap("downloader")))).toBe("Capture method downloader is not enabled for this project");
   });
@@ -24,25 +24,55 @@ describe("capture", () => {
   });
   it("denies when a protocol is required but has no number", () => {
     const d = evaluate(cfg("protocol: { requireBeforeCapture: true }"), cap("manual_upload"));
-    expect(d.result).toBe("deny");
+    expect(denyReason(d)).toBe("An approved protocol number is required before capture");
   });
   it("allows when a required protocol has a number", () => {
     expect(evaluate(cfg("protocol: { requireBeforeCapture: true, number: P-1 }"), cap("manual_upload")).result).toBe("allow");
   });
-  it("denies after the protocol expired", () => {
-    const d = evaluate(cfg("protocol: { expires: 2026-11-08 }"), cap("manual_upload"));
-    expect(denyReason(d)).toBe("Protocol expired on 2026-11-08");
+  const at = (now: string, tz?: string) => ({ ...cap("manual_upload"), now, ...(tz ? { tz } : {}) });
+  const exp = (d: string, extra = "") => cfg(`protocol: { expires: ${d}${extra} }`);
+  it("denies the day after the protocol expired", () => {
+    expect(denyReason(evaluate(exp("2026-11-08"), cap("manual_upload")))).toBe("Protocol expired on 2026-11-08");
+  });
+  it("allows on the expiry day itself, with an 'expires today' warning", () => {
+    expect(evaluate(exp("2026-11-09"), at("2026-11-09T23:59:00Z"))).toEqual({ result: "allow", warnings: ["Protocol expires today"] });
+  });
+  it("allows on the expiry day at 23:00 local in America/Los_Angeles", () => {
+    // 2026-11-10T07:00Z is 2026-11-09 23:00 PST
+    const d = evaluate(exp("2026-11-09"), at("2026-11-10T07:00:00Z", "America/Los_Angeles"));
+    expect(d.result).toBe("allow");
+  });
+  it("allows a Pacific user at 16:00 on the 13th when the protocol expires on the 13th", () => {
+    // 2026-11-14T00:00Z is 2026-11-13 16:00 PST
+    expect(evaluate(exp("2026-11-13"), at("2026-11-14T00:00:00Z", "America/Los_Angeles")).result).toBe("allow");
+    expect(denyReason(evaluate(exp("2026-11-13"), at("2026-11-14T00:00:00Z", "UTC")))).toBe("Protocol expired on 2026-11-13");
+  });
+  it("uses the date part (UTC) when expires carries a time", () => {
+    expect(evaluate(exp("2026-11-09T01:00:00Z"), at("2026-11-09T23:00:00Z")).result).toBe("allow");
+  });
+  it("denies on an invalid time zone", () => {
+    expect(denyReason(evaluate(cfg(), at(NOW, "Not/AZone")))).toMatch(/^Policy could not be evaluated/);
+  });
+  it("denies before the approval start date", () => {
+    const d = evaluate(cfg("protocol: { approvedFrom: 2026-11-10 }"), cap("manual_upload"));
+    expect(denyReason(d)).toBe("Protocol approval starts on 2026-11-10");
+    expect(evaluate(cfg("protocol: { approvedFrom: 2026-11-09 }"), cap("manual_upload")).result).toBe("allow");
   });
   it("warns at exactly 30 days to expiry", () => {
-    const d = evaluate(cfg("protocol: { expires: 2026-12-09 }"), cap("manual_upload"));
-    expect(d).toEqual({ result: "allow", warnings: ["Protocol expires in 30 days"] });
+    expect(evaluate(exp("2026-12-09"), cap("manual_upload"))).toEqual({ result: "allow", warnings: ["Protocol expires in 30 days"] });
   });
   it("does not warn at 31 days to expiry", () => {
-    expect(evaluate(cfg("protocol: { expires: 2026-12-10 }"), cap("manual_upload"))).toEqual({ result: "allow", warnings: [] });
+    expect(evaluate(exp("2026-12-10"), cap("manual_upload"))).toEqual({ result: "allow", warnings: [] });
   });
-  it("rounds partial days up", () => {
-    const d = evaluate(cfg("protocol: { expires: 2026-11-10 }"), { ...cap("manual_upload"), now: "2026-11-09T12:00:00Z" });
-    expect(d.warnings).toEqual(["Protocol expires in 1 days"]);
+  it("words one day remaining in the singular", () => {
+    expect(evaluate(exp("2026-11-10"), cap("manual_upload")).warnings).toEqual(["Protocol expires in 1 day"]);
+  });
+  it("counts whole calendar days regardless of time of day", () => {
+    expect(evaluate(exp("2026-11-11"), at("2026-11-09T23:30:00Z")).warnings).toEqual(["Protocol expires in 2 days"]);
+  });
+  it("does not let an empty platform bypass the scope check", () => {
+    const d = evaluate(cfg("protocol: { platforms: [youtube] }"), cap("manual_upload", ""));
+    expect(denyReason(d)).toContain("outside approved protocol scope");
   });
   it("denies a platform outside the approved protocol scope", () => {
     const d = evaluate(cfg("protocol: { platforms: [youtube] }"), cap("manual_upload", "tiktok"));
@@ -186,6 +216,24 @@ describe("effective policy and failure", () => {
     const d = evaluate(bad, req({ action: "view" }));
     expect(denyReason(d)).toMatch(/^Policy could not be evaluated/);
     expect(d.warnings).toEqual([]);
+  });
+  it("denies store and export payloads missing their booleans", () => {
+    expect(denyReason(evaluate(cfg(), req({ action: "store", store: {} as never })))).toMatch(/^Policy could not be evaluated/);
+    expect(denyReason(evaluate(cfg(), req({ action: "export", export: {} as never })))).toMatch(/^Policy could not be evaluated/);
+  });
+  it("denies malformed capture, process, move and legalBasis payloads", () => {
+    const bad = (r: Partial<PolicyRequest> & Pick<PolicyRequest, "action">) => denyReason(evaluate(cfg(), req(r)));
+    expect(bad({ action: "capture", capture: {} as never })).toMatch(/^Policy could not be evaluated/);
+    expect(bad({ action: "process", process: { op: "ocr" } as never })).toMatch(/^Policy could not be evaluated/);
+    expect(bad({ action: "move", move: {} as never })).toMatch(/^Policy could not be evaluated/);
+    expect(bad({ action: "store", store: { identifiable: true, hasLocation: false, legalBasis: 5 as never } })).toMatch(/^Policy could not be evaluated/);
+  });
+  it("denies a malformed scalar in the policy", () => {
+    const view = req({ action: "view" });
+    const c = cfg();
+    expect(denyReason(evaluate({ ...c, encryption: { atRest: "maybe" } } as any, view))).toMatch(/^Policy could not be evaluated.*atRest/);
+    expect(denyReason(evaluate({ ...c, consent: { ...c.consent, requireLegalBasis: "yes" } } as any, view))).toMatch(/^Policy could not be evaluated.*requireLegalBasis/);
+    expect(denyReason(evaluate({ ...c, protocol: { ...c.protocol, expires: "garbage" } } as any, view))).toMatch(/^Policy could not be evaluated/);
   });
   it("denies a request missing its action payload", () => {
     expect(denyReason(evaluate(cfg(), req({ action: "capture" })))).toMatch(/^Policy could not be evaluated/);

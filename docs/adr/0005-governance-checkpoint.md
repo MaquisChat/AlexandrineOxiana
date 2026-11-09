@@ -15,12 +15,13 @@ The library holds material governed by IRB, GDPR, HIPAA and funder rules. Every 
 - **Conditions, not silent changes.** When an action is allowed only if the caller does something (encrypt, pseudonymize file names, coarsen or strip location, export de-identified only), the decision lists those conditions in a fixed order (encrypt, pseudonymize-names, location, deidentified-only) and is `allow` only when there are none. Conditions are cumulative. The caller must apply them; the engine does not.
 - **Residency.** A move needs the destination in the effective `residency.allowed`. For `cloud_folder` the folder must also be in `approvedCloudFolders` under HIPAA, or whenever that list is non-empty; with no HIPAA and an empty list any folder is allowed. HIPAA already removes `cloud_folder` from `allowed` when no folder is approved.
 - **Processing.** The provider must be in the op's list, including `local`: a project may forbid even on-device processing.
-- **Dates.** Expiry is compared as `now > protocol.expires` (a date-only value means 00:00 UTC of that day). Within 30 days (whole days, rounded up) the decision carries a warning.
+- **Dates.** Protocol dates are calendar dates, inclusive, evaluated in the researcher's time zone (`tz`, an IANA name, default UTC; an invalid zone denies). Capture is allowed from `approvedFrom` through `expires` inclusive; a date with a time uses its UTC date part. Within 30 calendar days of expiry the decision carries a warning ("expires today", "in 1 day", "in N days").
+- **Request and policy validation.** Request payloads and the effective policy's scalar fields are type-checked before the rules run; anything malformed denies.
 - **Sync** is denied in Phase 1; `view`, `share` and `delete` are allowed and will be refined later.
 
 ## Consequences
 
 - Every action added later must be a `PolicyAction` with a rule here, otherwise it is denied as unknown.
 - The checkpoint is pure and synchronous, so it is cheap to call and simple to test, but it only decides: recording the decision in the audit log is the caller's job.
-- Date-only expiry means a protocol expiring "today" is already expired after midnight UTC; this errs on the side of denial.
+- The caller must pass the researcher's time zone; if it does not, the date rules use UTC and may differ by up to a day from the researcher's calendar.
 - The project name in the move reason is the request's `projectId` until the request carries a name.

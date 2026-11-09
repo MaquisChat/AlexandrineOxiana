@@ -1,6 +1,6 @@
 import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
-import { PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
+import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
 export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move";
 
@@ -10,6 +10,8 @@ export interface PolicyRequest {
   actor: string;
   /** ISO 8601 timestamp. */
   now: string;
+  /** IANA time zone of the researcher, used for calendar-date rules (default "UTC"). */
+  tz?: string;
   capture?: { method: Provenance["captureMethod"]; platform?: string };
   /** `provider` is 'local' (on-device) or a vendor id. */
   process?: { op: ProcessingOp; provider: string };
@@ -71,24 +73,74 @@ function assertShape(p: GovernanceConfig): void {
   obj(p.consent, "consent");
   obj(p.encryption, "encryption");
   obj(p.sharing, "sharing");
+  const oneOf = (v: unknown, allowed: readonly string[], path: string) => {
+    if (typeof v !== "string" || !allowed.includes(v)) throw new Error(`${path} must be one of ${allowed.join(", ")}`);
+  };
+  const bool = (v: unknown, path: string) => {
+    if (typeof v !== "boolean") throw new Error(`${path} must be true or false`);
+  };
+  const date = (v: unknown, path: string) => {
+    if (v === null) return;
+    if (typeof v !== "string" || Number.isNaN(Date.parse(v))) throw new Error(`${path} must be a date or null`);
+  };
+  oneOf(p.encryption.atRest, ENCRYPTION_LEVELS, "encryption.atRest");
+  oneOf(p.sharing.locationMetadata, LOCATION_LEVELS, "sharing.locationMetadata");
+  bool(p.consent.requireLegalBasis, "consent.requireLegalBasis");
+  bool(p.consent.requireStatus, "consent.requireStatus");
+  bool(p.identifiability.containsIdentifiable, "identifiability.containsIdentifiable");
+  bool(p.identifiability.pseudonymizeFileNames, "identifiability.pseudonymizeFileNames");
+  bool(p.identifiability.deidentifiedExportsOnly, "identifiability.deidentifiedExportsOnly");
+  bool(p.protocol.requireBeforeCapture, "protocol.requireBeforeCapture");
+  date(p.protocol.expires, "protocol.expires");
+  date(p.protocol.approvedFrom, "protocol.approvedFrom");
+}
+
+const str = (v: unknown, what: string): string => {
+  if (typeof v !== "string") throw new Error(`${what} must be a string`);
+  return v;
+};
+const bool = (v: unknown, what: string): boolean => {
+  if (typeof v !== "boolean") throw new Error(`${what} must be true or false`);
+  return v;
+};
+
+/** Calendar date (YYYY-MM-DD) of an instant in a time zone; throws on a bad zone or timestamp. */
+function localDate(nowIso: string, tz: string): string {
+  const t = Date.parse(nowIso);
+  if (Number.isNaN(t)) throw new Error(`invalid timestamp "${nowIso}"`);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(t));
+}
+
+/** Date part of a protocol date: date-only as written, otherwise the UTC date of the instant. */
+function datePart(d: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  const t = Date.parse(d);
+  if (Number.isNaN(t)) throw new Error(`invalid protocol date "${d}"`);
+  return new Date(t).toISOString().slice(0, 10);
 }
 
 function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const c = need(req.capture, "capture");
-  if (!p.captureMethods.includes(c.method)) return deny(`Capture method ${c.method} is not enabled for this project`, warnings);
+  const method = str(c.method, "capture.method");
+  if (c.platform !== undefined) str(c.platform, "capture.platform");
+  if (!(p.captureMethods as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
   if (p.protocol.requireBeforeCapture && !p.protocol.number) {
     return deny("An approved protocol number is required before capture", warnings);
   }
-  const now = Date.parse(req.now);
-  if (Number.isNaN(now)) throw new Error(`invalid timestamp "${req.now}"`);
-  if (p.protocol.expires) {
-    const expires = Date.parse(p.protocol.expires);
-    if (Number.isNaN(expires)) throw new Error(`invalid protocol expiry "${p.protocol.expires}"`);
-    if (now > expires) return deny(`Protocol expired on ${p.protocol.expires}`, warnings);
-    const days = Math.ceil((expires - now) / DAY_MS);
-    if (days <= EXPIRY_WARNING_DAYS) warnings.push(`Protocol expires in ${days} days`);
+  const today = localDate(req.now, req.tz ?? "UTC");
+  if (p.protocol.approvedFrom) {
+    const from = datePart(p.protocol.approvedFrom);
+    if (today < from) return deny(`Protocol approval starts on ${from}`, warnings);
   }
-  if (c.platform && p.protocol.platforms.length > 0 && !p.protocol.platforms.includes(c.platform)) {
+  if (p.protocol.expires) {
+    const exp = datePart(p.protocol.expires);
+    if (today > exp) return deny(`Protocol expired on ${exp}`, warnings);
+    const days = Math.round((Date.parse(`${exp}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / DAY_MS);
+    if (days <= EXPIRY_WARNING_DAYS) {
+      warnings.push(days === 0 ? "Protocol expires today" : days === 1 ? "Protocol expires in 1 day" : `Protocol expires in ${days} days`);
+    }
+  }
+  if (c.platform !== undefined && p.protocol.platforms.length > 0 && !p.protocol.platforms.includes(c.platform)) {
     return deny(`Platform ${c.platform} is outside approved protocol scope`, warnings);
   }
   return allow(warnings);
@@ -96,6 +148,8 @@ function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): P
 
 function processOp(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const { op, provider } = need(req.process, "process");
+  str(op, "process.op");
+  str(provider, "process.provider");
   if (!(PROCESSING_OPS as readonly string[]).includes(op)) throw new Error(`unknown processing op "${op}"`);
   if (!p.processing[op].includes(provider)) {
     return deny(`Processing "${op}" with provider "${provider}" is not permitted for this project`, warnings);
@@ -105,6 +159,9 @@ function processOp(p: GovernanceConfig, req: PolicyRequest, warnings: string[]):
 
 function store(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const s = need(req.store, "store");
+  bool(s.identifiable, "store.identifiable");
+  bool(s.hasLocation, "store.hasLocation");
+  if (s.legalBasis !== undefined) str(s.legalBasis, "store.legalBasis");
   const conditions: Condition[] = [];
   if (p.encryption.atRest === "required") conditions.push({ type: "encrypt" });
   if (s.identifiable && p.identifiability.pseudonymizeFileNames) conditions.push({ type: "pseudonymize-names" });
@@ -120,6 +177,8 @@ function store(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Pol
 
 function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const e = need(req.export, "export");
+  bool(e.identifiable, "export.identifiable");
+  bool(e.hasLocation, "export.hasLocation");
   const conditions: Condition[] = [];
   if (e.identifiable && p.identifiability.deidentifiedExportsOnly) conditions.push({ type: "deidentified-only" });
   if (e.hasLocation && p.sharing.locationMetadata !== "keep") conditions.push({ type: "location", mode: p.sharing.locationMetadata });
@@ -128,6 +187,8 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
 
 function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const { destination, cloudFolderId } = need(req.move, "move");
+  str(destination, "move.destination");
+  if (cloudFolderId !== undefined) str(cloudFolderId, "move.cloudFolderId");
   if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination)) {
     return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
   }
