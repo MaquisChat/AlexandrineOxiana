@@ -4,3 +4,15 @@ export const packageName = "@ao/core";
 export { isId, newId, shortId } from "./ids.js";
 
 export * from "./model/index.js";
+
+export {
+  defaultTemplates,
+  derivedFileName,
+  encName,
+  originalFileName,
+  pseudonymize,
+  sanitizeSegment,
+  sourceFolderName,
+  withCollisionSuffix,
+} from "./naming.js";
+export type { NamingTemplates } from "./naming.js";
