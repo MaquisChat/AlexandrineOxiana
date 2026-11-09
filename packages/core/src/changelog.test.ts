@@ -75,7 +75,7 @@ describe("diffToChanges", () => {
     const removed = changes.find((c) => c.field === "/gone")!;
     const added = changes.find((c) => c.field === "/added")!;
     expect(removed).toMatchObject({ op: "update", prev: "x", removed: true });
-    expect(removed.value).toBeUndefined();
+    expect(removed).not.toHaveProperty("value");
     expect(added).toMatchObject({ op: "update", value: "y" });
     expect(added.prev).toBeUndefined();
     expect(added.removed).toBeUndefined();
@@ -198,5 +198,66 @@ describe("mergeConcurrent", () => {
     const l2 = ch({ field: "/issued", value: "2", at: "2026-11-09T10:00:03.000Z", device: "a" });
     const r = ch({ field: "/issued", value: "R", at: "2026-11-09T10:00:02.000Z", device: "b" });
     expect(mergeConcurrent([l1, l2], [r]).applied).toEqual([l1, l2]);
+  });
+
+  it("type change of a parent vs child edit: one side wins as a unit, both orders", () => {
+    const [parentChange] = diffToChanges({ a: { x: 1 } }, { a: "s" }, { ...meta, at: "2026-11-09T10:00:05.000Z", device: "a" });
+    const child = ch({ field: "/a/x", value: 2, at: "2026-11-09T10:00:01.000Z", device: "b" });
+    const ab = mergeConcurrent([parentChange!], [child]);
+    const ba = mergeConcurrent([child], [parentChange!]);
+    expect(ab.applied).toEqual([parentChange]);
+    expect(ba.applied).toEqual([parentChange]);
+    expect(ab.conflicts).toEqual([]);
+    const later = ch({ field: "/a/x", value: 3, at: "2026-11-09T10:00:09.000Z", device: "b" });
+    expect(mergeConcurrent([parentChange!], [later]).applied).toEqual([later]);
+  });
+
+  it("removed object key vs child edit does not apply the child to a removed parent", () => {
+    const [removed] = diffToChanges({ a: { x: 1 } }, {}, { ...meta, at: "2026-11-09T10:00:05.000Z" });
+    const child = ch({ field: "/a/x", value: 2, at: "2026-11-09T10:00:01.000Z", device: "b" });
+    expect(mergeConcurrent([removed!], [child]).applied).toEqual([removed]);
+    expect(mergeConcurrent([child], [removed!]).applied).toEqual([removed]);
+  });
+
+  it("/details vs /details/foo conflicts, symmetric", () => {
+    const l = ch({ field: "/details", value: { foo: 1 }, device: "a" });
+    const r = ch({ field: "/details/foo", value: 2, device: "b" });
+    const ab = mergeConcurrent([l], [r]);
+    expect(ab.applied).toEqual([]);
+    expect(ab.conflicts).toEqual([{ field: "/details", entity: l.entity, local: l, remote: r }]);
+    const ba = mergeConcurrent([r], [l]);
+    expect(ba.conflicts).toEqual([{ field: "/details", entity: l.entity, local: r, remote: l }]);
+  });
+
+  it("create/create drops every other change to the entity into the conflict", () => {
+    const a = ch({ op: "create", value: { t: 1 }, device: "a" });
+    const b = ch({ op: "create", value: { t: 2 }, device: "b" });
+    const u1 = ch({ field: "/t", value: 3, device: "a" });
+    const u2 = ch({ field: "/z", value: 4, device: "b" });
+    const res = mergeConcurrent([a, u1], [b, u2]);
+    expect(res.applied).toEqual([]);
+    expect(res.conflicts).toHaveLength(1);
+    expect(res.conflicts[0]!.dropped).toEqual([u1, u2]);
+    const other = ch({ entity: { type: "tag", id: "t" }, field: "/n", value: 1 });
+    expect(mergeConcurrent([a, u1, other], [b, u2]).applied).toEqual([other]);
+  });
+
+  it("conflicts are sorted deterministically and symmetric under swap", () => {
+    const mk = (id: string, f: string, d: string) =>
+      ch({ entity: { type: "source", id }, field: f, value: d, device: d });
+    const l = [mk("s9", "/body", "a"), mk("s1", "/notes", "a"), mk("s1", "/body", "a")];
+    const r = [mk("s9", "/body", "b"), mk("s1", "/notes", "b"), mk("s1", "/body", "b")];
+    const ab = mergeConcurrent(l, r).conflicts;
+    const ba = mergeConcurrent(r, l).conflicts;
+    expect(ab.map((c) => `${c.entity.id}${c.field}`)).toEqual(["s1/body", "s1/notes", "s9/body"]);
+    expect(ba.map((c) => [c.entity.id, c.field, c.remote.id])).toEqual(
+      ab.map((c) => [c.entity.id, c.field, c.local.id]),
+    );
+  });
+
+  it("diffToChanges rejects non-UTC-ms timestamps", () => {
+    for (const at of ["2026-11-09T10:00:00Z", "2026-11-09T10:00:00.000+01:00", "nope"]) {
+      expect(() => diffToChanges({ a: 1 }, { a: 2 }, { ...meta, at })).toThrow(RangeError);
+    }
   });
 });

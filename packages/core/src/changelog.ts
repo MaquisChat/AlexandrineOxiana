@@ -14,7 +14,7 @@ export type EntityType =
 export interface Change {
   /** UUIDv7; sortable by creation time. */
   id: string;
-  /** ISO 8601 timestamp (UTC) of the write. */
+  /** UTC ISO 8601 with milliseconds and `Z` (`Date.toISOString()` form); compared as a string. */
   at: string;
   author: string;
   device: string;
@@ -37,10 +37,14 @@ export interface MergeConflict {
   entity: Change["entity"];
   local: Change;
   remote: Change;
+  /** Create/create only: every other change to the entity, none of which is applied. */
+  dropped?: Change[];
 }
 
 /** Rich-text pointers: concurrent edits are never auto-merged. Also matches as a pointer prefix. */
 export const RICH_TEXT_FIELDS: ReadonlySet<string> = new Set(["/body", "/notes", "/details"]);
+
+const AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 function escapeToken(token: string): string {
   return token.replace(/~/g, "~0").replace(/\//g, "~1");
@@ -76,6 +80,9 @@ export function diffToChanges(
   after: object | null,
   meta: ChangeMeta,
 ): Change[] {
+  if (!AT_PATTERN.test(meta.at) || Number.isNaN(Date.parse(meta.at))) {
+    throw new RangeError(`diffToChanges: "at" must be UTC ISO like 2026-11-09T10:00:00.000Z: ${meta.at}`);
+  }
   if (before === null && after === null) return [];
   if (before === null) return [{ ...meta, id: newId(), op: "create", value: after }];
   if (after === null) return [{ ...meta, id: newId(), op: "delete", prev: before }];
@@ -107,7 +114,7 @@ function walk(
     } else if (inAfter) {
       out.push({ ...meta, id: newId(), op: "update", field, value: after[key] });
     } else if (inBefore) {
-      out.push({ ...meta, id: newId(), op: "update", field, prev: before[key], value: undefined, removed: true });
+      out.push({ ...meta, id: newId(), op: "update", field, prev: before[key], removed: true });
     }
   }
 }
@@ -119,6 +126,21 @@ function cmpStr(a: string, b: string): number {
 /** Total order: (at, device, id). */
 function compareChanges(a: Change, b: Change): number {
   return cmpStr(a.at, b.at) || cmpStr(a.device, b.device) || cmpStr(a.id, b.id);
+}
+
+/** Pointers overlap when equal or one is an ancestor of the other. */
+function overlaps(f: string, g: string): boolean {
+  return f === g || g.startsWith(`${f}/`) || f.startsWith(`${g}/`);
+}
+
+function compareConflicts(a: MergeConflict, b: MergeConflict): number {
+  const pair = (c: MergeConflict) => [c.local.id, c.remote.id].sort().join("|");
+  return (
+    cmpStr(a.entity.type, b.entity.type) ||
+    cmpStr(a.entity.id, b.entity.id) ||
+    cmpStr(a.field, b.field) ||
+    cmpStr(pair(a), pair(b))
+  );
 }
 
 function isRichText(field: string): boolean {
@@ -194,41 +216,70 @@ export function mergeConcurrent(
 
     const lCreates = g.local.filter((c) => c.op === "create");
     const rCreates = g.remote.filter((c) => c.op === "create");
-    const dropped = new Set<Change>();
     if (lCreates.length > 0 && rCreates.length > 0) {
-      conflicts.push({ field: "*", entity: g.entity, local: latest(lCreates), remote: latest(rCreates) });
-      for (const c of [...lCreates, ...rCreates]) dropped.add(c);
+      // Neither create established the entity: drop everything for it.
+      const l = latest(lCreates);
+      const r = latest(rCreates);
+      const dropped = all.filter((c) => c !== l && c !== r).sort(compareChanges);
+      conflicts.push({
+        field: "*",
+        entity: g.entity,
+        local: l,
+        remote: r,
+        ...(dropped.length > 0 ? { dropped } : {}),
+      });
+      continue;
     }
 
-    const byField = new Map<string, { local: Change[]; remote: Change[] }>();
+    // Cluster overlapping pointers (one is a prefix of the other) and resolve each as a unit.
+    const fieldChanges = new Map<string, { local: Change[]; remote: Change[] }>();
     const slot = (f: string) => {
-      let s = byField.get(f);
-      if (!s) byField.set(f, (s = { local: [], remote: [] }));
+      let s = fieldChanges.get(f);
+      if (!s) fieldChanges.set(f, (s = { local: [], remote: [] }));
       return s;
     };
     for (const c of g.local) {
-      if (dropped.has(c)) continue;
       if (c.field === undefined) applied.push(c);
       else slot(c.field).local.push(c);
     }
     for (const c of g.remote) {
-      if (dropped.has(c)) continue;
       if (c.field === undefined) applied.push(c);
       else slot(c.field).remote.push(c);
     }
-
-    for (const field of [...byField.keys()].sort()) {
-      const s = byField.get(field)!;
-      if (s.local.length === 0 || s.remote.length === 0) {
-        applied.push(...s.local, ...s.remote);
-      } else if (isRichText(field)) {
-        conflicts.push({ field, entity: g.entity, local: latest(s.local), remote: latest(s.remote) });
+    const fields = [...fieldChanges.keys()].sort();
+    const parent = new Map(fields.map((f) => [f, f]));
+    const find = (f: string): string => {
+      let r = f;
+      while (parent.get(r) !== r) r = parent.get(r)!;
+      return r;
+    };
+    for (let i = 0; i < fields.length; i++) {
+      for (let j = i + 1; j < fields.length; j++) {
+        if (overlaps(fields[i]!, fields[j]!)) parent.set(find(fields[j]!), find(fields[i]!));
+      }
+    }
+    const clusters = new Map<string, string[]>();
+    for (const f of fields) {
+      const root = find(f);
+      clusters.set(root, [...(clusters.get(root) ?? []), f]);
+    }
+    for (const members of clusters.values()) {
+      const lc = members.flatMap((f) => fieldChanges.get(f)!.local);
+      const rc = members.flatMap((f) => fieldChanges.get(f)!.remote);
+      if (lc.length === 0 || rc.length === 0) {
+        applied.push(...lc, ...rc);
+        continue;
+      }
+      const rich = members.filter(isRichText).sort((x, y) => x.length - y.length || cmpStr(x, y));
+      if (rich.length > 0) {
+        conflicts.push({ field: rich[0]!, entity: g.entity, local: latest(lc), remote: latest(rc) });
       } else {
-        applied.push(...(compareChanges(latest(s.local), latest(s.remote)) > 0 ? s.local : s.remote));
+        applied.push(...(compareChanges(latest(lc), latest(rc)) > 0 ? lc : rc));
       }
     }
   }
 
+  conflicts.sort(compareConflicts);
   applied.sort(compareChanges);
   return { applied, conflicts };
 }
