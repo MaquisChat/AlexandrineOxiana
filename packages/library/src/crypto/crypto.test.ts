@@ -487,6 +487,16 @@ describe("key wrapping", () => {
     await expect(unwrapKey({ ...w, keyId: "nope" }, "pw")).rejects.toThrow(TypeError);
   });
 
+  it("caps scrypt params read from key files: N <= 2^18, r = 8, p <= 4", async () => {
+    const w = await wrapKey(generateDataKey(), "pw", newId(), FAST);
+    await expect(unwrapKey({ ...w, kdf: { ...w.kdf, N: 2 ** 19 } }, "pw")).rejects.toThrow(TypeError);
+    await expect(unwrapKey({ ...w, kdf: { ...w.kdf, r: 16 } }, "pw")).rejects.toThrow(TypeError);
+    await expect(unwrapKey({ ...w, kdf: { ...w.kdf, r: 4 } }, "pw")).rejects.toThrow(TypeError);
+    await expect(unwrapKey({ ...w, kdf: { ...w.kdf, p: 5 } }, "pw")).rejects.toThrow(TypeError);
+    // In-range but different params: rejected by the tag, not by the cap.
+    await expect(unwrapKey({ ...w, kdf: { ...w.kdf, p: 4 } }, "pw")).rejects.toBeInstanceOf(WrongPassphraseError);
+  });
+
   it("rejects bad inputs on wrap", async () => {
     await expect(wrapKey(randomBytes(16), "pw", newId(), FAST)).rejects.toThrow(TypeError);
     await expect(wrapKey(generateDataKey(), "", newId(), FAST)).rejects.toThrow(TypeError);

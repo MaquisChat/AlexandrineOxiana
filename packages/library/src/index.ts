@@ -1,7 +1,7 @@
 export const packageName = "@ao/library";
 
 export { cleanupTempFiles, copyFileAtomic, writeFileAtomic } from "./fs/atomic.js";
-export type { CopyOptions } from "./fs/atomic.js";
+export type { CopyOptions, WriteOptions } from "./fs/atomic.js";
 
 export {
   CHUNK_SIZE,

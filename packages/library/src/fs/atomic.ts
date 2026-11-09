@@ -38,17 +38,63 @@ async function removeQuietly(path: string): Promise<void> {
   }
 }
 
+const RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RETRY_DELAYS_MS = [20, 40, 80, 160, 320];
+
+/**
+ * Windows rename retry. Antivirus scanners, indexers and sync clients briefly
+ * hold files open there, making rename fail with EPERM/EACCES/EBUSY. We retry
+ * up to 5 times (20 → 320 ms backoff, ~620 ms in all), only on win32 or when a
+ * test sets `force`. Elsewhere those codes are real permission errors.
+ */
+export const _renameRetry = {
+  force: false,
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  const retry = process.platform === "win32" || _renameRetry.force;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fsp.rename(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      const delay = RETRY_DELAYS_MS[attempt];
+      if (!retry || !RETRY_CODES.has(code) || delay === undefined) throw err;
+      await _renameRetry.sleep(delay);
+    }
+  }
+}
+
 async function commit(tmp: string, dest: string): Promise<void> {
-  await fsp.rename(tmp, dest);
+  await renameWithRetry(tmp, dest);
   await fsyncDir(dirname(dest));
 }
 
+/** Applies `mode` to an open temp file before it is renamed into place (ignored on Windows). */
+async function applyMode(fh: fsp.FileHandle, mode: number | undefined): Promise<void> {
+  if (mode === undefined || process.platform === "win32") return;
+  await fh.chmod(mode);
+}
+
+export interface WriteOptions {
+  /** POSIX permission bits for the file, e.g. 0o600 for key files. Ignored on Windows. */
+  mode?: number;
+}
+
 /** Atomically replaces `path` with `data`. */
-export async function writeFileAtomic(path: string, data: Uint8Array | string): Promise<void> {
+export async function writeFileAtomic(
+  path: string,
+  data: Uint8Array | string,
+  opts: WriteOptions = {},
+): Promise<void> {
   const tmp = tempPathFor(path);
+  // If the exclusive open fails, the temp path is not ours: never unlink it.
+  const fh = await fsp.open(tmp, "wx", opts.mode);
   try {
-    const fh = await fsp.open(tmp, "wx");
     try {
+      await applyMode(fh, opts.mode);
       await fh.writeFile(data);
       await fh.sync();
     } finally {
@@ -68,6 +114,8 @@ export interface CopyOptions {
    * stream and returns the stream to write; it must consume all of `r`.
    */
   transform?: (r: Readable) => Readable;
+  /** POSIX permission bits for `dest`, e.g. 0o600. Ignored on Windows. */
+  mode?: number;
 }
 
 /**
@@ -83,7 +131,7 @@ export async function copyFileAtomic(
   // Open the temp file first so that every stream below gets its error
   // listeners attached synchronously, before any error can be emitted.
   const tmp = tempPathFor(dest);
-  let fh: fsp.FileHandle | undefined = await fsp.open(tmp, "wx");
+  let fh: fsp.FileHandle | undefined = await fsp.open(tmp, "wx", opts.mode);
   const hash = createHash("sha256");
   let bytes = 0;
   const source = createReadStream(src);
@@ -96,6 +144,7 @@ export async function copyFileAtomic(
   });
   let out: Readable = hasher;
   try {
+    await applyMode(fh, opts.mode);
     // `pipe` does not forward errors; do it by hand so the output fails too.
     source.on("error", (err) => hasher.destroy(err));
     const hashed = source.pipe(hasher);

@@ -6,7 +6,7 @@ import { newId } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { decryptStream, encryptStream } from "../crypto/format.js";
 import { generateDataKey } from "../crypto/keys.js";
-import { cleanupTempFiles, copyFileAtomic, writeFileAtomic } from "./atomic.js";
+import { _renameRetry, cleanupTempFiles, copyFileAtomic, writeFileAtomic } from "./atomic.js";
 
 // Wrap rename/unlink so individual tests can make them fail; by default they
 // delegate to the real implementation.
@@ -14,6 +14,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    open: vi.fn(actual.open),
     rename: vi.fn(actual.rename),
     unlink: vi.fn(actual.unlink),
   };
@@ -34,6 +35,8 @@ describe("atomic file writes", () => {
   afterEach(async () => {
     vi.mocked(realFs.rename).mockClear();
     vi.mocked(realFs.unlink).mockClear();
+    vi.mocked(realFs.open).mockClear();
+    _renameRetry.force = false;
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -176,6 +179,72 @@ describe("atomic file writes", () => {
       );
       expect(await readFile(dest, "utf8")).toBe("keep");
       expect((await readdir(dir)).sort()).toEqual(["dest", "src"]);
+    });
+  });
+  describe("hardening", () => {
+    const posix = process.platform !== "win32";
+    const errno = (code: string) => Object.assign(new Error(code), { code });
+
+    it.runIf(posix)("writeFileAtomic applies mode to the file (0600)", async () => {
+      const p = join(dir, "key.json");
+      await writeFileAtomic(p, "secret", { mode: 0o600 });
+      expect((await stat(p)).mode & 0o777).toBe(0o600);
+      // Replacing keeps the requested mode.
+      await writeFileAtomic(p, "secret2", { mode: 0o600 });
+      expect((await stat(p)).mode & 0o777).toBe(0o600);
+    });
+
+    it.runIf(posix)("copyFileAtomic applies mode to the file (0600)", async () => {
+      const src = join(dir, "src");
+      await writeFile(src, "data");
+      const dest = join(dir, "dest");
+      await copyFileAtomic(src, dest, { mode: 0o600 });
+      expect((await stat(dest)).mode & 0o777).toBe(0o600);
+    });
+
+    it("does not unlink the temp path when the exclusive open itself failed", async () => {
+      vi.mocked(realFs.open).mockRejectedValueOnce(errno("EEXIST"));
+      await expect(writeFileAtomic(join(dir, "x"), "data")).rejects.toThrow("EEXIST");
+      expect(realFs.unlink).not.toHaveBeenCalled();
+    });
+
+    it("retries a rename on EPERM/EACCES/EBUSY with bounded backoff on Windows", async () => {
+      _renameRetry.force = true;
+      const sleeps: number[] = [];
+      const realSleep = _renameRetry.sleep;
+      _renameRetry.sleep = async (ms) => {
+        sleeps.push(ms);
+      };
+      try {
+        vi.mocked(realFs.rename).mockRejectedValueOnce(errno("EPERM")).mockRejectedValueOnce(errno("EBUSY"));
+        const p = join(dir, "w.txt");
+        await writeFileAtomic(p, "ok");
+        expect(await readFile(p, "utf8")).toBe("ok");
+        expect(sleeps).toEqual([20, 40]);
+
+        sleeps.length = 0;
+        vi.mocked(realFs.rename).mockClear();
+        vi.mocked(realFs.rename).mockRejectedValue(errno("EACCES"));
+        await expect(writeFileAtomic(join(dir, "never.txt"), "x")).rejects.toThrow("EACCES");
+        expect(sleeps).toEqual([20, 40, 80, 160, 320]);
+        expect(realFs.rename).toHaveBeenCalledTimes(6);
+        expect(await readdir(dir)).toEqual(["w.txt"]);
+      } finally {
+        vi.mocked(realFs.rename).mockReset();
+        vi.mocked(realFs.rename).mockImplementation((await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).rename);
+        _renameRetry.sleep = realSleep;
+      }
+    });
+
+    it("does not retry renames off Windows, nor on other error codes", async () => {
+      vi.mocked(realFs.rename).mockRejectedValueOnce(errno("EPERM"));
+      await expect(writeFileAtomic(join(dir, "a"), "x")).rejects.toThrow("EPERM");
+      expect(realFs.rename).toHaveBeenCalledTimes(1);
+      _renameRetry.force = true;
+      vi.mocked(realFs.rename).mockClear();
+      vi.mocked(realFs.rename).mockRejectedValueOnce(errno("ENOSPC"));
+      await expect(writeFileAtomic(join(dir, "b"), "x")).rejects.toThrow("ENOSPC");
+      expect(realFs.rename).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -24,9 +24,8 @@ const WRAP_NONCE_LEN = 12;
 const TAG_LEN = 16;
 /** Bounds accepted when reading a key file, so a tampered file cannot demand absurd work. */
 const MIN_N = 2 ** 10;
-const MAX_N = 2 ** 20;
-const MAX_R = 32;
-const MAX_P = 16;
+const MAX_N = 2 ** 18;
+const MAX_P = 4;
 const MIN_MAXMEM = 256 * 1024 * 1024;
 
 export interface WrappedKey {
@@ -73,9 +72,7 @@ function checkKdfParams(N: number, r: number, p: number): void {
     N >= MIN_N &&
     N <= MAX_N &&
     (N & (N - 1)) === 0 &&
-    Number.isSafeInteger(r) &&
-    r >= 1 &&
-    r <= MAX_R &&
+    r === SCRYPT_R &&
     Number.isSafeInteger(p) &&
     p >= 1 &&
     p <= MAX_P;
@@ -137,8 +134,9 @@ async function unwrapWithSecret(w: WrappedKey, secret: Buffer): Promise<Uint8Arr
   const wrapped = decodeB64(w.wrapped, KEY_LEN + TAG_LEN, "wrapped");
 
   const kek = await deriveKek(secret, salt, kdf.N, kdf.r, kdf.p);
-  const decipher = createDecipheriv("aes-256-gcm", kek, nonce, { authTagLength: TAG_LEN });
   try {
+    // Inside the try so the KEK is zeroed even if decipher setup throws.
+    const decipher = createDecipheriv("aes-256-gcm", kek, nonce, { authTagLength: TAG_LEN });
     decipher.setAAD(Buffer.from(w.keyId, "utf8"));
     decipher.setAuthTag(wrapped.subarray(KEY_LEN));
     const key = decipher.update(wrapped.subarray(0, KEY_LEN));
