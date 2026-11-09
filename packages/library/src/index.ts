@@ -48,3 +48,4 @@ export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from ".
 export type { RegistryEntry } from "./registry.js";
 
 export * from "./repo/index.js";
+export * from "./index/index.js";
