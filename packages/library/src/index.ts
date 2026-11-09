@@ -29,3 +29,19 @@ export {
   wrapKey,
 } from "./crypto/keys.js";
 export type { WrapOptions, WrappedKey } from "./crypto/keys.js";
+
+export type { Deps } from "./deps.js";
+export {
+  AlreadyALibraryError,
+  CorruptLibraryError,
+  FORMAT_VERSION,
+  FolderNotEmptyError,
+  NotALibraryError,
+  createLibrary,
+  openLibrary,
+} from "./library.js";
+export type { Library, LibraryJson } from "./library.js";
+export { HEARTBEAT_MS, STALE_MS, acquireLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
+export type { LockInfo } from "./lock.js";
+export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
+export type { RegistryEntry } from "./registry.js";
