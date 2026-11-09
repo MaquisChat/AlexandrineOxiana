@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "uuidv7": "^1.2.1"
+    "uuidv7": "^1.2.1",
+    "zod": "^3.25.76"
   }
 }
