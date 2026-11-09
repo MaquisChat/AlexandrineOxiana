@@ -47,3 +47,6 @@ export { PROFILE_MINIMUMS, PROFILE_RULES } from "./governance/profiles/index.js"
 export type { ProfileRules } from "./governance/profiles/index.js";
 export { applyMinimum, effectivePolicy } from "./governance/merge.js";
 export type { EffectivePolicy, Violation } from "./governance/merge.js";
+
+export { evaluate } from "./governance/engine.js";
+export type { Condition, PolicyAction, PolicyDecision, PolicyRequest } from "./governance/engine.js";
