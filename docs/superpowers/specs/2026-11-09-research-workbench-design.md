@@ -66,6 +66,8 @@ These interfaces are the main way future programmers add capability without chan
 - **CaptureProvider** — `canHandle(input) → bool`, `capture(input, project) → CaptureResult` (source draft, assets, provenance).
 - **ProcessingProvider** — transcription, translation, OCR, de-identification; declares where it runs (local / named cloud vendor) and whether a BAA/DPA exists, so governance can decide.
 - **ExportTarget** — Word, Obsidian, Scrivener, REFI-QDA, BibTeX/RIS/CSL-JSON, quote card, clip.
+- **SearchProvider** — the search side of a capture provider (e.g., YouTube search, OpenAlex query, TikTok Research API query); returns candidate items without capturing them. Used by research watches and agents (Section 5.7).
+- **AgentProvider** — the language model behind research agents (Section 5.7); declares where it runs (local model / named cloud vendor, with BAA/DPA status) so governance can decide what it may see.
 - **AnalysisModule** (Phase 6) — read-only consumers of coding data (inter-rater reliability, co-occurrence, case comparison).
 
 ### 2.3 Sync model (hybrid from the start)
@@ -130,7 +132,13 @@ Points to one or more anchors. Kinds: highlight, note, coded segment, clip, scre
 
 Every bulk import (Section 5.4) is recorded as an **import batch**: source of import, options chosen, start/end time, counts, per-item results, and the governance decisions applied. Every source, asset, collection, and tag created by the batch references its batch id, so the batch can be reported on or undone as a unit.
 
-### 3.9 Audit event
+### 3.9 Research watches, agent runs, and candidates
+
+- **Research watch** — a saved, scheduled search definition (Section 5.7): brief, queries per language, sources, schedule, screening criteria, budget, project.
+- **Agent run** — one execution of a watch or agent: start/end, provider and model, prompt version, every query issued, results returned, decisions made, cost. Stored for audit and reproducibility.
+- **Candidate** — a found item awaiting the researcher's decision in the Research Inbox: link, preview metadata, which run found it, relevance score and the agent's stated reason, and the researcher's decision (accepted / rejected with reason / snoozed). Accepted candidates become Sources through the normal capture pipeline.
+
+### 3.10 Audit event
 
 Append-only, hash-chained (each event includes the hash of the previous one). Fields: actor, device, action, entity, project, governance decision and reason, timestamp.
 
@@ -376,6 +384,48 @@ Captures an entire website, or a defined part of it, both as images and as a rep
 - Sites requiring login can be captured only with the researcher's own credentials, held in the operating system's keychain and never stored in the library.
 - Governance checks apply before capture (protocol scope, identifiability flag for sites containing personal data, residency for where the archive is stored).
 
+### 5.7 Research watches and research agents
+
+Ongoing, automated discovery of new sources — articles, books, web pages, and new videos and posts on social media — delivered to a **Research Inbox** for the researcher to accept or reject.
+
+**Two layers**
+
+1. **Watches (deterministic, no AI required).** Saved searches that run on a schedule (hourly / daily / weekly) against SearchProviders and report new results since the last run:
+   - **Literature:** OpenAlex, Crossref, Semantic Scholar, arXiv/SSRN/SocArXiv, PubMed, publisher RSS/table-of-contents feeds, new works by followed authors, new citations of key works ("cited by" alerts).
+   - **YouTube:** keyword/channel/playlist search via the YouTube Data API, with language, region, and date filters (subject to API quota).
+   - **Instagram:** monitored profiles (Section 5.5); hashtag search via the official Hashtag Search API where available (business-account requirement and limits on how many hashtags can be queried per week, so hashtags are chosen deliberately); browser-assisted checks of hashtag/explore pages as the researcher views them.
+   - **TikTok:** keyword/hashtag/account queries via the Research API (with approved access); monitored profiles.
+   - **Websites:** re-capture of archived sites and pages with change detection (Section 5.6); RSS/Atom feeds.
+2. **Research agents (AI-assisted, optional).** A language-model agent works from a written **research brief** (research question, concepts, inclusion/exclusion criteria, languages, populations, platforms, date range) and uses the watches' SearchProviders as tools to:
+   - **expand queries across languages and vocabularies** (synonyms, slang, transliterations, hashtags in each target language), shown to the researcher for approval before use;
+   - **screen** new results against the inclusion/exclusion criteria, giving each a relevance score and a short stated reason (and, for video, screening on title, description, captions, or a transcript if governance permits);
+   - **snowball**: follow references and citations of accepted literature, related channels/accounts of accepted creators, and recurring hashtags — proposing them as new watch terms rather than adding them silently;
+   - **deduplicate** against the library and across platforms (reposts, re-uploads);
+   - **summarize** each run into a digest ("12 new candidates; 3 strongly relevant; new hashtag emerging: …").
+
+**Human in the loop (default)**
+
+- Agents and watches **never add sources to the library by themselves**: they place candidates in the **Research Inbox**. The researcher accepts (which triggers normal, governance-checked capture), rejects (with an optional reason, which the agent uses to improve later screening), or snoozes.
+- Optional per-watch automation: auto-capture **metadata only** for candidates above a confidence threshold; full media capture of human-subjects content always requires the researcher's acceptance unless the project's protocol explicitly allows automatic collection.
+- Inbox views: by watch, by platform, by relevance; bulk accept/reject; digest notifications in the app (email optional).
+
+**Governance and ethics**
+
+- Every agent and watch action passes the governance checkpoint (Section 6): searching a platform must be within protocol scope; the agent's model provider is a processing location, so **restricted projects can require a local model** or a vendor with a BAA/DPA, and can limit the agent to non-identifiable metadata.
+- Agents act only through the defined SearchProviders and capture pipeline — they do not post, message, follow, like, or interact with anyone on any platform, do not use accounts other than the researcher's own, and do not bypass access controls or rate limits.
+- **Reproducibility and audit:** every run records the model, prompt and brief versions, each query issued, results returned, scores, and decisions. A **search log export** documents the search strategy, and a **PRISMA-style flow report** (records identified, deduplicated, screened, included, excluded with reasons) supports systematic and scoping reviews and methods sections.
+- **Cost controls:** per-watch and per-project budgets (runs per period, token or currency limits), cost estimate before enabling, and automatic pause when a budget is reached.
+
+**Where agents run**
+
+- On the desktop while the app is open (missed runs catch up on next launch), or on the sync server for always-on monitoring (Phase 5), subject to residency rules.
+- **AgentProvider** is provider-agnostic. The default cloud provider is Claude (via the Anthropic API, using tool use for the search tools; default model Claude Opus 5.5, with the option to choose a smaller, cheaper model for high-volume screening). Local open models (e.g., via Ollama) are supported for projects that must keep all processing on-device.
+
+**Integration with external AI assistants (MCP server)**
+
+- The app exposes the library through a **Model Context Protocol (MCP) server**, so external AI assistants and agent tools (e.g., Claude Desktop, Claude Code, or other MCP clients) can search the library, read permitted metadata and text, propose candidates to the Research Inbox, and fetch citations.
+- Access is per project and read-mostly by default; writes are limited to adding Inbox candidates and notes. All access is governed and audited like any other actor, and identifiable data is never exposed beyond what the project's sharing rules allow.
+
 ---
 
 ## 6. Governance engine and compliance
@@ -518,6 +568,7 @@ Full keyboard navigation, screen-reader labels, reduced-motion setting, and visi
 - **Fixture projects** with synthetic data for each compliance profile, generating sample verification reports.
 - **Import fixtures:** sample Zotero library, sample iPhone (HEIC, Live Photo, HEVC) and camera (RAW, MP4) files, sample PDFs/EPUBs.
 - **Library move/reconnect tests:** in-app move with interruption and resume, hash verification failure (old copy kept), move blocked by residency rules, reconnect after an external move/rename, rebuild of a missing index, missing-file relinking, drive disconnect/reconnect, lock-file behavior with two devices, cloud placeholder files.
+- **Watch and agent tests:** watches run against mocked SearchProviders (new-since-last-run detection, deduplication, quota handling, schedule catch-up); governance denials for out-of-scope platforms and for cloud models in restricted projects; budget limits and auto-pause; run-log completeness; PRISMA-flow counts. **Agent screening is evaluated** against a set of items the researcher has already accepted/rejected, reporting how often the agent's screening matches the researcher's decisions (precision and recall), so agent quality is measured rather than assumed.
 - **Profile and website archive tests:** against local test fixtures (mock profile pages and a test website) — scope rules, depth and page limits, robots.txt handling, full-page screenshots of long and lazy-loading pages, WACZ validity and replay, incremental re-capture, detection of removed items, rate-limit backoff, resume after interruption.
 - **Bulk import tests:** metadata-resolution order and confidence scoring, duplicate detection and merge policies, interrupt-and-resume, incremental Zotero re-import, batch undo, and a large synthetic library (10,000+ items) for performance.
 - **End-to-end tests** driving the real app: import → capture → transcribe → translate → code → cite → export.
@@ -531,10 +582,10 @@ Full keyboard navigation, screen-reader labels, reduced-motion setting, and visi
 Each phase ends with something usable and has its own implementation plan.
 
 1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **appearance basics** (light/dark/system theme, design tokens, Goudy Old Style default typeface with fallbacks, multilingual font fallback, text size); **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
-2. **Capture & media** — browser capture extension and web snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); YouTube; Instagram, including **Instagram profile archive** with incremental re-capture and monitoring; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search.
+2. **Capture & media** — browser capture extension and web snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); YouTube; Instagram, including **Instagram profile archive** with incremental re-capture and monitoring; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search; **research watches** (literature, YouTube, Instagram profiles/hashtags, websites) and the **Research Inbox**.
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
-5. **Hybrid** — sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
+5. **Hybrid & agents** — **research agents** (research brief, multilingual query expansion, screening, snowballing, digests, search log and PRISMA-style report), always-on watches and agents on the server, **MCP server** for external AI assistants; sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
 6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok, including **TikTok profile archive**; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
 
 ---
@@ -564,6 +615,7 @@ Each phase ends with something usable and has its own implementation plan.
 | Appearance | Light/dark/system + high contrast; token-based theming; default typeface Goudy Old Style (installed copy, else Sorts Mill Goudy); per-area typefaces, multilingual fallback; separate export styles |
 | Library location | Movable across folders, drives, network and cloud storage, in the app (copy → verify → switch, governance-checked) or outside it (reconnect by library id); relative paths only |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
+| Research watches & agents | Watches + Research Inbox in Phase 2; AI research agents, server-side scheduling and MCP server in Phase 5; human acceptance required by default; governed model provider (local model option); full run logs, search-strategy export, PRISMA-style report; budgets |
 | Profile archive | Whole Instagram (Phase 2) and TikTok (Phase 6) profiles as linked, citable sources; incremental capture, monitoring, removed-item tracking; comments off by default; no bypass of access controls |
 | Website archive | Phase 2; scoped whole-site crawl; full-page screenshots per page at chosen viewports; WACZ archive; robots.txt respected by default; re-capture with change comparison |
 | Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
