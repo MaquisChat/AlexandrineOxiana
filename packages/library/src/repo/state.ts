@@ -85,7 +85,11 @@ export interface ProjectState {
   /** Source id → library-relative folder. */
   sources: Map<string, string>;
   manifest: Manifest;
-  /** Set when an in-process rollback failed; writes are refused until the library is reopened. */
+  /**
+   * Writes are refused (RecoveryPendingError) until the library is reopened and the cause is
+   * resolved: an in-process rollback failed, a write-ahead marker is unresolved, an incomplete
+   * audit or change-log line could not be trimmed, or an audit append failed while opening.
+   */
   recoveryPending?: boolean;
 }
 
@@ -187,7 +191,11 @@ export class RepoCore {
 }
 
 /** Reads every project folder under `Projects/` (skipping staging folders that start with "."). */
-export async function loadProjects(core: RepoCore): Promise<Array<{ st: ProjectState; events: Array<AuditEvent | null>; verify: Awaited<ReturnType<typeof AuditStore.load>>["verify"] }>> {
+export async function loadProjects(
+  core: RepoCore,
+  /** Runs for each project before its audit log is read (openRepo trims incomplete lines here). */
+  beforeAudit?: (project: { id: string; rel: string }) => Promise<void>,
+): Promise<Array<{ st: ProjectState; events: Array<AuditEvent | null>; verify: Awaited<ReturnType<typeof AuditStore.load>>["verify"] }>> {
   const projectsDir = join(core.root, "Projects");
   let names: string[] = [];
   try {
@@ -202,6 +210,7 @@ export async function loadProjects(core: RepoCore): Promise<Array<{ st: ProjectS
     if (!raw) continue;
     const data = parseProjectJson(JSON.parse(raw.toString("utf8")));
     const rel = `Projects/${name}`;
+    await beforeAudit?.({ id: data.project.id, rel });
     const { store, events, verify } = await AuditStore.load(join(projectsDir, name, "audit"), core.auditSegmentSize);
     const st: ProjectState = {
       project: { ...data.project, folder: rel },

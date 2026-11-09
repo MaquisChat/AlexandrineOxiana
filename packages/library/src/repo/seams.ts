@@ -10,6 +10,8 @@ export const seams: {
   crashAt?: CrashPoint;
   /** Makes every undo step of this kind fail (until cleared). */
   failUndo?: "created" | "replaced" | "dir" | "trashed" | "append";
+  /** Makes every audit append for this project id fail (until cleared). */
+  failAuditAppendFor?: string;
 } = {};
 
 /** Thrown at a crash point; the mutation does NOT roll back (as if the process died). */

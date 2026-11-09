@@ -142,6 +142,32 @@ async function endsWithNewline(path: string, size: number): Promise<boolean> {
   }
 }
 
+/**
+ * The incomplete last line of a regular file: the bytes after its last newline
+ * (`keep` is where they start). `null` when the file is missing, empty, not a
+ * regular file, or ends with a newline. Per R28 such a line is not a committed
+ * record: a record exists only once its whole line and newline are written.
+ */
+export async function incompleteTail(path: string): Promise<{ keep: number; tail: Buffer } | null> {
+  const st = await fsp.lstat(path).catch(() => null);
+  if (!st?.isFile() || st.size === 0 || (await endsWithNewline(path, st.size))) return null;
+  const data = await fsp.readFile(path);
+  if (data.length === 0 || data[data.length - 1] === 0x0a) return null;
+  const keep = data.lastIndexOf(0x0a) + 1;
+  return { keep, tail: data.subarray(keep) };
+}
+
+/** Durably cuts `path` back to `size` bytes. */
+export async function truncateDurable(path: string, size: number): Promise<void> {
+  const fh = await fsp.open(path, "r+");
+  try {
+    await fh.truncate(size);
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
 export async function undoAppend(u: AppendUndo): Promise<void> {
   if (u.created) await fsp.rm(u.path, { force: true });
   else await fsp.truncate(u.path, u.prevSize);

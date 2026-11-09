@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1125,5 +1126,200 @@ describe("recovery safety (fix round 3)", () => {
     await expect(again.unlockProject(enc.id, "pw")).rejects.toBeInstanceOf(RecoveryPendingError);
     expect(again.isUnlocked(enc.id)).toBe(false);
     expect(await auditEvents(join(lib.root, "Projects/E"))).toEqual(before);
+  });
+});
+
+describe("incomplete audit and change-log lines (fix round 4, R28)", () => {
+  const posix = process.platform !== "win32";
+  let repo: Repo;
+  let pid: string;
+  let dir: string;
+  let seg: string;
+  beforeEach(async () => {
+    repo = await repoFor();
+    pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    dir = join(lib.root, "Projects/P");
+    seg = join(dir, "audit/0001.jsonl");
+  });
+  afterEach(() => {
+    seams.crashAt = undefined;
+    seams.failAuditAppendFor = undefined;
+  });
+
+  const kinds = (r: Repo) => r.integrityWarnings.map((w) => w.kind);
+  const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+  const denied = (r: Repo, id = pid) =>
+    r.createSource(id, draft(), pdfFile(), { provenance: provenance({ captureMethod: "downloader" }) });
+  /** A deny event (no transaction, no marker) whose line is cut off by a crash. Returns the torn bytes. */
+  async function tornDeny(): Promise<{ clean: Buffer; torn: Buffer }> {
+    const clean = await readFile(seg);
+    seams.crashAt = "torn-audit";
+    await expect(denied(repo)).rejects.toBeInstanceOf(SimulatedCrash);
+    const after = await readFile(seg);
+    expect(after.subarray(0, clean.length).equals(clean)).toBe(true);
+    const torn = after.subarray(clean.length);
+    expect(torn.length).toBeGreaterThan(0);
+    expect(torn.includes(0x0a)).toBe(false);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("txn-"))).toEqual([]);
+    return { clean, torn };
+  }
+  async function plantInvalid(over: Record<string, unknown> = {}): Promise<void> {
+    const txn = newId();
+    const m = {
+      formatVersion: 1,
+      txn,
+      projectId: pid,
+      projectFolder: "Projects/P",
+      auditEvents: 1,
+      auditSeqBefore: 1,
+      entries: [{ kind: "created", path: "Projects/Elsewhere/x" }],
+      ...over,
+    };
+    await writeFile(join(lib.root, ".tmp", `txn-${txn}.json`), JSON.stringify(m));
+  }
+
+  it("trims a deny line torn by a crash: the library reopens, the trim is audited, later denies are audited", async () => {
+    const { clean, torn } = await tornDeny();
+    const eventsBefore = await auditEvents(dir).catch(() => null);
+    expect(eventsBefore).toBeNull(); // the torn line does not parse
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([
+      { projectId: pid, kind: "trimmed-incomplete-audit-line", file: "Projects/P/audit/0001.jsonl", bytes: torn.length, detail: expect.any(String) },
+    ]);
+    const raw = await readFile(seg);
+    expect(raw.subarray(0, clean.length).equals(clean)).toBe(true);
+    const events = await auditEvents(dir);
+    expect(verifyChain(events).ok).toBe(true);
+    const last = events[events.length - 1]!;
+    expect(last.action).toBe("audit.trimmed-incomplete-line");
+    expect(last.details).toEqual({ file: "Projects/P/audit/0001.jsonl", bytes: torn.length, sha256: sha(torn) });
+    // The anchor follows the trim event, so the next open is quiet.
+    await expect(denied(again)).rejects.toBeInstanceOf(PolicyDeniedError);
+    const later = await auditEvents(dir);
+    expect(later).toHaveLength(events.length + 1);
+    expect(later[later.length - 1]!.decision).toMatchObject({ result: "deny" });
+    expect(verifyChain(later).ok).toBe(true);
+    expect(kinds(await repoFor())).toEqual([]);
+  });
+
+  it("trims a torn change-log line the same way", async () => {
+    const log = join(dir, "changes/2026-11.jsonl");
+    const clean = await readFile(log);
+    const torn = Buffer.from('{"at":"2026-11-09T14:30:00.000Z","op":"cre');
+    await appendFile(log, torn);
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([
+      { projectId: pid, kind: "trimmed-incomplete-audit-line", file: "Projects/P/changes/2026-11.jsonl", bytes: torn.length, detail: expect.any(String) },
+    ]);
+    expect((await readFile(log)).equals(clean)).toBe(true);
+    const events = await auditEvents(dir);
+    expect(verifyChain(events).ok).toBe(true);
+    expect(events[events.length - 1]).toMatchObject({
+      action: "audit.trimmed-incomplete-line",
+      details: { file: "Projects/P/changes/2026-11.jsonl", bytes: torn.length, sha256: sha(torn) },
+    });
+    await expect(again.createCollection(pid, "x")).resolves.toBeDefined();
+    expect((await changeLines(dir)).length).toBeGreaterThan(0);
+  });
+
+  it("trims the workspace change log too (no project, so a warning only)", async () => {
+    await repo.createTag("workspace", "t1");
+    const log = join(lib.root, "changes/2026-11.jsonl");
+    const clean = await readFile(log);
+    await appendFile(log, '{"at":');
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([
+      { projectId: "*", kind: "trimmed-incomplete-audit-line", file: "changes/2026-11.jsonl", bytes: 6, detail: expect.any(String) },
+    ]);
+    expect((await readFile(log)).equals(clean)).toBe(true);
+    await expect(again.createTag("workspace", "t2")).resolves.toBeDefined();
+  });
+
+  it("a read-only open never trims: files are unchanged and the torn line is reported as pending", async () => {
+    const { torn } = await tornDeny();
+    const bytes = await readFile(seg);
+    const tree = await walk(lib.root);
+    const anchorsBefore = await readFile(join(tmp, "config/audit-anchors.json"), "utf8");
+    const ro: Library = { ...lib, mode: "read-only", readOnlyReason: "locked-by-other-device" };
+    const roRepo = await repoFor({}, ro);
+    expect(roRepo.integrityWarnings).toEqual([
+      { projectId: pid, kind: "incomplete-audit-line-pending", file: "Projects/P/audit/0001.jsonl", bytes: torn.length, detail: expect.any(String) },
+    ]);
+    expect((await readFile(seg)).equals(bytes)).toBe(true);
+    expect(await walk(lib.root)).toEqual(tree);
+    expect(await readFile(join(tmp, "config/audit-anchors.json"), "utf8")).toBe(anchorsBefore);
+    // A later read-write open trims it.
+    expect(kinds(await repoFor())).toEqual(["trimmed-incomplete-audit-line"]);
+  });
+
+  it("leaves a torn line alone while the project has an unresolved marker (in-memory warning only)", async () => {
+    await tornDeny();
+    await plantInvalid();
+    const bytes = await readFile(seg);
+    const anchorsBefore = await readFile(join(tmp, "config/audit-anchors.json"), "utf8");
+    const again = await repoFor();
+    expect(kinds(again).sort()).toEqual(["incomplete-audit-line-pending", "invalid-txn-marker"]);
+    expect((await readFile(seg)).equals(bytes)).toBe(true);
+    expect(await readFile(join(tmp, "config/audit-anchors.json"), "utf8")).toBe(anchorsBefore);
+    await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    expect((await readFile(seg)).equals(bytes)).toBe(true);
+  });
+
+  it("trims nothing while an unreadable marker (which could belong to any project) is unresolved", async () => {
+    await tornDeny();
+    await writeFile(join(lib.root, ".tmp", `txn-${newId()}.json`), "{ torn");
+    const bytes = await readFile(seg);
+    const again = await repoFor();
+    expect(kinds(again).sort()).toEqual(["incomplete-audit-line-pending", "invalid-txn-marker"]);
+    expect((await readFile(seg)).equals(bytes)).toBe(true);
+    await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+  });
+
+  it("an audit append that fails during open blocks only that project, not the library", async () => {
+    const q = (await repo.createProject({ name: "Q", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project;
+    // Make P's anchor disagree, so opening appends an anchor-mismatch event to P.
+    const path = join(tmp, "config/audit-anchors.json");
+    const j = JSON.parse(await readFile(path, "utf8"));
+    j.anchors[`${lib.id}/${pid}`].seq = 99;
+    await writeFile(path, JSON.stringify(j));
+    const auditBefore = await readFile(seg);
+    seams.failAuditAppendFor = pid;
+    const again = await repoFor();
+    seams.failAuditAppendFor = undefined;
+    expect(again.integrityWarnings).toEqual([
+      { projectId: pid, kind: "truncated", detail: expect.any(String) },
+      { projectId: pid, kind: "audit-append-failed-at-open", detail: expect.stringMatching(/simulated/) },
+    ]);
+    expect((await readFile(seg)).equals(auditBefore)).toBe(true);
+    await expect(again.createCollection(q.id, "x")).resolves.toBeDefined();
+    await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    await expect(denied(again)).rejects.toBeInstanceOf(RecoveryPendingError);
+  });
+
+  it.runIf(posix)("a symlinked audit folder never receives a deny event (PathEscapeError)", async () => {
+    const outside = join(tmp, "outside-audit");
+    await rename(join(dir, "audit"), outside);
+    await symlink(outside, join(dir, "audit"));
+    const before = await readFile(join(outside, "0001.jsonl"));
+    await expect(denied(repo)).rejects.toBeInstanceOf(PathEscapeError);
+    expect(await readdir(outside)).toEqual(["0001.jsonl"]);
+    expect((await readFile(join(outside, "0001.jsonl"))).equals(before)).toBe(true);
+  });
+
+  it("an invalid marker blocks both the project it names and the project at its folder", async () => {
+    const q = (await repo.createProject({ name: "Q", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project;
+    const r = (await repo.createProject({ name: "R", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project;
+    await plantInvalid({ projectId: q.id, entries: [{ kind: "created", path: "Projects/P/project.json" }] });
+    const pj = await readFile(join(dir, "project.json"), "utf8");
+    const again = await repoFor();
+    expect(kinds(again)).toEqual(["invalid-txn-marker"]);
+    expect(await readFile(join(dir, "project.json"), "utf8")).toBe(pj);
+    await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    await expect(again.createCollection(q.id, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    await expect(again.createCollection(r.id, "x")).resolves.toBeDefined();
+  });
+
+  it("TornFileError no longer promises that reopening recovers", () => {
+    expect(new TornFileError("/x/audit/0001.jsonl").message).not.toMatch(/reopen the library to recover/);
   });
 });

@@ -1,6 +1,6 @@
 /** `openRepo` and the `Repo` facade: one per open library. */
 import * as fsp from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, posix } from "node:path";
 import type { Asset, Collection, ConsentRecord, Participant, Project, Session, SourceDraft, SourceFile, Tag } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
@@ -17,6 +17,8 @@ import {
   type ParticipantInput,
   type SessionInput,
 } from "./fieldwork.js";
+import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
+import { foldName } from "./io.js";
 import { runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
 import { createProject, isUnlocked, lockProject, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
@@ -182,7 +184,11 @@ async function readAnchors(core: RepoCore, writable: boolean) {
 /**
  * Opens the repository for a library. When writable, first finishes or rolls
  * back writes interrupted by a crash (write-ahead markers, see txn.ts), each
- * rollback reported as `rolled-back-incomplete-write`. Then verifies every
+ * rollback reported as `rolled-back-incomplete-write`. Then removes incomplete
+ * last lines left in audit segments and change logs by a crash outside a
+ * transaction (R28: `trimmed-incomplete-audit-line`, audited as
+ * `audit.trimmed-incomplete-line`); a read-only library, or a project with an
+ * unresolved marker, only reports them (`incomplete-audit-line-pending`). Then verifies every
  * project's audit chain and compares its head with the external anchor (R12):
  * a broken chain, a different event at the anchored position, or a shorter log
  * is reported in `integrityWarnings` and, when writable, recorded as an
@@ -202,12 +208,22 @@ export async function openRepoInternal(
   const core = new RepoCore(library, keyRing, opts);
   const writable = library.mode === "read-write";
   const anchors = await readAnchors(core, writable);
-  /** Projects with a marker that is still unresolved: no writes and no audit appends until resolved. */
-  const pending = new Set<string>();
+  // Projects with a marker that is still unresolved: no writes, no audit appends and no trimming
+  // until it is resolved. An invalid marker may name one project and point into another's folder,
+  // so both its projectId and its projectFolder count.
+  const pendingIds = new Set<string>();
+  const pendingFolders = new Set<string>();
+  /** A marker is unresolved and cannot be tied to a project: no file of any project is trimmed. */
+  let unattributed = false;
   if (writable) {
     const recovered = await recoverTransactions(core.root, (pid) => anchors[core.anchorKey(pid)]);
     for (const r of recovered) {
-      if (r.outcome !== "committed" && r.outcome !== "rolled-back" && r.projectId !== "*") pending.add(r.projectId);
+      if (r.outcome !== "committed" && r.outcome !== "rolled-back") {
+        const folder = r.projectFolder === undefined ? null : folderKey(r.projectFolder);
+        if (r.projectId !== "*") pendingIds.add(r.projectId);
+        if (folder !== null) pendingFolders.add(folder);
+        if (r.projectId === "*" || folder === null) unattributed = true;
+      }
       const w = RECOVERY_WARNINGS[r.outcome];
       if (w) {
         core.integrityWarnings.push({
@@ -228,31 +244,100 @@ export async function openRepoInternal(
       });
     }
   }
-  const loaded = await loadProjects(core);
+  const isPending = (p: { id: string; rel: string }) => pendingIds.has(p.id) || pendingFolders.has(folderKey(p.rel) ?? "");
+
+  // Incomplete last lines (R28). Recovery ran first, so what a transaction appended is already
+  // truncated; what is left was cut off outside a transaction and is not a committed record.
+  // The workspace change log has no transactions and no audit chain: it is trimmed and reported.
+  reportIncompleteLines(core, "*", await scanIncompleteLines(core.root, "", writable), writable);
+  const incomplete = new Map<string, IncompleteLine[]>();
+  const loaded = await loadProjects(core, async (p) => {
+    const lines = await scanIncompleteLines(core.root, p.rel, writable && !unattributed && !isPending(p));
+    incomplete.set(p.id, lines);
+  });
+
   for (const { st, events, verify } of loaded) {
     core.projects.set(st.project.id, st);
+    const lines = incomplete.get(st.project.id) ?? [];
+    reportIncompleteLines(core, st.project.id, lines, writable);
     // An unresolved marker blocks writes. Its integrity findings are kept in memory only: appending
-    // an event or moving the anchor could change what recovery decides on a later open.
-    const blocked = pending.has(st.project.id);
+    // an event or moving the anchor could change what recovery decides on a later open. A line that
+    // is still incomplete blocks them too: nothing can be appended after it.
+    const blocked = isPending({ id: st.project.id, rel: st.rel }) || (writable && lines.some((l) => !l.trimmed));
     if (blocked) st.recoveryPending = true;
     const anchor = anchors[core.anchorKey(st.project.id)];
     const problem = checkAnchor(events, verify, anchor);
     const at = core.clock().toISOString();
-    if (problem) {
-      core.integrityWarnings.push({ projectId: st.project.id, ...problem });
-      if (writable && !blocked) {
+    if (problem) core.integrityWarnings.push({ projectId: st.project.id, ...problem });
+    if (!writable || blocked) continue;
+    // A failed append here must never keep the whole library from opening: it blocks this project only.
+    try {
+      let appended = false;
+      if (problem) {
         await core.auditNow(st, {
           ...core.auditBase(st, at),
           action: "audit.anchor-mismatch",
           entity: { type: "project", id: st.project.id },
           details: { kind: problem.kind, detail: problem.detail, ...(anchor ? { recorded: { seq: anchor.seq, hash: anchor.hash } } : {}) },
         });
+        appended = true;
       }
-    } else if (writable && !blocked && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
-      await core.updateAnchor(st, at);
+      // Only a chain that verifies gets the trim recorded in it; otherwise the warning stands alone.
+      if (verify.ok) {
+        for (const l of lines) {
+          await core.auditNow(st, {
+            ...core.auditBase(st, at),
+            action: "audit.trimmed-incomplete-line",
+            entity: { type: "project", id: st.project.id },
+            details: { file: l.file, bytes: l.bytes, sha256: l.sha256 },
+          });
+          appended = true;
+        }
+      }
+      if (!problem && !appended && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
+        await core.updateAnchor(st, at);
+      }
+    } catch (err) {
+      st.recoveryPending = true;
+      core.integrityWarnings.push({
+        projectId: st.project.id,
+        kind: "audit-append-failed-at-open",
+        detail: `an audit event could not be appended while opening (${err instanceof Error ? err.message : String(err)}); this project refuses changes until the library is reopened`,
+      });
     }
   }
   return new Repo(core);
+}
+
+/**
+ * The project folder name a marker's `projectFolder` points at, folded the way file systems
+ * compare names, or null when it is not `Projects/<one folder>` after normalizing separators,
+ * `.` and `..`. Used to block that project, so it errs towards matching.
+ */
+function folderKey(projectFolder: string): string | null {
+  const parts = posix.normalize(projectFolder.replaceAll("\\", "/")).split("/").filter((s) => s !== "");
+  if (parts.length !== 2 || foldName(parts[0]!) !== "projects" || parts[1] === "..") return null;
+  return foldName(parts[1]!);
+}
+
+/** Records one warning per incomplete line: trimmed, or left in place (and why). */
+function reportIncompleteLines(core: RepoCore, projectId: string, lines: IncompleteLine[], writable: boolean): void {
+  for (const l of lines) {
+    const what = `${l.file} ended in an incomplete line of ${l.bytes} byte(s) (an interrupted write)`;
+    core.integrityWarnings.push({
+      projectId,
+      kind: l.trimmed ? "trimmed-incomplete-audit-line" : "incomplete-audit-line-pending",
+      file: l.file,
+      bytes: l.bytes,
+      detail: l.trimmed
+        ? `${what}; it was never a complete record and was removed`
+        : !writable
+          ? `${what}; it will be removed when the library is opened read-write`
+          : l.error
+            ? `${what}; it could not be removed (${l.error}) and is left in place`
+            : `${what}; it is left in place until the interrupted change reported for this library is resolved`,
+    });
+  }
 }
 
 export type { RepoOptions };

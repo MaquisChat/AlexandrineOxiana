@@ -6,11 +6,11 @@
  * rewrite or truncation of the log inside the library is noticed on open.
  */
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import { SimulatedCrash, seams } from "./seams.js";
-import { appendDurable, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
+import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
 const SEGMENT = /^(\d{4,})\.jsonl$/;
@@ -29,8 +29,30 @@ export interface IntegrityWarning {
     | "rolled-back-incomplete-write"
     | "invalid-txn-marker"
     | "incomplete-write-pending"
-    | "txn-recovery-skipped-audit-unverifiable";
+    | "txn-recovery-skipped-audit-unverifiable"
+    /** An incomplete last line (cut off by a crash) was removed from an audit segment or change log (R28). */
+    | "trimmed-incomplete-audit-line"
+    /** Such a line was found but left in place: read-only library, or an unresolved interrupted change. */
+    | "incomplete-audit-line-pending"
+    /** An audit event could not be appended while opening; the project refuses writes until reopened. */
+    | "audit-append-failed-at-open";
   detail: string;
+  /** Library-relative file, for the two incomplete-line kinds. */
+  file?: string;
+  /** Size of the incomplete line in bytes, for the two incomplete-line kinds. */
+  bytes?: number;
+}
+
+/** Segment file names in `dir`, oldest first (empty when the folder is missing). */
+export async function auditSegments(dir: string): Promise<string[]> {
+  let names: string[];
+  try {
+    names = (await fsp.readdir(dir)).filter((n) => SEGMENT.test(n));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+  return names.sort((a, b) => Number(SEGMENT.exec(a)![1]) - Number(SEGMENT.exec(b)![1]));
 }
 
 export class AuditStore {
@@ -40,19 +62,19 @@ export class AuditStore {
     private readonly segmentSize: number = AUDIT_SEGMENT_SIZE,
   ) {}
 
-  /** Reads every segment in order. Unparseable lines become `null` (which verifyChain rejects). */
+  /**
+   * Reads every segment in order. Unparseable lines become `null` (which verifyChain rejects).
+   * An incomplete last line of the last segment (no newline: cut off by a crash) is not an event
+   * and is left out (R28); openRepo reports it and, when it may, trims it.
+   */
   static async read(dir: string): Promise<Array<AuditEvent | null>> {
-    let names: string[];
-    try {
-      names = (await fsp.readdir(dir)).filter((n) => SEGMENT.test(n));
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw err;
-    }
-    names.sort((a, b) => Number(SEGMENT.exec(a)![1]) - Number(SEGMENT.exec(b)![1]));
+    const names = await auditSegments(dir);
     const out: Array<AuditEvent | null> = [];
-    for (const n of names) {
-      for (const line of (await fsp.readFile(join(dir, n), "utf8")).split("\n")) {
+    for (const [i, n] of names.entries()) {
+      const lines = (await fsp.readFile(join(dir, n), "utf8")).split("\n");
+      // After a final newline the last piece is ""; anything else there is an incomplete line.
+      if (i === names.length - 1) lines.pop();
+      for (const line of lines) {
         if (line.trim() === "") continue;
         try {
           out.push(JSON.parse(line) as AuditEvent);
@@ -89,16 +111,23 @@ export class AuditStore {
     onPlan?: (u: AppendUndo) => Promise<void>,
   ): Promise<{ event: AuditEvent; undo: () => Promise<void> }> {
     const event = sealEvent(stripUndefined(input), this.head);
+    if (seams.failAuditAppendFor !== undefined && seams.failAuditAppendFor === input.projectId) {
+      throw new Error("simulated audit append failure");
+    }
+    // The audit folder and segment must really be inside the project folder: an event must never
+    // be written through a symbolic link, whether or not a transaction is running.
+    const path = join(this.dir, this.segmentName(event.seq));
+    await assertContained(dirname(this.dir), path);
     await fsp.mkdir(this.dir, { recursive: true });
     const prevHead = this.head;
     if (seams.crashAt === "torn-audit") {
       // Test seam: the process dies halfway through writing this event's line.
       seams.crashAt = undefined;
       const line = JSON.stringify(event);
-      await appendDurable(join(this.dir, this.segmentName(event.seq)), line.slice(0, line.length >> 1), undefined, onPlan);
+      await appendDurable(path, line.slice(0, line.length >> 1), undefined, onPlan);
       throw new SimulatedCrash("simulated crash while writing an audit line");
     }
-    const u = await appendDurable(join(this.dir, this.segmentName(event.seq)), `${JSON.stringify(event)}\n`, undefined, onPlan);
+    const u = await appendDurable(path, `${JSON.stringify(event)}\n`, undefined, onPlan);
     this.head = { seq: event.seq, hash: event.hash };
     return {
       event,

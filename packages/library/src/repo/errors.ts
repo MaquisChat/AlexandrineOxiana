@@ -40,11 +40,18 @@ export class GovernanceViolationError extends Error {
   override name = "GovernanceViolationError";
 }
 
-/** An earlier write could not be fully undone; reopen the library so recovery can finish it. */
+/**
+ * The project refuses writes until an earlier problem is resolved: an interrupted change that
+ * could not be undone or whose marker is unresolved, or an audit log that could not be repaired
+ * or appended to when the library was opened. The library's integrity warnings say which.
+ */
 export class RecoveryPendingError extends Error {
   override name = "RecoveryPendingError";
   constructor(readonly projectId: string) {
-    super(`An earlier change to project ${projectId} could not be fully undone; reopen the library to recover before making changes`);
+    super(
+      `Project ${projectId} refuses changes: an earlier change could not be fully undone, or its audit log could not be repaired when the library was opened. ` +
+        "Check the library's integrity warnings, then reopen the library",
+    );
   }
 }
 
@@ -56,11 +63,18 @@ export class PathEscapeError extends Error {
   }
 }
 
-/** A file to append to does not end with a newline (a torn line from a crash). */
+/**
+ * A file to append to does not end with a newline (a line cut off by a crash).
+ * Such lines are trimmed when the library is opened read-write, except while
+ * an interrupted change to the same project is still unresolved.
+ */
 export class TornFileError extends Error {
   override name = "TornFileError";
   constructor(readonly path: string) {
-    super(`Refusing to append to ${path}: its last line is incomplete (interrupted write); reopen the library to recover`);
+    super(`Refusing to append to ${path}: its last line is incomplete (interrupted write) and the file was left unchanged. ` +
+        "Incomplete lines are trimmed when the library is opened read-write, unless an interrupted change to the project is still unresolved; " +
+        "see the library's integrity warnings",
+    );
   }
 }
 

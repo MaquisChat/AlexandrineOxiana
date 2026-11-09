@@ -12,7 +12,8 @@
  * - invalid (unparseable; projectId not the project at projectFolder; any path
  *   outside where this transaction may write, lexically or through a symbolic
  *   link; backups/trash not named for this transaction): nothing is touched, the
- *   marker is kept, reported 'invalid-txn-marker';
+ *   marker is kept, reported 'invalid-txn-marker'. Both the project it names
+ *   and the project at its projectFolder refuse writes until it is resolved;
  * - committed (every allow event with this txn id is in the audit log): only
  *   the marker, its backups and its trash are removed;
  * - audit unverifiable (the chain up to the transaction's start does not verify
@@ -260,6 +261,8 @@ export type RecoveryOutcome =
 export interface RecoveryResult {
   /** The marker's project id, or "*" when the marker cannot be read. */
   projectId: string;
+  /** The marker's `projectFolder` as written, when it has one (it may be a different project's folder). */
+  projectFolder?: string;
   txn: string;
   outcome: RecoveryOutcome;
   detail?: string;
@@ -298,8 +301,15 @@ export async function recoverTransactions(
     }
     const problem = markerProblem(raw, fileTxn) ?? (await unsafeOnDisk(root, raw as TxnMarker));
     if (problem) {
-      const pid = (raw as { projectId?: unknown })?.projectId;
-      out.push({ projectId: typeof pid === "string" && isId(pid) ? pid : "*", txn: fileTxn, outcome: "invalid", detail: problem });
+      // An invalid marker may name one project and point into another: report both, so both are blocked.
+      const { projectId: pid, projectFolder: pf } = (raw ?? {}) as { projectId?: unknown; projectFolder?: unknown };
+      out.push({
+        projectId: typeof pid === "string" && isId(pid) ? pid : "*",
+        ...(typeof pf === "string" ? { projectFolder: pf } : {}),
+        txn: fileTxn,
+        outcome: "invalid",
+        detail: problem,
+      });
       continue;
     }
     const m = raw as TxnMarker;
@@ -325,6 +335,7 @@ export async function recoverTransactions(
     if (!prefixOk || (anchor && anchor.seq > m.auditSeqBefore)) {
       out.push({
         projectId: m.projectId,
+        projectFolder: m.projectFolder,
         txn: m.txn,
         outcome: "skipped-audit-unverifiable",
         detail: !prefixOk ? "the audit chain before this change does not verify" : `the audit anchor (event ${anchor!.seq}) is past this transaction's start (event ${m.auditSeqBefore})`,
@@ -335,7 +346,7 @@ export async function recoverTransactions(
       await removeMarker(root, m);
       out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
     } else {
-      out.push({ projectId: m.projectId, txn: m.txn, outcome: "rollback-incomplete" });
+      out.push({ projectId: m.projectId, projectFolder: m.projectFolder, txn: m.txn, outcome: "rollback-incomplete" });
     }
   }
   return out;
