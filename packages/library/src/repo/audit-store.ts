@@ -9,6 +9,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { SimulatedCrash, seams } from "./seams.js";
 import { appendDurable, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
 
 export const AUDIT_SEGMENT_SIZE = 10_000;
@@ -90,6 +91,13 @@ export class AuditStore {
     const event = sealEvent(stripUndefined(input), this.head);
     await fsp.mkdir(this.dir, { recursive: true });
     const prevHead = this.head;
+    if (seams.crashAt === "torn-audit") {
+      // Test seam: the process dies halfway through writing this event's line.
+      seams.crashAt = undefined;
+      const line = JSON.stringify(event);
+      await appendDurable(join(this.dir, this.segmentName(event.seq)), line.slice(0, line.length >> 1), undefined, onPlan);
+      throw new SimulatedCrash("simulated crash while writing an audit line");
+    }
     const u = await appendDurable(join(this.dir, this.segmentName(event.seq)), `${JSON.stringify(event)}\n`, undefined, onPlan);
     this.head = { seq: event.seq, hash: event.hash };
     return {

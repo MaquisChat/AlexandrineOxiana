@@ -24,7 +24,7 @@ import {
 } from "../crypto/keys.js";
 import { AuditStore } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
-import { GovernanceViolationError, PolicyDeniedError } from "./errors.js";
+import { GovernanceViolationError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
 import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
@@ -183,6 +183,8 @@ async function readKeyFile(core: RepoCore, st: ProjectState): Promise<ProjectKey
 export async function unlockProject(core: RepoCore, projectId: string, secret: string): Promise<void> {
   const st = core.state(projectId);
   if (!core.encrypted(st)) return;
+  // Unlocking is audited; that append must wait until the interrupted write is resolved.
+  if (st.recoveryPending && core.library.mode === "read-write") throw new RecoveryPendingError(projectId);
   const file = await readKeyFile(core, st);
   let key: Uint8Array;
   try {

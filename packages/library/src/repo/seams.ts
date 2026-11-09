@@ -4,7 +4,7 @@
  */
 
 /** Points in a mutation where a simulated crash can be injected. */
-export type CrashPoint = "before-changes" | "before-audit" | "between-audit" | "before-marker-delete";
+export type CrashPoint = "before-changes" | "before-audit" | "between-audit" | "before-marker-delete" | "torn-audit";
 
 export const seams: {
   crashAt?: CrashPoint;

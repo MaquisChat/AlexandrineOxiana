@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -22,12 +22,15 @@ import {
   PolicyDeniedError,
   ProjectLockedError,
   ReadOnlyLibraryError,
+  PathEscapeError,
   RecoveryPendingError,
+  TornFileError,
   type IndexSink,
   type Repo,
 } from "./index.js";
 import { SimulatedCrash, openTestRepo, seams, type InternalOptions } from "./testing.js";
 import { AnchorStore } from "./audit-store.js";
+import { appendDurable } from "./io.js";
 import type { RepoOptions } from "./state.js";
 
 const FAST = 2 ** 10;
@@ -1009,5 +1012,118 @@ describe("recovery safety (fix round 2)", () => {
     expect(kinds(again)).toContain("txn-recovery-skipped-audit-unverifiable");
     expect(await readdir(join(dir, "Sources"))).toHaveLength(1);
     expect((await tmpNames()).filter((n) => n.startsWith("txn-"))).toHaveLength(1);
+  });
+});
+
+describe("recovery safety (fix round 3)", () => {
+  const posix = process.platform !== "win32";
+  let repo: Repo;
+  let pid: string;
+  let dir: string;
+  let headSeq: number;
+  beforeEach(async () => {
+    repo = await repoFor();
+    pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    dir = join(lib.root, "Projects/P");
+    headSeq = (await auditEvents(dir)).length;
+  });
+  afterEach(() => {
+    seams.crashAt = undefined;
+  });
+
+  async function plant(entries: (txn: string) => unknown[], over: Record<string, unknown> = {}): Promise<string> {
+    const txn = newId();
+    const m = { formatVersion: 1, txn, projectId: pid, projectFolder: "Projects/P", auditEvents: 1, auditSeqBefore: headSeq, entries: entries(txn), ...over };
+    await writeFile(join(lib.root, ".tmp", `txn-${txn}.json`), JSON.stringify(m));
+    return txn;
+  }
+  const kinds = (r: Repo) => r.integrityWarnings.map((w) => w.kind);
+
+  it.runIf(posix)("1: never follows a symlinked folder out of the project during recovery", async () => {
+    const outside = join(tmp, "outside");
+    await mkdir(outside);
+    await writeFile(join(outside, "keep.txt"), "keep");
+    await symlink(outside, join(dir, "Sources/evil"));
+    await plant(() => [{ kind: "dir", path: "Projects/P/Sources/evil" }]);
+    await plant(() => [{ kind: "created", path: "Projects/P/Sources/evil/keep.txt" }]);
+    await plant((txn) => {
+      return [{ kind: "replaced", path: "Projects/P/Sources/evil/keep.txt", backup: `.tmp/txn-${txn}.orig-0`, mode: 0o644 }];
+    });
+    const markers = (await readdir(join(lib.root, ".tmp"))).filter((n) => n.endsWith(".json"));
+    for (const n of markers) await writeFile(join(lib.root, ".tmp", n.replace(".json", ".orig-0")), "evil");
+    const again = await repoFor();
+    expect(kinds(again)).toEqual(["invalid-txn-marker", "invalid-txn-marker", "invalid-txn-marker"]);
+    expect(await readdir(outside)).toEqual(["keep.txt"]);
+    expect(await readFile(join(outside, "keep.txt"), "utf8")).toBe("keep");
+  });
+
+  it.runIf(posix)("1: normal writes through a symlinked folder throw PathEscapeError", async () => {
+    const outside = join(tmp, "outside");
+    await mkdir(outside);
+    await rm(join(dir, "Sources"), { recursive: true });
+    await symlink(outside, join(dir, "Sources"));
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(PathEscapeError);
+    expect(await readdir(outside)).toEqual([]);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("txn-"))).toEqual([]);
+  });
+
+  it("2: a torn audit line from a crash is rolled back, and the chain verifies again", async () => {
+    const before = await auditEvents(dir);
+    seams.crashAt = "torn-audit";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    const raw = await readFile(join(dir, "audit/0001.jsonl"), "utf8");
+    expect(raw.endsWith("\n")).toBe(false);
+    await expect(appendDurable(join(dir, "audit/0001.jsonl"), "x\n")).rejects.toBeInstanceOf(TornFileError);
+    const again = await repoFor();
+    expect(kinds(again)).toEqual(["rolled-back-incomplete-write"]);
+    const events = await auditEvents(dir);
+    expect(events).toEqual(before);
+    expect(verifyChain(events).ok).toBe(true);
+    expect(await readdir(join(dir, "Sources"))).toEqual([]);
+    await expect(again.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).resolves.toBeDefined();
+  });
+
+  it("3: cross-checks project id, audit count, and this transaction's backup and trash names", async () => {
+    const q = (await repo.createProject({ name: "Q", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project;
+    const pj = join(dir, "project.json");
+    const pjBefore = await readFile(pj, "utf8");
+    await plant(() => [{ kind: "created", path: "Projects/P/project.json" }], { projectId: q.id });
+    await plant(() => [{ kind: "created", path: "Projects/P/project.json" }], { auditEvents: 0 });
+    await plant(() => [{ kind: "replaced", path: "Projects/P/project.json", backup: `.tmp/txn-${newId()}.orig-0`, mode: 0o644 }]);
+    await plant(() => [{ kind: "trashed", from: "Projects/P/Sources", to: ".tmp/trash-0123abcd" }]);
+    const again = await repoFor();
+    expect(kinds(again)).toEqual(Array(4).fill("invalid-txn-marker"));
+    expect(await readFile(pj, "utf8")).toBe(pjBefore);
+    expect(await readdir(join(dir, "Sources"))).toEqual([]);
+  });
+
+  it("4: a project with an unresolved marker refuses writes and appends no audit events", async () => {
+    await plant(() => [{ kind: "created", path: "Projects/Q/elsewhere" }]);
+    // Also make the anchor disagree, so an anchor-mismatch would normally be audited.
+    const path = join(tmp, "config/audit-anchors.json");
+    const j = JSON.parse(await readFile(path, "utf8"));
+    j.anchors[`${lib.id}/${pid}`].seq = 99;
+    await writeFile(path, JSON.stringify(j));
+    const anchorsBefore = await readFile(path, "utf8");
+    const auditBefore = await auditEvents(dir);
+    const again = await repoFor();
+    expect(kinds(again).sort()).toEqual(["invalid-txn-marker", "truncated"]);
+    expect(await auditEvents(dir)).toEqual(auditBefore);
+    expect(await readFile(path, "utf8")).toBe(anchorsBefore);
+    await expect(again.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+  });
+
+  it("4: unlockProject refuses (and audits nothing) while recovery is pending", async () => {
+    const enc = (await repo.createProject({ name: "E", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } }))
+      .project;
+    const txn = newId();
+    const m = { formatVersion: 1, txn, projectId: enc.id, projectFolder: "Projects/E", auditEvents: 1, auditSeqBefore: 1, entries: [{ kind: "created", path: "Projects/P/x" }] };
+    await writeFile(join(lib.root, ".tmp", `txn-${txn}.json`), JSON.stringify(m));
+    const before = await auditEvents(join(lib.root, "Projects/E"));
+    const again = await repoFor();
+    again.lockProject(enc.id);
+    await expect(again.unlockProject(enc.id, "pw")).rejects.toBeInstanceOf(RecoveryPendingError);
+    expect(again.isUnlocked(enc.id)).toBe(false);
+    expect(await auditEvents(join(lib.root, "Projects/E"))).toEqual(before);
   });
 });

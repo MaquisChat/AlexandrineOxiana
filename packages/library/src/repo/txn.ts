@@ -9,11 +9,15 @@
  *
  * A crash leaves the marker behind. On the next writable open,
  * `recoverTransactions` handles each marker:
- * - invalid (unparseable, or any path outside where this transaction may
- *   write): nothing is touched, the marker is kept, reported 'invalid-txn-marker';
+ * - invalid (unparseable; projectId not the project at projectFolder; any path
+ *   outside where this transaction may write, lexically or through a symbolic
+ *   link; backups/trash not named for this transaction): nothing is touched, the
+ *   marker is kept, reported 'invalid-txn-marker';
  * - committed (every allow event with this txn id is in the audit log): only
  *   the marker, its backups and its trash are removed;
- * - audit unverifiable (the chain does not verify, or the external anchor says
+ * - audit unverifiable (the chain up to the transaction's start does not verify
+ *   (its own tail, possibly torn by the crash, is not checked: the rollback
+ *   truncates it), or the external anchor says
  *   events at or after this transaction's start were committed, which an
  *   uncommitted transaction cannot explain): nothing is touched, the marker is
  *   kept, reported 'txn-recovery-skipped-audit-unverifiable';
@@ -29,7 +33,8 @@ import { join, relative, sep } from "node:path";
 import { LibraryRelativePath, isId, newId, verifyChain, type AuditEvent } from "@ao/core";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import { AuditStore, type Head } from "./audit-store.js";
-import { exists, undoAppend, type AppendUndo } from "./io.js";
+import { PathEscapeError } from "./errors.js";
+import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
 import { seams } from "./seams.js";
 
 export type MarkerEntry =
@@ -164,7 +169,9 @@ async function removeMarker(root: string, m: TxnMarker): Promise<void> {
 
 const isRel = (p: unknown): p is string => typeof p === "string" && LibraryRelativePath.safeParse(p).success && !p.split("/").includes(".");
 const under = (p: unknown, folder: string): boolean => isRel(p) && p.startsWith(`${folder}/`);
-const inTmp = (p: unknown): boolean => isRel(p) && /^\.tmp\/[^/]+$/.test(p);
+const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const isBackupOf = (p: unknown, txn: string): boolean => isRel(p) && new RegExp(`^\\.tmp/txn-${esc(txn)}\\.orig-\\d+$`).test(p);
+const isTrashOf = (p: unknown, txn: string): boolean => isRel(p) && new RegExp(`^\\.tmp/trash-${esc(txn)}-[0-9a-f]+$`).test(p);
 const count = (n: unknown): boolean => Number.isSafeInteger(n) && (n as number) >= 0;
 
 /**
@@ -180,7 +187,7 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
   if (typeof x.projectId !== "string" || !isId(x.projectId)) return "bad projectId";
   const pf = x.projectFolder;
   if (!isRel(pf) || !/^Projects\/[^/]+$/.test(pf) || pf.slice("Projects/".length).startsWith(".")) return "projectFolder is not Projects/<folder>";
-  if (!count(x.auditEvents) || !count(x.auditSeqBefore)) return "bad audit counters";
+  if (!count(x.auditEvents) || (x.auditEvents as number) < 1 || !count(x.auditSeqBefore)) return "bad audit counters";
   if (!Array.isArray(x.entries)) return "entries missing";
   for (const e of x.entries as unknown[]) {
     const en = e as Partial<Record<string, unknown>> | null;
@@ -192,12 +199,12 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
         break;
       case "replaced":
         if (!under(en.path, pf)) return "replaced path outside the project";
-        if (!inTmp(en.backup)) return "backup outside .tmp";
+        if (!isBackupOf(en.backup, x.txn)) return "backup is not this transaction's copy in .tmp";
         if (!count(en.mode) || (en.mode as number) > 0o777) return "bad mode";
         break;
       case "trashed":
         if (!under(en.from, pf)) return "trashed path outside the project";
-        if (!inTmp(en.to)) return "trash outside .tmp";
+        if (!isTrashOf(en.to, x.txn)) return "trash is not this transaction's folder in .tmp";
         break;
       case "append":
         if (!under(en.path, pf)) return "append path outside the project";
@@ -206,6 +213,37 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
       default:
         return "unknown entry kind";
     }
+  }
+  return null;
+}
+
+/**
+ * Checks against the file system, after markerProblem passed: the project at
+ * `projectFolder` must be the marker's project, and no path may resolve
+ * (through symbolic links) outside the project folder or `.tmp/`.
+ */
+async function unsafeOnDisk(root: string, m: TxnMarker): Promise<string | null> {
+  const projectDir = fromRel(root, m.projectFolder);
+  try {
+    const pj = JSON.parse(await fsp.readFile(join(projectDir, "project.json"), "utf8")) as { project?: { id?: unknown } };
+    if (pj.project?.id !== m.projectId) return "projectId does not match the project at projectFolder";
+  } catch {
+    return "projectFolder holds no readable project.json";
+  }
+  const tmpDir = join(root, ".tmp");
+  try {
+    for (const e of m.entries) {
+      if (e.kind === "trashed") {
+        await assertContained(projectDir, fromRel(root, e.from));
+        await assertContained(tmpDir, fromRel(root, e.to));
+      } else {
+        await assertContained(projectDir, fromRel(root, e.path));
+        if (e.kind === "replaced") await assertContained(tmpDir, fromRel(root, e.backup));
+      }
+    }
+  } catch (err) {
+    if (err instanceof PathEscapeError) return "a path resolves outside its folder through a symbolic link";
+    throw err;
   }
   return null;
 }
@@ -258,7 +296,7 @@ export async function recoverTransactions(
       out.push({ projectId: "*", txn: fileTxn, outcome: "invalid", detail: "unreadable" });
       continue;
     }
-    const problem = markerProblem(raw, fileTxn);
+    const problem = markerProblem(raw, fileTxn) ?? (await unsafeOnDisk(root, raw as TxnMarker));
     if (problem) {
       const pid = (raw as { projectId?: unknown })?.projectId;
       out.push({ projectId: typeof pid === "string" && isId(pid) ? pid : "*", txn: fileTxn, outcome: "invalid", detail: problem });
@@ -278,14 +316,18 @@ export async function recoverTransactions(
       continue;
     }
     // Rolling back is only safe when the audit log can be trusted to say "not committed".
-    const verify = verifyChain(events as AuditEvent[]);
+    // Only the part of the log written before this transaction is checked: its own tail (possibly a
+    // line torn by the crash) is exactly what the rollback truncates.
+    const prefix = events.slice(0, m.auditSeqBefore);
+    const verify = verifyChain(prefix as AuditEvent[]);
+    const prefixOk = verify.ok && prefix.length === m.auditSeqBefore && (verify.head?.seq ?? 0) === m.auditSeqBefore;
     const anchor = anchorOf(m.projectId);
-    if (!verify.ok || (anchor && anchor.seq > m.auditSeqBefore)) {
+    if (!prefixOk || (anchor && anchor.seq > m.auditSeqBefore)) {
       out.push({
         projectId: m.projectId,
         txn: m.txn,
         outcome: "skipped-audit-unverifiable",
-        detail: !verify.ok ? "the audit chain does not verify" : `the audit anchor (event ${anchor!.seq}) is past this transaction's start (event ${m.auditSeqBefore})`,
+        detail: !prefixOk ? "the audit chain before this change does not verify" : `the audit anchor (event ${anchor!.seq}) is past this transaction's start (event ${m.auditSeqBefore})`,
       });
       continue;
     }

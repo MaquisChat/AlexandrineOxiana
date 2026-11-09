@@ -202,9 +202,12 @@ export async function openRepoInternal(
   const core = new RepoCore(library, keyRing, opts);
   const writable = library.mode === "read-write";
   const anchors = await readAnchors(core, writable);
+  /** Projects with a marker that is still unresolved: no writes and no audit appends until resolved. */
+  const pending = new Set<string>();
   if (writable) {
     const recovered = await recoverTransactions(core.root, (pid) => anchors[core.anchorKey(pid)]);
     for (const r of recovered) {
+      if (r.outcome !== "committed" && r.outcome !== "rolled-back" && r.projectId !== "*") pending.add(r.projectId);
       const w = RECOVERY_WARNINGS[r.outcome];
       if (w) {
         core.integrityWarnings.push({
@@ -216,24 +219,28 @@ export async function openRepoInternal(
     }
     await sweep(core);
   } else {
-    const pending = await pendingMarkers(core.root);
-    if (pending > 0) {
+    const markers = await pendingMarkers(core.root);
+    if (markers > 0) {
       core.integrityWarnings.push({
         projectId: "*",
         kind: "incomplete-write-pending",
-        detail: `${pending} interrupted change(s) will be finished or rolled back when the library is opened read-write`,
+        detail: `${markers} interrupted change(s) will be finished or rolled back when the library is opened read-write`,
       });
     }
   }
   const loaded = await loadProjects(core);
   for (const { st, events, verify } of loaded) {
     core.projects.set(st.project.id, st);
+    // An unresolved marker blocks writes. Its integrity findings are kept in memory only: appending
+    // an event or moving the anchor could change what recovery decides on a later open.
+    const blocked = pending.has(st.project.id);
+    if (blocked) st.recoveryPending = true;
     const anchor = anchors[core.anchorKey(st.project.id)];
     const problem = checkAnchor(events, verify, anchor);
     const at = core.clock().toISOString();
     if (problem) {
       core.integrityWarnings.push({ projectId: st.project.id, ...problem });
-      if (writable) {
+      if (writable && !blocked) {
         await core.auditNow(st, {
           ...core.auditBase(st, at),
           action: "audit.anchor-mismatch",
@@ -241,7 +248,7 @@ export async function openRepoInternal(
           details: { kind: problem.kind, detail: problem.detail, ...(anchor ? { recorded: { seq: anchor.seq, hash: anchor.hash } } : {}) },
         });
       }
-    } else if (writable && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
+    } else if (writable && !blocked && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
       await core.updateAnchor(st, at);
     }
   }

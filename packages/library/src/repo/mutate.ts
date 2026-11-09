@@ -40,7 +40,7 @@ import type { AuditInput } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
 import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
-import { encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
+import { assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
@@ -130,12 +130,17 @@ class TxImpl implements Tx {
   key() {
     return this.core.key(this.state);
   }
+  /** PathEscapeError unless `abs` stays inside the project folder (no symlink escapes). */
+  guard(abs: string): Promise<void> {
+    return assertContained(this.core.abs(this.state.rel), abs);
+  }
   exists(rel: string) {
     return exists(this.core.abs(rel));
   }
 
   async mkdir(rel: string): Promise<void> {
     const abs = this.core.abs(rel);
+    await this.guard(abs);
     // Record the outermost folder this call will create, before creating it.
     let first: string | undefined;
     for (let cur = abs; !(await exists(cur)); cur = dirname(cur)) first = cur;
@@ -152,6 +157,7 @@ class TxImpl implements Tx {
 
   async writeFile(rel: string, data: Uint8Array | string, opts: FileOptions = {}): Promise<void> {
     const abs = this.core.abs(rel);
+    await this.guard(abs);
     const bytes = await this.payload(data, opts);
     if (await exists(abs)) await this.log.replaced(abs, (await fsp.stat(abs)).mode & 0o777);
     else await this.log.created(abs);
@@ -160,6 +166,7 @@ class TxImpl implements Tx {
 
   async copyFile(src: string, rel: string, opts: FileOptions = {}): Promise<{ sha256: string; bytes: number }> {
     const abs = this.core.abs(rel);
+    await this.guard(abs);
     if (await exists(abs)) throw new Error(`refusing to overwrite ${rel}`);
     await this.log.created(abs);
     if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode });
@@ -169,9 +176,11 @@ class TxImpl implements Tx {
 
   async trash(rel: string): Promise<void> {
     const from = this.core.abs(rel);
+    await this.guard(from);
     const dir = join(this.core.root, ".tmp");
     await fsp.mkdir(dir, { recursive: true });
-    const to = join(dir, `trash-${randomBytes(8).toString("hex")}`);
+    const to = join(dir, `trash-${this.log.id}-${randomBytes(8).toString("hex")}`);
+    await assertContained(dir, to);
     await this.log.trashed(from, to);
     await renameWithRetry(from, to);
     this.trashed.push(to);
@@ -294,6 +303,9 @@ export async function runMutation<T>(
         : undefined;
       maybeCrash("before-changes");
       // Unencrypted change logs hold entity values in the clear: always 0600 (R19).
+      // The change log and audit folders must be real folders inside the project too.
+      await tx.guard(core.abs(`${st.rel}/changes/x`));
+      await tx.guard(join(st.audit.dir, "x"));
       await appendChanges(core.abs(`${st.rel}/changes`), tx.changes, seal, seal ? undefined : CHANGE_LOG_MODE, onPlan);
       maybeCrash("before-audit");
       for (const [i, { req, d }] of allowed.entries()) {

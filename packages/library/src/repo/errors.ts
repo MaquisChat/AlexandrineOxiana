@@ -48,6 +48,22 @@ export class RecoveryPendingError extends Error {
   }
 }
 
+/** A path resolves (through a symbolic link) outside the folder it must stay in. */
+export class PathEscapeError extends Error {
+  override name = "PathEscapeError";
+  constructor(readonly path: string) {
+    super(`Refusing to write ${path}: it resolves outside its project folder (symbolic link)`);
+  }
+}
+
+/** A file to append to does not end with a newline (a torn line from a crash). */
+export class TornFileError extends Error {
+  override name = "TornFileError";
+  constructor(readonly path: string) {
+    super(`Refusing to append to ${path}: its last line is incomplete (interrupted write); reopen the library to recover`);
+  }
+}
+
 /** A project, source, collection, tag, participant or session id does not exist. */
 export class NotFoundError extends Error {
   override name = "NotFoundError";

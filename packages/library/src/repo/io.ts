@@ -1,9 +1,10 @@
 /** Small file and crypto helpers shared by the repository modules. */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { LibraryRelativePath } from "@ao/core";
 import { decryptStream, encryptStream } from "../crypto/format.js";
+import { PathEscapeError, TornFileError } from "./errors.js";
 
 /** Absolute path of a library-relative path; validates it first. */
 export function absPath(root: string, rel: string): string {
@@ -28,6 +29,28 @@ export async function exists(path: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw err;
   }
+}
+
+/**
+ * Throws PathEscapeError unless writing, replacing or removing `target` stays
+ * inside `base`: `target` itself must not be a symbolic link, and the real path
+ * of its nearest existing ancestor folder must lie inside the real path of
+ * `base` (which itself must not be a symbolic link).
+ */
+export async function assertContained(base: string, target: string): Promise<void> {
+  const baseStat = await fsp.lstat(base).catch(() => null);
+  if (!baseStat || baseStat.isSymbolicLink()) throw new PathEscapeError(target);
+  const realBase = await fsp.realpath(base);
+  const t = await fsp.lstat(target).catch(() => null);
+  if (t?.isSymbolicLink()) throw new PathEscapeError(target);
+  let p = dirname(target);
+  while (!(await exists(p))) {
+    const up = dirname(p);
+    if (up === p) throw new PathEscapeError(target);
+    p = up;
+  }
+  const real = await fsp.realpath(p);
+  if (real !== realBase && !real.startsWith(realBase + sep)) throw new PathEscapeError(target);
 }
 
 /** Lower-cased NFC names in `dir` (empty when missing), for case-insensitive collision checks. */
@@ -84,7 +107,10 @@ export async function appendDurable(
   let prevSize = 0;
   let created = false;
   try {
-    prevSize = (await fsp.stat(path)).size;
+    const st = await fsp.lstat(path);
+    if (st.isSymbolicLink()) throw new PathEscapeError(path);
+    prevSize = st.size;
+    if (st.isFile() && prevSize > 0 && !(await endsWithNewline(path, prevSize))) throw new TornFileError(path);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     created = true;
@@ -103,6 +129,17 @@ export async function appendDurable(
   }
   await fh.close();
   return undo;
+}
+
+async function endsWithNewline(path: string, size: number): Promise<boolean> {
+  const fh = await fsp.open(path, "r");
+  try {
+    const b = Buffer.alloc(1);
+    await fh.read(b, 0, 1, size - 1);
+    return b[0] === 0x0a;
+  } finally {
+    await fh.close();
+  }
 }
 
 export async function undoAppend(u: AppendUndo): Promise<void> {
