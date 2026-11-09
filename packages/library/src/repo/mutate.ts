@@ -38,7 +38,8 @@ import { encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import type { AuditInput } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
-import { PolicyDeniedError } from "./errors.js";
+import { AuditStore } from "./audit-store.js";
+import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 import { TxnLog } from "./txn.js";
@@ -240,6 +241,7 @@ export async function runMutation<T>(
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
     core.assertUnlocked(st);
     const now = core.clock();
     const at = now.toISOString();
@@ -277,7 +279,7 @@ export async function runMutation<T>(
 
     // 2–4. Files, change log, audit (commit point); roll everything back on failure.
     const headBefore = st.audit.head;
-    const log = new TxnLog(core.root, projectId, st.rel, allowed.length);
+    const log = new TxnLog(core.root, projectId, st.rel, allowed.length, st.audit.head?.seq ?? 0);
     const tx = new TxImpl(core, st, conditions, now, log);
     if (opts.entity) tx.entity(opts.entity.type, opts.entity.id);
     const onPlan = (u: AppendUndo) => log.append(u);
@@ -307,9 +309,15 @@ export async function runMutation<T>(
       maybeCrash("before-marker-delete");
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
-      await log.undo();
-      st.audit.head = headBefore;
-      await log.finish().catch(() => {});
+      if (await log.undo()) {
+        st.audit.head = headBefore;
+        await log.finish().catch(() => {});
+      } else {
+        // Keep the marker so the next open can finish the rollback, and stop writing to this
+        // project until then: later writes could otherwise be undone by that recovery.
+        st.recoveryPending = true;
+        st.audit.head = (await AuditStore.load(st.audit.dir).catch(() => null))?.store.head ?? headBefore;
+      }
       throw err;
     }
     await log.finish().catch(() => {}); // a leftover marker is resolved as committed on next open

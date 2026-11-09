@@ -20,7 +20,15 @@ export type AuditInput = Omit<AuditEvent, "hash" | "prevHash" | "seq">;
 export interface IntegrityWarning {
   /** A project id, or "*" for library-level problems (e.g. an unreadable anchors file). */
   projectId: string;
-  kind: "chain-broken" | "head-mismatch" | "truncated" | "anchors-unreadable" | "rolled-back-incomplete-write";
+  kind:
+    | "chain-broken"
+    | "head-mismatch"
+    | "truncated"
+    | "anchors-unreadable"
+    | "rolled-back-incomplete-write"
+    | "invalid-txn-marker"
+    | "incomplete-write-pending"
+    | "txn-recovery-skipped-audit-unverifiable";
   detail: string;
 }
 

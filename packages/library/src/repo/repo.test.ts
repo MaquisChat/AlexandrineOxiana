@@ -22,6 +22,7 @@ import {
   PolicyDeniedError,
   ProjectLockedError,
   ReadOnlyLibraryError,
+  RecoveryPendingError,
   type IndexSink,
   type Repo,
 } from "./index.js";
@@ -879,5 +880,134 @@ describe("anchors file corruption (R12)", () => {
       await expect(store.set("k", { seq: 1, hash: "a".repeat(64) }, NOW)).rejects.toThrow(/anchors/);
       expect(await readFile(store.path, "utf8")).toBe(bad);
     }
+  });
+});
+
+describe("recovery safety (fix round 2)", () => {
+  let repo: Repo;
+  let pid: string;
+  let dir: string;
+  beforeEach(async () => {
+    repo = await repoFor();
+    pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    dir = join(lib.root, "Projects/P");
+  });
+  afterEach(() => {
+    seams.crashAt = undefined;
+    seams.failUndo = undefined;
+  });
+
+  const tmpNames = async () => (await readdir(join(lib.root, ".tmp"))).sort();
+  async function plantMarker(over: Record<string, unknown>, entries: unknown[]): Promise<string> {
+    const txn = newId();
+    const m = { formatVersion: 1, txn, projectId: pid, projectFolder: "Projects/P", auditEvents: 2, auditSeqBefore: 1, entries, ...over };
+    await writeFile(join(lib.root, ".tmp", `txn-${txn}.json`), JSON.stringify(m));
+    return txn;
+  }
+  const kinds = (r: Repo) => r.integrityWarnings.map((w) => w.kind);
+
+  it("N1: never acts on a marker whose paths escape the library, its project or .tmp", async () => {
+    const outside = join(tmp, "outside.txt");
+    await writeFile(outside, "keep");
+    const q = (await repo.createProject({ name: "Q", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project;
+    const qJson = join(lib.root, q.folder, "project.json");
+    const qBefore = await readFile(qJson, "utf8");
+    const pJsonBefore = await readFile(join(dir, "project.json"), "utf8");
+    const govBefore = await readFile(join(dir, "governance.yaml"), "utf8");
+    await plantMarker({}, [{ kind: "created", path: "Projects/P/../../../outside.txt" }]);
+    await plantMarker({}, [{ kind: "created", path: `${q.folder}/project.json` }]);
+    await plantMarker({ projectFolder: q.folder.replace("Q", "../Q") }, [{ kind: "created", path: `${q.folder}/project.json` }]);
+    await plantMarker({}, [{ kind: "replaced", path: "Projects/P/project.json", backup: "Projects/P/governance.yaml", mode: 0o644 }]);
+    await plantMarker({}, [{ kind: "trashed", from: "Projects/P/Sources", to: "../elsewhere" }]);
+    const before = await tmpNames();
+
+    const again = await repoFor();
+    expect(kinds(again)).toEqual(Array(5).fill("invalid-txn-marker"));
+    expect(await readFile(outside, "utf8")).toBe("keep");
+    expect(await readFile(qJson, "utf8")).toBe(qBefore);
+    expect(await readFile(join(dir, "project.json"), "utf8")).toBe(pJsonBefore);
+    expect(await readFile(join(dir, "governance.yaml"), "utf8")).toBe(govBefore);
+    expect(await tmpNames()).toEqual(before); // markers kept
+  });
+
+  it("N2: backups of 0600 files are 0600", async () => {
+    if (process.platform === "win32") return;
+    const r = await repoFor();
+    const p2 = (await r.createProject({ name: "I", governanceYaml: IDENT_PLAIN_GOV, encryption: { enabled: false } })).project.id;
+    const sf = await r.createSource(p2, draft(), pdfFile(), {
+      provenance: provenance({ identifiable: true, legal: { status: "consented", basis: "consent" } }),
+    });
+    seams.crashAt = "before-audit";
+    await expect(r.updateSource(p2, sf.source.id, { publisher: "X" })).rejects.toBeInstanceOf(SimulatedCrash);
+    const backups = (await tmpNames()).filter((n) => /\.orig-\d+$/.test(n));
+    expect(backups).toHaveLength(1);
+    expect((await stat(join(lib.root, ".tmp", backups[0]!))).mode & 0o777).toBe(0o600);
+  });
+
+  it("N3: a read-only open reports pending markers and touches nothing", async () => {
+    seams.crashAt = "before-audit";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    const before = await walk(lib.root);
+    const ro: Library = { ...lib, mode: "read-only", readOnlyReason: "locked-by-other-device" };
+    const roRepo = await repoFor({}, ro);
+    expect(roRepo.integrityWarnings).toEqual([{ projectId: "*", kind: "incomplete-write-pending", detail: expect.any(String) }]);
+    expect(await walk(lib.root)).toEqual(before);
+    // Read-write recovery still works afterwards.
+    expect(kinds(await repoFor())).toEqual(["rolled-back-incomplete-write"]);
+  });
+
+  it("N4: keeps the marker and blocks writes when an in-process undo step fails", async () => {
+    await rm(join(dir, "changes/2026-11.jsonl"));
+    await mkdir(join(dir, "changes/2026-11.jsonl"));
+    seams.failUndo = "created";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toThrow();
+    expect((await tmpNames()).filter((n) => n.endsWith(".json"))).toHaveLength(1);
+    await expect(repo.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    seams.failUndo = undefined;
+    await rm(join(dir, "changes/2026-11.jsonl"), { recursive: true });
+
+    const again = await repoFor();
+    expect(kinds(again)).toEqual(["rolled-back-incomplete-write"]);
+    expect(await readdir(join(dir, "Sources"))).toEqual([]);
+    expect(await tmpNames()).toEqual([]);
+    await expect(again.createCollection(pid, "x")).resolves.toBeDefined();
+  });
+
+  it("N5: keeps backups of an unreadable marker, reports it, and removes orphan backups", async () => {
+    const txn = newId();
+    await writeFile(join(lib.root, ".tmp", `txn-${txn}.json`), "{ torn");
+    await writeFile(join(lib.root, ".tmp", `txn-${txn}.orig-0`), "original bytes");
+    const orphan = newId();
+    await writeFile(join(lib.root, ".tmp", `txn-${orphan}.orig-0`), "stale");
+    const again = await repoFor();
+    expect(again.integrityWarnings).toEqual([{ projectId: "*", kind: "invalid-txn-marker", detail: expect.any(String) }]);
+    expect(await tmpNames()).toEqual([`txn-${txn}.json`, `txn-${txn}.orig-0`].sort());
+  });
+
+  it("does not roll back when the audit chain does not verify", async () => {
+    seams.crashAt = "before-audit";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    const file = join(dir, "audit/0001.jsonl");
+    const ev = JSON.parse((await readFile(file, "utf8")).trim());
+    ev.actor = "mallory";
+    await writeFile(file, `${JSON.stringify(ev)}\n`);
+    const again = await repoFor();
+    expect(kinds(again)).toContain("txn-recovery-skipped-audit-unverifiable");
+    expect(kinds(again)).not.toContain("rolled-back-incomplete-write");
+    expect(await readdir(join(dir, "Sources"))).toHaveLength(1);
+    expect((await tmpNames()).filter((n) => n.startsWith("txn-"))).toHaveLength(1);
+  });
+
+  it("does not roll back when the anchor is past the transaction's start", async () => {
+    seams.crashAt = "before-audit";
+    await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toBeInstanceOf(SimulatedCrash);
+    const path = join(tmp, "config/audit-anchors.json");
+    const j = JSON.parse(await readFile(path, "utf8"));
+    j.anchors[`${lib.id}/${pid}`] = { seq: 2, hash: "f".repeat(64), at: NOW };
+    await writeFile(path, JSON.stringify(j));
+    const again = await repoFor();
+    expect(kinds(again)).toContain("txn-recovery-skipped-audit-unverifiable");
+    expect(await readdir(join(dir, "Sources"))).toHaveLength(1);
+    expect((await tmpNames()).filter((n) => n.startsWith("txn-"))).toHaveLength(1);
   });
 });

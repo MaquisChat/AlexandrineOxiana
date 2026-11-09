@@ -40,6 +40,14 @@ export class GovernanceViolationError extends Error {
   override name = "GovernanceViolationError";
 }
 
+/** An earlier write could not be fully undone; reopen the library so recovery can finish it. */
+export class RecoveryPendingError extends Error {
+  override name = "RecoveryPendingError";
+  constructor(readonly projectId: string) {
+    super(`An earlier change to project ${projectId} could not be fully undone; reopen the library to recover before making changes`);
+  }
+}
+
 /** A project, source, collection, tag, participant or session id does not exist. */
 export class NotFoundError extends Error {
   override name = "NotFoundError";

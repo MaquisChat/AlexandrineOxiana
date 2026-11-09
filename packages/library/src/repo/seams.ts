@@ -6,7 +6,11 @@
 /** Points in a mutation where a simulated crash can be injected. */
 export type CrashPoint = "before-changes" | "before-audit" | "between-audit" | "before-marker-delete";
 
-export const seams: { crashAt?: CrashPoint } = {};
+export const seams: {
+  crashAt?: CrashPoint;
+  /** Makes every undo step of this kind fail (until cleared). */
+  failUndo?: "created" | "replaced" | "dir" | "trashed" | "append";
+} = {};
 
 /** Thrown at a crash point; the mutation does NOT roll back (as if the process died). */
 export class SimulatedCrash extends Error {

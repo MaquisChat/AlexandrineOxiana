@@ -16,4 +16,5 @@ export {
   PolicyDeniedError,
   ProjectLockedError,
   ReadOnlyLibraryError,
+  RecoveryPendingError,
 } from "./errors.js";

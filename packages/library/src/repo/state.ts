@@ -85,6 +85,8 @@ export interface ProjectState {
   /** Source id → library-relative folder. */
   sources: Map<string, string>;
   manifest: Manifest;
+  /** Set when an in-process rollback failed; writes are refused until the library is reopened. */
+  recoveryPending?: boolean;
 }
 
 export class RepoCore {

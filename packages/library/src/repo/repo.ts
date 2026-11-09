@@ -31,7 +31,7 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
-import { recoverTransactions } from "./txn.js";
+import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 
 export class Repo {
   constructor(private readonly core: RepoCore) {}
@@ -125,21 +125,39 @@ export class Repo {
   }
 }
 
-/** Removes leftovers of interrupted work: project staging folders, trashed folders, orphan backup copies. */
+/**
+ * Removes leftovers of interrupted work: project staging folders, trashed
+ * folders and orphan backup copies. Runs after recoverTransactions; while any
+ * marker remains (invalid, skipped or incomplete) trash is kept, since that
+ * marker may still need it, and backups of existing markers are never removed.
+ */
 async function sweep(core: RepoCore): Promise<void> {
-  const clear = async (dir: string, match: (n: string) => boolean) => {
+  const markersLeft = (await pendingMarkers(core.root)) > 0;
+  const clear = async (dir: string, match: (n: string) => boolean | Promise<boolean>) => {
     let names: string[] = [];
     try {
       names = await fsp.readdir(dir);
     } catch {
       return;
     }
-    for (const n of names) if (match(n)) await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
+    for (const n of names) if (await match(n)) await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
   };
   await clear(join(core.root, "Projects"), (n) => n.startsWith(".creating-"));
-  // Runs after recoverTransactions, so no live marker still references these.
-  await clear(join(core.root, ".tmp"), (n) => n.startsWith("trash-") || /^txn-.*\.orig-\d+$/.test(n));
+  await clear(join(core.root, ".tmp"), (n) => (n.startsWith("trash-") && !markersLeft) || isOrphanBackup(core.root, n));
 }
+
+const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarning["kind"]; text: string }>> = {
+  "rolled-back": { kind: "rolled-back-incomplete-write", text: "a change interrupted before it was audited was rolled back" },
+  "rollback-incomplete": {
+    kind: "rolled-back-incomplete-write",
+    text: "a change interrupted before it was audited could only be partly rolled back; the marker is kept and recovery is retried on the next open",
+  },
+  invalid: { kind: "invalid-txn-marker", text: "a write-ahead marker is unreadable or points outside its project; it was kept and nothing was changed" },
+  "skipped-audit-unverifiable": {
+    kind: "txn-recovery-skipped-audit-unverifiable",
+    text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept",
+  },
+};
 
 /** Reads the anchors; an unreadable file is reported, moved aside (when writable) and replaced. */
 async function readAnchors(core: RepoCore, writable: boolean) {
@@ -183,17 +201,31 @@ export async function openRepoInternal(
 ): Promise<Repo> {
   const core = new RepoCore(library, keyRing, opts);
   const writable = library.mode === "read-write";
-  const recovered = writable ? await recoverTransactions(core.root) : [];
-  if (writable) await sweep(core);
-  const loaded = await loadProjects(core);
   const anchors = await readAnchors(core, writable);
-  for (const r of recovered.filter((x) => x.rolledBack)) {
-    core.integrityWarnings.push({
-      projectId: r.projectId,
-      kind: "rolled-back-incomplete-write",
-      detail: `a change interrupted before it was audited (transaction ${r.txn}) was rolled back`,
-    });
+  if (writable) {
+    const recovered = await recoverTransactions(core.root, (pid) => anchors[core.anchorKey(pid)]);
+    for (const r of recovered) {
+      const w = RECOVERY_WARNINGS[r.outcome];
+      if (w) {
+        core.integrityWarnings.push({
+          projectId: r.projectId,
+          kind: w.kind,
+          detail: `${w.text} (transaction ${r.txn}${r.detail ? `: ${r.detail}` : ""})`,
+        });
+      }
+    }
+    await sweep(core);
+  } else {
+    const pending = await pendingMarkers(core.root);
+    if (pending > 0) {
+      core.integrityWarnings.push({
+        projectId: "*",
+        kind: "incomplete-write-pending",
+        detail: `${pending} interrupted change(s) will be finished or rolled back when the library is opened read-write`,
+      });
+    }
   }
+  const loaded = await loadProjects(core);
   for (const { st, events, verify } of loaded) {
     core.projects.set(st.project.id, st);
     const anchor = anchors[core.anchorKey(st.project.id)];
