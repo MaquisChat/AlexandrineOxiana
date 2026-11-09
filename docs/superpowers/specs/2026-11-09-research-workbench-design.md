@@ -241,6 +241,8 @@ The library must be movable between storage locations and storage media — inte
 | **Instagram** | Official Graph API for owned/managed accounts; oEmbed for public metadata; browser-extension "capture what I'm viewing" and yt-dlp fallback for other public posts, labeled as non-API capture in provenance. | 2 |
 | **Legitimate access chain** | Institutional EZproxy + OpenURL link resolver; open-access lookup (Unpaywall, OpenAlex, CORE, Semantic Scholar, arXiv/SSRN/SocArXiv, PubMed Central, DOAJ, DOAB); books via HathiTrust, Internet Archive/Open Library (incl. controlled digital lending), Project Gutenberg, Google Books previews; interlibrary-loan request generator. | 5 |
 | **TikTok** | Research API slot + browser capture mode. | 6 |
+| **Profile archive** | Whole Instagram profile (Phase 2) or TikTok profile (Phase 6) captured as a set of linked sources; incremental re-capture and optional monitoring (Section 5.5). | 2 / 6 |
+| **Website archive** | Crawl a whole website within defined scope; full-page screenshot of every page plus a replayable WACZ web archive (Section 5.6). | 2 |
 
 **Out of scope by decision:** integrations with shadow libraries (e.g., Anna's Archive, LibGen). Files a user already holds can always be attached manually.
 
@@ -309,6 +311,70 @@ A wizard (and an equivalent command-line tool for experienced collaborators) for
 **Watched folder (optional)**
 
 A folder that is monitored; files dropped into it are imported automatically into a chosen project with saved options. Items below the confidence threshold wait in the review queue.
+
+### 5.5 Profile archive (Instagram, TikTok)
+
+Captures an entire public profile as a structured, citable collection.
+
+**Input:** a profile URL or handle, a target project, and options.
+
+**What is captured**
+
+- **Profile snapshot:** display name, bio, links, avatar, follower/following/post counts, verification status — stored as a dated snapshot, so repeated captures show how the profile changed over time.
+- **Every post visible on the profile:** photos, carousels, reels/videos, captions, posting dates, hashtags, mentions, location tags, engagement counts as captured, and (Instagram) story highlights where visible.
+- **Comments (optional, off by default):** comments are third-party personal data; enabling them sets the identifiability flag and requires that the project's protocol covers it.
+- Each post becomes its own **Source** (so it can be transcribed, translated, coded, and cited individually), all grouped under a **profile collection** with a profile-level Source record. Provenance records the profile capture job and method for every item.
+
+**Options:** date range, content types (posts / reels / highlights), metadata-only or full media, media quality, maximum number of items, include comments.
+
+**Capture methods** (chosen per project and recorded in provenance, Section 5.1):
+
+| Platform | Official route | Non-API route |
+|---|---|---|
+| Instagram | Graph API for owned/managed accounts (full); Business Discovery API for public business/creator accounts (metadata and media for posts) | Browser-extension capture of the profile as the researcher views it (auto-scroll, saves what is displayed); downloader fallback |
+| TikTok | Research API (requires approved academic access): user info and videos | Browser-extension capture; downloader fallback (yt-dlp supports profile pages) |
+
+**Incremental capture and monitoring**
+
+- Re-running a profile archive fetches only new items and refreshes the profile snapshot.
+- Optional **scheduled monitoring** (e.g., weekly) for profiles in the project's approved scope.
+- Items that have disappeared from the platform are marked **"no longer available on platform (first noticed <date>)"**; the archived copy is kept or destroyed according to the project's retention rules. Edited captions are recorded as new versions.
+
+**Safeguards (enforced by the governance engine)**
+
+- Profile-level collection must be within the project's protocol scope (platforms, populations, date range). Profiles flagged as possibly belonging to minors trigger a protocol check before capture.
+- Only content visible to the researcher is captured. The tool does **not** bypass private accounts, access controls, login walls, or platform anti-automation measures, and does not use accounts other than the researcher's own.
+- Conservative rate limits; the job pauses and backs off automatically when the platform signals rate limiting, rather than retrying aggressively.
+- Jobs are resumable, show progress, and produce a capture report (items captured, skipped, failed, and why), written to the audit log.
+
+### 5.6 Website archive (whole-site capture and screenshots)
+
+Captures an entire website, or a defined part of it, both as images and as a replayable archive.
+
+**Input:** a start URL, a target project, and scope rules.
+
+**Scope rules:** same domain only / include subdomains / path prefix only; link depth; maximum pages; include and exclude URL patterns; whether to include linked PDFs, images, audio, and video; optional time limit. A **dry run** estimates page count and storage before capture.
+
+**Per page:**
+
+- **Full-page screenshot** of the entire scroll height (PNG, plus a paginated PDF), at one or more viewports (desktop, tablet, phone).
+- HTML snapshot, readable text (indexed for search in all languages), page metadata, and outgoing links.
+- Lazy-loaded content is triggered by automatic scrolling; cookie/consent banners can be auto-dismissed (recorded in provenance); pages are rendered in a real browser engine (Chromium via Playwright) so dynamic sites capture correctly.
+
+**Whole crawl:**
+
+- A **WACZ web archive** (the open WARC-based standard used by the Internet Archive and Webrecorder) of the entire crawl, replayable inside the app exactly as the site appeared, and openable in other archival tools.
+- A **site map view** of the captured pages; each page is individually citable by its original URL with the archive date.
+- **Re-capture over time** of the same site, with a comparison view of what changed between snapshots (text changes and screenshot comparison).
+
+**Data model:** a website archive is a Source of type *website snapshot* with one child Source per page (each with its screenshot, HTML, text, and WACZ reference as assets), grouped in a collection.
+
+**Safeguards:**
+
+- `robots.txt` is respected by default; overriding it requires a recorded justification and appears in the verification report.
+- Polite crawling: limited concurrency and delay between requests; the crawler identifies itself with a descriptive user agent.
+- Sites requiring login can be captured only with the researcher's own credentials, held in the operating system's keychain and never stored in the library.
+- Governance checks apply before capture (protocol scope, identifiability flag for sites containing personal data, residency for where the archive is stored).
 
 ---
 
@@ -452,6 +518,7 @@ Full keyboard navigation, screen-reader labels, reduced-motion setting, and visi
 - **Fixture projects** with synthetic data for each compliance profile, generating sample verification reports.
 - **Import fixtures:** sample Zotero library, sample iPhone (HEIC, Live Photo, HEVC) and camera (RAW, MP4) files, sample PDFs/EPUBs.
 - **Library move/reconnect tests:** in-app move with interruption and resume, hash verification failure (old copy kept), move blocked by residency rules, reconnect after an external move/rename, rebuild of a missing index, missing-file relinking, drive disconnect/reconnect, lock-file behavior with two devices, cloud placeholder files.
+- **Profile and website archive tests:** against local test fixtures (mock profile pages and a test website) — scope rules, depth and page limits, robots.txt handling, full-page screenshots of long and lazy-loading pages, WACZ validity and replay, incremental re-capture, detection of removed items, rate-limit backoff, resume after interruption.
 - **Bulk import tests:** metadata-resolution order and confidence scoring, duplicate detection and merge policies, interrupt-and-resume, incremental Zotero re-import, batch undo, and a large synthetic library (10,000+ items) for performance.
 - **End-to-end tests** driving the real app: import → capture → transcribe → translate → code → cite → export.
 - **Theme and typography tests:** every screen rendered in light, dark, and high-contrast themes; automated contrast checks; font fallback rendering for non-Latin scripts and right-to-left text.
@@ -464,11 +531,11 @@ Full keyboard navigation, screen-reader labels, reduced-motion setting, and visi
 Each phase ends with something usable and has its own implementation plan.
 
 1. **Foundation** — core data model; governance engine + audit log; portable human-readable library on disk with encryption; desktop shell; drag-and-drop attach (PDF/EPUB/any file, OCR optional); collections and tags; **Bulk Import tool** (Zotero, folders, ZIP, BibTeX/RIS/CSL-JSON, Calibre; review queue; batch undo; watched folder) and **Zotero import/export**; DOI/ISBN lookup; **iPhone and camera media import**; citation engine and bibliography export; "Rebuild library from folder"; **appearance basics** (light/dark/system theme, design tokens, Goudy Old Style default typeface with fallbacks, multilingual font fallback, text size); **move library** (to any folder, drive, network storage, or cloud-synced folder) and **reconnect after an external move**; multiple libraries. Change log recorded (sync designed, not yet active).
-2. **Capture & media** — browser capture extension and web snapshots; YouTube; Instagram; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search.
+2. **Capture & media** — browser capture extension and web snapshots; **website archive** (whole-site crawl, full-page screenshots, WACZ); YouTube; Instagram, including **Instagram profile archive** with incremental re-capture and monitoring; media worker (transcribe, translate; manual trigger with optional automation); multilingual transcript viewer/editor; cross-language search.
 3. **Annotation & coding** — highlights on PDF/EPUB/web/video timeline/images; codebook; coding; memos; retrieval; REFI-QDA export/import.
 4. **Writing integrations** — Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clip export.
 5. **Hybrid** — sync server (including moving a library or project to server/S3-compatible cloud storage), web app, installable mobile PWA (incl. phone photo/video upload), verification reports, legitimate access chain (EZproxy, OA lookup, ILL).
-6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
+6. **Later** — custom theme files and per-area typefaces, export style presets (if not completed earlier), collaborators, roles and comments; analysis suite (IRR, co-occurrence, case comparison); TikTok, including **TikTok profile archive**; native mobile; AI features (semantic search, auto-tagging, summarization, theme discovery).
 
 ---
 
@@ -497,5 +564,7 @@ Each phase ends with something usable and has its own implementation plan.
 | Appearance | Light/dark/system + high contrast; token-based theming; default typeface Goudy Old Style (installed copy, else Sorts Mill Goudy); per-area typefaces, multilingual fallback; separate export styles |
 | Library location | Movable across folders, drives, network and cloud storage, in the app (copy → verify → switch, governance-checked) or outside it (reconnect by library id); relative paths only |
 | Device media | iPhone and camera photos/video supported in Phase 1 |
+| Profile archive | Whole Instagram (Phase 2) and TikTok (Phase 6) profiles as linked, citable sources; incremental capture, monitoring, removed-item tracking; comments off by default; no bypass of access controls |
+| Website archive | Phase 2; scoped whole-site crawl; full-page screenshots per page at chosen viewports; WACZ archive; robots.txt respected by default; re-capture with change comparison |
 | Bulk import | Phase 1; Zotero, folders, ZIP, reference-manager exports, Calibre; copy files into library by default (link optional, flagged); batch undo |
 | Collections and tags | Added to data model (hierarchical collections; workspace/project tags), distinct from qualitative codes |
