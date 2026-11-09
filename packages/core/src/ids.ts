@@ -47,6 +47,9 @@ function encodeBase32(value: number, chars: number): string {
  * starts with the 4-char value.
  */
 export function shortId(id: string, taken: ReadonlySet<string>): string {
+  if (!isId(id)) {
+    throw new TypeError(`shortId: not a UUIDv7 id: ${id}`);
+  }
   const bits = randomBits(id);
   const low = Number(bits & ((1n << BigInt(LOW_BITS)) - 1n));
   let result = encodeBase32(low, 4);
