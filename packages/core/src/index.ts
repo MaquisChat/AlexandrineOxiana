@@ -16,3 +16,6 @@ export {
   withCollisionSuffix,
 } from "./naming.js";
 export type { NamingTemplates } from "./naming.js";
+
+export { GENESIS_HASH, sealEvent, verifyChain } from "./audit.js";
+export type { AuditEvent, AuditBreakReason, AuditVerifyResult } from "./audit.js";
