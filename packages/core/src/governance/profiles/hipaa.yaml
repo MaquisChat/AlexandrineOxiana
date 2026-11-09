@@ -1,0 +1,11 @@
+# HIPAA profile: protected health information. Minimums only; a project may be stricter.
+encryption:
+  atRest: required
+residency:
+  allowed: [device, removable, network, own_server]
+audit:
+  enabled: true
+sharing:
+  locationMetadata: strip
+# Every external (non-local) vendor must have a signed business associate agreement.
+vendorRequires: [baa]

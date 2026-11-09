@@ -1,0 +1,7 @@
+# GDPR profile: personal data of people in the EU/EEA. Minimums only.
+consent:
+  requireLegalBasis: true
+audit:
+  enabled: true
+# Every external (non-local) vendor must have a data processing agreement.
+vendorRequires: [dpa]

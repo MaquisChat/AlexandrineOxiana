@@ -1,0 +1,6 @@
+# Funder data-management-plan profile. These are presence checks: the project
+# must fill the values in; the software cannot invent them.
+require:
+  - dmp.repository
+  - dmp.formats
+  - retention.rawDataDestroyAfter

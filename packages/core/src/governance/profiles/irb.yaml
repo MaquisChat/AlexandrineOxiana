@@ -1,0 +1,7 @@
+# IRB profile: human-subjects research under an approved protocol. Minimums only.
+protocol:
+  requireBeforeCapture: true
+identifiability:
+  pseudonymizeFileNames: true
+audit:
+  enabled: true

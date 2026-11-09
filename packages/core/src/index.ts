@@ -22,3 +22,27 @@ export type { AuditEvent, AuditBreakReason, AuditVerifyResult } from "./audit.js
 
 export { RICH_TEXT_FIELDS, diffToChanges, mergeConcurrent } from "./changelog.js";
 export type { Change, ChangeMeta, EntityType, MergeConflict } from "./changelog.js";
+
+export {
+  CAPTURE_METHODS,
+  DEFAULT_GOVERNANCE,
+  GovernanceParseError,
+  PROCESSING_OPS,
+  PROFILES,
+  PUBLIC_METADATA_SERVICES,
+  RESIDENCY_KINDS,
+  parseGovernance,
+} from "./governance/schema.js";
+export type {
+  GovernanceConfig,
+  GovernanceException,
+  PartialGovernance,
+  ProcessingOp,
+  Profile,
+  ResidencyKind,
+  Vendor,
+} from "./governance/schema.js";
+export { PROFILE_MINIMUMS, PROFILE_RULES } from "./governance/profiles/index.js";
+export type { ProfileRules } from "./governance/profiles/index.js";
+export { applyMinimum, effectivePolicy } from "./governance/merge.js";
+export type { EffectivePolicy, Violation } from "./governance/merge.js";
