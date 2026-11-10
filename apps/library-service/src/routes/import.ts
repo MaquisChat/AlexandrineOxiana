@@ -1,0 +1,215 @@
+/**
+ * Bulk Import (spec 5.4): dry run, start (progress as `import.progress` events), pause / resume /
+ * cancel / undo, report, review list; device import (spec 5.3); watched folders. Adapters are the
+ * library's own (`adapterFor`), chosen by `adapter.kind`.
+ */
+import type { FastifyInstance } from "fastify";
+import type { ImportOptionsInput } from "@ao/core";
+import {
+  addWatchedFolder,
+  adapterFor,
+  listWatchedFolders,
+  removeWatchedFolder,
+  startZoteroWebImport,
+  watchFolder,
+  zoteroWebAdapter,
+  zoteroWebSince,
+  proxyQueueFor,
+  scrubPaths,
+  type BatchHandle,
+  type ImportSourceAdapter,
+} from "@ao/library";
+import { badRequest, notFound } from "../errors.js";
+import type { ServiceState, Session } from "../state.js";
+import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
+
+const PATH_KINDS = new Set(["folder", "zip", "bibtex", "ris", "csl-json", "zotero-rdf", "calibre", "zotero-local"]);
+const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+
+type AdapterSpec = { web: false; adapter: ImportSourceAdapter } | { web: true; libraryType: "user" | "group"; libraryId: string; full: boolean };
+
+function adapterSpec(o: Obj | undefined): AdapterSpec {
+  if (!o) throw badRequest('"adapter" is required, e.g. { "kind": "folder", "path": "/…" }.');
+  const kind = str(o, "kind", 32);
+  if (kind === "zotero-web") {
+    const libraryType = str(o, "libraryType", 8);
+    if (libraryType !== "user" && libraryType !== "group") throw badRequest('"libraryType" must be "user" or "group".');
+    const libraryId = str(o, "libraryId", 12);
+    if (!/^\d{1,12}$/.test(libraryId)) throw badRequest('"libraryId" must be a number.');
+    return { web: true, libraryType, libraryId, full: optBool(o, "full") === true };
+  }
+  if (!PATH_KINDS.has(kind)) throw badRequest(`"${kind}" is not an import source. Use one of: ${[...PATH_KINDS, "zotero-web"].join(", ")}.`);
+  const path = str(o, kind === "zotero-local" ? "dataDir" : "path", 4096);
+  if (!isAbsolute(path)) throw badRequest("The import path must be absolute.");
+  const adapter = adapterFor(kind as Parameters<typeof adapterFor>[0], path);
+  if (!adapter) throw badRequest(`"${kind}" is not an import source.`);
+  return { web: false, adapter };
+}
+
+function approvals(o: Obj | undefined): { folders?: string[]; files?: string[] } {
+  if (!o) return {};
+  return { folders: strArray(o, "folders", { optional: true, max: 100 }), files: strArray(o, "files", { optional: true, max: 1000 }) };
+}
+
+/** Follows a running batch: progress and its end as `import.progress` events. */
+export function followBatch(state: ServiceState, s: Session, projectId: string, h: BatchHandle): void {
+  s.batches.set(h.batchId, { projectId, handle: h });
+  state.track(
+    (async () => {
+      for await (const p of h.progress) state.events.publish("import.progress", { batchId: h.batchId, projectId, state: "running", done: p.done, total: p.total });
+      const r = await h.done;
+      state.events.publish("import.progress", { batchId: h.batchId, projectId, state: r.state, counts: r.counts });
+      state.publishState();
+    })().catch((err: unknown) => state.events.publish("import.progress", { batchId: h.batchId, projectId, state: "failed", error: state.describe(err) })),
+    "import",
+  );
+}
+
+/** The project a batch belongs to: one this service runs, else found among the projects' batches. */
+export async function batchProject(state: ServiceState, batchId: string): Promise<string> {
+  const s = state.requireSession();
+  const running = s.batches.get(batchId);
+  if (running) return running.projectId;
+  if (s.bulk) {
+    for (const p of s.repo.listProjects()) {
+      if (!s.repo.isUnlocked(p.id)) continue;
+      const list = await s.bulk.listBatches(p.id).catch(() => []);
+      if (list.some((b) => b.batchId === batchId)) return p.id;
+    }
+  }
+  throw notFound("That import");
+}
+
+export function registerImport(app: FastifyInstance, ctx: Ctx): void {
+  const { state } = ctx;
+
+  app.post("/projects/:id/import/dry-run", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    const spec = adapterSpec(optObj(b, "adapter"));
+    const approveOutside = approvals(optObj(b, "approveOutside"));
+    if (spec.web) {
+      const since = spec.full ? undefined : zoteroWebSince(s.repo, projectId, `${spec.libraryType}:${spec.libraryId}`);
+      return s.bulk.dryRun(projectId, zoteroWebAdapter({ libraryType: spec.libraryType, libraryId: spec.libraryId, ...(since !== undefined ? { since } : {}) }), { approveOutside });
+    }
+    return s.bulk.dryRun(projectId, spec.adapter, { approveOutside });
+  });
+
+  app.post("/projects/:id/import", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    const spec = adapterSpec(optObj(b, "adapter"));
+    const options = (optObj(b, "options") ?? {}) as ImportOptionsInput;
+    const h = spec.web
+      ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
+      : await s.bulk.startBatch(projectId, spec.adapter, options);
+    followBatch(state, s, projectId, h);
+    return { batchId: h.batchId };
+  });
+
+  app.get("/projects/:id/imports", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    return { batches: await s.bulk.listBatches(projectId) };
+  });
+
+  for (const action of ["pause", "resume", "cancel"] as const) {
+    app.post(`/imports/:batchId/${action}`, async (req) => {
+      const s = state.requireWritable();
+      const batchId = paramsOf(req).batchId ?? "";
+      const projectId = await batchProject(state, batchId);
+      const running = s.batches.get(batchId);
+      if (running) {
+        running.handle[action]();
+        return { batchId, action };
+      }
+      if (action !== "resume") throw notFound("A running import with that id");
+      // A batch interrupted earlier (another run of the app): resumed from its record.
+      const h = await s.bulk.resumeBatch(projectId, batchId);
+      followBatch(state, s, projectId, h);
+      return { batchId, action };
+    });
+  }
+
+  app.post("/imports/:batchId/undo", async (req) => {
+    const s = state.requireWritable();
+    const batchId = paramsOf(req).batchId ?? "";
+    const projectId = await batchProject(state, batchId);
+    const r = await s.bulk.undoBatch(projectId, batchId);
+    s.batches.delete(batchId);
+    state.publishState();
+    return r;
+  });
+
+  app.get("/imports/:batchId/report", async (req) => {
+    const s = state.requireWritable();
+    const batchId = paramsOf(req).batchId ?? "";
+    return s.bulk.batchReport(await batchProject(state, batchId), batchId);
+  });
+
+  app.get("/imports/:batchId/review", async (req) => {
+    const s = state.requireWritable();
+    const batchId = paramsOf(req).batchId ?? "";
+    return { items: await s.bulk.listReview(await batchProject(state, batchId), batchId) };
+  });
+
+  app.post("/projects/:id/device-import", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    const dir = str(b, "dir", 4096);
+    if (!isAbsolute(dir)) throw badRequest('"dir" must be an absolute path.');
+    const sessionId = optStr(b, "sessionId", 64);
+    const participantIds = strArray(b, "participantIds", { optional: true, max: 1000, itemMax: 64 });
+    const options = (optObj(b, "options") ?? {}) as ImportOptionsInput & { researcherName?: string };
+    const h = await s.bulk.importDeviceFolder(projectId, dir, { ...options, ...(sessionId ? { sessionId } : {}), ...(participantIds.length ? { participantIds } : {}) });
+    followBatch(state, s, projectId, h);
+    return { batchId: h.batchId };
+  });
+
+  // ---- watched folders (their folders are this device's settings, R78 c) ----
+  app.get("/projects/:id/watched-folders", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    return { folders: await listWatchedFolders({ repo: s.repo, lib: s.lib }, projectId) };
+  });
+
+  app.post("/projects/:id/watched-folders", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    const dir = str(b, "dir", 4096);
+    if (!isAbsolute(dir)) throw badRequest('"dir" must be an absolute path.');
+    const options = (optObj(b, "options") ?? {}) as Parameters<typeof addWatchedFolder>[3];
+    const w = await addWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, dir, options);
+    const watch = watchFolder(
+      { repo: s.repo, http: s.http, lib: s.lib, proxies: proxyQueueFor(s.repo), onEvent: (e) => state.events.publish("job.progress", { kind: "watch", projectId, event: JSON.parse(scrubPaths(JSON.stringify(e), state.roots)) as unknown }) },
+      projectId,
+      dir,
+      options,
+    );
+    s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), watch]);
+    return w;
+  });
+
+  app.delete("/projects/:id/watched-folders/:wid", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const wid = paramsOf(req).wid ?? "";
+    const known = await listWatchedFolders({ repo: s.repo, lib: s.lib }, projectId);
+    const gone = known.find((w) => w.id === wid);
+    if (!gone) throw notFound("That watched folder");
+    await removeWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, wid);
+    // Restart the project's watches from what is left.
+    await Promise.allSettled((s.watches.get(projectId) ?? []).map((w) => w.stop()));
+    s.watches.delete(projectId);
+    for (const w of known) {
+      if (w.id === wid || !w.dir) continue;
+      const watch = watchFolder({ repo: s.repo, http: s.http, lib: s.lib, proxies: proxyQueueFor(s.repo) }, projectId, w.dir, w.options);
+      s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), watch]);
+    }
+    return { removed: true };
+  });
+}

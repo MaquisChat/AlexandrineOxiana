@@ -139,7 +139,7 @@ export { ACCEPTED_EXTENSIONS, FOLDER_REASON, LOCATION_REASON, createAttach } fro
 export type { Attach, AttachDeps, AttachOutcome, AttachStatus } from "./import/attach.js";
 export { DEVICE_EXTENSIONS, DEVICE_RESEARCHER_NOTE, RAW_JPEG_WINDOW_MS, deviceAdapter, groupDeviceFiles, importDeviceFolder } from "./import/device.js";
 export type { DeviceAdapterOptions, DeviceFile, DeviceGroup, DeviceImportOptions } from "./import/device.js";
-export { PROXY_ATTEMPTS, ProxyQueue, disposeProxyQueue, planProxies, proxyTypeFor } from "./import/proxies.js";
+export { PROXY_ATTEMPTS, ProxyQueue, disposeProxyQueue, planProxies, proxyQueueFor, proxyTypeFor } from "./import/proxies.js";
 export type { ProxyFailure, ProxyPlan, ProxyQueueOptions, ProxyResult } from "./import/proxies.js";
 export { BULK_REASONS, BatchRefusedError, PATTERN_BUDGET_MS, adapterFor, createBulkImport, folderAdapter, zipAdapter } from "./import/bulk/index.js";
 export type {
@@ -239,3 +239,7 @@ export {
 } from "./source-actions.js";
 export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";
+export { BROWSER_CAPTURE_LIMITS, captureBrowserPage } from "./capture/browser-capture.js";
+export type { BrowserCaptureInput, BrowserCaptureResult, ExtractedPage } from "./capture/browser-capture.js";
+export { startMediaWorker } from "./media-worker.js";
+export type { MediaWorker, ToolsUpdate } from "./media-worker.js";

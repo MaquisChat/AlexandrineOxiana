@@ -170,6 +170,19 @@ export class Repo {
     });
   }
 
+  /**
+   * A page of the project's audit events, newest first: at most `limit` events with a sequence
+   * number below `beforeSeq` (default: from the newest). Reads only.
+   */
+  async readAudit(projectId: string, opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number }> {
+    const st = this.core.state(projectId);
+    const all = (await AuditStore.read(st.audit.dir)).filter((e): e is AuditEvent => !!e);
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    const before = opts.beforeSeq;
+    const older = before === undefined ? all : all.filter((e) => e.seq < before);
+    return { events: older.slice(-limit).reverse(), total: all.length };
+  }
+
   /** Records (and audits) that the researcher acknowledged a one-time capture explanation (spec 5.1). */
   acknowledge(projectId: string, kind: AcknowledgementKind): Promise<Project> {
     return acknowledge(this.core, projectId, kind);
@@ -209,6 +222,11 @@ export class Repo {
   }
   getFieldwork(projectId: string): ReturnType<typeof getFieldwork> {
     return getFieldwork(this.core, projectId);
+  }
+
+  /** The project's collections and project tags (needs the key for an encrypted project). */
+  listCollectionsAndTags(projectId: string): Promise<{ collections: Collection[]; tags: Tag[] }> {
+    return projectCollectionsAndTags(this, projectId);
   }
 
   /** The project's governance.yaml as written ("" when the project has none: the defaults apply). */
