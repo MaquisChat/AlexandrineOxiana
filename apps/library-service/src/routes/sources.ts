@@ -3,6 +3,7 @@
  * membership), delete, attach files (drag and drop), collections and tags, confirming a field's
  * value (user evidence → user-confirmed), transcript versions, recheck.
  */
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { BIBLIO_FIELDS, SourceType, type SourceFile } from "@ao/core";
 import {
@@ -81,18 +82,13 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const patch: Obj = {};
     for (const [k, v] of Object.entries(b)) {
-      if (k === "collectionIds" || k === "tagIds") continue;
-      if (!EDITABLE.has(k)) throw badRequest(`"${k}" cannot be changed here.`);
+      if (!EDITABLE.has(k) && k !== "collectionIds" && k !== "tagIds") throw badRequest(`"${k}" cannot be changed here.`);
       patch[k] = v;
     }
-    if (b.collectionIds !== undefined || b.tagIds !== undefined) {
-      await s.repo.setMembership(projectId, sid, {
-        ...(b.collectionIds !== undefined ? { collectionIds: strArray(b, "collectionIds", { max: 1000, itemMax: 64 }) } : {}),
-        ...(b.tagIds !== undefined ? { tagIds: strArray(b, "tagIds", { max: 1000, itemMax: 64 }) } : {}),
-      });
-    }
-    if (Object.keys(patch).length) return s.repo.updateSource(projectId, sid, patch as SourcePatch);
-    return s.repo.getSource(projectId, sid);
+    if (b.collectionIds !== undefined) patch.collectionIds = [...new Set(strArray(b, "collectionIds", { max: 1000, itemMax: 64, optional: true }))];
+    if (b.tagIds !== undefined) patch.tagIds = [...new Set(strArray(b, "tagIds", { max: 1000, itemMax: 64, optional: true }))];
+    // One governed change: fields and membership together (ids checked inside it, R99).
+    return Object.keys(patch).length ? s.repo.updateSource(projectId, sid, patch as SourcePatch) : s.repo.getSource(projectId, sid);
   });
 
   app.delete("/projects/:id/sources/:sid", async (req) => {
@@ -123,17 +119,34 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     return s.repo.recheckSource(projectId, sid);
   });
 
+  // Every source of the project, as a background job with progress (`job.progress`, kind "recheck").
   app.post("/projects/:id/recheck", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    let changed = 0;
+    const jobId = randomUUID();
     const ids = s.repo.listSourceIds(projectId);
-    for (const id of ids) {
-      const before = await s.repo.getSource(projectId, id);
-      const after = await s.repo.recheckSource(projectId, id);
-      if (after.source.modifiedAt !== before.source.modifiedAt) changed++;
-    }
-    return { checked: ids.length, changed };
+    state.track(
+      (async () => {
+        let changed = 0;
+        let done = 0;
+        let failed = 0;
+        for (const id of ids) {
+          if (state.session !== s) break;
+          try {
+            const before = await s.repo.getSource(projectId, id);
+            const after = await s.repo.recheckSource(projectId, id);
+            if (after.source.modifiedAt !== before.source.modifiedAt) changed++;
+          } catch {
+            failed++;
+          }
+          done++;
+          state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total: ids.length, finished: false });
+        }
+        state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total: ids.length, changed, failed, finished: true });
+      })(),
+      "recheck",
+    );
+    return { jobId, total: ids.length };
   });
 
   app.post("/projects/:id/attach", async (req) => {
@@ -173,9 +186,13 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   app.patch("/projects/:id/collections/:cid", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
+    const cid = paramsOf(req).cid ?? "";
     const b = bodyOf(req);
-    if (!("parentId" in b)) throw badRequest('"parentId" is required (null for the top level).');
-    return s.repo.moveCollection(projectId, paramsOf(req).cid ?? "", b.parentId === null ? null : str(b, "parentId", 64));
+    if (!("parentId" in b) && b.name === undefined) throw badRequest('Give "name" and/or "parentId" (null for the top level).');
+    let c;
+    if (b.name !== undefined) c = await s.repo.renameCollection(projectId, cid, str(b, "name", 500));
+    if ("parentId" in b) c = await s.repo.moveCollection(projectId, cid, b.parentId === null ? null : str(b, "parentId", 64));
+    return c;
   });
   app.delete("/projects/:id/collections/:cid", async (req) => {
     const s = state.requireWritable();
@@ -196,6 +213,19 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const scope = optStr(b, "scope", 16) ?? "project";
     if (scope !== "project" && scope !== "workspace") throw badRequest('"scope" must be "project" or "workspace".');
     return s.repo.createTag(scope === "workspace" ? "workspace" : projectId, str(b, "name", 200), optStr(b, "color", 32));
+  });
+
+  app.patch("/projects/:id/tags/:tid", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    return s.repo.renameTag(projectId, paramsOf(req).tid ?? "", str(b, "name", 200), optStr(b, "color", 32));
+  });
+  app.delete("/projects/:id/tags/:tid", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    await s.repo.deleteTag(projectId, paramsOf(req).tid ?? "");
+    return { deleted: true };
   });
 
   // ---- transcript versions ----

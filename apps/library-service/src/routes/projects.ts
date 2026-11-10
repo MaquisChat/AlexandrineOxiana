@@ -68,8 +68,9 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const id = projectParam(ctx, req);
     const secret = str(bodyOf(req), "secret", 1024);
     await s.repo.unlockProject(id, secret);
-    // Work that waited for the key: viewing proxies and OCR of this project.
+    // Work that waited for the key: viewing proxies and OCR of this project, and its daily backup (R99 I7).
     state.resumeProject(s, id);
+    state.track(state.runScheduledBackups(id), "backup after unlock");
     state.publishState();
     return { unlocked: true };
   });
@@ -90,6 +91,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const automatic = optBool(b, "automatic");
     const keep = b.keep === undefined ? undefined : Number(b.keep);
+    if (keep !== undefined && (!Number.isInteger(keep) || keep < 1 || keep > 1000)) throw badRequest('"keep" must be a whole number from 1 to 1000.');
     const p = await setBackupSettings(s.repo, id, { ...(automatic !== undefined ? { automatic } : {}), ...(keep !== undefined ? { keep } : {}) });
     return { backups: p.backups ?? {} };
   });

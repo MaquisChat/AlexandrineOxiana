@@ -243,3 +243,4 @@ export { BROWSER_CAPTURE_LIMITS, captureBrowserPage } from "./capture/browser-ca
 export type { BrowserCaptureInput, BrowserCaptureResult, ExtractedPage } from "./capture/browser-capture.js";
 export { startMediaWorker } from "./media-worker.js";
 export type { MediaWorker, ToolsUpdate } from "./media-worker.js";
+export { LinkedContentChangedError } from "./repo/sources.js";

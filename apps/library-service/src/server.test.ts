@@ -271,12 +271,14 @@ describe("governance, audit, citations", () => {
     const got = await call({ url: `/projects/${pid}/governance` });
     expect(got.json.yaml).toBe(HIPAA_GOV);
     const looser = `${HIPAA_GOV}encryption:\n  atRest: optional\n`;
-    const r = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: looser } });
+    expect(got.json.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(got.headers.etag).toBe(`"${got.json.sha256}"`);
+    const r = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: looser, baseSha256: got.json.sha256 } });
     expect(r.status).toBe(400);
     expect(r.json.error.code).toBe("VALIDATION");
     expect(r.json.error.message).toContain("encryption.atRest");
     expect(r.json.error.message).toContain("hipaa");
-    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: looser, reason: "IRB amendment 7" } });
+    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: looser, reason: "IRB amendment 7" }, headers: { "if-match": `"${got.json.sha256}"` } });
     expect(ok.status, ok.body).toBe(200);
     expect(ok.json.violations).toContainEqual(expect.objectContaining({ control: "encryption.atRest", profile: "hipaa" }));
     expect(ok.json.loosened).toEqual([]); // the effective policy still requires encryption: only the violation is new
@@ -288,7 +290,8 @@ describe("governance, audit, citations", () => {
   it("PUT governance: invalid YAML, custom tags, alias bombs and oversize text are refused", async () => {
     await openNewLibrary();
     const pid = await newProject();
-    const put = (yaml: string) => call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml, reason: "test" } });
+    const base = (await call({ url: `/projects/${pid}/governance` })).json.sha256;
+    const put = (yaml: string) => call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml, reason: "test", baseSha256: base } });
     expect((await put("encryption: { atRest: sometimes }")).json.error.code).toBe("VALIDATION");
     expect((await put("encryption: !!js/function 'x'")).status).toBe(400);
     expect((await put("a: &a [1,1,1,1,1,1,1,1,1]\nb: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]\nc: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]\nd: [*c,*c,*c,*c,*c,*c,*c,*c,*c]\n")).status).toBe(400);
@@ -698,4 +701,281 @@ describe("entry point", () => {
     expect(again.mode).toBe("read-write");
     await again.close();
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 30 review round 1 (R98, R99)
+
+/** n small PDFs in a fresh folder (each a distinct title). */
+async function pdfFolder(n: number, name = "many"): Promise<string> {
+  const { mkdir } = await import("node:fs/promises");
+  const dir = join(tmp, name);
+  await mkdir(dir, { recursive: true });
+  for (let i = 0; i < n; i++) await writeFile(join(dir, `p${String(i).padStart(3, "0")}.pdf`), await buildPdf({ title: `Fieldwork Report Number ${i} on Delta Fisheries`, author: "Ana Souza", lines: [`Report ${i}.`] }));
+  return dir;
+}
+
+/** Resolves with the first event matching `pred`. */
+function nextEvent(pred: (e: { type: string; data: any }) => boolean): Promise<{ type: string; data: any }> {
+  return new Promise((resolve) => {
+    const off = svc.state.events.subscribe((e) => {
+      if (pred(e)) {
+        off();
+        resolve(e);
+      }
+    });
+  });
+}
+
+const batchState = async (pid: string, batchId: string) => ((await call({ url: `/projects/${pid}/imports` })).json.batches as Array<{ batchId: string; state: string }>).find((b) => b.batchId === batchId)?.state;
+
+describe("review round 1: governance PUT (R99 I1)", () => {
+  beforeEach(() => start());
+
+  it("requires a base hash; two concurrent PUTs from the same base: one succeeds, one gets 409 CONFLICT", async () => {
+    await openNewLibrary();
+    const pid = await newProject(`${OPEN_GOV}captureMethods: [manual_upload, refman_import, downloader]\n`);
+    const { sha256 } = (await call({ url: `/projects/${pid}/governance` })).json;
+    const noBase = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV } });
+    expect(noBase.status).toBe(400);
+    const a = `${OPEN_GOV}captureMethods: [manual_upload, refman_import]\n`;
+    const b = `${OPEN_GOV}captureMethods: [manual_upload, downloader]\n`;
+    const [r1, r2] = await Promise.all([
+      call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: a, baseSha256: sha256 } }),
+      call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: b, baseSha256: sha256 } }),
+    ]);
+    expect([r1.status, r2.status].sort()).toEqual([200, 409]);
+    expect([r1, r2].find((r) => r.status === 409)!.json.error.code).toBe("CONFLICT");
+  });
+
+  it("a broken governance.yaml can be repaired with a reason", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    await writeFile(join(tmp, "Lib", folder, "governance.yaml"), "encryption: [broken");
+    const { sha256 } = (await call({ url: `/projects/${pid}/governance` })).json;
+    expect((await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: sha256 } })).status).toBe(400);
+    const ok = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: sha256, reason: "repair" } });
+    expect(ok.status, ok.body).toBe(200);
+  });
+});
+
+describe("review round 1: errors, query credentials, pairing (R98, R99)", () => {
+  beforeEach(() => start());
+
+  it("credential-named query keys are refused; others such as sessionId are fine", async () => {
+    for (const k of ["token", "access_token", "api_key", "apikey", "password", "code", "authorization"]) {
+      expect((await call({ url: `/libraries?${k}=x` })).status, k).toBe(401);
+    }
+    expect((await call({ url: "/libraries?sessionId=abc&keyword=x" })).status).toBe(200);
+  });
+
+  it("the UI may re-issue a code (the old one stops working); rate limits are per origin", async () => {
+    await svc.close();
+    await start({ pairing: { confirmPerMinute: 2 } });
+    const A = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B = "moz-extension://bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const confirm = (origin: string, code: string) => svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin, "content-type": "application/json" }, payload: JSON.stringify({ code }) });
+    const first = (await call({ method: "POST", url: "/extension/pair" })).json.code as string;
+    const second = (await call({ method: "POST", url: "/extension/pair" })).json.code as string;
+    expect((await confirm(A, "999999" === second ? "888888" : "999999")).statusCode).toBe(401);
+    expect((await confirm(A, "999999" === second ? "888888" : "999999")).statusCode).toBe(401);
+    expect((await confirm(A, second)).statusCode).toBe(429); // A is limited…
+    if (first !== second) expect((await confirm(B, first)).statusCode).toBe(401); // …B is not, and the first code is void
+    expect((await confirm(B, second)).statusCode).toBe(200);
+  });
+
+  it("the pairing preflight (OPTIONS) is allowed from an extension origin", async () => {
+    const r = await svc.app.inject({ method: "OPTIONS", url: "/extension/pair/confirm", headers: { origin: "chrome-extension://cccccccccccccccccccccccccccccccc", "access-control-request-method": "POST" } });
+    expect(r.statusCode).toBe(204);
+    expect(r.headers["access-control-allow-origin"]).toBe("chrome-extension://cccccccccccccccccccccccccccccccc");
+    const other = await svc.app.inject({ method: "OPTIONS", url: "/libraries", headers: { origin: "chrome-extension://cccccccccccccccccccccccccccccccc" } });
+    expect(other.statusCode).toBe(403);
+  });
+
+  it("once shutting down, new requests are refused with 503", async () => {
+    const closing = svc.close();
+    const r = await svc.app.inject({ method: "GET", url: "/libraries", headers: auth }).catch(() => ({ statusCode: 503 }));
+    expect(r.statusCode).toBe(503);
+    await closing;
+  });
+});
+
+describe("review round 1: batches (R99 I3, I4)", () => {
+  beforeEach(() => start());
+
+  it("cancel, then resume through resumeBatch; finished → 409; /jobs lists only live work", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(12);
+    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await progressed;
+    expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("cancelled");
+    expect((await call({ url: `/jobs?projectId=${pid}` })).json.imports).toEqual([]);
+    expect((await call({ method: "POST", url: `/imports/${batchId}/pause` })).status).toBe(409);
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(12);
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(409);
+    expect((await call({ url: `/jobs?projectId=${pid}` })).json.imports).toEqual([]);
+  });
+
+  it("lock mid-import, unlock, resume: every item imported once", async () => {
+    await openNewLibrary();
+    const pid = await newProject(OPEN_GOV.replace("atRest: optional", "atRest: required"), true);
+    const dir = await pdfFolder(10);
+    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await progressed;
+    await call({ method: "POST", url: `/projects/${pid}/lock` });
+    await svc.state.idle();
+    await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
+    expect(["failed", "paused", "interrupted"]).toContain(await batchState(pid, batchId));
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(10);
+  });
+
+  it("shutdown pauses running batches (never cancels): after reopening the batch is paused and resumable", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(15);
+    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await progressed;
+    await svc.close();
+    await start();
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    expect(await batchState(pid, batchId)).toBe("paused");
+    expect((await call({ method: "POST", url: `/imports/${batchId}/resume` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(15);
+  });
+});
+
+describe("review round 1: library move during an import (R99 I5)", () => {
+  it("60 PDFs importing + move: the batch continues in the new library; nothing lost or doubled; token status", async () => {
+    const clock = { now: new Date("2026-11-10T10:00:00Z") };
+    await start({ now: () => clock.now });
+    const oldPath = await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(60);
+    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 5);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await progressed;
+    const dest = join(tmp, "Moved");
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(moved.status).toBe(200);
+    const lines = moved.body.trim().split("\n").map((l: string) => JSON.parse(l));
+    const done = lines.at(-1);
+    expect(done.done, moved.body).toBe(true);
+    expect(done.result.newRoot).toBe(dest);
+    expect((await call({ url: "/libraries" })).json.current.mode).toBe("read-write");
+    // The batch was paused for the move and resumed in the new library.
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    const all = (await call({ url: `/projects/${pid}/sources?limit=500` })).json;
+    expect(all.total).toBe(60);
+    expect(svc.state.session!.lib.root).toBe(dest);
+    // The old copy's token can be fetched again, and expires after 15 minutes.
+    const status = await call({ url: "/libraries/move/status" });
+    expect(status.json.pending).toMatchObject({ oldRoot: oldPath, newRoot: dest, confirmToken: done.result.confirmToken });
+    clock.now = new Date(clock.now.getTime() + 16 * 60_000);
+    expect((await call({ url: "/libraries/move/status" })).json.pending).toBeNull();
+    expect((await call({ method: "POST", url: "/libraries/move/delete-old", body: { token: done.result.confirmToken } })).status).toBe(400);
+  }, 180_000);
+});
+
+describe("review round 1: backups on open and unlock (R99 I7)", () => {
+  it("backupIfDue runs when a library opens and when a project is unlocked", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const plain = await newProject(OPEN_GOV, false, "Plain");
+    const enc = await newProject(OPEN_GOV.replace("atRest: optional", "atRest: required"), true, "Sealed");
+    await call({ method: "POST", url: "/libraries/close" });
+    await call({ method: "POST", url: "/libraries/open", body: { path } });
+    await svc.state.idle();
+    expect(await listBackups(svc.state.session!.repo, plain)).toHaveLength(1);
+    expect(await listBackups(svc.state.session!.repo, enc)).toHaveLength(0); // locked: not yet
+    await call({ method: "POST", url: `/projects/${enc}/unlock`, body: { secret: PASS } });
+    await svc.state.idle();
+    expect(await listBackups(svc.state.session!.repo, enc)).toHaveLength(1);
+  });
+});
+
+describe("review round 1: smaller route fixes (R99 minors)", () => {
+  beforeEach(() => start());
+
+  it("tags renamed and deleted, collections renamed", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const tag = (await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "kin" } })).json;
+    const col = (await call({ method: "POST", url: `/projects/${pid}/collections`, body: { name: "A" } })).json;
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/tags/${tag.id}`, body: { name: "kinship" } })).json.name).toBe("kinship");
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/collections/${col.id}`, body: { name: "Delta" } })).json.name).toBe("Delta");
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/tags/${tag.id}` })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/tags` })).json.tags).toEqual([]);
+  });
+
+  it("PATCH source with fields and membership is one governed change", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const sid = (await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } })).json.items[0].sourceId;
+    const tag = (await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "kin" } })).json;
+    const before = (await call({ url: `/projects/${pid}/audit?limit=1000` })).json.total as number;
+    const r = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}`, body: { issued: "2002", tagIds: [tag.id] } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.source).toMatchObject({ issued: "2002", tagIds: [tag.id] });
+    expect((await call({ url: `/projects/${pid}/audit?limit=1000` })).json.total).toBe(before + 1);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}`, body: { issued: "2003", tagIds: ["01ZZZZZZZZZZZZZZZZZZZZZZZZ"] } })).status).toBe(404);
+    expect((await call({ url: `/projects/${pid}/sources/${sid}` })).json.source.issued).toBe("2002");
+  });
+
+  it("the project-wide recheck runs as a job with progress", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    const finished = nextEvent((e) => e.type === "job.progress" && e.data.kind === "recheck" && e.data.finished === true);
+    const r = await call({ method: "POST", url: `/projects/${pid}/recheck` });
+    expect(r.status).toBe(200);
+    expect(r.json.jobId).toEqual(expect.any(String));
+    expect((await finished).data).toMatchObject({ jobId: r.json.jobId, done: 1, total: 1 });
+  });
+
+  it("watches restarted after removing one keep reporting events", async () => {
+    await svc.close();
+    await start({ watchStabilityMs: 50 });
+    await openNewLibrary();
+    const pid = await newProject();
+    const { mkdir } = await import("node:fs/promises");
+    const keep = join(tmp, "watch-keep");
+    const drop = join(tmp, "watch-drop");
+    await mkdir(keep);
+    await mkdir(drop);
+    expect((await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: keep } })).status).toBe(200);
+    const w2 = (await call({ method: "POST", url: `/projects/${pid}/watched-folders`, body: { dir: drop } })).json;
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/watched-folders/${w2.id}` })).status).toBe(200);
+    const seen = nextEvent((e) => e.type === "job.progress" && e.data.kind === "watch" && e.data.event?.kind === "imported");
+    await writeFile(join(keep, "dropped.pdf"), await buildPdf({ title: "Dropped Later Into The Folder" }));
+    expect((await seen).data.projectId).toBe(pid);
+  }, 60_000);
+
+  it("library errors map to their codes; a TypeError is 500 INTERNAL without its message", async () => {
+    const { toApiError } = await import("./errors.js");
+    const lib = await import("@ao/library");
+    const t = toApiError(new TypeError("secret detail /home/x/y"));
+    expect([t.status, t.code, t.message.includes("secret")]).toEqual([500, "INTERNAL", false]);
+    expect(toApiError(new lib.InvalidInputError("bad")).status).toBe(400);
+    expect(toApiError(new lib.GovernanceConflictError()).status).toBe(409);
+    expect(toApiError(new lib.KeyNotAvailableError("k")).status).toBe(423);
+    expect(toApiError(new lib.PathEscapeError("x")).status).toBe(400);
+    expect(toApiError(new lib.ExportDestinationError("x")).status).toBe(400);
+    expect(toApiError(new lib.RestoreError("x")).status).toBe(400);
+  });
 });

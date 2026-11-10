@@ -45,6 +45,8 @@ export interface ServiceOptions {
   now?: () => Date;
   backupCheckMs?: number;
   pairing?: PairingOptions;
+  /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
+  watchStabilityMs?: number;
 }
 
 export interface LibraryService {
@@ -98,22 +100,29 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     autoStartWorker: opts.autoStartWorker ?? opts.worker === undefined,
     now: opts.now ?? (() => new Date()),
     backupCheckMs: opts.backupCheckMs ?? 60 * 60_000,
+    ...(opts.watchStabilityMs !== undefined ? { watchStabilityMs: opts.watchStabilityMs } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
   await pairing.load();
   let port: number | undefined;
+  /** Set when shutdown starts: new requests are refused before the library is closed (R98). */
+  let closingNow = false;
 
   const fail = (reply: FastifyReply, e: ApiError) => reply.status(e.status).send(errorBody(e, state.roots));
 
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
+    if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
     // 1. DNS rebinding: only our own host names, on our port.
     if (!hostAllowed(req.headers.host, port)) return fail(reply, new ApiError(403, "FORBIDDEN", "This host name is not allowed."));
     // 2. Origin: the desktop shell, or a paired extension (an unpaired one only to confirm pairing).
     const origin = req.headers.origin;
     const route = `${req.method} ${req.routeOptions.url ?? ""}`;
+    // A preflight has no route of its own: it is judged by the route it asks for.
+    const path = req.url.split("?")[0] ?? "";
+    const preflightOpen = req.method === "OPTIONS" && OPEN_ROUTES.has(`POST ${path}`);
     if (origin !== undefined) {
-      const ok = SHELL_ORIGINS.has(origin) || pairing.isPairedOrigin(origin) || (OPEN_ROUTES.has(route) && isExtensionOrigin(origin));
+      const ok = SHELL_ORIGINS.has(origin) || pairing.isPairedOrigin(origin) || ((OPEN_ROUTES.has(route) || preflightOpen) && isExtensionOrigin(origin));
       if (!ok) return fail(reply, new ApiError(403, "FORBIDDEN", "Requests from this origin are not allowed."));
       reply.header("Access-Control-Allow-Origin", origin).header("Vary", "Origin");
       if (req.method === "OPTIONS") {
@@ -178,7 +187,9 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
       return port;
     },
     close() {
+      closingNow = true;
       closing ??= (async () => {
+        // Requests are refused from here on; then running work is paused and the library closed.
         await state.shutdown();
         await app.close();
       })();

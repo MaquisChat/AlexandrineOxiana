@@ -17,6 +17,9 @@ export type { ConsentInput, ParticipantInput, SessionInput } from "./fieldwork.j
 export {
   GovernanceViolationError,
   InvalidInputError,
+  DestroyedParentError,
+  MissingParentError,
+  ProxyRecordRefusedError,
   ImmutableProvenanceError,
   NotFoundError,
   PolicyDeniedError,

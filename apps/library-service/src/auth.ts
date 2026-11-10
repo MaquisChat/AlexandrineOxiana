@@ -40,13 +40,13 @@ export function bearerOf(header: string | string[] | undefined): string | undefi
   return m?.[1];
 }
 
-/** Query-string keys that look like a credential: refused outright (R96). */
+/** Query-string keys that carry a credential: refused outright (R96, exact names per R98). */
+export const CREDENTIAL_QUERY_KEYS: ReadonlySet<string> = new Set(["access_token", "token", "auth", "authorization", "key", "apikey", "api_key", "secret", "password", "passphrase", "code", "bearer"]);
+
 export function queryCarriesToken(url: string): boolean {
   const q = url.indexOf("?");
   if (q < 0) return false;
-  for (const key of new URLSearchParams(url.slice(q + 1)).keys()) {
-    if (/token|auth|key|secret|pass|bearer|session/i.test(key)) return true;
-  }
+  for (const key of new URLSearchParams(url.slice(q + 1)).keys()) if (CREDENTIAL_QUERY_KEYS.has(key.toLowerCase())) return true;
   return false;
 }
 
@@ -93,7 +93,8 @@ export class Pairing {
   private code: { value: string; expires: number; attempts: number } | undefined;
   private paired: PairedExtension[] = [];
   private loaded = false;
-  private readonly confirms: number[] = [];
+  /** Confirm calls per origin in the last minute (R98: limited per origin). */
+  private readonly confirms = new Map<string, number[]>();
   private readonly ttlMs: number;
   private readonly maxAttempts: number;
   private readonly perMinute: number;
@@ -115,7 +116,7 @@ export class Pairing {
     this.loaded = true;
   }
 
-  /** A new 6-digit code (any earlier code stops working). */
+  /** A new 6-digit code; the desktop app may ask again at any time (any earlier code stops working). */
   newCode(): { code: string; expiresAt: string } {
     const value = String(randomInt(0, 1_000_000)).padStart(6, "0");
     const expires = this.now() + this.ttlMs;
@@ -123,12 +124,17 @@ export class Pairing {
     return { code: value, expiresAt: new Date(expires).toISOString() };
   }
 
-  /** Whether another confirm call is allowed now (sliding one-minute window). */
-  rateLimited(): boolean {
+  /** Whether another confirm call from `origin` is allowed now (sliding one-minute window). */
+  rateLimited(origin: string): boolean {
     const t = this.now();
-    while (this.confirms.length && t - this.confirms[0]! > 60_000) this.confirms.shift();
-    if (this.confirms.length >= this.perMinute) return true;
-    this.confirms.push(t);
+    for (const [o, list] of this.confirms) {
+      while (list.length && t - list[0]! > 60_000) list.shift();
+      if (!list.length) this.confirms.delete(o);
+    }
+    const list = this.confirms.get(origin) ?? [];
+    if (list.length >= this.perMinute) return true;
+    list.push(t);
+    this.confirms.set(origin, list);
     return false;
   }
 

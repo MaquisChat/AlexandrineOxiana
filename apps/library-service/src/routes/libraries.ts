@@ -25,10 +25,8 @@ import {
 } from "@ao/library";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
+import { ndjsonWriter, sseWriter } from "../streams.js";
 import { bodyOf, queryOf, str, strArray, type Ctx } from "./util.js";
-
-/** Old library folders awaiting deletion after a move, by the move's single-use token. */
-const moveTokens = new Map<string, string>();
 
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
   const s = ctx.state.session;
@@ -37,17 +35,20 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
 }
 
 /** Starts a streamed response (NDJSON or SSE) with the headers the hooks set (CORS). */
-function stream(reply: FastifyReply, contentType: string): (line: string) => boolean {
+function startStream(reply: FastifyReply, contentType: string): void {
   reply.hijack();
   const headers: Record<string, string> = { "content-type": contentType, "cache-control": "no-store", "x-content-type-options": "nosniff" };
   for (const [k, v] of Object.entries(reply.getHeaders())) if (typeof v === "string") headers[k] = v;
   reply.raw.writeHead(200, headers);
-  return (line: string) => reply.raw.write(line);
 }
 
-function ndjsonError(ctx: Ctx, err: unknown): string {
-  return `${JSON.stringify(errorBody(toApiError(err), ctx.state.roots))}\n`;
+/** An NDJSON stream whose writes wait for the client to drain (R99). */
+function ndjson(reply: FastifyReply): (value: unknown) => Promise<void> {
+  startStream(reply, "application/x-ndjson");
+  return ndjsonWriter(reply.raw);
 }
+
+const ndjsonError = (ctx: Ctx, err: unknown) => errorBody(toApiError(err), ctx.state.roots);
 
 const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 function absPath(o: Record<string, unknown>, key: string): string {
@@ -100,13 +101,13 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       roots = [...new Set([...(known?.lastKnownPaths ?? []).map((p) => dirname(p)), ...(await defaultSearchRoots(await defaultLocationEnv()))])];
     }
     const ac = new AbortController();
-    const write = stream(reply, "application/x-ndjson");
+    const write = ndjson(reply);
     reply.raw.on("close", () => ac.abort());
     try {
-      for await (const f of findLibrary(libraryId, roots, { signal: ac.signal })) write(`${JSON.stringify({ found: f })}\n`);
-      write(`${JSON.stringify({ done: true })}\n`);
+      for await (const f of findLibrary(libraryId, roots, { signal: ac.signal })) await write({ found: f });
+      await write({ done: true });
     } catch (err) {
-      if (!ac.signal.aborted) write(ndjsonError(ctx, err));
+      if (!ac.signal.aborted) await write(ndjsonError(ctx, err));
     }
     reply.raw.end();
   });
@@ -142,16 +143,20 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     };
   });
 
-  // Copies, verifies and switches to `dest`, streaming progress as NDJSON; the service then works on the new copy.
+  // Copies, verifies and switches to `dest`, streaming progress as NDJSON; the service then works on
+  // the new copy. Nothing writes to the library meanwhile (R99 I5): imports are paused (the move is
+  // refused if one cannot be), watches, queues and the backup scheduler stopped; afterwards they
+  // start on the library now open, and the paused imports resume there.
   app.post("/libraries/move", async (req: FastifyRequest, reply: FastifyReply) => {
     const s = state.requireWritable();
     const b = bodyOf(req);
     const dest = absPath(b, "dest");
     const excludeProjectIds = strArray(b, "excludeProjectIds", { optional: true, max: 10_000, itemMax: 64 });
+    const paused = await state.quiesce(s); // 409 before the stream starts when an import cannot pause
     state.roots.add(dest);
-    const write = stream(reply, "application/x-ndjson");
+    const write = ndjson(reply);
+    const oldRoot = s.lib.root;
     try {
-      const oldRoot = s.lib.root;
       const r = await executeMove(s.lib, dest, {
         deps: state.deps,
         env: await defaultLocationEnv(),
@@ -159,25 +164,40 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         sourceRepo: s.repo,
         ...(s.index ? { index: s.index } : {}),
         tz: state.tz,
-        onProgress: (p) => void write(`${JSON.stringify({ progress: p })}\n`),
+        onProgress: (p) => write({ progress: p }),
       });
-      moveTokens.set(r.confirmToken, oldRoot);
       // The library now lives at the destination: switch to it.
       await state.closeLibrary();
       await state.adopt(await openLibrary(r.newRoot, state.deps, { onLockLost: () => state.publishState() }));
-      write(`${JSON.stringify({ done: true, result: { newRoot: r.newRoot, confirmToken: r.confirmToken, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) } })}\n`);
+      const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
+      state.resumeBatches(paused);
+      await write({
+        done: true,
+        result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) },
+      });
     } catch (err) {
-      write(ndjsonError(ctx, err));
+      // Not moved: the old library carries on as before.
+      if (state.session === s) {
+        state.activate(s);
+        state.resumeBatches(paused);
+      }
+      await write(ndjsonError(ctx, err));
     }
     reply.raw.end();
   });
 
+  // The last move's token (single use, 15 minutes), e.g. after the move's stream was cut off.
+  app.get("/libraries/move/status", async () => {
+    const m = state.pendingMove();
+    return { pending: m ?? null };
+  });
+
   app.post("/libraries/move/delete-old", async (req) => {
     const token = str(bodyOf(req), "token", 256);
-    const oldRoot = moveTokens.get(token);
-    if (!oldRoot) throw new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires).");
-    const r = await deleteOldCopy(oldRoot, token, { deps: state.deps, ...(state.session ? { destRepo: state.session.repo } : {}), tz: state.tz });
-    moveTokens.delete(token);
+    const m = state.pendingMove();
+    if (!m || m.confirmToken !== token) throw new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires after 15 minutes).");
+    const r = await deleteOldCopy(m.oldRoot, token, { deps: state.deps, ...(state.session ? { destRepo: state.session.repo } : {}), tz: state.tz });
+    state.forgetMove();
     return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
   });
 
@@ -218,16 +238,17 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   app.get("/events", async (_req: FastifyRequest, reply: FastifyReply) => {
     const s = state.session;
     if (s) await state.projectWarnings(s).catch(() => {});
-    const write = stream(reply, "text/event-stream");
-    write(sseFrame({ type: "library.state", data: state.libraryState() }));
-    const off = state.events.subscribe((e) => void write(sseFrame(e)));
-    const beat = setInterval(() => write(": keep-alive\n\n"), 25_000);
+    startStream(reply, "text/event-stream");
+    // A client that falls too far behind is dropped (R99); it reconnects and gets a fresh state.
+    const send = sseWriter(reply.raw);
+    send(sseFrame({ type: "library.state", data: state.libraryState() }));
+    const off = state.events.subscribe((e) => void send(sseFrame(e)));
+    const beat = setInterval(() => send(": keep-alive\n\n"), 25_000);
     beat.unref?.();
-    const done = () => {
+    // The response closes when the client goes away (the request's own "close" fires once it is read).
+    reply.raw.on("close", () => {
       off();
       clearInterval(beat);
-    };
-    // The response closes when the client goes away (the request's own "close" fires once it is read).
-    reply.raw.on("close", done);
+    });
   });
 }

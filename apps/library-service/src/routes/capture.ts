@@ -159,7 +159,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   });
 
   app.post("/extension/pair/confirm", async (req) => {
-    if (pairing.rateLimited()) throw new ApiError(429, "RATE_LIMITED", "Too many attempts. Wait a minute, then try again.");
+    if (pairing.rateLimited(req.headers.origin ?? "")) throw new ApiError(429, "RATE_LIMITED", "Too many attempts. Wait a minute, then try again.");
     const code = bodyOf(req).code;
     const token = await pairing.confirm(typeof code === "string" ? code : "", req.headers.origin ?? "");
     if (!token) throw new ApiError(401, "UNAUTHORIZED", "That code is not valid. Ask the desktop app for a new one.");

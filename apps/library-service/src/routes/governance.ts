@@ -2,7 +2,8 @@
  * Governance (spec 6; R96): the project's governance.yaml as text. PUT validates it with the core
  * schema after a safe YAML pre-parse (no custom tags, at most 64 KB, alias expansion capped), and
  * returns the effective policy's violations; a change that loosens the rules needs a `reason`,
- * which is recorded on the audit event (Repo.setGovernance).
+ * which is recorded on the audit event (Repo.setGovernance). An edit names the version it was made
+ * from (If-Match / `baseSha256`, the sha256 GET returns); a file changed since → 409 CONFLICT.
  */
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
@@ -38,17 +39,19 @@ export function safeYamlCheck(text: string): void {
 export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
-  app.get("/projects/:id/governance", async (req) => {
+  app.get("/projects/:id/governance", async (req, reply) => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
-    const yaml = await s.repo.getGovernanceText(projectId);
+    const { yaml, sha256 } = await s.repo.getGovernance(projectId);
+    // The version an edit is made from: send it back as If-Match (or `baseSha256`).
+    void reply.header("ETag", `"${sha256}"`);
     let violations: unknown[] = [];
     try {
       violations = effectivePolicy(parseGovernance(yaml)).violations;
     } catch {
       // unreadable rules: every request is denied; the text is still shown for fixing
     }
-    return { yaml, violations };
+    return { yaml, sha256, violations };
   });
 
   app.put("/projects/:id/governance", async (req) => {
@@ -57,9 +60,14 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const yaml = str(b, "yaml", 2 * GOVERNANCE_MAX_BYTES);
     const reason = optStr(b, "reason", 2000);
+    const ifMatch = typeof req.headers["if-match"] === "string" ? req.headers["if-match"].replace(/^W\//, "").replace(/"/g, "").trim() : undefined;
+    const baseSha256 = ifMatch || optStr(b, "baseSha256", 64);
+    if (!baseSha256 || !/^[0-9a-f]{64}$/.test(baseSha256)) {
+      throw badRequest("Say which version of the rules this change was made from: the sha256 from GET, as If-Match or baseSha256.");
+    }
     safeYamlCheck(yaml);
-    const r = await s.repo.setGovernance(projectId, yaml, reason ? { reason } : {});
+    const r = await s.repo.setGovernance(projectId, yaml, { baseSha256, ...(reason ? { reason } : {}) });
     state.publishState();
-    return { violations: r.violations, loosened: r.loosened };
+    return { violations: r.violations, loosened: r.loosened, sha256: r.sha256 };
   });
 }

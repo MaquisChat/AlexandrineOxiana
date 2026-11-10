@@ -15,12 +15,10 @@ import {
   zoteroWebAdapter,
   zoteroWebSince,
   proxyQueueFor,
-  scrubPaths,
-  type BatchHandle,
   type ImportSourceAdapter,
 } from "@ao/library";
-import { badRequest, notFound } from "../errors.js";
-import type { ServiceState, Session } from "../state.js";
+import { ApiError, badRequest, notFound } from "../errors.js";
+import type { ServiceState } from "../state.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
 
 const PATH_KINDS = new Set(["folder", "zip", "bibtex", "ris", "csl-json", "zotero-rdf", "calibre", "zotero-local"]);
@@ -49,20 +47,6 @@ function adapterSpec(o: Obj | undefined): AdapterSpec {
 function approvals(o: Obj | undefined): { folders?: string[]; files?: string[] } {
   if (!o) return {};
   return { folders: strArray(o, "folders", { optional: true, max: 100 }), files: strArray(o, "files", { optional: true, max: 1000 }) };
-}
-
-/** Follows a running batch: progress and its end as `import.progress` events. */
-export function followBatch(state: ServiceState, s: Session, projectId: string, h: BatchHandle): void {
-  s.batches.set(h.batchId, { projectId, handle: h });
-  state.track(
-    (async () => {
-      for await (const p of h.progress) state.events.publish("import.progress", { batchId: h.batchId, projectId, state: "running", done: p.done, total: p.total });
-      const r = await h.done;
-      state.events.publish("import.progress", { batchId: h.batchId, projectId, state: r.state, counts: r.counts });
-      state.publishState();
-    })().catch((err: unknown) => state.events.publish("import.progress", { batchId: h.batchId, projectId, state: "failed", error: state.describe(err) })),
-    "import",
-  );
 }
 
 /** The project a batch belongs to: one this service runs, else found among the projects' batches. */
@@ -105,7 +89,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const h = spec.web
       ? await startZoteroWebImport({ repo: s.repo, http: s.http, index: s.index, proxies: proxyQueueFor(s.repo) }, projectId, { libraryType: spec.libraryType, libraryId: spec.libraryId, ...(spec.full ? { full: true } : {}) }, options)
       : await s.bulk.startBatch(projectId, spec.adapter, options);
-    followBatch(state, s, projectId, h);
+    state.followBatch(s, projectId, h);
     return { batchId: h.batchId };
   });
 
@@ -115,6 +99,8 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     return { batches: await s.bulk.listBatches(projectId) };
   });
 
+  // A running batch is paused, resumed or cancelled in place; one that is not running (cancelled,
+  // paused, failed or interrupted) is resumed from its record; a finished one cannot be (R99 I3).
   for (const action of ["pause", "resume", "cancel"] as const) {
     app.post(`/imports/:batchId/${action}`, async (req) => {
       const s = state.requireWritable();
@@ -125,10 +111,11 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
         running.handle[action]();
         return { batchId, action };
       }
-      if (action !== "resume") throw notFound("A running import with that id");
-      // A batch interrupted earlier (another run of the app): resumed from its record.
+      const shown = (await s.bulk.listBatches(projectId)).find((b) => b.batchId === batchId)?.state;
+      if (action !== "resume") throw new ApiError(409, "CONFLICT", "This import is not running.", shown);
+      if (shown === "finished" || shown === "undone") throw new ApiError(409, "CONFLICT", "This import has already finished.", shown);
       const h = await s.bulk.resumeBatch(projectId, batchId);
-      followBatch(state, s, projectId, h);
+      state.followBatch(s, projectId, h);
       return { batchId, action };
     });
   }
@@ -165,7 +152,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const participantIds = strArray(b, "participantIds", { optional: true, max: 1000, itemMax: 64 });
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput & { researcherName?: string };
     const h = await s.bulk.importDeviceFolder(projectId, dir, { ...options, ...(sessionId ? { sessionId } : {}), ...(participantIds.length ? { participantIds } : {}) });
-    followBatch(state, s, projectId, h);
+    state.followBatch(s, projectId, h);
     return { batchId: h.batchId };
   });
 
@@ -184,12 +171,7 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     if (!isAbsolute(dir)) throw badRequest('"dir" must be an absolute path.');
     const options = (optObj(b, "options") ?? {}) as Parameters<typeof addWatchedFolder>[3];
     const w = await addWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, dir, options);
-    const watch = watchFolder(
-      { repo: s.repo, http: s.http, lib: s.lib, proxies: proxyQueueFor(s.repo), onEvent: (e) => state.events.publish("job.progress", { kind: "watch", projectId, event: JSON.parse(scrubPaths(JSON.stringify(e), state.roots)) as unknown }) },
-      projectId,
-      dir,
-      options,
-    );
+    const watch = watchFolder(state.watchDeps(s, projectId), projectId, dir, options);
     s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), watch]);
     return w;
   });
@@ -202,14 +184,8 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const gone = known.find((w) => w.id === wid);
     if (!gone) throw notFound("That watched folder");
     await removeWatchedFolder({ repo: s.repo, lib: s.lib }, projectId, wid);
-    // Restart the project's watches from what is left.
-    await Promise.allSettled((s.watches.get(projectId) ?? []).map((w) => w.stop()));
-    s.watches.delete(projectId);
-    for (const w of known) {
-      if (w.id === wid || !w.dir) continue;
-      const watch = watchFolder({ repo: s.repo, http: s.http, lib: s.lib, proxies: proxyQueueFor(s.repo) }, projectId, w.dir, w.options);
-      s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), watch]);
-    }
+    // The project's other watches start again from what is left, with their events (R99).
+    await state.startWatches(s, projectId);
     return { removed: true };
   });
 }

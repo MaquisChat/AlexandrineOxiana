@@ -26,6 +26,8 @@ import {
   type BulkImport,
   type Deps,
   type FolderWatch,
+  type BatchResult,
+  type WatchDeps,
   type Library,
   type Repo,
   type ToolsUpdate,
@@ -87,7 +89,19 @@ export interface StateOptions {
   /** How often the backup scheduler checks for due backups (default 1 hour). */
   backupCheckMs: number;
   log: { info(o: object, msg?: string): void; warn(o: object, msg?: string): void };
+  watchStabilityMs?: number;
 }
+
+/** A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99). */
+export interface PendingMove {
+  oldRoot: string;
+  newRoot: string;
+  confirmToken: string;
+  expiresAt: string;
+}
+export const MOVE_TOKEN_TTL_MS = 15 * 60_000;
+/** How long a running batch may take to reach a safe point when it is paused for shutdown or a move. */
+export const SUSPEND_TIMEOUT_MS = 60_000;
 
 export interface BackupRun {
   projectId: string;
@@ -114,6 +128,7 @@ export class ServiceState {
   /** Roots of libraries seen this run: paths inside them are shown library-relative in errors. */
   readonly roots = new Set<string>();
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  private move: PendingMove | undefined;
 
   constructor(readonly opts: StateOptions) {}
 
@@ -188,53 +203,165 @@ export class ServiceState {
       await lib.close().catch(() => {});
       throw err;
     }
-    const http = new HttpClient({ libraryRoot: lib.root });
-    const proxies = proxyQueueFor(repo);
-    const ocr = ocrQueueFor(repo);
     const s: Session = {
       lib,
       repo,
       ring,
       index,
-      http,
-      bulk: index ? createBulkImport({ repo, http, index, proxies, queueOcr: (p, sid) => void this.track(ocr.enqueue(p, sid), "OCR queueing") }) : undefined,
+      http: new HttpClient({ libraryRoot: lib.root }),
+      bulk: undefined,
       watches: new Map(),
       batches: new Map(),
       moveTokens: new Map(),
       workerClient: undefined,
       unsubscribe: [],
     };
+    this.session = s;
+    this.activate(s);
+    return s;
+  }
+
+  /**
+   * Starts the open library's background work: Bulk Import with the library's queues (job events
+   * subscribed), the worker attached (pending work resumed), watched folders, a backup check and the
+   * daily scheduler. Run at open, and again after a move that failed after `quiesce`.
+   */
+  activate(s: Session): void {
+    for (const u of s.unsubscribe.splice(0)) u();
+    const proxies = proxyQueueFor(s.repo);
+    const ocr = ocrQueueFor(s.repo);
+    s.bulk = s.index
+      ? createBulkImport({
+          repo: s.repo,
+          http: s.http,
+          index: s.index,
+          proxies,
+          queueOcr: async (p, sid) => {
+            // Awaited by the batch: the job is recorded before the batch moves on (and before it can be paused).
+            await ocr.enqueue(p, sid);
+          },
+        }) : undefined;
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
     s.unsubscribe.push(ocr.onResult((r) => this.events.publish("job.progress", { kind: "ocr", ...r })));
-    this.session = s;
-
-    if (lib.mode === "read-write") {
-      for (const p of repo.listProjects()) this.track(this.startWatches(s, p.id), "watched folders");
+    if (s.lib.mode === "read-write") {
+      for (const p of s.repo.listProjects()) this.track(this.startWatches(s, p.id), "watched folders");
+      // A backup that came due while the app was closed is made now (R99 I7).
+      this.track(this.runScheduledBackups(), "backups at open");
     }
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
     this.startBackupScheduler();
     this.publishState();
-    return s;
   }
 
-  private async startWatches(s: Session, projectId: string): Promise<void> {
-    const watches = await startWatchedFolders(
-      {
-        repo: s.repo,
-        http: s.http,
-        lib: s.lib,
-        proxies: proxyQueueFor(s.repo),
-        onEvent: (e) => this.events.publish("job.progress", { kind: "watch", projectId, event: JSON.parse(scrubPaths(JSON.stringify(e), this.roots)) }),
-        onWarning: (w) => this.opts.log.warn({ warning: scrubPaths(w, this.roots) }, "watched folders"),
-      },
-      projectId,
-    );
+  /** What every watched folder of the open library is started with (events included, R99). */
+  watchDeps(s: Session, projectId: string): WatchDeps & { onWarning: (w: string) => void } {
+    return {
+      repo: s.repo,
+      http: s.http,
+      lib: s.lib,
+      proxies: proxyQueueFor(s.repo),
+      ...(this.opts.watchStabilityMs !== undefined ? { stabilityMs: this.opts.watchStabilityMs, pollMs: Math.max(50, this.opts.watchStabilityMs) } : {}),
+      onEvent: (e) => this.events.publish("job.progress", { kind: "watch", projectId, event: JSON.parse(scrubPaths(JSON.stringify(e), this.roots)) as unknown }),
+      onWarning: (w) => this.opts.log.warn({ warning: scrubPaths(w, this.roots) }, "watched folders"),
+    };
+  }
+
+  /** Starts the project's watched folders (all of them; replaces any running). */
+  async startWatches(s: Session, projectId: string): Promise<void> {
+    await this.stopWatches(s, projectId);
+    const watches = await startWatchedFolders(this.watchDeps(s, projectId), projectId);
     if (this.session !== s) {
       await Promise.all(watches.map((w) => w.stop()));
       return;
     }
     s.watches.set(projectId, [...(s.watches.get(projectId) ?? []), ...watches]);
+  }
+
+  async stopWatches(s: Session, projectId?: string): Promise<void> {
+    const ids = projectId ? [projectId] : [...s.watches.keys()];
+    await Promise.allSettled(ids.flatMap((id) => s.watches.get(id) ?? []).map((w) => w.stop()));
+    for (const id of ids) s.watches.delete(id);
+  }
+
+  // ---- import batches ------------------------------------------------------------------
+
+  /** Follows a running batch: progress and its end as `import.progress`; it leaves the registry when it ends (R99 I3). */
+  followBatch(s: Session, projectId: string, h: BatchHandle): void {
+    s.batches.set(h.batchId, { projectId, handle: h });
+    this.track(
+      (async () => {
+        try {
+          for await (const p of h.progress) this.events.publish("import.progress", { batchId: h.batchId, projectId, state: "running", done: p.done, total: p.total });
+          const r = await h.done;
+          this.events.publish("import.progress", { batchId: h.batchId, projectId, state: r.state, counts: r.counts });
+        } catch (err) {
+          this.events.publish("import.progress", { batchId: h.batchId, projectId, state: "failed", error: this.describe(err) });
+        } finally {
+          if (s.batches.get(h.batchId)?.handle === h) s.batches.delete(h.batchId);
+          if (this.session === s) this.publishState();
+        }
+      })(),
+      "import",
+    );
+  }
+
+  /**
+   * Pauses every running batch at its next safe point and leaves it `paused` on disk (R99 I4/I5).
+   * Returns the batches paused; throws when one did not reach a safe point in time.
+   */
+  async suspendBatches(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
+    const running = [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b }));
+    const results = await Promise.all(
+      running.map(async (b) => ({ b, r: await withTimeout(b.handle.suspend().catch(() => undefined as BatchResult | undefined), SUSPEND_TIMEOUT_MS).catch(() => undefined) })),
+    );
+    const stuck = results.filter((x) => x.r === undefined && s.batches.has(x.b.batchId));
+    if (stuck.length) throw new ApiError(409, "CONFLICT", "An import could not be paused in time; try again in a moment.");
+    return results.filter((x) => x.r?.state === "paused").map((x) => ({ projectId: x.b.projectId, batchId: x.b.batchId }));
+  }
+
+  // ---- library move --------------------------------------------------------------------
+
+  /**
+   * Before a library move (R99 I5): running batches paused (refused if one cannot be), watches
+   * stopped, viewing-proxy and OCR queues disposed of and the backup scheduler stopped, so nothing
+   * writes to the library while it is copied. Returns the batches to resume afterwards.
+   */
+  async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
+    const paused = await this.suspendBatches(s);
+    this.stopBackupScheduler();
+    await this.stopWatches(s);
+    await disposeProxyQueue(s.repo).catch(() => {});
+    await disposeOcrQueue(s.repo).catch(() => {});
+    return paused;
+  }
+
+  /** After a move (or a failed one): the batches paused for it are resumed in the library now open. */
+  resumeBatches(list: Array<{ projectId: string; batchId: string }>): void {
+    const s = this.session;
+    if (!s?.bulk) return;
+    for (const b of list) {
+      if (!s.repo.listProjects().some((p) => p.id === b.projectId)) continue;
+      this.track(
+        s.bulk.resumeBatch(b.projectId, b.batchId).then((h) => this.followBatch(s, b.projectId, h)),
+        "resuming an import",
+      );
+    }
+  }
+
+  recordMove(m: Omit<PendingMove, "expiresAt">): PendingMove {
+    this.move = { ...m, expiresAt: new Date(this.opts.now().getTime() + MOVE_TOKEN_TTL_MS).toISOString() };
+    return this.move;
+  }
+
+  /** The finished move whose old copy may still be deleted, while its token is valid. */
+  pendingMove(): PendingMove | undefined {
+    if (this.move && Date.parse(this.move.expiresAt) <= this.opts.now().getTime()) this.move = undefined;
+    return this.move;
+  }
+
+  forgetMove(): void {
+    this.move = undefined;
   }
 
   /** Closes the open library: running batches cancelled, watches stopped, queues disposed of, lock released. */
@@ -243,15 +370,9 @@ export class ServiceState {
     if (!s) return;
     this.session = undefined;
     this.stopBackupScheduler();
-    for (const { handle } of s.batches.values()) {
-      try {
-        handle.cancel();
-      } catch {
-        // already finished
-      }
-    }
-    await Promise.allSettled([...s.batches.values()].map(({ handle }) => withTimeout(handle.done, 30_000)));
-    await Promise.allSettled([...s.watches.values()].flat().map((w) => w.stop()));
+    // Running imports are paused (resumable), never cancelled (R99 I4).
+    await this.suspendBatches(s).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "an import could not be paused"));
+    await this.stopWatches(s);
     for (const u of s.unsubscribe) u();
     await disposeProxyQueue(s.repo).catch(() => {});
     await disposeOcrQueue(s.repo).catch(() => {});
@@ -370,11 +491,12 @@ export class ServiceState {
   // ---- daily backups (R90 b, R96) --------------------------------------------------------
 
   /** One pass of the backup scheduler: every project whose automatic backup is due is backed up. */
-  async runScheduledBackups(): Promise<BackupRun[]> {
+  async runScheduledBackups(onlyProjectId?: string): Promise<BackupRun[]> {
     const s = this.session;
     if (!s || s.lib.mode !== "read-write") return [];
     const out: BackupRun[] = [];
     for (const p of s.repo.listProjects()) {
+      if (onlyProjectId && p.id !== onlyProjectId) continue;
       if (p.backups?.automatic === false) continue;
       try {
         const r = await backupIfDue(s.repo, p.id, this.opts.now());
@@ -397,7 +519,7 @@ export class ServiceState {
     this.backupTimer = t;
   }
 
-  private stopBackupScheduler(): void {
+  stopBackupScheduler(): void {
     if (this.backupTimer) clearInterval(this.backupTimer);
     this.backupTimer = undefined;
   }

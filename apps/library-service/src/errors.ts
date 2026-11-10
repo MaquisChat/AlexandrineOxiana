@@ -3,9 +3,30 @@
  * absolute paths scrubbed from `message` and `reason`. Library errors are mapped to codes here, in
  * one place.
  */
-import { GovernanceParseError } from "@ao/core";
+import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
 import {
   AcknowledgementRequiredError,
+  AnchorsUnreadableError,
+  AuditChainInvalidError,
+  DecryptionError,
+  DestroyedParentError,
+  EncryptionFormatError,
+  ExportDestinationError,
+  ExportFailedError,
+  GovernanceConflictError,
+  InvalidInputError,
+  KeyNotAvailableError,
+  LinkedContentChangedError,
+  LockNotWritableError,
+  MissingParentError,
+  MoveVerificationError,
+  PathEscapeError,
+  ProxyRecordRefusedError,
+  RestoreError,
+  SandboxError,
+  SecretStoreUnavailableError,
+  TornFileError,
+  UnsafeFileError,
   AlreadyALibraryError,
   BatchRefusedError,
   CorruptLibraryError,
@@ -48,6 +69,7 @@ export type ErrorCode =
   | "CONFLICT"
   | "ACKNOWLEDGEMENT_REQUIRED"
   | "WORKER_UNAVAILABLE"
+  | "UNAVAILABLE"
   | "INTERNAL";
 
 export class ApiError extends Error {
@@ -81,6 +103,27 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof NotFoundError) return new ApiError(404, "NOT_FOUND", err.message);
   if (err instanceof NotALibraryError) return new ApiError(404, "NOT_FOUND", "That folder is not a library.");
   if (err instanceof GovernanceLooseningError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof GovernanceConflictError) return new ApiError(409, "CONFLICT", err.message);
+  if (err instanceof InvalidInputError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
+  if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
+  if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");
+  if (err instanceof ParticipantCodeMissingError) return new ApiError(409, "CONFLICT", "A participant in these sources has no participant code yet, so they cannot be cited.");
+  if (err instanceof ExportDestinationError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof ExportFailedError) return new ApiError(500, "INTERNAL", "The export could not be finished; nothing was left half-written.");
+  if (err instanceof DestroyedParentError || err instanceof MissingParentError) return new ApiError(409, "CONFLICT", "The file this would be made from is no longer there.");
+  if (err instanceof KeyNotAvailableError) return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+  if (err instanceof DecryptionError || err instanceof EncryptionFormatError) return new ApiError(409, "CONFLICT", "An encrypted file could not be read (damaged, or made with another key).");
+  if (err instanceof PathEscapeError) return new ApiError(400, "VALIDATION", "That path is not allowed.");
+  if (err instanceof RestoreError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof AuditChainInvalidError) return new ApiError(409, "CONFLICT", "The audit log does not verify, so this cannot be done.");
+  if (err instanceof AnchorsUnreadableError || err instanceof TornFileError) return new ApiError(409, "CONFLICT", "A library record is damaged; see the library's integrity warnings.");
+  if (err instanceof UnsafeFileError) return new ApiError(400, "VALIDATION", "This file could not be opened safely.");
+  if (err instanceof LinkedContentChangedError) return new ApiError(409, "CONFLICT", "A linked file changed on disk.");
+  if (err instanceof ProxyRecordRefusedError) return new ApiError(409, "CONFLICT", "That viewing copy was not recorded.", err.code);
+  if (err instanceof SecretStoreUnavailableError) return new ApiError(503, "UNAVAILABLE", "This computer's keyring is not available.");
+  if (err instanceof MoveVerificationError) return new ApiError(409, "CONFLICT", "The copied library did not verify; the old copy is kept and nothing was switched.");
+  if (err instanceof LockNotWritableError) return new ApiError(409, "READ_ONLY", "The library's lock file cannot be written.");
   if (err instanceof GovernanceParseError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof GovernanceViolationError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof ImmutableProvenanceError) return new ApiError(400, "VALIDATION", "A source's provenance cannot be changed.");
@@ -101,7 +144,7 @@ export function toApiError(err: unknown): ApiError {
   if (code === "FST_ERR_CTP_BODY_TOO_LARGE") return new ApiError(413, "PAYLOAD_TOO_LARGE", "The request is too large.");
   if (typeof code === "string" && code.startsWith("FST_ERR_CTP")) return new ApiError(400, "VALIDATION", "The request body is not valid JSON.");
   if (code === "FST_ERR_VALIDATION") return new ApiError(400, "VALIDATION", (err as Error).message);
-  if (err instanceof TypeError || err instanceof RangeError) return new ApiError(400, "VALIDATION", err.message);
+  // A TypeError is a bug or an unchecked value: never echo its message (it may hold data).
   if ((err as { name?: string } | undefined)?.name === "ZodError") return new ApiError(400, "VALIDATION", "Some values are not valid.");
   return new ApiError(500, "INTERNAL", "Something went wrong. Nothing was changed by this request unless it says otherwise.");
 }
