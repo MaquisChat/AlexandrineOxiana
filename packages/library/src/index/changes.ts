@@ -59,12 +59,13 @@ export function projectKey(data: ProjectJson, keyRing: KeyRing): { key: Uint8Arr
 export const changeLogReads: string[] = [];
 
 /**
- * Per change-log file: what was read last time (size, inode) and the newest id in it. Change logs
- * are append-only, so when a file has only grown, only its new bytes are read; any other change
- * (shorter, replaced) reads it again in full. Keyed by path and key id (sealed lines need the key).
+ * Per change-log file: what was read last time (inode, size up to the last complete line, that
+ * line itself) and the newest id in it. Change logs are append-only, so when a file has only grown
+ * and still holds the same last line at the same place (the line carries its change's unique id),
+ * only the new bytes are read; anything else (shorter, replaced, cut back and appended again) reads
+ * the file in full. Keyed by path and the project key id (sealed lines need the key).
  */
-const scanned = new Map<string, { ino: number; size: number; best: string; tail: string }>();
-const TAIL = 128;
+const scanned = new Map<string, { ino: number; size: number; best: string; lastLine: Buffer }>();
 
 function newestIn(text: string, projectId: string, key: Uint8Array | null): string {
   let best = "";
@@ -86,12 +87,20 @@ function newestIn(text: string, projectId: string, key: Uint8Array | null): stri
   return best;
 }
 
+/** The last complete line of `data` up to `end` (a line boundary), newline included. */
+function lastLineOf(data: Buffer, end: number): Buffer {
+  if (end === 0) return Buffer.alloc(0);
+  const start = data.lastIndexOf(0x0a, end - 2) + 1;
+  return Buffer.from(data.subarray(start, end));
+}
+
 /** Newest change id in a project's change logs (sealed lines are opened with `key` when given). */
 export async function newestProjectChangeId(
   root: string,
   rel: string,
   projectId: string,
   key: Uint8Array | null,
+  keyId?: string,
 ): Promise<string> {
   changeLogReads.push(rel);
   const dir = join(root, rel, "changes");
@@ -103,26 +112,24 @@ export async function newestProjectChangeId(
   }
   for (const f of files) {
     const path = join(dir, f);
-    const cacheKey = `${path}\u0000${key ? "key" : "-"}`;
+    const cacheKey = `${path}\u0000${key ? `key:${keyId ?? "?"}` : "-"}`;
     const st = await fsp.stat(path).catch(() => null);
     if (!st) continue;
     const prev = scanned.get(cacheKey);
     let best: string | undefined;
     if (prev && prev.ino === st.ino && st.size >= prev.size) {
-      // Only the appended bytes, if what was read before is still there (its last bytes match: a
-      // rollback that cut the file and appended again reads it in full).
+      const from = prev.size - prev.lastLine.length;
       const fh = await fsp.open(path, "r");
       try {
-        const from = Math.max(0, prev.size - TAIL);
         const buf = Buffer.alloc(st.size - from);
         await fh.read(buf, 0, buf.length, from);
-        if (buf.subarray(0, prev.size - from).toString("latin1") === prev.tail) {
-          const rest = buf.subarray(prev.size - from);
+        if (buf.subarray(0, prev.lastLine.length).equals(prev.lastLine)) {
+          const rest = buf.subarray(prev.lastLine.length);
           const end = rest.lastIndexOf(0x0a) + 1;
           const more = newestIn(rest.subarray(0, end).toString("utf8"), projectId, key);
           best = more > prev.best ? more : prev.best;
           const size = prev.size + end;
-          scanned.set(cacheKey, { ino: st.ino, size, best, tail: buf.subarray(Math.max(0, size - TAIL - from), size - from).toString("latin1") });
+          scanned.set(cacheKey, { ino: st.ino, size, best, lastLine: end > 0 ? lastLineOf(buf, size - from) : prev.lastLine });
         }
       } finally {
         await fh.close();
@@ -132,7 +139,7 @@ export async function newestProjectChangeId(
       const data = await fsp.readFile(path);
       const end = data.lastIndexOf(0x0a) + 1;
       best = newestIn(data.subarray(0, end).toString("utf8"), projectId, key);
-      scanned.set(cacheKey, { ino: st.ino, size: end, best, tail: data.subarray(Math.max(0, end - TAIL), end).toString("latin1") });
+      scanned.set(cacheKey, { ino: st.ino, size: end, best, lastLine: lastLineOf(data, end) });
     }
     if (best) return best;
   }
@@ -159,7 +166,7 @@ export async function stampFor(root: string, rel: string, data: ProjectJson, key
     const st = await fsp.stat(join(root, rel, "manifest.json")).catch(() => null);
     return { mode: "manifest", mtimeMs: st ? st.mtimeMs : -1 };
   }
-  return { mode: "changes", id: await newestProjectChangeId(root, rel, data.project.id, k ? k.key : null) };
+  return { mode: "changes", id: await newestProjectChangeId(root, rel, data.project.id, k ? k.key : null, k ? k.keyId : undefined) };
 }
 
 /** The newest change id across readable projects. */

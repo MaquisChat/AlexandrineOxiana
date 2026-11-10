@@ -666,6 +666,25 @@ describe("duplicates (R55, R59)", () => {
   });
 });
 
+describe("groups (R62)", () => {
+  it("a group refused because the rules changed mid-run: each item's deny is audited exactly once", async () => {
+    const p = await project();
+    const src = join(tmp, "group");
+    await mkdir(src);
+    for (const n of fx.generated.slice(1, 5)) await copyFile(n, join(src, n.split(/[\\/]/).pop()!));
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    h.pause();
+    await new Promise((r) => setTimeout(r, 200));
+    const govPath = join(lib.root, p.folder, "governance.yaml");
+    await writeFile(govPath, (await readFile(govPath, "utf8")).replace("captureMethods: [manual_upload, refman_import, downloader]", "captureMethods: [refman_import]"));
+    h.resume();
+    const r = await h.done;
+    expect(r.counts.failed).toBeGreaterThanOrEqual(1);
+    const denies = (await auditEvents(p)).filter((e) => e.decision?.result === "deny" && e.details?.op === "source.create");
+    expect(denies).toHaveLength(r.counts.failed);
+  });
+});
+
 describe("location rule (R56)", () => {
   it("a photo with GPS in a project that must coarsen location fails with LOCATION_REASON; the batch goes on", async () => {
     const gov = `identifiability:

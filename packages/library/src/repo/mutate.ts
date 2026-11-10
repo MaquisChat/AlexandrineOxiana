@@ -76,6 +76,11 @@ export interface InternalMutateOptions extends MutateOptions {
    * Bulk Import): consulted when the events are written, after `fn` ran. Default: the change's entity.
    */
   entityFor?: (index: number) => { type: EntityType; id: string } | undefined;
+  /**
+   * A deny is thrown but NOT audited: only for a caller that then retries each request in a change
+   * of its own (which audits it), so every refusal is audited exactly once (Bulk Import groups, R62).
+   */
+  unauditedDeny?: boolean;
 }
 
 export const REFUSED_GENERIC = "Refused by an internal check";
@@ -329,6 +334,7 @@ async function decide(
   op: string,
   entity: MutateOptions["entity"],
   refuse?: RefuseHook,
+  unauditedDeny = false,
 ): Promise<Array<{ req: PolicyRequest; d: PolicyDecision }>> {
   let cfg: ReturnType<typeof parseGovernance> | undefined;
   let cfgError: string | undefined;
@@ -344,6 +350,7 @@ async function decide(
     const refused = runRefuse(refuse, d, req);
     if (refused) d = denyOf(refused, d.warnings);
     if (d.result === "deny") {
+      if (unauditedDeny) throw new PolicyDeniedError(d.reason, req.action);
       await core.auditNow(st, {
         ...core.auditBase(st, at),
         action: req.action,
@@ -413,7 +420,7 @@ export async function runMutation<T>(
     const op = opts.op ?? "mutate";
 
     // 1. Policy (a deny is audited and thrown).
-    const allowed = await decide(core, st, reqs, at, op, opts.entity, opts.refuse);
+    const allowed = await decide(core, st, reqs, at, op, opts.entity, opts.refuse, opts.unauditedDeny === true);
     const conditions: Condition[] = [];
     for (const { d } of allowed) {
       if (d.result !== "allow_with_conditions") continue;

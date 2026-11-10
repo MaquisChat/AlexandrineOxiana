@@ -20,7 +20,7 @@ import {
   rebuildIndex,
   search,
 } from "./index.js";
-import { changeLogReads } from "./changes.js";
+import { changeLogReads, newestProjectChangeId } from "./changes.js";
 import { indexProjectEntities, openIndexAt, purgeProject } from "./db.js";
 import { indexUnlockedProject } from "./sink.js";
 import { stripVtt } from "./load.js";
@@ -790,5 +790,30 @@ describe("fix round 2", () => {
     expect(err.message).toBe("rename failed");
     expect(err.reloadErrors).toEqual([{ folder: "Projects/E1", message: "reload boom" }]);
     expect(a.pid).toBeTruthy();
+  });
+});
+
+describe("change-log stamp, read incrementally (R62)", () => {
+  it("a rolled-back line replaced by another of the same length is not reported (no ghost id)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-stamp-"));
+    try {
+      const dir = join(root, "Projects/P/changes");
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, "2026-11.jsonl");
+      const line = (id: string) => `${JSON.stringify({ id, at: "2026-11-10T00:00:00.000Z", path: "/title", value: "x".repeat(300) })}\n`;
+      const a = "019a0000-0000-7000-8000-00000000000a";
+      const ghost = "019a0000-0000-7000-8000-0000000000ff";
+      const b = "019a0000-0000-7000-8000-0000000000bb";
+      await writeFile(file, line(a));
+      expect(await newestProjectChangeId(root, "Projects/P", "p", null)).toBe(a);
+      await appendFile(file, line(ghost));
+      expect(await newestProjectChangeId(root, "Projects/P", "p", null)).toBe(ghost);
+      // Rollback (truncate), then another create appends a line of the same length.
+      await writeFile(file, line(a));
+      await appendFile(file, line(b));
+      expect(await newestProjectChangeId(root, "Projects/P", "p", null)).toBe(b);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

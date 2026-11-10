@@ -258,8 +258,8 @@ export interface NewSourceInput {
 /**
  * Package-internal (Bulk Import): creates several sources in ONE governed change. Every source's
  * capture and store requests are evaluated (right before anything is written, R42) and each allow
- * is audited as an event about its own source; a deny of any of them stores none (the caller may
- * then create them one by one). Each source is written exactly as `createSource` writes it.
+ * is audited as an event about its own source; a deny of any of them stores none and is NOT
+ * audited here: the caller must then create them one by one (each refusal audited once there). Each source is written exactly as `createSource` writes it.
  */
 export async function createSources(core: RepoCore, projectId: string, items: NewSourceInput[], refuse?: RefuseHook): Promise<SourceFile[]> {
   core.assertWritable();
@@ -290,6 +290,8 @@ export async function createSources(core: RepoCore, projectId: string, items: Ne
       op: "source.create",
       ...(refuse ? { refuse } : {}),
       entityFor: (i) => (ids[owner[i]!] ? { type: "source" as const, id: ids[owner[i]!]! } : undefined),
+      // A refused group is retried source by source by the caller, which audits each refusal once.
+      unauditedDeny: true,
     },
   );
 }
