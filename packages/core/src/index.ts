@@ -56,3 +56,5 @@ export { normalizeTitle, titleSimilarity } from "./verify/evidence.js";
 export type { LookupEvidence } from "./verify/evidence.js";
 export { REQUIRED_FIELDS, applyVerification, recheckSourceFile, verifyDraft } from "./verify/recheck.js";
 export type { VerificationReport, VerifyContext } from "./verify/recheck.js";
+
+export * from "./import/index.js";
