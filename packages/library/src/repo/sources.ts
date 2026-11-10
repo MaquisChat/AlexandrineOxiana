@@ -30,6 +30,7 @@ import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mut
 import { readFullData, writeProjectData } from "./projects.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { appendReviewEntry, type ReviewInput } from "./review.js";
+import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
 export interface SourceInputFile {
@@ -518,10 +519,16 @@ export async function editSource(core: RepoCore, tx: Tx, id: string, edit: (s: S
   return sf;
 }
 
-/** Deletes one source inside a running mutation (its folder is trashed; linked originals are not touched). */
-export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string): Promise<SourceFile> {
+/**
+ * Deletes one source inside a running mutation (its folder is trashed; linked originals are not
+ * touched). Every path that deletes a source comes through here; a source imported incrementally
+ * (Zotero) leaves a deletion record so a later run does not bring it back (R73), except when the
+ * deletion is a batch undo (`undo`), which is not the user's.
+ */
+export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean } = {}): Promise<SourceFile> {
   const st = tx.state;
   const cur = await readSourceFile(core, st, id);
+  if (!opts.undo) await recordDeletion(core, tx, cur);
   await tx.trash(cur.source.folder);
   if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
   for (const a of cur.assets) tx.record("asset", a.id, a, null);
@@ -541,13 +548,7 @@ export async function deleteSource(core: RepoCore, projectId: string, id: string
     projectId,
     { action: "delete" },
     async (tx) => {
-      const cur = await readSourceFile(core, st, id);
-      await tx.trash(cur.source.folder);
-      if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
-      for (const a of cur.assets) tx.record("asset", a.id, a, null);
-      tx.record("source", id, cur.source, null);
-      tx.onCommit(() => st.sources.delete(id));
-      tx.index((sink) => sink.removeSource(id));
+      await deleteSourceInTx(core, tx, id);
     },
     { op: "source.delete", entity: { type: "source", id } },
   );

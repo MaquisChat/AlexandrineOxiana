@@ -23,6 +23,8 @@
 //   4 DDDD4444 bookSection "Street Food and the State"  Doe (author), Roe (editor); 2020
 //   5 EEEE5555 journalArticle "Street Vendors in Accra"  Doe; 2020 (same generated key as 4)
 //   6 FFFF6666 journalArticle "Deleted Article" — in the trash; 13 NOTEDEL1 its child note
+//   Not imported (counted): 15 NOTESTD1 standalone note; ATTPDF01's own note; 16 LINKURL1 linked URL
+//   (item 3); 17 IMGKEY01 image embedded in note 8; 18 BASEREL1 "attachments:" linked file (item 4)
 // Group library (2):
 //   14 GGGG7777 "Group Item" (not imported with the default library)
 import { createRequire } from "node:module";
@@ -202,6 +204,18 @@ export function buildZoteroFixture(dir, o) {
       db.prepare("INSERT INTO deletedItems (itemID) VALUES (6)").run();
       add(13, "note", "NOTEDEL1");
       db.prepare("INSERT INTO itemNotes (itemID, parentItemID, note, title) VALUES (13, 6, '<p>gone</p>', 'gone')").run();
+
+      // Kinds that are not imported (counted in a scan note): a standalone note, an attachment's own
+      // note, a linked URL, an image embedded in a note, a linked file relative to the base folder.
+      add(15, "note", "NOTESTD1");
+      db.prepare("INSERT INTO itemNotes (itemID, parentItemID, note, title) VALUES (15, NULL, '<p>standalone</p>', 'standalone')").run();
+      db.prepare("INSERT INTO itemNotes (itemID, parentItemID, note, title) VALUES (7, NULL, '<p>about this PDF</p>', 'about')").run();
+      add(16, "attachment", "LINKURL1");
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (16, 3, 3, 'text/html', NULL)").run();
+      add(17, "attachment", "IMGKEY01");
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (17, 8, 4, 'image/png', 'storage:image.png')").run();
+      add(18, "attachment", "BASEREL1");
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (18, 4, 2, 'application/pdf', 'attachments:Papers/doe.pdf')").run();
 
       // Group library.
       add(14, "journalArticle", "GGGG7777", { lib: 2 });

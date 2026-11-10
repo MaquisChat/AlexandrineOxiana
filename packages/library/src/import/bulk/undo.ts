@@ -113,7 +113,8 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   const removed = new Set<string>();
   for (const id of ids) {
     if (!hasSource(repo, projectId, id)) continue;
-    await repo.deleteSource(projectId, id);
+    // Not the user's deletion: no deletion record, so a later run imports the item again (R73).
+    await importChange(repo, projectId, { action: "delete" }, (ops) => ops.deleteSource(id, { undo: true }), { op: "source.delete", entity: { type: "source", id } });
     removed.add(id);
   }
   const removedSources = removed.size;

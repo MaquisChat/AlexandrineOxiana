@@ -529,6 +529,68 @@ processing:
     expect(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "report.md"), "utf8")).toMatch(/zotero:AAAA1111: \/title/u);
   });
 
+  const DELETED_NOTE = /^1 item you deleted here was not re-imported/u;
+  const DEFERRED_NOTE =
+    "Not imported from Zotero: 1 standalone note, 1 attachment note, 1 linked URL, 1 image embedded in a note, 1 linked file relative to Zotero's base folder (not given).";
+
+  it("dry run and report count the kinds that are not imported (no paths)", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    expect((await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir))).notes).toContain(DEFERRED_NOTE);
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain(DEFERRED_NOTE);
+  });
+
+  it("R73: a source deleted here is not re-imported (report note); includeDeleted brings it back and clears the tombstone", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const c = byZoteroKey(await sources(p), "CCCC3333");
+    await repo.deleteSource(p.id, c.source.id);
+    // The tombstone holds an HMAC, never the key.
+    const tomb = await readFile(join(lib.root, p.folder, "imports", "deleted-items.json"), "utf8");
+    expect(tomb).not.toContain("CCCC3333");
+    expect(JSON.parse(tomb).zotero).toHaveLength(1);
+
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    expect((await h.done).counts).toMatchObject({ created: 0, needsReview: 0, unchanged: 4 });
+    expect(repo.listSourceIds(p.id)).toHaveLength(4);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes.some((n) => DELETED_NOTE.test(n))).toBe(true);
+
+    const back = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), includeDeleted: true })).done;
+    expect(back.counts.created + back.counts.needsReview).toBe(1);
+    expect(byZoteroKey(await sources(p), "CCCC3333")).toBeDefined();
+    expect(JSON.parse(await readFile(join(lib.root, p.folder, "imports", "deleted-items.json"), "utf8")).zotero).toEqual([]);
+    expect((await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done).counts).toMatchObject({ unchanged: 5, created: 0 });
+  });
+
+  it("R73: undoing a batch is not a deletion: its items import again", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    expect((await bulk.undoBatch(p.id, h.batchId)).removedSources).toBe(5);
+    const again = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(again.counts.created + again.counts.needsReview).toBe(5);
+    expect(repo.listSourceIds(p.id)).toHaveLength(5);
+  });
+
+  it("R73: in an encrypted project the tombstone file is sealed", async () => {
+    const p = await project(true);
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    await repo.deleteSource(p.id, byZoteroKey(await sources(p), "CCCC3333").source.id);
+    const dir = join(lib.root, p.folder, "imports");
+    expect(await readdir(dir)).toContain("deleted-items.json.enc");
+    expect(await readdir(dir)).not.toContain("deleted-items.json");
+    const raw = (await readFile(join(dir, "deleted-items.json.enc"))).toString("latin1");
+    expect(raw).not.toContain("zotero");
+    expect(raw).not.toContain("CCCC3333");
+    const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r.counts).toMatchObject({ created: 0, needsReview: 0, unchanged: 4 });
+  });
+
   it("undo of an incremental update reverts the update (and its new annotation) like a merge", async () => {
     const p = await project();
     const bulk = bulkImport();

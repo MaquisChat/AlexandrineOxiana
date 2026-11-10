@@ -13,7 +13,9 @@
  *
  * Items: the chosen library's regular items (default: the user library, 1) and standalone file
  * attachments; items in the trash (`deletedItems`), and attachments, notes and annotations whose
- * parent is in the trash, are skipped. Standalone notes are not imported (a scan note counts them).
+ * parent is in the trash, are skipped. Not imported, and counted (never named) in one scan note:
+ * standalone notes, attachments' own notes, linked URLs, images embedded in notes, and linked files
+ * relative to Zotero's base folder when `baseAttachmentPath` is not given.
  * `ScanItem.key` = "zotero:" + item key (stored only as the R63 HMAC); `externalKeys` keep
  * zoteroKey, zoteroVersion, libraryId, related item keys (`related`, comma-separated, for linking
  * later), zoteroDateAdded and zoteroDateModified, and the citation key (`citekey`) when Zotero had one.
@@ -55,13 +57,32 @@ export const ZOTERO_REASONS = {
 } as const;
 
 export const ZOTERO_FILE_NOTES = {
-  baseDir: "linked file is relative to Zotero's base folder, which was not given",
   location: "attached file location is not valid",
 } as const;
 
+/** Kinds of Zotero items this import leaves out, counted (never named) in one scan note (R73). */
+export interface NotImported {
+  standaloneNotes: number;
+  attachmentNotes: number;
+  linkedUrls: number;
+  embeddedImages: number;
+  baseRelative: number;
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
 export const ZOTERO_NOTES = {
-  standaloneNotes: (n: number) => `${n} standalone note${n === 1 ? " was" : "s were"} not imported (only notes that belong to an item are).`,
   bbt: "Better BibTeX citation keys could not be read, so citation keys come from Extra or are generated.",
+  notImported: (c: NotImported): string | undefined => {
+    const parts = [
+      c.standaloneNotes && plural(c.standaloneNotes, "standalone note", "standalone notes"),
+      c.attachmentNotes && plural(c.attachmentNotes, "attachment note", "attachment notes"),
+      c.linkedUrls && plural(c.linkedUrls, "linked URL", "linked URLs"),
+      c.embeddedImages && plural(c.embeddedImages, "image embedded in a note", "images embedded in notes"),
+      c.baseRelative && plural(c.baseRelative, "linked file relative to Zotero's base folder (not given)", "linked files relative to Zotero's base folder (not given)"),
+    ].filter(Boolean);
+    return parts.length ? `Not imported from Zotero: ${parts.join(", ")}.` : undefined;
+  },
 } as const;
 
 /** Largest total size of the copied databases (R72). */
@@ -299,6 +320,8 @@ interface Snapshot {
   childNotes: Map<number, number[]>;
   /** Notes that belong to an item (the others are standalone notes). */
   childNoteIds: Set<number>;
+  /** Attachments whose own note field is not empty. */
+  attachmentNotes: Set<number>;
   notes: Set<number>;
   annotations: Map<number, AnnotationRef[]>;
   annotationIds: Set<number>;
@@ -350,8 +373,19 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
   const notes = new Set<number>();
   const childNotes = new Map<number, number[]>();
   const childNoteIds = new Set<number>();
-  for (const n of cappedRows<{ id: number; parent: number | null }>(db, "SELECT itemID AS id, parentItemID AS parent FROM itemNotes ORDER BY itemID", MAX_ITEMS, tooLarge)) {
-    if (!byId.has(n.id) || attachments.has(n.id)) continue; // an attachment's own note row is not a note item
+  const attachmentNotes = new Set<number>();
+  for (const n of cappedRows<{ id: number; parent: number | null; has: number }>(
+    db,
+    "SELECT itemID AS id, parentItemID AS parent, (note IS NOT NULL AND note != '') AS has FROM itemNotes ORDER BY itemID",
+    MAX_ITEMS,
+    tooLarge,
+  )) {
+    if (!byId.has(n.id)) continue;
+    if (attachments.has(n.id)) {
+      // An attachment's own note row is not a note item (not imported; counted).
+      if (n.has) attachmentNotes.add(n.id);
+      continue;
+    }
     notes.add(n.id);
     if (n.parent !== null && n.parent !== undefined) {
       childNoteIds.add(n.id);
@@ -447,7 +481,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
       note(ZOTERO_NOTES.bbt);
     }
   }
-  return { items, byId, deleted, attachments, childAttachments, childNotes, childNoteIds, notes, annotations, annotationIds, collectionPaths, tagColors, bbt };
+  return { items, byId, deleted, attachments, childAttachments, childNotes, childNoteIds, attachmentNotes, notes, annotations, annotationIds, collectionPaths, tagColors, bbt };
 }
 
 /** Per-item reads (prepared once): fields, creators, tags, relations, note text, annotation rows. */
@@ -605,7 +639,7 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
         const p = a.path ?? "";
         if (!p || p.includes("\u0000")) return { note: ZOTERO_FILE_NOTES.location };
         if (p.startsWith("attachments:")) {
-          if (!o.baseAttachmentPath) return { note: ZOTERO_FILE_NOTES.baseDir };
+          if (!o.baseAttachmentPath) return undefined; // counted in the scan note
           const rel = p.slice(12);
           if (isAbsolute(rel) || rel.split(/[\\/]/u).includes("..")) return { note: ZOTERO_FILE_NOTES.location };
           return { path: resolve(o.baseAttachmentPath, rel), link: true };
@@ -714,7 +748,19 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
         ...(notes.length ? { fileNotes: notes } : {}),
       };
     }
-    if (standaloneNotes) ctx.note?.(ZOTERO_NOTES.standaloneNotes(standaloneNotes));
+    // Kinds left out, counted over the library's items that are not in the trash.
+    const counts: NotImported = { standaloneNotes, attachmentNotes: 0, linkedUrls: 0, embeddedImages: 0, baseRelative: 0 };
+    for (const a of snap.attachments.values()) {
+      if (snap.deleted.has(a.id) || gone(a.parent)) continue;
+      if (snap.attachmentNotes.has(a.id)) counts.attachmentNotes++;
+      if (a.linkMode === 4) counts.embeddedImages++;
+      // A standalone one is an item of its own (imported with its title), so only children count.
+      else if (a.parent === null || a.parent === undefined) continue;
+      else if (a.linkMode === 3) counts.linkedUrls++;
+      else if (a.linkMode === 2 && a.path?.startsWith("attachments:") && !o.baseAttachmentPath) counts.baseRelative++;
+    }
+    const left = ZOTERO_NOTES.notImported(counts);
+    if (left) ctx.note?.(left);
   } finally {
     bbtDb?.close();
     db?.close();

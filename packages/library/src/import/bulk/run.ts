@@ -65,6 +65,7 @@ import {
   projectCollectionsAndTags,
   projectEncrypted,
   hasSource,
+  deletedHere,
   projectPolicyOrDefault,
   repoLibrary,
   type Repo,
@@ -126,6 +127,7 @@ export const REASONS = {
   failed: "The item could not be imported.",
   duplicateFile: "The same file is already in the project.",
   duplicateId: "A source with the same DOI or ISBN is already in the project.",
+  deletedHere: "You deleted this item's source here after an earlier import, so it was not imported again.",
   linkEncrypted:
     "Files cannot be linked in place in this project: its files must be encrypted at rest, and a linked file stays outside the library. Choose to copy the files instead.",
 } as const;
@@ -404,6 +406,10 @@ class Run {
   private readonly workName: string;
   /** Incremental import (R72): identity → the source and version token the newest journal line recorded. */
   private known = new Map<string, { sourceId: string; version: string }>();
+  /** Whether a Zotero item's source was deleted here (R73). */
+  private deletedHere: (zoteroKey: string) => boolean = () => false;
+  /** Item key → Zotero item key of items imported again although deleted here (includeDeleted): their records are cleared. */
+  private restored = new Map<string, string>();
   /** Item key → its identity and version token (journaled with its outcome). */
   private versions = new Map<string, { id: string; version: string }>();
   private structureCache = new Map<string, { collectionIds: string[]; tagIds: string[] }>();
@@ -537,7 +543,10 @@ class Run {
         this.rec.secret,
         this.rec.outsideApprovals ?? [],
       );
-      if (this.adapter.incremental) this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind);
+      if (this.adapter.incremental) {
+        this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind);
+        this.deletedHere = await deletedHere(this.repo, this.projectId);
+      }
       let total = 0;
       try {
         total = (await this.adapter.count?.(this.abort.signal)) ?? 0;
@@ -581,6 +590,7 @@ class Run {
         await sleepTurn();
       }
       await this.flush();
+      await this.clearRestored();
       if (this.cancelled) state = "cancelled";
     } catch (err) {
       if (this.cancelled && (err as Error)?.name === "AbortError") state = "cancelled";
@@ -599,6 +609,9 @@ class Run {
       await watchdog.close();
       await this.cleanup();
     }
+    const deleted = [...this.latest.values()].filter((e) => e.reason === REASONS.deletedHere).length;
+    this.rec.notes = this.rec.notes.filter((n) => !DELETED_NOTE.test(n));
+    if (deleted) this.note(deletedNote(deleted));
     for (const id of watchdog.disabled) {
       this.note(`The file-name pattern "${id}" took too long on a file name and was switched off for the rest of this import.`);
     }
@@ -628,6 +641,12 @@ class Run {
           if (k.version === item.version.version) return this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId });
           await this.flush(); // the source may be in the current group
           return await this.update(item, k.sourceId);
+        }
+        // Deleted here after an earlier import: stays deleted unless the options say otherwise (R73).
+        const zk = item.externalKeys?.zoteroKey;
+        if (zk && this.deletedHere(zk)) {
+          if (!this.rec.options.includeDeleted) return this.queue({ key: item.key, outcome: "skipped", reason: REASONS.deletedHere });
+          this.restored.set(item.key, zk);
         }
       }
       return await this.importItem(item, dedupe, watchdog);
@@ -663,6 +682,14 @@ class Run {
     const v = WITH_VERSION.has(e.outcome) && e.sourceId ? this.versions.get(e.key) : undefined;
     if (v) this.known.set(v.id, { sourceId: e.sourceId!, version: v.version });
     return { ...e, ...(notes?.length ? { notes } : {}), ...(v ? { ext: { id: v.id, version: v.version } } : {}) };
+  }
+
+  /** Clears the deletion records of items imported again with includeDeleted (one bookkeeping change). */
+  private async clearRestored(): Promise<void> {
+    const keys = [...this.restored].filter(([k]) => WITH_VERSION.has(String(this.latest.get(k)?.outcome))).map(([, zk]) => zk);
+    if (!keys.length) return;
+    await importChange(this.repo, this.projectId, BOOKKEEPING, (ops) => ops.clearDeletions(keys), { op: "import.clear-deleted" });
+    this.restored.clear();
   }
 
   /**
@@ -1205,6 +1232,10 @@ class Run {
     return out;
   }
 }
+
+const DELETED_NOTE = /^\d+ items? you deleted here (?:was|were) not re-imported/u;
+const deletedNote = (n: number) =>
+  `${n} ${n === 1 ? "item you deleted here was" : "items you deleted here were"} not re-imported (choose "include deleted items" to import ${n === 1 ? "it" : "them"} again).`;
 
 /** A merge record that changes nothing and only lists fields kept (R72). */
 const emptyRecord = (kept: string[]): MergeRecord => ({ addedAssetIds: [], filled: [], addedEvidence: [], kept });

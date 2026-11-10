@@ -20,6 +20,12 @@ export const ImportOptions = z.object({
    * ("link", the default) or copied ("copy"). Projects that keep files encrypted always copy them.
    */
   linkedFiles: z.enum(["link", "copy"]).default("link"),
+  /**
+   * Re-import items whose source was deleted in this app after an earlier import (R73). By default
+   * they stay deleted (skipped, with a report note); with this, they are imported again and their
+   * deletion records cleared.
+   */
+  includeDeleted: z.boolean().default(false),
   structure: z.enum(["collections", "tags", "none"]).default("collections"),
   duplicates: z.enum(["merge", "skip", "keep-both"]).default("merge"),
   ocr: z.boolean().default(true),

@@ -41,6 +41,7 @@ import {
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
 import { readReviewEntries, type ReviewEntry } from "./review.js";
+import { readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
@@ -573,6 +574,15 @@ export async function projectPolicyOrDefault(repo: Repo, projectId: string): Pro
 }
 
 /** Package-internal: whether the project has this source now (in memory, O(1)). */
+/** Package-internal (R73): whether a Zotero item's source was deleted in this app (its deletion record), by item key. */
+export async function deletedHere(repo: Repo, projectId: string): Promise<(zoteroKey: string) => boolean> {
+  const core = cores.get(repo)!;
+  const t = await readTombstones(core, core.state(projectId));
+  if (!t?.zotero.length) return () => false;
+  const set = new Set(t.zotero);
+  return (k) => set.has(tombstoneHash(t.secret, k));
+}
+
 export function hasSource(repo: Repo, projectId: string, id: string): boolean {
   return cores.get(repo)!.state(projectId).sources.has(id);
 }
