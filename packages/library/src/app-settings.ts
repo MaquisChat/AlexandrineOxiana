@@ -109,10 +109,19 @@ export function updateAppSetting<T>(dir: string, name: string, edit: (cur: T | u
   return run;
 }
 
+/** One path segment character: anything but whitespace, separators, quotes and angle brackets. */
+const SEG = String.raw`[^\s/\\"'<>|]`;
+/** An absolute POSIX path; spaces are taken only inside folder names (another "/" follows). */
+const POSIX_PATH = new RegExp(String.raw`(?<![\w.:/<\\])/${SEG}+(?:(?: ${SEG}+)*/${SEG}+)+`, "gu");
+/** A Windows path (drive or UNC), the same way. */
+const WINDOWS_PATH = new RegExp(String.raw`(?:[A-Za-z]:|\\\\${SEG}+)\\${SEG}*(?:(?: ${SEG}+)*\\${SEG}+)*`, "gu");
+/** A quoted absolute path: everything up to the closing quote. */
+const QUOTED_PATH = /(["'`])((?:\/|[A-Za-z]:\\|\\\\)[^"'`\n]*[/\\][^"'`\n]*)\1/gu;
+
 /**
  * Makes a message safe to show or return: no absolute paths. Paths inside one of `roots` (library
- * folders) become library-relative; other absolute paths become `<path>`. Links (anything with a
- * scheme) are kept exactly as they are.
+ * folders) become library-relative; other absolute paths (with spaces, non-ASCII letters, Windows
+ * drive or UNC forms) become `<path>`. Links (anything with a scheme) are kept exactly as they are.
  */
 export function scrubPaths(text: string, roots: Iterable<string> = []): string {
   const urls: string[] = [];
@@ -121,7 +130,8 @@ export function scrubPaths(text: string, roots: Iterable<string> = []): string {
     const esc = r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     out = out.replace(new RegExp(`${esc}[\\\\/]`, "g"), "").replace(new RegExp(esc, "g"), "<library>");
   }
-  out = out.replace(/[A-Za-z]:\\[^\s"'),;]+/g, "<path>");
-  out = out.replace(/(?<![\w.:])\/[\w.@~-]+(?:\/[\w.@~-]+)+/g, "<path>");
+  out = out.replace(QUOTED_PATH, (_m, q: string) => `${q}<path>${q}`);
+  out = out.replace(WINDOWS_PATH, "<path>");
+  out = out.replace(POSIX_PATH, "<path>");
   return out.replace(/\u0000(\d+)\u0000/g, (_m, n: string) => urls[Number(n)]!);
 }

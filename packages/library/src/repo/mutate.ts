@@ -32,6 +32,7 @@ import {
   type Change,
   type Condition,
   type EntityType,
+  type GovernanceConfig,
   type PolicyDecision,
   type PolicyRequest,
 } from "@ao/core";
@@ -83,8 +84,13 @@ export interface InternalMutateOptions extends MutateOptions {
    * of its own (which audits it), so every refusal is audited exactly once (Bulk Import groups, R62).
    */
   unauditedDeny?: boolean;
-  /** More details recorded on the allow audit event(s), e.g. the reason given for loosening governance. */
-  auditDetails?: Record<string, unknown>;
+  /** More details recorded on the allow audit event(s), e.g. the reason given for loosening governance; a function is called once `fn` has run. */
+  auditDetails?: Record<string, unknown> | (() => Record<string, unknown>);
+  /**
+   * Only for repairing an unreadable governance.yaml (governance edit, R98): the policy evaluated
+   * when the file cannot be read or parsed, instead of denying everything.
+   */
+  unreadablePolicyFallback?: GovernanceConfig;
 }
 
 export const REFUSED_GENERIC = "Refused by an internal check";
@@ -360,6 +366,7 @@ async function decide(
   entity: MutateOptions["entity"],
   refuse?: RefuseHook,
   unauditedDeny = false,
+  fallback?: GovernanceConfig,
 ): Promise<Array<{ req: PolicyRequest; d: PolicyDecision }>> {
   let cfg: ReturnType<typeof parseGovernance> | undefined;
   let cfgError: string | undefined;
@@ -367,6 +374,7 @@ async function decide(
     cfg = await governanceOf(core, st);
   } catch (e) {
     cfgError = `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}`;
+    if (fallback) cfg = fallback;
   }
   const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
   for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
@@ -445,7 +453,7 @@ export async function runMutation<T>(
     const op = opts.op ?? "mutate";
 
     // 1. Policy (a deny is audited and thrown).
-    const allowed = await decide(core, st, reqs, at, op, opts.entity, opts.refuse, opts.unauditedDeny === true);
+    const allowed = await decide(core, st, reqs, at, op, opts.entity, opts.refuse, opts.unauditedDeny === true, opts.unreadablePolicyFallback);
     const conditions: Condition[] = [];
     for (const { d } of allowed) {
       if (d.result !== "allow_with_conditions") continue;
@@ -481,7 +489,7 @@ export async function runMutation<T>(
           action: req.action,
           entity: opts.entityFor?.(i) ?? tx.auditEntity,
           decision: auditDecision(d),
-          details: { op, ...opts.auditDetails, txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
+          details: { op, ...(typeof opts.auditDetails === "function" ? opts.auditDetails() : opts.auditDetails), txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
         }, onPlan);
       }
       maybeCrash("before-marker-delete");

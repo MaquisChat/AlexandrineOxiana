@@ -382,10 +382,6 @@ export class ProxyQueue {
 /** One queue per library (R85 I2): attach, Bulk Import and watched folders share it. */
 const queues = new WeakMap<Library, ProxyQueue>();
 
-/**
- * The library's viewing-proxy queue, made on first use (with no worker: jobs stay pending until
- * `setWorker` and `resumePending`). Callers that are given a queue explicitly use that one.
- */
 /** Disposes of the library's queue (on library close, R96): the running job finishes, nothing new starts. */
 export async function disposeProxyQueue(repo: Repo): Promise<void> {
   const lib = repoLibrary(repo);
@@ -394,6 +390,10 @@ export async function disposeProxyQueue(repo: Repo): Promise<void> {
   await q?.dispose();
 }
 
+/**
+ * The library's viewing-proxy queue, made on first use (with no worker: jobs stay pending until
+ * `setWorker` and `resumePending`). Callers that are given a queue explicitly use that one.
+ */
 export function proxyQueueFor(repo: Repo): ProxyQueue {
   const lib = repoLibrary(repo);
   let q = queues.get(lib);

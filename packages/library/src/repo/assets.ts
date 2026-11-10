@@ -246,6 +246,8 @@ export async function addOriginalAsset(
   /** Package-internal: a newly captured file (e.g. a drop onto the source): its capture method is evaluated and audited in the same change. */
   internal: {
     captureMethod?: Provenance["captureMethod"];
+    /** The platform the capture is from (protocol.platforms applies, R99 I8). */
+    capturePlatform?: string;
     hasLocation?: boolean;
     refuse?: RefuseHook;
     /** Viewing proxies to queue for the new original (R83), written to source.json in the same change. */
@@ -257,7 +259,7 @@ export async function addOriginalAsset(
   core.assertUnlocked(st);
   const current = await readSourceFile(core, st, sourceId);
   const reqs: MutateRequest[] = [
-    ...(internal.captureMethod ? [{ action: "capture" as const, capture: { method: internal.captureMethod } }] : []),
+    ...(internal.captureMethod ? [{ action: "capture" as const, capture: { method: internal.captureMethod, ...(internal.capturePlatform ? { platform: internal.capturePlatform } : {}) } }] : []),
     storeRequest(current.source.provenance, internal.hasLocation === true),
   ];
   return runMutation(

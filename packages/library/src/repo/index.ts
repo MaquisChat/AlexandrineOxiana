@@ -1,5 +1,5 @@
 export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
-export { GOVERNANCE_MAX_BYTES, GovernanceLooseningError } from "./governance-edit.js";
+export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, UNREADABLE_GOVERNANCE } from "./governance-edit.js";
 export type { GovernanceEditResult } from "./governance-edit.js";
 export type { AuditCheck, RepoOptions } from "./repo.js";
 export type { IndexSink, Manifest, ManifestEntry, ProjectJson } from "./state.js";
@@ -16,6 +16,7 @@ export { REVIEW_FILE } from "./review.js";
 export type { ConsentInput, ParticipantInput, SessionInput } from "./fieldwork.js";
 export {
   GovernanceViolationError,
+  InvalidInputError,
   ImmutableProvenanceError,
   NotFoundError,
   PolicyDeniedError,

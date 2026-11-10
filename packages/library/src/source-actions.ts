@@ -17,7 +17,7 @@ import { recheckSourceFile, type Asset, type Source, type SourceFile } from "@ao
 import { classifyUrl } from "./capture/platforms.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, updateSourceRechecked, type Repo } from "./repo/repo.js";
-import { NotFoundError } from "./repo/errors.js";
+import { InvalidInputError, NotFoundError } from "./repo/errors.js";
 import { activeTemp } from "./tmp-registry.js";
 
 /** Evaluates (and on deny, audits and throws) the `capture` decision for each platform the links are on. */
@@ -60,7 +60,7 @@ export const CONFIRMABLE_FIELDS: ReadonlySet<string> = new Set([
  */
 export async function confirmField(repo: Repo, projectId: string, sourceId: string, field: string, value: unknown): Promise<SourceFile> {
   const name = field.replace(/^\//, "");
-  if (!CONFIRMABLE_FIELDS.has(name)) throw new TypeError(`"${field}" is not a field that can be set here`);
+  if (!CONFIRMABLE_FIELDS.has(name)) throw new InvalidInputError(`"${field}" is not a field that can be set here`);
   const at = new Date().toISOString();
   const pointer = `/${name}`;
   return updateSourceRechecked(repo, projectId, sourceId, { [name]: value } as Partial<Omit<Source, "id">>, {
@@ -77,12 +77,12 @@ export async function readAssetText(repo: Repo, projectId: string, sourceId: str
   const sf = await repo.getSource(projectId, sourceId);
   const asset = sf.assets.find((a) => a.id === assetId);
   if (!asset || asset.role !== "derived" || asset.status === "destroyed") throw new NotFoundError("Asset", assetId);
-  if (asset.bytes > ASSET_TEXT_MAX_BYTES + 1024) throw new TypeError("this file is too large to show as text");
+  if (asset.bytes > ASSET_TEXT_MAX_BYTES + 1024) throw new InvalidInputError("this file is too large to show as text");
   let raw = await readMaybe(join(repoLibrary(repo).root, ...asset.path.split("/")));
   if (!raw) throw new NotFoundError("Asset", assetId);
   if (asset.encrypted) {
     const k = projectDataKey(repo, projectId);
-    if (!k) throw new TypeError("this file is encrypted but the project is not");
+    if (!k) throw new InvalidInputError("this file is encrypted but the project is not");
     raw = await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
   }
   return raw.toString("utf8");
@@ -106,10 +106,10 @@ export async function addTranscriptVersion(
   sourceId: string,
   input: { text: string; format: "vtt" | "txt"; basedOn?: string; lang?: string },
 ): Promise<Asset> {
-  if (typeof input.text !== "string" || input.text.length === 0) throw new TypeError("the transcript text is empty");
-  if (Buffer.byteLength(input.text, "utf8") > ASSET_TEXT_MAX_BYTES) throw new TypeError("the transcript is too long");
-  if (input.format !== "vtt" && input.format !== "txt") throw new TypeError('format must be "vtt" or "txt"');
-  if (input.format === "vtt" && !/^﻿?WEBVTT/.test(input.text)) throw new TypeError("a WebVTT transcript must start with WEBVTT");
+  if (typeof input.text !== "string" || input.text.length === 0) throw new InvalidInputError("the transcript text is empty");
+  if (Buffer.byteLength(input.text, "utf8") > ASSET_TEXT_MAX_BYTES) throw new InvalidInputError("the transcript is too long");
+  if (input.format !== "vtt" && input.format !== "txt") throw new InvalidInputError('format must be "vtt" or "txt"');
+  if (input.format === "vtt" && !/^﻿?WEBVTT/.test(input.text)) throw new InvalidInputError("a WebVTT transcript must start with WEBVTT");
   const sf = await repo.getSource(projectId, sourceId);
   let parents: string[];
   if (input.basedOn) {

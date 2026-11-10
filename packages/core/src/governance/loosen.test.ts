@@ -26,7 +26,29 @@ describe("loosenedControls", () => {
     const exc = 'exceptions:\n  - { control: "encryption.atRest", value: optional, reason: "IRB amendment", by: pi, at: "2026-01-01T09:30:00Z" }\n';
     expect(loosenedControls(g("profiles: [hipaa]"), g(`profiles: [hipaa]\nencryption: { atRest: optional }\n${exc}`))).toEqual(["encryption.atRest", "exceptions.encryption.atRest"]);
   });
-  it("ignores descriptive lists (protocol platforms, DMP formats)", () => {
-    expect(loosenedControls(g(""), g("protocol: { platforms: [youtube] }\ndmp: { formats: [csv] }"))).toEqual([]);
+  it("ignores descriptive lists (DMP formats, populations); adding a first platform restricts", () => {
+    expect(loosenedControls(g(""), g("protocol: { platforms: [youtube], populations: [adults] }\ndmp: { formats: [csv] }"))).toEqual([]);
+  });
+});
+
+describe("loosenedControls (R98 I1, R99 I2)", () => {
+  it("protocol.approvedFrom moved earlier or removed is loosening; later is not", () => {
+    const b = g('protocol: { approvedFrom: "2026-06-01" }');
+    expect(loosenedControls(b, g('protocol: { approvedFrom: "2026-01-01" }'))).toEqual(["protocol.approvedFrom"]);
+    expect(loosenedControls(b, g(""))).toEqual(["protocol.approvedFrom"]);
+    expect(loosenedControls(b, g('protocol: { approvedFrom: "2026-09-01" }'))).toEqual([]);
+  });
+  it("protocol.platforms: removing the restriction or adding a platform is loosening; narrowing is not", () => {
+    const b = g("protocol: { platforms: [youtube] }");
+    expect(loosenedControls(b, g("protocol: { platforms: [youtube, instagram] }"))).toEqual(["protocol.platforms"]);
+    expect(loosenedControls(b, g(""))).toEqual(["protocol.platforms"]);
+    expect(loosenedControls(g("protocol: { platforms: [youtube, tiktok] }"), b)).toEqual([]);
+    expect(loosenedControls(g(""), b)).toEqual([]);
+  });
+  it("a new or changed consent.defaultLegalBasis entry is loosening", () => {
+    const b = g('consent: { defaultLegalBasis: { social-media: "public interest" } }');
+    expect(loosenedControls(b, g('consent: { defaultLegalBasis: { social-media: "public interest", manual-upload: "consent" } }'))).toEqual(["consent.defaultLegalBasis"]);
+    expect(loosenedControls(b, g('consent: { defaultLegalBasis: { social-media: "legitimate interest" } }'))).toEqual(["consent.defaultLegalBasis"]);
+    expect(loosenedControls(b, g(""))).toEqual([]);
   });
 });

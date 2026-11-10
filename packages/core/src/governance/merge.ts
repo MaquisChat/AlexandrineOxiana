@@ -202,8 +202,11 @@ export function effectivePolicy(cfg: GovernanceConfig): EffectivePolicy {
   return { policy, violations };
 }
 
-/** Controls whose lists are descriptive (not permissions): adding to them never loosens anything. */
-const NOT_PERMISSIONS = new Set(["dmp.formats", "protocol.platforms", "protocol.populations", "protocol.languages"]);
+/**
+ * Controls left out of the generic comparison: descriptive lists (adding to them never loosens
+ * anything) and controls with their own rule below (platforms, approvedFrom, default legal bases).
+ */
+const NOT_PERMISSIONS = new Set(["dmp.formats", "protocol.populations", "protocol.languages", "protocol.platforms", "protocol.approvedFrom", "consent.defaultLegalBasis"]);
 
 /**
  * The controls where `after` is looser than `before` (a governance edit, Task 30): their effective
@@ -229,6 +232,17 @@ export function loosenedControls(before: GovernanceConfig, after: GovernanceConf
   for (const path of DATE_PATHS) {
     if (getPath(eb, path) != null && getPath(ea, path) == null) out.add(path);
   }
+  // An empty platform list means no restriction: dropping the restriction, or adding a platform, loosens.
+  const pb = eb.protocol.platforms ?? [];
+  const pa = ea.protocol.platforms ?? [];
+  if (pb.length > 0 && (pa.length === 0 || pa.some((p) => !pb.includes(p)))) out.add("protocol.platforms");
+  // Approval starting earlier (or no start date any more) allows capture on more days (R98).
+  const fb = time(eb.protocol.approvedFrom);
+  if (!Number.isNaN(fb) && (eb.protocol.approvedFrom != null) && (ea.protocol.approvedFrom == null || time(ea.protocol.approvedFrom) < fb)) out.add("protocol.approvedFrom");
+  // A new or changed default legal basis lets captures through without the researcher stating one.
+  const lb = eb.consent.defaultLegalBasis ?? {};
+  const la = ea.consent.defaultLegalBasis ?? {};
+  if (Object.keys(la).some((k) => !Object.hasOwn(lb, k) || lb[k] !== la[k])) out.add("consent.defaultLegalBasis");
   if ((before.profiles ?? []).some((p) => !(after.profiles ?? []).includes(p))) out.add("profiles");
   const known = new Set((before.exceptions ?? []).map((e) => JSON.stringify(e)));
   for (const e of after.exceptions ?? []) if (!known.has(JSON.stringify(e))) out.add(`exceptions.${e.control}`);

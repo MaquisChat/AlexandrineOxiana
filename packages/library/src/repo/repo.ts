@@ -10,7 +10,7 @@ import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
-import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
+import { createCollection, createTag, deleteCollection, deleteTag, moveCollection, renameCollection, renameTag, setMembership, workspaceTags } from "./collections.js";
 import {
   createConsent,
   createParticipant,
@@ -52,7 +52,7 @@ import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutco
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
-import { setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
+import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -197,6 +197,17 @@ export class Repo {
   deleteCollection(projectId: string, id: string): Promise<void> {
     return deleteCollection(this.core, projectId, id);
   }
+  renameCollection(projectId: string, id: string, name: string): Promise<Collection> {
+    return renameCollection(this.core, projectId, id, name);
+  }
+  /** A project tag's new name (and colour). Workspace tags are not renamed here. */
+  renameTag(projectId: string, id: string, name: string, color?: string): Promise<Tag> {
+    return renameTag(this.core, projectId, id, name, color);
+  }
+  /** Deletes a project tag; its sources lose it in the same change. */
+  deleteTag(projectId: string, id: string): Promise<void> {
+    return deleteTag(this.core, projectId, id);
+  }
   /** `scope` is "workspace" or a project id. */
   createTag(scope: string, name: string, color?: string): Promise<Tag> {
     return createTag(this.core, scope, name, color);
@@ -231,16 +242,19 @@ export class Repo {
 
   /** The project's governance.yaml as written ("" when the project has none: the defaults apply). */
   async getGovernanceText(projectId: string): Promise<string> {
-    const st = this.core.state(projectId);
-    const raw = await readMaybe(this.core.abs(`${st.rel}/governance.yaml`));
-    return raw ? raw.toString("utf8") : "";
+    return (await readGovernance(this.core, projectId)).yaml;
+  }
+  /** The governance.yaml text and its SHA-256 (the `baseSha256` of an edit). */
+  getGovernance(projectId: string): Promise<{ yaml: string; sha256: string }> {
+    return readGovernance(this.core, projectId);
   }
   /**
    * Replaces the project's governance.yaml (governed and audited). A change that loosens a control
    * or goes below a profile's minimum needs `reason`, recorded on the audit event
-   * (GovernanceLooseningError otherwise); invalid text throws GovernanceParseError.
+   * (GovernanceLooseningError otherwise); invalid text throws GovernanceParseError; a file changed
+   * since `baseSha256` throws GovernanceConflictError.
    */
-  setGovernance(projectId: string, yamlText: string, opts: { reason?: string } = {}): Promise<GovernanceEditResult> {
+  setGovernance(projectId: string, yamlText: string, opts: { baseSha256: string; reason?: string }): Promise<GovernanceEditResult> {
     return setGovernanceIn(this.core, projectId, yamlText, opts);
   }
 }
@@ -573,10 +587,11 @@ export function addCapturedOriginal(
   sourceId: string,
   input: OriginalAssetInput,
   captureMethod: Provenance["captureMethod"],
-  opts: { hasLocation?: boolean; refuse?: RefuseHook; pendingProxies?: (asset: Asset) => PendingProxy[] } = {},
+  opts: { hasLocation?: boolean; refuse?: RefuseHook; pendingProxies?: (asset: Asset) => PendingProxy[]; platform?: string } = {},
 ): Promise<Asset> {
   return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, {
     captureMethod,
+    ...(opts.platform ? { capturePlatform: opts.platform } : {}),
     hasLocation: opts.hasLocation === true,
     ...(opts.refuse ? { refuse: opts.refuse } : {}),
     ...(opts.pendingProxies ? { pendingProxies: opts.pendingProxies } : {}),

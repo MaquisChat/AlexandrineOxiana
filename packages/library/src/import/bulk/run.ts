@@ -201,6 +201,13 @@ export interface BatchHandle {
   pause(): void;
   resume(): void;
   cancel(): void;
+  /**
+   * Stops the run at the next safe point (between items, everything so far stored and journaled)
+   * and leaves it `paused` on disk, resumable later with resumeBatch; nothing more is written by
+   * this run. Used when the app closes or the library moves (R99 I4/I5). Settles like `done`
+   * (state `paused`, or the state it ended in if it finished first).
+   */
+  suspend(): Promise<BatchResult>;
   progress: AsyncIterable<BatchProgress>;
   /** Settles when the run stops (finished, cancelled or failed). */
   done: Promise<BatchResult>;
@@ -420,6 +427,7 @@ class Run {
   readonly feed = new ProgressFeed();
   private paused = false;
   private cancelled = false;
+  private suspending = false;
   private gate: (() => void) | null = null;
   private readonly abort = new AbortController();
   /** Journal lines of items that stored nothing, written with the next change. */
@@ -514,6 +522,13 @@ class Run {
         this.abort.abort();
         this.gate?.();
         this.gate = null;
+      },
+      suspend: () => {
+        this.suspending = true;
+        this.paused = true;
+        this.gate?.();
+        this.gate = null;
+        return this.done;
       },
       progress: this.feed.iterable(),
       done: this.done,
@@ -618,10 +633,17 @@ class Run {
         }
         if (this.paused) {
           await this.checkpoint("paused");
-          await new Promise<void>((r) => {
-            this.gate = r;
-            if (!this.paused || this.cancelled) r();
-          });
+          if (!this.suspending) {
+            await new Promise<void>((r) => {
+              this.gate = r;
+              if (!this.paused || this.cancelled || this.suspending) r();
+            });
+          }
+          if (this.suspending) {
+            // Left paused on disk (just checkpointed); this run writes nothing more.
+            state = "paused";
+            break;
+          }
           if (!this.cancelled) await this.checkpoint("running");
         }
         if (this.cancelled) break;
@@ -634,9 +656,11 @@ class Run {
         if (this.pending.length >= 200) await this.checkpoint("running");
         await sleepTurn();
       }
-      await this.flush();
-      await this.clearRestored();
-      if (this.cancelled) state = "cancelled";
+      if (state !== "paused") {
+        await this.flush();
+        await this.clearRestored();
+        if (this.cancelled) state = "cancelled";
+      }
     } catch (err) {
       if (this.cancelled && (err as Error)?.name === "AbortError") state = "cancelled";
       else {
@@ -653,6 +677,13 @@ class Run {
     } finally {
       await watchdog.close();
       await this.cleanup();
+    }
+    if (state === "paused" && this.suspending) {
+      runListeners.delete(this.rec.id);
+      active.delete(this.rec.id);
+      this.feed.end();
+      this.settle({ batchId: this.rec.id, state, counts: this.counts() });
+      return;
     }
     const deleted = [...this.latest.values()].filter((e) => e.outcome === "deleted-here").length;
     this.rec.notes = this.rec.notes.filter((n) => !DELETED_NOTE.test(n));

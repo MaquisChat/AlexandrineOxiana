@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { Tag, diffToChanges, newId, type Collection } from "@ao/core";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { appendChanges } from "./changelog-store.js";
-import { NotFoundError } from "./errors.js";
+import { InvalidInputError, NotFoundError } from "./errors.js";
 import { readMaybe } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type MutateRequest } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
@@ -64,6 +64,75 @@ export async function moveCollection(core: RepoCore, projectId: string, id: stri
       return c;
     },
     { op: "collection.move", entity: { type: "collection", id } },
+  );
+}
+
+/** Renames a collection. */
+export async function renameCollection(core: RepoCore, projectId: string, id: string, name: string): Promise<Collection> {
+  core.assertWritable();
+  if (typeof name !== "string" || name.trim() === "" || name.length > 500) throw new InvalidInputError("a collection name of 1 to 500 characters is required");
+  return runMutation(
+    core,
+    projectId,
+    ORGANIZE,
+    async (tx) => {
+      const data = await readFullData(core, tx.state);
+      const c = data.collections.find((x) => x.id === id);
+      if (!c) throw new NotFoundError("Collection", id);
+      const before = structuredClone(c);
+      c.name = name;
+      await writeProjectData(core, tx, data);
+      tx.record("collection", id, before, c);
+      return c;
+    },
+    { op: "collection.rename", entity: { type: "collection", id } },
+  );
+}
+
+/** Renames (and optionally recolours) one of the project's tags. */
+export async function renameTag(core: RepoCore, projectId: string, id: string, name: string, color?: string): Promise<Tag> {
+  core.assertWritable();
+  if (typeof name !== "string" || name.trim() === "" || name.length > 200) throw new InvalidInputError("a tag name of 1 to 200 characters is required");
+  return runMutation(
+    core,
+    projectId,
+    ORGANIZE,
+    async (tx) => {
+      const data = await readFullData(core, tx.state);
+      const t = data.tags.find((x) => x.id === id);
+      if (!t) throw new NotFoundError("Tag", id);
+      if (data.tags.some((x) => x.id !== id && x.name.toLowerCase() === name.toLowerCase())) throw new InvalidInputError(`A tag named "${name}" already exists`);
+      const before = structuredClone(t);
+      const next = Tag.parse({ ...t, name, ...(color !== undefined ? { color } : {}) });
+      Object.assign(t, next);
+      await writeProjectData(core, tx, data);
+      tx.record("tag", id, before, t);
+      return t;
+    },
+    { op: "tag.rename", entity: { type: "tag", id } },
+  );
+}
+
+/** Deletes one of the project's tags; its sources keep existing and lose only the tag, in the same change. */
+export async function deleteTag(core: RepoCore, projectId: string, id: string): Promise<void> {
+  core.assertWritable();
+  await runMutation(
+    core,
+    projectId,
+    ORGANIZE,
+    async (tx) => {
+      const data = await readFullData(core, tx.state);
+      const t = data.tags.find((x) => x.id === id);
+      if (!t) throw new NotFoundError("Tag", id);
+      data.tags = data.tags.filter((x) => x.id !== id);
+      await writeProjectData(core, tx, data);
+      tx.record("tag", id, t, null);
+      for (const sid of tx.state.sources.keys()) {
+        const sf = await readSourceFile(core, tx.state, sid);
+        if (sf.source.tagIds.includes(id)) await editSource(core, tx, sid, (s) => ({ ...s, tagIds: s.tagIds.filter((x) => x !== id) }));
+      }
+    },
+    { op: "tag.delete", entity: { type: "tag", id } },
   );
 }
 

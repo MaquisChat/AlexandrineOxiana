@@ -113,3 +113,8 @@ export class DestroyedParentError extends Error {
     super(`the parent asset ${assetId} was destroyed under the project's retention rule`);
   }
 }
+
+/** A request's value is not acceptable (a plain message for the person; services answer 400 VALIDATION). */
+export class InvalidInputError extends Error {
+  override name = "InvalidInputError";
+}

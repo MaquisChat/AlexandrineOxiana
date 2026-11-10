@@ -17,9 +17,11 @@ import { randomUUID } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
+import { InvalidInputError } from "../repo/errors.js";
 import { addCapturedOriginal, projectPolicy, repoLibrary, updateSourceRechecked, type Repo } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
 import { classifyUrl } from "./platforms.js";
+import { keyWords, stripSnapshot } from "./snapshot.js";
 import type { CaptureOutcome, LinkCapture } from "./link-capture.js";
 
 export const BROWSER_CAPTURE_LIMITS = {
@@ -72,25 +74,26 @@ function validate(input: BrowserCaptureInput): { url: URL; png?: Buffer; html?: 
   try {
     url = new URL(String(input.url));
   } catch {
-    throw new TypeError("url must be a web address");
+    throw new InvalidInputError("url must be a web address");
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") throw new TypeError("url must be an http(s) address");
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw new InvalidInputError("url must be an http(s) address");
   let png: Buffer | undefined;
   if (input.screenshotPng !== undefined) {
-    if (typeof input.screenshotPng !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(input.screenshotPng)) throw new TypeError("screenshotPng must be base64");
+    if (typeof input.screenshotPng !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(input.screenshotPng)) throw new InvalidInputError("screenshotPng must be base64");
     png = Buffer.from(input.screenshotPng, "base64");
-    if (png.length > BROWSER_CAPTURE_LIMITS.screenshotBytes) throw new TypeError("the screenshot is too large");
-    if (!png.subarray(0, 8).equals(PNG_MAGIC)) throw new TypeError("the screenshot must be a PNG image");
+    if (png.length > BROWSER_CAPTURE_LIMITS.screenshotBytes) throw new InvalidInputError("the screenshot is too large");
+    if (!png.subarray(0, 8).equals(PNG_MAGIC)) throw new InvalidInputError("the screenshot must be a PNG image");
   }
-  if (input.html !== undefined && (typeof input.html !== "string" || input.html.length > BROWSER_CAPTURE_LIMITS.htmlChars)) throw new TypeError("html must be text of at most 10 MB");
-  if (!png && !input.html) throw new TypeError("a screenshot or the page's HTML is needed");
-  const e = (input.extracted ?? {}) as Record<string, unknown>;
+  if (input.html !== undefined && (typeof input.html !== "string" || input.html.length > BROWSER_CAPTURE_LIMITS.htmlChars)) throw new InvalidInputError("html must be text of at most 10 MB");
+  if (!png && !input.html) throw new InvalidInputError("a screenshot or the page's HTML is needed");
+  // What the extension read goes through the same stripping as a platform snapshot (R41/R42, R99 I8).
+  const e = stripSnapshot((input.extracted ?? {}) as Record<string, unknown>);
   const ex: ExtractedPage = {};
   for (const k of ["platform", "kind", "canonicalUrl", "postId", "handle", "displayName", "caption", "postedAt"] as const) {
     const v = text(e[k]);
     if (v) ex[k] = v;
   }
-  return { url, ...(png ? { png } : {}), ...(input.html ? { html: input.html } : {}), ex };
+  return { url, ...(png ? { png } : {}), ...(input.html ? { html: stripHtmlSnapshot(input.html) } : {}), ex };
 }
 
 const DAY = /^(\d{4}-\d{2}-\d{2})/;
@@ -140,7 +143,9 @@ export async function captureBrowserPage(
       if (download.sourceId && download.status !== "failed") {
         const sourceId = download.sourceId;
         for (const f of files) {
-          await addCapturedOriginal(repo, projectId, sourceId, { fromPath: f.path, kind: f.kind, ext: f.ext, mime: f.mime, label: `${f.label} ${at.slice(0, 10)}` }, "browser_capture");
+          await addCapturedOriginal(repo, projectId, sourceId, { fromPath: f.path, kind: f.kind, ext: f.ext, mime: f.mime, label: `${f.label} ${at.slice(0, 10)}` }, "browser_capture", {
+            platform: classifyUrl(url.href).platform,
+          });
         }
         if (evidence.length) {
           await updateSourceRechecked(repo, projectId, sourceId, {}, {
@@ -166,7 +171,8 @@ export async function captureBrowserPage(
       title: { variants: [{ lang: "und", kind: "original", value: title }] },
       creators: ex.handle ? [{ handle: ex.handle, ...(ex.displayName ? { literal: ex.displayName } : {}), role: "author" }] : [],
       ...(day ? { issued: day } : {}),
-      identifiers: { url: c.canonicalUrl || url.href, ...(social ? { platform: c.platform as "youtube" | "instagram" | "tiktok" } : {}), ...(c.postId ? { platformPostId: c.postId } : {}) },
+      // The platform from the URL ("other" for a web page), so a protocol's platform list applies (R99 I8).
+      identifiers: { url: c.canonicalUrl || url.href, platform: c.platform, ...(c.postId ? { platformPostId: c.postId } : {}) },
       caseAttributes: {},
       availability: { status: "available" },
       collectionIds: [],
@@ -195,4 +201,78 @@ export async function captureBrowserPage(
     await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
     activeTemp.delete(name);
   }
+}
+
+// ------------------------------------------------------------------------------------------
+// HTML snapshot stripping (R41/R42 applied to the page's HTML)
+
+/** Words that make an attribute, meta or form field a credential (same rule as snapshot keys). */
+const SECRET_WORDS = new Set(["csrf", "xsrf", "token", "tokens", "auth", "authorization", "session", "sessionid", "password", "passwd", "secret", "signature", "sig", "nonce", "jwt", "credential", "credentials", "apikey", "cookie", "cookies"]);
+const secretName = (n: string) => keyWords(n).some((w) => SECRET_WORDS.has(w)) || /^authenticity_token$/i.test(n);
+const URL_ATTRS = new Set(["href", "src", "action", "poster", "data-src", "data-href", "formaction", "cite", "background"]);
+const ATTR = /([^\s=/>"']+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>"']+))?/g;
+
+/** An http(s) link without its query and fragment (signed, expiring or tracking parameters). */
+function bareUrl(v: string): string {
+  const m = /^(\s*https?:\/\/[^?#\s]*)[?#][^\s]*/i.exec(v);
+  return m ? m[1]! : v;
+}
+
+function cleanTag(tag: string): string {
+  const m = /^<\s*([A-Za-z][A-Za-z0-9-]*)([\s\S]*?)(\/?)>$/.exec(tag);
+  if (!m) return tag; // closing tags, comments, doctype: kept as they are
+  const name = m[1]!.toLowerCase();
+  const attrs: Array<[string, string | undefined]> = [];
+  for (const a of m[2]!.matchAll(ATTR)) {
+    const raw = a[2];
+    const value = raw === undefined ? undefined : raw.startsWith('"') || raw.startsWith("'") ? raw.slice(1, -1) : raw;
+    attrs.push([a[1]!, value]);
+  }
+  const get = (k: string) => attrs.find(([n]) => n.toLowerCase() === k)?.[1];
+  // A meta or form field carrying a token is dropped whole.
+  if (name === "meta" && secretName(get("name") ?? get("property") ?? get("http-equiv") ?? "")) return "";
+  if (name === "input" && (secretName(get("name") ?? "") || (get("type") ?? "").toLowerCase() === "password")) return "";
+  const out: string[] = [];
+  for (const [k, v] of attrs) {
+    const lk = k.toLowerCase();
+    if (lk.startsWith("on")) continue; // inline event handlers
+    if (lk === "nonce" || lk === "integrity" || secretName(lk.replace(/^data-/, ""))) continue;
+    if (v === undefined) {
+      out.push(k);
+      continue;
+    }
+    let val = v;
+    if (URL_ATTRS.has(lk)) val = bareUrl(val);
+    else if (lk === "srcset") val = val.split(",").map((p) => bareUrl(p.trim()).trim() + (p.trim().split(/\s+/)[1] ? ` ${p.trim().split(/\s+/)[1]}` : "")).join(", ");
+    else if (/^\s*javascript:/i.test(val)) val = "";
+    out.push(`${k}="${val.replace(/"/g, "&quot;")}"`);
+  }
+  return `<${m[1]}${out.length ? ` ${out.join(" ")}` : ""}${m[3]}>`;
+}
+
+/**
+ * The page's HTML as stored: scripts removed (with their contents; an unclosed one to the end),
+ * inline event handlers, nonces and `javascript:` links dropped, meta tags and form fields that
+ * carry tokens or passwords removed, and links lose their query and fragment (signed or tracking
+ * parameters). Linear in the input's length.
+ */
+export function stripHtmlSnapshot(html: string): string {
+  // 1. Scripts, found case-insensitively by position (no backtracking).
+  const lower = html.toLowerCase();
+  let noScripts = "";
+  let i = 0;
+  for (;;) {
+    const open = lower.indexOf("<script", i);
+    if (open < 0) {
+      noScripts += html.slice(i);
+      break;
+    }
+    noScripts += html.slice(i, open);
+    const close = lower.indexOf("</script", open + 7);
+    if (close < 0) break;
+    const end = lower.indexOf(">", close);
+    i = end < 0 ? html.length : end + 1;
+  }
+  // 2. Every remaining tag, attribute by attribute.
+  return noScripts.replace(/<[^<>]*>/g, cleanTag);
 }
