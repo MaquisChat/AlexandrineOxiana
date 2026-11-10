@@ -244,6 +244,8 @@ export function agreeStrict(field: string, a: unknown, b: unknown): boolean {
   return canon(field, a) === canon(field, b);
 }
 
+const DAY_MS = 86_400_000;
+
 const result = (status: FieldVerification["status"], checks: string[], reason?: string, values?: FieldVerification["values"]): FieldVerification => ({
   status, checks, ...(reason ? { reason } : {}), ...(values ? { values } : {}),
 });
@@ -274,6 +276,12 @@ export function checkPlatformIdentity(field: string, c: CheckCtx): FieldVerifica
     const dates = snapshotDates(snap);
     const issued = parseEdtf(c.draft.issued);
     if (dates.length === 0 || !issued) return undefined;
+    // The platform's own dates (timestamp vs upload_date) more than a day apart: the platform data
+    // contradicts itself, so neither can confirm the date (a one-day gap is a time-zone difference).
+    const full = dates.filter((d) => d.m !== undefined && d.d !== undefined).map((d) => Date.UTC(d.y, d.m! - 1, d.d!));
+    if (full.length > 1 && Math.max(...full) - Math.min(...full) > DAY_MS) {
+      return result("conflict", ["platform-date"], "The platform data gives two different dates for this post (its timestamp and its upload date), so the date needs checking.");
+    }
     const ok = dates.some((d) => datesEqual(issued, d));
     return ok
       ? result("verified", ["platform-date"])

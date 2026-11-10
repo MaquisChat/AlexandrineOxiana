@@ -799,3 +799,41 @@ describe("review round 5", () => {
     expect(verifyDraft(h, [ev("/creators", [{ family: "Okafor", handle: "real" }], "embedded")], {}).fields["/creators"]!.status).toBe("conflict");
   });
 });
+
+describe("task 17 rulings", () => {
+  const aiDate = (issued: string, quote: string) =>
+    verifyDraft(draft({ issued }), [ev("/issued", issued, "ai", { quote })], { documentText: `Front matter. ${quote} end.` }).fields["/issued"]!.status;
+
+  it("number labels (number, nos, #, Jg, with or without a colon), dash page ranges and a preceding bare number are not the day", () => {
+    expect(aiDate("2020-05-03", "VOLUME 45 NUMBER 3 MAY 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Vol. 45 #3 May 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Issue: 3 May 2020")).toBe("unverified");
+    expect(aiDate("2020-05-17", "pp. 5–17 May 2020")).toBe("unverified");
+    expect(aiDate("2020-05-17", "pp. 5—17 May 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Vol 12 3 May 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Nos. 3 May 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Jg. 3 Mai 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Vol.: 3 May 2020")).toBe("unverified");
+  });
+  it("plain written dates still verify", () => {
+    expect(aiDate("2020-05-17", "May 17, 2020")).toBe("verified");
+    expect(aiDate("2020-05-17", "17 May 2020")).toBe("verified");
+    expect(aiDate("2020-05-17", "received 17 May 2020; accepted 2 July 2020")).toBe("verified");
+  });
+
+  describe("platform dates that disagree with each other", () => {
+    const url = "https://www.youtube.com/watch?v=abc123";
+    const d = draft({ type: "video", title: mt("T"), issued: "2020-11-09", creators: [{ handle: "ama_k", role: "channel" }], identifiers: { platformPostId: "abc123", url } });
+    const evs = [ev("/issued", "2020-11-09", "platform-json"), ev("/issued", "2021-03-01", "platform-json")];
+    it("timestamp and upload_date more than a day apart are a conflict", () => {
+      const r = verifyDraft(d, evs, { platformSnapshot: { id: "abc123", timestamp: 1_604_880_000, upload_date: "20210301" } });
+      expect(r.fields["/issued"]!.status).toBe("conflict");
+      expect(r.fields["/issued"]!.reason).toMatch(/platform/i);
+      expect(r.overall).toBe("needs-review");
+    });
+    it("a one-day difference (time zones) still verifies", () => {
+      const r = verifyDraft(d, [ev("/issued", "2020-11-09", "platform-json")], { platformSnapshot: { id: "abc123", timestamp: 1_604_880_000, upload_date: "20201110" } });
+      expect(r.fields["/issued"]!.status).toBe("verified");
+    });
+  });
+});

@@ -222,13 +222,13 @@ const MONTH_RE = [...MONTH_OF.keys()].sort((a, b) => b.length - a.length).join("
 const ORDINAL = "(?:st|nd|rd|th|er|e|o|a)?";
 /** 17 May 2020 · 17. Mai 2020 · 17 de mayo de 2020 · the 17th of May, 2020 · 17-May-2020. No comma between day and month. */
 const DAY_MONTH_YEAR = new RegExp(
-  `(?<![\\p{L}\\p{N}])(?<!\\d[.,:/-])(\\d{1,2})${ORDINAL}(?:\\.?\\s+(?:(?:de|of|do|da|di|del|den|des)\\s+)?|-)(${MONTH_RE})(?![\\p{L}])(?:\\.?,?\\s+(?:(?:de|del|of|do|da)\\s+)?|-)(\\d{4})(?!\\d)`, "giu");
+  `(?<![\\p{L}\\p{N}])(?<!\\d[.,:/\u2013\u2014-])(?<!\\p{N}\\s)(\\d{1,2})${ORDINAL}(?:\\.?\\s+(?:(?:de|of|do|da|di|del|den|des)\\s+)?|-)(${MONTH_RE})(?![\\p{L}])(?:\\.?,?\\s+(?:(?:de|del|of|do|da)\\s+)?|-)(\\d{4})(?!\\d)`, "giu");
 /** May 17, 2020 · June 5th 2020 · May the 17th, 2020 */
 const MONTH_DAY_YEAR = new RegExp(`(?<![\\p{L}])(${MONTH_RE})(?![\\p{L}])\\.?\\s+(?:the\\s+)?(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(?:of\\s+)?(\\d{4})(?!\\d)`, "giu");
 /** May 2020 · May, 2020 · mayo de 2020 · Sept. 2020 */
 const MONTH_YEAR = new RegExp(`(?<![\\p{L}])(${MONTH_RE})(?![\\p{L}])\\.?,?\\s+(?:(?:de|del|of|do|da)\\s+)?(\\d{4})(?!\\d)`, "giu");
 /** A number right after one of these is a volume, issue or page number, never a day or month. */
-const NUMBER_LABEL = /(?:^|[^\p{L}\p{N}])(?:no|nr|n|num|vol|volume|issue|iss|p|pp|page|pages|heft|bd|t|s|art|article)[.°]?\s*$/iu;
+const NUMBER_LABEL = /(?:(?:^|[^\p{L}\p{N}])(?:no|nos|nr|n|num|number|vol|volume|issue|iss|p|pp|page|pages|heft|bd|jg|t|s|art|article)[.°]?|#)\s*:?\s*$/iu;
 const fold = (s: string) => s.normalize("NFKD").replace(/\p{M}+/gu, "");
 const labelled = (s: string, index: number) => NUMBER_LABEL.test(fold(s.slice(0, index)));
 
@@ -239,7 +239,9 @@ const labelled = (s: string, index: number) => NUMBER_LABEL.test(fold(s.slice(0,
  * Recognized: 2020-05-17, 2020/05, 17.05.2020 or 5/17/2020 (only when day and month cannot be
  * swapped), 05/2020, 2020年5月17日, and month names: "17 May 2020", "May 17, 2020",
  * "17 de mayo de 2020", "le 1er mai 2020", "17. Mai 2020", "March 2020".
- * Not a day or month: a number right after a label such as "No.", "Vol.", "p.", "Heft".
+ * Not a day or month: a number right after a label such as "No.", "Vol.", "Number", "#", "p.", "Heft", "Jg."
+ * (a colon after the label is allowed), the end of a page range ("pp. 5–17 May"), or a number directly
+ * after another bare number ("Vol 12 3 May 2020").
  */
 export function quoteStatesDate(quote: string, date: Edtf): boolean {
   const text = quote.normalize("NFKC").replace(/\s+/gu, " ");
