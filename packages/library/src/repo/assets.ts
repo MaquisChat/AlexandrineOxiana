@@ -13,7 +13,7 @@ import {
   type Provenance,
   type SourceFile,
 } from "@ao/core";
-import { MissingParentError, ProxyRecordRefusedError } from "./errors.js";
+import { DestroyedParentError, MissingParentError, ProxyRecordRefusedError } from "./errors.js";
 import { foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type RefuseHook, type MutateRequest } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
@@ -71,9 +71,11 @@ export async function addDerivedAsset(
       const cur = await readSourceFile(core, st, sourceId);
       // A derived asset's parents must still exist (e.g. not removed by an import's undo, R85 I1).
       for (const parent of input.derivation.parents) {
-        if (!cur.assets.some((a) => a.id === parent)) {
+        const found = cur.assets.find((a) => a.id === parent);
+        if (!found || found.status === "destroyed") {
           if (internal.completesPendingProxy) throw new ProxyRecordRefusedError("ORIGINAL_GONE");
-          throw new MissingParentError(parent);
+          // Nothing may be derived again from destroyed raw data (R92 I4).
+          throw found ? new DestroyedParentError(parent) : new MissingParentError(parent);
         }
       }
       if (internal.completesPendingProxy) {

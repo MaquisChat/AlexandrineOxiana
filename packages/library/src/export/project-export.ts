@@ -9,6 +9,7 @@
  *     source.json      the source as stored (metadata, provenance, annotations …), decrypted
  *     <name>.md        Markdown: metadata, annotations, notes — all user text escaped
  *     files/           the original files, decrypted
+ *     files/derived/   derived text (transcripts, OCR, translations), decrypted, listed in the Markdown
  *
  * Governance: each source is evaluated with `evaluate({action:'export', export:{identifiable,
  * hasLocation}})` (hasLocation: it has photos, videos or audio); a deny refuses the whole export
@@ -17,14 +18,17 @@
  * location rule (`sharing.locationMetadata`): keep → the original; coarsen / strip → the source's
  * verified viewing proxy for it (its recorded rule at least as strict), else the original only if
  * its metadata, read again, shows no location; otherwise the file is left out with a note.
- * Destroyed files (retention) are not there to export. File and folder names are pseudonymized
+ * Destroyed files (retention) are not there to export. The folder is written as
+ * `<folder>.partial` and renamed when complete; leftover .partial folders (a crash) are overwritten
+ * and removed by the next export. `dest` is checked where it really is (the realpath of its nearest
+ * existing ancestor), before and after it is created. File and folder names are pseudonymized
  * with the project's pseudonym map when its governance requires it (names in the library already
  * are; this also covers codes assigned since). Everything is written 0600 (folders 0700). One
  * `export.project` audit event records the counts (never a path).
  */
 import { randomUUID } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   formatModified,
   primary,
@@ -39,7 +43,8 @@ import {
 } from "@ao/core";
 import { decryptStream } from "../crypto/format.js";
 import { extractMetadata } from "../extract/index.js";
-import { copyFileAtomic, writeFileAtomic } from "../fs/atomic.js";
+import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { shredPath } from "../fs/shred.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "../import/resolve.js";
 import { stricterLocation, type LocationMode } from "../repo/assets.js";
 import { foldName, namesIn } from "../repo/io.js";
@@ -49,6 +54,7 @@ import {
   lookupPolicyInfo,
   projectDataKey,
   projectPseudonymMap,
+  pseudonymizesIdentifiable,
   repoLibrary,
   type Repo,
 } from "../repo/repo.js";
@@ -72,6 +78,13 @@ export interface ProjectExportResult {
   /** Files left out (location rule, destroyed). */
   omittedFiles: number;
   notes: string[];
+}
+
+/** Derived text worth exporting: transcripts, OCR, translations, notes (not proxies, thumbnails or media). */
+function isDerivedText(a: Asset): boolean {
+  if (a.kind === "proxy" || a.kind === "thumbnail") return false;
+  const m = a.mime.toLowerCase();
+  return m.startsWith("text/") || /\.(?:txt|vtt|srt|md|json)(?:\.enc)?$/iu.test(a.path);
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -133,11 +146,11 @@ const KIND_LABEL: Record<Annotation["kind"], string> = {
   highlight: "Highlight", underline: "Underline", note: "Note", image: "Image", ink: "Drawing", "coded-segment": "Coded segment", clip: "Clip", screenshot: "Screenshot",
 };
 
-function markdownOf(sf: SourceFile, files: string[]): string {
+function markdownOf(sf: SourceFile, files: string[], derived: Array<{ file: string; kind: string; lang?: string }>): string {
   const s = sf.source;
   const out: string[] = [`# ${escapeMarkdown(primary(s.title) || "(untitled)")}`, ""];
   const field = (label: string, v: string | undefined) => {
-    if (v && v.trim()) out.push(`- **${label}:** ${escapeMarkdown(v.trim())}`);
+    if (v && v.trim()) out.push(`- **${escapeMarkdown(label)}:** ${escapeMarkdown(v.trim())}`);
   };
   field("Type", s.type);
   field("Creators", s.creators.map(creatorText).join("; "));
@@ -156,6 +169,10 @@ function markdownOf(sf: SourceFile, files: string[]): string {
   if (files.length) {
     out.push("", "## Files", "");
     for (const f of files) out.push(`- ${escapeMarkdown(f)}`);
+  }
+  if (derived.length) {
+    out.push("", "## Derived text", "");
+    for (const d of derived) out.push(`- ${escapeMarkdown(`derived/${d.file} (${d.kind}${d.lang ? `, ${d.lang}` : ""})`)}`);
   }
   const notes = sf.annotations.filter((a) => a.kind === "note" && a.anchors.length === 0);
   const anns = sf.annotations.filter((a) => !notes.includes(a));
@@ -180,13 +197,28 @@ function markdownOf(sf: SourceFile, files: string[]): string {
 
 // ------------------------------------------------------------------------------------------
 
+/**
+ * Where `p` really is (R92 I1): the realpath of its nearest existing ancestor, with the rest of the
+ * path after it — so a folder that does not exist yet, under a symbolic link into the library, is
+ * seen where it would be created.
+ */
 async function realOrResolved(p: string): Promise<string> {
-  try {
-    return await fsp.realpath(p);
-  } catch {
-    return resolve(p);
+  let cur = resolve(p);
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return join(await fsp.realpath(cur), ...rest);
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(p);
+      rest.unshift(basename(cur));
+      cur = parent;
+    }
   }
 }
+
+/** An export folder still being written (or left by a crash), possibly holding decrypted files. */
+const PARTIAL = /^.+ - export - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.partial$/u;
 
 const inside = (child: string, parent: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 
@@ -194,13 +226,16 @@ const inside = (child: string, parent: string) => child === parent || child.star
 export async function exportProjectOpenFormats(repo: Repo, projectId: string, dest: string): Promise<ProjectExportResult> {
   const lib = repoLibrary(repo);
   const libReal = await realOrResolved(lib.root);
-  const destReal = await realOrResolved(dest);
-  if (inside(destReal, libReal) || inside(resolve(dest), resolve(lib.root))) {
-    throw new ExportDestinationError("Choose a folder outside the library for the export");
-  }
+  const refuseInside = async () => {
+    if (inside(await realOrResolved(dest), libReal) || inside(resolve(dest), resolve(lib.root))) {
+      throw new ExportDestinationError("Choose a folder outside the library for the export");
+    }
+  };
+  await refuseInside();
   const project = repo.getProject(projectId);
-  const { policy, clock, tz } = await lookupPolicyInfo(repo, projectId);
-  const pseudonymizeNames = !policy || (policy.identifiability.containsIdentifiable && policy.identifiability.pseudonymizeFileNames);
+  const { clock, tz } = await lookupPolicyInfo(repo, projectId);
+  // The engine's own condition decides whether names are pseudonymized (R92).
+  const pseudonymizeNames = await pseudonymizesIdentifiable(repo, projectId);
   const map = pseudonymizeNames ? await projectPseudonymMap(repo, projectId) : new Map<string, string>();
   const nameOf = (n: string) => {
     let out = n.replace(/\.enc$/u, "");
@@ -235,13 +270,25 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
     allowed.push({ sf, mode: loc && loc.type === "location" ? loc.mode : "keep" });
   }
 
-  // 2. The export folder (new; never an existing one).
+  // 2. The export folder (new; never an existing one), written as "<folder>.partial" and renamed
+  // at the end: a crash leaves decrypted files only in a .partial folder, removed next time (R92 I1).
   await fsp.mkdir(dest, { recursive: true });
+  await refuseInside(); // again, now that it exists (a link could have appeared meanwhile)
+  for (const n of await fsp.readdir(dest)) if (PARTIAL.test(n)) await shredPath(join(dest, n)).catch(() => {});
   const takenTop = await namesIn(dest);
-  const folder = withCollisionSuffix(`${sanitizeSegment(`${project.name} - export`)} - modified ${formatModified(clock(), tz)}`, (n) => takenTop.has(foldName(n)), { isFile: false });
-  const root = join(dest, folder);
+  const folder = withCollisionSuffix(
+    `${sanitizeSegment(`${project.name} - export`)} - modified ${formatModified(clock(), tz)}`,
+    (n) => takenTop.has(foldName(n)) || takenTop.has(foldName(`${n}.partial`)),
+    { isFile: false },
+  );
+  const finalRoot = join(dest, folder);
+  const root = `${finalRoot}.partial`;
   await fsp.mkdir(root, { mode: 0o700 });
   if (process.platform !== "win32") await fsp.chmod(root, 0o700);
+  if (inside(await fsp.realpath(root), libReal)) {
+    await fsp.rm(root, { recursive: true, force: true });
+    throw new ExportDestinationError("Choose a folder outside the library for the export");
+  }
   const mkdir = async (p: string) => {
     await fsp.mkdir(p, { recursive: true, mode: 0o700 });
   };
@@ -267,17 +314,22 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
       await mkdir(join(dir, "files"));
       const written: string[] = [];
       const takenFiles = new Set<string>();
-      const copyOut = async (a: Asset) => {
-        const fileName = withCollisionSuffix(nameOf(a.path.slice(a.path.lastIndexOf("/") + 1)), (n) => takenFiles.has(foldName(n)));
-        takenFiles.add(foldName(fileName));
+      const copyOut = async (a: Asset, sub = "") => {
+        const taken = sub ? takenDerived : takenFiles;
+        const fileName = withCollisionSuffix(nameOf(a.path.slice(a.path.lastIndexOf("/") + 1)), (n) => taken.has(foldName(n)));
+        taken.add(foldName(fileName));
         const src = a.linked ? a.linked.absolutePath : join(lib.root, ...a.path.split("/"));
-        await copyFileAtomic(src, join(dir, "files", fileName), {
+        if (sub) await mkdir(join(dir, "files", sub));
+        await copyFileAtomic(src, join(dir, "files", sub, fileName), {
           mode: 0o600,
           ...(a.encrypted ? { decode: (r) => r.pipe(decryptStream(getKey)) } : {}),
         });
-        written.push(fileName);
+        if (!sub) written.push(fileName);
         filesWritten++;
+        return fileName;
       };
+      const takenDerived = new Set<string>();
+      const derivedOut: Array<{ file: string; kind: string; lang?: string }> = [];
       for (const a of sf.assets) {
         if (a.role !== "original") continue;
         if (a.status === "destroyed") {
@@ -308,13 +360,20 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
           await copyFileAtomic(src, check, { mode: 0o600, ...(a.encrypted ? { decode: (r) => r.pipe(decryptStream(getKey)) } : {}) });
           located = mayHaveLocation(a.mime, await extractMetadata(check, a.mime));
         } finally {
-          await fsp.rm(check, { force: true }).catch(() => {});
+          await shredPath(check).catch(() => {});
         }
         if (located) omittedLocated++;
         else await copyOut(a);
       }
+      // Derived text (transcripts, OCR, translations): same decision, decrypted the same way (R91-3).
+      for (const a of sf.assets) {
+        if (a.role !== "derived" || a.status === "destroyed" || !isDerivedText(a)) continue;
+        const file = await copyOut(a, "derived");
+        const lang = typeof a.derivation?.params.lang === "string" ? a.derivation.params.lang : undefined;
+        derivedOut.push({ file, kind: a.kind, ...(lang ? { lang } : {}) });
+      }
       await writeFileAtomic(join(dir, "source.json"), `${JSON.stringify(sf, null, 2)}\n`, { mode: 0o600 });
-      await writeFileAtomic(join(dir, `${name}.md`), markdownOf(sf, written), { mode: 0o600 });
+      await writeFileAtomic(join(dir, `${name}.md`), markdownOf(sf, written, derivedOut), { mode: 0o600 });
     }
 
     // 3. Reference files (the same writers as the reference export: read back exactly by our importers).
@@ -332,12 +391,13 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
     }
     if (omittedDestroyed) notes.push(`${plural(omittedDestroyed, "file was", "files were")} destroyed under the project's retention rule and ${omittedDestroyed === 1 ? "is" : "are"} not included.`);
     if (notes.length) await writeFileAtomic(join(root, "notes.txt"), `${notes.join("\n")}\n`, { mode: 0o600 });
+    await renameWithRetry(root, finalRoot);
   } catch (err) {
-    // A failed export leaves nothing half-written behind.
-    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    // A failed export leaves nothing half-written behind (decrypted files overwritten first).
+    await shredPath(root).catch(() => {});
     throw err;
   } finally {
-    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    await shredPath(workDir).catch(() => {});
     activeTemp.delete(work);
   }
   await appendLibraryEvent(repo, projectId, "export.project", {
@@ -346,5 +406,5 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
     files: filesWritten,
     omittedFiles: omittedLocated + omittedDestroyed,
   });
-  return { path: root, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed, notes };
+  return { path: finalRoot, exported: allowed.length, withheld, omittedFiles: omittedLocated + omittedDestroyed, notes };
 }

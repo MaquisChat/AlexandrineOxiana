@@ -299,7 +299,15 @@ export interface IndexSourceOptions {
 export function indexSource(db: IndexDb, sf: SourceFile, extractedText?: string, opts: IndexSourceOptions = {}): void {
   const s = sf.source;
   const projectId = s.projectIds[0] ?? "";
-  const sha256s = [...new Set([...Object.values(s.provenance.fileHashes), ...sf.assets.map((a) => a.sha256)].map((h) => h.toLowerCase()))];
+  // Destroyed files (retention, R92) are no longer duplicate keys: a re-import is not "already here".
+  const destroyed = new Set(sf.assets.filter((a) => a.status === "destroyed").map((a) => a.id));
+  const sha256s = [
+    ...new Set(
+      [...Object.entries(s.provenance.fileHashes).filter(([k]) => !destroyed.has(k)).map(([, h]) => h), ...sf.assets.filter((a) => !destroyed.has(a.id)).map((a) => a.sha256)].map((h) =>
+        h.toLowerCase(),
+      ),
+    ),
+  ];
   const isbns = [...new Set((s.identifiers.isbn ?? []).map(normalizeIsbn13).filter((x): x is string => x !== undefined))];
   const detail: Detail = {
     id: s.id,

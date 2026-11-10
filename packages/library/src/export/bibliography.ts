@@ -18,7 +18,9 @@
  * identifying details (name / handle fields) map people to their participant codes; in a project
  * that holds identifiable data and pseudonymizes names, every creator of an identifiable source must
  * have a code (requireParticipantCodes; a source linked to participants always does) — otherwise
- * the request fails (ParticipantCodeMissingError) rather than print a name.
+ * the request fails (ParticipantCodeMissingError) rather than print a name. Whether the project
+ * pseudonymizes is the engine's own decision (a `store` of identifiable data carries the
+ * `pseudonymize-names` condition, R92), not a reading of the settings here.
  *
  * Audit: `export.citation` / `export.bibliography` with the style id, format and counts; never a
  * path, title or name.
@@ -47,6 +49,7 @@ import {
   lookupPolicyInfo,
   projectCollectionsAndTags,
   projectPseudonymMap,
+  pseudonymizesIdentifiable,
   repoLibrary,
   type Repo,
 } from "../repo/repo.js";
@@ -90,9 +93,8 @@ const NAME_KEY = /name|handle|user|alias|account/iu;
  * participants' identifying names, and whether identifiable sources must cite codes only.
  */
 async function participantRules(repo: Repo, projectId: string): Promise<{ pseudonyms: Map<string, string>; requireCodes: boolean }> {
-  const { policy } = await lookupPolicyInfo(repo, projectId);
-  // Unreadable governance: the strictest reading (fail closed).
-  const requireCodes = !policy || (policy.identifiability.containsIdentifiable && policy.identifiability.pseudonymizeFileNames);
+  // The engine's own condition decides (unreadable governance: the strictest reading).
+  const requireCodes = await pseudonymizesIdentifiable(repo, projectId);
   const pseudonyms = await projectPseudonymMap(repo, projectId);
   const fw = await repo.getFieldwork(projectId);
   for (const p of fw.participants) {

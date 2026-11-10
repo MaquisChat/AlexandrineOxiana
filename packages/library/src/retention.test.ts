@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { verifyChain, type Project, type SourceFile } from "@ao/core";
 import { backupProject, listBackups } from "./export/backup.js";
-import { addSource, auditEvents, makeKit, makeProject, scratchFile, walk, type Kit } from "./export/test-kit.js";
+import { addSource, auditEvents, makeKit, makeProject, plainOf, scratchFile, walk, type Kit } from "./export/test-kit.js";
 import { SimulatedCrash, seams } from "./repo/testing.js";
+import { findSourceBy, indexSource, openIndex } from "./index/db.js";
+import { shredSeams } from "./fs/shred.js";
+import { backupSeams } from "./export/backup.js";
 import { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
 
 let kit: Kit;
@@ -126,7 +129,11 @@ describe("destroyRaw", () => {
     const backups = await listBackups(kit.repo, p.id);
     expect(backups).toHaveLength(1);
     expect(existsSync(join(kit.lib.root, "Backups", backups[0]!.file))).toBe(true);
-    const cert = JSON.parse(await readFile(r.certificatePath, "utf8"));
+    // Sealed in an encrypted project (readable when unlocked).
+    expect(r.certificatePath.endsWith(".json.enc")).toBe(true);
+    expect((await readFile(r.certificatePath)).includes(Buffer.from(original.sha256))).toBe(false);
+    const cert = JSON.parse((await plainOf(kit, p, r.certificatePath.slice(kit.lib.root.length + 1).split("\\").join("/"))).toString("utf8"));
+    expect(cert).toEqual(r.certificate);
     expect(cert.assets.map((a: { assetId: string }) => a.assetId).sort()).toEqual([original.id, proxy.id].sort());
     expect(cert.trashedCopies).toEqual([`.tmp/trash-00000000-0000-4000-8000-000000000000-abcd/${base}`]);
     expect(cert.backups).toMatchObject({ status: "deleted", deleted: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`], freshBackup: `Backups/${backups[0]!.file}` });
@@ -194,5 +201,137 @@ describe("destroyRaw", () => {
     expect(existsSync(old.path)).toBe(false);
     const cert = JSON.parse(await readFile(done[0]!, "utf8"));
     expect(cert.backups.status).toBe("deleted");
+  });
+});
+
+describe("R92", () => {
+  it("I3: a failed fresh backup keeps the step pending with lastError; resumeDestruction retries it", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    const old = await backupProject(kit.repo, p.id);
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    backupSeams.failBackup = true;
+    let r;
+    try {
+      r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    } finally {
+      backupSeams.failBackup = false;
+    }
+    expect(r.certificate.backups).toMatchObject({ status: "pending", deleted: [], lastError: expect.any(String) });
+    expect(existsSync(old.path)).toBe(true);
+    kit.clock.now = new Date("2026-12-02T10:20:00.000Z");
+    const done = await resumeDestruction(kit.repo, p.id);
+    expect(done).toHaveLength(1);
+    expect(existsSync(old.path)).toBe(false);
+    const cert = JSON.parse(await readFile(done[0]!, "utf8"));
+    expect(cert.backups).toMatchObject({ status: "deleted", deleted: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`] });
+    expect(cert.backups.lastError).toBeUndefined();
+  });
+
+  it("I3: a partly failed backup deletion reports exactly what was deleted, the manifest follows each deletion, and a retry finishes", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    const a = await backupProject(kit.repo, p.id);
+    kit.clock.now = new Date("2026-11-10T09:31:00.000Z");
+    const b = await backupProject(kit.repo, p.id);
+    const nameOf = (x: { path: string }) => x.path.slice(x.path.lastIndexOf("/") + 1);
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    shredSeams.failFor = (path) => path.endsWith(nameOf(b));
+    let r;
+    try {
+      r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    } finally {
+      shredSeams.failFor = undefined;
+    }
+    const bk = r.certificate.backups as { status: string; deleted: string[]; lastError?: string };
+    expect(bk.status).toBe("pending");
+    expect(bk.deleted).toEqual([`Backups/${nameOf(a)}`]);
+    expect(bk.lastError).toEqual(expect.any(String));
+    expect((await listBackups(kit.repo, p.id)).map((x) => x.file)).not.toContain(nameOf(a));
+    kit.clock.now = new Date("2026-12-02T10:20:00.000Z");
+    const [path] = await resumeDestruction(kit.repo, p.id);
+    const cert = JSON.parse(await readFile(path!, "utf8"));
+    expect(cert.backups.status).toBe("deleted");
+    expect(cert.backups.deleted.sort()).toEqual([`Backups/${nameOf(a)}`, `Backups/${nameOf(b)}`].sort());
+    expect(existsSync(b.path)).toBe(false);
+  });
+
+  it("I2: with a corrupt manifest, a project-named file that cannot be read counts as holding the data (unknown-pending, kept)", async () => {
+    const p = await makeProject(kit, GOV(false), false, "Corrupt");
+    const sf = await rawSource(p);
+    await backupProject(kit.repo, p.id);
+    const garbage = join(kit.lib.root, "Backups", "Corrupt - backup - modified 2026-01-01 0000.zip");
+    await writeFile(garbage, "not a zip at all");
+    await writeFile(join(kit.lib.root, "Backups", "backups-manifest.json"), "garbage");
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    const bk = r.certificate.backups as { status: string; containing: string[] };
+    expect(bk.status).toBe("unknown-pending");
+    expect(bk.containing).toContain("Backups/Corrupt - backup - modified 2026-01-01 0000.zip");
+    expect(existsSync(garbage)).toBe(true);
+  });
+
+  it("a manifest entry without asset ids counts as holding the data", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    const old = await backupProject(kit.repo, p.id);
+    const mpath = join(kit.lib.root, "Backups", "backups-manifest.json");
+    const m = JSON.parse(await readFile(mpath, "utf8"));
+    delete m.backups[0].assets;
+    await writeFile(mpath, JSON.stringify(m));
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    expect(existsSync(old.path)).toBe(false);
+  });
+
+  it("I4: a derived file cannot be added to a destroyed original", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    await expect(derived(p, sf, "ocr-text", "txt", "late")).rejects.toThrow(/destroyed/u);
+  });
+
+  it("recovery keeps the marker when overwriting fails, and finishes on a later open", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    seams.crashAt = "before-marker-delete";
+    await expect(destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester")).rejects.toBeInstanceOf(SimulatedCrash);
+    shredSeams.failFor = () => true;
+    try {
+      await kit.reopen();
+    } finally {
+      shredSeams.failFor = undefined;
+    }
+    const tmpNames = await readdir(join(kit.lib.root, ".tmp"));
+    expect(tmpNames.some((n) => n.startsWith("txn-"))).toBe(true);
+    expect(tmpNames.some((n) => n.startsWith("trash-"))).toBe(true);
+    await kit.reopen();
+    expect((await readdir(join(kit.lib.root, ".tmp"))).filter((n) => n.startsWith("txn-") || n.startsWith("trash-"))).toEqual([]);
+  });
+
+  it("isDue reads dates in UTC unless the project sets a time zone; a time without an offset is UTC", async () => {
+    const p = await makeProject(kit, GOV(false));
+    await rawSource(p);
+    const far = await kit.reopen({ tz: "Pacific/Kiritimati" }); // UTC+14: already 1 December there
+    expect(await retentionDue(far, p.id, new Date("2026-11-30T20:00:00Z"))).toEqual([]);
+    expect(await retentionDue(far, p.id, new Date("2026-12-01T00:00:00Z"))).toHaveLength(1);
+    const q = await makeProject(kit, GOV(false).replace("rawDataDestroyAfter: 2026-12-01", "rawDataDestroyAfter: 2026-12-01T10:00"));
+    await rawSource(q);
+    expect(await retentionDue(far, q.id, new Date("2026-12-01T09:59:00Z"))).toEqual([]);
+    expect(await retentionDue(far, q.id, new Date("2026-12-01T10:00:00Z"))).toHaveLength(1);
+  });
+
+  it("destroyed files leave the index's duplicate keys", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    const after = await kit.repo.getSource(p.id, sf.source.id);
+    const db = openIndex(join(kit.tmp));
+    try {
+      indexSource(db, after);
+      expect(findSourceBy(db, { sha256: sf.assets[0]!.sha256 })).toEqual([]);
+    } finally {
+      db.close();
+    }
   });
 });

@@ -28,18 +28,21 @@
  */
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { formatModified, type Asset } from "@ao/core";
-import { backupProject, destroyBackups, listBackups, pruneBackups, DEFAULT_KEEP } from "./export/backup.js";
+import { backupProject, destroyBackups, listBackups, pruneBackups, unresolvedBackupsOf, DEFAULT_KEEP } from "./export/backup.js";
+import { decryptBytes } from "./repo/io.js";
 import { NotFoundError } from "./repo/errors.js";
 import {
   appendLibraryEvent,
   destroyProjectAssets,
   lookupPolicyInfo,
+  projectDataKey,
   repoLibrary,
   type Repo,
 } from "./repo/repo.js";
 import { toRel } from "./repo/txn.js";
+import { isDue, projectTimeZone } from "./retention-date.js";
 
 export const DESTRUCTION_NOTICE =
   "Each file was overwritten with zeros and then deleted. This is a best effort: on solid-state drives (SSD), on copy-on-write file systems (such as APFS, Btrfs or ZFS) and in file system snapshots, and wherever cloud sync or backup software outside this app copied the library, earlier copies of the data may still exist. This certificate covers the copies this app manages.";
@@ -49,25 +52,13 @@ export interface DueItem {
   assetIds: string[];
 }
 
-/** The calendar date (YYYY-MM-DD) of `now` in `tz`. */
-function localDate(now: Date, tz?: string): string {
-  return new Intl.DateTimeFormat("en-CA", { ...(tz ? { timeZone: tz } : {}), year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
-}
-
-/** Whether the retention date has come at `now`: a date counts from its start in `tz`, a time from that instant. */
-function isDue(date: string, now: Date, tz?: string): boolean {
-  if (/^\d{4}-\d{2}-\d{2}$/u.test(date)) return localDate(now, tz) >= date;
-  const t = Date.parse(date);
-  return !Number.isNaN(t) && now.getTime() >= t;
-}
-
 const destroyable = (a: Asset) => a.role === "original" && a.status !== "destroyed" && !a.linked;
 
 /** Raw originals of identifiable sources due for destruction under the project's retention rule. */
 export async function retentionDue(repo: Repo, projectId: string, now: Date): Promise<DueItem[]> {
-  const { policy, tz } = await lookupPolicyInfo(repo, projectId);
+  const { policy } = await lookupPolicyInfo(repo, projectId);
   const date = policy?.retention.rawDataDestroyAfter ?? null;
-  if (!date || !isDue(date, now, tz)) return [];
+  if (!date || !isDue(date, now, projectTimeZone(repo, projectId))) return [];
   const out: DueItem[] = [];
   for (const id of repo.listSourceIds(projectId)) {
     const sf = await repo.getSource(projectId, id);
@@ -84,12 +75,17 @@ export interface DestroyOptions {
 }
 
 interface CertificateBackups {
-  status: "none" | "pending" | "deleted" | "kept-fresh-backup-failed";
+  /**
+   * none: no backup held the files; pending: not all removed yet (retried); unknown-pending: some
+   * backups could not be read (a damaged manifest) and may hold them; deleted: all removed.
+   */
+  status: "none" | "pending" | "unknown-pending" | "deleted";
   /** Backups (library-relative) that held destroyed files. */
   containing: string[];
   deleted: string[];
   freshBackup?: string;
-  reason?: string;
+  /** Why the last attempt stopped (plain; retried). */
+  lastError?: string;
 }
 
 const TRASH = /^trash-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-[0-9a-f]+$/u;
@@ -172,8 +168,9 @@ export async function destroyRaw(
   const { tz, policy } = await lookupPolicyInfo(repo, projectId);
   const strays = await strayCopies(root, names);
   const allIds = new Set([...plan.values()].flatMap((s) => [...s]));
-  const holding = (await listBackups(repo, projectId)).filter((b) => b.assets.some((id) => allIds.has(id)));
-  const containing = holding.map((b) => `Backups/${b.file}`);
+  const held = await holdingBackups(repo, projectId, allIds);
+  const containing = [...held.files, ...held.unresolved].map((f) => `Backups/${f}`);
+  const initialStatus: CertificateBackups["status"] = !containing.length ? "none" : held.unresolved.length ? "unknown-pending" : "pending";
   const res = await destroyProjectAssets(repo, projectId, {
     plan: [...plan.entries()].map(([sourceId, ids]) => ({ sourceId, assetIds: [...ids] })),
     strayCopies: strays,
@@ -198,7 +195,7 @@ export async function destroyRaw(
         encrypted: a.encrypted,
       })),
       trashedCopies: strays.map((p) => toRel(root, p)),
-      backups: { status: containing.length ? "pending" : "none", containing, deleted: [] } satisfies CertificateBackups,
+      backups: { status: initialStatus, containing, deleted: [] } satisfies CertificateBackups,
       notice: DESTRUCTION_NOTICE,
     }),
   });
@@ -209,43 +206,79 @@ export async function destroyRaw(
     includeDerived: opts.includeDerived === true,
     trashedCopies: strays.length,
     backupsContaining: containing.length,
-    certificateSha256: createHash("sha256").update(await fsp.readFile(certificatePath)).digest("hex"),
+    // Of the certificate's JSON (the plaintext, also when it is sealed).
+    certificateSha256: createHash("sha256").update(certificateText(res.certificate)).digest("hex"),
   });
   let certificate = res.certificate;
   if (containing.length) certificate = await settleBackups(repo, projectId, res.certificateRel);
   return { certificatePath, certificate };
 }
 
+/** The certificate as written (destroy.ts). */
+const certificateText = (c: Record<string, unknown>) => `${JSON.stringify(c, null, 2)}\n`;
+
 /**
- * The backups step of a destruction: a fresh backup, then the backups that held destroyed files are
- * overwritten and removed; the certificate is updated (a governed, audited change).
+ * The app's backups of the project that may hold any of `ids`: manifest entries listing one of them
+ * (or listing no asset ids at all: unknown, so possibly), and backup files the rebuilt manifest
+ * could not read whose name is the project's (R92 I2).
+ */
+async function holdingBackups(repo: Repo, projectId: string, ids: ReadonlySet<string>): Promise<{ files: string[]; unresolved: string[] }> {
+  const files = (await listBackups(repo, projectId)).filter((b) => !Array.isArray(b.assets) || b.assets.some((id) => ids.has(id))).map((b) => b.file);
+  return { files, unresolved: await unresolvedBackupsOf(repo, projectId) };
+}
+
+async function readCertificate(repo: Repo, projectId: string, rel: string): Promise<Record<string, unknown> & { backups: CertificateBackups; assets?: Array<{ assetId?: string }> }> {
+  const raw = await fsp.readFile(join(repoLibrary(repo).root, ...rel.split("/")));
+  if (!rel.endsWith(".enc")) return JSON.parse(raw.toString("utf8"));
+  const k = projectDataKey(repo, projectId);
+  if (!k) throw new TypeError("the certificate is sealed and the project is not encrypted");
+  return JSON.parse((await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw)).toString("utf8"));
+}
+
+const union = (a: string[], b: string[]) => [...new Set([...a, ...b])];
+const plainError = (err: unknown) => `${err instanceof Error ? err.name : "Error"}: the step will be tried again`;
+
+/**
+ * The backups step of a destruction (R92 I3): the backups holding destroyed files are worked out
+ * again now (from the manifest's asset ids); a fresh backup is made first (once), then each of
+ * them is overwritten and removed, the manifest updated after each. Whatever fails leaves the
+ * step `pending` with `lastError` (retried by resumeDestruction), and `deleted` lists exactly what
+ * was removed. Unreadable project-named backups (a rebuilt manifest) are never deleted blindly:
+ * the step stays `unknown-pending`. The certificate is updated in a governed, audited change.
  */
 async function settleBackups(repo: Repo, projectId: string, certificateRel: string): Promise<Record<string, unknown>> {
-  const root = repoLibrary(repo).root;
-  const cert = JSON.parse(await fsp.readFile(join(root, ...certificateRel.split("/")), "utf8")) as Record<string, unknown> & { backups: CertificateBackups };
+  const cert = await readCertificate(repo, projectId, certificateRel);
   const b = cert.backups;
-  if (b.status !== "pending") return cert;
-  let next: CertificateBackups;
+  if (b.status !== "pending" && b.status !== "unknown-pending") return cert;
+  const ids = new Set((cert.assets ?? []).map((a) => a.assetId).filter((x): x is string => typeof x === "string"));
+  const held = await holdingBackups(repo, projectId, ids);
+  const next: CertificateBackups = {
+    ...b,
+    containing: union(b.containing, [...held.files, ...held.unresolved].map((f) => `Backups/${f}`)),
+    deleted: [...b.deleted],
+  };
+  const unresolvedLeft = held.unresolved.length > 0;
   try {
-    const fresh = await backupProject(repo, projectId, { prune: false });
-    const files = b.containing.map((r) => r.slice("Backups/".length));
-    const deleted = await destroyBackups(repo, projectId, files);
-    next = { status: "deleted", containing: b.containing, deleted: deleted.map((f) => `Backups/${f}`), freshBackup: `Backups/${fresh.path.slice(fresh.path.lastIndexOf("/") + 1).slice(fresh.path.lastIndexOf("\\") + 1)}` };
+    if (held.files.length && !next.freshBackup) {
+      const fresh = await backupProject(repo, projectId, { prune: false });
+      next.freshBackup = `Backups/${basename(fresh.path)}`;
+    }
+    const r = await destroyBackups(repo, projectId, held.files);
+    next.deleted = union(next.deleted, r.deleted.map((f) => `Backups/${f}`));
+    if (r.error) throw r.error;
+    delete next.lastError;
+    next.status = unresolvedLeft ? "unknown-pending" : "deleted";
     await pruneBackups(repo, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP);
   } catch (err) {
-    next = {
-      status: "kept-fresh-backup-failed",
-      containing: b.containing,
-      deleted: [],
-      reason: `A fresh backup could not be made (${err instanceof Error ? err.name : "error"}), so the older backups that hold the destroyed files were kept.`,
-    };
+    next.status = unresolvedLeft ? "unknown-pending" : "pending";
+    next.lastError = plainError(err);
   }
   const updated = { ...cert, backups: next };
   await repo.mutate(
     projectId,
     { action: "delete" },
     async (tx) => {
-      await tx.writeFile(certificateRel, `${JSON.stringify(updated, null, 2)}\n`, { mode: 0o600 });
+      await tx.writeFile(certificateRel, certificateText(updated), certificateRel.endsWith(".enc") ? { encrypt: true } : { mode: 0o600 });
     },
     { op: "retention.backups", entity: { type: "project", id: projectId } },
   );
@@ -254,31 +287,30 @@ async function settleBackups(repo: Repo, projectId: string, certificateRel: stri
 }
 
 /**
- * Finishes destructions whose backups step did not run (a crash or quit after the destruction):
- * returns the certificates (absolute paths) settled now. For Task 30, at start.
+ * Finishes (or retries) destructions whose backups step is not done (a crash, a quit or a failure
+ * after the destruction): returns the certificates (absolute paths) worked on. For Task 30, at start.
  */
 export async function resumeDestruction(repo: Repo, projectId: string): Promise<string[]> {
   const root = repoLibrary(repo).root;
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
   let names: string[];
   try {
-    names = (await fsp.readdir(join(root, ...dirRel.split("/")))).filter((n) => /^destruction-.*\.json$/u.test(n)).sort();
+    names = (await fsp.readdir(join(root, ...dirRel.split("/")))).filter((n) => /^destruction-.*\.json(\.enc)?$/u.test(n)).sort();
   } catch {
     return [];
   }
   const out: string[] = [];
   for (const n of names) {
     const rel = `${dirRel}/${n}`;
-    const abs = join(root, ...rel.split("/"));
-    let pending = false;
+    let status: string | undefined;
     try {
-      pending = (JSON.parse(await fsp.readFile(abs, "utf8")) as { backups?: { status?: string } }).backups?.status === "pending";
+      status = (await readCertificate(repo, projectId, rel)).backups?.status;
     } catch {
       continue;
     }
-    if (!pending) continue;
+    if (status !== "pending" && status !== "unknown-pending") continue;
     await settleBackups(repo, projectId, rel);
-    out.push(abs);
+    out.push(join(root, ...rel.split("/")));
   }
   return out;
 }

@@ -365,11 +365,23 @@ export async function recoverTransactions(
       (e) => e !== null && e.decision?.result !== "deny" && (e.details as { txn?: unknown } | undefined)?.txn === m.txn,
     ).length;
     if (mine >= m.auditEvents) {
+      // Destroyed files are overwritten before they go (R90 d): a crash after the commit finishes it
+      // here. If that fails, the marker and the trash stay, and the next open tries again (R92).
+      let shredded = true;
       for (const e of m.entries) {
-        if (e.kind !== "trashed") continue;
-        // Destroyed files are overwritten before they go (R90 d): a crash after the commit finishes it here.
-        if (e.shred) await shredPath(fromRel(root, e.to)).catch(() => {});
-        await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
+        if (e.kind !== "trashed" || !e.shred) continue;
+        try {
+          await shredPath(fromRel(root, e.to));
+        } catch {
+          shredded = false;
+        }
+      }
+      if (!shredded) {
+        out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed", detail: "destroyed files could not be overwritten yet; retried on the next open" });
+        continue;
+      }
+      for (const e of m.entries) {
+        if (e.kind === "trashed") await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
       }
       await removeMarker(root, m);
       out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed" });

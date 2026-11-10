@@ -8,7 +8,8 @@
  *     evidence) and drops their pending viewing proxies;
  *   - overwrites and removes stray copies of the files left in `.tmp/trash-*` by earlier
  *     interrupted changes (orphans: no transaction can restore them);
- *   - writes the destruction certificate `retention/destruction-<YYYY-MM-DD HHmm>.json` (0600).
+ *   - writes the destruction certificate `retention/destruction-<YYYY-MM-DD HHmm>.json` (0600;
+ *     `.json.enc`, sealed with the project key, in an encrypted project).
  */
 import type { Asset, SourceFile } from "@ao/core";
 import { withCollisionSuffix } from "@ao/core";
@@ -77,10 +78,11 @@ export async function destroyAssets(
       const dir = `${st.rel}/retention`;
       await tx.mkdir(dir);
       const taken = await namesIn(core.abs(dir));
-      const name = withCollisionSuffix(`${input.certificateStem(tx.now)}.json`, (n) => taken.has(foldName(n)));
+      // Sealed in an encrypted project (R92): readable when it is unlocked.
+      const name = withCollisionSuffix(`${input.certificateStem(tx.now)}.json${tx.encrypted ? ".enc" : ""}`, (n) => taken.has(foldName(n)));
       const certificate = input.certificate(destroyed, tx.at);
       const rel = `${dir}/${name}`;
-      await tx.writeFile(rel, `${JSON.stringify(certificate, null, 2)}\n`, { mode: 0o600 });
+      await tx.writeFile(rel, `${JSON.stringify(certificate, null, 2)}\n`, tx.encrypted ? { encrypt: true } : { mode: 0o600 });
       return { certificateRel: rel, certificate, destroyed: destroyed.map((d) => d.asset) };
     },
     { op: "retention.destroy", entity: { type: "project", id: projectId } },

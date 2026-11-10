@@ -105,3 +105,11 @@ export class MissingParentError extends Error {
     super(`the parent asset ${assetId} no longer exists`);
   }
 }
+
+/** A derived file was asked for an original that was destroyed under the retention rule (R92 I4). */
+export class DestroyedParentError extends Error {
+  override name = "DestroyedParentError";
+  constructor(readonly assetId: string) {
+    super(`the parent asset ${assetId} was destroyed under the project's retention rule`);
+  }
+}

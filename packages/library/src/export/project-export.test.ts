@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ExifTool } from "exiftool-vendored";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -273,5 +273,81 @@ captureMethods: [manual_upload]
     const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
     const tif = (await walk(r.path)).find((n) => n.includes("/files/") && n.endsWith(".tif"))!;
     expect(sha(await readFile(join(r.path, tif)))).toBe(sf.assets[0]!.sha256);
+  });
+});
+
+describe("R92: open export", () => {
+  it("R91-3: derived text (transcripts, OCR) goes to files/derived/, decrypted, and is listed in the Markdown", async () => {
+    const p = await makeProject(kit, PSEUDO_GOV, true, "Derived");
+    const pdf = await scratchFile(kit, "scan.pdf", "%PDF-1.4 scan");
+    const sf = await addSource(kit, p, { title: "Scanned", files: [{ path: pdf, role: "original", handling: "copy" }] });
+    const txt = await scratchFile(kit, "ocr.txt", "recognised text body");
+    await kit.repo.addDerivedAsset(p.id, sf.source.id, {
+      fromPath: txt,
+      kind: "ocr-text",
+      tool: "tesseract-5",
+      ext: "txt",
+      lang: "en",
+      derivation: { parents: [sf.assets[0]!.id], operation: "ocr", provider: "tesseract", ranAt: "local", params: {}, at: kit.clock.now.toISOString(), triggeredBy: "tester" },
+    });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const names = await walk(r.path);
+    const derivedFile = names.find((n) => n.includes("/files/derived/") && n.endsWith(".txt"))!;
+    expect(derivedFile).toBeDefined();
+    expect(await readFile(join(r.path, derivedFile), "utf8")).toBe("recognised text body");
+    const md = await readFile(join(r.path, names.find((n) => n.endsWith(".md"))!), "utf8");
+    expect(md).toContain("## Derived text");
+    expect(md).toContain("ocr");
+  });
+
+  it("I1 (P1): a destination under a symbolic link into the library is refused, and nothing is created there", async () => {
+    const p = await makeProject(kit);
+    await addSource(kit, p, { title: "x" });
+    const link = join(kit.tmp, "sneaky");
+    await symlink(join(kit.lib.root, "Exports"), link);
+    await expect(exportProjectOpenFormats(kit.repo, p.id, join(link, "deeper", "new"))).rejects.toBeInstanceOf(ExportDestinationError);
+    expect(await readdir(join(kit.lib.root, "Exports"))).toEqual([]);
+  });
+
+  it("I1: the export is written to <folder>.partial and renamed at the end; stale .partial folders are removed", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Part");
+    await addSource(kit, p, { title: "x" });
+    const out = await outDir();
+    const stale = join(out, "Part - export - modified 2026-11-01 0900.partial");
+    await mkdir(join(stale, "Sources"), { recursive: true });
+    await writeFile(join(stale, "Sources", "secret.txt"), "decrypted leftovers");
+    const r = await exportProjectOpenFormats(kit.repo, p.id, out);
+    expect(r.path.endsWith(".partial")).toBe(false);
+    expect((await readdir(out)).sort()).toEqual(["Part - export - modified 2026-11-10 0930"]);
+  });
+
+  it("Markdown escapes case-attribute keys and title-variant labels too", async () => {
+    const p = await makeProject(kit);
+    const draft: SourceDraft = {
+      projectIds: [p.id],
+      type: "report",
+      title: { variants: [{ lang: "en", kind: "original", value: "T" }, { lang: "x<b>", kind: "translated", value: "V" }] },
+      creators: [],
+      identifiers: {},
+      caseAttributes: { "*region*<i>": "north" },
+      availability: { status: "available" },
+      collectionIds: [],
+      tagIds: [],
+      participantIds: [],
+    };
+    await kit.repo.createSource(p.id, draft, [], {
+      provenance: { captureMethod: "manual_upload", capturedAt: kit.clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+    }).catch(async () => {
+      // An invalid language tag is refused by the model: keep the case attribute only.
+      draft.title.variants.pop();
+      return kit.repo.createSource(p.id, draft, [], {
+        provenance: { captureMethod: "manual_upload", capturedAt: kit.clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+      });
+    });
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const md = await readFile(join(r.path, (await walk(r.path)).find((n) => n.endsWith(".md"))!), "utf8");
+    expect(md).not.toContain("<i>");
+    expect(md).not.toContain("<b>");
+    expect(md).toContain("\\*region\\*&lt;i&gt;");
   });
 });
