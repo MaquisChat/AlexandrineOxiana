@@ -239,14 +239,20 @@ beforeEach(async () => {
 afterEach(async () => {
   // Each step runs even when an earlier one fails, so one slow or failed test never leaves the next
   // one with a running queue, worker, open index or library lock (R102 minor).
-  const steps: Array<() => Promise<unknown>> = [
+  const steps: Array<() => unknown> = [
     ...queues.splice(0).map((q) => () => q.dispose()),
     ...closers.splice(0).map((c) => () => c()),
-    async () => handle.close(),
+    () => handle.close(),
     () => lib.close(),
     () => rm(tmp, { recursive: true, force: true, maxRetries: 3 }),
   ];
-  for (const step of steps) await step().catch(() => {});
+  for (const step of steps) {
+    try {
+      await step();
+    } catch {
+      // the next step still runs
+    }
+  }
 }, 30_000);
 
 describe("groupDeviceFiles (pairing rules)", () => {
