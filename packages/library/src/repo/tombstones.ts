@@ -39,10 +39,9 @@ const rel = (st: ProjectState, encrypted: boolean) => `${dir(st)}/${encrypted ? 
 
 export const tombstoneHash = (secret: string, key: string) => createHmac("sha256", Buffer.from(secret, "hex")).update(`zotero:${key}`, "utf8").digest("hex");
 
-/** The Zotero item keys a source stands for: its own and those merged into it (R74 M5). */
+/** The Zotero item keys a source stands for: its own (provenance) and those merged into it (R74 M5, kept outside provenance, R76). */
 export function zoteroKeysOf(sf: SourceFile): string[] {
-  const k = sf.source.provenance.externalKeys ?? {};
-  const keys = [k.zoteroKey ?? "", ...(k.zoteroMergedKeys ?? "").split(",")].map((x) => x.trim()).filter(Boolean);
+  const keys = [sf.source.provenance.externalKeys?.zoteroKey ?? "", ...(sf.mergedExternalKeys?.zotero ?? [])].map((x) => x.trim()).filter(Boolean);
   return [...new Set(keys)];
 }
 

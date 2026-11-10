@@ -97,20 +97,24 @@ export function applyMerge(
   mergedKeys: string[] = [],
 ): { next: SourceFile; record: MergeRecord } {
   let source: Src = { ...cur.source, modifiedAt: at, modifiedBy: actor };
-  const ext = source.provenance.externalKeys ?? {};
-  const have = new Set([ext.zoteroKey, ...(ext.zoteroMergedKeys ?? "").split(",")].filter(Boolean));
+  // Merged Zotero keys go on the source file, never into provenance (R76).
+  const already = cur.mergedExternalKeys?.zotero ?? [];
+  const have = new Set([source.provenance.externalKeys?.zoteroKey, ...already].filter(Boolean));
   const addedMergedKeys = [...new Set(mergedKeys)].filter((k) => !have.has(k));
-  if (addedMergedKeys.length) {
-    const list = [...(ext.zoteroMergedKeys ?? "").split(",").filter(Boolean), ...addedMergedKeys].join(",");
-    source = { ...source, provenance: { ...source.provenance, externalKeys: { ...ext, zoteroMergedKeys: list } } };
-  }
+  const mergedExternalKeys = addedMergedKeys.length ? { ...(cur.mergedExternalKeys ?? {}), zotero: [...already, ...addedMergedKeys] } : cur.mergedExternalKeys;
   for (const f of fill) source = setAt(source, f.path, f.after);
   const addedTagIds = [...new Set(tagIds)].filter((t) => !cur.source.tagIds.includes(t));
   if (addedTagIds.length) source = { ...source, tagIds: [...source.tagIds, ...addedTagIds] };
   const paths = new Set(fill.map((f) => f.path));
   const addedEvidence = evidence.filter((e) => paths.has(e.field));
   return {
-    next: { ...cur, source, assets: [...cur.assets, ...added], fieldEvidence: [...cur.fieldEvidence, ...addedEvidence] },
+    next: {
+      ...cur,
+      source,
+      assets: [...cur.assets, ...added],
+      fieldEvidence: [...cur.fieldEvidence, ...addedEvidence],
+      ...(mergedExternalKeys ? { mergedExternalKeys } : {}),
+    },
     record: {
       addedAssetIds: added.map((a) => a.id),
       filled: fill,
@@ -157,20 +161,21 @@ export function revertMerge(
     if (isDeepStrictEqual(now, u.after)) restore.set(now.id, u.before);
     else keptAnnotations.push(now.id);
   }
-  // Merged Zotero keys the merge added come off the provenance again.
+  // Merged Zotero keys the merge added come off again (R76: on the source file, not provenance).
   const dropKeys = new Set(rec.addedMergedKeys ?? []);
-  if (dropKeys.size) {
-    const ext = { ...(source.provenance.externalKeys ?? {}) };
-    const left = (ext.zoteroMergedKeys ?? "").split(",").filter((k) => k && !dropKeys.has(k));
-    if (left.length) ext.zoteroMergedKeys = left.join(",");
-    else delete ext.zoteroMergedKeys;
-    source = { ...source, provenance: { ...source.provenance, externalKeys: ext } };
+  let mergedExternalKeys = cur.mergedExternalKeys;
+  if (dropKeys.size && mergedExternalKeys?.zotero) {
+    const { zotero, ...others } = mergedExternalKeys;
+    const left = zotero.filter((k) => !dropKeys.has(k));
+    mergedExternalKeys = left.length ? { ...others, zotero: left } : Object.keys(others).length ? others : undefined;
   }
   const droppedAnnotations = annIds.size > 0 || restore.size > 0;
   const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations || dropKeys.size > 0;
+  const { mergedExternalKeys: _m, ...base } = cur;
   return {
     next: {
-      ...cur,
+      ...base,
+      ...(mergedExternalKeys ? { mergedExternalKeys } : {}),
       source: changed ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
       assets: cur.assets.filter((a) => !ids.has(a.id)),
       // An annotation anchored in a removed asset goes with it.

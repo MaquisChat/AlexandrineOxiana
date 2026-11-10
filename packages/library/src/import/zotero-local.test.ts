@@ -18,6 +18,8 @@ import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
 import { importChange, projectCollectionsAndTags, projectWarnings } from "../repo/repo.js";
 import { encryptBytes } from "../repo/io.js";
+import { ImmutableProvenanceError } from "../repo/errors.js";
+import { applyMerge } from "./bulk/merge.js";
 import { openTestRepo } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import { OUTSIDE_NOTE } from "./bulk/outside.js";
@@ -960,10 +962,58 @@ processing:
     const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
     expect((await h.done).counts.merged).toBe(1);
     const mine = (await sources(p)).find((sf) => sf.source.citationKey === "mine")!;
-    expect(mine.source.provenance.externalKeys?.zoteroMergedKeys).toBe("AAAA1111");
+    // R76: kept on the source file, never in provenance.
+    expect(mine.mergedExternalKeys).toEqual({ zotero: ["AAAA1111"] });
+    expect(mine.source.provenance.externalKeys?.zoteroMergedKeys).toBeUndefined();
     await repo.deleteSource(p.id, mine.source.id);
     const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
     expect(r.counts).toMatchObject({ created: 0, needsReview: 0, deletedHere: 1 });
+  });
+
+  it("R76: undoing the merge takes the merged Zotero key off again", async () => {
+    const p = await projectWith(GOV.replace("captureMethods: [zotero_import]", "captureMethods: [zotero_import, refman_import]").replace('zotero-import: "legitimate interest; Zotero library"', 'zotero-import: "legitimate interest; Zotero library"\n    refman-import: "legitimate interest; references"'), false);
+    const bulk = bulkImport();
+    const bib = join(tmp, "own.bib");
+    await writeFile(bib, "@article{mine, title={Feeding the City: Informal Markets in Lagos}, author={Okafor, Ngozi}, year={2024}, doi={10.5555/ao.urban.2024.017}}\n");
+    await (await bulk.startBatch(p.id, bibtexAdapter(bib))).done;
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    await bulk.undoBatch(p.id, h.batchId);
+    const mine = (await sources(p)).find((sf) => sf.source.citationKey === "mine")!;
+    expect(mine.mergedExternalKeys?.zotero ?? []).toEqual([]);
+  });
+
+  it("R76: provenance cannot be changed after creation, through a merge or any import change", async () => {
+    const p = await project();
+    await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    const before = await readFile(join(lib.root, a.source.folder, "source.json"), "utf8");
+    const req = { action: "store" as const, store: { identifiable: true, hasLocation: false, legalBasis: "legitimate interest; Zotero library" } };
+    // Through a merge (applyMerge's result, provenance altered on the way).
+    await expect(
+      importChange(repo, p.id, req, async (ops) => {
+        const cur = await ops.readSource(a.source.id);
+        const merged = applyMerge(cur, [], [], [], ops.tx.at, ops.tx.actor, [], ["ZZZZ9999"]);
+        const next = { ...merged.next, source: { ...merged.next.source, provenance: { ...merged.next.source.provenance, externalKeys: { ...merged.next.source.provenance.externalKeys, zoteroMergedKeys: "ZZZZ9999" } } } };
+        await ops.writeSource(cur, next);
+      }, { op: "test.merge" }),
+    ).rejects.toBeInstanceOf(ImmutableProvenanceError);
+    // Through any import change writing the source.
+    for (const change of [
+      (p0: SourceFile["source"]["provenance"]) => ({ ...p0, captureMethod: "manual_upload" as const }),
+      (p0: SourceFile["source"]["provenance"]) => ({ ...p0, importBatchId: undefined }),
+      (p0: SourceFile["source"]["provenance"]) => ({ ...p0, fileHashes: {} }),
+    ]) {
+      await expect(
+        importChange(repo, p.id, req, async (ops) => {
+          const cur = await ops.readSource(a.source.id);
+          await ops.writeSource(cur, { ...cur, source: { ...cur.source, provenance: change(cur.source.provenance) } });
+        }, { op: "test.tamper" }),
+      ).rejects.toBeInstanceOf(ImmutableProvenanceError);
+    }
+    expect(await readFile(join(lib.root, a.source.folder, "source.json"), "utf8")).toBe(before);
+    // Ordinary writes still work.
+    await repo.updateSource(p.id, a.source.id, { publisher: "Still fine" });
   });
 
   it("explicit citation keys are never changed; ones already used in the project are reported", async () => {

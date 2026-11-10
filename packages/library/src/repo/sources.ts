@@ -103,6 +103,26 @@ export function sourceFolderOf(st: ProjectState, id: string): string {
   return folder;
 }
 
+/**
+ * Provenance never changes after creation (R76), by any route: every write of a source file comes
+ * through writeSourceFile, which compares the provenance with the one stored (as it is now, within
+ * this change too) and refuses a difference with ImmutableProvenanceError. A new source has none
+ * stored yet.
+ */
+async function assertProvenanceUnchanged(core: RepoCore, tx: Tx, sf: SourceFile): Promise<void> {
+  const folder = sf.source.folder;
+  const raw = await readMaybe(core.abs(tx.encrypted ? `${folder}/source.json.enc` : `${folder}/source.json`));
+  if (!raw) return;
+  let text: string;
+  if (tx.encrypted) {
+    const { key, keyId } = tx.key();
+    text = (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
+  } else text = raw.toString("utf8");
+  const stored = SourceFile.parse(JSON.parse(text));
+  if (stored.source.id !== sf.source.id) throw new TypeError("source folder belongs to another source");
+  if (!deepEqual(stored.source.provenance, sf.source.provenance)) throw new ImmutableProvenanceError();
+}
+
 /** The annotations file of a source folder (R74 I4). */
 const annotationsRel = (folder: string, encrypted: boolean) => `${folder}/${encrypted ? "annotations.json.enc" : "annotations.json"}`;
 
@@ -159,6 +179,7 @@ function manifestEntry(sf: SourceFile): ManifestEntry {
 export async function writeSourceFile(core: RepoCore, tx: Tx, sf: SourceFile): Promise<void> {
   const full = SourceFile.parse(sf);
   const folder = full.source.folder;
+  await assertProvenanceUnchanged(core, tx, full);
   const annRel = annotationsRel(folder, tx.encrypted);
   const { annotationCount: _c, annotationsSha256: readSha, ...rest } = full;
   let meta: { annotationCount?: number; annotationsSha256?: string } = {};

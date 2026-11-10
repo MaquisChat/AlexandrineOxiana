@@ -145,6 +145,12 @@ export const SourceFile = z.object({
   annotations: z.array(Annotation),
   annotationCount: z.number().int().min(0).optional(),
   annotationsSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  /**
+   * Keys of items at other sources that were merged into this source (R76), by kind, e.g.
+   * { zotero: ["ABCD2345"] }: deleting the source records them as deleted here too. Not provenance
+   * (which never changes after creation); written by merges, reverted by undo.
+   */
+  mergedExternalKeys: z.record(z.string(), z.array(z.string().max(256)).max(10_000)).optional(),
   fieldEvidence: z.array(FieldEvidence).default([]),
   verification: z.record(z.string(), FieldVerification).default({}),
 });
