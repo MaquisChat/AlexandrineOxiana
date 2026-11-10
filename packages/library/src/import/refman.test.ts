@@ -500,9 +500,10 @@ describe("review round 1: parser budgets and edge cases (R68)", () => {
     const beBody = Buffer.from("TY  - JOUR\nTI  - Big Endian\nER  - \n", "utf16le").swap16();
     await writeFile(be, Buffer.concat([Buffer.from([0xfe, 0xff]), beBody]));
     expect((await collect(risAdapter(be))).map(title)).toEqual(["Big Endian"]);
-    const bad = join(exp, "bad.bib");
-    await writeFile(bad, Buffer.from([0x40, 0x61, 0x7b, 0x6b, 0x2c, 0x74, 0x3d, 0x7b, 0xc3, 0x28, 0x7d, 0x7d]));
-    const badItems = await collect(bibtexAdapter(bad));
+    // Invalid UTF-8 in a strict format (CSL-JSON; BibTeX/RIS fall back to Windows-1252, R69).
+    const bad = join(exp, "bad.json");
+    await writeFile(bad, Buffer.from([0x5b, 0x7b, 0x22, 0x74, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x5d]));
+    const badItems = await collect(cslJsonAdapter(bad));
     expect(badItems).toHaveLength(1);
     expect(badItems[0]!.unreadable).toMatch(/not in a text encoding/);
     // UTF-16 without a BOM looks like text with NULs: no references found, never silently 0 items.
@@ -511,6 +512,24 @@ describe("review round 1: parser budgets and edge cases (R68)", () => {
     const none = await collect(bibtexAdapter(nobom));
     expect(none).toHaveLength(1);
     expect(none[0]!.unreadable).toMatch(/no references/);
+  });
+
+  it("R69: invalid UTF-8 BibTeX/RIS without a BOM is decoded as Windows-1252 with a note; CSL-JSON stays strict", async () => {
+    const notes: string[] = [];
+    const c: ScanContext = { workDir: ctx.workDir, note: (t) => notes.push(t) };
+    const bib = join(exp, "latin1.bib");
+    await writeFile(bib, Buffer.from("@article{m, title={Caf\u00e9 Notes}, author={M\u00fcller, Jan}}\n", "latin1"));
+    const [b] = await collect(bibtexAdapter(bib), c);
+    expect(b!.referenceMetadata?.creators).toEqual([{ family: "Müller", given: "Jan", role: "author" }]);
+    expect(title(b)).toBe("Café Notes");
+    const ris = join(exp, "cp1252.ris");
+    await writeFile(ris, Buffer.concat([Buffer.from("TY  - JOUR\nTI  - Smart \x93quotes\x94 and M", "latin1"), Buffer.from([0xfc]), Buffer.from("ller\nER  - \n", "latin1")]));
+    const [r] = await collect(risAdapter(ris), c);
+    expect(title(r)).toBe("Smart \u201cquotes\u201d and Müller");
+    expect(notes).toEqual(["decoded as Windows-1252 — check accented characters", "decoded as Windows-1252 — check accented characters"]);
+    const csl = join(exp, "latin1.json");
+    await writeFile(csl, Buffer.from('[{"id":"m","title":"M\u00fcller"}]', "latin1"));
+    expect((await collect(cslJsonAdapter(csl), c))[0]!.unreadable).toMatch(/not in a text encoding/);
   });
 
   it("file fields: colon in a path, Windows backslashes in CSL, Mendeley's form, file://server and %2F", async () => {
@@ -831,6 +850,21 @@ processing:
     expect(report.fileNotes.filter((n) => n.note === "attached file not found")).toHaveLength(1);
     expect(sfs.every((sf) => sf.source.provenance.captureMethod === "calibre_import")).toBe(true);
     expect(await readdir(join(lib.root, ".tmp")).then((ns) => ns.filter((n) => n.startsWith("batch-")))).toEqual([]);
+  });
+
+  it("R69: a Latin-1 .bib imports with the right names, and the Windows-1252 note is in the dry run and the report", async () => {
+    const bib = join(exp, "latin1.bib");
+    await writeFile(bib, Buffer.from("@article{mueller2020, title={Caf\u00e9 Society}, author={M\u00fcller, Jan}, year={2020}}\n", "latin1"));
+    const p = await project();
+    const bulk = bulkImport();
+    const NOTE = "decoded as Windows-1252 — check accented characters";
+    expect((await bulk.dryRun(p.id, bibtexAdapter(bib))).notes).toEqual([NOTE]);
+    const h = await bulk.startBatch(p.id, bibtexAdapter(bib));
+    expect((await h.done).counts.failed).toBe(0);
+    const [sf] = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
+    expect(sf!.source.creators).toEqual([{ family: "Müller", given: "Jan", role: "author" }]);
+    expect(sf!.source.title.variants[0]?.value).toBe("Café Society");
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain(NOTE);
   });
 
   it("I2: an unsupported or vanished file is dropped with a note; the rest of the item imports", async () => {

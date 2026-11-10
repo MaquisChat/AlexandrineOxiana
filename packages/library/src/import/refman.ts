@@ -67,25 +67,38 @@ export class ExportUnreadable extends Error {
   }
 }
 
+/** Scan note when an old export was read as Windows-1252 (R69). */
+export const LEGACY_ENCODING_NOTE = "decoded as Windows-1252 — check accented characters";
+
 /**
  * Export bytes → text: UTF-16 (LE or BE) when it starts with a byte order mark, else UTF-8 (BOM
- * dropped); bytes that are not valid in that encoding → ExportUnreadable (never silently mangled).
- * Line endings become "\n" (CRLF and lone CR alike).
+ * dropped). Bytes that are not valid UTF-8 and have no BOM are read as Windows-1252 when `legacy`
+ * is allowed (old BibTeX and RIS exports, R69; `legacy: true` in the result, so the scan notes it),
+ * else → ExportUnreadable (never silently mangled). Line endings become "\n" (CRLF and lone CR).
  */
-export function decodeExport(buf: Buffer): string {
+export function decodeExport(buf: Buffer, allowLegacy = false): { text: string; legacy: boolean } {
   let s: string;
+  let legacy = false;
   try {
     if (buf[0] === 0xff && buf[1] === 0xfe) s = new TextDecoder("utf-16le", { fatal: true }).decode(buf.subarray(2));
     else if (buf[0] === 0xfe && buf[1] === 0xff) s = new TextDecoder("utf-16be", { fatal: true }).decode(buf.subarray(2));
-    else s = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(buf);
+    else {
+      try {
+        s = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(buf);
+      } catch (err) {
+        if (!allowLegacy) throw err;
+        s = new TextDecoder("windows-1252").decode(buf);
+        legacy = true;
+      }
+    }
   } catch {
     throw new ExportUnreadable(REFMAN_REASONS.encoding);
   }
-  return s.includes("\r") ? s.replace(/\r\n?/gu, "\n") : s;
+  return { text: s.includes("\r") ? s.replace(/\r\n?/gu, "\n") : s, legacy };
 }
 
-/** The export file's text (decodeExport), or ExportUnreadable with a plain reason. */
-export async function readExport(path: string): Promise<string> {
+/** The export file's bytes (size-checked), or ExportUnreadable with a plain reason. */
+export async function readExportBytes(path: string): Promise<Buffer> {
   const st = await fsp.stat(path).catch(() => null);
   if (!st?.isFile()) throw new ExportUnreadable(REFMAN_REASONS.unreadable);
   if (st.size > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
@@ -96,7 +109,12 @@ export async function readExport(path: string): Promise<string> {
     throw new ExportUnreadable(REFMAN_REASONS.unreadable);
   }
   if (buf.length > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
-  return decodeExport(buf);
+  return buf;
+}
+
+/** The export file's text, strictly decoded (decodeExport without the Windows-1252 fallback). */
+export async function readExport(path: string): Promise<string> {
+  return decodeExport(await readExportBytes(path)).text;
 }
 
 /** `<name>@<12 hex of sha256(absolute path)>`: identifies the export (or library) the keys belong to. */
@@ -396,6 +414,8 @@ export function exportAdapter<R>(
   path: string,
   parse: (text: string) => Iterable<R>,
   toItem: (record: R, keys: ItemKeys, baseDir: string) => Promise<ScanItem | undefined>,
+  /** Old exports may be Windows-1252 (BibTeX, RIS; R69). */
+  allowLegacy = false,
 ): ImportSourceAdapter {
   const baseDir = dirname(resolve(path));
   return {
@@ -406,9 +426,10 @@ export function exportAdapter<R>(
       const prefix = exportIdentity(path);
       let records: R[];
       try {
-        const text = await readExport(path);
+        const { text, legacy } = decodeExport(await readExportBytes(path), allowLegacy);
         records = [...parse(text)];
         if (!records.length && text.trim()) throw new ExportUnreadable(REFMAN_REASONS.empty);
+        if (legacy) ctx?.note?.(LEGACY_ENCODING_NOTE);
       } catch (err) {
         yield { key: `${prefix}#`, files: [], unreadable: err instanceof ExportUnreadable ? err.reason : REFMAN_REASONS.unreadable };
         return;
@@ -881,7 +902,7 @@ export function bibtexAdapter(path: string): ImportSourceAdapter {
     const f = bibFields(e);
     const raw = e.fields.get("file");
     return recordItem(keys.next(f.citekey), f, raw ? fileFieldLinks(raw, baseDir) : []);
-  });
+  }, true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -991,7 +1012,7 @@ export function risAdapter(path: string): ImportSourceAdapter {
     const f = risFields(r);
     const links = ["L1", "L2", "L4", "LK"].flatMap((t) => r.get(t) ?? []).slice(0, MAX_FILES);
     return recordItem(keys.next(f.citekey), f, links.map((l) => linkFromPath(l, baseDir)));
-  });
+  }, true);
 }
 
 // ---------------------------------------------------------------------------------------------
