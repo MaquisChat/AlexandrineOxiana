@@ -32,7 +32,8 @@ if (mode === "notfound") {
 // A synthetic profile (FAKE_PROFILE_FILE, JSON; tests change it between runs): the profile link is
 // enumerated (--flat-playlist: one playlist info JSON with the entries), an item link is downloaded.
 // Modes: ratelimit (items from position `rateLimitAfter`, default 3, fail with 429), enumpartial
-// (only the first `cutAfter` entries, default 7, then 429), enumratelimit (the enumeration fails with 429).
+// (only the first `cutAfter` entries, default 7, then 429), enumbroken (the same, then an extractor
+// error), enumratelimit (the enumeration fails with 429).
 if (process.env.FAKE_PROFILE_FILE) {
   const prof = JSON.parse(readFileSync(process.env.FAKE_PROFILE_FILE, "utf8"));
   if (prof.platform !== "instagram") profileRun(prof);
@@ -77,7 +78,7 @@ function profileRun(prof) {
   let items = prof.items;
   const end = args.indexOf("--playlist-end");
   if (end >= 0) items = items.slice(0, Number(args[end + 1]));
-  if (mode === "enumpartial") items = items.slice(0, prof.cutAfter ?? 7);
+  if (mode === "enumpartial" || mode === "enumbroken") items = items.slice(0, prof.cutAfter ?? 7);
   const playlist = {
     _type: "playlist", id: yt ? "UCfakeProfile0000000001" : prof.handle, title: yt ? `${prof.displayName} - Videos` : prof.handle,
     channel: prof.displayName, uploader: yt ? prof.displayName : prof.handle, uploader_id: yt ? `@${prof.handle}` : "7000000000000000999",
@@ -87,6 +88,10 @@ function profileRun(prof) {
     entries: items.map((it) => ({ _type: "url", ie_key: yt ? "Youtube" : "TikTok", id: it.id, url: `${itemUrl(it)}?si=track`, title: it.caption.split("\n")[0], description: it.caption, timestamp: it.timestamp })),
   };
   writeFileSync(join(out, `${playlist.id}.info.json`), JSON.stringify(playlist));
+  if (mode === "enumbroken") {
+    console.error(`ERROR: [tiktok:user] ${prof.handle}: Unable to extract secondary user info`);
+    process.exit(1);
+  }
   if (mode === "enumpartial") {
     console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: HTTP Error 429: Too Many Requests`);
     process.exit(1);

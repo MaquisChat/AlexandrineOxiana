@@ -375,6 +375,16 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
     expect(r).toMatchObject({ listComplete: false, newlyUnavailable: 0, created: 0 });
     for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
+    expect(waits).toEqual([60_000, 120_000, 240_000]);
+    // cut short by an extractor error: the listed new posts are captured, nothing is marked unavailable
+    waits.length = 0;
+    const prof = synthetic();
+    await setProfile({ ...prof, items: [item(13), ...prof.items], cutAfter: 3 });
+    process.env.FAKE_TOOL_MODE = "enumbroken";
+    const broken = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(broken).toMatchObject({ status: "completed", listComplete: false, created: 1, newlyUnavailable: 0 });
+    expect(waits).toEqual([]);
+    for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
     // date filters make the list partial too
     delete process.env.FAKE_TOOL_MODE;
     const since = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, since: "2026-01-10" });
@@ -518,6 +528,37 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     const record = JSON.parse(await readFile(join(lib.root, p.folder, "profiles", "fake_photographer".replace(/^/, "instagram-"), "profile.json"), "utf8")) as { knownPostIds: string[] };
     expect(record.knownPostIds).toHaveLength(12);
     expect((await posts(p.id)).every((sf) => sf.source.identifiers.platform === "instagram")).toBe(true);
+  });
+
+  it("a YouTube channel: chosen content types list each tab once, posts are not repeated, and the list counts as filtered", async () => {
+    await setProfile({ ...synthetic("youtube"), handle: "amatest_fake", displayName: "Ama Test Channel", items: synthetic("youtube").items.map((it) => ({ ...it, id: `aoProf${it.id.slice(-6)}` })) });
+    const p = await project();
+    const r = await capture.captureProfile(p.id, "https://www.youtube.com/@amatest_fake/videos?si=x", { transcribe: false, contentTypes: ["videos", "shorts"] });
+    expect(r).toMatchObject({ status: "completed", created: 12, listComplete: false });
+    expect(worker.submitted.filter((j) => j.params.flatList).map((j) => j.input)).toEqual([
+      "https://www.youtube.com/@amatest_fake/videos",
+      "https://www.youtube.com/@amatest_fake/shorts",
+    ]);
+    const prof = await repo.getSource(p.id, r.profileSourceId!);
+    expect(prof.source.creators).toEqual([{ literal: "Ama Test Channel", role: "channel", handle: "@amatest_fake" }]);
+    expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["youtube-amatest_fake"]);
+    expect((await posts(p.id)).every((sf) => sf.source.type === "video" && sf.source.identifiers.url!.startsWith("https://www.youtube.com/watch?v=aoProf"))).toBe(true);
+  });
+
+  it("a post already captured on its own is a duplicate: counted, tracked, not re-downloaded, not part of the batch", async () => {
+    const p = await project();
+    const single = await capture.captureUrl(p.id, `https://www.tiktok.com/@fake.dancer/video/${ttId(3)}`, { transcribe: false });
+    expect(single.status).toBe("created");
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ created: 11, duplicates: 1 });
+    expect(r.items.find((o) => o.status === "duplicate")).toMatchObject({ sourceId: single.sourceId });
+    expect(worker.submitted.filter((j) => j.input.includes(ttId(3)))).toHaveLength(1);
+    const sf = await repo.getSource(p.id, single.sourceId!);
+    expect(sf.source.provenance.importBatchId).toBeUndefined();
+    const batch = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0001", "batch.json"), "utf8")) as { createdSourceIds: string[] };
+    expect(batch.createdSourceIds).not.toContain(single.sourceId);
+    const record = JSON.parse(await readFile(join(lib.root, p.folder, "profiles", "tiktok-fake.dancer", "profile.json"), "utf8")) as { knownPostIds: string[] };
+    expect(record.knownPostIds).toContain(ttId(3));
   });
 
   it("captureUrl hands a profile link to the profile capture", async () => {

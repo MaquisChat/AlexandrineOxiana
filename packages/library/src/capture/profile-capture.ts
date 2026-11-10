@@ -479,8 +479,9 @@ export function createProfileCapture(core: CaptureCore) {
     report.listComplete = !partial && !filtered && !(entries.length === 0 && known.size > 0);
     if (!stopped && (await core.stillAllowed(projectId, platform))) {
       const listedIds = new Set(entries.map((e) => e.id));
+      const freshIds = new Set(fresh.map((e) => e.id));
       for (const e of entries) {
-        if (!known.has(e.id) || fresh.some((f) => f.id === e.id)) continue;
+        if (!known.has(e.id) || freshIds.has(e.id)) continue;
         const sid = await core.findExisting(projectId, platform, e.id);
         if (!sid) continue;
         const sf = await repo.getSource(projectId, sid);
@@ -488,7 +489,12 @@ export function createProfileCapture(core: CaptureCore) {
           await repo.updateSource(projectId, sid, { availability: { status: "available" } });
           report.reappeared++;
         }
-        if (await recordEdit(projectId, sid, e, platform, tool)) report.edited++;
+        const edit = await recordEdit(projectId, sid, e, platform, tool);
+        if (edit === "policy-changed") {
+          policyChanged();
+          break;
+        }
+        if (edit === "edited") report.edited++;
       }
       if (report.listComplete && report.status === "completed") {
         for (const id of known) {
@@ -699,24 +705,31 @@ export function createProfileCapture(core: CaptureCore) {
    * A known post whose listed caption (or YouTube title) differs from its latest stored snapshot:
    * a new dated platform-metadata original and, when the title changes, a title variant (rechecked).
    */
-  async function recordEdit(projectId: string, sourceId: string, e: ProfileEntry, platform: Platform, tool: CaptureTool): Promise<boolean> {
+  async function recordEdit(
+    projectId: string,
+    sourceId: string,
+    e: ProfileEntry,
+    platform: Platform,
+    tool: CaptureTool,
+  ): Promise<"edited" | "unchanged" | "policy-changed"> {
     const root = repoLibrary(repo).root;
     const sf = await repo.getSource(projectId, sourceId);
     const metas = sf.assets
       .filter((a) => a.role === "original" && a.kind === "platform-metadata")
       .sort((a, b) => (a.metadata?.capturedAt ?? "").localeCompare(b.metadata?.capturedAt ?? ""));
     const latest = metas.at(-1);
-    if (!latest) return false;
+    if (!latest) return "unchanged";
     const stored = await core.readJson(join(root, ...latest.path.split("/")), latest.encrypted, projectId);
-    if (!isRecord(stored)) return false;
+    if (!isRecord(stored)) return "unchanged";
     const now = stripSnapshot(e.raw, { localPrefixes: [root] });
     const oldCap = captionOf(stored);
     const newCap = captionOf(now);
     const capChanged = typeof oldCap === "string" && typeof newCap === "string" && norm(oldCap) !== norm(newCap);
     const newYtTitle = platform === "youtube" && typeof now.title === "string" ? now.title : undefined;
     const titleChanged = typeof stored.title === "string" && newYtTitle !== undefined && norm(stored.title) !== norm(newYtTitle);
-    if (!capChanged && !titleChanged) return false;
-    if (!(await core.stillAllowed(projectId, platform))) return false;
+    if (!capChanged && !titleChanged) return "unchanged";
+    // Immediately before storing (R42).
+    if (!(await core.stillAllowed(projectId, platform))) return "policy-changed";
 
     const at = new Date().toISOString();
     const { work, done } = await core.makeWork();
@@ -750,7 +763,7 @@ export function createProfileCapture(core: CaptureCore) {
         verification: (next) => recheckSourceFile(next, { platformSnapshot: ctx }).verification,
       });
     }
-    return true;
+    return "edited";
   }
 
   /** A captureUrl outcome for a profile link (the profile source stands for the run). */

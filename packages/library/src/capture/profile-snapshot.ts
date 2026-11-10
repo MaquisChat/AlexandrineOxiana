@@ -91,7 +91,9 @@ export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: Capture
   };
   const profile: ProfileMeta = { links: [] };
   if (tool === "yt-dlp") {
-    const list = docs.filter(isRecord).find((d) => Array.isArray(d.entries)) ?? docs.find(isRecord);
+    // One playlist JSON per listed tab (videos, shorts …): the profile from the first, posts from all.
+    const lists = docs.filter(isRecord).filter((d) => Array.isArray(d.entries));
+    const list = lists[0] ?? docs.find(isRecord);
     if (list) {
       const handle =
         platform === "youtube" ? (str(list.uploader_id)?.startsWith("@") ? str(list.uploader_id) : c.handle) : platform === "tiktok" ? (str(list.uploader) ? `@${str(list.uploader)!.replace(/^@+/, "")}` : c.handle) : c.handle;
@@ -106,7 +108,7 @@ export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: Capture
         ...(num(list.playlist_count) !== undefined ? { posts: num(list.playlist_count) } : {}),
         ...(typeof list.channel_is_verified === "boolean" ? { verified: list.channel_is_verified } : {}),
       });
-      for (const e of Array.isArray(list.entries) ? list.entries : []) {
+      for (const e of (lists.length ? lists : [list]).flatMap((l) => (Array.isArray(l.entries) ? (l.entries as unknown[]) : []))) {
         if (!isRecord(e)) continue;
         const id = str(e.id);
         const url = id ? entryLink(platform, id, e.url ?? e.webpage_url, handle) : undefined;
