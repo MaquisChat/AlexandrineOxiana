@@ -9,7 +9,7 @@
  * whole edited transcript).
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { appConfigDir, deviceDeps, type Deps } from "@ao/library";
+import { appConfigDir, deviceDeps, type Deps, type openLibrary } from "@ao/library";
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
@@ -45,6 +45,12 @@ export interface ServiceOptions {
   now?: () => Date;
   backupCheckMs?: number;
   pairing?: PairingOptions;
+  /** How long an import may take to reach a safe point when paused (test seam). */
+  suspendTimeoutMs?: number;
+  /** Opens a library (test seam). */
+  openLibrary?: typeof openLibrary;
+  /** Runs right before a move starts copying (test seam). */
+  beforeExecuteMove?: () => Promise<void>;
   /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
   watchStabilityMs?: number;
 }
@@ -101,6 +107,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     now: opts.now ?? (() => new Date()),
     backupCheckMs: opts.backupCheckMs ?? 60 * 60_000,
     ...(opts.watchStabilityMs !== undefined ? { watchStabilityMs: opts.watchStabilityMs } : {}),
+    ...(opts.suspendTimeoutMs !== undefined ? { suspendTimeoutMs: opts.suspendTimeoutMs } : {}),
+    ...(opts.openLibrary ? { openLibrary: opts.openLibrary } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
@@ -108,11 +116,22 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   let port: number | undefined;
   /** Set when shutdown starts: new requests are refused before the library is closed (R98). */
   let closingNow = false;
+  /** Requests being answered (event streams excepted): shutdown waits for them (R101 M7). */
+  let inFlight = 0;
+  let idleWaiters: Array<() => void> = [];
+  const requestEnded = () => {
+    inFlight--;
+    if (inFlight === 0) for (const w of idleWaiters.splice(0)) w();
+  };
 
   const fail = (reply: FastifyReply, e: ApiError) => reply.status(e.status).send(errorBody(e, state.roots));
 
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
     if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
+    if ((req.url.split("?")[0] ?? "") !== "/events") {
+      inFlight++;
+      reply.raw.once("close", requestEnded);
+    }
     // 1. DNS rebinding: only our own host names, on our port.
     if (!hostAllowed(req.headers.host, port)) return fail(reply, new ApiError(403, "FORBIDDEN", "This host name is not allowed."));
     // 2. Origin: the desktop shell, or a paired extension (an unpaired one only to confirm pairing).
@@ -154,6 +173,13 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     req.caller = "extension";
   });
 
+  // During a library move nothing may change anything (R102 N2): every non-read request waits it out.
+  app.addHook("preHandler", async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!state.moving || req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
+    if (`${req.method} ${req.routeOptions.url ?? ""}` === "POST /libraries/move") return fail(reply, new ApiError(409, "CONFLICT", "A move of this library is already running."));
+    return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", "The library is being moved. Try again when the move has finished."));
+  });
+
   app.setErrorHandler((err: unknown, req, reply) => {
     const e = toApiError(err);
     if (e.status >= 500) req.log.error({ err: state.describe(err) }, "request failed");
@@ -161,7 +187,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token };
+  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -188,8 +214,14 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     },
     close() {
       closingNow = true;
+      state.shuttingDown = true;
       closing ??= (async () => {
-        // Requests are refused from here on; then running work is paused and the library closed.
+        // Requests are refused from here on; those already in progress finish (a library being
+        // opened is then refused and released); then running work is paused and the library closed.
+        if (inFlight > 0) await new Promise<void>((r) => {
+          idleWaiters.push(r);
+          setTimeout(r, 60_000).unref?.();
+        });
         await state.shutdown();
         await app.close();
       })();
@@ -198,4 +230,4 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void> };

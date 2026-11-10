@@ -70,6 +70,7 @@ export type ErrorCode =
   | "ACKNOWLEDGEMENT_REQUIRED"
   | "WORKER_UNAVAILABLE"
   | "UNAVAILABLE"
+  | "MOVE_IN_PROGRESS"
   | "INTERNAL";
 
 export class ApiError extends Error {
@@ -95,7 +96,12 @@ export interface ErrorBody {
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
   if (err instanceof PolicyDeniedError) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
-  if (err instanceof BatchRefusedError) return err.denied ? new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason) : new ApiError(400, "VALIDATION", err.reason);
+  if (err instanceof BatchRefusedError) {
+    if (err.denied) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
+    // Running (e.g. still being paused for a move or shutdown) or already finished: a state conflict (R102).
+    if (/already (running|finished)/i.test(err.reason)) return new ApiError(409, "CONFLICT", err.reason);
+    return new ApiError(400, "VALIDATION", err.reason);
+  }
   if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");
   if (err instanceof WrongPassphraseError) return new ApiError(401, "WRONG_PASSPHRASE", "That passphrase is not correct.");
   if (err instanceof InvalidRecoveryCodeError) return new ApiError(401, "WRONG_PASSPHRASE", "That recovery code is not valid.");

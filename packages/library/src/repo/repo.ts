@@ -10,7 +10,7 @@ import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
-import { createCollection, createTag, deleteCollection, deleteTag, moveCollection, renameCollection, renameTag, setMembership, workspaceTags } from "./collections.js";
+import { createCollection, createTag, deleteCollection, deleteTag, moveCollection, renameCollection, renameTag, setMembership, updateCollection, workspaceTags } from "./collections.js";
 import {
   createConsent,
   createParticipant,
@@ -196,6 +196,10 @@ export class Repo {
   }
   deleteCollection(projectId: string, id: string): Promise<void> {
     return deleteCollection(this.core, projectId, id);
+  }
+  /** Renames and/or moves a collection in one change. */
+  updateCollection(projectId: string, id: string, change: { name?: string; parentId?: string | null }): Promise<Collection> {
+    return updateCollection(this.core, projectId, id, change);
   }
   renameCollection(projectId: string, id: string, name: string): Promise<Collection> {
     return renameCollection(this.core, projectId, id, name);

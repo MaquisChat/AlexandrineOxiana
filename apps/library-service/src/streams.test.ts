@@ -45,3 +45,18 @@ describe("streams", () => {
     expect(res.writes).toEqual(['{"a":1}\n', '{"b":2}\n']);
   });
 });
+
+describe("streams after the client left (R102 N1)", () => {
+  it("NDJSON never waits on a destroyed or ended response", async () => {
+    const res = new FakeRes();
+    (res as unknown as { destroyed: boolean }).destroyed = true;
+    const write = ndjsonWriter(res as never);
+    res.full = true;
+    await write({ a: 1 }); // resolves at once
+    expect(res.writes).toEqual([]);
+    const ended = new FakeRes();
+    (ended as unknown as { writableEnded: boolean }).writableEnded = true;
+    await ndjsonWriter(ended as never)({ b: 2 });
+    expect(ended.writes).toEqual([]);
+  });
+});

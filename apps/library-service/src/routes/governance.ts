@@ -60,8 +60,14 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const yaml = str(b, "yaml", 2 * GOVERNANCE_MAX_BYTES);
     const reason = optStr(b, "reason", 2000);
-    const ifMatch = typeof req.headers["if-match"] === "string" ? req.headers["if-match"].replace(/^W\//, "").replace(/"/g, "").trim() : undefined;
-    const baseSha256 = ifMatch || optStr(b, "baseSha256", 64);
+    // If-Match: one or more ETags (weak or strong); hex compared case-insensitively (R101 N3). Any
+    // listed tag that is the current version counts; otherwise the first one is used (→ 409).
+    const tags = typeof req.headers["if-match"] === "string" ? req.headers["if-match"].split(",").map((t) => t.trim().replace(/^W\//i, "").replace(/"/g, "").trim().toLowerCase()).filter(Boolean) : [];
+    let baseSha256 = tags[0] ?? optStr(b, "baseSha256", 64)?.toLowerCase();
+    if (tags.length > 1) {
+      const { sha256 } = await s.repo.getGovernance(projectId);
+      if (tags.includes(sha256)) baseSha256 = sha256;
+    }
     if (!baseSha256 || !/^[0-9a-f]{64}$/.test(baseSha256)) {
       throw badRequest("Say which version of the rules this change was made from: the sha256 from GET, as If-Match or baseSha256.");
     }

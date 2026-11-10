@@ -32,6 +32,7 @@ import {
   type Repo,
   type ToolsUpdate,
   type WorkerClient,
+  openLibrary,
 } from "@ao/library";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
@@ -90,6 +91,10 @@ export interface StateOptions {
   backupCheckMs: number;
   log: { info(o: object, msg?: string): void; warn(o: object, msg?: string): void };
   watchStabilityMs?: number;
+  /** How long an import may take to reach a safe point when paused (default SUSPEND_TIMEOUT_MS). */
+  suspendTimeoutMs?: number;
+  /** Opens a library (test seam; default the library's openLibrary). */
+  openLibrary?: typeof openLibrary;
 }
 
 /** A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99). */
@@ -129,6 +134,22 @@ export class ServiceState {
   readonly roots = new Set<string>();
   readonly tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   private move: PendingMove | undefined;
+  /** A library move is running: every change is refused (503 MOVE_IN_PROGRESS), background work waits (R102 N2). */
+  moving = false;
+  /** Shutdown has started: no library may be opened or adopted any more (R101 M7). */
+  shuttingDown = false;
+
+  /** Opens a library folder (honours the shutdown gate before and after the lock is taken). */
+  async openLibrary(root: string): Promise<Library> {
+    if (this.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
+    const open = this.opts.openLibrary ?? openLibrary;
+    return open(root, this.deps, { onLockLost: () => this.publishState() });
+  }
+
+  /** 503 MOVE_IN_PROGRESS while a library move runs. */
+  assertNotMoving(): void {
+    if (this.moving) throw new ApiError(503, "MOVE_IN_PROGRESS", "The library is being moved. Try again when the move has finished.");
+  }
 
   constructor(readonly opts: StateOptions) {}
 
@@ -181,6 +202,7 @@ export class ServiceState {
 
   /** The session, refusing a read-only library with 409 READ_ONLY (reason: why it is read-only). */
   requireWritable(): Session & { index: IndexHandle; bulk: BulkImport } {
+    this.assertNotMoving();
     const s = this.requireSession();
     if (s.lib.mode === "read-only" || !s.index || !s.bulk) {
       throw new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.", s.lib.readOnlyReason ?? "read-only");
@@ -190,6 +212,11 @@ export class ServiceState {
 
   /** Makes `lib` the open library (closing any other first). */
   async adopt(lib: Library): Promise<Session> {
+    if (this.shuttingDown) {
+      // Opened while the service was stopping: released at once, never adopted (R101 M7).
+      await lib.close().catch(() => {});
+      throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
+    }
     if (this.session && this.session.lib !== lib) await this.closeLibrary();
     this.roots.add(lib.root);
     const ring = new KeyRing();
@@ -308,16 +335,18 @@ export class ServiceState {
 
   /**
    * Pauses every running batch at its next safe point and leaves it `paused` on disk (R99 I4/I5).
-   * Returns the batches paused; throws when one did not reach a safe point in time.
+   * Returns the batches paused and those that did not reach a safe point in time (still running).
    */
-  async suspendBatches(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
+  async suspendBatches(s: Session): Promise<{ paused: Array<{ projectId: string; batchId: string }>; stuck: Array<{ projectId: string; batchId: string; handle: BatchHandle }> }> {
     const running = [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b }));
+    const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     const results = await Promise.all(
-      running.map(async (b) => ({ b, r: await withTimeout(b.handle.suspend().catch(() => undefined as BatchResult | undefined), SUSPEND_TIMEOUT_MS).catch(() => undefined) })),
+      running.map(async (b) => ({ b, r: await withTimeout(b.handle.suspend().catch(() => undefined as BatchResult | undefined), ms).catch(() => undefined) })),
     );
-    const stuck = results.filter((x) => x.r === undefined && s.batches.has(x.b.batchId));
-    if (stuck.length) throw new ApiError(409, "CONFLICT", "An import could not be paused in time; try again in a moment.");
-    return results.filter((x) => x.r?.state === "paused").map((x) => ({ projectId: x.b.projectId, batchId: x.b.batchId }));
+    return {
+      paused: results.filter((x) => x.r?.state === "paused").map((x) => ({ projectId: x.b.projectId, batchId: x.b.batchId })),
+      stuck: results.filter((x) => x.r === undefined && s.batches.get(x.b.batchId)?.handle === x.b.handle).map((x) => x.b),
+    };
   }
 
   // ---- library move --------------------------------------------------------------------
@@ -328,11 +357,29 @@ export class ServiceState {
    * writes to the library while it is copied. Returns the batches to resume afterwards.
    */
   async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
-    const paused = await this.suspendBatches(s);
-    this.stopBackupScheduler();
-    await this.stopWatches(s);
-    await disposeProxyQueue(s.repo).catch(() => {});
-    await disposeOcrQueue(s.repo).catch(() => {});
+    const { paused, stuck } = await this.suspendBatches(s);
+    if (stuck.length) {
+      // Refused: everything paused for it carries on (R102 N3); a pause that has not taken effect is withdrawn.
+      for (const b of stuck) {
+        try {
+          b.handle.resume();
+        } catch {
+          // already ended
+        }
+      }
+      this.resumeBatches(paused);
+      throw new ApiError(409, "CONFLICT", "An import could not be paused in time, so the library was not moved; try again in a moment.");
+    }
+    try {
+      this.stopBackupScheduler();
+      await this.stopWatches(s);
+      await disposeProxyQueue(s.repo);
+      await disposeOcrQueue(s.repo);
+    } catch (err) {
+      this.activate(s);
+      this.resumeBatches(paused);
+      throw err;
+    }
     return paused;
   }
 
@@ -370,8 +417,17 @@ export class ServiceState {
     if (!s) return;
     this.session = undefined;
     this.stopBackupScheduler();
-    // Running imports are paused (resumable), never cancelled (R99 I4).
-    await this.suspendBatches(s).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "an import could not be paused"));
+    // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
+    // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
+    const { stuck } = await this.suspendBatches(s).catch(() => ({ paused: [], stuck: [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b })) }));
+    for (const b of stuck) {
+      try {
+        b.handle.cancel();
+      } catch {
+        // already ended
+      }
+    }
+    await Promise.allSettled(stuck.map((b) => withTimeout(b.handle.done, this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS)));
     await this.stopWatches(s);
     for (const u of s.unsubscribe) u();
     await disposeProxyQueue(s.repo).catch(() => {});
@@ -430,7 +486,7 @@ export class ServiceState {
 
   /** Resumes a project's pending viewing proxies and OCR (at open / worker ready / unlock). */
   resumeProject(s: Session, projectId: string): void {
-    if (!s.workerClient || s.lib.mode !== "read-write") return;
+    if (!s.workerClient || s.lib.mode !== "read-write" || this.moving) return;
     this.track(proxyQueueFor(s.repo).resumePending(projectId), "resuming viewing proxies");
     this.track(ocrQueueFor(s.repo).resumePending(projectId), "resuming OCR");
   }
@@ -493,7 +549,7 @@ export class ServiceState {
   /** One pass of the backup scheduler: every project whose automatic backup is due is backed up. */
   async runScheduledBackups(onlyProjectId?: string): Promise<BackupRun[]> {
     const s = this.session;
-    if (!s || s.lib.mode !== "read-write") return [];
+    if (!s || s.lib.mode !== "read-write" || this.moving || this.shuttingDown) return [];
     const out: BackupRun[] = [];
     for (const p of s.repo.listProjects()) {
       if (onlyProjectId && p.id !== onlyProjectId) continue;
@@ -527,6 +583,7 @@ export class ServiceState {
   // ---- shutdown --------------------------------------------------------------------------
 
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
     await this.closeLibrary();
     const w = this.worker ?? (await this.workerStarting?.catch(() => undefined));
     this.worker = undefined;

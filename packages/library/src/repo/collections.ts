@@ -67,6 +67,40 @@ export async function moveCollection(core: RepoCore, projectId: string, id: stri
   );
 }
 
+/** Renames and/or moves a collection in one governed change (R102); refuses cycles. `parentId` null: top level. */
+export async function updateCollection(core: RepoCore, projectId: string, id: string, change: { name?: string; parentId?: string | null }): Promise<Collection> {
+  core.assertWritable();
+  if (change.name !== undefined && (typeof change.name !== "string" || change.name.trim() === "" || change.name.length > 500)) {
+    throw new InvalidInputError("a collection name of 1 to 500 characters is required");
+  }
+  return runMutation(
+    core,
+    projectId,
+    ORGANIZE,
+    async (tx) => {
+      const data = await readFullData(core, tx.state);
+      const byId = new Map(data.collections.map((c) => [c.id, c]));
+      const c = byId.get(id);
+      if (!c) throw new NotFoundError("Collection", id);
+      const parentId = change.parentId;
+      if (parentId !== undefined && parentId !== null) {
+        if (!byId.has(parentId)) throw new NotFoundError("Collection", parentId);
+        for (let p: string | undefined = parentId; p; p = byId.get(p)?.parentId) {
+          if (p === id) throw new InvalidInputError("Moving a collection under itself would create a cycle");
+        }
+      }
+      const before = structuredClone(c);
+      if (change.name !== undefined) c.name = change.name;
+      if (parentId === null) delete c.parentId;
+      else if (parentId !== undefined) c.parentId = parentId;
+      await writeProjectData(core, tx, data);
+      tx.record("collection", id, before, c);
+      return c;
+    },
+    { op: "collection.update", entity: { type: "collection", id } },
+  );
+}
+
 /** Renames a collection. */
 export async function renameCollection(core: RepoCore, projectId: string, id: string, name: string): Promise<Collection> {
   core.assertWritable();

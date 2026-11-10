@@ -15,13 +15,13 @@ import {
   executeMove,
   findLibrary,
   listLibraries,
-  openLibrary,
   planMove,
   rebuildIndex,
   reconnect,
   relinkMissing,
   scrubPaths,
   type IntegritySample,
+  type Library,
 } from "@ao/library";
 import { ApiError, badRequest, errorBody, toApiError } from "../errors.js";
 import { sseFrame } from "../events.js";
@@ -71,6 +71,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const name = str(b, "name", 200);
     state.roots.add(path);
     await state.closeLibrary();
+    if (state.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
     const lib = await createLibrary(path, name, state.deps);
     await state.adopt(lib);
     return libraryView(ctx);
@@ -80,7 +81,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const path = absPath(bodyOf(req), "path");
     state.roots.add(path);
     await state.closeLibrary();
-    const lib = await openLibrary(path, state.deps, { onLockLost: () => state.publishState() });
+    const lib = await state.openLibrary(path);
     await state.adopt(lib);
     return libraryView(ctx);
   });
@@ -118,6 +119,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const libraryId = str(b, "libraryId", 64);
     state.roots.add(path);
     await state.closeLibrary();
+    if (state.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
     const r = await reconnect(path, libraryId, state.deps, { tz: state.tz, onLockLost: () => state.publishState() });
     await state.adopt(r.library);
     return {
@@ -148,42 +150,74 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   // refused if one cannot be), watches, queues and the backup scheduler stopped; afterwards they
   // start on the library now open, and the paused imports resume there.
   app.post("/libraries/move", async (req: FastifyRequest, reply: FastifyReply) => {
+    if (state.moving) throw new ApiError(409, "CONFLICT", "A move of this library is already running.");
     const s = state.requireWritable();
     const b = bodyOf(req);
     const dest = absPath(b, "dest");
     const excludeProjectIds = strArray(b, "excludeProjectIds", { optional: true, max: 10_000, itemMax: 64 });
-    const paused = await state.quiesce(s); // 409 before the stream starts when an import cannot pause
-    state.roots.add(dest);
-    const write = ndjson(reply);
-    const oldRoot = s.lib.root;
+    // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
+    state.moving = true;
     try {
-      const r = await executeMove(s.lib, dest, {
-        deps: state.deps,
-        env: await defaultLocationEnv(),
-        excludeProjectIds,
-        sourceRepo: s.repo,
-        ...(s.index ? { index: s.index } : {}),
-        tz: state.tz,
-        onProgress: (p) => write({ progress: p }),
-      });
-      // The library now lives at the destination: switch to it.
-      await state.closeLibrary();
-      await state.adopt(await openLibrary(r.newRoot, state.deps, { onLockLost: () => state.publishState() }));
+      const paused = await state.quiesce(s); // 409 before the stream starts when an import cannot pause
+      state.roots.add(dest);
+      // Lines are dropped once the client is gone: the move itself always runs to its end (R102 N1).
+      const write = ndjson(reply);
+      const oldRoot = s.lib.root;
+      let moved: Awaited<ReturnType<typeof executeMove>>;
+      try {
+        await ctx.beforeExecuteMove?.();
+        moved = await executeMove(s.lib, dest, {
+          deps: state.deps,
+          env: await defaultLocationEnv(),
+          excludeProjectIds,
+          sourceRepo: s.repo,
+          ...(s.index ? { index: s.index } : {}),
+          tz: state.tz,
+          onProgress: (p) => write({ progress: p }),
+        });
+      } catch (err) {
+        // Not moved: the old library carries on as before.
+        state.moving = false;
+        if (state.session === s) {
+          state.activate(s);
+          state.resumeBatches(paused);
+        }
+        await write(ndjsonError(ctx, err));
+        reply.raw.end();
+        return;
+      }
+      const r = moved;
       const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
+      // The library now lives at the destination (the move closed the old copy): open it there, retrying once.
+      let lib: Library | undefined;
+      for (let attempt = 0; attempt < 2 && !lib; attempt++) {
+        try {
+          lib = await state.openLibrary(r.newRoot);
+        } catch (err) {
+          state.opts.log.warn({ err: state.describe(err), attempt }, "the moved library could not be opened");
+        }
+      }
+      await state.closeLibrary();
+      state.moving = false;
+      if (!lib) {
+        // Nothing is lost: the move finished and verified; the imports paused for it wait in the new
+        // copy, resumable once it is opened there. The old copy is kept until its deletion is confirmed.
+        await write(
+          errorBody(new ApiError(503, "LIBRARY_OFFLINE", "The library was moved and verified, but it could not be opened at its new place. Open it there to continue; paused imports can be resumed then, and the old copy is kept until you confirm its deletion."), state.roots),
+        );
+        reply.raw.end();
+        return;
+      }
+      await state.adopt(lib);
       state.resumeBatches(paused);
       await write({
         done: true,
         result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) },
       });
-    } catch (err) {
-      // Not moved: the old library carries on as before.
-      if (state.session === s) {
-        state.activate(s);
-        state.resumeBatches(paused);
-      }
-      await write(ndjsonError(ctx, err));
+      reply.raw.end();
+    } finally {
+      state.moving = false;
     }
-    reply.raw.end();
   });
 
   // The last move's token (single use, 15 minutes), e.g. after the move's stream was cut off.

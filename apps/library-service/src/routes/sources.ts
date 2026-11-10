@@ -189,10 +189,11 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const cid = paramsOf(req).cid ?? "";
     const b = bodyOf(req);
     if (!("parentId" in b) && b.name === undefined) throw badRequest('Give "name" and/or "parentId" (null for the top level).');
-    let c;
-    if (b.name !== undefined) c = await s.repo.renameCollection(projectId, cid, str(b, "name", 500));
-    if ("parentId" in b) c = await s.repo.moveCollection(projectId, cid, b.parentId === null ? null : str(b, "parentId", 64));
-    return c;
+    // Name and parent together: one governed change (R102).
+    return s.repo.updateCollection(projectId, cid, {
+      ...(b.name !== undefined ? { name: str(b, "name", 500) } : {}),
+      ...("parentId" in b ? { parentId: b.parentId === null ? null : str(b, "parentId", 64) } : {}),
+    });
   });
   app.delete("/projects/:id/collections/:cid", async (req) => {
     const s = state.requireWritable();

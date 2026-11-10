@@ -513,6 +513,8 @@ class Run {
         this.paused = true;
       },
       resume: () => {
+        // Also withdraws a suspend that has not taken effect yet (the run carries on).
+        this.suspending = false;
         this.paused = false;
         this.gate?.();
         this.gate = null;

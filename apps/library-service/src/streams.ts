@@ -8,7 +8,7 @@ import type { ServerResponse } from "node:http";
 /** Unsent bytes an event-stream client may fall behind by before it is dropped. */
 export const SSE_BUFFER_CAP = 1024 * 1024;
 
-type Res = Pick<ServerResponse, "write" | "destroy" | "writableLength" | "once" | "off">;
+type Res = Pick<ServerResponse, "write" | "destroy" | "writableLength" | "once" | "off" | "destroyed" | "writableEnded">;
 
 /** Returns a sender; false once the client was dropped (or is gone). */
 export function sseWriter(res: Res, cap = SSE_BUFFER_CAP): (frame: string) => boolean {
@@ -25,11 +25,17 @@ export function sseWriter(res: Res, cap = SSE_BUFFER_CAP): (frame: string) => bo
   };
 }
 
-/** Returns a writer of one JSON line that resolves when the line may be followed by the next. */
+/**
+ * Returns a writer of one JSON line that resolves when the line may be followed by the next. Once
+ * the client is gone (destroyed or ended) lines are dropped at once: the work never waits on a
+ * departed client (R102 N1).
+ */
 export function ndjsonWriter(res: Res): (value: unknown) => Promise<void> {
   return (value) =>
     new Promise<void>((resolve) => {
+      if (res.destroyed || res.writableEnded) return resolve();
       if (res.write(`${JSON.stringify(value)}\n`)) return resolve();
+      if (res.destroyed || res.writableEnded) return resolve();
       const done = () => {
         res.off("drain", done);
         res.off("close", done);
