@@ -30,7 +30,7 @@ function pick(groups: Record<string, string | undefined> | undefined, underscore
     return t ? t : undefined;
   };
   const cleanTitle = (v: string | undefined) => {
-    const t = clean(v)?.replace(/^[\s\-_–]+/u, "");
+    const t = clean(v)?.replace(/^[\s\-_–—]+/u, "");
     return t ? t : undefined;
   };
   const creator = clean(groups["creator"]);

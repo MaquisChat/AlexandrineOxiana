@@ -46,6 +46,20 @@ describe("findIdentifiers", () => {
     expect(findIdentifiers("https://arxiv.org/abs/hep-th/9901001").arxiv).toEqual(["hep-th/9901001"]);
     expect(findIdentifiers("arXiv:math.GT/0309136").arxiv).toEqual(["math.GT/0309136"]);
   });
+  it("keeps full old-style subject classes and versions", () => {
+    expect(findIdentifiers("cond-mat.str-el/0101001").arxiv).toEqual(["cond-mat.str-el/0101001"]);
+    expect(findIdentifiers("arXiv:physics.optics/0101001").arxiv).toEqual(["physics.optics/0101001"]);
+    expect(findIdentifiers("cond-mat.stat-mech/0101001v2").arxiv).toEqual(["cond-mat.stat-mech/0101001v2"]);
+    expect(findIdentifiers("math/0703001").arxiv).toEqual(["math/0703001"]);
+    expect(findIdentifiers("math/0712001").arxiv).toEqual([]);
+  });
+  it("accepts space-separated ISBN-10/13 labels and nearest-label reach", () => {
+    expect(findIdentifiers("ISBN 13 9780306406157").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("ISBN 10 0306406152").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("ISBN 0-306-40615-2 Tel 555-123-4002").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("ISBN 0306406152 (pbk.), 9780306406157 (ebk.)").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("ISBN 0306406152 (pbk.), 0-8044-2957-X (ebk.)").isbns).toEqual(["9780306406157", "9780804429573"]);
+  });
   it("validates arXiv YYMM and suffix length", () => {
     for (const bad of ["2024.12345", "2413.12345", "1999.9999", "3141.59265", "1501.1234", "1412.12345", "2401.1234"])
       expect(findIdentifiers(bad).arxiv).toEqual([]);
@@ -84,6 +98,7 @@ describe("parseFileName", () => {
     expect(parseFileName("Smith-Jones - 2024 - Title.pdf")).toEqual({ creator: "Smith-Jones", year: "2024", title: "Title" });
     expect(parseFileName("Okafor 2024 - Title.pdf")).toEqual({ creator: "Okafor", year: "2024", title: "Title" });
     expect(parseFileName("Okafor 2024 _–Title.pdf")?.title).toBe("Title");
+    expect(parseFileName("Okafor 2024 —Title.pdf")?.title).toBe("Title");
   });
 });
 
@@ -154,6 +169,10 @@ describe("findDuplicate", () => {
     expect(findDuplicate({ sha256s: [], isbns: ["0-306-40615-2"] }, [{ sourceId: "i", sha256s: [], isbns: ["978-0-306-40615-7"] }])?.reason).toBe("same-isbn");
     expect(findDuplicate({ sha256s: [], doi: "https://doi.org/10.1/ABC" }, [{ sourceId: "d", sha256s: [], doi: "doi:10.1/abc" }])?.reason).toBe("same-doi");
     expect(findDuplicate({ sha256s: [], doi: "http://dx.doi.org/10.1/abc" }, [{ sourceId: "d", sha256s: [], doi: "10.1/abc" }])?.reason).toBe("same-doi");
+  });
+  it("canonicalises more DOI URL forms", () => {
+    for (const d of ["https://www.doi.org/10.1/ABC", "doi.org/10.1/abc", "dx.doi.org/10.1/abc", "DOI 10.1/abc", "DOI: 10.1/abc"])
+      expect(findDuplicate({ sha256s: [], doi: d }, [{ sourceId: "d", sha256s: [], doi: "10.1/abc" }])?.reason).toBe("same-doi");
   });
   it("vetoes fuzzy matches on conflicting DOIs or ISBNs; year uses first four digits", () => {
     const t = { title: "Feeding the Feed", firstCreatorFamily: "Okafor" };

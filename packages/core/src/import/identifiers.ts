@@ -30,13 +30,15 @@ function trimDoi(raw: string): string {
 // Separators between digits are a single space or hyphen. Candidates may not be glued to other digits.
 const ISBN_RE =
   /(?<!\d[ -]?)(?:97[89](?:[ -]?\d){10}|\d(?:[ -]?\d){8}[ -]?[\dXx])(?![ -]?[\dXx])/g;
-const ISBN_LABEL = /ISBN(?:-?1[03])?:?/gi;
+const ISBN_LABEL = /ISBN(?:[ -]?1[03](?!\d))?:?/gi;
+// Only ISBN-like tokens and separators may sit between a label and the ISBN it labels.
+const ISBN_GAP = /^(?:[ \t,;()\dXx-]|(?:pbk|ebk|hbk|pb|hb)\.?)*$/i;
 const ISBN_LABEL_REACH = 20;
 
 // New-style arXiv ids: YYMM.NNNN (to 1412) or YYMM.NNNNN (from 1501); validated after matching.
 const ARXIV_NEW = /(?<!\d)(?<!\d\.)(\d{4})\.(\d{4,5})(?:v\d+)?(?!\d)(?!\.\d)(?![A-Za-z])/g;
 // Old-style: archive[.CLASS]/YYMMNNN
-const ARXIV_OLD = /(?<![A-Za-z0-9-])[a-z]+(?:-[a-z]+)*(?:\.[A-Za-z]{2})?\/(\d{7})(?:v\d+)?(?!\d)/g;
+const ARXIV_OLD = /(?<![A-Za-z0-9.-])[a-z]+(?:-[a-z]+)*(?:\.[A-Za-z]+(?:-[A-Za-z]+)*)?\/(\d{7})(?:v\d+)?(?!\d)/g;
 
 function dedupe(xs: string[]): string[] {
   return [...new Set(xs)];
@@ -77,7 +79,7 @@ function validNewArxiv(yymm: string, suffix: string): boolean {
 function validOldArxiv(digits: string): boolean {
   const yy = Number(digits.slice(0, 2));
   const mm = Number(digits.slice(2, 4));
-  return mm >= 1 && mm <= 12 && (yy >= 91 || yy <= 7);
+  return mm >= 1 && mm <= 12 && (yy >= 91 || yy * 100 + mm <= 703);
 }
 
 export function findIdentifiers(text: string): FoundIdentifiers {
@@ -94,19 +96,21 @@ export function findIdentifiers(text: string): FoundIdentifiers {
     return " ".repeat(m.length);
   });
   const isbns: string[] = [];
+  let chainEnd = -1; // end of the last ISBN accepted under a label, so lists like "ISBN a (pbk.), b" work
   for (const m of isbnText.matchAll(ISBN_RE)) {
     const v = toIsbn13(m[0]);
     if (!v) continue;
-    const digits = m[0].replace(/[ -]/g, "");
-    if (digits.length === 10) {
-      const idx = m.index ?? 0;
-      const labelled = labelEnds.some(
-        (e) => e <= idx && idx - e <= ISBN_LABEL_REACH && !/[\r\n]/.test(text.slice(e, idx)),
-      );
-      if (!labelled) continue;
-    }
+    const idx = m.index ?? 0;
+    const end = idx + m[0].length;
+    // Nearest label (or labelled ISBN) before the candidate, with only ISBN-like text in between.
+    let anchor = chainEnd;
+    for (const e of labelEnds) if (e <= idx && e > anchor) anchor = e;
+    const labelled =
+      anchor >= 0 && idx - anchor <= ISBN_LABEL_REACH && ISBN_GAP.test(text.slice(anchor, idx));
+    if (m[0].replace(/[ -]/g, "").length === 10 && !labelled) continue;
     if (v.startsWith("9790")) continue; // ISMN, not a book
     isbns.push(v);
+    if (labelled) chainEnd = end;
   }
 
   const arxiv: string[] = [];

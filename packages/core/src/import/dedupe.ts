@@ -20,7 +20,7 @@ export type DupMatch = {
 export const FUZZY_THRESHOLD = 0.92;
 
 function canonDoi(d: string | undefined): string {
-  return (d ?? "").trim().replace(/^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)/i, "").trim().toLowerCase();
+  return (d ?? "").trim().replace(/^(?:(?:https?:\/\/)?(?:dx\.|www\.)?doi\.org\/|doi:\s*|doi\s+)/i, "").trim().toLowerCase();
 }
 
 function canonIsbns(xs: string[] | undefined): string[] {
