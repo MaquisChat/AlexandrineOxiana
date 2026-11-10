@@ -110,6 +110,8 @@ describe("bibliographic fields in sidecars (R87)", () => {
     expect(parseBibtex(`@book{b, title = {T}, edition = {2}, address = {London}, series = {Food Studies}, number = {7}, pagetotal = {312}}`)).toMatchObject({
       edition: "2", publisherPlace: "London", collectionTitle: "Food Studies", collectionNumber: "7", numberOfPages: "312",
     });
+    expect(parseBibtex(`@techreport{r, title = {T}, institution = {WHO}, number = {WHO/2021/7}}`)).toMatchObject({ number: "WHO/2021/7" });
+    expect(parseBibtex(`@techreport{r, title = {T}, institution = {WHO}, number = {WHO/2021/7}}`).collectionNumber).toBeUndefined();
     expect(parseRis("TY  - JOUR\nTI  - T\nVL  - 12\nIS  - 3\nSP  - 201\nEP  - 219\nCY  - Lagos\nET  - 2\nT3  - S\nER  - \n")).toMatchObject({
       volume: "12", issue: "3", page: "201-219", publisherPlace: "Lagos", edition: "2", collectionTitle: "S",
     });

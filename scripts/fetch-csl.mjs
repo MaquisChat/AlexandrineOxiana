@@ -19,10 +19,10 @@
 // made with `git fetch --depth 1 <repo> <commit>` + `git archive`, and checked against the same
 // sha256. Any mismatch fails closed: nothing is written, exit 1. Any other failure exits 1 too (the
 // citation tests then skip locally, and fail in CI). A bundle already built from the pinned
-// hashes is kept.
+// hashes is kept only while styles.zip and locales/ still hash to what was built (bundle.json).
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -46,6 +46,13 @@ export const PINS = {
 };
 
 const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+
+/** sha256 over the locales folder: every file name and its bytes, in name order. */
+function localesHash(dir) {
+  const h = createHash("sha256");
+  for (const n of readdirSync(dir).sort()) h.update(`${n}\0`).update(readFileSync(join(dir, n))).update("\0");
+  return h.digest("hex");
+}
 const prefixOf = (pin) => `${pin.repo.split("/")[1]}-${pin.commit}/`;
 
 class MismatchError extends Error {}
@@ -131,10 +138,16 @@ async function main() {
   if (existsSync(metaPath) && existsSync(join(outDir, "styles.zip")) && existsSync(join(outDir, "locales", "locales-en-US.xml"))) {
     try {
       const cur = JSON.parse(readFileSync(metaPath, "utf8"));
-      if (JSON.stringify({ styles: cur.styles, locales: cur.locales }) === JSON.stringify(meta)) {
+      // The files themselves must still be what was built (R88): re-hash them, never trust the marker alone.
+      if (
+        JSON.stringify({ styles: cur.styles, locales: cur.locales }) === JSON.stringify(meta) &&
+        cur.zipSha256 === sha256(readFileSync(join(outDir, "styles.zip"))) &&
+        cur.localesSha256 === localesHash(join(outDir, "locales"))
+      ) {
         console.log("ok (cached) CSL bundle at the pinned commits");
         return;
       }
+      console.log("CSL bundle changed or out of date; rebuilding");
     } catch {
       // rebuild
     }
@@ -186,7 +199,8 @@ async function main() {
   renameSync(locTmp, join(outDir, "locales"));
   writeFileSync(join(outDir, "styles.zip.part"), zipped);
   renameSync(join(outDir, "styles.zip.part"), join(outDir, "styles.zip"));
-  writeFileSync(metaPath, `${JSON.stringify({ ...meta, styleCount: index.length, localeCount: locales.length - 1 }, null, 2)}\n`);
+  const built = { zipSha256: sha256(zipped), localesSha256: localesHash(join(outDir, "locales")) };
+  writeFileSync(metaPath, `${JSON.stringify({ ...meta, ...built, styleCount: index.length, localeCount: locales.length - 1 }, null, 2)}\n`);
   console.log(`ok CSL bundle: ${index.length} styles (${(zipped.length / 1e6).toFixed(1)} MB zip), ${locales.length - 1} locales`);
 }
 

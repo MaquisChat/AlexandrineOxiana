@@ -29,12 +29,22 @@ export interface CslLoader {
   localeXml(lang: string): string | undefined;
   /** Old style ids renamed upstream → current id. */
   renamed?(id: string): string | undefined;
+  /** Imported into the library (not bundled): rendered only in the library's sandbox (R88 I3). */
+  isCustom?(id: string): boolean;
 }
 
 export class UnknownStyleError extends Error {
   constructor(readonly styleId: string) {
     super(`Unknown citation style: ${styleId}`);
     this.name = "UnknownStyleError";
+  }
+}
+
+/** An imported style must be rendered through the library's sandboxed worker, not in-process (R88 I3). */
+export class CustomStyleSandboxError extends Error {
+  constructor(readonly styleId: string) {
+    super(`The imported citation style ${styleId} is rendered only in the sandbox`);
+    this.name = "CustomStyleSandboxError";
   }
 }
 
@@ -123,6 +133,7 @@ export function withCustomStyles(base: CslLoader, custom: ReadonlyArray<{ id: st
     styleXml: (id) => base.styleXml(id) ?? byId.get(id)?.xml,
     localeXml: (lang) => base.localeXml(lang),
     renamed: (id) => base.renamed?.(id),
+    isCustom: (id) => base.styleXml(id) === undefined && byId.has(id),
   };
 }
 
@@ -167,16 +178,23 @@ export function dependentParentOf(xml: string): string | undefined {
 }
 
 /**
- * The XML citeproc-js renders with for `id`: the style itself, or, for a dependent style, its
- * independent parent. Renamed ids resolve to their current style. Throws UnknownStyleError.
+ * The independent style citeproc-js renders with for `id`: the style itself, or, for a dependent
+ * style, its independent parent; renamed ids resolve to their current style. `custom` when that
+ * independent style is an imported one. Throws UnknownStyleError.
  */
-export function loadStyle(id: string, loader: CslLoader = currentCslLoader()): string {
-  const resolved = loader.styleXml(id) !== undefined ? id : (loader.renamed?.(id) ?? id);
-  const xml = loader.styleXml(resolved);
+export function resolveStyle(id: string, loader: CslLoader = currentCslLoader()): { id: string; xml: string; custom: boolean } {
+  const own = loader.styleXml(id) !== undefined ? id : (loader.renamed?.(id) ?? id);
+  const xml = loader.styleXml(own);
   if (xml === undefined) throw new UnknownStyleError(id);
   const parent = dependentParentOf(xml);
-  if (parent === undefined) return xml;
-  const parentXml = loader.styleXml(parent) ?? loader.styleXml(loader.renamed?.(parent) ?? "");
+  if (parent === undefined) return { id: own, xml, custom: loader.isCustom?.(own) === true };
+  const parentId = loader.styleXml(parent) !== undefined ? parent : (loader.renamed?.(parent) ?? parent);
+  const parentXml = loader.styleXml(parentId);
   if (parentXml === undefined || dependentParentOf(parentXml) !== undefined) throw new UnknownStyleError(id);
-  return parentXml;
+  return { id: parentId, xml: parentXml, custom: loader.isCustom?.(parentId) === true };
+}
+
+/** The XML citeproc-js renders with for `id` (see resolveStyle). */
+export function loadStyle(id: string, loader: CslLoader = currentCslLoader()): string {
+  return resolveStyle(id, loader).xml;
 }

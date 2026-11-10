@@ -97,6 +97,7 @@ describe("lookupDoi", () => {
       volume: "12",
       issue: "3",
       page: "201-219",
+      edition: "2",
       type: "article-journal",
       identifiers: { doi: DOI, issn: "1234-5679" },
       provider: "crossref",

@@ -8,11 +8,14 @@
  * `\ { }` and writes non-ASCII as `\uN`). Nothing else is interpolated into the output.
  *
  * `lang` is forced over the style's default locale (citations follow the document's language);
- * a locale the bundle lacks falls back to en-US.
+ * a locale the bundle lacks, or a tag that is not one, falls back to en-US. Locators are reduced to
+ * plain text first (cleanLocator). Every call starts from fresh engine state (R88 C1). Imported (custom)
+ * styles are never rendered here: @ao/library renders them in a sandboxed worker (R88 I3), and
+ * this module throws CustomStyleSandboxError for them.
  */
 import CSL from "citeproc";
 import type { CslItem, LocatorLabel } from "./csl-map.js";
-import { currentCslLoader, loadStyle, type CslLoader } from "./styles.js";
+import { CustomStyleSandboxError, currentCslLoader, resolveStyle, type CslLoader } from "./styles.js";
 
 export type CitationFormat = "text" | "html" | "rtf";
 
@@ -22,44 +25,87 @@ export interface CitationItemInput {
   label?: LocatorLabel;
 }
 
-interface CachedEngine {
-  engine: InstanceType<typeof CSL.Engine>;
-  items: Map<string, CslItem>;
+/** A BCP-47-looking tag, else en-US (R88: an invalid lang never reaches citeproc). */
+export function citationLang(lang: string | undefined): string {
+  return typeof lang === "string" && lang.length <= 35 && /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$/u.test(lang) ? lang : "en-US";
 }
 
+/**
+ * A locator as plain text (R88 I4): markup-like parts (`<…>`) are removed and only letters, digits,
+ * spaces and the punctuation locators use are kept, at most 64 characters, so nothing in a locator
+ * can become html or rtf markup through citeproc's rich-text parsing. Undefined when nothing is left.
+ */
+export function cleanLocator(locator: string | undefined): string | undefined {
+  if (!locator) return undefined;
+  const t = locator
+    .replace(/<[^>]*>/gu, "")
+    .replace(/[^\p{L}\p{N}\s.,:;()\-–—/§+]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 64);
+  return t || undefined;
+}
+
+/** Citation items as citeproc takes them: locators cleaned, labels only with a locator. */
+export function citeprocCitationItems(items: CitationItemInput[]): Array<{ id: string; locator?: string; label?: string }> {
+  return items.map((i) => {
+    const locator = cleanLocator(i.locator);
+    return { id: i.item.id, ...(locator ? { locator } : {}), ...(locator && i.label ? { label: i.label } : {}) };
+  });
+}
+
+/** Joins makeBibliography's output: html in citeproc's own wrapper, text and rtf one entry per line. */
+export function joinBibliography(out: [{ bibstart: string; bibend: string }, string[]] | false, format: CitationFormat): string {
+  if (!out) return "";
+  const [meta, entries] = out;
+  if (format === "html") return `${meta.bibstart}${entries.join("")}${meta.bibend}`;
+  return entries.map((x) => x.trim()).join("\n");
+}
+
+interface CachedEngine {
+  engine: InstanceType<typeof CSL.Engine>;
+  xml: string;
+  items: Map<string, CslItem>;
+}
 const ENGINE_CACHE_MAX = 8;
 const engines = new WeakMap<CslLoader, Map<string, CachedEngine>>();
 
-function engineFor(loader: CslLoader, styleId: string, lang: string): CachedEngine {
+/**
+ * An engine with fresh state for this call (R88 C1). Building an engine costs about half a
+ * second (style and locale set-up), so one is kept per loader, style and language; but citeproc-js
+ * keeps rendered items in its registry by id, and a reused registry could show an item as it was
+ * before an edit (a name since replaced by a participant code). So every call first empties the
+ * item registry (updateItems([]), which also drops the name-disambiguation state) and the citation
+ * state, then registers this call's items afresh. Items are copies (citeproc annotates them).
+ */
+function engineFor(loader: CslLoader, styleId: string, format: CitationFormat, lang: string, list: CslItem[]): InstanceType<typeof CSL.Engine> {
+  const resolved = resolveStyle(styleId, loader);
+  if (resolved.custom) throw new CustomStyleSandboxError(styleId);
+  const tag = citationLang(lang);
   let byKey = engines.get(loader);
   if (!byKey) engines.set(loader, (byKey = new Map()));
-  const key = `${styleId}\u0000${lang}`;
-  const hit = byKey.get(key);
-  if (hit) {
-    byKey.delete(key);
-    byKey.set(key, hit); // most recently used last
-    return hit;
+  const key = `${resolved.id}\u0000${tag}`;
+  let e = byKey.get(key);
+  if (e && e.xml !== resolved.xml) e = undefined;
+  if (e) byKey.delete(key);
+  else {
+    const items = new Map<string, CslItem>();
+    const sys = {
+      retrieveLocale: (l: string) => loader.localeXml(l) ?? loader.localeXml("en-US") ?? false,
+      retrieveItem: (id: string) => items.get(id),
+    };
+    e = { engine: new CSL.Engine(sys, resolved.xml, tag, true), xml: resolved.xml, items };
   }
-  const items = new Map<string, CslItem>();
-  const sys = {
-    retrieveLocale: (l: string) => loader.localeXml(l) ?? loader.localeXml("en-US") ?? false,
-    retrieveItem: (id: string) => items.get(id),
-  };
-  const engine = new CSL.Engine(sys, loadStyle(styleId, loader), lang, true);
-  const made = { engine, items };
-  byKey.set(key, made);
+  byKey.set(key, e); // most recently used last
   if (byKey.size > ENGINE_CACHE_MAX) byKey.delete(byKey.keys().next().value!);
-  return made;
-}
-
-function prepare(loader: CslLoader, styleId: string, format: CitationFormat, lang: string, list: CslItem[]): CachedEngine {
-  const e = engineFor(loader, styleId, lang);
-  e.items.clear();
-  // citeproc-js annotates the objects it is given; hand it copies.
-  for (const it of list) e.items.set(it.id, structuredClone(it));
-  e.engine.setOutputFormat(format);
-  e.engine.updateItems([...e.items.keys()]);
-  return e;
+  const { engine, items } = e;
+  items.clear();
+  engine.updateItems([]);
+  engine.restoreProcessorState([]);
+  for (const it of list) items.set(it.id, structuredClone(it));
+  engine.setOutputFormat(format);
+  engine.updateItems([...items.keys()]);
+  return engine;
 }
 
 /** One in-text citation (a cluster) of `items`, each with an optional locator. */
@@ -71,10 +117,7 @@ export function renderCitation(
   loader: CslLoader = currentCslLoader(),
 ): string {
   if (items.length === 0) return "";
-  const e = prepare(loader, styleId, format, lang, items.map((i) => i.item));
-  return e.engine.makeCitationCluster(
-    items.map((i) => ({ id: i.item.id, ...(i.locator ? { locator: i.locator } : {}), ...(i.locator && i.label ? { label: i.label } : {}) })),
-  );
+  return engineFor(loader, styleId, format, lang, items.map((i) => i.item)).makeCitationCluster(citeprocCitationItems(items));
 }
 
 /** The bibliography of `items` in the style's order ('' for styles without a bibliography). */
@@ -86,10 +129,5 @@ export function renderBibliography(
   loader: CslLoader = currentCslLoader(),
 ): string {
   if (items.length === 0) return "";
-  const e = prepare(loader, styleId, format, lang, items);
-  const out = e.engine.makeBibliography();
-  if (!out) return "";
-  const [meta, entries] = out;
-  if (format === "html") return `${meta.bibstart}${entries.join("")}${meta.bibend}`;
-  return entries.map((x) => x.trim()).join("\n");
+  return joinBibliography(engineFor(loader, styleId, format, lang, items).makeBibliography(), format);
 }

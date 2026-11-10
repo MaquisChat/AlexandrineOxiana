@@ -14,18 +14,21 @@
  * `publisher` (APA "[Video]. YouTube."), a social post's its `container-title`, and a social post
  * that is a video (a reel, a TikTok) gets genre "Video" unless the source overrides it.
  *
- * Participants (spec 4.4): with the project's pseudonym map (`pseudonyms`, handle or name →
- * participant code), any creator matching it under any of their name forms (handle with or without
- * "@", literal, family, given, "given family", "family, given") becomes `{ literal: <code> }`, and
- * those name forms in the title and container are replaced by the code too (core `pseudonymize`).
- * A URL containing one of them is left out (it would name the participant). The participant's
- * `details` are never an input here. `requireParticipantCodes` (projects that pseudonymize names)
- * makes an uncoded creator other than the interviewer an error instead (fail closed).
+ * Participants (spec 4.4, R88): names are compared folded (NFKD, no combining marks, lowercase,
+ * words only, so "@Lucía.Cocina" = "lucia cocina"). With the project's pseudonym map
+ * (`pseudonyms`, handle or name → participant code), a creator matching it under any of their
+ * name forms (handle, literal, "given family", "family given", family, given) becomes
+ * `{ literal: <code> }`. Every map entry and every coded creator's name forms are replaced by the
+ * code in the title, container, publisher and the other text fields (see scrubText for the rule on
+ * short bare names). A URL carrying any of them in a slug form (joined, -, ., _) is left out, and
+ * no citation key is copied when participants are involved. The participant's `details` are never
+ * an input here. A source linked to participants (`participantIds`), or any source when
+ * `requireParticipantCodes` is set, fails closed: a creator other than the interviewer without a
+ * code is an error (ParticipantCodeMissingError), never a printed name.
  */
 import type { Anchor } from "../model/anchor.js";
 import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
-import { pseudonymize } from "../naming.js";
 
 export interface CslName {
   family?: string;
@@ -56,6 +59,7 @@ export interface CslItem {
   "number-of-pages"?: string;
   "collection-title"?: string;
   "collection-number"?: string;
+  number?: string;
   issued?: CslDate;
   accessed?: CslDate;
   URL?: string;
@@ -118,6 +122,7 @@ const BIBLIO_CSL: ReadonlyArray<[BiblioField, keyof CslItem]> = [
   ["publisherPlace", "publisher-place"],
   ["collectionTitle", "collection-title"],
   ["collectionNumber", "collection-number"],
+  ["number", "number"],
 ];
 
 const PLATFORM_NAMES: Readonly<Record<string, string>> = { youtube: "YouTube", instagram: "Instagram", tiktok: "TikTok" };
@@ -137,25 +142,94 @@ const ROLE_MAP: Readonly<Record<Creator["role"], Role>> = {
 
 const lang1 = (tag: string) => tag.trim().toLowerCase().split(/[-_]/)[0] ?? "";
 
-/** Every form under which a creator's name may appear. */
-function nameForms(c: Creator): string[] {
-  const bare = c.handle?.replace(/^@+/, "");
-  const full = [c.given, c.family].filter(Boolean).join(" ");
-  const inverted = c.family && c.given ? `${c.family}, ${c.given}` : undefined;
-  return [c.handle, bare, c.literal, c.family, c.given, full, inverted]
-    .map((s) => s?.normalize("NFC").trim())
-    .filter((s): s is string => !!s);
+// ------------------------------------------------------------------------------------------
+// Participant names (R88 I1)
+
+/** Name comparison key: NFKD, combining marks removed, lowercase. */
+const fold = (s: string) => s.normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase();
+/** The words of a name or text, folded ("@Lucía.Cocina" → ["lucia", "cocina"]). */
+const words = (s: string) => fold(s).match(/[\p{L}\p{N}]+/gu) ?? [];
+/** A name's comparison form: its folded words joined by single spaces (no "@", no punctuation). */
+export const normName = (s: string) => words(s).join(" ");
+
+/** A name form to look for, as folded words; `bare`: a lone given or family name. */
+interface NameForm {
+  words: string[];
+  code: string;
+  bare: boolean;
 }
 
-function codeFor(c: Creator, map: ReadonlyMap<string, string> | undefined): string | undefined {
-  if (!map || map.size === 0) return undefined;
-  const lower = new Map<string, string>();
-  for (const [k, v] of map) lower.set(k.normalize("NFC").trim().toLowerCase(), v);
-  for (const f of nameForms(c)) {
-    const hit = lower.get(f.toLowerCase());
+/** The forms under which a creator's name may appear (the lone given and family names marked bare). */
+function creatorForms(c: Creator): Array<{ text: string; bare: boolean }> {
+  const out: Array<{ text: string; bare: boolean }> = [];
+  const add = (t: string | undefined, bare = false) => {
+    if (t?.trim()) out.push({ text: t, bare });
+  };
+  add(c.handle);
+  add(c.literal);
+  if (c.given && c.family) {
+    add(`${c.given} ${c.family}`);
+    add(`${c.family} ${c.given}`);
+  }
+  add(c.family, true);
+  add(c.given, true);
+  return out;
+}
+
+function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefined {
+  for (const f of creatorForms(c)) {
+    const hit = keys.get(normName(f.text));
     if (hit) return hit;
   }
   return undefined;
+}
+
+/**
+ * Replaces every participant name form in `text` by its code, matching whole words after folding
+ * (case, accents, full-width forms, an "@" in front). Longer forms win. A bare given or family name
+ * of fewer than 4 letters is replaced only together with the other part of the name ("Li" alone is
+ * kept, "Rose Li" and "Li, Rose" are not): replacing every short name everywhere would blank common
+ * words. Longer bare names are always replaced, even where the word means something else ("Rose
+ * gardens"): over-scrubbing a title is the fail-safe side (R88).
+ */
+function scrubText(text: string, forms: readonly NameForm[]): string {
+  const usable = forms.filter((f) => f.words.length > 0 && !(f.bare && f.words.length === 1 && f.words[0]!.length < 4));
+  if (usable.length === 0) return text;
+  usable.sort((a, b) => b.words.length - a.words.length);
+  const tokens = [...text.matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, w: words(m[0]).join("") }));
+  let out = "";
+  let pos = 0;
+  for (let i = 0; i < tokens.length; ) {
+    const hit = usable.find((f) => f.words.every((w, k) => tokens[i + k]?.w === w));
+    if (!hit) {
+      i++;
+      continue;
+    }
+    let start = tokens[i]!.start;
+    while (start > pos && text[start - 1] === "@") start--;
+    out += text.slice(pos, start) + hit.code;
+    pos = tokens[i + hit.words.length - 1]!.end;
+    i += hit.words.length;
+  }
+  return out + text.slice(pos);
+}
+
+/** Whether a URL carries any participant name form, in any slug form (joined, -, ., _), as whole words. */
+function urlNamesParticipant(url: string, forms: readonly NameForm[]): boolean {
+  let u = url;
+  try {
+    u = decodeURIComponent(url);
+  } catch {
+    // keep as is
+  }
+  const hay = fold(u);
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return forms.some((f) =>
+    ["", "-", ".", "_"].some((sep) => {
+      const slug = f.words.join(sep);
+      return slug !== "" && new RegExp(`(?<![\\p{L}\\p{N}])${esc(slug)}(?![\\p{L}])`, "u").test(hay);
+    }),
+  );
 }
 
 function cslName(c: Creator): CslName | undefined {
@@ -220,23 +294,34 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (mapped.genre) item.genre = mapped.genre;
   if (mapped.medium) item.medium = mapped.medium;
 
-  // Creators, coded where the pseudonym map knows them.
-  const coded = new Map<string, string>(); // name form → code, for titles and URLs
+  // Creators, coded where the pseudonym map knows them (names compared folded, R88 I1).
+  const keys = new Map<string, string>();
+  const forms: NameForm[] = [];
+  for (const [k, code] of opts.pseudonyms ?? []) {
+    const n = normName(k);
+    if (!n) continue;
+    if (!keys.has(n)) keys.set(n, code);
+    forms.push({ words: n.split(" "), code, bare: false });
+  }
+  // Sources linked to participants fail closed: every creator but the interviewer needs a code (R88 I2).
+  const requireCodes = opts.requireParticipantCodes === true || s.participantIds.length > 0;
+  let anyCoded = false;
   for (const c of s.creators) {
-    const code = codeFor(c, opts.pseudonyms);
+    const code = codeFor(c, keys);
     let name: CslName | undefined;
     if (code) {
+      anyCoded = true;
       name = { literal: code };
-      for (const f of nameForms(c)) if (!coded.has(f)) coded.set(f, code);
+      for (const f of creatorForms(c)) forms.push({ words: normName(f.text).split(" ").filter(Boolean), code, bare: f.bare });
     } else {
-      if (opts.requireParticipantCodes && c.role !== "interviewer" && nameForms(c).length > 0) throw new ParticipantCodeMissingError();
+      if (requireCodes && c.role !== "interviewer" && creatorForms(c).length > 0) throw new ParticipantCodeMissingError();
       name = cslName(c);
     }
     if (!name) continue;
     const role = ROLE_MAP[c.role];
     (item[role] ??= []).push(name);
   }
-  const scrub = (text: string) => (coded.size ? pseudonymize(text, coded) : text);
+  const scrub = (text: string) => (forms.length ? scrubText(text, forms) : text);
 
   const title = pickTitle(s.title, opts, true);
   if (title.value) item.title = scrub(title.value);
@@ -268,16 +353,13 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (accessed) item.accessed = accessed;
 
   const url = s.identifiers.url;
-  if (url) {
-    const lowerUrl = url.toLowerCase();
-    const namesParticipant = [...coded.keys()].some((f) => f.length >= 3 && lowerUrl.includes(f.toLowerCase()));
-    if (!namesParticipant) item.URL = url;
-  }
+  if (url && !urlNamesParticipant(url, forms)) item.URL = url;
   if (s.identifiers.doi) item.DOI = s.identifiers.doi;
   const isbn = s.identifiers.isbn?.[0];
   if (isbn) item.ISBN = isbn;
   if (s.identifiers.issn) item.ISSN = s.identifiers.issn;
-  if (s.citationKey) item["citation-key"] = s.citationKey;
+  // A citation key is usually made from a creator's name: none when participants are involved.
+  if (s.citationKey && !anyCoded && s.participantIds.length === 0) item["citation-key"] = s.citationKey;
   return item;
 }
 

@@ -54,14 +54,29 @@ These follow the CSL convention the styles expect (R87):
 - A social post's platform is its `container-title`.
 - A social post that is a video gets genre "Video", unless the source sets its own genre. A post counts as a video when its original media is a video, when it is on TikTok, or when its URL is an Instagram reel.
 
+### Engine state, locators and imported styles (R88)
+
+- **Engine state.** citeproc-js keeps rendered items in its registry by id. An engine is kept per style and language, because building one takes about half a second. Every render first empties the item registry and the citation state, so a render never shows an item as it was before an edit.
+- **Input checks.** A `lang` that is not a language tag falls back to en-US. Locators are reduced to plain text (letters, digits and the punctuation locators use) before citeproc sees them, so `<i>3</i>` cannot become markup in html or rtf.
+- **Imported styles.** These are untrusted, and citeproc-js has no limits of its own. They are never rendered in-process: core throws `CustomStyleSandboxError`.
+  - `@ao/library` renders them in a `worker_threads` worker with a 2 s timeout and a 256 MB heap cap. This covers the import probe, every render with an imported style, and files dropped into `styles/` by hand (checked when listed, remembered by sha256).
+  - Before any of that, a memoised walk of the macro graph refuses styles that would expand more than 10,000 macro calls, or whose macros call themselves.
+  - Bundled styles render in-process.
+
 ### Participants
 
 - `toCslItem` takes the project's pseudonym map (handle or name → participant code).
-- A creator who matches the map under any name form becomes `{ literal: <code> }`. Name forms are: the handle with or without `@`, literal, family, given, "given family", and "family, given".
-- The same name forms are replaced by the code in the title, container and publisher, using core `pseudonymize`.
-- A URL that contains a name form is left out.
+- Names are compared folded (R88): NFKD, combining marks removed, lowercase, words only. So "@Lucía.Cocina", "lucia cocina" and full-width forms are the same name.
+- A creator who matches the map under any name form becomes `{ literal: <code> }`. Name forms are: handle, literal, "given family", "family given", family, and given.
+- Every map entry, and every coded creator's name forms, are replaced by the code in the title, container, publisher and the other text fields. Matching is on whole words. Longer forms win, and an `@` in front is included.
+- A bare given or family name shorter than 4 letters is replaced only together with the other part of the name. So "Li" alone is kept, while "Rose Li" and "Li, Rose" are replaced.
+  - Longer bare names are always replaced, even where the word means something else: "Rose gardens" becomes "P-040 gardens". This over-scrubbing is the fail-safe side of the tradeoff.
+  - Short first names alone can still appear in a title. Projects that need more should keep names out of titles; R64 flags them at import.
+- A URL that carries any name form, as whole words in any slug form (joined, `-`, `.` or `_`), is left out. There is no length floor.
+- The citation key is not copied when participants are involved.
 - `Participant.details` is never an input to `toCslItem`.
-- With `requireParticipantCodes` (projects that pseudonymize names), an uncoded creator is an error rather than a name. The interviewer is excluded, because the interviewer is the researcher.
+- A creator other than the interviewer who has no code is an error, never a printed name (`ParticipantCodeMissingError`). This applies to every source with `participantIds`, and to any source when `requireParticipantCodes` is set. The interviewer is excluded, because the interviewer is the researcher.
+- Wiring the project's governance into these options (`requireParticipantCodes` and the pseudonym map) is carried to Tasks 32 and 36.
 
 ### Custom styles
 
@@ -83,3 +98,4 @@ These follow the CSL convention the styles expect (R87):
 - R87 added optional bibliographic fields to `Source`: volume, issue, page, edition, numberOfPages, publisherPlace, collectionTitle, collectionNumber, and genre/medium overrides. Lookups, the Zotero, BibTeX, RIS and CSL-JSON importers and the exporters carry them. Before this, a journal article without volume, issue or pages rendered as "ahead of print" in Chicago and as "[Preprint]" in Harvard.
 - ASA prints no URL for a video and only the title for a field photo. Those are the ASA style's own rules for `motion_picture` and `graphic`, not missing fields. It also prints no platform for a social post, because the style reads `publisher` for posts, while APA, Chicago, MLA and Harvard read `container-title`. Setting both would print "Instagram" twice in those four styles.
 - Updating the styles means bumping the commit and the sha256 pins in `fetch-csl.mjs` and in `NOTICE.md`.
+- **Open decision:** citeproc-js is dual-licensed CPAL-1.0 / AGPL-3.0. Which licence the application takes is the project owner's decision. It has not been made yet and must be made before distribution (R87).

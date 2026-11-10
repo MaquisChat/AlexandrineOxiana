@@ -10,17 +10,25 @@
  *     (no entity expansion, no external entities); markup that is not plainly well-formed (the
  *     linear pre-scan shared with Zotero RDF import); a root element that is not `<style>` in the
  *     CSL namespace (http://purl.org/net/xbiblio/csl); no `<info><id>` or `<info><title>`; an
- *     independent style without `<citation>`, or one citeproc-js cannot load; a dependent style
- *     whose independent parent is not a bundled or imported independent style.
+ *     independent style without `<citation>`; one whose macros would expand more than
+ *     MAX_MACRO_EXPANSIONS calls (a memoised walk of the macro graph; self-calling macros too); one
+ *     that does not render a probe citation and bibliography in the sandbox (sandbox.ts: a worker
+ *     with a 2 s timeout and a 256 MB heap); a dependent style whose independent parent is not a
+ *     bundled or imported independent style (R88 I3).
  *   - governed: evaluated as a `store` with no identifiable data and no location
  *     (authorizeProcessing; a deny is audited and thrown as PolicyDeniedError).
  *   - ids: the last segment of the style's `<info><id>` URI, reduced to [a-z0-9-]. An id taken by
  *     a bundled style (or an upstream renamed id) gets `custom-` in front, so a bundled style is
  *     never shadowed or overwritten; an id taken by another file in styles/ gets `-2`, `-3` …
- *     (the same bytes again return the existing id, writing nothing).
+ *     (the same bytes again return the existing id, writing nothing, but are still governed and
+ *     audited, with `unchanged: true`).
  *   - written atomically, 0600 (styles/ created 0700), then audited as `style.add` with the id,
  *     sha256 and size (never the title or XML). Runs one at a time per library (in-process; the
  *     library lock keeps other processes out).
+ *
+ * Rendering: renderCitationIn / renderBibliographyIn render bundled styles in-process and imported
+ * ones only in the sandbox; listCustomStyles offers a file found in styles/ only once it passed the
+ * same checks (remembered by sha256).
  */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -33,10 +41,15 @@ import {
   dependentParentOf,
   listStyles as coreListStyles,
   loadStyle,
+  citationLang,
+  citeprocCitationItems,
   renderBibliography,
   renderCitation,
+  resolveStyle,
   withCustomStyles,
   zipCslLoader,
+  type CitationFormat,
+  type CitationItemInput,
   type CslItem,
   type CslLoader,
   type StyleEntry,
@@ -45,12 +58,15 @@ import { writeSmallFileAtomic } from "../fs/atomic.js";
 import { prescanXml } from "../import/zotero-rdf.js";
 import type { Library } from "../library.js";
 import { appendLibraryEvent, authorizeProcessing, type Repo } from "../repo/repo.js";
+import { SandboxError, renderInSandbox } from "./sandbox.js";
 import { repoLibrary } from "../repo/repo.js";
 
 export const CSL_NS = "http://purl.org/net/xbiblio/csl";
 export const CUSTOM_STYLE_MAX_BYTES = 1024 * 1024;
 const STYLES_DIR = "styles";
 const MAX_ID = 80;
+/** Macro calls one rendering may expand (R88 I3 static cap); the bundled styles stay far below. */
+export const MAX_MACRO_EXPANSIONS = 10_000;
 
 export class CustomStyleError extends Error {
   constructor(message: string) {
@@ -69,6 +85,8 @@ const REASONS = {
   noCitation: "This CSL style has no <citation> section, so it cannot cite.",
   unusable: "This CSL style cannot be used: the citation processor could not load it.",
   unknownParent: "This dependent CSL style refers to a parent style that is neither bundled nor imported.",
+  tooComplex: "This CSL style is too complex to render (its macros call each other too many times), so it was not imported.",
+  tooSlow: "This CSL style took too long or needed too much memory to render, so it cannot be used.",
 } as const;
 
 // ------------------------------------------------------------------------------------------
@@ -133,12 +151,154 @@ export async function listCustomStyles(lib: Pick<Library, "root">): Promise<Cust
       if (!st.isFile() || st.size > CUSTOM_STYLE_MAX_BYTES) continue;
       const xml = await fsp.readFile(join(dir, n), "utf8");
       const info = inspect(xml);
+      // A file someone put here by hand gets the same checks as an import, in the sandbox (R88 I3).
+      if (info.independent && !(await probeCached(xml))) continue;
       out.push({ id: n.slice(0, -4), title: info.title, xml, ...(info.parent !== undefined ? { parent: info.parent } : {}) });
     } catch {
       // not a style we can offer
     }
   }
   return out;
+}
+
+const probed = new Map<string, boolean>();
+
+/** probeStyle's verdict for this exact XML, remembered by its sha256 (true: usable). */
+async function probeCached(xml: string): Promise<boolean> {
+  const key = sha256(xml);
+  const hit = probed.get(key);
+  if (hit !== undefined) return hit;
+  let ok = true;
+  try {
+    await probeStyle(xml);
+  } catch {
+    ok = false;
+  }
+  if (probed.size > 1000) probed.clear();
+  probed.set(key, ok);
+  return ok;
+}
+
+/**
+ * Macro calls a style makes when rendered: a memoised walk over its macro graph (each macro's
+ * expansions = 1 + those of the macros it calls), summed over the citation and bibliography
+ * (layouts and sort keys). Infinity for a macro that calls itself, directly or not. Saturates
+ * just above MAX_MACRO_EXPANSIONS.
+ */
+export function macroExpansions(xml: string): number {
+  const root = parseStyle(xml);
+  const calls = new Map<string, string[]>();
+  for (const m of childrenNamed(root, "macro")) {
+    const name = m.getAttribute("name") ?? "";
+    calls.set(name, macroRefs(m));
+  }
+  const cap = MAX_MACRO_EXPANSIONS + 1;
+  const memo = new Map<string, number>();
+  const visiting = new Set<string>();
+  const expand = (name: string): number => {
+    const hit = memo.get(name);
+    if (hit !== undefined) return hit;
+    if (visiting.has(name)) return Number.POSITIVE_INFINITY;
+    visiting.add(name);
+    let n = 1;
+    for (const r of calls.get(name) ?? []) {
+      n += expand(r);
+      if (n > cap) break;
+    }
+    visiting.delete(name);
+    const v = Number.isFinite(n) ? Math.min(n, cap) : n;
+    memo.set(name, v);
+    return v;
+  };
+  let total = 0;
+  for (const section of [...childrenNamed(root, "citation"), ...childrenNamed(root, "bibliography")]) {
+    for (const r of macroRefs(section)) {
+      total += expand(r);
+      if (total > cap) return Number.isFinite(total) ? cap : total;
+    }
+  }
+  return total;
+}
+
+/** The `macro="…"` attributes under `el` (text and sort keys), in document order. */
+function macroRefs(el: Element): string[] {
+  const out: string[] = [];
+  const walk = (e: Element) => {
+    for (let n = e.firstChild; n; n = n.nextSibling) {
+      if (n.nodeType !== 1) continue;
+      const c = n as Element;
+      const m = c.getAttribute("macro");
+      if (m) out.push(m);
+      walk(c);
+    }
+  };
+  walk(el);
+  return out;
+}
+
+/** Static and sandboxed checks of an independent style; throws CustomStyleError. */
+async function probeStyle(xml: string): Promise<void> {
+  if (macroExpansions(xml) > MAX_MACRO_EXPANSIONS) throw new CustomStyleError(REASONS.tooComplex);
+  let out: string;
+  try {
+    out = await renderInSandbox({
+      styleXml: xml,
+      locales: localesFor(bundledCslLoader(), "en-US"),
+      lang: "en-US",
+      format: "text",
+      kind: "probe",
+      items: [PROBE_ITEM],
+      cites: citeprocCitationItems([{ item: PROBE_ITEM, locator: "1", label: "page" }]),
+    });
+  } catch (e) {
+    throw new CustomStyleError(e instanceof SandboxError && e.reason !== "error" ? REASONS.tooSlow : REASONS.unusable);
+  }
+  if (out.includes("CSL STYLE ERROR")) throw new CustomStyleError(REASONS.unusable);
+}
+
+/** Locale XML for the sandbox: the requested tag (its primary dialect for a bare language) and en-US. */
+function localesFor(loader: CslLoader, tag: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const t of [tag, "en-US"]) {
+    const x = loader.localeXml(t);
+    if (x) out[t] = x;
+  }
+  return out;
+}
+
+/** Renders through the library's styles: bundled ones in-process, imported ones in the sandbox (R88 I3). */
+async function renderVia<T>(
+  lib: Pick<Library, "root">,
+  styleId: string,
+  lang: string,
+  inProcess: (loader: CslLoader, tag: string) => T,
+  sandboxed: (xml: string, locales: Record<string, string>, tag: string) => Promise<string>,
+): Promise<T | string> {
+  const loader = await libraryCslLoader(lib);
+  const resolved = resolveStyle(styleId, loader);
+  const tag = citationLang(lang);
+  if (!resolved.custom) return inProcess(loader, tag);
+  try {
+    return await sandboxed(resolved.xml, localesFor(loader, tag), tag);
+  } catch (e) {
+    throw e instanceof SandboxError ? new CustomStyleError(e.reason === "error" ? REASONS.unusable : REASONS.tooSlow) : e;
+  }
+}
+
+/** renderCitation with the library's styles (see renderVia). */
+export async function renderCitationIn(lib: Pick<Library, "root">, items: CitationItemInput[], styleId: string, format: CitationFormat, lang = "en-US"): Promise<string> {
+  if (items.length === 0) return "";
+  return renderVia(lib, styleId, lang, (loader, tag) => renderCitation(items, styleId, format, tag, loader), (styleXml, locales, tag) =>
+    renderInSandbox({ styleXml, locales, lang: tag, format, kind: "citation", items: items.map((i) => i.item), cites: citeprocCitationItems(items) }),
+  ) as Promise<string>;
+}
+
+/** renderBibliography with the library's styles (see renderVia). */
+export async function renderBibliographyIn(lib: Pick<Library, "root">, items: CslItem[], styleId: string, format: CitationFormat, lang = "en-US"): Promise<string> {
+  if (items.length === 0) return "";
+  return renderVia(lib, styleId, lang, (loader, tag) => renderBibliography(items, styleId, format, tag, loader), (styleXml, locales, tag) =>
+    renderInSandbox({ styleXml, locales, lang: tag, format, kind: "bibliography", items }),
+  ) as Promise<string>;
 }
 
 /** The bundled styles plus the library's imported ones. */
@@ -161,6 +321,26 @@ const childrenNamed = (el: Element, name: string): Element[] => {
   }
   return out;
 };
+
+/** The root `<style>` element of CSL XML (size, declarations and well-formedness checked first); throws CustomStyleError. */
+function parseStyle(xml: string): Element {
+  if (new TextEncoder().encode(xml).length > CUSTOM_STYLE_MAX_BYTES) throw new CustomStyleError(REASONS.tooLarge);
+  if (/<!\s*(?:doctype|entity)/iu.test(xml)) throw new CustomStyleError(REASONS.declaration);
+  const src = xml.replace(/^\uFEFF/u, "");
+  if (prescanXml(src) !== undefined) throw new CustomStyleError(REASONS.notWellFormed);
+  let root: Element | null;
+  try {
+    root = new DOMParser({
+      onError: (level: string) => {
+        if (level !== "warning") throw new CustomStyleError(REASONS.notWellFormed);
+      },
+    }).parseFromString(src, "text/xml").documentElement;
+  } catch {
+    throw new CustomStyleError(REASONS.notWellFormed);
+  }
+  if (!root || root.localName !== "style" || root.namespaceURI !== CSL_NS) throw new CustomStyleError(REASONS.notCsl);
+  return root;
+}
 
 /** Checks the text is a CSL style; returns its id URI, title and (for a dependent style) parent id. */
 function inspect(xml: string): { idUri: string; title: string; parent?: string; independent: boolean } {
@@ -199,6 +379,7 @@ function baseIdOf(idUri: string): string {
   const last = idUri.replace(/[?#].*$/u, "").replace(/\/+$/u, "").replace(/^.*\//u, "");
   const id = last
     .normalize("NFKD")
+    .replace(/\p{M}+/gu, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/gu, "-")
     .replace(/^-+|-+$/gu, "")
@@ -207,7 +388,6 @@ function baseIdOf(idUri: string): string {
   return id || "custom-style";
 }
 
-const PROBE_ID = "\u0000probe";
 const PROBE_ITEM: CslItem = { id: "probe", type: "book", title: "Probe", issued: { "date-parts": [[2000]] }, author: [{ family: "Probe", given: "A" }] };
 
 const sha256 = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
@@ -237,15 +417,8 @@ export async function addCustomStyle(repo: Repo, projectId: string, xml: string)
     const custom = await listCustomStyles(lib);
     const loader = withCustomStyles(base, custom);
     if (info.independent) {
-      // citeproc-js must be able to load it (a style it cannot load could never render).
-      const probe = withCustomStyles(base, [{ id: PROBE_ID, title: info.title, xml }]);
-      let out: string;
-      try {
-        out = renderCitation([{ item: PROBE_ITEM, locator: "1", label: "page" }], PROBE_ID, "text", "en-US", probe) + renderBibliography([PROBE_ITEM], PROBE_ID, "text", "en-US", probe);
-      } catch {
-        throw new CustomStyleError(REASONS.unusable);
-      }
-      if (out.includes("CSL STYLE ERROR")) throw new CustomStyleError(REASONS.unusable);
+      // It must render, in the sandbox, within the limits (R88 I3).
+      await probeStyle(xml);
     } else {
       try {
         loadStyle(info.parent!, loader);
@@ -269,7 +442,12 @@ export async function addCustomStyle(repo: Repo, projectId: string, xml: string)
       const path = join(dir, `${id}.csl`);
       const existing = await fsp.readFile(path, "utf8").catch((e: NodeJS.ErrnoException) => (e.code === "ENOENT" ? undefined : ""));
       if (existing === undefined) break; // free
-      if (sha256(existing) === hash) return id; // the same style again
+      if (sha256(existing) === hash) {
+        // The same style again: still governed and audited, though nothing is written (R88).
+        await authorizeProcessing(repo, projectId, { action: "store", store: { identifiable: false, hasLocation: false } }, { op: "style.add" });
+        await appendLibraryEvent(repo, projectId, "style.add", { styleId: id, sha256: hash, bytes: Buffer.byteLength(xml, "utf8"), unchanged: true });
+        return id;
+      }
       id = `${stem}-${n}`;
     }
 

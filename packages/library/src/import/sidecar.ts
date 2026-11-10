@@ -263,8 +263,8 @@ export function parseBibtex(text: string): SidecarMetadata {
 
 /**
  * BibTeX/BibLaTeX bibliographic fields (R87): volume, pages (`--` → en dash), edition, address
- * (place), series, pagetotal; `number` is an article's issue, else the series number (`issue`
- * is read too).
+ * (place), series, pagetotal; `number` is an article's issue, a report's own number, else the
+ * series number (`issue` is read too).
  */
 export function bibtexBiblio(type: SourceType | undefined, get: (k: string) => string | undefined): Biblio {
   const out: Biblio = {};
@@ -280,7 +280,11 @@ export function bibtexBiblio(type: SourceType | undefined, get: (k: string) => s
   set("numberOfPages", get("pagetotal"));
   const number = get("number");
   if (type === "article-journal" || type === "preprint") set("issue", get("issue") ?? number);
-  else {
+  else if (type === "report") {
+    // A @techreport's number is the report's own number (R88), not a series number.
+    set("issue", get("issue"));
+    set("number", number);
+  } else {
     set("issue", get("issue"));
     set("collectionNumber", number);
   }
@@ -311,6 +315,7 @@ export function cslBiblio(item: Record<string, unknown>): Biblio {
     collectionNumber: pick("collection-number"),
     genre: pick("genre"),
     medium: pick("medium"),
+    number: pick("number"),
   });
 }
 

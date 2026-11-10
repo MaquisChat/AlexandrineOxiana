@@ -13,6 +13,7 @@ declare module "citeproc" {
     constructor(sys: CiteprocSys, style: string, lang?: string, forceLang?: boolean);
     setOutputFormat(format: "text" | "html" | "rtf"): void;
     updateItems(ids: string[]): void;
+    restoreProcessorState(citations: unknown[]): void;
     makeBibliography(): [BibliographyMeta, string[]] | false;
     makeCitationCluster(items: Array<{ id: string; locator?: string; label?: string }>): string;
   }

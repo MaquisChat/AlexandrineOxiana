@@ -186,7 +186,11 @@ export {
   libraryCslLoader,
   listCustomStyles,
   listStyles,
+  macroExpansions,
+  renderBibliographyIn,
+  renderCitationIn,
 } from "./citation/custom-styles.js";
+export { SANDBOX_MAX_HEAP_MB, SANDBOX_TIMEOUT_MS, SandboxError, renderInSandbox } from "./citation/sandbox.js";
 export {
   WATCH_REASONS,
   WATCH_STABILITY_MS,

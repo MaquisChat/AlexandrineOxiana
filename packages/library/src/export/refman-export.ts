@@ -17,7 +17,7 @@
  * DOI, ISBN, ISSN, URL, arXiv id (BibTeX), the citation key, and tags only with `includeTags`; and
  * the bibliographic detail each format can hold (R87): BibTeX volume, number (an article's issue,
  * else the series number; a non-article's issue as `issue`), pages (an en dash as `--`), edition,
- * address, series, pagetotal; RIS VL, IS, SP/EP, ET, CY, T3; CSL-JSON every variable, genre and
+ * address, series, pagetotal, a report's number; RIS VL, IS, SP/EP, ET, CY, T3; CSL-JSON every variable, genre and
  * medium included.
  * Never exported: file paths, notes, annotations, provenance.
  *
@@ -150,7 +150,10 @@ function toBibtex(refs: Ref[]): string {
     text("volume", r.volume);
     const article = r.type === "article-journal" || r.type === "preprint";
     if (article) text("number", r.issue);
-    else {
+    else if (r.type === "report") {
+      text("issue", r.issue);
+      text("number", r.number);
+    } else {
       text("issue", r.issue);
       text("number", r.collectionNumber);
     }
@@ -207,8 +210,10 @@ function toRis(refs: Ref[]): string {
     add("VL", r.volume);
     add("IS", r.issue);
     if (r.page) {
-      const m = /^([^-–]+)[-–]+(.+)$/u.exec(r.page.trim());
-      add("SP", m ? m[1]!.trim() : r.page);
+      // Split at an en dash or "--" first, so "A-1–A-9" is A-1 to A-9; else at the first hyphen.
+      const p = r.page.trim();
+      const m = /^(.+?)\s*(?:–|--+)\s*(.+)$/u.exec(p) ?? /^([^-]+)-(.+)$/u.exec(p);
+      add("SP", m ? m[1]!.trim() : p);
       if (m) add("EP", m[2]!.trim());
     }
     add("T3", r.collectionTitle);
@@ -252,7 +257,7 @@ function toCslJson(refs: Ref[]): string {
     for (const [k, v] of [
       ["publisher-place", r.publisherPlace], ["volume", r.volume], ["issue", r.issue], ["page", r.page], ["edition", r.edition],
       ["number-of-pages", r.numberOfPages], ["collection-title", r.collectionTitle], ["collection-number", r.collectionNumber],
-      ["genre", r.genre], ["medium", r.medium],
+      ["genre", r.genre], ["medium", r.medium], ["number", r.number],
     ] as const) if (v) o[k] = v;
     if (r.doi) o.DOI = r.doi;
     if (r.isbn.length) o.ISBN = r.isbn.join(", ");

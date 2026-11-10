@@ -26,6 +26,7 @@ interface CrossrefWork {
   issue?: string;
   page?: string;
   edition?: string | number;
+  "edition-number"?: string | number;
   "publisher-location"?: string;
 }
 
@@ -96,7 +97,7 @@ export function mapCrossref(w: CrossrefWork, doi: string): LookupResult | null {
     ...(container ? { container } : {}),
     ...(w.publisher ? { publisher: clean(w.publisher) } : {}),
     ...cleanBiblio(
-      biblioOf({ volume: w.volume, issue: w.issue, page: w.page, edition: w.edition, publisherPlace: w["publisher-location"] }),
+      biblioOf({ volume: w.volume, issue: w.issue, page: w.page, edition: w["edition-number"] ?? w.edition, publisherPlace: w["publisher-location"] }),
     ),
     type: TYPES[w.type ?? ""] ?? "other",
     identifiers: { doi: (w.DOI ?? doi).toLowerCase(), ...(isbns.length ? { isbn: isbns } : {}), ...(issn ? { issn } : {}) },

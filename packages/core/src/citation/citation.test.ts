@@ -274,10 +274,11 @@ describe("toCslItem", () => {
     const all = toCslItem(
       source("book", mt(["en", "original", "T"]), [], {
         volume: "3", issue: "1", page: "9", edition: "2nd", numberOfPages: "312", publisherPlace: "London",
-        collectionTitle: "Studies in Food", collectionNumber: "7", genre: "Cookbook", medium: "Print",
+        collectionTitle: "Studies in Food", collectionNumber: "7", genre: "Cookbook", medium: "Print", number: "WP-17",
       }),
       OPTS,
     );
+    expect(all.number).toBe("WP-17");
     expect(all).toMatchObject({
       volume: "3", issue: "1", page: "9", edition: "2nd", "number-of-pages": "312", "publisher-place": "London",
       "collection-title": "Studies in Food", "collection-number": "7", genre: "Cookbook", medium: "Print",
@@ -348,7 +349,7 @@ describe("toCslItem", () => {
       identifiers: { url: "https://www.tiktok.com/@lucia.cocina/video/7300000000000000000", platform: "tiktok" },
     });
     const item = toCslItem(tiktok, OPTS);
-    expect(item.title).toBe("P-014 cocina con P-014");
+    expect(item.title).toBe("P-014 con P-014"); // "Lucía cocina" is also the handle's words (lucia.cocina)
     expect(item.URL).toBeUndefined();
     expect(JSON.stringify(item)).not.toMatch(/luc[ií]a/i);
   });
@@ -359,6 +360,84 @@ describe("toCslItem", () => {
     // The interviewer is the researcher, never a participant.
     const ok = source("interview", mt(["en", "original", "T"]), [{ role: "interviewer", given: "Ana", family: "Castillo" }]);
     expect(toCslItem(ok, { ...OPTS, requireParticipantCodes: true }).interviewer).toEqual([{ family: "Castillo", given: "Ana" }]);
+  });
+});
+
+describe("review round 1 (R88 I1, I2): participant names are matched however they are written", () => {
+  const reel = (creator: Creator, extra: Partial<SourceFile["source"]> = {}) =>
+    source("social-post", mt(["es", "original", "Receta"]), [creator], { participantIds: [PARTICIPANT.id], ...extra });
+  const LUCIA: Creator = { role: "uploader", given: "Lucía", family: "Fernández Ruiz", handle: "@lucia.cocina" };
+
+  it("probe 1: a map key with '@' and capitals matches a handle without them", () => {
+    const item = toCslItem(reel({ role: "uploader", handle: "lucia.cocina" }), { ...OPTS, pseudonyms: new Map([["@Lucia.Cocina", "P-014"]]) });
+    expect(item.author).toEqual([{ literal: "P-014" }]);
+  });
+
+  it("probe 2: accents, decomposed (NFD) and full-width forms match the map", () => {
+    const map = new Map([["Lucía Fernández Ruiz", "P-014"]]);
+    expect(toCslItem(reel({ role: "uploader", given: "Lucia", family: "Fernandez Ruiz" }), { ...OPTS, pseudonyms: map }).author).toEqual([{ literal: "P-014" }]);
+    expect(toCslItem(reel({ role: "uploader", given: "Luci\u0301a", family: "Ferna\u0301ndez Ruiz" }), { ...OPTS, pseudonyms: map }).author).toEqual([{ literal: "P-014" }]);
+    expect(toCslItem(reel({ role: "uploader", literal: "ＬＵＣＩＡ ＦＥＲＮＡＮＤＥＺ ＲＵＩＺ" }), { ...OPTS, pseudonyms: map }).author).toEqual([{ literal: "P-014" }]);
+  });
+
+  it("probe 3: titles, container and publisher are scrubbed of every pseudonym-map entry, also people who are not creators here", () => {
+    const map = new Map([["@lucia.cocina", "P-014"], ["Marta Pérez", "P-020"]]);
+    const sf = reel(LUCIA, {
+      title: mt(["es", "original", "Cocinando con MARTA PEREZ y @lucia.cocina"]),
+      container: mt(["es", "original", "Las recetas de Marta Pérez"]),
+      publisher: "Ediciones marta perez",
+    });
+    const item = toCslItem({ ...sf, source: { ...sf.source, type: "book" } }, { ...OPTS, pseudonyms: map });
+    expect(item.title).toBe("Cocinando con P-020 y P-014");
+    expect(item["container-title"]).toBe("Las recetas de P-020");
+    expect(item.publisher).toBe("Ediciones P-020");
+  });
+
+  it("probe 4: a URL with the name in any slug form (joined, -, ., _) is left out", () => {
+    for (const slug of ["luciafernandezruiz", "lucia-fernandez", "lucia.fernandez.ruiz", "lucia_fernandez", "Lucía-Fernández", "fernandez-ruiz"]) {
+      const item = toCslItem(reel(LUCIA, { identifiers: { url: `https://www.instagram.com/${slug}/reel/C4/`, platform: "instagram" } }), OPTS);
+      expect(item.URL, slug).toBeUndefined();
+    }
+    const ok = toCslItem(reel(LUCIA, { identifiers: { url: "https://www.instagram.com/reel/C4abc/", platform: "instagram" } }), OPTS);
+    expect(ok.URL).toBe("https://www.instagram.com/reel/C4abc/");
+  });
+
+  it("probe 5: no length floor for URLs: a two-letter handle in the URL drops it, but not as part of a longer word", () => {
+    const li = reel({ role: "uploader", handle: "@li" }, { identifiers: { url: "https://www.tiktok.com/@li/video/7300", platform: "tiktok" } });
+    const map = new Map([["@li", "P-031"]]);
+    expect(toCslItem(li, { ...OPTS, pseudonyms: map }).URL).toBeUndefined();
+    const other = reel({ role: "uploader", handle: "@li" }, { identifiers: { url: "https://www.linkedin.com/posts/7300", platform: "other" } });
+    expect(toCslItem(other, { ...OPTS, pseudonyms: map }).URL).toBe("https://www.linkedin.com/posts/7300");
+  });
+
+  it("probe 6: the citation key is not copied when the source has participants", () => {
+    const sf = reel(LUCIA, { citationKey: "fernandezruiz2024receta" });
+    expect(toCslItem(sf, OPTS)["citation-key"]).toBeUndefined();
+    expect(toCslItem(FIXTURES.book, OPTS)["citation-key"]).toBe("key");
+  });
+
+  it("probe 7: names in the title are matched across case, accents and an '@' prefix", () => {
+    const sf = reel(LUCIA, { title: mt(["es", "original", "LUCIA FERNANDEZ RUIZ cocina; sigue a @Lucia.Cocina"]) });
+    expect(toCslItem(sf, OPTS).title).toBe("P-014 cocina; sigue a P-014");
+  });
+
+  it("Rose gardens: a bare given or family name is replaced when it has 4+ letters or stands next to the other part (fail-safe over-scrubbing, short names only with their partner)", () => {
+    const rose: Creator = { role: "interviewee", given: "Rose", family: "Li" };
+    const map = new Map([["Rose Li", "P-040"]]);
+    const t = (title: string) =>
+      toCslItem(source("interview", mt(["en", "original", title]), [rose], { participantIds: [PARTICIPANT.id] }), { ...OPTS, pseudonyms: map }).title;
+    expect(t("Rose gardens on the Li river")).toBe("P-040 gardens on the Li river"); // "Rose" (4) replaced; bare "Li" (2) kept
+    expect(t("Talking with Rose Li about Li Bai")).toBe("Talking with P-040 about Li Bai");
+    expect(t("Li, Rose: an oral history")).toBe("P-040: an oral history");
+    expect(t("Primrose and Roseanne")).toBe("Primrose and Roseanne"); // whole words only
+  });
+
+  it("I2: a source with participants fails closed when a creator other than the interviewer has no code", () => {
+    const s = source("interview", mt(["en", "original", "T"]), [{ role: "interviewee", given: "Jane", family: "Doe" }], { participantIds: [PARTICIPANT.id] });
+    expect(() => toCslItem(s, { ...OPTS, pseudonyms: new Map() })).toThrow(ParticipantCodeMissingError);
+    expect(() => toCslItem(s, { citationLanguage: "en", translatedTitles: "off", script: "original" })).toThrow(ParticipantCodeMissingError);
+    const researcher = source("interview", mt(["en", "original", "T"]), [{ role: "interviewer", given: "Ana", family: "Castillo" }], { participantIds: [PARTICIPANT.id] });
+    expect(toCslItem(researcher, { ...OPTS, pseudonyms: new Map() }).interviewer).toEqual([{ family: "Castillo", given: "Ana" }]);
   });
 });
 
@@ -499,6 +578,36 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
     expect(rtf).toContain("\\\\par injection");
     expect(rtf).not.toMatch(/(?<!\\)\\par injection/);
     expect(rtf).toMatch(/\\\{x\\\}/);
+  });
+
+  it("R88 C1: a second render after an edit shows the new data (no stale engine state), text and html", () => {
+    const id = newId();
+    const before: CslItem = { id, type: "book", title: "First title by Lucía", author: [{ family: "Fernández Ruiz", given: "Lucía" }], issued: { "date-parts": [[2024]] } };
+    const after: CslItem = { id, type: "book", title: "Second title", author: [{ literal: "P-014" }], issued: { "date-parts": [[2024]] } };
+    for (const style of STYLES) {
+      for (const format of ["text", "html"] as const) {
+        renderBibliography([before], style, format);
+        renderCitation([{ item: before }], style, format);
+        const out = renderBibliography([after], style, format) + renderCitation([{ item: after }], style, format);
+        expect(out, `${style}/${format}`).toContain("P-014");
+        expect(out, `${style}/${format}`).toMatch(/Second title/iu);
+        expect(out, `${style}/${format}`).not.toMatch(/Luc[ií]a|Fern[aá]ndez|First title/iu);
+      }
+    }
+  });
+
+  it("R88 I4: a locator is never markup (html and rtf)", () => {
+    for (const format of ["html", "rtf", "text"] as const) {
+      const out = renderCitation([{ item: items.book, locator: "<i>3</i>", label: "page" }], "apa", format);
+      expect(out, format).toContain("p. 3");
+      expect(out, format).not.toMatch(/<i>3|\\i 3|\{\\i/u);
+    }
+    expect(renderCitation([{ item: items.book, locator: "{\\b 3}", label: "page" }], "apa", "rtf")).toContain("p. b 3");
+  });
+
+  it("R88 minor: an invalid lang falls back to en-US", () => {
+    const en = renderBibliography([items.youtubeVideo], "apa", "text", "en-US");
+    for (const bad of ["", "../../etc/passwd", "en_US<script>", "x".repeat(200)]) expect(renderBibliography([items.youtubeVideo], "apa", "text", bad), bad).toBe(en);
   });
 
   it("honours the lang parameter", () => {

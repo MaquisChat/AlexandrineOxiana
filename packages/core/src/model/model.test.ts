@@ -92,7 +92,7 @@ describe("SourceFile", () => {
     expect(Source.parse(f.source).volume).toBeUndefined();
     const biblio = {
       volume: "42", issue: "2", page: "115–134", edition: "2nd", numberOfPages: "312", publisherPlace: "London",
-      collectionTitle: "Studies in Food", collectionNumber: "7", genre: "Video", medium: "Online video",
+      collectionTitle: "Studies in Food", collectionNumber: "7", genre: "Video", medium: "Online video", number: "WP-17",
     };
     const parsed = Source.parse({ ...f.source, ...biblio });
     expect(Object.fromEntries(BIBLIO_FIELDS.map((k) => [k, parsed[k]]))).toEqual(biblio);

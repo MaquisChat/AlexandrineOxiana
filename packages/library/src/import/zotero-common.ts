@@ -38,6 +38,8 @@ export const CREATOR_ROLES: Readonly<Record<string, Creator["role"]>> = {
 
 const CONTAINER_FIELDS = ["publicationTitle", "bookTitle", "proceedingsTitle", "websiteTitle", "blogTitle", "forumTitle", "encyclopediaTitle", "dictionaryTitle", "programTitle"];
 const PUBLISHER_FIELDS = ["publisher", "university", "institution", "label", "company", "studio", "network", "distributor", "repository"];
+const GENRE_FIELDS = ["genre", "type", "thesisType", "reportType", "websiteType", "letterType", "manuscriptType", "presentationType", "postType", "mapType"];
+const MEDIUM_FIELDS = ["medium", "videoRecordingFormat", "audioRecordingFormat", "audioFileType", "artworkMedium", "interviewMedium"];
 const TITLE_FIELDS = ["title", "caseName", "nameOfAct", "subject"];
 
 /** Zotero annotation types (itemAnnotations.type). */
@@ -207,6 +209,10 @@ export function recordFields(type: string, f: Map<string, string>, creators: Cre
       collectionTitle: first(["series"]),
       collectionNumber: first(["seriesNumber"]),
       numberOfPages: first(["numPages"]),
+      // R88: the item type's own "type" field is its genre; recording and artwork formats its medium.
+      genre: first(GENRE_FIELDS),
+      medium: first(MEDIUM_FIELDS),
+      number: first(["reportNumber"]),
     }),
   );
   let doi = doiOf(f.get("DOI"));

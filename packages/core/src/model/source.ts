@@ -94,11 +94,11 @@ export const Identifiers = z.object({
 /**
  * Optional bibliographic detail (R87), stored as text like the other descriptive fields: volume,
  * issue, page range ("115–134"), edition, number of pages, place of publication, series title and
- * number, and overrides of the genre and medium the citation type map gives (e.g. "Video" for a
- * reel, "Photograph"). All optional, so sources written before them read unchanged.
+ * number, overrides of the genre and medium the citation type map gives (e.g. "Video" for a
+ * reel, "Photograph"), and the work's own number (a report's number, R88). All optional, so sources written before them read unchanged.
  */
 export const BIBLIO_FIELDS = [
-  "volume", "issue", "page", "edition", "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber", "genre", "medium",
+  "volume", "issue", "page", "edition", "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber", "genre", "medium", "number",
 ] as const;
 export type BiblioField = (typeof BIBLIO_FIELDS)[number];
 export const BIBLIO_MAX = 1000;
@@ -114,6 +114,7 @@ export const BiblioShape = {
   collectionNumber: BiblioText,
   genre: BiblioText,
   medium: BiblioText,
+  number: BiblioText,
 } satisfies Record<BiblioField, z.ZodTypeAny>;
 export type Biblio = Partial<Record<BiblioField, string>>;
 

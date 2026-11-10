@@ -34,6 +34,7 @@ export const FIELD_LABELS: Record<string, string> = {
   "/collectionNumber": "Number in series",
   "/genre": "Genre",
   "/medium": "Medium",
+  "/number": "Number",
   "/identifiers/platformPostId": "Post ID",
   "/identifiers/url": "Link",
   "/identifiers/doi": "DOI",

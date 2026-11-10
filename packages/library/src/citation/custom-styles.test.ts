@@ -3,14 +3,26 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { renderBibliography, type CslItem, type Project } from "@ao/core";
+import { CustomStyleSandboxError, renderBibliography, type CslItem, type Project } from "@ao/core";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
 import { PolicyDeniedError } from "../repo/errors.js";
 import type { Repo } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
-import { CUSTOM_STYLE_MAX_BYTES, CustomStyleError, addCustomStyle, bundleAvailable, libraryCslLoader, listStyles } from "./custom-styles.js";
+import {
+  CUSTOM_STYLE_MAX_BYTES,
+  CustomStyleError,
+  addCustomStyle,
+  bundleAvailable,
+  libraryCslLoader,
+  listCustomStyles,
+  listStyles,
+  macroExpansions,
+  renderBibliographyIn,
+  renderCitationIn,
+} from "./custom-styles.js";
+import { SandboxError, renderInSandbox } from "./sandbox.js";
 
 const HAVE_BUNDLE = bundleAvailable();
 if (!HAVE_BUNDLE && process.env.CI === "true") throw new Error("CSL bundle missing: run `pnpm fetch-csl` (scripts/fetch-csl.mjs)");
@@ -104,7 +116,10 @@ describe.skipIf(!HAVE_BUNDLE)("addCustomStyle", () => {
     expect(all.some((s) => s.id === "apa" && !s.custom)).toBe(true);
     expect(all.some((s) => s.id === "my-lab-style" && s.custom)).toBe(true);
     const item: CslItem = { id: "x", type: "book", title: "Lab notes", author: [{ family: "Diaz", given: "Rosa" }], issued: { "date-parts": [[2020]] } };
-    expect(renderBibliography([item], "my-lab-style", "text", "en-US", await libraryCslLoader(lib))).toBe("Rosa Diaz. Lab notes");
+    expect(await renderBibliographyIn(lib, [item], "my-lab-style", "text")).toBe("Rosa Diaz. Lab notes");
+    // R88 I3: never in-process.
+    const loader = await libraryCslLoader(lib);
+    expect(() => renderBibliography([item], "my-lab-style", "text", "en-US", loader)).toThrow(CustomStyleSandboxError);
   });
 
   it.each([
@@ -151,7 +166,7 @@ describe.skipIf(!HAVE_BUNDLE)("addCustomStyle", () => {
     await expect(addCustomStyle(repo, p.id, dep("no-such-parent-style"))).rejects.toThrow(/parent/);
     expect(await addCustomStyle(repo, p.id, dep("apa"))).toBe("journal-of-lab-studies");
     const item: CslItem = { id: "x", type: "book", title: "Lab notes", author: [{ family: "Diaz", given: "Rosa" }], issued: { "date-parts": [[2020]] } };
-    expect(renderBibliography([item], "journal-of-lab-studies", "text", "en-US", await libraryCslLoader(lib))).toBe("Diaz, R. (2020). Lab notes.");
+    expect(await renderBibliographyIn(lib, [item], "journal-of-lab-studies", "text")).toBe("Diaz, R. (2020). Lab notes.");
   });
 
   it("never overwrites a bundled style; same id twice gets a suffix; the same bytes again are not duplicated", async () => {
@@ -159,6 +174,9 @@ describe.skipIf(!HAVE_BUNDLE)("addCustomStyle", () => {
     const apaLike = style({ id: "http://www.zotero.org/styles/apa", title: "My APA" });
     expect(await addCustomStyle(repo, p.id, apaLike)).toBe("custom-apa");
     expect(await addCustomStyle(repo, p.id, apaLike)).toBe("custom-apa"); // identical: the existing one
+    // R88 minor: the same bytes again are still governed and audited, though nothing is written.
+    expect((await auditOf(p)).match(/"action":"style\.add"/gu)).toHaveLength(2);
+    expect(await auditOf(p)).toMatch(/"styleId":"custom-apa".*"unchanged":true/u);
     const other = style({ id: "http://www.zotero.org/styles/apa", title: "My other APA" });
     expect(await addCustomStyle(repo, p.id, other)).toBe("custom-apa-2");
     expect(await filesIn(stylesDir())).toEqual(["custom-apa-2.csl", "custom-apa.csl"]);
@@ -167,9 +185,8 @@ describe.skipIf(!HAVE_BUNDLE)("addCustomStyle", () => {
     expect(apa).toHaveLength(1);
     expect(apa[0]!.custom).toBeUndefined();
     const item: CslItem = { id: "x", type: "book", title: "Lab notes", author: [{ family: "Diaz", given: "Rosa" }], issued: { "date-parts": [[2020]] } };
-    const loader = await libraryCslLoader(lib);
-    expect(renderBibliography([item], "apa", "text", "en-US", loader)).toBe("Diaz, R. (2020). Lab notes.");
-    expect(renderBibliography([item], "custom-apa", "text", "en-US", loader)).toBe("Rosa Diaz. Lab notes");
+    expect(await renderBibliographyIn(lib, [item], "apa", "text")).toBe("Diaz, R. (2020). Lab notes.");
+    expect(await renderBibliographyIn(lib, [item], "custom-apa", "text")).toBe("Rosa Diaz. Lab notes");
   });
 
   it("a file placed in styles/ by hand with a taken name is not overwritten", async () => {
@@ -187,4 +204,76 @@ describe.skipIf(!HAVE_BUNDLE)("addCustomStyle", () => {
     expect(await filesIn(stylesDir())).toEqual([]);
     expect(await auditOf(p)).toMatch(/"action":"store".*"result":"deny"/u);
   });
+
+  it("R88 minor: the same bytes again are refused when the project's rules refuse the import", async () => {
+    const p = await project();
+    expect(await addCustomStyle(repo, p.id, style())).toBe("my-lab-style");
+    await writeFile(join(lib.root, p.folder, "governance.yaml"), "identifiability: [not, valid\n");
+    await expect(addCustomStyle(repo, p.id, style())).rejects.toBeInstanceOf(PolicyDeniedError);
+  });
+
+  it("R88 minor: marks are removed before the id is made (Café Ñandú → cafe-nandu)", async () => {
+    const p = await project();
+    expect(await addCustomStyle(repo, p.id, style({ id: "http://www.zotero.org/styles/Estilo Café Ñandú", title: "Estilo" }))).toBe("estilo-cafe-nandu");
+  });
 });
+
+/** A style whose macros call each other `fan` times per level, `depth` levels deep: fan^depth expansions. */
+function fanOut(depth: number, fan = 2): string {
+  const macros: string[] = [];
+  for (let i = 0; i < depth; i++) {
+    macros.push(`<macro name="m${i}"><group>${Array.from({ length: fan }, () => `<text macro="m${i + 1}"/>`).join("")}</group></macro>`);
+  }
+  macros.push(`<macro name="m${depth}"><text variable="title"/></macro>`);
+  return style({ id: `http://www.zotero.org/styles/fan-${depth}`, body: `${macros.join("\n")}<citation><layout><text macro="m0"/></layout></citation><bibliography><layout><text macro="m0"/></layout></bibliography>` });
+}
+
+describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust the process", () => {
+  it("counts macro expansions with a memoised walk", () => {
+    expect(macroExpansions(fanOut(3))).toBe(2 * (1 + 2 + 4 + 8));
+    expect(macroExpansions(fanOut(25))).toBeGreaterThan(10_000);
+    expect(macroExpansions(style({ body: '<macro name="a"><text macro="a"/></macro><citation><layout><text macro="a"/></layout></citation>' }))).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("an N=25 fan-out style is refused quickly, and the process carries on", async () => {
+    const p = await project();
+    const t = performance.now();
+    await expect(addCustomStyle(repo, p.id, fanOut(25))).rejects.toThrow(/too complex/u);
+    expect(performance.now() - t).toBeLessThan(3000);
+    expect(await addCustomStyle(repo, p.id, style())).toBe("my-lab-style");
+  });
+
+  it("an N=17 style is refused (static cap or timeout)", async () => {
+    const p = await project();
+    await expect(addCustomStyle(repo, p.id, fanOut(17))).rejects.toBeInstanceOf(CustomStyleError);
+    expect(await filesIn(stylesDir())).toEqual([]);
+  });
+
+  it("the sandbox stops a render that runs too long, or needs too much memory, without harming this process", async () => {
+    const ok = { styleXml: style(), locales: {}, lang: "en-US", format: "text" as const, kind: "bibliography" as const, items: [{ id: "x", type: "book", title: "T" }] };
+    await expect(renderInSandbox(ok, { timeoutMs: 1 })).rejects.toBeInstanceOf(SandboxError);
+    // A heap cap: a style that builds ever longer output runs out of its (here 16 MB) heap.
+    const big = { ...ok, styleXml: fanOut(18), items: [{ id: "x", type: "book", title: "T".repeat(1000) }] };
+    await expect(renderInSandbox(big, { maxHeapMb: 16, timeoutMs: 15_000 })).rejects.toMatchObject({ name: "SandboxError", reason: "resources" });
+    // A fan-out the static cap would refuse, run directly: the timeout ends it.
+    const t = performance.now();
+    await expect(renderInSandbox({ ...ok, styleXml: fanOut(22) }, { timeoutMs: 2000 })).rejects.toBeInstanceOf(SandboxError);
+    expect(performance.now() - t).toBeLessThan(5000);
+  }, 20_000);
+
+  it("renders citations with a custom style in the sandbox, locators cleaned", async () => {
+    const p = await project();
+    await addCustomStyle(repo, p.id, style());
+    const item: CslItem = { id: "x", type: "book", title: "Lab notes", author: [{ family: "Diaz", given: "Rosa" }], issued: { "date-parts": [[2020]] } };
+    expect(await renderCitationIn(lib, [{ item }], "my-lab-style", "text")).toBe("[Diaz 2020]");
+    expect(await renderCitationIn(lib, [{ item, locator: "<i>3</i>", label: "page" }], "apa", "html")).toBe("(Diaz, 2020, p. 3)");
+  });
+
+  it("listCustomStyles probe-renders hand-dropped files in the sandbox and skips those that fail", async () => {
+    await import("node:fs/promises").then((fs) => fs.mkdir(stylesDir(), { recursive: true }));
+    await writeFile(join(stylesDir(), "dropped-fan.csl"), fanOut(25));
+    await writeFile(join(stylesDir(), "dropped-ok.csl"), style({ id: "http://www.zotero.org/styles/dropped-ok", title: "Dropped OK" }));
+    expect((await listCustomStyles(lib)).map((s) => s.id)).toEqual(["dropped-ok"]);
+  });
+});
+

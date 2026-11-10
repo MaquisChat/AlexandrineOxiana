@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Annotation, AuditEvent, Project, SourceFile } from "@ao/core";
 import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { NOTE_HTML, buildZoteroFixture } from "../../tests/fixtures/zotero/build-fixture.mjs";
+import { recordFields } from "./zotero-common.js";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
@@ -1334,3 +1335,16 @@ processing:
     expect(note.body!.endsWith("(note truncated)")).toBe(true);
   });
 });
+
+describe("R88 minor: Zotero genre, type and format fields", () => {
+  it("genre and the item-type 'type' fields map to genre, recording formats to medium, reportNumber to number", () => {
+    const f = (type: string, fields: Record<string, string>) => recordFields(type, new Map(Object.entries({ title: "T", ...fields })), [], []).fields;
+    expect(f("videoRecording", { genre: "Documentary", videoRecordingFormat: "MP4" })).toMatchObject({ genre: "Documentary", medium: "MP4" });
+    expect(f("thesis", { thesisType: "PhD thesis" })).toMatchObject({ genre: "PhD thesis" });
+    expect(f("report", { reportType: "Working paper", reportNumber: "WP-17" })).toMatchObject({ genre: "Working paper", number: "WP-17" });
+    expect(f("audioRecording", { audioRecordingFormat: "Cassette" })).toMatchObject({ medium: "Cassette" });
+    expect(f("interview", { interviewMedium: "Telephone" })).toMatchObject({ medium: "Telephone" });
+    expect(f("artwork", { artworkMedium: "Oil on canvas" })).toMatchObject({ medium: "Oil on canvas" });
+  });
+});
+

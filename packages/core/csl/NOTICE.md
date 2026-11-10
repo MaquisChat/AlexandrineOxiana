@@ -21,3 +21,8 @@ metadata states.
 The citation processor is citeproc-js (Frank Bennett), npm `citeproc` 2.4.63, licensed under the
 Common Public Attribution License 1.0 (or later) or the GNU Affero General Public License 3.0 (or later), at the user's option (dual-licensed;
 see its `LICENSE`).
+
+**Open decision before distribution:** citeproc-js may be used under either the CPAL-1.0 or the
+AGPL-3.0, and which of the two this application takes (with its attribution or source-offer
+duties) is a decision for the project owner that has not been made yet (R87). It must be made
+before the application is distributed.

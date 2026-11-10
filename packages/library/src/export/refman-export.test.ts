@@ -153,6 +153,7 @@ const REFS: Ref[] = [
     issued: "2022",
     publisher: "Lagos Institute",
     citationKey: "bello2022trader",
+    biblio: { number: "WP-17" },
   },
 ];
 
@@ -169,7 +170,7 @@ async function readBack(format: RefmanFormat, text: string): Promise<ScanItem[]>
 
 /** The bibliographic fields each format carries (R87): RIS has no series number or page count. */
 const BIBLIO_IN: Record<RefmanFormat, readonly BiblioField[]> = {
-  bibtex: ["volume", "issue", "page", "edition", "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber"],
+  bibtex: ["volume", "issue", "page", "edition", "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber", "number"],
   ris: ["volume", "issue", "page", "edition", "publisherPlace", "collectionTitle"],
   "csl-json": BIBLIO_FIELDS,
 };
@@ -274,6 +275,24 @@ describe("escaping", () => {
     expect(back[0]!.referenceMetadata).toMatchObject({ volume: "61", issue: "4", page: "777–799" });
     expect(back[1]!.referenceMetadata).toMatchObject({ collectionTitle: "African Studies", collectionNumber: "141" });
     expect(back[1]!.referenceMetadata!.issue).toBeUndefined();
+  });
+
+  it("R88 minor: RIS splits a page range at an en dash or -- before a hyphen (A-1–A-9, S12--S19)", async () => {
+    const p = await project();
+    const a = await addSource(p, { ...REFS[0]!, citationKey: "r1", biblio: { page: "A-1–A-9" } });
+    const b = await addSource(p, { ...REFS[0]!, citationKey: "r2", biblio: { page: "S12--S19" } });
+    const { text } = await exportRefman(repo, p.id, [a, b], "ris");
+    expect(text).toContain("SP  - A-1\nEP  - A-9");
+    expect(text).toContain("SP  - S12\nEP  - S19");
+  });
+
+  it("R88 minor: a report's number is its BibTeX number (a techreport), not a series number", async () => {
+    const p = await project();
+    const id = await addSource(p, REFS[3]!);
+    const { text } = await exportRefman(repo, p.id, [id], "bibtex");
+    expect(text).toMatch(/@techreport\{bello2022trader,[^@]*number = \{WP-17\}/u);
+    expect((await readBack("bibtex", text))[0]!.referenceMetadata).toMatchObject({ number: "WP-17" });
+    expect((await readBack("bibtex", text))[0]!.referenceMetadata!.collectionNumber).toBeUndefined();
   });
 
   it("CSL-JSON is standard JSON (quotes, backslashes, control characters, U+2028)", async () => {
