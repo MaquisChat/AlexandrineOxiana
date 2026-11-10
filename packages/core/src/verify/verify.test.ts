@@ -431,7 +431,7 @@ describe("review round 2", () => {
     const c = verifyDraft(draft({ creators: okaforMensah }), [ev("/creators", okaforMensah, "embedded"), ev("/creators", [okaforMensah[0]], "zotero")], {});
     expect(c.fields["/creators"]!.checks).toContain("cross-source");
     const lit = draft({ creators: [{ literal: "Ada Okafor", role: "author" }] });
-    const ok = verifyDraft(lit, [ev("/creators", [{ family: "Okafor", role: "author" }], "embedded"), ev("/creators", [{ literal: "Okafor, Ada", role: "author" }], "zotero")], {});
+    const ok = verifyDraft(lit, [ev("/creators", [{ family: "Okafor", given: "Ada", role: "author" }], "embedded"), ev("/creators", [{ literal: "Okafor, Ada", role: "author" }], "zotero")], {});
     expect(ok.fields["/creators"]!.status).toBe("verified");
   });
   it("AI quote must name every creator", () => {
@@ -479,5 +479,84 @@ describe("review round 2", () => {
     const d = draft({ title: { variants: [{ lang: "zh", kind: "original", value: "AI時代" }] } });
     expect(verifyDraft(d, [ev("/title", "AI時代", "filename")], { documentText: "OpenAI時代 の物語" }).fields["/title"]!.status).toBe("unverified");
     expect(verifyDraft(d, [ev("/title", "AI時代", "filename")], { documentText: "the AI時代 の物語" }).fields["/title"]!.status).toBe("verified");
+  });
+});
+
+describe("review round 3", () => {
+  const cr = (c: unknown[], d: Record<string, unknown> = {}, evKind = "embedded", text?: string) =>
+    verifyDraft(draft({ creators: c, ...d }), [ev("/creators", c, evKind)], { documentText: text }).fields["/creators"]!.status;
+  it("comma-less organisation literals are compared whole, not by last word", () => {
+    const org = [{ literal: "Fake Research Organization", role: "author" }];
+    expect(cr(org, {}, "filename", "Report by the World Health Organization, 2020")).toBe("unverified");
+    expect(cr([{ literal: "World Health Organization", role: "author" }], {}, "filename", "Report by the World Health Organization, 2020")).toBe("verified");
+    const d = draft({ creators: [{ literal: "Ghost Writer", role: "author" }] });
+    expect(verifyDraft(d, [ev("/creators", [{ literal: "Real Writer", role: "author" }], "embedded")], {}).fields["/creators"]!.status).toBe("conflict");
+  });
+  it("literal vs structured names agree only when given and family both match", () => {
+    const agreeWith = (lit: string, struct: Record<string, unknown>) =>
+      verifyDraft(draft({ creators: [{ literal: lit, role: "author" }] }), [ev("/creators", [{ ...struct, role: "author" }], "embedded")], {}).fields["/creators"]!.status;
+    expect(agreeWith("山田 太郎", { family: "山田", given: "太郎" })).toBe("single-source");
+    expect(agreeWith("Ada Okafor", { family: "Okafor", given: "Ada" })).toBe("single-source");
+    expect(agreeWith("Ada Okafor", { family: "Okafor" })).toBe("conflict");
+  });
+  it("given names must match when both are present; a handle does not rescue a family mismatch", () => {
+    const base = [{ family: "Okafor", given: "Ada", role: "author" }];
+    expect(cr(base, {}, "embedded")).toBe("single-source");
+    const d = draft({ creators: base });
+    expect(verifyDraft(d, [ev("/creators", [{ family: "Okafor", given: "Bola", role: "author" }], "embedded")], {}).fields["/creators"]!.status).toBe("conflict");
+    const h = draft({ creators: [{ family: "Okafor", handle: "@ada", role: "author" }] });
+    expect(verifyDraft(h, [ev("/creators", [{ family: "Mensah", handle: "ada", role: "author" }], "embedded")], {}).fields["/creators"]!.status).toBe("conflict");
+  });
+  it("strict user-confirmed: identifier arrays set-equal, title variants equal, creators exact", () => {
+    const st = (field: string, d: SourceDraft, v: unknown) => verifyDraft(d, [ev(field, v, "user")], {}).fields[field]?.status;
+    const book = (isbn: string[]) => draft({ type: "book", identifiers: { isbn } });
+    expect(st("/identifiers/isbn", book(["9780306406157", "0306406152"]), ["9780306406157"])).not.toBe("user-confirmed");
+    expect(st("/identifiers/isbn", book(["978-0-306-40615-7"]), ["9780306406157"])).toBe("user-confirmed");
+    const two = { variants: [...mt("Rivers of Memory").variants, { lang: "fr", kind: "translated", value: "Rivieres de memoire" }] };
+    expect(st("/title", draft({ title: two }), mt("Rivers of Memory"))).not.toBe("user-confirmed");
+    expect(st("/title", draft({ title: two }), two)).toBe("user-confirmed");
+    const c1 = [{ family: "Okafor", given: "Ada", role: "author" }];
+    expect(st("/creators", draft({ creators: [{ family: "Okafor", given: "Bola", role: "author" }] }), c1)).not.toBe("user-confirmed");
+    expect(st("/creators", draft({ creators: [{ literal: "Okafor, Ada", role: "author" }] }), c1)).not.toBe("user-confirmed");
+    expect(st("/creators", draft({ creators: c1 }), c1)).toBe("user-confirmed");
+  });
+  it("integrity checks override user-confirmed", () => {
+    const d = draft({ type: "book", identifiers: { isbn: ["9780306406158"] } });
+    expect(verifyDraft(d, [ev("/identifiers/isbn", ["9780306406158"], "user")], {}).fields["/identifiers/isbn"]!.status).toBe("conflict");
+    const doi = draft({ identifiers: { doi: "10.1000/xyz" } });
+    const r = verifyDraft(doi, [ev("/identifiers/doi", "10.1000/xyz", "user")], { lookups: [{ provider: "crossref", matchedIdentifier: "10.1000/xyz", title: "Quantum chromodynamics on a lattice" }] });
+    expect(r.fields["/identifiers/doi"]!.status).toBe("conflict");
+  });
+  it("near-match titles are unverified, 'differs slightly from the source'", () => {
+    const d = draft({ title: mt("one two three four five six seven eight nine ten") });
+    const r = verifyDraft(d, [ev("/title", "one two three four five six seven eight nine tenn", "embedded")], {});
+    expect(near(r)).toBe(true);
+    function near(x: ReturnType<typeof verifyDraft>) { return x.fields["/title"]!.status === "unverified" && /differs slightly from the source/.test(x.fields["/title"]!.reason!); }
+  });
+  it("a date more precise than every source is unverified", () => {
+    const r = verifyDraft(draft({ issued: "2020-05-01" }), [ev("/issued", "2020", "embedded")], {});
+    expect(r.fields["/issued"]!.status).toBe("unverified");
+    expect(r.fields["/issued"]!.reason).toMatch(/more precise than any source/);
+    expect(verifyDraft(draft({ issued: "2020" }), [ev("/issued", "2020-05-01", "embedded")], {}).fields["/issued"]!.status).toBe("single-source");
+  });
+  it("AI-quoted values obey the minimum-length rule", () => {
+    const d = draft({ title: mt("Re") });
+    const r = verifyDraft(d, [ev("/title", "Re", "ai", { quote: "Re: the oral histories" })], { documentText: "Re: the oral histories of rivers" });
+    expect(r.fields["/title"]!.status).toBe("unverified");
+  });
+  it("other text fields compare case/punctuation-insensitively; ISSN and URL canonicalised", () => {
+    const pub = draft({ type: "book", publisher: "Oxford University Press" });
+    expect(verifyDraft(pub, [ev("/publisher", "oxford university press.", "embedded")], {}).fields["/publisher"]!.status).toBe("single-source");
+    const issn = draft({ identifiers: { issn: "1234-567x" } });
+    expect(verifyDraft(issn, [ev("/identifiers/issn", "1234567X", "embedded")], {}).fields["/identifiers/issn"]!.status).toBe("single-source");
+    const url = draft({ identifiers: { url: "https://Example.com/Path?Q=1" } });
+    expect(verifyDraft(url, [ev("/identifiers/url", "https://example.com/Path?Q=1", "embedded")], {}).fields["/identifiers/url"]!.status).toBe("single-source");
+    expect(verifyDraft(url, [ev("/identifiers/url", "https://example.com/path?q=1", "embedded")], {}).fields["/identifiers/url"]!.status).toBe("conflict");
+  });
+  it("creatorsText shows the whole literal; ISO times are validated", () => {
+    const d = draft({ creators: [{ literal: "Fake Research Organization", role: "author" }] });
+    const r = verifyDraft(d, [ev("/creators", [{ literal: "World Health Organization", role: "author" }], "embedded")], {});
+    expect(r.reasons.join(" ")).toContain("Fake Research Organization");
+    expect(verifyDraft(draft({ issued: "2020-05-01T99:99:00Z" }), [ev("/issued", "2020-05-01", "embedded")], {}).fields["/issued"]!.status).toBe("unverified");
   });
 });

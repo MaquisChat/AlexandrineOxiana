@@ -117,8 +117,9 @@ export type Edtf = { y: number; m?: number; d?: number };
 
 export function parseEdtf(s: unknown): Edtf | undefined {
   if (typeof s !== "string") return undefined;
-  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?(?:T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?[?~]?$/.exec(s.trim());
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?[?~]?$/.exec(s.trim());
   if (!m) return undefined;
+  if (m[4] !== undefined && (Number(m[4]) > 23 || Number(m[5]) > 59 || (m[6] !== undefined && Number(m[6]) > 60))) return undefined;
   const y = Number(m[1]);
   const mo = m[2] ? Number(m[2]) : undefined;
   const d = m[3] ? Number(m[3]) : undefined;
@@ -182,11 +183,16 @@ export function hasTokens(hay: string, needle: string): boolean {
  * Is a normalized title/name long enough to be grounded by text alone, and does the text contain it?
  * Titles: at least 2 tokens or 8 characters (CJK: 2 characters). Names: at least 3 characters (CJK: 2).
  */
-export function groundedIn(hay: string, needle: string, kind: "title" | "name"): boolean {
-  if (NO_SPACE_SCRIPT.test(needle)) {
-    if (Array.from(needle).length < 2) return false;
-  } else if (kind === "title") {
-    if (needle.split(" ").length < 2 && needle.length < 8) return false;
-  } else if (needle.length < 3) return false;
-  return hasTokens(hay, needle);
+/** Long enough to be trusted as a match on its own? Titles: 2 tokens or 8 chars; names: 3 chars; CJK: 2 chars. */
+export function longEnough(needle: string, kind: "title" | "name"): boolean {
+  if (NO_SPACE_SCRIPT.test(needle)) return Array.from(needle).length >= 2;
+  if (kind === "title") return needle.split(" ").length >= 2 || needle.length >= 8;
+  return needle.length >= 3;
 }
+
+export function groundedIn(hay: string, needle: string, kind: "title" | "name"): boolean {
+  return longEnough(needle, kind) && hasTokens(hay, needle);
+}
+
+/** Number of date components given (1 year, 2 month, 3 day). */
+export const datePrecision = (e: Edtf): number => (e.d !== undefined ? 3 : e.m !== undefined ? 2 : 1);

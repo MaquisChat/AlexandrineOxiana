@@ -1,6 +1,6 @@
 import type { FieldEvidence, FieldVerification, SourceType } from "../model/index.js";
 import {
-  clip, datesEqual, getByPointer, groundedIn, handleKey, hasTokens, isRecord, NO_SPACE_SCRIPT, normalizeTitle,
+  clip, datesEqual, getByPointer, datePrecision, groundedIn, handleKey, longEnough, hasTokens, isRecord, NO_SPACE_SCRIPT, normalizeTitle,
   parseEdtf, snapshotDates, sourceKey, textOf, textVariants, titleSimilarity, TRUSTED_KINDS,
 } from "./evidence.js";
 import type { LookupEvidence } from "./evidence.js";
@@ -51,38 +51,66 @@ export function creatorList(v: unknown): Record<string, unknown>[] {
   if (typeof v === "string") return v.trim() ? [{ literal: v }] : [];
   return Array.isArray(v) ? v.filter(isRecord) : [];
 }
-/** Family name from a literal: "Family, Given" or "Given Family" (last token). */
-function literalFamily(lit: string): string {
-  const t = lit.trim();
-  return t.includes(",") ? t.split(",")[0]!.trim() : t.split(/\s+/).pop() ?? t;
+type Person = { family?: string; given?: string; whole?: string; handle?: string };
+const nz = (v: unknown): string | undefined => {
+  if (typeof v !== "string") return undefined;
+  const n = normalizeTitle(v);
+  return n || undefined;
+};
+/**
+ * Normalized parts of a creator. A literal with a comma is "Family, Given"; a literal without a comma
+ * is kept whole (it may be an organisation) and never split into words.
+ */
+function person(x: Record<string, unknown>): Person {
+  const p: Person = { family: nz(x.family), given: nz(x.given), handle: nz(x.handle) };
+  if (typeof x.literal === "string" && x.literal.trim()) {
+    const lit = x.literal.trim();
+    if (lit.includes(",")) {
+      p.family ??= nz(lit.split(",")[0]);
+      p.given ??= nz(lit.split(",").slice(1).join(" "));
+    } else p.whole = nz(lit);
+  }
+  return p;
 }
 export function creatorName(x: Record<string, unknown>, handleFirst = false): string | undefined {
-  const lit = typeof x.literal === "string" && x.literal.trim() ? literalFamily(x.literal) : undefined;
-  const order = handleFirst ? [x.handle, x.family, lit] : [x.family, lit, x.handle];
-  for (const v of order) if (typeof v === "string" && v.trim()) return v.trim();
-  return undefined;
+  const p = person(x);
+  const lit = p.whole ?? undefined;
+  const raw = (k: "family" | "handle") => (typeof x[k] === "string" && (x[k] as string).trim() ? (x[k] as string).trim() : undefined);
+  const fam = raw("family") ?? (p.family && typeof x.literal === "string" ? x.literal.split(",")[0]!.trim() : undefined);
+  const whole = lit && typeof x.literal === "string" ? x.literal.trim() : undefined;
+  const order = handleFirst ? [raw("handle"), fam, whole] : [fam, whole, raw("handle")];
+  return order.find((v) => v !== undefined);
 }
-function creatorCands(x: Record<string, unknown>): Set<string> {
-  const out = new Set<string>();
-  const add = (v: unknown) => {
-    if (typeof v === "string" && v.trim()) out.add(normalizeTitle(v));
-  };
-  add(x.family);
-  add(typeof x.literal === "string" && x.literal.trim() ? literalFamily(x.literal) : undefined);
-  add(x.handle);
-  out.delete("");
-  return out;
+const joinNames = (a: string, b: string) => [`${a} ${b}`, ...(NO_SPACE_SCRIPT.test(a + b) ? [`${a}${b}`] : [])];
+function personAgree(x: Person, y: Person): boolean {
+  const wholeVsStructured = (w: string, o: Person) =>
+    !!o.family && !!o.given && [...joinNames(o.given, o.family), ...joinNames(o.family, o.given)].some((n) => n === w || n.replace(/ /g, "") === w.replace(/ /g, ""));
+  if (x.whole || y.whole) {
+    if (x.whole && y.whole) return x.whole === y.whole;
+    return x.whole ? wholeVsStructured(x.whole, y) : wholeVsStructured(y.whole!, x);
+  }
+  if (x.family && y.family) return x.family === y.family && (!x.given || !y.given || x.given === y.given);
+  if (x.handle && y.handle && !x.family && !y.family) return x.handle === y.handle;
+  if (x.handle && y.handle && (!x.family || !y.family)) return x.handle === y.handle;
+  return false;
 }
-/** The full ordered creator lists match: same length, and at each position a shared family name or handle. */
+/** The full ordered creator lists match: same length, and each position the same person. */
 export function creatorsAgree(a: unknown, b: unknown): boolean {
   const la = creatorList(a), lb = creatorList(b);
   if (la.length === 0 || la.length !== lb.length) return false;
+  return la.every((x, i) => personAgree(person(x), person(lb[i]!)));
+}
+/** Exact creator list equality on family, given, whole literal and handle. */
+export function creatorsEqualStrict(a: unknown, b: unknown): boolean {
+  const la = creatorList(a), lb = creatorList(b);
+  if (la.length === 0 || la.length !== lb.length) return false;
   return la.every((x, i) => {
-    const cb = creatorCands(lb[i]!);
-    return [...creatorCands(x)].some((k) => cb.has(k));
+    const y = lb[i]!;
+    return (["family", "given", "literal", "handle"] as const).every((k) => nz(x[k]) === nz(y[k]));
   });
 }
-const creatorsText = (v: unknown): string => creatorList(v).map((x) => creatorName(x) ?? "?").join("; ");
+const creatorsText = (v: unknown): string =>
+  creatorList(v).map((x) => (typeof x.literal === "string" && x.literal.trim() ? x.literal.trim() : creatorName(x) ?? "?")).join("; ");
 
 const canonList = (field: string, v: unknown): string[] =>
   (Array.isArray(v) ? v : [v]).map((x) => canon(field, x));
@@ -91,8 +119,20 @@ const canon = (field: string, v: unknown): string => {
   if (Array.isArray(v)) return v.map((x) => canon(field, x)).sort().join("|");
   const t = textOf(v);
   if (t === undefined) return JSON.stringify(v) ?? "";
-  const n = t.trim().toLowerCase();
-  return field === "/identifiers/doi" || field === "/identifiers/isbn" || field === "/identifiers/arxiv" ? n.replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, "").replace(/[\s-]/g, "") : t.trim();
+  if (field === "/identifiers/doi" || field === "/identifiers/isbn" || field === "/identifiers/arxiv") {
+    return t.trim().toLowerCase().replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, "").replace(/[\s-]/g, "");
+  }
+  if (field === "/identifiers/issn") return t.toUpperCase().replace(/[\s-]/g, "");
+  if (field === "/identifiers/url") {
+    try {
+      const u = new URL(t.trim());
+      return `${u.protocol}//${u.host.toLowerCase()}${u.pathname}${u.search}${u.hash}`;
+    } catch {
+      return t.trim();
+    }
+  }
+  if (field.startsWith("/identifiers/")) return t.trim();
+  return normalizeTitle(t);
 };
 
 /** Do two evidence values for this field say the same thing (at the precision we care about)? */
@@ -111,6 +151,48 @@ export function agree(field: string, a: unknown, b: unknown): boolean {
     const y = canonList(field, b);
     return canonList(field, a).some((x) => y.includes(x));
   }
+  return canon(field, a) === canon(field, b);
+}
+
+export type Match = "exact" | "near" | "differ";
+
+/** How well does an evidence value support the CURRENT value? "near" = close but not enough. */
+export function matchDraft(field: string, evValue: unknown, draftValue: unknown): Match {
+  if (field === "/title" || field === "/container") {
+    const dv = textVariants(draftValue), ev = textVariants(evValue);
+    if (dv.some((x) => ev.some((y) => normalizeTitle(x) !== "" && normalizeTitle(x) === normalizeTitle(y)))) return "exact";
+    return dv.some((x) => ev.some((y) => titleSimilarity(x, y) >= 0.9)) ? "near" : "differ";
+  }
+  if (field === "/issued") {
+    const d = parseEdtf(draftValue), e = parseEdtf(evValue);
+    if (!d || !e || !datesEqual(d, e)) return "differ";
+    return datePrecision(d) > datePrecision(e) ? "near" : "exact";
+  }
+  return agree(field, evValue, draftValue) ? "exact" : "differ";
+}
+
+const setEqual = (field: string, a: unknown, b: unknown) => {
+  const x = new Set(canonList(field, a)), y = new Set(canonList(field, b));
+  return x.size === y.size && [...x].every((k) => y.has(k));
+};
+
+function variantKeys(v: unknown): string[] | undefined {
+  if (!isRecord(v) || !Array.isArray(v.variants)) return undefined;
+  return v.variants.filter(isRecord).map((x) => `${String(x.lang)}|${String(x.kind)}|${normalizeTitle(String(x.value))}`).sort();
+}
+
+/** Strict agreement used before stamping `user-confirmed`: no similarity thresholds, no coarser dates. */
+export function agreeStrict(field: string, a: unknown, b: unknown): boolean {
+  if (field === "/title" || field === "/container") {
+    const ka = variantKeys(a), kb = variantKeys(b);
+    if (ka && kb) return ka.length > 0 && ka.join("\n") === kb.join("\n");
+    const one = (v: unknown, k: string[] | undefined) => (k ? (k.length === 1 ? k[0]!.split("|").slice(2).join("|") : undefined) : typeof v === "string" ? normalizeTitle(v) : undefined);
+    const x = one(a, ka), y = one(b, kb);
+    return x !== undefined && x !== "" && x === y;
+  }
+  if (field === "/issued") return typeof a === "string" && a === b;
+  if (field === "/creators") return creatorsEqualStrict(a, b);
+  if (Array.isArray(a) || Array.isArray(b)) return setEqual(field, a, b);
   return canon(field, a) === canon(field, b);
 }
 
@@ -269,11 +351,12 @@ function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
     const list = creatorList(e.value);
     return list.length > 0 && list.every((x) => {
       const n = creatorName(x, SOCIAL.has(c.type));
-      return !!n && hasTokens(q, normalizeTitle(n));
+      const nn = n ? normalizeTitle(n) : "";
+      return !!nn && longEnough(nn, "name") && hasTokens(q, nn);
     });
   }
   const vals = Array.isArray(e.value) ? e.value.flatMap(textVariants) : textVariants(e.value);
-  return vals.map(normalizeTitle).some((v) => !!v && hasTokens(q, v));
+  return vals.map(normalizeTitle).some((v) => !!v && longEnough(v, "title") && hasTokens(q, v));
 }
 
 // ---------------------------------------------------------------- grounding
@@ -332,15 +415,6 @@ function aiUnverified(label: string, aiEvs: FieldEvidence[]): FieldVerification 
 
 const showValue = (field: string, v: unknown) => clip(field === "/creators" ? creatorsText(v) : v);
 
-/** Strict agreement used before stamping `user-confirmed`: no similarity thresholds, no coarser dates. */
-export function agreeStrict(field: string, a: unknown, b: unknown): boolean {
-  if (field === "/title" || field === "/container") {
-    return textVariants(a).some((x) => textVariants(b).some((y) => normalizeTitle(x) !== "" && normalizeTitle(x) === normalizeTitle(y)));
-  }
-  if (field === "/issued") return typeof a === "string" && a === b;
-  return agree(field, a, b);
-}
-
 export function verifyField(field: string, c: CheckCtx, required: boolean): FieldVerification | undefined {
   const label = labelOf(field);
   const allEvs = evidenceFor(c, field);
@@ -350,6 +424,9 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
   if (empty) {
     return required || allEvs.length > 0 ? result("unverified", ["present"], `${label} is missing.`) : undefined;
   }
+  // Integrity failures (bad ISBN checksum, DOI resolving to another work) override even user confirmation.
+  const integrity = checkIdentifier(field, c);
+  if (integrity?.status === "conflict") return integrity;
   // User evidence confirms only the value the user actually saw; a later change makes it stale.
   if (allEvs.some((e) => e.source.kind === "user" && agreeStrict(field, e.value, value))) return result("user-confirmed", ["user"]);
   const evs = allEvs.filter((e) => e.source.kind !== "user");
@@ -360,13 +437,21 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
   const hit = checkPlatformIdentity(field, c) ?? checkIdentifier(field, c) ?? checkCrossSource(field, c);
   if (hit) return hit;
 
-  const agreeing = evs.filter((e) => agree(field, e.value, value));
-  const disagreeing = evs.filter((e) => !agree(field, e.value, value));
+  const match = new Map(evs.map((e) => [e, matchDraft(field, e.value, value)] as const));
+  const agreeing = evs.filter((e) => match.get(e) === "exact");
+  const near = evs.filter((e) => match.get(e) === "near");
+  const disagreeing = evs.filter((e) => match.get(e) === "differ");
   const mismatchSentence = (e: FieldEvidence) =>
     `${label} recorded here ("${showValue(field, value)}") does not match what ${sourceName(e)} says ("${showValue(field, e.value)}").`;
   const trustedDis = disagreeing.filter((e) => TRUSTED_KINDS.has(e.source.kind));
   if (trustedDis.length > 0) {
     return { ...result("conflict", ["draft-vs-evidence"], mismatchSentence(trustedDis[0]!), trustedDis.map((e) => ({ value: e.value, source: e.source }))), current: value };
+  }
+  if (agreeing.length === 0 && near.length > 0) {
+    const n = near[0]!;
+    return result("unverified", ["draft-vs-evidence"], field === "/issued"
+      ? `${label} "${showValue(field, value)}" is more precise than any source supports (${sourceName(n)} says "${showValue(field, n.value)}").`
+      : `${label} recorded here ("${showValue(field, value)}") differs slightly from the source (${sourceName(n)} says "${showValue(field, n.value)}").`);
   }
   if (agreeing.length === 0 && disagreeing.length > 0) {
     return result("unverified", ["draft-vs-evidence"], mismatchSentence(disagreeing[0]!));
