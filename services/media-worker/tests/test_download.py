@@ -84,6 +84,19 @@ def test_build_ytdlp_args_params():
     assert args[args.index("--sleep-interval") + 1] == "3" and args[args.index("--max-sleep-interval") + 1] == "8"
 
 
+def test_ytdlp_quality_selects_a_format():
+    from ao_worker.download import validate_params
+    assert "-f" not in build_ytdlp_args("https://x.test/p", "/out", {})
+    best = build_ytdlp_args("https://x.test/p", "/out", {"quality": "best"})
+    assert best[best.index("-f") + 1] == "bv*+ba/b"
+    hd = build_ytdlp_args("https://x.test/p", "/out", {"quality": "720p"})
+    assert hd[hd.index("-f") + 1] == "bv*[height<=720]+ba/b[height<=720]/b"
+    assert hd.index("-f") < hd.index("--")
+    assert validate_params("https://x.test/p", {"quality": "1080p"}) is None
+    assert validate_params("https://x.test/p", {"quality": "4k"}) is not None
+    assert validate_params("https://x.test/p", {"quality": "720p", "tool": "gallery-dl"}) is not None
+
+
 @pytest.mark.parametrize("stderr,code", [
     ("ERROR: [youtube] x: Sign in to confirm you're not a bot", "LOGIN_REQUIRED"),
     ("ERROR: [instagram] x: login required to access this", "LOGIN_REQUIRED"),

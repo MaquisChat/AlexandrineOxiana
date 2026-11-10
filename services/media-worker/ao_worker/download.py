@@ -32,6 +32,12 @@ log = logging.getLogger("ao_worker.download")
 
 TOOLS = ("yt-dlp", "gallery-dl")
 BROWSERS = ("chrome", "firefox", "safari", "edge", "brave")
+# yt-dlp format selection per quality choice (best video+audio, falling back to the best single file).
+QUALITY_FORMATS = {
+    "best": "bv*+ba/b",
+    "1080p": "bv*[height<=1080]+ba/b[height<=1080]/b",
+    "720p": "bv*[height<=720]+ba/b[height<=720]/b",
+}
 DATE_RE = re.compile(r"^\d{8}$")
 YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
 _TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(\.\d+)?$")
@@ -278,6 +284,8 @@ def build_ytdlp_args(url: str, out: str, params: dict) -> list[str]:
         args.append("--skip-download")
     if params.get("cookiesFromBrowser"):
         args += ["--cookies-from-browser", params["cookiesFromBrowser"]]
+    if params.get("quality"):
+        args += ["-f", QUALITY_FORMATS[params["quality"]]]
     return [*args, "--", url]
 
 
@@ -325,6 +333,9 @@ def validate_params(url: str, params: dict) -> str | None:
     for k in ("flatList", "metadataOnly"):
         if k in params and not isinstance(params[k], bool):
             return f"params.{k} must be a boolean"
+    q = params.get("quality")
+    if q is not None and (q not in QUALITY_FORMATS or params.get("tool", "yt-dlp") != "yt-dlp"):
+        return "params.quality must be best, 1080p or 720p (yt-dlp only)"
     if params.get("includeComments", False) is not False:
         return "params.includeComments is not supported (comments are not captured)"
     m = params.get("maxItems")
