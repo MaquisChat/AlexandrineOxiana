@@ -758,4 +758,37 @@ describe("fix round 2", () => {
       expect(handle.db.prepare(`SELECT DISTINCT project_id FROM temp.${t}`).all(), t).toEqual([{ project_id: other }]);
     }
   });
+
+  it("3b: a tag id listed by two unlocked encrypted projects survives locking one", async () => {
+    const a = await encProject("E1", "A");
+    const b = await encProject("E2", "B");
+    const tag = { id: newId(), scope: "workspace" as const, name: "shared" };
+    const data = (pid: string) => ({ project: { id: pid }, collections: [], tags: [tag], participants: [], sessions: [], consents: [] });
+    indexProjectEntities(handle.db, data(a.pid), true);
+    indexProjectEntities(handle.db, data(b.pid), true);
+    const visible = () => handle.db.prepare("SELECT id FROM v_tags WHERE id = ?").all(tag.id).length;
+    expect(visible()).toBe(1); // one tag, not two
+    repo.lockProject(a.pid);
+    expect(visible()).toBe(1);
+    repo.lockProject(b.pid);
+    expect(visible()).toBe(0);
+  });
+
+  it("reload errors from a failed rebuild are attached to the thrown error", async () => {
+    const a = await encProject("E1", "A");
+    const err = await rebuildIndex(handle, ring, lib, undefined, {
+      afterClose: () => {
+        throw new Error("rename failed");
+      },
+      reloadProject: async () => {
+        throw new Error("reload boom");
+      },
+    }).then(
+      () => new Error("unexpected success") as Error & { reloadErrors?: unknown },
+      (e: unknown) => e as Error & { reloadErrors?: unknown },
+    );
+    expect(err.message).toBe("rename failed");
+    expect(err.reloadErrors).toEqual([{ folder: "Projects/E1", message: "reload boom" }]);
+    expect(a.pid).toBeTruthy();
+  });
 });

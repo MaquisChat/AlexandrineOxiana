@@ -96,9 +96,13 @@ export async function rebuildIndex(
     if (!handle.isOpen) {
       try {
         handle.reopen(); // whichever database is at library.sqlite is intact
-        await reloadUnlocked(handle, root, keyRing, opts.reloadProject); // the new connection has no in-memory content
       } catch {
         // the original error is the useful one
+      }
+      if (handle.isOpen) {
+        // the new connection has no in-memory content; errors ride along on the thrown error
+        const reloadErrors = await reloadUnlocked(handle, root, keyRing, opts.reloadProject);
+        if (err !== null && typeof err === "object") (err as { reloadErrors?: unknown }).reloadErrors = reloadErrors;
       }
     }
     throw err;

@@ -140,7 +140,7 @@ CREATE TEMP TABLE IF NOT EXISTS t_assets (
 CREATE TEMP TABLE IF NOT EXISTS t_source_collections (source_id TEXT NOT NULL, collection_id TEXT NOT NULL, PRIMARY KEY (source_id, collection_id));
 CREATE TEMP TABLE IF NOT EXISTS t_source_tags (source_id TEXT NOT NULL, tag_id TEXT NOT NULL, PRIMARY KEY (source_id, tag_id));
 CREATE TEMP TABLE IF NOT EXISTS t_collections (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, name TEXT NOT NULL);
-CREATE TEMP TABLE IF NOT EXISTS t_tags (id TEXT PRIMARY KEY, scope TEXT NOT NULL, name TEXT NOT NULL, color TEXT, project_id TEXT NOT NULL DEFAULT '');
+CREATE TEMP TABLE IF NOT EXISTS t_tags (id TEXT NOT NULL, scope TEXT NOT NULL, name TEXT NOT NULL, color TEXT, project_id TEXT NOT NULL DEFAULT '', PRIMARY KEY (id, project_id));
 CREATE TEMP TABLE IF NOT EXISTS t_participants (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, code TEXT NOT NULL);
 CREATE TEMP TABLE IF NOT EXISTS t_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, date TEXT NOT NULL);
 CREATE TEMP TABLE IF NOT EXISTS t_consents (
@@ -155,6 +155,10 @@ CREATE TEMP VIEW IF NOT EXISTS v_sources AS
          s.issued_year, s.folder, COALESCE(t.needs_review, s.needs_review) AS needs_review,
          CASE WHEN s.locked = 1 AND t.id IS NULL THEN 1 ELSE 0 END AS locked
   FROM main.sources s LEFT JOIN temp.t_sources t ON t.id = s.id;
+-- A tag id listed by several unlocked encrypted projects is one tag.
+CREATE TEMP VIEW IF NOT EXISTS v_tags AS
+  SELECT id, scope, name, color FROM main.tags
+  UNION ALL SELECT id, MIN(scope), MIN(name), MIN(color) FROM temp.t_tags GROUP BY id;
 CREATE TEMP VIEW IF NOT EXISTS v_hashes AS
   SELECT source_id, sha256 FROM main.source_hashes UNION ALL SELECT source_id, sha256 FROM temp.t_source_hashes;
 CREATE TEMP VIEW IF NOT EXISTS v_isbns AS
@@ -404,7 +408,7 @@ export function purgeProject(db: IndexDb, projectId: string): void {
       db.prepare(`DELETE FROM temp.${t} WHERE project_id = ?`).run(projectId);
     }
     // tags listed in the project's project.json go with it whatever their scope ('workspace' included)
-    db.prepare("DELETE FROM temp.t_tags WHERE project_id = ? OR scope = ?").run(projectId, projectId);
+    db.prepare("DELETE FROM temp.t_tags WHERE project_id = ?").run(projectId);
     // safety net: anything else still keyed by the project
     db.prepare("DELETE FROM temp.t_source_text WHERE project_id = ?").run(projectId);
   })();
