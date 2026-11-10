@@ -57,6 +57,9 @@ export const REFMAN_REASONS = {
   unreadable: "The export file could not be read, so nothing was imported from it.",
 } as const;
 
+/** A table lookup that never reaches Object.prototype ("constructor", "__proto__" … are unknown keys). */
+const own = <T>(table: Readonly<Record<string, T>>, key: string): T | undefined => (Object.hasOwn(table, key) ? table[key] : undefined);
+
 export const cap = (s: string) => (s.length > MAX_FIELD_CHARS ? s.slice(0, MAX_FIELD_CHARS) : s);
 
 /** Plain text of a field value: capped, control characters and runs of white space collapsed. */
@@ -630,7 +633,7 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
           const word = src.slice(ms, j);
           if (keep) {
             const lw = word.toLowerCase();
-            push(/^\d+$/u.test(word) ? word : (macros.get(lw) ?? MONTH_MACROS[lw] ?? word));
+            push(/^\d+$/u.test(word) ? word : (macros.get(lw) ?? own(MONTH_MACROS, lw) ?? word));
           }
         }
         if (ended) break;
@@ -684,7 +687,7 @@ export function latexToText(s: string): string {
       const d = s[i + 1];
       if (d === undefined) break;
       if (!isLetterAscii(d)) {
-        if (ACCENTS[d]) {
+        if (own(ACCENTS, d)) {
           // \'e  \'{e}  \"{\i}
           let j = i + 2;
           while (s[j] === " ") j++;
@@ -706,7 +709,7 @@ export function latexToText(s: string): string {
             base = s[j]!;
             j++;
           }
-          out += base + ACCENTS[d];
+          out += base + own(ACCENTS, d)!;
           i = j - 1;
         } else if (d === "\\") {
           out += " ";
@@ -720,7 +723,7 @@ export function latexToText(s: string): string {
       let j = i + 1;
       while (j < n && isLetterAscii(s[j]) && j - i < 40) j++;
       const name = s.slice(i + 1, j);
-      if (name.length === 1 && ACCENTS[name] && (s[j] === "{" || s[j] === " ")) {
+      if (name.length === 1 && own(ACCENTS, name) && (s[j] === "{" || s[j] === " ")) {
         // \v{S}  \c c
         let k = j;
         while (s[k] === " ") k++;
@@ -730,11 +733,11 @@ export function latexToText(s: string): string {
           if (s[k] !== undefined && s[k] !== "}") base = s[k++]!;
           if (s[k] === "}") k++;
         } else if (s[k] !== undefined) base = s[k++]!;
-        out += base + ACCENTS[name];
+        out += base + own(ACCENTS, name)!;
         i = k - 1;
         continue;
       }
-      const sym = SYMBOLS[name];
+      const sym = own(SYMBOLS, name);
       if (sym !== undefined) {
         out += sym;
         if (s[j] === "{" && s[j + 1] === "}") j += 2;
@@ -878,7 +881,7 @@ export function bibFields(e: BibEntry): RecordFields {
   const archive = (t("archiveprefix") ?? t("eprinttype") ?? "").toLowerCase();
   const creators = [...people("author", "author"), ...people("editor", "editor"), ...people("translator", "translator")];
   const f: RecordFields = {
-    type: BIB_TYPES[e.type] ?? "other",
+    type: own(BIB_TYPES, e.type) ?? "other",
     ...(t("title") ? { title: t("title")! } : {}),
     ...(creators.length ? { creators } : {}),
     ...(issued ? { issued } : {}),
@@ -981,7 +984,7 @@ export function risFields(r: RisRecord): RecordFields {
   const all = (...tags: string[]) => tags.flatMap((t) => r.get(t) ?? []).filter(Boolean);
   const first = (...tags: string[]) => all(...tags)[0];
   const ty = (first("TY") ?? "").toUpperCase();
-  const type = RIS_TYPES[ty] ?? "other";
+  const type = own(RIS_TYPES, ty) ?? "other";
   const people = (role: Creator["role"], ...tags: string[]) => all(...tags).map((v) => parseName(v, role)).filter((c): c is Creator => !!c);
   const creators = [...people("author", "AU", "A1"), ...people("editor", "A2", "ED"), ...people("translator", "A4")];
   const f: RecordFields = { type };
@@ -1105,7 +1108,7 @@ export function cslFields(item: Json): RecordFields {
     }
     return out;
   };
-  const f: RecordFields = { type: CSL_TYPES[s("type") ?? ""] ?? "other" };
+  const f: RecordFields = { type: own(CSL_TYPES, s("type") ?? "") ?? "other" };
   if (s("title")) f.title = s("title");
   const creators = [...people("author", "author"), ...people("editor", "editor"), ...people("translator", "translator")];
   if (creators.length) f.creators = creators;

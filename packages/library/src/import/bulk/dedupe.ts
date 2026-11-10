@@ -59,6 +59,14 @@ export class BatchDedupe {
     return this.indexed({ sha256: h });
   }
 
+  /** A stored source (never a queued placeholder) holding a file with this SHA-256, from the live index. */
+  storedBySha(sha256: string): string | undefined {
+    const h = sha256.toLowerCase();
+    const inBatch = this.sha.get(h);
+    if (inBatch && !inBatch.startsWith("pending:") && this.alive(inBatch)) return inBatch;
+    return this.indexed({ sha256: h });
+  }
+
   private loadBuckets(): Map<string, Existing[]> {
     if (this.buckets) return this.buckets;
     const rows = this.db

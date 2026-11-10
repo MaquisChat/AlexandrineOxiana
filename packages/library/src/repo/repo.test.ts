@@ -949,12 +949,16 @@ describe("anchors file corruption (R12)", () => {
     const path = join(tmp, "config/audit-anchors.json");
     await writeFile(path, "{ not json");
     const again = await repoFor();
-    expect(again.integrityWarnings).toEqual([{ projectId: "*", kind: "anchors-unreadable", detail: expect.any(String) }]);
+    // R82: the lost anchor of a log this device wrote is reported and audited, never re-recorded silently.
+    expect(again.integrityWarnings).toEqual([
+      { projectId: "*", kind: "anchors-unreadable", detail: expect.any(String) },
+      { projectId: project.id, kind: "anchor-missing", detail: expect.any(String) },
+    ]);
     const aside = (await readdir(join(tmp, "config"))).filter((n) => n.startsWith("audit-anchors.json.corrupt-"));
     expect(aside).toHaveLength(1);
     expect(await readFile(join(tmp, "config", aside[0]!), "utf8")).toBe("{ not json");
     const fresh = JSON.parse(await readFile(path, "utf8"));
-    expect(fresh.anchors[`${lib.id}/${project.id}`].seq).toBe(1);
+    expect(fresh.anchors[`${lib.id}/${project.id}`].seq).toBe(2); // after the audit.anchor-missing event
   });
 
   it("never overwrites an unparseable or wrong-shape anchors file", async () => {

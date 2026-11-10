@@ -9,7 +9,7 @@ import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
-import { AnchorsUnreadableError, AuditStore, checkAnchor, type IntegrityWarning } from "./audit-store.js";
+import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
   createConsent,
@@ -142,10 +142,10 @@ export class Repo {
         if (!(err instanceof AnchorsUnreadableError)) throw err;
       }
       const anchor = anchors?.[core.anchorKey(projectId)];
-      const problem = checkAnchor(events, verify, anchor);
+      const problem = checkAnchor(events, verify, anchor, core.device);
       // Alterations found (and recorded) when the library was opened earlier.
       const alteredAt = events
-        .filter((e): e is AuditEvent => !!e && e.action === "audit.anchor-mismatch")
+        .filter((e): e is AuditEvent => !!e && (e.action === "audit.anchor-mismatch" || e.action === "audit.anchor-missing"))
         .map((e) => e.at)
         .filter((at): at is string => typeof at === "string");
       return {
@@ -244,7 +244,9 @@ async function readAnchors(core: RepoCore, writable: boolean) {
     return await core.anchors.readAll();
   } catch (err) {
     if (!(err instanceof AnchorsUnreadableError)) throw err;
-    let detail = `${err.message}; audit heads could not be compared and are re-recorded from the current logs`;
+    let detail = writable
+      ? `${err.message}; audit heads could not be compared and are re-recorded from the current logs`
+      : `${err.message}; audit heads could not be compared (nothing was changed)`;
     if (writable) {
       try {
         const aside = await core.anchors.moveAside(core.clock().toISOString());
@@ -259,7 +261,8 @@ async function readAnchors(core: RepoCore, writable: boolean) {
 }
 
 /**
- * Opens the repository for a library. When writable, first finishes or rolls
+ * Opens the repository for a library. When writable (read-write, and not opened with `noHeal`,
+ * which only checks and reports), first finishes or rolls
  * back writes interrupted by a crash (write-ahead markers, see txn.ts), each
  * rollback reported as `rolled-back-incomplete-write`. Then removes incomplete
  * last lines left in audit segments and change logs by a crash outside a
@@ -269,7 +272,9 @@ async function readAnchors(core: RepoCore, writable: boolean) {
  * project's audit chain and compares its head with the external anchor (R12):
  * a broken chain, a different event at the anchored position, or a shorter log
  * is reported in `integrityWarnings` and, when writable, recorded as an
- * `audit.anchor-mismatch` event. Projects without an anchor get one.
+ * `audit.anchor-mismatch` event. A missing anchor for a log this device wrote to, or an empty log,
+ * is reported too (R82; audited as `audit.anchor-missing` before re-anchoring). Projects without
+ * an anchor whose log this device never wrote get one.
  */
 export function openRepo(library: Library, keyRing: KeyRing, opts: RepoOptions = {}): Promise<Repo> {
   const { index, tz, clock, actor, device, noHeal } = opts;
@@ -343,7 +348,7 @@ export async function openRepoInternal(
     const blocked = isPending({ id: st.project.id, rel: st.rel }) || (writable && lines.some((l) => !l.trimmed));
     if (blocked) st.recoveryPending = true;
     const anchor = anchors[core.anchorKey(st.project.id)];
-    const problem = checkAnchor(events, verify, anchor);
+    const problem = checkAnchor(events, verify, anchor, core.device);
     const at = core.clock().toISOString();
     if (problem) core.integrityWarnings.push({ projectId: st.project.id, ...problem });
     if (!writable || blocked) continue;
@@ -353,7 +358,8 @@ export async function openRepoInternal(
       if (problem) {
         await core.auditNow(st, {
           ...core.auditBase(st, at),
-          action: "audit.anchor-mismatch",
+          // A missing anchor is recorded as such before the project is anchored again (never silently, R82).
+          action: problem.kind === "anchor-missing" ? "audit.anchor-missing" : "audit.anchor-mismatch",
           entity: { type: "project", id: st.project.id },
           details: { kind: problem.kind, detail: problem.detail, ...(anchor ? { recorded: { seq: anchor.seq, hash: anchor.hash } } : {}) },
         });
@@ -409,7 +415,9 @@ function reportIncompleteLines(core: RepoCore, projectId: string, lines: Incompl
       detail: l.trimmed
         ? `${what}; it was never a complete record and was removed`
         : !writable
-          ? `${what}; it will be removed when the library is opened read-write`
+          ? core.noHeal
+            ? `${what}; it was left in place (checked only, nothing changed)`
+            : `${what}; it will be removed when the library is opened read-write`
           : l.error
             ? `${what}; it could not be removed (${l.error}) and is left in place`
             : `${what}; it is left in place until the interrupted change reported for this library is resolved`,
@@ -736,5 +744,5 @@ export interface AuditCheck {
   anchored: boolean;
   /** When earlier opens of the library found the log altered (its `audit.anchor-mismatch` events). */
   alteredAt: string[];
-  problem?: { kind: "chain-broken" | "head-mismatch" | "truncated" | "anchors-unreadable"; detail: string };
+  problem?: { kind: AnchorProblemKind | "anchors-unreadable"; detail: string };
 }

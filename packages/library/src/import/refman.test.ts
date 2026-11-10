@@ -1253,3 +1253,15 @@ processing:
     expect(u.kept).toContainEqual(expect.objectContaining({ kind: "tag", id: foodId }));
   });
 });
+
+describe("review round 2 (R82): tables never reach Object.prototype", () => {
+  it("\\constructor{}, @constructor{…} and CSL type constructor read as plain text / other", async () => {
+    const { latexToText, parseBibtexEntries, bibFields, cslFields, risFields } = await import("./refman.js");
+    expect(latexToText("a \\constructor{} b \\__proto__ c \\toString{x}")).toBe("a  b __proto__ c x"); // \\_ is an escaped underscore: text
+    const [e] = [...parseBibtexEntries("@constructor{k, title = {T}}\n")];
+    expect(bibFields(e!).type).toBe("other");
+    expect(cslFields({ type: "constructor", title: "T" }).type).toBe("other");
+    expect(risFields(new Map([["TY", ["CONSTRUCTOR"]], ["TI", ["T"]]])).type).toBe("other");
+    expect(risFields(new Map([["TY", ["__proto__"]]])).type).toBe("other");
+  });
+});

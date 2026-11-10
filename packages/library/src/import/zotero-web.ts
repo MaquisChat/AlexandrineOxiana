@@ -35,6 +35,7 @@ import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
+import * as nodePath from "node:path";
 import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -306,7 +307,7 @@ class ZoteroApi {
    */
   async file(prefix: string, attKey: string, dest: string, md5: string | undefined): Promise<{ path: string } | { note: string }> {
     const max = this.o.maxFileBytes ?? MAX_ZOTERO_FILE_BYTES;
-    const dir = dest.slice(0, dest.lastIndexOf("/")) || ".";
+    const { dir } = splitDownloadPath(dest);
     const free = () => (this.o.freeSpace ?? statfsFree)(dir);
     if ((await free()) < SPACE_MARGIN) return { note: ZOTERO_WEB_FILE_NOTES.noSpace };
     let res: Dispatcher.ResponseData;
@@ -382,7 +383,7 @@ class ZoteroApi {
     const out = `${dest}.d`;
     try {
       const entries = await extractArchive(target, out, { maxEntries: 10, maxEntryBytes: max, maxTotalBytes: max }, this.signal);
-      const want = dest.slice(dest.lastIndexOf("/") + 1);
+      const want = splitDownloadPath(dest).name;
       const e = entries.find((x) => !x.refused && x.name === want) ?? entries.find((x) => !x.refused && x.path);
       if (!e) return { note: ZOTERO_WEB_FILE_NOTES.failed };
       // Zotero's MD5 is of the file itself, so it is checked after unpacking.
@@ -402,6 +403,11 @@ class ZoteroApi {
       await fsp.rm(target, { force: true });
     }
   }
+}
+
+/** A download's folder and file name, by the platform's path rules (Windows separators included). */
+export function splitDownloadPath(dest: string, p: Pick<typeof nodePath, "dirname" | "basename"> = nodePath): { dir: string; name: string } {
+  return { dir: p.dirname(dest), name: p.basename(dest) };
 }
 
 /** A file name from Zotero that is safe as one path segment. */

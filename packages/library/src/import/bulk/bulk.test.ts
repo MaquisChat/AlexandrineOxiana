@@ -8,7 +8,7 @@ import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AuditEvent, Project, SourceDraft } from "@ao/core";
 import { FIXTURE_DOI, buildCameraTiff, buildImportFolder, buildPdf, buildZip, type ImportFolderFixture } from "../../../../../tests/fixtures/generate.mjs";
-import { LOCATION_REASON } from "../attach.js";
+import { LOCATION_REASON, createAttach } from "../attach.js";
 import { KeyRing } from "../../crypto/keys.js";
 import type { Deps } from "../../deps.js";
 import { shutdownExtractors } from "../../extract/index.js";
@@ -1107,4 +1107,37 @@ describe("review round 2 (R63)", () => {
     expect(rec.counts.skipped).toBe(report.counts.duplicates);
     expect(report.counts.needsReview).toBe(report.pendingReview.length);
   });
+});
+
+describe("review round 2 (R82): stores from attach and Bulk Import share the project's queue", () => {
+  it("a batch holding a.pdf while attachFiles stores the same file: one source, one duplicate", async () => {
+    const p = await project();
+    const dir = join(tmp, "Race");
+    await mkdir(dir, { recursive: true });
+    const pdf = await buildPdf({ title: "Racing the Queue", author: "Ada Lovelace", extra: "race" });
+    await writeFile(join(dir, "a.pdf"), pdf);
+    await writeFile(join(dir, "dropped.pdf"), pdf);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let yielded!: () => void;
+    const firstOut = new Promise<void>((r) => (yielded = r));
+    const adapter: ImportSourceAdapter = {
+      kind: "folder",
+      location: dir,
+      async *scan() {
+        yield { key: "a.pdf", files: [{ path: join(dir, "a.pdf"), mime: "application/pdf", bytes: pdf.length }] };
+        yielded();
+        await held; // a.pdf is checked and queued in the batch's group, not stored yet
+      },
+    };
+    const h = await bulk.startBatch(p.id, adapter);
+    await firstOut;
+    await new Promise((r) => setTimeout(r, 200));
+    const [dropped] = await createAttach({ repo, http }).attachFiles(p.id, [join(dir, "dropped.pdf")]);
+    expect(dropped!.outcome).toMatch(/created|needs-review/u);
+    release();
+    const r = await h.done;
+    expect(r.counts).toMatchObject({ duplicates: 1, created: 0, needsReview: 0 });
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  }, 30_000);
 });

@@ -87,3 +87,17 @@ describe("parseBibtex", () => {
     ]);
   });
 });
+
+describe("review round 2 (R82): sidecar tables never reach Object.prototype", () => {
+  it("@constructor, TY constructor and CSL type constructor are 'other'", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ao-sidecar-proto-"));
+    try {
+      await writeFile(join(dir, "a.bib"), "@constructor{k, title = {T}}\n");
+      await writeFile(join(dir, "b.ris"), "TY  - constructor\nTI  - T\nER  - \n");
+      await writeFile(join(dir, "c.json"), JSON.stringify([{ type: "constructor", title: "T" }]));
+      for (const f of ["a.bib", "b.ris", "c.json"]) expect((await readSidecar(join(dir, f)))?.type).toBe("other");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

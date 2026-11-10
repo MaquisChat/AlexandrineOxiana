@@ -77,7 +77,7 @@ import { acceptedType } from "../attach.js";
 import { MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs } from "../common.js";
 import { LOCATED_MEDIA, mayHaveLocation, resolveItem, type Resolution } from "../resolve.js";
 import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
-import { serialStore } from "../project-queue.js";
+import { serialStore, storeTurn } from "../project-queue.js";
 import { findSidecars } from "../sidecar.js";
 import {
   BOOKKEEPING,
@@ -1001,12 +1001,60 @@ class Run {
     return serialStore(this.repo, this.projectId, () => this.flushInner());
   }
 
+  /** The project queue turn of this run's last store. */
+  private lastOwnTurn = -1;
+
+  /**
+   * Inside a store turn: whether anyone else (attach, a watched folder, another batch) stored in
+   * this project since this run's previous turn, so items checked before then must be checked again
+   * against the live index (R82).
+   */
+  private othersStored(): boolean {
+    const t = storeTurn(this.repo, this.projectId);
+    if (t === this.lastOwnTurn) return false; // the same (re-entered) turn
+    const other = t !== this.lastOwnTurn + 1;
+    this.lastOwnTurn = t;
+    return other;
+  }
+
+  /**
+   * An item checked before another store ran, checked again in this turn against the live index:
+   * its file (or a certain DOI/ISBN match) is now in the project → its outcome as in `importItem`,
+   * else null (store it as planned).
+   */
+  private async recheck(q: Queued, dedupe: BatchDedupe): Promise<JournalEntry | null> {
+    const sha = q.prep.shas[0];
+    const same = sha ? dedupe.storedBySha(sha) : undefined;
+    if (same) return this.queue({ key: q.item.key, outcome: "duplicate", sourceId: same, reason: REASONS.duplicateFile });
+    const key = candidateKey(q.r, q.prep.shas);
+    const dup = findDuplicate(key, dedupe.candidates(key).filter((e) => !isPlaceholder(e.sourceId)));
+    if (dup?.certainty !== "certain") return null;
+    if (dup.reason === "same-file") return this.queue({ key: q.item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateFile });
+    const how = this.rec.options.duplicates;
+    if (how === "skip") return this.queue({ key: q.item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateId });
+    if (how === "merge") return this.merge(q.item, dup.sourceId, q.r, q.prep, CAPTURE_METHOD[this.rec.source.kind], dedupe);
+    return null;
+  }
+
   private async flushInner(): Promise<void> {
-    const queued = this.group;
+    let queued = this.group;
     if (!queued.length) return;
     if (this.adapter.incremental) await this.refreshDeleted();
     this.group = [];
     const dedupe = this.dedupe!;
+    if (this.othersStored()) {
+      const still: Queued[] = [];
+      for (const q of queued) {
+        dedupe.dropPending([q.placeholder]); // its own placeholder must not match itself
+        const e = await this.recheck(q, dedupe);
+        if (e) this.latest.set(q.item.key, e);
+        else {
+          dedupe.addPending(q.placeholder, candidateKey(q.r, q.prep.shas));
+          still.push(q);
+        }
+      }
+      queued = still;
+    }
     const group: Queued[] = [];
     for (const q of queued) {
       const v = await this.revalidate(q.item, q.inputs);
@@ -1075,6 +1123,10 @@ class Run {
   }
 
   private async createOneInner(q: Queued, dedupe: BatchDedupe): Promise<JournalEntry> {
+    if (this.othersStored()) {
+      const e = await this.recheck(q, dedupe);
+      if (e) return e;
+    }
     const v = await this.revalidate(q.item, q.inputs);
     if (v.fail) return this.queue({ key: q.item.key, outcome: "failed", reason: REASONS.changed });
     const { item, r, draft, provenance, reviewItem } = q;

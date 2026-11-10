@@ -149,6 +149,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let realRoot = root;
   /** SHA-256 of every file already in the project (read when first needed, kept up to date). */
   let known: Set<string> | null = null;
+  /**
+   * Files handled in this session by real path, with the size and modification time they had then:
+   * an unchanged file is not hashed again by a scan, and one that failed is not retried (nor
+   * reported again) until its size or modification time changes.
+   */
+  const handled = new Map<string, { size: number; mtimeMs: number; failed: boolean }>();
+  const note = (real: string, st: { size: number; mtimeMs: number }, failed: boolean) => handled.set(real, { size: st.size, mtimeMs: st.mtimeMs, failed });
   const relName = (p: string) => relative(root, p).split(sep).join("/");
   const libraryGone = () => isClosed(deps.lib) || deps.lib.mode !== "read-write";
   const projectLocked = () => projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId);
@@ -200,10 +207,16 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         return;
       }
       if (!st.isFile()) return;
+      const before = handled.get(real);
+      if (before && before.size === st.size && before.mtimeMs === st.mtimeMs && (quiet || before.failed)) return;
       const sha = await sha256Of(real);
-      if (quiet && (await knownHashes()).has(sha)) return;
+      if (quiet && (await knownHashes()).has(sha)) {
+        note(real, st, false);
+        return;
+      }
       const [o] = await attach.attachFiles(projectId, [real]);
       if (!o) return;
+      note(real, st, o.outcome === "failed");
       if (o.outcome !== "failed") (await knownHashes()).add(sha);
       emit({
         kind: o.outcome === "failed" ? "failed" : "imported",
@@ -222,8 +235,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     queue = queue.then(() => importOne(path, quiet));
   };
 
-  /** Queues every file in the folder (quietly: what is already in the project is skipped). */
+  /** Queues every file in the folder (quietly: what is already in the project is skipped), 100 at a time. */
   async function scanFolder(): Promise<void> {
+    let n = 0;
     const walk = async (d: string, depth: number): Promise<void> => {
       const entries = await fsp.readdir(d, { withFileTypes: true }).catch(() => []);
       for (const e of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
@@ -231,10 +245,25 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         const p = join(d, e.name);
         if (e.isDirectory()) {
           if (opts.recursive && depth < MAX_DEPTH) await walk(p, depth + 1);
-        } else if (e.isFile() || e.isSymbolicLink()) enqueue(p, true);
+        } else if (e.isFile() || e.isSymbolicLink()) {
+          enqueue(p, true);
+          if (++n % 100 === 0) await queue; // never more than a chunk waiting in memory
+          if (stopped || removed) return;
+        }
       }
     };
     await walk(root, 0);
+  }
+
+  /** The folder's checks (at start and on every resume): real path, a folder, apart from the library. Null when fine. */
+  async function checkRoot(): Promise<string | null> {
+    try {
+      realRoot = await fsp.realpath(root);
+      if (!(await fsp.stat(realRoot)).isDirectory()) return WATCH_REASONS.watchFailed;
+    } catch {
+      return WATCH_REASONS.watchFailed;
+    }
+    return (await overlapsLibrary(realRoot, deps.lib)) ? WATCH_REASONS.library : null;
   }
 
   let stopping: Promise<void> | undefined;
@@ -289,8 +318,13 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         await w?.close().catch(() => {});
         emit({ kind: "stopped", reason: WATCH_REASONS.removed });
       } else if (removed && present) {
+        // What came back may not be the folder that went away (e.g. a link into the library): checked again.
+        const bad = await checkRoot();
+        if (bad) {
+          await stopWith(bad);
+          return;
+        }
         removed = false;
-        realRoot = await fsp.realpath(root).catch(() => root);
         await startWatcher();
         emit({ kind: "resumed" });
         await scanFolder();
@@ -309,17 +343,9 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   timer.unref?.();
 
   const ready = (async () => {
-    try {
-      realRoot = await fsp.realpath(root);
-      const st = await fsp.stat(realRoot);
-      if (!st.isDirectory()) throw new Error("not a folder");
-    } catch {
-      emit({ kind: "error", reason: WATCH_REASONS.watchFailed });
-      await stopWith();
-      return;
-    }
-    if (await overlapsLibrary(realRoot, deps.lib)) {
-      emit({ kind: "error", reason: WATCH_REASONS.library });
+    const bad = await checkRoot();
+    if (bad) {
+      emit({ kind: "error", reason: bad });
       await stopWith();
       return;
     }

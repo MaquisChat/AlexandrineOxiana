@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockAgent } from "undici";
@@ -211,6 +211,37 @@ describe("watchFolder (review round 1, R81)", () => {
     await sleep(300);
     await writeFile(join(inbox, "back.pdf"), await buildPdf({ title: "Back again", extra: "back" }));
     await until(() => events.some((e) => e.kind === "imported" && e.file === "back.pdf"));
+  });
+
+  it("review round 2 (R82): on resume the folder is checked again (a link swapped in pointing into the library stops the watch)", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await rm(inbox, { recursive: true });
+    await until(() => events.some((e) => e.kind === "stopped"));
+    await symlink(join(lib.root, "Projects"), inbox);
+    await until(() => w.stopped);
+    expect(events.at(-1)).toMatchObject({ kind: "stopped", reason: WATCH_REASONS.library });
+    expect(events.some((e) => e.kind === "resumed")).toBe(false);
+    await rm(inbox);
+    await writeFile(inbox, "now a file");
+  });
+
+  it("review round 2: a rescan does not report a failed file again until it changes", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await writeFile(join(inbox, "notes.txt"), "plain text");
+    await until(() => events.some((e) => e.file === "notes.txt"));
+    // The folder goes away and comes back with the same file: resumed and rescanned, no second report.
+    await rename(inbox, `${inbox}-away`);
+    await until(() => events.some((e) => e.kind === "stopped"));
+    await rename(`${inbox}-away`, inbox);
+    await until(() => events.some((e) => e.kind === "resumed"));
+    await sleep(800);
+    expect(events.filter((e) => e.file === "notes.txt")).toHaveLength(1);
+    await writeFile(join(inbox, "notes.txt"), "changed text, still not a source");
+    await until(() => events.filter((e) => e.file === "notes.txt").length === 2);
   });
 
   it("one per-project queue: the same PDF arriving in two watched folders gives one source and one duplicate", async () => {

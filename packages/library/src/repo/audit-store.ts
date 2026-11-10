@@ -25,6 +25,8 @@ export interface IntegrityWarning {
     | "chain-broken"
     | "head-mismatch"
     | "truncated"
+    | "empty"
+    | "anchor-missing"
     | "anchors-unreadable"
     | "rolled-back-incomplete-write"
     | "invalid-txn-marker"
@@ -145,16 +147,36 @@ export class AuditStore {
   }
 }
 
-/** Compares a project's log with its recorded anchor. `null` means consistent (or nothing to compare). */
+export type AnchorProblemKind = "chain-broken" | "head-mismatch" | "truncated" | "empty" | "anchor-missing";
+
+/**
+ * Compares a project's log with its recorded anchor. `null` means consistent (or nothing to compare).
+ *
+ * R82: a log with no events is never valid (every project's log starts with its creation). With no
+ * anchor for the project on this computer, a log holding any event written by this device
+ * (`deviceId`) is 'anchor-missing': this computer anchored it before, so the anchor was removed or
+ * lost and a truncation could hide behind it. A log this device never wrote to has nothing to be
+ * compared with here (unverified, not a problem).
+ *
+ * Known limit: rolling the anchors file back to an older head together with a matching truncation
+ * of the log is not detectable (no anchor history is kept).
+ */
 export function checkAnchor(
   events: Array<AuditEvent | null>,
   verify: AuditVerifyResult,
   anchor: Head | undefined,
-): { kind: "chain-broken" | "head-mismatch" | "truncated"; detail: string } | null {
+  deviceId?: string,
+): { kind: AnchorProblemKind; detail: string } | null {
   if (!verify.ok) {
     return { kind: "chain-broken", detail: `audit chain breaks at event ${verify.brokenAt + 1} (${verify.reason}); the audit log changed outside the app` };
   }
-  if (!anchor) return null;
+  if (events.length === 0) return { kind: "empty", detail: "the audit log is empty; the audit log changed outside the app" };
+  if (!anchor) {
+    if (deviceId !== undefined && events.some((e) => e?.device === deviceId)) {
+      return { kind: "anchor-missing", detail: "this computer wrote to the audit log but its record of the log's head is missing; the audit log may have changed outside the app" };
+    }
+    return null;
+  }
   const seq = verify.head?.seq ?? 0;
   if (seq < anchor.seq) {
     return { kind: "truncated", detail: `audit log ends at event ${seq} but event ${anchor.seq} was recorded; the audit log changed outside the app` };

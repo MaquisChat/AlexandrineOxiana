@@ -22,6 +22,7 @@ import {
   ZOTERO_STORAGE_HOSTS,
   ZOTERO_WEB_FILE_NOTES,
   ZOTERO_WEB_REASONS,
+  splitDownloadPath,
   startZoteroWebImport,
   zoteroWebAdapter,
   zoteroWebSince,
@@ -162,6 +163,17 @@ describe("secrets", () => {
     }
     // @ts-expect-error unknown names are refused
     await expect(getSecret("something-else")).rejects.toThrow(TypeError);
+  });
+});
+
+describe("download paths (R82)", () => {
+  it("splits Windows paths with the platform's path rules, not on '/'", async () => {
+    const { win32, posix } = await import("node:path");
+    expect(splitDownloadPath("C:\\Users\\me\\Lib\\.tmp\\batch-1\\zotero-web\\ABCD1234\\paper.pdf", win32)).toEqual({
+      dir: "C:\\Users\\me\\Lib\\.tmp\\batch-1\\zotero-web\\ABCD1234",
+      name: "paper.pdf",
+    });
+    expect(splitDownloadPath("/lib/.tmp/zotero-web/K/a.pdf", posix)).toEqual({ dir: "/lib/.tmp/zotero-web/K", name: "a.pdf" });
   });
 });
 

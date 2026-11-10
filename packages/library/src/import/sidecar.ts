@@ -15,6 +15,8 @@ const MAX_SIDECAR_BYTES = 1024 * 1024;
 /** Each field is cut to this many characters before anything else looks at it (R55). */
 export const MAX_FIELD_CHARS = 2000;
 const cap = (s: string) => s.slice(0, MAX_FIELD_CHARS);
+/** A table lookup that never reaches Object.prototype. */
+const own = <T>(table: Readonly<Record<string, T>>, key: string): T | undefined => (Object.hasOwn(table, key) ? table[key] : undefined);
 
 /** `s` without trailing `ch` characters, scanned from the end (no backtracking regex). */
 function trimEnd(s: string, ch: string): string {
@@ -111,7 +113,7 @@ export function parseRis(text: string): SidecarMetadata {
     const v = clean(cap(line.slice(6)));
     if (tag === "ER") break;
     if (!v) continue;
-    if (tag === "TY") m.type ??= RIS_TYPES[v.toUpperCase()] ?? "other";
+    if (tag === "TY") m.type ??= own(RIS_TYPES, v.toUpperCase()) ?? "other";
     else if ((tag === "TI" || tag === "T1") && !m.title) m.title = v;
     else if (tag === "AU" || tag === "A1") {
       const c = parseName(v);
@@ -218,7 +220,7 @@ export function parseBibtex(text: string): SidecarMetadata {
     }
     if (name && !fields.has(name)) fields.set(name, clean(cap(value).replace(/[{}]/gu, "")));
   }
-  const m: SidecarMetadata = { type: BIB_TYPES[kind] ?? "other" };
+  const m: SidecarMetadata = { type: own(BIB_TYPES, kind) ?? "other" };
   const get = (k: string) => fields.get(k) || undefined;
   if (get("title")) m.title = get("title");
   const people = (k: string, role: Creator["role"]) =>
@@ -251,7 +253,7 @@ export function parseCslJson(text: string): SidecarMetadata {
   if (!item || typeof item !== "object") return {};
   const s = (k: string) => (typeof item[k] === "string" && clean(cap(item[k] as string)) ? clean(cap(item[k] as string)) : undefined);
   const m: SidecarMetadata = {};
-  if (typeof item.type === "string") m.type = CSL_TYPES[item.type] ?? "other";
+  if (typeof item.type === "string") m.type = own(CSL_TYPES, item.type) ?? "other";
   if (s("title")) m.title = s("title");
   const people = (k: string, role: Creator["role"]): Creator[] =>
     (Array.isArray(item[k]) ? (item[k] as Array<Record<string, unknown>>) : []).flatMap((p): Creator[] => {
