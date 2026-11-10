@@ -6,10 +6,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
+import { DEFAULT_GOVERNANCE, parseGovernanceWithWarnings } from "@ao/core";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import { shutdownExtractors } from "../extract/index.js";
+import { setExifReaderForTests } from "../extract/exif.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient, lookupContextFor } from "../lookup/index.js";
@@ -18,7 +20,7 @@ import { kindFor, mimeFor, openLine } from "../repo/io.js";
 import type { Repo } from "../repo/repo.js";
 import { projectDataKey } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
-import { ACCEPTED_EXTENSIONS, createAttach, type Attach } from "./attach.js";
+import { ACCEPTED_EXTENSIONS, LOCATION_REASON, createAttach, type Attach } from "./attach.js";
 import { AUTO_ACCEPT_THRESHOLD, resolveItem } from "./resolve.js";
 
 const FAST = 2 ** 10;
@@ -467,15 +469,19 @@ describe("resolveItem", () => {
     agent.assertNoPendingInterceptors();
   });
 
-  it("identifier+lookup scores 0.97 when no local title evidence exists", async () => {
+  it("with no local title, a grounded text identifier is still only a hint: capped at 0.6, no DOI (R57)", async () => {
     const p = await project();
     const lookup = await lookupContextFor(repo, p.id, http);
     crossref().intercept({ path: `/works/${MISMATCH_DOI}`, method: "GET" }).reply(200, crossrefFor(MISMATCH_DOI), JSON_HEADERS).times(1);
     const path = await put("scan0002.pdf", await buildPdf({ lines: ["Rivers and Memory in Upland Villages", "Amara Okafor and Henrik Lindqvist", `doi:${MISMATCH_DOI}`] }));
     const r = await resolveItem({ path, mime: "application/pdf" }, { projectId: p.id, patterns: [], lookup });
     expect(r.evidence.method).toBe("identifier+lookup");
-    expect(r.confidence).toBe(0.97);
-    expect(r.draft.identifiers.doi).toBe(MISMATCH_DOI);
+    expect(r.confidence).toBeLessThanOrEqual(0.6);
+    expect(r.draft.identifiers.doi).toBeUndefined();
+    expect(r.identifierHints).toEqual([`doi:${MISMATCH_DOI}`]);
+    // The lookup's values are still offered for review.
+    expect(r.draft.title.variants[0]!.value).toBe("Rivers and Memory in Upland Villages");
+    expect(r.candidates[0]).toMatchObject({ provider: "crossref" });
   });
 });
 
@@ -698,5 +704,127 @@ processing:
     expect(["created", "needs-review"]).toContain(r!.outcome);
     const sf = await repo.getSource(p.id, r!.sourceId!);
     expect(sf.assets[0]!.encrypted).toBe(true);
+  });
+});
+
+describe("review round 2 (R57)", () => {
+  const scan0008 = () =>
+    buildPdf({ lines: ["Minutes of the reading group.", `Background reading: Rivers and Memory in Upland Villages doi:${FIXTURE_DOI}`] });
+
+  it("C1: scan0008 (no metadata, cites a DOI whose title is in its text) → review, no DOI, in an empty project", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, JSON.stringify({ results: [] }), JSON_HEADERS).persist();
+    const [r] = await attach.attachFiles(p.id, [await put("scan0008.pdf", await scan0008())]);
+    expect(r!.outcome).toBe("needs-review");
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.identifiers.doi).toBeUndefined();
+    expect(sf.source.provenance.identification!.confidence).toBeLessThanOrEqual(0.6);
+    const entry = (await reviewEntries(p.id, p.folder)).find((e) => e.sourceId === r!.sourceId)!;
+    expect(entry.hints).toContain(`doi:${FIXTURE_DOI}`);
+  });
+
+  it("C1: scan0008 in a project already holding doi-article.pdf is never its duplicate", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, JSON.stringify({ results: [] }), JSON_HEADERS).persist();
+    const [first] = await attach.attachFiles(p.id, [await put("doi-article.pdf", await buildDoiPdf())]);
+    expect(first!.outcome).toBe("created");
+    const [r] = await attach.attachFiles(p.id, [await put("scan0008.pdf", await scan0008())]);
+    expect(r!.outcome).toBe("needs-review");
+    expect(r!.sourceId).not.toBe(first!.sourceId);
+    expect((await repo.getSource(p.id, r!.sourceId!)).source.identifiers.doi).toBeUndefined();
+  });
+
+  it("C1: a file named after a work gets no DOI from the title search (step 5)", async () => {
+    const p = await project();
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, fixture("openalex-search.json"), JSON_HEADERS).persist();
+    const path = await put("Okafor - 2021 - Rivers and Memory in Upland Villages.pdf", await buildPdf({ lines: ["Scanned pages without a usable text layer title."] }));
+    const [r] = await attach.attachFiles(p.id, [path]);
+    expect(r!.outcome).toBe("needs-review");
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.provenance.identification!.method).toBe("filename+lookup");
+    expect(sf.source.identifiers.doi).toBeUndefined();
+    expect(sf.source.identifiers.isbn).toBeUndefined();
+  });
+
+  it("I2: when exiftool cannot read a photo, it is treated as having location data (fail closed)", async () => {
+    const p = await project(
+      `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+sharing:
+  locationMetadata: coarsen
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`,
+      true,
+    );
+    const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    setExifReaderForTests(() => Promise.reject(new Error("spawn exiftool ENOENT")));
+    try {
+      const png = await put("photo.png", tinyPng());
+      expect(await attach.attachFiles(p.id, [png])).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
+      expect(await attach.attachFiles(p.id, [png], { toSourceId: made!.sourceId! })).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
+    } finally {
+      setExifReaderForTests(undefined);
+    }
+    expect(repo.listSourceIds(p.id)).toEqual([made!.sourceId]);
+  });
+
+  it("I3: audio and video types outside the list are accepted by MIME prefix (oga, mts)", async () => {
+    const p = await project(`${NO_LOOKUP_GOV}sharing:
+  locationMetadata: keep
+`);
+    const oga = Buffer.alloc(64);
+    oga.write("OggS", 0);
+    Buffer.from([0x7f, 0x46, 0x4c, 0x41, 0x43]).copy(oga, 28);
+    const mts = Buffer.alloc(188 * 3);
+    mts[0] = mts[188] = mts[376] = 0x47;
+    const out = await attach.attachFiles(p.id, [await put("song.bin", oga), await put("clip.bin", mts)]);
+    expect(out.map((o) => o.outcome).every((o) => o === "created" || o === "needs-review")).toBe(true);
+    const a = (await repo.getSource(p.id, out[0]!.sourceId!)).assets[0]!;
+    const v = (await repo.getSource(p.id, out[1]!.sourceId!)).assets[0]!;
+    expect([a.kind, a.mime, a.path.endsWith(".oga")]).toEqual(["audio", "audio/ogg", true]);
+    expect([v.kind, v.mime, v.path.endsWith(".mts")]).toEqual(["video", "video/mp2t", true]);
+  });
+
+  it("I3: the MIME table knows the further audio, video and image types", () => {
+    const cases: Array<[string, string, string]> = [
+      ["oga", "audio/ogg", "audio"], ["ogv", "video/ogg", "video"], ["spx", "audio/ogg", "audio"], ["aif", "audio/aiff", "audio"],
+      ["amr", "audio/amr", "audio"], ["m4b", "audio/mp4", "audio"], ["mts", "video/mp2t", "video"], ["asf", "video/x-ms-asf", "video"],
+      ["3g2", "video/3gpp2", "video"], ["flv", "video/x-flv", "video"], ["apng", "image/apng", "image"], ["jxl", "image/jxl", "image"],
+      ["mp2", "audio/mpeg", "audio"],
+    ];
+    for (const [ext, mime, kind] of cases) expect([ext, mimeFor(ext), kindFor(ext)]).toEqual([ext, mime, kind]);
+  });
+
+  it("M3: a legacy defaultLegalBasis.manual_upload is read as manual-upload, with a load warning", async () => {
+    const yaml = `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+consent:
+  requireLegalBasis: true
+  defaultLegalBasis:
+    manual_upload: "legitimate interest; legacy key"
+encryption:
+  atRest: optional
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`;
+    const { config, warnings } = parseGovernanceWithWarnings(yaml);
+    expect(config.consent.defaultLegalBasis["manual-upload"]).toBe("legitimate interest; legacy key");
+    expect(warnings.filter((w) => w.includes("manual_upload"))).toHaveLength(1);
+    expect(DEFAULT_GOVERNANCE.consent.defaultLegalBasis).toEqual({});
+    const p = await project(yaml);
+    const notes: string[] = [];
+    const noting = createAttach({ repo, http, debug: (n) => notes.push(n) });
+    const [r] = await noting.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    expect((await repo.getSource(p.id, r!.sourceId!)).source.provenance.legal.basis).toBe("legitimate interest; legacy key");
+    await noting.attachFiles(p.id, [await put("other slides.pdf", await buildPdf({ title: "Other Slides", lines: ["Other Slides"] }))]);
+    expect(notes.filter((n) => n.includes("manual_upload"))).toHaveLength(1);
   });
 });

@@ -136,12 +136,17 @@ const BIB_TYPES: Record<string, SourceType> = {
 };
 
 /** The first `@type{key, field = {value} | "value" | number, ...}` entry, braces balanced by counting. */
-/** Index just past the brace (or parenthesis) block opening at `open`, counting nesting; text.length if unclosed. */
+/**
+ * Index just past the brace (or parenthesis) block opening at `open`, counting nesting. A block
+ * that does not balance before a line starting with "@" ends there (an unbalanced @comment or a
+ * quoted brace in @string must not swallow the entries after it); text.length if unclosed.
+ */
 function blockEnd(text: string, open: number): number {
   const o = text[open]!;
   const c = o === "(" ? ")" : "}";
   let depth = 0;
   for (let i = open; i < text.length; i++) {
+    if (text[i] === "\n" && text[i + 1] === "@") return i + 1;
     if (text[i] === o) depth++;
     else if (text[i] === c && --depth === 0) return i + 1;
   }

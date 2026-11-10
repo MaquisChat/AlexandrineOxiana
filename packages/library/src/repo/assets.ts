@@ -1,7 +1,7 @@
 /** Derived assets: new dated files under `derived/`, never overwriting (spec 4.2). */
 import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix, type Provenance } from "@ao/core";
 import { foldName, mimeFor, namesIn } from "./io.js";
-import { runMutation, type MutateOptions, type MutateRequest } from "./mutate.js";
+import { runMutation, type RefuseHook, type MutateRequest } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
 import type { RepoCore } from "./state.js";
 
@@ -24,6 +24,8 @@ export interface OriginalAssetInput {
   fromPath: string;
   kind: string;
   ext: string;
+  /** MIME type, e.g. the sniffed one (default: from the extension). */
+  mime?: string;
   /** Distinguishes the file name from the source's other originals, e.g. "platform-metadata 2026-11-10 0930". */
   label: string;
   fromEncrypted?: boolean;
@@ -107,7 +109,7 @@ export async function addOriginalAsset(
   sourceId: string,
   input: OriginalAssetInput,
   /** Package-internal: a newly captured file (e.g. a drop onto the source): its capture method is evaluated and audited in the same change. */
-  internal: { captureMethod?: Provenance["captureMethod"]; hasLocation?: boolean; refuse?: MutateOptions["refuse"] } = {},
+  internal: { captureMethod?: Provenance["captureMethod"]; hasLocation?: boolean; refuse?: RefuseHook } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -149,7 +151,7 @@ export async function addOriginalAsset(
         encrypted: tx.encrypted,
         sha256,
         bytes,
-        mime: mimeFor(ext),
+        mime: input.mime ?? mimeFor(ext),
         ...(input.metadata ? { metadata: input.metadata } : {}),
       });
       tx.entity("asset", asset.id);

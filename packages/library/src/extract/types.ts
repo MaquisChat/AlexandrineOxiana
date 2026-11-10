@@ -23,6 +23,8 @@ export interface MediaMetadata {
   durationSec?: number;
   width?: number;
   height?: number;
+  /** exiftool could not read the file: nothing is known, in particular not whether it has GPS. */
+  readFailed?: boolean;
   /** Apple Live Photo pairing id (MakerNotes / QuickTime com.apple.quicktime.content.identifier). */
   contentIdentifier?: string;
 }

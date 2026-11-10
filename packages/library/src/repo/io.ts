@@ -264,6 +264,21 @@ const MIME: Record<string, string> = {
   flac: "audio/flac",
   aac: "audio/aac",
   opus: "audio/opus",
+  oga: "audio/ogg",
+  ogv: "video/ogg",
+  spx: "audio/ogg",
+  aif: "audio/aiff",
+  aiff: "audio/aiff",
+  amr: "audio/amr",
+  m4b: "audio/mp4",
+  mp2: "audio/mpeg",
+  mts: "video/mp2t",
+  m2ts: "video/mp2t",
+  asf: "video/x-ms-asf",
+  "3g2": "video/3gpp2",
+  flv: "video/x-flv",
+  apng: "image/apng",
+  jxl: "image/jxl",
 };
 
 export function mimeFor(ext: string): string {

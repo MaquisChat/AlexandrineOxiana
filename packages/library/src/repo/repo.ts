@@ -22,7 +22,7 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
-import { authorizeOnly, runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
+import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { createProject, isUnlocked, lockProject, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
   createSource,
@@ -81,7 +81,9 @@ export class Repo {
 
   /** The governed write path; see mutate.ts for the ordering guarantees. */
   mutate<T>(projectId: string, req: MutateRequest | MutateRequest[], fn: (tx: Tx) => Promise<T>, opts?: MutateOptions): Promise<T> {
-    return runMutation(this.core, projectId, req, fn, opts);
+    // Only the public options pass: package-internal ones (a refuse hook) are dropped.
+    const pub: MutateOptions = { ...(opts?.op !== undefined ? { op: opts.op } : {}), ...(opts?.entity ? { entity: opts.entity } : {}) };
+    return runMutation(this.core, projectId, req, fn, pub);
   }
 
   createSource(projectId: string, draft: SourceDraft, files: SourceInputFile[], opts: CreateSourceOptions): Promise<SourceFile> {
@@ -472,13 +474,26 @@ export function addCapturedOriginal(
   sourceId: string,
   input: OriginalAssetInput,
   captureMethod: Provenance["captureMethod"],
-  opts: { hasLocation?: boolean; refuse?: MutateOptions["refuse"] } = {},
+  opts: { hasLocation?: boolean; refuse?: RefuseHook } = {},
 ): Promise<Asset> {
   return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, {
     captureMethod,
     hasLocation: opts.hasLocation === true,
     ...(opts.refuse ? { refuse: opts.refuse } : {}),
   });
+}
+
+/** Package-internal: `Repo.mutate` with a refuse hook (see RefuseHook). */
+export function mutateRefusing<T>(
+  repo: Repo,
+  projectId: string,
+  req: MutateRequest | MutateRequest[],
+  fn: (tx: Tx) => Promise<T>,
+  opts: MutateOptions,
+  refuse: RefuseHook,
+): Promise<T> {
+  const internal: InternalMutateOptions = { ...opts, refuse };
+  return runMutation(cores.get(repo)!, projectId, req, fn, internal);
 }
 
 /**
@@ -492,7 +507,7 @@ export function createSourceRefusing(
   draft: SourceDraft,
   files: SourceInputFile[],
   opts: CreateSourceOptions,
-  refuse: NonNullable<MutateOptions["refuse"]>,
+  refuse: RefuseHook,
 ): Promise<SourceFile> {
   return createSource(cores.get(repo)!, projectId, draft, files, opts, { refuse });
 }

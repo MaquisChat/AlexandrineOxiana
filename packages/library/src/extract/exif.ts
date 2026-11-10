@@ -122,11 +122,23 @@ export function mediaFromTags(t: Partial<Tags> & Record<string, unknown>): Media
   return m;
 }
 
+type ExifReader = (path: string) => Promise<unknown>;
+let readerOverride: ExifReader | undefined;
+
+/** Test-only (not exported from the package): replaces the exiftool read, e.g. to make it fail. */
+export function setExifReaderForTests(reader: ExifReader | undefined): void {
+  readerOverride = reader;
+}
+
+/**
+ * A file exiftool could not read (error, timeout, helper failed to start) is reported as
+ * `media: { readFailed: true }`, never as "no GPS": callers treat it as possibly located (R57).
+ */
 export async function extractExif(path: string): Promise<RawExtract> {
   try {
-    const tags = await exiftool().read(path);
+    const tags = await (readerOverride ?? ((p: string) => exiftool().read(p)))(path);
     return { media: mediaFromTags(tags as Partial<Tags> & Record<string, unknown>) };
   } catch {
-    return { media: {} };
+    return { media: { readFailed: true } };
   }
 }

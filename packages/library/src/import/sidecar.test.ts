@@ -56,6 +56,12 @@ describe("sidecar parsing is linear (R55-3)", () => {
 });
 
 describe("parseBibtex", () => {
+  it("an unbalanced @comment or @string block ends at the next line starting with @ (R57 M2)", () => {
+    expect(parseBibtex("@comment(unbalanced ( here)\n@article{k,title={Good}}").title).toBe("Good");
+    expect(parseBibtex('@string{x = "a } quoted"\n@article{k,title={Good}}').title).toBe("Good");
+    expect(parseBibtex("@comment{never closed\n@book{k, title = {Also good}}").title).toBe("Also good");
+  });
+
   it("skips @string, @comment and @preamble blocks and reads the first real entry", () => {
     const m = parseBibtex(`@string{jcs = {Journal of Craft Studies}}
 @comment{ exported by a tool, title = {Not this} }

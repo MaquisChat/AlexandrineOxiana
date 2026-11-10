@@ -292,8 +292,19 @@ export function parseGovernanceWithWarnings(yamlText: string): { config: Governa
   }
   if (issues.length) throw new GovernanceParseError(`governance.yaml is invalid:\n${issues.join("\n")}`, issues);
   const known = new Set(leafPaths(DEFAULT_GOVERNANCE));
-  const warnings = cfg.exceptions
+  const legacy: string[] = [];
+  // The drag-and-drop category was first spelled `manual_upload`; it is `manual-upload` now (R57).
+  const bases = cfg.consent.defaultLegalBasis;
+  if (Object.prototype.hasOwnProperty.call(bases, "manual_upload")) {
+    if (!Object.prototype.hasOwnProperty.call(bases, "manual-upload")) {
+      cfg.consent.defaultLegalBasis = { ...bases, "manual-upload": bases["manual_upload"]! };
+      legacy.push('consent.defaultLegalBasis.manual_upload: the category is now spelled "manual-upload"; the old key is read as it, please rename it');
+    } else {
+      legacy.push('consent.defaultLegalBasis.manual_upload: ignored, "manual-upload" is set (the old spelling of the same category)');
+    }
+  }
+  const warnings = [...legacy, ...cfg.exceptions
     .map((e, i) => (known.has(e.control) ? null : `exceptions.${i}.control: "${e.control}" is not a known control path; it waives nothing`))
-    .filter((w): w is string => w !== null);
+    .filter((w): w is string => w !== null)];
   return { config: cfg, warnings };
 }

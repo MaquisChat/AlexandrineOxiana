@@ -55,12 +55,50 @@ export interface MutateOptions {
   op?: string;
   /** Entity for the audit events, when known before `fn` runs (deny events). */
   entity?: { type: EntityType; id: string };
-  /**
-   * Package-internal: turns an allowed decision the caller cannot honour into a deny with the
-   * returned reason (audited and thrown like any deny, before anything is written). E.g. attach
-   * refuses media whose store carries a location condition until coarsening exists (R56).
-   */
-  refuse?: (d: PolicyDecision, req: PolicyRequest) => string | undefined;
+}
+
+/**
+ * Package-internal: turns an allowed decision the caller cannot honour into a deny with the returned
+ * reason, e.g. attach refusing media whose store carries a location condition until coarsening
+ * exists (R56). It receives frozen deep copies, so it cannot change the decision; a hook that
+ * throws is a deny too (fail closed). The deny is audited and thrown like any other, before
+ * anything is written.
+ */
+export type RefuseHook = (d: Readonly<PolicyDecision>, req: Readonly<PolicyRequest>) => string | undefined;
+
+/** Options of the package-internal write path; the public `Repo.mutate` takes only MutateOptions. */
+export interface InternalMutateOptions extends MutateOptions {
+  refuse?: RefuseHook;
+}
+
+export const REFUSED_GENERIC = "Refused by an internal check";
+
+function deepFreeze<T>(v: T): T {
+  if (v && typeof v === "object" && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    for (const x of Object.values(v as Record<string, unknown>)) deepFreeze(x);
+  }
+  return v;
+}
+
+/** A hook's error message without file paths (and short), or the generic reason. */
+function scrubbed(err: unknown): string {
+  const msg = err instanceof Error ? err.message : "";
+  const clean = msg
+    .slice(0, 300)
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s"'`]*/gu, "<path>")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return clean && clean !== "<path>" ? `${REFUSED_GENERIC}: ${clean}` : REFUSED_GENERIC;
+}
+
+function runRefuse(refuse: RefuseHook | undefined, d: PolicyDecision, req: PolicyRequest): string | undefined {
+  if (!refuse || d.result === "deny") return undefined;
+  try {
+    return refuse(deepFreeze(structuredClone(d)), deepFreeze(structuredClone(req)));
+  } catch (err) {
+    return scrubbed(err);
+  }
 }
 
 export interface FileOptions {
@@ -275,7 +313,7 @@ async function decide(
   at: string,
   op: string,
   entity: MutateOptions["entity"],
-  refuse?: MutateOptions["refuse"],
+  refuse?: RefuseHook,
 ): Promise<Array<{ req: PolicyRequest; d: PolicyDecision }>> {
   let cfg: ReturnType<typeof parseGovernance> | undefined;
   let cfgError: string | undefined;
@@ -288,7 +326,7 @@ async function decide(
   for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
     const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.tz };
     let d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
-    const refused = d.result !== "deny" ? refuse?.(d, req) : undefined;
+    const refused = runRefuse(refuse, d, req);
     if (refused) d = denyOf(refused, d.warnings);
     if (d.result === "deny") {
       await core.auditNow(st, {
@@ -315,7 +353,7 @@ export async function authorizeOnly(
   core: RepoCore,
   projectId: string,
   req: MutateRequest,
-  opts: MutateOptions & {
+  opts: InternalMutateOptions & {
     /** Also audit an allow, as this one event (the caller then skips re-evaluating the request when storing). */
     auditAllow?: { details: Record<string, unknown> };
   } = {},
@@ -347,7 +385,7 @@ export async function runMutation<T>(
   projectId: string,
   reqs: MutateRequest | MutateRequest[],
   fn: (tx: Tx) => Promise<T>,
-  opts: MutateOptions = {},
+  opts: InternalMutateOptions = {},
 ): Promise<T> {
   core.assertWritable();
   return core.serial(async () => {

@@ -22,8 +22,11 @@
  * at least one local title (reference, embedded, file name), when any exists. Otherwise the local
  * values stay in the draft, the lookup becomes a candidate, the confidence is 0.6 and `/title` is
  * a conflict: the item goes to review (a DOI in a PDF's first pages may well be a cited work's).
- * With no local title, the lookup's title must be found in the document text (`groundedIn`, as
- * verification does); a lookup with nothing of the file's own to back it is capped at 0.6.
+ * With no local title, an identifier found only in the file's text is never the item's own (R57):
+ * even when its work's title appears in the text (a citation names its title too), the lookup's
+ * values are only offered for review, without the identifier, and the confidence is capped at
+ * 0.6. A reference identifier with no reference title needs its work's title in the text.
+ * Title searches (steps 5 and 6) never give identifiers.
  *
  * R55: an identifier taken from the file is written to the draft (and so used for duplicate
  * detection) only when a lookup confirmed it as above. Unconfirmed ones are returned as
@@ -341,11 +344,13 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
             break;
           }
           conflict ??= hit;
-        } else if (docNorm && groundedIn(docNorm, normalizeTitle(r.title), "title")) {
+        } else if (id.trusted && docNorm && groundedIn(docNorm, normalizeTitle(r.title), "title")) {
+          // A reference identifier whose work's title is in the text.
           accepted = hit;
           break;
         } else {
-          // No title of the file's own, and the lookup's title is not in its text (or it has none).
+          // No title of the file's own (R57): a text-only identifier, even one whose work's title is
+          // in the text (a citation names its title too), is never the item's own: review.
           ungrounded ??= hit;
         }
       }
@@ -369,7 +374,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       });
     } else if (ungrounded) {
       // Nothing of the file's own backs the lookup: its values are offered for review, without its
-      // identifiers (unconfirmed), and the confidence is capped.
+      // identifiers (unconfirmed), and the confidence is capped at 0.6.
       const { doi: _d, isbn: _i, issn: _s, ...rest } = fromLookup(ungrounded.r);
       offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, { kind: "lookup", provider: ungrounded.r.provider }, true);
       confidence = CONFLICT_CONFIDENCE;
@@ -408,7 +413,9 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       const { best, sim } = await search(parsedName.title, parsedName.creator);
       if (best && sim >= AGREE) {
         const e: Evidence = { method: "filename+lookup", titleSimilarity: sim };
-        step(scoreConfidence(e), e, fromLookup(best), { kind: "lookup", provider: best.provider });
+        // A title search never names the item's identifiers (R57): they stay with the candidate.
+        const { doi: _d, isbn: _i, issn: _s, ...rest } = fromLookup(best);
+        step(scoreConfidence(e), e, rest, { kind: "lookup", provider: best.provider });
       }
     }
   }
@@ -481,8 +488,17 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     verification: report,
     titleConflict,
     identifierHints: hints.slice(0, 10),
-    hasLocation: !!extracted.media?.gps,
+    hasLocation: mayHaveLocation(input.mime, extracted),
   };
+}
+
+/**
+ * GPS found, or an image or video whose metadata could not be read: location governance must
+ * apply (fail closed, R57).
+ */
+export function mayHaveLocation(mime: string, extracted: Pick<Extracted, "media">): boolean {
+  if (extracted.media?.gps) return true;
+  return /^(?:image|video)\//u.test(mime) && extracted.media?.readFailed === true;
 }
 
 /** Reference fields resolution does not decide (collections, tags, case attributes ...). */

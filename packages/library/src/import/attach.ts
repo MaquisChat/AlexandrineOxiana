@@ -43,10 +43,10 @@ import { findDuplicate, primary, type DupKey, type FileNamePattern, type PolicyD
 import { UnsafeFileError, extractMetadata } from "../extract/index.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
-import { kindFor } from "../repo/io.js";
+import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectPolicy, type Repo } from "../repo/repo.js";
-import { AUTO_ACCEPT_THRESHOLD, resolveItem, type Resolution } from "./resolve.js";
+import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem, type Resolution } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
@@ -100,7 +100,9 @@ const LEGAL_CATEGORY = "manual-upload";
 
 /**
  * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
- * raw), audio and video. Each has its MIME type and asset kind in repo/io.ts.
+ * raw), audio and video, each with its MIME type and asset kind in repo/io.ts. Anything else that
+ * file-type reports as image/*, audio/* or video/* is accepted too (kind from the prefix, MIME
+ * from file-type).
  */
 export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
   "pdf", "epub", "mobi", "azw", "azw3", "docx",
@@ -214,29 +216,40 @@ export function createAttach(deps: AttachDeps): Attach {
   }
   type Session = ReturnType<typeof session>;
 
+  /** Projects whose legacy `manual_upload` legal-basis key was already reported. */
+  const legacyNoted = new Set<string>();
+
   async function storeInputs(projectId: string): Promise<{ identifiable: boolean; legalBasis?: string }> {
     const policy = await projectPolicy(repo, projectId);
+    // The governance loader reads the legacy key as `manual-upload` (and warns); say so once here.
+    if (policy && Object.prototype.hasOwnProperty.call(policy.consent.defaultLegalBasis, "manual_upload") && !legacyNoted.has(projectId)) {
+      legacyNoted.add(projectId);
+      deps.debug?.('governance: consent.defaultLegalBasis.manual_upload is the old spelling of "manual-upload"; please rename it');
+    }
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
     const legalBasis = policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
     return { identifiable, ...(legalBasis ? { legalBasis } : {}) };
   }
 
-  async function ontoSource(projectId: string, path: string, sf: SourceFile, mime: string, ext: string, sha256: string): Promise<AttachOutcome> {
+  type Stored = { ext: string; mime: string; kind: string };
+
+  async function ontoSource(projectId: string, path: string, sf: SourceFile, mime: string, stored: Stored, sha256: string): Promise<AttachOutcome> {
     const sourceId = sf.source.id;
     // Files added in this call count too.
     const current = await repo.getSource(projectId, sourceId);
     if (current.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
     // Media with GPS: location governance applies to the store (R54a).
-    const hasLocation = /^(?:image|video)\//u.test(mime) && !!(await extractMetadata(path, mime).catch(() => undefined))?.media?.gps;
-    const kind = kindFor(ext);
-    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, label: addedLabel(kind, new Date()) }, "manual_upload", {
+    // Unreadable metadata counts as located (fail closed, R57); a thrown error is not swallowed.
+    const hasLocation = /^(?:image|video)\//u.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
+    const { ext, kind } = stored;
+    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
       refuse: refuseLocation,
     });
     return { path, outcome: "attached", sourceId };
   }
 
-  async function ontoLibrary(projectId: string, path: string, mime: string, ext: string, sha256: string, s: Session): Promise<AttachOutcome> {
+  async function ontoLibrary(projectId: string, path: string, mime: string, stored: Stored, sha256: string, s: Session): Promise<AttachOutcome> {
     const keys = await s.keys();
     const same = keys.find((k) => k.sha256s.includes(sha256));
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
@@ -266,7 +279,7 @@ export function createAttach(deps: AttachDeps): Attach {
     ];
     // createSource evaluates capture and store again, right before writing (R42).
     // A location condition (coarsen/strip) cannot be honoured yet: an audited deny, nothing stored (R56).
-    const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext }], {
+    const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }], {
       provenance,
       fieldEvidence: r.fieldEvidence,
       verification: r.verification.fields,
@@ -302,14 +315,19 @@ export function createAttach(deps: AttachDeps): Attach {
     } catch {
       return failed(path, REASONS.missing);
     }
-    if (!type || !ACCEPTED_EXTENSIONS.has(type.ext)) return failed(path, REASONS.unsupported);
+    if (!type) return failed(path, REASONS.unsupported);
+    const media = /^(image|audio|video)\//u.exec(type.mime)?.[1];
+    if (!ACCEPTED_EXTENSIONS.has(type.ext) && !media) return failed(path, REASONS.unsupported);
+    // The MIME table's type and kind where it knows the extension, else file-type's MIME and the prefix.
+    const known = mimeFor(type.ext) !== "application/octet-stream";
+    const stored = { ext: type.ext, mime: known ? mimeFor(type.ext) : type.mime.split(";")[0]!.trim(), kind: known ? kindFor(type.ext) : media! };
     const target = toSourceId ? await s.target() : null;
     if (toSourceId && !target) return failed(path, REASONS.noSource);
     const denied = await s.policy();
     if (denied) return failed(path, denied);
     const sha256 = await sha256File(path);
-    if (target) return ontoSource(projectId, path, target, type.mime, type.ext, sha256);
-    return ontoLibrary(projectId, path, type.mime, type.ext, sha256, s);
+    if (target) return ontoSource(projectId, path, target, type.mime, stored, sha256);
+    return ontoLibrary(projectId, path, type.mime, stored, sha256, s);
   }
 
   async function attachFiles(projectId: string, paths: string[], opts: { toSourceId?: string } = {}): Promise<AttachOutcome[]> {

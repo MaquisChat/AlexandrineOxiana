@@ -24,7 +24,7 @@ import {
 } from "@ao/core";
 import { GovernanceViolationError, ImmutableProvenanceError, NotFoundError } from "./errors.js";
 import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe } from "./io.js";
-import { runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
+import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { appendReviewEntry, type ReviewInput } from "./review.js";
@@ -40,6 +40,8 @@ export interface SourceInputFile {
   encrypted?: boolean;
   /** Stored file extension, e.g. from the sniffed type (default: the path's extension). */
   ext?: string;
+  /** MIME type, e.g. the sniffed one (default: from the extension). */
+  mime?: string;
   metadata?: Asset["metadata"];
 }
 
@@ -189,7 +191,7 @@ export async function createSource(
   files: SourceInputFile[],
   opts: CreateSourceOptions,
   /** Package-internal: the caller already evaluated and audited this capture (link capture), so only `store` is evaluated here. */
-  internal: { captureAuthorized?: boolean; refuse?: MutateOptions["refuse"] } = {},
+  internal: { captureAuthorized?: boolean; refuse?: RefuseHook } = {},
 ): Promise<SourceFile> {
   core.assertWritable();
   const draft = SourceDraft.parse(draftIn);
@@ -284,7 +286,7 @@ export async function createSource(
           encrypted: tx.encrypted && !linked,
           sha256: content.sha256,
           bytes: content.bytes,
-          mime: mimeFor(ext),
+          mime: f.mime ?? mimeFor(ext),
           ...(linked ? { linked } : {}),
           ...(f.metadata ? { metadata: f.metadata } : {}),
         };
