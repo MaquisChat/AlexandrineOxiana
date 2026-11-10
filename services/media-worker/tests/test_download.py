@@ -165,3 +165,68 @@ def test_gallerydl_dates_are_inclusive_and_validated():
     args = build_gallerydl_args("https://x.test/p", "/out", {"dateAfter": "20260101", "dateBefore": "20261231"})
     assert args[args.index("--filter") + 1] == "date >= datetime(2026, 1, 1) and date < datetime(2027, 1, 1)"
     assert validate_params("https://x.test/p", {"dateBefore": "20261340"}) is not None
+
+
+# ---------- R36: comments; partial enumerations ----------
+
+
+def test_include_comments_is_accepted_and_validated():
+    from ao_worker.download import validate_params
+
+    assert validate_params("https://x.test/p", {"includeComments": True}) is None
+    assert validate_params("https://x.test/p", {"includeComments": False}) is None
+    assert validate_params("https://x.test/p", {"includeComments": "yes"}) is not None
+    assert "--write-comments" in build_ytdlp_args("https://x.test/p", "/out", {"includeComments": True})
+    assert "--write-comments" not in build_ytdlp_args("https://x.test/p", "/out", {})
+
+
+def test_ytdlp_comments_go_to_a_separate_json_file(worker, tmp_path):
+    out = tmp_path / "c"
+    job = worker.run("capture.download", URL, str(out), {"tool": "yt-dlp", "includeComments": True})
+    assert job["status"] == "done", job
+    meta = job["result"]["meta"]
+    assert [Path(f).name for f in meta["comments"]] == ["abc123.comments.json"]
+    assert "abc123.comments.json" not in [Path(f).name for f in meta["files"] + meta["infoJson"]]
+    comments = json.loads((out / "abc123.comments.json").read_text())
+    assert comments == [{"id": "c1", "author": "someone", "text": "Nice video"}]
+    info = json.loads((out / "abc123.info.json").read_text())
+    assert "comments" not in info and info["comment_count"] == 1
+    assert "commentsUnsupported" not in meta
+
+
+def test_ytdlp_without_comments_writes_no_comments_file(worker, tmp_path):
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    meta = job["result"]["meta"]
+    assert meta.get("comments", []) == []
+    assert not list((tmp_path / "c").glob("*.comments.json"))
+
+
+def test_gallerydl_comments_are_unsupported_and_flagged(worker, tmp_path, monkeypatch):
+    from conftest import FAKE_BIN
+
+    monkeypatch.setenv("AO_GALLERYDL_BIN", str(FAKE_BIN / "gallery-dl"))
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_ARGV_FILE", str(argv_file))
+    job = worker.run("capture.download", "https://www.instagram.com/p/XYZ/", str(tmp_path / "g"), {"tool": "gallery-dl", "includeComments": True})
+    assert job["status"] == "done", job
+    meta = job["result"]["meta"]
+    assert meta["commentsUnsupported"] is True
+    assert meta.get("comments", []) == []
+    assert not any(a.startswith("-") and "comment" in a for a in json.loads(argv_file.read_text()))
+
+
+def test_an_enumeration_cut_short_is_partial_not_failed(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_MODE", "ratelimit-flat")
+    job = worker.run("capture.download", "https://www.youtube.com/@someone", str(tmp_path / "c"), {"tool": "yt-dlp", "flatList": True})
+    assert job["status"] == "done", job
+    meta = job["result"]["meta"]
+    assert meta["partial"] is True and meta["errorCode"] == "RATE_LIMITED"
+    assert [Path(f).name for f in meta["infoJson"]] == ["abc123.info.json"]
+    assert meta["files"] == []
+
+
+def test_a_single_item_with_only_its_info_json_still_fails(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_YTDLP_MODE", "ratelimit-flat")
+    job = worker.run("capture.download", URL, str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "RATE_LIMITED"

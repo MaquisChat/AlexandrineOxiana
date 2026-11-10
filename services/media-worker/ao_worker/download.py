@@ -5,6 +5,14 @@ then `yt-dlp` on PATH; only when none exists is the official standalone release 
 `AO_TOOLS_DIR` and verified against the release's SHA2-256SUMS. gallery-dl runs as
 `python -m gallery_dl` from the worker's own environment unless `AO_GALLERYDL_BIN` is set.
 
+Comments (`includeComments`): yt-dlp `--write-comments` puts them in the info JSON; the worker moves
+them to `<id>.comments.json` next to it (listed in `meta.comments`, never in `files` or `infoJson`).
+gallery-dl has no comment support for the platforms used here: the option is ignored and
+`meta.commentsUnsupported` is true.
+
+An enumeration (`flatList` or `metadataOnly`) that stops with an error after writing metadata is
+returned as partial (`meta.partial`, `meta.errorCode`), not failed.
+
 Privacy: URLs are logged without query string, fragment or credentials; cookie options are never
 logged; error details are redacted the same way.
 """
@@ -12,6 +20,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import logging
 import os
 import platform
@@ -282,6 +291,8 @@ def build_ytdlp_args(url: str, out: str, params: dict) -> list[str]:
         args += ["--datebefore", params["dateBefore"]]
     if params.get("metadataOnly"):
         args.append("--skip-download")
+    if params.get("includeComments"):
+        args.append("--write-comments")
     if params.get("cookiesFromBrowser"):
         args += ["--cookies-from-browser", params["cookiesFromBrowser"]]
     if params.get("quality"):
@@ -330,14 +341,12 @@ def validate_params(url: str, params: dict) -> str | None:
     a = params.get("archiveFile")
     if a is not None and (not isinstance(a, str) or not os.path.isabs(a)):
         return "params.archiveFile must be an absolute path"
-    for k in ("flatList", "metadataOnly"):
+    for k in ("flatList", "metadataOnly", "includeComments"):
         if k in params and not isinstance(params[k], bool):
             return f"params.{k} must be a boolean"
     q = params.get("quality")
     if q is not None and (q not in QUALITY_FORMATS or params.get("tool", "yt-dlp") != "yt-dlp"):
         return "params.quality must be best, 1080p or 720p (yt-dlp only)"
-    if params.get("includeComments", False) is not False:
-        return "params.includeComments is not supported (comments are not captured)"
     m = params.get("maxItems")
     if m is not None and (isinstance(m, bool) or not isinstance(m, int) or m < 1):
         return "params.maxItems must be a positive integer"
@@ -360,18 +369,39 @@ _ITEM = re.compile(r"Downloading (?:item|video) (\d+) of (\d+)")
 _SKIP_SUFFIXES = (".part", ".ytdl", ".temp", ".tmp")
 
 
-def _list_outputs(out: Path, tool: str, archive: str | None) -> tuple[list[str], list[str]]:
-    files, infos = [], []
+COMMENTS_SUFFIX = ".comments.json"
+
+
+def _list_outputs(out: Path, tool: str, archive: str | None) -> tuple[list[str], list[str], list[str]]:
+    files, infos, comments = [], [], []
     if not out.exists():
-        return files, infos
+        return files, infos, comments
     for p in sorted(out.rglob("*")):
         if not p.is_file() or p.name.endswith(_SKIP_SUFFIXES) or ".part-Frag" in p.name:
             continue
         if archive and os.path.abspath(p) == os.path.abspath(archive):
             continue
+        if p.name.endswith(COMMENTS_SUFFIX):
+            comments.append(str(p))
+            continue
         is_info = p.name.endswith(".info.json") if tool == "yt-dlp" else p.suffix == ".json"
         (infos if is_info else files).append(str(p))
-    return files, infos
+    return files, infos, comments
+
+
+def _split_comments(out: Path) -> None:
+    """Moves yt-dlp's `comments` out of each info JSON into `<id>.comments.json` next to it."""
+    for p in sorted(out.rglob("*.info.json")):
+        try:
+            info = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(info, dict) or "comments" not in info:
+            continue
+        comments = info.pop("comments")
+        target = p.with_name(p.name[: -len(".info.json")] + COMMENTS_SUFFIX)
+        target.write_text(json.dumps(comments if isinstance(comments, list) else [], ensure_ascii=False), encoding="utf-8")
+        p.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
 
 
 def run(job: Job, ctx: JobContext) -> dict:
@@ -408,12 +438,18 @@ def run(job: Job, ctx: JobContext) -> dict:
         errf.seek(0)
         stderr = errf.read()
 
-    files, infos = _list_outputs(out, tool, params.get("archiveFile"))
-    meta = {"files": files, "infoJson": infos, "tool": tool, "toolVersion": version, "partial": False}
+    comments_wanted = bool(params.get("includeComments"))
+    if comments_wanted and tool == "yt-dlp":
+        _split_comments(out)
+    files, infos, comments = _list_outputs(out, tool, params.get("archiveFile"))
+    meta = {"files": files, "infoJson": infos, "comments": comments, "tool": tool, "toolVersion": version, "partial": False}
+    if comments_wanted and tool != "yt-dlp":
+        meta["commentsUnsupported"] = True
+    enumeration = bool(params.get("flatList") or params.get("metadataOnly"))
     if rc != 0:
         code = map_error(stderr)
         detail = redact("\n".join(stderr.strip().splitlines()[-20:]))
-        if files:
+        if files or (enumeration and infos):
             log.warning("capture job %s partial code=%s", job.id, code)
             meta.update(partial=True, errorCode=code, errorDetail=detail)
         else:
