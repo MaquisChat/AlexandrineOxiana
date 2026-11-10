@@ -26,6 +26,7 @@ import { bibtexAdapter, cslJsonAdapter, risAdapter } from "../refman.js";
 import { SIDECAR_EXTS } from "../sidecar.js";
 import { zoteroLocalAdapter } from "../zotero-local.js";
 import { zoteroRdfAdapter } from "../zotero-rdf.js";
+import { zoteroWebAdapterFor } from "../zotero-web.js";
 
 export interface ScanFile {
   path: string;
@@ -113,6 +114,8 @@ export interface ScanContext {
   workDir(): Promise<string>;
   /** A plain note for the batch report or preview (e.g. how many empty records were skipped). */
   note?(text: string): void;
+  /** The scan is for a dry run (nothing is imported): adapters that download files skip the downloads. */
+  dryRun?: boolean;
 }
 
 export interface ImportSourceAdapter {
@@ -133,6 +136,8 @@ export interface ImportSourceAdapter {
   incremental?: boolean;
   /** Generated citation keys are made unique within the project (a, b, c … appended). */
   uniqueCitationKeys?: boolean;
+  /** The tool recorded in the provenance of the sources it creates (default: the bulk import engine). */
+  tool?: { name: string; version: string };
   /** How many items the scan will yield (for progress), when it can tell cheaply. */
   count?(signal: AbortSignal): Promise<number>;
 }
@@ -307,5 +312,6 @@ export function adapterFor(kind: ImportBatch["source"]["kind"], location: string
   if (kind === "zotero-rdf") return zoteroRdfAdapter(location);
   if (kind === "calibre") return calibreAdapter(location);
   if (kind === "zotero-local") return zoteroLocalAdapter(location);
+  if (kind === "zotero-web") return zoteroWebAdapterFor(location);
   return undefined;
 }

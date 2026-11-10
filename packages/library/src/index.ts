@@ -155,5 +155,20 @@ export type {
   ScanItem,
   ScanSummary,
 } from "./import/bulk/index.js";
+export { bibtexAdapter, cslJsonAdapter, risAdapter } from "./import/refman.js";
+export { calibreAdapter } from "./import/calibre.js";
+export { zoteroLocalAdapter } from "./import/zotero-local.js";
+export { zoteroRdfAdapter } from "./import/zotero-rdf.js";
+export {
+  ZOTERO_STORAGE_HOSTS,
+  ZOTERO_WEB_FILE_NOTES,
+  ZOTERO_WEB_REASONS,
+  startZoteroWebImport,
+  zoteroWebAdapter,
+  zoteroWebSince,
+} from "./import/zotero-web.js";
+export type { ZoteroWebAdapter, ZoteroWebOptions, ZoteroWebScanResult } from "./import/zotero-web.js";
+export { SECRET_NAMES, SECRET_SERVICE, SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, deleteSecret, getSecret, setSecret } from "./secrets.js";
+export type { SecretName } from "./secrets.js";
 export { ARCHIVE_LIMITS } from "./extract/zip.js";
 export * from "./lookup/index.js";

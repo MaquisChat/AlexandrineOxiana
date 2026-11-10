@@ -256,15 +256,8 @@ export class HttpClient {
   }
 
   private retryDelay(attempt: number, retryAfter: string | undefined): number {
-    if (retryAfter !== undefined) {
-      let ms: number | undefined;
-      if (/^\d+$/.test(retryAfter.trim())) ms = Number(retryAfter.trim()) * 1000;
-      else {
-        const t = Date.parse(retryAfter);
-        if (!Number.isNaN(t)) ms = Math.max(0, t - this.clock());
-      }
-      if (ms !== undefined) return Math.min(ms, this.maxRetryAfterMs);
-    }
+    const ms = retryAfterMs(retryAfter, this.clock());
+    if (ms !== undefined) return Math.min(ms, this.maxRetryAfterMs);
     return this.backoffMs * 2 ** attempt;
   }
 
@@ -324,6 +317,15 @@ export class HttpClient {
       return { status: 200, body: await readBounded(res.body) };
     }
   }
+}
+
+/** A Retry-After (or Backoff) header — seconds or an HTTP date — in milliseconds from `now`; undefined when absent or unreadable. */
+export function retryAfterMs(value: string | undefined, now: number): number | undefined {
+  if (value === undefined) return undefined;
+  const v = value.trim();
+  if (/^\d{1,10}$/.test(v)) return Number(v) * 1000;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? undefined : Math.max(0, t - now);
 }
 
 async function readBounded(body: AsyncIterable<Buffer | Uint8Array> & { destroy?: (e?: Error) => void }): Promise<string> {

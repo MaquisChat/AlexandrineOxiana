@@ -2,11 +2,12 @@
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { DEFAULT_GOVERNANCE, effectivePolicy, parseGovernance, recheckSourceFile } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext } from "@ao/core";
+import { DEFAULT_GOVERNANCE, effectivePolicy, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
+import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
@@ -124,6 +125,33 @@ export class Repo {
   addOriginalAsset(projectId: string, sourceId: string, input: OriginalAssetInput): Promise<Asset> {
     return addOriginalAsset(this.core, projectId, sourceId, input);
   }
+  /**
+   * Checks a project's audit log (`ao verify-audit`): the hash chain verifies, and its head matches
+   * the anchor recorded outside the library (R12). Reads only; nothing is written.
+   */
+  verifyAudit(projectId: string): Promise<AuditCheck> {
+    const core = this.core;
+    return core.serial(async () => {
+      const st = core.state(projectId);
+      const events = await AuditStore.read(st.audit.dir);
+      const verify = verifyChain(events as AuditEvent[]);
+      let anchors: Awaited<ReturnType<RepoCore["anchors"]["readAll"]>> | undefined;
+      try {
+        anchors = await core.anchors.readAll();
+      } catch (err) {
+        if (!(err instanceof AnchorsUnreadableError)) throw err;
+      }
+      const anchor = anchors?.[core.anchorKey(projectId)];
+      const problem = checkAnchor(events, verify, anchor);
+      return {
+        ok: !problem && anchors !== undefined,
+        events: events.length,
+        anchored: !!anchor,
+        ...(problem ? { problem } : anchors === undefined ? { problem: { kind: "anchors-unreadable" as const, detail: "the record of audit heads kept outside the library could not be read" } } : {}),
+      };
+    });
+  }
+
   /** Records (and audits) that the researcher acknowledged a one-time capture explanation (spec 5.1). */
   acknowledge(projectId: string, kind: AcknowledgementKind): Promise<Project> {
     return acknowledge(this.core, projectId, kind);
@@ -661,6 +689,21 @@ export async function lookupPolicyInfo(
   return { policy, actor: core.actor, ...(core.tz ? { tz: core.tz } : {}), clock: core.clock, sensitive: core.encrypted(st) };
 }
 
+/** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
+export function recordZoteroWebLibraryVersion(repo: Repo, projectId: string, ref: string, version: number): Promise<void> {
+  return recordZoteroWebVersion(cores.get(repo)!, projectId, ref, version);
+}
+
+/** Package-internal (watched folders): adds a watch's id + options to project.json (governed, audited). */
+export function addWatchedFolderEntry(repo: Repo, projectId: string, options: unknown): Promise<WatchedFolder> {
+  return addWatchedFolderRecord(cores.get(repo)!, projectId, options);
+}
+
+/** Package-internal (watched folders): removes a watch's record from project.json (governed, audited). */
+export function removeWatchedFolderEntry(repo: Repo, projectId: string, id: string): Promise<void> {
+  return removeWatchedFolderRecord(cores.get(repo)!, projectId, id);
+}
+
 /** Package-internal: the researcher's time zone the repo names dated files in. */
 export function repoTz(repo: Repo): string | undefined {
   return cores.get(repo)!.tz;
@@ -677,3 +720,13 @@ export function recoveryPendingProjects(repo: Repo): string[] {
 }
 
 export type { RepoOptions };
+
+/** The result of `Repo.verifyAudit`. */
+export interface AuditCheck {
+  ok: boolean;
+  /** Events in the log. */
+  events: number;
+  /** Whether a head was recorded outside the library to compare with. */
+  anchored: boolean;
+  problem?: { kind: "chain-broken" | "head-mismatch" | "truncated" | "anchors-unreadable"; detail: string };
+}

@@ -908,7 +908,7 @@ class Run {
     const { identifiable, legalBasis } = this.inputsCache.value;
     return itemProvenance(r, {
       captureMethod: method,
-      tool: TOOL,
+      tool: this.adapter.tool ?? TOOL,
       identifiable,
       importBatchId: this.rec.id,
       ...(legalBasis ? { legalBasis } : {}),
@@ -1545,6 +1545,7 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
       note: (t) => {
         if (!summary.notes.includes(t)) summary.notes.push(t);
       },
+      dryRun: true,
     });
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))]);
     for await (const scanned of scan) {
