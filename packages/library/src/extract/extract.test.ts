@@ -241,6 +241,7 @@ describe("camera media (exiftool)", () => {
       capturedAtSource: "created",
       tzOffset: "+09:00",
       device: "Apple iPhone 13",
+      model: "iPhone 13",
       contentIdentifier: "6F1D2A3B-0000-4C5D-8E9F-123456789ABC",
       durationSec: 3.4,
       width: 1920,
