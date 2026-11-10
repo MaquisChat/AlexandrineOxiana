@@ -2,7 +2,7 @@ import type { Command } from "commander";
 import { createLinkCapture, type ProfileContentType } from "@ao/library";
 import { EXIT, ExitError } from "../errors.js";
 import { itemLines, profileLines } from "../output.js";
-import { ensureCookieAcknowledgement, exitForItems, LEGAL_BASIS_HINT, parseBrowser, parseModel, viewOf, withProject } from "./common.js";
+import { rateLimitWaitOverride, ensureCookieAcknowledgement, exitForItems, LEGAL_BASIS_HINT, parseBrowser, parseModel, viewOf, withProject } from "./common.js";
 
 const TYPES: ProfileContentType[] = ["posts", "reels", "videos", "shorts", "highlights"];
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -11,12 +11,6 @@ function day(name: string, v: unknown): string | undefined {
   if (v === undefined) return undefined;
   if (!DAY.test(String(v))) throw new ExitError(`${name} must be a date written YYYY-MM-DD, for example 2026-03-14.`);
   return String(v);
-}
-
-/** Rate-limit waits are 60/120/240 s; AO_RATE_LIMIT_WAIT_MS shortens them (for scripts and tests). */
-function waitOverride(): { sleep: (ms: number) => Promise<void> } | undefined {
-  const ms = Number(process.env.AO_RATE_LIMIT_WAIT_MS);
-  return Number.isFinite(ms) && ms >= 0 && process.env.AO_RATE_LIMIT_WAIT_MS ? { sleep: () => new Promise((r) => setTimeout(r, ms)) } : undefined;
 }
 
 export function registerCapture(program: Command): void {
@@ -38,7 +32,7 @@ export function registerCapture(program: Command): void {
         const transcribeModel = parseModel(o.model);
         await ensureCookieAcknowledgement(s, project, browser, o.acknowledgeCookies === true);
         const worker = await s.needWorker();
-        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}), ...waitOverride() });
+        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}), ...rateLimitWaitOverride() });
         const outcomes = await capture.captureUrls(
           project.id,
           urls,
@@ -100,7 +94,7 @@ export function registerCapture(program: Command): void {
         }
         await ensureCookieAcknowledgement(s, project, browser, o.acknowledgeCookies === true);
         const worker = await s.needWorker();
-        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}), ...waitOverride() });
+        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}), ...rateLimitWaitOverride() });
         const tty = Boolean(process.stderr.isTTY);
         const report = await capture.captureProfile(
           project.id,

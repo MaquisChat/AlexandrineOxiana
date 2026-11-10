@@ -156,7 +156,6 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
     // same shutdown, so the lock is released before the process exits whichever gets there first.
     close() {
       closing ??= (async () => {
-        open.delete(session);
         await session.worker?.stop().catch(() => {});
         try {
           index?.close();
@@ -165,6 +164,7 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
         }
         ring.clear();
         await lib.close().catch(() => {});
+        open.delete(session); // only once the library is released: a Ctrl+C handler must still see it until then
       })();
       return closing;
     },

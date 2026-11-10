@@ -8,6 +8,7 @@ import { registerRecheck } from "./commands/recheck.js";
 import { registerTools } from "./commands/tools.js";
 import { registerTranscribe } from "./commands/transcribe.js";
 import { EXIT, describeError } from "./errors.js";
+import { hasEnvPassphrase } from "./prompt.js";
 import { openSessions } from "./session.js";
 
 export const packageName = "@ao/cli";
@@ -47,6 +48,7 @@ function installSignalHandlers(): void {
 export async function run(argv: string[]): Promise<number> {
   const args = argv.slice(2);
   if (args[0] === "--") args.shift(); // `pnpm ao -- <args>`
+  hasEnvPassphrase(); // reads AO_PASSPHRASE now and removes it from the environment, before anything is started
   installSignalHandlers();
   const program = buildProgram();
   try {

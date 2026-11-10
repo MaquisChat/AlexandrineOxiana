@@ -65,12 +65,14 @@ export function rememberRoot(root: string): void {
 
 /** Makes an error message safe to print: no absolute paths (library-relative when inside a library, else `<path>`). */
 export function scrubPaths(text: string): string {
-  let out = text;
+  // Links (anything with a scheme) are kept exactly as they are.
+  const urls: string[] = [];
+  let out = text.replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>)]+/g, (u) => `\u0000${urls.push(u) - 1}\u0000`);
   for (const r of [...roots].sort((a, b) => b.length - a.length)) {
     const esc = r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     out = out.replace(new RegExp(`${esc}[\\\\/]`, "g"), "").replace(new RegExp(esc, "g"), "<library>");
   }
   out = out.replace(/[A-Za-z]:\\[^\s"'),;]+/g, "<path>");
   out = out.replace(/(?<![\w.:])\/[\w.@~-]+(?:\/[\w.@~-]+)+/g, "<path>");
-  return out;
+  return out.replace(/\u0000(\d+)\u0000/g, (_m, n: string) => urls[Number(n)]!);
 }

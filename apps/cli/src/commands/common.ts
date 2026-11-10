@@ -87,11 +87,15 @@ export async function ensureCookieAcknowledgement(s: Session, project: Project, 
 export const LEGAL_BASIS_HINT =
   'Add --legal-basis "<text>" to this command, or give the project a default when you create it with: ao project create <name> --default-legal-basis "<text>"';
 
-/** Exit code of a run of items: denial 2, then legal basis missing 4, then any failure 1, else 0. */
+/**
+ * Exit code of a run of items: denial 2, then needs-the-researcher 4 (legal basis missing, or a
+ * profile paused by the platform's rate limit), then any failure 1, else 0.
+ */
 export function exitForItems(items: Array<Pick<CaptureOutcome, "status" | "errorCode">>): number {
   const failed = items.filter((i) => i.status === "failed");
   if (failed.some((i) => i.errorCode === "POLICY_DENIED")) return EXIT.denied;
   if (failed.some((i) => i.errorCode === "LEGAL_BASIS_REQUIRED")) return EXIT.needsAction;
+  if (items.some((i) => i.status === "incomplete" && i.errorCode === "RATE_LIMITED")) return EXIT.needsAction;
   if (failed.length > 0) return EXIT.failure;
   return EXIT.ok;
 }
@@ -100,4 +104,16 @@ export async function viewOf(s: Session, projectId: string, o: CaptureOutcome): 
   let sf: SourceFile | undefined;
   if (o.sourceId) sf = await s.repo.getSource(projectId, o.sourceId).catch(() => undefined);
   return itemView(o, sf);
+}
+
+/**
+ * Rate-limit waits are 60/120/240 s. AO_RATE_LIMIT_WAIT_MS shortens them, but only under test
+ * (NODE_ENV=test or VITEST set): outside tests it is ignored so a platform that is already
+ * limiting requests is never hammered.
+ */
+export function rateLimitWaitOverride(env: NodeJS.ProcessEnv = process.env): { sleep: (ms: number) => Promise<void> } | undefined {
+  if (env.NODE_ENV !== "test" && !env.VITEST) return undefined;
+  const raw = env.AO_RATE_LIMIT_WAIT_MS;
+  const ms = Number(raw);
+  return raw && Number.isFinite(ms) && ms >= 0 ? { sleep: () => new Promise((r) => setTimeout(r, ms)) } : undefined;
 }
