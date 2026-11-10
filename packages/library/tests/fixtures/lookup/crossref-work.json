@@ -12,6 +12,9 @@
     ],
     "container-title": ["Journal of Upland Studies"],
     "publisher": "Example University Press",
+    "volume": "12",
+    "issue": "3",
+    "page": "201-219",
     "issued": { "date-parts": [[2021, 3, 4]] },
     "ISSN": ["1234-5679"],
     "URL": "https://doi.org/10.5555/ao.fixture.2021.001"

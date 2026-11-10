@@ -7,6 +7,7 @@ import {
   ImportOptions,
   LibraryRelativePath,
   LinkedRelativePath,
+  BIBLIO_FIELDS,
   Source,
   SourceFile,
   inLang,
@@ -84,6 +85,19 @@ describe("SourceFile", () => {
     expect(sf.source.availability).toEqual({ status: "available" });
     expect(sf.fieldEvidence).toEqual([]);
     expect(sf.verification).toEqual({});
+  });
+
+  it("accepts the optional bibliographic fields (R87), and sources without them", () => {
+    const f = fixture();
+    expect(Source.parse(f.source).volume).toBeUndefined();
+    const biblio = {
+      volume: "42", issue: "2", page: "115–134", edition: "2nd", numberOfPages: "312", publisherPlace: "London",
+      collectionTitle: "Studies in Food", collectionNumber: "7", genre: "Video", medium: "Online video",
+    };
+    const parsed = Source.parse({ ...f.source, ...biblio });
+    expect(Object.fromEntries(BIBLIO_FIELDS.map((k) => [k, parsed[k]]))).toEqual(biblio);
+    expect(Source.safeParse({ ...f.source, volume: 42 }).success).toBe(false);
+    expect(Source.safeParse({ ...f.source, page: "x".repeat(1001) }).success).toBe(false);
   });
 
   it("primary falls back to first variant", () => {

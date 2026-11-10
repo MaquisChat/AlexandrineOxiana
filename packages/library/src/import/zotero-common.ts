@@ -4,7 +4,7 @@
  * metadata, dates, citation keys in Extra, and reader annotations (anchors in PDFs and EPUBs). Both
  * adapters read Zotero's own field names (the Web API's `data` uses the same names as zotero.sqlite).
  */
-import type { Creator, SourceType } from "@ao/core";
+import { biblioOf, type Creator, type SourceType } from "@ao/core";
 import type { ScanAnnotation, ScanRect } from "./bulk/scan.js";
 import { arxivOf, doiOf, isbnsOf, issnOf, tagList, text, type RecordFields } from "./refman.js";
 
@@ -195,6 +195,20 @@ export function recordFields(type: string, f: Map<string, string>, creators: Cre
   if (container) out.container = container;
   const publisher = first(PUBLISHER_FIELDS);
   if (publisher) out.publisher = publisher;
+  // R87: bibliographic detail (Zotero's own field names).
+  Object.assign(
+    out,
+    biblioOf({
+      volume: first(["volume"]),
+      issue: first(["issue"]),
+      page: first(["pages"]),
+      edition: first(["edition"]),
+      publisherPlace: first(["place"]),
+      collectionTitle: first(["series"]),
+      collectionNumber: first(["seriesNumber"]),
+      numberOfPages: first(["numPages"]),
+    }),
+  );
   let doi = doiOf(f.get("DOI"));
   if (!doi) {
     // Item types without a DOI field keep it in Extra ("DOI: 10…").

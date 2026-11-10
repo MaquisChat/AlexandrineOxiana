@@ -1,5 +1,5 @@
 /** Crossref REST API: `https://api.crossref.org/works/{doi}`. */
-import { toIsbn13, type Creator, type SourceType } from "@ao/core";
+import { biblioOf, toIsbn13, type Biblio, type Creator, type SourceType } from "@ao/core";
 import { clean } from "../extract/names.js";
 import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
 
@@ -22,6 +22,11 @@ interface CrossrefWork {
   published?: { "date-parts"?: Array<Array<number | null>> };
   ISSN?: string[];
   ISBN?: string[];
+  volume?: string;
+  issue?: string;
+  page?: string;
+  edition?: string | number;
+  "publisher-location"?: string;
 }
 
 const TYPES: Record<string, SourceType> = {
@@ -66,6 +71,16 @@ function people(list: CrossrefPerson[] | undefined, role: Creator["role"]): Crea
   });
 }
 
+/** Bibliographic text from a service, cleaned like its other values (control characters, spacing). */
+export function cleanBiblio(b: Biblio): Biblio {
+  const out: Biblio = {};
+  for (const [k, v] of Object.entries(b) as Array<[keyof Biblio, string]>) {
+    const t = clean(v);
+    if (t) out[k] = t;
+  }
+  return out;
+}
+
 export function mapCrossref(w: CrossrefWork, doi: string): LookupResult | null {
   const title = clean(w.title?.[0] ?? "");
   if (!title) return null;
@@ -80,6 +95,9 @@ export function mapCrossref(w: CrossrefWork, doi: string): LookupResult | null {
     ...(issued ? { issued } : {}),
     ...(container ? { container } : {}),
     ...(w.publisher ? { publisher: clean(w.publisher) } : {}),
+    ...cleanBiblio(
+      biblioOf({ volume: w.volume, issue: w.issue, page: w.page, edition: w.edition, publisherPlace: w["publisher-location"] }),
+    ),
     type: TYPES[w.type ?? ""] ?? "other",
     identifiers: { doi: (w.DOI ?? doi).toLowerCase(), ...(isbns.length ? { isbn: isbns } : {}), ...(issn ? { issn } : {}) },
     provider: "crossref",

@@ -1,8 +1,8 @@
 /** OpenAlex: `https://api.openalex.org/works/doi:{doi}` and title search. */
-import type { SourceType } from "@ao/core";
+import { biblioOf, type SourceType } from "@ao/core";
 import { clean, normalizeDate, parseName } from "../extract/names.js";
 import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
-import { encodeDoi } from "./crossref.js";
+import { cleanBiblio, encodeDoi } from "./crossref.js";
 
 interface OpenAlexWork {
   doi?: string | null;
@@ -12,6 +12,7 @@ interface OpenAlexWork {
   publication_year?: number | null;
   type?: string | null;
   authorships?: Array<{ author?: { display_name?: string | null } | null; raw_author_name?: string | null }> | null;
+  biblio?: { volume?: string | null; issue?: string | null; first_page?: string | null; last_page?: string | null } | null;
   primary_location?: { source?: { display_name?: string | null; host_organization_name?: string | null } | null } | null;
 }
 
@@ -38,10 +39,15 @@ export function mapOpenAlex(w: OpenAlexWork): LookupResult | null {
     const c = parseName(a.author?.display_name ?? a.raw_author_name ?? "");
     return c ? [c] : [];
   });
+  const b = w.biblio;
+  const first = b?.first_page?.trim();
+  const last = b?.last_page?.trim();
+  const page = first && last && last !== first ? `${first}–${last}` : first || undefined;
   return {
     title,
     creators,
     ...(issued ? { issued } : {}),
+    ...cleanBiblio(biblioOf({ volume: b?.volume, issue: b?.issue, page })),
     ...(source?.display_name ? { container: clean(source.display_name) } : {}),
     ...(source?.host_organization_name ? { publisher: clean(source.host_organization_name) } : {}),
     type: TYPES[w.type ?? ""] ?? "other",

@@ -8,5 +8,8 @@
   "isbn_13": ["9780262033848"],
   "isbn_10": ["0262033844"],
   "languages": [{ "key": "/languages/eng" }],
-  "number_of_pages": 312
+  "number_of_pages": 312,
+  "publish_places": ["Lagos"],
+  "edition_name": "2nd ed.",
+  "series": ["Craft Histories"]
 }

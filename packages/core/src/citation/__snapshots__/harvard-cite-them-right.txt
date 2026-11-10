@@ -5,33 +5,33 @@ style: harvard-cite-them-right
 ## journalArticle
 citation:     (Quispe and Ortega, 2021)
 with locator: (Quispe and Ortega, 2021, p. 12)
-bibliography: Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” Journal of Ethnobiology [Preprint]. Available at: https://doi.org/10.5555/joe.2021.0042.
+bibliography: Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” Journal of Ethnobiology, 41(2), pp. 115–134. Available at: https://doi.org/10.5555/joe.2021.0042.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” <i>Journal of Ethnobiology</i> [Preprint]. Available at: https://doi.org/10.5555/joe.2021.0042.</div>
+  <div class="csl-entry">Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” <i>Journal of Ethnobiology</i>, 41(2), pp. 115–134. Available at: https://doi.org/10.5555/joe.2021.0042.</div>
 </div>
 
 ## book
 citation:     (Katz, 2012)
 with locator: (Katz, 2012, p. 12)
-bibliography: Katz, S.E. (2012) The art of fermentation. Chelsea Green Publishing.
+bibliography: Katz, S.E. (2012) The art of fermentation. White River Junction, VT: Chelsea Green Publishing.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Katz, S.E. (2012) <i>The art of fermentation</i>. Chelsea Green Publishing.</div>
+  <div class="csl-entry">Katz, S.E. (2012) <i>The art of fermentation</i>. White River Junction, VT: Chelsea Green Publishing.</div>
 </div>
 
 ## chapter
 citation:     (Tanaka, 2019)
 with locator: (Tanaka, 2019, p. 12)
-bibliography: Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) Ferment and society. Routledge.
+bibliography: Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) Ferment and society. London: Routledge, pp. 45–67.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) <i>Ferment and society</i>. Routledge.</div>
+  <div class="csl-entry">Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) <i>Ferment and society</i>. London: Routledge, pp. 45–67.</div>
 </div>
 
 ## youtubeVideo
 citation:     (Fermentology Lab, 2023)
 with locator: (Fermentology Lab, 2023, 0:38–0:46)
-bibliography: Fermentology Lab (2023) How to start a sourdough culture [Video], YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).
+bibliography: Fermentology Lab (2023) How to start a sourdough culture [Video]. YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Fermentology Lab (2023) <i>How to start a sourdough culture</i> [Video], <i>YouTube</i>. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).</div>
+  <div class="csl-entry">Fermentology Lab (2023) <i>How to start a sourdough culture</i> [Video]. YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).</div>
 </div>
 
 ## instagramReel
@@ -51,8 +51,8 @@ html:         <div class="csl-bib-body">
 
 ## all six, one bibliography
 Castillo, A. (2025) Clay fermentation jars at a market stall.
-Fermentology Lab (2023) How to start a sourdough culture [Video], YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).
-Katz, S.E. (2012) The art of fermentation. Chelsea Green Publishing.
+Fermentology Lab (2023) How to start a sourdough culture [Video]. YouTube. Available at: https://www.youtube.com/watch?v=dQw4w9WgXcQ (Accessed: November 1, 2026).
+Katz, S.E. (2012) The art of fermentation. White River Junction, VT: Chelsea Green Publishing.
 P-014 (2024) “Receta de la abuela, sin filtros [Grandma’s recipe, no filters],” Instagram. Available at: https://www.instagram.com/reel/C4abc123XyZ/ (Accessed: October 30, 2026).
-Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” Journal of Ethnobiology [Preprint]. Available at: https://doi.org/10.5555/joe.2021.0042.
-Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) Ferment and society. Routledge.
+Quispe, M.J. and Ortega, D.K. (2021) “Fermentation and food sovereignty in the Andes,” Journal of Ethnobiology, 41(2), pp. 115–134. Available at: https://doi.org/10.5555/joe.2021.0042.
+Tanaka, A. (2019) “Kitchen ferments as household knowledge,” in R. Mendel and O. Haddad (eds.) Ferment and society. London: Routledge, pp. 45–67.

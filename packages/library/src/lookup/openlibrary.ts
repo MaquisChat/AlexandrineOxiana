@@ -1,7 +1,8 @@
 /** Open Library: `https://openlibrary.org/isbn/{isbn}.json` (redirects to the edition) + author records. */
-import { toIsbn13, type Creator } from "@ao/core";
+import { biblioOf, toIsbn13, type Creator } from "@ao/core";
 import { clean, normalizeDate, parseName } from "../extract/names.js";
 import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
+import { cleanBiblio } from "./crossref.js";
 
 interface Edition {
   title?: string;
@@ -12,6 +13,10 @@ interface Edition {
   isbn_13?: string[];
   isbn_10?: string[];
   by_statement?: string;
+  number_of_pages?: number;
+  publish_places?: string[];
+  edition_name?: string;
+  series?: string[];
 }
 
 const MAX_AUTHORS = 10;
@@ -42,6 +47,14 @@ export async function openLibraryIsbn(isbn13: string, ctx: LookupContext): Promi
     creators,
     ...(issued ? { issued } : {}),
     ...(ed.publishers?.[0] ? { publisher: clean(ed.publishers[0]) } : {}),
+    ...cleanBiblio(
+      biblioOf({
+        publisherPlace: ed.publish_places?.[0],
+        edition: ed.edition_name,
+        numberOfPages: Number.isInteger(ed.number_of_pages) && ed.number_of_pages! > 0 ? ed.number_of_pages : undefined,
+        collectionTitle: ed.series?.[0],
+      }),
+    ),
     type: "book",
     identifiers: { isbn: isbns },
     provider: "openlibrary",

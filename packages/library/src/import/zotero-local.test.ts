@@ -265,6 +265,9 @@ describe("zoteroLocalAdapter scan", () => {
 
     const b = byKey(items, "BBBB2222")!;
     expect(b.referenceMetadata).toMatchObject({ type: "book", citationKey: "adebayo2019markets", publisher: "MIT Press", identifiers: { isbn: ["9780262033848"] } });
+    // R87: bibliographic detail from Zotero's own fields.
+    expect(a.referenceMetadata).toMatchObject({ volume: "61", issue: "4", page: "777-799" });
+    expect(b.referenceMetadata).toMatchObject({ edition: "2", publisherPlace: "Cambridge, MA", collectionTitle: "Urban Histories", collectionNumber: "12", numberOfPages: "312" });
     expect(b.folderPath).toEqual(["Urban"]);
     expect(b.files).toEqual([expect.objectContaining({ path: fx.linkedPdf, link: true })]);
 
@@ -698,6 +701,28 @@ processing:
 
     // Nothing more to do after that.
     expect((await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done).counts).toMatchObject({ updated: 0, unchanged: 5, created: 0 });
+  });
+
+  it("R87: volume, issue and pages are stored with Zotero evidence, verified, and a re-import updates a changed volume", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    expect(a.source).toMatchObject({ volume: "61", issue: "4", page: "777-799" });
+    expect(a.fieldEvidence.filter((e) => e.field === "/volume").map((e) => [e.value, e.source.kind])).toEqual([["61", "zotero"]]);
+    expect(a.verification["/volume"]?.status).toBe("single-source");
+    const b = byZoteroKey(await sources(p), "BBBB2222");
+    expect(b.source).toMatchObject({ edition: "2", publisherPlace: "Cambridge, MA", collectionTitle: "Urban Histories", collectionNumber: "12", numberOfPages: "312" });
+
+    zoteroEdit((db) => {
+      const v = (db.prepare("SELECT max(valueID) AS m FROM itemDataValues").get() as { m: number }).m + 1;
+      db.prepare("INSERT INTO itemDataValues (valueID, value) VALUES (?, '62')").run(v);
+      db.prepare("UPDATE itemData SET valueID = ? WHERE itemID = 1 AND fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'volume')").run(v);
+      db.prepare("UPDATE items SET version = 9, clientDateModified = '2024-06-01 08:00:00' WHERE itemID = 1").run();
+    });
+    const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r.counts).toMatchObject({ updated: 1, created: 0 });
+    expect(byZoteroKey(await sources(p), "AAAA1111").source.volume).toBe("62");
   });
 
   it("re-import keeps a field the user edited, lists it in the report, and adds new annotations", async () => {

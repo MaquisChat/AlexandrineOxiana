@@ -91,6 +91,44 @@ export const Identifiers = z.object({
   arxiv: z.string().optional(),
 });
 
+/**
+ * Optional bibliographic detail (R87), stored as text like the other descriptive fields: volume,
+ * issue, page range ("115–134"), edition, number of pages, place of publication, series title and
+ * number, and overrides of the genre and medium the citation type map gives (e.g. "Video" for a
+ * reel, "Photograph"). All optional, so sources written before them read unchanged.
+ */
+export const BIBLIO_FIELDS = [
+  "volume", "issue", "page", "edition", "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber", "genre", "medium",
+] as const;
+export type BiblioField = (typeof BIBLIO_FIELDS)[number];
+export const BIBLIO_MAX = 1000;
+const BiblioText = z.string().min(1).max(BIBLIO_MAX).optional();
+export const BiblioShape = {
+  volume: BiblioText,
+  issue: BiblioText,
+  page: BiblioText,
+  edition: BiblioText,
+  numberOfPages: BiblioText,
+  publisherPlace: BiblioText,
+  collectionTitle: BiblioText,
+  collectionNumber: BiblioText,
+  genre: BiblioText,
+  medium: BiblioText,
+} satisfies Record<BiblioField, z.ZodTypeAny>;
+export type Biblio = Partial<Record<BiblioField, string>>;
+
+/** The bibliographic fields of `o` that hold text (trimmed, at most BIBLIO_MAX characters; empty ones dropped). */
+export function biblioOf(o: Partial<Record<BiblioField, unknown>> | undefined): Biblio {
+  const out: Biblio = {};
+  if (!o) return out;
+  for (const k of BIBLIO_FIELDS) {
+    const v = o[k];
+    const t = typeof v === "string" ? v.trim() : typeof v === "number" && Number.isFinite(v) ? String(v) : "";
+    if (t) out[k] = t.slice(0, BIBLIO_MAX);
+  }
+  return out;
+}
+
 export const Source = z.object({
   id: Id,
   projectIds: z.array(Id),
@@ -99,6 +137,7 @@ export const Source = z.object({
   creators: z.array(Creator),
   container: MultiText.optional(),
   publisher: z.string().optional(),
+  ...BiblioShape,
   issued: EdtfLite.optional(),
   accessed: Timestamp.optional(),
   identifiers: Identifiers,

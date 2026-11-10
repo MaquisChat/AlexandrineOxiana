@@ -13,13 +13,14 @@
  * Also here: ScanAnnotation → Annotation, and unique citation keys.
  */
 import { isDeepStrictEqual } from "node:util";
-import { Annotation, newId, primary, type Asset, type FieldEvidence, type MultiText, type SourceDraft, type SourceFile } from "@ao/core";
+import { Annotation, BIBLIO_FIELDS, newId, primary, type Asset, type FieldEvidence, type MultiText, type SourceDraft, type SourceFile } from "@ao/core";
 import { annotationHash, getAt, unedited, type FilledField } from "./merge.js";
 import type { ScanAnnotation } from "./scan.js";
 
 /** The fields an update may change, as JSON pointers (the ones resolution records evidence for, and the URL). */
 export const UPDATABLE = [
   "/type", "/title", "/creators", "/issued", "/container", "/publisher",
+  ...BIBLIO_FIELDS.map((k) => `/${k}` as const),
   "/identifiers/doi", "/identifiers/isbn", "/identifiers/issn", "/identifiers/arxiv", "/identifiers/url",
 ] as const;
 /** Fields a source cannot be without: an update changes them but never removes them. */
@@ -45,6 +46,7 @@ export function referenceValues(ref: Partial<SourceDraft>): Map<string, unknown>
     "/issued": ref.issued,
     "/container": ref.container,
     "/publisher": ref.publisher,
+    ...Object.fromEntries(BIBLIO_FIELDS.map((k) => [`/${k}`, ref[k]])),
     "/identifiers/doi": ids.doi,
     "/identifiers/isbn": ids.isbn,
     "/identifiers/issn": ids.issn,

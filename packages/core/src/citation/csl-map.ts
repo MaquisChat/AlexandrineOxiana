@@ -8,6 +8,12 @@
  * (`en-GB` matches `en`). The item's `language` is the original's, so citeproc-js leaves the case
  * of non-English titles alone.
  *
+ * Bibliographic detail (R87): volume, issue, page, edition, number-of-pages, publisher-place,
+ * collection-title and collection-number are copied from the source; its `genre` and `medium`
+ * override the type map's. Platforms follow the styles' CSL convention: a video's platform is its
+ * `publisher` (APA "[Video]. YouTube."), a social post's its `container-title`, and a social post
+ * that is a video (a reel, a TikTok) gets genre "Video" unless the source overrides it.
+ *
  * Participants (spec 4.4): with the project's pseudonym map (`pseudonyms`, handle or name →
  * participant code), any creator matching it under any of their name forms (handle with or without
  * "@", literal, family, given, "given family", "family, given") becomes `{ literal: <code> }`, and
@@ -17,7 +23,7 @@
  * makes an uncoded creator other than the interviewer an error instead (fail closed).
  */
 import type { Anchor } from "../model/anchor.js";
-import type { Creator, SourceFile, SourceType } from "../model/source.js";
+import type { BiblioField, Creator, SourceFile, SourceType } from "../model/source.js";
 import type { MultiText } from "../model/text.js";
 import { pseudonymize } from "../naming.js";
 
@@ -42,6 +48,14 @@ export interface CslItem {
   interviewer?: CslName[];
   contributor?: CslName[];
   publisher?: string;
+  "publisher-place"?: string;
+  volume?: string;
+  issue?: string;
+  page?: string;
+  edition?: string;
+  "number-of-pages"?: string;
+  "collection-title"?: string;
+  "collection-number"?: string;
   issued?: CslDate;
   accessed?: CslDate;
   URL?: string;
@@ -94,7 +108,18 @@ const TYPE_MAP: Readonly<Record<SourceType, { type: string; genre?: string; medi
   other: { type: "document" },
 };
 
-const PLATFORM_TYPES: ReadonlySet<SourceType> = new Set(["social-post", "video"]);
+/** Source bibliographic field → CSL variable (genre and medium are overrides, handled apart). */
+const BIBLIO_CSL: ReadonlyArray<[BiblioField, keyof CslItem]> = [
+  ["volume", "volume"],
+  ["issue", "issue"],
+  ["page", "page"],
+  ["edition", "edition"],
+  ["numberOfPages", "number-of-pages"],
+  ["publisherPlace", "publisher-place"],
+  ["collectionTitle", "collection-title"],
+  ["collectionNumber", "collection-number"],
+];
+
 const PLATFORM_NAMES: Readonly<Record<string, string>> = { youtube: "YouTube", instagram: "Instagram", tiktok: "TikTok" };
 
 type Role = "author" | "editor" | "translator" | "interviewer" | "contributor";
@@ -173,6 +198,18 @@ function dateParts(s: string | undefined, timestamp = false): CslDate | undefine
   return { "date-parts": [[m[1], m[2], m[3]].filter((x): x is string => x !== undefined).map(Number)] };
 }
 
+/**
+ * A social post that is a video: its original media is a video (an Instagram reel), or its platform
+ * only carries videos (TikTok), or its URL is a reel's.
+ */
+function isVideoPost(sf: SourceFile): boolean {
+  const s = sf.source;
+  if (sf.assets.some((a) => a.role === "original" && (a.kind === "video" || a.mime.toLowerCase().startsWith("video/")))) return true;
+  if (s.identifiers.platform === "tiktok") return true;
+  const url = s.identifiers.url ?? "";
+  return /^https?:\/\/(?:www\.)?instagram\.com\/(?:[^/?#]+\/)?reels?\//iu.test(url);
+}
+
 export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   const s = sf.source;
   const mapped = TYPE_MAP[s.type] ?? TYPE_MAP.other;
@@ -205,15 +242,26 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   if (title.value) item.title = scrub(title.value);
   if (title.lang) item.language = title.lang;
 
+  // Platforms (R87, the CSL convention the styles expect): a video's platform is its publisher
+  // (APA: "[Video]. YouTube."); a social post's is its container (MLA/APA: "Instagram").
   const platform = s.identifiers.platform;
-  if (PLATFORM_TYPES.has(s.type) && platform && PLATFORM_NAMES[platform]) {
-    item["container-title"] = PLATFORM_NAMES[platform];
+  const platformName = platform ? PLATFORM_NAMES[platform] : undefined;
+  if (s.type === "social-post" && platformName) {
+    item["container-title"] = platformName;
   } else {
     const container = pickTitle(s.container, opts, false);
     if (container.value) item["container-title"] = scrub(container.value);
   }
+  if (s.type === "video" && platformName) item.publisher = platformName;
+  else if (s.publisher) item.publisher = scrub(s.publisher);
+  for (const [field, csl] of BIBLIO_CSL) {
+    const v = s[field]?.trim();
+    if (v) (item as unknown as Record<string, string>)[csl] = scrub(v);
+  }
+  if (s.type === "social-post" && !mapped.genre && isVideoPost(sf)) item.genre = "Video";
+  if (s.genre?.trim()) item.genre = scrub(s.genre.trim());
+  if (s.medium?.trim()) item.medium = scrub(s.medium.trim());
 
-  if (s.publisher) item.publisher = scrub(s.publisher);
   const issued = dateParts(s.issued);
   if (issued) item.issued = issued;
   const accessed = dateParts(s.accessed, true);

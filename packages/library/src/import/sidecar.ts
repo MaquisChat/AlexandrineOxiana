@@ -6,7 +6,7 @@
  */
 import * as fsp from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
-import { toIsbn13, type Creator, type SourceType } from "@ao/core";
+import { biblioOf, toIsbn13, type Biblio, type Creator, type SourceType } from "@ao/core";
 import { dcValues } from "../extract/epub.js";
 import { clean, decodeEntities, normalizeDate, parseName } from "../extract/names.js";
 
@@ -25,7 +25,7 @@ function trimEnd(s: string, ch: string): string {
   return s.slice(0, end);
 }
 
-export interface SidecarMetadata {
+export interface SidecarMetadata extends Biblio {
   type?: SourceType;
   title?: string;
   creators?: Creator[];
@@ -107,6 +107,8 @@ export function parseRis(text: string): SidecarMetadata {
   const m: SidecarMetadata = {};
   const creators: Creator[] = [];
   const isbns: string[] = [];
+  let sp = "";
+  let ep = "";
   for (const line of text.split(/\r?\n/u)) {
     if (line.length < 5 || line[2] !== " " || line[3] !== " " || line[4] !== "-") continue;
     const tag = line.slice(0, 2).toUpperCase();
@@ -124,11 +126,28 @@ export function parseRis(text: string): SidecarMetadata {
     } else if ((tag === "PY" || tag === "Y1" || tag === "DA") && !m.issued) m.issued = normalizeDate(trimEnd(v, "/").replaceAll("/", "-"));
     else if ((tag === "JO" || tag === "JF" || tag === "T2" || tag === "BT") && !m.container) m.container = v;
     else if (tag === "PB" && !m.publisher) m.publisher = v;
+    else if (tag === "VL" && !m.volume) m.volume = v;
+    else if (tag === "IS" && !m.issue) m.issue = v;
+    else if (tag === "SP" && !sp) sp = v;
+    else if (tag === "EP" && !ep) ep = v;
+    else if (tag === "ET" && !m.edition) m.edition = v;
+    else if (tag === "CY" && !m.publisherPlace) m.publisherPlace = v;
+    else if (tag === "T3" && !m.collectionTitle) m.collectionTitle = v;
     else if (tag === "DO" && !m.doi) m.doi = doiOf(v);
     else if (tag === "SN") isbns.push(...v.split(/[;,\s]+/u));
   }
   if (creators.length) m.creators = creators;
+  const page = risPages(sp, ep);
+  if (page) m.page = page;
   return finish(m, isbns);
+}
+
+/** RIS start and end page → one page range ("201-219"; just the start when there is no end). */
+export function risPages(sp: string | undefined, ep: string | undefined): string | undefined {
+  const a = sp?.trim() ?? "";
+  const b = ep?.trim() ?? "";
+  if (!a) return b || undefined;
+  return b && b !== a && !/[-–]/u.test(a) ? `${a}-${b}` : a;
 }
 
 const BIB_TYPES: Record<string, SourceType> = {
@@ -236,9 +255,36 @@ export function parseBibtex(text: string): SidecarMetadata {
   if (container) m.container = container;
   const publisher = get("publisher") ?? get("institution") ?? get("school");
   if (publisher) m.publisher = publisher;
+  Object.assign(m, bibtexBiblio(m.type, get));
   const doi = doiOf(get("doi"));
   if (doi) m.doi = doi;
   return finish(m, (get("isbn") ?? "").split(/[;,\s]+/u));
+}
+
+/**
+ * BibTeX/BibLaTeX bibliographic fields (R87): volume, pages (`--` → en dash), edition, address
+ * (place), series, pagetotal; `number` is an article's issue, else the series number (`issue`
+ * is read too).
+ */
+export function bibtexBiblio(type: SourceType | undefined, get: (k: string) => string | undefined): Biblio {
+  const out: Biblio = {};
+  const set = (k: keyof Biblio, v: string | undefined) => {
+    const t = v?.trim();
+    if (t) out[k] = t;
+  };
+  set("volume", get("volume"));
+  set("page", get("pages")?.replace(/\s*-{2,3}\s*/gu, "–"));
+  set("edition", get("edition"));
+  set("publisherPlace", get("address") ?? get("location"));
+  set("collectionTitle", get("series"));
+  set("numberOfPages", get("pagetotal"));
+  const number = get("number");
+  if (type === "article-journal" || type === "preprint") set("issue", get("issue") ?? number);
+  else {
+    set("issue", get("issue"));
+    set("collectionNumber", number);
+  }
+  return out;
 }
 
 const CSL_TYPES: Record<string, SourceType> = {
@@ -246,6 +292,27 @@ const CSL_TYPES: Record<string, SourceType> = {
   book: "book", chapter: "chapter", report: "report", thesis: "thesis", webpage: "webpage", dataset: "dataset",
   "paper-conference": "article-journal", manuscript: "manuscript", speech: "presentation", article: "preprint",
 };
+
+/** CSL-JSON's bibliographic variables (R87), strings or numbers, at most MAX_FIELD_CHARS each. */
+export function cslBiblio(item: Record<string, unknown>): Biblio {
+  const pick = (k: string) => {
+    const v = item[k];
+    const t = typeof v === "string" ? clean(cap(v)) : typeof v === "number" && Number.isFinite(v) ? String(v) : "";
+    return t || undefined;
+  };
+  return biblioOf({
+    volume: pick("volume"),
+    issue: pick("issue"),
+    page: pick("page"),
+    edition: pick("edition"),
+    numberOfPages: pick("number-of-pages"),
+    publisherPlace: pick("publisher-place"),
+    collectionTitle: pick("collection-title"),
+    collectionNumber: pick("collection-number"),
+    genre: pick("genre"),
+    medium: pick("medium"),
+  });
+}
 
 export function parseCslJson(text: string): SidecarMetadata {
   const parsed = JSON.parse(text) as unknown;
@@ -277,6 +344,7 @@ export function parseCslJson(text: string): SidecarMetadata {
   if (issued) m.issued = issued;
   if (s("container-title")) m.container = s("container-title");
   if (s("publisher")) m.publisher = s("publisher");
+  Object.assign(m, cslBiblio(item));
   const doi = doiOf(s("DOI"));
   if (doi) m.doi = doi;
   const isbn = item.ISBN;

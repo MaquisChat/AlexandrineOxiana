@@ -12,7 +12,7 @@
  *   keep-both         keep the source as it is
  */
 import { join } from "node:path";
-import { newId, recheckSourceFile, type FieldEvidence, type LookupEvidence, type SourceDraft, type SourceFile, type SourceType } from "@ao/core";
+import { BIBLIO_FIELDS, biblioOf, newId, recheckSourceFile, type FieldEvidence, type LookupEvidence, type SourceDraft, type SourceFile, type SourceType } from "@ao/core";
 import { NotFoundError } from "../../repo/errors.js";
 import type { ReviewEntry } from "../../repo/review.js";
 import { storeRequest } from "../../repo/sources.js";
@@ -49,7 +49,7 @@ async function pendingEntry(repo: Repo, projectId: string, itemId: string): Prom
   return e as ReviewEntry & { sourceId: string };
 }
 
-const DRAFT_FIELDS = ["type", "title", "creators", "container", "publisher", "issued", "identifiers"] as const;
+const DRAFT_FIELDS = ["type", "title", "creators", "container", "publisher", ...BIBLIO_FIELDS, "issued", "identifiers"] as const;
 
 /** Applies field values to a source, with evidence of `source` kind, and rechecks its verification. */
 function applyFields(cur: SourceFile, fields: Partial<SourceDraft>, evidence: FieldEvidence["source"], at: string, actor: string, lookups: LookupEvidence[] = []): SourceFile {
@@ -80,6 +80,7 @@ function fromCandidate(c: LookupResult): Partial<SourceDraft> {
     ...(c.issued ? { issued: c.issued } : {}),
     ...(c.container ? { container: mt(c.container) } : {}),
     ...(c.publisher ? { publisher: c.publisher } : {}),
+    ...biblioOf(c),
     identifiers: { ...(c.identifiers.doi ? { doi: c.identifiers.doi } : {}), ...(c.identifiers.isbn?.length ? { isbn: c.identifiers.isbn } : {}), ...(c.identifiers.issn ? { issn: c.identifiers.issn } : {}) },
   };
 }

@@ -5,9 +5,9 @@ style: modern-language-association
 ## journalArticle
 citation:     (Quispe and Ortega)
 with locator: (Quispe and Ortega 12)
-bibliography: Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology, June 2021, https://doi.org/10.5555/joe.2021.0042.
+bibliography: Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology, vol. 41, no. 2, June 2021, pp. 115–34, https://doi.org/10.5555/joe.2021.0042.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” <i>Journal of Ethnobiology</i>, June 2021, https://doi.org/10.5555/joe.2021.0042.</div>
+  <div class="csl-entry">Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” <i>Journal of Ethnobiology</i>, vol. 41, no. 2, June 2021, pp. 115–34, https://doi.org/10.5555/joe.2021.0042.</div>
 </div>
 
 ## book
@@ -21,25 +21,25 @@ html:         <div class="csl-bib-body">
 ## chapter
 citation:     (Tanaka)
 with locator: (Tanaka 12)
-bibliography: Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” Ferment and Society, edited by Ruth Mendel and Omar Haddad, Routledge, 2019.
+bibliography: Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” Ferment and Society, edited by Ruth Mendel and Omar Haddad, Routledge, 2019, pp. 45–67.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” <i>Ferment and Society</i>, edited by Ruth Mendel and Omar Haddad, Routledge, 2019.</div>
+  <div class="csl-entry">Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” <i>Ferment and Society</i>, edited by Ruth Mendel and Omar Haddad, Routledge, 2019, pp. 45–67.</div>
 </div>
 
 ## youtubeVideo
 citation:     (Fermentology Lab)
 with locator: (Fermentology Lab, 0:38–0:46)
-bibliography: Fermentology Lab. “How to Start a Sourdough Culture.” YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.
+bibliography: Fermentology Lab. How to Start a Sourdough Culture. YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">Fermentology Lab. “How to Start a Sourdough Culture.” <i>YouTube</i>, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.</div>
+  <div class="csl-entry">Fermentology Lab. <i>How to Start a Sourdough Culture</i>. YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.</div>
 </div>
 
 ## instagramReel
 citation:     (P-014)
 with locator: (P-014, 0:38–0:46)
-bibliography: P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Instagram, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.
+bibliography: P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. Instagram, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.
 html:         <div class="csl-bib-body">
-  <div class="csl-entry">P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” <i>Instagram</i>, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.</div>
+  <div class="csl-entry">P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. <i>Instagram</i>, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.</div>
 </div>
 
 ## fieldPhoto
@@ -51,8 +51,8 @@ html:         <div class="csl-bib-body">
 
 ## all six, one bibliography
 Castillo, Ana. Clay Fermentation Jars at a Market Stall. Field photograph. 14 Aug. 2025.
-Fermentology Lab. “How to Start a Sourdough Culture.” YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.
+Fermentology Lab. How to Start a Sourdough Culture. YouTube, 2023, https://www.youtube.com/watch?v=dQw4w9WgXcQ. Video.
 Katz, Sandor Ellix. The Art of Fermentation. Chelsea Green Publishing, 2012.
-P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Instagram, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.
-Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology, June 2021, https://doi.org/10.5555/joe.2021.0042.
-Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” Ferment and Society, edited by Ruth Mendel and Omar Haddad, Routledge, 2019.
+P-014. “Receta de la abuela, sin filtros [Grandma’s recipe, no filters].” Video. Instagram, 2 Mar. 2024, https://www.instagram.com/reel/C4abc123XyZ/.
+Quispe, María José, and Daniel K. Ortega. “Fermentation and Food Sovereignty in the Andes.” Journal of Ethnobiology, vol. 41, no. 2, June 2021, pp. 115–34, https://doi.org/10.5555/joe.2021.0042.
+Tanaka, Aiko. “Kitchen Ferments as Household Knowledge.” Ferment and Society, edited by Ruth Mendel and Omar Haddad, Routledge, 2019, pp. 45–67.

@@ -44,7 +44,9 @@
 import { basename, extname } from "node:path";
 import {
   AUTO_ACCEPT_THRESHOLD,
+  BIBLIO_FIELDS,
   DOC_TEXT_LIMIT,
+  biblioOf,
   EdtfLite,
   SourceDraft,
   applyVerification,
@@ -56,6 +58,8 @@ import {
   titleSimilarity,
   toIsbn13,
   verifyDraft,
+  type Biblio,
+  type BiblioField,
   type Creator,
   type Evidence,
   type FieldEvidence,
@@ -133,7 +137,7 @@ export interface Resolution {
   unreadable: boolean;
 }
 
-interface Fields {
+interface Fields extends Biblio {
   type?: SourceType;
   title?: string;
   creators?: Creator[];
@@ -155,6 +159,7 @@ const POINTER: Record<keyof Fields, string> = {
   issued: "/issued",
   container: "/container",
   publisher: "/publisher",
+  ...(Object.fromEntries(BIBLIO_FIELDS.map((k) => [k, `/${k}`])) as Record<BiblioField, string>),
   doi: "/identifiers/doi",
   isbn: "/identifiers/isbn",
   issn: "/identifiers/issn",
@@ -182,6 +187,7 @@ function fromLookup(r: LookupResult): Fields {
     ...(r.issued ? { issued: r.issued } : {}),
     ...(r.container ? { container: r.container } : {}),
     ...(r.publisher ? { publisher: r.publisher } : {}),
+    ...biblioOf(r),
     ...(r.identifiers.doi ? { doi: r.identifiers.doi } : {}),
     ...(r.identifiers.isbn?.length ? { isbn: r.identifiers.isbn } : {}),
     ...(r.identifiers.issn ? { issn: r.identifiers.issn } : {}),
@@ -199,6 +205,7 @@ function fromReference(ref: Partial<SourceDraft>): Fields {
     ...(ref.issued ? { issued: ref.issued } : {}),
     ...(container ? { container } : {}),
     ...(ref.publisher ? { publisher: ref.publisher } : {}),
+    ...biblioOf(ref),
     ...(ids.doi ? { doi: ids.doi } : {}),
     ...(ids.isbn?.length ? { isbn: ids.isbn } : {}),
     ...(ids.issn ? { issn: ids.issn } : {}),
@@ -214,6 +221,7 @@ function fromSidecar(m: SidecarMetadata): Fields {
     ...(m.issued ? { issued: m.issued } : {}),
     ...(m.container ? { container: m.container } : {}),
     ...(m.publisher ? { publisher: m.publisher } : {}),
+    ...biblioOf(m),
     ...(m.doi ? { doi: m.doi } : {}),
     ...(m.isbn?.length ? { isbn: m.isbn } : {}),
   };
@@ -495,6 +503,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     creators: values.creators ?? [],
     ...(values.container ? { container: ref.container && values.container === refFields.container ? ref.container : mt(values.container) } : {}),
     ...(values.publisher ? { publisher: values.publisher } : {}),
+    ...biblioOf(values),
     ...(issued ? { issued } : {}),
     identifiers: {
       ...(ref.identifiers ?? {}),
@@ -549,5 +558,6 @@ export function mayHaveLocation(mime: string, extracted: Pick<Extracted, "media"
 /** Reference fields resolution does not decide (collections, tags, case attributes ...). */
 function stripResolved(ref: Partial<SourceDraft>): Partial<SourceDraft> {
   const { type: _t, title: _ti, creators: _c, issued: _i, container: _co, publisher: _p, identifiers: _id, ...rest } = ref;
+  for (const k of BIBLIO_FIELDS) delete rest[k];
   return rest;
 }

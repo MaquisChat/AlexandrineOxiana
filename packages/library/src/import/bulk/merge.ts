@@ -9,7 +9,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { createHash } from "node:crypto";
-import type { Annotation, Asset, FieldEvidence, Source, SourceDraft, SourceFile } from "@ao/core";
+import { BIBLIO_FIELDS, type Annotation, type Asset, type FieldEvidence, type Source, type SourceDraft, type SourceFile } from "@ao/core";
 
 /** Hash of an annotation's content (kind, text, colour, page label, anchors without their ids): what Annotation.externalHash records. */
 export function annotationHash(a: Pick<Annotation, "kind" | "body" | "quote" | "color" | "pageLabel" | "anchors">): string {
@@ -78,6 +78,7 @@ export function missingFields(cur: SourceFile, d: SourceDraft): FilledField[] {
   if (!s.issued && d.issued) out.push({ path: "/issued", after: d.issued });
   if (!s.container && d.container) out.push({ path: "/container", after: d.container });
   if (!s.publisher && d.publisher) out.push({ path: "/publisher", after: d.publisher });
+  for (const k of BIBLIO_FIELDS) if (!s[k] && d[k]) out.push({ path: `/${k}`, after: d[k] });
   for (const [k, v] of Object.entries(d.identifiers)) {
     if (v !== undefined && (s.identifiers as Record<string, unknown>)[k] === undefined) out.push({ path: `/identifiers/${k}`, after: v });
   }

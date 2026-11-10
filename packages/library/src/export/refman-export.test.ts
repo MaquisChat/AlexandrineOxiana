@@ -2,7 +2,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Creator, Project, Provenance, SourceDraft, SourceType } from "@ao/core";
+import { BIBLIO_FIELDS, biblioOf, type Biblio, type BiblioField, type Creator, type Project, type Provenance, type SourceDraft, type SourceType } from "@ao/core";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
@@ -79,6 +79,7 @@ interface Ref {
   identifiers?: SourceDraft["identifiers"];
   citationKey: string;
   identifiable?: boolean;
+  biblio?: Biblio;
 }
 
 async function addSource(p: Project, r: Ref): Promise<string> {
@@ -90,6 +91,7 @@ async function addSource(p: Project, r: Ref): Promise<string> {
     ...(r.container ? { container: mt(r.container) } : {}),
     ...(r.publisher ? { publisher: r.publisher } : {}),
     ...(r.issued ? { issued: r.issued } : {}),
+    ...(r.biblio ?? {}),
     identifiers: r.identifiers ?? {},
     citationKey: r.citationKey,
     caseAttributes: {},
@@ -123,6 +125,7 @@ const REFS: Ref[] = [
     publisher: "Sage",
     identifiers: { doi: "10.5555/ao.urban.2024.017", issn: "0042-0980", url: "https://example.org/a?x=1&y=2" },
     citationKey: "okafor2024feeding",
+    biblio: { volume: "61", issue: "4", page: "777-799" },
   },
   {
     type: "book",
@@ -132,6 +135,7 @@ const REFS: Ref[] = [
     publisher: "Cambridge University Press",
     identifiers: { isbn: ["9780262033848"] },
     citationKey: "adebayo2019street",
+    biblio: { edition: "2", numberOfPages: "312", publisherPlace: "Cambridge", collectionTitle: "African Studies", collectionNumber: "141" },
   },
   {
     type: "chapter",
@@ -140,6 +144,7 @@ const REFS: Ref[] = [
     issued: "2021-06",
     container: "Handbook of Urban Africa",
     citationKey: "idowu2021markets",
+    biblio: { page: "45-67", publisherPlace: "London" },
   },
   {
     type: "report",
@@ -161,6 +166,14 @@ async function readBack(format: RefmanFormat, text: string): Promise<ScanItem[]>
   for await (const i of adapters[format](path).scan(new AbortController().signal)) out.push(i);
   return out;
 }
+
+/** The bibliographic fields each format carries (R87): RIS has no series number or page count. */
+const BIBLIO_IN: Record<RefmanFormat, readonly BiblioField[]> = {
+  bibtex: ["volume", "issue", "page", "edition", "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber"],
+  ris: ["volume", "issue", "page", "edition", "publisherPlace", "collectionTitle"],
+  "csl-json": BIBLIO_FIELDS,
+};
+const biblioIn = (format: RefmanFormat, b: Biblio | undefined) => Object.fromEntries(BIBLIO_IN[format].flatMap((k) => (b?.[k] ? [[k, b[k]]] : [])));
 
 /** The fields an export carries, as our adapters read them. */
 const fieldsOf = (m: ScanItem["referenceMetadata"]) => ({
@@ -249,6 +262,20 @@ describe("escaping", () => {
     expect(back[0]!.referenceMetadata!.title!.variants[0]!.value).toBe("Line one ER - injected TY - BOOK TI - Fake");
   });
 
+  it("BibTeX pages: an en dash is written as -- and read back as an en dash; number is the issue of an article and the series number of a book", async () => {
+    const p = await project();
+    const a = await addSource(p, { ...REFS[0]!, citationKey: "a1", biblio: { volume: "61", issue: "4", page: "777–799" } });
+    const b = await addSource(p, { ...REFS[1]!, citationKey: "b1" });
+    const { text } = await exportRefman(repo, p.id, [a, b], "bibtex");
+    expect(text).toContain("pages = {777--799}");
+    expect(text).toMatch(/@article\{a1,[^@]*number = \{4\}/u);
+    expect(text).toMatch(/@book\{b1,[^@]*number = \{141\}/u);
+    const back = await readBack("bibtex", text);
+    expect(back[0]!.referenceMetadata).toMatchObject({ volume: "61", issue: "4", page: "777–799" });
+    expect(back[1]!.referenceMetadata).toMatchObject({ collectionTitle: "African Studies", collectionNumber: "141" });
+    expect(back[1]!.referenceMetadata!.issue).toBeUndefined();
+  });
+
   it("CSL-JSON is standard JSON (quotes, backslashes, control characters, U+2028)", async () => {
     const p = await project();
     const title = 'Quote " back \\ tab\t line sep';
@@ -271,6 +298,8 @@ describe("round trips through our adapters", () => {
       const back = await readBack(format, text);
       expect(back.map((i) => i.referenceMetadata?.citationKey)).toEqual(REFS.map((r) => r.citationKey));
       expect(back.map((i) => fieldsOf(i.referenceMetadata))).toEqual(REFS.map(expected));
+      // R87: volume, issue, pages, edition, place, series … survive (what the format can hold).
+      expect(back.map((i) => biblioOf(i.referenceMetadata))).toEqual(REFS.map((r) => biblioIn(format, r.biblio)));
     });
   }
 

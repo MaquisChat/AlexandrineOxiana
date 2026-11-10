@@ -28,9 +28,10 @@ import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fileTypeFromFile } from "file-type";
-import { toIsbn13, type Creator, type ImportBatch, type SourceDraft, type SourceType } from "@ao/core";
+import { biblioOf, toIsbn13, type Biblio, type Creator, type ImportBatch, type SourceDraft, type SourceType } from "@ao/core";
 import { clean, normalizeDate, parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanFile, ScanItem } from "./bulk/scan.js";
+import { bibtexBiblio, cslBiblio, risPages } from "./sidecar.js";
 
 export const MAX_EXPORT_BYTES = 100 * 1024 * 1024;
 export const MAX_FIELD_CHARS = 64 * 1024;
@@ -205,7 +206,7 @@ export const arxivOf = (v: string | undefined) => {
 };
 
 /** What an adapter knows about one record, before its files are checked. */
-export interface RecordFields {
+export interface RecordFields extends Biblio {
   type?: SourceType;
   title?: string;
   creators?: Creator[];
@@ -237,6 +238,7 @@ export function referenceMetadata(f: RecordFields): Partial<SourceDraft> {
     ...(issued ? { issued } : {}),
     ...(f.container ? { container: mt(f.container) } : {}),
     ...(f.publisher ? { publisher: f.publisher } : {}),
+    ...biblioOf(f),
     ...(Object.keys(ids).length ? { identifiers: ids } : {}),
     ...(f.citekey ? { citationKey: f.citekey } : {}),
   };
@@ -490,6 +492,8 @@ const KNOWN_FIELDS = new Set([
   "title", "author", "editor", "translator", "year", "month", "date", "journal", "journaltitle", "booktitle",
   "publisher", "institution", "school", "organization", "doi", "isbn", "issn", "url", "eprint", "archiveprefix",
   "eprinttype", "keywords", "file",
+  // R87: bibliographic detail.
+  "volume", "number", "issue", "pages", "edition", "address", "location", "series", "pagetotal",
 ]);
 const isNameChar = (c: string | undefined) => !!c && c !== "," && c !== "=" && c !== "#" && c !== "{" && c !== "}" && c !== "(" && c !== ")" && c !== '"' && c !== "@" && !/\s/u.test(c);
 const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v";
@@ -890,6 +894,7 @@ export function bibFields(e: BibEntry): RecordFields {
   if (container) f.container = container;
   const publisher = t("publisher") ?? t("institution") ?? t("school") ?? t("organization");
   if (publisher) f.publisher = publisher;
+  Object.assign(f, bibtexBiblio(f.type, t));
   const doi = doiOf(get("doi"));
   if (doi) f.doi = doi;
   const isbn = isbnsOf([get("isbn") ?? ""]);
@@ -1001,6 +1006,10 @@ export function risFields(r: RisRecord): RecordFields {
   if (container) f.container = container;
   const publisher = first("PB");
   if (publisher) f.publisher = publisher;
+  Object.assign(
+    f,
+    biblioOf({ volume: first("VL"), issue: first("IS"), page: risPages(first("SP"), first("EP")), edition: first("ET"), publisherPlace: first("CY"), collectionTitle: first("T3") }),
+  );
   const doi = doiOf(first("DO"));
   if (doi) f.doi = doi;
   const sn = all("SN");
@@ -1116,6 +1125,7 @@ export function cslFields(item: Json): RecordFields {
   if (issued) f.issued = issued;
   if (s("container-title")) f.container = s("container-title");
   if (s("publisher")) f.publisher = s("publisher");
+  Object.assign(f, cslBiblio(item));
   const doi = doiOf(s("DOI"));
   if (doi) f.doi = doi;
   const isbnRaw = item.ISBN;

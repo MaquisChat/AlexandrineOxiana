@@ -14,7 +14,11 @@
  * Citation keys are made unique within one export (a, b, c … appended, noted).
  *
  * Exported: type, title, creators (author / editor / translator), date, container, publisher,
- * DOI, ISBN, ISSN, URL, arXiv id (BibTeX), the citation key, and tags only with `includeTags`.
+ * DOI, ISBN, ISSN, URL, arXiv id (BibTeX), the citation key, and tags only with `includeTags`; and
+ * the bibliographic detail each format can hold (R87): BibTeX volume, number (an article's issue,
+ * else the series number; a non-article's issue as `issue`), pages (an en dash as `--`), edition,
+ * address, series, pagetotal; RIS VL, IS, SP/EP, ET, CY, T3; CSL-JSON every variable, genre and
+ * medium included.
  * Never exported: file paths, notes, annotations, provenance.
  *
  * Governance: each source is evaluated with `evaluate({action:'export', export:{identifiable,
@@ -23,8 +27,8 @@
  * out with a note. One `export.refman` audit event records the format and counts (never the path).
  * `writeRefmanExport` writes the file atomically (0600) to the path the user chose.
  */
-import type { Creator, Source, SourceType } from "@ao/core";
-import { primary } from "@ao/core";
+import type { Biblio, Creator, Source, SourceType } from "@ao/core";
+import { biblioOf, primary } from "@ao/core";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { appendLibraryEvent, authorizeProcessing, projectCollectionsAndTags, type Repo } from "../repo/repo.js";
 
@@ -53,7 +57,7 @@ const EXPORT_NOTES = {
 };
 
 /** What one exported reference holds (no files, notes, annotations or provenance). */
-interface Ref {
+interface Ref extends Biblio {
   key: string;
   type: SourceType;
   title: string;
@@ -141,6 +145,18 @@ function toBibtex(refs: Ref[]): string {
     }
     text(r.type === "article-journal" || r.type === "preprint" ? "journal" : "booktitle", r.container);
     text("publisher", r.publisher);
+    text("address", r.publisherPlace);
+    text("edition", r.edition);
+    text("volume", r.volume);
+    const article = r.type === "article-journal" || r.type === "preprint";
+    if (article) text("number", r.issue);
+    else {
+      text("issue", r.issue);
+      text("number", r.collectionNumber);
+    }
+    if (r.page) f.push(["pages", `{${escapeBibtex(r.page).replace(/–/gu, "--")}}`]);
+    text("series", r.collectionTitle);
+    text("pagetotal", r.numberOfPages);
     if (r.doi) f.push(["doi", `{${bibVerbatim(r.doi)}}`]);
     if (r.isbn.length) f.push(["isbn", `{${escapeBibtex(r.isbn.join(", "))}}`]);
     text("issn", r.issn);
@@ -186,6 +202,16 @@ function toRis(refs: Ref[]): string {
     if (r.issued) add("PY", r.issued.split("-").join("/"));
     add("T2", r.container);
     add("PB", r.publisher);
+    add("CY", r.publisherPlace);
+    add("ET", r.edition);
+    add("VL", r.volume);
+    add("IS", r.issue);
+    if (r.page) {
+      const m = /^([^-–]+)[-–]+(.+)$/u.exec(r.page.trim());
+      add("SP", m ? m[1]!.trim() : r.page);
+      if (m) add("EP", m[2]!.trim());
+    }
+    add("T3", r.collectionTitle);
     add("DO", r.doi);
     for (const i of r.isbn) add("SN", i);
     add("SN", r.issn);
@@ -223,6 +249,11 @@ function toCslJson(refs: Ref[]): string {
     if (parts.length) o.issued = { "date-parts": [parts] };
     if (r.container) o["container-title"] = r.container;
     if (r.publisher) o.publisher = r.publisher;
+    for (const [k, v] of [
+      ["publisher-place", r.publisherPlace], ["volume", r.volume], ["issue", r.issue], ["page", r.page], ["edition", r.edition],
+      ["number-of-pages", r.numberOfPages], ["collection-title", r.collectionTitle], ["collection-number", r.collectionNumber],
+      ["genre", r.genre], ["medium", r.medium],
+    ] as const) if (v) o[k] = v;
     if (r.doi) o.DOI = r.doi;
     if (r.isbn.length) o.ISBN = r.isbn.join(", ");
     if (r.issn) o.ISSN = r.issn;
@@ -248,6 +279,7 @@ function refOf(s: Source, tagNames: Map<string, string>, includeTags: boolean): 
     ...(s.issued ? { issued: s.issued } : {}),
     ...(s.container && primary(s.container) ? { container: primary(s.container) } : {}),
     ...(s.publisher ? { publisher: s.publisher } : {}),
+    ...biblioOf(s),
     ...(s.identifiers.doi ? { doi: s.identifiers.doi } : {}),
     isbn: s.identifiers.isbn ?? [],
     ...(s.identifiers.issn ? { issn: s.identifiers.issn } : {}),

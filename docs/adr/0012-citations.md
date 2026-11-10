@@ -46,6 +46,14 @@ Constraints:
 
 We chose the bracketed append because APA 7, MLA 9 and Chicago all accept or recommend a bracketed English translation after a non-English title. A plain string works with every CSL style, whereas CSL-M's multilingual fields work only with styles written for them. `'off'` leaves the title as stored.
 
+### Platforms
+
+These follow the CSL convention the styles expect (R87):
+
+- A video's platform is its `publisher`. APA then gives "[Video]. YouTube.", and MLA and Chicago italicize the video's title as a standalone work.
+- A social post's platform is its `container-title`.
+- A social post that is a video gets genre "Video", unless the source sets its own genre. A post counts as a video when its original media is a video, when it is on TikTok, or when its URL is an Instagram reel.
+
 ### Participants
 
 - `toCslItem` takes the project's pseudonym map (handle or name → participant code).
@@ -72,5 +80,6 @@ We chose the bracketed append because APA 7, MLA 9 and Chicago all accept or rec
 
 - Every CSL style can show translated titles without changes. Styles that would rather print the translation elsewhere, for example after the container, cannot be served this way. That would need CSL-M or a per-style override.
 - Snapshots of APA, Chicago author-date, MLA, ASA and Harvard (Cite Them Right) are committed with a "PENDING HUMAN REVIEW" header. They must be checked against the style guides.
-- The `Source` model has no volume, issue or page range. Journal articles therefore render without them. Chicago prints "ahead of print" and Harvard prints "[Preprint]" for such articles. Adding these fields is a follow-up.
+- R87 added optional bibliographic fields to `Source`: volume, issue, page, edition, numberOfPages, publisherPlace, collectionTitle, collectionNumber, and genre/medium overrides. Lookups, the Zotero, BibTeX, RIS and CSL-JSON importers and the exporters carry them. Before this, a journal article without volume, issue or pages rendered as "ahead of print" in Chicago and as "[Preprint]" in Harvard.
+- ASA prints no URL for a video and only the title for a field photo. Those are the ASA style's own rules for `motion_picture` and `graphic`, not missing fields. It also prints no platform for a social post, because the style reads `publisher` for posts, while APA, Chicago, MLA and Harvard read `container-title`. Setting both would print "Instagram" twice in those four styles.
 - Updating the styles means bumping the commit and the sha256 pins in `fetch-csl.mjs` and in `NOTICE.md`.

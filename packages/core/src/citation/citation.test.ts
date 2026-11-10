@@ -119,12 +119,16 @@ const FIXTURES = {
     ],
     {
       container: mt(["en", "original", "Journal of Ethnobiology"]),
+      volume: "41",
+      issue: "2",
+      page: "115–134",
       issued: "2021-06",
       identifiers: { doi: "10.5555/joe.2021.0042", issn: "0278-0771" },
     },
   ),
   book: source("book", mt(["en", "original", "The art of fermentation"]), [{ role: "author", given: "Sandor Ellix", family: "Katz" }], {
     publisher: "Chelsea Green Publishing",
+    publisherPlace: "White River Junction, VT",
     issued: "2012",
     identifiers: { isbn: ["9781603582865"] },
   }),
@@ -136,7 +140,7 @@ const FIXTURES = {
       { role: "editor", given: "Ruth", family: "Mendel" },
       { role: "editor", given: "Omar", family: "Haddad" },
     ],
-    { container: mt(["en", "original", "Ferment and society"]), publisher: "Routledge", issued: "2019" },
+    { container: mt(["en", "original", "Ferment and society"]), publisher: "Routledge", publisherPlace: "London", page: "45–67", issued: "2019" },
   ),
   youtubeVideo: source(
     "video",
@@ -167,10 +171,22 @@ const FIXTURES = {
       },
     },
   ),
+  // (the reel's original video asset is added below)
   fieldPhoto: source("field-photo", mt(["en", "original", "Clay fermentation jars at a market stall"]), [{ role: "photographer", given: "Ana", family: "Castillo" }], {
     issued: "2025-08-14",
   }),
 } satisfies Record<string, SourceFile>;
+
+/** An original asset of `kind`/`mime` on a source (what capture stores). */
+function withAsset(sf: SourceFile, kind: string, mime: string): SourceFile {
+  return {
+    ...sf,
+    assets: [
+      { id: newId(), sourceId: sf.source.id, role: "original", kind, path: `${sf.source.folder}/original/a`, encrypted: false, sha256: "0".repeat(64), bytes: 1, mime },
+    ],
+  };
+}
+FIXTURES.instagramReel = withAsset(FIXTURES.instagramReel, "video", "video/mp4");
 
 const OPTS: ToCslOptions = { citationLanguage: "en", translatedTitles: "append", script: "original", pseudonyms: PSEUDONYMS };
 const STYLES = ["apa", "chicago-author-date", "modern-language-association", "american-sociological-association", "harvard-cite-them-right"] as const;
@@ -220,7 +236,6 @@ describe("toCslItem", () => {
   it("maps creators by role, identifiers, dates and the platform as container", () => {
     const yt = toCslItem(FIXTURES.youtubeVideo, OPTS);
     expect(yt.author).toEqual([{ literal: "Fermentology Lab" }]);
-    expect(yt["container-title"]).toBe("YouTube");
     expect(yt.URL).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
     expect(yt.issued).toEqual({ "date-parts": [[2023, 5, 1]] });
     expect(yt.accessed).toEqual({ "date-parts": [[2026, 11, 1]] });
@@ -251,6 +266,44 @@ describe("toCslItem", () => {
     // Uploader with only a handle: the handle is the literal name.
     const handleOnly = toCslItem(source("social-post", mt(["en", "original", "T"]), [{ role: "uploader", handle: "@someone" }]), OPTS);
     expect(handleOnly.author).toEqual([{ literal: "@someone" }]);
+  });
+
+  it("maps the bibliographic fields (R87) and lets genre and medium overrides win", () => {
+    const article = toCslItem(FIXTURES.journalArticle, OPTS);
+    expect([article.volume, article.issue, article.page]).toEqual(["41", "2", "115–134"]);
+    const all = toCslItem(
+      source("book", mt(["en", "original", "T"]), [], {
+        volume: "3", issue: "1", page: "9", edition: "2nd", numberOfPages: "312", publisherPlace: "London",
+        collectionTitle: "Studies in Food", collectionNumber: "7", genre: "Cookbook", medium: "Print",
+      }),
+      OPTS,
+    );
+    expect(all).toMatchObject({
+      volume: "3", issue: "1", page: "9", edition: "2nd", "number-of-pages": "312", "publisher-place": "London",
+      "collection-title": "Studies in Food", "collection-number": "7", genre: "Cookbook", medium: "Print",
+    });
+    // Overrides beat the type map's genre/medium.
+    const photo = toCslItem(source("field-photo", mt(["en", "original", "T"]), [], { genre: "Photograph" }), OPTS);
+    expect(photo.genre).toBe("Photograph");
+    const video = toCslItem(source("video", mt(["en", "original", "T"]), [], { medium: "Streaming video" }), OPTS);
+    expect(video.medium).toBe("Streaming video");
+  });
+
+  it("puts the platform in publisher for videos, in container-title for social posts; video posts get genre Video", () => {
+    const yt = toCslItem(FIXTURES.youtubeVideo, OPTS);
+    expect(yt.publisher).toBe("YouTube");
+    expect(yt["container-title"]).toBeUndefined();
+    const reel = toCslItem(FIXTURES.instagramReel, OPTS);
+    expect(reel["container-title"]).toBe("Instagram");
+    expect(reel.publisher).toBeUndefined();
+    expect(reel.genre).toBe("Video");
+    // A photo post is not a video.
+    const photoPost = withAsset(source("social-post", mt(["en", "original", "T"]), [], { identifiers: { platform: "instagram" } }), "image", "image/jpeg");
+    expect(toCslItem(photoPost, OPTS).genre).toBeUndefined();
+    // TikTok posts are videos even before their file is stored; an override wins.
+    const tiktok = source("social-post", mt(["en", "original", "T"]), [], { identifiers: { platform: "tiktok" } });
+    expect(toCslItem(tiktok, OPTS).genre).toBe("Video");
+    expect(toCslItem({ ...tiktok, source: { ...tiktok.source, genre: "Short video" } }, OPTS).genre).toBe("Short video");
   });
 
   it("appends the translated title when the original language differs from the citation language", () => {
@@ -374,6 +427,23 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
     expect(bib).toContain("P-014");
   });
 
+  it("journal articles with volume, issue and pages are not taken for advance or preprint versions (R87)", () => {
+    const chicago = renderBibliography([items.journalArticle], "chicago-author-date", "text");
+    expect(chicago).not.toContain("ahead of print");
+    expect(chicago).toContain("41 (2): 115–34");
+    const harvard = renderBibliography([items.journalArticle], "harvard-cite-them-right", "text");
+    expect(harvard).not.toContain("[Preprint]");
+    expect(harvard).toContain("41(2), pp. 115–134");
+    expect(renderBibliography([items.journalArticle], "apa", "text")).toContain("Journal of Ethnobiology, 41(2), 115–134.");
+  });
+
+  it("APA cites a YouTube video as \"[Video]. YouTube.\" and a reel as \"[Video]. Instagram.\"", () => {
+    const yt = renderBibliography([items.youtubeVideo], "apa", "text");
+    expect(yt).toContain("How to start a sourdough culture [Video]. YouTube. https://www.youtube.com/");
+    expect(yt).not.toContain("In YouTube");
+    expect(renderBibliography([items.instagramReel], "apa", "text")).toContain("[Grandma’s recipe, no filters] [Video]. Instagram.");
+  });
+
   it("puts a timestamp locator into the citation", () => {
     const loc = locatorFromAnchor({ kind: "time-range", id: newId(), assetId: newId(), startMs: 38_000, endMs: 46_000 })!;
     expect(renderCitation([{ item: items.youtubeVideo, ...loc }], "apa", "text")).toBe("(Fermentology Lab, 2023, 0:38–0:46)");
@@ -436,9 +506,9 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
     expect(renderBibliography([items.youtubeVideo], "apa", "text", "de-DE")).toContain("(2023, Mai 1)");
     expect(renderBibliography([items.youtubeVideo], "apa", "text", "en-US")).toContain("(2023, May 1)");
     // A bare language maps to its primary dialect (de → de-DE: German quotation marks in MLA).
-    const mlaDe = renderBibliography([items.youtubeVideo], "modern-language-association", "text", "de");
-    expect(mlaDe).toBe(renderBibliography([items.youtubeVideo], "modern-language-association", "text", "de-DE"));
-    expect(mlaDe).toContain("„How to Start a Sourdough Culture“");
+    const mlaDe = renderBibliography([items.journalArticle], "modern-language-association", "text", "de");
+    expect(mlaDe).toBe(renderBibliography([items.journalArticle], "modern-language-association", "text", "de-DE"));
+    expect(mlaDe).toContain("„Fermentation and Food Sovereignty in the Andes“");
     // A locale the bundle lacks falls back to en-US.
     expect(renderBibliography([items.youtubeVideo], "apa", "text", "xx-XX")).toContain("(2023, May 1)");
   });

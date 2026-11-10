@@ -476,13 +476,22 @@ describe("resolveItem", () => {
       {
         path,
         mime: "application/pdf",
-        referenceMetadata: { type: "presentation", title: { variants: [{ lang: "en", kind: "original", value: "Field Notes on Market Days" }] }, creators: [{ family: "Okafor", given: "Amara", role: "author" }], issued: "2021" },
+        referenceMetadata: {
+          type: "presentation",
+          title: { variants: [{ lang: "en", kind: "original", value: "Field Notes on Market Days" }] },
+          creators: [{ family: "Okafor", given: "Amara", role: "author" }],
+          issued: "2021",
+          publisherPlace: "Lagos",
+          genre: "Conference slides",
+        },
       },
       { projectId: p.id, patterns: [], lookup },
     );
     expect(ref.evidence.method).toBe("reference-metadata");
     expect(ref.confidence).toBe(0.9);
     expect(ref.draft.type).toBe("presentation");
+    expect(ref.draft).toMatchObject({ publisherPlace: "Lagos", genre: "Conference slides" });
+    expect(ref.fieldEvidence.find((e) => e.field === "/publisherPlace")).toMatchObject({ value: "Lagos", source: { kind: "refman" } });
     agent.assertNoPendingInterceptors();
   });
 
@@ -1004,6 +1013,13 @@ processing:
     const res = await resolveItem({ path, mime: "application/pdf" }, { projectId: p.id, patterns: [], lookup });
     expect(res.draft.identifiers.doi).toBe(FIXTURE_DOI);
     expect(res.confidence).toBe(0.97);
+    // R87: the lookup's volume, issue and pages reach the draft, with their evidence.
+    expect(res.draft).toMatchObject({ volume: "12", issue: "3", page: "201-219" });
+    expect(res.fieldEvidence.filter((e) => ["/volume", "/issue", "/page"].includes(e.field)).map((e) => [e.field, e.value, e.source.provider])).toEqual([
+      ["/volume", "12", "crossref"],
+      ["/issue", "3", "crossref"],
+      ["/page", "201-219", "crossref"],
+    ]);
     const [first] = await attach.attachFiles(p.id, [path]);
     expect(first!.outcome).toBe("created");
     expect((await repo.getSource(p.id, first!.sourceId!)).source.identifiers.doi).toBe(FIXTURE_DOI);

@@ -1,9 +1,9 @@
-import { evaluate, type Creator, type GovernanceConfig, type SourceType } from "@ao/core";
+import { evaluate, type Biblio, type Creator, type GovernanceConfig, type SourceType } from "@ao/core";
 import { lookupPolicyInfo, type Repo } from "../repo/repo.js";
 import type { HttpClient } from "./http.js";
 
-/** What a metadata service returned, mapped to the library's model. */
-export interface LookupResult {
+/** What a metadata service returned, mapped to the library's model (with the bibliographic detail it gives, R87). */
+export interface LookupResult extends Biblio {
   title: string;
   creators: Creator[];
   issued?: string;

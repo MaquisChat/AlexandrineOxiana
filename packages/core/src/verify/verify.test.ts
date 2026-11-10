@@ -837,3 +837,23 @@ describe("task 17 rulings", () => {
     });
   });
 });
+
+describe("bibliographic fields (R87)", () => {
+  it("are verified like other text fields: two sources agreeing, dash forms ignored", () => {
+    const d = draft({ volume: "42", page: "115-134" });
+    const evs = [
+      ev("/volume", "42", "refman"),
+      ev("/volume", "42", "lookup", { provider: "crossref" }),
+      ev("/page", "115–134", "lookup", { provider: "crossref" }),
+      ev("/page", "115-134", "refman"),
+    ];
+    const r = verifyDraft(d, evs, {});
+    expect(r.fields["/volume"]!.status).toBe("verified");
+    expect(r.fields["/page"]!.status).toBe("verified");
+  });
+  it("a disagreeing source is reported with the field's name", () => {
+    const r = verifyDraft(draft({ issue: "3" }), [ev("/issue", "4", "lookup", { provider: "crossref" })], {});
+    expect(r.fields["/issue"]!.status).not.toBe("verified");
+    expect(r.fields["/issue"]!.reason).toMatch(/^Issue recorded here/u);
+  });
+});

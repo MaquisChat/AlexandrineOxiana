@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseName } from "../extract/names.js";
-import { parseBibtex, parseRis, readSidecar } from "./sidecar.js";
+import { parseBibtex, parseCslJson, parseRis, readSidecar } from "./sidecar.js";
 
 let tmp: string;
 beforeEach(async () => {
@@ -99,5 +99,22 @@ describe("review round 2 (R82): sidecar tables never reach Object.prototype", ()
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("bibliographic fields in sidecars (R87)", () => {
+  it("BibTeX, RIS and CSL-JSON give volume, issue, pages, edition, place and series", () => {
+    expect(
+      parseBibtex(`@article{a, title = {T}, journal = {J}, volume = {12}, number = {3}, pages = {201--219}, year = 2020}`),
+    ).toMatchObject({ volume: "12", issue: "3", page: "201–219" });
+    expect(parseBibtex(`@book{b, title = {T}, edition = {2}, address = {London}, series = {Food Studies}, number = {7}, pagetotal = {312}}`)).toMatchObject({
+      edition: "2", publisherPlace: "London", collectionTitle: "Food Studies", collectionNumber: "7", numberOfPages: "312",
+    });
+    expect(parseRis("TY  - JOUR\nTI  - T\nVL  - 12\nIS  - 3\nSP  - 201\nEP  - 219\nCY  - Lagos\nET  - 2\nT3  - S\nER  - \n")).toMatchObject({
+      volume: "12", issue: "3", page: "201-219", publisherPlace: "Lagos", edition: "2", collectionTitle: "S",
+    });
+    expect(
+      parseCslJson(JSON.stringify([{ type: "book", title: "T", volume: 2, issue: "1", page: "9-10", edition: "3", "number-of-pages": "300", "publisher-place": "Oxford", "collection-title": "S", "collection-number": 4 }])),
+    ).toMatchObject({ volume: "2", issue: "1", page: "9-10", edition: "3", numberOfPages: "300", publisherPlace: "Oxford", collectionTitle: "S", collectionNumber: "4" });
   });
 });

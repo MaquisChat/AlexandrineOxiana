@@ -13,5 +13,6 @@
   "primary_location": {
     "source": { "id": "https://openalex.org/S1", "display_name": "Journal of Upland Studies", "issn_l": "1234-5679", "host_organization_name": "Example University Press" }
   },
+  "biblio": { "volume": "12", "issue": "3", "first_page": "201", "last_page": "219" },
   "ids": { "openalex": "https://openalex.org/W1000000001", "doi": "https://doi.org/10.5555/ao.fixture.2021.001" }
 }

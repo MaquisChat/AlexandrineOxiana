@@ -73,7 +73,10 @@ CREATE TABLE settings (setting TEXT, key TEXT, value, PRIMARY KEY (setting, key)
 `;
 
 const TYPES = ["annotation", "attachment", "note", "journalArticle", "book", "bookSection", "report"];
-const FIELDS = ["title", "date", "publicationTitle", "bookTitle", "publisher", "DOI", "ISBN", "ISSN", "url", "extra", "abstractNote"];
+const FIELDS = [
+  "title", "date", "publicationTitle", "bookTitle", "publisher", "DOI", "ISBN", "ISSN", "url", "extra", "abstractNote",
+  "volume", "issue", "pages", "edition", "place", "series", "seriesNumber", "numPages",
+];
 const CREATOR_TYPES = ["author", "editor", "contributor", "bookAuthor"];
 
 export const NOTE_HTML =
@@ -151,6 +154,9 @@ export function buildZoteroFixture(dir, o) {
       setField(1, "date", "2024-03-00 March 2024");
       setField(1, "publicationTitle", "Journal of Urban Studies");
       setField(1, "DOI", "10.5555/ao.urban.2024.017");
+      setField(1, "volume", "61");
+      setField(1, "issue", "4");
+      setField(1, "pages", "777-799");
       creator(1, 0, "author", "Okafor", "Ngozi");
       creator(1, 1, "author", "Müller", "Jan");
       add(7, "attachment", "ATTPDF01");
@@ -175,6 +181,11 @@ export function buildZoteroFixture(dir, o) {
       setField(2, "date", "2019");
       setField(2, "ISBN", "978-0-262-03384-8");
       setField(2, "publisher", "MIT Press");
+      setField(2, "edition", "2");
+      setField(2, "place", "Cambridge, MA");
+      setField(2, "series", "Urban Histories");
+      setField(2, "seriesNumber", "12");
+      setField(2, "numPages", "312");
       setField(2, "extra", "Citation Key: adebayo2019markets\ntex.howpublished: print");
       creator(2, 0, "author", "Adebayo", "Tunde");
       add(12, "attachment", "LINKPDF1");
