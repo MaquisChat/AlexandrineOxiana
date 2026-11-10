@@ -50,3 +50,8 @@ export type { EffectivePolicy, Violation } from "./governance/merge.js";
 
 export { evaluate } from "./governance/engine.js";
 export type { Condition, PolicyAction, PolicyDecision, PolicyRequest } from "./governance/engine.js";
+
+export { normalizeTitle, titleSimilarity } from "./verify/evidence.js";
+export type { LookupEvidence } from "./verify/evidence.js";
+export { REQUIRED_FIELDS, applyVerification, recheckSourceFile, verifyDraft } from "./verify/recheck.js";
+export type { VerificationReport, VerifyContext } from "./verify/recheck.js";
