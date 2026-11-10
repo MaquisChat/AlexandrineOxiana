@@ -1,5 +1,5 @@
 import type { FieldEvidence, FieldVerification, SourceDraft, SourceFile, SourceType } from "../model/index.js";
-import { agree, labelOf, verifyField } from "./checks.js";
+import { agree, agreeStrict, labelOf, verifyField } from "./checks.js";
 import type { CheckCtx } from "./checks.js";
 import { DOC_TEXT_LIMIT, getByPointer, isRecord, normalizeTitle } from "./evidence.js";
 import type { LookupEvidence } from "./evidence.js";
@@ -144,10 +144,11 @@ export function recheckSourceFile(sf: SourceFile, ctx: VerifyContext): SourceFil
   const verification: Record<string, FieldVerification> = { ...report.fields };
   for (const [k, v] of Object.entries(sf.verification)) {
     if (v.status !== "user-confirmed") continue;
-    // Keep the old entry unless a user evidence entry exists and the value has since changed.
-    const userEvs = sf.fieldEvidence.filter((e) => e.field === k && e.source.kind === "user");
+    // Keep the old entry only while user evidence for this field still strictly matches the value.
     const current = getByPointer(sf.source, k);
-    if (userEvs.length === 0 || userEvs.some((e) => agree(k, e.value, current))) verification[k] = structuredClone(v);
+    if (sf.fieldEvidence.some((e) => e.field === k && e.source.kind === "user" && agreeStrict(k, e.value, current))) {
+      verification[k] = structuredClone(v);
+    }
   }
   return { ...sf, verification };
 }

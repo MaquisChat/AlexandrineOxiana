@@ -46,20 +46,43 @@ function evidenceFor(c: CheckCtx, field: string): FieldEvidence[] {
   return c.evidence.filter((e) => e.field === field);
 }
 
+/** Creator records of a value; a bare string counts as one literal creator. */
 export function creatorList(v: unknown): Record<string, unknown>[] {
+  if (typeof v === "string") return v.trim() ? [{ literal: v }] : [];
   return Array.isArray(v) ? v.filter(isRecord) : [];
 }
+/** Family name from a literal: "Family, Given" or "Given Family" (last token). */
+function literalFamily(lit: string): string {
+  const t = lit.trim();
+  return t.includes(",") ? t.split(",")[0]!.trim() : t.split(/\s+/).pop() ?? t;
+}
 export function creatorName(x: Record<string, unknown>, handleFirst = false): string | undefined {
-  const lit = typeof x.literal === "string" && x.literal ? (x.family ? x.literal : x.literal.split(",")[0]!.trim()) : undefined;
+  const lit = typeof x.literal === "string" && x.literal.trim() ? literalFamily(x.literal) : undefined;
   const order = handleFirst ? [x.handle, x.family, lit] : [x.family, lit, x.handle];
   for (const v of order) if (typeof v === "string" && v.trim()) return v.trim();
   return undefined;
 }
-export function firstFamily(v: unknown): string | undefined {
-  if (typeof v === "string") return v.includes(",") ? v.split(",")[0]!.trim() : v;
-  const first = creatorList(v)[0];
-  return first ? creatorName(first) : undefined;
+function creatorCands(x: Record<string, unknown>): Set<string> {
+  const out = new Set<string>();
+  const add = (v: unknown) => {
+    if (typeof v === "string" && v.trim()) out.add(normalizeTitle(v));
+  };
+  add(x.family);
+  add(typeof x.literal === "string" && x.literal.trim() ? literalFamily(x.literal) : undefined);
+  add(x.handle);
+  out.delete("");
+  return out;
 }
+/** The full ordered creator lists match: same length, and at each position a shared family name or handle. */
+export function creatorsAgree(a: unknown, b: unknown): boolean {
+  const la = creatorList(a), lb = creatorList(b);
+  if (la.length === 0 || la.length !== lb.length) return false;
+  return la.every((x, i) => {
+    const cb = creatorCands(lb[i]!);
+    return [...creatorCands(x)].some((k) => cb.has(k));
+  });
+}
+const creatorsText = (v: unknown): string => creatorList(v).map((x) => creatorName(x) ?? "?").join("; ");
 
 const canonList = (field: string, v: unknown): string[] =>
   (Array.isArray(v) ? v : [v]).map((x) => canon(field, x));
@@ -69,7 +92,7 @@ const canon = (field: string, v: unknown): string => {
   const t = textOf(v);
   if (t === undefined) return JSON.stringify(v) ?? "";
   const n = t.trim().toLowerCase();
-  return field.startsWith("/identifiers/") ? n.replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, "").replace(/[\s-]/g, "") : n;
+  return field === "/identifiers/doi" || field === "/identifiers/isbn" || field === "/identifiers/arxiv" ? n.replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, "").replace(/[\s-]/g, "") : t.trim();
 };
 
 /** Do two evidence values for this field say the same thing (at the precision we care about)? */
@@ -82,8 +105,7 @@ export function agree(field: string, a: unknown, b: unknown): boolean {
     return !!x && !!y && datesEqual(x, y);
   }
   if (field === "/creators") {
-    const x = firstFamily(a), y = firstFamily(b);
-    return x !== undefined && y !== undefined && normalizeTitle(x) === normalizeTitle(y);
+    return creatorsAgree(a, b);
   }
   if (Array.isArray(a) || Array.isArray(b)) {
     const y = canonList(field, b);
@@ -195,8 +217,7 @@ function conflicts(field: string, a: unknown, b: unknown): boolean {
     return !!x && !!y && Math.abs(x.y - y.y) > 1;
   }
   if (field === "/creators") {
-    const x = firstFamily(a), y = firstFamily(b);
-    return x !== undefined && y !== undefined && !!normalizeTitle(x) && !!normalizeTitle(y) && normalizeTitle(x) !== normalizeTitle(y);
+    return creatorList(a).length > 0 && creatorList(b).length > 0 && !creatorsAgree(a, b);
   }
   return false;
 }
@@ -207,7 +228,7 @@ export function checkCrossSource(field: string, c: CheckCtx): FieldVerification 
     for (let j = i + 1; j < evs.length; j++) {
       const a = evs[i]!, b = evs[j]!;
       if (conflicts(field, a.value, b.value)) {
-        const show = (e: FieldEvidence) => `"${clip(field === "/creators" ? firstFamily(e.value) ?? "" : e.value)}" (from ${sourceName(e)})`;
+        const show = (e: FieldEvidence) => `"${clip(field === "/creators" ? creatorsText(e.value) : e.value)}" (from ${sourceName(e)})`;
         return result("conflict", ["cross-source"], `Two sources disagree about the ${labelOf(field).toLowerCase()}: ${show(a)} versus ${show(b)}.`, [
           { value: a.value, source: a.source },
           { value: b.value, source: b.source },
@@ -245,9 +266,11 @@ function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
     return !!d && hasTokens(q, String(d.y));
   }
   if (field === "/creators") {
-    const first = creatorList(e.value)[0];
-    const n = first ? creatorName(first, SOCIAL.has(c.type)) : undefined;
-    return !!n && hasTokens(q, normalizeTitle(n));
+    const list = creatorList(e.value);
+    return list.length > 0 && list.every((x) => {
+      const n = creatorName(x, SOCIAL.has(c.type));
+      return !!n && hasTokens(q, normalizeTitle(n));
+    });
   }
   const vals = Array.isArray(e.value) ? e.value.flatMap(textVariants) : textVariants(e.value);
   return vals.map(normalizeTitle).some((v) => !!v && hasTokens(q, v));
@@ -307,8 +330,16 @@ function aiUnverified(label: string, aiEvs: FieldEvidence[]): FieldVerification 
     : `${label} was suggested by AI without a quoted passage from the document to back it up.`);
 }
 
-const showValue = (field: string, v: unknown) => clip(field === "/creators" ? firstFamily(v) ?? "" : v);
-const DRAFT_SOURCE = { kind: "user" as const, ref: "current value in the record" };
+const showValue = (field: string, v: unknown) => clip(field === "/creators" ? creatorsText(v) : v);
+
+/** Strict agreement used before stamping `user-confirmed`: no similarity thresholds, no coarser dates. */
+export function agreeStrict(field: string, a: unknown, b: unknown): boolean {
+  if (field === "/title" || field === "/container") {
+    return textVariants(a).some((x) => textVariants(b).some((y) => normalizeTitle(x) !== "" && normalizeTitle(x) === normalizeTitle(y)));
+  }
+  if (field === "/issued") return typeof a === "string" && a === b;
+  return agree(field, a, b);
+}
 
 export function verifyField(field: string, c: CheckCtx, required: boolean): FieldVerification | undefined {
   const label = labelOf(field);
@@ -320,7 +351,7 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
     return required || allEvs.length > 0 ? result("unverified", ["present"], `${label} is missing.`) : undefined;
   }
   // User evidence confirms only the value the user actually saw; a later change makes it stale.
-  if (allEvs.some((e) => e.source.kind === "user" && agree(field, e.value, value))) return result("user-confirmed", ["user"]);
+  if (allEvs.some((e) => e.source.kind === "user" && agreeStrict(field, e.value, value))) return result("user-confirmed", ["user"]);
   const evs = allEvs.filter((e) => e.source.kind !== "user");
 
   if (field === "/issued" && !parseEdtf(value)) {
@@ -335,10 +366,7 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
     `${label} recorded here ("${showValue(field, value)}") does not match what ${sourceName(e)} says ("${showValue(field, e.value)}").`;
   const trustedDis = disagreeing.filter((e) => TRUSTED_KINDS.has(e.source.kind));
   if (trustedDis.length > 0) {
-    return result("conflict", ["draft-vs-evidence"], mismatchSentence(trustedDis[0]!), [
-      { value, source: DRAFT_SOURCE },
-      ...trustedDis.map((e) => ({ value: e.value, source: e.source })),
-    ]);
+    return { ...result("conflict", ["draft-vs-evidence"], mismatchSentence(trustedDis[0]!), trustedDis.map((e) => ({ value: e.value, source: e.source }))), current: value };
   }
   if (agreeing.length === 0 && disagreeing.length > 0) {
     return result("unverified", ["draft-vs-evidence"], mismatchSentence(disagreeing[0]!));

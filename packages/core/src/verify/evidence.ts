@@ -19,7 +19,7 @@ export const TRUSTED_KINDS: ReadonlySet<string> = new Set([
   "embedded", "lookup", "zotero", "refman", "platform-json", "page-dom", "ocr",
 ]);
 
-const KEEP_MARKS = /([\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3099\u309A]+)/u;
+const KEEP_MARKS = /([\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3099\u309A\uFF9E\uFF9F]+)/u;
 
 /**
  * NFKD, strip combining marks, lowercase, drop punctuation and symbols, collapse whitespace.
@@ -119,7 +119,16 @@ export function parseEdtf(s: unknown): Edtf | undefined {
   if (typeof s !== "string") return undefined;
   const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?(?:T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?[?~]?$/.exec(s.trim());
   if (!m) return undefined;
-  return { y: Number(m[1]), m: m[2] ? Number(m[2]) : undefined, d: m[3] ? Number(m[3]) : undefined };
+  const y = Number(m[1]);
+  const mo = m[2] ? Number(m[2]) : undefined;
+  const d = m[3] ? Number(m[3]) : undefined;
+  if (mo !== undefined && (mo < 1 || mo > 12)) return undefined;
+  if (d !== undefined && mo !== undefined) {
+    const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+    const max = mo === 2 ? (leap ? 29 : 28) : [31, 0, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1]!;
+    if (d < 1 || d > max) return undefined;
+  }
+  return { y, m: mo, d };
 }
 
 /** Equal at the precision of the less precise value. */
@@ -151,11 +160,22 @@ export function clip(v: unknown): string {
   return s.length > 80 ? `${s.slice(0, 77)}...` : s;
 }
 
-/** Does normalized `hay` contain normalized `needle` on token boundaries (any position for no-space scripts)? */
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+const isLatinWordChar = (ch: string | undefined) => !!ch && WORD_CHAR.test(ch) && !NO_SPACE_SCRIPT.test(ch);
+
+/**
+ * Does normalized `hay` contain normalized `needle`, with word boundaries wherever the needle starts
+ * or ends in a spaced-script (Latin etc.) character? Works for mixed Latin+CJK needles.
+ */
 export function hasTokens(hay: string, needle: string): boolean {
   if (!needle) return false;
-  if (NO_SPACE_SCRIPT.test(needle)) return hay.includes(needle);
-  return ` ${hay} `.includes(` ${needle} `);
+  const first = needle[0], last = needle[needle.length - 1];
+  for (let i = hay.indexOf(needle); i !== -1; i = hay.indexOf(needle, i + 1)) {
+    if (isLatinWordChar(first) && isLatinWordChar(hay[i - 1])) continue;
+    if (isLatinWordChar(last) && isLatinWordChar(hay[i + needle.length])) continue;
+    return true;
+  }
+  return false;
 }
 
 /**

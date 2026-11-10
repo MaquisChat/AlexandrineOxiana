@@ -74,6 +74,8 @@ export const FieldVerification = z.object({
   checks: z.array(z.string()),
   reason: z.string().optional(),
   values: z.array(z.object({ value: z.unknown(), source: FieldEvidenceSource })).optional(),
+  /** The record's own value at check time (evidence values go in `values`). */
+  current: z.unknown().optional(),
 });
 export type FieldVerification = z.infer<typeof FieldVerification>;
 

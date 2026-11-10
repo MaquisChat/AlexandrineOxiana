@@ -273,10 +273,8 @@ describe("user evidence and overall", () => {
     const long = "word ".repeat(200);
     const r = verifyDraft(draft({ title: mt(long) }), [ev("/title", long, "embedded"), ev("/title", "different", "zotero")], {});
     expect(r.reasons.length).toBeGreaterThan(0);
-    for (const s of r.reasons) {
-      expect(s.length).toBeLessThan(400);
-      expect(s).not.toContain("word ".repeat(17)); // more than 80 chars of the value
-    }
+    expect(r.reasons.some((x) => x.includes(long.slice(0, 70)))).toBe(true);
+    for (const s of r.reasons) expect(s).not.toContain(long.slice(0, 81));
   });
 });
 
@@ -306,7 +304,7 @@ describe("recheckSourceFile", () => {
     source: { ...draft(), id: "x", folder: "f", citationKey: "k", provenance: { platformSnapshot: undefined } } as never,
     assets: [],
     annotations: [],
-    fieldEvidence: [ev("/title", "Rivers of Memory", "filename")],
+    fieldEvidence: [ev("/title", "Rivers of Memory", "filename"), ev("/issued", "2020", "user")],
     verification: { "/issued": { status: "user-confirmed", checks: ["user"] }, "/title": { status: "verified", checks: [] } },
   });
   it("recomputes verification from stored evidence", () => {
@@ -343,7 +341,9 @@ describe("review round 1: evidence must support the current value", () => {
     const d = draft({ title: mt("Hallucinated Title") });
     const one = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded")], {});
     expect(one.fields["/title"]!.status).toBe("conflict");
-    expect(one.fields["/title"]!.values!.length).toBe(2);
+    expect(one.fields["/title"]!.values!.length).toBe(1);
+    expect(one.fields["/title"]!.values![0]!.source.kind).toBe("embedded");
+    expect(one.fields["/title"]!.current).toEqual(mt("Hallucinated Title"));
     const two = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded"), ev("/title", "Rivers of Memory", "zotero")], {});
     expect(two.fields["/title"]!.status).toBe("conflict");
     expect(two.overall).toBe("needs-review");
@@ -413,5 +413,71 @@ describe("review round 1: evidence must support the current value", () => {
     const d = draft({ creators: [{ literal: "Okafor, Ada", role: "author" }] });
     const r = verifyDraft(d, [ev("/creators", [{ family: "Okafor", role: "author" }], "embedded"), ev("/creators", [{ family: "Okafor", role: "author" }], "zotero")], {});
     expect(r.fields["/creators"]!.status).toBe("verified");
+  });
+});
+
+describe("review round 2", () => {
+  const okaforMensah = [{ family: "Okafor", role: "author" }, { family: "Mensah", role: "author" }];
+  it("creators agree only as a full ordered list (fabricated co-author)", () => {
+    const d = draft({ creators: [{ family: "Okafor", role: "author" }, { family: "Fabricated", role: "author" }] });
+    const r = verifyDraft(d, [ev("/creators", okaforMensah, "embedded")], {});
+    expect(r.fields["/creators"]!.status).toBe("conflict");
+    const r2 = verifyDraft(d, [ev("/creators", okaforMensah, "embedded"), ev("/creators", okaforMensah, "zotero")], { documentText: "Okafor" });
+    expect(r2.fields["/creators"]!.status).toBe("conflict");
+    const r3 = verifyDraft(d, [ev("/creators", okaforMensah, "filename")], {});
+    expect(r3.fields["/creators"]!.status).toBe("unverified");
+  });
+  it("cross-source creators conflict on a differing co-author, not on given-name forms", () => {
+    const c = verifyDraft(draft({ creators: okaforMensah }), [ev("/creators", okaforMensah, "embedded"), ev("/creators", [okaforMensah[0]], "zotero")], {});
+    expect(c.fields["/creators"]!.checks).toContain("cross-source");
+    const lit = draft({ creators: [{ literal: "Ada Okafor", role: "author" }] });
+    const ok = verifyDraft(lit, [ev("/creators", [{ family: "Okafor", role: "author" }], "embedded"), ev("/creators", [{ literal: "Okafor, Ada", role: "author" }], "zotero")], {});
+    expect(ok.fields["/creators"]!.status).toBe("verified");
+  });
+  it("AI quote must name every creator", () => {
+    const d = draft({ creators: okaforMensah });
+    const ai = (quote: string) => verifyDraft(d, [ev("/creators", okaforMensah, "ai", { quote })], { documentText: "by Okafor and Mensah, 2020 edition" }).fields["/creators"]!.status;
+    expect(ai("by Okafor and Mensah")).toBe("verified");
+    expect(ai("by Okafor and others")).toBe("unverified");
+  });
+  it("user-confirmed needs strict agreement", () => {
+    const st = (field: string, d: SourceDraft, value: unknown) => verifyDraft(d, [ev(field, value, "user")], {}).fields[field]!.status;
+    expect(st("/title", draft({ title: mt("Rivers of Memory") }), "Rivers of Memory")).toBe("user-confirmed");
+    expect(st("/title", draft({ title: mt("Rivers of Memories") }), "Rivers of Memory")).not.toBe("user-confirmed");
+    expect(st("/creators", draft({ creators: okaforMensah }), [okaforMensah[0]])).not.toBe("user-confirmed");
+    expect(st("/issued", draft({ issued: "2020-05-01" }), "2020")).not.toBe("user-confirmed");
+  });
+  it("recheck drops a prior user-confirmed when no user evidence exists", () => {
+    const f: SourceFile = {
+      formatVersion: 1,
+      source: { ...draft(), id: "x", folder: "f", citationKey: "k", provenance: {} } as never,
+      assets: [], annotations: [],
+      fieldEvidence: [ev("/title", "Rivers of Memory", "ai")],
+      verification: { "/title": { status: "user-confirmed", checks: ["user"] } },
+    };
+    expect(recheckSourceFile(f, {}).verification["/title"]!.status).not.toBe("user-confirmed");
+  });
+  it("only real user evidence ever carries kind user", () => {
+    const d = draft({ title: mt("Hallucinated Title") });
+    const r = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded")], {});
+    expect(JSON.stringify(r.fields)).not.toContain('"kind":"user"');
+  });
+  it("halfwidth kana keep voicing marks", () => {
+    expect(normalizeTitle("ﾊﾞｽ")).toBe(normalizeTitle("バス"));
+    expect(normalizeTitle("ﾊﾞｽ")).not.toBe(normalizeTitle("ﾊｽ"));
+  });
+  it("impossible dates are unverified", () => {
+    const r = verifyDraft(draft({ issued: "2020-13-45" }), [ev("/issued", "2020-13-45", "embedded")], {});
+    expect(r.fields["/issued"]!.status).toBe("unverified");
+  });
+  it("url and post id compare case-sensitively", () => {
+    const d = draft({ type: "video", identifiers: { platformPostId: "AbC", url: "https://x.test/v/AbC" } });
+    const r = verifyDraft(d, [ev("/identifiers/url", "https://x.test/v/abc", "platform-json")], {});
+    expect(r.fields["/identifiers/url"]!.status).toBe("conflict");
+  });
+  it("mixed Latin+CJK needles respect Latin word boundaries", () => {
+    const d = draft({ title: { variants: [{ lang: "zh", kind: "original", value: "AI時代" }] } });
+    expect(verifyDraft(d, [ev("/title", "AI時代", "filename")], { documentText: "OpenAI時代 の物語" }).fields["/title"]!.status).toBe("unverified");
+    expect(verifyDraft(d, [ev("/title", "AI時代", "filename")], { documentText: "the AI時代 の物語" }).fields["/title"]!.status).toBe("verified");
   });
 });
