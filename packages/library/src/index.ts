@@ -172,5 +172,16 @@ export { SECRET_NAMES, SECRET_SERVICE, SECRET_STORE_UNAVAILABLE, SecretStoreUnav
 export type { SecretName } from "./secrets.js";
 export { DEIDENTIFIED_NOTE, REFMAN_FORMATS, exportRefman, writeRefmanExport } from "./export/refman-export.js";
 export type { RefmanExportOptions, RefmanExportResult, RefmanFormat } from "./export/refman-export.js";
+export {
+  WATCH_REASONS,
+  WATCH_STABILITY_MS,
+  addWatchedFolder,
+  ignoredName,
+  listWatchedFolders,
+  removeWatchedFolder,
+  startWatchedFolders,
+  watchFolder,
+} from "./import/watch.js";
+export type { FolderWatch, WatchDeps, WatchEvent, WatchSettingsDeps } from "./import/watch.js";
 export { ARCHIVE_LIMITS } from "./extract/zip.js";
 export * from "./lookup/index.js";
