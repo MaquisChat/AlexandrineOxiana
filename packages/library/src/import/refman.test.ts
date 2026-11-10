@@ -832,6 +832,66 @@ processing:
     expect(await readdir(join(lib.root, ".tmp")).then((ns) => ns.filter((n) => n.startsWith("batch-")))).toEqual([]);
   });
 
+  it("I2: an unsupported or vanished file is dropped with a note; the rest of the item imports", async () => {
+    await writeFile(join(exp, "files", "snapshot.html"), "<html><body>Snapshot</body></html>");
+    const p = await project();
+    const bulk = bulkImport();
+    const bib = await writeExport("snap.bib", "@article{snap, title={With Snapshot}, author={Doe, J.}, file={PDF:files/okafor2024feeding.pdf:application/pdf;Snapshot:files/snapshot.html:text/html}}");
+    const vanished: ImportSourceAdapter = {
+      kind: "bibtex",
+      location: join(exp, "gone.bib"),
+      roots: [exp],
+      async *scan() {
+        yield { key: "gone.bib@000000000000#gone", files: [{ path: join(exp, "files", "vanished.pdf"), mime: "application/pdf", bytes: 10 }], referenceMetadata: { title: { variants: [{ lang: "und", kind: "original", value: "Vanished File" }] }, citationKey: "gone" } };
+      },
+    };
+    const h1 = await bulk.startBatch(p.id, bibtexAdapter(bib));
+    expect((await h1.done).counts.failed).toBe(0);
+    const h2 = await bulk.startBatch(p.id, vanished);
+    expect((await h2.done).counts.failed).toBe(0);
+    const sfs = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
+    const snap = sfs.find((sf) => sf.source.citationKey === "snap")!;
+    expect(snap.assets.map((a) => a.mime)).toEqual(["application/pdf"]);
+    expect(sfs.find((sf) => sf.source.citationKey === "gone")!.assets).toEqual([]);
+    expect((await bulk.batchReport(p.id, h1.batchId)).fileNotes.map((n) => n.note)).toEqual(["attached file type not supported"]);
+    expect((await bulk.batchReport(p.id, h2.batchId)).fileNotes.map((n) => n.note)).toEqual(["attached file no longer present"]);
+  });
+
+  it("two references linking the same file: the second imports metadata-only with a note", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const bib = await writeExport(
+      "same.bib",
+      "@article{first, title={First Reference}, author={Doe, J.}, file={files/okafor2024feeding.pdf}}\n@article{second, title={Second Reference}, author={Roe, R.}, file={files/okafor2024feeding.pdf}}\n",
+    );
+    const h = await bulk.startBatch(p.id, bibtexAdapter(bib));
+    const r = await h.done;
+    expect(r.counts.created + r.counts.needsReview).toBe(2);
+    const sfs = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
+    expect(sfs.find((sf) => sf.source.citationKey === "first")!.assets).toHaveLength(1);
+    expect(sfs.find((sf) => sf.source.citationKey === "second")!.assets).toHaveLength(0);
+    expect((await bulk.batchReport(p.id, h.batchId)).fileNotes).toEqual([{ item: expect.stringMatching(/^second \([0-9a-f]{8}\)$/), note: "same file as another item in this batch" }]);
+  });
+
+  it("report labels are the citation key (or 'item N') with an 8-hex HMAC; skipped empty records are a report note", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const bib = await writeExport("labels.bib", "@misc{, title={No Key}, file={files/nope.pdf}}\n@misc{e, note={empty}}\n@misc{keyed, title={Keyed}, file={files/nope2.pdf}}\n");
+    const dry = await bulk.dryRun(p.id, bibtexAdapter(bib));
+    expect(dry.notes).toEqual(["1 reference had no title, creators, identifiers or files and was skipped."]);
+    const h = await bulk.startBatch(p.id, bibtexAdapter(bib));
+    await h.done;
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.fileNotes.map((n) => n.item)).toEqual([expect.stringMatching(/^item 1 \([0-9a-f]{8}\)$/), expect.stringMatching(/^keyed \([0-9a-f]{8}\)$/)]);
+    expect(report.notes).toContain("1 reference had no title, creators, identifiers or files and was skipped.");
+    const json = await readFile(join(lib.root, p.folder, "imports", "batch-0001", "report.json"), "utf8");
+    const md = await readFile(join(lib.root, p.folder, "imports", "batch-0001", "report.md"), "utf8");
+    for (const t of [json, md]) {
+      expect(t).not.toContain("labels.bib");
+      expect(t).not.toMatch(/@[0-9a-f]{12}#/);
+    }
+  });
+
   it("a merge adds the item's missing tags, and undo takes them off again (a tag still in use is kept)", async () => {
     const p = await project();
     const bulk = bulkImport();

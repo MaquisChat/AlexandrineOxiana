@@ -40,8 +40,8 @@ export interface ScanItem {
   folderPath?: string[];
   /**
    * Tag names the source carries (reference-manager keywords, Zotero subjects, Calibre tags): found
-   * or created (as the batch's) whatever the structure option, when the item creates a source; a
-   * merge into an existing source does not add them.
+   * or created (as the batch's) whatever the structure option. A new source gets them all; a merge
+   * adds those the existing source lacks, recorded in the merge record so undo takes them off (R66).
    */
   tags?: string[];
   /** e.g. Zotero annotations (Task 24; not stored by the folder/zip import). */

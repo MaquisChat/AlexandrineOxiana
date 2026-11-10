@@ -5,11 +5,14 @@
  * (encrypted in encrypted projects) and recorded in the audit log as `import.batch` (counts only).
  *
  * Items are named by their key: a path relative to the import's root (never an absolute path), or
- * the source's own key (e.g. a post id). Reasons are fixed sentences or the policy's own reason.
+ * the source's own key (e.g. a post id); export and Calibre items by citation key (or "item N")
+ * plus an 8-hex HMAC (reportLabel). Reasons and file notes are fixed sentences or the policy's own
+ * reason, never a path.
  */
 import { appendLibraryEvent, projectReviewEntries, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
-import { BOOKKEEPING, activeBatches, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
+import { createHash } from "node:crypto";
+import { BOOKKEEPING, activeBatches, itemKeyHash, PRIVATE_MODE, countOutcomes, fileName, findBatch, latestByKey, readJournal, type GovernanceNote, type ShownState } from "./batch.js";
 
 export interface ImportReport {
   batchId: string;
@@ -31,6 +34,23 @@ export interface ImportReport {
 function itemLabel(key: string): string {
   if (/^(?:\/|[A-Za-z]:[\\/]|\\\\)/u.test(key)) return key.split(/[\\/]/u).filter(Boolean).pop() ?? "item";
   return key;
+}
+
+/** Export and Calibre keys: `<file or folder name>@<12 hex>#<citation key | @n | book-id>`. */
+const EXPORT_KEY = /@[0-9a-f]{12}#(.*)$/su;
+
+/**
+ * The name an item has in a report (R68). Export and Calibre items: the citation key (or "item N",
+ * "book-N") with the first 8 hex of the item's HMAC (the provenance `import-item` value), never the
+ * export's name or path hash. Other items: their key (a path relative to the import's root).
+ */
+export function reportLabel(key: string, secret: string | undefined): string {
+  const m = EXPORT_KEY.exec(key);
+  if (!m) return itemLabel(key);
+  const tail = m[1] ?? "";
+  const name = !tail ? "export" : tail.startsWith("@") ? `item ${tail.slice(1).split("~")[0]}` : tail;
+  const tag = (secret ? itemKeyHash(secret, key) : createHash("sha256").update(key).digest("hex")).slice(0, 8);
+  return `${name} (${tag})`;
 }
 
 function markdown(r: ImportReport): string {
@@ -97,8 +117,8 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     startedAt: rec.startedAt,
     ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
     counts: c,
-    failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: itemLabel(e.key), reason: e.reason ?? "The item could not be imported." })),
-    fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: itemLabel(key), note }))),
+    failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: reportLabel(e.key, rec.secret), reason: e.reason ?? "The item could not be imported." })),
+    fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),
     governance: rec.governance,
     notes: rec.notes,

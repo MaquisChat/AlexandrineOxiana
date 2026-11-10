@@ -102,6 +102,13 @@ import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
 const VERSION: string = (createRequire(import.meta.url)("../../../package.json") as { version: string }).version;
 const TOOL = { name: "bulk-import", version: VERSION };
 
+/** File notes the engine adds when it leaves out one of an item's files (R68 I2; never a path). */
+export const ENGINE_FILE_NOTES = {
+  unsupported: "attached file type not supported",
+  vanished: "attached file no longer present",
+  sameFile: "same file as another item in this batch",
+} as const;
+
 export const REASONS = {
   missing: "The file could not be found or read.",
   unsupported: "This kind of file cannot be imported. Import PDFs, EPUB or Kindle books, Word documents, images, audio or video.",
@@ -177,6 +184,8 @@ export interface ScanSummary {
   /** Items whose file is already in the project. */
   alreadyImported: number;
   unreadable: Array<{ path: string; reason: string }>;
+  /** Scan notes (e.g. how many empty records an export had). */
+  notes: string[];
 }
 
 export interface BatchSummary {
@@ -354,6 +363,8 @@ class Run {
   private workDir: string | null = null;
   /** File notes per item key (ScanItem.fileNotes), added to the item's journal line. */
   private fileNotes = new Map<string, string[]>();
+  /** Real path of each file attached in this run → the item it went to (a second item gets a note). */
+  private fileOwners = new Map<string, string>();
   private readonly workName: string;
   private structureCache = new Map<string, { collectionIds: string[]; tagIds: string[] }>();
   private projectTags: { collections: Array<{ id: string; name: string; parentId?: string }>; tags: Array<{ id: string; name: string }> } | null = null;
@@ -490,7 +501,7 @@ class Run {
       let done = 0;
       const seenKeys = new Set<string>();
       this.feed.emit({ done, total });
-      const scan = this.adapter.scan(this.abort.signal, { workDir: () => this.ensureWorkDir() });
+      const scan = this.adapter.scan(this.abort.signal, { workDir: () => this.ensureWorkDir(), note: (t) => this.note(t) });
       for await (const item of scan) {
         if (seenKeys.has(item.key)) continue;
         seenKeys.add(item.key);
@@ -603,12 +614,31 @@ class Run {
     const inputs: SourceInputFile[] = [];
     const shas: string[] = [];
     let mime = "";
+    // Files that vanished, are not supported, or went to another item of this run are left out with
+    // a note; the item imports with the rest (metadata-only if none). An item with no reference
+    // metadata (a plain file from a folder) has nothing else, so it fails as before.
+    const kept: ScanItem["files"] = [];
+    const dropped: Array<{ note: string; reason: string }> = [];
     for (const f of item.files) {
       const st = await fsp.stat(f.path).catch(() => null);
-      if (!st?.isFile()) return this.queue({ key: item.key, outcome: "failed", reason: REASONS.missing });
+      if (!st?.isFile()) {
+        dropped.push({ note: ENGINE_FILE_NOTES.vanished, reason: REASONS.missing });
+        continue;
+      }
+      const real = await fsp.realpath(f.path).catch(() => resolve(f.path));
+      const owner = this.fileOwners.get(real);
+      if (owner !== undefined && owner !== item.key) {
+        dropped.push({ note: ENGINE_FILE_NOTES.sameFile, reason: REASONS.duplicateFile });
+        continue;
+      }
       const type = await fileTypeFromFile(f.path).catch(() => undefined);
       const stored = type ? acceptedType(type) : undefined;
-      if (!type || !stored) return this.queue({ key: item.key, outcome: "failed", reason: REASONS.unsupported });
+      if (!type || !stored) {
+        dropped.push({ note: ENGINE_FILE_NOTES.unsupported, reason: REASONS.unsupported });
+        continue;
+      }
+      this.fileOwners.set(real, item.key);
+      kept.push(f);
       if (!mime) mime = type.mime;
       const sha = await sha256File(f.path);
       shas.push(sha);
@@ -623,7 +653,11 @@ class Run {
       }
       if (same) return this.queue({ key: item.key, outcome: "duplicate", sourceId: same, reason: REASONS.duplicateFile });
     }
-    const primaryFile = item.files[0];
+    if (dropped.length) {
+      if (!item.referenceMetadata && !kept.length) return this.queue({ key: item.key, outcome: "failed", reason: dropped[0]!.reason });
+      this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...dropped.map((d) => d.note)]);
+    }
+    const primaryFile = kept[0];
     const name = primaryFile ? basename(primaryFile.path) : undefined;
     let userParsedName;
     if (name && watchdog.active) userParsedName = (await watchdog.match(name)).parsed;
@@ -1074,7 +1108,7 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
   const repo = deps.repo;
   repo.getProject(projectId);
   const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
-  const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [] };
+  const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [] };
   const name = `batch-dry-${newId()}`;
   const dir = join(repoLibrary(repo).root, ".tmp", name);
   let made = false;
@@ -1090,6 +1124,9 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
           made = true;
         }
         return dir;
+      },
+      note: (t) => {
+        if (!summary.notes.includes(t)) summary.notes.push(t);
       },
     });
     for await (const item of scan) {
