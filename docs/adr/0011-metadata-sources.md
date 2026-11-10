@@ -32,7 +32,7 @@ Both run on untrusted input and both can leak. A file can carry scripts, links t
   - Absolute paths and `..` entry names are refused.
   - A violation throws `UnsafeFileError` with a code.
   - EPUB metadata comes from the OPF (`dc:*`); DOCX metadata comes from `docProps/core.xml`.
-- **Linear-time scanning (R52):** markup is never matched with backtracking patterns over whole documents. `extract/scan.ts` tokenises with `indexOf` and stops at the first unterminated tag, comment or quote, so hostile input such as 200,000 unclosed `<title>` tags stays linear. Metadata is read from at most the first 512 KB: the HTML head, the OPF, `core.xml` and LoC responses. DOCX and HTML text collection stops at 20,000 characters. Extracted text keeps single line breaks and at most one blank line.
+- **Linear-time scanning (R52):** markup is never matched with backtracking patterns over whole documents. `extract/scan.ts` tokenises with `indexOf` and stops at the first unterminated tag, comment or quote, so hostile input such as 200,000 unclosed `<title>` tags stays linear. Metadata is read from at most the first 512 KB: the HTML head, the OPF, `core.xml` and LoC responses. DOCX and HTML text collection stops at 20,000 characters. A `<` that never closes is text and the scan carries on; an unclosed element never hides a later complete one; a `<head>` with no `</head>` ends at the first body-level tag. Repeated HTML meta keys keep at most 200 values (creator keys 500). Extracted text keeps single line breaks and at most one blank line.
 - **HTML:**
   - Parsed as text, with no DOM and no scripts. Nothing the page references is fetched.
   - Fields are taken in order of preference: Highwire `citation_*`, then Dublin Core, then OpenGraph, then `<title>`.
@@ -62,14 +62,14 @@ Both run on untrusted input and both can leak. A file can carry scripts, links t
   - **User-Agent:** `AlexandrineOxiana/<version> (+https://github.com/maquiscatta-sys/AlexandrineOxiana)`. The user's contact email is added as `; mailto:<email>` only when it is set in settings, and only if it is a plain address.
   - **Rate limits per host:** Crossref 5/s, OpenAlex 5/s, Open Library 1/s, LoC 1/s, and 1/s for any other host.
   - **Retries:** 3 retries on 429, 5xx or network errors. The backoff is 0.5 s, 1 s, then 2 s, or the server's Retry-After, capped at 60 s.
-  - **Deadline:** each attempt, redirects and body included, is aborted after 60 s (`AbortSignal.timeout`).
+  - **Deadline:** each attempt, redirects and body included, is aborted after 60 s (`AbortSignal.timeout`). The deadline starts once the attempt's first rate-limit slot is granted, so time spent queued behind other requests to the same host does not count.
   - **Redirects:** followed only within the same origin, at most 3 times.
   - **Responses:** bodies are capped at 5 MB.
 - **Cache:**
   - Stored in `<Library>/.cache/lookups/<sha256(cacheKey)>.json`. The directory is 0700 and the files are 0600, written atomically.
   - Answers (200) are kept for 30 days; not-found answers (404/410) for 1 day. An entry whose stored time is in the future counts as expired.
-  - On JSON paths, a 200 response is cached only if it parses as JSON.
-  - Files are written with the library's atomic writer (mode 0600). A symlink in place of the cache directory is refused: nothing is read or written through it, and it is never chmodded.
+  - On JSON paths, a 200 response is cached only if it parses as JSON. A LoC 200 is cached only if it is an SRU `searchRetrieveResponse`; anything else (such as LoC's "No Connections Available" page) counts as the provider being unavailable.
+  - Files are written with the library's atomic writer (mode 0600). A symlink in place of `.cache` or `.cache/lookups` is refused: nothing is read or written through it, and it is never chmodded.
   - An entry holds only the time it was stored, the status and the body. It never holds the URL, the request headers or the contact email.
   - Lookups for an encrypted project (`sensitive: true`) are cached in memory only. `HttpClient.purgeSensitive()` drops them; it must be called when an encrypted project is locked (wiring belongs to Task 22/30).
 

@@ -270,6 +270,34 @@ describe("cache and transport hardening", () => {
     agent.assertNoPendingInterceptors();
   });
 
+  it("never reads the cache through a symlinked .cache directory", async () => {
+    if (process.platform === "win32") return;
+    const planted = join(tmp, "planted");
+    await mkdir(join(planted, "lookups"), { recursive: true });
+    const entry = { v: 1, storedAt: now, status: 200, body: JSON.stringify({ message: { title: ["Planted"], type: "book" } }) };
+    await writeFile(join(planted, "lookups", `${createHash("sha256").update(`crossref:doi:${DOI}`).digest("hex")}.json`), JSON.stringify(entry));
+    await mkdir(join(tmp, "Lib"), { recursive: true });
+    await symlink(planted, join(tmp, "Lib", ".cache"));
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS);
+    expect((await lookupDoi(DOI, ctx(client())))?.title).toBe("Rivers and Memory in Upland Villages");
+    agent.assertNoPendingInterceptors();
+  });
+
+  it("a LoC 200 that is not an SRU response is never cached", async () => {
+    loc().intercept({ path: (p: string) => p.startsWith("/LCDB?"), method: "GET" }).reply(200, "<html><title>No Connections Available</title></html>").times(2);
+    // An outage page is "LoC unavailable" (the only permitted provider failed), and is asked again next time.
+    await expect(lookupIsbn(ISBN, ctx(client(), ["loc"]))).rejects.toBeInstanceOf(LookupHttpError);
+    await expect(lookupIsbn(ISBN, ctx(client(), ["loc"]))).rejects.toBeInstanceOf(LookupHttpError);
+    agent.assertNoPendingInterceptors();
+  });
+
+  it("time spent queued for the rate limit does not count against the attempt deadline", async () => {
+    openlibrary().intercept({ path: (p: string) => p.startsWith("/q"), method: "GET" }).reply(200, "{}", JSON_HEADERS).times(4);
+    const http = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: agent, rateLimits: { "openlibrary.org": 10 }, attemptTimeoutMs: 150, maxRetries: 0 });
+    const rs = await Promise.all(["1", "2", "3", "4"].map((k) => http.getJson(`https://openlibrary.org/q${k}`, { cacheKey: `t:q${k}`, sensitive: false })));
+    expect(rs).toEqual([{}, {}, {}, {}]);
+  });
+
   it("refuses to write through a symlinked cache directory", async () => {
     if (process.platform === "win32") return;
     const elsewhere = join(tmp, "elsewhere");

@@ -146,8 +146,8 @@ export class HttpClient {
   }
 
   /** The response body, or null when the resource does not exist (404). */
-  getText(url: string, opts: GetOptions): Promise<string | null> {
-    return this.get(url, opts);
+  getText(url: string, opts: GetOptions & { validate?: (body: string) => void }): Promise<string | null> {
+    return this.get(url, opts, opts.validate);
   }
 
   private async get(url: string, opts: GetOptions, validate?: (body: string) => void): Promise<string | null> {
@@ -214,7 +214,8 @@ export class HttpClient {
 
   private async readCache(name: string): Promise<CacheEntry | undefined> {
     try {
-      if (!(await this.realDir(this.cacheDir))) return undefined;
+      // Same rule as writing: never through a symlinked .cache or .cache/lookups.
+      if (!(await this.realDir(join(this.cacheDir, ".."))) || !(await this.realDir(this.cacheDir))) return undefined;
       const e = JSON.parse(await fsp.readFile(join(this.cacheDir, `${name}.json`), "utf8")) as CacheEntry;
       if (e?.v !== 1 || typeof e.storedAt !== "number" || (e.status !== 200 && e.status !== 404)) return undefined;
       if (e.body !== null && typeof e.body !== "string") return undefined;
@@ -272,7 +273,7 @@ export class HttpClient {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(url, AbortSignal.timeout(this.attemptTimeoutMs));
+        res = await this.fetchFollowingRedirects(url);
       } catch (e) {
         if (e instanceof LookupHttpError) throw e; // refused redirect or oversized body: not retryable
         lastError = new LookupHttpError(`The metadata service could not be reached: ${e instanceof Error ? e.message : String(e)}`);
@@ -288,10 +289,13 @@ export class HttpClient {
     throw lastError!;
   }
 
-  private async fetchFollowingRedirects(url: string, signal: AbortSignal): Promise<{ status: number; body: string | null; retryAfter?: string }> {
+  /** One attempt; its deadline starts once the first rate-limit slot is granted (queueing is not counted). */
+  private async fetchFollowingRedirects(url: string): Promise<{ status: number; body: string | null; retryAfter?: string }> {
     let current = new URL(url);
+    let signal: AbortSignal | undefined;
     for (let hop = 0; ; hop++) {
       await this.throttle(current.hostname);
+      signal ??= AbortSignal.timeout(this.attemptTimeoutMs);
       const res = await request(current, {
         method: "GET",
         headers: { "user-agent": this.userAgent, accept: "application/json, application/xml;q=0.9, */*;q=0.1" },

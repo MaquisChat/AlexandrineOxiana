@@ -38,7 +38,10 @@ export function docxText(xml: string): string {
     else if (tagIs(t, "w:p") && (t.end || t.self)) flush();
   }
   flush();
-  return cleanText(paragraphs.join("\n")).slice(0, MAX_TEXT_CHARS);
+  const text = cleanText(paragraphs.join("\n"));
+  const cut = text.slice(0, MAX_TEXT_CHARS);
+  // Never end on half a surrogate pair.
+  return text.length > MAX_TEXT_CHARS && /[\uD800-\uDBFF]$/u.test(cut) ? cut.slice(0, -1) : cut;
 }
 
 export async function extractDocx(path: string): Promise<RawExtract> {

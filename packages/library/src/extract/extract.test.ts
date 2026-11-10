@@ -7,6 +7,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FIXTURE_DOI, FIXTURE_ISBN, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
+import { docxText } from "./docx.js";
+import { elements } from "./scan.js";
 import { MAX_TEXT_CHARS, UnsafeFileError, extractMetadata, mediaFromTags, shutdownExtractors } from "./index.js";
 
 const DOWNLOADED = join(dirname(fileURLToPath(import.meta.url)), "../../../../tests/fixtures/downloaded");
@@ -291,6 +293,50 @@ describe("linear-time parsing of hostile markup", () => {
     const x = await extractMetadata(f, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     expect(x.text!.length).toBeLessThanOrEqual(20_000);
     expect(x.text!.length).toBeGreaterThan(19_000);
+  });
+});
+
+describe("review round 2", () => {
+  const ms = async (fn: () => Promise<unknown>) => {
+    const t0 = performance.now();
+    await fn();
+    return performance.now() - t0;
+  };
+
+  it("a repeated meta key stays linear (23,000 repeats) and values are capped", async () => {
+    const f = join(tmp, "metas.html");
+    await writeFile(f, "<meta name=a content=b>".repeat(23_000));
+    expect(await ms(() => extractMetadata(f, "text/html"))).toBeLessThan(1000);
+    const g = join(tmp, "authors.html");
+    await writeFile(g, '<meta name="citation_author" content="Ana Lima">'.repeat(2_000));
+    expect((await extractMetadata(g, "text/html")).creators).toHaveLength(500);
+  });
+
+  it("text survives a page with no </head> and no <body>", async () => {
+    const f = join(tmp, "nohead.html");
+    await writeFile(f, "<html><head><title>T</title><p>Paragraph text here</p>");
+    const x = await extractMetadata(f, "text/html");
+    expect(x.title).toBe("T");
+    expect(x.text).toContain("Paragraph text here");
+  });
+
+  it("a stray '<' with no '>' is text, and the scan carries on (linearly)", async () => {
+    const f = join(tmp, "stray.html");
+    await writeFile(f, "<p>Hello</p>if a<b then c and more text");
+    expect((await extractMetadata(f, "text/html")).text).toBe("Hello\nif a<b then c and more text");
+    const g = join(tmp, "strays.html");
+    await writeFile(g, "<body>" + "a<b ".repeat(200_000));
+    expect(await ms(() => extractMetadata(g, "text/html"))).toBeLessThan(1000);
+  });
+
+  it("an unclosed element does not hide a later complete one", () => {
+    expect([...elements("<dc:title>Broken<dc:title>Real</dc:title>", "title")].map((e) => e.inner)).toContain("Real");
+  });
+
+  it("DOCX text never ends in half a surrogate pair", () => {
+    const t = docxText(`<w:p><w:t>${"y".repeat(19_999)}\u{1F600}${"z".repeat(10)}</w:t></w:p>`);
+    expect(t.length).toBeLessThanOrEqual(20_000);
+    expect(/[\uD800-\uDBFF]$/u.test(t)).toBe(false);
   });
 });
 

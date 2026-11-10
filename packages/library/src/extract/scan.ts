@@ -27,25 +27,55 @@ export type Token = TagToken | TextToken;
 
 const isNameStart = (c: string | undefined) => !!c && /[A-Za-z_:]/u.test(c);
 
-/** Index of the '>' ending the tag that starts at `lt`, skipping quoted attribute values; -1 if none. */
-function tagEnd(s: string, lt: number): number {
-  let quote = "";
-  for (let i = lt + 1; i < s.length; i++) {
-    const c = s[i]!;
-    if (quote) {
-      if (c === quote) quote = "";
-    } else if (c === '"' || c === "'") {
-      // Only quotes that open an attribute value (after '=') count; stray quotes are text.
-      let j = i - 1;
-      while (j > lt && /\s/u.test(s[j]!)) j--;
-      if (s[j] === "=") quote = c;
-    } else if (c === ">") return i;
+/** What one scan has learnt about the rest of the input, so nothing is searched twice. */
+interface Memo {
+  /** No '>' exists at or after this index. */
+  noGt: number;
+  /** No such quote character exists at or after the index. */
+  noQuote: Record<string, number>;
+}
+
+const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+
+/**
+ * Index of the '>' ending the tag that starts at `lt`, skipping quoted attribute values (only a
+ * quote right after '=' opens one; an unclosed one is ignored); -1 when no '>' follows at all.
+ * Linear: the input after a failed search is remembered in `memo` and never searched again.
+ */
+function tagEnd(s: string, lt: number, memo: Memo): number {
+  let i = lt + 1;
+  for (;;) {
+    if (i >= memo.noGt) return -1;
+    const gt = s.indexOf(">", i);
+    if (gt < 0) {
+      memo.noGt = i;
+      return -1;
+    }
+    let q = -1;
+    for (let k = i; k < gt; k++) {
+      const c = s[k];
+      if (c !== '"' && c !== "'") continue;
+      let j = k - 1;
+      while (j > lt && isSpace(s[j])) j--;
+      if (s[j] === "=") {
+        q = k;
+        break;
+      }
+    }
+    if (q < 0) return gt;
+    const qc = s[q]!;
+    const close = q + 1 >= (memo.noQuote[qc] ?? Infinity) ? -1 : s.indexOf(qc, q + 1);
+    if (close < 0) {
+      memo.noQuote[qc] = Math.min(memo.noQuote[qc] ?? Infinity, q + 1);
+      return gt; // unclosed quote: treat it as text
+    }
+    i = close + 1;
   }
-  return -1;
 }
 
 /** Tokens of `s` (text, start/end/self-closing tags); comments, PIs and doctypes are dropped, CDATA is text. */
 export function* tokens(s: string): Generator<Token> {
+  const memo: Memo = { noGt: Infinity, noQuote: {} };
   let pos = 0;
   const n = s.length;
   while (pos < n) {
@@ -81,8 +111,13 @@ export function* tokens(s: string): Generator<Token> {
       pos = lt + 1;
       continue;
     }
-    const gt = tagEnd(s, lt);
-    if (gt < 0) return;
+    const gt = tagEnd(s, lt, memo);
+    if (gt < 0) {
+      // A '<' that never closes ("if a<b then") is text; the scan carries on.
+      yield { kind: "text", text: "<" };
+      pos = lt + 1;
+      continue;
+    }
     let i = nameAt;
     while (i < gt && !/[\s/>]/u.test(s[i]!)) i++;
     const name = s.slice(nameAt, i);
@@ -99,24 +134,24 @@ export function tagIs(t: TagToken, want: string): boolean {
   return want.includes(":") ? t.name.toLowerCase() === want.toLowerCase() : t.local === want.toLowerCase();
 }
 
-/** Every complete `<want ...>…</want>` (outermost when nested) and `<want/>`: its attributes and raw inner markup. */
+/**
+ * Every complete `<want ...>…</want>` and `<want/>`: its attributes and raw inner markup. An open
+ * tag of the same name restarts the match at the innermost one, so an unclosed element never hides
+ * a later complete one (`<t>Broken<t>Real</t>` yields "Real"); same-name nesting yields the inner.
+ */
 export function* elements(s: string, want: string): Generator<{ attrs: string; inner: string }> {
-  let depth = 0;
-  let open = 0;
+  let open = -1;
   let attrs = "";
   for (const t of tokens(s)) {
     if (t.kind !== "tag" || !tagIs(t, want)) continue;
     if (t.self) {
-      if (depth === 0) yield { attrs: t.attrs, inner: "" };
+      if (open < 0) yield { attrs: t.attrs, inner: "" };
     } else if (!t.end) {
-      if (depth === 0) {
-        open = t.stop;
-        attrs = t.attrs;
-      }
-      depth++;
-    } else if (depth > 0) {
-      depth--;
-      if (depth === 0) yield { attrs, inner: s.slice(open, t.start) };
+      open = t.stop;
+      attrs = t.attrs;
+    } else if (open >= 0) {
+      yield { attrs, inner: s.slice(open, t.start) };
+      open = -1;
     }
   }
 }

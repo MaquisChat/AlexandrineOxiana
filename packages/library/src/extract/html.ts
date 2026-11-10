@@ -12,6 +12,10 @@ import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 
 const MAX_HTML_BYTES = 16 * 1024 * 1024;
 export const MAX_METADATA_SCAN = 512 * 1024;
+/** Values kept per meta key (creators: per creator key), so repeats stay cheap. */
+const MAX_VALUES_PER_KEY = 200;
+const MAX_CREATORS = 500;
+const CREATOR_KEYS = new Set(["citation_author", "dc.creator", "dcterms.creator", "author", "article:author"]);
 
 export async function extractHtml(path: string): Promise<RawExtract> {
   const fh = await fsp.open(path, "r");
@@ -37,7 +41,11 @@ export async function extractHtml(path: string): Promise<RawExtract> {
       const a = new Map(attrPairs(t.attrs));
       const key = (a.get("name") ?? a.get("property") ?? "").toLowerCase();
       const content = clean(decodeEntities(a.get("content") ?? ""));
-      if (key && content) meta.set(key, [...(meta.get(key) ?? []), content]);
+      if (key && content) {
+        let values = meta.get(key);
+        if (!values) meta.set(key, (values = []));
+        if (values.length < (CREATOR_KEYS.has(key) ? MAX_CREATORS : MAX_VALUES_PER_KEY)) values.push(content);
+      }
     } else if (t.local === "html" && !t.end && lang === undefined) {
       lang = attrValue(t.attrs, "lang");
     } else if (t.local === "title" && docTitle === undefined) {
@@ -57,7 +65,7 @@ export async function extractHtml(path: string): Promise<RawExtract> {
   let creators = list("citation_author").map((n) => parseName(n));
   if (!creators.length) creators = list("dc.creator", "dcterms.creator").map((n) => parseName(n));
   if (!creators.length) creators = list("author", "article:author").filter((n) => !/^https?:/iu.test(n)).map((n) => parseName(n));
-  const cs = creators.filter((c): c is Creator => !!c);
+  const cs = creators.filter((c): c is Creator => !!c).slice(0, MAX_CREATORS);
   if (cs.length) out.creators = cs;
 
   const issued = normalizeDate(

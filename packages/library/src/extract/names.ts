@@ -83,6 +83,8 @@ export function decodeEntities(s: string): string {
 }
 
 const SKIP = new Set(["script", "style", "noscript", "template", "svg", "math", "head", "title"]);
+/** Start tags that end an unterminated <head> (pages with no </head> and no <body>). */
+const BODY_START = new Set(["body", "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "article", "main", "section", "table", "ul", "ol"]);
 const BREAK_AFTER = new Set(["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "blockquote", "section", "article", "pre", "dd", "dt"]);
 
 /**
@@ -98,7 +100,8 @@ export function markupToText(markup: string, maxChars = Number.POSITIVE_INFINITY
     if (t.kind === "tag") {
       if (skipping) {
         if (t.end && t.local === skipping) skipping = undefined;
-        continue;
+        else if (skipping === "head" && !t.end && BODY_START.has(t.local)) skipping = undefined;
+        if (skipping || t.end) continue;
       }
       if (!t.end && !t.self && SKIP.has(t.local)) skipping = t.local;
       else if (t.local === "br" || (t.end && BREAK_AFTER.has(t.local))) parts.push("\n");
