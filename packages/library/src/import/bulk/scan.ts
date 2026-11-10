@@ -38,7 +38,11 @@ export interface ScanItem {
   referenceMetadata?: Partial<SourceDraft>;
   /** Folder names from the import's root to the item, for structure mapping. */
   folderPath?: string[];
-  /** Tag names the source carries (e.g. reference-manager keywords); found or created whatever the structure option. */
+  /**
+   * Tag names the source carries (reference-manager keywords, Zotero subjects, Calibre tags): found
+   * or created (as the batch's) whatever the structure option, when the item creates a source; a
+   * merge into an existing source does not add them.
+   */
   tags?: string[];
   /** e.g. Zotero annotations (Task 24; not stored by the folder/zip import). */
   annotations?: Annotation[];

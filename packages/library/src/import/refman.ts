@@ -473,9 +473,10 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
             } else if (d === '"' && c === '"' && depth === 0) break;
           }
           push(src.slice(vs, Math.min(j, n)));
-          if (!ended && j < n && (src[j] === "}" && c === '"' && depth === 0)) {
-            // `"..}` : the quote never closed before the entry's close.
-          } else if (!ended && j < n) j++;
+          // Step past the closing brace or quote, but not past a stray "}" ending a quoted value
+          // that never closed (that brace closes the entry).
+          const strayClose = c === '"' && src[j] === "}";
+          if (!ended && j < n && !strayClose) j++;
         } else if (c !== undefined && isNameChar(c)) {
           // Number or macro name.
           const ms = j;

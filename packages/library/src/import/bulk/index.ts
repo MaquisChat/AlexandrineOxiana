@@ -20,7 +20,7 @@ export interface BulkImport {
   /** Wizard step 2: what a batch would find; nothing is written. */
   dryRun(projectId: string, adapter: ImportSourceAdapter): Promise<ScanSummary>;
   startBatch(projectId: string, adapter: ImportSourceAdapter, options?: ImportOptionsInput): Promise<BatchHandle>;
-  /** Folder and ZIP batches find their source from the record; other kinds need the adapter. */
+  /** Folder, ZIP, reference-manager export and Calibre batches find their source from the record; other kinds need the adapter. */
   resumeBatch(projectId: string, batchId: string, adapter?: ImportSourceAdapter): Promise<BatchHandle>;
   listBatches(projectId: string): Promise<BatchSummary[]>;
   listReview(projectId: string, batchId: string): Promise<ReviewEntry[]>;
