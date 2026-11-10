@@ -19,15 +19,19 @@ export async function indexUnlockedProject(
   root: string,
   keyRing: KeyRing,
   projectId: string,
+  /** Test seam: runs after each source file is read (a lock may happen here). */
+  hooks: { afterRead?: () => void | Promise<void> } = {},
 ): Promise<{ indexed: number; errors: Array<{ folder: string; message: string }> }> {
   const out = { indexed: 0, errors: [] as Array<{ folder: string; message: string }> };
   const entry = (await listProjectEntries(root)).find((e) => e.data?.project.id === projectId);
   if (!entry?.data) return out;
   const k = projectKey(entry.data, keyRing);
   if (!k) return out;
+  // The project can be locked while we await file reads: check the key before every insert.
+  const still = () => keyRing.has(k.keyId);
   purgeProject(db, projectId);
   indexProject(db, { ...entry.data.project, folder: entry.rel });
-  indexProjectEntities(db, entry.data, true);
+  if (still()) indexProjectEntities(db, entry.data, true);
   let names: string[] = [];
   try {
     names = await fsp.readdir(join(root, entry.rel, "Sources"));
@@ -39,13 +43,17 @@ export async function indexUnlockedProject(
     const folder = `${entry.rel}/Sources/${name}`;
     try {
       const sf = await readSource(join(root, folder), k);
+      await hooks.afterRead?.();
       if (!sf) continue;
-      indexSource(db, sf, await readExtractedText(root, sf, k), { protected: true });
+      const text = await readExtractedText(root, sf, k);
+      if (!still()) break; // locked meanwhile: insert nothing more
+      indexSource(db, sf, text, { protected: true });
       out.indexed++;
     } catch (err) {
       out.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
     }
   }
+  if (!still()) purgeProject(db, projectId); // locked during the load: nothing may stay in memory
   return out;
 }
 

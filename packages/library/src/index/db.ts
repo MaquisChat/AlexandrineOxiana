@@ -140,7 +140,7 @@ CREATE TEMP TABLE IF NOT EXISTS t_assets (
 CREATE TEMP TABLE IF NOT EXISTS t_source_collections (source_id TEXT NOT NULL, collection_id TEXT NOT NULL, PRIMARY KEY (source_id, collection_id));
 CREATE TEMP TABLE IF NOT EXISTS t_source_tags (source_id TEXT NOT NULL, tag_id TEXT NOT NULL, PRIMARY KEY (source_id, tag_id));
 CREATE TEMP TABLE IF NOT EXISTS t_collections (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, name TEXT NOT NULL);
-CREATE TEMP TABLE IF NOT EXISTS t_tags (id TEXT PRIMARY KEY, scope TEXT NOT NULL, name TEXT NOT NULL, color TEXT);
+CREATE TEMP TABLE IF NOT EXISTS t_tags (id TEXT PRIMARY KEY, scope TEXT NOT NULL, name TEXT NOT NULL, color TEXT, project_id TEXT NOT NULL DEFAULT '');
 CREATE TEMP TABLE IF NOT EXISTS t_participants (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, code TEXT NOT NULL);
 CREATE TEMP TABLE IF NOT EXISTS t_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, date TEXT NOT NULL);
 CREATE TEMP TABLE IF NOT EXISTS t_consents (
@@ -403,8 +403,10 @@ export function purgeProject(db: IndexDb, projectId: string): void {
     for (const t of ["t_collections", "t_participants", "t_sessions", "t_consents"]) {
       db.prepare(`DELETE FROM temp.${t} WHERE project_id = ?`).run(projectId);
     }
-    // tags are scoped to a project or the workspace; a project's own tags go with it
-    db.prepare("DELETE FROM temp.t_tags WHERE scope = ?").run(projectId);
+    // tags listed in the project's project.json go with it whatever their scope ('workspace' included)
+    db.prepare("DELETE FROM temp.t_tags WHERE project_id = ? OR scope = ?").run(projectId, projectId);
+    // safety net: anything else still keyed by the project
+    db.prepare("DELETE FROM temp.t_source_text WHERE project_id = ?").run(projectId);
   })();
 }
 
@@ -419,13 +421,16 @@ export function indexProject(db: IndexDb, p: Project, locked = false): void {
 /** Collections, tags and fieldwork records of a project: persistent when plain, TEMP when encrypted (R30). */
 export function indexProjectEntities(
   db: IndexDb,
-  data: { collections: Collection[]; tags: Tag[]; participants: Participant[]; sessions: Session[]; consents: ConsentRecord[] },
+  data: { project: { id: string }; collections: Collection[]; tags: Tag[]; participants: Participant[]; sessions: Session[]; consents: ConsentRecord[] },
   prot: boolean,
 ): void {
   const S = prot ? TEMP : MAIN;
   db.transaction(() => {
     for (const c of data.collections) db.prepare(`INSERT OR REPLACE INTO ${S.collections} VALUES (?,?,?,?)`).run(c.id, c.projectId, c.parentId ?? null, c.name);
-    for (const t of data.tags) db.prepare(`INSERT OR REPLACE INTO ${S.tagTable} VALUES (?,?,?,?)`).run(t.id, t.scope, t.name, t.color ?? null);
+    for (const t of data.tags) {
+      if (prot) db.prepare("INSERT OR REPLACE INTO temp.t_tags VALUES (?,?,?,?,?)").run(t.id, t.scope, t.name, t.color ?? null, data.project.id);
+      else db.prepare(`INSERT OR REPLACE INTO ${S.tagTable} VALUES (?,?,?,?)`).run(t.id, t.scope, t.name, t.color ?? null);
+    }
     for (const p of data.participants) db.prepare(`INSERT OR REPLACE INTO ${S.participants} VALUES (?,?,?)`).run(p.id, p.projectId, p.code);
     for (const s of data.sessions) db.prepare(`INSERT OR REPLACE INTO ${S.sessions} VALUES (?,?,?)`).run(s.id, s.projectId, s.date);
     for (const c of data.consents) {

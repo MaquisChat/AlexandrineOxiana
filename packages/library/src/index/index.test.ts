@@ -21,7 +21,8 @@ import {
   search,
 } from "./index.js";
 import { changeLogReads } from "./changes.js";
-import { openIndexAt } from "./db.js";
+import { indexProjectEntities, openIndexAt, purgeProject } from "./db.js";
+import { indexUnlockedProject } from "./sink.js";
 import { stripVtt } from "./load.js";
 import { buildMatchQuery, cjkBigrams } from "./text.js";
 
@@ -673,5 +674,88 @@ describe("review fixes", () => {
     expect(buildMatchQuery("\u0301 !!")).toBeUndefined();
     expect(findSourceBy(handle.db, { sha256: hash.toUpperCase() })).toHaveLength(1);
     expect(findSourceBy(handle.db, { sha256: hash })).toHaveLength(1);
+  });
+});
+
+describe("fix round 2", () => {
+  async function encProject(name: string, title: string) {
+    const pid = (await repo.createProject({ name, governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const sf = await repo.createSource(pid, draft(title, { identifiers: { doi: `10.1/${name.toLowerCase()}` } }), files(), {
+      provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }),
+    });
+    return { pid, sf };
+  }
+
+  it("1: a rename failure after the connection was closed still reloads unlocked encrypted projects", async () => {
+    const { sf } = await encProject("E1", "Persisting Wolfsbane");
+    await expect(
+      rebuildIndex(handle, ring, lib, undefined, {
+        afterClose: () => {
+          throw new Error("rename failed");
+        },
+      }),
+    ).rejects.toThrow("rename failed");
+    expect(handle.isOpen).toBe(true);
+    expect(search(handle.db, { text: "wolfsbane" }).items[0]).toMatchObject({ id: sf.source.id, locked: false });
+    expect(findSourceBy(handle.db, { doi: "10.1/e1" })).toHaveLength(1);
+  });
+
+  it("1: a reload failure in one project does not skip the others and is reported", async () => {
+    const a = await encProject("E1", "First Wolfsbane");
+    const b = await encProject("E2", "Second Wolfsbane");
+    const res = await rebuildIndex(handle, ring, lib, undefined, {
+      reloadProject: async (db, root, keyRing, pid) => {
+        if (pid === a.pid) throw new Error("reload boom");
+        return indexUnlockedProject(db, root, keyRing, pid);
+      },
+    });
+    expect(res.errors).toEqual([{ folder: "Projects/E1", message: "reload boom" }]);
+    expect(search(handle.db, { text: "second" }).items.map((i) => i.id)).toEqual([b.sf.source.id]);
+    expect(findSourceBy(handle.db, { doi: "10.1/e2" })).toHaveLength(1);
+  });
+
+  it("2: locking while a project is being loaded leaves nothing in memory", async () => {
+    const { pid } = await encProject("E1", "Racy Wolfsbane");
+    await repo.createSource(pid, draft("Another racy one"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    repo.lockProject(pid);
+    await repo.unlockProject(pid, "pw");
+    expect(search(handle.db, { text: "racy" }).total).toBe(2);
+    let reads = 0;
+    await indexUnlockedProject(handle.db, lib.root, ring, pid, {
+      afterRead: () => {
+        if (++reads === 1) repo.lockProject(pid);
+      },
+    });
+    for (const t of ["t_sources", "t_source_text", "t_assets", "t_source_hashes", "t_collections", "t_tags"]) {
+      expect(handle.db.prepare(`SELECT COUNT(*) AS n FROM temp.${t}`).get(), t).toEqual({ n: 0 });
+    }
+    expect(search(handle.db, { text: "racy" }).total).toBe(0);
+    expect(reads).toBe(1);
+  });
+
+  it("3: purge removes the project's tags whatever their scope, and other rows keyed by it", async () => {
+    const pid = newId();
+    const other = newId();
+    const mk = (project: string) => ({
+      project: { id: project },
+      collections: [{ id: newId(), projectId: project, name: "c" }],
+      tags: [
+        { id: newId(), scope: "workspace" as const, name: "ws tag" },
+        { id: newId(), scope: project, name: "own tag" },
+      ],
+      participants: [{ id: newId(), projectId: project, code: "P-1", consentIds: [] }],
+      sessions: [{ id: newId(), projectId: project, date: "2026-01-01", participantIds: [] }],
+      consents: [{ id: newId(), projectId: project, participantId: newId(), scope: "s", date: "2026-01-01" }],
+    });
+    indexProjectEntities(handle.db, mk(pid), true);
+    indexProjectEntities(handle.db, mk(other), true);
+    purgeProject(handle.db, pid);
+    expect(handle.db.prepare("SELECT project_id FROM temp.t_tags ORDER BY name").all()).toEqual([
+      { project_id: other },
+      { project_id: other },
+    ]);
+    for (const t of ["t_collections", "t_participants", "t_sessions", "t_consents"]) {
+      expect(handle.db.prepare(`SELECT DISTINCT project_id FROM temp.${t}`).all(), t).toEqual([{ project_id: other }]);
+    }
   });
 });

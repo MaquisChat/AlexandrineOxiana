@@ -19,3 +19,9 @@
 
 - Locking by clearing the key ring without `lockProject` leaves in-memory content until the connection closes; the app must use `lockProject`.
 - After a rebuild or an app restart, an unlocked encrypted project is searchable only once its content is reloaded (rebuild does this; the sink does it on unlock).
+
+## Constraints on later tasks and exposure notes
+
+- `review_items`, `import_batches` and `jobs` rows (including `payload_json`) for an encrypted project must never contain titles, creators or other identifying text. Later tasks must seal such payloads in files or keep them in the in-memory TEMP schema.
+- `main.projects.name` for an encrypted project comes from the plaintext `project.json`, so it carries the same exposure as on disk.
+- Loading an unlocked project into memory checks the key before every insert and purges if the project was locked meanwhile; a rebuild reloads every unlocked project even when the rebuild itself failed after the connection was closed, collecting errors per project.

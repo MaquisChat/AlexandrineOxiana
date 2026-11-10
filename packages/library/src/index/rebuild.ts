@@ -26,6 +26,10 @@ export interface RebuildResult {
 export interface RebuildOptions {
   /** Test seam: runs after the new index is complete and closed, right before it replaces the old one. */
   beforeRename?: () => void | Promise<void>;
+  /** Test seam: runs after the live connection is closed, before the rename (throw to simulate a rename failure). */
+  afterClose?: () => void | Promise<void>;
+  /** Test seam: replaces the per-project in-memory reload. */
+  reloadProject?: typeof indexUnlockedProject;
 }
 
 /**
@@ -75,15 +79,12 @@ export async function rebuildIndex(
     await opts.beforeRename?.();
     if (handle.isOpen) checkpointTruncate(handle.db); // failure here aborts with the old DB intact
     handle.close();
+    await opts.afterClose?.();
     await fsp.rm(`${dest}-wal`, { force: true });
     await fsp.rm(`${dest}-shm`, { force: true });
     await renameWithRetry(tmp, dest);
     handle.reopen();
-    for (const e of await listProjectEntries(root)) {
-      const d = e.data;
-      if (!d || !d.project.encryption.enabled || !projectKey(d, keyRing)) continue;
-      result.errors.push(...(await indexUnlockedProject(handle.db, root, keyRing, d.project.id)).errors);
-    }
+    result.errors.push(...(await reloadUnlocked(handle, root, keyRing, opts.reloadProject)));
     return result;
   } catch (err) {
     try {
@@ -95,12 +96,42 @@ export async function rebuildIndex(
     if (!handle.isOpen) {
       try {
         handle.reopen(); // whichever database is at library.sqlite is intact
+        await reloadUnlocked(handle, root, keyRing, opts.reloadProject); // the new connection has no in-memory content
       } catch {
         // the original error is the useful one
       }
     }
     throw err;
   }
+}
+
+/**
+ * Loads every unlocked encrypted project into the handle's in-memory schema. A failure in one
+ * project is collected (never thrown) so the others are still loaded.
+ */
+async function reloadUnlocked(
+  handle: IndexHandle,
+  root: string,
+  keyRing: KeyRing,
+  reload: typeof indexUnlockedProject = indexUnlockedProject,
+): Promise<Array<{ folder: string; message: string }>> {
+  const errors: Array<{ folder: string; message: string }> = [];
+  let entries: Awaited<ReturnType<typeof listProjectEntries>> = [];
+  try {
+    entries = await listProjectEntries(root);
+  } catch (err) {
+    return [{ folder: "Projects", message: err instanceof Error ? err.message : String(err) }];
+  }
+  for (const e of entries) {
+    const d = e.data;
+    if (!d || !d.project.encryption.enabled || !projectKey(d, keyRing)) continue;
+    try {
+      errors.push(...(await reload(handle.db, root, keyRing, d.project.id)).errors);
+    } catch (err) {
+      errors.push({ folder: e.rel, message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return errors;
 }
 
 function readCarried(old: IndexDb | undefined): Record<string, Array<Record<string, unknown>>> {
