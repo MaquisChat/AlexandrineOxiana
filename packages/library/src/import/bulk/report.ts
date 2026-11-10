@@ -71,10 +71,7 @@ function markdown(r: ImportReport): string {
   return lines.join("\n");
 }
 
-/**
- * Builds the batch's report from its record, journal and the review queue, writes report.md and
- * report.json into the batch folder and records `import.batch` in the audit log.
- */
+/** The batch's report as it stands, from its record, journal and the review queue. Writes nothing. */
 export async function batchReport(repo: Repo, projectId: string, batchId: string): Promise<ImportReport> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
@@ -94,6 +91,16 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     governance: rec.governance,
     notes: rec.notes,
   };
+  return report;
+}
+
+/**
+ * When a run ends: writes report.md and report.json into the batch folder (encrypted in encrypted
+ * projects) and records `import.batch` in the audit log (counts only). Viewing a report does not.
+ */
+export async function writeBatchReport(repo: Repo, projectId: string, batchId: string): Promise<ImportReport> {
+  const report = await batchReport(repo, projectId, batchId);
+  const rec = (await findBatch(repo, projectId, batchId))!;
   const projectRel = repo.getProject(projectId).folder;
   await repo.mutate(
     projectId,

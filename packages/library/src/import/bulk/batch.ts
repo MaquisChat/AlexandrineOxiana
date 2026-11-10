@@ -2,8 +2,8 @@
  * An import batch's files (spec 3.8, R31): `<Project>/imports/batch-<NNNN>/`
  *
  *   batch.json      the ImportBatch record plus state, created ids, notes and governance decisions
- *   journal.jsonl   one line per finished item `{ key, outcome, sourceId?, reason?, mergedInto?, snapshot? }`
- *   snapshots/      pre-merge copies of merged sources' source.json (for undo)
+ *   journal.jsonl   one line per finished item `{ key, outcome, sourceId?, reason?, mergedInto?, snapshot?, merge? }`; a review decision adds a later line for the item
+ *   snapshots/      pre-merge copies of merged sources' source.json (a record; undo uses the journal's merge records)
  *   report.md/.json the import report
  *
  * In encrypted projects every file is encrypted (`.enc`) and every journal line is sealed with the
@@ -13,6 +13,7 @@
  */
 import { join } from "node:path";
 import { ImportBatch, encName, type PolicyDecision } from "@ao/core";
+import type { MergeRecord } from "./merge.js";
 import { decryptBytes, namesIn, openLine, readMaybe, sealLine } from "../../repo/io.js";
 import type { MutateRequest, Tx } from "../../repo/mutate.js";
 import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
@@ -40,8 +41,10 @@ export interface JournalEntry {
   mergedInto?: string;
   snapshot?: string;
   reviewId?: string;
-  /** A review decision taken later (decideReview), journaled for undo. */
+  /** A review decision taken later (decideReview): this line then supersedes the item's outcome. */
   decision?: string;
+  /** Merges: what the merge added (reverted exactly by undo, R61). */
+  merge?: MergeRecord;
 }
 
 export interface GovernanceNote {
@@ -177,11 +180,10 @@ export function latestByKey(entries: JournalEntry[]): Map<string, JournalEntry> 
   return m;
 }
 
-/** Counts by outcome over the newest line per key (lines of review decisions are not items). */
+/** Counts by outcome over the newest line per key (a review decision's line supersedes the run's). */
 export function countOutcomes(latest: Iterable<JournalEntry>): { created: number; needsReview: number; duplicates: number; merged: number; failed: number; items: number } {
   const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, failed: 0, items: 0 };
   for (const e of latest) {
-    if (e.decision) continue; // a later review decision (e.g. a merge), not an item of the source
     c.items++;
     if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
     else if (e.outcome === "needs-review") c.needsReview++;

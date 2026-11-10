@@ -2,7 +2,7 @@
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { effectivePolicy, parseGovernance, recheckSourceFile } from "@ao/core";
+import { DEFAULT_GOVERNANCE, effectivePolicy, parseGovernance, recheckSourceFile } from "@ao/core";
 import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
@@ -555,6 +555,26 @@ export function projectReviewEntries(repo: Repo, projectId: string): Promise<Rev
   const st = core.state(projectId);
   core.assertUnlocked(st);
   return readReviewEntries(core, st);
+}
+
+/**
+ * Package-internal (Bulk Import link preflight): the effective policy, the default policy when the
+ * project has no governance.yaml, or null when the file cannot be read or parsed (fail closed).
+ */
+export async function projectPolicyOrDefault(repo: Repo, projectId: string): Promise<GovernanceConfig | null> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  try {
+    const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+    return effectivePolicy(raw ? parseGovernance(raw.toString("utf8")) : DEFAULT_GOVERNANCE).policy;
+  } catch {
+    return null;
+  }
+}
+
+/** Package-internal: whether the project has this source now (in memory, O(1)). */
+export function hasSource(repo: Repo, projectId: string, id: string): boolean {
+  return cores.get(repo)!.state(projectId).sources.has(id);
 }
 
 /** Package-internal: whether the project's files are encrypted at rest. */

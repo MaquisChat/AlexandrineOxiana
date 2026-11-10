@@ -61,7 +61,8 @@ import {
   importChange,
   projectCollectionsAndTags,
   projectEncrypted,
-  projectPolicy,
+  hasSource,
+  projectPolicyOrDefault,
   repoLibrary,
   type Repo,
 } from "../../repo/repo.js";
@@ -90,7 +91,8 @@ import {
   type ShownState,
 } from "./batch.js";
 import { BatchDedupe } from "./dedupe.js";
-import { batchReport as batchReportOf } from "./report.js";
+import { applyMerge, missingFields, type MergeRecord } from "./merge.js";
+import { writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
 
@@ -264,13 +266,21 @@ const decisionNote = (action: string, d: PolicyDecision): GovernanceNote => ({
   ...(d.result === "allow_with_conditions" ? { conditions: d.conditions } : {}),
 });
 
+/**
+ * Whether linking in place is refused (R24): the project is encrypted, or its effective policy
+ * requires encryption at rest. No governance.yaml means the default policy; a governance file that
+ * cannot be read or parsed refuses (fail closed).
+ */
+export async function preflightLink(repo: Repo, projectId: string): Promise<boolean> {
+  if (projectEncrypted(repo, projectId)) return true;
+  const policy = await projectPolicyOrDefault(repo, projectId);
+  return !policy || policy.encryption.atRest === "required";
+}
+
 /** Policy and option checks a batch must pass before it starts (or resumes). */
 async function preflight(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], options: ImportOptions): Promise<GovernanceNote[]> {
   repo.getProject(projectId); // NotFoundError for an unknown project
-  if (options.fileHandling === "link") {
-    const policy = await projectPolicy(repo, projectId);
-    if (!policy || policy.encryption.atRest === "required" || projectEncrypted(repo, projectId)) throw new BatchRefusedError(REASONS.linkEncrypted);
-  }
+  if (options.fileHandling === "link" && (await preflightLink(repo, projectId))) throw new BatchRefusedError(REASONS.linkEncrypted);
   const method = CAPTURE_METHOD[kind];
   const { identifiable, legalBasis } = await storeInputs(repo, projectId, legalCategory(method));
   const notes: GovernanceNote[] = [];
@@ -457,8 +467,7 @@ class Run {
     const watchdog = new PatternWatchdog(this.rec.options.fileNamePatterns, this.deps.patternBudgetMs ?? PATTERN_BUDGET_MS);
     let state: BatchState = "finished";
     try {
-      const live = new Set(this.repo.listSourceIds(this.projectId));
-      const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, live);
+      const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
       this.lookup = await lookupContextFor(this.repo, this.projectId, this.deps.http, this.deps.debug ? { debug: this.deps.debug } : {});
       let total = 0;
@@ -523,7 +532,7 @@ class Run {
     try {
       await this.flush().catch(() => {});
       await this.checkpoint(state, true);
-      await batchReportOf(this.repo, this.projectId, this.rec.id);
+      await writeBatchReport(this.repo, this.projectId, this.rec.id);
     } catch (err) {
       this.deps.debug?.(`bulk import: the batch record could not be saved (${err instanceof Error ? err.name : "error"})`);
     } finally {
@@ -676,7 +685,7 @@ class Run {
       identifiable,
       importBatchId: this.rec.id,
       ...(legalBasis ? { legalBasis } : {}),
-      ...(item.externalKeys ? { externalKeys: item.externalKeys } : {}),
+      externalKeys: { ...(item.externalKeys ?? {}), [ITEM_KEY]: item.key },
     });
   }
 
@@ -810,7 +819,7 @@ class Run {
     }
   }
 
-  /** Adds the item's files and the fields the existing source lacks, after snapshotting it (for undo). */
+  /** Adds the item's files and the fields the existing source lacks (snapshot kept as a record; the journal records what was added, for undo). */
   private async merge(
     item: ScanItem,
     targetId: string,
@@ -824,6 +833,7 @@ class Run {
     const n = ++this.snapshots;
     const snapshotRel = `${this.rec.dir}/snapshots/${targetId}-${Date.now()}-${n}.json`;
     const projectRel = this.projectRel;
+    let record: MergeRecord | undefined;
     const sf = await importChange(
       this.repo,
       this.projectId,
@@ -844,18 +854,13 @@ class Run {
           if (f.handling === "link") added.push(await linkedAsset(repoLibrary(this.repo).root, f, targetId, sha));
           else added.push(await ops.copyOriginal(cur, { fromPath: f.path, kind: f.kind!, ext: f.ext!, ...(f.mime ? { mime: f.mime } : {}), label: `${f.kind} added ${label}` }));
         }
-        const fill = missingFields(cur, r.draft);
-        const filled = new Set(Object.keys(fill.pointers));
-        const next: SourceFile = {
-          ...cur,
-          source: { ...cur.source, ...fill.patch, modifiedAt: tx.at, modifiedBy: tx.actor },
-          assets: [...cur.assets, ...added],
-          fieldEvidence: [...cur.fieldEvidence, ...r.fieldEvidence.filter((e) => filled.has(e.field))],
-        };
+        const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, tx.at, tx.actor);
+        record = merged.record;
+        const next = merged.next;
         await ops.writeSource(cur, next);
         await appendJournal(tx, projectRel, this.rec.dir, [
           ...this.pending.slice(0, flush),
-          { key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel },
+          { key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: record },
         ]);
         return next;
       },
@@ -863,7 +868,7 @@ class Run {
     );
     this.pending = this.pending.slice(flush);
     dedupe.add(sf);
-    return { key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel };
+    return { key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, ...(record ? { merge: record } : {}) };
   }
 }
 
@@ -888,90 +893,114 @@ async function linkedAsset(root: string, f: SourceInputFile, sourceId: string, s
   });
 }
 
-/** The fields a merge may fill: only those the existing source lacks (its title is never changed). */
-export function missingFields(cur: SourceFile, d: SourceDraft): { patch: Partial<SourceFile["source"]>; pointers: Record<string, true> } {
-  const s = cur.source;
-  const patch: Partial<SourceFile["source"]> = {};
-  const pointers: Record<string, true> = {};
-  if (s.type === "other" && d.type !== "other") {
-    patch.type = d.type;
-    pointers["/type"] = true;
-  }
-  if (s.creators.length === 0 && d.creators.length) {
-    patch.creators = d.creators;
-    pointers["/creators"] = true;
-  }
-  if (!s.issued && d.issued) {
-    patch.issued = d.issued;
-    pointers["/issued"] = true;
-  }
-  if (!s.container && d.container) {
-    patch.container = d.container;
-    pointers["/container"] = true;
-  }
-  if (!s.publisher && d.publisher) {
-    patch.publisher = d.publisher;
-    pointers["/publisher"] = true;
-  }
-  const ids = { ...s.identifiers };
-  for (const [k, v] of Object.entries(d.identifiers) as Array<[keyof typeof ids, never]>) {
-    if (v !== undefined && ids[k] === undefined) {
-      ids[k] = v;
-      pointers[`/identifiers/${k}`] = true;
+
+/** Starts a batch: options vetted and the project's rules checked first (BatchRefusedError), then batch.json, then the run. */
+/** In-process lock for batch numbers (with an exclusive mkdir of the folder for other writers). */
+let numbering: Promise<unknown> = Promise.resolve();
+
+/** Allocates the next `imports/batch-NNNN` folder: serialised in process, exclusive on disk (EEXIST → next number). */
+function allocateBatchNumber(repo: Repo, projectId: string): Promise<number> {
+  const next = numbering.then(async () => {
+    const imports = join(repoLibrary(repo).root, ...repo.getProject(projectId).folder.split("/"), "imports");
+    await fsp.mkdir(imports, { recursive: true });
+    let n = Math.max(0, ...(await batchDirs(repo, projectId)).map((d) => d.number)) + 1;
+    for (;;) {
+      try {
+        await fsp.mkdir(join(imports, `batch-${String(n).padStart(4, "0")}`));
+        return n;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        n++;
+      }
     }
-  }
-  if (Object.keys(ids).length !== Object.keys(s.identifiers).length) patch.identifiers = ids;
-  return { patch, pointers };
+  });
+  numbering = next.catch(() => {});
+  return next;
 }
+
+/** Item key recorded in each new source's provenance (resume guard, R61). */
+export const ITEM_KEY = "import-item";
 
 /** Starts a batch: options vetted and the project's rules checked first (BatchRefusedError), then batch.json, then the run. */
 export async function startBatch(deps: BulkImportDeps, projectId: string, adapter: ImportSourceAdapter, input: ImportOptionsInput = {}): Promise<BatchHandle> {
-  const options = acceptOptions(input);
-  const governance = await preflight(deps.repo, projectId, adapter.kind, options);
-  const number = Math.max(0, ...(await batchDirs(deps.repo, projectId)).map((d) => d.number)) + 1;
-  const rec: BatchRecord = {
-    id: newId(),
-    projectId,
-    number,
-    source: { kind: adapter.kind, location: adapter.location },
-    options,
-    startedAt: new Date().toISOString(),
-    counts: { created: 0, merged: 0, skipped: 0, failed: 0, needsReview: 0 },
-    state: "running",
-    dir: `imports/batch-${String(number).padStart(4, "0")}`,
-    createdSourceIds: [],
-    createdCollectionIds: [],
-    createdTagIds: [],
-    governance,
-    notes: [],
-  };
-  // Written before anything is created, so an interrupted batch still has its record.
-  await saveRecord(deps.repo, projectId, rec);
-  const run = new Run(deps, projectId, rec, adapter, []);
-  run.start();
-  return run.handle();
+  // The id is in the running set before anything is awaited (R61).
+  const id = newId();
+  active.add(id);
+  try {
+    const options = acceptOptions(input);
+    const governance = await preflight(deps.repo, projectId, adapter.kind, options);
+    const number = await allocateBatchNumber(deps.repo, projectId);
+    const rec: BatchRecord = {
+      id,
+      projectId,
+      number,
+      source: { kind: adapter.kind, location: adapter.location },
+      options,
+      startedAt: new Date().toISOString(),
+      counts: { created: 0, merged: 0, skipped: 0, failed: 0, needsReview: 0 },
+      state: "running",
+      dir: `imports/batch-${String(number).padStart(4, "0")}`,
+      createdSourceIds: [],
+      createdCollectionIds: [],
+      createdTagIds: [],
+      governance,
+      notes: [],
+    };
+    // Written before anything is created, so an interrupted batch still has its record.
+    await saveRecord(deps.repo, projectId, rec);
+    const run = new Run(deps, projectId, rec, adapter, []);
+    run.start();
+    return run.handle();
+  } catch (err) {
+    active.delete(id);
+    throw err;
+  }
 }
 
 /**
  * Resumes a batch that was paused, cancelled or interrupted: items already in its journal are
- * skipped. Folder and ZIP batches find their source again from the record; others need `adapter`.
+ * skipped, and so are items whose source (same batch id and item key) exists although its journal
+ * line was lost. Folder and ZIP batches find their source again from the record; others need `adapter`.
  */
 export async function resumeBatch(deps: BulkImportDeps, projectId: string, batchId: string, adapter?: ImportSourceAdapter): Promise<BatchHandle> {
+  // Checked and taken before anything is awaited: a second resume at the same time is refused (R61).
   if (active.has(batchId)) throw new BatchRefusedError("This import is already running.");
-  const rec = await findBatch(deps.repo, projectId, batchId);
-  if (!rec) throw new NotFoundError("Import batch", batchId);
-  if (rec.state === "finished" || rec.state === "undone") throw new BatchRefusedError("This import has already finished.");
-  if (rec.source.kind === "profile-capture") throw new BatchRefusedError("Profile captures are resumed by capturing the profile again.");
-  const source = adapter ?? adapterFor(rec.source.kind, rec.source.location);
-  if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
-  const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
-  rec.governance = [...rec.governance.filter((g) => g.items !== undefined), ...governance];
-  rec.state = "running";
-  delete rec.finishedAt;
-  await saveRecord(deps.repo, projectId, rec);
-  const run = new Run(deps, projectId, rec, source, await readJournal(deps.repo, projectId, rec.dir));
-  run.start();
-  return run.handle();
+  active.add(batchId);
+  try {
+    const rec = await findBatch(deps.repo, projectId, batchId);
+    if (!rec) throw new NotFoundError("Import batch", batchId);
+    if (rec.state === "finished" || rec.state === "undone") throw new BatchRefusedError("This import has already finished.");
+    if (rec.source.kind === "profile-capture") throw new BatchRefusedError("Profile captures are resumed by capturing the profile again.");
+    const source = adapter ?? adapterFor(rec.source.kind, rec.source.location);
+    if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
+    const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
+    rec.governance = [...rec.governance.filter((g) => g.items !== undefined), ...governance];
+    rec.state = "running";
+    delete rec.finishedAt;
+    const journal = await readJournal(deps.repo, projectId, rec.dir);
+    // Resume guard: sources of this batch whose journal line is missing count as done.
+    const journaled = new Set(journal.map((e) => e.key));
+    const recovered: JournalEntry[] = [];
+    for (const sid of deps.repo.listSourceIds(projectId)) {
+      try {
+        const prov = (await deps.repo.getSource(projectId, sid)).source.provenance;
+        const key = prov.externalKeys?.[ITEM_KEY];
+        if (prov.importBatchId === batchId && key && !journaled.has(key)) {
+          recovered.push({ key, outcome: "created", sourceId: sid });
+          journaled.add(key);
+        }
+      } catch {
+        // unreadable source: not provably this batch's
+      }
+    }
+    await saveRecord(deps.repo, projectId, rec, recovered);
+    const run = new Run(deps, projectId, rec, source, [...journal, ...recovered]);
+    run.start();
+    return run.handle();
+  } catch (err) {
+    active.delete(batchId);
+    throw err;
+  }
 }
 
 /** The project's batches, newest first; a `running` batch not running in this process is shown as `interrupted` (R45). */
@@ -1005,8 +1034,7 @@ export async function listBatches(repo: Repo, projectId: string): Promise<BatchS
 export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: ImportSourceAdapter): Promise<ScanSummary> {
   const repo = deps.repo;
   repo.getProject(projectId);
-  const live = new Set(repo.listSourceIds(projectId));
-  const dedupe = new BatchDedupe(deps.index.db, projectId, live);
+  const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
   const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [] };
   const name = `batch-dry-${newId()}`;
   const dir = join(repoLibrary(repo).root, ".tmp", name);

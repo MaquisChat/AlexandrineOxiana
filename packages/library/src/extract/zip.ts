@@ -129,10 +129,15 @@ function isSymlink(e: yauzl.Entry): boolean {
 export interface ExtractedEntry {
   /** The entry's name in the archive ("/"-separated). */
   name: string;
-  /** Where it was written. */
+  /** Where it was written ("" when it was not: see `refused`). */
   path: string;
   bytes: number;
+  /** Not written: the plain reason (a name that duplicates an earlier entry's, ignoring case). */
+  refused?: string;
 }
+
+export const DUPLICATE_NAME_REASON = "duplicate name in archive";
+const SIZE_MISMATCH_REASON = "A file inside the archive is larger than it says it is";
 
 /**
  * Unpacks `zipPath` into `destDir` (created 0700; files 0600). Every entry is checked before
@@ -178,11 +183,20 @@ export async function extractArchive(
     const base = resolve(destDir);
     const out: ExtractedEntry[] = [];
     let total = 0;
+    /** Names written so far, compared the way case-insensitive file systems do. */
+    const written = new Set<string>();
     for (const e of entries) {
       signal?.throwIfAborted();
       const name = e.fileName.replace(/\\/gu, "/");
       const segs = name.split("/").filter((x) => x !== "" && x !== ".");
       if (name.endsWith("/") || segs.length === 0) continue;
+      const folded = segs.join("/").normalize("NFC").toLowerCase();
+      if (written.has(folded)) {
+        // Two entries that would be one file: the later one is not imported (only it fails).
+        out.push({ name: segs.join("/"), path: "", bytes: 0, refused: DUPLICATE_NAME_REASON });
+        continue;
+      }
+      written.add(folded);
       const target = join(base, ...segs);
       const rel = relative(base, target);
       if (rel.startsWith("..") || rel.split(sep).includes("..")) throw new UnsafeFileError("zip-path", PATH_REASON);
@@ -204,6 +218,8 @@ export async function extractArchive(
         await pipeline(stream, counter, createWriteStream(target, { flags: "wx", mode: 0o600 }));
       } catch (err) {
         if (err instanceof UnsafeFileError) throw err;
+        // yauzl checks inflated sizes against the declared ones: more bytes than declared is a bomb.
+        if (/too many bytes/iu.test(err instanceof Error ? err.message : String(err))) throw new UnsafeFileError("zip-entry-too-large", SIZE_MISMATCH_REASON);
         throw new UnsafeFileError("zip-invalid", "A file inside the archive could not be read");
       }
       out.push({ name: segs.join("/"), path: target, bytes });

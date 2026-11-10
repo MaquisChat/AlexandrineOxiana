@@ -18,8 +18,9 @@ import type { ReviewEntry } from "../../repo/review.js";
 import { storeRequest } from "../../repo/sources.js";
 import { importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import type { LookupResult } from "../../lookup/index.js";
-import { PRIVATE_MODE, appendJournal, fileName, findBatch } from "./batch.js";
-import { BatchRefusedError, missingFields } from "./run.js";
+import { PRIVATE_MODE, appendJournal, fileName, findBatch, readJournal, type JournalEntry } from "./batch.js";
+import { applyMerge, missingFields } from "./merge.js";
+import { BatchRefusedError } from "./run.js";
 
 export type ReviewDecision =
   | { action: "accept"; draft?: SourceDraft }
@@ -42,6 +43,7 @@ export async function listReview(repo: Repo, projectId: string, batchId: string)
 async function pendingEntry(repo: Repo, projectId: string, itemId: string): Promise<ReviewEntry & { sourceId: string }> {
   const e = (await projectReviewEntries(repo, projectId)).find((x) => x.id === itemId);
   if (!e || !e.sourceId) throw new NotFoundError("Review item", itemId);
+  if (e.kind !== "import") throw new BatchRefusedError("This review entry is not an import item; it is reviewed with the source's verification.");
   if (e.status !== "pending") throw new BatchRefusedError("This item has already been reviewed.");
   return e as ReviewEntry & { sourceId: string };
 }
@@ -91,8 +93,10 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
     if (d.sourceId === entry.sourceId) throw new BatchRefusedError("An item cannot be merged into itself.");
     target = await repo.getSource(projectId, d.sourceId);
     reqs.push(storeRequest(target.source.provenance));
-    batchDir = entry.batchId ? (await findBatch(repo, projectId, entry.batchId))?.dir : undefined;
   }
+  batchDir = entry.batchId ? (await findBatch(repo, projectId, entry.batchId))?.dir : undefined;
+  // The item's journal key, so the decision's line supersedes the run's outcome (counts stay in step).
+  const itemKey = batchDir ? [...(await readJournal(repo, projectId, batchDir))].reverse().find((e) => e.sourceId === entry.sourceId && e.outcome === "needs-review")?.key : undefined;
   if (d.action === "accept-candidate") {
     const c = entry.candidates?.[d.index];
     if (!c) throw new BatchRefusedError("That candidate does not exist.");
@@ -106,6 +110,7 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
     async (ops) => {
       const { tx } = ops;
       const cur = await ops.readSource(entry.sourceId);
+      let line: Omit<JournalEntry, "key"> = { outcome: "created", sourceId: cur.source.id };
       if (d.action === "accept" && d.draft) {
         await ops.writeSource(cur, applyFields(cur, d.draft, { kind: "user" }, tx.at, tx.actor));
       } else if (d.action === "accept-candidate") {
@@ -116,7 +121,7 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
         const tgt = await ops.readSource(d.sourceId);
         let snapshot: string | undefined;
         if (batchDir) {
-          // Snapshot first, journaled in the batch, so undoing the batch restores the target.
+          // The target as it was (kept with the batch for the record; undo reverts the merge record).
           snapshot = `${batchDir}/snapshots/${tgt.source.id}-${Date.now()}-review.json`;
           await tx.mkdir(`${projectRel}/${batchDir}/snapshots`);
           const name = fileName(snapshot.slice(snapshot.lastIndexOf("/") + 1), tx.encrypted);
@@ -135,23 +140,15 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
           const ext = a.path.replace(/\.enc$/u, "").split(".").pop() ?? "bin";
           added.push(await ops.copyOriginal(tgt, { fromPath: join(root, ...a.path.split("/")), kind: a.kind, ext, mime: a.mime, label: `${a.kind} added ${label}`, ...(a.encrypted ? { fromEncrypted: true } : {}) }));
         }
-        const fill = missingFields(tgt, cur.source as unknown as SourceDraft);
-        const filled = new Set(Object.keys(fill.pointers));
-        await ops.writeSource(tgt, {
-          ...tgt,
-          source: { ...tgt.source, ...fill.patch, modifiedAt: tx.at, modifiedBy: tx.actor },
-          assets: [...tgt.assets, ...added],
-          fieldEvidence: [...tgt.fieldEvidence, ...cur.fieldEvidence.filter((e) => filled.has(e.field))],
-        });
+        const merged = applyMerge(tgt, added, missingFields(tgt, cur.source as unknown as SourceDraft), cur.fieldEvidence, tx.at, tx.actor);
+        await ops.writeSource(tgt, merged.next);
         await ops.deleteSource(cur.source.id);
-        if (batchDir && snapshot) {
-          await appendJournal(tx, projectRel, batchDir, [
-            { key: `review:${entry.id}`, outcome: "merged", sourceId: tgt.source.id, mergedInto: tgt.source.id, snapshot, decision: "merge" },
-          ]);
-        }
+        line = { outcome: "merged", sourceId: tgt.source.id, mergedInto: tgt.source.id, ...(snapshot ? { snapshot } : {}), merge: merged.record };
       } else if (d.action === "skip") {
         await ops.deleteSource(cur.source.id);
+        line = { outcome: "skipped", sourceId: cur.source.id };
       }
+      if (batchDir && itemKey) await appendJournal(tx, projectRel, batchDir, [{ key: itemKey, ...line, decision: d.action }]);
       await ops.updateReview({ ...entry, status: "resolved", resolvedAt: tx.at, decision: d.action });
     },
     { op: "review.decide", entity: { type: "source", id: entry.sourceId } },

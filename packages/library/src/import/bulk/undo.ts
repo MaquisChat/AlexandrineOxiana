@@ -1,15 +1,19 @@
 /**
  * Undo a whole import batch (spec 5.4 step 7, 3.8; R44, R45):
  *
- *   1. merges are reverted, newest first: each merged source gets back its pre-merge source.json
- *      from the batch's snapshot, and the files the merge copied in are removed;
+ *   1. merges are reverted, newest first, from what each merge recorded (R61): the originals it
+ *      added are removed and the fields it filled are cleared, unless the user changed them since
+ *      (kept, and reported). Another batch's files are never touched; the pre-merge snapshot in
+ *      the batch folder is kept as a record only;
  *   2. every source the batch created is deleted. They are found by their provenance
  *      `importBatchId` as well as by the batch record's `createdSourceIds` and the journal (R45),
  *      so a source created just before a crash is found too;
- *   3. the collections and tags the batch created are deleted (deepest collections first);
- *   4. a profile-capture batch's post ids are removed from the profile's `profile.json`
- *      (`knownPostIds`, `knownPosts`) and `archive.txt` (R44), so a later run may capture them again
- *      only if they are still listed (deliberately deleted posts are not brought back by undo);
+ *   3. the collections and tags the batch created are deleted (deepest collections first), unless a
+ *      surviving source uses them or (collections) the user added a folder inside: those are kept
+ *      and reported;
+ *   4. a profile-capture batch's post ids whose sources this undo removed are taken out of the
+ *      profile's `profile.json` (`knownPostIds`, `knownPosts`) and `archive.txt` (R44); a post whose
+ *      source the user had already deleted stays known, so it is not captured again;
  *   5. the batch's pending review entries are resolved, the record is marked `undone` and the
  *      undo is audited (`import.undo`).
  *
@@ -17,13 +21,14 @@
  * folders (trashed through the repository) and the copies a merge added. Linked originals and the
  * user's files outside the library are never touched.
  */
-import { appendLibraryEvent, importChange, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
+import { appendLibraryEvent, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
-import { encName, SourceFile } from "@ao/core";
+import { encName } from "@ao/core";
 import { decryptBytes, readMaybe } from "../../repo/io.js";
 import { projectDataKey } from "../../repo/repo.js";
 import { join } from "node:path";
 import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, writeBatchRecord } from "./batch.js";
+import { revertMerge } from "./merge.js";
 import { BatchRefusedError } from "./run.js";
 
 const CREATED = new Set(["created", "needs-review", "incomplete"]);
@@ -36,42 +41,57 @@ async function readProjectRel(repo: Repo, projectId: string, rel: string): Promi
   return (await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw)).toString("utf8");
 }
 
-export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<{ removedSources: number; revertedMerges: number }> {
+export interface UndoKept {
+  kind: "tag" | "collection" | "field";
+  /** The tag or collection id, or the field's JSON pointer. */
+  id: string;
+  /** For fields: the source. */
+  sourceId?: string;
+  reason: string;
+}
+
+export interface UndoResult {
+  removedSources: number;
+  revertedMerges: number;
+  /** What undo left in place because it is in use or was changed since (R61). */
+  kept: UndoKept[];
+}
+
+export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   if (activeBatches.has(batchId)) throw new BatchRefusedError("This import is still running; cancel it first.");
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
   if (rec.state === "undone") throw new BatchRefusedError("This import has already been undone.");
   const projectRel = repo.getProject(projectId).folder;
   const journal = await readJournal(repo, projectId, rec.dir);
+  const kept: UndoKept[] = [];
 
-  // 1. Merges, newest first.
+  // 1. Merges, newest first, exactly what each one added.
   let revertedMerges = 0;
-  const live = () => new Set(repo.listSourceIds(projectId));
   for (const e of [...journal].reverse()) {
-    if (!e.mergedInto || !e.snapshot) continue;
-    if (!live().has(e.mergedInto)) continue;
-    const text = await readProjectRel(repo, projectId, `${projectRel}/${e.snapshot}`);
-    if (!text) continue;
-    const snap = SourceFile.parse(JSON.parse(text));
+    if (!e.mergedInto || !e.merge || !hasSource(repo, projectId, e.mergedInto)) continue;
     const cur = await repo.getSource(projectId, e.mergedInto);
-    await importChange(
+    const p = cur.source.provenance;
+    const changed = await importChange(
       repo,
       projectId,
-      { action: "store", store: { identifiable: cur.source.provenance.identifiable, hasLocation: false, ...(cur.source.provenance.legal.basis ? { legalBasis: cur.source.provenance.legal.basis } : {}) } },
+      { action: "store", store: { identifiable: p.identifiable, hasLocation: false, ...(p.legal.basis ? { legalBasis: p.legal.basis } : {}) } },
       async (ops) => {
         const now = await ops.readSource(e.mergedInto!);
-        const keep = new Set(snap.assets.map((a) => a.id));
-        for (const a of now.assets) if (!keep.has(a.id)) await ops.trashAssetFile(a);
-        await ops.writeSource(now, snap);
+        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor);
+        for (const a of r.removed) await ops.trashAssetFile(a);
+        for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
+        if (r.removed.length || r.next.source !== now.source) await ops.writeSource(now, r.next);
+        return true;
       },
       { op: "import.undo.merge", entity: { type: "source", id: e.mergedInto } },
     );
-    revertedMerges++;
+    if (changed) revertedMerges++;
   }
 
   // 2. Sources the batch created: by provenance, the record and the journal (R45).
   const ids = new Set<string>(rec.createdSourceIds);
-  for (const e of journal) if (e.sourceId && CREATED.has(e.outcome)) ids.add(e.sourceId);
+  for (const e of journal) if (e.sourceId && CREATED.has(e.outcome) && !e.mergedInto) ids.add(e.sourceId);
   for (const id of repo.listSourceIds(projectId)) {
     if (ids.has(id)) continue;
     try {
@@ -80,30 +100,57 @@ export async function undoBatch(repo: Repo, projectId: string, batchId: string):
       // unreadable: not provably this batch's
     }
   }
-  let removedSources = 0;
+  const removed = new Set<string>();
   for (const id of ids) {
-    if (!live().has(id)) continue;
+    if (!hasSource(repo, projectId, id)) continue;
     await repo.deleteSource(projectId, id);
-    removedSources++;
+    removed.add(id);
   }
+  const removedSources = removed.size;
 
-  // 3. Collections (deepest first: they were created parents first) and tags.
-  for (const id of [...rec.createdCollectionIds].reverse()) {
-    try {
+  // 3. Collections (deepest first: they were created parents first) and tags, unless still in use.
+  if (rec.createdCollectionIds.length || rec.createdTagIds.length) {
+    const usedCollections = new Set<string>();
+    const usedTags = new Set<string>();
+    for (const id of repo.listSourceIds(projectId)) {
+      try {
+        const s = (await repo.getSource(projectId, id)).source;
+        s.collectionIds.forEach((c) => usedCollections.add(c));
+        s.tagIds.forEach((t) => usedTags.add(t));
+      } catch {
+        // unreadable: cannot tell, so nothing it might use is removed below
+        rec.createdCollectionIds.forEach((c) => usedCollections.add(c));
+        rec.createdTagIds.forEach((t) => usedTags.add(t));
+      }
+    }
+    for (const id of [...rec.createdCollectionIds].reverse()) {
+      const { collections } = await projectCollectionsAndTags(repo, projectId);
+      if (!collections.some((c) => c.id === id)) continue;
+      if (usedCollections.has(id)) {
+        kept.push({ kind: "collection", id, reason: "a source outside the import is in it; kept" });
+        continue;
+      }
+      if (collections.some((c) => c.parentId === id)) {
+        kept.push({ kind: "collection", id, reason: "it holds a collection added after the import; kept" });
+        continue;
+      }
       await repo.deleteCollection(projectId, id);
-    } catch (err) {
-      if (!(err instanceof NotFoundError)) throw err;
+    }
+    const tagsToDelete: string[] = [];
+    for (const t of rec.createdTagIds) {
+      if (usedTags.has(t)) kept.push({ kind: "tag", id: t, reason: "a source outside the import has it; kept" });
+      else tagsToDelete.push(t);
+    }
+    if (tagsToDelete.length) {
+      await importChange(repo, projectId, BOOKKEEPING, async (ops) => {
+        await ops.deleteTags(tagsToDelete, []);
+      }, { op: "import.undo.tags" });
     }
   }
-  if (rec.createdTagIds.length) {
-    await importChange(repo, projectId, BOOKKEEPING, async (ops) => {
-      for (const t of rec.createdTagIds) await ops.deleteTag(t, repo.listSourceIds(projectId));
-    }, { op: "import.undo.tags" });
-  }
 
-  // 4. Profile capture: forget the batch's posts (R44).
+  // 4. Profile capture: forget the posts whose sources this undo removed (R44).
   if (rec.source.kind === "profile-capture") {
-    const keys = new Set(journal.filter((e) => CREATED.has(e.outcome) || e.outcome === "duplicate").filter((e) => !e.sourceId || ids.has(e.sourceId)).map((e) => e.key));
+    const keys = new Set(journal.filter((e) => e.sourceId && removed.has(e.sourceId)).map((e) => e.key));
     const dir = `${projectRel}/${rec.source.location.replace(/^\/+|\/+$/gu, "")}`;
     if (keys.size && rec.source.location.startsWith("profiles/") && !rec.source.location.includes("..")) {
       const profileText = await readProjectRel(repo, projectId, `${dir}/profile.json`);
@@ -131,7 +178,7 @@ export async function undoBatch(repo: Repo, projectId: string, batchId: string):
   }
 
   // 5. Review entries, the record, the audit log.
-  const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.status === "pending" && (e.batchId === batchId || (e.sourceId && ids.has(e.sourceId))));
+  const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.status === "pending" && (e.batchId === batchId || (e.sourceId && removed.has(e.sourceId))));
   rec.state = "undone";
   await importChange(
     repo,
@@ -149,8 +196,7 @@ export async function undoBatch(repo: Repo, projectId: string, batchId: string):
     kind: rec.source.kind,
     removedSources,
     revertedMerges,
-    removedCollections: rec.createdCollectionIds.length,
-    removedTags: rec.createdTagIds.length,
+    kept: kept.length,
   });
-  return { removedSources, revertedMerges };
+  return { removedSources, revertedMerges, kept };
 }

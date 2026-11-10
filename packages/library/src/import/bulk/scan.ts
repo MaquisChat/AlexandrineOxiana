@@ -103,6 +103,10 @@ async function* zipItems(zipPath: string, key: string, folderPath: string[], sig
       const segs = e.name.split("/");
       const name = segs[segs.length - 1]!;
       if (segs.some(skipName) || isSidecar(name) || isZip(name)) continue; // no archives inside archives
+      if (e.refused) {
+        yield { key: `${key}!/${e.name}`, files: [], unreadable: e.refused };
+        continue;
+      }
       const f = await sniff(e.path);
       if (!f) continue;
       yield { key: `${key}!/${e.name}`, files: [f], folderPath: [...folderPath, stem, ...segs.slice(0, -1)] };

@@ -26,8 +26,8 @@ export interface ImportOps {
   reviewEntries(): Promise<ReviewEntry[]>;
   appendReview(input: ReviewInput): Promise<ReviewEntry>;
   updateReview(entry: ReviewEntry): Promise<void>;
-  /** Removes a project tag (and its use on the given sources). */
-  deleteTag(tagId: string, sourceIds: Iterable<string>): Promise<boolean>;
+  /** Removes project tags (and their use on the given sources), in one write of project.json. */
+  deleteTags(tagIds: string[], sourceIds: Iterable<string>): Promise<string[]>;
   /** Reads a project file written by this repo (decrypted when the project is encrypted). */
   readText(rel: string): Promise<string | null>;
 }
@@ -98,21 +98,22 @@ export function runImportChange<T>(
         reviewEntries: () => readReviewEntries(core, st),
         appendReview: (input) => appendReviewEntry(core, tx, input),
         updateReview: (entry) => appendReviewUpdate(core, tx, entry),
-        async deleteTag(tagId, sourceIds) {
+        async deleteTags(tagIds, sourceIds) {
           const data = await readFullData(core, st);
-          const tag = data.tags.find((t) => t.id === tagId);
-          if (!tag) return false;
+          const gone = data.tags.filter((t) => tagIds.includes(t.id));
+          if (!gone.length) return [];
+          const ids = new Set(gone.map((t) => t.id));
           for (const id of sourceIds) {
             if (!st.sources.has(id)) continue;
             const cur = await readSourceFile(core, st, id);
-            if (!cur.source.tagIds.includes(tagId)) continue;
-            const sf: SourceFile = { ...cur, source: { ...cur.source, tagIds: cur.source.tagIds.filter((t) => t !== tagId), modifiedAt: tx.at, modifiedBy: tx.actor } };
+            if (!cur.source.tagIds.some((t) => ids.has(t))) continue;
+            const sf: SourceFile = { ...cur, source: { ...cur.source, tagIds: cur.source.tagIds.filter((t) => !ids.has(t)), modifiedAt: tx.at, modifiedBy: tx.actor } };
             await ops.writeSource(cur, sf);
           }
-          data.tags = data.tags.filter((t) => t.id !== tagId);
+          data.tags = data.tags.filter((t) => !ids.has(t.id));
           await writeProjectData(core, tx, data);
-          tx.record("tag", tagId, tag, null);
-          return true;
+          for (const t of gone) tx.record("tag", t.id, t, null);
+          return [...ids];
         },
         async readText(rel) {
           const raw = await readMaybe(core.abs(rel));

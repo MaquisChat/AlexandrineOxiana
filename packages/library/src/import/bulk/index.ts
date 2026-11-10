@@ -14,7 +14,7 @@ import {
   type ScanSummary,
 } from "./run.js";
 import type { ImportSourceAdapter } from "./scan.js";
-import { undoBatch } from "./undo.js";
+import { undoBatch, type UndoResult } from "./undo.js";
 
 export interface BulkImport {
   /** Wizard step 2: what a batch would find; nothing is written. */
@@ -27,7 +27,7 @@ export interface BulkImport {
   decideReview(projectId: string, itemId: string, decision: ReviewDecision): Promise<void>;
   bulkEditReview(projectId: string, itemIds: string[], patch: ReviewPatch): Promise<void>;
   batchReport(projectId: string, batchId: string): Promise<ImportReport>;
-  undoBatch(projectId: string, batchId: string): Promise<{ removedSources: number; revertedMerges: number }>;
+  undoBatch(projectId: string, batchId: string): Promise<UndoResult>;
 }
 
 export function createBulkImport(deps: BulkImportDeps): BulkImport {
@@ -49,6 +49,7 @@ export { BatchRefusedError, REASONS as BULK_REASONS } from "./run.js";
 export type { BatchHandle, BatchProgress, BatchResult, BatchSummary, BulkImportDeps, ScanSummary, BatchCounts } from "./run.js";
 export type { ImportReport } from "./report.js";
 export type { ReviewDecision, ReviewPatch } from "./review.js";
+export type { UndoKept, UndoResult } from "./undo.js";
 export { adapterFor, folderAdapter, zipAdapter } from "./scan.js";
 export type { ImportSourceAdapter, ScanContext, ScanFile, ScanItem } from "./scan.js";
 export { PATTERN_BUDGET_MS } from "./patterns.js";

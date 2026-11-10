@@ -31,15 +31,23 @@ export class BatchDedupe {
   /** Fuzzy keys of sources added before the buckets were loaded. */
   private readonly early: Existing[] = [];
 
+  /** Placeholders of sources queued but not stored yet. */
+  private readonly live = new Set<string>();
+
   constructor(
     private readonly db: IndexDb,
     private readonly projectId: string,
-    /** The project's sources (ids), kept current by the caller. */
-    private readonly live: Set<string>,
+    /** Whether the project has the source now: sources added during the batch (e.g. dropped files) count too. */
+    private readonly exists: (id: string) => boolean,
   ) {}
 
+  private alive(id: string): boolean {
+    return id.startsWith("pending:") ? this.live.has(id) : this.exists(id);
+  }
+
+  /** Exact keys come from the index on every lookup, so they include sources added meanwhile by anyone. */
   private indexed(q: Parameters<typeof findSourceBy>[1]): string | undefined {
-    for (const row of findSourceBy(this.db, q)) if (this.live.has(row.id)) return row.id;
+    for (const row of findSourceBy(this.db, q)) if (this.alive(row.id)) return row.id;
     return undefined;
   }
 
@@ -47,7 +55,7 @@ export class BatchDedupe {
   bySha(sha256: string): string | undefined {
     const h = sha256.toLowerCase();
     const inBatch = this.sha.get(h);
-    if (inBatch && this.live.has(inBatch)) return inBatch;
+    if (inBatch && this.alive(inBatch)) return inBatch;
     return this.indexed({ sha256: h });
   }
 
@@ -63,7 +71,7 @@ export class BatchDedupe {
     const loaded = new Set<string>();
     for (const r of rows) {
       loaded.add(r.id);
-      if (!this.live.has(r.id)) continue;
+      if (!this.alive(r.id)) continue;
       this.put({
         sourceId: r.id,
         sha256s: [],
@@ -74,7 +82,7 @@ export class BatchDedupe {
         ...(r.isbn13 ? { isbns: [r.isbn13] } : {}),
       });
     }
-    for (const e of this.early) if (!loaded.has(e.sourceId) && this.live.has(e.sourceId)) this.put(e);
+    for (const e of this.early) if (!loaded.has(e.sourceId) && this.alive(e.sourceId)) this.put(e);
     this.early.length = 0;
     return this.buckets;
   }
@@ -93,7 +101,7 @@ export class BatchDedupe {
     const out: Existing[] = [];
     const seen = new Set<string>();
     const add = (id: string | undefined, e: Omit<Existing, "sourceId">) => {
-      if (!id || !this.live.has(id) || seen.has(`${id}|${e.doi ?? ""}|${e.isbns?.[0] ?? ""}|${e.title ?? ""}`)) return;
+      if (!id || !this.alive(id) || seen.has(`${id}|${e.doi ?? ""}|${e.isbns?.[0] ?? ""}|${e.title ?? ""}`)) return;
       seen.add(`${id}|${e.doi ?? ""}|${e.isbns?.[0] ?? ""}|${e.title ?? ""}`);
       out.push({ sourceId: id, ...e });
     };
@@ -109,7 +117,7 @@ export class BatchDedupe {
     const y = yearOf(c.year);
     if (c.title && c.firstCreatorFamily && y !== null) {
       const buckets = this.loadBuckets();
-      for (const yy of [y - 1, y, y + 1]) for (const e of buckets.get(bucketKey(c.firstCreatorFamily, yy)) ?? []) if (this.live.has(e.sourceId)) out.push(e);
+      for (const yy of [y - 1, y, y + 1]) for (const e of buckets.get(bucketKey(c.firstCreatorFamily, yy)) ?? []) if (this.alive(e.sourceId)) out.push(e);
     }
     return out;
   }
@@ -139,7 +147,6 @@ export class BatchDedupe {
   /** Adds a source the batch created or merged into. */
   add(sf: SourceFile): void {
     const s = sf.source;
-    this.live.add(s.id);
     for (const a of sf.assets) if (a.role === "original") this.sha.set(a.sha256.toLowerCase(), s.id);
     if (s.identifiers.doi) this.doi.set(normalizeDoi(s.identifiers.doi), s.id);
     for (const i of s.identifiers.isbn ?? []) {

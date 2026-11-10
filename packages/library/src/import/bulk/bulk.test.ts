@@ -18,7 +18,7 @@ import { createLibrary, openLibrary, type Library } from "../../library.js";
 import { HttpClient } from "../../lookup/index.js";
 import { decryptBytes } from "../../repo/io.js";
 import type { Repo } from "../../repo/repo.js";
-import { projectDataKey } from "../../repo/repo.js";
+import { importChange, projectCollectionsAndTags, projectDataKey } from "../../repo/repo.js";
 import { openTestRepo } from "../../repo/testing.js";
 import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
 
@@ -507,7 +507,8 @@ describe("undoBatch", () => {
     expect(u.revertedMerges).toBe(1);
     expect(u.removedSources).toBe(result.counts.created + result.counts.needsReview);
     expect(repo.listSourceIds(p.id)).toHaveLength(pre);
-    expect(await repo.getSource(p.id, existing.source.id)).toEqual(before);
+    const after = await repo.getSource(p.id, existing.source.id);
+    expect({ ...after, source: { ...after.source, modifiedAt: "", modifiedBy: "" } }).toEqual({ ...before, source: { ...before.source, modifiedAt: "", modifiedBy: "" } });
     expect((await (await import("../../repo/repo.js")).projectCollectionsAndTags(repo, p.id)).collections).toEqual([]);
     // The user's files are untouched.
     expect(existsSync(fx.doiPdf)).toBe(true);
@@ -561,6 +562,7 @@ describe("undoBatch", () => {
     const keep = await mk("Older post", "P0", false);
     const a = await mk("Post A", "PA");
     const b = await mk("Post B", "PB"); // created but not in batch.json (crash before the record was saved)
+    const c = await mk("Post C", "PC"); // deleted by the user before the undo (R44: stays known)
     const profileDir = "profiles/instagram-someone";
     await repo.mutate(p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, async (tx) => {
       const base = `${p.folder}/imports/batch-0001`;
@@ -581,20 +583,22 @@ describe("undoBatch", () => {
       );
       await tx.appendLine(`${base}/journal.jsonl`, JSON.stringify({ key: "PA", outcome: "created", sourceId: a.source.id }));
       await tx.appendLine(`${base}/journal.jsonl`, JSON.stringify({ key: "PB", outcome: "created", sourceId: b.source.id }));
+      await tx.appendLine(`${base}/journal.jsonl`, JSON.stringify({ key: "PC", outcome: "created", sourceId: c.source.id }));
       await tx.mkdir(`${p.folder}/${profileDir}`);
       await tx.writeFile(
         `${p.folder}/${profileDir}/profile.json`,
-        JSON.stringify({ platform: "instagram", handle: "someone", knownPostIds: ["P0", "PA", "PB"], knownPosts: { P0: { listing: "posts" }, PA: { listing: "posts" }, PB: { listing: "posts" } } }),
+        JSON.stringify({ platform: "instagram", handle: "someone", knownPostIds: ["P0", "PA", "PB", "PC"], knownPosts: { P0: { listing: "posts" }, PA: { listing: "posts" }, PB: { listing: "posts" }, PC: { listing: "posts" } } }),
       );
-      await tx.writeFile(`${p.folder}/${profileDir}/archive.txt`, "instagram P0\ninstagram PA\ninstagram PB\n");
+      await tx.writeFile(`${p.folder}/${profileDir}/archive.txt`, "instagram P0\ninstagram PA\ninstagram PB\ninstagram PC\n");
     });
+    await repo.deleteSource(p.id, c.source.id);
     const u = await bulk.undoBatch(p.id, batchId);
     expect(u.removedSources).toBe(2);
     expect(repo.listSourceIds(p.id)).toEqual([keep.source.id]);
     const profile = JSON.parse(await readProjectFile(p, `${profileDir}/profile.json`)) as { knownPostIds: string[]; knownPosts: Record<string, unknown> };
-    expect(profile.knownPostIds).toEqual(["P0"]);
-    expect(Object.keys(profile.knownPosts)).toEqual(["P0"]);
-    expect(await readProjectFile(p, `${profileDir}/archive.txt`)).toBe("instagram P0\n");
+    expect(profile.knownPostIds).toEqual(["P0", "PC"]);
+    expect(Object.keys(profile.knownPosts)).toEqual(["P0", "PC"]);
+    expect(await readProjectFile(p, `${profileDir}/archive.txt`)).toBe("instagram P0\ninstagram PC\n");
   });
 });
 
@@ -725,3 +729,265 @@ describe("work folders", () => {
   });
 });
 
+
+const crossrefPersist = () =>
+  agent.get("https://api.crossref.org").intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, readFileSync(join(LOOKUP_FIX, "crossref-work.json"), "utf8"), JSON_HEADERS).persist();
+const WORK_TITLE = "Rivers and Memory in Upland Villages";
+/** A PDF of the fixture work (its title, its DOI in the text), different bytes per `tag`. */
+const workPdf = (tag: string) => buildPdf({ title: WORK_TITLE, lines: [WORK_TITLE, `https://doi.org/${FIXTURE_DOI}`, `copy ${tag}`], extra: tag });
+const folderWith = async (name: string, files: Record<string, Buffer>) => {
+  const dir = join(tmp, name);
+  await mkdir(dir, { recursive: true });
+  for (const [n, b] of Object.entries(files)) await writeFile(join(dir, n), b);
+  return dir;
+};
+
+describe("review round 1: undo (R61)", () => {
+  it("keeps a batch tag and a batch collection that the user put to use, and says so", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder), { structure: "tags" });
+    const { tags } = await projectCollectionsAndTags(repo, p.id);
+    const theory = tags.find((t) => t.name === "Theory")!;
+    const own = await repo.createSource(p.id, plainDraft("My own notes"), [], { provenance: plainProvenance() });
+    await repo.setMembership(p.id, own.source.id, { tagIds: [theory.id] });
+
+    const p2 = await project();
+    const { handle: h2 } = await run(p2, folderAdapter(folder));
+    const cols = (await projectCollectionsAndTags(repo, p2.id)).collections;
+    const fieldwork = cols.find((c) => c.name === "Fieldwork")!;
+    const mine = await repo.createCollection(p2.id, "My subfolder", fieldwork.id);
+
+    const u = await bulk.undoBatch(p.id, h.batchId);
+    expect(u.kept).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "tag", id: theory.id })]));
+    expect((await projectCollectionsAndTags(repo, p.id)).tags.map((t) => t.id)).toEqual([theory.id]);
+    expect((await repo.getSource(p.id, own.source.id)).source.tagIds).toEqual([theory.id]);
+
+    const u2 = await bulk.undoBatch(p2.id, h2.batchId);
+    expect(u2.kept).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "collection", id: fieldwork.id })]));
+    const left = (await projectCollectionsAndTags(repo, p2.id)).collections.map((c) => c.id).sort();
+    expect(left).toEqual([fieldwork.id, mine.id].sort());
+  });
+
+  it("merge undo reverts only what the merge added: a user rename and a user edit of a filled field are kept", async () => {
+    const p = await project(CROSSREF_GOV);
+    crossrefPersist();
+    const existing = await repo.createSource(p.id, plainDraft(WORK_TITLE, { type: "other", identifiers: { doi: FIXTURE_DOI } }), [], { provenance: plainProvenance() });
+    const { handle: h, result } = await run(p, folderAdapter(await folderWith("m1", { "a.pdf": await workPdf("a") })));
+    expect(result.counts.merged).toBe(1);
+    const merged = await repo.getSource(p.id, existing.source.id);
+    expect(merged.source.issued).toBeDefined();
+    expect(merged.source.creators.length).toBeGreaterThan(0);
+    // The user renames the source and corrects the date the merge filled in.
+    await repo.updateSource(p.id, existing.source.id, { title: { variants: [{ lang: "en", kind: "original", value: "Renamed by me" }] }, issued: "1999" });
+
+    const u = await bulk.undoBatch(p.id, h.batchId);
+    expect(u.revertedMerges).toBe(1);
+    const after = await repo.getSource(p.id, existing.source.id);
+    expect(after.source.title.variants[0]!.value).toBe("Renamed by me");
+    expect(after.source.issued).toBe("1999");
+    expect(after.source.creators).toEqual([]); // filled by the merge, untouched since: cleared
+    expect(after.assets).toEqual([]);
+    expect(u.kept).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "field", id: "/issued", sourceId: existing.source.id })]));
+  });
+
+  it("two batches merge into the same source; undoing the first keeps the second's files", async () => {
+    const p = await project(CROSSREF_GOV);
+    crossrefPersist();
+    const s = await repo.createSource(p.id, plainDraft(WORK_TITLE, { identifiers: { doi: FIXTURE_DOI } }), [], { provenance: plainProvenance() });
+    const a = await run(p, folderAdapter(await folderWith("ma", { "a.pdf": await workPdf("a") })));
+    const b = await run(p, folderAdapter(await folderWith("mb", { "b.pdf": await workPdf("b") })));
+    expect([a.result.counts.merged, b.result.counts.merged]).toEqual([1, 1]);
+    const both = await repo.getSource(p.id, s.source.id);
+    expect(both.assets).toHaveLength(2);
+    const bAsset = both.assets[1]!;
+
+    await bulk.undoBatch(p.id, a.handle.batchId);
+    const after = await repo.getSource(p.id, s.source.id);
+    expect(after.assets.map((x) => x.id)).toEqual([bAsset.id]);
+    expect(existsSync(join(lib.root, ...bAsset.path.split("/")))).toBe(true);
+  });
+
+  it("undo after a review merge removes the files the decision copied in", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const [x, y] = await bulk.listReview(p.id, h.batchId);
+    await bulk.decideReview(p.id, y!.id, { action: "merge", sourceId: x!.sourceId! });
+    expect((await repo.getSource(p.id, x!.sourceId!)).assets).toHaveLength(2);
+    const u = await bulk.undoBatch(p.id, h.batchId);
+    expect(u.revertedMerges).toBe(1);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("an encrypted project: a merge snapshot is sealed and the merge is undone", async () => {
+    const gov = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: [crossref]
+`;
+    const p = await project(gov, true);
+    crossrefPersist();
+    const existing = await repo.createSource(p.id, plainDraft(WORK_TITLE, { identifiers: { doi: FIXTURE_DOI } }), [], { provenance: plainProvenance() });
+    const { handle: h, result } = await run(p, folderAdapter(await folderWith("me", { "a.pdf": await workPdf("a") })));
+    expect(result.counts.merged).toBe(1);
+    const snaps = await readdir(join(lib.root, p.folder, "imports", "batch-0001", "snapshots"));
+    expect(snaps.length).toBe(1);
+    expect(snaps[0]).toMatch(/\.enc$/);
+    expect(await readFile(join(lib.root, p.folder, "imports", "batch-0001", "snapshots", snaps[0]!), "latin1")).not.toContain(WORK_TITLE);
+    await bulk.undoBatch(p.id, h.batchId);
+    expect((await repo.getSource(p.id, existing.source.id)).assets).toEqual([]);
+  });
+});
+
+describe("review round 1: review queue and report (R61)", () => {
+  it("decisions are journaled: the counts stay consistent with the review queue; viewing the report writes nothing", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const items = await bulk.listReview(p.id, h.batchId);
+    await bulk.decideReview(p.id, items[0]!.id, { action: "keep-both" });
+    await bulk.decideReview(p.id, items[1]!.id, { action: "skip" });
+    const auditBefore = (await auditEvents(p)).length;
+    const filesBefore = await tree(join(lib.root, p.folder, "imports"));
+    const r = await bulk.batchReport(p.id, h.batchId);
+    expect(r.counts.needsReview).toBe(r.pendingReview.length);
+    expect(r.counts.needsReview).toBe(items.length - 2);
+    expect((await auditEvents(p)).length).toBe(auditBefore);
+    expect(await tree(join(lib.root, p.folder, "imports"))).toEqual(filesBefore);
+    expect(repo.listSourceIds(p.id)).toContain(items[0]!.sourceId);
+  });
+
+  it("accept-candidate takes the candidate's fields", async () => {
+    const p = await project();
+    const sf = await repo.createSource(p.id, plainDraft("scan0001"), [], { provenance: plainProvenance() });
+    const entry = await importChange(repo, p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, (ops) =>
+      ops.appendReview({
+        sourceId: sf.source.id,
+        kind: "import",
+        fields: {},
+        reasons: ["low confidence"],
+        candidates: [{ provider: "openalex", title: "The Candidate Title", creators: [{ role: "author", family: "Mensah" }], issued: "2018", type: "book", identifiers: { doi: "10.5555/cand" } }],
+      }),
+      { op: "test" },
+    );
+    await bulk.decideReview(p.id, entry.id, { action: "accept-candidate", index: 0 });
+    const after = await repo.getSource(p.id, sf.source.id);
+    expect(after.source.title.variants[0]!.value).toBe("The Candidate Title");
+    expect(after.source.type).toBe("book");
+    expect(after.source.identifiers.doi).toBe("10.5555/cand");
+    await expect(bulk.decideReview(p.id, entry.id, { action: "skip" })).rejects.toThrow(/already been reviewed/);
+  });
+
+  it("decideReview refuses entries that are not import items", async () => {
+    const p = await project();
+    const sf = await repo.createSource(p.id, plainDraft("x"), [], { provenance: plainProvenance() });
+    const entry = await importChange(repo, p.id, { action: "store", store: { identifiable: false, hasLocation: false } }, (ops) =>
+      ops.appendReview({ sourceId: sf.source.id, kind: "verification", fields: {}, reasons: ["r"] }),
+      { op: "test" },
+    );
+    await expect(bulk.decideReview(p.id, entry.id, { action: "accept" })).rejects.toThrow(/not an import item/);
+  });
+
+  it("an encrypted project: a fuzzy match is found through the in-memory keys and goes to review", async () => {
+    const p = await project(ENC_GOV, true);
+    const existing = await repo.createSource(p.id, plainDraft("Feeding the Feed", { creators: [{ role: "author", family: "Okafor" }], issued: "2019" }), [], { provenance: plainProvenance() });
+    const src = await folderWith("encfuzzy", { "Okafor - 2019 - Feeding the Feed.pdf": await readFile(fx.generated[1]!) });
+    const { handle: h, result } = await run(p, folderAdapter(src));
+    expect(result.counts.needsReview).toBe(1);
+    expect((await bulk.listReview(p.id, h.batchId))[0]!.duplicateOf).toEqual({ sourceId: existing.source.id, reason: "fuzzy" });
+  });
+});
+
+describe("review round 1: concurrency and resume (R61)", () => {
+  it("two startBatch calls at once get distinct batch numbers", async () => {
+    const p = await project();
+    const [a, b] = await Promise.all([bulk.startBatch(p.id, folderAdapter(folder)), bulk.startBatch(p.id, folderAdapter(folder))]);
+    await Promise.all([a.done, b.done]);
+    const nums = (await bulk.listBatches(p.id)).map((x) => x.number).sort();
+    expect(nums).toEqual([1, 2]);
+  });
+
+  it("two resumeBatch calls at once: the second is refused and no extra sources appear", async () => {
+    const whole = await project();
+    await run(whole, folderAdapter(folder));
+    const p = await project();
+    const h = await bulk.startBatch(p.id, folderAdapter(folder));
+    for await (const e of h.progress) if (e.done >= 5) { h.cancel(); break; }
+    await h.done;
+    const results = await Promise.allSettled([bulk.resumeBatch(p.id, h.batchId), bulk.resumeBatch(p.id, h.batchId)]);
+    expect(results.filter((r) => r.status === "rejected")).toHaveLength(1);
+    const ok = results.find((r) => r.status === "fulfilled") as PromiseFulfilledResult<Awaited<ReturnType<BulkImport["resumeBatch"]>>>;
+    await ok.value.done;
+    expect(repo.listSourceIds(p.id)).toHaveLength(repo.listSourceIds(whole.id).length);
+  });
+
+  it("resume counts a source already carrying the batch id and item key as done (no second copy)", async () => {
+    const p = await project();
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(): AsyncGenerator<ScanItem> {
+        yield { key: "only", files: [], referenceMetadata: { type: "book", title: { variants: [{ lang: "en", kind: "original", value: "No identifiers at all" }] } } };
+      },
+    };
+    const h = await bulk.startBatch(p.id, adapter);
+    await h.done;
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+    // Lose the journal line (as if the record of it never reached the disk).
+    await writeFile(join(lib.root, p.folder, "imports", "batch-0001", "journal.jsonl"), "");
+    const recPath = join(lib.root, p.folder, "imports", "batch-0001", "batch.json");
+    await writeFile(recPath, JSON.stringify({ ...(JSON.parse(await readFile(recPath, "utf8")) as object), state: "running" }));
+    await (await bulk.resumeBatch(p.id, h.batchId, adapter)).done;
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  });
+
+  it("a file dropped into the project during a paused batch is a duplicate when the batch goes on", async () => {
+    const p = await project();
+    const pdf = join(tmp, "drop.pdf");
+    await copyFile(fx.generated[5]!, pdf);
+    const src = await folderWith("during", { "a.pdf": await readFile(fx.generated[6]!), "b.pdf": await readFile(fx.generated[5]!) });
+    const h = await bulk.startBatch(p.id, folderAdapter(src));
+    h.pause();
+    await new Promise((r) => setTimeout(r, 200));
+    const { createAttach } = await import("../attach.js");
+    const [dropped] = await createAttach({ repo, http }).attachFiles(p.id, [pdf]);
+    expect(dropped!.sourceId).toBeDefined();
+    h.resume();
+    const r = await h.done;
+    expect(r.counts.duplicates).toBe(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+  });
+});
+
+describe("review round 1: ZIP and link preflight (R61)", () => {
+  it("duplicate and case-colliding names in an archive fail only those items", async () => {
+    const p = await project();
+    const one = await buildPdf({ title: "One", lines: ["One"], extra: "1" });
+    const two = await buildPdf({ title: "Two", lines: ["Two"], extra: "2" });
+    const three = await buildPdf({ title: "Three", lines: ["Three"], extra: "3" });
+    const src = await folderWith("dupzip", { "names.zip": buildZip([{ name: "a.pdf", data: one }, { name: "A.PDF", data: two }, { name: "b.pdf", data: three }]) });
+    const { handle: h, result } = await run(p, folderAdapter(src));
+    expect(result.counts.failed).toBe(1);
+    expect(result.counts.created + result.counts.needsReview).toBe(2);
+    expect((await bulk.batchReport(p.id, h.batchId)).failures).toEqual([{ item: "names.zip!/A.PDF", reason: "duplicate name in archive" }]);
+  });
+
+  it("an archive whose entry inflates past its declared size fails with the size reason", async () => {
+    const { extractArchive } = await import("../../extract/zip.js");
+    const zip = join(tmp, "bomb.zip");
+    await writeFile(zip, buildZip([{ name: "x.bin", data: Buffer.alloc(200_000), declaredSize: 10 }]));
+    await expect(extractArchive(zip, join(tmp, "out"), { maxEntries: 10, maxEntryBytes: 100_000, maxTotalBytes: 1_000_000 })).rejects.toThrow(/larger than|too large/);
+  });
+
+  it("link mode in a project without governance.yaml uses the default policy (no refusal unless it requires encryption)", async () => {
+    const p = await project();
+    await rm(join(lib.root, p.folder, "governance.yaml"));
+    const { preflightLink } = await import("./run.js");
+    const { DEFAULT_GOVERNANCE } = await import("@ao/core");
+    const expectRefused = DEFAULT_GOVERNANCE.encryption.atRest === "required";
+    await expect(preflightLink(repo, p.id)).resolves.toBe(expectRefused);
+    await writeFile(join(lib.root, p.folder, "governance.yaml"), "encryption: [unparseable");
+    await expect(preflightLink(repo, p.id)).resolves.toBe(true);
+  });
+});

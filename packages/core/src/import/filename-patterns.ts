@@ -159,10 +159,10 @@ function structuralProblem(src: string): string | undefined {
       continue;
     }
     if (c === "[") {
-      // Character class: skip to its unescaped closing bracket.
+      // Character class: skip to its unescaped closing bracket. In JavaScript `[]` (nothing) and
+      // `[^]` (anything) are complete classes: a "]" right after "[" or "[^" closes it.
       i++;
       if (src[i] === "^") i++;
-      if (src[i] === "]") i++;
       while (i < src.length && src[i] !== "]") i += src[i] === "\\" ? 2 : 1;
       i++;
       const q = quantifierAt(src, i);
