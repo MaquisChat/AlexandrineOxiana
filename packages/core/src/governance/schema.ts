@@ -96,7 +96,12 @@ export const PartialGovernanceSchema = z
       pseudonymizeFileNames: z.boolean(),
       deidentifiedExportsOnly: z.boolean(),
     }),
-    consent: section({ requireStatus: z.boolean(), requireLegalBasis: z.boolean() }),
+    consent: section({
+      requireStatus: z.boolean(),
+      requireLegalBasis: z.boolean(),
+      /** Legal basis recorded by default per data category, e.g. `social-media: public task (Art. 6(1)(e))`. */
+      defaultLegalBasis: z.record(z.string().min(1), z.string().trim().min(1)),
+    }),
     retention: section({ rawDataDestroyAfter: isoDate.nullable() }),
     audit: section({ enabled: z.boolean() }),
     encryption: section({ atRest: z.enum(ENCRYPTION_LEVELS) }),
@@ -141,7 +146,7 @@ export interface GovernanceConfig {
     pseudonymizeFileNames: boolean;
     deidentifiedExportsOnly: boolean;
   };
-  consent: { requireStatus: boolean; requireLegalBasis: boolean };
+  consent: { requireStatus: boolean; requireLegalBasis: boolean; defaultLegalBasis: Record<string, string> };
   retention: { rawDataDestroyAfter: string | null };
   audit: { enabled: boolean };
   encryption: { atRest: (typeof ENCRYPTION_LEVELS)[number] };
@@ -186,7 +191,7 @@ export const DEFAULT_GOVERNANCE: GovernanceConfig = {
   },
   vendors: [],
   identifiability: { containsIdentifiable: true, pseudonymizeFileNames: true, deidentifiedExportsOnly: true },
-  consent: { requireStatus: true, requireLegalBasis: true },
+  consent: { requireStatus: true, requireLegalBasis: true, defaultLegalBasis: {} },
   retention: { rawDataDestroyAfter: null },
   audit: { enabled: true },
   encryption: { atRest: "required" },

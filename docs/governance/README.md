@@ -41,6 +41,18 @@ Some profile requirements cannot be made stricter automatically because the soft
 
 Processing steps (OCR, translation, transcription, and so on) are either `local` (on the researcher's own device) or an outside vendor listed under `vendors`, with flags for whether a Business Associate Agreement (`baa`) or Data Processing Agreement (`dpa`) is in place. A vendor name that is not declared is an error when the file is loaded. Public bibliographic lookup services (Crossref, OpenAlex, Open Library, Library of Congress) used for metadata lookup receive only bibliographic identifiers and are exempt from the vendor-agreement requirement.
 
+### Default legal basis
+
+When `consent.requireLegalBasis` is on (the GDPR profile turns it on), identifiable data can only be stored with a stated legal basis. For data captured in bulk, a project can record the basis once per category under `consent.defaultLegalBasis`:
+
+```yaml
+consent:
+  defaultLegalBasis:
+    social-media: "public task (GDPR Art. 6(1)(e)); approved by the ethics board on 2026-10-01"
+```
+
+Link capture from YouTube, Instagram and TikTok uses the `social-media` entry, unless the researcher gives a basis for that one capture. The basis is stored in each source's provenance. If no basis is recorded, the capture stops before anything is downloaded and says so in plain language. The software records the basis you state; it does not judge whether it is valid.
+
 ## Enforcement status
 
 At present the workbench computes the effective policy and the list of violations. Actually blocking actions (for example refusing a capture until a protocol is recorded) lands with the policy engine, the next task. Where the profile pages say the app "blocks" something, that describes the behavior the policy engine will enforce.

@@ -317,3 +317,15 @@ describe("parseGovernanceWithWarnings", () => {
     expect(parseGovernanceWithWarnings(exc("encryption.atRest", "optional")).warnings).toEqual([]);
   });
 });
+
+describe("consent.defaultLegalBasis", () => {
+  it("defaults to none and keeps the project's per-category bases under a gdpr profile", () => {
+    expect(parseGovernance("").consent.defaultLegalBasis).toEqual({});
+    const { policy } = effectivePolicy(parseGovernance("profiles: [gdpr]\nconsent:\n  defaultLegalBasis:\n    social-media: public task (Art. 6(1)(e))\n"));
+    expect(policy.consent.defaultLegalBasis).toEqual({ "social-media": "public task (Art. 6(1)(e))" });
+    expect(policy.consent.requireLegalBasis).toBe(true);
+  });
+  it("rejects a blank basis", () => {
+    expect(() => parseGovernance("consent:\n  defaultLegalBasis:\n    social-media: '  '\n")).toThrow(GovernanceParseError);
+  });
+});
