@@ -47,7 +47,7 @@ export type {
 } from "./governance/schema.js";
 export { PROFILE_MINIMUMS, PROFILE_RULES } from "./governance/profiles/index.js";
 export type { ProfileRules } from "./governance/profiles/index.js";
-export { applyMinimum, effectivePolicy } from "./governance/merge.js";
+export { applyMinimum, effectivePolicy, loosenedControls } from "./governance/merge.js";
 export type { EffectivePolicy, Violation } from "./governance/merge.js";
 
 export { LOCATION_NEEDS_ENCRYPTION, evaluate } from "./governance/engine.js";

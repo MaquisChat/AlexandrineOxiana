@@ -83,6 +83,8 @@ export interface InternalMutateOptions extends MutateOptions {
    * of its own (which audits it), so every refusal is audited exactly once (Bulk Import groups, R62).
    */
   unauditedDeny?: boolean;
+  /** More details recorded on the allow audit event(s), e.g. the reason given for loosening governance. */
+  auditDetails?: Record<string, unknown>;
 }
 
 export const REFUSED_GENERIC = "Refused by an internal check";
@@ -479,7 +481,7 @@ export async function runMutation<T>(
           action: req.action,
           entity: opts.entityFor?.(i) ?? tx.auditEntity,
           decision: auditDecision(d),
-          details: { op, txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
+          details: { op, ...opts.auditDetails, txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
         }, onPlan);
       }
       maybeCrash("before-marker-delete");

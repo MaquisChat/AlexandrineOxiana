@@ -102,6 +102,27 @@ export interface ProxyQueueOptions {
   /** The media worker; null or absent: none is configured (jobs stay pending, LOCATION_REASON). */
   worker?: WorkerClient | null;
   debug?: (note: string) => void;
+  /** Attempts per job before it is recorded as failed (default PROXY_ATTEMPTS). */
+  attempts?: number;
+  /** Wait before the second attempt, multiplied by 4 for each further one (default 2 s). */
+  backoffMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Attempts of a viewing-proxy job (a transient worker failure is retried with backoff) before it is recorded as failed (R96). */
+export const PROXY_ATTEMPTS = 3;
+/** Failures that another attempt cannot fix: recorded at once. */
+const FINAL_CODES = new Set(["LOCATION_MISMATCH", "POLICY_DENIED", "NOT_DECRYPTABLE", "ORIGINAL_GONE", "PENDING", "ALREADY_RECORDED", "RULE_CHANGED", "CANCELLED", "ENCRYPTION_REQUIRED", "INPUT_NOT_DECRYPTABLE"]);
+
+/** A job recorded as failed (after its attempts), for the researcher to see and retry. */
+export interface ProxyFailure {
+  projectId: string;
+  sourceId: string;
+  jobId: string;
+  type: PendingProxy["type"];
+  code: string;
+  at: string;
+  attempts: number;
 }
 
 /** Runs pending viewing-proxy jobs one at a time (per library), in the background. */
@@ -111,11 +132,67 @@ export class ProxyQueue {
   private readonly debug: ((note: string) => void) | undefined;
   private chain: Promise<void> = Promise.resolve();
   private results: ProxyResult[] = [];
+  private readonly attempts: number;
+  private readonly backoffMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private disposed = false;
+  private readonly listeners = new Set<(r: ProxyResult) => void>();
 
   constructor(opts: ProxyQueueOptions) {
     this.repo = opts.repo;
     this.worker = opts.worker ?? null;
     this.debug = opts.debug;
+    this.attempts = Math.max(1, opts.attempts ?? PROXY_ATTEMPTS);
+    this.backoffMs = opts.backoffMs ?? 2000;
+    this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms).unref?.()));
+  }
+
+  /** Called with each job's result as it finishes (progress for the researcher). Returns an unsubscribe function. */
+  onResult(fn: (r: ProxyResult) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  /** Jobs of the project recorded as failed, with their codes (surfaced to the researcher, R96). */
+  async failures(projectId: string): Promise<ProxyFailure[]> {
+    const out: ProxyFailure[] = [];
+    for (const id of this.repo.listSourceIds(projectId)) {
+      let sf: SourceFile;
+      try {
+        sf = await this.repo.getSource(projectId, id);
+      } catch {
+        continue;
+      }
+      for (const j of sf.pendingProxies ?? []) {
+        if (j.failed) out.push({ projectId, sourceId: id, jobId: j.id, type: j.type, code: j.failed.code, at: j.failed.at, attempts: j.failed.attempts ?? 1 });
+      }
+    }
+    return out;
+  }
+
+  /** Clears the failed mark of the project's failed jobs (or one source's) and runs them again. */
+  async retryFailed(projectId: string, sourceId?: string): Promise<ProxyResult[]> {
+    const ids = sourceId ? [sourceId] : this.repo.listSourceIds(projectId);
+    for (const id of ids) {
+      let sf: SourceFile;
+      try {
+        sf = await this.repo.getSource(projectId, id);
+      } catch {
+        continue;
+      }
+      if (!(sf.pendingProxies ?? []).some((j) => j.failed)) continue;
+      await editPendingProxies(this.repo, projectId, id, (list) => list.map(({ failed: _f, ...j }) => j));
+    }
+    if (sourceId) return this.then(() => this.runSource(projectId, sourceId));
+    return this.resumePending(projectId);
+  }
+
+  /** Stops taking work (the library is closing): waits for the job running now; later jobs stay pending. */
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    this.worker = null;
+    this.listeners.clear();
+    await this.idle().catch(() => {});
   }
 
   /** Whether proxy jobs can be run now (a media worker is configured). */
@@ -130,6 +207,7 @@ export class ProxyQueue {
 
   /** A worker became available (or went away). Call `resumePending` for each open project afterwards. */
   setWorker(worker: WorkerClient | null): void {
+    if (this.disposed) return;
     this.worker = worker;
   }
 
@@ -177,21 +255,38 @@ export class ProxyQueue {
     const out: ProxyResult[] = [];
     for (const job of sf.pendingProxies ?? []) {
       if (job.failed) continue;
-      if (!this.worker) {
-        out.push({ projectId, sourceId, jobId: job.id, ok: false, code: "PENDING" });
-        continue;
+      let r: ProxyResult | undefined;
+      for (let attempt = 1; ; attempt++) {
+        if (!this.worker) {
+          r = { projectId, sourceId, jobId: job.id, ok: false, code: "PENDING" };
+          break;
+        }
+        const last = attempt >= this.attempts;
+        r = await this.runJob(this.worker, projectId, sf, job, last ? attempt : 0);
+        if (r.ok || last || FINAL_CODES.has(r.code ?? "")) break;
+        // A transient failure (the worker failed this time): try again after a pause (R96).
+        this.debug?.(`viewing proxy attempt ${attempt} failed (${r.code}); retrying`);
+        await this.sleep(this.backoffMs * 4 ** (attempt - 1));
       }
-      const r = await this.runJob(this.worker, projectId, sf, job);
       out.push(r);
-      this.results.push(r);
+      if (r.code !== "PENDING") this.results.push(r);
+      for (const l of this.listeners) {
+        try {
+          l(r);
+        } catch {
+          // a listener's problem is not the queue's
+        }
+      }
     }
     return out;
   }
 
-  private async fail(projectId: string, sourceId: string, job: PendingProxy, code: string): Promise<ProxyResult> {
+  /** `attempts` > 0: record the failure (the job's last attempt); 0: only report it (it is retried). */
+  private async fail(projectId: string, sourceId: string, job: PendingProxy, code: string, attempts = 1): Promise<ProxyResult> {
+    if (attempts === 0 && !FINAL_CODES.has(code)) return { projectId, sourceId, jobId: job.id, ok: false, code };
     try {
       await editPendingProxies(this.repo, projectId, sourceId, (list) =>
-        list.map((j) => (j.id === job.id ? { ...j, failed: { code: code.slice(0, 64), at: new Date().toISOString() } } : j)),
+        list.map((j) => (j.id === job.id ? { ...j, failed: { code: code.slice(0, 64), at: new Date().toISOString(), attempts: Math.max(1, attempts) } } : j)),
       );
     } catch {
       this.debug?.("a failed viewing-proxy job could not be recorded");
@@ -199,7 +294,7 @@ export class ProxyQueue {
     return { projectId, sourceId, jobId: job.id, ok: false, code };
   }
 
-  private async runJob(worker: WorkerClient, projectId: string, sf: SourceFile, job: PendingProxy): Promise<ProxyResult> {
+  private async runJob(worker: WorkerClient, projectId: string, sf: SourceFile, job: PendingProxy, attempts: number): Promise<ProxyResult> {
     const sourceId = sf.source.id;
     const base = { projectId, sourceId, jobId: job.id };
     const asset = sf.assets.find((a) => a.id === job.assetId && a.role === "original");
@@ -227,19 +322,19 @@ export class ProxyQueue {
         entity: { type: "asset", id: asset.id },
       });
       const file = r.files[0];
-      if (!file) return await this.fail(projectId, sourceId, job, "NO_OUTPUT");
+      if (!file) return await this.fail(projectId, sourceId, job, "NO_OUTPUT", attempts);
       // The proxy's location is checked on the file itself before it is recorded (R83).
       let check = file;
       if (r.encrypted) {
         const k = projectDataKey(this.repo, projectId);
-        if (!k) return await this.fail(projectId, sourceId, job, "NOT_DECRYPTABLE");
+        if (!k) return await this.fail(projectId, sourceId, job, "NOT_DECRYPTABLE", attempts);
         check = join(work, `check.${ext}`);
         await copyFileAtomic(file, check, { transform: (rs) => rs.pipe(decryptStream((id) => (id === k.keyId ? k.key : undefined))), mode: 0o600 });
       }
       const verdict = await checkProxyLocation(check, mode);
       if (!verdict.ok) {
         this.debug?.(`viewing proxy discarded: ${verdict.reason}`);
-        return await this.fail(projectId, sourceId, job, "LOCATION_MISMATCH");
+        return await this.fail(projectId, sourceId, job, "LOCATION_MISMATCH", attempts);
       }
       const added = await addProxyAsset(
         this.repo,
@@ -273,10 +368,10 @@ export class ProxyQueue {
         if (err.code === "ORIGINAL_GONE") await editPendingProxies(this.repo, projectId, sourceId, (list) => list.filter((j) => j.id !== job.id)).catch(() => {});
         return { ...base, ok: false, code: err.code };
       }
-      if (err instanceof PolicyDeniedError) return await this.fail(projectId, sourceId, job, "POLICY_DENIED");
-      if (err instanceof WorkerJobError) return await this.fail(projectId, sourceId, job, err.code);
+      if (err instanceof PolicyDeniedError) return await this.fail(projectId, sourceId, job, "POLICY_DENIED", attempts);
+      if (err instanceof WorkerJobError) return await this.fail(projectId, sourceId, job, err.code, attempts);
       this.debug?.(`viewing proxy failed: ${err instanceof Error ? err.name : "error"}`);
-      return await this.fail(projectId, sourceId, job, "FAILED");
+      return await this.fail(projectId, sourceId, job, "FAILED", attempts);
     } finally {
       await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
       activeTemp.delete(name);
@@ -291,6 +386,14 @@ const queues = new WeakMap<Library, ProxyQueue>();
  * The library's viewing-proxy queue, made on first use (with no worker: jobs stay pending until
  * `setWorker` and `resumePending`). Callers that are given a queue explicitly use that one.
  */
+/** Disposes of the library's queue (on library close, R96): the running job finishes, nothing new starts. */
+export async function disposeProxyQueue(repo: Repo): Promise<void> {
+  const lib = repoLibrary(repo);
+  const q = queues.get(lib);
+  queues.delete(lib);
+  await q?.dispose();
+}
+
 export function proxyQueueFor(repo: Repo): ProxyQueue {
   const lib = repoLibrary(repo);
   let q = queues.get(lib);

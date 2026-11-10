@@ -6,6 +6,14 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "start": "node --max-old-space-size=512 --import tsx src/main.ts"
+  },
+  "dependencies": {
+    "@ao/core": "workspace:*",
+    "@ao/library": "workspace:*",
+    "fastify": "5.12.7",
+    "yaml": "2.9.1"
   }
 }

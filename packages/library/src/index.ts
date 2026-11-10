@@ -139,8 +139,8 @@ export { ACCEPTED_EXTENSIONS, FOLDER_REASON, LOCATION_REASON, createAttach } fro
 export type { Attach, AttachDeps, AttachOutcome, AttachStatus } from "./import/attach.js";
 export { DEVICE_EXTENSIONS, DEVICE_RESEARCHER_NOTE, RAW_JPEG_WINDOW_MS, deviceAdapter, groupDeviceFiles, importDeviceFolder } from "./import/device.js";
 export type { DeviceAdapterOptions, DeviceFile, DeviceGroup, DeviceImportOptions } from "./import/device.js";
-export { ProxyQueue, planProxies, proxyTypeFor } from "./import/proxies.js";
-export type { ProxyPlan, ProxyQueueOptions, ProxyResult } from "./import/proxies.js";
+export { PROXY_ATTEMPTS, ProxyQueue, disposeProxyQueue, planProxies, proxyTypeFor } from "./import/proxies.js";
+export type { ProxyFailure, ProxyPlan, ProxyQueueOptions, ProxyResult } from "./import/proxies.js";
 export { BULK_REASONS, BatchRefusedError, PATTERN_BUDGET_MS, adapterFor, createBulkImport, folderAdapter, zipAdapter } from "./import/bulk/index.js";
 export type {
   BatchCounts,
@@ -227,3 +227,15 @@ export {
 export type { FolderWatch, WatchDeps, WatchEvent, WatchSettingsDeps } from "./import/watch.js";
 export { ARCHIVE_LIMITS } from "./extract/zip.js";
 export * from "./lookup/index.js";
+export { appConfigDir, deviceDeps, ensurePrivateDir, readAppSetting, scrubPaths, updateAppSetting } from "./app-settings.js";
+export {
+  ASSET_TEXT_MAX_BYTES,
+  CONFIRMABLE_FIELDS,
+  addTranscriptVersion,
+  checkCaptureAllowed,
+  confirmField,
+  readAssetText,
+  transcriptVersions,
+} from "./source-actions.js";
+export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
+export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";

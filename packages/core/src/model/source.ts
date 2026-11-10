@@ -185,9 +185,18 @@ export const PendingProxy = z.object({
   assetId: Id,
   location: z.enum(["keep", "coarsen", "strip"]),
   queuedAt: Timestamp,
-  failed: z.object({ code: z.string().max(64), at: Timestamp }).optional(),
+  failed: z.object({ code: z.string().max(64), at: Timestamp, attempts: z.number().int().min(1).max(100).optional() }).optional(),
 });
 export type PendingProxy = z.infer<typeof PendingProxy>;
+
+/** An OCR job still to be run on a PDF original without a text layer (R31: persisted with the source). */
+export const PendingOcr = z.object({
+  id: Id,
+  assetId: Id,
+  queuedAt: Timestamp,
+  failed: z.object({ code: z.string().max(64), at: Timestamp, attempts: z.number().int().min(1).max(100).optional() }).optional(),
+});
+export type PendingOcr = z.infer<typeof PendingOcr>;
 
 /** The source.json shape. */
 export const SourceFile = z.object({
@@ -213,5 +222,7 @@ export const SourceFile = z.object({
   verification: z.record(z.string(), FieldVerification).default({}),
   /** Viewing proxies still to be made (R83); absent or empty when none are pending. */
   pendingProxies: z.array(PendingProxy).max(10_000).optional(),
+  /** OCR jobs still to be run (Task 30 OCR queue); absent or empty when none are pending. */
+  pendingOcr: z.array(PendingOcr).max(10_000).optional(),
 });
 export type SourceFile = z.infer<typeof SourceFile>;

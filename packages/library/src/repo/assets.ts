@@ -9,6 +9,7 @@ import {
   originalFileName,
   parseGovernance,
   withCollisionSuffix,
+  type PendingOcr,
   type PendingProxy,
   type Provenance,
   type SourceFile,
@@ -57,7 +58,7 @@ export async function addDerivedAsset(
    * gone, or when the project's location rule is now stricter than `location`, the rule the proxy
    * was checked against.
    */
-  internal: { completesPendingProxy?: string; location?: LocationMode } = {},
+  internal: { completesPendingProxy?: string; location?: LocationMode; completesPendingOcr?: string } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -83,6 +84,9 @@ export async function addDerivedAsset(
         if (!(cur.pendingProxies ?? []).some((j) => j.id === internal.completesPendingProxy && !j.failed)) throw new ProxyRecordRefusedError("ALREADY_RECORDED");
         const now = await currentLocationMode(core, st.rel);
         if (stricterLocation(now, internal.location ?? "keep") !== (internal.location ?? "keep")) throw new ProxyRecordRefusedError("RULE_CHANGED");
+      }
+      if (internal.completesPendingOcr && !(cur.pendingOcr ?? []).some((j) => j.id === internal.completesPendingOcr && !j.failed)) {
+        throw new ProxyRecordRefusedError("ALREADY_RECORDED");
       }
       const folder = cur.source.folder;
       // The folder name is already pseudonymized; drop its "[id]" (and any collision suffix).
@@ -126,6 +130,7 @@ export async function addDerivedAsset(
       tx.entity("asset", asset.id);
       const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
       if (internal.completesPendingProxy) withPending(sf, (cur.pendingProxies ?? []).filter((j) => j.id !== internal.completesPendingProxy));
+      if (internal.completesPendingOcr) withPendingOcr(sf, (cur.pendingOcr ?? []).filter((j) => j.id !== internal.completesPendingOcr));
       await writeSourceFile(core, tx, sf);
       tx.record("asset", asset.id, null, asset);
       tx.index((sink) => sink.indexSource(sf));
@@ -151,6 +156,42 @@ export async function currentLocationMode(core: RepoCore, projectRel: string): P
   } catch {
     return "strip";
   }
+}
+
+/** Sets (or, when empty, removes) a source file's pending OCR jobs. */
+function withPendingOcr(sf: SourceFile, list: PendingOcr[]): void {
+  if (list.length) sf.pendingOcr = list;
+  else delete sf.pendingOcr;
+}
+
+/** Package-internal (OCR queue): changes a source's pending OCR jobs in one governed change. Nothing is written when unchanged. */
+export async function updatePendingOcr(
+  core: RepoCore,
+  projectId: string,
+  sourceId: string,
+  edit: (list: PendingOcr[], sf: SourceFile) => PendingOcr[],
+): Promise<SourceFile> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const current = await readSourceFile(core, st, sourceId);
+  return runMutation(
+    core,
+    projectId,
+    storeRequest(current.source.provenance),
+    async (tx) => {
+      const cur = await readSourceFile(core, st, sourceId);
+      const before = cur.pendingOcr ?? [];
+      const next = edit(structuredClone(before), cur);
+      if (JSON.stringify(next) === JSON.stringify(before)) return cur;
+      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor } };
+      withPendingOcr(sf, next);
+      await writeSourceFile(core, tx, sf);
+      tx.record("source", sourceId, cur.source, sf.source);
+      return sf;
+    },
+    { op: "asset.ocr-pending", entity: { type: "source", id: sourceId } },
+  );
 }
 
 /** Sets (or, when empty, removes) a source file's pending proxies. */

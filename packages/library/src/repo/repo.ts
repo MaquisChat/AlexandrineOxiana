@@ -3,12 +3,12 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
-import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
+import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
@@ -52,6 +52,7 @@ import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutco
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
+import { setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -208,6 +209,21 @@ export class Repo {
   }
   getFieldwork(projectId: string): ReturnType<typeof getFieldwork> {
     return getFieldwork(this.core, projectId);
+  }
+
+  /** The project's governance.yaml as written ("" when the project has none: the defaults apply). */
+  async getGovernanceText(projectId: string): Promise<string> {
+    const st = this.core.state(projectId);
+    const raw = await readMaybe(this.core.abs(`${st.rel}/governance.yaml`));
+    return raw ? raw.toString("utf8") : "";
+  }
+  /**
+   * Replaces the project's governance.yaml (governed and audited). A change that loosens a control
+   * or goes below a profile's minimum needs `reason`, recorded on the audit event
+   * (GovernanceLooseningError otherwise); invalid text throws GovernanceParseError.
+   */
+  setGovernance(projectId: string, yamlText: string, opts: { reason?: string } = {}): Promise<GovernanceEditResult> {
+    return setGovernanceIn(this.core, projectId, yamlText, opts);
   }
 }
 
@@ -576,6 +592,21 @@ export function editPendingProxies(
   edit: (list: PendingProxy[], sf: SourceFile) => PendingProxy[],
 ): Promise<SourceFile> {
   return updatePendingProxies(cores.get(repo)!, projectId, sourceId, edit);
+}
+
+/** Package-internal (OCR queue): edits a source's pending OCR jobs in one governed change. */
+export function editPendingOcr(
+  repo: Repo,
+  projectId: string,
+  sourceId: string,
+  edit: (list: PendingOcr[], sf: SourceFile) => PendingOcr[],
+): Promise<SourceFile> {
+  return updatePendingOcr(cores.get(repo)!, projectId, sourceId, edit);
+}
+
+/** Package-internal (OCR queue): records the OCR text as a derived asset and removes its pending entry, in one governed change. */
+export function addOcrAsset(repo: Repo, projectId: string, sourceId: string, input: DerivedAssetInput, pendingId: string): Promise<Asset> {
+  return addDerivedAsset(cores.get(repo)!, projectId, sourceId, input, { completesPendingOcr: pendingId });
 }
 
 /** Package-internal: `Repo.mutate` with a refuse hook (see RefuseHook). */

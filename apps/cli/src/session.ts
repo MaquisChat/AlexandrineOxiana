@@ -1,13 +1,13 @@
-import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, hostname, userInfo } from "node:os";
-import { join, resolve } from "node:path";
-import { newId, type Project } from "@ao/core";
+import { userInfo } from "node:os";
+import { resolve } from "node:path";
+import type { Project } from "@ao/core";
 import {
   IndexHandle,
   KeyRing,
   WrongPassphraseError,
+  appConfigDir,
   createIndexSink,
+  deviceDeps,
   listLibraries,
   openLibrary,
   openRepo,
@@ -23,67 +23,8 @@ import { startCaptureWorker, type CaptureWorker } from "./worker.js";
 export const userCwd = (): string => process.env.INIT_CWD || process.cwd();
 export const resolveUserPath = (p: string): string => resolve(userCwd(), p);
 
-function configDir(): string {
-  if (process.env.AO_CONFIG_DIR) return resolve(process.env.AO_CONFIG_DIR);
-  if (process.platform === "win32") return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "AlexandrineOxiana");
-  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support", "AlexandrineOxiana");
-  return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "alexandrine-oxiana");
-}
-
-function deviceId(dir: string): string {
-  const file = join(dir, "device.json");
-  try {
-    const v = JSON.parse(readFileSync(file, "utf8")) as { deviceId?: unknown };
-    if (typeof v.deviceId === "string" && v.deviceId) return v.deviceId;
-  } catch {
-    // first run
-  }
-  const id = (() => {
-    try {
-      return newId();
-    } catch {
-      return randomUUID();
-    }
-  })();
-  try {
-    ensurePrivateDir(dir);
-    writeFileSync(file, JSON.stringify({ deviceId: id }), { mode: 0o600 });
-  } catch {
-    // an unwritable config folder: the id is just not remembered
-  }
-  return id;
-}
-
-/** The CLI's settings folder holds device ids, approved folders and audit anchors: private (0700). */
-function ensurePrivateDir(dir: string): void {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") {
-    try {
-      chmodSync(dir, 0o700);
-    } catch {
-      // not ours to change (a shared folder given in AO_CONFIG_DIR): left as it is
-    }
-  }
-}
-
 export function makeDeps(): Deps {
-  const dir = configDir();
-  ensurePrivateDir(dir);
-  return {
-    clock: () => new Date(),
-    deviceId: deviceId(dir),
-    hostname: hostname(),
-    pid: process.pid,
-    isPidAlive: (pid) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch (err) {
-        return (err as NodeJS.ErrnoException).code === "EPERM";
-      }
-    },
-    appConfigDir: dir,
-  };
+  return deviceDeps(appConfigDir());
 }
 
 const READ_ONLY_TEXT: Record<string, string> = {

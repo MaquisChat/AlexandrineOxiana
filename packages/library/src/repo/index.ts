@@ -1,4 +1,6 @@
-export { Repo, openRepo } from "./repo.js";
+export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
+export { GOVERNANCE_MAX_BYTES, GovernanceLooseningError } from "./governance-edit.js";
+export type { GovernanceEditResult } from "./governance-edit.js";
 export type { AuditCheck, RepoOptions } from "./repo.js";
 export type { IndexSink, Manifest, ManifestEntry, ProjectJson } from "./state.js";
 export type { FileOptions, MutateOptions, MutateRequest, Tx } from "./mutate.js";

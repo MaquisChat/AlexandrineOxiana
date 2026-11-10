@@ -201,3 +201,36 @@ export function effectivePolicy(cfg: GovernanceConfig): EffectivePolicy {
   }
   return { policy, violations };
 }
+
+/** Controls whose lists are descriptive (not permissions): adding to them never loosens anything. */
+const NOT_PERMISSIONS = new Set(["dmp.formats", "protocol.platforms", "protocol.populations", "protocol.languages"]);
+
+/**
+ * The controls where `after` is looser than `before` (a governance edit, Task 30): their effective
+ * policies (profile minimums applied) compared control by control with the same strictest-wins
+ * rules (`applyMinimum`), plus a profile removed, a date rule removed, and an exception added or
+ * changed. Violations (a project asking for less than its profile) are reported by
+ * `effectivePolicy`, not here. Pure.
+ */
+export function loosenedControls(before: GovernanceConfig, after: GovernanceConfig): string[] {
+  const strip = (c: GovernanceConfig): Record<string, unknown> => {
+    const { exceptions: _e, vendors: _v, profiles: _p, ...rest } = c;
+    const out = structuredClone(rest) as Record<string, unknown>;
+    for (const path of NOT_PERMISSIONS) {
+      const [a, b] = path.split(".") as [string, string];
+      const o = out[a];
+      if (isObj(o)) delete o[b];
+    }
+    return out;
+  };
+  const eb = effectivePolicy(before).policy;
+  const ea = effectivePolicy(after).policy;
+  const out = new Set(applyMinimum(strip(ea) as unknown as GovernanceConfig, strip(eb) as PartialGovernance).loosened);
+  for (const path of DATE_PATHS) {
+    if (getPath(eb, path) != null && getPath(ea, path) == null) out.add(path);
+  }
+  if ((before.profiles ?? []).some((p) => !(after.profiles ?? []).includes(p))) out.add("profiles");
+  const known = new Set((before.exceptions ?? []).map((e) => JSON.stringify(e)));
+  for (const e of after.exceptions ?? []) if (!known.has(JSON.stringify(e))) out.add(`exceptions.${e.control}`);
+  return [...out].sort();
+}
