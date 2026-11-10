@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:vcard="http://nwalsh.com/rdf/vCard#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:link="http://purl.org/rss/1.0/modules/link/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:prism="http://prismstandard.org/namespaces/1.2/basic/">
+    <bib:Article rdf:about="#item_12">
+        <z:itemType>journalArticle</z:itemType>
+        <dcterms:isPartOf rdf:resource="urn:issn:1234-5678"/>
+        <bib:authors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Okafor</foaf:surname>
+                        <foaf:givenName>Ngozi</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Müller</foaf:surname>
+                        <foaf:givenName>Jan</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:authors>
+        <link:link rdf:resource="#item_13"/>
+        <dc:subject>food systems</dc:subject>
+        <dc:subject>
+           <z:AutomaticTag>
+              <rdf:value>Lagos</rdf:value>
+           </z:AutomaticTag>
+        </dc:subject>
+        <dc:title>Feeding the City: Informal Markets in Lagos</dc:title>
+        <dc:date>2024-03</dc:date>
+        <dc:description>Citation Key: okafor2024feeding</dc:description>
+        <dc:identifier>DOI 10.5555/ao.urban.2024.017</dc:identifier>
+    </bib:Article>
+    <bib:Journal rdf:about="urn:issn:1234-5678">
+        <dc:title>Journal of Urban Studies</dc:title>
+        <dc:identifier>ISSN 1234-5678</dc:identifier>
+    </bib:Journal>
+    <z:Attachment rdf:about="#item_13">
+        <z:itemType>attachment</z:itemType>
+        <rdf:resource rdf:resource="files/13/okafor2024feeding.pdf"/>
+        <dc:title>Full Text PDF</dc:title>
+        <link:type>application/pdf</link:type>
+    </z:Attachment>
+    <bib:Book rdf:about="urn:isbn:9780262033848">
+        <z:itemType>book</z:itemType>
+        <dc:publisher>
+            <foaf:Organization>
+                <foaf:name>Ibadan University Press</foaf:name>
+            </foaf:Organization>
+        </dc:publisher>
+        <bib:authors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Adebayo</foaf:surname>
+                        <foaf:givenName>Tunde</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:authors>
+        <link:link rdf:resource="#item_15"/>
+        <dc:title>Markets and Memory</dc:title>
+        <dc:date>2019</dc:date>
+        <dc:identifier>ISBN 978-0-262-03384-8</dc:identifier>
+    </bib:Book>
+    <z:Attachment rdf:about="#item_15">
+        <z:itemType>attachment</z:itemType>
+        <rdf:resource rdf:resource="files/15/adebayo2019markets.pdf"/>
+        <dc:title>Book PDF</dc:title>
+        <link:type>application/pdf</link:type>
+    </z:Attachment>
+    <bib:BookSection rdf:about="#item_20">
+        <z:itemType>bookSection</z:itemType>
+        <dcterms:isPartOf>
+            <bib:Book>
+                <dc:title>Collected Essays</dc:title>
+            </bib:Book>
+        </dcterms:isPartOf>
+        <bib:authors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Doe</foaf:surname>
+                        <foaf:givenName>Jane</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:authors>
+        <bib:editors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Roe</foaf:surname>
+                        <foaf:givenName>Richard</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:editors>
+        <link:link rdf:resource="#item_21"/>
+        <dc:title>A Chapter Whose File Is Gone</dc:title>
+        <dc:date>2020</dc:date>
+    </bib:BookSection>
+    <z:Attachment rdf:about="#item_21">
+        <z:itemType>attachment</z:itemType>
+        <rdf:resource rdf:resource="files/21/missing.pdf"/>
+        <dc:title>Full Text</dc:title>
+        <link:type>application/pdf</link:type>
+    </z:Attachment>
+    <z:Collection rdf:about="#collection_1">
+        <dc:title>Urban</dc:title>
+        <dcterms:hasPart rdf:resource="#collection_2"/>
+        <dcterms:hasPart rdf:resource="urn:isbn:9780262033848"/>
+    </z:Collection>
+    <z:Collection rdf:about="#collection_2">
+        <dc:title>Food</dc:title>
+        <dcterms:hasPart rdf:resource="#item_12"/>
+    </z:Collection>
+</rdf:RDF>

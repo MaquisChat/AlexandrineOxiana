@@ -195,7 +195,7 @@ const CAPTURE_METHOD: Record<ImportBatch["source"]["kind"], Provenance["captureM
   attach: "manual_upload",
   "zotero-local": "zotero_import",
   "zotero-web": "zotero_import",
-  "zotero-rdf": "zotero_import",
+  "zotero-rdf": "refman_import", // an export file, like BibTeX/RIS/CSL-JSON (R65)
   bibtex: "refman_import",
   ris: "refman_import",
   "csl-json": "refman_import",
@@ -669,21 +669,32 @@ class Run {
       }
       out = { collectionIds: [parent!], tagIds: [] };
     } else {
-      const ids: string[] = [];
-      for (const seg of new Set(folderPath)) {
-        let t = known.tags.find((x) => x.name.toLowerCase() === seg.toLowerCase());
-        if (!t) {
-          t = await this.repo.createTag(this.projectId, seg);
-          known.tags.push(t);
-          this.rec.createdTagIds.push(t.id);
-          await this.checkpoint("running");
-        }
-        ids.push(t.id);
-      }
-      out = { collectionIds: [], tagIds: ids };
+      out = { collectionIds: [], tagIds: await this.namedTags(folderPath) };
     }
     this.structureCache.set(k, out);
     return out;
+  }
+
+  /** Ids of the project's tags with these names (case-insensitive), creating the missing ones as the batch's. */
+  private async namedTags(names: string[] | undefined): Promise<string[]> {
+    if (!names?.length) return [];
+    this.projectTags ??= await projectCollectionsAndTags(this.repo, this.projectId);
+    const known = this.projectTags;
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const name of names) {
+      if (seen.has(name.toLowerCase())) continue;
+      seen.add(name.toLowerCase());
+      let t = known.tags.find((x) => x.name.toLowerCase() === name.toLowerCase());
+      if (!t) {
+        t = await this.repo.createTag(this.projectId, name);
+        known.tags.push(t);
+        this.rec.createdTagIds.push(t.id);
+        await this.checkpoint("running"); // recorded at once, so undo finds it after a crash
+      }
+      ids.push(t.id);
+    }
+    return ids;
   }
 
   private async provenanceFor(r: Resolution, method: Provenance["captureMethod"], item: ScanItem): Promise<Provenance> {
@@ -713,10 +724,11 @@ class Run {
     dedupe: BatchDedupe,
   ): Promise<JournalEntry | null> {
     const struct = await this.structure(item.folderPath ?? []);
+    const own = await this.namedTags(item.tags);
     const draft: SourceDraft = {
       ...r.draft,
       collectionIds: [...new Set([...r.draft.collectionIds, ...struct.collectionIds])],
-      tagIds: [...new Set([...r.draft.tagIds, ...struct.tagIds])],
+      tagIds: [...new Set([...r.draft.tagIds, ...struct.tagIds, ...own])],
     };
     const provenance = await this.provenanceFor(r, method, item);
     // Unpacked files are removed once the scan moves past their archive, and located media may be

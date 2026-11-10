@@ -1,7 +1,8 @@
 /**
  * Bulk Import sources (spec 5.4 "Import sources"): the `ImportSourceAdapter` interface, implemented
- * here for a folder (recursive, ZIP archives included) and a single ZIP archive, and by Tasks
- * 24–26 for Zotero, reference-manager exports and Calibre.
+ * here for a folder (recursive, ZIP archives included) and a single ZIP archive, in ../refman.ts,
+ * ../zotero-rdf.ts and ../calibre.ts for reference-manager exports and Calibre (Task 24), and by
+ * Tasks 25–26 for Zotero.
  *
  * A folder scan never follows symbolic links, skips hidden files and the sidecar metadata files
  * that resolution reads next to an item (`.bib`, `.ris`, `.json`, `.opf`), and yields one item per
@@ -19,7 +20,10 @@ import { fileTypeFromFile } from "file-type";
 import type { Annotation, ImportBatch, SourceDraft } from "@ao/core";
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractArchive } from "../../extract/zip.js";
+import { calibreAdapter } from "../calibre.js";
+import { bibtexAdapter, cslJsonAdapter, risAdapter } from "../refman.js";
 import { SIDECAR_EXTS } from "../sidecar.js";
+import { zoteroRdfAdapter } from "../zotero-rdf.js";
 
 export interface ScanFile {
   path: string;
@@ -34,6 +38,8 @@ export interface ScanItem {
   referenceMetadata?: Partial<SourceDraft>;
   /** Folder names from the import's root to the item, for structure mapping. */
   folderPath?: string[];
+  /** Tag names the source carries (e.g. reference-manager keywords); found or created whatever the structure option. */
+  tags?: string[];
   /** e.g. Zotero annotations (Task 24; not stored by the folder/zip import). */
   annotations?: Annotation[];
   notes?: string[];
@@ -213,5 +219,10 @@ export function zipAdapter(zipPath: string): ImportSourceAdapter {
 export function adapterFor(kind: ImportBatch["source"]["kind"], location: string): ImportSourceAdapter | undefined {
   if (kind === "folder") return folderAdapter(location);
   if (kind === "zip") return zipAdapter(location);
+  if (kind === "bibtex") return bibtexAdapter(location);
+  if (kind === "ris") return risAdapter(location);
+  if (kind === "csl-json") return cslJsonAdapter(location);
+  if (kind === "zotero-rdf") return zoteroRdfAdapter(location);
+  if (kind === "calibre") return calibreAdapter(location);
   return undefined;
 }

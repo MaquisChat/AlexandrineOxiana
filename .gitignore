@@ -20,3 +20,4 @@ target/
 tests/fixtures/downloaded/
 *.egg-info/
 tests/fixtures/generated/
+packages/library/tests/fixtures/refman/generated/

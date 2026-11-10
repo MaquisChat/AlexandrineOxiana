@@ -56,6 +56,15 @@ Link capture from YouTube, Instagram and TikTok uses the `social-media` entry, u
 
 Files you drag and drop onto the library (drag-and-drop attach) use the `manual-upload` entry for each new source. A file dropped onto an existing source is stored under that source's own recorded basis instead. Without a basis, an identifiable project refuses the drop and says why.
 
+Bulk Import uses one entry per kind of source: folders and ZIP archives use `manual-upload`; reference-manager exports (BibTeX, RIS, CSL-JSON and Zotero RDF files) use `refman-import`; Calibre libraries use `calibre-import`. The capture methods behind them (`refman_import`, `calibre_import`) must be listed under `captureMethods`. They are by default.
+
+```yaml
+consent:
+  defaultLegalBasis:
+    refman-import: "legitimate interest (GDPR Art. 6(1)(f)); bibliographic records only"
+    calibre-import: "legitimate interest (GDPR Art. 6(1)(f)); the researcher's own e-book library"
+```
+
 ## Enforcement status
 
 At present the workbench computes the effective policy and the list of violations. Actually blocking actions (for example refusing a capture until a protocol is recorded) lands with the policy engine, the next task. Where the profile pages say the app "blocks" something, that describes the behavior the policy engine will enforce.

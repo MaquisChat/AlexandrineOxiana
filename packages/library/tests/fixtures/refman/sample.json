@@ -1,0 +1,33 @@
+[
+  {
+    "id": "okafor2024feeding",
+    "citation-key": "okafor2024feeding",
+    "type": "article-journal",
+    "title": "Feeding the City: Informal Markets in Lagos",
+    "author": [{ "family": "Okafor", "given": "Ngozi" }, { "family": "Müller", "given": "Jan" }],
+    "container-title": "Journal of Urban Studies",
+    "issued": { "date-parts": [[2024, 3]] },
+    "DOI": "10.5555/ao.urban.2024.017",
+    "keyword": "food systems, Lagos",
+    "file": "Full Text PDF:files/okafor2024feeding.pdf:application/pdf"
+  },
+  {
+    "id": "adebayo2019markets",
+    "type": "book",
+    "title": "Markets and Memory",
+    "author": [{ "family": "Adebayo", "given": "Tunde" }],
+    "publisher": "Ibadan University Press",
+    "issued": { "date-parts": [["2019"]] },
+    "ISBN": "978-0-262-03384-8",
+    "file": ["files/adebayo2019markets.pdf"]
+  },
+  {
+    "id": "doe2020missing",
+    "type": "chapter",
+    "title": "A Chapter Whose File Is Gone",
+    "author": [{ "family": "Doe", "given": "Jane" }],
+    "container-title": "Collected Essays",
+    "issued": { "raw": "2020" },
+    "file": "files/missing.pdf"
+  }
+]

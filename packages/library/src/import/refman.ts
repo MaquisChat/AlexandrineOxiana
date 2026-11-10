@@ -1,0 +1,953 @@
+/**
+ * Reference-manager exports for Bulk Import (spec 5.4 "Import sources"; Task 24, R65): BibTeX
+ * (incl. BibLaTeX, Better BibTeX, JabRef), RIS and CSL-JSON files as `ImportSourceAdapter`s.
+ * Zotero RDF is in zotero-rdf.ts and Calibre libraries in calibre.ts; they share the helpers here.
+ * The adapters only read: every write goes through the Task 23 engine (provenance `refman_import`).
+ *
+ * Parsing is our own and linear (no backtracking regular expressions on the input, no recursion):
+ * citation-js was evaluated and set aside, because a 64 KB field nested deeply in braces overflows
+ * its recursive-descent parser, one malformed entry aborts the whole file, and its BibTeX → CSL
+ * mapping drops the `file` field we need. Limits: an export file is at most 100 MB; every field
+ * value is cut to 64 KB before anything else looks at it.
+ *
+ * Linked files (`file` fields, RIS L1/L2/L4) may be absolute, relative to the export file, or
+ * `file:` URLs; the Zotero/JabRef form `desc:path:mime` (several separated by ";", "\:" escapes)
+ * is understood. Only regular files are attached. An item whose file is missing, or is a folder,
+ * FIFO or device, is yielded with `unreadable` set (a plain reason; never the path), so the batch
+ * reports it instead of crashing or silently dropping the file.
+ *
+ * Item keys are `<export file name>@<hash of its absolute path>#<citation key>` (or `#@<n>` for an
+ * entry without a key; a repeated key gets `~2`, `~3`, ...): stable across scans of the same export,
+ * so resume and re-import recognise items. The engine stores only an HMAC of the key (R63); the
+ * citation key itself goes into `externalKeys.citekey` and the draft's `citationKey`.
+ */
+import { createHash } from "node:crypto";
+import * as fsp from "node:fs/promises";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { fileTypeFromFile } from "file-type";
+import { toIsbn13, type Creator, type ImportBatch, type SourceDraft, type SourceType } from "@ao/core";
+import { clean, normalizeDate, parseName } from "../extract/names.js";
+import type { ImportSourceAdapter, ScanFile, ScanItem } from "./bulk/scan.js";
+
+export const MAX_EXPORT_BYTES = 100 * 1024 * 1024;
+export const MAX_FIELD_CHARS = 64 * 1024;
+const MAX_TAGS = 100;
+const MAX_TAG_CHARS = 200;
+const MAX_FILES = 50;
+
+export const REFMAN_REASONS = {
+  missingFile: "A file linked from this reference could not be found, so the reference was not imported. Check that the export's files are where it says, then import again.",
+  notRegular: "A file linked from this reference is not a regular file (it is a folder or a device), so the reference was not imported.",
+  tooLarge: "The export file is too large to import (more than 100 MB). Split it into smaller exports, then import each.",
+  unreadable: "The export file could not be read, so nothing was imported from it.",
+} as const;
+
+export const cap = (s: string) => (s.length > MAX_FIELD_CHARS ? s.slice(0, MAX_FIELD_CHARS) : s);
+
+/** Plain text of a field value: capped, control characters and runs of white space collapsed. */
+export const text = (s: string | undefined | null) => (s ? clean(cap(s)) : "");
+
+const mt = (value: string) => ({ variants: [{ lang: "und", kind: "original" as const, value }] });
+
+export class ExportUnreadable extends Error {
+  constructor(public readonly reason: string) {
+    super(reason);
+  }
+}
+
+/** The export file's text (BOM dropped), or ExportUnreadable with a plain reason. */
+export async function readExport(path: string): Promise<string> {
+  const st = await fsp.stat(path).catch(() => null);
+  if (!st?.isFile()) throw new ExportUnreadable(REFMAN_REASONS.unreadable);
+  if (st.size > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
+  try {
+    const buf = await fsp.readFile(path);
+    if (buf.length > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
+    const s = buf.toString("utf8");
+    return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
+  } catch (err) {
+    if (err instanceof ExportUnreadable) throw err;
+    throw new ExportUnreadable(REFMAN_REASONS.unreadable);
+  }
+}
+
+/** `<name>@<12 hex of sha256(absolute path)>`: identifies the export (or library) the keys belong to. */
+export function exportIdentity(path: string): string {
+  const abs = resolve(path);
+  return `${basename(abs)}@${createHash("sha256").update(abs).digest("hex").slice(0, 12)}`;
+}
+
+/** Unique, stable item keys within one export. */
+export class ItemKeys {
+  private seen = new Map<string, number>();
+  private n = 0;
+  constructor(private readonly prefix: string) {}
+  next(citekey: string | undefined): string {
+    this.n++;
+    const base = citekey ? citekey : `@${this.n}`;
+    const count = (this.seen.get(base) ?? 0) + 1;
+    this.seen.set(base, count);
+    return `${this.prefix}#${count === 1 ? base : `${base}~${count}`}`;
+  }
+}
+
+/** Tag names: cleaned, capped, de-duplicated (case-insensitive), at most 100. */
+export function tagList(raw: Iterable<string>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const r of raw) {
+    const t = text(r).slice(0, MAX_TAG_CHARS).trim();
+    if (!t || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase());
+    out.push(t);
+    if (out.length >= MAX_TAGS) break;
+  }
+  return out;
+}
+
+/** Splits on any of the given single characters (linear). */
+function splitOn(s: string, chars: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (chars.includes(s[i]!)) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+export const keywordTags = (s: string | undefined) => (s ? tagList(splitOn(cap(s), ",;")) : []);
+
+export const doiOf = (v: string | undefined) => {
+  const d = text(v)
+    .replace(/^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)/iu, "")
+    .toLowerCase();
+  return d && d.length <= 500 && /^10\.\d{4,9}\/\S+$/u.test(d) ? d : undefined;
+};
+
+export function isbnsOf(values: Iterable<string>): string[] {
+  const out = new Set<string>();
+  for (const v of values) {
+    for (const part of splitOn(cap(v), ";, \t")) {
+      const i = part.length <= 40 ? toIsbn13(part) : undefined;
+      if (i) out.add(i);
+      if (out.size >= 20) return [...out];
+    }
+  }
+  return [...out];
+}
+
+export const issnOf = (v: string | undefined) => {
+  const t = text(v).replace(/^issn\s*/iu, "");
+  return /^\d{4}-?\d{3}[\dXx]$/u.test(t) ? `${t.slice(0, 4)}-${t.slice(-4).toUpperCase()}` : undefined;
+};
+
+const ARXIV = /^(?:arxiv:)?(\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?\/\d{7}(?:v\d+)?)$/iu;
+export const arxivOf = (v: string | undefined) => {
+  const t = text(v);
+  return t.length <= 60 ? ARXIV.exec(t)?.[1] : undefined;
+};
+
+/** What an adapter knows about one record, before its files are checked. */
+export interface RecordFields {
+  type?: SourceType;
+  title?: string;
+  creators?: Creator[];
+  issued?: string;
+  container?: string;
+  publisher?: string;
+  doi?: string;
+  isbn?: string[];
+  issn?: string;
+  url?: string;
+  arxiv?: string;
+  citekey?: string;
+  tags?: string[];
+}
+
+/** RecordFields → the engine's reference metadata (only what is present). */
+export function referenceMetadata(f: RecordFields): Partial<SourceDraft> {
+  const ids: NonNullable<SourceDraft["identifiers"]> = {};
+  if (f.doi) ids.doi = f.doi;
+  if (f.isbn?.length) ids.isbn = f.isbn;
+  if (f.issn) ids.issn = f.issn;
+  if (f.url && f.url.length <= 2000 && /^https?:\/\//iu.test(f.url)) ids.url = f.url;
+  if (f.arxiv) ids.arxiv = f.arxiv;
+  const issued = f.issued ? normalizeDate(f.issued) : undefined;
+  return {
+    ...(f.type ? { type: f.type } : {}),
+    ...(f.title ? { title: mt(f.title) } : {}),
+    ...(f.creators?.length ? { creators: f.creators } : {}),
+    ...(issued ? { issued } : {}),
+    ...(f.container ? { container: mt(f.container) } : {}),
+    ...(f.publisher ? { publisher: f.publisher } : {}),
+    ...(Object.keys(ids).length ? { identifiers: ids } : {}),
+    ...(f.citekey ? { citationKey: f.citekey } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Linked files
+
+/** Unescapes `\x` → `x` (linear). */
+function unescapeBackslashes(s: string): string {
+  if (!s.includes("\\")) return s;
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "\\" && i + 1 < s.length) i++;
+    out += s[i];
+  }
+  return out;
+}
+
+/** Splits at unescaped `sep` (a backslash escapes the next character; escapes are kept). */
+function splitUnescaped(s: string, sep: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "\\") i++;
+    else if (s[i] === sep) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+const isDriveLetter = (s: string) => s.length === 1 && /[A-Za-z]/u.test(s);
+
+/**
+ * The paths in a `file` field: `path`, `desc:path:mime` (Zotero, JabRef), several of either
+ * separated by ";". `\:` `\;` `\\` are escapes; an unescaped Windows drive colon is kept.
+ */
+export function fileFieldPaths(raw: string): string[] {
+  const out: string[] = [];
+  for (const entry of splitUnescaped(cap(raw), ";")) {
+    if (out.length >= MAX_FILES) break;
+    const e = entry.trim();
+    if (!e) continue;
+    if (/^file:\/\//iu.test(e)) {
+      out.push(e);
+      continue;
+    }
+    const parts = splitUnescaped(e, ":");
+    let path: string;
+    if (parts.length === 1) path = parts[0]!;
+    else if (parts.length === 2) path = isDriveLetter(parts[0]!) ? `${parts[0]}:${parts[1]}` : parts[1]!;
+    else path = parts.slice(1, -1).join(":");
+    path = unescapeBackslashes(path).trim();
+    if (path) out.push(path);
+  }
+  return out;
+}
+
+/** A linked file's absolute path: `file:` URLs decoded, relative paths against the export's folder. */
+export function resolveLinked(raw: string, baseDir: string): string | undefined {
+  const p = raw.trim();
+  if (!p || p.includes("\u0000")) return undefined;
+  if (/^file:/iu.test(p)) {
+    try {
+      return fileURLToPath(p);
+    } catch {
+      return undefined;
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(p)) return undefined; // http(s), internal-pdf:// ...: not a local file
+  return isAbsolute(p) ? p : resolve(baseDir, p);
+}
+
+/** Checks each linked file: ScanFiles, or the plain reason the item is unreadable. */
+export async function checkFiles(paths: string[]): Promise<{ files: ScanFile[] } | { unreadable: string }> {
+  const files: ScanFile[] = [];
+  for (const path of paths) {
+    const st = await fsp.stat(path).catch(() => null);
+    if (!st) return { unreadable: REFMAN_REASONS.missingFile };
+    if (!st.isFile()) return { unreadable: REFMAN_REASONS.notRegular };
+    const t = await fileTypeFromFile(path).catch(() => undefined);
+    files.push({ path, mime: t?.mime ?? "application/octet-stream", bytes: st.size });
+  }
+  return { files };
+}
+
+/** One ScanItem from a parsed record and its linked files (`undefined` entries: links that are not local files). */
+export async function recordItem(
+  key: string,
+  f: RecordFields,
+  linked: Array<string | undefined>,
+  extra: Pick<ScanItem, "folderPath"> & { externalKeys?: Record<string, string> } = {},
+): Promise<ScanItem> {
+  const paths = [...new Set(linked.filter((p): p is string => !!p))];
+  const checked = await checkFiles(paths);
+  const externalKeys = { ...(f.citekey ? { citekey: f.citekey } : {}), ...(extra.externalKeys ?? {}) };
+  return {
+    key,
+    files: "files" in checked ? checked.files : [],
+    referenceMetadata: referenceMetadata(f),
+    ...(f.tags?.length ? { tags: f.tags } : {}),
+    ...(extra.folderPath?.length ? { folderPath: extra.folderPath } : {}),
+    ...(Object.keys(externalKeys).length ? { externalKeys } : {}),
+    ...("unreadable" in checked ? { unreadable: checked.unreadable } : {}),
+  };
+}
+
+/** An adapter over a parsed export: one unreadable item if the export cannot be read or parsed. */
+export function exportAdapter<R>(
+  kind: ImportBatch["source"]["kind"],
+  path: string,
+  parse: (text: string) => Iterable<R>,
+  toItem: (record: R, keys: ItemKeys, baseDir: string) => Promise<ScanItem>,
+): ImportSourceAdapter {
+  return {
+    kind,
+    location: path,
+    async *scan(signal) {
+      const prefix = exportIdentity(path);
+      let records: Iterable<R>;
+      try {
+        records = parse(await readExport(path));
+      } catch (err) {
+        yield { key: `${prefix}#`, files: [], unreadable: err instanceof ExportUnreadable ? err.reason : REFMAN_REASONS.unreadable };
+        return;
+      }
+      const keys = new ItemKeys(prefix);
+      const baseDir = dirname(resolve(path));
+      for (const r of records) {
+        signal.throwIfAborted();
+        yield await toItem(r, keys, baseDir);
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// BibTeX
+
+const BIB_TYPES: Record<string, SourceType> = {
+  article: "article-journal", book: "book", mvbook: "book", inbook: "chapter", incollection: "chapter", inreference: "chapter",
+  bookinbook: "chapter", inproceedings: "article-journal", conference: "article-journal", phdthesis: "thesis",
+  mastersthesis: "thesis", thesis: "thesis", techreport: "report", report: "report", misc: "other", online: "webpage",
+  electronic: "webpage", www: "webpage", dataset: "dataset", unpublished: "manuscript", manual: "report", booklet: "book",
+  collection: "book", proceedings: "book", periodical: "book",
+};
+
+const MONTH_MACROS: Record<string, string> = {
+  jan: "1", feb: "2", mar: "3", apr: "4", may: "5", jun: "6", jul: "7", aug: "8", sep: "9", oct: "10", nov: "11", dec: "12",
+};
+
+export interface BibEntry {
+  type: string;
+  key: string;
+  /** Raw field values (macros expanded, braces kept), lower-case names, first occurrence wins. */
+  fields: Map<string, string>;
+}
+
+const MAX_MACROS = 10_000;
+const isNameChar = (c: string | undefined) => !!c && c !== "," && c !== "=" && c !== "#" && c !== "{" && c !== "}" && c !== "(" && c !== ")" && c !== '"' && c !== "@" && !/\s/u.test(c);
+const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v";
+
+/**
+ * Entries of a BibTeX file (linear; no recursion). @comment and @preamble are skipped, @string
+ * macros are defined and expanded. A block that does not close before a line starting with "@"
+ * ends there (the same recovery rule as the sidecar reader, R57/R58), so one broken entry never
+ * swallows the rest of the file.
+ */
+export function* parseBibtexEntries(src: string): Generator<BibEntry> {
+  const n = src.length;
+  const macros = new Map<string, string>();
+  /** Positions of "@" that start a line (after spaces/tabs): block boundaries. */
+  const lineAt = (i: number) => {
+    let j = i + 1;
+    while (src[j] === " " || src[j] === "\t") j++;
+    return src[j] === "@" ? j : -1;
+  };
+  let i = src.indexOf("@");
+  while (i >= 0 && i < n) {
+    let j = i + 1;
+    while (j < n && /[A-Za-z]/u.test(src[j]!)) j++;
+    const type = src.slice(i + 1, j).toLowerCase();
+    while (isSpace(src[j])) j++;
+    if (!type || (src[j] !== "{" && src[j] !== "(")) {
+      i = src.indexOf("@", j > i + 1 ? j : i + 1);
+      continue;
+    }
+    const close = src[j] === "(" ? ")" : "}";
+    j++;
+    /** Index where the block stopped (just past its closing delimiter, or at a line-start "@"). */
+    let stop = n;
+    if (type === "comment" || type === "preamble") {
+      let depth = 1;
+      for (; j < n; j++) {
+        const c = src[j];
+        if (c === "\n" && lineAt(j) >= 0) {
+          stop = lineAt(j);
+          break;
+        }
+        if (c === "{" || c === "(") depth++;
+        else if ((c === "}" || c === ")") && --depth === 0) {
+          stop = j + 1;
+          break;
+        }
+      }
+      i = src.indexOf("@", stop === n ? n : stop);
+      continue;
+    }
+    // Key (entries only).
+    let key = "";
+    if (type !== "string") {
+      const ks = j;
+      while (j < n && src[j] !== "," && src[j] !== close && src[j] !== "\n" && j - ks < 1000) j++;
+      key = text(src.slice(ks, j));
+      if (src[j] === "\n") {
+        // "@type{key\n  field = ..." with the comma on the next line, or a key-less entry.
+        let k = j;
+        while (isSpace(src[k])) k++;
+        if (src[k] === ",") j = k;
+      }
+      if (src[j] === ",") j++;
+    }
+    const fields = new Map<string, string>();
+    let ended = false;
+    // Fields: name = value [# value ...], separated by commas.
+    while (j < n && !ended) {
+      while (j < n && (isSpace(src[j]) || src[j] === ",")) {
+        if (src[j] === "\n" && lineAt(j) >= 0) {
+          stop = lineAt(j);
+          ended = true;
+          break;
+        }
+        j++;
+      }
+      if (ended || j >= n) break;
+      if (src[j] === close) {
+        stop = j + 1;
+        break;
+      }
+      const ns = j;
+      while (j < n && isNameChar(src[j]) && j - ns < 200) j++;
+      const name = src.slice(ns, j).toLowerCase();
+      while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
+      if (src[j] !== "=" || !name) {
+        // Not a field: skip to the next separator.
+        if (j === ns) j++;
+        continue;
+      }
+      j++;
+      const parts: string[] = [];
+      let length = 0;
+      const push = (s: string) => {
+        if (length < MAX_FIELD_CHARS) {
+          const t = s.slice(0, MAX_FIELD_CHARS - length);
+          parts.push(t);
+          length += t.length;
+        }
+      };
+      for (;;) {
+        while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
+        const c = src[j];
+        if (c === "{" || c === '"') {
+          // Braced or quoted value; braces nest (counted, not recursed).
+          const vs = j + 1;
+          let depth = c === "{" ? 1 : 0;
+          j++;
+          for (; j < n; j++) {
+            const d = src[j];
+            if (d === "\n" && lineAt(j) >= 0) {
+              ended = true;
+              stop = lineAt(j);
+              break;
+            }
+            if (d === "\\") {
+              j++;
+              continue;
+            }
+            if (d === "{") depth++;
+            else if (d === "}") {
+              if (depth === 0) break; // stray close brace inside quotes: end of entry
+              depth--;
+              if (depth === 0 && c === "{") break;
+            } else if (d === '"' && c === '"' && depth === 0) break;
+          }
+          push(src.slice(vs, Math.min(j, n)));
+          if (!ended && j < n && (src[j] === "}" && c === '"' && depth === 0)) {
+            // `"..}` : the quote never closed before the entry's close.
+          } else if (!ended && j < n) j++;
+        } else if (c !== undefined && isNameChar(c)) {
+          // Number or macro name.
+          const ms = j;
+          while (j < n && isNameChar(src[j]) && j - ms < 200) j++;
+          const word = src.slice(ms, j);
+          const lw = word.toLowerCase();
+          push(/^\d+$/u.test(word) ? word : (macros.get(lw) ?? MONTH_MACROS[lw] ?? word));
+        }
+        if (ended) break;
+        while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
+        if (src[j] === "#") {
+          j++;
+          continue;
+        }
+        break;
+      }
+      const value = parts.join("");
+      if (type === "string") {
+        if (macros.size < MAX_MACROS) macros.set(name, value);
+      } else if (!fields.has(name)) fields.set(name, value);
+      // Anything else up to the next separator is skipped by the loop above.
+      while (j < n && !ended && src[j] !== "," && src[j] !== close && !isSpace(src[j])) j++;
+    }
+    if (type !== "string") yield { type, key, fields };
+    i = src.indexOf("@", stop > i ? stop : i + 1);
+  }
+}
+
+const ACCENTS: Record<string, string> = {
+  "'": "́", "`": "̀", "^": "̂", '"': "̈", "~": "̃", "=": "̄", ".": "̇",
+  u: "̆", v: "̌", H: "̋", c: "̧", k: "̨", r: "̊", d: "̣", b: "̱",
+};
+const SYMBOLS: Record<string, string> = {
+  ss: "ß", o: "ø", O: "Ø", ae: "æ", AE: "Æ", oe: "œ", OE: "Œ", aa: "å", AA: "Å", l: "ł", L: "Ł", i: "ı", j: "ȷ",
+  textendash: "–", textemdash: "—", textquoteright: "’", textquoteleft: "‘", ldots: "…", dots: "…", textellipsis: "…",
+  textasciitilde: "~", textbackslash: "\\", S: "§", P: "¶", copyright: "©", textregistered: "®", texttrademark: "™",
+  pounds: "£", euro: "€", textdegree: "°", guillemotleft: "«", guillemotright: "»", dh: "ð", DH: "Ð", th: "þ", TH: "Þ",
+  ng: "ŋ", NG: "Ŋ", dj: "đ", DJ: "Đ",
+};
+const isLetterAscii = (c: string | undefined) => !!c && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z"));
+
+/** LaTeX-ish BibTeX text → plain text (accents, symbols, escapes; braces and $ dropped). Linear. */
+export function latexToText(s: string): string {
+  let out = "";
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    const c = s[i]!;
+    if (c === "\\") {
+      const d = s[i + 1];
+      if (d === undefined) break;
+      if (!isLetterAscii(d)) {
+        if (ACCENTS[d]) {
+          // \'e  \'{e}  \"{\i}
+          let j = i + 2;
+          while (s[j] === " ") j++;
+          let base = "";
+          if (s[j] === "{") {
+            j++;
+            if (s[j] === "\\" && (s[j + 1] === "i" || s[j + 1] === "j") && !isLetterAscii(s[j + 2])) {
+              base = s[j + 1]!;
+              j += 2;
+            } else if (s[j] !== undefined && s[j] !== "}") {
+              base = s[j]!;
+              j++;
+            }
+            if (s[j] === "}") j++;
+          } else if (s[j] === "\\" && (s[j + 1] === "i" || s[j + 1] === "j") && !isLetterAscii(s[j + 2])) {
+            base = s[j + 1]!;
+            j += 2;
+          } else if (s[j] !== undefined) {
+            base = s[j]!;
+            j++;
+          }
+          out += base + ACCENTS[d];
+          i = j - 1;
+        } else if (d === "\\") {
+          out += " ";
+          i++;
+        } else {
+          out += d; // \& \% \$ \_ \# \{ \} and the like
+          i++;
+        }
+        continue;
+      }
+      let j = i + 1;
+      while (j < n && isLetterAscii(s[j]) && j - i < 40) j++;
+      const name = s.slice(i + 1, j);
+      if (name.length === 1 && ACCENTS[name] && (s[j] === "{" || s[j] === " ")) {
+        // \v{S}  \c c
+        let k = j;
+        while (s[k] === " ") k++;
+        let base = "";
+        if (s[k] === "{") {
+          k++;
+          if (s[k] !== undefined && s[k] !== "}") base = s[k++]!;
+          if (s[k] === "}") k++;
+        } else if (s[k] !== undefined) base = s[k++]!;
+        out += base + ACCENTS[name];
+        i = k - 1;
+        continue;
+      }
+      const sym = SYMBOLS[name];
+      if (sym !== undefined) {
+        out += sym;
+        if (s[j] === "{" && s[j + 1] === "}") j += 2;
+        else if (s[j] === " ") j++;
+      }
+      // Unknown commands (\emph, \textit ...) drop their name and keep their argument's text.
+      i = j - 1;
+      continue;
+    }
+    if (c === "{" || c === "}" || c === "$") continue;
+    if (c === "~") {
+      out += " ";
+      continue;
+    }
+    if (c === "-" && s[i + 1] === "-") {
+      if (s[i + 2] === "-") {
+        out += "—";
+        i += 2;
+      } else {
+        out += "–";
+        i += 1;
+      }
+      continue;
+    }
+    out += c;
+  }
+  return out.normalize("NFC");
+}
+
+const bibText = (v: string | undefined) => (v ? clean(latexToText(cap(v))) : "");
+
+/** Splits at `sep` (a single character) at brace depth 0 (linear). */
+function splitTop(s: string, sep: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") i++;
+    else if (c === "{") depth++;
+    else if (c === "}") depth = Math.max(0, depth - 1);
+    else if (c === sep && depth === 0) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+/** Splits a BibTeX name list at " and " (any case, any white space) outside braces (linear). */
+export function splitBibNames(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (c === "{") depth++;
+    else if (c === "}") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && isSpace(c) && (s[i + 1] === "a" || s[i + 1] === "A") && (s[i + 2] === "n" || s[i + 2] === "N") && (s[i + 3] === "d" || s[i + 3] === "D") && isSpace(s[i + 4])) {
+      out.push(s.slice(start, i));
+      start = i + 5;
+      i += 4;
+    }
+  }
+  out.push(s.slice(start));
+  return out.map((x) => x.trim()).filter(Boolean);
+}
+
+/** Words of a name part at brace depth 0 (a braced group is one word). */
+function nameWords(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const c of s) {
+    if (c === "{") depth++;
+    else if (c === "}") depth = Math.max(0, depth - 1);
+    if (depth === 0 && isSpace(c)) {
+      if (cur) out.push(cur);
+      cur = "";
+    } else cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** A von-particle: its first letter (outside braces, after commands) is lower case. */
+function isVon(word: string): boolean {
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i]!;
+    if (c === "{") return false;
+    if (c === "\\") {
+      i++;
+      while (isLetterAscii(word[i + 1])) i++;
+      continue;
+    }
+    if (/\p{L}/u.test(c)) return c === c.toLowerCase() && c !== c.toUpperCase();
+  }
+  return false;
+}
+
+/** One BibTeX name ("von Last, Jr, First", "von Last, First", "First von Last", "{Corporate}"). */
+export function bibName(raw: string, role: Creator["role"]): Creator | undefined {
+  const s = raw.slice(0, 2000).trim();
+  if (!s || s.toLowerCase() === "others") return undefined;
+  const words0 = nameWords(s);
+  if (words0.length === 1 && s.startsWith("{") && s.endsWith("}")) {
+    const literal = bibText(s);
+    return literal ? { literal, role } : undefined;
+  }
+  const parts = splitTop(s, ",").map((p) => p.trim());
+  let family: string;
+  let given: string;
+  if (parts.length >= 2) {
+    family = bibText(parts[0]);
+    given = bibText(parts.length >= 3 ? parts.slice(2).join(", ") : parts[1]);
+  } else {
+    const words = words0;
+    if (words.length === 1) {
+      const literal = bibText(words[0]);
+      return literal ? { literal, role } : undefined;
+    }
+    // First von Last: the family name starts at the first von word (if any, not the last word).
+    let vonAt = words.findIndex((w, k) => k < words.length - 1 && isVon(w));
+    if (vonAt < 0) vonAt = words.length - 1;
+    family = bibText(words.slice(vonAt).join(" "));
+    given = bibText(words.slice(0, vonAt).join(" "));
+  }
+  if (!family) return given ? { literal: given, role } : undefined;
+  return given ? { family, given, role } : { family, role };
+}
+
+export function bibFields(e: BibEntry): RecordFields {
+  const get = (k: string) => e.fields.get(k);
+  const t = (k: string) => bibText(get(k)) || undefined;
+  const people = (k: string, role: Creator["role"]) => splitBibNames(cap(get(k) ?? "")).map((x) => bibName(x, role)).filter((c): c is Creator => !!c);
+  const year = t("year");
+  const month = t("month");
+  const issued = t("date") ?? (year ? (month && /^\d{1,2}$/u.test(month) ? `${year}-${month.padStart(2, "0")}` : year) : undefined);
+  const eprint = t("eprint");
+  const archive = (t("archiveprefix") ?? t("eprinttype") ?? "").toLowerCase();
+  const creators = [...people("author", "author"), ...people("editor", "editor"), ...people("translator", "translator")];
+  const f: RecordFields = {
+    type: BIB_TYPES[e.type] ?? "other",
+    ...(t("title") ? { title: t("title")! } : {}),
+    ...(creators.length ? { creators } : {}),
+    ...(issued ? { issued } : {}),
+  };
+  const container = t("journaltitle") ?? t("journal") ?? t("booktitle");
+  if (container) f.container = container;
+  const publisher = t("publisher") ?? t("institution") ?? t("school") ?? t("organization");
+  if (publisher) f.publisher = publisher;
+  const doi = doiOf(get("doi"));
+  if (doi) f.doi = doi;
+  const isbn = isbnsOf([get("isbn") ?? ""]);
+  if (isbn.length) f.isbn = isbn;
+  const issn = issnOf(get("issn"));
+  if (issn) f.issn = issn;
+  const url = text(get("url"));
+  if (url) f.url = url;
+  const arxiv = archive === "arxiv" ? arxivOf(eprint) : undefined;
+  if (arxiv) f.arxiv = arxiv;
+  const key = text(e.key);
+  if (key) f.citekey = key;
+  const tags = keywordTags(bibText(get("keywords")) || undefined);
+  if (tags.length) f.tags = tags;
+  return f;
+}
+
+/** BibTeX / BibLaTeX export (Zotero, JabRef, Better BibTeX, Mendeley ...). */
+export function bibtexAdapter(path: string): ImportSourceAdapter {
+  return exportAdapter("bibtex", path, parseBibtexEntries, async (e, keys, baseDir) => {
+    const f = bibFields(e);
+    const raw = e.fields.get("file");
+    const linked = raw ? fileFieldPaths(raw).map((p) => resolveLinked(p, baseDir)) : [];
+    return recordItem(keys.next(f.citekey), f, linked);
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// RIS
+
+const RIS_TYPES: Record<string, SourceType> = {
+  JOUR: "article-journal", EJOUR: "article-journal", MGZN: "article-journal", NEWS: "article-journal", JFULL: "article-journal",
+  BOOK: "book", EBOOK: "book", EDBOOK: "book", CHAP: "chapter", ECHAP: "chapter", RPRT: "report", THES: "thesis",
+  CONF: "article-journal", CPAPER: "article-journal", DATA: "dataset", ELEC: "webpage", WEB: "webpage", BLOG: "webpage",
+  SLIDE: "presentation", MANSCPT: "manuscript", UNPB: "manuscript", AUDIO: "audio", VIDEO: "video", MPCT: "video",
+  ART: "image", FIGURE: "image", GOVDOC: "report", STAND: "report", PAT: "other", GEN: "other",
+};
+
+/** One RIS record: tag → values in order. */
+export type RisRecord = Map<string, string[]>;
+
+const isTagChar = (c: string | undefined) => !!c && ((c >= "A" && c <= "Z") || (c >= "0" && c <= "9"));
+const MAX_VALUES_PER_RECORD = 100_000;
+
+/** Records of a RIS file (`TY` … `ER`), line by line (linear). Lines without a tag continue the previous value. */
+export function* parseRisRecords(src: string): Generator<RisRecord> {
+  let rec: RisRecord | null = null;
+  let last: { tag: string; idx: number } | null = null;
+  let count = 0;
+  let start = 0;
+  const n = src.length;
+  while (start <= n) {
+    let end = src.indexOf("\n", start);
+    if (end < 0) end = n;
+    let line = src.slice(start, Math.min(end, start + MAX_FIELD_CHARS + 6));
+    start = end + 1;
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    const tagged = line.length >= 5 && isTagChar(line[0]) && isTagChar(line[1]) && line[2] === " " && line[3] === " " && line[4] === "-";
+    if (!tagged) {
+      const cont = clean(line);
+      if (rec && last && cont) {
+        const vals = rec.get(last.tag)!;
+        const prev = vals[last.idx]!;
+        if (prev.length < MAX_FIELD_CHARS) vals[last.idx] = cap(prev ? `${prev} ${cont}` : cont);
+      }
+      if (end === n) break;
+      continue;
+    }
+    const tag = line.slice(0, 2);
+    const value = clean(line.slice(6));
+    if (tag === "TY") {
+      if (rec) yield rec;
+      rec = new Map([["TY", [value]]]);
+      count = 1;
+      last = null;
+    } else if (tag === "ER") {
+      if (rec) yield rec;
+      rec = null;
+      last = null;
+    } else if (rec && count < MAX_VALUES_PER_RECORD) {
+      const vals = rec.get(tag) ?? [];
+      vals.push(cap(value));
+      rec.set(tag, vals);
+      last = { tag, idx: vals.length - 1 };
+      count++;
+    }
+    if (end === n) break;
+  }
+  if (rec) yield rec;
+}
+
+export function risFields(r: RisRecord): RecordFields {
+  const all = (...tags: string[]) => tags.flatMap((t) => r.get(t) ?? []).filter(Boolean);
+  const first = (...tags: string[]) => all(...tags)[0];
+  const ty = (first("TY") ?? "").toUpperCase();
+  const type = RIS_TYPES[ty] ?? "other";
+  const people = (role: Creator["role"], ...tags: string[]) => all(...tags).map((v) => parseName(v, role)).filter((c): c is Creator => !!c);
+  const creators = [...people("author", "AU", "A1"), ...people("editor", "A2", "ED"), ...people("translator", "A4")];
+  const f: RecordFields = { type };
+  const title = first("TI", "T1") ?? (type === "book" ? first("BT") : undefined);
+  if (title) f.title = title;
+  if (creators.length) f.creators = creators;
+  const date = first("PY", "Y1", "DA");
+  if (date) {
+    // "2019///" and "2019/03/01/" → 2019, 2019-03-01
+    const parts = splitOn(date.slice(0, 100), "/").filter(Boolean);
+    f.issued = parts.length > 1 && /^\d{4}$/u.test(parts[0]!) ? parts.join("-") : date;
+  }
+  const container = first("T2", "JO", "JF", "JA", "J2") ?? (type !== "book" ? first("BT") : undefined);
+  if (container) f.container = container;
+  const publisher = first("PB");
+  if (publisher) f.publisher = publisher;
+  const doi = doiOf(first("DO"));
+  if (doi) f.doi = doi;
+  const sn = all("SN");
+  const isbn = isbnsOf(sn);
+  if (isbn.length) f.isbn = isbn;
+  const issn = sn.map(issnOf).find(Boolean);
+  if (issn) f.issn = issn;
+  const url = first("UR");
+  if (url) f.url = url;
+  const id = first("ID");
+  if (id) f.citekey = id.slice(0, 1000);
+  const tags = tagList(all("KW"));
+  if (tags.length) f.tags = tags;
+  return f;
+}
+
+/** RIS export (EndNote, Mendeley, Zotero, Paperpile ...). L1/L2/L4 links that are local files are attached. */
+export function risAdapter(path: string): ImportSourceAdapter {
+  return exportAdapter("ris", path, parseRisRecords, async (r, keys, baseDir) => {
+    const f = risFields(r);
+    const links = ["L1", "L2", "L4", "LK"].flatMap((t) => r.get(t) ?? []).slice(0, MAX_FILES);
+    return recordItem(keys.next(f.citekey), f, links.map((l) => resolveLinked(l, baseDir)));
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// CSL-JSON
+
+const CSL_TYPES: Record<string, SourceType> = {
+  "article-journal": "article-journal", "article-magazine": "article-journal", "article-newspaper": "article-journal",
+  book: "book", chapter: "chapter", report: "report", thesis: "thesis", webpage: "webpage", "post-weblog": "webpage",
+  dataset: "dataset", "paper-conference": "article-journal", manuscript: "manuscript", speech: "presentation",
+  article: "preprint", song: "audio", motion_picture: "video", graphic: "image", interview: "interview", post: "social-post",
+};
+
+type Json = Record<string, unknown>;
+
+/** Items of a CSL-JSON export (an array, or one object). V8's JSON.parse is linear and non-recursive. */
+export function parseCslItems(src: string): Json[] {
+  const parsed = JSON.parse(src) as unknown;
+  const list = Array.isArray(parsed) ? parsed : [parsed];
+  return list.filter((x): x is Json => !!x && typeof x === "object" && !Array.isArray(x));
+}
+
+const str = (v: unknown) => (typeof v === "string" ? text(v) : typeof v === "number" && Number.isFinite(v) ? String(v) : "");
+
+function cslDate(v: unknown): string | undefined {
+  if (!v || typeof v !== "object") return typeof v === "string" ? text(v) || undefined : undefined;
+  const d = v as Json;
+  const parts = d["date-parts"];
+  const first = Array.isArray(parts) && Array.isArray(parts[0]) ? (parts[0] as unknown[]) : [];
+  const nums: number[] = [];
+  for (const x of first.slice(0, 3)) {
+    const y = typeof x === "string" ? Number(x) : x;
+    if (typeof y !== "number" || !Number.isInteger(y)) break;
+    nums.push(y);
+  }
+  if (nums.length) return nums.map((x, i) => (i ? String(x).padStart(2, "0") : String(x))).join("-");
+  return str(d.raw) || str(d.literal) || undefined;
+}
+
+export function cslFields(item: Json): RecordFields {
+  const s = (k: string) => str(item[k]) || undefined;
+  const people = (k: string, role: Creator["role"]): Creator[] => {
+    const list = Array.isArray(item[k]) ? (item[k] as unknown[]) : [];
+    const out: Creator[] = [];
+    for (const p of list) {
+      if (!p || typeof p !== "object") continue;
+      const o = p as Json;
+      const family = [str(o["non-dropping-particle"]), str(o.family)].filter(Boolean).join(" ");
+      const given = [str(o.given), str(o["dropping-particle"])].filter(Boolean).join(" ");
+      if (family) out.push(given ? { family, given, role } : { family, role });
+      else if (str(o.literal)) out.push({ literal: str(o.literal), role });
+      else if (given) out.push({ literal: given, role });
+    }
+    return out;
+  };
+  const f: RecordFields = { type: CSL_TYPES[s("type") ?? ""] ?? "other" };
+  if (s("title")) f.title = s("title");
+  const creators = [...people("author", "author"), ...people("editor", "editor"), ...people("translator", "translator")];
+  if (creators.length) f.creators = creators;
+  const issued = cslDate(item.issued);
+  if (issued) f.issued = issued;
+  if (s("container-title")) f.container = s("container-title");
+  if (s("publisher")) f.publisher = s("publisher");
+  const doi = doiOf(s("DOI"));
+  if (doi) f.doi = doi;
+  const isbnRaw = item.ISBN;
+  const isbn = isbnsOf(typeof isbnRaw === "string" ? [isbnRaw] : Array.isArray(isbnRaw) ? isbnRaw.filter((x): x is string => typeof x === "string").slice(0, 20) : []);
+  if (isbn.length) f.isbn = isbn;
+  const issn = issnOf(s("ISSN"));
+  if (issn) f.issn = issn;
+  if (s("URL")) f.url = s("URL");
+  const key = s("citation-key") ?? s("citationKey") ?? s("id");
+  if (key) f.citekey = key.slice(0, 1000);
+  const tags = keywordTags(s("keyword"));
+  if (tags.length) f.tags = tags;
+  return f;
+}
+
+/** CSL-JSON export. A non-standard `file` (string in the BibTeX form, or an array of paths) is attached. */
+export function cslJsonAdapter(path: string): ImportSourceAdapter {
+  return exportAdapter("csl-json", path, parseCslItems, async (item, keys, baseDir) => {
+    const f = cslFields(item);
+    const raw = item.file;
+    const paths = typeof raw === "string" ? fileFieldPaths(raw) : Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string").slice(0, MAX_FILES).flatMap(fileFieldPaths) : [];
+    return recordItem(keys.next(f.citekey), f, paths.map((p) => resolveLinked(p, baseDir)));
+  });
+}
