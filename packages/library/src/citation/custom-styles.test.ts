@@ -268,7 +268,9 @@ describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust t
 
   it("the sandbox stops a render that runs too long, or needs too much memory, without harming this process", async () => {
     const ok = { styleXml: style(), locales: {}, lang: "en-US", format: "text" as const, kind: "bibliography" as const, items: [{ id: "x", type: "book", title: "T" }] };
-    await expect(renderInSandbox(ok, { timeoutMs: 1 })).rejects.toBeInstanceOf(SandboxError);
+    // A render that always takes far longer than its 1 ms budget (a fan-out the static cap would
+    // refuse), so the outcome never depends on machine load: the timeout fires first.
+    await expect(renderInSandbox({ ...ok, styleXml: fanOut(22) }, { timeoutMs: 1 })).rejects.toMatchObject({ name: "SandboxError", reason: "timeout" });
     // A heap cap: a style that builds ever longer output runs out of its (here 16 MB) heap.
     const big = { ...ok, styleXml: fanOut(18), items: [{ id: "x", type: "book", title: "T".repeat(1000) }] };
     await expect(renderInSandbox(big, { maxHeapMb: 16, timeoutMs: 15_000 })).rejects.toMatchObject({ name: "SandboxError", reason: "resources" });
