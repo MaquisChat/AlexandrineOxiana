@@ -131,6 +131,24 @@ export const SourceDraft = Source.omit({
 }).extend({ citationKey: z.string().optional() });
 export type SourceDraft = z.infer<typeof SourceDraft>;
 
+/**
+ * A viewing proxy (spec 5.3) waiting to be made for one of the source's originals (R83): an
+ * image.proxy / video.proxy job of the media worker, with the location rule it must apply. Kept in
+ * source.json (sealed in encrypted projects) from the change that stored the original until the
+ * change that records the proxy, so a job queued while no worker was available (the source is
+ * "proxy pending"), or interrupted, is run again later (R31). `failed`: the job ran and failed
+ * (e.g. the proxy's GPS did not match the rule); it is not retried on its own.
+ */
+export const PendingProxy = z.object({
+  id: Id,
+  type: z.enum(["image.proxy", "video.proxy"]),
+  assetId: Id,
+  location: z.enum(["keep", "coarsen", "strip"]),
+  queuedAt: Timestamp,
+  failed: z.object({ code: z.string().max(64), at: Timestamp }).optional(),
+});
+export type PendingProxy = z.infer<typeof PendingProxy>;
+
 /** The source.json shape. */
 export const SourceFile = z.object({
   formatVersion: z.literal(1),
@@ -153,5 +171,7 @@ export const SourceFile = z.object({
   mergedExternalKeys: z.record(z.string(), z.array(z.string().max(256)).max(10_000)).optional(),
   fieldEvidence: z.array(FieldEvidence).default([]),
   verification: z.record(z.string(), FieldVerification).default({}),
+  /** Viewing proxies still to be made (R83); absent or empty when none are pending. */
+  pendingProxies: z.array(PendingProxy).max(10_000).optional(),
 });
 export type SourceFile = z.infer<typeof SourceFile>;

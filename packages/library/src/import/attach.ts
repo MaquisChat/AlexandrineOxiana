@@ -23,9 +23,11 @@
  * Identifiers found in a file but not confirmed by a lookup are never recorded or used to find
  * duplicates (R55): they go on the review entry as `hints`. Media (images, video, audio) with GPS,
  * or whose metadata could not be read, are stored with `hasLocation: true`, so location governance
- * applies (R54a, R57, R58); while a location condition (coarsen or strip) cannot be carried out
- * for dropped files, such a store is refused as an audited deny with LOCATION_REASON and nothing is
- * stored (R56; Task 27 adds the coarsening).
+ * applies (R54a, R57, R58). A store allowed with a location condition (coarsen or strip) stores the
+ * original as the decision says (encrypted where required) and queues its viewing proxy with the
+ * location coarsened or removed (R83, proxies.ts); with no media worker configured the proxy stays
+ * pending and the outcome carries the note LOCATION_REASON. A denied store (e.g. encryption off
+ * with coarsen) fails with the policy's own reason.
  *
  * Each stored file is one governed mutation (`createSource` / an original added to a source): the
  * `capture` and `store` decisions are evaluated again inside it, right before anything is written
@@ -45,7 +47,8 @@ import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/er
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, type Repo } from "../repo/repo.js";
-import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
+import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
+import { pendingFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
 import { serialStore, storeTurn } from "./project-queue.js";
 import { LOCATED_MEDIA, mayHaveLocation, resolveItem } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
@@ -62,6 +65,8 @@ export interface AttachOutcome {
   outcome: AttachStatus;
   sourceId?: string;
   reason?: string;
+  /** Stored, but something is still to come: e.g. LOCATION_REASON (its location-safe viewing copy waits for the media worker, R83). */
+  note?: string;
 }
 
 export interface AttachDeps {
@@ -72,6 +77,8 @@ export interface AttachDeps {
   patterns?: FileNamePattern[];
   /** Receives short notes (lookup providers skipped or failed). */
   debug?: (note: string) => void;
+  /** Viewing proxies of located photos and videos (R83); absent: no media worker is configured (proxies stay pending). */
+  proxies?: ProxyQueue;
 }
 
 export interface Attach {
@@ -210,12 +217,31 @@ export function createAttach(deps: AttachDeps): Attach {
     // Media with GPS: location governance applies to the store (R54a).
     // Unreadable metadata counts as located (fail closed, R57); a thrown error is not swallowed.
     const hasLocation = LOCATED_MEDIA.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
+    const plan = locatedPlan(hasLocation, mime);
+    const rule = locationRule();
     const { ext, kind } = stored;
     await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
-      refuse: refuseLocation,
+      refuse: rule.hook,
+      pendingProxies: (asset) => pendingFor(plan, [asset], rule.mode()),
     });
-    return { path, outcome: "attached", sourceId };
+    return { path, outcome: "attached", sourceId, ...proxyNote(projectId, sourceId, plan, rule.mode()) };
+  }
+
+  /** A single dropped file's proxy plan: located photos and videos get one under a location rule. */
+  function locatedPlan(hasLocation: boolean, mime: string): ProxyPlan {
+    const type = proxyTypeFor(mime);
+    return { located: hasLocation, proxies: hasLocation && type ? [{ index: 0, type }] : [] };
+  }
+
+  /** Starts the stored file's proxy jobs; the note when they must wait for a media worker (R83). */
+  function proxyNote(projectId: string, sourceId: string, plan: ProxyPlan, mode: string | undefined): { note?: string } {
+    if (!mode || !plan.proxies.length) return {};
+    if (deps.proxies?.available) {
+      deps.proxies.enqueue(projectId, sourceId);
+      return {};
+    }
+    return { note: LOCATION_REASON };
   }
 
   async function ontoLibrary(projectId: string, path: string, mime: string, stored: Stored, sha256: string, s: Session): Promise<AttachOutcome> {
@@ -236,18 +262,22 @@ export function createAttach(deps: AttachDeps): Attach {
       identifiable,
       ...(legalBasis ? { legalBasis } : {}),
     });
-    // createSource evaluates capture and store again, right before writing (R42).
-    // A location condition (coarsen/strip) cannot be honoured yet: an audited deny, nothing stored (R56).
+    // createSource evaluates capture and store again, right before writing (R42). Under a location
+    // condition (coarsen/strip) the viewing proxy is queued in the same change (R83).
+    const plan = locatedPlan(r.hasLocation, mime);
+    const rule = locationRule();
     const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }], {
       provenance,
       fieldEvidence: r.fieldEvidence,
       verification: r.verification.fields,
       ...(r.hasLocation ? { hasLocation: true } : {}),
       ...(reviewItem ? { reviewItem } : {}),
-    }, refuseLocation);
+      pendingProxies: (assets) => pendingFor(plan, assets, rule.mode()),
+    }, rule.hook);
     keys.push(dupKey(sf));
-    if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id };
-    return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review };
+    const note = proxyNote(projectId, sf.source.id, plan, rule.mode());
+    if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id, ...note };
+    return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review, ...note };
   }
 
   async function attachOne(projectId: string, path: string, toSourceId: string | undefined, s: Session, freshKeys = false): Promise<AttachOutcome> {

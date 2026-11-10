@@ -3,12 +3,12 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
-import { addDerivedAsset, addOriginalAsset, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
+import { addDerivedAsset, addOriginalAsset, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
@@ -523,13 +523,29 @@ export function addCapturedOriginal(
   sourceId: string,
   input: OriginalAssetInput,
   captureMethod: Provenance["captureMethod"],
-  opts: { hasLocation?: boolean; refuse?: RefuseHook } = {},
+  opts: { hasLocation?: boolean; refuse?: RefuseHook; pendingProxies?: (asset: Asset) => PendingProxy[] } = {},
 ): Promise<Asset> {
   return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, {
     captureMethod,
     hasLocation: opts.hasLocation === true,
     ...(opts.refuse ? { refuse: opts.refuse } : {}),
+    ...(opts.pendingProxies ? { pendingProxies: opts.pendingProxies } : {}),
   });
+}
+
+/** Package-internal (R83): records a viewing proxy as a derived asset and removes its pending entry, in one governed change. */
+export function addProxyAsset(repo: Repo, projectId: string, sourceId: string, input: DerivedAssetInput, pendingId: string): Promise<Asset> {
+  return addDerivedAsset(cores.get(repo)!, projectId, sourceId, input, { completesPendingProxy: pendingId });
+}
+
+/** Package-internal (R83): edits a source's pending viewing proxies in one governed change. */
+export function editPendingProxies(
+  repo: Repo,
+  projectId: string,
+  sourceId: string,
+  edit: (list: PendingProxy[], sf: SourceFile) => PendingProxy[],
+): Promise<SourceFile> {
+  return updatePendingProxies(cores.get(repo)!, projectId, sourceId, edit);
 }
 
 /** Package-internal: `Repo.mutate` with a refuse hook (see RefuseHook). */

@@ -1,5 +1,5 @@
 /** Derived assets: new dated files under `derived/`, never overwriting (spec 4.2). */
-import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix, type Provenance } from "@ao/core";
+import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix, type PendingProxy, type Provenance, type SourceFile } from "@ao/core";
 import { foldName, mimeFor, namesIn } from "./io.js";
 import { runMutation, type RefuseHook, type MutateRequest } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
@@ -37,6 +37,8 @@ export async function addDerivedAsset(
   projectId: string,
   sourceId: string,
   input: DerivedAssetInput,
+  /** Package-internal (R83): the pending proxy (source.json `pendingProxies` id) this asset completes, removed in the same change. */
+  internal: { completesPendingProxy?: string } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -88,13 +90,53 @@ export async function addDerivedAsset(
         ...(input.metadata ? { metadata: input.metadata } : {}),
       });
       tx.entity("asset", asset.id);
-      const sf = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
+      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
+      if (internal.completesPendingProxy) withPending(sf, (cur.pendingProxies ?? []).filter((j) => j.id !== internal.completesPendingProxy));
       await writeSourceFile(core, tx, sf);
       tx.record("asset", asset.id, null, asset);
       tx.index((sink) => sink.indexSource(sf));
       return asset;
     },
     { op: "asset.derive" },
+  );
+}
+
+/** Sets (or, when empty, removes) a source file's pending proxies. */
+function withPending(sf: SourceFile, list: PendingProxy[]): void {
+  if (list.length) sf.pendingProxies = list;
+  else delete sf.pendingProxies;
+}
+
+/**
+ * Package-internal (R83): changes a source's pending viewing proxies (e.g. marks one failed, or
+ * drops one whose original is gone) in one governed change. Nothing is written when unchanged.
+ */
+export async function updatePendingProxies(
+  core: RepoCore,
+  projectId: string,
+  sourceId: string,
+  edit: (list: PendingProxy[], sf: SourceFile) => PendingProxy[],
+): Promise<SourceFile> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const current = await readSourceFile(core, st, sourceId);
+  return runMutation(
+    core,
+    projectId,
+    storeRequest(current.source.provenance),
+    async (tx) => {
+      const cur = await readSourceFile(core, st, sourceId);
+      const before = cur.pendingProxies ?? [];
+      const next = edit(structuredClone(before), cur);
+      if (JSON.stringify(next) === JSON.stringify(before)) return cur;
+      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor } };
+      withPending(sf, next);
+      await writeSourceFile(core, tx, sf);
+      tx.record("source", sourceId, cur.source, sf.source);
+      return sf;
+    },
+    { op: "asset.proxy-pending", entity: { type: "source", id: sourceId } },
   );
 }
 
@@ -109,7 +151,13 @@ export async function addOriginalAsset(
   sourceId: string,
   input: OriginalAssetInput,
   /** Package-internal: a newly captured file (e.g. a drop onto the source): its capture method is evaluated and audited in the same change. */
-  internal: { captureMethod?: Provenance["captureMethod"]; hasLocation?: boolean; refuse?: RefuseHook } = {},
+  internal: {
+    captureMethod?: Provenance["captureMethod"];
+    hasLocation?: boolean;
+    refuse?: RefuseHook;
+    /** Viewing proxies to queue for the new original (R83), written to source.json in the same change. */
+    pendingProxies?: (asset: Asset) => PendingProxy[];
+  } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -155,7 +203,9 @@ export async function addOriginalAsset(
         ...(input.metadata ? { metadata: input.metadata } : {}),
       });
       tx.entity("asset", asset.id);
-      const sf = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
+      const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor }, assets: [...cur.assets, asset] };
+      const more = internal.pendingProxies?.(asset) ?? [];
+      if (more.length) withPending(sf, [...(cur.pendingProxies ?? []), ...more]);
       await writeSourceFile(core, tx, sf);
       tx.record("asset", asset.id, null, asset);
       tx.index((sink) => sink.indexSource(sf));

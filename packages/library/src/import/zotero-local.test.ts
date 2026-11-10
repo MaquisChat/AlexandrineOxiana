@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Annotation, Project, SourceFile } from "@ao/core";
+import type { Annotation, AuditEvent, Project, SourceFile } from "@ao/core";
 import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { NOTE_HTML, buildZoteroFixture } from "../../tests/fixtures/zotero/build-fixture.mjs";
 import { KeyRing } from "../crypto/keys.js";
@@ -25,6 +25,7 @@ import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContex
 import type { ScanAnnotation } from "./bulk/scan.js";
 import { OUTSIDE_NOTE } from "./bulk/outside.js";
 import { ENGINE_FILE_NOTES } from "./bulk/run.js";
+import { LOCATION_REASON } from "./common.js";
 import { bibtexAdapter } from "./refman.js";
 import { IMAGE_PLACEHOLDER, MAX_NOTE_CHARS, encodeHref, noteToMarkdown } from "./note-html.js";
 import { planAnnotations } from "./bulk/update.js";
@@ -783,8 +784,6 @@ processing:
   });
 
   // ---- R74 (engine review round 1) ----
-  const LOCATION_REASON =
-    "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
   const locGov = `identifiability:
   containsIdentifiable: false
 encryption:
@@ -795,6 +794,14 @@ captureMethods: [zotero_import]
 processing:
   metadata_lookup: []
 `;
+  const auditEvents = async (p: Project): Promise<AuditEvent[]> => {
+    const dir = join(lib.root, p.folder, "audit");
+    const out: AuditEvent[] = [];
+    for (const f of (await readdir(dir)).sort()) {
+      for (const line of (await readFile(join(dir, f), "utf8")).split("\n")) if (line.trim()) out.push(JSON.parse(line) as AuditEvent);
+    }
+    return out;
+  };
   const projectWith = async (gov: string, encrypted: boolean): Promise<Project> =>
     (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: gov, encryption: encrypted ? { enabled: true, passphrase: "pw" } : { enabled: false } }))
       .project;
@@ -806,7 +813,7 @@ processing:
       await ops.writeSource(cur, { ...cur, annotations: cur.annotations.map((a) => (a.externalKey === externalKey ? { ...a, body } : a)) });
     }, { op: "test.edit-annotation" });
 
-  it("R74 I1: a located file added in Zotero after the first import is refused on re-run (coarsen, encrypted)", async () => {
+  it("R74 I1 / R83: a located file added in Zotero after the first import is added on re-run with a coarsened proxy pending (coarsen, encrypted)", async () => {
     const p = await projectWith(locGov, true);
     const bulk = bulkImport();
     await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
@@ -818,9 +825,17 @@ processing:
     });
     const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
     const r = await h.done;
-    expect(r.counts.failed).toBe(1);
-    expect((await bulk.batchReport(p.id, h.batchId)).failures).toEqual([{ item: "zotero:CCCC3333", reason: LOCATION_REASON }]);
-    expect(byZoteroKey(await sources(p), "CCCC3333").assets).toEqual([]);
+    expect(r.counts.failed).toBe(0);
+    expect(r.counts.updated).toBe(1);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.failures).toEqual([]);
+    expect(report.notes).toContain(LOCATION_REASON);
+    const sf = byZoteroKey(await sources(p), "CCCC3333");
+    const photo = sf.assets.find((a) => a.kind === "image")!;
+    expect(photo.encrypted).toBe(true);
+    expect(sf.pendingProxies?.map((j) => [j.type, j.location, j.assetId])).toEqual([["image.proxy", "coarsen", photo.id]]);
+    const store = (await auditEvents(p)).filter((e) => e.action === "store" && e.entity?.id === sf.source.id).pop()!;
+    expect(store.decision?.conditions).toContainEqual({ type: "location", mode: "coarsen" });
   });
 
   it("R74 I2: an unreadable (truncated) deletion record fails closed until reset; the reset is audited", async () => {

@@ -23,6 +23,7 @@ import {
   type Availability,
   type FieldEvidence,
   type FieldVerification,
+  type PendingProxy,
 } from "@ao/core";
 import { GovernanceViolationError, ImmutableProvenanceError, NotFoundError } from "./errors.js";
 import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe } from "./io.js";
@@ -70,6 +71,16 @@ export interface CreateSourceOptions {
    * one not yet used in the project (e.g. by appending a, b, c …).
    */
   uniqueCitationKey?: (generated: string) => string;
+  /**
+   * Package-internal (device import, R83): pairs of `files` indexes stored as one Live Photo (the
+   * still and the video): each asset's `metadata.pairedAssetId` names the other.
+   */
+  pairedFiles?: Array<[number, number]>;
+  /**
+   * Package-internal (R83): viewing proxies to queue for the stored originals, given those assets
+   * (in the order of `files`); written to source.json in the same change (R31).
+   */
+  pendingProxies?: (assets: Asset[]) => PendingProxy[];
 }
 
 export type SourcePatch = Partial<Omit<Source, "id">>;
@@ -510,6 +521,15 @@ async function writeNewSource(
     hashes[assetId] = content.sha256;
   }
 
+  for (const [i, j] of opts.pairedFiles ?? []) {
+    const a = assets[i];
+    const b = assets[j];
+    if (!a || !b || a === b) continue;
+    assets[i] = { ...a, metadata: { ...(a.metadata ?? {}), pairedAssetId: b.id } };
+    assets[j] = { ...b, metadata: { ...(b.metadata ?? {}), pairedAssetId: a.id } };
+  }
+  const pending = opts.pendingProxies?.(assets) ?? [];
+
   const name = tx.pseudonymize ? creator : creatorName(draft);
   const source = Source.parse({
     ...draft,
@@ -532,6 +552,7 @@ async function writeNewSource(
     annotations: (opts.annotations?.(id, assets, tx.actor) ?? []).map((a) => Annotation.parse(a)),
     fieldEvidence: opts.fieldEvidence ?? [],
     verification: opts.verification ?? {},
+    ...(pending.length ? { pendingProxies: pending } : {}),
   });
   await writeSourceFile(core, tx, sf);
   tx.record("source", id, null, source);

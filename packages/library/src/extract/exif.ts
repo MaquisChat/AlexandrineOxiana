@@ -99,6 +99,7 @@ export function mediaFromTags(t: Partial<Tags> & Record<string, unknown>): Media
   const model = text(t.Model);
   const device = make && model ? (model.toLowerCase().startsWith(make.toLowerCase()) ? model : `${make} ${model}`) : (model ?? make);
   if (device) m.device = device;
+  if (model) m.model = model;
   const lens = text(t.LensModel);
   if (lens) m.lens = lens;
 
@@ -145,4 +146,71 @@ export async function extractExif(path: string): Promise<RawExtract> {
   } catch {
     return { media: { readFailed: true } };
   }
+}
+
+// ---------- location verification of derived copies (R83) ----------
+
+/** Tag names (ExifTool, with their group) that hold a location: GPS, ISO 6709, QuickTime and XMP locations. */
+const LOCATION_TAG = /GPS|Location|ISO6709|xyz|GeoTag/iu;
+/** Tags that only describe the file or ExifTool itself. */
+const NOT_METADATA = /^(?:File|System|ExifTool|SourceFile)(?::|$)/u;
+/** Tags holding a single latitude or longitude value. */
+const COORDINATE_TAG = /(?:Latitude|Longitude)$/u;
+/** Tags holding a position string ("40.7 -74.0", "+40.7-074.0/", "Lat=40.70000 Lon=-74.00000 ..."). */
+const POSITION_TAG = /GPSCoordinates|GPSPosition|ISO6709|Location(?:Information)?$|xyz/iu;
+/** How far a coarsened value may be from one decimal (DMS rationals written by the worker round-trip within 1e-6°). */
+const COARSE_TOLERANCE = 1e-4;
+
+/** Every location tag of a file, by "Group:Tag" (ExifTool -G1 -a -n), or null when it cannot be read. */
+export async function readLocationTags(path: string): Promise<Record<string, unknown> | null> {
+  let tags: Record<string, unknown>;
+  try {
+    tags = (await exiftool().readRaw(path, { readArgs: ["-G1", "-a", "-n"] })) as unknown as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const errors = tags.errors;
+  if ((tags["ExifTool:Error"] != null && String(tags["ExifTool:Error"]).trim() !== "") || (Array.isArray(errors) && errors.length > 0)) return null;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(tags)) if (!NOT_METADATA.test(k) && LOCATION_TAG.test(k)) out[k] = v;
+  return out;
+}
+
+const isCoarse = (v: number) => Number.isFinite(v) && Math.abs(v * 10 - Math.round(v * 10)) <= COARSE_TOLERANCE * 10;
+
+/** The numbers in a position string, in order. */
+function numbersIn(text: string): number[] {
+  const out: number[] = [];
+  for (const m of text.matchAll(/[+-]?\d+(?:\.\d+)?/gu)) out.push(Number(m[0]));
+  return out;
+}
+
+/**
+ * Whether a derived copy's location metadata matches the project's rule (R83), re-read from the
+ * file itself: `strip` → no location tag at all; `coarsen` → every latitude and longitude it holds
+ * is rounded to one decimal; `keep` → anything. A file whose metadata cannot be read does not match
+ * (except under `keep`). Returns a reason (no values) when it does not match.
+ */
+export async function checkProxyLocation(path: string, mode: "keep" | "coarsen" | "strip"): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (mode === "keep") return { ok: true };
+  const tags = await readLocationTags(path);
+  if (!tags) return { ok: false, reason: "the copy's metadata could not be read" };
+  const names = Object.keys(tags);
+  if (mode === "strip") return names.length ? { ok: false, reason: `the copy still has location tags (${names.slice(0, 5).join(", ")})` } : { ok: true };
+  for (const [k, v] of Object.entries(tags)) {
+    const tag = k.slice(k.indexOf(":") + 1);
+    if (/Ref$|Version|Altitude|TimeStamp|DateStamp|Datum|MapDatum|ProcessingMethod|Status|MeasureMode|DOP|Accuracy|Speed|Track|ImgDirection|Body|Role/iu.test(tag)) continue;
+    if (COORDINATE_TAG.test(tag)) {
+      const n = typeof v === "number" ? v : numbersIn(String(v))[0];
+      if (n === undefined || !isCoarse(n)) return { ok: false, reason: `${k} is not coarsened` };
+    } else if (POSITION_TAG.test(tag)) {
+      const text = String(v);
+      const nums = /Lat=|Lon=/u.test(text) ? [...text.matchAll(/(?:Lat|Lon)=([+-]?\d+(?:\.\d+)?)/gu)].map((m) => Number(m[1])) : numbersIn(text);
+      if (nums.length < 2 || !isCoarse(nums[0]!) || !isCoarse(nums[1]!)) return { ok: false, reason: `${k} is not coarsened` };
+    } else if (typeof v === "number" || /\d/u.test(String(v))) {
+      // A location-named tag this check does not understand (e.g. GPSDestBearing) is not allowed in a coarsened copy.
+      return { ok: false, reason: `${k} is not allowed in a coarsened copy` };
+    }
+  }
+  return { ok: true };
 }

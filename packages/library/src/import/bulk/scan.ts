@@ -18,10 +18,11 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import yauzl from "yauzl";
 import { fileTypeFromFile } from "file-type";
-import type { FieldEvidence, ImportBatch, SourceDraft } from "@ao/core";
+import type { Asset, FieldEvidence, ImportBatch, SourceDraft } from "@ao/core";
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractArchive } from "../../extract/zip.js";
 import { calibreAdapter } from "../calibre.js";
+import { deviceAdapter } from "../device.js";
 import { bibtexAdapter, cslJsonAdapter, risAdapter } from "../refman.js";
 import { SIDECAR_EXTS } from "../sidecar.js";
 import { zoteroLocalAdapter } from "../zotero-local.js";
@@ -38,6 +39,8 @@ export interface ScanFile {
    * is copied with the note ENGINE_FILE_NOTES.linkedCopied.
    */
   link?: boolean;
+  /** Capture details stored on the file's asset (device import: capture time, device, lens). */
+  metadata?: Asset["metadata"];
 }
 
 /** A rectangle on a PDF page, in PDF points from the page's origin. */
@@ -107,6 +110,11 @@ export interface ScanItem {
   fileNotes?: string[];
   /** The item could not be read at all (e.g. a refused archive): it fails with this plain reason. */
   unreadable?: string;
+  /**
+   * Pairs of `files` indexes stored as one Live Photo (device import): each stored asset's
+   * `metadata.pairedAssetId` names the other.
+   */
+  pairs?: Array<[number, number]>;
 }
 
 /** What the engine gives a scan: a private (0700) work folder for unpacked archives, created on first use. */
@@ -140,6 +148,12 @@ export interface ImportSourceAdapter {
   tool?: { name: string; version: string };
   /** How many items the scan will yield (for progress), when it can tell cheaply. */
   count?(signal: AbortSignal): Promise<number>;
+  /**
+   * Every photo and video gets a viewing proxy (device import, spec 5.3: HEIC, RAW and MOV are not
+   * viewable as they are), under the project's location rule. Otherwise only located media under a
+   * location condition get one (R83).
+   */
+  viewingProxies?: boolean;
 }
 
 const SIDECARS: ReadonlySet<string> = new Set(SIDECAR_EXTS);
@@ -313,5 +327,6 @@ export function adapterFor(kind: ImportBatch["source"]["kind"], location: string
   if (kind === "calibre") return calibreAdapter(location);
   if (kind === "zotero-local") return zoteroLocalAdapter(location);
   if (kind === "zotero-web") return zoteroWebAdapterFor(location);
+  if (kind === "device") return deviceAdapter(location);
   return undefined;
 }

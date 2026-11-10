@@ -19,8 +19,10 @@
  * are evaluated again right before writing (R42) and audited as events about its own source, and
  * its journal line is written in the same change. New sources are stored in groups of up to 32 per
  * change (shared fixed costs); a group the policy refuses is stored item by item, so a deny fails
- * only the items concerned, with the policy's reason, and the batch goes on. Location-
- * conditioned media are refused (R56, LOCATION_REASON). Journal lines of items that stored nothing
+ * only the items concerned, with the policy's reason, and the batch goes on. Media whose store
+ * carries a location condition are stored as the decision allows and get viewing proxies with the
+ * location coarsened or removed (R83, ../proxies.ts); without a media worker those stay pending
+ * (LOCATION_REASON in the item's notes and the report). Journal lines of items that stored nothing
  * (duplicates, failures) are written with the next store or at the next checkpoint; after a crash
  * such an item is simply processed again, with the same result.
  *
@@ -47,6 +49,7 @@ import {
   type PolicyDecision,
   type Provenance,
   type Annotation,
+  type PendingProxy,
   type SourceDraft,
   type SourceFile,
 } from "@ao/core";
@@ -74,8 +77,9 @@ import {
 } from "../../repo/repo.js";
 import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
-import { MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs } from "../common.js";
-import { LOCATED_MEDIA, mayHaveLocation, resolveItem, type Resolution } from "../resolve.js";
+import { LOCATION_REASON, MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs, type LocationMode } from "../common.js";
+import { pendingFor, planProxies, type ProxyPlan, type ProxyQueue } from "../proxies.js";
+import { resolveItem, type Resolution } from "../resolve.js";
 import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
 import { serialStore, storeTurn } from "../project-queue.js";
 import { findSidecars } from "../sidecar.js";
@@ -157,6 +161,8 @@ export interface BulkImportDeps {
   index: { db: IndexDb };
   /** Queues OCR for a source whose PDF has no text layer (Task 15's worker), when `options.ocr`. */
   queueOcr?: (projectId: string, sourceId: string) => void | Promise<void>;
+  /** Viewing proxies of photos and videos (R83); absent: no media worker is configured (proxies stay pending, LOCATION_REASON). */
+  proxies?: ProxyQueue;
   debug?: (note: string) => void;
   /** Test seam: the watchdog budget per pattern per name (default 50 ms). */
   patternBudgetMs?: number;
@@ -394,6 +400,8 @@ interface Prepared {
   /** Adapter path → checked real path, and real path → sha256 (for anchoring annotations). */
   realOf: Map<string, string>;
   shaOf: Map<string, string>;
+  /** Which files may carry a location and which get viewing proxies (R83); set by importItem. */
+  plan: ProxyPlan;
 }
 
 interface Queued {
@@ -451,6 +459,11 @@ class Run {
   private inputsCache: { at: number; method: string; value: { identifiable: boolean; legalBasis?: string } } | null = null;
   private dedupe: BatchDedupe | null = null;
   private lookup: LookupContext | null = null;
+  /**
+   * The project's location rule, for viewing proxies of files whose store carried no location
+   * condition (adapters with `viewingProxies`): read at the start of the run; unreadable → strip.
+   */
+  private policyMode: LocationMode = "strip";
   readonly done: Promise<BatchResult>;
   private settle!: (r: BatchResult) => void;
   private fail!: (e: unknown) => void;
@@ -568,6 +581,7 @@ class Run {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
       this.lookup = await lookupContextFor(this.repo, this.projectId, this.deps.http, this.deps.debug ? { debug: this.deps.debug } : {});
+      if (this.adapter.viewingProxies) this.policyMode = (await projectPolicyOrDefault(this.repo, this.projectId))?.sharing.locationMetadata ?? "strip";
       this.outside = await OutsidePolicy.create(
         this.adapter.roots,
         [join(repoLibrary(this.repo).root, ".tmp", this.workName), ...(await approvedFolders(repoLibrary(this.repo)))],
@@ -746,7 +760,7 @@ class Run {
   private async prepareFiles(item: ScanItem): Promise<Prepared> {
     const opts = this.rec.options;
     const fromArchive = item.key.includes("!/");
-    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map() };
+    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map(), plan: { located: false, proxies: [] } };
     for (const f of item.files) {
       const st = await fsp.stat(f.path).catch(() => null);
       if (!st?.isFile()) {
@@ -783,7 +797,7 @@ class Run {
       const wantsLink = !fromArchive && (opts.fileHandling === "link" || sourceLinks);
       if (wantsLink && sourceLinks && opts.fileHandling !== "link" && (await this.linkRefused())) out.copiedLinks++;
       const handling = wantsLink && !(await this.linkRefused()) ? "link" : "copy";
-      out.inputs.push({ path: real, noFollow: true, role: "original", handling, ext: stored.ext, mime: stored.mime, kind: stored.kind });
+      out.inputs.push({ path: real, noFollow: true, role: "original", handling, ext: stored.ext, mime: stored.mime, kind: stored.kind, ...(f.metadata ? { metadata: f.metadata } : {}) });
     }
     return out;
   }
@@ -800,6 +814,8 @@ class Run {
     const method = CAPTURE_METHOD[this.rec.source.kind];
     const prep = await this.prepareFiles(item);
     const { inputs, shas, kept, names, mime, dropped } = prep;
+    // Every file is checked for a location, not only the one resolution reads (R74 I1, R83).
+    prep.plan = await planProxies(inputs, { all: this.adapter.viewingProxies === true });
     // Same file → duplicate (whatever the duplicate policy).
     if (shas[0]) {
       let same = dedupe.bySha(shas[0]);
@@ -939,10 +955,14 @@ class Run {
       structTags.push(...struct.tagIds);
     }
     const own = await this.namedTags(item.tags, item.tagColors);
+    const link = this.rec.fieldwork;
     const draft: SourceDraft = {
       ...r.draft,
       collectionIds: [...new Set([...r.draft.collectionIds, ...collectionIds])],
       tagIds: [...new Set([...r.draft.tagIds, ...structTags, ...own])],
+      // Device import (R83): every new source is linked to the session and participants, in its own governed change.
+      ...(link?.participantIds?.length ? { participantIds: [...new Set([...r.draft.participantIds, ...link.participantIds])] } : {}),
+      ...(link?.sessionId ? { sessionId: link.sessionId } : {}),
     };
     if (this.adapter.uniqueCitationKeys) {
       const keys = await this.citationKeys();
@@ -961,9 +981,9 @@ class Run {
       }
     }
     const provenance = await this.provenanceFor(r, method, item);
-    // Unpacked files are removed once the scan moves past their archive, and located media may be
-    // refused on their own: those are stored at once, one by one.
-    if (!r.hasLocation && !item.key.includes("!/")) {
+    // Unpacked files are removed once the scan moves past their archive, and located media are
+    // decided on their own (their store may carry a location condition): those are stored at once, one by one.
+    if (!r.hasLocation && !prep.plan.located && !item.key.includes("!/")) {
       const placeholder = `${PLACEHOLDER}${++this.placeholders}`;
       dedupe.addPending(placeholder, candidateKey(r, shas));
       this.group.push({ item, r, prep, inputs, draft, provenance, reviewItem, placeholder });
@@ -1069,6 +1089,7 @@ class Run {
     if (!group.length) return;
     const flushLines = this.pending.length;
     const entries: JournalEntry[] = [];
+    const rule = locationRule();
     try {
       const stored = await createSourcesRefusing(
         this.repo,
@@ -1081,15 +1102,16 @@ class Run {
             fieldEvidence: q.r.fieldEvidence,
             verification: q.r.verification.fields,
             ...(q.reviewItem ? { reviewItem: { ...q.reviewItem, batchId: this.rec.id } } : {}),
-            ...this.extraCreateOpts(q.item, q.prep, q.inputs),
+            ...this.extraCreateOpts(q.item, q.prep, q.inputs, rule.mode),
           },
           inTx: async (tx, sf) => {
+            this.notePending(q.item.key, sf, rule.mode());
             const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id });
             entries[i] = entry;
             await appendJournal(tx, this.projectRel, this.rec.dir, i === 0 ? [...this.pending.slice(0, flushLines), entry] : [entry]);
           },
         })),
-        refuseLocation,
+        rule.hook,
       );
       this.pending = this.pending.slice(flushLines);
       dedupe.dropPending(group.map((q) => q.placeholder));
@@ -1097,6 +1119,7 @@ class Run {
         this.latest.set(entries[i]!.key, entries[i]!);
         this.createdIds.add(sf.source.id);
         dedupe.add(sf);
+        this.startProxies(sf);
         const q = group[i]!;
         if (this.rec.options.ocr && q.r.needsOcr && q.inputs.length) await this.ocr(sf.source.id);
       }
@@ -1134,6 +1157,7 @@ class Run {
     const outcome = reviewItem ? "needs-review" : "created";
     const flush = this.pending.length;
     let entry: JournalEntry | undefined;
+    const rule = locationRule();
     // createSource evaluates capture and store again right before writing (R42); the journal line
     // is part of the same change.
     const sf = await createSourceRefusing(
@@ -1145,12 +1169,13 @@ class Run {
         provenance,
         fieldEvidence: r.fieldEvidence,
         verification: r.verification.fields,
-        ...(r.hasLocation ? { hasLocation: true } : {}),
+        ...(r.hasLocation || q.prep.plan.located ? { hasLocation: true } : {}),
         ...(reviewItem ? { reviewItem: { ...reviewItem, batchId: this.rec.id } } : {}),
-        ...this.extraCreateOpts(item, q.prep, inputs),
+        ...this.extraCreateOpts(item, q.prep, inputs, rule.mode),
       },
-      refuseLocation,
+      rule.hook,
       async (tx, created) => {
+        this.notePending(item.key, created, rule.mode());
         entry = this.withNotes({ key: item.key, outcome, sourceId: created.source.id });
         await appendJournal(tx, this.projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
       },
@@ -1158,14 +1183,72 @@ class Run {
     this.pending = this.pending.slice(flush);
     this.createdIds.add(sf.source.id);
     dedupe.add(sf);
+    this.startProxies(sf);
     if (this.rec.options.ocr && r.needsOcr && inputs.length) await this.ocr(sf.source.id);
     return entry!;
   }
 
+  /**
+   * Inside the change that stores a source (its decision known): a located file's viewing proxy
+   * that must wait for a media worker is noted on the item and in the report (R83, LOCATION_REASON).
+   */
+  private notePending(key: string, sf: SourceFile, mode: LocationMode | undefined): void {
+    if (!mode || !sf.pendingProxies?.some((j) => !j.failed) || this.deps.proxies?.available) return;
+    const notes = this.fileNotes.get(key) ?? [];
+    if (!notes.includes(LOCATION_REASON)) this.fileNotes.set(key, [...notes, LOCATION_REASON]);
+    this.note(LOCATION_REASON);
+  }
+
+  /** Starts the stored source's viewing-proxy jobs (they stay pending in its source.json without a worker). */
+  private startProxies(sf: SourceFile): void {
+    if (sf.pendingProxies?.length) this.deps.proxies?.enqueue(this.projectId, sf.source.id);
+  }
+
+  /** The item's proxy plan against the files actually stored (some may have been left out since it was made). */
+  private planFor(prep: Prepared, inputs: SourceInputFile[]): ProxyPlan {
+    const proxies: ProxyPlan["proxies"] = [];
+    for (const p of prep.plan.proxies) {
+      const path = prep.inputs[p.index]?.path;
+      const i = inputs.findIndex((f) => f.path === path);
+      if (i >= 0) proxies.push({ index: i, type: p.type });
+    }
+    return { located: prep.plan.located, proxies };
+  }
+
+  /** Pending proxies for files a merge or update added (matched by hash to the assets it stored). */
+  private pendingForAdded(plan: ProxyPlan, files: SourceInputFile[], shaOf: Map<string, string>, added: Asset[], mode: LocationMode | undefined): PendingProxy[] {
+    const assets: Asset[] = [];
+    const sub: ProxyPlan = { located: plan.located, proxies: [] };
+    for (const p of plan.proxies) {
+      const sha = shaOf.get(files[p.index]?.path ?? "");
+      const a = sha ? added.find((x) => x.sha256 === sha) : undefined;
+      if (!a) continue;
+      sub.proxies.push({ index: assets.length, type: p.type });
+      assets.push(a);
+    }
+    const all = this.adapter.viewingProxies === true;
+    return pendingFor(sub, assets, mode ?? (all ? this.policyMode : undefined), all);
+  }
+
   /** The item's annotations and the citation-key rule, as createSource options. */
-  private extraCreateOpts(item: ScanItem, prep: Prepared, inputs: SourceInputFile[]): Pick<CreateSourceOptions, "annotations" | "uniqueCitationKey"> {
+  private extraCreateOpts(
+    item: ScanItem,
+    prep: Prepared,
+    inputs: SourceInputFile[],
+    mode: () => LocationMode | undefined,
+  ): Pick<CreateSourceOptions, "annotations" | "uniqueCitationKey" | "pairedFiles" | "pendingProxies"> {
     const keys = this.adapter.uniqueCitationKeys ? this.citationKeySet : null;
+    const plan = this.planFor(prep, inputs);
+    const all = this.adapter.viewingProxies === true;
+    // Paired files (a Live Photo's still and video), as indexes of the files stored.
+    const indexOf = (n: number) => {
+      const real = prep.realOf.get(item.files[n]?.path ?? "");
+      return real ? inputs.findIndex((f) => f.path === real) : -1;
+    };
+    const pairs = (item.pairs ?? []).map(([a, b]) => [indexOf(a), indexOf(b)] as [number, number]).filter(([a, b]) => a >= 0 && b >= 0 && a !== b);
     return {
+      ...(plan.proxies.length ? { pendingProxies: (assets: Asset[]) => pendingFor(plan, assets, mode() ?? (all ? this.policyMode : undefined), all) } : {}),
+      ...(pairs.length ? { pairedFiles: pairs } : {}),
       ...(item.annotations?.length
         ? {
             annotations: (sourceId: string, assets: Asset[], actor: string) =>
@@ -1223,8 +1306,11 @@ class Run {
     // Tags are found or created first (each its own change, recorded as the batch's for undo).
     const tagIds = await this.namedTags(item.tags, item.tagColors);
     const haveSha = new Set(target.assets.map((a) => a.sha256));
-    // Every new file is checked for a location, not only the one resolution read (R74 I1).
-    const located = r.hasLocation || (await this.located(v.inputs.filter((f) => !haveSha.has(prep.shaOf.get(f.path) ?? ""))));
+    // Every new file is checked for a location, not only the one resolution read (R74 I1, R83).
+    const newInputs = v.inputs.filter((f) => !haveSha.has(prep.shaOf.get(f.path) ?? ""));
+    const plan = await planProxies(newInputs, { all: this.adapter.viewingProxies === true });
+    const located = r.hasLocation || plan.located;
+    const rule = locationRule();
     const zk = item.externalKeys?.zoteroKey;
     let dropped = 0;
     const out = await this.changeSource(item, targetId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, located)], "import.merge", async (ops, cur) => {
@@ -1233,10 +1319,11 @@ class Run {
       const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, ops.tx.at, ops.tx.actor, tagIds, zk ? [zk] : []);
       const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
       dropped = ann.dropped;
-      const next = ann.added.length ? { ...merged.next, annotations: [...merged.next.annotations, ...ann.added] } : merged.next;
+      const next = this.withPendingProxies(item.key, ann.added.length ? { ...merged.next, annotations: [...merged.next.annotations, ...ann.added] } : merged.next, this.pendingForAdded(plan, newInputs, prep.shaOf, added, rule.mode()), rule.mode());
       return { next, record: ann.added.length ? { ...merged.record, addedAnnotationIds: ann.added.map((a) => a.id) } : merged.record, outcome: "merged" };
-    }, () => (dropped ? { annotationsDropped: dropped } : {}));
+    }, () => (dropped ? { annotationsDropped: dropped } : {}), rule.hook);
     dedupe.add(out.sf);
+    this.startProxies(out.sf);
     return out.entry;
   }
 
@@ -1276,8 +1363,10 @@ class Run {
       return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}) });
     }
     const tagIds = await this.namedTags(item.tags, item.tagColors);
-    // New files may carry a location: location governance applies to them (R56, R57; R74 I1).
-    const located = await this.located(newInputs);
+    // New files may carry a location: location governance applies to them (R57; R74 I1; R83).
+    const proxyPlan = await planProxies(newInputs, { all: this.adapter.viewingProxies === true });
+    const located = proxyPlan.located;
+    const rule = locationRule();
     let dropped = 0;
     const out = await this.changeSource(
       item,
@@ -1302,26 +1391,31 @@ class Run {
         const changed = plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
         if (!changed) return { next: null, record, outcome: "unchanged" };
         const replaced = new Map(ann.updated.map((u) => [u.after.id, u.after]));
-        const next: SourceFile = {
-          ...merged.next,
-          annotations: [...merged.next.annotations.map((a) => replaced.get(a.id) ?? a), ...ann.added],
-          fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence],
-        };
+        const next: SourceFile = this.withPendingProxies(
+          item.key,
+          {
+            ...merged.next,
+            annotations: [...merged.next.annotations.map((a) => replaced.get(a.id) ?? a), ...ann.added],
+            fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence],
+          },
+          this.pendingForAdded(proxyPlan, newInputs, prep.shaOf, added, rule.mode()),
+          rule.mode(),
+        );
         return { next, record, outcome: "updated" };
       },
       () => (dropped ? { annotationsDropped: dropped } : {}),
+      rule.hook,
     );
+    this.startProxies(out.sf);
     return out.entry;
   }
 
-  /** Whether any of these new files may carry a location (GPS, or media whose metadata cannot be read; R57). */
-  private async located(inputs: SourceInputFile[]): Promise<boolean> {
-    for (const f of inputs) {
-      const mime = f.mime ?? "";
-      if (!LOCATED_MEDIA.test(mime)) continue;
-      if (mayHaveLocation(mime, await extractMetadata(f.path, mime))) return true;
-    }
-    return false;
+  /** `next` with more pending viewing proxies (inside the change; the item noted when they must wait for a worker). */
+  private withPendingProxies(key: string, next: SourceFile, more: PendingProxy[], mode: LocationMode | undefined): SourceFile {
+    if (!more.length) return next;
+    const sf = { ...next, pendingProxies: [...(next.pendingProxies ?? []), ...more] };
+    this.notePending(key, sf, mode);
+    return sf;
   }
 
   /**
@@ -1337,6 +1431,8 @@ class Run {
     fn: (ops: Parameters<Parameters<typeof importChange>[3]>[0], cur: SourceFile) => Promise<{ next: SourceFile | null; record: MergeRecord; outcome: "merged" | "updated" | "unchanged" }>,
     /** More fields for the journal line, known once `fn` ran. */
     extra: () => Partial<JournalEntry> = () => ({}),
+    /** Watches the decision (the location rule, R83); never refuses. */
+    refuse?: (d: PolicyDecision, req: Parameters<typeof evaluate>[1]) => string | undefined,
   ): Promise<{ sf: SourceFile; entry: JournalEntry }> {
     const flush = this.pending.length;
     const n = ++this.snapshots;
@@ -1363,7 +1459,7 @@ class Run {
         await appendJournal(tx, projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
         return r.next ?? cur;
       },
-      { op, entity: { type: "source", id: targetId }, refuse: refuseLocation },
+      { op, entity: { type: "source", id: targetId }, ...(refuse ? { refuse } : {}) },
     );
     this.pending = this.pending.slice(flush);
     return { sf, entry: entry! };
@@ -1475,7 +1571,14 @@ function allocateBatchNumber(repo: Repo, projectId: string): Promise<number> {
 export const ITEM_KEY = "import-item";
 
 /** Starts a batch: options vetted and the project's rules checked first (BatchRefusedError), then batch.json, then the run. */
-export async function startBatch(deps: BulkImportDeps, projectId: string, adapter: ImportSourceAdapter, input: ImportOptionsInput = {}): Promise<BatchHandle> {
+export async function startBatch(
+  deps: BulkImportDeps,
+  projectId: string,
+  adapter: ImportSourceAdapter,
+  input: ImportOptionsInput = {},
+  /** Package-internal (device import, R83): the session and participants every new source is linked to (checked by the caller). */
+  internal: { fieldwork?: { sessionId?: string; participantIds?: string[] } } = {},
+): Promise<BatchHandle> {
   // The id is in the running set before anything is awaited (R61).
   const id = newId();
   active.add(id);
@@ -1509,9 +1612,18 @@ export async function startBatch(deps: BulkImportDeps, projectId: string, adapte
       notes: [],
       secret,
       ...(outsideApprovals.length ? { outsideApprovals } : {}),
+      ...(internal.fieldwork && (internal.fieldwork.sessionId || internal.fieldwork.participantIds?.length) ? { fieldwork: internal.fieldwork } : {}),
     };
     // Written before anything is created, so an interrupted batch still has its record.
     await saveRecord(deps.repo, projectId, rec);
+    if (rec.fieldwork) {
+      // The links themselves are part of each source's governed, audited creation; the request is audited here once.
+      await appendLibraryEvent(deps.repo, projectId, "import.fieldwork-link", {
+        batchId: id,
+        ...(rec.fieldwork.sessionId ? { sessionId: rec.fieldwork.sessionId } : {}),
+        participants: rec.fieldwork.participantIds?.length ?? 0,
+      });
+    }
     const run = new Run(deps, projectId, rec, adapter, []);
     run.start();
     return run.handle();

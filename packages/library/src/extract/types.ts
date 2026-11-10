@@ -17,6 +17,8 @@ export interface MediaMetadata {
   /** From OffsetTimeOriginal (or an explicit zone on the QuickTime creation date), e.g. "+02:00". */
   tzOffset?: string;
   device?: string;
+  /** The camera model alone (EXIF/QuickTime Model), e.g. "iPhone 15 Pro". */
+  model?: string;
   lens?: string;
   /** Raw coordinates as stored; coarsening/stripping is governed elsewhere (spec 5.3). */
   gps?: { lat: number; lon: number; alt?: number };

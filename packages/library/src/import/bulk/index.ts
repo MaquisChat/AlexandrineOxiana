@@ -15,6 +15,7 @@ import {
 } from "./run.js";
 import type { ImportSourceAdapter } from "./scan.js";
 import { undoBatch, type UndoResult } from "./undo.js";
+import { importDeviceFolder, type DeviceImportOptions } from "../device.js";
 
 export interface BulkImport {
   /** Wizard step 2: what a batch would find; nothing is written. */
@@ -28,6 +29,8 @@ export interface BulkImport {
   bulkEditReview(projectId: string, itemIds: string[], patch: ReviewPatch): Promise<void>;
   batchReport(projectId: string, batchId: string): Promise<ImportReport>;
   undoBatch(projectId: string, batchId: string): Promise<UndoResult>;
+  /** iPhone and camera media (spec 5.3): a device folder as a batch, every new source linked to the session and participants given. */
+  importDeviceFolder(projectId: string, dir: string, opts?: DeviceImportOptions): Promise<BatchHandle>;
 }
 
 export function createBulkImport(deps: BulkImportDeps): BulkImport {
@@ -42,6 +45,7 @@ export function createBulkImport(deps: BulkImportDeps): BulkImport {
     bulkEditReview: (p, i, x) => bulkEditReview(repo, p, i, x),
     batchReport: (p, b) => batchReport(repo, p, b),
     undoBatch: (p, b) => undoBatch(repo, p, b),
+    importDeviceFolder: (p, d, o) => importDeviceFolder(deps, p, d, o),
   };
 }
 

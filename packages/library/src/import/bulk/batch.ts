@@ -103,6 +103,8 @@ export interface BatchRecord extends ImportBatch {
   clearedDeletions?: string[];
   /** Profile capture (Task 18): counts detail. */
   countsDetail?: Record<string, number>;
+  /** Device import (R83): the session and participants every new source is linked to. */
+  fieldwork?: { sessionId?: string; participantIds?: string[] };
 }
 
 /** `<project folder>/imports`. */

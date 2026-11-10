@@ -137,6 +137,10 @@ export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/res
 export type { Resolution, ResolveContext, ResolveInput } from "./import/resolve.js";
 export { ACCEPTED_EXTENSIONS, FOLDER_REASON, LOCATION_REASON, createAttach } from "./import/attach.js";
 export type { Attach, AttachDeps, AttachOutcome, AttachStatus } from "./import/attach.js";
+export { DEVICE_EXTENSIONS, DEVICE_RESEARCHER_NOTE, RAW_JPEG_WINDOW_MS, deviceAdapter, groupDeviceFiles, importDeviceFolder } from "./import/device.js";
+export type { DeviceAdapterOptions, DeviceFile, DeviceGroup, DeviceImportOptions } from "./import/device.js";
+export { ProxyQueue, planProxies, proxyTypeFor } from "./import/proxies.js";
+export type { ProxyPlan, ProxyQueueOptions, ProxyResult } from "./import/proxies.js";
 export { BULK_REASONS, BatchRefusedError, PATTERN_BUDGET_MS, adapterFor, createBulkImport, folderAdapter, zipAdapter } from "./import/bulk/index.js";
 export type {
   BatchCounts,

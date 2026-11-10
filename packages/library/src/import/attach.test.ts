@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
 import { DEFAULT_GOVERNANCE, findDuplicate, parseGovernanceWithWarnings } from "@ao/core";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { ExifTool } from "exiftool-vendored";
 import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import { shutdownExtractors } from "../extract/index.js";
@@ -20,7 +21,12 @@ import { kindFor, mimeFor, openLine } from "../repo/io.js";
 import type { Repo } from "../repo/repo.js";
 import { projectDataKey } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
+import { WorkerClient } from "../worker-client.js";
+import { stubWorker } from "../worker-testing.js";
+import { decryptBytes } from "../repo/io.js";
 import { ACCEPTED_EXTENSIONS, LOCATION_REASON, acceptedType, createAttach, type Attach } from "./attach.js";
+import { ProxyQueue } from "./proxies.js";
+import { gpsOf, locationTags, proxyStub } from "./proxy-testing.js";
 import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem } from "./resolve.js";
 
 const FAST = 2 ** 10;
@@ -101,6 +107,17 @@ async function reviewEntries(projectId: string, projectFolder: string): Promise<
   }
   const k = projectDataKey(repo, projectId);
   return parseReviewFile(text, projectId, k ? k.key : null).entries;
+}
+
+/** A plaintext copy of a stored asset (decrypted with the project key in encrypted projects). */
+async function plainCopy(p: { id: string }, rel: string): Promise<string> {
+  const abs = join(lib.root, ...rel.split("/"));
+  const out = join(tmp, "plain", `${Math.random().toString(36).slice(2)}.${rel.replace(/\.enc$/u, "").split(".").pop()}`);
+  await mkdir(dirname(out), { recursive: true });
+  const k = projectDataKey(repo, p.id);
+  if (!k) await copyFile(abs, out);
+  else await writeFile(out, await decryptBytes((id) => (id === k.keyId ? k.key : undefined), await readFile(abs)));
+  return out;
 }
 
 async function put(name: string, data: Buffer | string): Promise<string> {
@@ -659,9 +676,7 @@ processing:
   });
 });
 
-describe("R56: location-conditioned media fail closed until coarsening exists", () => {
-  const LOCATION_REASON =
-    "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
+describe("R83: location-conditioned media are stored; their viewing proxies follow the project's location rule", () => {
   const gov = (mode: string) => `identifiability:
   containsIdentifiable: false
 encryption:
@@ -672,38 +687,101 @@ captureMethods: [manual_upload]
 processing:
   metadata_lookup: []
 `;
+  let et: ExifTool;
+  const closers: Array<() => Promise<void> | void> = [];
+  beforeAll(() => {
+    et = new ExifTool({ maxProcs: 1 });
+  });
+  afterAll(async () => {
+    await et.end();
+  });
+  afterEach(async () => {
+    for (const c of closers.splice(0)) await c();
+  });
 
-  for (const mode of ["coarsen", "strip"]) {
-    it(`locationMetadata ${mode}: a dropped photo with GPS is refused, nothing stored, refusal audited`, async () => {
+  async function withWorker(opts: { lie?: boolean } = {}) {
+    const w = await stubWorker(proxyStub(et, opts), { closers, pollsUntilDone: 1 });
+    const proxies = new ProxyQueue({ repo, worker: new WorkerClient({ repo, worker: w, pollMs: 5 }) });
+    return { attach: createAttach({ repo, http, proxies }), proxies };
+  }
+
+  for (const mode of ["coarsen", "strip"] as const) {
+    it(`locationMetadata ${mode}: a dropped photo with GPS is stored encrypted with its GPS; its proxy follows the rule (re-read)`, async () => {
+      const { attach, proxies } = await withWorker();
       const p = await project(gov(mode), true);
       const tif = join(files, "IMG_0001.tif");
       await buildCameraTiff(tif);
-      expect(await attach.attachFiles(p.id, [tif])).toEqual([{ path: tif, outcome: "failed", reason: LOCATION_REASON }]);
-      expect(repo.listSourceIds(p.id)).toEqual([]);
-      expect(await readdir(join(lib.root, p.folder, "Sources")).catch(() => [])).toEqual([]);
-      const denies = (await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny");
-      expect(denies.map((e) => [e.action, e.decision?.reason])).toEqual([["store", LOCATION_REASON]]);
+      const [r] = await attach.attachFiles(p.id, [tif]);
+      expect(["created", "needs-review"]).toContain(r!.outcome);
+      expect(r!.note).toBeUndefined();
+      await proxies.idle();
+      const sf = await repo.getSource(p.id, r!.sourceId!);
+      const original = sf.assets.find((a) => a.role === "original")!;
+      expect(original.encrypted).toBe(true);
+      expect(await gpsOf(et, await plainCopy(p, original.path))).toEqual({ lat: 40.6892, lon: -74.0445 });
+      const proxy = sf.assets.find((a) => a.role === "derived")!;
+      expect(proxy).toMatchObject({ kind: "proxy", encrypted: true, derivation: { operation: "image.proxy", parents: [original.id], params: { location: mode } } });
+      const plain = await plainCopy(p, proxy.path);
+      if (mode === "coarsen") expect(await gpsOf(et, plain)).toEqual({ lat: 40.7, lon: -74 });
+      else expect(await locationTags(et, plain)).toEqual([]);
+      expect(sf.pendingProxies ?? []).toEqual([]);
+      const events = await auditEvents(p.folder);
+      expect(events.filter((e) => e.decision?.result === "deny")).toEqual([]);
+      const store = events.find((e) => e.action === "store" && e.entity?.id === sf.source.id)!;
+      expect(store.decision?.conditions).toContainEqual({ type: "location", mode });
     });
   }
 
-  it("locationMetadata coarsen: dropping a photo with GPS onto a source is refused too", async () => {
+  it("no media worker: the photo is stored, the source is flagged proxy pending (LOCATION_REASON) and the job is kept with it", async () => {
+    const p = await project(gov("coarsen"), true);
+    const tif = join(files, "IMG_0001.tif");
+    await buildCameraTiff(tif);
+    const [r] = await attach.attachFiles(p.id, [tif]);
+    expect(["created", "needs-review"]).toContain(r!.outcome);
+    expect(r!.note).toBe(LOCATION_REASON);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.assets.filter((a) => a.role === "original")).toHaveLength(1);
+    expect(sf.pendingProxies?.map((j) => [j.type, j.location, j.assetId])).toEqual([["image.proxy", "coarsen", sf.assets[0]!.id]]);
+  });
+
+  it("locationMetadata coarsen: a photo with GPS dropped onto a source is added as an original, and its proxy is made", async () => {
+    const { attach, proxies } = await withWorker();
     const p = await project(gov("coarsen"), true);
     const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
     const tif = join(files, "IMG_0002.tif");
     await buildCameraTiff(tif);
-    expect(await attach.attachFiles(p.id, [tif], { toSourceId: made!.sourceId! })).toEqual([{ path: tif, outcome: "failed", reason: LOCATION_REASON }]);
-    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(1);
+    expect(await attach.attachFiles(p.id, [tif], { toSourceId: made!.sourceId! })).toEqual([{ path: tif, outcome: "attached", sourceId: made!.sourceId }]);
+    await proxies.idle();
+    const sf = await repo.getSource(p.id, made!.sourceId!);
+    expect(sf.assets.filter((a) => a.role === "original")).toHaveLength(2);
+    const proxy = sf.assets.find((a) => a.role === "derived")!;
+    expect(await gpsOf(et, await plainCopy(p, proxy.path))).toEqual({ lat: 40.7, lon: -74 });
   });
 
-  it("locationMetadata keep: the photo is stored", async () => {
+  it("a proxy whose GPS does not match the rule is discarded; no derived asset is recorded", async () => {
+    const { attach, proxies } = await withWorker({ lie: true });
+    const p = await project(gov("coarsen"), true);
+    const tif = join(files, "IMG_0001.tif");
+    await buildCameraTiff(tif);
+    const [r] = await attach.attachFiles(p.id, [tif]);
+    const results = await proxies.idle();
+    expect(results).toEqual([expect.objectContaining({ ok: false, code: "LOCATION_MISMATCH" })]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.assets.filter((a) => a.role === "derived")).toEqual([]);
+    expect(sf.pendingProxies?.[0]?.failed?.code).toBe("LOCATION_MISMATCH");
+  });
+
+  it("locationMetadata keep: the photo is stored, no proxy is needed", async () => {
     const p = await project(gov("keep"), true);
     const tif = join(files, "IMG_0003.tif");
     await buildCameraTiff(tif);
     const [r] = await attach.attachFiles(p.id, [tif]);
     // No title or creator in the photo: stored, and queued for review.
     expect(["created", "needs-review"]).toContain(r!.outcome);
+    expect(r!.note).toBeUndefined();
     const sf = await repo.getSource(p.id, r!.sourceId!);
     expect(sf.assets[0]!.encrypted).toBe(true);
+    expect(sf.pendingProxies ?? []).toEqual([]);
   });
 });
 
@@ -764,14 +842,19 @@ processing:
     );
     const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
     setExifReaderForTests(() => Promise.reject(new Error("spawn exiftool ENOENT")));
+    let created: string | undefined;
     try {
       const png = await put("photo.png", tinyPng());
-      expect(await attach.attachFiles(p.id, [png])).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
-      expect(await attach.attachFiles(p.id, [png], { toSourceId: made!.sourceId! })).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
+      const [r] = await attach.attachFiles(p.id, [png]);
+      expect(r).toMatchObject({ note: LOCATION_REASON });
+      created = r!.sourceId;
+      expect(await attach.attachFiles(p.id, [await put("photo2.png", tinyPng())], { toSourceId: made!.sourceId! })).toMatchObject([{ outcome: "attached", note: LOCATION_REASON }]);
     } finally {
       setExifReaderForTests(undefined);
     }
-    expect(repo.listSourceIds(p.id)).toEqual([made!.sourceId]);
+    // Stored (the decision allows it), with location-safe proxies pending (coarsen).
+    expect((await repo.getSource(p.id, created!)).pendingProxies?.map((j) => j.location)).toEqual(["coarsen"]);
+    expect((await repo.getSource(p.id, made!.sourceId!)).pendingProxies?.map((j) => j.location)).toEqual(["coarsen"]);
   });
 
   it("I3: audio and video types outside the list are accepted by MIME prefix (oga, mts)", async () => {
@@ -905,19 +988,22 @@ processing:
     expect((await attach.attachFiles(p.id, [other]))[0]).toMatchObject({ outcome: "duplicate", sourceId: first!.sourceId });
   });
 
-  it("I-2: an exiftool result carrying an Error counts as unreadable: a PNG is refused in a coarsen project (library and source)", async () => {
+  it("I-2: an exiftool result carrying an Error counts as unreadable: a PNG gets a coarsened proxy pending in a coarsen project (library and source)", async () => {
     const p = await project(COARSEN, true);
     const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
     setExifReaderForTests(() => Promise.resolve({ Error: "File format error", errors: ["File format error"] }));
+    let created: string | undefined;
     try {
       const png = await put("photo.png", tinyPng());
-      expect(await attach.attachFiles(p.id, [png])).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
-      expect(await attach.attachFiles(p.id, [png], { toSourceId: made!.sourceId! })).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
+      const [r] = await attach.attachFiles(p.id, [png]);
+      expect(r).toMatchObject({ note: LOCATION_REASON });
+      created = r!.sourceId;
+      expect(await attach.attachFiles(p.id, [await put("photo2.png", tinyPng())], { toSourceId: made!.sourceId! })).toMatchObject([{ outcome: "attached", note: LOCATION_REASON }]);
     } finally {
       setExifReaderForTests(undefined);
     }
-    expect(repo.listSourceIds(p.id)).toEqual([made!.sourceId]);
-    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(1);
+    expect((await repo.getSource(p.id, created!)).pendingProxies).toHaveLength(1);
+    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(2);
   });
 
   it("I-2: errors alone count too; warnings alone do not", async () => {
@@ -931,22 +1017,21 @@ processing:
     }
   });
 
-  it("audio is checked for location like images and video: GPS or an unreadable file is refused (library and source)", async () => {
+  it("audio is checked for location like images and video: stored under the location condition (encrypted), no proxy (audio has none)", async () => {
     const p = await project(COARSEN, true);
-    const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
     const memo = await put("memo.bin", oggBytes());
     try {
       setExifReaderForTests(() => Promise.resolve({ GPSLatitude: 51.5, GPSLongitude: -0.12 }));
-      expect(await attach.attachFiles(p.id, [memo])).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
-      expect(await attach.attachFiles(p.id, [memo], { toSourceId: made!.sourceId! })).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
-      setExifReaderForTests(() => Promise.reject(new Error("exiftool timed out")));
-      expect(await attach.attachFiles(p.id, [memo])).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
-      expect(await attach.attachFiles(p.id, [memo], { toSourceId: made!.sourceId! })).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
+      const [r] = await attach.attachFiles(p.id, [memo]);
+      expect(r!.note).toBeUndefined();
+      const sf = await repo.getSource(p.id, r!.sourceId!);
+      expect(sf.assets[0]!.encrypted).toBe(true);
+      expect(sf.pendingProxies ?? []).toEqual([]);
+      const store = (await auditEvents(p.folder)).find((e) => e.action === "store" && e.entity?.id === sf.source.id)!;
+      expect(store.decision?.conditions).toContainEqual({ type: "location", mode: "coarsen" });
     } finally {
       setExifReaderForTests(undefined);
     }
-    expect(repo.listSourceIds(p.id)).toEqual([made!.sourceId]);
-    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(1);
     expect(mayHaveLocation("audio/mp4", { media: { readFailed: true } })).toBe(true);
   });
 

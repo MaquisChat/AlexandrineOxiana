@@ -1,4 +1,3 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,6 +14,7 @@ import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { projectDataKey } from "./repo/repo.js";
 import { openTestRepo } from "./repo/testing.js";
 import { WorkerJobError, WorkerUnavailableError, WorkerClient, startWorker, type WorkerHandle } from "./worker-client.js";
+import { stubWorker as sharedStubWorker } from "./worker-testing.js";
 
 const FAST = 2 ** 10;
 const TOKEN = "stub-token-0123456789";
@@ -48,65 +48,9 @@ function deps(): Deps {
   };
 }
 
-interface StubJob {
-  id: string;
-  body: { type: string; input: string; output: string; params: Record<string, unknown> };
-  polls: number;
-  final: Record<string, unknown>;
-  cancelled: boolean;
-}
-
-/** In-process stand-in for the Python worker's HTTP API. `onSubmit` plays the job and returns its final state. */
-async function stubWorker(
-  onSubmit: (job: StubJob) => Promise<Record<string, unknown>> | Record<string, unknown>,
-  opts: { pollsUntilDone?: number; failPolls?: number } = {},
-) {
-  const jobs = new Map<string, StubJob>();
-  let failPolls = opts.failPolls ?? 0;
-  const requests: string[] = [];
-  let n = 0;
-  const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const send = (status: number, body: unknown) => {
-      res.writeHead(status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(body));
-    };
-    requests.push(`${req.method} ${req.url}`);
-    if (req.method === "GET" && failPolls > 0) {
-      failPolls--;
-      req.socket.destroy(); // the connection drops: the client sees a network error
-      return;
-    }
-    if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: { code: "UNAUTHORIZED", message: "no" } });
-    const chunks: Buffer[] = [];
-    for await (const c of req) chunks.push(c as Buffer);
-    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
-    if (req.method === "POST" && req.url === "/jobs") {
-      const job: StubJob = { id: `j${++n}`, body, polls: 0, final: {}, cancelled: false };
-      try {
-        job.final = await onSubmit(job);
-      } catch (err) {
-        job.final = { status: "failed", error: { code: "STUB_ASSERTION", message: String(err) } };
-      }
-      jobs.set(job.id, job);
-      return send(202, { id: job.id });
-    }
-    const m = /^\/jobs\/([^/]+)(\/cancel)?$/.exec(req.url ?? "");
-    const job = m ? jobs.get(m[1]!) : undefined;
-    if (!job) return send(404, { error: { code: "NOT_FOUND", message: "no" } });
-    if (m![2]) {
-      job.cancelled = true;
-      return send(202, { id: job.id, type: job.body.type, status: "running", progress: 0.5 });
-    }
-    job.polls++;
-    if (job.cancelled) return send(200, { id: job.id, type: job.body.type, status: "cancelled", progress: 0.5 });
-    if (job.polls < (opts.pollsUntilDone ?? 2)) return send(200, { id: job.id, type: job.body.type, status: "running", progress: 0.5 });
-    return send(200, { id: job.id, type: job.body.type, progress: 1, ...job.final });
-  });
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const port = (server.address() as { port: number }).port;
-  closers.push(() => new Promise<void>((r) => server.close(() => r())));
-  return { baseUrl: `http://127.0.0.1:${port}`, token: TOKEN, jobs, requests };
-}
+/** In-process stand-in for the Python worker's HTTP API (shared with other suites: worker-testing.ts). */
+const stubWorker = (onSubmit: Parameters<typeof sharedStubWorker>[0], opts: Parameters<typeof sharedStubWorker>[1] = {}) =>
+  sharedStubWorker(onSubmit, { ...opts, token: TOKEN, closers });
 
 async function auditEvents(projectFolder: string): Promise<AuditEvent[]> {
   const dir = join(lib.root, projectFolder, "audit");

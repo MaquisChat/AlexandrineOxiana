@@ -1,6 +1,6 @@
 /**
- * Rules shared by drag-and-drop attach and Bulk Import (package-internal): the location refusal
- * (R56), the legal-basis category of user files, duplicate keys, the review entry of a resolved
+ * Rules shared by drag-and-drop attach and Bulk Import (package-internal): the location note
+ * (R83), the legal-basis category of user files, duplicate keys, the review entry of a resolved
  * item and the item's provenance. Both callers create, merge and queue items under these rules.
  */
 import { createHash } from "node:crypto";
@@ -10,13 +10,34 @@ import type { ReviewInput } from "../repo/review.js";
 import { projectPolicy, type Repo } from "../repo/repo.js";
 import { AUTO_ACCEPT_THRESHOLD, type Resolution } from "./resolve.js";
 
-/** R56: until GPS coarsening/stripping exists (Task 27), media whose store needs it are refused. */
+/**
+ * R83 (replaces the R56 refusal): media whose store carries a location condition are stored as the
+ * decision allows, and their viewing proxies are made with the location coarsened or removed. Only
+ * when no media worker is configured at all can those proxies not be queued: the original is still
+ * stored, the source is "proxy pending" (the jobs are kept in its source.json and run once a worker
+ * is available), and the outcome carries this note.
+ */
 export const LOCATION_REASON =
-  "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
+  "This file contains location data. It was stored as this project's rules allow; its viewing copy, with the location coarsened or removed, will be made once the media helper is available.";
 
-/** Refuse hook: an allowed `store` carrying a location condition cannot be honoured yet (R56). */
-export const refuseLocation = (d: PolicyDecision, req: PolicyRequest): string | undefined =>
-  req.action === "store" && d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "location") ? LOCATION_REASON : undefined;
+export type LocationMode = "keep" | "coarsen" | "strip";
+
+/**
+ * Watches the `store` decisions of one governed change for a location condition (R83): the hook
+ * never refuses; `mode()` is the condition's mode once the change was decided (undefined: none).
+ */
+export function locationRule(): { hook: (d: PolicyDecision, req: PolicyRequest) => string | undefined; mode: () => LocationMode | undefined } {
+  let mode: LocationMode | undefined;
+  return {
+    hook: (d, req) => {
+      if (req.action === "store" && d.result === "allow_with_conditions") {
+        for (const c of d.conditions) if (c.type === "location") mode = c.mode;
+      }
+      return undefined;
+    },
+    mode: () => mode,
+  };
+}
 
 /** The `consent.defaultLegalBasis` category of files from the user's own disk (docs/governance/README.md). */
 export const MANUAL_UPLOAD_CATEGORY = "manual-upload";

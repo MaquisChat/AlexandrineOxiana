@@ -5,10 +5,15 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MockAgent } from "undici";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { ExifTool } from "exiftool-vendored";
 import type { AuditEvent, Project, SourceDraft } from "@ao/core";
 import { FIXTURE_DOI, buildCameraTiff, buildImportFolder, buildPdf, buildZip, type ImportFolderFixture } from "../../../../../tests/fixtures/generate.mjs";
 import { LOCATION_REASON, createAttach } from "../attach.js";
+import { ProxyQueue } from "../proxies.js";
+import { gpsOf, proxyStub } from "../proxy-testing.js";
+import { WorkerClient } from "../../worker-client.js";
+import { stubWorker } from "../../worker-testing.js";
 import { KeyRing } from "../../crypto/keys.js";
 import type { Deps } from "../../deps.js";
 import { shutdownExtractors } from "../../extract/index.js";
@@ -689,29 +694,84 @@ describe("groups (R62)", () => {
   });
 });
 
-describe("location rule (R56)", () => {
-  it("a photo with GPS in a project that must coarsen location fails with LOCATION_REASON; the batch goes on", async () => {
-    const gov = `identifiability:
+describe("location rule (R83)", () => {
+  const gov = (atRest: string) => `identifiability:
   containsIdentifiable: false
 encryption:
-  atRest: required
+  atRest: ${atRest}
 sharing:
   locationMetadata: coarsen
 captureMethods: [manual_upload]
 processing:
   metadata_lookup: []
 `;
-    const p = await project(gov, true);
+  let et: ExifTool;
+  const closers: Array<() => Promise<void> | void> = [];
+  beforeAll(() => {
+    et = new ExifTool({ maxProcs: 1 });
+  });
+  afterAll(async () => {
+    await et.end();
+  });
+  afterEach(async () => {
+    for (const c of closers.splice(0)) await c();
+  });
+
+  async function photos(): Promise<string> {
     const src = join(tmp, "photos");
     await mkdir(src);
     await buildCameraTiff(join(src, "IMG_0001.tif"));
     await copyFile(fx.generated[3]!, join(src, "paper.pdf"));
-    const { handle: h, result } = await run(p, folderAdapter(src));
-    expect(result.counts.failed).toBe(1);
-    expect(result.counts.created + result.counts.needsReview).toBe(1);
+    return src;
+  }
+
+  it("a photo with GPS in a coarsen project is stored encrypted with its GPS and gets a coarsened proxy (re-read); the batch goes on", async () => {
+    const w = await stubWorker(proxyStub(et), { closers, pollsUntilDone: 1 });
+    const proxies = new ProxyQueue({ repo, worker: new WorkerClient({ repo, worker: w, pollMs: 5 }) });
+    const withProxies = createBulkImport({ repo, http, index: handle, proxies });
+    const p = await project(gov("required"), true);
+    const h = await withProxies.startBatch(p.id, folderAdapter(await photos()));
+    const result = await h.done;
+    await proxies.idle();
+    expect(result.counts.failed).toBe(0);
+    expect(result.counts.created + result.counts.needsReview).toBe(2);
+    const photo = (await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)))).find((s) => s.assets.some((a) => a.kind === "image"))!;
+    const original = photo.assets.find((a) => a.role === "original")!;
+    expect(original.encrypted).toBe(true);
+    const k = projectDataKey(repo, p.id)!;
+    const plain = async (rel: string) => {
+      const out = join(tmp, `plain-${Math.random().toString(36).slice(2)}.${rel.replace(/\.enc$/u, "").split(".").pop()}`);
+      await writeFile(out, await decryptBytes((id) => (id === k.keyId ? k.key : undefined), await readFile(join(lib.root, ...rel.split("/")))));
+      return out;
+    };
+    expect(await gpsOf(et, await plain(original.path))).toEqual({ lat: 40.6892, lon: -74.0445 });
+    const proxy = photo.assets.find((a) => a.role === "derived")!;
+    expect(proxy).toMatchObject({ kind: "proxy", derivation: { operation: "image.proxy", parents: [original.id], params: { location: "coarsen" } } });
+    expect(await gpsOf(et, await plain(proxy.path))).toEqual({ lat: 40.7, lon: -74 });
+    const report = await withProxies.batchReport(p.id, h.batchId);
+    expect(report.failures).toEqual([]);
+    expect(report.notes).not.toContain(LOCATION_REASON);
+  });
+
+  it("no media worker: the photo is stored and flagged proxy pending (LOCATION_REASON in the report)", async () => {
+    const p = await project(gov("required"), true);
+    const h = await bulk.startBatch(p.id, folderAdapter(await photos()));
+    const result = await h.done;
+    expect(result.counts.failed).toBe(0);
     const report = await bulk.batchReport(p.id, h.batchId);
-    expect(report.failures).toEqual([{ item: "IMG_0001.tif", reason: LOCATION_REASON }]);
-    expect(report.governance.some((g) => g.result === "deny" && g.reason === LOCATION_REASON && g.items === 1)).toBe(true);
+    expect(report.notes).toContain(LOCATION_REASON);
+    expect(report.fileNotes).toContainEqual({ item: "IMG_0001.tif", note: LOCATION_REASON });
+    const photo = (await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)))).find((s) => s.assets.some((a) => a.kind === "image"))!;
+    expect(photo.pendingProxies?.map((j) => [j.type, j.location])).toEqual([["image.proxy", "coarsen"]]);
+  });
+
+  it("encryption off + coarsen: the store is denied with the engine's reason; the batch goes on", async () => {
+    const p = await project(gov("off"), false);
+    const h = await bulk.startBatch(p.id, folderAdapter(await photos()));
+    const result = await h.done;
+    expect(result.counts.failed).toBe(1);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.failures).toEqual([{ item: "IMG_0001.tif", reason: "Location data requires encryption or locationMetadata: keep" }]);
   });
 });
 

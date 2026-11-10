@@ -18,6 +18,7 @@ import { openTestRepo } from "../repo/testing.js";
 import { SECRET_STORE_UNAVAILABLE, getSecret, setSecret } from "../secrets.js";
 import { useMemorySecrets, useNoSecretStore } from "../secrets-testing.js";
 import { BatchRefusedError, createBulkImport, type ScanContext, type ScanItem } from "./bulk/index.js";
+import { LOCATION_REASON } from "./common.js";
 import {
   ZOTERO_STORAGE_HOSTS,
   ZOTERO_WEB_FILE_NOTES,
@@ -716,8 +717,38 @@ processing:
     expect(first.source.title.variants[0]!.value).toBe("First title, revised");
   });
 
-  it("since is recorded only when nothing failed: a failed item or a failed download leaves it unchanged", async () => {
+  /** A Zotero item with a located camera photo attached (GPS 40.6892, -74.0445). */
+  async function serveLocatedPhoto(key: string, attKey: string, version: number): Promise<void> {
+    const tiffPath = join(tmp, `camera-${key}.tif`);
+    await buildCameraTiff(tiffPath);
+    serveItems(
+      [
+        article(key, "Located photo"),
+        { key: attKey, version: 5, data: { key: attKey, version: 5, itemType: "attachment", parentItem: key, linkMode: "imported_file", contentType: "image/tiff", filename: "c.tif", tags: [] } },
+      ],
+      version,
+    );
+    serveCollections([]);
+    serveTagColors();
+    agent.get(API).intercept({ path: `/users/42/items/${attKey}/file`, method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/${attKey}` } });
+    agent.get(STORAGE).intercept({ path: `/${attKey}`, method: "GET" }).reply(200, await readFile(tiffPath));
+  }
+
+  it("R83: a located photo goes through the shared location flow: stored as the decision allows, its coarsened proxy pending (no worker)", async () => {
     const p = await project();
+    await serveLocatedPhoto("LOCPHOT1", "LOCATT01", 40);
+    const h = await startZoteroWebImport(bulkDeps(), p.id, web);
+    const r = await h.done;
+    expect(r.counts.failed).toBe(0);
+    const sf = (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === "LOCPHOT1")!;
+    const photo = sf.assets.find((a) => a.kind === "image")!;
+    expect(sf.pendingProxies?.map((j) => [j.type, j.location, j.assetId])).toEqual([["image.proxy", "coarsen", photo.id]]);
+    expect((await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId)).notes).toContain(LOCATION_REASON);
+  });
+
+  it("since is recorded only when nothing failed: a failed item or a failed download leaves it unchanged", async () => {
+    // Location data the project requires to be coarsened, with encryption off: the engine denies the store.
+    const p = await project(GOV.replace("atRest: optional", "atRest: \"off\""));
     const tiffPath = join(tmp, "camera.tif");
     await buildCameraTiff(tiffPath);
     const tiff = await readFile(tiffPath);
@@ -732,7 +763,6 @@ processing:
     serveTagColors();
     agent.get(API).intercept({ path: "/users/42/items/FAILATT1/file", method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/c` } });
     agent.get(STORAGE).intercept({ path: "/c", method: "GET" }).reply(200, tiff);
-    // Location data the project requires to be coarsened: the item fails (R56).
     const r = await (await startZoteroWebImport(bulkDeps(), p.id, web)).done;
     expect(r.state).toBe("finished");
     expect(r.counts.failed).toBe(1);
