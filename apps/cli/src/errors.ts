@@ -35,6 +35,11 @@ export class ExitError extends Error {
 
 /** Turns anything thrown into the message, hint and exit code the researcher sees. */
 export function describeError(err: unknown): { message: string; hint?: string; code: number } {
+  const d = describeRaw(err);
+  return { ...d, message: scrubPaths(d.message), ...(d.hint ? { hint: scrubPaths(d.hint) } : {}) };
+}
+
+function describeRaw(err: unknown): { message: string; hint?: string; code: number } {
   if (err instanceof ExitError) return { message: err.message, ...(err.hint ? { hint: err.hint } : {}), code: err.code };
   if (err instanceof PolicyDeniedError) return { message: `This project's rules do not allow that: ${err.reason}`, code: EXIT.denied };
   if (err instanceof GovernanceViolationError) return { message: err.message, code: EXIT.denied };
@@ -50,4 +55,22 @@ export function describeError(err: unknown): { message: string; hint?: string; c
   }
   const message = err instanceof Error ? err.message : String(err);
   return { message, code: EXIT.failure };
+}
+
+const roots = new Set<string>();
+/** Remembers a library folder so messages can show paths relative to it. */
+export function rememberRoot(root: string): void {
+  roots.add(root);
+}
+
+/** Makes an error message safe to print: no absolute paths (library-relative when inside a library, else `<path>`). */
+export function scrubPaths(text: string): string {
+  let out = text;
+  for (const r of [...roots].sort((a, b) => b.length - a.length)) {
+    const esc = r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`${esc}[\\\\/]`, "g"), "").replace(new RegExp(esc, "g"), "<library>");
+  }
+  out = out.replace(/[A-Za-z]:\\[^\s"'),;]+/g, "<path>");
+  out = out.replace(/(?<![\w.:])\/[\w.@~-]+(?:\/[\w.@~-]+)+/g, "<path>");
+  return out;
 }

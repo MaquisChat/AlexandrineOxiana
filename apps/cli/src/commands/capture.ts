@@ -2,9 +2,8 @@ import type { Command } from "commander";
 import { createLinkCapture, type ProfileContentType } from "@ao/library";
 import { EXIT, ExitError } from "../errors.js";
 import { itemLines, profileLines } from "../output.js";
-import { ensureCookieAcknowledgement, exitForItems, LEGAL_BASIS_HINT, parseBrowser, viewOf, withProject } from "./common.js";
+import { ensureCookieAcknowledgement, exitForItems, LEGAL_BASIS_HINT, parseBrowser, parseModel, viewOf, withProject } from "./common.js";
 
-const MODELS = ["large-v3", "medium", "small"];
 const TYPES: ProfileContentType[] = ["posts", "reels", "videos", "shorts", "highlights"];
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -14,10 +13,10 @@ function day(name: string, v: unknown): string | undefined {
   return String(v);
 }
 
-function model(v: unknown): string | undefined {
-  if (v === undefined) return undefined;
-  if (!MODELS.includes(String(v))) throw new ExitError(`"${String(v)}" is not a transcription model.`, EXIT.failure, `Choose one of: ${MODELS.join(", ")}`);
-  return String(v);
+/** Rate-limit waits are 60/120/240 s; AO_RATE_LIMIT_WAIT_MS shortens them (for scripts and tests). */
+function waitOverride(): { sleep: (ms: number) => Promise<void> } | undefined {
+  const ms = Number(process.env.AO_RATE_LIMIT_WAIT_MS);
+  return Number.isFinite(ms) && ms >= 0 && process.env.AO_RATE_LIMIT_WAIT_MS ? { sleep: () => new Promise((r) => setTimeout(r, ms)) } : undefined;
 }
 
 export function registerCapture(program: Command): void {
@@ -28,6 +27,7 @@ export function registerCapture(program: Command): void {
     .requiredOption("--project <name>", "the project to save into")
     .option("--cookies-from-browser <browser>", "use your signed-in browser session (chrome, firefox, safari, edge, brave)")
     .option("--acknowledge-cookies", "confirm, without being asked, the one-time notice about using your browser session")
+    .option("--transcribe", "make a transcript (default: as the project is set up; off unless it turns it on)")
     .option("--no-transcribe", "do not make a transcript")
     .option("--model <name>", "transcription model: large-v3, medium or small")
     .option("--refresh", "for a link already saved, add a new dated copy of the platform's data")
@@ -35,15 +35,15 @@ export function registerCapture(program: Command): void {
     .action(async (urls: string[], _o, cmd: Command) => {
       await withProject(cmd, true, async (s, project, out, o) => {
         const browser = parseBrowser(o.cookiesFromBrowser);
-        const transcribeModel = model(o.model);
+        const transcribeModel = parseModel(o.model);
         await ensureCookieAcknowledgement(s, project, browser, o.acknowledgeCookies === true);
         const worker = await s.needWorker();
-        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}) });
+        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}), ...waitOverride() });
         const outcomes = await capture.captureUrls(
           project.id,
           urls,
           {
-            transcribe: o.transcribe !== false,
+            transcribe: o.transcribe === undefined ? "project-default" : o.transcribe === true,
             ...(transcribeModel ? { transcribeModel } : {}),
             ...(browser ? { cookiesFromBrowser: browser } : {}),
             ...(o.refresh ? { refreshIfExists: true } : {}),
@@ -77,12 +77,14 @@ export function registerCapture(program: Command): void {
     .option("--metadata-only", "save the posts' data without their media")
     .option("--comments", "also save comments (they are other people's personal data)")
     .option("--transcribe", "also make transcripts of videos")
+    .option("--model <name>", "transcription model: large-v3, medium or small")
     .option("--cookies-from-browser <browser>", "use your signed-in browser session")
     .option("--acknowledge-cookies", "confirm, without being asked, the one-time notice about using your browser session")
     .option("--legal-basis <text>", "the legal basis for saving this social-media data")
     .action(async (url: string, _o, cmd: Command) => {
       await withProject(cmd, true, async (s, project, out, o) => {
         const browser = parseBrowser(o.cookiesFromBrowser);
+        const transcribeModel = parseModel(o.model);
         const since = day("--since", o.since);
         const until = day("--until", o.until);
         let maxItems: number | undefined;
@@ -98,13 +100,14 @@ export function registerCapture(program: Command): void {
         }
         await ensureCookieAcknowledgement(s, project, browser, o.acknowledgeCookies === true);
         const worker = await s.needWorker();
-        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}) });
+        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}), ...waitOverride() });
         const tty = Boolean(process.stderr.isTTY);
         const report = await capture.captureProfile(
           project.id,
           url,
           {
             transcribe: o.transcribe === true,
+            ...(transcribeModel ? { transcribeModel } : {}),
             ...(browser ? { cookiesFromBrowser: browser } : {}),
             ...(o.legalBasis ? { legalBasis: String(o.legalBasis) } : {}),
             ...(since ? { since } : {}),
@@ -136,6 +139,8 @@ export function registerCapture(program: Command): void {
           else if (report.errorCode === "POLICY_DENIED") code = EXIT.denied;
           else if (code === EXIT.ok) code = EXIT.failure;
         }
+        // A run paused by the platform's rate limit needs the researcher to run it again later.
+        if (report.status === "paused-rate-limited" && code !== EXIT.denied) code = EXIT.needsAction;
         process.exitCode = code;
       });
     });

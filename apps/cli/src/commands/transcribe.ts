@@ -1,9 +1,8 @@
-import { basename, join } from "node:path";
 import type { Command } from "commander";
-import { PolicyDeniedError } from "@ao/library";
+import { NoMediaError, PolicyDeniedError, WorkerJobError, WorkerUnavailableError, createLinkCapture } from "@ao/library";
 import { EXIT, ExitError } from "../errors.js";
 import { folderLabel } from "../output.js";
-import { withProject } from "./common.js";
+import { parseLanguage, parseModel, withProject } from "./common.js";
 import { resolveSource } from "./sources.js";
 
 export function registerTranscribe(program: Command): void {
@@ -16,63 +15,24 @@ export function registerTranscribe(program: Command): void {
     .option("--language <code>", "spoken language: auto (default) or a code such as en")
     .action(async (ref: string, _o: unknown, cmd: Command) => {
       await withProject(cmd, true, async (s, project, out, o) => {
+        const model = parseModel(o.model);
+        const language = parseLanguage(o.language);
         const sf = await resolveSource(s.repo, project.id, ref);
-        const media = sf.assets.find((a) => a.role === "original" && (a.kind === "video" || a.kind === "audio"));
-        if (!media) throw new ExitError("This source has no video or audio file to transcribe.");
-        const model = o.model ? String(o.model) : undefined;
-        const language = o.language ? String(o.language) : "auto";
         const worker = await s.needWorker();
-        const work = join(s.lib.root, ".tmp", `transcribe-${Date.now()}`);
+        const capture = createLinkCapture({ repo: s.repo, worker: worker.client, ...(s.index ? { index: s.index } : {}) });
+        out.progress("Transcribing (this can take a while)...");
         let r;
         try {
-          out.progress("Transcribing (this can take a while)...");
-          r = await worker.client.submit(project.id, {
-            type: "audio.transcribe",
-            input: join(s.lib.root, ...media.path.split("/")),
-            inputEncrypted: media.encrypted,
-            output: work,
-            params: { ...(model ? { model } : {}), ...(language !== "auto" ? { language } : {}) },
-            entity: { type: "asset", id: media.id },
-          });
+          r = await capture.transcribeSource(project.id, sf.source.id, { ...(model ? { model } : {}), ...(language ? { language } : {}) });
         } catch (err) {
-          if (err instanceof PolicyDeniedError) throw err;
-          const code = (err as { code?: string }).code;
-          throw new ExitError(code === "CANCELLED" ? "Cancelled. Nothing was saved." : "The transcript could not be made.", EXIT.failure, err instanceof Error ? err.message : undefined);
+          if (err instanceof PolicyDeniedError || err instanceof WorkerUnavailableError) throw err;
+          if (err instanceof NoMediaError) throw new ExitError(err.message, EXIT.failure);
+          if (err instanceof WorkerJobError && err.code === "CANCELLED") throw new ExitError("Cancelled. Nothing was saved.", EXIT.failure);
+          throw new ExitError("The transcript could not be made.", EXIT.failure, err instanceof Error ? err.message : undefined);
         }
-        const used = typeof r.meta.model === "string" ? r.meta.model : (model ?? "whisper");
-        const langs = Array.isArray(r.meta.detectedLanguages) ? r.meta.detectedLanguages.filter((l): l is string => typeof l === "string") : [];
-        const lang = langs.length === 1 ? langs[0]! : langs.length > 1 ? "mul" : "und";
-        const flagged = typeof r.meta.flaggedCount === "number" ? r.meta.flaggedCount : undefined;
-        const at = new Date().toISOString();
-        const saved: string[] = [];
-        for (const ext of ["vtt", "json"]) {
-          const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
-          if (!file) continue;
-          const asset = await s.repo.addDerivedAsset(project.id, sf.source.id, {
-            fromPath: file,
-            kind: "transcript",
-            lang,
-            tool: `whisper-${used}`,
-            ext,
-            ...(r.encrypted ? { fromEncrypted: true } : {}),
-            ...(flagged !== undefined ? { metadata: { flaggedSegments: flagged } } : {}),
-            derivation: {
-              parents: [media.id],
-              operation: "transcribe",
-              provider: "faster-whisper",
-              model: used,
-              ranAt: "local",
-              params: { model: used, detectedLanguages: langs, language },
-              at,
-              triggeredBy: "cli",
-            },
-          });
-          saved.push(asset.path);
-        }
-        const label = folderLabel(sf.source.folder);
-        out.data({ sourceId: sf.source.id, folder: sf.source.folder, files: saved, flaggedSegments: flagged ?? 0 });
-        out.line(`transcribed  ${label}  →  ${sf.source.folder}`);
-        if (flagged) out.line(`${" ".repeat(13)}${flagged} passage(s) were flagged as possibly wrong; check them against the audio.`);
+        out.data({ sourceId: r.sourceId, folder: r.folder, files: r.files, flaggedSegments: r.flaggedSegments });
+        out.line(`transcribed  ${folderLabel(r.folder)}  →  ${r.folder}`);
+        if (r.flaggedSegments) out.line(`${" ".repeat(13)}${r.flaggedSegments} passage(s) were flagged as possibly wrong; check them against the audio.`);
       });
     });
 }

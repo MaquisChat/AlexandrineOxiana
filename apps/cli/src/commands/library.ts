@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import type { Command } from "commander";
 import { createLibrary, openLibrary } from "@ao/library";
+import { rememberRoot } from "../errors.js";
 import { createOut } from "../output.js";
 import { makeDeps, readOnlyText, resolveUserPath } from "../session.js";
 import type { GlobalOpts } from "./common.js";
@@ -16,6 +17,7 @@ export function registerLibrary(program: Command): void {
     .action(async (path: string, o: { name?: string }, cmd: Command) => {
       const out = createOut((cmd.optsWithGlobals() as GlobalOpts).json === true);
       const root = resolveUserPath(path);
+      rememberRoot(root);
       const library = await createLibrary(root, o.name ?? basename(root), makeDeps());
       try {
         out.data({ libraryId: library.id, name: library.name, mode: library.mode });
@@ -32,7 +34,9 @@ export function registerLibrary(program: Command): void {
     .argument("<path>", "the library's folder")
     .action(async (path: string, _o: unknown, cmd: Command) => {
       const out = createOut((cmd.optsWithGlobals() as GlobalOpts).json === true);
-      const library = await openLibrary(resolveUserPath(path), makeDeps());
+      const root = resolveUserPath(path);
+      rememberRoot(root);
+      const library = await openLibrary(root, makeDeps());
       try {
         const reason = library.readOnlyReason;
         out.data({ libraryId: library.id, name: library.name, mode: library.mode, ...(reason ? { readOnlyReason: reason, readOnlyExplanation: readOnlyText(reason) } : {}) });

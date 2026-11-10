@@ -15,8 +15,8 @@ import {
   type Library,
   type Repo,
 } from "@ao/library";
-import { EXIT, ExitError } from "./errors.js";
-import { isInteractive, readPassphrase } from "./prompt.js";
+import { EXIT, ExitError, rememberRoot } from "./errors.js";
+import { hasEnvPassphrase, isInteractive, readPassphrase } from "./prompt.js";
 import { startCaptureWorker, type CaptureWorker } from "./worker.js";
 
 /** Where a path the researcher typed is relative to: the folder the command was run from. */
@@ -120,6 +120,7 @@ export interface OpenSessionOptions {
 export async function openSession(opts: OpenSessionOptions): Promise<Session> {
   const deps = makeDeps();
   const root = await locateLibrary(opts.library, deps);
+  rememberRoot(root);
   const lib = await openLibrary(root, deps);
   if (opts.write && lib.mode === "read-only") {
     const reason = readOnlyText(lib.readOnlyReason);
@@ -140,7 +141,7 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
     await lib.close();
     throw err;
   }
-  let closed = false;
+  let closing: Promise<void> | undefined;
   const session: Session = {
     deps,
     lib,
@@ -151,18 +152,21 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
       session.worker ??= await startCaptureWorker({ repo, index });
       return session.worker;
     },
-    async close() {
-      if (closed) return;
-      closed = true;
-      open.delete(session);
-      await session.worker?.stop().catch(() => {});
-      try {
-        index?.close();
-      } catch {
-        // already closed
-      }
-      ring.clear();
-      await lib.close().catch(() => {});
+    // One shared promise: the Ctrl+C handler and the command's own `finally` both wait for the
+    // same shutdown, so the lock is released before the process exits whichever gets there first.
+    close() {
+      closing ??= (async () => {
+        open.delete(session);
+        await session.worker?.stop().catch(() => {});
+        try {
+          index?.close();
+        } catch {
+          // already closed
+        }
+        ring.clear();
+        await lib.close().catch(() => {});
+      })();
+      return closing;
     },
   };
   open.add(session);
@@ -196,7 +200,7 @@ const projectHint = (projects: Project[]): string =>
 /** Unlocks an encrypted project: AO_PASSPHRASE, or typed (hidden) in a terminal. */
 export async function unlockIfNeeded(repo: Repo, project: Project): Promise<void> {
   if (!project.encryption.enabled || repo.isUnlocked(project.id)) return;
-  const attempts = isInteractive() && !process.env.AO_PASSPHRASE ? 3 : 1;
+  const attempts = isInteractive() && !hasEnvPassphrase() ? 3 : 1;
   for (let i = 0; i < attempts; i++) {
     const pass = await readPassphrase(`Passphrase for project "${project.name}": `, false);
     if (pass === null) {

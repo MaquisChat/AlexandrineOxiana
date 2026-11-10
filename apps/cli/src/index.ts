@@ -30,6 +30,7 @@ export function buildProgram(): Command {
 }
 
 let shuttingDown = false;
+export const isShuttingDown = (): boolean => shuttingDown;
 
 /** Ctrl+C: stop the worker (which stops its running downloads), close the index, release the library. */
 function installSignalHandlers(): void {
@@ -50,8 +51,10 @@ export async function run(argv: string[]): Promise<number> {
   const program = buildProgram();
   try {
     await program.parseAsync(args, { from: "user" });
+    if (shuttingDown) return 130;
     return typeof process.exitCode === "number" ? process.exitCode : EXIT.ok;
   } catch (err) {
+    if (shuttingDown) return 130; // Ctrl+C: whatever the interrupted command reported is not the story
     const code = (err as { code?: string }).code;
     if (typeof code === "string" && code.startsWith("commander.")) {
       return code === "commander.helpDisplayed" || code === "commander.version" || code === "commander.help" ? EXIT.ok : EXIT.failure;

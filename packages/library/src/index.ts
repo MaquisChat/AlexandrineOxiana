@@ -128,6 +128,6 @@ export { classifyUrl } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
 export { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, incompleteReason, plainReason } from "./capture/errors.js";
 export { stripSnapshot } from "./capture/snapshot.js";
-export { createLinkCapture } from "./capture/link-capture.js";
-export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps } from "./capture/link-capture.js";
+export { NoMediaError, createLinkCapture } from "./capture/link-capture.js";
+export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps, TranscribeSourceResult } from "./capture/link-capture.js";
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";

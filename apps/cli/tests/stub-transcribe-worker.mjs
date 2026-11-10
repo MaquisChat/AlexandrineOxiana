@@ -10,6 +10,8 @@ const token = process.env.AO_WORKER_TOKEN;
 const jobs = new Map();
 let n = 0;
 
+if (process.env.AO_TEST_ENV_DUMP) writeFileSync(process.env.AO_TEST_ENV_DUMP, JSON.stringify(Object.keys(process.env)));
+
 const server = createServer((req, res) => {
   const send = (status, body) => {
     res.writeHead(status, { "Content-Type": "application/json" });
@@ -19,6 +21,7 @@ const server = createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
+    if (req.method === "GET" && req.url === "/health") return send(200, { ok: true, versions: { yt_dlp: null } });
     if (req.method === "POST" && req.url === "/jobs") {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const id = `j${++n}`;

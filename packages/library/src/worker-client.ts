@@ -446,12 +446,14 @@ const WORKER_ENV_NAMES = new Set([
   "TESSDATA_PREFIX",
 ]);
 const WORKER_ENV_PREFIXES = ["LC_", "XDG_", "AO_"];
+// Secrets of the app that the worker (and the tools it runs) must never see.
+const WORKER_ENV_DENY = new Set(["AO_WORKER_TOKEN", "AO_PASSPHRASE"]);
 
 /** The allowlisted subset of `env` passed to the worker (names compared case-insensitively). */
 export function workerEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
-    if (v === undefined || k.toUpperCase() === "AO_WORKER_TOKEN") continue;
+    if (v === undefined || WORKER_ENV_DENY.has(k.toUpperCase())) continue;
     const u = k.toUpperCase();
     if (WORKER_ENV_NAMES.has(u) || WORKER_ENV_PREFIXES.some((p) => u.startsWith(p))) out[k] = v;
   }

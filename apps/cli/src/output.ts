@@ -47,13 +47,16 @@ export interface ItemView {
 }
 
 /** An outcome plus where its source lives (library-relative) and its readable title. */
+/** The library's "Use my browser session" wording, as this tool says it. */
+export const loginHint = (reason: string): string => reason.replace("'Use my browser session'", "--cookies-from-browser <browser> (chrome, firefox, safari, edge or brave)");
+
 export function itemView(o: CaptureOutcome, sf?: SourceFile): ItemView {
   return {
     url: safeUrl(o.url),
     status: o.status,
     ...(o.sourceId ? { sourceId: o.sourceId } : {}),
     ...(sf ? { folder: sf.source.folder, title: folderLabel(sf.source.folder) } : {}),
-    ...(o.reason ? { reason: o.reason } : {}),
+    ...(o.reason ? { reason: loginHint(o.reason) } : {}),
     ...(o.errorCode ? { errorCode: o.errorCode } : {}),
   };
 }
@@ -72,7 +75,7 @@ export function profileLines(r: ProfileCaptureReport): string[] {
   const head =
     r.status === "completed" ? "Profile capture finished." : r.status === "paused-rate-limited" ? "Profile capture paused." : "Profile capture did not finish.";
   const lines = [head];
-  if (r.reason) lines.push(r.reason);
+  if (r.reason) lines.push(loginHint(r.reason));
   lines.push(
     `  saved ${r.created}, already had ${r.duplicates}, partly saved ${r.incomplete}, failed ${r.failed}`,
     `  edited since last time ${r.edited}, no longer on the platform ${r.newlyUnavailable}, back again ${r.reappeared}`,

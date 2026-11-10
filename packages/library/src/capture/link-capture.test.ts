@@ -367,6 +367,22 @@ describe("captureUrl", () => {
     expect(handle.db.prepare("SELECT source_id, payload_json FROM review_items").all()).toEqual([{ source_id: out.sourceId, payload_json: JSON.stringify({ fields: { "/issued": "conflict" } }) }]);
   });
 
+  it("transcribeSource transcribes a stored source, keeps the transcript with it and leaves no work folder behind", async () => {
+    const p = await project();
+    const out = await capture.captureUrl(p.id, YT, { transcribe: false });
+    const before = await repo.getSource(p.id, out.sourceId!);
+    expect(before.assets.some((a) => a.kind === "transcript")).toBe(false);
+    const r = await capture.transcribeSource(p.id, out.sourceId!, { model: "small", language: "en" });
+    expect(r.flaggedSegments).toBe(1);
+    expect(r.files).toHaveLength(2);
+    expect(r.files.every((f) => f.startsWith(`${before.source.folder}/derived/`))).toBe(true);
+    const after = await repo.getSource(p.id, out.sourceId!);
+    expect(after.assets.filter((a) => a.kind === "transcript")).toHaveLength(2);
+    expect(worker.submitted.at(-1)).toMatchObject({ type: "audio.transcribe", params: { model: "small", language: "en" } });
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("capture-") || n.startsWith("transcribe-"))).toEqual([]);
+    await expect(capture.transcribeSource(p.id, "00000000-0000-7000-8000-000000000000")).rejects.toThrow();
+  });
+
   it("profile and playlist links go to the profile capture (or the captureProfile given)", async () => {
     const p = await project();
     // the built-in profile capture: the fake tools have no such channel, so listing it fails plainly

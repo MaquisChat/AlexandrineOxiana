@@ -1,8 +1,9 @@
 /** `openRepo` and the `Repo` facade: one per open library. */
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
-import { effectivePolicy, parseGovernance } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Session, SourceDraft, SourceFile, Tag } from "@ao/core";
+import { isDeepStrictEqual } from "node:util";
+import { effectivePolicy, parseGovernance, recheckSourceFile } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Session, SourceDraft, SourceFile, Tag, VerifyContext } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -94,6 +95,16 @@ export class Repo {
   }
   updateSource(projectId: string, id: string, patch: SourcePatch): Promise<SourceFile> {
     return updateSource(this.core, projectId, id, patch);
+  }
+  /**
+   * The "Recheck" action: recomputes the source's field verification from its stored evidence and,
+   * when it changed, saves it as a governed, audited and change-logged update of the source.
+   * Returns the source file as stored afterwards. A source whose verification is unchanged is not written.
+   */
+  async recheckSource(projectId: string, id: string, ctx: VerifyContext = {}): Promise<SourceFile> {
+    const cur = await this.getSource(projectId, id);
+    if (isDeepStrictEqual(recheckSourceFile(cur, ctx).verification, cur.verification)) return cur;
+    return updateSource(this.core, projectId, id, {}, { verification: (next) => recheckSourceFile(next, ctx).verification });
   }
   deleteSource(projectId: string, id: string): Promise<void> {
     return deleteSource(this.core, projectId, id);

@@ -5,7 +5,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -111,6 +111,39 @@ describe("library and project", () => {
     expect(r.stderr).toContain("--encrypt");
   });
 
+  it("error messages show no absolute paths", async () => {
+    const again = await ao(["library", "create", libPath]);
+    expect(again.code).toBe(1);
+    expect(again.stderr).toContain("already contains a library");
+    expect(again.stderr).not.toContain(tmp);
+    expect(again.stderr).toContain("<library>");
+  });
+
+  it("--encrypt with no usable passphrase creates nothing (never a quiet unencrypted project)", async () => {
+    const none = await ao(["project", "create", "NoPass", "--profile", "gdpr", "--encrypt"]);
+    expect(none.code).toBe(1);
+    expect(none.stderr).toContain("needs a passphrase");
+    const empty = await ao(["project", "create", "NoPass", "--profile", "gdpr", "--encrypt"], { AO_PASSPHRASE: "" });
+    expect(empty.code).toBe(1);
+    const blank = await ao(["--json", "project", "create", "NoPass", "--not-identifiable", "--encrypt"], { AO_PASSPHRASE: "   " });
+    expect(blank.code).toBe(1);
+    const listing = await ao(["list", "--project", "NoPass"]);
+    expect(listing.stderr).toContain('no project called "NoPass"');
+  });
+
+  it("the worker never sees AO_PASSPHRASE (or the token)", async () => {
+    const dump = join(tmp, "worker-env.json");
+    const r = await ao(["tools", "versions"], {
+      AO_WORKER_BIN: join(REPO_ROOT, "apps/cli/tests/stub-transcribe-worker.mjs"),
+      AO_TEST_ENV_DUMP: dump,
+      AO_PASSPHRASE: "super secret words",
+    });
+    expect(r.code, r.stderr).toBe(0);
+    const names = JSON.parse(await readFile(dump, "utf8")) as string[];
+    expect(names).toContain("AO_WORKER_TOKEN"); // its own token, set by the app for it
+    expect(names).not.toContain("AO_PASSPHRASE");
+  });
+
   it("a read-only library prints the reason and refuses write commands", async () => {
     const p = await newLibrary("Busy");
     // Held by this process under another device id: the CLI sees it as in use elsewhere.
@@ -202,6 +235,43 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
     expect(one.stderr).toContain("--all");
   }, 60_000);
 
+  it("recheck saves its result: a stale verification on disk is replaced and shows up again", async () => {
+    const list = json(await cap(["--json", "list", "--project", "Open"]));
+    const conflict = list.sources.find((x: any) => x.needsReview);
+    expect(conflict).toBeTruthy();
+    const file = join(lib, conflict.folder, "source.json");
+    const sf = JSON.parse(await readFile(file, "utf8"));
+    const real = sf.verification;
+    sf.verification = {};
+    await writeFile(file, JSON.stringify(sf, null, 2));
+    expect((await cap(["list", "--project", "Open", "--needs-review"])).stdout).toContain("Nothing needs review");
+
+    const r = await cap(["--json", "recheck", conflict.id, "--project", "Open"]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(json(r).sources[0]).toMatchObject({ saved: true });
+    const saved = JSON.parse(await readFile(file, "utf8"));
+    expect(saved.verification).toEqual(real);
+    expect((await cap(["list", "--project", "Open", "--needs-review"])).stdout).toContain("[needs review]");
+
+    const again = await cap(["recheck", conflict.id, "--project", "Open"]);
+    expect(again.stdout).toContain("Nothing had changed");
+  });
+
+  it("capture follows the project's transcription setting by default (off) and --model is checked", async () => {
+    const r = await cap(["--json", "capture", "https://www.youtube.com/watch?v=aoTest00002", "--project", "Fresh"]);
+    expect(r.code).not.toBe(0); // no such project yet: plain error
+    expect((await cap(["project", "create", "Fresh", "--profile", "irb", "--capture", "downloader", "--protocol-number", "IRB-2", "--not-identifiable"])).code).toBe(0);
+    const ok = await cap(["--json", "capture", "https://www.youtube.com/watch?v=aoTest00002", "--project", "Fresh"]);
+    expect(ok.code, ok.stdout + ok.stderr).toBe(0);
+    const item = json(ok).items[0];
+    const stored = JSON.parse(await readFile(join(lib, item.folder, "source.json"), "utf8"));
+    expect(stored.assets.some((a: any) => a.kind === "transcript")).toBe(false);
+    const badModel = await cap(["capture", YT, "--project", "Open", "--model", "huge"]);
+    expect(badModel.code).toBe(1);
+    const badModel2 = await cap(["capture-profile", "https://www.tiktok.com/@fake.dancer", "--project", "Open", "--model", "huge"]);
+    expect(badModel2.code).toBe(1);
+  });
+
   it("a project without the downloader exits 2 with the policy reason", async () => {
     const r = await cap(["capture", YT, "--project", "Manual", "--no-transcribe"]);
     expect(r.code).toBe(2);
@@ -229,6 +299,8 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
     expect(r.code).toBe(1);
     expect(r.stdout).toContain("failed");
     expect(r.stdout).toContain("needs a signed-in session");
+    expect(r.stdout).toContain("--cookies-from-browser <browser>");
+    expect(r.stdout).not.toContain("Use my browser session");
   }, 60_000);
 
   it("encrypted project: AO_PASSPHRASE unlocks, a missing passphrase is refused, recovery code is shown once", async () => {
@@ -309,6 +381,24 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
     expect(badDate.stderr).toContain("YYYY-MM-DD");
   }, 120_000);
 
+  it("a profile run paused by the platform's rate limit exits 4 and says to run it again", async () => {
+    const profile = join(tmp, "profile-limited.json");
+    const T0 = 1767312000;
+    await writeFile(
+      profile,
+      JSON.stringify({
+        platform: "tiktok", handle: "fake.limited", displayName: "Fake Limited", bio: "Synthetic.", links: [], avatar: "https://p16.example/a.jpeg",
+        followers: 1, following: 1, rateLimitAfter: 1,
+        items: Array.from({ length: 4 }, (_, i) => ({ id: `720000000000000000${4 - i}`, caption: `Post ${4 - i}`, timestamp: T0 + (4 - i) * 86400 })),
+      }),
+    );
+    const bin = await wrapper("ratelimit", { FAKE_PROFILE_FILE: profile });
+    const r = await cap(["capture-profile", "https://www.tiktok.com/@fake.limited", "--project", "Open"], { PATH: `${bin}${delimiter}${baseEnv.PATH}`, AO_RATE_LIMIT_WAIT_MS: "5" });
+    expect(r.code, r.stdout + r.stderr).toBe(4);
+    expect(r.stdout).toContain("Profile capture paused.");
+    expect(r.stdout).toContain("Run the same command later");
+  });
+
   it("transcribe adds a transcript (and flags) to a captured video source", async () => {
     const list = json(await cap(["--json", "list", "--project", "Open"]));
     const vid = list.sources.find((s: any) => s.title.includes("Market day in Kumasi"));
@@ -333,6 +423,13 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
     expect(real.code).toBe(1);
     expect(real.stderr).toContain("transcript could not be made");
 
+    expect((await readdir(join(lib, ".tmp"))).filter((n) => /^(transcribe|capture|worker)-/.test(n))).toEqual([]);
+
+    expect((await cap(["transcribe", vid.id, "--project", "Open", "--model", "huge"])).code).toBe(1);
+    const badLang = await cap(["transcribe", vid.id, "--project", "Open", "--language", "e n"]);
+    expect(badLang.code).toBe(1);
+    expect(badLang.stderr).toContain("not a language code");
+
     const none = await cap(["transcribe", "zzzzzzzz", "--project", "Open"]);
     expect(none.code).toBe(1);
     expect(none.stderr).toContain("No source");
@@ -351,6 +448,18 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
     const r = await done;
     expect(r.code).toBe(130);
     expect(r.stderr).toContain("Stopping");
+    // the fake download (the downloader's child process) is gone too
+    const pid = Number((await readFile(mark, "utf8")).trim());
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((r2) => setTimeout(r2, 100));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive, "the downloader's child process should have ended").toBe(false);
 
     const check = await openLibrary(lib, {
       clock: () => new Date(),
@@ -384,14 +493,14 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
 });
 
 /** A folder with yt-dlp / gallery-dl wrappers (for modes and extra environment the worker would not pass on). */
-async function wrapper(mode: "ok" | "login" | "sleep", env: Record<string, string> = {}): Promise<string> {
+async function wrapper(mode: string, env: Record<string, string> = {}): Promise<string> {
   // (the worker passes only some of its environment on to the tools, so values are written into the scripts)
   const dir = await mkdtemp(join(tmp, "bin-"));
   const exports = Object.entries(env).map(([k, v]) => `export ${k}=${JSON.stringify(v)}`).join("\n");
   for (const tool of ["yt-dlp", "gallery-dl"]) {
     const body =
       mode === "sleep"
-        ? `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 2026.10.22; exit 0; fi\ntouch "${env.mark}"\nsleep 60\n`
+        ? `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 2026.10.22; exit 0; fi\necho $$ > "${env.mark}"\nexec sleep 60\n`
         : `#!/bin/sh\n${exports}\nexport FAKE_TOOL_MODE=${mode}\nexec "${join(FAKE_TOOLS, tool)}" "$@"\n`;
     await writeFile(join(dir, tool), body);
     await chmod(join(dir, tool), 0o755);

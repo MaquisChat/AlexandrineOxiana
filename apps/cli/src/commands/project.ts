@@ -83,7 +83,7 @@ export function registerProject(program: Command): void {
           created = await s.repo.createProject({
             name,
             governanceYaml: yaml,
-            encryption: passphrase ? { enabled: true, passphrase } : { enabled: false },
+            encryption: o.encrypt ? { enabled: true, ...(passphrase ? { passphrase } : {}) } : { enabled: false },
           });
         } catch (err) {
           if (err instanceof GovernanceViolationError && !o.encrypt) {
@@ -94,6 +94,9 @@ export function registerProject(program: Command): void {
         const { project: p, recoveryCode } = created;
         out.data({ id: p.id, name: p.name, folder: p.folder, encrypted: p.encryption.enabled, ...(recoveryCode ? { recoveryCode } : {}) });
         out.line(`Created the project "${p.name}"  →  ${p.folder}`);
+        if (recoveryCode && out.json) {
+          out.progress("RECOVERY CODE shown only this once (see the JSON output). Write it down and keep it safe, apart from your computer.");
+        }
         if (recoveryCode) {
           out.line("");
           out.line("RECOVERY CODE (shown only this once):");

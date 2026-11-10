@@ -37,6 +37,25 @@ export async function withProject<T>(
   return withSession(cmd, write, async (s, out, opts) => body(s, await openProject(s, opts.project as string | undefined), out, opts));
 }
 
+const MODELS = ["large-v3", "medium", "small"];
+
+/** `--model`: one of the transcription models, or undefined. */
+export function parseModel(v: unknown): string | undefined {
+  if (v === undefined) return undefined;
+  if (!MODELS.includes(String(v))) throw new ExitError(`"${String(v)}" is not a transcription model.`, EXIT.failure, `Choose one of: ${MODELS.join(", ")}`);
+  return String(v);
+}
+
+/** `--language`: `auto` or a language code such as en or pt-BR. */
+export function parseLanguage(v: unknown): string | undefined {
+  if (v === undefined) return undefined;
+  const l = String(v);
+  if (l !== "auto" && !/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(l)) {
+    throw new ExitError(`"${l}" is not a language code.`, EXIT.failure, "Use auto, or a code such as en, fr or pt-BR.");
+  }
+  return l;
+}
+
 export function parseBrowser(v: unknown): BrowserName | undefined {
   if (v === undefined) return undefined;
   const b = String(v).toLowerCase() as BrowserName;

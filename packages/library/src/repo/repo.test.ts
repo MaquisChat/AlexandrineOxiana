@@ -565,6 +565,28 @@ describe("sources", () => {
     expect(changes.some((c) => c.op === "update" && c.field === "/publisher" && c.value === "Acme Press")).toBe(true);
   });
 
+  it("recheckSource saves a changed verification (governed, change-logged) and skips an unchanged one", async () => {
+    const sf = await repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() });
+    const file = join(lib.root, sf.source.folder, "source.json");
+    const stale = JSON.parse(await readFile(file, "utf8"));
+    stale.verification = { "/bogus": { status: "conflict", checks: [], reason: "stale" } };
+    await writeFile(file, JSON.stringify(stale, null, 2));
+    expect(Object.keys((await repo.getSource(pid, sf.source.id)).verification)).toEqual(["/bogus"]);
+
+    now = new Date("2026-11-09T16:00:00.000Z");
+    const saved = await repo.recheckSource(pid, sf.source.id);
+    expect(saved.verification["/bogus"]).toBeUndefined();
+    expect(saved.source.modifiedAt).toBe("2026-11-09T16:00:00.000Z");
+    const onDisk = JSON.parse(await readFile(file, "utf8"));
+    expect(onDisk.verification["/bogus"]).toBeUndefined();
+    expect(Object.keys(onDisk.verification)).toEqual(Object.keys(saved.verification));
+    expect((await auditEvents(join(lib.root, "Projects/P"))).map((e) => e.action)).toContain("store"); expect((await changeLines(join(lib.root, "Projects/P"))).some((c) => (c.entity as { type: string }).type === "source" && c.op === "update")).toBe(true);
+
+    now = new Date("2026-11-09T17:00:00.000Z");
+    const again = await repo.recheckSource(pid, sf.source.id);
+    expect(again.source.modifiedAt).toBe("2026-11-09T16:00:00.000Z"); // unchanged: not written
+  });
+
   it("two derived assets in the same minute never overwrite each other", async () => {
     const sf = await repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() });
     const a = await repo.addDerivedAsset(pid, sf.source.id, derivedInput(sf.assets[0]!.id));

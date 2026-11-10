@@ -114,7 +114,26 @@ export interface CaptureCore {
   captureItem(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item: ItemContext): Promise<CaptureOutcome>;
 }
 
+export interface TranscribeSourceResult {
+  sourceId: string;
+  /** Library-relative folder of the source. */
+  folder: string;
+  /** Library-relative paths of the stored transcript files. */
+  files: string[];
+  flaggedSegments: number;
+}
+
+/** The source has no video or audio original to transcribe. */
+export class NoMediaError extends Error {
+  override name = "NoMediaError";
+  constructor(readonly sourceId: string) {
+    super("This source has no video or audio file to transcribe.");
+  }
+}
+
 export interface LinkCapture {
+  /** Transcribes a video or audio source already in the project and stores the transcript with it. */
+  transcribeSource(projectId: string, sourceId: string, opts?: { model?: string; language?: string }): Promise<TranscribeSourceResult>;
   captureUrl(projectId: string, url: string, opts: CaptureOptions): Promise<CaptureOutcome>;
   /** A whole profile, channel or playlist (profile-capture.ts). */
   captureProfile(
@@ -310,57 +329,89 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     });
   }
 
-  async function transcribe(projectId: string, sf: SourceFile, media: Asset, opts: CaptureOptions, work: string): Promise<string | undefined> {
+  /**
+   * Runs the transcription of one media original and stores the transcript (.vtt and segments.json)
+   * as derived assets. Throws what the worker client throws (PolicyDeniedError, WorkerJobError ...).
+   */
+  async function runTranscription(
+    projectId: string,
+    sf: SourceFile,
+    media: Asset,
+    params: { model?: string | undefined; language?: string | undefined },
+    work: string,
+    triggeredBy: string,
+  ): Promise<{ files: string[]; flaggedSegments: number }> {
     const root = repoLibrary(repo).root;
-    let r: JobResult;
-    try {
-      r = await worker.submit(projectId, {
-        type: "audio.transcribe",
-        input: join(root, ...media.path.split("/")),
-        inputEncrypted: media.encrypted,
-        output: join(work, "transcript"),
-        params: opts.transcribeModel ? { model: opts.transcribeModel } : {},
-        entity: { type: "asset", id: media.id },
-      });
-    } catch (err) {
-      if (err instanceof PolicyDeniedError) return "The source was saved, but this project does not allow transcription.";
-      if (err instanceof WorkerUnavailableError) return "The source was saved, but the transcript could not be made because the media helper is not running.";
-      return "The source was saved, but the transcript could not be made.";
-    }
+    const r = await worker.submit(projectId, {
+      type: "audio.transcribe",
+      input: join(root, ...media.path.split("/")),
+      inputEncrypted: media.encrypted,
+      output: join(work, "transcript"),
+      params: { ...(params.model ? { model: params.model } : {}), ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },
+      entity: { type: "asset", id: media.id },
+    });
     const meta = r.meta;
-    const model = typeof meta.model === "string" ? meta.model : (opts.transcribeModel ?? "whisper");
+    const model = typeof meta.model === "string" ? meta.model : (params.model ?? "whisper");
     const langs = Array.isArray(meta.detectedLanguages) ? meta.detectedLanguages.filter((l): l is string => typeof l === "string") : [];
     const lang = langs.length === 1 ? langs[0]! : langs.length > 1 ? "mul" : "und";
     const flagged = typeof meta.flaggedCount === "number" ? meta.flaggedCount : undefined;
     const at = new Date().toISOString();
+    const files: string[] = [];
+    for (const ext of ["vtt", "json"]) {
+      const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
+      if (!file) continue;
+      const asset = await repo.addDerivedAsset(projectId, sf.source.id, {
+        fromPath: file,
+        kind: "transcript",
+        lang,
+        tool: `whisper-${model}`,
+        ext,
+        ...(r.encrypted ? { fromEncrypted: true } : {}),
+        ...(flagged !== undefined ? { metadata: { flaggedSegments: flagged } } : {}),
+        derivation: {
+          parents: [media.id],
+          operation: "transcribe",
+          provider: "faster-whisper",
+          model,
+          ranAt: "local",
+          params: { model, detectedLanguages: langs, ...(params.language ? { language: params.language } : {}) },
+          at,
+          triggeredBy,
+        },
+      });
+      files.push(asset.path);
+    }
+    return { files, flaggedSegments: flagged ?? 0 };
+  }
+
+  async function transcribe(projectId: string, sf: SourceFile, media: Asset, opts: CaptureOptions, work: string): Promise<string | undefined> {
     try {
-      for (const ext of ["vtt", "json"]) {
-        const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
-        if (!file) continue;
-        await repo.addDerivedAsset(projectId, sf.source.id, {
-          fromPath: file,
-          kind: "transcript",
-          lang,
-          tool: `whisper-${model}`,
-          ext,
-          ...(r.encrypted ? { fromEncrypted: true } : {}),
-          ...(flagged !== undefined ? { metadata: { flaggedSegments: flagged } } : {}),
-          derivation: {
-            parents: [media.id],
-            operation: "transcribe",
-            provider: "faster-whisper",
-            model,
-            ranAt: "local",
-            params: { model, detectedLanguages: langs },
-            at,
-            triggeredBy: "capture",
-          },
-        });
-      }
-    } catch {
+      await runTranscription(projectId, sf, media, { model: opts.transcribeModel }, work, "capture");
+    } catch (err) {
+      if (err instanceof PolicyDeniedError) return "The source was saved, but this project does not allow transcription.";
+      if (err instanceof WorkerUnavailableError) return "The source was saved, but the transcript could not be made because the media helper is not running.";
+      if (err instanceof WorkerJobError) return "The source was saved, but the transcript could not be made.";
       return "The source was saved, but the transcript could not be stored.";
     }
     return undefined;
+  }
+
+  /** The transcript of a source already in the project (spec 5.2): work folder private (0700) and removed afterwards. */
+  async function transcribeSource(
+    projectId: string,
+    sourceId: string,
+    opts: { model?: string; language?: string } = {},
+  ): Promise<TranscribeSourceResult> {
+    const sf = await repo.getSource(projectId, sourceId);
+    const media = sf.assets.find((a) => a.role === "original" && (a.kind === "video" || a.kind === "audio"));
+    if (!media) throw new NoMediaError(sourceId);
+    const { work, done } = await makeWork();
+    try {
+      const r = await runTranscription(projectId, sf, media, opts, work, "cli");
+      return { sourceId, folder: sf.source.folder, ...r };
+    } finally {
+      await done();
+    }
   }
 
   async function captureOne(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item?: ItemContext): Promise<CaptureOutcome> {
@@ -628,5 +679,5 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return out;
   }
 
-  return { captureUrl, captureUrls, captureProfile: profiles.captureProfile };
+  return { captureUrl, captureUrls, captureProfile: profiles.captureProfile, transcribeSource };
 }

@@ -34,10 +34,10 @@ pnpm ao --help
 
 ## 2. Create a library (once)
 
-A library is just a folder that holds all your projects. Pick a folder that does not exist yet:
+A library is just a folder that holds all your projects. Give it a name that does not exist yet; it is created inside the folder you are in (or write a full path, such as `C:\Users\you\ResearchLibrary` on Windows or `/Users/you/ResearchLibrary` on a Mac):
 
 ```
-pnpm ao library create ~/ResearchLibrary --name "My research"
+pnpm ao library create ResearchLibrary --name "My research"
 ```
 
 After this, `ao` remembers the library you used last. To use another one, add
@@ -50,8 +50,7 @@ A project is one study. Its rules decide what may be captured. This example is a
 basis written down, and encrypted with a passphrase:
 
 ```
-pnpm ao project create "Market study" --profile irb --profile gdpr --capture downloader \
-  --default-legal-basis "consent (Art. 6(1)(a))" --protocol-number "IRB-2026-014" --encrypt
+pnpm ao project create "Market study" --profile irb --profile gdpr --capture downloader --default-legal-basis "consent (Art. 6(1)(a))" --protocol-number "IRB-2026-014" --encrypt
 ```
 
 - `--profile` picks the rules to follow: `irb`, `gdpr`, `hipaa` or `dmp`. You can repeat it.
@@ -83,7 +82,7 @@ created     2026-03-14 Channel Name - Market day [2f9p]  →  Projects/Market st
 
 The first word says what happened: `created`, `duplicate` (you already have it), `refreshed`,
 `incomplete` (only part was saved), `needs-review` (saved, but see below) or `failed` (with the
-reason on the next line). A transcript is made by default; add `--no-transcribe` to skip it, or
+reason on the next line). Whether a transcript is made follows the project's setting (off unless the project turns it on); add `--transcribe` to make one, `--no-transcribe` to skip it, and
 `--model small` for a faster, rougher one (`large-v3`, `medium` or `small`). The first
 transcription downloads the speech model.
 
@@ -95,16 +94,15 @@ short code is the four characters in `[brackets]` at the end of its folder name.
 ## 5. Capture an Instagram profile (or a channel, or a TikTok profile)
 
 ```
-pnpm ao capture-profile "https://www.instagram.com/some_account/" --project "Market study" \
-  --since 2026-01-01 --max-items 50
+pnpm ao capture-profile "https://www.instagram.com/some_account/" --project "Market study" --since 2026-01-01 --max-items 50
 ```
 
 You see a live "Captured 12 of 40 posts" line, then a summary. Run the same command again later:
 it saves only what is new and notes posts that were edited or have disappeared. Options:
 `--until YYYY-MM-DD`, `--types posts,reels,videos,shorts,highlights`, `--metadata-only` (the
 data without the pictures and videos), `--comments` (comments are other people's personal data,
-so they always need a legal basis), `--transcribe`. If the platform starts limiting requests, the
-run pauses and tells you; run it again later and it continues where it stopped.
+so they always need a legal basis), `--transcribe` (with `--model`). If the platform starts limiting requests, the
+run pauses, tells you, and ends with exit code 4; run it again later and it continues where it stopped.
 
 Some posts need you to be signed in. Add `--cookies-from-browser chrome` (or `firefox`,
 `safari`, `edge`, `brave`) to let the downloader use your browser's signed-in session. The first
@@ -136,8 +134,7 @@ pnpm ao recheck --all --project "Market study"
 
 Each problem is listed as the detail (for example `/issued`, the date), its status
 (`unverified`: nothing to confirm it; `conflict`: two sources disagree) and a sentence saying
-why. `recheck` only reports; it changes nothing. Decide which value is right when you review the
-source.
+why. `recheck` also saves the new result in the project (and records it in the audit log), so the review list stays up to date. It does not change any detail itself: decide which value is right when you review the source.
 
 ## 8. If a capture is refused
 
@@ -147,11 +144,12 @@ source.
 - **Needs a legal basis (exit code 4):** add `--legal-basis "<text>"` to the command, or create
   the project with `--default-legal-basis "<text>"`.
 - **Needs your confirmation about cookies (exit code 3):** add `--acknowledge-cookies`.
-- **"This post needs a signed-in session":** add `--cookies-from-browser <your browser>`.
+- **"This post needs a signed-in session":** add `--cookies-from-browser <your browser>` (chrome, firefox, safari, edge or brave).
 - **"The downloader could not read this page":** the platform changed; update the tools (next section).
 
 Exit codes, if you use `ao` in a script: 0 success, 1 something failed, 2 refused by the
-project's rules, 3 cookie confirmation needed, 4 you must supply something (a legal basis).
+project's rules, 3 cookie confirmation needed, 4 you must do something and run it again (supply a
+legal basis, or wait and re-run a profile capture that the platform paused).
 Add `--json` to any command for machine-readable output (paths are library-relative; no tokens).
 
 ## 9. Update yt-dlp
@@ -186,15 +184,15 @@ so you can open it again straight away. A capture that was running is not saved.
 
 | Command | What it does |
 | --- | --- |
-| `ao library create <folder> --name <name>` | make a library |
-| `ao library open <folder>` | show whether the library can be changed |
-| `ao project create <name> [--profile ...] [--capture ...] [--encrypt]` | make a project |
-| `ao capture <url...> --project <name>` | capture links |
-| `ao capture-profile <url> --project <name>` | capture a whole profile |
-| `ao transcribe <source> --project <name>` | transcribe a saved video or audio |
-| `ao recheck <source> or --all --project <name>` | list details that need checking |
-| `ao list --project <name> [--needs-review]` | list sources |
-| `ao tools update` / `ao tools versions` | update or show the capture tools |
+| `pnpm ao library create <folder> --name <name>` | make a library |
+| `pnpm ao library open <folder>` | show whether the library can be changed |
+| `pnpm ao project create <name> [--profile ...] [--capture ...] [--encrypt]` | make a project |
+| `pnpm ao capture <url...> --project <name>` | capture links |
+| `pnpm ao capture-profile <url> --project <name>` | capture a whole profile |
+| `pnpm ao transcribe <source> --project <name>` | transcribe a saved video or audio |
+| `pnpm ao recheck <source> or --all --project <name>` | list details that need checking |
+| `pnpm ao list --project <name> [--needs-review]` | list sources |
+| `pnpm ao tools update` / `pnpm ao tools versions` | update or show the capture tools |
 
 Settings you can put in the environment: `AO_LIBRARY` (library folder), `AO_PASSPHRASE`
 (passphrase for encrypted projects, for scripts), `AO_CONFIG_DIR` (where `ao` keeps its small
