@@ -59,14 +59,19 @@ These follow the CSL convention the styles expect (R87):
 - **Engine state.** citeproc-js keeps rendered items in its registry by id. An engine is kept per style and language, because building one takes about half a second. Every render first empties the item registry and the citation state, so a render never shows an item as it was before an edit.
 - **Input checks.** A `lang` that is not a language tag falls back to en-US. Locators are reduced to plain text (letters, digits and the punctuation locators use) before citeproc sees them, so `<i>3</i>` cannot become markup in html or rtf.
 - **Imported styles.** These are untrusted, and citeproc-js has no limits of its own. They are never rendered in-process: core throws `CustomStyleSandboxError`.
-  - `@ao/library` renders them in a `worker_threads` worker with a 2 s timeout and a 256 MB heap cap. This covers the import probe, every render with an imported style, and files dropped into `styles/` by hand (checked when listed, remembered by sha256).
-  - Before any of that, a memoised walk of the macro graph refuses styles that would expand more than 10,000 macro calls, or whose macros call themselves.
+  - `@ao/library` renders them in a pool of `worker_threads` workers (R89). At most 2 run at once, and further renders wait their turn.
+  - Each style keeps one warm worker, whose engine is reused with fresh state for every render. A warm worker is ended after 60 s idle, or when its slot is needed for another style.
+  - Limits: 10 s to start a worker and build its engine; 5 s per render, counted from when the worker begins it; 256 MB of heap.
+  - A timeout, a heap overrun or an error ends the worker.
+  - This covers the import probe, every render with an imported style, and files dropped into `styles/` by hand (checked when listed).
+  - A verdict on a dropped file is remembered by sha256 only when it is deterministic: usable, too complex, or refused by citeproc. A timeout is never remembered.
+  - A memoised walk of the macro graph refuses styles whose macros call themselves, or that would expand more than 1,000,000 macro calls. That cap is a backstop only: the bundled styles reach about 225,000, and a test keeps every bundled style under it. The sandbox's limits are the real guard.
   - Bundled styles render in-process.
 
 ### Participants
 
 - `toCslItem` takes the project's pseudonym map (handle or name → participant code).
-- Names are compared folded (R88): NFKD, combining marks removed, lowercase, words only. So "@Lucía.Cocina", "lucia cocina" and full-width forms are the same name.
+- Names are compared folded (R88, R89): ł ø đ ß æ œ þ ı transliterated, then NFKD, combining marks removed, lowercase, words only. So "@Lucía.Cocina", "lucia cocina" and full-width forms are the same name, and so are "Wałęsa" and "Walesa". A name written as one word ("marialopez") matches in titles and URLs.
 - A creator who matches the map under any name form becomes `{ literal: <code> }`. Name forms are: handle, literal, "given family", "family given", family, and given.
 - Every map entry, and every coded creator's name forms, are replaced by the code in the title, container, publisher and the other text fields. Matching is on whole words. Longer forms win, and an `@` in front is included.
 - A bare given or family name shorter than 4 letters is replaced only together with the other part of the name. So "Li" alone is kept, while "Rose Li" and "Li, Rose" are replaced.
@@ -75,6 +80,7 @@ These follow the CSL convention the styles expect (R87):
 - A URL that carries any name form, as whole words in any slug form (joined, `-`, `.` or `_`), is left out. There is no length floor.
 - The citation key is not copied when participants are involved.
 - `Participant.details` is never an input to `toCslItem`.
+- A source with `participantIds` but no pseudonym map is an error outright (R89).
 - A creator other than the interviewer who has no code is an error, never a printed name (`ParticipantCodeMissingError`). This applies to every source with `participantIds`, and to any source when `requireParticipantCodes` is set. The interviewer is excluded, because the interviewer is the researcher.
 - Wiring the project's governance into these options (`requireParticipantCodes` and the pseudonym map) is carried to Tasks 32 and 36.
 

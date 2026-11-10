@@ -14,15 +14,17 @@
  * `publisher` (APA "[Video]. YouTube."), a social post's its `container-title`, and a social post
  * that is a video (a reel, a TikTok) gets genre "Video" unless the source overrides it.
  *
- * Participants (spec 4.4, R88): names are compared folded (NFKD, no combining marks, lowercase,
- * words only, so "@Lucía.Cocina" = "lucia cocina"). With the project's pseudonym map
+ * Participants (spec 4.4, R88, R89): names are compared folded (ł ø đ ß æ œ þ ı transliterated,
+ * NFKD, no combining marks, lowercase, words only, so "@Lucía.Cocina" = "lucia cocina" and
+ * "Wałęsa" = "walesa"; a name written as one word, "marialopez", matches too). With the project's pseudonym map
  * (`pseudonyms`, handle or name → participant code), a creator matching it under any of their
  * name forms (handle, literal, "given family", "family given", family, given) becomes
  * `{ literal: <code> }`. Every map entry and every coded creator's name forms are replaced by the
  * code in the title, container, publisher and the other text fields (see scrubText for the rule on
  * short bare names). A URL carrying any of them in a slug form (joined, -, ., _) is left out, and
  * no citation key is copied when participants are involved. The participant's `details` are never
- * an input here. A source linked to participants (`participantIds`), or any source when
+ * an input here. A source linked to participants with no pseudonym map is an error outright. A
+ * source linked to participants (`participantIds`), or any source when
  * `requireParticipantCodes` is set, fails closed: a creator other than the interviewer without a
  * code is an error (ParticipantCodeMissingError), never a printed name.
  */
@@ -145,8 +147,17 @@ const lang1 = (tag: string) => tag.trim().toLowerCase().split(/[-_]/)[0] ?? "";
 // ------------------------------------------------------------------------------------------
 // Participant names (R88 I1)
 
-/** Name comparison key: NFKD, combining marks removed, lowercase. */
-const fold = (s: string) => s.normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase();
+/** Letters NFKD leaves whole, spelled the way names are commonly written without them (R89). */
+const TRANSLIT: Readonly<Record<string, string>> = {
+  ł: "l", Ł: "L", ø: "o", Ø: "O", đ: "d", Đ: "D", ß: "ss", ẞ: "SS", æ: "ae", Æ: "AE", œ: "oe", Œ: "OE", þ: "th", Þ: "TH", ı: "i",
+};
+/** Name comparison key: those letters transliterated, then NFKD, combining marks removed, lowercase. */
+const fold = (s: string) =>
+  s
+    .replace(/[łŁøØđĐßẞæÆœŒþÞı]/gu, (c) => TRANSLIT[c] ?? c)
+    .normalize("NFKD")
+    .replace(/\p{M}+/gu, "")
+    .toLowerCase();
 /** The words of a name or text, folded ("@Lucía.Cocina" → ["lucia", "cocina"]). */
 const words = (s: string) => fold(s).match(/[\p{L}\p{N}]+/gu) ?? [];
 /** A name's comparison form: its folded words joined by single spaces (no "@", no punctuation). */
@@ -194,6 +205,8 @@ function codeFor(c: Creator, keys: ReadonlyMap<string, string>): string | undefi
  */
 function scrubText(text: string, forms: readonly NameForm[]): string {
   const usable = forms.filter((f) => f.words.length > 0 && !(f.bare && f.words.length === 1 && f.words[0]!.length < 4));
+  // A name written as one word ("marialopez", "MariaLopez") is the same name (R89).
+  for (const f of [...usable]) if (f.words.length > 1) usable.push({ words: [f.words.join("")], code: f.code, bare: false });
   if (usable.length === 0) return text;
   usable.sort((a, b) => b.words.length - a.words.length);
   const tokens = [...text.matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, w: words(m[0]).join("") }));
@@ -305,6 +318,8 @@ export function toCslItem(sf: SourceFile, opts: ToCslOptions): CslItem {
   }
   // Sources linked to participants fail closed: every creator but the interviewer needs a code (R88 I2).
   const requireCodes = opts.requireParticipantCodes === true || s.participantIds.length > 0;
+  // Participants but no pseudonym map to code them with: nothing about them can be cited safely (R89).
+  if (s.participantIds.length > 0 && keys.size === 0) throw new ParticipantCodeMissingError();
   let anyCoded = false;
   for (const c of s.creators) {
     const code = codeFor(c, keys);

@@ -18,11 +18,13 @@ import {
   libraryCslLoader,
   listCustomStyles,
   listStyles,
+  MAX_MACRO_EXPANSIONS,
+  bundledCslLoader,
   macroExpansions,
   renderBibliographyIn,
   renderCitationIn,
 } from "./custom-styles.js";
-import { SandboxError, renderInSandbox } from "./sandbox.js";
+import { SandboxError, configureSandbox, renderInSandbox, sandboxStats, shutdownSandbox } from "./sandbox.js";
 
 const HAVE_BUNDLE = bundleAvailable();
 if (!HAVE_BUNDLE && process.env.CI === "true") throw new Error("CSL bundle missing: run `pnpm fetch-csl` (scripts/fetch-csl.mjs)");
@@ -231,7 +233,7 @@ function fanOut(depth: number, fan = 2): string {
 describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust the process", () => {
   it("counts macro expansions with a memoised walk", () => {
     expect(macroExpansions(fanOut(3))).toBe(2 * (1 + 2 + 4 + 8));
-    expect(macroExpansions(fanOut(25))).toBeGreaterThan(10_000);
+    expect(macroExpansions(fanOut(25))).toBeGreaterThan(MAX_MACRO_EXPANSIONS);
     expect(macroExpansions(style({ body: '<macro name="a"><text macro="a"/></macro><citation><layout><text macro="a"/></layout></citation>' }))).toBe(Number.POSITIVE_INFINITY);
   });
 
@@ -243,9 +245,24 @@ describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust t
     expect(await addCustomStyle(repo, p.id, style())).toBe("my-lab-style");
   });
 
-  it("an N=17 style is refused (static cap or timeout)", async () => {
+  it("R89: every bundled independent style is under the macro cap (the cap is only a backstop)", () => {
+    const loader = bundledCslLoader();
+    const over: Array<[string, number]> = [];
+    let n = 0;
+    for (const s of loader.styles()) {
+      if (s.parent !== undefined) continue;
+      n++;
+      const v = macroExpansions(loader.styleXml(s.id)!);
+      if (!(v <= MAX_MACRO_EXPANSIONS)) over.push([s.id, v]);
+    }
+    expect(n).toBeGreaterThan(2000);
+    expect(over).toEqual([]);
+  }, 180_000);
+
+  it("an N=21 style passes the static cap but is refused by the render timeout", async () => {
     const p = await project();
-    await expect(addCustomStyle(repo, p.id, fanOut(17))).rejects.toBeInstanceOf(CustomStyleError);
+    expect(macroExpansions(fanOut(21))).toBeLessThan(MAX_MACRO_EXPANSIONS * 10);
+    await expect(addCustomStyle(repo, p.id, fanOut(21))).rejects.toBeInstanceOf(CustomStyleError);
     expect(await filesIn(stylesDir())).toEqual([]);
   });
 
@@ -275,5 +292,71 @@ describe.skipIf(!HAVE_BUNDLE)("R88 I3: imported styles cannot block or exhaust t
     await writeFile(join(stylesDir(), "dropped-ok.csl"), style({ id: "http://www.zotero.org/styles/dropped-ok", title: "Dropped OK" }));
     expect((await listCustomStyles(lib)).map((s) => s.id)).toEqual(["dropped-ok"]);
   });
+});
+
+describe.skipIf(!HAVE_BUNDLE)("R89: the sandbox pool", () => {
+  const item = (i: number): CslItem => ({ id: `x${i}`, type: "book", title: `Lab notes ${i}`, author: [{ family: "Diaz", given: "Rosa" }], issued: { "date-parts": [[2020]] } });
+  /** The bundled APA under another id: a realistic (heavy) imported style. */
+  const apaCopy = () => bundledCslLoader().styleXml("apa")!.replace(/<id>[^<]*<\/id>/u, "<id>http://www.zotero.org/styles/apa-copy</id>").replace(/<title>[^<]*<\/title>/u, "<title>APA copy</title>");
+
+  afterEach(async () => {
+    await shutdownSandbox();
+    configureSandbox({});
+  });
+
+  it("10 parallel renders with an imported APA copy all succeed, with at most 2 workers at once", async () => {
+    const p = await project();
+    expect(await addCustomStyle(repo, p.id, apaCopy())).toBe("apa-copy");
+    await addCustomStyle(repo, p.id, style());
+    const before = sandboxStats();
+    const outs = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => renderBibliographyIn(lib, [item(i)], i % 3 === 0 ? "my-lab-style" : "apa-copy", "text")),
+    );
+    outs.forEach((o, i) => expect(o).toContain(`Lab notes ${i}`));
+    expect(sandboxStats().peakWorkers).toBeLessThanOrEqual(2);
+    expect(sandboxStats().spawned - before.spawned).toBeLessThanOrEqual(4);
+  }, 60_000);
+
+  it("keeps a warm worker per style: the second render reuses it (one spawn, much faster)", async () => {
+    const p = await project();
+    await addCustomStyle(repo, p.id, apaCopy());
+    await shutdownSandbox();
+    const s0 = sandboxStats().spawned;
+    let t = performance.now();
+    await renderBibliographyIn(lib, [item(1)], "apa-copy", "text");
+    const first = performance.now() - t;
+    t = performance.now();
+    expect(await renderBibliographyIn(lib, [item(2)], "apa-copy", "text")).toContain("Lab notes 2");
+    const second = performance.now() - t;
+    expect(sandboxStats().spawned - s0).toBe(1);
+    expect(second).toBeLessThan(first / 2);
+    // A fresh engine state each time: the first item is not in the second bibliography.
+    expect(await renderBibliographyIn(lib, [item(3)], "apa-copy", "text")).not.toContain("Lab notes 2");
+  }, 60_000);
+
+  it("terminates an idle worker", async () => {
+    configureSandbox({ idleMs: 200 });
+    const p = await project();
+    await addCustomStyle(repo, p.id, style());
+    await renderBibliographyIn(lib, [item(1)], "my-lab-style", "text");
+    expect(sandboxStats().live).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 600));
+    expect(sandboxStats().live).toBe(0);
+  });
+
+  it("a timeout is never remembered: after a forced timeout the next try succeeds", async () => {
+    await import("node:fs/promises").then((fs) => fs.mkdir(stylesDir(), { recursive: true }));
+    // Bytes no earlier test has probed (verdicts are remembered by sha256).
+    await writeFile(join(stylesDir(), "dropped-ok.csl"), style({ id: "http://www.zotero.org/styles/dropped-ok", title: `Dropped OK ${Date.now()}` }));
+    configureSandbox({ renderTimeoutMs: 1 });
+    expect((await listCustomStyles(lib)).map((s) => s.id)).toEqual([]);
+    configureSandbox({});
+    expect((await listCustomStyles(lib)).map((s) => s.id)).toEqual(["dropped-ok"]);
+    // A render that timed out does not poison the worker either.
+    configureSandbox({ renderTimeoutMs: 1 });
+    await expect(renderBibliographyIn(lib, [item(1)], "dropped-ok", "text")).rejects.toBeInstanceOf(CustomStyleError);
+    configureSandbox({});
+    expect(await renderBibliographyIn(lib, [item(1)], "dropped-ok", "text")).toBe("Rosa Diaz. Lab notes 1");
+  }, 60_000);
 });
 

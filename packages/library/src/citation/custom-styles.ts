@@ -13,7 +13,7 @@
  *     independent style without `<citation>`; one whose macros would expand more than
  *     MAX_MACRO_EXPANSIONS calls (a memoised walk of the macro graph; self-calling macros too); one
  *     that does not render a probe citation and bibliography in the sandbox (sandbox.ts: a worker
- *     with a 2 s timeout and a 256 MB heap); a dependent style whose independent parent is not a
+ *     pool: warm workers, 5 s per render, 256 MB heap); a dependent style whose independent parent is not a
  *     bundled or imported independent style (R88 I3).
  *   - governed: evaluated as a `store` with no identifiable data and no location
  *     (authorizeProcessing; a deny is audited and thrown as PolicyDeniedError).
@@ -65,8 +65,12 @@ export const CSL_NS = "http://purl.org/net/xbiblio/csl";
 export const CUSTOM_STYLE_MAX_BYTES = 1024 * 1024;
 const STYLES_DIR = "styles";
 const MAX_ID = 80;
-/** Macro calls one rendering may expand (R88 I3 static cap); the bundled styles stay far below. */
-export const MAX_MACRO_EXPANSIONS = 10_000;
+/**
+ * Macro calls one rendering may expand: a backstop only (R89). The bundled styles reach about
+ * 225,000 (chicago-author-date-access-dates; apa about 17,000); the sandbox's time and heap limits
+ * are the real guard.
+ */
+export const MAX_MACRO_EXPANSIONS = 1_000_000;
 
 export class CustomStyleError extends Error {
   constructor(message: string) {
@@ -163,19 +167,28 @@ export async function listCustomStyles(lib: Pick<Library, "root">): Promise<Cust
 
 const probed = new Map<string, boolean>();
 
-/** probeStyle's verdict for this exact XML, remembered by its sha256 (true: usable). */
+/**
+ * probeStyle's verdict for this exact XML (true: usable), remembered by its sha256 only when it
+ * is deterministic (R89): usable, too complex, or refused by citeproc itself. A timeout or heap
+ * overrun depends on the machine and its load, so it is never remembered: the next listing tries
+ * again.
+ */
 async function probeCached(xml: string): Promise<boolean> {
   const key = sha256(xml);
   const hit = probed.get(key);
   if (hit !== undefined) return hit;
   let ok = true;
+  let remember = true;
   try {
     await probeStyle(xml);
-  } catch {
+  } catch (e) {
     ok = false;
+    remember = !(e instanceof CustomStyleError && e.message === REASONS.tooSlow);
   }
-  if (probed.size > 1000) probed.clear();
-  probed.set(key, ok);
+  if (remember) {
+    if (probed.size > 1000) probed.clear();
+    probed.set(key, ok);
+  }
   return ok;
 }
 

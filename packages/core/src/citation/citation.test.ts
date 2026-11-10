@@ -30,6 +30,7 @@ import {
   setCslLoader,
   toCslItem,
   zipCslLoader,
+  normName,
   type CslItem,
   type CslLoader,
   type ToCslOptions,
@@ -437,7 +438,33 @@ describe("review round 1 (R88 I1, I2): participant names are matched however the
     expect(() => toCslItem(s, { ...OPTS, pseudonyms: new Map() })).toThrow(ParticipantCodeMissingError);
     expect(() => toCslItem(s, { citationLanguage: "en", translatedTitles: "off", script: "original" })).toThrow(ParticipantCodeMissingError);
     const researcher = source("interview", mt(["en", "original", "T"]), [{ role: "interviewer", given: "Ana", family: "Castillo" }], { participantIds: [PARTICIPANT.id] });
-    expect(toCslItem(researcher, { ...OPTS, pseudonyms: new Map() }).interviewer).toEqual([{ family: "Castillo", given: "Ana" }]);
+    expect(toCslItem(researcher, { ...OPTS, pseudonyms: new Map([["@someone", "P-001"]]) }).interviewer).toEqual([{ family: "Castillo", given: "Ana" }]);
+  });
+
+  it("R89: a source with participants and no pseudonym map fails closed, even without creators", () => {
+    const none = source("interview", mt(["en", "original", "T"]), [], { participantIds: [PARTICIPANT.id] });
+    expect(() => toCslItem(none, { ...OPTS, pseudonyms: new Map() })).toThrow(ParticipantCodeMissingError);
+    expect(() => toCslItem(none, { citationLanguage: "en", translatedTitles: "off", script: "original" })).toThrow(ParticipantCodeMissingError);
+    const researcher = source("interview", mt(["en", "original", "T"]), [{ role: "interviewer", given: "Ana", family: "Castillo" }], { participantIds: [PARTICIPANT.id] });
+    expect(() => toCslItem(researcher, { ...OPTS, pseudonyms: new Map() })).toThrow(ParticipantCodeMissingError);
+  });
+
+  it("R89: letters NFKD does not decompose (ł ø đ ß æ œ þ ı) are transliterated before folding: Łukasz Wałęsa", () => {
+    const map = new Map([["Lukasz Walesa", "P-050"]]);
+    const sf = source("interview", mt(["pl", "original", "Rozmowa: ŁUKASZ WAŁĘSA w Gdańsku"]), [{ role: "interviewee", given: "Łukasz", family: "Wałęsa" }], {
+      participantIds: [PARTICIPANT.id],
+      identifiers: { url: "https://example.org/archiwum/lukasz-walesa/1" },
+    });
+    const item = toCslItem(sf, { ...OPTS, pseudonyms: map });
+    expect(item.author).toEqual([{ literal: "P-050" }]);
+    expect(item.title).toBe("Rozmowa: P-050 w Gdańsku");
+    expect(item.URL).toBeUndefined();
+    expect(normName("Øster Þór Æbelø Straße Œuvre Iıl Đorđe")).toBe("oster thor aebelo strasse oeuvre iil dorde");
+  });
+
+  it("R89: joined name forms are found in titles too (marialopez)", () => {
+    const sf = source("social-post", mt(["es", "original", "Recetas de marialopez y de MariaLopez"]), [{ role: "uploader", given: "María", family: "López" }], { participantIds: [PARTICIPANT.id] });
+    expect(toCslItem(sf, { ...OPTS, pseudonyms: new Map([["María López", "P-060"]]) }).title).toBe("Recetas de P-060 y de P-060");
   });
 });
 
@@ -479,6 +506,10 @@ describe.skipIf(!HAVE_BUNDLE)("rendering with the bundled styles", () => {
   beforeAll(() => {
     setCslLoader(bundleLoader());
     items = Object.fromEntries(Object.entries(FIXTURES).map(([k, sf]) => [k, toCslItem(sf, OPTS)])) as typeof items;
+  });
+
+  it("R89: a bundled-only loader says explicitly that no style is imported", () => {
+    expect(bundleLoader().isCustom("apa")).toBe(false);
   });
 
   it("lists the bundled styles, with search", () => {

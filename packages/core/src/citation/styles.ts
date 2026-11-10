@@ -29,8 +29,11 @@ export interface CslLoader {
   localeXml(lang: string): string | undefined;
   /** Old style ids renamed upstream → current id. */
   renamed?(id: string): string | undefined;
-  /** Imported into the library (not bundled): rendered only in the library's sandbox (R88 I3). */
-  isCustom?(id: string): boolean;
+  /**
+   * Imported into the library (not bundled): rendered only in the library's sandbox (R88 I3).
+   * Required (R89): a loader of bundled styles only says `false` explicitly.
+   */
+  isCustom(id: string): boolean;
 }
 
 export class UnknownStyleError extends Error {
@@ -118,6 +121,7 @@ export function zipCslLoader(zip: Uint8Array, locale: (fileName: string) => stri
       return xml;
     },
     renamed: (id) => own(renamed, id),
+    isCustom: () => false,
   };
 }
 
@@ -187,11 +191,11 @@ export function resolveStyle(id: string, loader: CslLoader = currentCslLoader())
   const xml = loader.styleXml(own);
   if (xml === undefined) throw new UnknownStyleError(id);
   const parent = dependentParentOf(xml);
-  if (parent === undefined) return { id: own, xml, custom: loader.isCustom?.(own) === true };
+  if (parent === undefined) return { id: own, xml, custom: loader.isCustom(own) };
   const parentId = loader.styleXml(parent) !== undefined ? parent : (loader.renamed?.(parent) ?? parent);
   const parentXml = loader.styleXml(parentId);
   if (parentXml === undefined || dependentParentOf(parentXml) !== undefined) throw new UnknownStyleError(id);
-  return { id: parentId, xml: parentXml, custom: loader.isCustom?.(parentId) === true };
+  return { id: parentId, xml: parentXml, custom: loader.isCustom(parentId) };
 }
 
 /** The XML citeproc-js renders with for `id` (see resolveStyle). */
