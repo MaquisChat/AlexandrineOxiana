@@ -13,7 +13,7 @@ import threading
 
 
 def main() -> int:
-    token = os.environ.get("AO_WORKER_TOKEN", "")
+    token = os.environ.pop("AO_WORKER_TOKEN", "")  # removed so no child process inherits it
     if len(token) < 16:
         print("AO_WORKER_TOKEN must be set (at least 16 characters)", file=sys.stderr)
         return 2

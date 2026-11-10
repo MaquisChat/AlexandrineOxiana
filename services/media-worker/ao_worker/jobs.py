@@ -83,6 +83,8 @@ class JobContext:
     def popen(self, argv: list[str], **kw) -> subprocess.Popen:
         """Starts a child in its own process group (killed as a group on cancel)."""
         self.check_cancelled()
+        # Child tools never see the API token.
+        kw.setdefault("env", {k: v for k, v in os.environ.items() if k != "AO_WORKER_TOKEN"})
         if os.name == "nt":
             kw.setdefault("creationflags", subprocess.CREATE_NEW_PROCESS_GROUP)
         else:

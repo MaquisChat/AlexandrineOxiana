@@ -169,3 +169,16 @@ def test_tools_update_does_not_touch_unmanaged_binary(worker):
     assert body["ytDlp"]["managed"] is False
     assert body["ytDlp"]["old"] == body["ytDlp"]["new"] == "2026.10.22"
     assert not (FAKE_BIN / "yt-dlp.version").exists()
+
+
+def test_child_tools_do_not_inherit_the_token(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("AO_WORKER_TOKEN", TOKEN)
+    monkeypatch.setenv("FAKE_YTDLP_MODE", "env")
+    env_file = tmp_path / "env.json"
+    monkeypatch.setenv("FAKE_ENV_FILE", str(env_file))
+    job = worker.run("capture.download", "https://www.youtube.com/watch?v=abc123", str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "done", job
+    import json
+
+    env = json.loads(env_file.read_text())
+    assert "AO_WORKER_TOKEN" not in env and env.get("FAKE_YTDLP_MODE") == "env"
