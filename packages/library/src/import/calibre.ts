@@ -24,12 +24,14 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Creator } from "@ao/core";
 import { parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanContext, ScanItem } from "./bulk/scan.js";
-import { CopyTooLarge, cappedRows, copyDatabases, openCopy, plainTables, t64 } from "./sqlite-copy.js";
+import { CopyNoSpace, CopyTooLarge, CopyUnstable, cappedRows, copyDatabases, openCopy, plainTables, t64 } from "./sqlite-copy.js";
 import { exportIdentity, isbnsOf, recordItem, skippedNote, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
 
 export const CALIBRE_REASONS = {
   unreadable: "The Calibre library could not be read (its metadata.db is missing or damaged), so nothing was imported from it.",
   tooLarge: "The Calibre library is too large to import (its metadata.db is over 1 GB or lists too many books), so nothing was imported from it.",
+  busy: "Calibre is busy saving — try again in a moment or close Calibre.",
+  noSpace: "There is not enough free disk space to read the Calibre library; free some space and try again.",
 } as const;
 
 /** The largest metadata.db copied (R68 I1). */
@@ -56,12 +58,14 @@ export interface CalibreCopy {
 }
 
 /** Copies `<libraryDir>/metadata.db` (and its -wal/-shm, if any) into a new 0700 folder inside `workDir` (sqlite-copy.ts). */
-export async function copyCalibreDb(libraryDir: string, workDir: string): Promise<CalibreCopy> {
+export async function copyCalibreDb(libraryDir: string, workDir: string, signal?: AbortSignal): Promise<CalibreCopy> {
   try {
-    const copy = await copyDatabases(libraryDir, { required: ["metadata.db"] }, workDir, "calibre", MAX_CALIBRE_DB_BYTES);
+    const copy = await copyDatabases(libraryDir, { required: ["metadata.db"] }, workDir, "calibre", MAX_CALIBRE_DB_BYTES, signal ? { signal } : {});
     return { path: copy.paths.get("metadata.db")!, remove: copy.remove };
   } catch (err) {
     if (err instanceof CopyTooLarge) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
+    if (err instanceof CopyUnstable) throw new CalibreUnreadable(CALIBRE_REASONS.busy);
+    if (err instanceof CopyNoSpace) throw new CalibreUnreadable(CALIBRE_REASONS.noSpace);
     throw err;
   }
 }
@@ -193,7 +197,7 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
   let realRoot: string;
   try {
     realRoot = await fsp.realpath(root);
-    const copy = await copyCalibreDb(root, await ctx.workDir());
+    const copy = await copyCalibreDb(root, await ctx.workDir(), signal);
     try {
       books = readBooks(copy.path);
     } finally {

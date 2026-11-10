@@ -48,12 +48,14 @@ import type { Creator, SourceType } from "@ao/core";
 import type { ImportSourceAdapter, ScanAnnotation, ScanContext, ScanFile, ScanItem, ScanRect } from "./bulk/scan.js";
 import { MAX_NOTE_CHARS, noteToMarkdown } from "./note-html.js";
 import { arxivOf, checkFiles, doiOf, isbnsOf, issnOf, referenceMetadata, tagList, text, type RecordFields } from "./refman.js";
-import { CopyTooLarge, CopyUnstable, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
+import { CopyNoSpace, CopyTooLarge, CopyUnstable, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
 
 export const ZOTERO_REASONS = {
   unreadable: "The Zotero library could not be read (its zotero.sqlite is missing or damaged), so nothing was imported from it.",
   tooLarge: "The Zotero library is too large to import (its databases are over 4 GB, or it holds too many items or annotations), so nothing was imported from it.",
-  busy: "Zotero kept changing its database while it was being read. Try again in a moment, or close Zotero first.",
+  busy: "Zotero is busy saving — try again in a moment or close Zotero.",
+  locked: "Zotero is keeping its database locked; close Zotero and try again.",
+  noSpace: "There is not enough free disk space to read the Zotero library; free some space and try again.",
 } as const;
 
 export const ZOTERO_FILE_NOTES = {
@@ -147,27 +149,45 @@ export function zoteroTimestamp(v: unknown): string | undefined {
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
-/** Zotero's multipart date ("2024-03-00 March 2024") → "2024-03"; a free-text date → its text. */
+/**
+ * Zotero's multipart date ("2024-03-00 March 2024") → "2024-03"; one Zotero could not parse
+ * ("0000-00-00 Spring 2020") → the text after the first space; a free-text date → its text.
+ */
 function zoteroDate(v: string): string | undefined {
   const m = /^(\d{4})-(\d{2})-(\d{2})(?:\s|$)/u.exec(v);
   if (!m) return v || undefined;
-  if (m[1] === "0000") return undefined;
+  if (m[1] === "0000") return v.slice(11).trim() || undefined;
   if (m[2] === "00") return m[1];
   if (m[3] === "00") return `${m[1]}-${m[2]}`;
   return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
-/** The "Citation Key: …" line of Extra (Better BibTeX's convention, also Zotero 7's). */
+/** The "Citation Key: …" line of Extra (Better BibTeX's convention, also Zotero 7's), else a legacy "bibtex: …" line. */
 function extraCitationKey(extra: string): string | undefined {
+  let legacy: string | undefined;
   for (const line of extra.split("\n")) {
     const t = line.trim();
-    if (t.toLowerCase().startsWith("citation key:")) {
-      const k = text(t.slice(13));
-      if (k && k.length <= 200 && !/\s/u.test(k)) return k;
-    }
+    const lower = t.toLowerCase();
+    const k = lower.startsWith("citation key:") ? text(t.slice(13)) : lower.startsWith("bibtex:") ? text(t.slice(7)) : "";
+    if (!k || k.length > 200 || /\s/u.test(k)) continue;
+    if (lower.startsWith("citation key:")) return k;
+    legacy ??= k;
   }
-  return undefined;
+  return legacy;
 }
+
+/** Why the databases could not be copied, in plain words (a lock held by Zotero on Windows: close Zotero). */
+export function zoteroCopyReason(err: unknown): string {
+  if (err instanceof CopyTooLarge) return ZOTERO_REASONS.tooLarge;
+  if (err instanceof CopyUnstable) return ZOTERO_REASONS.busy;
+  if (err instanceof CopyNoSpace) return ZOTERO_REASONS.noSpace;
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EBUSY" || (process.platform === "win32" && (code === "EPERM" || code === "EACCES"))) return ZOTERO_REASONS.locked;
+  return ZOTERO_REASONS.unreadable;
+}
+
+/** An integer column as itself, NULL when it holds anything else (a text "0" is not trusted). */
+const int = (col: string, as: string) => `CASE WHEN typeof(${col}) = 'integer' THEN ${col} END AS ${as}`;
 
 const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && Math.abs(v) <= MAX_COORD;
 
@@ -308,6 +328,8 @@ export interface ZoteroLocalOptions {
   baseAttachmentPath?: string;
   /** Test seam: the size cap of the copied databases (default 4 GB). */
   maxCopyBytes?: number;
+  /** Test seam: free bytes in the work folder. */
+  freeSpace?: (dir: string) => Promise<number>;
 }
 
 /** Everything read up front from the copy (small per item; texts are read per item later). */
@@ -339,7 +361,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
 
   const annotationRows = cappedRows<{ id: number; parent: number; key: string; added: string | null; modified: string | null }>(
     db,
-    `SELECT a.itemID AS id, a.parentItemID AS parent, ${t64("i.key", "key")}, ${t64("i.dateAdded", "added")}, ${t64("i.clientDateModified", "modified")}
+    `SELECT a.itemID AS id, ${int("a.parentItemID", "parent")}, ${t64("i.key", "key")}, ${t64("i.dateAdded", "added")}, ${t64("i.clientDateModified", "modified")}
        FROM itemAnnotations a JOIN items i ON i.itemID = a.itemID WHERE i.libraryID = ? ORDER BY a.parentItemID, a.itemID`,
     MAX_ANNOTATIONS,
     tooLarge,
@@ -348,7 +370,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
   const annotationIds = new Set(annotationRows.map((r) => r.id));
   const items = cappedRows<ItemRow>(
     db,
-    `SELECT i.itemID AS id, ${t64("t.typeName", "type")}, ${t64("i.key", "key")}, i.version AS version, ${t64("i.dateAdded", "added")},
+    `SELECT i.itemID AS id, ${t64("t.typeName", "type")}, ${t64("i.key", "key")}, ${int("i.version", "version")}, ${t64("i.dateAdded", "added")},
             ${t64("i.dateModified", "modified")}, ${t64("i.clientDateModified", "clientModified")}
        FROM items i JOIN itemTypes t ON t.itemTypeID = i.itemTypeID
       WHERE i.libraryID = ? AND i.itemID NOT IN (SELECT itemID FROM itemAnnotations) ORDER BY i.itemID`,
@@ -361,7 +383,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
 
   const attachments = new Map<number, AttachmentRow>();
   const childAttachments = new Map<number, AttachmentRow[]>();
-  for (const a of cappedRows<AttachmentRow>(db, `SELECT itemID AS id, parentItemID AS parent, linkMode, ${tN("path", "path", 8192)} FROM itemAttachments ORDER BY itemID`, MAX_ITEMS, tooLarge)) {
+  for (const a of cappedRows<AttachmentRow>(db, `SELECT itemID AS id, ${int("parentItemID", "parent")}, ${int("linkMode", "linkMode")}, ${tN("path", "path", 8192)} FROM itemAttachments ORDER BY itemID`, MAX_ITEMS, tooLarge)) {
     if (!byId.has(a.id)) continue;
     attachments.set(a.id, a);
     if (a.parent !== null && a.parent !== undefined) {
@@ -376,7 +398,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
   const attachmentNotes = new Set<number>();
   for (const n of cappedRows<{ id: number; parent: number | null; has: number }>(
     db,
-    "SELECT itemID AS id, parentItemID AS parent, (note IS NOT NULL AND note != '') AS has FROM itemNotes ORDER BY itemID",
+    `SELECT itemID AS id, ${int("parentItemID", "parent")}, (note IS NOT NULL AND note != '') AS has FROM itemNotes ORDER BY itemID`,
     MAX_ITEMS,
     tooLarge,
   )) {
@@ -405,7 +427,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
   // Collections (those in the trash, and their subcollections, left out).
   const colls = cappedRows<{ id: number; name: string; parent: number | null }>(
     db,
-    `SELECT collectionID AS id, ${tN("collectionName", "name", 200)}, parentCollectionID AS parent FROM collections WHERE libraryID = ?`,
+    `SELECT collectionID AS id, ${tN("collectionName", "name", 200)}, ${int("parentCollectionID", "parent")} FROM collections WHERE libraryID = ?`,
     MAX_LINK_ROWS,
     tooLarge,
     libraryId,
@@ -491,7 +513,7 @@ function itemQueries(db: Database.Database) {
        JOIN itemDataValues v ON v.valueID = d.valueID WHERE d.itemID = ? LIMIT ${MAX_FIELDS}`,
   );
   const creators = db.prepare(
-    `SELECT ${t64("c.firstName", "first")}, ${t64("c.lastName", "last")}, c.fieldMode AS mode, ${t64("ct.creatorType", "type")}
+    `SELECT ${t64("c.firstName", "first")}, ${t64("c.lastName", "last")}, ${int("c.fieldMode", "mode")}, ${t64("ct.creatorType", "type")}
        FROM itemCreators ic JOIN creators c ON c.creatorID = ic.creatorID JOIN creatorTypes ct ON ct.creatorTypeID = ic.creatorTypeID
       WHERE ic.itemID = ? ORDER BY ic.orderIndex LIMIT ${MAX_CREATORS}`,
   );
@@ -500,9 +522,10 @@ function itemQueries(db: Database.Database) {
     `SELECT ${tN("r.object", "object", 1024)} FROM itemRelations r JOIN relationPredicates p ON p.predicateID = r.predicateID
       WHERE r.itemID = ? AND p.predicate = 'dc:relation' LIMIT ${MAX_RELATED}`,
   );
-  const note = db.prepare(`SELECT ${tN("note", "note", MAX_NOTE_CHARS)} FROM itemNotes WHERE itemID = ?`);
+  // One character more than a note may hold, so a longer note is known to be cut (and says so).
+  const note = db.prepare(`SELECT ${tN("note", "note", MAX_NOTE_CHARS + 1)} FROM itemNotes WHERE itemID = ?`);
   const annotation = db.prepare(
-    `SELECT type, ${t64("authorName", "authorName")}, ${t64("text", "text")}, ${t64("comment", "comment")}, ${t64("color", "color")},
+    `SELECT ${int("type", "type")}, ${t64("authorName", "authorName")}, ${t64("text", "text")}, ${t64("comment", "comment")}, ${t64("color", "color")},
             ${t64("pageLabel", "pageLabel")}, ${t64("position", "position")} FROM itemAnnotations WHERE itemID = ?`,
   );
   return {
@@ -596,10 +619,13 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
   const storage = join(root, "storage");
   let copy;
   try {
-    copy = await copyDatabases(root, { required: ["zotero.sqlite"], optional: ["better-bibtex.sqlite"] }, await ctx.workDir(), "zotero", o.maxCopyBytes ?? MAX_ZOTERO_COPY_BYTES);
+    copy = await copyDatabases(root, { required: ["zotero.sqlite"], optional: ["better-bibtex.sqlite"] }, await ctx.workDir(), "zotero", o.maxCopyBytes ?? MAX_ZOTERO_COPY_BYTES, {
+      signal,
+      ...(o.freeSpace ? { freeSpace: o.freeSpace } : {}),
+    });
   } catch (err) {
-    if ((err as Error)?.name === "AbortError") throw err;
-    yield fail(err instanceof CopyTooLarge ? ZOTERO_REASONS.tooLarge : err instanceof CopyUnstable ? ZOTERO_REASONS.busy : ZOTERO_REASONS.unreadable);
+    if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
+    yield fail(zoteroCopyReason(err));
     return;
   }
   let db: Database.Database | undefined;
@@ -702,7 +728,10 @@ async function* scanZotero(dataDir: string, o: Required<Pick<ZoteroLocalOptions,
       const creators = att ? [] : q.creators(it.id);
       const tags = q.tags(it.id);
       const { fields, extra } = recordFields(att ? "attachment" : it.type, fieldMap, creators, tags);
-      const citekey = snap.bbt.get(it.key) ?? extraCitationKey(extra);
+      // BBT's database, then Zotero's own citationKey field, then Extra, else generated later.
+      const native = text(fieldMap.get("citationKey"));
+      const citekey = snap.bbt.get(it.key) ?? (native && native.length <= 200 && !/\s/u.test(native) ? native : undefined) ?? extraCitationKey(extra);
+      stamp.push(`citekey:${citekey ?? ""}`);
       if (citekey) fields.citekey = citekey;
       const related = q.related(it.id);
       const paths = snap.collectionPaths.get(it.id) ?? [];

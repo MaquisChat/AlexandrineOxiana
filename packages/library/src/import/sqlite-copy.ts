@@ -4,15 +4,21 @@
  * must never be changed — but copied into a private (0700) folder inside the batch's work folder,
  * opened read-only, read, closed and deleted.
  *
- * Copy consistency: the main file and its `-wal` (and `-shm`, if present) are copied together, and
- * the copy is accepted only if neither the main file nor the `-wal` changed size or modification
- * time while they were copied (up to three tries). SQLite writes the main file only when it
- * checkpoints, and appends to (or resets) the `-wal` on every commit, so an unchanged pair is a
- * snapshot SQLite itself could have read: the copy holds every committed transaction up to that
- * moment and nothing half-written (a frame without its commit record is ignored when the copy is
- * opened). The `-shm` is only an index of the `-wal`; it is copied first, so it never points past
- * the copied `-wal`, and SQLite rebuilds it if it does not match. With Zotero's default exclusive
- * locking there is no `-shm` at all.
+ * Copy consistency: the main file is copied together with its `-wal` (and `-shm`) or its rollback
+ * `-journal`, whichever exist, and the copy is accepted only if none of the main file, `-wal` and
+ * `-journal` changed size or modification time while they were copied (up to three tries; then
+ * CopyUnstable, "busy saving"). In WAL mode SQLite writes the main file only when it checkpoints
+ * and appends to (or resets) the `-wal` on every commit, so an unchanged pair is a snapshot SQLite
+ * itself could have read (a frame without its commit record is ignored). The `-shm` is only an
+ * index of the `-wal`; it is copied first, so it never points past the copied `-wal`, and SQLite
+ * rebuilds it if it does not match. In rollback-journal mode (Zotero's default, with exclusive
+ * locking) a large uncommitted transaction can already have written pages into the main file — a
+ * torn file — while the original pages sit in the hot `-journal` (R75 I1). So the copied
+ * `-journal` is copied too, and the private copy is opened read-write once, which makes SQLite roll
+ * the hot journal back into the copy, before it is opened read-only: the copy then holds exactly
+ * the committed data.
+ *
+ * The copy checks free space first (CopyNoSpace) and stops when the signal aborts.
  *
  * What is read is a file anyone could edit, so: `trusted_schema` is off (schema objects cannot call
  * functions with side effects) and `query_only` on; every table read must be a plain table (a view,
@@ -22,7 +28,9 @@
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
 import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
 import Database from "better-sqlite3";
 
 export interface DbCopy {
@@ -40,6 +48,50 @@ export class CopyTooLarge extends Error {
 /** The files kept changing while they were copied (the other program is busy writing). */
 export class CopyUnstable extends Error {
   override name = "CopyUnstable";
+}
+
+/** Not enough free disk space for the copy. */
+export class CopyNoSpace extends Error {
+  override name = "CopyNoSpace";
+}
+
+/** Space kept free beyond the copy itself. */
+const SPACE_MARGIN = 64 * 1024 * 1024;
+
+/** A database file's companions, copied with it. */
+const COMPANIONS = ["-shm", "-wal", "-journal"] as const;
+
+export interface CopyOptions {
+  signal?: AbortSignal;
+  /** Test seam: free bytes where the copy goes (default: statfs). */
+  freeSpace?: (dir: string) => Promise<number>;
+}
+
+async function statfsFree(dir: string): Promise<number> {
+  try {
+    const st = await fsp.statfs(dir);
+    return Number(st.bavail) * Number(st.bsize);
+  } catch {
+    return Number.POSITIVE_INFINITY; // cannot tell: the copy itself fails if the disk fills
+  }
+}
+
+async function copyOne(src: string, dest: string, signal: AbortSignal | undefined): Promise<void> {
+  await pipeline(createReadStream(src), createWriteStream(dest, { mode: 0o600, flags: "wx" }), ...(signal ? [{ signal }] : []));
+}
+
+/**
+ * Rolls back a hot journal in a private copy: opening it read-write once lets SQLite do that (and
+ * nothing else: no statement but a read of the schema table runs).
+ */
+function settleCopy(path: string): void {
+  const db = new Database(path, { fileMustExist: true });
+  try {
+    db.pragma("trusted_schema = OFF");
+    db.prepare("SELECT count(*) AS n FROM sqlite_master").get();
+  } finally {
+    db.close();
+  }
 }
 
 const COPY_TRIES = 3;
@@ -63,7 +115,9 @@ export async function copyDatabases(
   workDir: string,
   prefix: string,
   maxBytes: number,
+  opts: CopyOptions = {},
 ): Promise<DbCopy> {
+  opts.signal?.throwIfAborted();
   const dir = join(workDir, `${prefix}-${randomBytes(6).toString("hex")}`);
   await fsp.mkdir(dir, { mode: 0o700 });
   const remove = () => fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -78,31 +132,39 @@ export async function copyDatabases(
     for (const n of names.optional ?? []) if ((await stampOf(join(srcDir, n))) !== null) present.push(n);
 
     for (let attempt = 1; ; attempt++) {
-      const watched = present.flatMap((n) => [join(srcDir, n), join(srcDir, `${n}-wal`)]);
+      const watched = present.flatMap((n) => [join(srcDir, n), join(srcDir, `${n}-wal`), join(srcDir, `${n}-journal`)]);
       const before = await Promise.all(watched.map(stampOf));
       let total = 0;
-      for (const n of present) for (const s of ["", "-wal", "-shm"]) total += (await stampOf(join(srcDir, n + s)))?.size ?? 0;
+      for (const n of present) for (const s of ["", ...COMPANIONS]) total += (await stampOf(join(srcDir, n + s)))?.size ?? 0;
       if (total > maxBytes) throw new CopyTooLarge();
+      if (total + SPACE_MARGIN > (await (opts.freeSpace ?? statfsFree)(dir))) throw new CopyNoSpace();
       const paths = new Map<string, string>();
       for (const n of present) {
         const src = join(srcDir, n);
         const dest = join(dir, n);
-        // -shm first (it must not point past the -wal copied after it), then -wal, then the database.
-        for (const s of ["-shm", "-wal"]) {
+        // -shm first (it must not point past the -wal copied after it), then -wal and -journal, then the database.
+        for (const s of COMPANIONS) {
           await fsp.rm(dest + s, { force: true });
-          if ((await stampOf(src + s)) !== null) await fsp.copyFile(src + s, dest + s).catch((e: NodeJS.ErrnoException) => {
-            if (e.code !== "ENOENT") throw e; // a -shm/-wal removed meanwhile is caught by the check below
-          });
+          if ((await stampOf(src + s)) !== null) {
+            await copyOne(src + s, dest + s, opts.signal).catch((e: NodeJS.ErrnoException) => {
+              if (e.code !== "ENOENT") throw e; // one removed meanwhile is caught by the check below
+            });
+          }
         }
-        await fsp.copyFile(src, dest);
+        await fsp.rm(dest, { force: true });
+        await copyOne(src, dest, opts.signal);
         paths.set(n, dest);
       }
       const after = await Promise.all(watched.map(stampOf));
       let copied = 0;
-      for (const n of present) for (const s of ["", "-wal", "-shm"]) copied += (await stampOf(join(dir, n + s)))?.size ?? 0;
+      for (const n of present) for (const s of ["", ...COMPANIONS]) copied += (await stampOf(join(dir, n + s)))?.size ?? 0;
       if (copied > maxBytes) throw new CopyTooLarge();
-      if (before.every((b, i) => same(b, after[i]!))) return { paths, dir, remove };
+      if (before.every((b, i) => same(b, after[i]!))) {
+        for (const dest of paths.values()) if ((await stampOf(`${dest}-journal`)) !== null) settleCopy(dest);
+        return { paths, dir, remove };
+      }
       if (attempt >= COPY_TRIES) throw new CopyUnstable();
+      opts.signal?.throwIfAborted();
     }
   } catch (err) {
     await remove();
@@ -124,14 +186,21 @@ export function openCopy(path: string): Database.Database {
 }
 
 /**
- * Which of `names` are plain tables: sqlite_master lists them as type 'table', they are not
- * virtual tables (CREATE VIRTUAL TABLE, run by a module) and none of their columns is generated
+ * Which of `names` are plain tables: sqlite_master lists them as type 'table' with a root page (a
+ * virtual table, run by a module, has root page 0 — told by the schema's data, never by reading
+ * its SQL, R75 I2), pragma_table_list says 'table' too, and none of their columns is generated
  * (computed on read, e.g. a printf() building a gigabyte string; PRAGMA table_xinfo hidden 2 or 3).
  */
 export function plainTables(db: Database.Database, names: Iterable<string>): Set<string> {
-  const rows = db.prepare("SELECT name, substr(sql, 1, 64) AS head FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string; head: string | null }>;
+  const rows = db.prepare("SELECT name, rootpage FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: unknown; rootpage: unknown }>;
   const tables = new Set<string>();
-  for (const r of rows) if (!/^\s*create\s+virtual\b/iu.test(r.head ?? "")) tables.add(r.name);
+  for (const r of rows) if (typeof r.name === "string" && typeof r.rootpage === "number" && r.rootpage > 0) tables.add(r.name);
+  try {
+    const kinds = db.prepare("SELECT name, type FROM pragma_table_list WHERE schema = 'main'").all() as Array<{ name: unknown; type: unknown }>;
+    for (const k of kinds) if (typeof k.name === "string" && k.type !== "table") tables.delete(k.name);
+  } catch {
+    // pragma_table_list unavailable: the root page check stands
+  }
   const out = new Set<string>();
   for (const t of names) {
     if (!tables.has(t)) continue;

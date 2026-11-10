@@ -23,7 +23,7 @@ import { OUTSIDE_NOTE } from "./bulk/outside.js";
 import { ENGINE_FILE_NOTES } from "./bulk/run.js";
 import { IMAGE_PLACEHOLDER, MAX_NOTE_CHARS, noteToMarkdown } from "./note-html.js";
 import { RDF_REASONS } from "./zotero-rdf.js";
-import { ZOTERO_REASONS, zoteroAnnotation, zoteroLocalAdapter } from "./zotero-local.js";
+import { ZOTERO_NOTES, ZOTERO_REASONS, zoteroAnnotation, zoteroCopyReason, zoteroLocalAdapter } from "./zotero-local.js";
 
 const FAST = 2 ** 10;
 
@@ -334,6 +334,135 @@ describe("zoteroLocalAdapter scan", () => {
   it("a folder without zotero.sqlite is one unreadable item", async () => {
     const items = await collect(zoteroLocalAdapter(join(tmp, "nowhere")));
     expect(items).toEqual([expect.objectContaining({ unreadable: ZOTERO_REASONS.unreadable })]);
+  });
+});
+
+describe("R75: adapter review round 1", () => {
+  it("I1: a torn copy is never read: the hot -journal is copied and rolled back (exclusive locking, spilled cache)", async () => {
+    zoteroEdit((db) => {
+      const ins = db.prepare("INSERT INTO itemDataValues (valueID, value) VALUES (?, ?)");
+      db.transaction(() => {
+        for (let i = 0; i < 5000; i++) ins.run(1000 + i, `filler value ${i} ${"x".repeat(200)}`);
+      })();
+    });
+    const live = new Database(fx.db);
+    try {
+      live.pragma("locking_mode = EXCLUSIVE");
+      live.pragma("cache_size = 10");
+      live.exec("BEGIN");
+      live.prepare("UPDATE itemDataValues SET value = value || ' TORN'").run(); // spills pages into zotero.sqlite
+      expect((await stat(`${fx.db}-journal`)).size).toBeGreaterThan(0);
+      const before = { db: await sha(fx.db), journal: await sha(`${fx.db}-journal`) };
+      const items = await collect(zoteroLocalAdapter(dataDir));
+      expect(items.every((i) => !i.unreadable)).toBe(true);
+      expect(items.map(title).sort()).toEqual(["Feeding the City: Informal Markets in Lagos", "Markets and Memory", "Street Food and the State", "Street Vendors in Accra", "Water Access in Peri-Urban Areas"]);
+      expect(JSON.stringify(items)).not.toContain("TORN");
+      expect(await sha(fx.db)).toBe(before.db);
+      expect(await sha(`${fx.db}-journal`)).toBe(before.journal);
+      expect(await readdir(work)).toEqual([]);
+    } finally {
+      live.exec("ROLLBACK");
+      live.close();
+    }
+  });
+
+  it("I2: a virtual table is refused promptly whatever its SQL looks like", async () => {
+    zoteroEdit((db) => db.exec("ALTER TABLE items RENAME TO items_real; CREATE /**/ VIRTUAL TABLE items USING fts5(key)"));
+    const t = performance.now();
+    const items = await collect(zoteroLocalAdapter(dataDir));
+    expect(performance.now() - t).toBeLessThan(5_000);
+    expect(items).toEqual([expect.objectContaining({ unreadable: ZOTERO_REASONS.unreadable })]);
+  });
+
+  it("I3: note link URLs cannot inject Markdown links or images", () => {
+    const inputs = [
+      '<a href="https://example.org/a)[x](javascript:alert(1))">t</a>',
+      '<a href="https://example.org/b ![i](https://evil.example/p.png)">t</a>',
+      '<a href="https://example.org/c*_<x>`!">t</a>',
+    ];
+    for (const html of inputs) {
+      const md = noteToMarkdown(html);
+      expect(md, html).not.toMatch(/\]\(|!\[/u);
+      expect(md, html).toMatch(/^t \(https:\/\/example\.org\/[^\s()[\]<>*_!`]+\)$/u);
+    }
+    expect(noteToMarkdown(inputs[0]!)).toBe("t (https://example.org/a%29%5Bx%5D%28javascript:alert%281%29%29)");
+  });
+
+  it("links nested deeper than the kept depth keep their URL", () => {
+    const md = noteToMarkdown("<div>".repeat(40) + '<a href="https://deep.example/x">deep</a> after');
+    expect(md).toContain("deep (https://deep.example/x)");
+    expect(md).toContain("after");
+  });
+
+  it("1 MB floods of '<', nested lists and table cells convert in under 2 s", { timeout: 60_000 }, () => {
+    const MB1 = 1024 * 1024;
+    for (const unit of ["<", "<ul><li>", "<td>x", "<tr><td>", "<li>", "<li>x", "<ul><li>x", "<p>x", "<b>x</b> "]) {
+      const n = Math.floor(MB1 / unit.length);
+      const html = unit.repeat(n);
+      noteToMarkdown(html.slice(0, 10_000)); // warm up
+      const t = performance.now();
+      const md = noteToMarkdown(html);
+      expect(performance.now() - t, unit).toBeLessThan(2_000);
+      // Past the element cap the tags go but every bit of text stays.
+      if (unit.includes("x")) expect(md.split("x").length - 1, unit).toBe(n);
+    }
+  });
+
+  it("integer columns holding text are not trusted; an undated '0000' date falls back to its text", async () => {
+    zoteroEdit((db) => {
+      db.prepare("UPDATE items SET version = 'not a number' WHERE itemID = 2").run();
+      const v = (db.prepare("SELECT max(valueID) AS m FROM itemDataValues").get() as { m: number }).m + 1;
+      db.prepare("INSERT INTO itemDataValues (valueID, value) VALUES (?, '0000-00-00 Spring 2020')").run(v);
+      db.prepare("UPDATE itemData SET valueID = ? WHERE itemID = 3 AND fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'date')").run(v);
+    });
+    const items = await collect(zoteroLocalAdapter(dataDir));
+    expect(byKey(items, "BBBB2222")!.externalKeys?.zoteroVersion).toBe("0");
+    expect(byKey(items, "CCCC3333")!.referenceMetadata?.issued).toBe("2020");
+  });
+
+  it("citation keys: BBT, then Zotero's own field, then Extra (Citation Key or legacy bibtex:), else none", async () => {
+    zoteroEdit((db) => {
+      db.prepare("INSERT INTO fields (fieldID, fieldName) VALUES (100, 'citationKey')").run();
+      db.prepare("INSERT INTO itemDataValues (valueID, value) VALUES (900, 'whoWater2021'), (901, 'okaforNative'), (902, 'Citation Key: extraLoses'), (903, 'bibtex: doeVendors2020')").run();
+      db.prepare("INSERT INTO itemData (itemID, fieldID, valueID) VALUES (3, 100, 900), (1, 100, 901)").run();
+      db.prepare("INSERT INTO itemData (itemID, fieldID, valueID) VALUES (3, (SELECT fieldID FROM fields WHERE fieldName = 'extra'), 902), (5, (SELECT fieldID FROM fields WHERE fieldName = 'extra'), 903)").run();
+    });
+    const items = await collect(zoteroLocalAdapter(dataDir));
+    expect(byKey(items, "AAAA1111")!.referenceMetadata?.citationKey).toBe("okaforFeedingCity2024"); // BBT first
+    expect(byKey(items, "CCCC3333")!.referenceMetadata?.citationKey).toBe("whoWater2021"); // native field over Extra
+    expect(byKey(items, "EEEE5555")!.referenceMetadata?.citationKey).toBe("doeVendors2020"); // legacy bibtex: line
+    expect(byKey(items, "DDDD4444")!.referenceMetadata?.citationKey).toBeUndefined();
+  });
+
+  it("a legacy (Loki) Better BibTeX store gives the scan note; a changed BBT key changes the version token", async () => {
+    const notes: string[] = [];
+    const before = await collect(zoteroLocalAdapter(dataDir));
+    const b = new Database(fx.bbtDb!);
+    b.prepare("UPDATE citationkey SET citationKey = 'okafor2024new' WHERE itemKey = 'AAAA1111'").run();
+    b.close();
+    const after = await collect(zoteroLocalAdapter(dataDir));
+    expect(byKey(after, "AAAA1111")!.version!.version).not.toBe(byKey(before, "AAAA1111")!.version!.version);
+    expect(byKey(after, "BBBB2222")!.version!.version).toBe(byKey(before, "BBBB2222")!.version!.version);
+    await rm(fx.bbtDb!);
+    const loki = new Database(fx.bbtDb!);
+    loki.exec(`CREATE TABLE "better-bibtex" (name TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL); INSERT INTO "better-bibtex" VALUES ('better-bibtex.citekey', '{}')`);
+    loki.close();
+    await collect(zoteroLocalAdapter(dataDir), { ...ctx, note: (t) => notes.push(t) });
+    expect(notes).toContain(ZOTERO_NOTES.bbt);
+  });
+
+  it("the copy honours the abort signal and checks free space first; a Windows lock error asks to close Zotero", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    await expect((async () => {
+      for await (const _ of zoteroLocalAdapter(dataDir).scan(ac.signal, ctx)) void _;
+    })()).rejects.toThrow(/abort/iu);
+    expect(await readdir(work)).toEqual([]);
+    const items = await collect(zoteroLocalAdapter(dataDir, { freeSpace: async () => 1024 }));
+    expect(items).toEqual([expect.objectContaining({ unreadable: ZOTERO_REASONS.noSpace })]);
+    expect(zoteroCopyReason(Object.assign(new Error("busy"), { code: "EBUSY" }))).toBe(ZOTERO_REASONS.locked);
+    expect(zoteroCopyReason(Object.assign(new Error("x"), { code: "ENOENT" }))).toBe(ZOTERO_REASONS.unreadable);
+    expect(ZOTERO_REASONS.busy).toBe("Zotero is busy saving — try again in a moment or close Zotero.");
   });
 });
 
@@ -658,5 +787,6 @@ processing:
     const items = await collect(zoteroLocalAdapter(dataDir));
     const note = byKey(items, "AAAA1111")!.annotations!.find((x) => x.key === "zotero:NOTE0001")!;
     expect(note.body!.length).toBeLessThanOrEqual(MAX_NOTE_CHARS);
+    expect(note.body!.endsWith("(note truncated)")).toBe(true);
   });
 });

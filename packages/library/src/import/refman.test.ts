@@ -6,6 +6,7 @@ import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import Database from "better-sqlite3";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
@@ -24,7 +25,7 @@ import { openTestRepo } from "../repo/testing.js";
 import { approvedFolders, rememberApprovedFolders } from "./approved-folders.js";
 import { adapterFor, createBulkImport, folderAdapter, zipAdapter, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import { reportLabel } from "./bulk/report.js";
-import { CALIBRE_FILE_NOTE, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
+import { CALIBRE_FILE_NOTE, CALIBRE_REASONS, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
 import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_EXPORT_RECORDS, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, exportIdentity, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
@@ -394,6 +395,43 @@ describe("calibreAdapter", () => {
     expect(await readdir(work)).toEqual([]);
     // Stable keys.
     expect((await collect(calibreAdapter(calibre.dir))).map((i) => i.key)).toEqual(items.map((i) => i.key));
+  });
+
+  it("R75 I1: a torn metadata.db is never read: the hot -journal is copied and rolled back", async () => {
+    const seed = new Database(calibre.db);
+    const ins = seed.prepare("INSERT INTO tags (name) VALUES (?)");
+    seed.transaction(() => {
+      for (let i = 0; i < 5000; i++) ins.run(`filler tag ${i} ${"x".repeat(200)}`);
+    })();
+    seed.close();
+    const live = new Database(calibre.db);
+    try {
+      live.pragma("locking_mode = EXCLUSIVE");
+      live.pragma("cache_size = 10");
+      live.exec("BEGIN");
+      live.prepare("UPDATE tags SET name = name || ' TORN'").run();
+      live.prepare("UPDATE books SET title = title || ' TORN'").run();
+      expect((await stat(`${calibre.db}-journal`)).size).toBeGreaterThan(0);
+      const before = await sha(calibre.db);
+      const items = await collect(calibreAdapter(calibre.dir));
+      expect(items.map(title)).toEqual(["Feeding the City", "Markets and Memory", "Outside the Library", "Absolute Path", "Sneaky Name", "Lost Format"]);
+      expect(JSON.stringify(items)).not.toContain("TORN");
+      expect(await sha(calibre.db)).toBe(before);
+    } finally {
+      live.exec("ROLLBACK");
+      live.close();
+    }
+  });
+
+  it("R75 I2: a virtual table is refused promptly whatever its SQL looks like", async () => {
+    const db = new Database(calibre.db);
+    db.exec("ALTER TABLE books RENAME TO books_real; CREATE /**/ VIRTUAL TABLE books USING fts5(title, path)");
+    db.close();
+    const t = performance.now();
+    const items = await collect(calibreAdapter(calibre.dir));
+    expect(performance.now() - t).toBeLessThan(5_000);
+    expect(items).toEqual([expect.objectContaining({ unreadable: CALIBRE_REASONS.unreadable })]);
+    expect(CALIBRE_REASONS.busy).toBe("Calibre is busy saving — try again in a moment or close Calibre.");
   });
 
   it("copies metadata.db into a private (0700) folder under the work folder", async () => {

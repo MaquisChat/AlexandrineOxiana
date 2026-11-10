@@ -3,7 +3,7 @@
  *
  * The HTML comes from a file anyone could edit, so it is never handed to a full HTML parser or a
  * browser DOM. A small tokenizer here reads it in one linear pass and builds a sanitised DOM
- * (@xmldom/xmldom nodes, which carry no behaviour) that turndown (pinned exact) turns into Markdown:
+ * (mini-dom.ts: plain nodes with no behaviour) that turndown (pinned exact) turns into Markdown:
  *
  *   - script, style, iframe, object, embed, svg, math, template, form controls and the like are
  *     dropped with everything inside them; unknown tags are dropped but their text is kept;
@@ -17,7 +17,7 @@
  *
  * The input is cut at MAX_NOTE_CHARS (1 MB) before parsing, and the Markdown at the same length.
  */
-import { DOMImplementation, type Element as XElement, type Node as XNode } from "@xmldom/xmldom";
+import { MiniElement, MiniText, type MiniNode } from "./mini-dom.js";
 import TurndownService from "turndown";
 
 /** Longest note read (in characters, before and after conversion). */
@@ -26,6 +26,12 @@ export const NOTE_TRUNCATED = "\n\n(note truncated)";
 export const IMAGE_PLACEHOLDER = "[image]";
 
 const MAX_DEPTH = 24;
+/**
+ * Elements kept per note: past this many, tags are dropped and their text kept (a space between
+ * blocks). turndown's work per element (rule lookup, escaping) is what a megabyte of tiny elements
+ * costs; real notes stay far below this.
+ */
+const MAX_ELEMENTS = 20_000;
 const MAX_CHILDREN = 64;
 
 /** Elements kept as themselves (turndown knows how to render them). */
@@ -94,11 +100,19 @@ export function decodeEntities(s: string): string {
 function safeHref(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const v = decodeEntities(raw).trim();
-  if (v.length > 2048 || /[\u0000-\u001f\u007f\s<>"'`]/u.test(v)) return undefined;
-  return /^(?:https?:\/\/|mailto:)/iu.test(v) ? v : undefined;
+  if (v.length > 2048 || /[\u0000-\u001f\u007f]/u.test(v)) return undefined;
+  return /^(?:https?:\/\/|mailto:)/iu.test(v) ? encodeHref(v) : undefined;
 }
 
-type El = XElement;
+/**
+ * Characters that could start Markdown (a link, an image, emphasis, code) or end the "(URL)" around
+ * a link's address, and whitespace, percent-encoded (R75 I3): the URL is inert text.
+ */
+export function encodeHref(v: string): string {
+  return v.replace(/[()[\]<>*_!`"'\\\s]/gu, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+}
+
+type El = MiniElement;
 
 /** The sanitised tree before it becomes DOM nodes: a text, or an element with its kept attributes. */
 interface PEl {
@@ -127,7 +141,17 @@ export function sanitizeNoteHtml(htmlIn: string): El {
   const top = () => stack[stack.length - 1]!;
 
   const append = (node: PEl | string) => {
-    top().el.kids.push(node);
+    const kids = top().el.kids;
+    // Adjacent text joins one node (a flood of stray "<" stays one text, not a million nodes).
+    if (typeof node === "string" && typeof kids[kids.length - 1] === "string") kids[kids.length - 1] += node;
+    else kids.push(node);
+  };
+  /** A link opened deeper than MAX_DEPTH (not kept as an element): its URL follows its text. */
+  let deepHref: string | undefined;
+  let elements = 0;
+  const flushDeepLink = () => {
+    if (deepHref) append({ tag: "X-URL", attrs: { href: deepHref }, kids: ["url"] });
+    deepHref = undefined;
   };
   const text = (s: string) => {
     // Unicode spaces become plain ones (turndown's edge-whitespace pattern backtracks on runs mixing them).
@@ -215,6 +239,7 @@ export function sanitizeNoteHtml(htmlIn: string): El {
     i = j < n ? j + 1 : n;
 
     if (closing) {
+      if (name === "a") flushDeepLink();
       close(name);
       continue;
     }
@@ -245,6 +270,10 @@ export function sanitizeNoteHtml(htmlIn: string): El {
       continue;
     }
     if (!KEEP.has(name)) continue; // unknown or presentational: the tag goes, its text stays
+    if (++elements > MAX_ELEMENTS) {
+      if (name !== "a" && name !== "strong" && name !== "b" && name !== "em" && name !== "i" && name !== "code") text(" ");
+      continue;
+    }
     if (SELF_CLOSING_SIBLINGS.has(name)) {
       for (let k = stack.length - 1; k > 0 && k >= stack.length - 4; k--) {
         const open = stack[k]!.name;
@@ -273,12 +302,44 @@ export function sanitizeNoteHtml(htmlIn: string): El {
       append(el);
       continue;
     }
-    if (stack.length > MAX_DEPTH) continue; // too deep: its content goes into the deepest kept element
+    if (stack.length > MAX_DEPTH) {
+      // Too deep: its content goes into the deepest kept element; a link keeps its URL.
+      if (name === "a" && el.attrs?.href) {
+        flushDeepLink();
+        deepHref = el.attrs.href;
+      }
+      continue;
+    }
     append(el);
     stack.push({ name, el });
   }
+  flushDeepLink();
+  prune(root);
   group(root);
   return toDom(root);
+}
+
+/** Elements that mean something with no text in them. */
+const MEANINGFUL_EMPTY = new Set(["BR", "HR", "X-IMAGE", "X-URL"]);
+
+/**
+ * Drops elements with no text and nothing meaningful inside (turndown renders them as nothing or a
+ * blank line, after costly checks on each: a flood of empty `<li>` or `<td>` would be slow).
+ * Iterative, post-order, linear.
+ */
+function prune(root: PEl): void {
+  const keep = new Map<PEl, boolean>();
+  const todo: Array<[PEl, boolean]> = [[root, false]];
+  while (todo.length) {
+    const [el, visited] = todo.pop()!;
+    if (!visited) {
+      todo.push([el, true]);
+      for (const c of el.kids) if (typeof c !== "string") todo.push([c, false]);
+      continue;
+    }
+    el.kids = el.kids.filter((c) => typeof c === "string" || keep.get(c));
+    keep.set(el, MEANINGFUL_EMPTY.has(el.tag) || el.kids.some((c) => typeof c !== "string" || c.trim() !== ""));
+  }
 }
 
 /**
@@ -300,18 +361,17 @@ function group(root: PEl): void {
   }
 }
 
-/** The tree as @xmldom/xmldom nodes (iterative; every element has at most MAX_CHILDREN children). */
+/** The tree as mini-dom nodes (iterative; every element has at most MAX_CHILDREN children). */
 function toDom(root: PEl): El {
-  const doc = new DOMImplementation().createDocument(null, root.tag);
-  const top = doc.documentElement!;
+  const top = new MiniElement(root.tag);
   const todo: Array<[PEl, El]> = [[root, top]];
   while (todo.length) {
     const [p, el] = todo.pop()!;
     for (const [k, v] of Object.entries(p.attrs ?? {})) el.setAttribute(k, v);
     for (const c of p.kids) {
-      if (typeof c === "string") el.appendChild(doc.createTextNode(c));
+      if (typeof c === "string") el.appendChild(new MiniText(c));
       else {
-        const e = doc.createElement(c.tag);
+        const e = new MiniElement(c.tag);
         el.appendChild(e);
         todo.push([c, e]);
       }
@@ -335,16 +395,17 @@ ts.addRule("aoLink", {
     return `${content} (${href})`;
   },
 });
+ts.addRule("aoUrl", { filter: (node) => node.nodeName === "X-URL", replacement: (_c, node) => ` (${(node as unknown as El).getAttribute("href") ?? ""})` });
 ts.addRule("aoImage", { filter: (node) => node.nodeName === "X-IMAGE", replacement: () => IMAGE_PLACEHOLDER });
-const nextElement = (node: XNode) => {
+const nextElement = (node: MiniNode) => {
   let s = node.nextSibling;
   while (s && s.nodeType !== 1) s = s.nextSibling;
   return s;
 };
-// turndown's own list rules read `children` and `lastElementChild`, which xmldom does not have.
+// turndown's own list rules read `children` and `lastElementChild`, which mini-dom does not have.
 ts.addRule("aoList", {
   filter: ["ul", "ol"],
-  replacement: (content, node) => (node.parentNode?.nodeName === "LI" && !nextElement(node as unknown as XNode) ? `\n${content}` : `\n\n${content}\n\n`),
+  replacement: (content, node) => (node.parentNode?.nodeName === "LI" && !nextElement(node as unknown as MiniNode) ? `\n${content}` : `\n\n${content}\n\n`),
 });
 ts.addRule("aoListItem", {
   filter: "li",
