@@ -218,14 +218,15 @@ describe("cross-source conflict", () => {
     const far = verifyDraft(draft(), [ev("/issued", "2020", "embedded"), ev("/issued", "2023-05", "zotero")], {});
     expect(far.fields["/issued"]!.status).toBe("conflict");
     const near = verifyDraft(draft(), [ev("/issued", "2020", "embedded"), ev("/issued", "2021", "zotero")], {});
-    expect(near.fields["/issued"]!.status).not.toBe("conflict");
+    expect(near.fields["/issued"]!.checks).not.toContain("cross-source");
   });
   it("flags a different first-creator family", () => {
     const evs = [ev("/creators", [{ family: "Okafor", role: "author" }], "embedded"), ev("/creators", [{ family: "Mensah", role: "author" }], "zotero")];
     expect(verifyDraft(draft(), evs, {}).fields["/creators"]!.status).toBe("conflict");
   });
   it("uses lookups from the context as a source", () => {
-    const f = verifyDraft(draft(), [ev("/title", "Rivers of Memory", "embedded")], { lookups: [{ provider: "crossref", title: "Totally unrelated words" }] }).fields["/title"]!;
+    const d = draft({ identifiers: { doi: "10.1000/xyz" } });
+    const f = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded")], { lookups: [{ provider: "crossref", matchedIdentifier: "10.1000/xyz", title: "Totally unrelated words" }] }).fields["/title"]!;
     expect(f.status).toBe("conflict");
   });
 });
@@ -244,7 +245,7 @@ describe("AI-produced values", () => {
     expect(r.fields["/title"]!.status).toBe("verified");
   });
   it("accepts a quote found in the platform snapshot", () => {
-    const r = verifyDraft(draft(), [ev("/title", "Rivers", "ai", { quote: "Rivers of Memory" })], { platformSnapshot: { title: "Rivers of Memory" } });
+    const r = verifyDraft(draft(), [ev("/title", "Rivers of Memory", "ai", { quote: "Rivers of Memory" })], { platformSnapshot: { title: "Rivers of Memory" } });
     expect(r.fields["/title"]!.status).toBe("verified");
   });
 });
@@ -271,7 +272,11 @@ describe("user evidence and overall", () => {
   it("reasons never contain more than 80 characters of a value", () => {
     const long = "word ".repeat(200);
     const r = verifyDraft(draft({ title: mt(long) }), [ev("/title", long, "embedded"), ev("/title", "different", "zotero")], {});
-    for (const s of r.reasons) expect(s.length).toBeLessThan(400);
+    expect(r.reasons.length).toBeGreaterThan(0);
+    for (const s of r.reasons) {
+      expect(s.length).toBeLessThan(400);
+      expect(s).not.toContain("word ".repeat(17)); // more than 80 chars of the value
+    }
   });
 });
 
@@ -313,11 +318,100 @@ describe("recheckSourceFile", () => {
     const out = recheckSourceFile(f, {});
     expect(out.verification["/issued"]).toEqual({ status: "user-confirmed", checks: ["user"] });
   });
+  it("drops a stale user-confirmed entry when the value changed since the user evidence", () => {
+    const f = file();
+    f.fieldEvidence = [ev("/issued", "2019", "user")];
+    const out = recheckSourceFile(f, {});
+    expect(out.verification["/issued"]!.status).not.toBe("user-confirmed");
+  });
+  it("keeps user-confirmed when the user evidence still matches the value", () => {
+    const f = file();
+    f.fieldEvidence = [ev("/issued", "2020", "user")];
+    expect(recheckSourceFile(f, {}).verification["/issued"]).toEqual({ status: "user-confirmed", checks: ["user"] });
+  });
   it("is pure: does not mutate the input", () => {
     const f = file();
     const before = JSON.stringify(f);
     const out = recheckSourceFile(f, { documentText: "unrelated" });
     expect(JSON.stringify(f)).toBe(before);
     expect(out).not.toBe(f);
+  });
+});
+
+describe("review round 1: evidence must support the current value", () => {
+  it("C1: a draft title the evidence does not support is a conflict, even with two agreeing-with-each-other sources", () => {
+    const d = draft({ title: mt("Hallucinated Title") });
+    const one = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded")], {});
+    expect(one.fields["/title"]!.status).toBe("conflict");
+    expect(one.fields["/title"]!.values!.length).toBe(2);
+    const two = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded"), ev("/title", "Rivers of Memory", "zotero")], {});
+    expect(two.fields["/title"]!.status).toBe("conflict");
+    expect(two.overall).toBe("needs-review");
+  });
+  it("C1: disagreeing filename or ai evidence alone is unverified, not conflict", () => {
+    const d = draft({ title: mt("Hallucinated Title") });
+    expect(verifyDraft(d, [ev("/title", "Rivers of Memory", "filename")], {}).fields["/title"]!.status).toBe("unverified");
+    expect(verifyDraft(d, [ev("/title", "Rivers of Memory", "ai", { quote: "Rivers of Memory" })], { documentText: TEXT }).fields["/title"]!.status).toBe("unverified");
+  });
+  it("C2: a lookup for a different DOI is not evidence for this draft", () => {
+    const d = draft({ identifiers: { doi: "10.1000/xyz" } });
+    const other: LookupEvidence = { provider: "crossref", matchedIdentifier: "10.9999/other", title: "Quantum chromodynamics" };
+    const r = verifyDraft(d, [ev("/title", "Rivers of Memory", "embedded")], { lookups: [other] });
+    expect(r.fields["/title"]!.status).toBe("single-source");
+    expect(r.fields["/identifiers/doi"]).toBeUndefined();
+  });
+  it("C2: a lookup without matchedIdentifier counts only when its value agrees with the draft", () => {
+    const e = [ev("/title", "Rivers of Memory", "embedded")];
+    const agreeing = verifyDraft(draft(), e, { lookups: [{ provider: "crossref", title: "Rivers of Memory" }] });
+    expect(agreeing.fields["/title"]!.status).toBe("verified");
+    const unrelated = verifyDraft(draft(), e, { lookups: [{ provider: "crossref", title: "Quantum chromodynamics" }] });
+    expect(unrelated.fields["/title"]!.status).toBe("single-source");
+  });
+  it("C3: an AI quote must contain the value", () => {
+    const d = draft({ title: mt("Quantum Physics") });
+    const r = verifyDraft(d, [ev("/title", "Quantum Physics", "ai", { quote: "oral histories" })], { documentText: "Rivers of Memory: oral histories of the river." });
+    expect(r.fields["/title"]!.status).toBe("unverified");
+    const dd = draft({ issued: "1999" });
+    const r2 = verifyDraft(dd, [ev("/issued", "1999", "ai", { quote: "the" })], { documentText: "the oral histories" });
+    expect(r2.fields["/issued"]!.status).toBe("unverified");
+    const r3 = verifyDraft(dd, [ev("/issued", "1999", "ai", { quote: "the oral histories" })], { documentText: "the oral histories" });
+    expect(r3.fields["/issued"]!.status).toBe("unverified");
+    const r4 = verifyDraft(dd, [ev("/issued", "1999", "ai", { quote: "published in 1999 by" })], { documentText: "first published in 1999 by Okafor" });
+    expect(r4.fields["/issued"]!.status).toBe("verified");
+  });
+  it("C3: a quote shorter than 3 tokens is not enough", () => {
+    const r = verifyDraft(draft(), [ev("/title", "Rivers of Memory", "ai", { quote: "Rivers of" })], { documentText: TEXT });
+    expect(r.fields["/title"]!.status).toBe("unverified");
+  });
+  it("I4: short titles and names are not grounded inside longer words", () => {
+    const d = draft({ title: mt("Re") });
+    expect(verifyDraft(d, [ev("/title", "Re", "filename")], { documentText: "There is nothing here" }).fields["/title"]!.status).toBe("unverified");
+    const d2 = draft({ title: mt("River stories") });
+    expect(verifyDraft(d2, [ev("/title", "River stories", "filename")], { documentText: "Rivers stories everywhere" }).fields["/title"]!.status).toBe("unverified");
+    const d3 = draft({ creators: [{ family: "Li", role: "author" }] });
+    expect(verifyDraft(d3, [ev("/creators", d3.creators, "filename")], { documentText: "a list of things" }).fields["/creators"]!.status).toBe("unverified");
+    expect(verifyDraft(d3, [ev("/creators", d3.creators, "filename")], { documentText: "by Li, 2020" }).fields["/creators"]!.status).toBe("unverified");
+  });
+  it("I5: user evidence for an old value does not confirm a changed value", () => {
+    const d = draft({ title: mt("New title here") });
+    const r = verifyDraft(d, [ev("/title", "Old title here", "user")], {});
+    expect(r.fields["/title"]!.status).not.toBe("user-confirmed");
+  });
+  it("normalizeTitle keeps kana voicing marks", () => {
+    expect(normalizeTitle("バス")).not.toBe(normalizeTitle("ハス"));
+    expect(titleSimilarity("バス", "ハス")).toBeLessThan(0.9);
+  });
+  it("dates accept ? and ~ qualifiers and ISO timestamps; unparseable dates are unverified", () => {
+    const evs = (v: string) => [ev("/issued", v, "embedded")];
+    expect(verifyDraft(draft({ issued: "2020?" }), evs("2020?"), {}).fields["/issued"]!.status).toBe("single-source");
+    expect(verifyDraft(draft({ issued: "2020-05-01T10:00:00Z" }), evs("2020-05-01"), {}).fields["/issued"]!.status).toBe("single-source");
+    const bad = verifyDraft(draft({ issued: "last spring" }), evs("last spring"), {});
+    expect(bad.fields["/issued"]!.status).toBe("unverified");
+    expect(bad.fields["/issued"]!.reason).toMatch(/not in a form/);
+  });
+  it("literal creators in 'Family, Given' form compare by family name", () => {
+    const d = draft({ creators: [{ literal: "Okafor, Ada", role: "author" }] });
+    const r = verifyDraft(d, [ev("/creators", [{ family: "Okafor", role: "author" }], "embedded"), ev("/creators", [{ family: "Okafor", role: "author" }], "zotero")], {});
+    expect(r.fields["/creators"]!.status).toBe("verified");
   });
 });

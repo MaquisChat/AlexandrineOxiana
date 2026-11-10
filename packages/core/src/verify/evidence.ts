@@ -19,18 +19,24 @@ export const TRUSTED_KINDS: ReadonlySet<string> = new Set([
   "embedded", "lookup", "zotero", "refman", "platform-json", "page-dom", "ocr",
 ]);
 
-/** NFKD, strip combining marks, lowercase, drop punctuation and symbols, collapse whitespace. */
+const KEEP_MARKS = /([\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3099\u309A]+)/u;
+
+/**
+ * NFKD, strip combining marks, lowercase, drop punctuation and symbols, collapse whitespace.
+ * Kana and Hangul runs use NFKC instead, so voicing marks survive (バ stays distinct from ハ).
+ */
 export function normalizeTitle(s: string): string {
   return s
-    .normalize("NFKD")
-    .replace(/\p{M}+/gu, "")
+    .split(KEEP_MARKS)
+    .map((part, i) => (i % 2 === 1 ? part.normalize("NFKC") : part.normalize("NFKD").replace(/\p{M}+/gu, "")))
+    .join("")
     .toLowerCase()
     .replace(/[\p{P}\p{S}]+/gu, "")
     .replace(/\s+/gu, " ")
     .trim();
 }
 
-const NO_SPACE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+export const NO_SPACE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
 
 function tokens(normalized: string): Set<string> {
   const out = new Set<string>();
@@ -107,15 +113,11 @@ export function sourceKey(e: Pick<FieldEvidence, "source">): string {
   return e.source.kind === "lookup" ? `lookup:${e.source.provider ?? ""}` : e.source.kind;
 }
 
-export function distinctSourceCount(evs: FieldEvidence[]): number {
-  return new Set(evs.map(sourceKey)).size;
-}
-
 export type Edtf = { y: number; m?: number; d?: number };
 
 export function parseEdtf(s: unknown): Edtf | undefined {
   if (typeof s !== "string") return undefined;
-  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(s.trim());
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?(?:T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?[?~]?$/.exec(s.trim());
   if (!m) return undefined;
   return { y: Number(m[1]), m: m[2] ? Number(m[2]) : undefined, d: m[3] ? Number(m[3]) : undefined };
 }
@@ -147,4 +149,24 @@ export function snapshotDates(snap: Record<string, unknown> | undefined): Edtf[]
 export function clip(v: unknown): string {
   const s = textOf(v) ?? (typeof v === "object" ? JSON.stringify(v) ?? "" : String(v));
   return s.length > 80 ? `${s.slice(0, 77)}...` : s;
+}
+
+/** Does normalized `hay` contain normalized `needle` on token boundaries (any position for no-space scripts)? */
+export function hasTokens(hay: string, needle: string): boolean {
+  if (!needle) return false;
+  if (NO_SPACE_SCRIPT.test(needle)) return hay.includes(needle);
+  return ` ${hay} `.includes(` ${needle} `);
+}
+
+/**
+ * Is a normalized title/name long enough to be grounded by text alone, and does the text contain it?
+ * Titles: at least 2 tokens or 8 characters (CJK: 2 characters). Names: at least 3 characters (CJK: 2).
+ */
+export function groundedIn(hay: string, needle: string, kind: "title" | "name"): boolean {
+  if (NO_SPACE_SCRIPT.test(needle)) {
+    if (Array.from(needle).length < 2) return false;
+  } else if (kind === "title") {
+    if (needle.split(" ").length < 2 && needle.length < 8) return false;
+  } else if (needle.length < 3) return false;
+  return hasTokens(hay, needle);
 }

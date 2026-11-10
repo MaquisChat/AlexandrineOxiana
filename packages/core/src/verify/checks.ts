@@ -1,7 +1,7 @@
 import type { FieldEvidence, FieldVerification, SourceType } from "../model/index.js";
 import {
-  clip, datesEqual, getByPointer, handleKey, isRecord, normalizeTitle, parseEdtf, snapshotDates,
-  sourceKey, textOf, textVariants, titleSimilarity, TRUSTED_KINDS,
+  clip, datesEqual, getByPointer, groundedIn, handleKey, hasTokens, isRecord, NO_SPACE_SCRIPT, normalizeTitle,
+  parseEdtf, snapshotDates, sourceKey, textOf, textVariants, titleSimilarity, TRUSTED_KINDS,
 } from "./evidence.js";
 import type { LookupEvidence } from "./evidence.js";
 
@@ -49,19 +49,33 @@ function evidenceFor(c: CheckCtx, field: string): FieldEvidence[] {
 export function creatorList(v: unknown): Record<string, unknown>[] {
   return Array.isArray(v) ? v.filter(isRecord) : [];
 }
-function firstFamily(v: unknown): string | undefined {
-  if (typeof v === "string") return v;
-  const first = creatorList(v)[0];
-  if (!first) return undefined;
-  for (const k of ["family", "literal", "handle"]) if (typeof first[k] === "string" && first[k]) return first[k] as string;
+export function creatorName(x: Record<string, unknown>, handleFirst = false): string | undefined {
+  const lit = typeof x.literal === "string" && x.literal ? (x.family ? x.literal : x.literal.split(",")[0]!.trim()) : undefined;
+  const order = handleFirst ? [x.handle, x.family, lit] : [x.family, lit, x.handle];
+  for (const v of order) if (typeof v === "string" && v.trim()) return v.trim();
   return undefined;
 }
+export function firstFamily(v: unknown): string | undefined {
+  if (typeof v === "string") return v.includes(",") ? v.split(",")[0]!.trim() : v;
+  const first = creatorList(v)[0];
+  return first ? creatorName(first) : undefined;
+}
+
+const canonList = (field: string, v: unknown): string[] =>
+  (Array.isArray(v) ? v : [v]).map((x) => canon(field, x));
+
+const canon = (field: string, v: unknown): string => {
+  if (Array.isArray(v)) return v.map((x) => canon(field, x)).sort().join("|");
+  const t = textOf(v);
+  if (t === undefined) return JSON.stringify(v) ?? "";
+  const n = t.trim().toLowerCase();
+  return field.startsWith("/identifiers/") ? n.replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, "").replace(/[\s-]/g, "") : n;
+};
 
 /** Do two evidence values for this field say the same thing (at the precision we care about)? */
 export function agree(field: string, a: unknown, b: unknown): boolean {
   if (field === "/title" || field === "/container") {
-    const x = textOf(a), y = textOf(b);
-    return x !== undefined && y !== undefined && titleSimilarity(x, y) >= 0.9;
+    return textVariants(a).some((x) => textVariants(b).some((y) => titleSimilarity(x, y) >= 0.9));
   }
   if (field === "/issued") {
     const x = parseEdtf(a), y = parseEdtf(b);
@@ -71,7 +85,11 @@ export function agree(field: string, a: unknown, b: unknown): boolean {
     const x = firstFamily(a), y = firstFamily(b);
     return x !== undefined && y !== undefined && normalizeTitle(x) === normalizeTitle(y);
   }
-  return JSON.stringify(a) === JSON.stringify(b) || (textOf(a) !== undefined && textOf(a)!.trim().toLowerCase() === textOf(b)?.trim().toLowerCase());
+  if (Array.isArray(a) || Array.isArray(b)) {
+    const y = canonList(field, b);
+    return canonList(field, a).some((x) => y.includes(x));
+  }
+  return canon(field, a) === canon(field, b);
 }
 
 const result = (status: FieldVerification["status"], checks: string[], reason?: string, values?: FieldVerification["values"]): FieldVerification => ({
@@ -84,7 +102,6 @@ export function checkPlatformIdentity(field: string, c: CheckCtx): FieldVerifica
   const snap = c.snapshot;
   if (!snap) return undefined;
   const id = typeof snap.id === "string" || typeof snap.id === "number" ? String(snap.id) : undefined;
-  const label = labelOf(field);
 
   if (field === "/identifiers/platformPostId" || field === "/identifiers/url") {
     if (id === undefined) return undefined;
@@ -120,7 +137,6 @@ export function checkPlatformIdentity(field: string, c: CheckCtx): FieldVerifica
     if (bad) return result("conflict", ["platform-handle"], `The handle "${clip(bad.handle)}" does not match the account recorded by the platform.`);
     if (withHandle.length > 0 && withHandle.length === list.length) return result("verified", ["platform-handle"]);
   }
-  void label;
   return undefined;
 }
 
@@ -159,7 +175,7 @@ export function checkIdentifier(field: string, c: CheckCtx): FieldVerification |
     const titles = textVariants(c.draft.title);
     let sim = Math.max(0, ...titles.map((t) => titleSimilarity(t, hit.title!)));
     const lt = normalizeTitle(hit.title!);
-    if (lt && c.docNorm.includes(lt)) sim = Math.max(sim, 1);
+    if (lt && groundedIn(c.docNorm, lt, "title")) sim = Math.max(sim, 1);
     if (sim >= 0.9) return result("verified", ["doi-lookup"]);
     if (sim < 0.6) return result("conflict", ["doi-lookup"], `The DOI resolves to a different work ("${clip(hit.title)}") than the title recorded here.`);
     return result("unverified", ["doi-lookup"], `The DOI resolves to a work whose title only partly matches ("${clip(hit.title)}").`);
@@ -213,32 +229,44 @@ export function sourceName(e: Pick<FieldEvidence, "source">): string {
 
 // ---------------------------------------------------------------- AI quotes
 
-function quoteFound(quote: unknown, c: CheckCtx): boolean {
-  if (typeof quote !== "string") return false;
-  const q = normalizeTitle(quote);
-  if (!q) return false;
-  if (c.docNorm.includes(q)) return true;
-  return snapNorm(c.snapshot, [...PLATFORM_TEXT_KEYS, ...PLATFORM_NAME_KEYS]).some((s) => s.includes(q));
+function quoteTokensOk(q: string): boolean {
+  return NO_SPACE_SCRIPT.test(q) ? Array.from(q.replace(/ /g, "")).length >= 4 : q.split(" ").length >= 3;
+}
+
+/** The quote exists in the document/snapshot, is long enough, and actually contains the value it supports. */
+function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
+  if (typeof e.quote !== "string") return false;
+  const q = normalizeTitle(e.quote);
+  if (!q || !quoteTokensOk(q)) return false;
+  const inText = hasTokens(c.docNorm, q) || snapNorm(c.snapshot, [...PLATFORM_TEXT_KEYS, ...PLATFORM_NAME_KEYS]).some((x) => hasTokens(x, q));
+  if (!inText) return false;
+  if (field === "/issued") {
+    const d = parseEdtf(e.value);
+    return !!d && hasTokens(q, String(d.y));
+  }
+  if (field === "/creators") {
+    const first = creatorList(e.value)[0];
+    const n = first ? creatorName(first, SOCIAL.has(c.type)) : undefined;
+    return !!n && hasTokens(q, normalizeTitle(n));
+  }
+  const vals = Array.isArray(e.value) ? e.value.flatMap(textVariants) : textVariants(e.value);
+  return vals.map(normalizeTitle).some((v) => !!v && hasTokens(q, v));
 }
 
 // ---------------------------------------------------------------- grounding
 
 function creatorNames(c: CheckCtx): (string | undefined)[] {
   const social = SOCIAL.has(c.type);
-  return creatorList(c.draft.creators).map((x) => {
-    const order = social ? ["handle", "family", "literal"] : ["family", "literal", "handle"];
-    for (const k of order) if (typeof x[k] === "string" && x[k]) return x[k] as string;
-    return undefined;
-  });
+  return creatorList(c.draft.creators).map((x) => creatorName(x, social));
 }
 
 /** Is the field's current value found in the document text or the platform snapshot? */
 export function checkGrounding(field: string, c: CheckCtx): FieldVerification | undefined {
   if (field === "/title") {
     const titles = textVariants(c.draft.title).map(normalizeTitle).filter(Boolean);
-    if (titles.some((t) => c.docNorm.includes(t))) return result("verified", ["found-in-document-text"]);
+    if (titles.some((t) => groundedIn(c.docNorm, t, "title"))) return result("verified", ["found-in-document-text"]);
     const snaps = snapNorm(c.snapshot, PLATFORM_TEXT_KEYS);
-    if (titles.some((t) => snaps.some((s) => s.includes(t)))) return result("verified", ["found-in-platform-data"]);
+    if (titles.some((t) => snaps.some((s) => groundedIn(s, t, "title")))) return result("verified", ["found-in-platform-data"]);
     return undefined;
   }
   if (field === "/creators") {
@@ -247,7 +275,7 @@ export function checkGrounding(field: string, c: CheckCtx): FieldVerification | 
     const snaps = snapNorm(c.snapshot, PLATFORM_NAME_KEYS);
     const ok = names.every((n) => {
       const nn = normalizeTitle(n!);
-      return !!nn && (c.docNorm.includes(nn) || snaps.some((s) => s.includes(nn)));
+      return !!nn && (groundedIn(c.docNorm, nn, "name") || snaps.some((s) => groundedIn(s, nn, "name")));
     });
     return ok ? result("verified", ["found-in-document-or-platform-data"]) : undefined;
   }
@@ -279,26 +307,48 @@ function aiUnverified(label: string, aiEvs: FieldEvidence[]): FieldVerification 
     : `${label} was suggested by AI without a quoted passage from the document to back it up.`);
 }
 
+const showValue = (field: string, v: unknown) => clip(field === "/creators" ? firstFamily(v) ?? "" : v);
+const DRAFT_SOURCE = { kind: "user" as const, ref: "current value in the record" };
+
 export function verifyField(field: string, c: CheckCtx, required: boolean): FieldVerification | undefined {
   const label = labelOf(field);
-  const evs = evidenceFor(c, field);
-  if (evs.some((e) => e.source.kind === "user")) return result("user-confirmed", ["user"]);
+  const allEvs = evidenceFor(c, field);
   const value = getByPointer(c.draft, field);
   const empty = isEmpty(value);
 
   if (empty) {
-    return required || evs.length > 0 ? result("unverified", ["present"], `${label} is missing.`) : undefined;
+    return required || allEvs.length > 0 ? result("unverified", ["present"], `${label} is missing.`) : undefined;
+  }
+  // User evidence confirms only the value the user actually saw; a later change makes it stale.
+  if (allEvs.some((e) => e.source.kind === "user" && agree(field, e.value, value))) return result("user-confirmed", ["user"]);
+  const evs = allEvs.filter((e) => e.source.kind !== "user");
+
+  if (field === "/issued" && !parseEdtf(value)) {
+    return result("unverified", ["date-format"], `The publication date "${clip(value)}" is not in a form we can read (expected YYYY, YYYY-MM or YYYY-MM-DD).`);
   }
   const hit = checkPlatformIdentity(field, c) ?? checkIdentifier(field, c) ?? checkCrossSource(field, c);
   if (hit) return hit;
 
-  const aiEvs = evs.filter((e) => e.source.kind === "ai");
-  const goodAi = aiEvs.filter((e) => quoteFound(e.quote, c));
-  if (goodAi.length > 0) return result("verified", ["ai-quote-found"]);
+  const agreeing = evs.filter((e) => agree(field, e.value, value));
+  const disagreeing = evs.filter((e) => !agree(field, e.value, value));
+  const mismatchSentence = (e: FieldEvidence) =>
+    `${label} recorded here ("${showValue(field, value)}") does not match what ${sourceName(e)} says ("${showValue(field, e.value)}").`;
+  const trustedDis = disagreeing.filter((e) => TRUSTED_KINDS.has(e.source.kind));
+  if (trustedDis.length > 0) {
+    return result("conflict", ["draft-vs-evidence"], mismatchSentence(trustedDis[0]!), [
+      { value, source: DRAFT_SOURCE },
+      ...trustedDis.map((e) => ({ value: e.value, source: e.source })),
+    ]);
+  }
+  if (agreeing.length === 0 && disagreeing.length > 0) {
+    return result("unverified", ["draft-vs-evidence"], mismatchSentence(disagreeing[0]!));
+  }
 
-  const solid = evs.filter((e) => e.source.kind !== "filename" && e.source.kind !== "ai");
+  const aiEvs = agreeing.filter((e) => e.source.kind === "ai");
+  if (aiEvs.some((e) => quoteSupports(field, e, c))) return result("verified", ["ai-quote-found"]);
+  const solid = agreeing.filter((e) => e.source.kind !== "filename" && e.source.kind !== "ai");
   // AI-only values are judged by their quote alone, never by the value merely appearing in the text.
-  if (aiEvs.length > 0 && evs.every((e) => e.source.kind === "ai")) return aiUnverified(label, aiEvs);
+  if (aiEvs.length > 0 && agreeing.every((e) => e.source.kind === "ai")) return aiUnverified(label, aiEvs);
 
   const grounded = checkGrounding(field, c);
   if (grounded) return grounded;
@@ -306,7 +356,7 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
   if (independentAgreement(field, solid)) return result("verified", ["independent-sources-agree"]);
   if (solid.some((e) => TRUSTED_KINDS.has(e.source.kind))) return result("single-source", ["single-trusted-source"]);
 
-  if (evs.length === 0) {
+  if (agreeing.length === 0) {
     return required ? result("unverified", ["evidence"], `${label} has no recorded source, so it could not be checked.`) : undefined;
   }
   if (aiEvs.length > 0) return aiUnverified(label, aiEvs);

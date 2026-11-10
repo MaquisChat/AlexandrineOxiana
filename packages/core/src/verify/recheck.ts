@@ -1,7 +1,7 @@
 import type { FieldEvidence, FieldVerification, SourceDraft, SourceFile, SourceType } from "../model/index.js";
-import { labelOf, verifyField } from "./checks.js";
+import { agree, labelOf, verifyField } from "./checks.js";
 import type { CheckCtx } from "./checks.js";
-import { DOC_TEXT_LIMIT, isRecord, normalizeTitle } from "./evidence.js";
+import { DOC_TEXT_LIMIT, getByPointer, isRecord, normalizeTitle } from "./evidence.js";
 import type { LookupEvidence } from "./evidence.js";
 
 export const REQUIRED_FIELDS: Record<SourceType, string[]> = {
@@ -38,14 +38,36 @@ export interface VerificationReport {
   reasons: string[];
 }
 
-function lookupEvidence(lookups: LookupEvidence[]): FieldEvidence[] {
+const normId = (s: string) =>
+  s.trim().toLowerCase().replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:|arxiv:)/, "").replace(/[\s-]/g, "");
+
+function draftIdentifiers(d: Record<string, unknown>): Set<string> {
+  const ids = isRecord(d.identifiers) ? d.identifiers : {};
+  const out = new Set<string>();
+  for (const v of [ids.doi, ids.arxiv, ids.platformPostId, ...(Array.isArray(ids.isbn) ? ids.isbn : [ids.isbn])]) {
+    if (typeof v === "string" && v.trim()) out.add(normId(v));
+  }
+  return out;
+}
+
+/**
+ * A lookup becomes evidence only if it is tied to this draft: its matchedIdentifier is one of the
+ * draft's identifiers, or (no matchedIdentifier) the value it gives agrees with the draft's value.
+ */
+function lookupEvidence(lookups: LookupEvidence[], d: Record<string, unknown>): FieldEvidence[] {
   const out: FieldEvidence[] = [];
+  const ids = draftIdentifiers(d);
   for (const l of lookups) {
     if (!isRecord(l) || typeof l.provider !== "string") continue;
+    const tied = typeof l.matchedIdentifier === "string";
+    if (tied && !ids.has(normId(l.matchedIdentifier as string))) continue;
     const source = { kind: "lookup" as const, provider: l.provider };
-    if (typeof l.title === "string") out.push({ field: "/title", value: l.title, source, at: "" });
-    if (Array.isArray(l.creators) && l.creators.length > 0) out.push({ field: "/creators", value: l.creators, source, at: "" });
-    if (typeof l.issued === "string") out.push({ field: "/issued", value: l.issued, source, at: "" });
+    const add = (field: string, value: unknown) => {
+      if (tied || agree(field, value, getByPointer(d, field))) out.push({ field, value, source, at: "" });
+    };
+    if (typeof l.title === "string") add("/title", l.title);
+    if (Array.isArray(l.creators) && l.creators.length > 0) add("/creators", l.creators);
+    if (typeof l.issued === "string") add("/issued", l.issued);
   }
   return out;
 }
@@ -78,7 +100,7 @@ export function verifyDraft(draft: SourceDraft, evidence: FieldEvidence[], ctx: 
   const c: CheckCtx = {
     type,
     draft: d,
-    evidence: [...stored, ...lookupEvidence(lookups)],
+    evidence: [...stored, ...lookupEvidence(lookups, d)],
     documentText: text,
     docNorm,
     snapshot: isRecord(safeCtx.platformSnapshot) ? safeCtx.platformSnapshot : undefined,
@@ -120,6 +142,12 @@ export function recheckSourceFile(sf: SourceFile, ctx: VerifyContext): SourceFil
   const snapshot = ctx.platformSnapshot ?? (isRecord(sf.source.provenance?.platformSnapshot) ? sf.source.provenance.platformSnapshot : undefined);
   const report = verifyDraft(sf.source as unknown as SourceDraft, sf.fieldEvidence, { ...ctx, platformSnapshot: snapshot });
   const verification: Record<string, FieldVerification> = { ...report.fields };
-  for (const [k, v] of Object.entries(sf.verification)) if (v.status === "user-confirmed") verification[k] = structuredClone(v);
+  for (const [k, v] of Object.entries(sf.verification)) {
+    if (v.status !== "user-confirmed") continue;
+    // Keep the old entry unless a user evidence entry exists and the value has since changed.
+    const userEvs = sf.fieldEvidence.filter((e) => e.field === k && e.source.kind === "user");
+    const current = getByPointer(sf.source, k);
+    if (userEvs.length === 0 || userEvs.some((e) => agree(k, e.value, current))) verification[k] = structuredClone(v);
+  }
   return { ...sf, verification };
 }
