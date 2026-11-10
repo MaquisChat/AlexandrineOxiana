@@ -46,6 +46,7 @@ import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, type Repo } from "../repo/repo.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
+import { serialStore, storeTurn } from "./project-queue.js";
 import { LOCATED_MEDIA, mayHaveLocation, resolveItem } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
 
@@ -130,6 +131,9 @@ export function createAttach(deps: AttachDeps): Attach {
     let allowed: Promise<string | null> | undefined;
     let lookup: Promise<LookupContext> | undefined;
     let keys: Promise<Array<DupKey & { sourceId: string }>> | undefined;
+    let keysStale = false;
+    /** The queue turn of this call's last store: any other turn since means other stores may have happened. */
+    let lastTurn = -1;
     const self = {
       /** The source dropped onto (null when it does not exist). */
       target: () =>
@@ -166,8 +170,18 @@ export function createAttach(deps: AttachDeps): Attach {
           }
         })()),
       lookup: () => (lookup ??= lookupContextFor(repo, projectId, http, deps.debug ? { debug: deps.debug } : {})),
-      keys: () =>
-        (keys ??= (async () => {
+      /** Inside a queue turn: forget the cached duplicate keys if anyone else stored since this call's last turn. */
+      refreshKeys: () => {
+        const t = storeTurn(repo, projectId);
+        if (t !== lastTurn + 1) keysStale = true;
+        lastTurn = t;
+      },
+      keys: () => {
+        if (keysStale) {
+          keys = undefined;
+          keysStale = false;
+        }
+        return (keys ??= (async () => {
           const out: Array<DupKey & { sourceId: string }> = [];
           for (const id of repo.listSourceIds(projectId)) {
             try {
@@ -177,7 +191,8 @@ export function createAttach(deps: AttachDeps): Attach {
             }
           }
           return out;
-        })()),
+        })());
+      },
     };
     return self;
   }
@@ -235,7 +250,8 @@ export function createAttach(deps: AttachDeps): Attach {
     return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review };
   }
 
-  async function attachOne(projectId: string, path: string, toSourceId: string | undefined, s: Session): Promise<AttachOutcome> {
+  async function attachOne(projectId: string, path: string, toSourceId: string | undefined, s: Session, freshKeys = false): Promise<AttachOutcome> {
+    if (freshKeys) s.refreshKeys();
     const st = await fsp.stat(path).catch(() => null);
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);
@@ -263,7 +279,9 @@ export function createAttach(deps: AttachDeps): Attach {
     const out: AttachOutcome[] = [];
     for (const path of paths) {
       try {
-        out.push(await attachOne(projectId, path, opts.toSourceId, s));
+        // One file at a time per project, across attach, watched folders and Bulk Import (R81 I4);
+        // the duplicate keys are read afresh inside the turn.
+        out.push(await serialStore(repo, projectId, () => attachOne(projectId, path, opts.toSourceId, s, true)));
       } catch (err) {
         if (err instanceof PolicyDeniedError) out.push(failed(path, err.reason));
         else if (err instanceof ProjectLockedError) out.push(failed(path, REASONS.locked));

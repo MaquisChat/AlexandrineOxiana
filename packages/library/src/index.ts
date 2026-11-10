@@ -179,6 +179,7 @@ export {
   ignoredName,
   listWatchedFolders,
   removeWatchedFolder,
+  setWatchFolder,
   startWatchedFolders,
   watchFolder,
 } from "./import/watch.js";

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockAgent } from "undici";
@@ -19,6 +19,7 @@ import {
   ignoredName,
   listWatchedFolders,
   removeWatchedFolder,
+  setWatchFolder,
   watchFolder,
   type FolderWatch,
   type WatchEvent,
@@ -79,12 +80,19 @@ afterAll(async () => {
   await shutdownExtractors();
 });
 
-const project = async (): Promise<Project> =>
-  (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: { enabled: false } })).project;
+const project = async (encrypted = false): Promise<Project> =>
+  (
+    await repo.createProject({
+      name: `P${Math.random().toString(36).slice(2, 7)}`,
+      governanceYaml: GOV,
+      encryption: encrypted ? { enabled: true, passphrase: "pw" } : { enabled: false },
+    })
+  ).project;
 
-function start(p: Project, opts: { stabilityMs?: number; pollMs?: number } = {}): { w: FolderWatch; events: WatchEvent[] } {
+function start(p: Project, opts: { stabilityMs?: number; pollMs?: number; dir?: string; recursive?: boolean } = {}): { w: FolderWatch; events: WatchEvent[] } {
   const events: WatchEvent[] = [];
-  const w = watchFolder({ repo, http, lib, onEvent: (e) => events.push(e), ...opts }, p.id, inbox);
+  const { dir, recursive, ...seams } = opts;
+  const w = watchFolder({ repo, http, lib, onEvent: (e) => events.push(e), ...seams }, p.id, dir ?? inbox, recursive ? { recursive: true } : {});
   watches.push(w);
   return { w, events };
 }
@@ -188,6 +196,107 @@ describe("watchFolder", () => {
   });
 });
 
+describe("watchFolder (review round 1, R81)", () => {
+  it("the watched folder removed → 'stopped' with a reason; it resumes when the folder comes back", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await rm(inbox, { recursive: true });
+    await until(() => events.some((e) => e.kind === "stopped"));
+    expect(events.find((e) => e.kind === "stopped")).toMatchObject({ reason: WATCH_REASONS.removed });
+    expect(WATCH_REASONS.removed).toMatch(/the watched folder was removed/iu);
+    expect(w.stopped).toBe(false); // waiting for it, not finished
+    await mkdir(inbox);
+    await until(() => events.some((e) => e.kind === "resumed"));
+    await sleep(300);
+    await writeFile(join(inbox, "back.pdf"), await buildPdf({ title: "Back again", extra: "back" }));
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "back.pdf"));
+  });
+
+  it("one per-project queue: the same PDF arriving in two watched folders gives one source and one duplicate", async () => {
+    const p = await project();
+    const other = join(tmp, "Inbox2");
+    await mkdir(other);
+    const a = start(p, { stabilityMs: 200 });
+    const b = start(p, { stabilityMs: 200, dir: other });
+    await Promise.all([a.w.ready, b.w.ready]);
+    const pdf = await buildPdf({ title: "Same twice", extra: "same" });
+    await Promise.all([writeFile(join(inbox, "same.pdf"), pdf), writeFile(join(other, "same.pdf"), pdf)]);
+    await until(() => a.events.length + b.events.length >= 2);
+    const outcomes = [...a.events, ...b.events].map((e) => e.outcome);
+    expect(outcomes.filter((o) => o === "duplicate")).toHaveLength(1);
+    expect(outcomes.filter((o) => o === "created" || o === "needs-review")).toHaveLength(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  });
+
+  it("refuses a folder inside the library or one that contains it", async () => {
+    const p = await project();
+    for (const dir of [join(lib.root, "Projects"), tmp]) {
+      const { w, events } = start(p, { dir });
+      await w.ready;
+      expect(events).toEqual([expect.objectContaining({ kind: "error", reason: WATCH_REASONS.library }), expect.objectContaining({ kind: "stopped" })]);
+      expect(w.stopped).toBe(true);
+      await expect(addWatchedFolder({ repo, lib }, p.id, dir)).rejects.toThrow(WATCH_REASONS.library);
+    }
+  });
+
+  it("files already there when the watch starts are imported; files imported before are skipped silently", async () => {
+    const p = await project();
+    await writeFile(join(inbox, "early.pdf"), await buildPdf({ title: "Early bird", extra: "early" }));
+    const first = start(p, { stabilityMs: 200 });
+    await first.w.ready;
+    await until(() => first.events.some((e) => e.file === "early.pdf"));
+    expect(first.events.find((e) => e.file === "early.pdf")!.kind).toBe("imported");
+    await first.w.stop();
+    const second = start(p, { stabilityMs: 200 });
+    await second.w.ready;
+    await sleep(1200);
+    expect(second.events.filter((e) => e.file === "early.pdf")).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  });
+
+  it("an encrypted project that is locked pauses the watch; on unlock, files that arrived meanwhile are imported", async () => {
+    const p = await project(true);
+    repo.lockProject(p.id);
+    const { w, events } = start(p, { stabilityMs: 200, pollMs: 50 });
+    await w.ready;
+    await writeFile(join(inbox, "while-locked.pdf"), await buildPdf({ title: "While locked", extra: "locked" }));
+    await until(() => events.some((e) => e.kind === "paused"));
+    await sleep(500);
+    expect(events.some((e) => e.kind === "imported")).toBe(false);
+    await repo.unlockProject(p.id, "pw");
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "while-locked.pdf"));
+    expect(repo.listSourceIds(p.id)).toHaveLength(1);
+  });
+
+  it("a changed file is imported again when its content changed (same content: nothing)", async () => {
+    const p = await project();
+    const { w, events } = start(p, { stabilityMs: 200 });
+    await w.ready;
+    const f = join(inbox, "draft.pdf");
+    const v1 = await buildPdf({ title: "Draft one", extra: "v1" });
+    await writeFile(f, v1);
+    await until(() => events.filter((e) => e.kind === "imported").length === 1);
+    await writeFile(f, v1); // rewritten, same bytes
+    await sleep(1000);
+    expect(events.filter((e) => e.file === "draft.pdf")).toHaveLength(1);
+    await writeFile(f, await buildPdf({ title: "Draft two", extra: "v2" }));
+    await until(() => events.filter((e) => e.kind === "imported").length === 2);
+    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+  });
+
+  it("a link to a folder in a recursive watch gets its own plain reason", async () => {
+    const p = await project();
+    const target = join(inbox, "Real");
+    await mkdir(target);
+    const { w, events } = start(p, { stabilityMs: 200, recursive: true });
+    await w.ready;
+    await symlink(target, join(inbox, "LinkToFolder"));
+    await until(() => events.some((e) => e.file === "LinkToFolder"));
+    expect(events.find((e) => e.file === "LinkToFolder")).toMatchObject({ kind: "failed", reason: WATCH_REASONS.folderLink });
+  });
+});
+
 describe("watched-folder settings (R69)", () => {
   it("project.json keeps only the id and options; the folder is a device setting", async () => {
     const p = await project();
@@ -204,9 +313,30 @@ describe("watched-folder settings (R69)", () => {
     const other = { repo, lib: { ...lib, id: lib.id, appConfigDir: join(tmp, "other-config") } as Library };
     expect((await listWatchedFolders(other, p.id))[0]!.dir).toBeUndefined();
 
+    // setWatchFolder: choose the folder for an existing watch on this (other) computer.
+    const otherInbox = join(tmp, "OtherInbox");
+    await mkdir(otherInbox);
+    await setWatchFolder(other, p.id, wf.id, otherInbox);
+    expect((await listWatchedFolders(other, p.id))[0]!.dir).toContain("OtherInbox");
+    expect((await stat(join(tmp, "other-config"))).mode & 0o777).toBe(0o700);
+    await expect(setWatchFolder(other, p.id, "no-such-watch", otherInbox)).rejects.toThrow();
+
     await removeWatchedFolder({ repo, lib }, p.id, wf.id);
     expect(JSON.parse(await readFile(join(lib.root, p.folder, "project.json"), "utf8")).project.watchedFolders).toEqual([]);
     expect(await readFile(join(tmp, "config", "watched-folders.json"), "utf8")).not.toContain(wf.id);
     await expect(addWatchedFolder({ repo, lib }, p.id, "relative/dir", {})).rejects.toThrow(/absolute/u);
+  });
+
+  it("an unreadable settings file is moved aside with a warning, never silently emptied", async () => {
+    const p = await project();
+    await mkdir(join(tmp, "config"), { recursive: true });
+    await writeFile(join(tmp, "config", "watched-folders.json"), "{ not json");
+    const warnings: string[] = [];
+    const wf = await addWatchedFolder({ repo, lib, onWarning: (w) => warnings.push(w) }, p.id, inbox);
+    expect(warnings).toEqual([WATCH_REASONS.settingsUnreadable]);
+    const aside = (await readdir(join(tmp, "config"))).filter((n) => n.startsWith("watched-folders.unreadable-"));
+    expect(aside).toHaveLength(1);
+    expect(await readFile(join(tmp, "config", aside[0]!), "utf8")).toBe("{ not json");
+    expect(await readFile(join(tmp, "config", "watched-folders.json"), "utf8")).toContain(wf.id);
   });
 });

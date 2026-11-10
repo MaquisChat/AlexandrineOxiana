@@ -76,6 +76,7 @@ import { acceptedType } from "../attach.js";
 import { MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs } from "../common.js";
 import { LOCATED_MEDIA, mayHaveLocation, resolveItem, type Resolution } from "../resolve.js";
 import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
+import { serialStore } from "../project-queue.js";
 import { findSidecars } from "../sidecar.js";
 import {
   BOOKKEEPING,
@@ -994,7 +995,12 @@ class Run {
     return { inputs: kept, fail: false };
   }
 
-  private async flush(): Promise<void> {
+  /** Stores go through the project's queue (R81 I4). */
+  private flush(): Promise<void> {
+    return serialStore(this.repo, this.projectId, () => this.flushInner());
+  }
+
+  private async flushInner(): Promise<void> {
     const queued = this.group;
     if (!queued.length) return;
     if (this.adapter.incremental) await this.refreshDeleted();
@@ -1063,7 +1069,11 @@ class Run {
   }
 
   /** Stores one new source in its own governed change. */
-  private async createOne(q: Queued, dedupe: BatchDedupe): Promise<JournalEntry> {
+  private createOne(q: Queued, dedupe: BatchDedupe): Promise<JournalEntry> {
+    return serialStore(this.repo, this.projectId, () => this.createOneInner(q, dedupe));
+  }
+
+  private async createOneInner(q: Queued, dedupe: BatchDedupe): Promise<JournalEntry> {
     const v = await this.revalidate(q.item, q.inputs);
     if (v.fail) return this.queue({ key: q.item.key, outcome: "failed", reason: REASONS.changed });
     const { item, r, draft, provenance, reviewItem } = q;
@@ -1149,7 +1159,11 @@ class Run {
   }
 
   /** Adds the item's files and the fields the existing source lacks (snapshot kept as a record; the journal records what was added, for undo). */
-  private async merge(item: ScanItem, targetId: string, r: Resolution, prep: Prepared, method: Provenance["captureMethod"], dedupe: BatchDedupe): Promise<JournalEntry> {
+  private merge(item: ScanItem, targetId: string, r: Resolution, prep: Prepared, method: Provenance["captureMethod"], dedupe: BatchDedupe): Promise<JournalEntry> {
+    return serialStore(this.repo, this.projectId, () => this.mergeInner(item, targetId, r, prep, method, dedupe));
+  }
+
+  private async mergeInner(item: ScanItem, targetId: string, r: Resolution, prep: Prepared, method: Provenance["captureMethod"], dedupe: BatchDedupe): Promise<JournalEntry> {
     const v = await this.revalidate(item, prep.inputs);
     if (v.fail) return this.queue({ key: item.key, outcome: "failed", reason: REASONS.changed });
     const target = await this.repo.getSource(this.projectId, targetId);
@@ -1180,7 +1194,11 @@ class Run {
    * audited like a merge, and recorded like one (MergeRecord), so undo reverts it the same way (R61).
    * Nothing to change: `unchanged` (the new version is still recorded).
    */
-  private async update(item: ScanItem, sourceId: string): Promise<JournalEntry> {
+  private update(item: ScanItem, sourceId: string): Promise<JournalEntry> {
+    return serialStore(this.repo, this.projectId, () => this.updateInner(item, sourceId));
+  }
+
+  private async updateInner(item: ScanItem, sourceId: string): Promise<JournalEntry> {
     const method = CAPTURE_METHOD[this.rec.source.kind];
     const prep = await this.prepareFiles(item);
     this.addFileNotes(item, prep);
