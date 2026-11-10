@@ -105,3 +105,21 @@ export type { RegistryEntry } from "./registry.js";
 
 export * from "./repo/index.js";
 export * from "./index/index.js";
+
+export {
+  JOB_OPS,
+  WorkerClient,
+  WorkerJobError,
+  WorkerUnavailableError,
+  devWorkerPython,
+  startWorker,
+} from "./worker-client.js";
+export type {
+  JobResult,
+  StartWorkerOptions,
+  WorkerClientOptions,
+  WorkerEndpoint,
+  WorkerHandle,
+  WorkerJob,
+  WorkerJobType,
+} from "./worker-client.js";

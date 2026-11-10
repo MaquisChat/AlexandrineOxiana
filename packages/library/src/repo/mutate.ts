@@ -239,6 +239,68 @@ async function governanceOf(core: RepoCore, st: ProjectState) {
   return parseGovernance(raw.toString("utf8"));
 }
 
+/**
+ * Step 1 of a mutation: evaluates each request with the researcher's tz and `now` (R17). A
+ * governance file that cannot be read or parsed denies (fail closed); conditions the project cannot
+ * honour deny. A deny is audited and thrown as PolicyDeniedError. Caller holds `core.serial`.
+ */
+async function decide(
+  core: RepoCore,
+  st: ProjectState,
+  reqs: MutateRequest | MutateRequest[],
+  at: string,
+  op: string,
+  entity: MutateOptions["entity"],
+): Promise<Array<{ req: PolicyRequest; d: PolicyDecision }>> {
+  let cfg: ReturnType<typeof parseGovernance> | undefined;
+  let cfgError: string | undefined;
+  try {
+    cfg = await governanceOf(core, st);
+  } catch (e) {
+    cfgError = `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
+  for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
+    const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.tz };
+    const d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
+    if (d.result === "deny") {
+      await core.auditNow(st, {
+        ...core.auditBase(st, at),
+        action: req.action,
+        entity,
+        decision: auditDecision(d),
+        details: { op, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
+      });
+      throw new PolicyDeniedError(d.reason, req.action);
+    }
+    allowed.push({ req, d });
+  }
+  return allowed;
+}
+
+/**
+ * Package-internal: a policy decision for work that writes nothing to the library by itself (local
+ * processing by the media worker). Same guards and evaluation as `runMutation` step 1: a deny is
+ * audited and thrown as PolicyDeniedError; an allow is returned (not audited; whatever the work
+ * produces is stored, and audited, through `runMutation`).
+ */
+export async function authorizeOnly(
+  core: RepoCore,
+  projectId: string,
+  req: MutateRequest,
+  opts: MutateOptions = {},
+): Promise<PolicyDecision> {
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    const st = core.state(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    core.assertUnlocked(st);
+    const [first] = await decide(core, st, req, core.clock().toISOString(), opts.op ?? "authorize", opts.entity);
+    return first!.d;
+  });
+}
+
 export async function runMutation<T>(
   core: RepoCore,
   projectId: string,
@@ -256,30 +318,8 @@ export async function runMutation<T>(
     const at = now.toISOString();
     const op = opts.op ?? "mutate";
 
-    // 1. Policy. A governance file that cannot be read or parsed denies (fail closed).
-    let cfg: ReturnType<typeof parseGovernance> | undefined;
-    let cfgError: string | undefined;
-    try {
-      cfg = await governanceOf(core, st);
-    } catch (e) {
-      cfgError = `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}`;
-    }
-    const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
-    for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
-      const req: PolicyRequest = { ...r, projectId, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.tz };
-      const d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
-      if (d.result === "deny") {
-        await core.auditNow(st, {
-          ...core.auditBase(st, at),
-          action: req.action,
-          entity: opts.entity,
-          decision: auditDecision(d),
-          details: { op, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
-        });
-        throw new PolicyDeniedError(d.reason, req.action);
-      }
-      allowed.push({ req, d });
-    }
+    // 1. Policy (a deny is audited and thrown).
+    const allowed = await decide(core, st, reqs, at, op, opts.entity);
     const conditions: Condition[] = [];
     for (const { d } of allowed) {
       if (d.result !== "allow_with_conditions") continue;

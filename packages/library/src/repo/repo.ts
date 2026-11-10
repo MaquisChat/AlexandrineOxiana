@@ -19,7 +19,7 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName } from "./io.js";
-import { runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
+import { authorizeOnly, runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
 import { createProject, isUnlocked, lockProject, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
   createSource,
@@ -384,6 +384,24 @@ export async function appendLibraryEvent(
 /** Package-internal (reconnect): points a linked asset at its new library-relative path, governed and audited. */
 export function relinkLinkedAsset(repo: Repo, projectId: string, sourceId: string, assetId: string, libraryRelativePath: string): Promise<SourceFile> {
   return relinkLinkedAssetIn(cores.get(repo)!, projectId, sourceId, assetId, libraryRelativePath);
+}
+
+/**
+ * Package-internal (worker client): evaluates a request for work that writes nothing by itself,
+ * such as local processing; a deny is audited and thrown as PolicyDeniedError.
+ */
+export function authorizeProcessing(repo: Repo, projectId: string, req: MutateRequest, opts: MutateOptions = {}): ReturnType<typeof authorizeOnly> {
+  return authorizeOnly(cores.get(repo)!, projectId, req, opts);
+}
+
+/**
+ * Package-internal (worker client): the project's data key when its files are encrypted at rest,
+ * else null. Throws ProjectLockedError for a locked encrypted project.
+ */
+export function projectDataKey(repo: Repo, projectId: string): { key: Uint8Array; keyId: string } | null {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  return core.encrypted(st) ? core.key(st) : null;
 }
 
 /** Package-internal: the library a repo was opened on. */
