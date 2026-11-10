@@ -31,6 +31,24 @@ import { listLibraries } from "./registry.js";
 import { ReadOnlyLibraryError, type Repo } from "./repo/index.js";
 import { openTestRepo } from "./repo/testing.js";
 
+vi.mock("./fs/atomic.js", async (orig) => {
+  const actual = await orig<typeof import("./fs/atomic.js")>();
+  return { ...actual, writeFileAtomic: vi.fn(actual.writeFileAtomic) };
+});
+import * as atomic from "./fs/atomic.js";
+const realWrite = (await vi.importActual<typeof import("./fs/atomic.js")>("./fs/atomic.js")).writeFileAtomic;
+/** Makes the next `times` lock writes fail as on a write-protected drive. */
+function failLockWrites(times: number) {
+  let left = times;
+  vi.mocked(atomic.writeFileAtomic).mockImplementation(async (p, d, o) => {
+    if (String(p).endsWith(".lock") && left > 0) {
+      left--;
+      throw Object.assign(new Error("EROFS"), { code: "EROFS" });
+    }
+    return realWrite(p, d, o);
+  });
+}
+
 const FAST = 2 ** 10;
 const NOW = "2026-11-09T14:30:00.000Z";
 const OPEN_GOV = `identifiability:
@@ -157,7 +175,10 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   vi.useRealTimers();
+  vi.mocked(atomic.writeFileAtomic).mockImplementation(realWrite);
   relinkSeams.beforeCopy = undefined;
+  relinkSeams.beforeLinkedUpdate = undefined;
+  relinkSeams.noHardLinks = undefined;
   for (const l of open) await l.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -447,7 +468,7 @@ describe("checkIntegrity", () => {
 // ---------------------------------------------------------------------------------------------
 describe("relinkMissing", () => {
   it("restores a removed asset from a renamed copy with the same hash", async () => {
-    const { lib, assets } = await fixture();
+    const { lib, repo, assets } = await fixture();
     const target = join(lib.root, assets[1]!.path);
     const content = await readFile(target);
     await unlink(target);
@@ -456,14 +477,35 @@ describe("relinkMissing", () => {
     await writeFile(found, content);
     await writeFile(join(tmp, "Found", "decoy.pdf"), "x".repeat(content.length)); // same size, other content
 
-    const r = await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring });
-    expect(r).toMatchObject({ relinked: 1, stillMissing: 0, relinkedPaths: [assets[1]!.path], relinkedUnverified: [] });
+    const r = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+    expect(r).toMatchObject({ relinked: 1, stillMissing: 0, relinkedPaths: [assets[1]!.path], skipped: [], placeholderCandidates: [] });
     expect((await readFile(target)).equals(content)).toBe(true);
     expect((await checkIntegrity(lib, "full")).missing).toEqual([]);
   });
 
+  it("requires the repo open on this library", async () => {
+    const { lib } = await fixture();
+    const other = await createLibrary(join(tmp, "Other"), "Other", mkDeps());
+    open.push(other);
+    const otherRepo = await openTestRepo(other, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    await expect(relinkMissing(lib, tmp, otherRepo)).rejects.toThrow(/not open on this library/);
+  });
+
+  it("uses one candidate for at most one missing asset per run", async () => {
+    const { lib, repo, pid } = await fixture();
+    const dup = await input("dup.pdf", "duplicate body");
+    const s1 = await repo.createSource(pid, draft("Dup one"), [{ path: dup, role: "original", handling: "copy" }], { provenance: provenance() });
+    const s2 = await repo.createSource(pid, draft("Dup two"), [{ path: dup, role: "original", handling: "copy" }], { provenance: provenance() });
+    await unlink(join(lib.root, s1.assets[0]!.path));
+    await unlink(join(lib.root, s2.assets[0]!.path));
+    await mkdir(join(tmp, "Found"));
+    await cp(dup, join(tmp, "Found", "only-copy.pdf"));
+    const r = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+    expect(r).toMatchObject({ relinked: 1, stillMissing: 1 });
+  });
+
   it("never relinks a same-name, same-size file with other content, and never overwrites an existing file", async () => {
-    const { lib, assets } = await fixture();
+    const { lib, repo, assets } = await fixture();
     const missing = join(lib.root, assets[0]!.path);
     const size = (await stat(missing)).size;
     await unlink(missing);
@@ -473,7 +515,7 @@ describe("relinkMissing", () => {
     await writeFile(join(tmp, "Found", basename(assets[0]!.path)), "y".repeat(size));
     await cp(join(tmp, "inputs", "Three.pdf"), join(tmp, "Found", "three.pdf"));
 
-    const r = await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring });
+    const r = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
     expect(r).toMatchObject({ relinked: 0, stillMissing: 1 });
     await expect(stat(missing)).rejects.toThrow();
     expect(await readFile(present, "utf8")).toBe("changed");
@@ -481,7 +523,7 @@ describe("relinkMissing", () => {
   });
 
   it("verifies the copy (a candidate changed after matching is not relinked) and never replaces a file that appeared meanwhile", async () => {
-    const { lib, assets } = await fixture();
+    const { lib, repo, assets } = await fixture();
     const target = join(lib.root, assets[0]!.path);
     const content = await readFile(target);
     await unlink(target);
@@ -490,16 +532,39 @@ describe("relinkMissing", () => {
     await writeFile(cand, content);
 
     relinkSeams.beforeCopy = async (src) => writeFile(src, Buffer.alloc(content.length, 0x41)); // same size, other bytes
-    const r1 = await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring });
+    const r1 = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
     expect(r1).toMatchObject({ relinked: 0, stillMissing: 1, skipped: [{ path: assets[0]!.path, reason: "verify-failed" }] });
     await expect(stat(target)).rejects.toThrow();
 
+    // A file that appears at the target after the check is never replaced, with or without hard links.
     await writeFile(cand, content);
-    relinkSeams.beforeCopy = async (_src, t) => writeFile(t, "written by someone else");
-    const r2 = await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring });
-    expect(r2).toMatchObject({ relinked: 0, stillMissing: 1, skipped: [{ path: assets[0]!.path, reason: "target-exists" }] });
-    expect(await readFile(target, "utf8")).toBe("written by someone else");
+    for (const noHardLinks of [false, true]) {
+      relinkSeams.noHardLinks = noHardLinks;
+      await rm(target, { force: true });
+      relinkSeams.beforeCopy = async (_src, t) => writeFile(t, "written by someone else");
+      const r2 = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+      expect(r2).toMatchObject({ relinked: 0, stillMissing: 1, skipped: [{ path: assets[0]!.path, reason: "target-exists" }] });
+      expect(await readFile(target, "utf8")).toBe("written by someone else");
+    }
     expect((await readdir(join(target, ".."))).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("restores without hard links (exclusive copy) with the expected mode", async () => {
+    const { lib, repo } = await fixture();
+    const p = (await repo.createProject({ name: "I", governanceYaml: IDENT_PLAIN_GOV, encryption: { enabled: false } })).project;
+    const src = await input("ident.pdf", "identifiable body");
+    const sf = await repo.createSource(p.id, draft("Ident"), [{ path: src, role: "original", handling: "copy" }], {
+      provenance: provenance({ identifiable: true, legal: { status: "consented", basis: "consent" } }),
+    });
+    const target = join(lib.root, sf.assets[0]!.path);
+    await unlink(target);
+    await mkdir(join(tmp, "Found"));
+    await cp(src, join(tmp, "Found", "x.pdf"));
+    await chmod(join(tmp, "Found", "x.pdf"), 0o644);
+    relinkSeams.noHardLinks = true;
+    expect((await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring })).relinked).toBe(1);
+    expect((await stat(target)).mode & 0o777).toBe(0o600);
+    expect(await sha(target)).toBe(sf.assets[0]!.sha256);
   });
 
   it("restores 0600 for an identifiable source's file", async () => {
@@ -514,12 +579,33 @@ describe("relinkMissing", () => {
     await mkdir(join(tmp, "Found"));
     await cp(src, join(tmp, "Found", "x.pdf"));
     await chmod(join(tmp, "Found", "x.pdf"), 0o644);
-    expect((await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring })).relinked).toBe(1);
+    expect((await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring })).relinked).toBe(1);
     expect((await stat(target)).mode & 0o777).toBe(0o600);
   });
 
-  it("updates a linked asset's stored paths through the repo (audited) instead of copying", async () => {
-    const { lib, repo, pid, folder } = await fixture();
+  it("never reads placeholder candidates: reports them (and the missing file they might be) instead", async () => {
+    const { lib, repo, assets } = await fixture();
+    const target = join(lib.root, assets[1]!.path);
+    const content = await readFile(target);
+    await unlink(target);
+    await mkdir(join(tmp, "Cloud", "sub"), { recursive: true });
+    const ph = join(tmp, "Cloud", "sub", "online-only.pdf");
+    await writeFile(ph, content);
+    const realLstat = (await import("node:fs/promises")).lstat;
+    const statFn = vi.fn(async (p: string) => {
+      const s = await realLstat(p);
+      return p === ph ? (Object.assign(Object.create(Object.getPrototypeOf(s) as object) as Stats, s, { blocks: 0 }) as Stats) : s;
+    });
+    const openRead = vi.fn((p: string) => createReadStream(p));
+    const r = await relinkMissing(lib, join(tmp, "Cloud"), repo, { keyRing: ring, stat: statFn, openRead });
+    expect(r).toMatchObject({ relinked: 0, stillMissing: 1, placeholderCandidates: ["sub/online-only.pdf"] });
+    expect(r.skipped).toEqual([{ path: assets[1]!.path, reason: "placeholder" }]);
+    expect(openRead.mock.calls.map((c) => c[0])).not.toContain(ph);
+    await expect(stat(target)).rejects.toThrow();
+  });
+
+  it("updates a linked asset's stored paths through the repo (audited) instead of copying, only to linkable places", async () => {
+    const { lib, repo, pid, folder, assets } = await fixture();
     await mkdir(join(lib.root, "Exports", "linked"), { recursive: true });
     const linkedFile = join(lib.root, "Exports", "linked", "scan.pdf");
     await writeFile(linkedFile, "linked body");
@@ -530,11 +616,20 @@ describe("relinkMissing", () => {
     // A copy outside the library cannot be linked (linked files live inside the library).
     await mkdir(join(tmp, "Outside"));
     await writeFile(join(tmp, "Outside", "scan.pdf"), "linked body");
-    const outside = await relinkMissing(lib, join(tmp, "Outside"), { keyRing: ring, repo });
+    const outside = await relinkMissing(lib, join(tmp, "Outside"), repo, { keyRing: ring });
     expect(outside).toMatchObject({ relinked: 0, stillMissing: 1 });
     expect(outside.skipped).toEqual([{ path: "Exports/linked/scan.pdf", reason: "outside-library" }]);
+    // Nor to .tmp/, hidden folders, or another source's own files.
+    const sourceDir = join(lib.root, assets[0]!.path, "..");
+    for (const d of [join(lib.root, ".tmp", "x"), join(lib.root, "Exports", ".hidden"), sourceDir]) {
+      await mkdir(d, { recursive: true });
+      await writeFile(join(d, "scan copy.pdf"), "linked body");
+      const r = await relinkMissing(lib, d, repo, { keyRing: ring });
+      expect(r.skipped, d).toEqual([{ path: "Exports/linked/scan.pdf", reason: "not-linkable" }]);
+      await unlink(join(d, "scan copy.pdf"));
+    }
 
-    const r = await relinkMissing(lib, join(lib.root, "Exports", "moved"), { keyRing: ring, repo });
+    const r = await relinkMissing(lib, join(lib.root, "Exports", "moved"), repo, { keyRing: ring });
     expect(r).toMatchObject({ relinked: 1, stillMissing: 0, relinkedPaths: ["Exports/moved/scan renamed.pdf"] });
     const after = await repo.getSource(pid, sf.source.id);
     expect(after.assets[0]!.path).toBe("Exports/moved/scan renamed.pdf");
@@ -544,7 +639,25 @@ describe("relinkMissing", () => {
     expect(ev).toHaveLength(1);
   });
 
-  it("relinks encrypted files: verified by decrypting when unlocked, unverified by name and size when locked", async () => {
+  it("re-checks a linked file's content inside the mutation", async () => {
+    const { lib, repo, pid, folder } = await fixture();
+    await mkdir(join(lib.root, "Exports", "linked"), { recursive: true });
+    const linkedFile = join(lib.root, "Exports", "linked", "scan.pdf");
+    await writeFile(linkedFile, "linked body");
+    const sf = await repo.createSource(pid, draft("Linked"), [{ path: linkedFile, role: "original", handling: "link" }], { provenance: provenance() });
+    await mkdir(join(lib.root, "Exports", "moved"));
+    const moved = join(lib.root, "Exports", "moved", "scan.pdf");
+    await rename(linkedFile, moved);
+    const before = (await auditOf(lib.root, folder)).length;
+    relinkSeams.beforeLinkedUpdate = async (abs) => writeFile(abs, "LINKED BODY"); // same size, other content
+    const r = await relinkMissing(lib, join(lib.root, "Exports", "moved"), repo, { keyRing: ring });
+    expect(r).toMatchObject({ relinked: 0, stillMissing: 1, skipped: [{ path: "Exports/linked/scan.pdf", reason: "verify-failed" }] });
+    expect((await repo.getSource(pid, sf.source.id)).assets[0]!.path).toBe("Exports/linked/scan.pdf");
+    expect((await auditOf(lib.root, folder)).filter((e) => e.details?.op === "asset.relink" && e.decision?.result === "allow")).toHaveLength(0);
+    expect((await auditOf(lib.root, folder)).length).toBeGreaterThanOrEqual(before);
+  });
+
+  it("relinks encrypted files verified by decrypting when unlocked; a locked project's files are reported, not relinked", async () => {
     const { lib, repo } = await fixture();
     const b = (await repo.createProject({ name: "B", governanceYaml: HIPAA_GOV, encryption: { enabled: true, passphrase: PASS } })).project;
     const sf = await repo.createSource(b.id, draft("Secret"), [{ path: await input("s.pdf", "secret body"), role: "original", handling: "copy" }], {
@@ -555,20 +668,17 @@ describe("relinkMissing", () => {
     await unlink(target);
     await mkdir(join(tmp, "Found"));
     await writeFile(join(tmp, "Found", "renamed.enc"), enc);
-    const unlocked = await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring, repo });
-    expect(unlocked).toMatchObject({ relinked: 1, relinkedPaths: [sf.assets[0]!.path], relinkedUnverified: [] });
+    const unlocked = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+    expect(unlocked).toMatchObject({ relinked: 1, relinkedPaths: [sf.assets[0]!.path] });
     expect((await readFile(target)).equals(enc)).toBe(true);
     expect((await stat(target)).mode & 0o777).toBe(0o600);
 
     repo.lockProject(b.id);
     await unlink(target);
-    await rm(join(tmp, "Found"), { recursive: true });
-    await mkdir(join(tmp, "Found", "sub"), { recursive: true });
-    await writeFile(join(tmp, "Found", "renamed.enc"), enc); // other name: no match when locked
-    await writeFile(join(tmp, "Found", "sub", basename(target)), enc);
-    const locked = await relinkMissing(lib, join(tmp, "Found"), { keyRing: ring, repo });
-    expect(locked).toMatchObject({ relinked: 1, relinkedPaths: [sf.assets[0]!.path], relinkedUnverified: [sf.assets[0]!.path] });
-    expect(await sha(target)).toBe(createHash("sha256").update(enc).digest("hex"));
+    await writeFile(join(tmp, "Found", basename(target)), enc);
+    const locked = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+    expect(locked).toMatchObject({ relinked: 0, stillMissing: 1, skipped: [{ path: sf.assets[0]!.path, reason: "project-locked" }] });
+    await expect(stat(target)).rejects.toThrow();
   });
 
   it("refuses a read-only library", async () => {
@@ -576,7 +686,8 @@ describe("relinkMissing", () => {
     await lib.close();
     await acquireLock(lib.root, depsB());
     const ro = await openLibrary(lib.root, mkDeps());
-    await expect(relinkMissing(ro, tmp)).rejects.toBeInstanceOf(ReadOnlyLibraryError);
+    const roRepo = await openTestRepo(ro, ring, { clock: () => now, tz: "UTC" });
+    await expect(relinkMissing(ro, tmp, roRepo)).rejects.toBeInstanceOf(ReadOnlyLibraryError);
   });
 });
 
@@ -689,6 +800,62 @@ describe("watchAvailability", () => {
     expect(await changed).toBe("offline");
     expect(lib.readOnlyReason).toBe("offline");
     stop();
+    await rename(`${lib.root}-gone`, lib.root);
+  });
+
+  it("keeps a handle offline while the lock is briefly unwritable, and settles on not-writable only after 3 ticks", async () => {
+    const { lib } = await fixture(timerDeps());
+    const states: string[] = [];
+    watchAvailability(lib, (s) => states.push(s), wopts());
+    await rename(lib.root, `${lib.root}-x`);
+    await tickWatch();
+    await rename(`${lib.root}-x`, lib.root);
+    failLockWrites(1); // flapping: one failed write, then fine
+    await tickWatch();
+    expect(states).toEqual(["offline"]);
+    expect(lib.readOnlyReason).toBe("offline");
+    await tickWatch();
+    expect(states).toEqual(["offline", "online"]);
+    expect(lib.mode).toBe("read-write");
+
+    await rename(lib.root, `${lib.root}-x`);
+    await tickWatch();
+    await rename(`${lib.root}-x`, lib.root);
+    failLockWrites(100); // write-protected for good
+    await tickWatch();
+    await tickWatch();
+    expect(lib.readOnlyReason).toBe("offline");
+    await tickWatch();
+    expect(states).toEqual(["offline", "online", "offline", "online"]);
+    expect(lib.readOnlyReason).toBe("not-writable");
+  });
+
+  it("does not re-acquire or report after stop() during a tick", async () => {
+    const { lib } = await fixture(timerDeps());
+    const states: string[] = [];
+    const stop = watchAvailability(lib, (s) => states.push(s), wopts());
+    await rename(lib.root, `${lib.root}-x`);
+    await tickWatch();
+    await rename(`${lib.root}-x`, lib.root);
+    const t = tickWatch();
+    stop();
+    await t;
+    expect(states).toEqual(["offline"]);
+    expect(lib.readOnlyReason).toBe("offline");
+  });
+
+  it("stops by itself once the library handle is closed (fake timers)", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const { lib } = await fixture();
+    const onChange = vi.fn();
+    watchAvailability(lib, onChange);
+    expect(vi.getTimerCount()).toBe(1);
+    await lib.close();
+    await rename(lib.root, `${lib.root}-gone`);
+    vi.advanceTimersByTime(5000);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(vi.getTimerCount()).toBe(0);
+    expect(onChange).not.toHaveBeenCalled();
     await rename(`${lib.root}-gone`, lib.root);
   });
 });

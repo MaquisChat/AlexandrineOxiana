@@ -326,9 +326,10 @@ export async function openLibraryInternal(
     await hb?.stop();
     hb = undefined;
   };
-  ctl.reacquire = async () => {
+  ctl.reacquire = async (acceptNotWritable: boolean) => {
     // Back online: the lock must be ours again before the handle may write.
     const holder = await peekLock(root, deps);
+    if (ctl.closed) return;
     if (holder) {
       lockLost(holder);
       return;
@@ -337,7 +338,9 @@ export async function openLibraryInternal(
     try {
       again = await acquireLock(root, deps);
     } catch (err) {
-      if (err instanceof LockNotWritableError) {
+      // A drive that is still coming back may refuse writes for a moment: stay offline (the
+      // caller retries) unless the caller has seen this persist.
+      if (err instanceof LockNotWritableError && acceptNotWritable) {
         state.mode = "read-only";
         state.reason = "not-writable";
         state.held = false;
@@ -345,6 +348,11 @@ export async function openLibraryInternal(
         return;
       }
       throw err;
+    }
+    if (ctl.closed) {
+      // Closed while we were re-acquiring: give the lock back.
+      if (again.acquired) await releaseLock(root, deps).catch(() => {});
+      return;
     }
     if (!again.acquired) {
       lockLost(again.holder);
@@ -373,7 +381,7 @@ interface HandleControl {
   /** Read-write handles only: stop the heartbeat while offline. */
   stopLock?: () => Promise<void>;
   /** Read-write handles only: re-acquire the lock when the library is back. */
-  reacquire?: () => Promise<void>;
+  reacquire?: (acceptNotWritable: boolean) => Promise<void>;
 }
 const controls = new WeakMap<Library, HandleControl>();
 
@@ -427,8 +435,10 @@ export async function markOffline(lib: Library): Promise<void> {
  * Package-internal: the library folder is reachable again. A handle that was read-write re-acquires
  * the lock first (another device may have taken it meanwhile: then it stays read-only,
  * `locked-by-other-device`); any other handle gets its previous reason back. No-op unless offline.
+ * With `acceptNotWritable: false`, a lock that cannot be written (LockNotWritableError) leaves the
+ * handle offline and is thrown, so the caller can retry; otherwise the handle becomes `not-writable`.
  */
-export async function markOnline(lib: Library): Promise<void> {
+export async function markOnline(lib: Library, opts: { acceptNotWritable?: boolean } = {}): Promise<void> {
   const ctl = controls.get(lib);
   if (!ctl || !ctl.beforeOffline) return;
   const before = ctl.beforeOffline;
@@ -436,7 +446,7 @@ export async function markOnline(lib: Library): Promise<void> {
   if (ctl.closed) return;
   if (before.mode === "read-write" && ctl.reacquire) {
     try {
-      await ctl.reacquire();
+      await ctl.reacquire(opts.acceptNotWritable ?? true);
     } catch (err) {
       ctl.beforeOffline = before; // still unreachable after all: stay offline, retry later
       throw err;
@@ -445,6 +455,11 @@ export async function markOnline(lib: Library): Promise<void> {
   }
   ctl.state.mode = before.mode;
   ctl.state.reason = before.reason;
+}
+
+/** Package-internal: true once `close()` was called on the handle. */
+export function isClosed(lib: Library): boolean {
+  return controls.get(lib)?.closed ?? false;
 }
 
 /** Records the library in the app-level registry (outside the library folder). */

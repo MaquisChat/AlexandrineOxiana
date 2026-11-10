@@ -1,8 +1,10 @@
 /** Sources: create (capture + store), read, update, delete; source.json / source.json.enc and manifest.json. */
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import * as fsp from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  LibraryRelativePath,
   Provenance,
   Source,
   SourceDraft,
@@ -391,6 +393,13 @@ export async function deleteSource(core: RepoCore, projectId: string, id: string
  * linked file, spec 4.5). Governed and audited like any edit of the source; the file itself is not
  * touched. The new path must hold a file with the asset's recorded SHA-256 (checked by the caller).
  */
+export class LinkedContentChangedError extends Error {
+  override name = "LinkedContentChangedError";
+  constructor(readonly path: string) {
+    super(`The file at ${path} is not (or no longer) the linked asset's content; nothing was changed`);
+  }
+}
+
 export async function relinkLinkedAsset(
   core: RepoCore,
   projectId: string,
@@ -398,6 +407,7 @@ export async function relinkLinkedAsset(
   assetId: string,
   libraryRelativePath: string,
 ): Promise<SourceFile> {
+  LibraryRelativePath.parse(libraryRelativePath);
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -410,6 +420,10 @@ export async function relinkLinkedAsset(
       const cur = await readSourceFile(core, st, sourceId);
       const before = cur.assets.find((a) => a.id === assetId);
       if (!before?.linked) throw new NotFoundError("Linked asset", assetId);
+      // Re-check inside the mutation: the file may have changed since the caller matched it.
+      const abs = core.abs(libraryRelativePath);
+      const fst = await fsp.lstat(abs).catch(() => null);
+      if (!fst?.isFile() || (await sha256File(abs)).sha256 !== before.sha256) throw new LinkedContentChangedError(libraryRelativePath);
       const after: Asset = {
         ...before,
         path: libraryRelativePath,

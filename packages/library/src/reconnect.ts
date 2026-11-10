@@ -3,7 +3,7 @@
  * ones, cloud placeholder files, and offline drives (spec 4.5, ADR 0010).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream, type Stats } from "node:fs";
+import { constants as fsConstants, createReadStream, type Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
 import path, { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
@@ -21,6 +21,7 @@ import {
   MOVED_MARKER,
   MOVE_JOURNAL,
   WrongLibraryError,
+  isClosed,
   markOffline,
   markOnline,
   openLibrary,
@@ -33,7 +34,9 @@ import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
 import { ReadOnlyLibraryError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { appendLibraryEvent, openRepo, relinkLinkedAsset, type Repo } from "./repo/repo.js";
+import { appendLibraryEvent, openRepo, relinkLinkedAsset, repoLibrary, type Repo } from "./repo/repo.js";
+import { LinkedContentChangedError } from "./repo/sources.js";
+import { LockNotWritableError } from "./lock.js";
 import type { Manifest } from "./repo/state.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -601,7 +604,7 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
     }
 
     if (library.readOnlyReason !== "move-incomplete" && library.readOnlyReason !== "newer-format") {
-      await recordLocation(library.id, root, deps).catch((err: unknown) => warnings.push(`The location could not be recorded (${msg(err)})`));
+      await recordLocation(library.id, resolve(root), deps).catch((err: unknown) => warnings.push(`The location could not be recorded (${msg(err)})`));
     }
 
     if (repo) {
@@ -670,35 +673,56 @@ async function rebuildIfNeeded(library: Library, keyRing: KeyRing, warnings: str
 export interface RelinkOptions {
   /** Keys of unlocked encrypted projects: their files are verified by decrypting. */
   keyRing?: KeyRing;
-  /** The open repo of `lib` (linked-asset updates and audit events). Opened on `lib` if absent. */
-  repo?: Repo;
   /** Folder levels searched below `searchDir` (default 6). */
   maxDepth?: number;
   signal?: AbortSignal;
+  /** Test seams: file status of candidates (default `lstat`) and streaming reads. */
+  stat?: StatFn;
+  openRead?: OpenReadFn;
 }
 
-export type RelinkSkipReason = "outside-library" | "ambiguous" | "verify-failed" | "target-exists";
+export type RelinkSkipReason =
+  /** Encrypted project whose key is not unlocked: unlock it first, then relink (verified by decrypting). */
+  | "project-locked"
+  /** Only online-only placeholders of the right size were found: hydrate them first. */
+  | "placeholder"
+  /** Linked asset: the matching file is outside the library. */
+  | "outside-library"
+  /** Linked asset: the matching file is in a place a link may not point to (`.tmp/`, hidden, another source's files). */
+  | "not-linkable"
+  | "verify-failed"
+  | "target-exists";
 
 export interface RelinkResult {
   relinked: number;
   stillMissing: number;
   /** Library-relative paths restored (copied back, or a linked asset's new path). */
   relinkedPaths: string[];
-  /** Of those, copies that could not be verified (locked encrypted project: matched by name and size only). */
-  relinkedUnverified: string[];
-  /** Missing files for which a candidate was found but not used. */
+  /** Missing files that were not restored, and why (files with no candidate at all are not listed). */
   skipped: Array<{ path: string; reason: RelinkSkipReason }>;
+  /** Online-only placeholders in the search folder (relative to it, at most 50); never read. */
+  placeholderCandidates: string[];
   warnings: string[];
 }
 
 interface Candidate {
   abs: string;
+  /** Relative to the search folder, with `/`. */
+  rel: string;
   name: string;
   size: number;
 }
 
-async function listCandidates(dir: string, maxDepth: number, signal?: AbortSignal): Promise<Candidate[]> {
-  const out: Candidate[] = [];
+const MAX_PLACEHOLDER_REPORT = 50;
+
+async function listCandidates(
+  dir: string,
+  maxDepth: number,
+  stat: StatFn,
+  signal?: AbortSignal,
+): Promise<{ files: Candidate[]; placeholders: Candidate[] }> {
+  const files: Candidate[] = [];
+  const placeholders: Candidate[] = [];
   const visit = async (d: string, depth: number) => {
     signal?.throwIfAborted();
     let entries: import("node:fs").Dirent[];
@@ -713,30 +737,54 @@ async function listCandidates(dir: string, maxDepth: number, signal?: AbortSigna
       if (e.isDirectory()) {
         if (depth < maxDepth) await visit(p, depth + 1);
       } else if (e.isFile() && !/\.tmp-[0-9a-f]+$/.test(e.name)) {
-        const st = await fsp.lstat(p).catch(() => null);
-        if (st?.isFile()) out.push({ abs: p, name: e.name, size: st.size });
+        const st = await stat(p).catch(() => null);
+        if (!st?.isFile()) continue;
+        const c = { abs: p, rel: relative(dir, p).split(sep).join("/"), name: e.name, size: st.size };
+        // Never read a placeholder: that would download it.
+        if (await isPlaceholder(p, { stat: async () => st })) placeholders.push(c);
+        else files.push(c);
       }
     }
   };
   await visit(dir, 0);
-  return out;
+  return { files, placeholders };
+}
+
+/** Where a linked asset may point: inside the library, not in `.tmp/`, not hidden, not inside a source's own files. */
+function linkable(rel: string): boolean {
+  if (!LibraryRelativePath.safeParse(rel).success) return false;
+  const parts = rel.split("/");
+  if (parts.some((s) => s.startsWith(".") || s === "")) return false;
+  return !/^Projects\/[^/]+\/Sources\/[^/]+\/(original|derived)(\/|$)/.test(rel);
 }
 
 /**
  * Searches `searchDir` (depth ≤ 6, symbolic links not followed) for the library's missing files and
- * restores them. A candidate matches by SHA-256 (only candidates of the right size are hashed;
- * encrypted files are decrypted with the project key when it is unlocked). In a locked encrypted
- * project, where no hash is readable, a file with the same name and the project's key id matches:
- * it is restored but listed in `relinkedUnverified`. Matches are copied back to their library path
- * (`copyFileAtomic` into a staging name, verified, then placed without ever replacing an existing
- * file), with mode 0600 for identifiable or encrypted content. Linked assets are not copied: their
- * stored path is updated through the repo (governed and audited), and only to a file inside the
- * library. Copies are recorded as `library.relink` in the project's audit log. Requires read-write.
+ * restores them, through `repo`, the open repo of `lib` (required: a second repo on an open library
+ * would run recovery against live writes and fork the audit head).
+ *
+ * A candidate matches by SHA-256 only: candidates of the right size are hashed (decrypted with the
+ * project key for encrypted projects). Each candidate restores at most one file per run. Files of
+ * locked encrypted projects are not relinked (`project-locked`): unlock first. Online-only
+ * placeholders in the search folder are never read; they are listed in `placeholderCandidates`, and
+ * a missing file whose only same-size candidates are placeholders is skipped as `placeholder`.
+ *
+ * Matches are copied back to their library path (`copyFileAtomic` into a staging name, verified,
+ * then placed without ever replacing an existing file), with mode 0600 for identifiable or
+ * encrypted content, and recorded as `library.relink` in the project's audit log. Linked assets are
+ * not copied: their stored path is updated through the repo (governed and audited; the content is
+ * re-checked inside the mutation), and only to a linkable file inside the library. Requires
+ * read-write.
  */
-export async function relinkMissing(lib: Library, searchDir: string, opts: RelinkOptions = {}): Promise<RelinkResult> {
+export async function relinkMissing(lib: Library, searchDir: string, repo: Repo, opts: RelinkOptions = {}): Promise<RelinkResult> {
   if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
+  const rl = repoLibrary(repo);
+  if (rl !== lib && (rl.id !== lib.id || resolve(rl.root) !== resolve(lib.root))) {
+    throw new TypeError("relinkMissing: the repo passed is not open on this library");
+  }
   const keyRing = opts.keyRing ?? new KeyRing();
-  const result: RelinkResult = { relinked: 0, stillMissing: 0, relinkedPaths: [], relinkedUnverified: [], skipped: [], warnings: [] };
+  const openRead = opts.openRead ?? defaultOpenRead;
+  const result: RelinkResult = { relinked: 0, stillMissing: 0, relinkedPaths: [], skipped: [], placeholderCandidates: [], warnings: [] };
   const errors: IntegrityReport["errors"] = [];
   const files = await expectedFiles(lib.root, keyRing, errors);
   for (const e of errors) result.warnings.push(`${e.path}: ${e.message}`);
@@ -752,133 +800,113 @@ export async function relinkMissing(lib: Library, searchDir: string, opts: Relin
   result.stillMissing = missing.length;
   if (missing.length === 0) return result;
 
-  const candidates = await listCandidates(searchDir, opts.maxDepth ?? 6, opts.signal);
-  const rawHashes = new Map<string, Promise<string | null>>();
-  const rawHash = (c: Candidate) => {
-    let h = rawHashes.get(c.abs);
+  const found = await listCandidates(searchDir, opts.maxDepth ?? 6, opts.stat ?? ((p) => fsp.lstat(p)), opts.signal);
+  const candidates = found.files;
+  result.placeholderCandidates = found.placeholders.slice(0, MAX_PLACEHOLDER_REPORT).map((c) => c.rel);
+  /** Candidates already used in this run: one file never restores two missing assets. */
+  const used = new Set<string>();
+  const memo = new Map<string, Promise<string | null>>();
+  const hashOf = (c: Candidate, key?: { key: Uint8Array; keyId: string }) => {
+    const k = `${key?.keyId ?? ""}:${c.abs}`;
+    let h = memo.get(k);
     if (!h) {
-      h = hashStream(c.abs, defaultOpenRead).catch(() => null);
-      rawHashes.set(c.abs, h);
-    }
-    return h;
-  };
-  const plainHashes = new Map<string, Promise<string | null>>();
-  const plainHash = (c: Candidate, key: { key: Uint8Array; keyId: string }) => {
-    const k = `${key.keyId}:${c.abs}`;
-    let h = plainHashes.get(k);
-    if (!h) {
-      h = hashStream(c.abs, defaultOpenRead, key).catch(() => null);
-      plainHashes.set(k, h);
+      h = hashStream(c.abs, openRead, key).catch(() => null);
+      memo.set(k, h);
     }
     return h;
   };
   const keyIdOf = (c: Candidate) => readKeyId(c.abs).catch(() => null);
   const realRoot = await fsp.realpath(lib.root);
-
-  let repo = opts.repo;
-  const getRepo = async () => (repo ??= await openRepo(lib, keyRing));
-  /** Per project: asset ids (or paths) restored by copying, for the audit event. */
-  const copied = new Map<string, { assetIds: string[]; files: number; unverified: number }>();
+  /** Per project: asset ids restored by copying, for the audit event. */
+  const copied = new Map<string, string[]>();
+  const placeholderOfSize = (size: number) => found.placeholders.some((c) => c.size === size);
 
   for (const f of missing) {
     opts.signal?.throwIfAborted();
     const a = f.asset;
     const target = absIn(lib.root, f.path);
     try {
-      if (a?.linked) {
-        // Linked: find a same-content file and point the asset at it, if it is inside the library.
-        let outside = false;
-        let inside: string | undefined;
-        for (const c of candidates.filter((c) => c.size === a.bytes)) {
-          if ((await rawHash(c)) !== a.sha256) continue;
+      if (!a || (a.encrypted && !f.key)) {
+        // Locked encrypted project (R35): no hash to verify against; unlock first.
+        result.skipped.push({ path: f.path, reason: "project-locked" });
+        continue;
+      }
+      if (a.linked) {
+        // Linked: find a same-content file and point the asset at it, if it may be linked to.
+        let refused: RelinkSkipReason | undefined;
+        let chosen: { c: Candidate; rel: string } | undefined;
+        for (const c of candidates) {
+          if (c.size !== a.bytes || used.has(c.abs) || (await hashOf(c)) !== a.sha256) continue;
           const real = await fsp.realpath(c.abs).catch(() => null);
           const rel = real ? relative(realRoot, real) : "..";
-          const relPosix = rel.split(sep).join("/");
-          if (rel.startsWith("..") || path.isAbsolute(rel) || !LibraryRelativePath.safeParse(relPosix).success) {
-            outside = true;
+          if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            refused ??= "outside-library";
             continue;
           }
-          inside = relPosix;
+          const relPosix = rel.split(sep).join("/");
+          if (!linkable(relPosix)) {
+            refused = "not-linkable";
+            continue;
+          }
+          chosen = { c, rel: relPosix };
           break;
         }
-        if (!inside) {
-          if (outside) result.skipped.push({ path: f.path, reason: "outside-library" });
+        if (!chosen) {
+          if (refused) result.skipped.push({ path: f.path, reason: refused });
+          else if (placeholderOfSize(a.bytes)) result.skipped.push({ path: f.path, reason: "placeholder" });
           continue;
         }
-        await relinkLinkedAsset(await getRepo(), f.projectId, f.sourceId!, a.id, inside);
+        await relinkSeams.beforeLinkedUpdate?.(chosen.c.abs);
+        try {
+          await relinkLinkedAsset(repo, f.projectId, f.sourceId!, a.id, chosen.rel);
+        } catch (err) {
+          if (err instanceof LinkedContentChangedError) {
+            result.skipped.push({ path: f.path, reason: "verify-failed" });
+            continue;
+          }
+          throw err;
+        }
+        used.add(chosen.c.abs);
         result.relinked++;
-        result.relinkedPaths.push(inside);
+        result.relinkedPaths.push(chosen.rel);
         continue;
       }
 
+      const key = a.encrypted ? f.key : undefined;
+      const size = a.encrypted ? encryptedSize(a.bytes) : a.bytes;
       let src: Candidate | undefined;
-      let verify: (staged: string) => Promise<boolean>;
-      let unverified = false;
-      if (a && !a.encrypted) {
-        for (const c of candidates.filter((c) => c.size === a.bytes)) {
-          if ((await rawHash(c)) === a.sha256) {
-            src = c;
-            break;
-          }
+      for (const c of candidates) {
+        if (c.size !== size || used.has(c.abs)) continue;
+        if (key && (await keyIdOf(c)) !== key.keyId) continue;
+        if ((await hashOf(c, key)) === a.sha256) {
+          src = c;
+          break;
         }
-        verify = async (staged) => (await hashStream(staged, defaultOpenRead).catch(() => null)) === a.sha256;
-      } else if (a && f.key) {
-        const key = f.key;
-        const size = encryptedSize(a.bytes);
-        for (const c of candidates.filter((c) => c.size === size)) {
-          if ((await keyIdOf(c)) !== key.keyId) continue;
-          if ((await plainHash(c, key)) === a.sha256) {
-            src = c;
-            break;
-          }
-        }
-        verify = async (staged) => (await hashStream(staged, defaultOpenRead, key).catch(() => null)) === a.sha256;
-      } else {
-        // Locked encrypted project: no hash to compare. Same name (and size, when known) and the
-        // project's key id; refuse when the candidates differ in content.
-        const name = basename(f.path);
-        const size = a ? encryptedSize(a.bytes) : undefined;
-        const matches: Candidate[] = [];
-        for (const c of candidates) {
-          if (c.name !== name || (size !== undefined && c.size !== size)) continue;
-          if (f.keyId && (await keyIdOf(c)) !== f.keyId) continue;
-          matches.push(c);
-        }
-        const distinct = new Set(await Promise.all(matches.map((c) => rawHash(c))));
-        if (distinct.size > 1 || distinct.has(null)) {
-          result.skipped.push({ path: f.path, reason: "ambiguous" });
-          continue;
-        }
-        src = matches[0];
-        const expected = src ? await rawHash(src) : null;
-        verify = async (staged) => expected !== null && (await hashStream(staged, defaultOpenRead).catch(() => null)) === expected;
-        unverified = true;
       }
-      if (!src) continue;
-
-      const mode = f.keyId || f.identifiable || a?.encrypted ? 0o600 : undefined;
+      if (!src) {
+        if (placeholderOfSize(size)) result.skipped.push({ path: f.path, reason: "placeholder" });
+        continue;
+      }
+      const verify = async (staged: string) => (await hashStream(staged, defaultOpenRead, key).catch(() => null)) === a.sha256;
+      const mode = f.identifiable || a.encrypted || f.keyId ? 0o600 : undefined;
       const placed = await copyBack(lib.root, src.abs, target, mode, verify);
       if (placed !== "ok") {
         result.skipped.push({ path: f.path, reason: placed });
         continue;
       }
+      used.add(src.abs);
       result.relinked++;
       result.relinkedPaths.push(f.path);
-      if (unverified) result.relinkedUnverified.push(f.path);
-      const c = copied.get(f.projectId) ?? { assetIds: [], files: 0, unverified: 0 };
-      c.files++;
-      if (a) c.assetIds.push(a.id);
-      if (unverified) c.unverified++;
-      copied.set(f.projectId, c);
+      copied.set(f.projectId, [...(copied.get(f.projectId) ?? []), a.id]);
     } catch (err) {
       result.warnings.push(`${f.path}: ${msg(err)}`);
     }
   }
   result.stillMissing = missing.length - result.relinked;
 
-  for (const [projectId, c] of copied) {
+  for (const [projectId, assetIds] of copied) {
     try {
-      await appendLibraryEvent(await getRepo(), projectId, "library.relink", { files: c.files, unverified: c.unverified, assetIds: c.assetIds });
+      await appendLibraryEvent(repo, projectId, "library.relink", { files: assetIds.length, assetIds });
     } catch (err) {
       result.warnings.push(`The library.relink audit event could not be recorded for project ${projectId} (${msg(err)})`);
     }
@@ -886,14 +914,34 @@ export async function relinkMissing(lib: Library, searchDir: string, opts: Relin
   return result;
 }
 
+/** Test seams (not exported from the package). */
+export const relinkSeams: {
+  /** Runs after the target was found absent, right before the copy. */
+  beforeCopy?: (src: string, target: string) => Promise<void>;
+  /** Runs after a linked asset's new file was matched, right before the repo update. */
+  beforeLinkedUpdate?: (abs: string) => Promise<void>;
+  /** Behave as on a file system without hard links (FAT/exFAT). */
+  noHardLinks?: boolean;
+} = {};
+
+async function fsyncDir(dir: string): Promise<void> {
+  let fh: fsp.FileHandle | undefined;
+  try {
+    fh = await fsp.open(dir, "r");
+    await fh.sync();
+  } catch {
+    // best effort (not supported everywhere)
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
 /**
  * Copies `src` to a staging name next to `target` (copyFileAtomic), verifies the staged copy, then
- * places it at `target` without replacing anything there: a hard link fails if `target` exists;
- * where hard links are unsupported (e.g. FAT/exFAT) it checks and renames (a narrow race).
+ * places it at `target` without ever replacing anything there: a hard link, which fails if `target`
+ * exists; where hard links are unsupported (e.g. FAT/exFAT), an exclusive copy
+ * (`COPYFILE_EXCL`). The parent folder is synced afterwards (best effort).
  */
-/** Test seam (not exported from the package): runs after the target was found absent, right before the copy. */
-export const relinkSeams: { beforeCopy?: (src: string, target: string) => Promise<void> } = {};
-
 async function copyBack(
   root: string,
   src: string,
@@ -911,15 +959,20 @@ async function copyBack(
     await copyFileAtomic(src, staged, mode === undefined ? {} : { mode });
     if (!(await verify(staged))) return "verify-failed";
     try {
+      if (relinkSeams.noHardLinks) throw Object.assign(new Error("hard links not supported (simulated)"), { code: "EPERM" });
       await fsp.link(staged, target);
-      return "ok";
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") return "target-exists";
-      if (await pathExists(target)) return "target-exists";
-      await renameWithRetry(staged, target);
-      return "ok";
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return "target-exists";
+      try {
+        await fsp.copyFile(staged, target, fsConstants.COPYFILE_EXCL);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "EEXIST") return "target-exists";
+        throw e;
+      }
+      if (mode !== undefined && process.platform !== "win32") await fsp.chmod(target, mode);
     }
+    await fsyncDir(dirname(target));
+    return "ok";
   } finally {
     await fsp.unlink(staged).catch(() => {});
   }
@@ -935,13 +988,19 @@ export interface WatchOptions {
   clearInterval?: (handle: unknown) => void;
 }
 
+/** Consecutive ticks a lock must stay unwritable after the library came back before the handle settles on `not-writable`. */
+const NOT_WRITABLE_TICKS = 3;
+
 /**
  * Polls `library.json` every 5 s. When it is gone (drive unplugged, network share lost) the
  * library becomes read-only with `readOnlyReason: "offline"` (writes throw ReadOnlyLibraryError)
  * and `onChange("offline")` is called; when it is back, a handle that was read-write re-acquires
  * the lock first (if another device took it meanwhile it stays read-only,
  * `locked-by-other-device`, and its `onLockLost` is called), any other handle gets its previous
- * reason back, and `onChange("online")` is called. Returns a function that stops watching.
+ * reason back, and `onChange("online")` is called. A lock that cannot be written while the drive
+ * comes back keeps the handle offline and is retried; only after 3 consecutive ticks does the
+ * handle become read-only `not-writable`. The watcher stops by itself once the handle is closed.
+ * Returns a function that stops watching.
  */
 export function watchAvailability(lib: Library, onChange: (state: "online" | "offline") => void, opts: WatchOptions = {}): () => void {
   const set =
@@ -954,7 +1013,18 @@ export function watchAvailability(lib: Library, onChange: (state: "online" | "of
   const clear = opts.clearInterval ?? ((h: unknown) => clearInterval(h as NodeJS.Timeout));
   let state: "online" | "offline" = lib.readOnlyReason === "offline" ? "offline" : "online";
   let stopped = false;
+  let notWritable = 0;
   let inflight: Promise<void> | undefined;
+  let handle: unknown;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clear(handle);
+  };
+  const done = () => {
+    if (isClosed(lib)) stop();
+    return stopped;
+  };
   const reachable = async () => {
     try {
       return (await fsp.stat(join(lib.root, "library.json"))).isFile();
@@ -963,24 +1033,33 @@ export function watchAvailability(lib: Library, onChange: (state: "online" | "of
     }
   };
   const tick = async () => {
+    if (done()) return;
     const ok = await reachable();
-    if (stopped) return;
+    if (done()) return;
     if (!ok && state === "online") {
+      notWritable = 0;
       await markOffline(lib);
+      if (done()) return;
       state = "offline";
       onChange("offline");
     } else if (ok && state === "offline") {
       try {
-        await markOnline(lib);
-      } catch {
-        return; // still not usable: stay offline and try again on the next tick
+        await markOnline(lib, { acceptNotWritable: notWritable + 1 >= NOT_WRITABLE_TICKS });
+      } catch (err) {
+        // Still not usable: stay offline and try again on the next tick.
+        notWritable = err instanceof LockNotWritableError ? notWritable + 1 : 0;
+        return;
       }
+      notWritable = 0;
+      if (done()) return;
       state = "online";
       onChange("online");
+    } else if (!ok) {
+      notWritable = 0;
     }
   };
   // The callback returns the tick promise so tests can await it.
-  const handle = set((() => {
+  handle = set((() => {
     if (stopped || inflight) return;
     inflight = tick()
       .catch(() => {})
@@ -989,8 +1068,5 @@ export function watchAvailability(lib: Library, onChange: (state: "online" | "of
       });
     return inflight;
   }) as () => void, opts.intervalMs ?? 5000);
-  return () => {
-    stopped = true;
-    clear(handle);
-  };
+  return stop;
 }
