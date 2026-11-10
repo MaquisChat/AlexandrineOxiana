@@ -49,6 +49,9 @@ import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { RecoveryPendingError } from "./errors.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
+import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
+import { destroyAssets, type DestroyInput } from "./destroy.js";
+import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 
 /** Repo → its core, for package-internal helpers below (not part of the public Repo API). */
 const cores = new WeakMap<Repo, RepoCore>();
@@ -753,6 +756,11 @@ export function repoTz(repo: Repo): string | undefined {
   return cores.get(repo)!.tz;
 }
 
+/** Package-internal: the repo's clock (tests set it). */
+export function repoClock(repo: Repo): () => Date {
+  return cores.get(repo)!.clock;
+}
+
 /** Package-internal: the library a repo was opened on. */
 export function repoLibrary(repo: Repo): Library {
   return cores.get(repo)!.library;
@@ -761,6 +769,85 @@ export function repoLibrary(repo: Repo): Library {
 /** Package-internal: ids of projects that refuse writes until the library is reopened. */
 export function recoveryPendingProjects(repo: Repo): string[] {
   return [...cores.get(repo)!.projects.values()].filter((s) => s.recoveryPending).map((s) => s.project.id);
+}
+
+/** Package-internal (backups, R90 b): what a backup sees of its project while it holds the write queue. */
+export interface ProjectQueueContext {
+  /** Library root (absolute). */
+  root: string;
+  /** Library-relative project folder. */
+  rel: string;
+  project: Project;
+  encrypted: boolean;
+  /** The data key (encrypted projects; throws ProjectLockedError when locked), else null. */
+  key(): { key: Uint8Array; keyId: string } | null;
+  /** The audit head now. */
+  head(): { seq: number; hash: string } | null;
+  /** ISO time from the repo's clock. */
+  at(): string;
+  /** Appends one audit event about the project (decision allow), anchored. */
+  audit(action: string, details: Record<string, unknown>): Promise<void>;
+}
+
+/**
+ * Package-internal (backups): runs `fn` in the repository's write queue, so no change to any project
+ * happens meanwhile (a backup then reads one consistent state). Same guards as a write.
+ */
+export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: ProjectQueueContext) => Promise<T>): Promise<T> {
+  const core = cores.get(repo)!;
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    const st = core.state(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    core.assertUnlocked(st);
+    return fn({
+      root: core.root,
+      rel: st.rel,
+      project: structuredClone(st.project),
+      encrypted: core.encrypted(st),
+      key: () => (core.encrypted(st) ? core.key(st) : null),
+      head: () => (st.audit.head ? { ...st.audit.head } : null),
+      at: () => core.clock().toISOString(),
+      audit: async (action, details) => {
+        const at = core.clock().toISOString();
+        await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision: { result: "allow" }, details });
+      },
+    });
+  });
+}
+
+/** Package-internal (restore): a key in the repo's key ring, if unlocked. */
+export function keyFromRing(repo: Repo, keyId: string): Uint8Array | undefined {
+  return cores.get(repo)!.keyRing.get(keyId);
+}
+
+/** Package-internal (restore with a passphrase): puts a project key in the repo's key ring. */
+export function addKeyToRing(repo: Repo, keyId: string, key: Uint8Array): void {
+  cores.get(repo)!.keyRing.add(keyId, key);
+}
+
+/** Package-internal (restore, R90 b): makes an unpacked backup a new project of the library. */
+export function adoptRestoredProject(repo: Repo, s: StagedRestore): Promise<Project> {
+  return adoptRestoredIn(cores.get(repo)!, s);
+}
+
+/** Package-internal (retention, R90 d): the governed destruction change. */
+export function destroyProjectAssets(repo: Repo, projectId: string, input: DestroyInput): ReturnType<typeof destroyAssets> {
+  return destroyAssets(cores.get(repo)!, projectId, input);
+}
+
+/** Sets a project's backup settings (daily automatic backup, how many to keep); governed and audited. */
+export function setProjectBackupSettings(repo: Repo, projectId: string, settings: BackupSettings): Promise<Project> {
+  return setBackupSettingsIn(cores.get(repo)!, projectId, settings);
+}
+
+/** Package-internal (citations, exports): the project's pseudonym map (handle or name → code); empty unless encrypted. */
+export async function projectPseudonymMap(repo: Repo, projectId: string): Promise<Map<string, string>> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  if (!core.encrypted(st)) return new Map();
+  return loadPseudonyms(core, st);
 }
 
 export type { RepoOptions };

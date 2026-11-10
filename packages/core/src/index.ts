@@ -10,6 +10,7 @@ export {
   defaultTemplates,
   derivedFileName,
   encName,
+  formatModified,
   originalFileName,
   pseudonymize,
   sanitizeSegment,

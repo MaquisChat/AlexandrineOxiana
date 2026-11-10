@@ -176,6 +176,26 @@ export { SECRET_NAMES, SECRET_SERVICE, SECRET_STORE_UNAVAILABLE, SecretStoreUnav
 export type { SecretName } from "./secrets.js";
 export { DEIDENTIFIED_NOTE, REFMAN_FORMATS, exportRefman, writeRefmanExport } from "./export/refman-export.js";
 export type { RefmanExportOptions, RefmanExportResult, RefmanFormat } from "./export/refman-export.js";
+export { WITHHELD_NOTE, citeSources, exportBibliography } from "./export/bibliography.js";
+export type { BibliographyResult, BibliographySelection, CiteOptions, CiteRef } from "./export/bibliography.js";
+export {
+  AuditChainInvalidError,
+  BACKUPS_MANIFEST,
+  BACKUP_LIMITS,
+  DEFAULT_KEEP,
+  RestoreError,
+  backupIfDue,
+  backupProject,
+  listBackups,
+  pruneBackups,
+  restoreBackup,
+  setBackupSettings,
+} from "./export/backup.js";
+export type { BackupEntry, BackupResult, RestoreResult } from "./export/backup.js";
+export { ExportDestinationError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
+export type { ProjectExportResult } from "./export/project-export.js";
+export { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
+export type { DestroyOptions, DueItem } from "./retention.js";
 export {
   CSL_NS,
   CUSTOM_STYLE_MAX_BYTES,

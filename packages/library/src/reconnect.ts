@@ -417,6 +417,8 @@ async function expectedFiles(
         const sf = await readSource(absIn(root, folder), k);
         if (!sf) continue;
         for (const a of sf.assets) {
+          // Destroyed under the retention rule (R90 d): there is no file to check.
+          if (a.status === "destroyed") continue;
           out.push({
             projectId: project.id,
             projectRel: e.rel,

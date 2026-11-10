@@ -35,6 +35,7 @@ import { LibraryRelativePath, isId, newId, verifyChain, type AuditEvent } from "
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { AuditStore, type Head } from "./audit-store.js";
 import { PathEscapeError } from "./errors.js";
+import { shredPath } from "../fs/shred.js";
 import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
 import { seams } from "./seams.js";
 
@@ -42,7 +43,8 @@ export type MarkerEntry =
   | { kind: "created"; path: string }
   | { kind: "replaced"; path: string; backup: string; mode: number }
   | { kind: "dir"; path: string }
-  | { kind: "trashed"; from: string; to: string }
+  /** `shred`: destroyed, not deleted (R90 d): overwritten before it is removed once committed. */
+  | { kind: "trashed"; from: string; to: string; shred?: boolean }
   | { kind: "append"; path: string; prevSize: number; created: boolean };
 
 export interface TxnMarker {
@@ -147,14 +149,14 @@ export class TxnLog {
     await writeSmallFileAtomic(this.path, JSON.stringify(this.marker));
   }
 
-  async trashed(from: string, to: string) {
+  async trashed(from: string, to: string, shred = false) {
     const rel = toRel(this.root, from);
     // What was at or under `from` is gone: a later append or folder there is new and needs its own
     // step (else undo would truncate or remove the new file and leave the original in the trash).
     const covers = (p: string) => p === rel || p.startsWith(`${rel}/`);
     for (const p of [...this.appended]) if (covers(p)) this.appended.delete(p);
     for (let i = this.newDirs.length - 1; i >= 0; i--) if (covers(this.newDirs[i]!)) this.newDirs.splice(i, 1);
-    await this.add({ kind: "trashed", from: rel, to: toRel(this.root, to) });
+    await this.add({ kind: "trashed", from: rel, to: toRel(this.root, to), ...(shred ? { shred: true } : {}) });
   }
 
   async append(u: AppendUndo) {
@@ -250,6 +252,7 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
       case "trashed":
         if (!under(en.from, pf)) return "trashed path outside the project";
         if (!isTrashOf(en.to, x.txn)) return "trash is not this transaction's folder in .tmp";
+        if (en.shred !== undefined && typeof en.shred !== "boolean") return "bad trashed entry";
         break;
       case "append":
         if (!under(en.path, pf)) return "append path outside the project";
@@ -363,7 +366,10 @@ export async function recoverTransactions(
     ).length;
     if (mine >= m.auditEvents) {
       for (const e of m.entries) {
-        if (e.kind === "trashed") await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
+        if (e.kind !== "trashed") continue;
+        // Destroyed files are overwritten before they go (R90 d): a crash after the commit finishes it here.
+        if (e.shred) await shredPath(fromRel(root, e.to)).catch(() => {});
+        await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
       }
       await removeMarker(root, m);
       out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed" });

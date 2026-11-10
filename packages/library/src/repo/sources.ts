@@ -211,7 +211,7 @@ async function putManifest(tx: Tx, edit: (m: Manifest) => void): Promise<void> {
 }
 
 function manifestEntry(sf: SourceFile): ManifestEntry {
-  const e: ManifestEntry = { id: sf.source.id, type: sf.source.type, folder: sf.source.folder, files: sf.assets.map((a) => a.path) };
+  const e: ManifestEntry = { id: sf.source.id, type: sf.source.type, folder: sf.source.folder, files: sf.assets.filter((a) => a.status !== "destroyed").map((a) => a.path) };
   if (sf.source.issued) e.issuedYear = sf.source.issued.slice(0, 4);
   return e;
 }

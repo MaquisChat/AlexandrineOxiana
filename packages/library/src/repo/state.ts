@@ -227,24 +227,35 @@ export async function loadProjects(
     if (name.startsWith(".")) continue;
     // A project moved to another library (split move): its old folder is not part of this one.
     if (await projectMovedAway(core.root, name)) continue;
-    const raw = await readMaybe(join(projectsDir, name, "project.json"));
-    if (!raw) continue;
-    const data = parseProjectJson(JSON.parse(raw.toString("utf8")));
-    const rel = `Projects/${name}`;
-    await beforeAudit?.({ id: data.project.id, rel });
-    const { store, events, verify } = await AuditStore.load(join(projectsDir, name, "audit"), core.auditSegmentSize);
-    const st: ProjectState = {
-      project: { ...data.project, folder: rel },
-      rel,
-      data,
-      audit: store,
-      sources: new Map(),
-      manifest: { formatVersion: 1, sources: [] },
-    };
-    await loadSourceIndex(core, st);
-    out.push({ st, events, verify });
+    const loaded = await loadProjectFolder(core, name, beforeAudit);
+    if (loaded) out.push(loaded);
   }
   return out;
+}
+
+/** Reads one project folder `Projects/<name>` (null when it holds no project.json). */
+export async function loadProjectFolder(
+  core: RepoCore,
+  name: string,
+  beforeAudit?: (project: { id: string; rel: string }) => Promise<void>,
+): Promise<{ st: ProjectState; events: Array<AuditEvent | null>; verify: Awaited<ReturnType<typeof AuditStore.load>>["verify"] } | null> {
+  const projectsDir = join(core.root, "Projects");
+  const raw = await readMaybe(join(projectsDir, name, "project.json"));
+  if (!raw) return null;
+  const data = parseProjectJson(JSON.parse(raw.toString("utf8")));
+  const rel = `Projects/${name}`;
+  await beforeAudit?.({ id: data.project.id, rel });
+  const { store, events, verify } = await AuditStore.load(join(projectsDir, name, "audit"), core.auditSegmentSize);
+  const st: ProjectState = {
+    project: { ...data.project, folder: rel },
+    rel,
+    data,
+    audit: store,
+    sources: new Map(),
+    manifest: { formatVersion: 1, sources: [] },
+  };
+  await loadSourceIndex(core, st);
+  return { st, events, verify };
 }
 
 /** Source id → folder, from manifest.json (encrypted) or by reading each source.json. */

@@ -44,5 +44,10 @@ export const Project = z.object({
    * stored in the library: on another computer the watch exists but has no folder until one is chosen.
    */
   watchedFolders: z.array(WatchedFolder).max(100).optional(),
+  /**
+   * Backups (spec 9, R90 b): `automatic` — a daily backup while the app is open (absent: on);
+   * `keep` — how many backups of this project are kept (absent: 10).
+   */
+  backups: z.object({ automatic: z.boolean().optional(), keep: z.number().int().min(1).max(1000).optional() }).optional(),
 });
 export type Project = z.infer<typeof Project>;

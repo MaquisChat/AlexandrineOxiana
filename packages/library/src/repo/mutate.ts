@@ -38,6 +38,7 @@ import {
 import type { Readable } from "node:stream";
 import { decryptStream, encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
+import { shredPath } from "../fs/shred.js";
 
 const SMALL_FILE_BYTES = 256 * 1024;
 import type { AuditInput } from "./audit-store.js";
@@ -138,6 +139,12 @@ export interface Tx {
   appendLine(rel: string, line: string, opts?: { mode?: number }): Promise<void>;
   /** Moves a file or folder to `.tmp/` (restored on rollback, purged after commit). */
   trash(rel: string): Promise<void>;
+  /**
+   * Like `trash`, but the file or folder is destroyed once the change commits (R90 d): overwritten,
+   * then removed, before the write-ahead marker goes (a crash after the commit finishes it on the
+   * next open). Restored on rollback like trash.
+   */
+  destroy(rel: string): Promise<void>;
   /** Records the change(s) between `before` and `after` (null = create/delete). */
   record(type: EntityType, id: string, before: object | null, after: object | null): void;
   /** The entity the audit events are about. */
@@ -153,6 +160,8 @@ class TxImpl implements Tx {
   readonly commitHooks: Array<() => void> = [];
   readonly indexHooks: Array<(sink: IndexSink) => void | Promise<void>> = [];
   readonly trashed: string[] = [];
+  /** Trash entries to overwrite before they are removed (`destroy`). */
+  readonly shred: string[] = [];
   auditEntity?: { type: EntityType; id: string };
 
   constructor(
@@ -259,7 +268,15 @@ class TxImpl implements Tx {
     await appendDurable(abs, `${line}\n`, opts.mode, (u) => this.log.append(u));
   }
 
-  async trash(rel: string): Promise<void> {
+  trash(rel: string): Promise<void> {
+    return this.moveToTrash(rel, false);
+  }
+
+  destroy(rel: string): Promise<void> {
+    return this.moveToTrash(rel, true);
+  }
+
+  private async moveToTrash(rel: string, shred: boolean): Promise<void> {
     const from = this.core.abs(rel);
     await this.guard(from);
     this.containment.dirs.clear(); // folders move away: check again from here on
@@ -267,9 +284,10 @@ class TxImpl implements Tx {
     await fsp.mkdir(dir, { recursive: true });
     const to = join(dir, `trash-${this.log.id}-${randomBytes(8).toString("hex")}`);
     await assertContained(dir, to);
-    await this.log.trashed(from, to);
+    await this.log.trashed(from, to, shred);
     await renameWithRetry(from, to);
     this.trashed.push(to);
+    if (shred) this.shred.push(to);
   }
 
   record(type: EntityType, id: string, before: object | null, after: object | null): void {
@@ -478,12 +496,22 @@ export async function runMutation<T>(
       }
       throw err;
     }
-    await log.finish().catch(() => {}); // a leftover marker is resolved as committed on next open
+    // Destroyed files are overwritten before the marker goes; if that fails the marker stays, and
+    // the next open (which resolves it as committed) overwrites them then.
+    let shredded = true;
+    for (const t of tx.shred) {
+      try {
+        await shredPath(t);
+      } catch {
+        shredded = false;
+      }
+    }
+    if (shredded) await log.finish().catch(() => {}); // a leftover marker is resolved as committed on next open
 
     // 5. Committed.
     await core.updateAnchor(st, at);
     for (const h of tx.commitHooks) h();
-    for (const t of tx.trashed) await fsp.rm(t, { recursive: true, force: true }).catch(() => {});
+    for (const t of tx.trashed) if (shredded || !tx.shred.includes(t)) await fsp.rm(t, { recursive: true, force: true }).catch(() => {});
     for (const h of tx.indexHooks) {
       try {
         await h(core.index);

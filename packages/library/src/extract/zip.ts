@@ -43,12 +43,17 @@ function unsafeName(name: string): boolean {
   return n.split("/").some((seg) => seg === "..");
 }
 
-const open = (path: string) =>
-  new Promise<yauzl.ZipFile>((resolve, reject) =>
-    yauzl.open(path, { lazyEntries: true, autoClose: false, validateEntrySizes: true, strictFileNames: false, decodeStrings: true }, (err, zf) =>
-      err || !zf ? reject(err ?? new Error("cannot open")) : resolve(zf),
-    ),
-  );
+const YAUZL_OPTIONS = { lazyEntries: true, autoClose: false, validateEntrySizes: true, strictFileNames: false, decodeStrings: true } as const;
+
+/** A ZIP archive: a file path, or a random-access reader over its bytes (e.g. a sealed backup, R90 b). */
+export type ZipSource = string | { reader: yauzl.RandomAccessReader; size: number };
+
+const open = (src: ZipSource) =>
+  new Promise<yauzl.ZipFile>((resolve, reject) => {
+    const done = (err: Error | null, zf?: yauzl.ZipFile) => (err || !zf ? reject(err ?? new Error("cannot open")) : resolve(zf));
+    if (typeof src === "string") yauzl.open(src, YAUZL_OPTIONS, done);
+    else yauzl.fromRandomAccessReader(src.reader, src.size, YAUZL_OPTIONS, done);
+  });
 
 export async function openZip(path: string): Promise<SafeZip> {
   let zf: yauzl.ZipFile;
@@ -118,6 +123,7 @@ export async function openZip(path: string): Promise<SafeZip> {
 }
 
 const PATH_REASON = "The archive contains a file name that points outside it";
+const mb = (n: number) => `${Math.round(n / (1024 * 1024))} MB`;
 
 /** A symbolic link entry (Unix mode in the external attributes). */
 function isSymlink(e: yauzl.Entry): boolean {
@@ -146,7 +152,7 @@ const SIZE_MISMATCH_REASON = "A file inside the archive is larger than it says i
  * in the caller's private work folder). `limits` is a test seam.
  */
 export async function extractArchive(
-  zipPath: string,
+  zipPath: ZipSource,
   destDir: string,
   limits: { maxEntries: number; maxEntryBytes: number; maxTotalBytes: number } = ARCHIVE_LIMITS,
   signal?: AbortSignal,
@@ -169,7 +175,7 @@ export async function extractArchive(
       zf.on("end", res);
       zf.on("entry", (e: yauzl.Entry) => {
         if (unsafeName(e.fileName) || isSymlink(e)) return rej(new UnsafeFileError("zip-path", PATH_REASON));
-        if (e.uncompressedSize > limits.maxEntryBytes) return rej(new UnsafeFileError("zip-entry-too-large", "A file inside the archive is larger than 50 MB"));
+        if (e.uncompressedSize > limits.maxEntryBytes) return rej(new UnsafeFileError("zip-entry-too-large", `A file inside the archive is larger than ${mb(limits.maxEntryBytes)}`));
         declared += e.uncompressedSize;
         if (declared > limits.maxTotalBytes) return rej(new UnsafeFileError("zip-too-large", "The archive's contents are too large to import"));
         if (entries.length >= limits.maxEntries) return rej(new UnsafeFileError("zip-too-many-entries", `The archive has more than ${limits.maxEntries} files`));
@@ -209,7 +215,7 @@ export async function extractArchive(
         transform(chunk: Buffer, _enc, cb) {
           bytes += chunk.length;
           total += chunk.length;
-          if (bytes > limits.maxEntryBytes) return cb(new UnsafeFileError("zip-entry-too-large", "A file inside the archive is larger than 50 MB"));
+          if (bytes > limits.maxEntryBytes) return cb(new UnsafeFileError("zip-entry-too-large", `A file inside the archive is larger than ${mb(limits.maxEntryBytes)}`));
           if (total > limits.maxTotalBytes) return cb(new UnsafeFileError("zip-too-large", "The archive's contents are too large to import"));
           cb(null, chunk);
         },

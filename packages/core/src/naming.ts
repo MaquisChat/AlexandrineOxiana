@@ -103,7 +103,8 @@ export function originalFileName(
   return `${render(templates.originalFile, { source })}.${safeExt}`;
 }
 
-function formatModified(date: Date, tz?: string): string {
+/** `YYYY-MM-DD HHmm` in `tz` (the researcher's), as dated file names write it. */
+export function formatModified(date: Date, tz?: string): string {
   const parts = new Intl.DateTimeFormat("en-US", {
     ...(tz ? { timeZone: tz } : {}),
     year: "numeric",

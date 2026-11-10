@@ -27,6 +27,14 @@ export const Asset = z
       triggeredBy: z.string(),
     })
     .optional(),
+  /**
+   * Absent: the file is stored. `destroyed`: the file was destroyed under the project's retention
+   * rule (spec 6.3(5), R90 d) — overwritten and removed; the record (path, sha256) is kept as
+   * evidence and the destruction certificate names it.
+   */
+  status: z.enum(["destroyed"]).optional(),
+  /** When the file was destroyed (with `status: "destroyed"`). */
+  destroyedAt: Timestamp.optional(),
   metadata: z
     .object({
       capturedAt: Timestamp.optional(),

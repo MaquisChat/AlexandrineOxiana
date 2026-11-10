@@ -294,8 +294,11 @@ function refOf(s: Source, tagNames: Map<string, string>, includeTags: boolean): 
   };
 }
 
-/** The export (governance evaluated per source); not yet audited as an export. */
-async function buildExport(
+/**
+ * The export (governance evaluated per source); not yet audited as an export. Package-internal
+ * (open-format project export, R90 c, which audits the whole export once).
+ */
+export async function buildExport(
   repo: Repo,
   projectId: string,
   sourceIds: string[],

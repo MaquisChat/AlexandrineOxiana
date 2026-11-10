@@ -93,13 +93,14 @@ export function buildHeader(keyId: string, baseNonce: Uint8Array, chunkSize: num
   return h;
 }
 
-interface ParsedHeader {
+export interface ParsedHeader {
   keyId: string;
   baseNonce: Buffer;
   chunkSize: number;
 }
 
-function parseHeader(h: Buffer): ParsedHeader {
+/** Parses a v1 header (exported for the random-access reader, crypto/random-access.ts). */
+export function parseHeader(h: Buffer): ParsedHeader {
   if (h.length < MAGIC.length || !h.subarray(0, MAGIC.length).equals(MAGIC)) {
     throw new EncryptionFormatError("bad-magic", "not an encrypted file (bad magic)");
   }
