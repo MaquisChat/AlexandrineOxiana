@@ -668,7 +668,7 @@ const ACCENTS: Record<string, string> = {
 const SYMBOLS: Record<string, string> = {
   ss: "ß", o: "ø", O: "Ø", ae: "æ", AE: "Æ", oe: "œ", OE: "Œ", aa: "å", AA: "Å", l: "ł", L: "Ł", i: "ı", j: "ȷ",
   textendash: "–", textemdash: "—", textquoteright: "’", textquoteleft: "‘", ldots: "…", dots: "…", textellipsis: "…",
-  textasciitilde: "~", textbackslash: "\\", S: "§", P: "¶", copyright: "©", textregistered: "®", texttrademark: "™",
+  textasciitilde: "~", textasciicircum: "^", textbackslash: "\\", S: "§", P: "¶", copyright: "©", textregistered: "®", texttrademark: "™",
   pounds: "£", euro: "€", textdegree: "°", guillemotleft: "«", guillemotright: "»", dh: "ð", DH: "Ð", th: "þ", TH: "Þ",
   ng: "ŋ", NG: "Ŋ", dj: "đ", DJ: "Đ",
 };
