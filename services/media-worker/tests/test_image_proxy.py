@@ -87,3 +87,16 @@ def test_unreadable_image_fails(worker, tmp_path):
     assert job["status"] == "failed"
     assert job["error"]["code"] == "UNSUPPORTED_INPUT"
     assert str(tmp_path) not in job["error"]["message"]
+
+
+def test_icc_profile_is_kept(worker, tmp_path):
+    from PIL import ImageCms
+
+    icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    src = tmp_path / "a.jpg"
+    Image.new("RGB", (64, 48), (200, 10, 10)).save(src, icc_profile=icc)
+    out = tmp_path / "o.jpg"
+    assert worker.run("image.proxy", str(src), str(out), {})["status"] == "done"
+    with Image.open(out) as im:
+        assert im.info.get("icc_profile") == icc
+    assert not any(p.name.startswith(".work-") for p in tmp_path.iterdir())

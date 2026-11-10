@@ -83,6 +83,10 @@ def worker_env(tmp_path, monkeypatch):
     monkeypatch.delenv("AO_YTDLP_BIN", raising=False)
     monkeypatch.delenv("AO_GALLERYDL_BIN", raising=False)
     monkeypatch.delenv("FAKE_YTDLP_MODE", raising=False)
+    # Child tools get an allowlisted environment; let the fakes' FAKE_* controls through.
+    from ao_worker import jobs
+
+    monkeypatch.setattr(jobs, "CHILD_ENV_PREFIXES", (*jobs.CHILD_ENV_PREFIXES, "FAKE_"))
     return {"models": models, "tools": tools}
 
 

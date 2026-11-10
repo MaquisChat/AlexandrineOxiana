@@ -59,9 +59,10 @@ interface StubJob {
 /** In-process stand-in for the Python worker's HTTP API. `onSubmit` plays the job and returns its final state. */
 async function stubWorker(
   onSubmit: (job: StubJob) => Promise<Record<string, unknown>> | Record<string, unknown>,
-  opts: { pollsUntilDone?: number } = {},
+  opts: { pollsUntilDone?: number; failPolls?: number } = {},
 ) {
   const jobs = new Map<string, StubJob>();
+  let failPolls = opts.failPolls ?? 0;
   const requests: string[] = [];
   let n = 0;
   const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -70,6 +71,11 @@ async function stubWorker(
       res.end(JSON.stringify(body));
     };
     requests.push(`${req.method} ${req.url}`);
+    if (req.method === "GET" && failPolls > 0) {
+      failPolls--;
+      req.socket.destroy(); // the connection drops: the client sees a network error
+      return;
+    }
     if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: { code: "UNAUTHORIZED", message: "no" } });
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
@@ -293,6 +299,45 @@ describe("WorkerClient.submit", () => {
   });
 });
 
+describe("WorkerClient polling", () => {
+  async function imageJob(failPolls: number) {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    let workerOut = "";
+    const worker = await stubWorker(
+      async (job) => {
+        workerOut = job.body.output;
+        await mkdir(dirname(job.body.output), { recursive: true });
+        await writeFile(job.body.output, "jpeg");
+        return { status: "done", result: { output: job.body.output, meta: {} } };
+      },
+      { failPolls },
+    );
+    const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 10 });
+    const p = client.submit(project.id, { type: "image.proxy", input, output: join(tmp, "o.jpg"), params: {} });
+    return { p, worker, workerOut: () => workerOut };
+  }
+
+  it("retries up to 3 failed polls", async () => {
+    const { p } = await imageJob(3);
+    const r = await p;
+    expect(await readFile(r.output, "utf8")).toBe("jpeg");
+    expect(jobRows().map((x) => x.status)).toEqual(["done"]);
+  });
+
+  it("after 4 failed polls it sends a best-effort cancel, keeps the job pending and only then removes the temp folder", async () => {
+    const { p, worker, workerOut } = await imageJob(1000);
+    await expect(p).rejects.toBeInstanceOf(WorkerUnavailableError);
+    const gets = worker.requests.filter((r) => r.startsWith("GET "));
+    expect(gets).toHaveLength(4);
+    expect(worker.requests.at(-1)).toBe("POST /jobs/j1/cancel");
+    expect(existsSync(workerOut())).toBe(false);
+    expect(await workerTempDirs()).toEqual([]);
+    expect(jobRows().map((x) => x.status)).toEqual(["running"]);
+  });
+});
+
 describe("startWorker", () => {
   async function stubScript(body: string): Promise<string> {
     const p = join(tmp, `stub-${Math.random().toString(36).slice(2)}.mjs`);
@@ -305,19 +350,28 @@ const token = process.env.AO_WORKER_TOKEN;
 const s = createServer((req, res) => {
   if (req.headers.authorization !== "Bearer " + token) { res.writeHead(401); return res.end("{}"); }
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: true, versions: {}, env: { port: process.env.AO_WORKER_PORT, models: process.env.AO_MODELS_DIR } }));
+  res.end(JSON.stringify({ ok: true, versions: {}, env: { port: process.env.AO_WORKER_PORT, models: process.env.AO_MODELS_DIR, secret: process.env.SOME_APP_SECRET ?? null, hasPath: !!process.env.PATH, proxy: process.env.HTTPS_PROXY ?? null } }));
 });
 s.listen(0, "127.0.0.1", () => console.log("AO_WORKER_READY port=" + s.address().port));
 `;
 
   it("spawns the worker with a random token and resolves once it prints AO_WORKER_READY; stop() kills it", async () => {
     const script = await stubScript(READY_STUB);
-    const w: WorkerHandle = await startWorker({ command: [process.execPath, script], env: { AO_MODELS_DIR: "/models" } });
+    process.env.SOME_APP_SECRET = "s3cret";
+    process.env.HTTPS_PROXY = "http://proxy.test:3128";
+    let w: WorkerHandle;
+    try {
+      w = await startWorker({ command: [process.execPath, script], env: { AO_MODELS_DIR: "/models" } });
+    } finally {
+      delete process.env.SOME_APP_SECRET;
+      delete process.env.HTTPS_PROXY;
+    }
     closers.push(() => w.stop());
     expect(w.token).toMatch(/^[0-9a-f]{64}$/);
     const res = await fetch(`${w.baseUrl}/health`, { headers: { Authorization: `Bearer ${w.token}` } });
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, env: { port: "0", models: "/models" } });
+    // only an allowlisted environment reaches the worker
+    expect(await res.json()).toMatchObject({ ok: true, env: { port: "0", models: "/models", secret: null, hasPath: true, proxy: "http://proxy.test:3128" } });
     const other = await startWorker({ command: [process.execPath, script] });
     closers.push(() => other.stop());
     expect(other.token).not.toBe(w.token);

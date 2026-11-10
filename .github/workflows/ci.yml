@@ -19,7 +19,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: System tools for the media worker (proxies, OCR)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr ghostscript ffmpeg
       - run: pnpm install --frozen-lockfile
+      - name: Media worker venv
+        run: pnpm setup:py
+        env:
+          PYTHON: python
+      - name: Pinned test fixtures
+        run: pnpm fetch-fixtures
       - run: pnpm -r typecheck
       - run: pnpm test
       - run: pnpm test:scripts

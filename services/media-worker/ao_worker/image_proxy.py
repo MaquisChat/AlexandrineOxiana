@@ -120,6 +120,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     ctx.check_cancelled()
     ctx.progress(0.3)
     orig = img
+    icc = img.info.get("icc_profile")
     try:
         if fmt != "RAW":
             img = ImageOps.exif_transpose(img)
@@ -139,7 +140,8 @@ def run(job: Job, ctx: JobContext) -> dict:
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_name(f".{out.name}.{os.getpid()}.part")
         try:
-            img.save(tmp, "JPEG", quality=int(p["quality"]), exif=new_exif.tobytes(), optimize=True)
+            extra = {"icc_profile": icc} if icc else {}
+            img.save(tmp, "JPEG", quality=int(p["quality"]), exif=new_exif.tobytes(), optimize=True, **extra)
             os.replace(tmp, out)
         finally:
             tmp.unlink(missing_ok=True)

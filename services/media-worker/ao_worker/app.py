@@ -116,8 +116,8 @@ def validate_job(body: object) -> tuple[str, str, str, dict]:
         for k in ("multilingual", "vad", "wordTimestamps"):
             _bool(params, k)
         lang = params.get("language", "auto")
-        if not isinstance(lang, str) or not re.fullmatch(r"auto|[a-z]{2,3}(-[A-Za-z]{2,4})?", lang):
-            raise BadRequest("params.language must be 'auto' or a language code")
+        if not isinstance(lang, str) or (lang != "auto" and lang not in transcribe.language_codes()):
+            raise BadRequest("params.language must be 'auto' or a language code supported by the model")
     elif type_ == "image.proxy":
         _num(params, "maxEdge", 16, 16384)
         _num(params, "quality", 1, 100)
@@ -175,7 +175,10 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(h[7:].strip().encode(), self.server.token)
 
     def _body(self) -> object:
-        n = int(self.headers.get("Content-Length") or 0)
+        raw_len = (self.headers.get("Content-Length") or "0").strip()
+        if not raw_len.isdigit():
+            raise BadRequest("invalid Content-Length")
+        n = int(raw_len)
         if n > MAX_BODY:
             raise BadRequest("body too large")
         raw = self.rfile.read(n) if n else b""

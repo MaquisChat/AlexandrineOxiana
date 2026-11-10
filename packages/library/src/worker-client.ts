@@ -124,6 +124,8 @@ interface WorkerJobState {
 }
 
 const TERMINAL = new Set(["done", "failed", "cancelled"]);
+/** Failed polls retried (with backoff) before the worker is treated as gone. */
+const POLL_RETRIES = 3;
 
 export class WorkerClient {
   private readonly repo: Repo;
@@ -248,13 +250,28 @@ export class WorkerClient {
   private async poll(workerId: string, job: WorkerJob): Promise<WorkerJobState> {
     let cancelSent = false;
     let last = -1;
+    let failures = 0;
     for (;;) {
       if (job.signal?.aborted && !cancelSent) {
         cancelSent = true;
         await this.request("POST", `/jobs/${encodeURIComponent(workerId)}/cancel`).catch(() => {});
       }
       await new Promise((r) => setTimeout(r, this.pollMs));
-      const state = await this.request<WorkerJobState>("GET", `/jobs/${encodeURIComponent(workerId)}`);
+      let state: WorkerJobState;
+      try {
+        state = await this.request<WorkerJobState>("GET", `/jobs/${encodeURIComponent(workerId)}`);
+        failures = 0;
+      } catch (err) {
+        if (!(err instanceof WorkerUnavailableError)) throw err;
+        if (++failures <= POLL_RETRIES) {
+          await new Promise((r) => setTimeout(r, this.pollMs * 2 ** failures)); // backoff
+          continue;
+        }
+        // Give up: ask the worker (best effort) to stop, so it does not keep writing into the temp
+        // folder we are about to delete. The job stays pending and is resubmitted on next launch.
+        await this.request("POST", `/jobs/${encodeURIComponent(workerId)}/cancel`).catch(() => {});
+        throw err;
+      }
       if (typeof state.progress === "number" && state.progress !== last && state.status !== "cancelled") {
         last = state.progress;
         try {
@@ -407,6 +424,28 @@ export interface WorkerHandle extends WorkerEndpoint {
 const WORKER_DIR = fileURLToPath(new URL("../../../services/media-worker/", import.meta.url));
 const READY_RE = /^AO_WORKER_READY port=(\d+)\s*$/;
 
+// The worker (and the tools it runs) get only what they need from the app's environment.
+const WORKER_ENV_NAMES = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "USERPROFILE", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP",
+  "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+  "DBUS_SESSION_BUS_ADDRESS",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "TESSDATA_PREFIX",
+]);
+const WORKER_ENV_PREFIXES = ["LC_", "XDG_", "AO_"];
+
+/** The allowlisted subset of `env` passed to the worker (names compared case-insensitively). */
+export function workerEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined || k.toUpperCase() === "AO_WORKER_TOKEN") continue;
+    const u = k.toUpperCase();
+    if (WORKER_ENV_NAMES.has(u) || WORKER_ENV_PREFIXES.some((p) => u.startsWith(p))) out[k] = v;
+  }
+  return out;
+}
+
 export function devWorkerPython(): string {
   return join(WORKER_DIR, ".venv", process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
 }
@@ -428,7 +467,7 @@ export async function startWorker(opts: StartWorkerOptions = {}): Promise<Worker
   const child = spawn(argv[0]!, argv.slice(1), {
     cwd,
     env: {
-      ...process.env,
+      ...workerEnv(process.env),
       ...opts.env,
       AO_WORKER_TOKEN: token,
       AO_WORKER_PORT: "0",

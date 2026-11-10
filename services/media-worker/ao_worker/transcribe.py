@@ -30,6 +30,13 @@ _model_lock = threading.Lock()
 _model_cache: dict = {}
 
 
+def language_codes() -> frozenset[str]:
+    """Language codes faster-whisper's multilingual models accept."""
+    from faster_whisper.tokenizer import _LANGUAGE_CODES
+
+    return frozenset(_LANGUAGE_CODES)
+
+
 def models_dir() -> Path:
     d = os.environ.get("AO_MODELS_DIR")
     if d:

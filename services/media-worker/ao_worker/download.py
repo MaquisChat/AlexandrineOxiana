@@ -10,6 +10,7 @@ logged; error details are redacted the same way.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import logging
 import os
@@ -19,19 +20,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from .jobs import Job, JobContext, JobError
+from .jobs import Job, JobContext, JobError, child_env
 
 log = logging.getLogger("ao_worker.download")
 
 TOOLS = ("yt-dlp", "gallery-dl")
 BROWSERS = ("chrome", "firefox", "safari", "edge", "brave")
 DATE_RE = re.compile(r"^\d{8}$")
-YTDLP_RELEASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/"
+YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
+_TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(\.\d+)?$")
 
 ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR")
 
@@ -122,12 +125,39 @@ def _fetch(url: str) -> bytes:
         return r.read()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003 - urllib's signature
+        return None
+
+
+def _latest_tag() -> str:
+    """The latest release tag, from the redirect of `releases/latest/download/SHA2-256SUMS`
+    (→ `…/releases/download/<tag>/SHA2-256SUMS`)."""
+    req = urllib.request.Request(YTDLP_RELEASES + "latest/download/SHA2-256SUMS", method="HEAD", headers={"User-Agent": "ao-worker"})
+    location = ""
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            location = e.headers.get("Location", "")
+        else:
+            raise
+    tag = location.split("/releases/download/", 1)[-1].split("/", 1)[0] if "/releases/download/" in location else ""
+    if not _TAG_RE.match(tag):
+        raise ToolError("TOOL_DOWNLOAD_FAILED", "could not determine the latest yt-dlp release")
+    return tag
+
+
 def _download_ytdlp(dest: Path) -> None:
     """Downloads the official standalone yt-dlp release to `dest`, verified against SHA2-256SUMS."""
     asset = ytdlp_asset_name()
     try:
-        sums = _fetch(YTDLP_RELEASE + "SHA2-256SUMS").decode("utf-8", "replace")
-        payload = _fetch(YTDLP_RELEASE + asset)
+        # One tag for both files, so a release published in between cannot mix checksums and binary.
+        tag = _latest_tag()
+        base = f"{YTDLP_RELEASES}download/{tag}/"
+        sums = _fetch(base + "SHA2-256SUMS").decode("utf-8", "replace")
+        payload = _fetch(base + asset)
     except OSError as e:
         raise ToolError("TOOL_DOWNLOAD_FAILED", "yt-dlp could not be downloaded", type(e).__name__) from e
     expected = None
@@ -174,7 +204,7 @@ def gallerydl_cmd() -> list[str]:
 
 def tool_version(argv: list[str]) -> str | None:
     try:
-        r = subprocess.run([*argv, "--version"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([*argv, "--version"], capture_output=True, text=True, timeout=30, env=child_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:
@@ -209,7 +239,7 @@ def update_tools() -> dict:
     path, managed = r
     if managed and old is not None:
         try:
-            p = subprocess.run([path, "--update-to", "stable"], capture_output=True, text=True, timeout=600)
+            p = subprocess.run([path, "--update-to", "stable"], capture_output=True, text=True, timeout=600, env=child_env())
         except (OSError, subprocess.TimeoutExpired) as e:
             raise ToolError("TOOL_UPDATE_FAILED", "yt-dlp could not be updated", type(e).__name__) from e
         if p.returncode != 0:
@@ -251,12 +281,13 @@ def build_ytdlp_args(url: str, out: str, params: dict) -> list[str]:
     return [*args, "--", url]
 
 
-def _gdl_date(d: str) -> str:
-    return f"datetime({int(d[:4])}, {int(d[4:6])}, {int(d[6:])})"
+def _gdl_date(d: str, plus_days: int = 0) -> str:
+    day = datetime.date(int(d[:4]), int(d[4:6]), int(d[6:])) + datetime.timedelta(days=plus_days)
+    return f"datetime({day.year}, {day.month}, {day.day})"
 
 
 def build_gallerydl_args(url: str, out: str, params: dict) -> list[str]:
-    args = ["--write-metadata", "--sleep", "3-8", "-D", out]
+    args = ["--config-ignore", "--write-metadata", "--sleep", "3-8", "-D", out]
     if params.get("archiveFile"):
         args += ["--download-archive", params["archiveFile"]]
     if params.get("maxItems"):
@@ -265,7 +296,7 @@ def build_gallerydl_args(url: str, out: str, params: dict) -> list[str]:
     if params.get("dateAfter"):
         filters.append(f"date >= {_gdl_date(params['dateAfter'])}")
     if params.get("dateBefore"):
-        filters.append(f"date <= {_gdl_date(params['dateBefore'])}")
+        filters.append(f"date < {_gdl_date(params['dateBefore'], 1)}")  # inclusive, like yt-dlp --datebefore
     if filters:
         args += ["--filter", " and ".join(filters)]
     if params.get("metadataOnly"):
@@ -301,8 +332,13 @@ def validate_params(url: str, params: dict) -> str | None:
         return "params.maxItems must be a positive integer"
     for k in ("dateAfter", "dateBefore"):
         v = params.get(k)
-        if v is not None and (not isinstance(v, str) or not DATE_RE.match(v)):
-            return f"params.{k} must be YYYYMMDD"
+        if v is not None:
+            if not isinstance(v, str) or not DATE_RE.match(v):
+                return f"params.{k} must be YYYYMMDD"
+            try:
+                datetime.datetime.strptime(v, "%Y%m%d")
+            except ValueError:
+                return f"params.{k} is not a real date"
     return None
 
 
@@ -344,7 +380,7 @@ def run(job: Job, ctx: JobContext) -> dict:
         version = gallerydl_version()
         argv = [*cmd, *build_gallerydl_args(job.input, str(out), params)]
 
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errf:
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace", dir=ctx.workdir) as errf:
         proc = ctx.popen(argv, stdout=subprocess.PIPE, stderr=errf, stdin=subprocess.DEVNULL,
                          text=True, encoding="utf-8", errors="replace", bufsize=1)
         assert proc.stdout is not None

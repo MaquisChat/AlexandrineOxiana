@@ -182,3 +182,66 @@ def test_child_tools_do_not_inherit_the_token(worker, tmp_path, monkeypatch):
 
     env = json.loads(env_file.read_text())
     assert "AO_WORKER_TOKEN" not in env and env.get("FAKE_YTDLP_MODE") == "env"
+
+
+def test_child_tools_get_an_allowlisted_env_with_a_private_tmpdir(worker, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("SOME_APP_SECRET", "s3cret")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("FAKE_YTDLP_MODE", "env")
+    env_file = tmp_path / "env.json"
+    monkeypatch.setenv("FAKE_ENV_FILE", str(env_file))
+    out = tmp_path / "c"
+    job = worker.run("capture.download", "https://www.youtube.com/watch?v=abc123", str(out), {"tool": "yt-dlp"})
+    assert job["status"] == "done", job
+    env = json.loads(env_file.read_text())
+    assert "SOME_APP_SECRET" not in env
+    assert env["HTTPS_PROXY"] == "http://proxy.test:3128" and env["LC_ALL"] == "C.UTF-8" and "PATH" in env
+    assert env["TMPDIR"] == env["TEMP"] == env["TMP"] == str(tmp_path / f".work-{job['id']}")
+    assert not Path(env["TMPDIR"]).exists()  # removed when the job ended
+
+
+def test_bad_content_length_is_400(worker):
+    import http.client
+    from urllib.parse import urlsplit
+
+    host = urlsplit(worker.base)
+    for value in ("-5", "abc"):
+        c = http.client.HTTPConnection(host.hostname, host.port, timeout=10)
+        c.putrequest("POST", "/jobs")
+        c.putheader("Authorization", f"Bearer {TOKEN}")
+        c.putheader("Content-Length", value)
+        c.endheaders()
+        r = c.getresponse()
+        assert r.status == 400, value
+        c.close()
+
+
+def test_transcription_language_must_be_known(worker, tmp_path):
+    for lang in ("xx", "english", ["en"], "EN"):
+        status, _ = worker.request("POST", "/jobs", {"type": "audio.transcribe", "input": str(tmp_path / "a.wav"), "output": str(tmp_path), "params": {"language": lang}})
+        assert status == 400, lang
+    status, _ = worker.request("POST", "/jobs", {"type": "audio.transcribe", "input": str(tmp_path / "a.wav"), "output": str(tmp_path / "t"), "params": {"language": "de"}})
+    assert status == 202
+
+
+def test_finished_jobs_are_forgotten_after_their_state_was_fetched(worker, tmp_path):
+    job = worker.run("capture.download", "https://www.youtube.com/watch?v=abc123", str(tmp_path / "c"), {"tool": "yt-dlp"})
+    assert job["status"] == "done"
+    status, _ = worker.request("GET", f"/jobs/{job['id']}")
+    assert status == 404
+
+
+def test_unfetched_finished_jobs_expire(worker, tmp_path, monkeypatch):
+    from ao_worker import jobs
+
+    job_id = worker.submit("capture.download", "https://www.youtube.com/watch?v=abc123", str(tmp_path / "c"), {"tool": "yt-dlp"})
+    deadline = time.monotonic() + 15
+    while worker.server.manager.jobs[job_id].status != "done" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    monkeypatch.setattr(jobs, "RETAIN_FINISHED_SEC", 0.0)
+    time.sleep(0.01)
+    worker.submit("capture.download", "https://www.youtube.com/watch?v=abc123", str(tmp_path / "d"), {"tool": "yt-dlp"})
+    assert job_id not in worker.server.manager.jobs

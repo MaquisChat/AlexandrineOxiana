@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Fake ocrmypdf for tests: copies the input under $TMPDIR (as the real one does), records where, then hangs."""
+import os, shutil, sys, time
+from pathlib import Path
+
+src = sys.argv[-2]
+tmp = Path(os.environ["TMPDIR"]) / "ocrmypdf.io.fake" / "origin.pdf"
+tmp.parent.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(src, tmp)
+Path(os.environ["FAKE_OCR_RECORD"]).write_text(str(tmp))
+time.sleep(300)

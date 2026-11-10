@@ -2,7 +2,7 @@
 // Downloads pinned third-party test fixtures into tests/fixtures/downloaded/ (gitignored).
 // Each file is pinned by URL and sha256; a file that is already present with the right hash is
 // kept. Offline (or any download failure) skips that file with a reason and exits 0, so tests
-// that need it skip too. Licenses and sources: tests/fixtures/ATTRIBUTION.md.
+// that need it skip too (with CI=true it exits 1 instead). Licenses and sources: tests/fixtures/ATTRIBUTION.md.
 // Later tasks add entries to FIXTURES.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -49,4 +49,11 @@ async function fetchOne(f) {
 }
 
 mkdirSync(outDir, { recursive: true });
-for (const f of FIXTURES) console.log(await fetchOne(f));
+let skipped = 0;
+for (const f of FIXTURES) {
+  const line = await fetchOne(f);
+  if (line.startsWith("SKIP")) skipped++;
+  console.log(line);
+}
+// Locally a missing fixture only skips the tests that need it; CI must have them all.
+if (skipped && process.env.CI === "true") process.exit(1);

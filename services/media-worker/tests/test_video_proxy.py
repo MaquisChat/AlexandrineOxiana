@@ -59,3 +59,14 @@ def test_faststart_moov_before_mdat(worker, mov_with_location, tmp_path):
     worker.run("video.proxy", str(mov_with_location), str(out), {"location": "strip"}, timeout=300)
     data = out.read_bytes()
     assert data.find(b"moov") < data.find(b"mdat")
+
+
+def test_odd_source_height_gives_even_output_and_no_workdir_left(worker, tmp_path):
+    src = tmp_path / "odd.mov"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x241:rate=10:duration=1",
+                    "-c:v", "mpeg4", "-pix_fmt", "yuv420p", str(src)], check=True)
+    out = tmp_path / "o.mp4"
+    job = worker.run("video.proxy", str(src), str(out), {"location": "strip"}, timeout=120)
+    assert job["status"] == "done", job
+    assert probe(out)["streams"][0]["height"] == 240
+    assert not any(p.name.startswith(".work-") for p in tmp_path.iterdir())

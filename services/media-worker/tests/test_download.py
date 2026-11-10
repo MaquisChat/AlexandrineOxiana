@@ -66,6 +66,7 @@ def test_gallery_dl_via_env_binary(worker, tmp_path, monkeypatch):
     assert [Path(f).name for f in meta["files"]] == ["post_1.jpg"]
     assert [Path(f).name for f in meta["infoJson"]] == ["post_1.jpg.json"]
     args = json.loads(argv_file.read_text())
+    assert "--config-ignore" in args  # never the user's own gallery-dl config
     assert "--write-metadata" in args
     assert args[args.index("--sleep") + 1] == "3-8"
     assert args[args.index("--download-archive") + 1] == str(archive)
@@ -121,7 +122,14 @@ def test_managed_download_verifies_sha256(worker_env, monkeypatch):
     """The managed binary is checked against SHA2-256SUMS; a mismatch is refused (no network: fetch is stubbed)."""
     payload = b"#!/bin/sh\necho 2026.11.01\n"
     sums = "0" * 64 + "  " + download.ytdlp_asset_name() + "\n"
-    monkeypatch.setattr(download, "_fetch", lambda url: sums.encode() if url.endswith("SHA2-256SUMS") else payload)
+    fetched = []
+
+    def fetch(url):
+        fetched.append(url)
+        return sums.encode() if url.endswith("SHA2-256SUMS") else payload
+
+    monkeypatch.setattr(download, "_latest_tag", lambda: "2026.11.01")
+    monkeypatch.setattr(download, "_fetch", fetch)
     dest = worker_env["tools"] / "yt-dlp"
     with pytest.raises(download.ToolError) as e:
         download._download_ytdlp(dest)
@@ -131,7 +139,16 @@ def test_managed_download_verifies_sha256(worker_env, monkeypatch):
     import hashlib
 
     sums = hashlib.sha256(payload).hexdigest() + "  " + download.ytdlp_asset_name() + "\n"
-    monkeypatch.setattr(download, "_fetch", lambda url: sums.encode() if url.endswith("SHA2-256SUMS") else payload)
     download._download_ytdlp(dest)
+    # both files come from the same pinned tag, not from "latest"
+    assert all("/download/2026.11.01/" in u for u in fetched) and len(fetched) == 4
     assert dest.read_bytes() == payload
     assert os.access(dest, os.X_OK)
+
+
+def test_gallerydl_dates_are_inclusive_and_validated():
+    from ao_worker.download import build_gallerydl_args, validate_params
+
+    args = build_gallerydl_args("https://x.test/p", "/out", {"dateAfter": "20260101", "dateBefore": "20261231"})
+    assert args[args.index("--filter") + 1] == "date >= datetime(2026, 1, 1) and date < datetime(2027, 1, 1)"
+    assert validate_params("https://x.test/p", {"dateBefore": "20261340"}) is not None

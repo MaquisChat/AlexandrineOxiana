@@ -12,7 +12,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .jobs import Job, JobContext, JobError
+from .download import redact
+from .jobs import Job, JobContext, JobError, child_env
 from .location import coarsen_iso6709
 
 DEFAULTS = {"maxHeight": 1080, "crf": 23, "location": "keep"}
@@ -31,8 +32,8 @@ LOCATION_TAGS = ("location", "com.apple.quicktime.location.iso6709")
 
 def probe(path: Path) -> dict:
     r = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
-        capture_output=True, text=True,
+        ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        capture_output=True, text=True, env=child_env(),
     )
     if r.returncode != 0:
         raise JobError("UNSUPPORTED_INPUT", "the input is not a readable video file")
@@ -81,9 +82,11 @@ def run(job: Job, ctx: JobContext) -> dict:
     movflags = "+faststart+use_metadata_tags"
     argv = [
         "ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-y",
+        "-protocol_whitelist", "file,pipe",
         "-i", str(src),
         "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", f"scale=-2:'min({max_h},ih)'",
+        # even height (H.264 4:2:0 needs it), never upscaled
+        "-vf", f"scale=-2:'trunc(min({max_h},ih)/2)*2'",
         "-c:v", "libx264", "-preset", "medium", "-crf", str(int(p["crf"])), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k",
         *metadata_args(tags, p["location"]),
@@ -91,7 +94,7 @@ def run(job: Job, ctx: JobContext) -> dict:
         "-progress", "pipe:1", "-nostats",
         str(tmp),
     ]
-    errf = tempfile.TemporaryFile(mode="w+")
+    errf = tempfile.TemporaryFile(mode="w+", dir=ctx.workdir)
     try:
         proc = ctx.popen(argv, stdout=subprocess.PIPE, stderr=errf, text=True)
         assert proc.stdout is not None
@@ -127,4 +130,4 @@ def run(job: Job, ctx: JobContext) -> dict:
 def _tail(stderr: str, src: Path) -> str:
     """Last lines of ffmpeg's stderr without the input's path."""
     text = "\n".join(stderr.strip().splitlines()[-10:])
-    return text.replace(str(src), "<input>")
+    return redact(text.replace(str(src), "<input>"))

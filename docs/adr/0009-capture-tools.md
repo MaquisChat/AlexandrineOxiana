@@ -16,9 +16,10 @@ each capture. Using these tools may conflict with platform terms of service.
 ## Decision
 
 - **yt-dlp is a managed standalone binary**, not a Python dependency. On first use the media worker
-  downloads the official release asset for the platform (`yt-dlp_linux`, `yt-dlp_linux_aarch64`,
-  `yt-dlp_macos`, `yt-dlp.exe`) from `github.com/yt-dlp/yt-dlp/releases/latest/download/`, checks
-  its SHA-256 against the release's `SHA2-256SUMS`, and installs it (mode 0755) into
+  resolves the latest release tag once (from the redirect of `releases/latest/download/SHA2-256SUMS`),
+  downloads that tag's `SHA2-256SUMS` and the platform's asset (`yt-dlp_linux`,
+  `yt-dlp_linux_aarch64`, `yt-dlp_macos`, `yt-dlp.exe`) from `releases/download/<tag>/`, checks
+  the SHA-256, and installs it (mode 0755) into
   `AO_TOOLS_DIR`. A mismatch is refused (`TOOL_CHECKSUM_MISMATCH`) and nothing is installed.
 - **Resolution order:** `AO_YTDLP_BIN`, then the managed binary, then `yt-dlp` on PATH; it is
   downloaded only when none of these exists. Tests put fake `yt-dlp`/`gallery-dl` scripts first on
@@ -29,7 +30,9 @@ each capture. Using these tools may conflict with platform terms of service.
   when to call it (for example from a "Update capture tools" button, or after an
   `EXTRACTOR_ERROR`).
 - **gallery-dl is pinned** in the worker's Python dependencies (`gallery-dl==1.32.19`) and runs as
-  `python -m gallery_dl` from the worker's environment (or `AO_GALLERYDL_BIN`). It updates with app
+  `python -m gallery_dl --config-ignore` from the worker's environment (or `AO_GALLERYDL_BIN`), so
+  the user's own gallery-dl configuration (which may hold credentials or post-processors) is never
+  read; yt-dlp likewise runs with `--ignore-config`. It updates with app
   releases. It has no verified standalone update channel comparable to yt-dlp's.
 - **Provenance:** every capture result reports `tool` and `toolVersion`; the Node side records them
   (with the capture method) in provenance.

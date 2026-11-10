@@ -8,6 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .download import redact
 from .jobs import Job, JobContext, JobError
 
 LANG_RE = re.compile(r"^[a-z]{3}(_[a-z]{3,4})?$")
@@ -26,6 +27,12 @@ EXIT_CODES = {
 }
 
 
+def ocrmypdf_cmd() -> list[str]:
+    """`python -m ocrmypdf` from the worker's environment, or `AO_OCRMYPDF_BIN` (tests, packaged builds)."""
+    env = os.environ.get("AO_OCRMYPDF_BIN")
+    return [env] if env else [sys.executable, "-m", "ocrmypdf"]
+
+
 def valid_languages(langs) -> bool:
     return isinstance(langs, list) and 0 < len(langs) <= 8 and all(isinstance(x, str) and LANG_RE.match(x) for x in langs)
 
@@ -39,7 +46,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     sidecar = Path(str(out) + ".txt")
     out.parent.mkdir(parents=True, exist_ok=True)
     argv = [
-        sys.executable, "-m", "ocrmypdf",
+        *ocrmypdf_cmd(),
         "--skip-text", "--output-type", "pdf", "--sidecar", str(sidecar),
         "-l", "+".join(p["languages"]),
         "--jobs", str(max(1, (os.cpu_count() or 2) // 2)),
@@ -47,14 +54,16 @@ def run(job: Job, ctx: JobContext) -> dict:
         str(src), str(out),
     ]
     ctx.progress(0.05)
-    with tempfile.TemporaryFile(mode="w+") as errf:
+    # ocrmypdf's (and tesseract's/ghostscript's) temporary copies of the input go to the job's
+    # private workdir (TMPDIR), which is removed when the job ends, cancelled or not.
+    with tempfile.TemporaryFile(mode="w+", dir=ctx.workdir) as errf:
         proc = ctx.popen(argv, stdout=subprocess.DEVNULL, stderr=errf, text=True)
         rc = ctx.wait(proc)
         errf.seek(0)
         stderr = errf.read()
     if rc != 0:
         code, message = EXIT_CODES.get(rc, ("OCR_FAILED", "OCR failed"))
-        detail = "\n".join(stderr.strip().splitlines()[-10:]).replace(str(src), "<input>")
+        detail = redact("\n".join(stderr.strip().splitlines()[-10:]).replace(str(src), "<input>"))
         raise JobError(code, message, detail or None)
     text = sidecar.read_text(encoding="utf-8", errors="replace") if sidecar.exists() else ""
     import pikepdf
