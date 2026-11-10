@@ -26,6 +26,7 @@ import {
   deleteSource,
   getSource,
   listSourceIds,
+  relinkLinkedAsset as relinkLinkedAssetIn,
   updateSource,
   type CreateSourceOptions,
   type SourceInputFile,
@@ -378,6 +379,11 @@ export async function appendLibraryEvent(
       details,
     });
   });
+}
+
+/** Package-internal (reconnect): points a linked asset at its new library-relative path, governed and audited. */
+export function relinkLinkedAsset(repo: Repo, projectId: string, sourceId: string, assetId: string, libraryRelativePath: string): Promise<SourceFile> {
+  return relinkLinkedAssetIn(cores.get(repo)!, projectId, sourceId, assetId, libraryRelativePath);
 }
 
 /** Package-internal: the library a repo was opened on. */

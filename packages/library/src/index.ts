@@ -36,8 +36,10 @@ export {
   CorruptLibraryError,
   FORMAT_VERSION,
   FolderNotEmptyError,
+  LibraryMovedError,
   LibraryNotWritableError,
   NotALibraryError,
+  WrongLibraryError,
   createLibrary,
   openLibrary,
 } from "./library.js";
@@ -71,6 +73,33 @@ export type {
   ProjectPlan,
   SwitchStep,
 } from "./move.js";
+export {
+  checkIntegrity,
+  defaultSearchRoots,
+  encryptedSize,
+  findLibrary,
+  hydrate,
+  isPlaceholder,
+  pickSample,
+  reconnect,
+  relinkMissing,
+  watchAvailability,
+} from "./reconnect.js";
+export type {
+  FindOptions,
+  FoundLibrary,
+  IntegrityEntry,
+  IntegrityOptions,
+  IntegrityReport,
+  IntegritySample,
+  PlaceholderOptions,
+  ReconnectOptions,
+  ReconnectResult,
+  RelinkOptions,
+  RelinkResult,
+  RelinkSkipReason,
+  WatchOptions,
+} from "./reconnect.js";
 export { addKnownPath, forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 

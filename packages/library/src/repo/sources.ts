@@ -385,3 +385,47 @@ export async function deleteSource(core: RepoCore, projectId: string, id: string
     { op: "source.delete", entity: { type: "source", id } },
   );
 }
+
+/**
+ * Points a linked (not copied) asset at a new library-relative location (relinking a missing
+ * linked file, spec 4.5). Governed and audited like any edit of the source; the file itself is not
+ * touched. The new path must hold a file with the asset's recorded SHA-256 (checked by the caller).
+ */
+export async function relinkLinkedAsset(
+  core: RepoCore,
+  projectId: string,
+  sourceId: string,
+  assetId: string,
+  libraryRelativePath: string,
+): Promise<SourceFile> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const current = await readSourceFile(core, st, sourceId);
+  return runMutation(
+    core,
+    projectId,
+    storeRequest(current.source.provenance),
+    async (tx) => {
+      const cur = await readSourceFile(core, st, sourceId);
+      const before = cur.assets.find((a) => a.id === assetId);
+      if (!before?.linked) throw new NotFoundError("Linked asset", assetId);
+      const after: Asset = {
+        ...before,
+        path: libraryRelativePath,
+        linked: { absolutePath: resolve(core.abs(libraryRelativePath)), libraryRelativePath },
+      };
+      const sf: SourceFile = {
+        ...cur,
+        source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor },
+        assets: cur.assets.map((a) => (a.id === assetId ? after : a)),
+      };
+      await writeSourceFile(core, tx, sf);
+      tx.entity("asset", assetId);
+      tx.record("asset", assetId, before, after);
+      tx.index((sink) => sink.indexSource(sf));
+      return sf;
+    },
+    { op: "asset.relink", entity: { type: "asset", id: assetId } },
+  );
+}

@@ -76,6 +76,35 @@ export class LibraryNotWritableError extends Error {
     this.name = "LibraryNotWritableError";
   }
 }
+/** The folder holds a different library than the one expected (reconnect). */
+export class WrongLibraryError extends Error {
+  override name = "WrongLibraryError";
+  constructor(
+    readonly expectedId: string,
+    readonly foundId: string,
+  ) {
+    super(`This folder holds a different library (${foundId}), not the one being reconnected (${expectedId})`);
+  }
+}
+
+/**
+ * The folder is the old copy of a library that was moved elsewhere (MOVED.json). `movedTo` is
+ * where it went, from this device's records, when known; `toHint` is the marker's
+ * `host:folder` hint.
+ */
+export class LibraryMovedError extends Error {
+  override name = "LibraryMovedError";
+  constructor(
+    readonly root: string,
+    readonly movedTo?: { newRoot: string; unfinished: boolean },
+    readonly toHint?: string,
+  ) {
+    super(
+      `This folder is an old copy of a library that was moved${movedTo ? ` to ${movedTo.newRoot}` : toHint ? ` (to ${toHint})` : ""}; reconnect to the new location instead`,
+    );
+  }
+}
+
 export interface OpenOptions {
   /** Called when a read-write handle loses its lock (see startHeartbeat). */
   onLockLost?: (holder: LockInfo | null) => void;
@@ -160,6 +189,11 @@ export async function createLibrary(
   return lib;
 }
 
+/** Reads and validates `<root>/library.json` (NotALibraryError, CorruptLibraryError). Writes nothing. */
+export async function readLibraryMeta(root: string): Promise<LibraryJson> {
+  return readMeta(root);
+}
+
 async function readMeta(root: string): Promise<LibraryJson> {
   let raw: string;
   try {
@@ -208,16 +242,8 @@ export async function openLibraryInternal(
 ): Promise<Library> {
   const meta = await readMeta(root);
   const key = resolve(root);
-  const readOnly = (reason: NonNullable<Library["readOnlyReason"]>): Library => ({
-    id: meta.libraryId,
-    name: meta.name,
-    root,
-    mode: "read-only",
-    readOnlyReason: reason,
-    appConfigDir: deps.appConfigDir,
-    deviceId: deps.deviceId,
-    close: async () => {},
-  });
+  const readOnly = (reason: NonNullable<Library["readOnlyReason"]>, movedTo?: Library["movedTo"]): Library =>
+    makeHandle(meta, root, deps, { mode: "read-only", reason }, movedTo);
 
   // Read-only opens must not touch the library folder at all.
   if ((meta.formatVersion as number) > FORMAT_VERSION) {
@@ -227,7 +253,7 @@ export async function openLibraryInternal(
   // A moved-away copy or an unfinished move: read-only, and not recorded as the library's location.
   if (await exists(join(root, MOVED_MARKER))) {
     const movedTo = await movedToFor(deps, resolve(root), meta.libraryId).catch(() => undefined);
-    return { ...readOnly("moved"), ...(movedTo ? { movedTo } : {}) };
+    return readOnly("moved", movedTo);
   }
   if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
   // Same-process double open: the lock on disk is ours, so the lock rules
@@ -257,16 +283,18 @@ export async function openLibraryInternal(
   }
 
   openRoots.add(key);
-  const state: { mode: Library["mode"]; reason?: Library["readOnlyReason"] } = { mode: "read-write" };
+  const state: HandleState = { mode: "read-write" };
   let hb: ReturnType<typeof startHeartbeat> | undefined;
+  /** Lock lost: demote this handle to read-only and tell the caller. */
+  const lockLost = (holder: LockInfo | null) => {
+    state.mode = "read-only";
+    state.reason = "locked-by-other-device";
+    state.held = false;
+    openRoots.delete(key);
+    opts.onLockLost?.(holder);
+  };
   try {
-    hb = startHeartbeat(root, deps, (holder) => {
-      // Lock lost: demote this handle to read-only and tell the caller.
-      state.mode = "read-only";
-      state.reason = "locked-by-other-device";
-      openRoots.delete(key);
-      opts.onLockLost?.(holder);
-    });
+    hb = startHeartbeat(root, deps, lockLost);
     // Re-read: library.json may have changed while we waited for the lock.
     const fresh = await readMeta(root);
     const hint = hintFor(root, deps);
@@ -283,9 +311,82 @@ export async function openLibraryInternal(
     await releaseLock(root, deps).catch(() => {});
     throw err;
   }
+  state.held = true;
 
-  let closed = false;
-  return {
+  const lib = makeHandle(meta, root, deps, state, undefined, async () => {
+    if (state.held) openRoots.delete(key);
+    state.held = false;
+    await hb?.stop();
+    await releaseLock(root, deps);
+  });
+  const ctl = controls.get(lib)!;
+  ctl.stopLock = async () => {
+    // Offline: the heartbeat could neither refresh nor read the lock; stop it rather than let it
+    // report a lost lock after the stale window. The lock file (if still there) is left as is.
+    await hb?.stop();
+    hb = undefined;
+  };
+  ctl.reacquire = async () => {
+    // Back online: the lock must be ours again before the handle may write.
+    const holder = await peekLock(root, deps);
+    if (holder) {
+      lockLost(holder);
+      return;
+    }
+    let again: Awaited<ReturnType<typeof acquireLock>>;
+    try {
+      again = await acquireLock(root, deps);
+    } catch (err) {
+      if (err instanceof LockNotWritableError) {
+        state.mode = "read-only";
+        state.reason = "not-writable";
+        state.held = false;
+        openRoots.delete(key);
+        return;
+      }
+      throw err;
+    }
+    if (!again.acquired) {
+      lockLost(again.holder);
+      return;
+    }
+    hb = startHeartbeat(root, deps, lockLost);
+    state.mode = "read-write";
+    state.reason = undefined;
+  };
+  return lib;
+}
+
+interface HandleState {
+  mode: Library["mode"];
+  reason?: Library["readOnlyReason"];
+  /** True while this handle holds the library lock. */
+  held?: boolean;
+}
+
+/** Package-internal control of a handle's availability (see `watchAvailability` in reconnect.ts). */
+interface HandleControl {
+  state: HandleState;
+  closed: boolean;
+  /** The mode and reason before the library went offline. */
+  beforeOffline?: { mode: Library["mode"]; reason?: Library["readOnlyReason"] };
+  /** Read-write handles only: stop the heartbeat while offline. */
+  stopLock?: () => Promise<void>;
+  /** Read-write handles only: re-acquire the lock when the library is back. */
+  reacquire?: () => Promise<void>;
+}
+const controls = new WeakMap<Library, HandleControl>();
+
+function makeHandle(
+  meta: LibraryJson,
+  root: string,
+  deps: Deps,
+  state: HandleState,
+  movedTo: Library["movedTo"],
+  release?: () => Promise<void>,
+): Library {
+  const ctl: HandleControl = { state, closed: false };
+  const lib: Library = {
     id: meta.libraryId,
     name: meta.name,
     root,
@@ -295,16 +396,55 @@ export async function openLibraryInternal(
     get readOnlyReason() {
       return state.reason;
     },
+    ...(movedTo ? { movedTo } : {}),
     appConfigDir: deps.appConfigDir,
     deviceId: deps.deviceId,
     async close() {
-      if (closed) return;
-      closed = true;
-      openRoots.delete(key);
-      await hb?.stop();
-      await releaseLock(root, deps);
+      if (ctl.closed) return;
+      ctl.closed = true;
+      await release?.();
     },
   };
+  controls.set(lib, ctl);
+  return lib;
+}
+
+/**
+ * Package-internal: the library folder is unreachable (drive unplugged, network gone). The handle
+ * becomes read-only with reason `offline`, remembering its previous mode; a read-write handle stops
+ * its heartbeat. No-op when already offline or closed.
+ */
+export async function markOffline(lib: Library): Promise<void> {
+  const ctl = controls.get(lib);
+  if (!ctl || ctl.closed || ctl.beforeOffline) return;
+  ctl.beforeOffline = { mode: ctl.state.mode, reason: ctl.state.reason };
+  ctl.state.mode = "read-only";
+  ctl.state.reason = "offline";
+  if (ctl.beforeOffline.mode === "read-write") await ctl.stopLock?.();
+}
+
+/**
+ * Package-internal: the library folder is reachable again. A handle that was read-write re-acquires
+ * the lock first (another device may have taken it meanwhile: then it stays read-only,
+ * `locked-by-other-device`); any other handle gets its previous reason back. No-op unless offline.
+ */
+export async function markOnline(lib: Library): Promise<void> {
+  const ctl = controls.get(lib);
+  if (!ctl || !ctl.beforeOffline) return;
+  const before = ctl.beforeOffline;
+  ctl.beforeOffline = undefined;
+  if (ctl.closed) return;
+  if (before.mode === "read-write" && ctl.reacquire) {
+    try {
+      await ctl.reacquire();
+    } catch (err) {
+      ctl.beforeOffline = before; // still unreachable after all: stay offline, retry later
+      throw err;
+    }
+    return;
+  }
+  ctl.state.mode = before.mode;
+  ctl.state.reason = before.reason;
 }
 
 /** Records the library in the app-level registry (outside the library folder). */
