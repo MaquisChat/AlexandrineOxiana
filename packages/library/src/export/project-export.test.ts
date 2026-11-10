@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ExifTool } from "exiftool-vendored";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -316,9 +316,69 @@ describe("R92: open export", () => {
     const stale = join(out, "Part - export - modified 2026-11-01 0900.partial");
     await mkdir(join(stale, "Sources"), { recursive: true });
     await writeFile(join(stale, "Sources", "secret.txt"), "decrypted leftovers");
+    const old = new Date(Date.now() - 2 * 3600_000);
+    await utimes(stale, old, old);
+    // Not swept (R94): too recent (another export may be writing it), or another project's.
+    const young = join(out, "Part - export - modified 2026-11-10 0900.partial");
+    await mkdir(young);
+    const other = join(out, "Other - export - modified 2026-11-01 0900.partial");
+    await mkdir(other);
+    await utimes(other, old, old);
     const r = await exportProjectOpenFormats(kit.repo, p.id, out);
     expect(r.path.endsWith(".partial")).toBe(false);
-    expect((await readdir(out)).sort()).toEqual(["Part - export - modified 2026-11-10 0930"]);
+    expect((await readdir(out)).sort()).toEqual(
+      ["Other - export - modified 2026-11-01 0900.partial", "Part - export - modified 2026-11-10 0900.partial", "Part - export - modified 2026-11-10 0930"].sort(),
+    );
+  });
+
+  it("R94 (P12): two exports of the project to the same folder at once both succeed", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Twice");
+    for (let i = 0; i < 3; i++) await addSource(kit, p, { title: `s${i}`, files: [{ path: await scratchFile(kit, `f${i}.pdf`, "%PDF-1.4 x"), role: "original", handling: "copy" }] });
+    const out = await outDir();
+    const [a, b] = await Promise.all([exportProjectOpenFormats(kit.repo, p.id, out), exportProjectOpenFormats(kit.repo, p.id, out)]);
+    expect(a.path).not.toBe(b.path);
+    for (const r of [a, b]) expect((await walk(r.path)).filter((n) => n.endsWith("/source.json"))).toHaveLength(3);
+    expect((await readdir(out)).some((n) => n.endsWith(".partial"))).toBe(false);
+  });
+
+  it("R94: a failed export's error names no absolute path", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Err");
+    await addSource(kit, p, { title: "x" });
+    const out = await outDir();
+    const blocker = join(out, "file-not-folder");
+    await writeFile(blocker, "x");
+    const err = (await exportProjectOpenFormats(kit.repo, p.id, join(blocker, "inside")).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).not.toContain(kit.tmp);
+    expect(err.message).not.toContain(kit.lib.root);
+  });
+
+  it("R94: under coarsen/strip, derived JSON (e.g. a profile snapshot) is left out; derived text stays", async () => {
+    const gov = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+sharing:
+  locationMetadata: strip
+consent:
+  requireLegalBasis: false
+captureMethods: [manual_upload]
+`;
+    const p = await makeProject(kit, gov, true, "Snap");
+    const sf = await addSource(kit, p, { title: "x", files: [{ path: await scratchFile(kit, "a.pdf", "%PDF-1.4"), role: "original", handling: "copy" }] });
+    const der = (kind: string, ext: string, body: string) =>
+      scratchFile(kit, `d.${ext}`, body).then((f) =>
+        kit.repo.addDerivedAsset(p.id, sf.source.id, {
+          fromPath: f, kind, tool: "t", ext,
+          derivation: { parents: [sf.assets[0]!.id], operation: kind, provider: "t", ranAt: "local", params: {}, at: kit.clock.now.toISOString(), triggeredBy: "tester" },
+        }),
+      );
+    await der("profile-snapshot", "json", '{"gps":{"lat":40.6892}}');
+    await der("ocr-text", "txt", "words");
+    const r = await exportProjectOpenFormats(kit.repo, p.id, await outDir());
+    const derived = (await walk(r.path)).filter((n) => n.includes("/files/derived/"));
+    expect(derived.some((n) => n.endsWith(".txt"))).toBe(true);
+    expect(derived.some((n) => n.endsWith(".json"))).toBe(false);
   });
 
   it("Markdown escapes case-attribute keys and title-variant labels too", async () => {

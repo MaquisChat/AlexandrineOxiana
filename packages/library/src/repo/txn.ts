@@ -300,6 +300,8 @@ async function unsafeOnDisk(root: string, m: TxnMarker): Promise<string | null> 
 
 export type RecoveryOutcome =
   | "committed"
+  /** Committed, but files it destroyed could not be overwritten yet: marker and trash kept, retried (R94). */
+  | "committed-destroy-pending"
   | "rolled-back"
   | "rollback-incomplete"
   | "invalid"
@@ -377,7 +379,7 @@ export async function recoverTransactions(
         }
       }
       if (!shredded) {
-        out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed", detail: "destroyed files could not be overwritten yet; retried on the next open" });
+        out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed-destroy-pending" });
         continue;
       }
       for (const e of m.entries) {

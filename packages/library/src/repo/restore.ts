@@ -28,7 +28,7 @@ import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { AuditStore } from "./audit-store.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
-import { loadProjectFolder, parseProjectJson, type RepoCore } from "./state.js";
+import { loadProjectFolder, parseProjectJson, type Manifest, type RepoCore } from "./state.js";
 import { listSourceIds, readSourceFile } from "./sources.js";
 
 /** The backup's audit log does not verify (or differs from what the backup recorded). Nothing was restored. */
@@ -274,8 +274,10 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       const map = (v: Json) => rewrite(v, ids, oldRel, newRel);
 
       // Sources: annotations first (their hash goes into source.json).
+      const written: Array<{ source: { id: string; type: string; folder: string; issued?: string }; assets: Array<{ path: string; status?: string }> }> = [];
       for (const f of sourceFiles) {
         const sf = map(parsedSources.get(f)) as Record<string, unknown>;
+        written.push(sf as unknown as (typeof written)[number]);
         const annFile = f.replace(/source\.json(\.enc)?$/u, (_m, enc: string | undefined) => `annotations.json${enc ?? ""}`);
         if (files.includes(annFile)) {
           const annJson = JSON.stringify(map(JSON.parse(await readText(join(staging, annFile)))));
@@ -325,6 +327,21 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
           const next = out.join("\n");
           if (next !== text) await writeFileAtomic(abs, next, { mode: 0o600 });
         }
+      }
+      // manifest.json (encrypted projects) is made again from the sources as restored, so it never
+      // lists a file that was left out because it had been destroyed (R94).
+      if (files.includes("manifest.json")) {
+        const manifest: Manifest = {
+          formatVersion: 1,
+          sources: written.map((sf) => ({
+            id: sf.source.id,
+            type: sf.source.type,
+            ...(sf.source.issued ? { issuedYear: sf.source.issued.slice(0, 4) } : {}),
+            folder: sf.source.folder,
+            files: sf.assets.filter((a) => a.status !== "destroyed").map((a) => a.path),
+          })),
+        };
+        await writeFileAtomic(join(staging, "manifest.json"), JSON.stringify(manifest, null, 2));
       }
       await fsp.rm(join(staging, "backup.json"), { force: true });
       await fsp.mkdir(join(staging, "Sources"), { recursive: true });

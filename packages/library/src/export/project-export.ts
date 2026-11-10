@@ -47,10 +47,12 @@ import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.j
 import { shredPath } from "../fs/shred.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "../import/resolve.js";
 import { stricterLocation, type LocationMode } from "../repo/assets.js";
+import { PolicyDeniedError } from "../repo/errors.js";
 import { foldName, namesIn } from "../repo/io.js";
 import {
   appendLibraryEvent,
   authorizeProcessing,
+  currentProjectLocationMode,
   lookupPolicyInfo,
   projectDataKey,
   projectPseudonymMap,
@@ -219,11 +221,36 @@ async function realOrResolved(p: string): Promise<string> {
 
 /** An export folder still being written (or left by a crash), possibly holding decrypted files. */
 const PARTIAL = /^.+ - export - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.partial$/u;
+/** .partial folders being written by exports in this process (never swept). */
+const activePartials = new Set<string>();
+const STALE_PARTIAL_MS = 3600_000;
+
+/** An export failed for a reason that is not one of the plain refusals above; the message names no path (R94). */
+export class ExportFailedError extends Error {
+  constructor(readonly code?: string) {
+    super(`The export could not be completed${code ? ` (${code})` : ""}`);
+    this.name = "ExportFailedError";
+  }
+}
 
 const inside = (child: string, parent: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 
-/** Exports the project in open formats into a new folder in `dest` (outside the library). */
+/**
+ * Exports the project in open formats into a new folder in `dest` (outside the library). Errors
+ * other than the plain refusals (destination, governance) become ExportFailedError, whose message
+ * names no path (R94).
+ */
 export async function exportProjectOpenFormats(repo: Repo, projectId: string, dest: string): Promise<ProjectExportResult> {
+  try {
+    return await exportInner(repo, projectId, dest);
+  } catch (err) {
+    if (err instanceof ExportDestinationError || err instanceof PolicyDeniedError || err instanceof ExportFailedError) throw err;
+    const code = (err as NodeJS.ErrnoException)?.code;
+    throw new ExportFailedError(typeof code === "string" && /^[A-Z_]{2,32}$/u.test(code) ? code : undefined);
+  }
+}
+
+async function exportInner(repo: Repo, projectId: string, dest: string): Promise<ProjectExportResult> {
   const lib = repoLibrary(repo);
   const libReal = await realOrResolved(lib.root);
   const refuseInside = async () => {
@@ -249,6 +276,7 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
     return sanitizeSegment(out);
   };
 
+  const projectLocation = await currentProjectLocationMode(repo, projectId);
   // 1. Decisions (nothing is decrypted before them).
   const allowed: Array<{ sf: SourceFile; mode: LocationMode }> = [];
   let withheld = 0;
@@ -274,16 +302,34 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
   // at the end: a crash leaves decrypted files only in a .partial folder, removed next time (R92 I1).
   await fsp.mkdir(dest, { recursive: true });
   await refuseInside(); // again, now that it exists (a link could have appeared meanwhile)
-  for (const n of await fsp.readdir(dest)) if (PARTIAL.test(n)) await shredPath(join(dest, n)).catch(() => {});
-  const takenTop = await namesIn(dest);
-  const folder = withCollisionSuffix(
-    `${sanitizeSegment(`${project.name} - export`)} - modified ${formatModified(clock(), tz)}`,
-    (n) => takenTop.has(foldName(n)) || takenTop.has(foldName(`${n}.partial`)),
-    { isFile: false },
-  );
+  // Leftovers of this project's crashed exports (R94): only an hour old or more, and never one
+  // another export in this process is still writing.
+  const stem = `${sanitizeSegment(`${project.name} - export`)} - modified `;
+  for (const n of await fsp.readdir(dest)) {
+    if (!PARTIAL.test(n) || !n.startsWith(stem) || activePartials.has(join(dest, n))) continue;
+    const st = await fsp.lstat(join(dest, n)).catch(() => null);
+    if (st?.isDirectory() && Date.now() - st.mtimeMs > STALE_PARTIAL_MS) await shredPath(join(dest, n)).catch(() => {});
+  }
+  let folder = "";
+  let root = "";
+  for (;;) {
+    const takenTop = await namesIn(dest);
+    folder = withCollisionSuffix(
+      `${stem}${formatModified(clock(), tz)}`,
+      (n) => takenTop.has(foldName(n)) || takenTop.has(foldName(`${n}.partial`)),
+      { isFile: false },
+    );
+    root = join(dest, `${folder}.partial`);
+    try {
+      // Exclusive: another export choosing the same name at the same moment takes the next one.
+      await fsp.mkdir(root, { mode: 0o700 });
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
   const finalRoot = join(dest, folder);
-  const root = `${finalRoot}.partial`;
-  await fsp.mkdir(root, { mode: 0o700 });
+  activePartials.add(root);
   if (process.platform !== "win32") await fsp.chmod(root, 0o700);
   if (inside(await fsp.realpath(root), libReal)) {
     await fsp.rm(root, { recursive: true, force: true });
@@ -368,6 +414,9 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
       // Derived text (transcripts, OCR, translations): same decision, decrypted the same way (R91-3).
       for (const a of sf.assets) {
         if (a.role !== "derived" || a.status === "destroyed" || !isDerivedText(a)) continue;
+        // JSON derivatives (e.g. a profile snapshot) can carry raw platform metadata with a
+        // location: left out when the project hides locations (R94).
+        if (projectLocation !== "keep" && /\.json(?:\.enc)?$/iu.test(a.path)) continue;
         const file = await copyOut(a, "derived");
         const lang = typeof a.derivation?.params.lang === "string" ? a.derivation.params.lang : undefined;
         derivedOut.push({ file, kind: a.kind, ...(lang ? { lang } : {}) });
@@ -397,6 +446,7 @@ export async function exportProjectOpenFormats(repo: Repo, projectId: string, de
     await shredPath(root).catch(() => {});
     throw err;
   } finally {
+    activePartials.delete(root);
     await shredPath(workDir).catch(() => {});
     activeTemp.delete(work);
   }

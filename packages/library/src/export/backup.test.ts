@@ -8,7 +8,7 @@ import { UnsafeFileError } from "../extract/errors.js";
 import { decryptBytes } from "../repo/io.js";
 import { projectDataKey, projectWarnings } from "../repo/repo.js";
 import { restoreSeams } from "../repo/restore.js";
-import { AuditChainInvalidError, BACKUPS_MANIFEST, RestoreError, backupIfDue, backupSeams, backupProject, listBackups, restoreBackup, setBackupSettings } from "./backup.js";
+import { AuditChainInvalidError, BACKUPS_MANIFEST, BACKUPS_STATE, RestoreError, backupIfDue, backupSeams, backupProject, listBackups, restoreBackup, setBackupSettings } from "./backup.js";
 import { OPEN_GOV, PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, walk, type Kit } from "./test-kit.js";
 
 let kit: Kit;
@@ -80,7 +80,7 @@ describe("backupProject", () => {
       }
     }
     // Nothing but the backup and the manifest is there (no temp file, no plaintext zip).
-    expect((await readdir(backupsDir())).sort()).toEqual([BACKUPS_MANIFEST, "Cocina Project - backup - modified 2026-11-10 0930.zip.enc"].sort());
+    expect((await readdir(backupsDir())).sort()).toEqual([BACKUPS_MANIFEST, BACKUPS_STATE, "Cocina Project - backup - modified 2026-11-10 0930.zip.enc"].sort());
 
     const restored = await restoreBackup(kit.repo, r.path);
     expect(restored.projectId).not.toBe(p.id);
@@ -419,5 +419,50 @@ describe("R92 I2: a corrupt backups manifest", () => {
     expect(after[0]!.keyFile?.keyId).toBe(before.keyFile?.keyId);
     // A copy was kept aside, never silently dropped.
     expect((await readdir(backupsDir())).some((n) => n.startsWith(`${BACKUPS_MANIFEST}.unreadable-`))).toBe(true);
+  });
+});
+
+describe("R94", () => {
+  it("a recorded backup failure survives a manifest rebuild", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Keepfail");
+    await backupProject(kit.repo, p.id);
+    backupSeams.failBackup = true;
+    try {
+      await expect(backupProject(kit.repo, p.id)).rejects.toThrow();
+    } finally {
+      backupSeams.failBackup = false;
+    }
+    await writeFile(join(backupsDir(), BACKUPS_MANIFEST), "{ damaged");
+    expect(await listBackups(kit.repo, p.id)).toHaveLength(1);
+    expect(await projectWarnings(kit.repo, p.id)).toContain("backup-failed");
+  });
+
+  it("an append-only log replaced by another file (new inode) during the backup makes it retry", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Inode");
+    await addSource(kit, p, { title: "x" });
+    const changes = join(kit.lib.root, p.folder, "changes");
+    const log = join(changes, (await readdir(changes)).find((n) => n.endsWith(".jsonl"))!);
+    let calls = 0;
+    backupSeams.afterSnapshot = async () => {
+      calls++;
+      if (calls === 1) {
+        // Same bytes, another file (written beside it, then renamed over it: a new inode).
+        await writeFile(`${log}.new`, await readFile(log), { mode: 0o600 });
+        await rename(`${log}.new`, log);
+      }
+    };
+    try {
+      await backupProject(kit.repo, p.id);
+    } finally {
+      backupSeams.afterSnapshot = undefined;
+    }
+    expect(calls).toBe(2);
+  });
+
+  it("the temp sweep touches only temp files of backup names", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Sweep");
+    await writeFile(join(backupsDir(), "notes.tmp-abcdef12"), "mine");
+    await backupProject(kit.repo, p.id);
+    expect(await readFile(join(backupsDir(), "notes.tmp-abcdef12"), "utf8")).toBe("mine");
   });
 });

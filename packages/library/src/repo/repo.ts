@@ -53,6 +53,12 @@ import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./r
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 
+/** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
+const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
+export function onProjectUnlocked(fn: (repo: Repo, projectId: string) => Promise<void>): void {
+  unlockHooks.push(fn);
+}
+
 /** Repo → its core, for package-internal helpers below (not part of the public Repo API). */
 const cores = new WeakMap<Repo, RepoCore>();
 
@@ -79,8 +85,10 @@ export class Repo {
   createProject(input: CreateProjectInput): Promise<{ project: Project; recoveryCode?: string }> {
     return createProject(this.core, input);
   }
-  unlockProject(projectId: string, passphraseOrRecovery: string): Promise<void> {
-    return unlockProject(this.core, projectId, passphraseOrRecovery);
+  async unlockProject(projectId: string, passphraseOrRecovery: string): Promise<void> {
+    await unlockProject(this.core, projectId, passphraseOrRecovery);
+    // Work that waited for the key (e.g. sealed backups the backups manifest could not read, R94).
+    for (const h of unlockHooks) await h(this, projectId).catch(() => {});
   }
   lockProject(projectId: string): void {
     lockProject(this.core, projectId);
@@ -229,6 +237,10 @@ async function sweep(core: RepoCore): Promise<void> {
 }
 
 const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarning["kind"]; text: string }>> = {
+  "committed-destroy-pending": {
+    kind: "destroy-incomplete",
+    text: "files destroyed under the project's retention rule could not be overwritten yet (the disk refused the write); they are kept out of the project and overwriting is tried again each time the library is opened",
+  },
   "rolled-back": { kind: "rolled-back-incomplete-write", text: "a change interrupted before it was audited was rolled back" },
   "rollback-incomplete": {
     kind: "rolled-back-incomplete-write",
@@ -303,7 +315,8 @@ export async function openRepoInternal(
   if (writable) {
     const recovered = await recoverTransactions(core.root, (pid) => anchors[core.anchorKey(pid)]);
     for (const r of recovered) {
-      if (r.outcome !== "committed" && r.outcome !== "rolled-back") {
+      // A committed change whose destroyed files still wait to be overwritten does not block writes.
+      if (r.outcome !== "committed" && r.outcome !== "rolled-back" && r.outcome !== "committed-destroy-pending") {
         const folder = r.projectFolder === undefined ? null : folderKey(r.projectFolder);
         if (r.projectId !== "*") pendingIds.add(r.projectId);
         if (folder !== null) pendingFolders.add(folder);
@@ -670,7 +683,7 @@ export async function deletedRecordsTrouble(repo: Repo, projectId: string): Prom
   return (await readTombstones(core, st)).status === "unreadable" || (await deletedRecordsWarning(core, st));
 }
 
-/** Persisted in the backups manifest (`failures`) when a backup of the project failed (R92); cleared by the next success. */
+/** Persisted in `Backups/backups-state.json` (`failures`) when a backup of the project failed (R92); cleared by the next success. */
 export const BACKUP_FAILED_WARNING = "backup-failed";
 
 /**
@@ -681,7 +694,7 @@ export async function projectWarnings(repo: Repo, projectId: string): Promise<st
   const core = cores.get(repo)!;
   const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
   try {
-    const raw = await readMaybe(join(core.root, "Backups", "backups-manifest.json"));
+    const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
     const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
   } catch {

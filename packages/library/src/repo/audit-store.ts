@@ -43,7 +43,9 @@ export interface IntegrityWarning {
     /** A source's annotations file is missing or damaged; the source is read without annotations (R77). */
     | "annotations-unreadable"
     /** A source's annotations file does not match its recorded hash; read as it is (R77). */
-    | "annotations-hash-mismatch";
+    | "annotations-hash-mismatch"
+    /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
+    | "destroy-incomplete";
   detail: string;
   /** Library-relative file, for the two incomplete-line kinds. */
   file?: string;

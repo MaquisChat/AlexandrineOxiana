@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { verifyChain, type Project, type SourceFile } from "@ao/core";
-import { backupProject, listBackups } from "./export/backup.js";
+import { backupProject, listBackups, restoreBackup } from "./export/backup.js";
 import { addSource, auditEvents, makeKit, makeProject, plainOf, scratchFile, walk, type Kit } from "./export/test-kit.js";
 import { SimulatedCrash, seams } from "./repo/testing.js";
 import { findSourceBy, indexSource, openIndex } from "./index/db.js";
@@ -297,11 +297,18 @@ describe("R92", () => {
     seams.crashAt = "before-marker-delete";
     await expect(destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester")).rejects.toBeInstanceOf(SimulatedCrash);
     shredSeams.failFor = () => true;
+    let stuck;
     try {
-      await kit.reopen();
+      stuck = await kit.reopen();
     } finally {
       shredSeams.failFor = undefined;
     }
+    // R94: said plainly, not only kept quietly.
+    const w = stuck.integrityWarnings.find((x) => x.kind === "destroy-incomplete");
+    expect(w?.detail).toMatch(/could not be overwritten/u);
+    expect(w?.detail).not.toContain(kit.lib.root);
+    // Not a reason to refuse changes to the project.
+    await addSource(kit, p, { title: "still writable" });
     const tmpNames = await readdir(join(kit.lib.root, ".tmp"));
     expect(tmpNames.some((n) => n.startsWith("txn-"))).toBe(true);
     expect(tmpNames.some((n) => n.startsWith("trash-"))).toBe(true);
@@ -333,5 +340,66 @@ describe("R92", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("R94", () => {
+  const PASS = "correct horse battery staple";
+
+  it("P5b: a sealed backup unresolved by a locked rebuild is resolved on unlock and destroyed with the data", async () => {
+    const p = await makeProject(kit, GOV(true), true);
+    const sf = await rawSource(p);
+    const old = await backupProject(kit.repo, p.id);
+    const mpath = join(kit.lib.root, "Backups", "backups-manifest.json");
+    await writeFile(mpath, "{ damaged");
+    kit.repo.lockProject(p.id);
+    expect(await listBackups(kit.repo, p.id)).toEqual([]);
+    expect(JSON.parse(await readFile(mpath, "utf8")).unresolved).toContain(old.path.slice(old.path.lastIndexOf("/") + 1));
+    await kit.repo.unlockProject(p.id, PASS);
+    // Resolved on unlock.
+    const m = JSON.parse(await readFile(mpath, "utf8"));
+    expect(m.unresolved ?? []).toEqual([]);
+    expect(m.backups.map((b: { projectId: string }) => b.projectId)).toEqual([p.id]);
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    expect(existsSync(old.path)).toBe(false);
+    expect((r.certificate.backups as { status: string }).status).toBe("deleted");
+  });
+
+  it("P5b (renamed): an unreadable sealed backup under another project name still counts for this project (by its key, not its name)", async () => {
+    const p = await makeProject(kit, GOV(true), true);
+    const sf = await rawSource(p);
+    const old = await backupProject(kit.repo, p.id);
+    const renamed = join(kit.lib.root, "Backups", "Old Name - backup - modified 2026-11-10 0930.zip.enc");
+    const bytes = await readFile(old.path);
+    bytes[bytes.length - 40] = bytes[bytes.length - 40]! ^ 0xff; // unreadable even with the key
+    await writeFile(renamed, bytes);
+    await rm(old.path);
+    await writeFile(join(kit.lib.root, "Backups", "backups-manifest.json"), "{ damaged");
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    const bk = r.certificate.backups as { status: string; containing: string[] };
+    expect(bk.status).toBe("unknown-pending");
+    expect(bk.containing).toContain("Backups/Old Name - backup - modified 2026-11-10 0930.zip.enc");
+    expect(existsSync(renamed)).toBe(true);
+  });
+
+  it("restore leaves out files a destruction certificate names, regenerates manifest.json, and warns retention-due", async () => {
+    const p = await makeProject(kit, GOV(true), true, "Gone");
+    const sf = await rawSource(p);
+    const b = await backupProject(kit.repo, p.id);
+    const copy = join(kit.tmp, "offline copy.zip.enc");
+    await writeFile(copy, await readFile(b.path));
+    kit.clock.now = new Date("2026-12-02T10:15:00.000Z");
+    await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    const restored = await restoreBackup(kit.repo, copy);
+    expect(restored.warnings).toContain("retention-due");
+    expect(restored.notes.join(" ")).toMatch(/destroyed earlier/u);
+    const [sid] = kit.repo.listSourceIds(restored.projectId);
+    const back = await kit.repo.getSource(restored.projectId, sid!);
+    expect(back.assets[0]!.status).toBe("destroyed");
+    expect(existsSync(abs(back.assets[0]!.path))).toBe(false);
+    const manifest = JSON.parse(await readFile(join(kit.lib.root, restored.folder, "manifest.json"), "utf8"));
+    expect(manifest.sources[0].files).not.toContain(back.assets[0]!.path);
   });
 });

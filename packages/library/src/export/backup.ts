@@ -16,9 +16,10 @@
  * (`*.jsonl`: audit, change log, review, journals) are copied up to their snapshot size, which is
  * exactly the state of the audit head taken (a rollback never cuts below it). Any other file that
  * changed meanwhile (size, time, inode, gone) makes the backup start again once; if it changes
- * again, the backup is kept with a warning (`warnings`). A backup that fails is recorded in the
- * manifest (`failures`), which the project shows as the persisted warning `backup-failed` until a
- * backup succeeds. Leftover temp files of interrupted backups are overwritten and removed.
+ * again, the backup is kept with a warning (`warnings`). A backup that fails is recorded in
+ * `Backups/backups-state.json` (`failures`, beside each backup's owning project id: a damaged
+ * manifest loses neither), which the project shows as the persisted warning `backup-failed` until
+ * a backup succeeds. Leftover temp files of interrupted backups are overwritten and removed.
  * Audited as `backup.create` (sha256, size, file count; no path).
  *
  * The sidecar manifest `Backups/backups-manifest.json` (0600) lists every backup the app made: file
@@ -28,7 +29,10 @@
  * the project had when it was made). A manifest that cannot be read is kept aside and rebuilt from
  * each backup's own backup.json (sealed ones with the project key when it is unlocked; the key file
  * is taken from the project again); files that cannot be read then are listed as `unresolved` and
- * treated as possibly holding any project's data (R92 I2). Pruning keeps the newest `keep`
+ * treated as possibly holding the data of the project that owns them (R92 I2): by the owner the
+ * state file recorded, else by the key a sealed file names, else by name (R94). They are tried
+ * again whenever the manifest is read and when a project is unlocked, and move into the manifest
+ * once readable. Pruning keeps the newest `keep`
  * (default 10) by the manifest's project id, and only ever removes manifest-listed files that have
  * a backup's name: nothing else in Backups/ is touched.
  *
@@ -67,6 +71,7 @@ import {
   adoptRestoredProject,
   appendLibraryEvent,
   keyFromRing,
+  onProjectUnlocked,
   lookupPolicyInfo,
   repoClock,
   repoLibrary,
@@ -88,6 +93,8 @@ export const BACKUP_LIMITS = { maxEntries: 10_000_000, maxEntryBytes: Number.MAX
 /** Kept free on the disk beyond what a restore declares. */
 const FREE_MARGIN = 64 * 1024 * 1024;
 const TEMP_FILE = /\.tmp-[0-9a-f]+$/u;
+/** A backup's temp file while it is written (R94: only these are swept). */
+const BACKUP_TEMP = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?\.tmp-[0-9a-f]+$/u;
 /** A backup's file name (any project name, date and collision suffix). */
 const BACKUP_NAME = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?$/u;
 
@@ -117,8 +124,6 @@ export interface BackupEntry {
 interface BackupManifest {
   formatVersion: 1;
   backups: BackupEntry[];
-  /** Projects whose last backup failed (R92): shown as the warning `backup-failed`. */
-  failures?: Record<string, { at: string; reason: string }>;
   /** Backup-named files that could not be read when the manifest was rebuilt (R92 I2). */
   unresolved?: string[];
 }
@@ -167,14 +172,14 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
   const dir = backupsDir(repo);
   const raw = await readMaybe(join(dir, BACKUPS_MANIFEST));
   if (!raw) return { formatVersion: 1, backups: [] };
+  let m: BackupManifest;
   try {
-    const m = JSON.parse(raw.toString("utf8")) as BackupManifest;
-    if (m.formatVersion !== 1 || !Array.isArray(m.backups)) throw new Error("bad manifest");
-    return {
+    const parsed = JSON.parse(raw.toString("utf8")) as BackupManifest;
+    if (parsed.formatVersion !== 1 || !Array.isArray(parsed.backups)) throw new Error("bad manifest");
+    m = {
       formatVersion: 1,
-      backups: m.backups.filter((b) => b && typeof b.file === "string" && typeof b.projectId === "string"),
-      ...(m.failures && typeof m.failures === "object" ? { failures: m.failures } : {}),
-      ...(Array.isArray(m.unresolved) ? { unresolved: m.unresolved.filter((x) => typeof x === "string") } : {}),
+      backups: parsed.backups.filter((b) => b && typeof b.file === "string" && typeof b.projectId === "string"),
+      ...(Array.isArray(parsed.unresolved) ? { unresolved: parsed.unresolved.filter((x) => typeof x === "string") } : {}),
     };
   } catch {
     await fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {});
@@ -182,6 +187,75 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
     await writeManifest(dir, rebuilt);
     return rebuilt;
   }
+  // Files a rebuild could not read are tried again every time (R94): e.g. a sealed backup whose
+  // project has been unlocked since.
+  if (m.unresolved?.length) {
+    const still: string[] = [];
+    let moved = false;
+    for (const f of m.unresolved) {
+      if (!(await fsp.stat(join(dir, f)).then((x) => x.isFile(), () => false))) {
+        moved = true; // gone
+        continue;
+      }
+      const e = await readEntry(repo, f);
+      if (e && !m.backups.some((b) => b.file === f)) {
+        m.backups.push(e);
+        moved = true;
+      } else if (e) moved = true;
+      else still.push(f);
+    }
+    if (moved) {
+      if (still.length) m.unresolved = still;
+      else delete m.unresolved;
+      await writeManifest(dir, m);
+    }
+  }
+  return m;
+}
+
+// ------------------------------------------------------------------------------------------
+// Backup state kept beside the manifest (R94): who each backup belongs to and failed backups, in a
+// file of its own, so a damaged manifest loses neither (both are plaintext ids, nothing identifying).
+
+interface BackupState {
+  formatVersion: 1;
+  /** Backup file → project id (rename-safe: never inferred from the project's current name). */
+  owners: Record<string, string>;
+  /** Projects whose last backup failed: the warning `backup-failed`. */
+  failures: Record<string, { at: string; reason: string }>;
+}
+
+export const BACKUPS_STATE = "backups-state.json";
+
+async function readState(dir: string): Promise<BackupState> {
+  try {
+    const raw = await readMaybe(join(dir, BACKUPS_STATE));
+    const s = raw ? (JSON.parse(raw.toString("utf8")) as Partial<BackupState>) : {};
+    return {
+      formatVersion: 1,
+      owners: s.owners && typeof s.owners === "object" ? s.owners : {},
+      failures: s.failures && typeof s.failures === "object" ? s.failures : {},
+    };
+  } catch {
+    return { formatVersion: 1, owners: {}, failures: {} };
+  }
+}
+
+/** Edits the state (in the manifest's queue, so writes never interleave). */
+function withState(repo: Repo, fn: (s: BackupState) => void): Promise<void> {
+  const dir = backupsDir(repo);
+  const prev = manifestLocks.get(dir) ?? Promise.resolve();
+  const run = prev.then(async () => {
+    const s = await readState(dir);
+    fn(s);
+    await fsp.mkdir(dir, { recursive: true });
+    await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
+  });
+  manifestLocks.set(
+    dir,
+    run.catch(() => {}),
+  );
+  return run;
 }
 
 async function sha256Of(path: string): Promise<string> {
@@ -211,6 +285,17 @@ async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
     return m;
   }
   for (const file of names) {
+    const e = await readEntry(repo, file);
+    if (e) m.backups.push(e);
+    else m.unresolved!.push(file);
+  }
+  return m;
+}
+
+/** A backup's manifest entry, read back from its own backup.json (undefined: unreadable now). */
+async function readEntry(repo: Repo, file: string): Promise<BackupEntry | undefined> {
+  const dir = backupsDir(repo);
+  {
     const abs = join(dir, file);
     let close: (() => Promise<void>) | undefined;
     try {
@@ -234,7 +319,7 @@ async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
       };
       if (typeof h.projectId !== "string" || typeof h.createdAt !== "string") throw new Error("bad backup.json");
       const keyFile = file.endsWith(".enc") ? await projectKeyFile(repo, h.projectId) : undefined;
-      m.backups.push({
+      return {
         file,
         projectId: h.projectId,
         createdAt: h.createdAt,
@@ -245,14 +330,13 @@ async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
         auditHead: h.auditHead ?? null,
         ...(Array.isArray(h.assets) ? { assets: h.assets.filter((x): x is string => typeof x === "string") } : {}),
         ...(keyFile ? { keyFile } : {}),
-      });
+      };
     } catch {
-      m.unresolved!.push(file);
+      return undefined;
     } finally {
       await close?.().catch(() => {});
     }
   }
-  return m;
 }
 
 /** The project's backups the app made and that still exist, newest first. */
@@ -273,12 +357,22 @@ export async function listBackups(repo: Repo, projectId: string): Promise<Backup
  */
 export async function unresolvedBackupsOf(repo: Repo, projectId: string): Promise<string[]> {
   const m = await withManifest(repo, async (x) => x);
-  const stem = datedFileName(`${repo.getProject(projectId).name} - backup`, new Date(0), "zip").replace(/ - modified .*$/u, "");
   const dir = backupsDir(repo);
+  const state = await readState(dir);
+  const project = repo.getProject(projectId);
+  const stem = datedFileName(`${project.name} - backup`, new Date(0), "zip").replace(/ - modified .*$/u, "");
   const out: string[] = [];
   for (const f of m.unresolved ?? []) {
-    if (!f.startsWith(`${stem} - modified `)) continue;
-    if (await fsp.stat(join(dir, f)).then((s) => s.isFile(), () => false)) out.push(f);
+    const abs = join(dir, f);
+    if (!(await fsp.stat(abs).then((s) => s.isFile(), () => false))) continue;
+    // Rename-safe (R94): the recorded owner; else, sealed, the key it is sealed with (a restored
+    // copy shares its key: both projects count, fail closed); else, last, the project's name.
+    const owner = Object.hasOwn(state.owners, f) ? state.owners[f] : undefined;
+    let mine: boolean;
+    if (owner) mine = owner === projectId;
+    else if (f.endsWith(".enc")) mine = !!project.encryption.keyId && (await readKeyId(abs).catch(() => undefined)) === project.encryption.keyId;
+    else mine = f.startsWith(`${stem} - modified `);
+    if (mine) out.push(f);
   }
   return out;
 }
@@ -320,7 +414,7 @@ async function changedSince(files: FileToZip[]): Promise<boolean> {
     const st = await fsp.stat(f.abs).catch(() => null);
     if (!st) return true;
     if (f.appendOnly) {
-      if (st.size < f.size) return true;
+      if (st.size < f.size || st.ino !== f.ino) return true;
     } else if (st.size !== f.size || st.mtimeMs !== f.mtimeMs || st.ino !== f.ino) return true;
   }
   return false;
@@ -435,13 +529,13 @@ async function sweepTemps(dir: string): Promise<void> {
   } catch {
     return;
   }
-  for (const n of names) if (TEMP_FILE.test(n) && !activeTemps.has(join(dir, n))) await shredPath(join(dir, n)).catch(() => {});
+  for (const n of names) if (BACKUP_TEMP.test(n) && !activeTemps.has(join(dir, n))) await shredPath(join(dir, n)).catch(() => {});
 }
 
 async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
   const at = repoClock(repo)().toISOString();
-  await withManifest(repo, async (m) => {
-    m.failures = { ...m.failures, [projectId]: { at, reason: err instanceof Error ? err.name : "Error" } };
+  await withState(repo, (s) => {
+    s.failures[projectId] = { at, reason: err instanceof Error ? err.name : "Error" };
   }).catch(() => {});
 }
 
@@ -519,12 +613,12 @@ export async function backupProject(repo: Repo, projectId: string, opts: { keep?
     await recordFailure(repo, projectId, err);
     throw err;
   }
+  await withState(repo, (s) => {
+    s.owners[made.entry.file] = projectId;
+    delete s.failures[projectId];
+  });
   await withManifest(repo, async (m) => {
     m.backups.push(made.entry);
-    if (m.failures && Object.hasOwn(m.failures, projectId)) {
-      const { [projectId]: _gone, ...rest } = m.failures;
-      m.failures = rest;
-    }
   });
   const pruned = opts.prune === false ? [] : await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
   return { path: join(dir, made.entry.file), sha256: made.entry.sha256, bytes: made.entry.bytes, pruned, warnings };
@@ -702,3 +796,8 @@ export async function restoreBackup(repo: Repo, path: string, opts: { passphrase
     throw err;
   }
 }
+
+// Unresolved sealed backups are tried again as soon as a project is unlocked (R94).
+onProjectUnlocked(async (repo) => {
+  await withManifest(repo, async () => {});
+});

@@ -181,6 +181,7 @@ export type { BibliographyResult, BibliographySelection, CiteOptions, CiteRef } 
 export {
   AuditChainInvalidError,
   BACKUPS_MANIFEST,
+  BACKUPS_STATE,
   BACKUP_LIMITS,
   DEFAULT_KEEP,
   RestoreError,
@@ -192,7 +193,7 @@ export {
   setBackupSettings,
 } from "./export/backup.js";
 export type { BackupEntry, BackupResult, RestoreResult } from "./export/backup.js";
-export { ExportDestinationError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
+export { ExportDestinationError, ExportFailedError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
 export type { ProjectExportResult } from "./export/project-export.js";
 export { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
 export type { DestroyOptions, DueItem } from "./retention.js";
