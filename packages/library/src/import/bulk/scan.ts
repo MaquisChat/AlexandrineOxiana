@@ -14,7 +14,7 @@
  */
 import type { Dirent } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import yauzl from "yauzl";
 import { fileTypeFromFile } from "file-type";
 import type { Annotation, ImportBatch, SourceDraft } from "@ao/core";
@@ -62,12 +62,20 @@ export interface ScanItem {
 /** What the engine gives a scan: a private (0700) work folder for unpacked archives, created on first use. */
 export interface ScanContext {
   workDir(): Promise<string>;
+  /** A plain note for the batch report or preview (e.g. how many empty records were skipped). */
+  note?(text: string): void;
 }
 
 export interface ImportSourceAdapter {
   kind: ImportBatch["source"]["kind"];
   /** Where the items come from (recorded, sealed in encrypted projects, in batch.json; never in reports). */
   location: string;
+  /**
+   * Folders the source's files are expected in (R67): the export file's folder, the Calibre
+   * library, the scanned folder. A file whose real path (links followed) lies outside every root
+   * (and outside the batch's own work folder) needs the user's approval before it is attached.
+   */
+  roots?: string[];
   scan(signal: AbortSignal, ctx?: ScanContext): AsyncIterable<ScanItem>;
   /** How many items the scan will yield (for progress), when it can tell cheaply. */
   count?(signal: AbortSignal): Promise<number>;
@@ -210,6 +218,7 @@ export function folderAdapter(root: string): ImportSourceAdapter {
   return {
     kind: "folder",
     location: root,
+    roots: [resolve(root)],
     scan: (signal, ctx) => walk(root, [], signal, ctx),
     count: (signal) => countFolder(root, [], signal),
   };
@@ -220,6 +229,7 @@ export function zipAdapter(zipPath: string): ImportSourceAdapter {
   return {
     kind: "zip",
     location: zipPath,
+    roots: [], // its files are unpacked into the batch work folder, which is always allowed
     scan: (signal, ctx) => zipItems(zipPath, basename(zipPath), [], signal, ctx),
     count: () => zipEntryCount(zipPath),
   };

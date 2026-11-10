@@ -41,11 +41,15 @@ const MAX_FILES = 50;
 /** Per-item notes for linked files that were left out (shown in the batch report; never a path). */
 export const FILE_NOTES = {
   missing: "attached file not found",
+  location: "attached file location not supported",
   notRegular: "attached file is not a regular file",
   unreadable: "attached file could not be read",
 } as const;
 
 export const REFMAN_REASONS = {
+  encoding: "The export file is not in a text encoding that can be read (UTF-8 or UTF-16), so nothing was imported from it. Export it again as UTF-8.",
+  empty: "The export file contains no references that could be read, so nothing was imported from it.",
+  budget: "The export file's @string definitions or field values are too large to import safely, so nothing was imported from it.",
   tooLarge: "The export file is too large to import (more than 100 MB). Split it into smaller exports, then import each.",
   unreadable: "The export file could not be read, so nothing was imported from it.",
 } as const;
@@ -63,20 +67,36 @@ export class ExportUnreadable extends Error {
   }
 }
 
-/** The export file's text (BOM dropped), or ExportUnreadable with a plain reason. */
+/**
+ * Export bytes → text: UTF-16 (LE or BE) when it starts with a byte order mark, else UTF-8 (BOM
+ * dropped); bytes that are not valid in that encoding → ExportUnreadable (never silently mangled).
+ * Line endings become "\n" (CRLF and lone CR alike).
+ */
+export function decodeExport(buf: Buffer): string {
+  let s: string;
+  try {
+    if (buf[0] === 0xff && buf[1] === 0xfe) s = new TextDecoder("utf-16le", { fatal: true }).decode(buf.subarray(2));
+    else if (buf[0] === 0xfe && buf[1] === 0xff) s = new TextDecoder("utf-16be", { fatal: true }).decode(buf.subarray(2));
+    else s = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(buf);
+  } catch {
+    throw new ExportUnreadable(REFMAN_REASONS.encoding);
+  }
+  return s.includes("\r") ? s.replace(/\r\n?/gu, "\n") : s;
+}
+
+/** The export file's text (decodeExport), or ExportUnreadable with a plain reason. */
 export async function readExport(path: string): Promise<string> {
   const st = await fsp.stat(path).catch(() => null);
   if (!st?.isFile()) throw new ExportUnreadable(REFMAN_REASONS.unreadable);
   if (st.size > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
+  let buf: Buffer;
   try {
-    const buf = await fsp.readFile(path);
-    if (buf.length > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
-    const s = buf.toString("utf8");
-    return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
-  } catch (err) {
-    if (err instanceof ExportUnreadable) throw err;
+    buf = await fsp.readFile(path);
+  } catch {
     throw new ExportUnreadable(REFMAN_REASONS.unreadable);
   }
+  if (buf.length > MAX_EXPORT_BYTES) throw new ExportUnreadable(REFMAN_REASONS.tooLarge);
+  return decodeExport(buf);
 }
 
 /** `<name>@<12 hex of sha256(absolute path)>`: identifies the export (or library) the keys belong to. */
@@ -226,58 +246,96 @@ function splitUnescaped(s: string, sep: string): string[] {
   return out;
 }
 
-const isDriveLetter = (s: string) => s.length === 1 && /[A-Za-z]/u.test(s);
+/** One linked file: candidate absolute paths (the first that exists is used), or a note why it cannot be. */
+export type Link = { paths: string[] } | { note: string };
+
+const MIME_OR_TYPE = /^[A-Za-z0-9.+/ -]{0,100}$/u;
 
 /**
- * The paths in a `file` field: `path`, `desc:path:mime` (Zotero, JabRef), several of either
- * separated by ";". `\:` `\;` `\\` are escapes; an unescaped Windows drive colon is kept.
+ * A single linked location → Link: `file:` URLs decoded (a host, or an encoded "/" inside a name,
+ * gives the note FILE_NOTES.location), relative paths against the export's folder; undefined for
+ * links that are not local files (http(s), EndNote internal-pdf:// …), which are ignored.
  */
-export function fileFieldPaths(raw: string): string[] {
-  const out: string[] = [];
-  for (const entry of splitUnescaped(cap(raw), ";")) {
-    if (out.length >= MAX_FILES) break;
-    const e = entry.trim();
-    if (!e) continue;
-    if (/^file:\/\//iu.test(e)) {
-      out.push(e);
-      continue;
-    }
-    const parts = splitUnescaped(e, ":");
-    let path: string;
-    if (parts.length === 1) path = parts[0]!;
-    else if (parts.length === 2) path = isDriveLetter(parts[0]!) ? `${parts[0]}:${parts[1]}` : parts[1]!;
-    else path = parts.slice(1, -1).join(":");
-    path = unescapeBackslashes(path).trim();
-    if (path) out.push(path);
-  }
-  return out;
-}
-
-/** A linked file's absolute path: `file:` URLs decoded, relative paths against the export's folder. */
-export function resolveLinked(raw: string, baseDir: string): string | undefined {
+export function linkFromPath(raw: string, baseDir: string): Link | undefined {
   const p = raw.trim();
   if (!p || p.includes("\u0000")) return undefined;
   if (/^file:/iu.test(p)) {
     try {
-      return fileURLToPath(p);
+      return { paths: [fileURLToPath(p)] };
     } catch {
-      return undefined;
+      return { note: FILE_NOTES.location };
     }
   }
-  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(p)) return undefined; // http(s), internal-pdf:// ...: not a local file
-  return isAbsolute(p) ? p : resolve(baseDir, p);
+  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(p)) return undefined;
+  return { paths: [isAbsolute(p) ? p : resolve(baseDir, p)] };
 }
 
-/** Checks each linked file: the regular files as ScanFiles, and a note (FILE_NOTES) for each one left out. */
-export async function checkFiles(paths: string[]): Promise<{ files: ScanFile[]; notes: string[] }> {
+/**
+ * The links in a `file` field: `path`, `desc:path:mime` (Zotero, JabRef, Mendeley), several of
+ * either separated by ";". With `escapes` (BibTeX), `\:` `\;` `\\` are escapes; without (CSL-JSON),
+ * backslashes are Windows path separators. Ambiguous colons give several candidates, the one that
+ * names an existing file wins: "a:b.pdf" (no mime part) is tried whole, then as "desc:path";
+ * Mendeley's ":home/user/x.pdf:pdf" (leading slash dropped) is tried as written, then absolute.
+ */
+export function fileFieldLinks(raw: string, baseDir: string, escapes = true): Link[] {
+  const out: Link[] = [];
+  const fix = (x: string) => (escapes ? unescapeBackslashes(x) : x.replaceAll("\\", "/")).trim();
+  const split = (x: string, sep: string) => (escapes ? splitUnescaped(x, sep) : splitOn(x, sep));
+  for (const entry of split(cap(raw), ";")) {
+    if (out.length >= MAX_FILES) break;
+    const e = entry.trim();
+    if (!e) continue;
+    if (/^file:/iu.test(e)) {
+      const l = linkFromPath(e, baseDir);
+      if (l) out.push(l);
+      continue;
+    }
+    const parts = split(e, ":");
+    let candidates: string[];
+    if (parts.length === 1) candidates = [fix(e)];
+    else if (parts.length >= 3 && MIME_OR_TYPE.test(parts[parts.length - 1]!)) {
+      const middle = fix(parts.slice(1, -1).join(":"));
+      candidates = [middle];
+      if (!parts[0]!.trim() && middle && !isAbsolute(middle) && !/^[A-Za-z]:/u.test(middle)) candidates.push(`/${middle}`);
+    } else candidates = [fix(e), fix(parts.slice(1).join(":"))];
+    const paths: string[] = [];
+    let note: string | undefined;
+    for (const c of candidates) {
+      const l = c ? linkFromPath(c, baseDir) : undefined;
+      if (l && "paths" in l) paths.push(...l.paths);
+      else if (l) note ??= l.note;
+    }
+    if (paths.length) out.push({ paths: [...new Set(paths)] });
+    else if (note) out.push({ note });
+  }
+  return out;
+}
+
+/** Checks each link: the regular files as ScanFiles, and a note (FILE_NOTES) for each one left out. */
+export async function checkFiles(links: Link[]): Promise<{ files: ScanFile[]; notes: string[] }> {
   const files: ScanFile[] = [];
   const notes: string[] = [];
-  for (const path of paths) {
-    let st;
-    try {
-      st = await fsp.stat(path);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
+  const seen = new Set<string>();
+  for (const link of links) {
+    if ("note" in link) {
+      notes.push(link.note);
+      continue;
+    }
+    let path = link.paths[0]!;
+    let st: import("node:fs").Stats | undefined;
+    let code: string | undefined;
+    for (const p of link.paths) {
+      try {
+        st = await fsp.stat(p);
+        path = p;
+        break;
+      } catch (err) {
+        code ??= (err as NodeJS.ErrnoException).code;
+      }
+    }
+    if (seen.has(path)) continue;
+    seen.add(path);
+    if (!st) {
       notes.push(code === "ENOENT" || code === "ENOTDIR" ? FILE_NOTES.missing : FILE_NOTES.unreadable);
       continue;
     }
@@ -291,18 +349,29 @@ export async function checkFiles(paths: string[]): Promise<{ files: ScanFile[]; 
   return { files, notes };
 }
 
+/** A record with nothing to identify it: no title, creators, identifiers or linked files (skipped, R68). */
+export const isEmptyRecord = (f: RecordFields, links: unknown[]) =>
+  !f.title && !f.creators?.length && !f.doi && !f.isbn?.length && !f.issn && !f.url && !f.arxiv && links.length === 0;
+
+/** The scan note for skipped empty records. */
+export const skippedNote = (n: number) =>
+  n === 1
+    ? "1 reference had no title, creators, identifiers or files and was skipped."
+    : `${n} references had no title, creators, identifiers or files and were skipped.`;
+
 /**
- * One ScanItem from a parsed record and its linked files (`undefined` entries: links that are not
- * local files). `notes` are file notes the adapter already has (e.g. a Calibre path refused).
+ * One ScanItem from a parsed record and its links, or undefined for an empty record (isEmptyRecord).
+ * `notes` are file notes the adapter already has (e.g. a Calibre path refused).
  */
 export async function recordItem(
   key: string,
   f: RecordFields,
-  linked: Array<string | undefined>,
+  links: Array<Link | undefined>,
   extra: Pick<ScanItem, "folderPath"> & { externalKeys?: Record<string, string>; notes?: string[] } = {},
-): Promise<ScanItem> {
-  const paths = [...new Set(linked.filter((p): p is string => !!p))];
-  const checked = await checkFiles(paths);
+): Promise<ScanItem | undefined> {
+  const real = links.filter((l): l is Link => !!l).slice(0, MAX_FILES);
+  if (isEmptyRecord(f, [...real, ...(extra.notes ?? [])])) return undefined;
+  const checked = await checkFiles(real);
   const notes = [...(extra.notes ?? []), ...checked.notes];
   const externalKeys = { ...(f.citekey ? { citekey: f.citekey } : {}), ...(extra.externalKeys ?? {}) };
   return {
@@ -316,31 +385,43 @@ export async function recordItem(
   };
 }
 
-/** An adapter over a parsed export: one unreadable item if the export cannot be read or parsed. */
+/**
+ * An adapter over a parsed export. The whole file is parsed before the first item is yielded (all
+ * budgets are checked up front), so an export that cannot be read or parsed — or that yields no
+ * references at all — is one unreadable item and nothing else. Empty records are skipped and
+ * counted in a scan note. Roots (R67): the export's folder.
+ */
 export function exportAdapter<R>(
   kind: ImportBatch["source"]["kind"],
   path: string,
   parse: (text: string) => Iterable<R>,
-  toItem: (record: R, keys: ItemKeys, baseDir: string) => Promise<ScanItem>,
+  toItem: (record: R, keys: ItemKeys, baseDir: string) => Promise<ScanItem | undefined>,
 ): ImportSourceAdapter {
+  const baseDir = dirname(resolve(path));
   return {
     kind,
     location: path,
-    async *scan(signal) {
+    roots: [baseDir],
+    async *scan(signal, ctx) {
       const prefix = exportIdentity(path);
-      let records: Iterable<R>;
+      let records: R[];
       try {
-        records = parse(await readExport(path));
+        const text = await readExport(path);
+        records = [...parse(text)];
+        if (!records.length && text.trim()) throw new ExportUnreadable(REFMAN_REASONS.empty);
       } catch (err) {
         yield { key: `${prefix}#`, files: [], unreadable: err instanceof ExportUnreadable ? err.reason : REFMAN_REASONS.unreadable };
         return;
       }
       const keys = new ItemKeys(prefix);
-      const baseDir = dirname(resolve(path));
+      let skipped = 0;
       for (const r of records) {
         signal.throwIfAborted();
-        yield await toItem(r, keys, baseDir);
+        const item = await toItem(r, keys, baseDir);
+        if (item) yield item;
+        else skipped++;
       }
+      if (skipped) ctx?.note?.(skippedNote(skipped));
     },
   };
 }
@@ -368,6 +449,16 @@ export interface BibEntry {
 }
 
 const MAX_MACROS = 10_000;
+/** Budgets (R68 C1): all @string values together, and all kept field values of one file together. */
+export const MAX_MACRO_BYTES = 4 * 1024 * 1024;
+export const MAX_EXPANDED_BYTES = 32 * 1024 * 1024;
+const MAX_FIELDS_PER_ENTRY = 64;
+/** The only fields kept (bibFields and the `file` field); others are skipped unexpanded. */
+const KNOWN_FIELDS = new Set([
+  "title", "author", "editor", "translator", "year", "month", "date", "journal", "journaltitle", "booktitle",
+  "publisher", "institution", "school", "organization", "doi", "isbn", "issn", "url", "eprint", "archiveprefix",
+  "eprinttype", "keywords", "file",
+]);
 const isNameChar = (c: string | undefined) => !!c && c !== "," && c !== "=" && c !== "#" && c !== "{" && c !== "}" && c !== "(" && c !== ")" && c !== '"' && c !== "@" && !/\s/u.test(c);
 const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v";
 
@@ -375,10 +466,14 @@ const isSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n"
  * Entries of a BibTeX file (linear; no recursion). @comment and @preamble are skipped, @string
  * macros are defined and expanded. A block that does not close before a line starting with "@"
  * ends there (the same recovery rule as the sidecar reader, R57/R58), so one broken entry never
- * swallows the rest of the file.
+ * swallows the rest of the file. Only KNOWN_FIELDS are kept (at most 64 per entry); other values
+ * are scanned past without expanding macros. All @string values together are at most 4 MB and all
+ * kept values of the file at most 32 MB: past either budget, ExportUnreadable (R68).
  */
 export function* parseBibtexEntries(src: string): Generator<BibEntry> {
   const n = src.length;
+  let macroBytes = 0;
+  let expandedBytes = 0;
   const macros = new Map<string, string>();
   /** Positions of "@" that start a line (after spaces/tabs): block boundaries. */
   const lineAt = (i: number) => {
@@ -458,10 +553,11 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
         continue;
       }
       j++;
+      const keep = type === "string" || (KNOWN_FIELDS.has(name) && !fields.has(name) && fields.size < MAX_FIELDS_PER_ENTRY);
       const parts: string[] = [];
       let length = 0;
       const push = (s: string) => {
-        if (length < MAX_FIELD_CHARS) {
+        if (keep && length < MAX_FIELD_CHARS) {
           const t = s.slice(0, MAX_FIELD_CHARS - length);
           parts.push(t);
           length += t.length;
@@ -483,7 +579,7 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
               break;
             }
             if (d === "\\") {
-              j++;
+              if (src[j + 1] !== "\n") j++; // a backslash never hides a line break (recovery)
               continue;
             }
             if (d === "{") depth++;
@@ -503,8 +599,10 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
           const ms = j;
           while (j < n && isNameChar(src[j]) && j - ms < 200) j++;
           const word = src.slice(ms, j);
-          const lw = word.toLowerCase();
-          push(/^\d+$/u.test(word) ? word : (macros.get(lw) ?? MONTH_MACROS[lw] ?? word));
+          if (keep) {
+            const lw = word.toLowerCase();
+            push(/^\d+$/u.test(word) ? word : (macros.get(lw) ?? MONTH_MACROS[lw] ?? word));
+          }
         }
         if (ended) break;
         while (j < n && isSpace(src[j]) && !(src[j] === "\n" && lineAt(j) >= 0)) j++;
@@ -514,10 +612,18 @@ export function* parseBibtexEntries(src: string): Generator<BibEntry> {
         }
         break;
       }
-      const value = parts.join("");
-      if (type === "string") {
-        if (macros.size < MAX_MACROS) macros.set(name, value);
-      } else if (!fields.has(name)) fields.set(name, value);
+      if (keep) {
+        const value = parts.join("");
+        if (type === "string") {
+          macroBytes += value.length;
+          if (macroBytes > MAX_MACRO_BYTES) throw new ExportUnreadable(REFMAN_REASONS.budget);
+          if (macros.size < MAX_MACROS) macros.set(name, value);
+        } else {
+          expandedBytes += value.length;
+          if (expandedBytes > MAX_EXPANDED_BYTES) throw new ExportUnreadable(REFMAN_REASONS.budget);
+          fields.set(name, value);
+        }
+      }
       // Anything else up to the next separator is skipped by the loop above.
       while (j < n && !ended && src[j] !== "," && src[j] !== close && !isSpace(src[j])) j++;
     }
@@ -774,8 +880,7 @@ export function bibtexAdapter(path: string): ImportSourceAdapter {
   return exportAdapter("bibtex", path, parseBibtexEntries, async (e, keys, baseDir) => {
     const f = bibFields(e);
     const raw = e.fields.get("file");
-    const linked = raw ? fileFieldPaths(raw).map((p) => resolveLinked(p, baseDir)) : [];
-    return recordItem(keys.next(f.citekey), f, linked);
+    return recordItem(keys.next(f.citekey), f, raw ? fileFieldLinks(raw, baseDir) : []);
   });
 }
 
@@ -885,7 +990,7 @@ export function risAdapter(path: string): ImportSourceAdapter {
   return exportAdapter("ris", path, parseRisRecords, async (r, keys, baseDir) => {
     const f = risFields(r);
     const links = ["L1", "L2", "L4", "LK"].flatMap((t) => r.get(t) ?? []).slice(0, MAX_FILES);
-    return recordItem(keys.next(f.citekey), f, links.map((l) => resolveLinked(l, baseDir)));
+    return recordItem(keys.next(f.citekey), f, links.map((l) => linkFromPath(l, baseDir)));
   });
 }
 
@@ -969,7 +1074,12 @@ export function cslJsonAdapter(path: string): ImportSourceAdapter {
   return exportAdapter("csl-json", path, parseCslItems, async (item, keys, baseDir) => {
     const f = cslFields(item);
     const raw = item.file;
-    const paths = typeof raw === "string" ? fileFieldPaths(raw) : Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string").slice(0, MAX_FILES).flatMap(fileFieldPaths) : [];
-    return recordItem(keys.next(f.citekey), f, paths.map((p) => resolveLinked(p, baseDir)));
+    const strings = typeof raw === "string" ? [raw] : Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string").slice(0, MAX_FILES) : [];
+    const links: Link[] = [];
+    for (const x of strings) {
+      if (links.length >= MAX_FILES) break;
+      links.push(...fileFieldLinks(x, baseDir, false));
+    }
+    return recordItem(keys.next(f.citekey), f, links.slice(0, MAX_FILES));
   });
 }

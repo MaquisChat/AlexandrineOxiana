@@ -22,7 +22,7 @@ import type { Repo } from "../repo/repo.js";
 import { projectCollectionsAndTags } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
-import { CALIBRE_FILE_NOTE, calibreAdapter, copyCalibreDb } from "./calibre.js";
+import { CALIBRE_FILE_NOTE, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
 import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
@@ -425,6 +425,179 @@ describe("calibreAdapter", () => {
     await rm(calibre.db);
     expect((await collect(calibreAdapter(calibre.dir)))[0]!.unreadable).toMatch(/Calibre library could not be read/);
     expect((await collect(calibreAdapter(calibre.dir), undefined))[0]!.unreadable).toMatch(/Calibre library could not be read/);
+  });
+});
+
+describe("review round 1: parser budgets and edge cases (R68)", () => {
+  const heapGrowth = async (fn: () => Promise<unknown>) => {
+    const before = process.memoryUsage().heapUsed;
+    let peak = before;
+    const timer = setInterval(() => (peak = Math.max(peak, process.memoryUsage().heapUsed)), 5);
+    try {
+      await fn();
+    } finally {
+      clearInterval(timer);
+    }
+    return Math.max(peak, process.memoryUsage().heapUsed) - before;
+  };
+
+  it("C1: a @string doubling chain and repeated big macros make the file unreadable without exhausting memory", async () => {
+    const chain = ['@string{a0 = "' + "x".repeat(1000) + '"}'];
+    for (let i = 1; i <= 7; i++) chain.push(`@string{a${i} = a${i - 1} # a${i - 1}}`);
+    chain.push("@string{big = a7 # a7 # a7 # a7 # a7 # a7 # a7 # a7}");
+    for (let k = 0; k < 20_000; k++) chain.push(`@string{c${k} = big # "y"}`);
+    chain.push("@article{k, title={After}}");
+    const p = await writeExport("chain.bib", chain.join("\n"));
+    let items: ScanItem[] = [];
+    const grew = await heapGrowth(async () => {
+      items = await collect(bibtexAdapter(p));
+    });
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(/too large to import safely/);
+    expect(grew).toBeLessThan(200 * MB);
+  });
+
+  it("C1: an entry with very many (unknown) fields expanding a big macro is skipped field by field, without exhausting memory", async () => {
+    const parts = ['@string{big = "' + "x".repeat(60_000) + '"}', "@misc{k, title={Many Fields}"];
+    for (let i = 0; i < 100_000; i++) parts.push(`, f${i} = big`);
+    parts.push("}");
+    const p = await writeExport("fields.bib", parts.join(""));
+    let items: ScanItem[] = [];
+    const grew = await heapGrowth(async () => {
+      items = await collect(bibtexAdapter(p));
+    });
+    expect(items.map(title)).toEqual(["Many Fields"]);
+    expect(grew).toBeLessThan(200 * MB);
+  });
+
+  it("C1: known fields expanding big macros in many entries exceed the per-file budget: unreadable", async () => {
+    const parts = ['@string{big = "' + "x".repeat(60_000) + '"}'];
+    for (let i = 0; i < 1000; i++) parts.push(`@misc{k${i}, title = big, note = big, abstract = big, url = big, publisher = big}`);
+    const items = await collect(bibtexAdapter(await writeExport("budget.bib", parts.join("\n"))));
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(/too large to import safely/);
+  });
+
+  it("BibTeX recovery copes with a backslash before a newline and with lone CR line endings", async () => {
+    const bs = await writeExport("bs.bib", "@article{a, title={Ends in a backslash \\\n@article{b, title={Next}}\n");
+    expect((await collect(bibtexAdapter(bs))).map(title)).toEqual(["Ends in a backslash", "Next"]);
+    const cr = await writeExport("cr.bib", "@article{a, title={Unclosed\r@article{b, title={Second}}\r@article{c,\r  title={Third}\r}\r");
+    expect((await collect(bibtexAdapter(cr))).map(title)).toEqual(["Unclosed", "Second", "Third"]);
+  });
+
+  it("RIS handles lone CR line endings", async () => {
+    const p = await writeExport("cr.ris", "TY  - JOUR\rTI  - First\rER  - \rTY  - BOOK\rTI  - Second\rER  - \r");
+    expect((await collect(risAdapter(p))).map(title)).toEqual(["First", "Second"]);
+  });
+
+  it("decodes UTF-16 with a BOM; text that cannot be decoded, or yields no references, is unreadable", async () => {
+    const bib = "@article{u, title={Ünïcode Title}}\n";
+    const le = join(exp, "le.bib");
+    await writeFile(le, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(bib, "utf16le")]));
+    expect((await collect(bibtexAdapter(le))).map(title)).toEqual(["Ünïcode Title"]);
+    const be = join(exp, "be.ris");
+    const beBody = Buffer.from("TY  - JOUR\nTI  - Big Endian\nER  - \n", "utf16le").swap16();
+    await writeFile(be, Buffer.concat([Buffer.from([0xfe, 0xff]), beBody]));
+    expect((await collect(risAdapter(be))).map(title)).toEqual(["Big Endian"]);
+    const bad = join(exp, "bad.bib");
+    await writeFile(bad, Buffer.from([0x40, 0x61, 0x7b, 0x6b, 0x2c, 0x74, 0x3d, 0x7b, 0xc3, 0x28, 0x7d, 0x7d]));
+    const badItems = await collect(bibtexAdapter(bad));
+    expect(badItems).toHaveLength(1);
+    expect(badItems[0]!.unreadable).toMatch(/not in a text encoding/);
+    // UTF-16 without a BOM looks like text with NULs: no references found, never silently 0 items.
+    const nobom = join(exp, "nobom.bib");
+    await writeFile(nobom, Buffer.from("@article{a, title={Plain ASCII}}\n", "utf16le"));
+    const none = await collect(bibtexAdapter(nobom));
+    expect(none).toHaveLength(1);
+    expect(none[0]!.unreadable).toMatch(/no references/);
+  });
+
+  it("file fields: colon in a path, Windows backslashes in CSL, Mendeley's form, file://server and %2F", async () => {
+    await writeFile(join(exp, "files", "a:b.pdf"), pdfs["files/okafor2024feeding.pdf"]!);
+    const abs = join(exp, "files/okafor2024feeding.pdf");
+    const bib = await writeExport(
+      "colon.bib",
+      [
+        "@misc{colon, title={Colon}, file={files/a:b.pdf}}",
+        `@misc{mendeley, title={Mendeley}, file={:${abs.slice(1)}:pdf}}`,
+        "@misc{server, title={Server}, file={file://server/share/x.pdf}}",
+        "@misc{enc, title={Encoded}, file={file:///tmp/a%2Fb.pdf}}",
+      ].join("\n"),
+    );
+    const items = await collect(bibtexAdapter(bib));
+    expect(items[0]!.files.map((f) => f.path)).toEqual([join(exp, "files", "a:b.pdf")]);
+    expect(items[1]!.files.map((f) => f.path)).toEqual([abs]);
+    expect(items[2]!.fileNotes).toEqual([FILE_NOTES.location]);
+    expect(items[3]!.fileNotes).toEqual([FILE_NOTES.location]);
+    const csl = await writeExport("win.json", JSON.stringify([{ id: "w", title: "Win", file: "files\\okafor2024feeding.pdf" }]));
+    expect((await collect(cslJsonAdapter(csl)))[0]!.files.map((f) => f.path)).toEqual([abs]);
+  });
+
+  it("CSL file arrays respect MAX_FILES across every string", async () => {
+    const files = Array.from({ length: 30 }, (_, i) => `files/m${i}a.pdf;files/m${i}b.pdf`);
+    const [i] = await collect(cslJsonAdapter(await writeExport("many.json", JSON.stringify([{ id: "m", title: "Many", file: files }]))));
+    expect(i!.fileNotes).toHaveLength(50);
+  });
+
+  it("RDF: a very long rdf:about is hashed into the key; LCC/DDC/UDC subjects are not tags", async () => {
+    const about = `#${"x".repeat(1000)}`;
+    const text = (await readFile(join(exp, "sample.rdf"), "utf8"))
+      .replace('rdf:about="#item_20"', `rdf:about="${about}"`)
+      .replace("<dc:subject>food systems</dc:subject>", "<dc:subject>food systems</dc:subject><dc:subject><dcterms:LCC><rdf:value>HD9000</rdf:value></dcterms:LCC></dc:subject><dc:subject><dcterms:DDC><rdf:value>338.1</rdf:value></dcterms:DDC></dc:subject><dc:subject><dcterms:UDC><rdf:value>63</rdf:value></dcterms:UDC></dc:subject>");
+    const items = await collect(zoteroRdfAdapter(await writeExport("long.rdf", text)));
+    expect(items[0]!.tags).toEqual(["food systems", "Lagos"]);
+    const chap = byTitle(items, "A Chapter Whose File Is Gone")!;
+    expect(chap.key.length).toBeLessThan(200);
+    expect(chap.key).not.toContain("xxxxxxxx");
+  });
+
+  it("empty records are skipped in every format and the count is reported", async () => {
+    const notes: string[] = [];
+    const c: ScanContext = { workDir: ctx.workDir, note: (t) => notes.push(t) };
+    const bib = await writeExport("empty.bib", "@misc{e1, note={nothing}}\n@misc{e2}\n@misc{ok, title={Kept}}\n");
+    expect((await collect(bibtexAdapter(bib), c)).map(title)).toEqual(["Kept"]);
+    const ris = await writeExport("empty.ris", "TY  - JOUR\nN1  - nothing\nER  - \nTY  - JOUR\nTI  - Kept\nER  - \n");
+    expect((await collect(risAdapter(ris), c)).map(title)).toEqual(["Kept"]);
+    const csl = await writeExport("empty.json", JSON.stringify([{ id: "e" }, { id: "k", title: "Kept" }]));
+    expect((await collect(cslJsonAdapter(csl), c)).map(title)).toEqual(["Kept"]);
+    const rdf = (await readFile(join(exp, "sample.rdf"), "utf8")).replace("</rdf:RDF>", '<bib:Book rdf:about="#empty"><z:itemType>book</z:itemType></bib:Book></rdf:RDF>');
+    expect(await collect(zoteroRdfAdapter(await writeExport("empty.rdf", rdf)), c)).toHaveLength(3);
+    expect(notes).toEqual([
+      "2 references had no title, creators, identifiers or files and were skipped.",
+      "1 reference had no title, creators, identifiers or files and was skipped.",
+      "1 reference had no title, creators, identifiers or files and was skipped.",
+      "1 reference had no title, creators, identifiers or files and was skipped.",
+    ]);
+  });
+});
+
+describe("review round 1: Calibre reads (R68 I1)", () => {
+  let calibre: ReturnType<typeof buildCalibreLibrary>;
+  beforeEach(async () => {
+    calibre = buildCalibreLibrary(join(tmp, "Calibre Library"), { pdf: pdfs["files/okafor2024feeding.pdf"]! });
+  });
+
+  it("a view in place of a table (e.g. a recursive CTE named books) is refused promptly", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(calibre.db);
+    db.exec("ALTER TABLE books RENAME TO books_real; CREATE VIEW books AS WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM r) SELECT id, 'x' AS title, '' AS path, NULL AS pubdate, NULL AS uuid FROM r;");
+    db.close();
+    const t = performance.now();
+    const items = await collect(calibreAdapter(calibre.dir));
+    expect(performance.now() - t).toBeLessThan(2000);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(/Calibre library could not be read/);
+    expect(await readdir(work)).toEqual([]);
+  });
+
+  it("a metadata.db over 1 GB is refused before it is copied", async () => {
+    const fh = await open(calibre.db, "r+");
+    await fh.truncate(MAX_CALIBRE_DB_BYTES + 1); // sparse
+    await fh.close();
+    const items = await collect(calibreAdapter(calibre.dir));
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(/too large/);
+    expect(await readdir(work)).toEqual([]);
   });
 });
 

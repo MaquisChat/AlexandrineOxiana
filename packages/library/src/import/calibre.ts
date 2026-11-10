@@ -26,11 +26,24 @@ import Database from "better-sqlite3";
 import type { Creator } from "@ao/core";
 import { parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanContext, ScanItem } from "./bulk/scan.js";
-import { exportIdentity, isbnsOf, recordItem, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
+import { exportIdentity, isbnsOf, recordItem, skippedNote, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
 
 export const CALIBRE_REASONS = {
   unreadable: "The Calibre library could not be read (its metadata.db is missing or damaged), so nothing was imported from it.",
+  tooLarge: "The Calibre library is too large to import (its metadata.db is over 1 GB or lists too many books), so nothing was imported from it.",
 } as const;
+
+/** The largest metadata.db copied (R68 I1). */
+export const MAX_CALIBRE_DB_BYTES = 1024 * 1024 * 1024;
+const MAX_BOOKS = 200_000;
+const MAX_LINK_ROWS = 2_000_000;
+const REQUIRED_TABLES = ["books", "authors", "books_authors_link", "identifiers", "tags", "books_tags_link", "data"];
+
+class CalibreUnreadable extends Error {
+  constructor(public readonly reason: string) {
+    super(reason);
+  }
+}
 
 /** File note for a format file whose recorded location points outside the library (never the path). */
 export const CALIBRE_FILE_NOTE = "attached file is outside the Calibre library";
@@ -53,10 +66,12 @@ export async function copyCalibreDb(libraryDir: string, workDir: string): Promis
     const src = join(libraryDir, "metadata.db");
     const st = await fsp.stat(src);
     if (!st.isFile()) throw new Error("metadata.db is not a file");
+    const wal = await fsp.stat(`${src}-wal`).catch(() => null);
+    if (st.size + (wal?.isFile() ? wal.size : 0) > MAX_CALIBRE_DB_BYTES) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
     const dest = join(dir, "metadata.db");
     await fsp.copyFile(src, dest);
-    const wal = await fsp.stat(`${src}-wal`).catch(() => null);
     if (wal?.isFile()) await fsp.copyFile(`${src}-wal`, `${dest}-wal`);
+    if ((await fsp.stat(dest)).size > MAX_CALIBRE_DB_BYTES) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge); // grew while copied
     return { path: dest, remove };
   } catch (err) {
     await remove();
@@ -80,34 +95,49 @@ interface CalibreBook {
   files: Array<string | null>;
 }
 
-const tableExists = (db: Database.Database, name: string) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+/** The names sqlite_master lists as real tables (views, triggers and the like are not). */
+const realTables = (db: Database.Database) =>
+  new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name));
 
-/** Reads every book from a (copied) metadata.db. */
+/**
+ * Reads every book from a (copied) metadata.db. Every name read must be a real table (a view named
+ * `books` could run any query, e.g. an endless recursive CTE); `trusted_schema` is off so schema
+ * objects cannot call functions with side effects; rows are read with iterate() under caps (books
+ * ≤ 200,000; each link/data table ≤ 2,000,000), past which the library is refused (R68 I1).
+ */
 function readBooks(dbPath: string): CalibreBook[] {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
+    db.pragma("trusted_schema = OFF");
     db.pragma("query_only = ON");
-    const books = db.prepare("SELECT id, title, path, pubdate, uuid FROM books ORDER BY id").all() as BookRow[];
-    const group = <T>(rows: Array<{ book: number } & T>) => {
+    const tables = realTables(db);
+    for (const t of REQUIRED_TABLES) if (!tables.has(t)) throw new CalibreUnreadable(CALIBRE_REASONS.unreadable);
+    const rows = <T>(sql: string, max: number): T[] => {
+      const out: T[] = [];
+      for (const r of db.prepare(sql).iterate() as IterableIterator<T>) {
+        if (out.length >= max) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
+        out.push(r);
+      }
+      return out;
+    };
+    const books = rows<BookRow>("SELECT id, title, path, pubdate, uuid FROM books ORDER BY id", MAX_BOOKS);
+    const group = <T>(list: Array<{ book: number } & T>) => {
       const m = new Map<number, T[]>();
-      for (const r of rows) {
-        const list = m.get(r.book) ?? [];
-        list.push(r);
-        m.set(r.book, list);
+      for (const r of list) {
+        const l = m.get(r.book) ?? [];
+        l.push(r);
+        m.set(r.book, l);
       }
       return m;
     };
-    const authors = group(
-      db.prepare("SELECT l.book AS book, a.name AS name FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.book, l.id").all() as Array<{ book: number; name: string }>,
-    );
-    const ids = group(db.prepare("SELECT book, type, val FROM identifiers ORDER BY book, id").all() as Array<{ book: number; type: string; val: string }>);
-    const tags = group(
-      db.prepare("SELECT l.book AS book, t.name AS name FROM books_tags_link l JOIN tags t ON t.id = l.tag ORDER BY l.book, l.id").all() as Array<{ book: number; name: string }>,
-    );
-    const data = group(db.prepare("SELECT book, format, name FROM data ORDER BY book, id").all() as Array<{ book: number; format: string; name: string }>);
-    const publishers = tableExists(db, "books_publishers_link") && tableExists(db, "publishers")
-      ? group(db.prepare("SELECT l.book AS book, p.name AS name FROM books_publishers_link l JOIN publishers p ON p.id = l.publisher ORDER BY l.book, l.id").all() as Array<{ book: number; name: string }>)
-      : new Map<number, Array<{ name: string }>>();
+    const authors = group(rows<{ book: number; name: string }>("SELECT l.book AS book, a.name AS name FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.book, l.id", MAX_LINK_ROWS));
+    const ids = group(rows<{ book: number; type: string; val: string }>("SELECT book, type, val FROM identifiers ORDER BY book, id", MAX_LINK_ROWS));
+    const tags = group(rows<{ book: number; name: string }>("SELECT l.book AS book, t.name AS name FROM books_tags_link l JOIN tags t ON t.id = l.tag ORDER BY l.book, l.id", MAX_LINK_ROWS));
+    const data = group(rows<{ book: number; format: string; name: string }>("SELECT book, format, name FROM data ORDER BY book, id", MAX_LINK_ROWS));
+    const publishers =
+      tables.has("books_publishers_link") && tables.has("publishers")
+        ? group(rows<{ book: number; name: string }>("SELECT l.book AS book, p.name AS name FROM books_publishers_link l JOIN publishers p ON p.id = l.publisher ORDER BY l.book, l.id", MAX_LINK_ROWS))
+        : new Map<number, Array<{ name: string }>>();
 
     return books.map((b): CalibreBook => {
       const f: RecordFields = { type: "book" };
@@ -197,16 +227,20 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
     }
   } catch (err) {
     if ((err as Error)?.name === "AbortError") throw err;
-    yield fail();
+    yield err instanceof CalibreUnreadable ? { ...fail(), unreadable: err.reason } : fail();
     return;
   }
+  let skipped = 0;
   for (const b of books) {
     signal.throwIfAborted();
     const key = `${prefix}#book-${b.id}`;
     const externalKeys = { "calibre-book": String(b.id), ...(b.uuid ? { "calibre-uuid": b.uuid } : {}) };
     const { paths, outside } = await locate(root, realRoot, b.files);
-    yield await recordItem(key, b.fields, paths, { externalKeys, notes: Array<string>(outside).fill(CALIBRE_FILE_NOTE) });
+    const item = await recordItem(key, b.fields, paths.map((p) => ({ paths: [p] })), { externalKeys, notes: Array<string>(outside).fill(CALIBRE_FILE_NOTE) });
+    if (item) yield item;
+    else skipped++;
   }
+  if (skipped) ctx.note?.(skippedNote(skipped));
 }
 
 /** A Calibre library folder (the one holding `metadata.db`). */
@@ -214,6 +248,7 @@ export function calibreAdapter(libraryDir: string): ImportSourceAdapter {
   return {
     kind: "calibre",
     location: libraryDir,
+    roots: [resolve(libraryDir)],
     scan: (signal, ctx) => scanCalibre(libraryDir, signal, ctx),
   };
 }

@@ -18,6 +18,7 @@
  * Citation keys come from `z:citationKey` or a "Citation Key: …" line in `dc:description` (Better
  * BibTeX keeps them in Zotero's Extra field).
  */
+import { createHash } from "node:crypto";
 import { DOMParser, type Element } from "@xmldom/xmldom";
 import type { Creator, SourceType } from "@ao/core";
 import type { ImportSourceAdapter } from "./bulk/scan.js";
@@ -29,7 +30,7 @@ import {
   isbnsOf,
   issnOf,
   recordItem,
-  resolveLinked,
+  linkFromPath,
   tagList,
   text,
   type RecordFields,
@@ -52,6 +53,11 @@ export const RDF_REASONS = {
 const MAX_DEPTH = 256;
 const MAX_ATTRS = 256;
 const MAX_COLLECTION_DEPTH = 64;
+const CALL_NUMBERS = new Set(["LCC", "DDC", "UDC"]);
+const MAX_ABOUT_KEY = 256;
+
+/** An rdf:about as an item key: longer than 256 characters → `about-<sha256>` (keys stay short). */
+const keyOfAbout = (about: string) => (about.length > MAX_ABOUT_KEY ? `about-${createHash("sha256").update(about).digest("hex")}` : about);
 
 const isNameStart = (c: string | undefined) => !!c && (/[A-Za-z_:]/u.test(c) || c.charCodeAt(0) > 0x7f);
 const isNameChar = (c: string | undefined) => !!c && (/[A-Za-z0-9_.:-]/u.test(c) || c.charCodeAt(0) > 0x7f);
@@ -344,6 +350,8 @@ export function rdfRecords(src: string): RdfRecord[] {
       (function* () {
         for (const s of children(e, NS.dc, "subject")) {
           const inner = children(s).next().value as Element | undefined;
+          // Library call numbers (dcterms:LCC, DDC, UDC) are not tags.
+          if (inner && inner.namespaceURI === NS.dcterms && CALL_NUMBERS.has(inner.localName ?? "")) continue;
           yield inner ? childText(inner, NS.rdf, "value") || content(inner) : content(s);
         }
       })(),
@@ -363,7 +371,7 @@ export function rdfRecords(src: string): RdfRecord[] {
     }
     const about = aboutOf(e);
     const coll = firstColl.get(about);
-    out.push({ key: citekey ?? about, fields: f, files, folderPath: coll ? collPath(coll) : [] });
+    out.push({ key: citekey ?? keyOfAbout(about), fields: f, files, folderPath: coll ? collPath(coll) : [] });
   }
   // Stand-alone attachments.
   for (const e of tops) {
@@ -378,7 +386,7 @@ export function rdfRecords(src: string): RdfRecord[] {
     const tags = tagList([...children(e, NS.dc, "subject")].map((s) => content(s)));
     if (tags.length) f.tags = tags;
     const coll = firstColl.get(about);
-    out.push({ key: about, fields: f, files: [p], folderPath: coll ? collPath(coll) : [] });
+    out.push({ key: keyOfAbout(about), fields: f, files: [p], folderPath: coll ? collPath(coll) : [] });
   }
   return out;
 }
@@ -386,6 +394,6 @@ export function rdfRecords(src: string): RdfRecord[] {
 /** Zotero RDF export (Zotero's "Export Library…" → Zotero RDF, with files). */
 export function zoteroRdfAdapter(path: string): ImportSourceAdapter {
   return exportAdapter("zotero-rdf", path, rdfRecords, async (r, keys, baseDir) =>
-    recordItem(keys.next(r.key || undefined), r.fields, r.files.map((p) => resolveLinked(p, baseDir)), { folderPath: r.folderPath }),
+    recordItem(keys.next(r.key || undefined), r.fields, r.files.map((p) => linkFromPath(p, baseDir)), { folderPath: r.folderPath }),
   );
 }
