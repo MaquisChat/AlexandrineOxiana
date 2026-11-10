@@ -1,0 +1,48 @@
+# Stock phrases speech models are known to emit over silence or music.
+# One per line; matched against a segment's normalized text (lowercase, no punctuation)
+# only when the segment is also flagged no-speech or outside-speech.
+thanks for watching
+thank you for watching
+thanks for watching and see you next time
+thank you for watching and see you next time
+thank you so much for watching
+please subscribe
+please subscribe to my channel
+please like and subscribe
+dont forget to like and subscribe
+like and subscribe
+subscribe to my channel
+see you next time
+see you in the next video
+bye
+thank you
+thank you very much
+thanks
+you
+subtitles by the amaraorg community
+subtitles by amaraorg
+subtitles by
+subtitles made by the community of amaraorg
+transcription by castingwords
+translated by
+captions by
+amaraorg
+music
+applause
+silence
+gracias por ver
+gracias por ver el video
+suscríbete
+subtítulos por la comunidad de amaraorg
+merci davoir regardé
+sous-titres réalisés par la communauté damaraorg
+untertitel im auftrag des zdf
+untertitel der amaraorg-community
+vielen dank fürs zuschauen
+grazie per la visione
+obrigado por assistir
+спасибо за просмотр
+продолжение следует
+ご視聴ありがとうございました
+字幕由amaraorg社区提供
+请不吝点赞 订阅 转发 打赏支持明镜与点点栏目

@@ -15,3 +15,7 @@ __pycache__/
 playwright-report/
 test-results/
 target/
+
+# Third-party fixtures fetched by scripts/fetch-fixtures.mjs
+tests/fixtures/downloaded/
+*.egg-info/

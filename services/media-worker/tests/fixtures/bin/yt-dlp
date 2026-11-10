@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Fake yt-dlp for tests. Mode from FAKE_YTDLP_MODE: ok (default), login, ratelimit-partial, hang."""
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+me = Path(__file__)
+version_file = Path(str(me) + ".version")
+args = sys.argv[1:]
+if "--version" in args:
+    print(version_file.read_text().strip() if version_file.exists() else "2026.10.22")
+    sys.exit(0)
+if "--update-to" in args:
+    version_file.write_text("2026.11.01\n")
+    print("Updated yt-dlp to stable@2026.11.01")
+    sys.exit(0)
+if os.environ.get("FAKE_ARGV_FILE"):
+    Path(os.environ["FAKE_ARGV_FILE"]).write_text(json.dumps(args))
+template = args[args.index("-o") + 1]
+out = Path(template).parent
+out.mkdir(parents=True, exist_ok=True)
+url = args[-1]
+mode = os.environ.get("FAKE_YTDLP_MODE", "ok")
+if mode == "login":
+    print("[youtube] Extracting URL: " + url)
+    print("ERROR: [youtube] abc123: Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies for the authentication.", file=sys.stderr)
+    sys.exit(1)
+if mode == "hang":
+    child = subprocess.Popen(["sleep", "300"])
+    Path(os.environ["FAKE_CHILD_PID_FILE"]).write_text(str(child.pid))
+    print("[download]   1.0% of 10.00MiB", flush=True)
+    time.sleep(300)
+    sys.exit(0)
+(out / "abc123.info.json").write_text(json.dumps({"id": "abc123", "title": "Test video", "webpage_url": url}))
+(out / "abc123.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42fake")
+for pct in (25.0, 50.0, 100.0):
+    print(f"[download] {pct:5.1f}% of 1.00MiB at 1.00MiB/s ETA 00:00", flush=True)
+if mode == "ratelimit-partial":
+    print("ERROR: [instagram] def456: HTTP Error 429: Too Many Requests", file=sys.stderr)
+    sys.exit(1)
+(out / "abc123.en.vtt").write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n")
+(out / "abc123.webp").write_bytes(b"RIFFfakeWEBP")
+sys.exit(0)

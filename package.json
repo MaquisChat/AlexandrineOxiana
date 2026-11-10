@@ -10,7 +10,9 @@
     "test:scripts": "node --test scripts/test-report.test.mjs",
     "test:py": "node scripts/run-pytest.mjs",
     "e2e": "node scripts/run-e2e.mjs",
-    "report": "node scripts/test-report.mjs"
+    "report": "node scripts/test-report.mjs",
+    "setup:py": "node scripts/setup-py.mjs",
+    "fetch-fixtures": "node scripts/fetch-fixtures.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
