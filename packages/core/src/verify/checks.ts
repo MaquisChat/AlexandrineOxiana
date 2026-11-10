@@ -1,7 +1,7 @@
 import type { FieldEvidence, FieldVerification, SourceType } from "../model/index.js";
 import {
   clip, datesEqual, getByPointer, datePrecision, groundedIn, handleKey, longEnough, hasTokens, isRecord, NO_SPACE_SCRIPT, normalizeTitle,
-  parseEdtf, snapshotDates, sourceKey, textOf, textVariants, titleSimilarity, TRUSTED_KINDS,
+  parseEdtf, quoteStatesDate, snapshotDates, sourceKey, textOf, textVariants, titleSimilarity, TRUSTED_KINDS,
 } from "./evidence.js";
 import type { LookupEvidence } from "./evidence.js";
 
@@ -82,7 +82,11 @@ export function creatorName(x: Record<string, unknown>, handleFirst = false): st
   return order.find((v) => v !== undefined);
 }
 const joinNames = (a: string, b: string) => [`${a} ${b}`, ...(NO_SPACE_SCRIPT.test(a + b) ? [`${a}${b}`] : [])];
-function personAgree(x: Person, y: Person): boolean {
+/**
+ * `handleRescue`: a record with a family name may match a handle-only record by handle alone. Only
+ * social posts and videos allow that; elsewhere a matching handle must not carry an unsupported name.
+ */
+function personAgree(x: Person, y: Person, handleRescue: boolean): boolean {
   const wholeVsStructured = (w: string, o: Person) =>
     !!o.family && !!o.given && [...joinNames(o.given, o.family), ...joinNames(o.family, o.given)].some((n) => n === w || n.replace(/ /g, "") === w.replace(/ /g, ""));
   if (x.whole || y.whole) {
@@ -91,14 +95,15 @@ function personAgree(x: Person, y: Person): boolean {
   }
   if (x.family && y.family) return x.family === y.family && (!x.given || !y.given || x.given === y.given);
   if (x.handle && y.handle && !x.family && !y.family) return x.handle === y.handle;
-  if (x.handle && y.handle && (!x.family || !y.family)) return x.handle === y.handle;
+  if (handleRescue && x.handle && y.handle) return x.handle === y.handle;
   return false;
 }
 /** The full ordered creator lists match: same length, and each position the same person. */
-export function creatorsAgree(a: unknown, b: unknown): boolean {
+export function creatorsAgree(a: unknown, b: unknown, type?: string): boolean {
   const la = creatorList(a), lb = creatorList(b);
   if (la.length === 0 || la.length !== lb.length) return false;
-  return la.every((x, i) => personAgree(person(x), person(lb[i]!)));
+  const handleRescue = type !== undefined && SOCIAL.has(type);
+  return la.every((x, i) => personAgree(person(x), person(lb[i]!), handleRescue));
 }
 /** Exact creator list equality on family, given, whole literal and handle. */
 export function creatorsEqualStrict(a: unknown, b: unknown): boolean {
@@ -109,8 +114,16 @@ export function creatorsEqualStrict(a: unknown, b: unknown): boolean {
     return (["family", "given", "literal", "handle"] as const).every((k) => nz(x[k]) === nz(y[k]));
   });
 }
-const creatorsText = (v: unknown): string =>
-  creatorList(v).map((x) => (typeof x.literal === "string" && x.literal.trim() ? x.literal.trim() : creatorName(x) ?? "?")).join("; ");
+/** Creators as shown in reason sentences: the whole literal or "Family, Given", plus the handle ("@name") if any. */
+function creatorsText(v: unknown): string {
+  const str = (x: unknown) => (typeof x === "string" && x.trim() ? x.trim() : undefined);
+  return creatorList(v).map((x) => {
+    const family = str(x.family), given = str(x.given);
+    const name = str(x.literal) ?? (family && given ? `${family}, ${given}` : family ?? given);
+    const handle = str(x.handle) ? `@${str(x.handle)!.replace(/^@/, "")}` : undefined;
+    return name && handle ? `${name} (${handle})` : name ?? handle ?? "?";
+  }).join("; ");
+}
 
 const canonList = (field: string, v: unknown): string[] =>
   (Array.isArray(v) ? v : [v]).map((x) => canon(field, x));
@@ -135,8 +148,13 @@ const canon = (field: string, v: unknown): string => {
   return normalizeTitle(t);
 };
 
-/** Do two evidence values for this field say the same thing (at the precision we care about)? */
-export function agree(field: string, a: unknown, b: unknown): boolean {
+/**
+ * Do two evidence values for this field say the same thing (at the precision we care about)?
+ * `type` is the source type; it only matters for creators (see personAgree).
+ * Lists (ISBNs etc.) agree when they are equal as sets or one contains the other; that is only safe
+ * between sources that each already list every current value (see matchDraft).
+ */
+export function agree(field: string, a: unknown, b: unknown, type?: string): boolean {
   if (field === "/title" || field === "/container") {
     return textVariants(a).some((x) => textVariants(b).some((y) => titleSimilarity(x, y) >= 0.9));
   }
@@ -145,19 +163,23 @@ export function agree(field: string, a: unknown, b: unknown): boolean {
     return !!x && !!y && datesEqual(x, y);
   }
   if (field === "/creators") {
-    return creatorsAgree(a, b);
+    return creatorsAgree(a, b, type);
   }
   if (Array.isArray(a) || Array.isArray(b)) {
-    const y = canonList(field, b);
-    return canonList(field, a).some((x) => y.includes(x));
+    const x = canonList(field, a), y = canonList(field, b);
+    if (x.length === 0 || y.length === 0) return false;
+    return x.every((k) => y.includes(k)) || y.every((k) => x.includes(k));
   }
   return canon(field, a) === canon(field, b);
 }
 
 export type Match = "exact" | "near" | "differ";
 
-/** How well does an evidence value support the CURRENT value? "near" = close but not enough. */
-export function matchDraft(field: string, evValue: unknown, draftValue: unknown): Match {
+/**
+ * How well does an evidence value support the CURRENT value? "near" = close but not enough.
+ * A list of identifiers is supported only by a source that lists every current value.
+ */
+export function matchDraft(field: string, evValue: unknown, draftValue: unknown, type?: string): Match {
   if (field === "/title" || field === "/container") {
     const dv = textVariants(draftValue), ev = textVariants(evValue);
     if (dv.some((x) => ev.some((y) => normalizeTitle(x) !== "" && normalizeTitle(x) === normalizeTitle(y)))) return "exact";
@@ -168,7 +190,12 @@ export function matchDraft(field: string, evValue: unknown, draftValue: unknown)
     if (!d || !e || !datesEqual(d, e)) return "differ";
     return datePrecision(d) > datePrecision(e) ? "near" : "exact";
   }
-  return agree(field, evValue, draftValue) ? "exact" : "differ";
+  if (field !== "/creators" && (Array.isArray(evValue) || Array.isArray(draftValue))) {
+    const dv = canonList(field, draftValue), ev = canonList(field, evValue);
+    const found = dv.filter((k) => ev.includes(k)).length;
+    return dv.length > 0 && found === dv.length ? "exact" : found > 0 ? "near" : "differ";
+  }
+  return agree(field, evValue, draftValue, type) ? "exact" : "differ";
 }
 
 const setEqual = (field: string, a: unknown, b: unknown) => {
@@ -239,7 +266,9 @@ export function checkPlatformIdentity(field: string, c: CheckCtx): FieldVerifica
     const withHandle = list.filter((x) => typeof x.handle === "string" && x.handle);
     const bad = withHandle.find((x) => !handles.includes(handleKey(x.handle as string)));
     if (bad) return result("conflict", ["platform-handle"], `The handle "${clip(bad.handle)}" does not match the account recorded by the platform.`);
-    if (withHandle.length > 0 && withHandle.length === list.length) return result("verified", ["platform-handle"]);
+    // The handle says nothing about a family name; only social posts and videos are identified by handle alone.
+    const byHandleAlone = SOCIAL.has(c.type) || list.every((x) => !person(x).family && !person(x).whole);
+    if (byHandleAlone && withHandle.length > 0 && withHandle.length === list.length) return result("verified", ["platform-handle"]);
   }
   return undefined;
 }
@@ -289,7 +318,7 @@ export function checkIdentifier(field: string, c: CheckCtx): FieldVerification |
 
 // ---------------------------------------------------------------- cross-source conflict
 
-function conflicts(field: string, a: unknown, b: unknown): boolean {
+function conflicts(field: string, a: unknown, b: unknown, type: string): boolean {
   if (field === "/title") {
     const x = textOf(a), y = textOf(b);
     return x !== undefined && y !== undefined && titleSimilarity(x, y) < 0.6;
@@ -299,7 +328,7 @@ function conflicts(field: string, a: unknown, b: unknown): boolean {
     return !!x && !!y && Math.abs(x.y - y.y) > 1;
   }
   if (field === "/creators") {
-    return creatorList(a).length > 0 && creatorList(b).length > 0 && !creatorsAgree(a, b);
+    return creatorList(a).length > 0 && creatorList(b).length > 0 && !creatorsAgree(a, b, type);
   }
   return false;
 }
@@ -309,7 +338,7 @@ export function checkCrossSource(field: string, c: CheckCtx): FieldVerification 
   for (let i = 0; i < evs.length; i++) {
     for (let j = i + 1; j < evs.length; j++) {
       const a = evs[i]!, b = evs[j]!;
-      if (conflicts(field, a.value, b.value)) {
+      if (conflicts(field, a.value, b.value, c.type)) {
         const show = (e: FieldEvidence) => `"${clip(field === "/creators" ? creatorsText(e.value) : e.value)}" (from ${sourceName(e)})`;
         return result("conflict", ["cross-source"], `Two sources disagree about the ${labelOf(field).toLowerCase()}: ${show(a)} versus ${show(b)}.`, [
           { value: a.value, source: a.source },
@@ -336,16 +365,22 @@ function quoteTokensOk(q: string): boolean {
   return NO_SPACE_SCRIPT.test(q) ? Array.from(q.replace(/ /g, "")).length >= 4 : q.split(" ").length >= 3;
 }
 
-/** The quote exists in the document/snapshot, is long enough, and actually contains the value it supports. */
-function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
+/** The quote is long enough and exists in the document/snapshot. */
+function quoteFound(e: FieldEvidence, c: CheckCtx): boolean {
   if (typeof e.quote !== "string") return false;
   const q = normalizeTitle(e.quote);
   if (!q || !quoteTokensOk(q)) return false;
-  const inText = hasTokens(c.docNorm, q) || snapNorm(c.snapshot, [...PLATFORM_TEXT_KEYS, ...PLATFORM_NAME_KEYS]).some((x) => hasTokens(x, q));
-  if (!inText) return false;
+  return hasTokens(c.docNorm, q) || snapNorm(c.snapshot, [...PLATFORM_TEXT_KEYS, ...PLATFORM_NAME_KEYS]).some((x) => hasTokens(x, q));
+}
+
+/** The quote exists in the document/snapshot, is long enough, and actually contains the whole value it supports. */
+function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
+  if (typeof e.quote !== "string" || !quoteFound(e, c)) return false;
+  const q = normalizeTitle(e.quote);
   if (field === "/issued") {
+    // Every component the date gives (year, month, day) must be written in the quote.
     const d = parseEdtf(e.value);
-    return !!d && hasTokens(q, String(d.y));
+    return !!d && quoteStatesDate(e.quote, d);
   }
   if (field === "/creators") {
     const list = creatorList(e.value);
@@ -355,8 +390,10 @@ function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
       return !!nn && longEnough(nn, "name") && hasTokens(q, nn);
     });
   }
-  const vals = Array.isArray(e.value) ? e.value.flatMap(textVariants) : textVariants(e.value);
-  return vals.map(normalizeTitle).some((v) => !!v && longEnough(v, "title") && hasTokens(q, v));
+  const inQuote = (v: string) => !!v && longEnough(v, "title") && hasTokens(q, v);
+  // A list (ISBNs etc.) is backed only when the quote contains every one of its values.
+  if (Array.isArray(e.value)) return e.value.length > 0 && e.value.every((x) => textVariants(x).map(normalizeTitle).some(inQuote));
+  return textVariants(e.value).map(normalizeTitle).some(inQuote);
 }
 
 // ---------------------------------------------------------------- grounding
@@ -388,11 +425,12 @@ export function checkGrounding(field: string, c: CheckCtx): FieldVerification | 
   return undefined;
 }
 
-export function independentAgreement(field: string, evs: FieldEvidence[]): boolean {
+/** Call only with evidence that already supports the current value (matchDraft "exact"). */
+export function independentAgreement(field: string, evs: FieldEvidence[], type?: string): boolean {
   const usable = evs.filter((e) => TRUSTED_KINDS.has(e.source.kind));
   for (let i = 0; i < usable.length; i++)
     for (let j = i + 1; j < usable.length; j++)
-      if (sourceKey(usable[i]!) !== sourceKey(usable[j]!) && agree(field, usable[i]!.value, usable[j]!.value)) return true;
+      if (sourceKey(usable[i]!) !== sourceKey(usable[j]!) && agree(field, usable[i]!.value, usable[j]!.value, type)) return true;
   return false;
 }
 
@@ -406,8 +444,11 @@ function isEmpty(v: unknown): boolean {
   return t !== undefined && t.trim() === "";
 }
 
-function aiUnverified(label: string, aiEvs: FieldEvidence[]): FieldVerification {
+function aiUnverified(label: string, aiEvs: FieldEvidence[], c: CheckCtx): FieldVerification {
   const hasQuote = aiEvs.some((e) => typeof e.quote === "string" && e.quote.trim() !== "");
+  if (aiEvs.some((e) => quoteFound(e, c))) {
+    return result("unverified", ["ai-quote"], `${label} was suggested by AI, but the passage it quoted does not clearly state it.`);
+  }
   return result("unverified", ["ai-quote"], hasQuote
     ? `${label} was suggested by AI, but the passage it quoted could not be found in the document.`
     : `${label} was suggested by AI without a quoted passage from the document to back it up.`);
@@ -437,7 +478,7 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
   const hit = checkPlatformIdentity(field, c) ?? checkIdentifier(field, c) ?? checkCrossSource(field, c);
   if (hit) return hit;
 
-  const match = new Map(evs.map((e) => [e, matchDraft(field, e.value, value)] as const));
+  const match = new Map(evs.map((e) => [e, matchDraft(field, e.value, value, c.type)] as const));
   const agreeing = evs.filter((e) => match.get(e) === "exact");
   const near = evs.filter((e) => match.get(e) === "near");
   const disagreeing = evs.filter((e) => match.get(e) === "differ");
@@ -446,6 +487,15 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
   const trustedDis = disagreeing.filter((e) => TRUSTED_KINDS.has(e.source.kind));
   if (trustedDis.length > 0) {
     return { ...result("conflict", ["draft-vs-evidence"], mismatchSentence(trustedDis[0]!), trustedDis.map((e) => ({ value: e.value, source: e.source }))), current: value };
+  }
+  if (agreeing.length === 0 && near.length > 0 && Array.isArray(value) && field !== "/creators") {
+    // A list of identifiers: say which values no source lists.
+    const listed = new Set(evs.flatMap((e) => canonList(field, e.value)));
+    const missing = value.filter((x) => !listed.has(canon(field, x)));
+    const names = missing.slice(0, 3).map((x) => `"${clip(x)}"`).join(", ") + (missing.length > 3 ? ` and ${missing.length - 3} more` : "");
+    return result("unverified", ["draft-vs-evidence"], missing.length > 0
+      ? `${label}: ${names} ${missing.length === 1 ? "is" : "are"} not listed by any source, so ${missing.length === 1 ? "it" : "they"} may be mistyped or invented.`
+      : `${label}: no single source lists all of the values recorded here, so the list could not be confirmed as a whole.`);
   }
   if (agreeing.length === 0 && near.length > 0) {
     const n = near[0]!;
@@ -461,18 +511,22 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
   if (aiEvs.some((e) => quoteSupports(field, e, c))) return result("verified", ["ai-quote-found"]);
   const solid = agreeing.filter((e) => e.source.kind !== "filename" && e.source.kind !== "ai");
   // AI-only values are judged by their quote alone, never by the value merely appearing in the text.
-  if (aiEvs.length > 0 && agreeing.every((e) => e.source.kind === "ai")) return aiUnverified(label, aiEvs);
+  if (aiEvs.length > 0 && agreeing.every((e) => e.source.kind === "ai")) return aiUnverified(label, aiEvs, c);
 
   const grounded = checkGrounding(field, c);
   if (grounded) return grounded;
 
-  if (independentAgreement(field, solid)) return result("verified", ["independent-sources-agree"]);
+  if (independentAgreement(field, solid, c.type)) return result("verified", ["independent-sources-agree"]);
   if (solid.some((e) => TRUSTED_KINDS.has(e.source.kind))) return result("single-source", ["single-trusted-source"]);
 
   if (agreeing.length === 0) {
+    // Only user evidence for a different (older) value is left: say so instead of leaving the field unmarked.
+    if (allEvs.some((e) => e.source.kind === "user")) {
+      return result("unverified", ["user-stale"], `${label} no longer matches the value the researcher confirmed, and nothing else confirms it.`);
+    }
     return required ? result("unverified", ["evidence"], `${label} has no recorded source, so it could not be checked.`) : undefined;
   }
-  if (aiEvs.length > 0) return aiUnverified(label, aiEvs);
+  if (aiEvs.length > 0) return aiUnverified(label, aiEvs, c);
   return result("unverified", ["filename-only"], c.docNorm
     ? `${label} from the file name could not be found in the document text.`
     : `${label} comes only from the file name and nothing else confirms it.`);

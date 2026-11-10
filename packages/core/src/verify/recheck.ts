@@ -1,5 +1,5 @@
 import type { FieldEvidence, FieldVerification, SourceDraft, SourceFile, SourceType } from "../model/index.js";
-import { agree, agreeStrict, labelOf, verifyField } from "./checks.js";
+import { agree, labelOf, verifyField } from "./checks.js";
 import type { CheckCtx } from "./checks.js";
 import { DOC_TEXT_LIMIT, getByPointer, isRecord, normalizeTitle } from "./evidence.js";
 import type { LookupEvidence } from "./evidence.js";
@@ -63,7 +63,7 @@ function lookupEvidence(lookups: LookupEvidence[], d: Record<string, unknown>): 
     if (tied && !ids.has(normId(l.matchedIdentifier as string))) continue;
     const source = { kind: "lookup" as const, provider: l.provider };
     const add = (field: string, value: unknown) => {
-      if (tied || agree(field, value, getByPointer(d, field))) out.push({ field, value, source, at: "" });
+      if (tied || agree(field, value, getByPointer(d, field), typeof d.type === "string" ? d.type : undefined)) out.push({ field, value, source, at: "" });
     };
     if (typeof l.title === "string") add("/title", l.title);
     if (Array.isArray(l.creators) && l.creators.length > 0) add("/creators", l.creators);
@@ -136,7 +136,9 @@ export function applyVerification(confidence: number, report: VerificationReport
 
 /**
  * Recompute `verification` from the stored `fieldEvidence` (the "Recheck" action, and after any
- * non-user metadata change). Pure; existing `user-confirmed` entries are kept exactly.
+ * non-user metadata change). Pure. A stored `user-confirmed` entry is kept exactly, but only while the
+ * fresh check itself still says user-confirmed: the user's evidence strictly matches the current value
+ * and no integrity check (ISBN checksum, DOI resolving to another work) contradicts it.
  */
 export function recheckSourceFile(sf: SourceFile, ctx: VerifyContext): SourceFile {
   const snapshot = ctx.platformSnapshot ?? (isRecord(sf.source.provenance?.platformSnapshot) ? sf.source.provenance.platformSnapshot : undefined);
@@ -144,11 +146,8 @@ export function recheckSourceFile(sf: SourceFile, ctx: VerifyContext): SourceFil
   const verification: Record<string, FieldVerification> = { ...report.fields };
   for (const [k, v] of Object.entries(sf.verification)) {
     if (v.status !== "user-confirmed") continue;
-    // Keep the old entry only while user evidence for this field still strictly matches the value.
-    const current = getByPointer(sf.source, k);
-    if (sf.fieldEvidence.some((e) => e.field === k && e.source.kind === "user" && agreeStrict(k, e.value, current))) {
-      verification[k] = structuredClone(v);
-    }
+    // The fresh report is the only authority: it must have reached user-confirmed on its own.
+    if (report.fields[k]?.status === "user-confirmed") verification[k] = structuredClone(v);
   }
   return { ...sf, verification };
 }

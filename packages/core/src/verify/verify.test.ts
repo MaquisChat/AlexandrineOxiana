@@ -560,3 +560,150 @@ describe("review round 3", () => {
     expect(verifyDraft(draft({ issued: "2020-05-01T99:99:00Z" }), [ev("/issued", "2020-05-01", "embedded")], {}).fields["/issued"]!.status).toBe("unverified");
   });
 });
+
+describe("review round 4", () => {
+  const VALID = "9780306406157";
+  const INVENTED = "9781234567897"; // passes the checksum, but no source lists it
+  const book = (isbn: string[]) => draft({ type: "book", publisher: "P", identifiers: { isbn } });
+  const stored = (source: SourceDraft, evidence: FieldEvidence[], field: string): SourceFile => ({
+    formatVersion: 1,
+    source: { ...source, id: "x", folder: "f", citationKey: "k", provenance: {} } as never,
+    assets: [],
+    annotations: [],
+    fieldEvidence: evidence,
+    verification: { [field]: { status: "user-confirmed", checks: ["user"] } },
+  });
+
+  it("B1: recheck does not keep user-confirmed for an ISBN that fails its checksum", () => {
+    const sf = stored(book(["9780306406158"]), [ev("/identifiers/isbn", ["9780306406158"], "user")], "/identifiers/isbn");
+    const v = recheckSourceFile(sf, {}).verification["/identifiers/isbn"]!;
+    expect(v.status).toBe("conflict");
+    expect(v.checks).toEqual(["isbn-checksum"]);
+  });
+  it("B2: recheck does not keep user-confirmed for a DOI that a new lookup resolves to a different work", () => {
+    const sf = stored(draft({ identifiers: { doi: "10.1000/xyz" } }), [ev("/identifiers/doi", "10.1000/xyz", "user")], "/identifiers/doi");
+    const lookups: LookupEvidence[] = [{ provider: "crossref", matchedIdentifier: "10.1000/xyz", title: "Quantum chromodynamics on a lattice" }];
+    const v = recheckSourceFile(sf, { lookups }).verification["/identifiers/doi"]!;
+    expect(v.status).toBe("conflict");
+    expect(v.checks).toEqual(["doi-lookup"]);
+    // Without the lookup nothing contradicts the user, so the stored entry is kept.
+    expect(recheckSourceFile(sf, {}).verification["/identifiers/doi"]!.status).toBe("user-confirmed");
+  });
+
+  it("A1: an identifier list is supported only when the source lists every value", () => {
+    const r = verifyDraft(book([VALID, INVENTED]), [ev("/identifiers/isbn", [VALID], "embedded")], {});
+    const v = r.fields["/identifiers/isbn"]!;
+    expect(v.status).toBe("unverified");
+    expect(v.reason).toContain(INVENTED);
+    expect(v.reason).not.toContain(VALID);
+    expect(verifyDraft(book([VALID]), [ev("/identifiers/isbn", [VALID, "0306406152"], "embedded")], {}).fields["/identifiers/isbn"]!.status).toBe("single-source");
+    expect(verifyDraft(book([VALID]), [ev("/identifiers/isbn", ["978-0-306-40615-7"], "embedded")], {}).fields["/identifiers/isbn"]!.status).toBe("single-source");
+    expect(verifyDraft(book([INVENTED]), [ev("/identifiers/isbn", [VALID], "embedded")], {}).fields["/identifiers/isbn"]!.status).toBe("conflict");
+  });
+  it("A2: two sources verify an identifier list only when both list every value", () => {
+    const st = (isbn: string[], a: string[], b: string[]) =>
+      verifyDraft(book(isbn), [ev("/identifiers/isbn", a, "embedded"), ev("/identifiers/isbn", b, "zotero")], {}).fields["/identifiers/isbn"]!;
+    expect(st([VALID, INVENTED], [VALID], [VALID]).status).toBe("unverified");
+    expect(st([VALID, INVENTED], [VALID], [VALID]).reason).toContain(INVENTED);
+    expect(st([VALID, INVENTED], [VALID, INVENTED], [VALID]).status).toBe("single-source");
+    expect(st([VALID, INVENTED], [VALID, INVENTED], [INVENTED, VALID]).status).toBe("verified");
+    expect(st([VALID], [VALID], [VALID, INVENTED]).status).toBe("verified");
+    expect(st([VALID], [VALID, "0306406152"], [VALID, INVENTED]).status).toBe("single-source");
+    // Each value has a source, but no source lists them all: not enough.
+    const split = st([VALID, INVENTED], [VALID], [INVENTED]);
+    expect(split.status).toBe("unverified");
+    expect(split.reason).toMatch(/no single source lists all/);
+  });
+  it("A: the names of unsupported identifiers are clipped in the reason", () => {
+    const long = "9".repeat(200);
+    const d = draft({ identifiers: { isbn: undefined, custom: [VALID, long] } });
+    const v = verifyDraft(d, [ev("/identifiers/custom", [VALID], "embedded")], {}).fields["/identifiers/custom"]!;
+    expect(v.status).toBe("unverified");
+    expect(v.reason).not.toContain("9".repeat(81));
+  });
+  it("A: an AI quote must contain every value of an identifier list", () => {
+    const text = "Published 2020. ISBN 978-0-306-40615-7 (hardback), printed in Lagos.";
+    const ai = (isbn: string[]) =>
+      verifyDraft(book(isbn), [ev("/identifiers/isbn", isbn, "ai", { quote: "ISBN 978-0-306-40615-7 (hardback)" })], { documentText: text }).fields["/identifiers/isbn"]!.status;
+    expect(ai([VALID])).toBe("verified");
+    expect(ai([VALID, INVENTED])).toBe("unverified");
+  });
+
+  it("D4: an AI date quote must state every component of the date", () => {
+    const ai = (issued: string, quote: string, more: FieldEvidence[] = []) =>
+      verifyDraft(draft({ issued }), [ev("/issued", issued, "ai", { quote }), ...more], { documentText: `Preface. ${quote} the press.` }).fields["/issued"]!;
+    const d4 = ai("2020-05-17", "first published in 2020 by", [ev("/issued", "2020", "embedded")]);
+    expect(d4.status).toBe("unverified");
+    expect(d4.reason).toMatch(/does not clearly state/);
+    expect(ai("2020-05-01", "first published 2020 by").status).toBe("unverified");
+    expect(ai("2020", "first published in 2020 by").status).toBe("verified");
+    expect(ai("2020-05", "first published in 2020 by").status).toBe("unverified");
+    // the day must be stated too
+    expect(ai("2020-05-17", "first published in May 2020 by").status).toBe("unverified");
+    expect(ai("2020-05-17", "first published on 18 May 2020 by").status).toBe("unverified");
+    expect(ai("2020-05-17", "first published on 17 June 2020 by").status).toBe("unverified");
+    expect(ai("2020-05-17", "first published on 17 May 2021 by").status).toBe("unverified");
+    // components scattered through the quote are not a date expression
+    expect(ai("2020-05-17", "volume 17 of the series may appear in 2020 by").status).toBe("unverified");
+    expect(ai("2020-05", "the results may change in 2020 by").status).toBe("unverified");
+    expect(ai("2020-10-03", "found in 3 out of 2020 items by").status).toBe("unverified");
+    expect(ai("2020-05-17", "between May 17 and June 3, 2020 by").status).toBe("unverified");
+  });
+  it("D4: recognises dates written with numbers or month names in common languages", () => {
+    const ok = (issued: string, quote: string) =>
+      verifyDraft(draft({ issued }), [ev("/issued", issued, "ai", { quote })], { documentText: `Preface. ${quote} and more.` }).fields["/issued"]!.status;
+    for (const q of [
+      "first published on 17 May 2020", "first published May 17, 2020", "published on the 17th of May, 2020", "published 17 May, 2020 online",
+      "publicado el 17 de mayo de 2020", "publicado em 17 de maio de 2020", "publié le 17 mai 2020", "erschienen am 17. Mai 2020",
+      "published on 2020-05-17 online", "published on 2020/05/17 online", "published on 17.05.2020 online", "published on 5/17/2020 online", "2020年5月17日 発行",
+    ]) expect([q, ok("2020-05-17", q)]).toEqual([q, "verified"]);
+    for (const [issued, q] of [
+      ["2020-03", "publicado em março de 2020"], ["2020-08", "paru en août 2020 chez"], ["2020-03", "erschienen im März 2020 bei"],
+      ["2020-12", "publié en décembre 2020 chez"], ["2020-01", "publicado en enero de 2020"], ["2020-05", "first published May 17, 2020"],
+      ["2020-09", "first published Sept. 2020 by"], ["2020-05", "first published 05/2020 by"], ["2020", "first published May 17, 2020"],
+      ["2020-05-01", "publié le 1er mai 2020"],
+    ] as const) expect([q, ok(issued, q)]).toEqual([q, "verified"]);
+    // 05/06/2020 could be 5 June or May 6: too ambiguous to back either
+    expect(ok("2020-06-05", "published on 05/06/2020 online")).toBe("unverified");
+    expect(ok("2020-05-06", "published on 05/06/2020 online")).toBe("unverified");
+  });
+
+  it("C15: a matching handle supports an added family name only for social posts and videos", () => {
+    const creators = [{ family: "Fabricated", handle: "real", role: "author" }];
+    const evs = [ev("/creators", [{ handle: "real" }], "embedded")];
+    const plain = verifyDraft(draft({ creators }), evs, {}).fields["/creators"]!;
+    expect(plain.status).toBe("conflict");
+    expect(plain.reason).toContain('"Fabricated (@real)"');
+    expect(plain.reason).toContain('"@real"');
+    expect(verifyDraft(draft({ type: "social-post", creators }), evs, {}).fields["/creators"]!.status).toBe("single-source");
+    expect(verifyDraft(draft({ type: "video", creators }), evs, {}).fields["/creators"]!.status).toBe("single-source");
+    // two sources that only share the handle do not make it verified either
+    const two = [ev("/creators", [{ handle: "real" }], "embedded"), ev("/creators", [{ handle: "real" }], "zotero")];
+    expect(verifyDraft(draft({ creators }), two, {}).fields["/creators"]!.status).toBe("conflict");
+    // identical handle-only records still agree for any type
+    expect(verifyDraft(draft({ type: "webpage", creators: [{ handle: "@real", role: "author" }] }), evs, {}).fields["/creators"]!.status).toBe("single-source");
+    // a platform snapshot handle does not verify an added family name outside social types
+    const snap = { platformSnapshot: { uploader_id: "real" } };
+    expect(verifyDraft(draft({ creators }), [], snap).fields["/creators"]!.status).not.toBe("verified");
+    expect(verifyDraft(draft({ type: "video", creators }), [], snap).fields["/creators"]!.status).toBe("verified");
+  });
+
+  it("reasons show given names, so an initial against a full given name reads clearly (and stays a conflict)", () => {
+    const d = draft({ creators: [{ family: "Okafor", given: "A.", role: "author" }] });
+    const v = verifyDraft(d, [ev("/creators", [{ family: "Okafor", given: "Ada", role: "author" }], "embedded")], {}).fields["/creators"]!;
+    expect(v.status).toBe("conflict");
+    expect(v.reason).toContain('"Okafor, A."');
+    expect(v.reason).toContain('"Okafor, Ada"');
+    const x = verifyDraft(draft({ creators: [{ family: "Okafor", given: "Ada", role: "author" }, { literal: "World Health Organization", role: "author" }, { handle: "@ada", role: "author" }] }), [
+      ev("/creators", [{ family: "Okafor", given: "Ada" }], "embedded"), ev("/creators", [{ family: "Mensah", given: "Kofi" }], "zotero"),
+    ], {}).fields["/creators"]!;
+    expect(x.reason).toContain('"Okafor, Ada" (from');
+    expect(x.reason).toContain('"Mensah, Kofi" (from');
+  });
+
+  it("a value that no longer matches what the researcher confirmed, with nothing else behind it, is unverified (not silent)", () => {
+    const r = verifyDraft(book([VALID, INVENTED]), [ev("/identifiers/isbn", [VALID], "user")], {});
+    expect(r.fields["/identifiers/isbn"]!.status).toBe("unverified");
+    expect(r.fields["/identifiers/isbn"]!.reason).toMatch(/no longer matches the value the researcher confirmed/);
+  });
+});

@@ -196,3 +196,82 @@ export function groundedIn(hay: string, needle: string, kind: "title" | "name"):
 
 /** Number of date components given (1 year, 2 month, 3 day). */
 export const datePrecision = (e: Edtf): number => (e.d !== undefined ? 3 : e.m !== undefined ? 2 : 1);
+
+// ---------------------------------------------------------------- dates written in running text
+
+const MONTH_NAMES: string[][] = [
+  ["january", "jan", "enero", "ene", "janeiro", "janvier", "janv", "januar", "janner"],
+  ["february", "feb", "febrero", "fevereiro", "fev", "fevrier", "fevr", "februar"],
+  ["march", "mar", "marzo", "marco", "mars", "marz"],
+  ["april", "apr", "abril", "abr", "avril", "avr"],
+  ["may", "mayo", "maio", "mai"],
+  ["june", "jun", "junio", "junho", "juin", "juni"],
+  ["july", "jul", "julio", "julho", "juillet", "juil", "juli"],
+  ["august", "aug", "agosto", "ago", "aout"],
+  ["september", "sep", "sept", "septiembre", "setiembre", "setembro", "septembre"],
+  ["october", "oct", "octubre", "outubro", "octobre", "oktober", "okt"],
+  ["november", "nov", "noviembre", "novembro", "novembre"],
+  ["december", "dec", "diciembre", "dic", "dezembro", "dez", "decembre", "dezember"],
+];
+/**
+ * Month names and common abbreviations (English, Spanish, Portuguese, French, German), accents removed.
+ * Portuguese "set" and "out" are left out: they are everyday English words ("3 out of 2020 items").
+ */
+const MONTH_OF: ReadonlyMap<string, number> = new Map(MONTH_NAMES.flatMap((names, i) => names.map((n) => [n, i + 1] as const)));
+/** Little words allowed inside a written date: "17 de mayo de 2020", "the 17th of May". */
+const DATE_CONNECTORS: ReadonlySet<string> = new Set(["de", "del", "do", "da", "di", "of", "the", "le", "den", "des", "d"]);
+
+const dayOf = (tok: string | undefined): number | undefined => {
+  const m = tok === undefined ? null : /^(\d{1,2})(?:st|nd|rd|th|er|e|o|a)?$/.exec(tok);
+  const n = m ? Number(m[1]) : NaN;
+  return n >= 1 && n <= 31 ? n : undefined;
+};
+
+/**
+ * Does the quoted passage state this date, with every component the date gives (year; month; day)
+ * together in one recognizable date expression? A year alone only backs a year-only date.
+ * Recognized: 2020-05-17, 2020/05, 17.05.2020 or 5/17/2020 (only when day and month cannot be
+ * swapped), 05/2020, 2020年5月17日, and month names: "17 May 2020", "May 17, 2020",
+ * "17 de mayo de 2020", "le 1er mai 2020", "17. Mai 2020", "March 2020".
+ */
+export function quoteStatesDate(quote: string, date: Edtf): boolean {
+  const text = quote.normalize("NFKC");
+  const stated: Edtf[] = [];
+  if (new RegExp(`(?<!\\d)${String(date.y).padStart(4, "0")}(?!\\d)`).test(text)) stated.push({ y: date.y });
+  const num = (re: RegExp, read: (m: RegExpExecArray) => Edtf | undefined) => {
+    for (const m of text.matchAll(re)) {
+      const e = read(m as RegExpExecArray);
+      if (e && e.m !== undefined && e.m >= 1 && e.m <= 12 && (e.d === undefined || (e.d >= 1 && e.d <= 31))) stated.push(e);
+    }
+  };
+  const n = (s: string | undefined) => (s === undefined ? undefined : Number(s));
+  num(/(?<!\d)(\d{4})[-/.](\d{1,2})(?:[-/.](\d{1,2}))?(?!\d)/g, (m) => ({ y: Number(m[1]), m: n(m[2]), d: n(m[3]) }));
+  num(/(?<!\d)(\d{4})\s*[年년]\s*(\d{1,2})\s*[月월](?:\s*(\d{1,2})\s*[日일])?/g, (m) => ({ y: Number(m[1]), m: n(m[2]), d: n(m[3]) }));
+  num(/(?<!\d)(?<!\d[-/.])(\d{1,2})[-/.](\d{4})(?!\d)/g, (m) => ({ y: Number(m[2]), m: n(m[1]) }));
+  num(/(?<!\d)(\d{1,2})([-/.])(\d{1,2})\2(\d{4})(?!\d)/g, (m) => {
+    const a = Number(m[1]), b = Number(m[3]), y = Number(m[4]);
+    if (a === b) return { y, m: a, d: a };
+    if (a > 12 && b <= 12) return { y, m: b, d: a };
+    if (b > 12 && a <= 12) return { y, m: a, d: b };
+    return undefined; // 05/06/2020: day and month could be either way round
+  });
+
+  const toks = text.normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  const skip = (i: number, step: 1 | -1) => {
+    let hops = 0;
+    while (hops < 2 && DATE_CONNECTORS.has(toks[i] ?? "")) { i += step; hops++; }
+    return i;
+  };
+  const yearAt = (i: number) => (/^\d{4}$/.test(toks[i] ?? "") ? Number(toks[i]) : undefined);
+  toks.forEach((tok, i) => {
+    const mo = MONTH_OF.get(tok);
+    if (mo === undefined) return;
+    const after = skip(i + 1, 1);
+    const y1 = yearAt(after);
+    if (y1 !== undefined) stated.push({ y: y1, m: mo, d: dayOf(toks[skip(i - 1, -1)]) }); // 17 [de] May [de] 2020, May 2020
+    const y2 = dayOf(toks[after]) !== undefined ? yearAt(skip(after + 1, 1)) : undefined;
+    if (y2 !== undefined) stated.push({ y: y2, m: mo, d: dayOf(toks[after]) }); // May 17, 2020
+  });
+
+  return stated.some((s) => s.y === date.y && (date.m === undefined || s.m === date.m) && (date.d === undefined || s.d === date.d));
+}
