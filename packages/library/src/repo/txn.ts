@@ -132,8 +132,29 @@ export class TxnLog {
     await this.add({ kind: "dir", path: rel });
   }
 
+  /**
+   * Takes back the step just recorded for a folder the transaction then found already created by
+   * someone else (an exclusive mkdir failed with EEXIST): it is not ours, so undo must not remove it.
+   */
+  async retractDir(abs: string) {
+    const rel = toRel(this.root, abs);
+    let i = this.marker.entries.length - 1;
+    while (i >= 0 && !(this.marker.entries[i]!.kind === "dir" && (this.marker.entries[i] as { path: string }).path === rel)) i--;
+    if (i < 0) return;
+    this.marker.entries.splice(i, 1);
+    const j = this.newDirs.lastIndexOf(rel);
+    if (j >= 0) this.newDirs.splice(j, 1);
+    await writeSmallFileAtomic(this.path, JSON.stringify(this.marker));
+  }
+
   async trashed(from: string, to: string) {
-    await this.add({ kind: "trashed", from: toRel(this.root, from), to: toRel(this.root, to) });
+    const rel = toRel(this.root, from);
+    // What was at or under `from` is gone: a later append or folder there is new and needs its own
+    // step (else undo would truncate or remove the new file and leave the original in the trash).
+    const covers = (p: string) => p === rel || p.startsWith(`${rel}/`);
+    for (const p of [...this.appended]) if (covers(p)) this.appended.delete(p);
+    for (let i = this.newDirs.length - 1; i >= 0; i--) if (covers(this.newDirs[i]!)) this.newDirs.splice(i, 1);
+    await this.add({ kind: "trashed", from: rel, to: toRel(this.root, to) });
   }
 
   async append(u: AppendUndo) {

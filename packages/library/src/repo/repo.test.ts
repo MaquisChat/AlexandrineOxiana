@@ -849,6 +849,65 @@ describe("crash recovery (write-ahead marker)", () => {
     expect(await readdir(join(dir, "Sources"))).toEqual([]);
   });
 
+  it("R62(1): append, trash, append again to the same file, then a crash: recovery restores the original", async () => {
+    const rel = "Projects/P/notes/log.jsonl";
+    await mkdir(join(lib.root, "Projects/P/notes"));
+    await writeFile(join(lib.root, rel), "pre\n");
+    seams.crashAt = "before-changes";
+    await expect(
+      repo.mutate(pid, { action: "store", store: { identifiable: false, hasLocation: false } }, async (tx) => {
+        await tx.appendLine(rel, "one");
+        await tx.trash(rel);
+        await tx.appendLine(rel, "two");
+      }),
+    ).rejects.toBeInstanceOf(SimulatedCrash);
+    expect(await readFile(join(lib.root, rel), "utf8")).toBe("two\n");
+    const again = await repoFor();
+    expect(again.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    expect(await readFile(join(lib.root, rel), "utf8")).toBe("pre\n");
+  });
+
+  it("R62: a folder someone else creates between the check and the mkdir is not journaled as new (not removed by recovery)", async () => {
+    const theirs = join(lib.root, "Projects/P/theirs");
+    seams.beforeMkdir = async (abs) => {
+      seams.beforeMkdir = undefined;
+      await mkdir(theirs);
+      await writeFile(join(theirs, "keep.txt"), "mine");
+      void abs;
+    };
+    seams.crashAt = "before-changes";
+    await expect(
+      repo.mutate(pid, { action: "store", store: { identifiable: false, hasLocation: false } }, async (tx) => {
+        await tx.mkdir("Projects/P/theirs/sub");
+        await tx.writeFile("Projects/P/theirs/sub/ours.txt", "ours");
+      }),
+    ).rejects.toBeInstanceOf(SimulatedCrash);
+    await repoFor();
+    expect(await readFile(join(theirs, "keep.txt"), "utf8")).toBe("mine");
+    expect(await readdir(theirs)).toEqual(["keep.txt"]);
+  });
+
+  it("R62: a failing 'created' undo step keeps the marker and blocks writes until the next open", async () => {
+    const rel = "Projects/P/created-outside-new-folder.txt";
+    seams.failUndo = "created";
+    try {
+      await expect(
+        repo.mutate(pid, { action: "store", store: { identifiable: false, hasLocation: false } }, async (tx) => {
+          await tx.writeFile(rel, "x");
+          throw new Error("boom");
+        }),
+      ).rejects.toThrow("boom");
+    } finally {
+      seams.failUndo = undefined;
+    }
+    expect(await markers()).toHaveLength(1);
+    await expect(repo.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);
+    const again = await repoFor();
+    expect(again.integrityWarnings.map((w) => w.kind)).toEqual(["rolled-back-incomplete-write"]);
+    expect(await readdir(join(lib.root, "Projects/P"))).not.toContain("created-outside-new-folder.txt");
+    expect(await markers()).toEqual([]);
+  });
+
   it("restores replaced and trashed files of interrupted updates and deletes", async () => {
     const sf = await repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() });
     const jsonPath = join(lib.root, sf.source.folder, "source.json");

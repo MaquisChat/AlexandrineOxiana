@@ -44,7 +44,7 @@ import { appendChanges } from "./changelog-store.js";
 import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
-import { SimulatedCrash, maybeCrash } from "./seams.js";
+import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
 
@@ -188,12 +188,25 @@ class TxImpl implements Tx {
   async mkdir(rel: string): Promise<void> {
     const abs = this.core.abs(rel);
     await this.guard(abs);
-    // Record the outermost folder this call will create, before creating it.
-    let first: string | undefined;
-    for (let cur = abs; !(await exists(cur)); cur = dirname(cur)) first = cur;
-    if (!first) return;
-    await this.log.createdDir(first);
-    await fsp.mkdir(abs, { recursive: true });
+    // Record the outermost folder this call will create, before creating it. That folder is created
+    // on its own (not recursively): EEXIST means someone else made it, so it is not ours to remove
+    // on undo; its step is taken back and the next missing folder below it is tried.
+    for (;;) {
+      let first: string | undefined;
+      for (let cur = abs; !(await exists(cur)); cur = dirname(cur)) first = cur;
+      if (!first) return;
+      await this.log.createdDir(first);
+      await seams.beforeMkdir?.(first);
+      try {
+        await fsp.mkdir(first);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        await this.log.retractDir(first);
+        continue;
+      }
+      if (first !== abs) await fsp.mkdir(abs, { recursive: true });
+      return;
+    }
   }
 
   private async payload(data: Uint8Array | string, opts: FileOptions): Promise<Uint8Array | string> {

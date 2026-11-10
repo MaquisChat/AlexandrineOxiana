@@ -10,6 +10,8 @@ export const seams: {
   crashAt?: CrashPoint;
   /** Makes every undo step of this kind fail (until cleared). */
   failUndo?: "created" | "replaced" | "dir" | "trashed" | "append";
+  /** Runs after a new folder is recorded in the marker and before it is created (a racing writer, R62). */
+  beforeMkdir?: (abs: string) => Promise<void>;
   /** Makes every audit append for this project id fail (until cleared). */
   failAuditAppendFor?: string;
 } = {};
