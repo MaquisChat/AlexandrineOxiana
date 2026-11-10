@@ -4,23 +4,24 @@
  * project; a denied provider is skipped silently (a debug note) and the next one is tried.
  *
  *  - lookupDoi: Crossref, then OpenAlex.
- *  - lookupIsbn: Open Library, then the Library of Congress (SRU).
+ *  - lookupIsbn: Open Library, then the Library of Congress (SRU; plain HTTP, so never for a
+ *    sensitive / encrypted-project lookup).
  *  - searchTitle: OpenAlex search.
  *
  * Returns null (or []) when no permitted provider knows the item or every provider is denied.
  * Throws LookupHttpError only when every permitted provider failed to answer.
  */
 import { toIsbn13 } from "@ao/core";
-import { providerAllowed, type LookupContext, type LookupResult, type Provider } from "./context.js";
+import { isSensitive, providerAllowed, type LookupContext, type LookupResult, type Provider } from "./context.js";
 import { crossrefWork } from "./crossref.js";
 import { LookupHttpError } from "./http.js";
 import { locIsbn } from "./loc.js";
 import { openAlexSearch, openAlexWork } from "./openalex.js";
 import { openLibraryIsbn } from "./openlibrary.js";
 
-export { HttpClient, LookupHttpError, USER_AGENT, DEFAULT_RATE_LIMITS } from "./http.js";
+export { DEFAULT_ATTEMPT_TIMEOUT_MS, DEFAULT_RATE_LIMITS, HttpClient, LookupHttpError, USER_AGENT } from "./http.js";
 export type { GetOptions, HttpClientOptions } from "./http.js";
-export { lookupContextFor, providerAllowed } from "./context.js";
+export { isSensitive, lookupContextFor, providerAllowed } from "./context.js";
 export type { LookupContext, LookupResult, Provider } from "./context.js";
 export { LOC_SRU_BASE } from "./loc.js";
 
@@ -31,6 +32,10 @@ async function firstAnswer(
   let failed: LookupHttpError | undefined;
   let answered = false;
   for (const [provider, ask] of chain) {
+    if (provider === "loc" && isSensitive(ctx)) {
+      ctx.debug?.("metadata lookup via loc skipped: its endpoint is plain HTTP, never used for encrypted (sensitive) projects");
+      continue;
+    }
     if (!providerAllowed(ctx, provider)) continue;
     try {
       const r = await ask();

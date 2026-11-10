@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { FIXTURE_DOI, FIXTURE_ISBN, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
+import { FIXTURE_DOI, FIXTURE_ISBN, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
 import { MAX_TEXT_CHARS, UnsafeFileError, extractMetadata, mediaFromTags, shutdownExtractors } from "./index.js";
 
 const DOWNLOADED = join(dirname(fileURLToPath(import.meta.url)), "../../../../tests/fixtures/downloaded");
@@ -188,6 +188,7 @@ describe("camera media (exiftool)", () => {
       device: "Apple iPhone 15 Pro",
       lens: "iPhone 15 Pro back triple camera 6.86mm f/1.78",
       gps: { lat: 40.6892, lon: -74.0445 },
+      capturedAtSource: "original",
       width: 4,
       height: 4,
     });
@@ -197,6 +198,7 @@ describe("camera media (exiftool)", () => {
     const x = await extractMetadata(DNG, "image/x-adobe-dng");
     expect(x.media?.device).toBe("Canon EOS 5D Mark III");
     expect(x.media?.capturedAt).toBe("2017-12-12T09:45:40");
+    expect(x.media?.capturedAtSource).toBe("modified"); // only IFD0 DateTime: flagged, not a capture time
     expect(x.media?.tzOffset).toBeUndefined();
   });
 
@@ -224,6 +226,7 @@ describe("camera media (exiftool)", () => {
     });
     expect(m).toEqual({
       capturedAt: "2023-01-02T03:04:05+09:00",
+      capturedAtSource: "created",
       tzOffset: "+09:00",
       device: "Apple iPhone 13",
       contentIdentifier: "6F1D2A3B-0000-4C5D-8E9F-123456789ABC",
@@ -231,6 +234,87 @@ describe("camera media (exiftool)", () => {
       width: 1920,
       height: 1080,
     });
+  });
+});
+
+describe("capturedAtSource", () => {
+  it("marks a ModifyDate fallback as 'modified'", () => {
+    expect(mediaFromTags({ ModifyDate: "2019:01:02 03:04:05" })).toEqual({ capturedAt: "2019-01-02T03:04:05", capturedAtSource: "modified" });
+    expect(mediaFromTags({ DateTimeOriginal: "2019:01:02 03:04:05" }).capturedAtSource).toBe("original");
+    expect(mediaFromTags({ CreateDate: "2019:01:02 03:04:05" }).capturedAtSource).toBe("created");
+  });
+});
+
+describe("linear-time parsing of hostile markup", () => {
+  const fast = async (fn: () => Promise<unknown>) => {
+    const t0 = performance.now();
+    await fn();
+    return performance.now() - t0;
+  };
+
+  it("HTML of 200,000 unclosed <title> tags", async () => {
+    const f = join(tmp, "titles.html");
+    await writeFile(f, "<title>".repeat(200_000));
+    expect(await fast(() => extractMetadata(f, "text/html"))).toBeLessThan(1000);
+  });
+
+  it("HTML of unclosed <script> and <meta> tags", async () => {
+    const f = join(tmp, "scripts.html");
+    await writeFile(f, "<body>" + "<script><meta ".repeat(100_000));
+    expect(await fast(() => extractMetadata(f, "text/html"))).toBeLessThan(1000);
+  });
+
+  it("an OPF of ~2 MB of unclosed <dc:title>", async () => {
+    const f = join(tmp, "unclosed.epub");
+    const opf = '<package><metadata xmlns:dc="x">' + "<dc:title>".repeat(200_000) + "</metadata></package>";
+    await writeFile(
+      f,
+      buildZip([
+        { name: "mimetype", data: "application/epub+zip", store: true },
+        { name: "META-INF/container.xml", data: '<container><rootfiles><rootfile full-path="c.opf"/></rootfiles></container>' },
+        { name: "c.opf", data: opf },
+      ]),
+    );
+    expect(await fast(() => extractMetadata(f, "application/epub+zip"))).toBeLessThan(1000);
+  });
+
+  it("a DOCX with an unclosed <w:p> and <w:t>", async () => {
+    const f = join(tmp, "unclosed.docx");
+    await writeFile(f, buildZip([{ name: "word/document.xml", data: "<w:document><w:body>" + "<w:p><w:t>x".repeat(200_000) }]));
+    expect(await fast(() => extractMetadata(f, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))).toBeLessThan(1000);
+  });
+
+  it("DOCX text extraction stops at 20,000 characters", async () => {
+    const f = join(tmp, "long.docx");
+    const para = `<w:p><w:r><w:t>${"y".repeat(1000)}</w:t></w:r></w:p>`;
+    await writeFile(f, buildZip([{ name: "word/document.xml", data: "<w:document><w:body>" + para.repeat(5000) + "</w:body></w:document>" }]));
+    const x = await extractMetadata(f, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    expect(x.text!.length).toBeLessThanOrEqual(20_000);
+    expect(x.text!.length).toBeGreaterThan(19_000);
+  });
+});
+
+describe("robustness", () => {
+  it("an EPUB manifest href with a malformed %-escape is skipped, not a URIError", async () => {
+    const f = join(tmp, "badhref.epub");
+    const opf = '<package><metadata xmlns:dc="x"><dc:title>Bad Href</dc:title></metadata><manifest><item id="a" href="a%zz.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/></spine></package>';
+    await writeFile(
+      f,
+      buildZip([
+        { name: "META-INF/container.xml", data: '<container><rootfiles><rootfile full-path="c.opf"/></rootfiles></container>' },
+        { name: "c.opf", data: opf },
+        { name: "a%zz.xhtml", data: "<html><body>x</body></html>" },
+      ]),
+    );
+    const x = await extractMetadata(f, "application/epub+zip");
+    expect(x.title).toBe("Bad Href");
+  });
+
+  it("extracted text keeps single line breaks (at most one blank line)", async () => {
+    const f = join(tmp, "lines.html");
+    await writeFile(f, "<html><body><p>one  \t two</p><p>three</p><br><br><br><br><p>four</p></body></html>");
+    const x = await extractMetadata(f, "text/html");
+    expect(x.text).toBe("one two\nthree\n\nfour");
   });
 });
 

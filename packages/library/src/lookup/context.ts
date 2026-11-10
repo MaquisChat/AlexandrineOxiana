@@ -26,12 +26,20 @@ export interface LookupContext {
   actor: string;
   tz?: string;
   clock?: () => Date;
+  /**
+   * Lookup made for an encrypted project: responses are cached in memory only and the plain-HTTP
+   * Library of Congress endpoint is never used (R52). Fail-closed: anything but an explicit
+   * `false` counts as sensitive. `lookupContextFor` sets it from the project.
+   */
   sensitive?: boolean;
   /** Receives a short note when a provider is skipped (denied by policy, or unavailable). */
   debug?: (note: string) => void;
 }
 
 export type Provider = "crossref" | "openalex" | "openlibrary" | "loc";
+
+/** True unless the context explicitly says `sensitive: false` (R52, fail-closed). */
+export const isSensitive = (ctx: LookupContext): boolean => ctx.sensitive !== false;
 
 /** `evaluate({action:'process', process:{op:'metadata_lookup', provider}})`; a deny is a debug note, never an error. */
 export function providerAllowed(ctx: LookupContext, provider: Provider): boolean {

@@ -1,27 +1,38 @@
 /** EPUB: OPF metadata (dc:title, dc:creator, dc:date, dc:identifier, dc:language) and the first spine items' text. */
 import type { Creator } from "@ao/core";
 import { clean, decodeEntities, markupToText, normalizeDate, parseName } from "./names.js";
+import { attrValue, elements, firstElement, startTags, textOf } from "./scan.js";
 import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 import { openZip } from "./zip.js";
 
-const MAX_XML_BYTES = 2 * 1024 * 1024;
+/** OPF and container are metadata: only their first 512 KB is read (R52). */
+const MAX_XML_BYTES = 512 * 1024;
+const MAX_CHAPTER_BYTES = 2 * 1024 * 1024;
 const TEXT_SECTIONS = 3;
 
-/** Text of each `<dc:tag ...>` element (namespace prefix optional), entity-decoded. */
+/** Text of each complete `<tag ...>` element (namespace prefix optional), entity-decoded. Linear time. */
 export function dcValues(xml: string, tag: string): Array<{ attrs: string; value: string }> {
-  const re = new RegExp(`<(?:[\\w-]+:)?${tag}\\b([^>]*?)(?:/>|>([\\s\\S]*?)</(?:[\\w-]+:)?${tag}\\s*>)`, "giu");
-  return [...xml.matchAll(re)]
-    .map((m) => ({ attrs: m[1] ?? "", value: clean(decodeEntities((m[2] ?? "").replace(/<[^>]*>/gu, " "))) }))
-    .filter((v) => v.value);
+  const out: Array<{ attrs: string; value: string }> = [];
+  for (const e of elements(xml, tag)) {
+    const value = clean(decodeEntities(textOf(e.inner)));
+    if (value) out.push({ attrs: e.attrs, value });
+  }
+  return out;
 }
 
-const attr = (attrs: string, name: string) => new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "iu").exec(attrs)?.slice(2).find((v) => v !== undefined);
+const attr = (attrs: string, name: string) => attrValue(attrs, name);
 
-/** Joins an OPF-relative href to the OPF's folder (no `..` escapes past the root). */
-function resolveHref(opfPath: string, href: string): string {
+/** Joins an OPF-relative href to the OPF's folder (no `..` escapes past the root); undefined for a malformed href. */
+function resolveHref(opfPath: string, href: string): string | undefined {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(href.split("#")[0]!);
+  } catch {
+    return undefined;
+  }
   const base = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
   const parts: string[] = [];
-  for (const seg of (base + decodeURIComponent(href.split("#")[0]!)).split("/")) {
+  for (const seg of (base + decoded).split("/")) {
     if (seg === "..") parts.pop();
     else if (seg && seg !== ".") parts.push(seg);
   }
@@ -32,10 +43,15 @@ export async function extractEpub(path: string): Promise<RawExtract> {
   const zip = await openZip(path);
   try {
     const container = (await zip.read("META-INF/container.xml", MAX_XML_BYTES))?.toString("utf8") ?? "";
-    const opfPath = attr(/<rootfile\b([^>]*)>/iu.exec(container)?.[1] ?? "", "full-path") ?? zip.names().find((n) => n.endsWith(".opf"));
+    let rootfile: string | undefined;
+    for (const a of startTags(container, "rootfile")) {
+      rootfile = attr(a, "full-path");
+      break;
+    }
+    const opfPath = rootfile ?? zip.names().find((n) => n.endsWith(".opf"));
     const opf = opfPath ? (await zip.read(opfPath, MAX_XML_BYTES))?.toString("utf8") : undefined;
     if (!opf || !opfPath) return {};
-    const meta = /<(?:[\w-]+:)?metadata\b[\s\S]*?<\/(?:[\w-]+:)?metadata>/iu.exec(opf)?.[0] ?? opf;
+    const meta = firstElement(opf, "metadata")?.inner ?? opf;
 
     const out: RawExtract = {};
     const title = dcValues(meta, "title")[0]?.value;
@@ -61,21 +77,22 @@ export async function extractEpub(path: string): Promise<RawExtract> {
 
     // Text of the first spine items (scripts and styles dropped, never run).
     const manifest = new Map<string, string>();
-    for (const m of opf.matchAll(/<(?:[\w-]+:)?item\b([^>]*)\/?>/giu)) {
-      const id = attr(m[1]!, "id");
-      const href = attr(m[1]!, "href");
-      const type = attr(m[1]!, "media-type") ?? "";
+    for (const a of startTags(opf, "item")) {
+      const id = attr(a, "id");
+      const href = attr(a, "href");
+      const type = attr(a, "media-type") ?? "";
       if (id && href && /html/iu.test(type)) manifest.set(id, href);
     }
     const texts: string[] = [];
     let length = 0;
-    for (const m of opf.matchAll(/<(?:[\w-]+:)?itemref\b([^>]*)\/?>/giu)) {
+    for (const a of startTags(opf, "itemref")) {
       if (texts.length >= TEXT_SECTIONS || length >= MAX_TEXT_CHARS) break;
-      const href = manifest.get(attr(m[1]!, "idref") ?? "");
-      if (!href) continue;
-      const body = (await zip.read(resolveHref(opfPath, href), MAX_XML_BYTES))?.toString("utf8");
+      const href = manifest.get(attr(a, "idref") ?? "");
+      const entry = href ? resolveHref(opfPath, href) : undefined;
+      if (!entry) continue;
+      const body = (await zip.read(entry, MAX_CHAPTER_BYTES))?.toString("utf8");
       if (!body) continue;
-      const t = markupToText(/<body\b[\s\S]*/iu.exec(body)?.[0] ?? body);
+      const t = markupToText(body, MAX_TEXT_CHARS);
       if (t) {
         texts.push(t);
         length += t.length;

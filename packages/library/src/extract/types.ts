@@ -8,6 +8,12 @@ export const OCR_THRESHOLD_CHARS = 50;
 export interface MediaMetadata {
   /** ISO 8601 local time as recorded, with its offset when the file gives one. */
   capturedAt?: string;
+  /**
+   * Which tag `capturedAt` came from: 'original' (DateTimeOriginal), 'created' (CreateDate /
+   * QuickTime CreationDate / MediaCreateDate) or 'modified' (ModifyDate: a last resort that is
+   * only a capture time for files straight from the camera; treat as unverified).
+   */
+  capturedAtSource?: "original" | "created" | "modified";
   /** From OffsetTimeOriginal (or an explicit zone on the QuickTime creation date), e.g. "+02:00". */
   tzOffset?: string;
   device?: string;

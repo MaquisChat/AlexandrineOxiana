@@ -7,7 +7,7 @@
  */
 import * as fsp from "node:fs/promises";
 import type { Creator } from "@ao/core";
-import { clean, normalizeDate, parseName, parseNameList } from "./names.js";
+import { clean, cleanText, normalizeDate, parseName, parseNameList } from "./names.js";
 import { OCR_THRESHOLD_CHARS, type RawExtract } from "./types.js";
 
 type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -85,7 +85,7 @@ export async function extractPdf(path: string): Promise<RawExtract> {
         pages.push("");
       }
     }
-    const text = pages.join("\n\n").trim();
+    const text = cleanText(pages.join("\n\n"));
     if (text) out.text = text;
     out.needsOcr = (pages[0] ?? "").replace(/\s+/gu, "").length < OCR_THRESHOLD_CHARS;
     return out;

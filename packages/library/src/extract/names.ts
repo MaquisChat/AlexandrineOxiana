@@ -1,5 +1,6 @@
 /** Small, pure helpers shared by the extractors and the lookup clients. */
 import type { Creator } from "@ao/core";
+import { tokens } from "./scan.js";
 
 type Role = Creator["role"];
 
@@ -53,7 +54,7 @@ function ymd(y: number, m?: number, d?: number): string | undefined {
  */
 export function normalizeDate(raw: string | undefined | null): string | undefined {
   if (!raw) return undefined;
-  const s = clean(String(raw));
+  const s = clean(String(raw)).slice(0, 200);
   let m = /^D:(\d{4})(\d{2})?(\d{2})?/.exec(s);
   if (m) return ymd(Number(m[1]), m[2] ? Number(m[2]) : undefined, m[3] ? Number(m[3]) : undefined);
   m = /^(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2}))?)?(?=$|[T\s])/.exec(s);
@@ -72,7 +73,7 @@ export function normalizeDate(raw: string | undefined | null): string | undefine
 /** Decodes the common named and numeric XML/HTML character references. */
 export function decodeEntities(s: string): string {
   const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0" };
-  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/giu, (whole, ref: string) => {
+  return s.replace(/&(#x[0-9a-f]{1,8}|#\d{1,8}|[a-z]{1,32});/giu, (whole, ref: string) => {
     if (ref[0] === "#") {
       const cp = ref[1] === "x" || ref[1] === "X" ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
       return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : whole;
@@ -81,15 +82,46 @@ export function decodeEntities(s: string): string {
   });
 }
 
-/** Text content of markup: drops script/style/head-only elements and tags, decodes entities. */
-export function markupToText(markup: string): string {
-  return clean(
-    decodeEntities(
-      markup
-        .replace(/<!--[\s\S]*?-->/gu, " ")
-        .replace(/<(script|style|noscript|template|svg|math)\b[\s\S]*?<\/\1\s*>/giu, " ")
-        .replace(/<(br|\/p|\/div|\/h[1-6]|\/li|\/tr)\b[^>]*>/giu, "\n")
-        .replace(/<[^>]*>/gu, " "),
-    ),
-  );
+const SKIP = new Set(["script", "style", "noscript", "template", "svg", "math", "head", "title"]);
+const BREAK_AFTER = new Set(["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "blockquote", "section", "article", "pre", "dd", "dt"]);
+
+/**
+ * Text content of markup: drops script/style/head-only elements and tags, decodes entities, keeps
+ * paragraph and line breaks (cleanText). Linear in the input (scan.ts); stops collecting once
+ * `maxChars` characters of text have been gathered.
+ */
+export function markupToText(markup: string, maxChars = Number.POSITIVE_INFINITY): string {
+  const parts: string[] = [];
+  let length = 0;
+  let skipping: string | undefined;
+  for (const t of tokens(markup)) {
+    if (t.kind === "tag") {
+      if (skipping) {
+        if (t.end && t.local === skipping) skipping = undefined;
+        continue;
+      }
+      if (!t.end && !t.self && SKIP.has(t.local)) skipping = t.local;
+      else if (t.local === "br" || (t.end && BREAK_AFTER.has(t.local))) parts.push("\n");
+      continue;
+    }
+    if (skipping) continue;
+    parts.push(t.text);
+    length += t.text.length;
+    if (length > maxChars * 2) break;
+  }
+  return cleanText(decodeEntities(parts.join("")));
+}
+
+/**
+ * Body text: control characters and runs of spaces/tabs become one space, single line breaks are
+ * kept, and at most one blank line separates paragraphs.
+ */
+export function cleanText(s: string): string {
+  return s
+    .replace(/\r\n?/gu, "\n")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f]/gu, " ")
+    .replace(/[^\S\n]+/gu, " ")
+    .replace(/ ?\n ?/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
 }

@@ -70,9 +70,23 @@ export function mediaFromTags(t: Partial<Tags> & Record<string, unknown>): Media
   const m: MediaMetadata = {};
   // Capture time: EXIF original, then creation, then QuickTime creation, then the IFD0 date
   // (on files straight from a camera, such as many DNGs, that is the capture time).
-  const captured = [t.SubSecDateTimeOriginal, t.DateTimeOriginal, t.SubSecCreateDate, t.CreateDate, t.CreationDate, t.MediaCreateDate, t.ModifyDate]
-    .map(dateOf)
-    .find((d) => d);
+  const candidates: Array<[unknown, NonNullable<MediaMetadata["capturedAtSource"]>]> = [
+    [t.SubSecDateTimeOriginal, "original"],
+    [t.DateTimeOriginal, "original"],
+    [t.SubSecCreateDate, "created"],
+    [t.CreateDate, "created"],
+    [t.CreationDate, "created"],
+    [t.MediaCreateDate, "created"],
+    [t.ModifyDate, "modified"],
+  ];
+  let captured: { iso: string; zone?: string } | undefined;
+  for (const [v, source] of candidates) {
+    captured = dateOf(v);
+    if (captured) {
+      m.capturedAtSource = source;
+      break;
+    }
+  }
   if (captured) m.capturedAt = captured.iso;
   const offset = text(t.OffsetTimeOriginal);
   if (offset && OFFSET_RE.test(offset)) m.tzOffset = offset;

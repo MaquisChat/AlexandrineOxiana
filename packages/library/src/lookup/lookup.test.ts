@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_GOVERNANCE, type GovernanceConfig } from "@ao/core";
-import { MockAgent } from "undici";
+import { Agent, MockAgent } from "undici";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary } from "../library.js";
 import { openTestRepo } from "../repo/testing.js";
-import { HttpClient, LookupHttpError, USER_AGENT } from "./http.js";
+import { datePartsToEdtf } from "./crossref.js";
+import { mapLocMods } from "./loc.js";
+import { DEFAULT_ATTEMPT_TIMEOUT_MS, HttpClient, LookupHttpError, USER_AGENT } from "./http.js";
 import { lookupContextFor, lookupDoi, lookupIsbn, searchTitle, type LookupContext } from "./index.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/lookup");
@@ -51,6 +55,7 @@ function ctx(http: HttpClient, providers: string[] | null = ["crossref", "openal
     actor: "tester",
     clock: () => new Date("2026-11-10T12:00:00Z"),
     debug: (n) => notes.push(n),
+    sensitive: false,
     ...extra,
   };
 }
@@ -230,6 +235,92 @@ describe("lookupDoi", () => {
   });
 });
 
+describe("cache and transport hardening", () => {
+  const cacheFile = (key: string) => join(tmp, "Lib", ".cache", "lookups", `${createHash("sha256").update(key).digest("hex")}.json`);
+
+  it("an entry stored in the future is treated as expired", async () => {
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(2);
+    await lookupDoi(DOI, ctx(client()));
+    const f = cacheFile(`crossref:doi:${DOI}`);
+    const e = JSON.parse(await readFile(f, "utf8")) as { storedAt: number };
+    e.storedAt = now + 10 * 86_400_000;
+    await writeFile(f, JSON.stringify(e));
+    await lookupDoi(DOI, ctx(client()));
+    agent.assertNoPendingInterceptors();
+  });
+
+  it("not-found answers are cached for one day only", async () => {
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(404, "").times(2);
+    openalex().intercept({ path: OA_PATH, method: "GET" }).reply(404, "").times(2);
+    expect(await lookupDoi(DOI, ctx(client()))).toBeNull();
+    now += 12 * 3_600_000;
+    expect(await lookupDoi(DOI, ctx(client()))).toBeNull(); // still cached
+    expect(agent.pendingInterceptors().map((i) => i.origin).sort()).toEqual(["https://api.crossref.org", "https://api.openalex.org"]);
+    now += 13 * 3_600_000;
+    expect(await lookupDoi(DOI, ctx(client()))).toBeNull();
+    agent.assertNoPendingInterceptors();
+  });
+
+  it("a 200 that is not JSON is never cached", async () => {
+    const http = client();
+    crossref().intercept({ path: "/j", method: "GET" }).reply(200, "<html>oops</html>");
+    await expect(http.getJson("https://api.crossref.org/j", { cacheKey: "t:j" })).rejects.toBeInstanceOf(LookupHttpError);
+    crossref().intercept({ path: "/j", method: "GET" }).reply(200, '{"ok":true}', JSON_HEADERS);
+    expect(await http.getJson("https://api.crossref.org/j", { cacheKey: "t:j" })).toEqual({ ok: true });
+    agent.assertNoPendingInterceptors();
+  });
+
+  it("refuses to write through a symlinked cache directory", async () => {
+    if (process.platform === "win32") return;
+    const elsewhere = join(tmp, "elsewhere");
+    await mkdir(elsewhere);
+    await mkdir(join(tmp, "Lib", ".cache"), { recursive: true });
+    await symlink(elsewhere, join(tmp, "Lib", ".cache", "lookups"));
+    crossref().intercept({ path: CR_PATH, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS);
+    expect((await lookupDoi(DOI, ctx(client())))?.provider).toBe("crossref");
+    expect(await readdir(elsewhere)).toEqual([]);
+    expect((await stat(elsewhere)).mode & 0o777).not.toBe(0o700);
+  });
+
+  it("each attempt has an overall deadline (a server that trickles forever)", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      const t = setInterval(() => res.write(" "), 20);
+      res.on("close", () => clearInterval(t));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const real = new Agent();
+    try {
+      const http = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: real, sleep, attemptTimeoutMs: 300, maxRetries: 0 });
+      const t0 = performance.now();
+      await expect(http.getJson(`http://127.0.0.1:${port}/slow`, { cacheKey: "t:slow" })).rejects.toBeInstanceOf(LookupHttpError);
+      expect(performance.now() - t0).toBeLessThan(3000);
+    } finally {
+      await real.close();
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("the default attempt deadline is 60 s", () => {
+    expect(DEFAULT_ATTEMPT_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("LoC MODS parsing is linear on unclosed tags", () => {
+    const t0 = performance.now();
+    expect(mapLocMods("<mods>" + "<name type=\"personal\"><namePart>".repeat(100_000), ISBN)).toBeNull();
+    expect(mapLocMods("<zs:x>" + "<mods>".repeat(200_000), ISBN)).toBeNull();
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+
+  it("Crossref date-parts stop at the first null", () => {
+    expect(datePartsToEdtf([[2020, null, 5]])).toBe("2020");
+    expect(datePartsToEdtf([[2020, 7, null]])).toBe("2020-07");
+    expect(datePartsToEdtf([[null]])).toBeUndefined();
+  });
+});
+
 describe("rate limits", () => {
   it("spaces requests to one host (Open Library: 1 req/s)", async () => {
     const http = client();
@@ -274,8 +365,30 @@ describe("lookupIsbn", () => {
 
   it("a redirect to another host is not followed", async () => {
     openlibrary().intercept({ path: `/isbn/${ISBN}.json`, method: "GET" }).reply(302, "", { headers: { location: "https://evil.example/x.json" } });
+    agent.get("https://evil.example").intercept({ path: "/x.json", method: "GET" }).reply(200, fixture("openlibrary-edition.json"), JSON_HEADERS);
     loc().intercept({ path: (p: string) => p.startsWith("/LCDB?"), method: "GET" }).reply(200, fixture("loc-sru-empty.xml"));
     await expect(lookupIsbn(ISBN, ctx(client()))).resolves.toBeNull();
+    const pending = agent.pendingInterceptors();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.origin).toBe("https://evil.example");
+  });
+
+  it("sensitive lookups never use the Library of Congress (plain HTTP)", async () => {
+    openlibrary().intercept({ path: `/isbn/${ISBN}.json`, method: "GET" }).reply(404, "");
+    loc().intercept({ path: (p: string) => p.startsWith("/LCDB?"), method: "GET" }).reply(200, fixture("loc-sru-mods.xml"));
+    expect(await lookupIsbn(ISBN, ctx(client(), undefined, { sensitive: true }))).toBeNull();
+    expect(agent.pendingInterceptors().map((i) => i.origin)).toEqual(["http://lx2.loc.gov:210"]);
+    expect(notes.some((n) => n.includes("loc") && /encrypted|sensitive/u.test(n))).toBe(true);
+  });
+
+  it("a context built by hand without `sensitive` is treated as sensitive (fail closed)", async () => {
+    openlibrary().intercept({ path: `/isbn/${ISBN}.json`, method: "GET" }).reply(404, "");
+    loc().intercept({ path: (p: string) => p.startsWith("/LCDB?"), method: "GET" }).reply(200, fixture("loc-sru-mods.xml"));
+    const c = ctx(client());
+    delete (c as { sensitive?: boolean }).sensitive;
+    expect(await lookupIsbn(ISBN, c)).toBeNull();
+    expect(agent.pendingInterceptors()).toHaveLength(1); // LoC not asked
+    expect(existsSync(join(tmp, "Lib", ".cache"))).toBe(false); // nothing cached on disk
   });
 
   it("denied Open Library → Library of Congress SRU (MODS)", async () => {

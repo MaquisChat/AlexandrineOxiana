@@ -2,10 +2,13 @@
  * HTTP client for the public metadata services (Crossref, OpenAlex, Open Library, Library of
  * Congress), spec 5.1 / 5.4 step 3.6 and R50.
  *
- *  - Cache: `<Library>/.cache/lookups/<sha256(cacheKey)>.json` (dir 0700, files 0600), 30-day TTL.
- *    An entry holds only the time it was stored, the status (200 or 404) and the response body:
- *    never the URL, request headers or the contact email. Lookups made for an encrypted project
- *    pass `sensitive: true` and are cached in memory only (R30: nothing about them reaches disk).
+ *  - Cache: `<Library>/.cache/lookups/<sha256(cacheKey)>.json` (dir 0700, files 0600, written
+ *    atomically; a symlinked cache directory is refused), 30-day TTL for answers, 1 day for
+ *    not-found; an entry stored "in the future" is expired. Only JSON that parses is cached on
+ *    getJson paths. An entry holds only the time it was stored, the status (200 or 404) and the
+ *    body: never the URL, request headers or the contact email. Sensitive lookups (encrypted
+ *    projects; the default unless `sensitive: false`) are cached in memory only (R30, R52).
+ *  - Each attempt (redirects and body included) has an overall deadline (default 60 s).
  *  - Per-host rate limits (Crossref 5/s, OpenAlex 5/s, Open Library 1/s, LoC 1/s; others 1/s).
  *  - 429 / 5xx / network errors: 3 retries with exponential backoff (0.5 s, 1 s, 2 s), or the
  *    server's Retry-After, capped (default 60 s).
@@ -13,11 +16,12 @@
  *  - User-Agent `AlexandrineOxiana/<version> (+https://github.com/maquiscatta-sys/AlexandrineOxiana)`;
  *    `; mailto:<email>` is added inside the parentheses only when the user set a contact email.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { request, type Dispatcher } from "undici";
+import { writeFileAtomic } from "../fs/atomic.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
 const PROJECT_URL = "https://github.com/maquiscatta-sys/AlexandrineOxiana";
@@ -34,6 +38,9 @@ export const DEFAULT_RATE_LIMITS: Readonly<Record<string, number>> = {
 };
 const DEFAULT_RATE = 1;
 const DAY_MS = 86_400_000;
+/** Not-found answers are kept this long at most (a DOI may be registered tomorrow). */
+const NEGATIVE_TTL_MS = DAY_MS;
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 60_000;
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const MEMORY_ENTRIES = 2000;
@@ -70,13 +77,15 @@ export interface HttpClientOptions {
   /** First backoff step (default 500 ms; doubled per retry). */
   backoffMs?: number;
   timeoutMs?: number;
+  /** Overall deadline of one attempt, redirects and body included (default 60 s). */
+  attemptTimeoutMs?: number;
 }
 
 export interface GetOptions {
   /** Identifies the request in the cache; the file name is its sha256. */
   cacheKey: string;
   ttlDays?: number;
-  /** Lookup made for an encrypted project: memory cache only, nothing written to disk. */
+  /** Lookup made for an encrypted project: memory cache only, nothing written to disk. Default true (fail-closed). */
   sensitive?: boolean;
 }
 
@@ -102,6 +111,7 @@ export class HttpClient {
   private readonly maxRetryAfterMs: number;
   private readonly backoffMs: number;
   private readonly timeoutMs: number;
+  private readonly attemptTimeoutMs: number;
   private readonly memory = new Map<string, MemoryEntry>();
   private readonly nextSlot = new Map<string, number>();
   private readonly hostQueue = new Map<string, Promise<unknown>>();
@@ -118,40 +128,63 @@ export class HttpClient {
     this.maxRetryAfterMs = opts.maxRetryAfterMs ?? 60_000;
     this.backoffMs = opts.backoffMs ?? 500;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
+    this.attemptTimeoutMs = opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
   }
 
-  /** Parsed JSON, or null when the resource does not exist (404). */
+  /** Parsed JSON, or null when the resource does not exist (404). A 200 that is not JSON is never cached. */
   async getJson<T = unknown>(url: string, opts: GetOptions): Promise<T | null> {
-    const body = await this.getText(url, opts);
+    let parsed: unknown;
+    const body = await this.get(url, opts, (b) => {
+      try {
+        parsed = JSON.parse(b);
+      } catch {
+        throw new LookupHttpError("The metadata service returned a response that is not JSON");
+      }
+    });
     if (body === null) return null;
-    try {
-      return JSON.parse(body) as T;
-    } catch {
-      throw new LookupHttpError("The metadata service returned a response that is not JSON");
-    }
+    return (parsed !== undefined ? parsed : JSON.parse(body)) as T;
   }
 
   /** The response body, or null when the resource does not exist (404). */
-  async getText(url: string, opts: GetOptions): Promise<string | null> {
+  getText(url: string, opts: GetOptions): Promise<string | null> {
+    return this.get(url, opts);
+  }
+
+  private async get(url: string, opts: GetOptions, validate?: (body: string) => void): Promise<string | null> {
+    const sensitive = opts.sensitive !== false;
     const name = createHash("sha256").update(opts.cacheKey).digest("hex");
     const ttl = (opts.ttlDays ?? 30) * DAY_MS;
-    const fresh = (e: CacheEntry | undefined) => e && this.clock() - e.storedAt < ttl;
+    const fresh = (e: CacheEntry | undefined): e is CacheEntry => {
+      if (!e) return false;
+      const age = this.clock() - e.storedAt;
+      return age >= 0 && age < (e.status === 404 ? Math.min(ttl, NEGATIVE_TTL_MS) : ttl);
+    };
 
     const mem = this.memory.get(name);
-    if (fresh(mem)) return mem!.body;
-    if (!opts.sensitive) {
+    if (fresh(mem)) return mem.body;
+    if (!sensitive) {
       const disk = await this.readCache(name);
-      if (fresh(disk)) {
-        this.remember(name, disk!, false);
-        return disk!.body;
+      if (fresh(disk) && (disk.body === null || this.valid(disk.body, validate))) {
+        this.remember(name, disk, false);
+        return disk.body;
       }
     }
 
     const res = await this.fetchWithRetries(url);
+    if (res.body !== null) validate?.(res.body); // throws: nothing is cached
     const entry: CacheEntry = { v: 1, storedAt: this.clock(), status: res.status, body: res.body };
-    this.remember(name, entry, !!opts.sensitive);
-    if (!opts.sensitive) await this.writeCache(name, entry);
+    this.remember(name, entry, sensitive);
+    if (!sensitive) await this.writeCache(name, entry);
     return entry.body;
+  }
+
+  private valid(body: string, validate?: (body: string) => void): boolean {
+    try {
+      validate?.(body);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -169,8 +202,19 @@ export class HttpClient {
     if (this.memory.size > MEMORY_ENTRIES) this.memory.delete(this.memory.keys().next().value!);
   }
 
+  /** True when `dir` exists as a real directory (not a symlink or anything else). */
+  private async realDir(dir: string): Promise<boolean> {
+    try {
+      const st = await fsp.lstat(dir);
+      return st.isDirectory() && !st.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  }
+
   private async readCache(name: string): Promise<CacheEntry | undefined> {
     try {
+      if (!(await this.realDir(this.cacheDir))) return undefined;
       const e = JSON.parse(await fsp.readFile(join(this.cacheDir, `${name}.json`), "utf8")) as CacheEntry;
       if (e?.v !== 1 || typeof e.storedAt !== "number" || (e.status !== 200 && e.status !== 404)) return undefined;
       if (e.body !== null && typeof e.body !== "string") return undefined;
@@ -182,12 +226,16 @@ export class HttpClient {
 
   private async writeCache(name: string, e: CacheEntry): Promise<void> {
     try {
-      await fsp.mkdir(join(this.cacheDir, ".."), { recursive: true, mode: 0o700 });
-      await fsp.mkdir(this.cacheDir, { recursive: true, mode: 0o700 });
-      await fsp.chmod(this.cacheDir, 0o700);
-      const tmp = join(this.cacheDir, `.${name}.${randomUUID()}.tmp`);
-      await fsp.writeFile(tmp, JSON.stringify(e), { mode: 0o600 });
-      await fsp.rename(tmp, join(this.cacheDir, `${name}.json`));
+      const parent = join(this.cacheDir, "..");
+      await fsp.mkdir(parent, { recursive: true, mode: 0o700 });
+      if (!(await this.realDir(parent))) return;
+      await fsp.mkdir(this.cacheDir, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "EEXIST") throw err;
+      });
+      // Never chmod or write through a symlink planted in place of the cache directory.
+      if (!(await this.realDir(this.cacheDir))) return;
+      if (process.platform !== "win32") await fsp.chmod(this.cacheDir, 0o700);
+      await writeFileAtomic(join(this.cacheDir, `${name}.json`), JSON.stringify(e), { mode: 0o600 });
     } catch {
       // The cache is an optimisation: a read-only or full disk only costs a repeat lookup.
     }
@@ -224,7 +272,7 @@ export class HttpClient {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
       try {
-        res = await this.fetchFollowingRedirects(url);
+        res = await this.fetchFollowingRedirects(url, AbortSignal.timeout(this.attemptTimeoutMs));
       } catch (e) {
         if (e instanceof LookupHttpError) throw e; // refused redirect or oversized body: not retryable
         lastError = new LookupHttpError(`The metadata service could not be reached: ${e instanceof Error ? e.message : String(e)}`);
@@ -240,7 +288,7 @@ export class HttpClient {
     throw lastError!;
   }
 
-  private async fetchFollowingRedirects(url: string): Promise<{ status: number; body: string | null; retryAfter?: string }> {
+  private async fetchFollowingRedirects(url: string, signal: AbortSignal): Promise<{ status: number; body: string | null; retryAfter?: string }> {
     let current = new URL(url);
     for (let hop = 0; ; hop++) {
       await this.throttle(current.hostname);
@@ -248,6 +296,7 @@ export class HttpClient {
         method: "GET",
         headers: { "user-agent": this.userAgent, accept: "application/json, application/xml;q=0.9, */*;q=0.1" },
         dispatcher: this.dispatcher,
+        signal,
         headersTimeout: this.timeoutMs,
         bodyTimeout: this.timeoutMs,
       });

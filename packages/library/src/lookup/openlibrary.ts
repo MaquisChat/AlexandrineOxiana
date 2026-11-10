@@ -1,7 +1,7 @@
 /** Open Library: `https://openlibrary.org/isbn/{isbn}.json` (redirects to the edition) + author records. */
 import { toIsbn13, type Creator } from "@ao/core";
 import { clean, normalizeDate, parseName } from "../extract/names.js";
-import type { LookupContext, LookupResult } from "./context.js";
+import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
 
 interface Edition {
   title?: string;
@@ -18,7 +18,7 @@ const MAX_AUTHORS = 10;
 const AUTHOR_KEY = /^\/authors\/OL\d+A$/u;
 
 export async function openLibraryIsbn(isbn13: string, ctx: LookupContext): Promise<LookupResult | null> {
-  const opts = { ttlDays: 30, sensitive: ctx.sensitive };
+  const opts = { ttlDays: 30, sensitive: isSensitive(ctx) };
   const ed = await ctx.http.getJson<Edition>(`https://openlibrary.org/isbn/${isbn13}.json`, { ...opts, cacheKey: `openlibrary:isbn:${isbn13}` });
   const title = clean(ed?.title ?? "");
   if (!ed || !title) return null;

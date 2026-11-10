@@ -32,13 +32,14 @@ Both run on untrusted input and both can leak. A file can carry scripts, links t
   - Absolute paths and `..` entry names are refused.
   - A violation throws `UnsafeFileError` with a code.
   - EPUB metadata comes from the OPF (`dc:*`); DOCX metadata comes from `docProps/core.xml`.
+- **Linear-time scanning (R52):** markup is never matched with backtracking patterns over whole documents. `extract/scan.ts` tokenises with `indexOf` and stops at the first unterminated tag, comment or quote, so hostile input such as 200,000 unclosed `<title>` tags stays linear. Metadata is read from at most the first 512 KB: the HTML head, the OPF, `core.xml` and LoC responses. DOCX and HTML text collection stops at 20,000 characters. Extracted text keeps single line breaks and at most one blank line.
 - **HTML:**
   - Parsed as text, with no DOM and no scripts. Nothing the page references is fetched.
   - Fields are taken in order of preference: Highwire `citation_*`, then Dublin Core, then OpenGraph, then `<title>`.
 - **MOBI and AZW3:** the PalmDB header and record 0 are parsed directly, using EXTH 100 (author), 503 (title), 104 (ISBN), 106 (date) and 524 (language). Every offset and length is checked against the bytes read, and record counts are bounded.
 - **Images and video (exiftool-vendored):**
   - Uses one process pool per process, ended by `shutdownExtractors()`.
-  - **Capture time:** DateTimeOriginal, then CreateDate, then QuickTime CreationDate or MediaCreateDate, then ModifyDate as a last resort. ModifyDate is needed because files straight from a camera, such as the test DNG, carry only IFD0 DateTime.
+  - **Capture time:** DateTimeOriginal, then CreateDate, then QuickTime CreationDate or MediaCreateDate, then ModifyDate as a last resort. ModifyDate is needed because files straight from a camera, such as the test DNG, carry only IFD0 DateTime. `capturedAtSource` (`original`, `created` or `modified`) says which one was used; `modified` must be treated as unverified, not as a capture time.
   - **Time zone:** `tzOffset` comes only from OffsetTimeOriginal, or from an explicit zone on the QuickTime creation date. Nothing is inferred from GPS.
   - **Other fields:** device (Make + Model), lens (LensModel), and ContentIdentifier for Live Photo pairing.
   - GPS stays raw here. Coarsening and stripping are governed where files are stored and exported.
@@ -47,10 +48,11 @@ Both run on untrusted input and both can leak. A file can carry scripts, links t
 
 - **Order:**
   - `lookupDoi`: Crossref, then OpenAlex.
-  - `lookupIsbn`: Open Library (the edition, then author records), then the Library of Congress.
+  - `lookupIsbn`: Open Library (the edition, then author records), then the Library of Congress. The LoC endpoint is plain HTTP, so it is **never used for sensitive (encrypted-project) lookups** (R52): it is skipped with a debug note, and an encrypted project loses that ISBN fallback.
   - `searchTitle`: OpenAlex search.
 - **Governance (R14, R50):**
   - Every call takes a `LookupContext`: the project id, its effective policy, the actor, the time zone and clock, and `sensitive`.
+  - `sensitive` fails closed: anything but an explicit `false` counts as sensitive, so a context built by hand without it never writes to the disk cache and never uses LoC. `lookupContextFor` sets it from the project's encryption.
   - `lookupContextFor(repo, projectId, http)` builds this context from the repository.
   - Before each provider is asked, the lookup calls `evaluate({action:'process', process:{op:'metadata_lookup', provider}})`.
   - A denied provider is skipped with a debug note and the next one is tried; a deny is never an error.
@@ -60,13 +62,16 @@ Both run on untrusted input and both can leak. A file can carry scripts, links t
   - **User-Agent:** `AlexandrineOxiana/<version> (+https://github.com/maquiscatta-sys/AlexandrineOxiana)`. The user's contact email is added as `; mailto:<email>` only when it is set in settings, and only if it is a plain address.
   - **Rate limits per host:** Crossref 5/s, OpenAlex 5/s, Open Library 1/s, LoC 1/s, and 1/s for any other host.
   - **Retries:** 3 retries on 429, 5xx or network errors. The backoff is 0.5 s, 1 s, then 2 s, or the server's Retry-After, capped at 60 s.
+  - **Deadline:** each attempt, redirects and body included, is aborted after 60 s (`AbortSignal.timeout`).
   - **Redirects:** followed only within the same origin, at most 3 times.
   - **Responses:** bodies are capped at 5 MB.
 - **Cache:**
   - Stored in `<Library>/.cache/lookups/<sha256(cacheKey)>.json`. The directory is 0700 and the files are 0600, written atomically.
-  - Entries are kept for 30 days and cover 200 and 404 responses.
+  - Answers (200) are kept for 30 days; not-found answers (404/410) for 1 day. An entry whose stored time is in the future counts as expired.
+  - On JSON paths, a 200 response is cached only if it parses as JSON.
+  - Files are written with the library's atomic writer (mode 0600). A symlink in place of the cache directory is refused: nothing is read or written through it, and it is never chmodded.
   - An entry holds only the time it was stored, the status and the body. It never holds the URL, the request headers or the contact email.
-  - Lookups for an encrypted project (`sensitive: true`) are cached in memory only.
+  - Lookups for an encrypted project (`sensitive: true`) are cached in memory only. `HttpClient.purgeSensitive()` drops them; it must be called when an encrypted project is locked (wiring belongs to Task 22/30).
 
 ### Endpoints
 

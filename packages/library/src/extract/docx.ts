@@ -1,11 +1,45 @@
 /** DOCX: `docProps/core.xml` (dc:title, dc:creator, dcterms:created, dc:language) and the body text. */
-import { decodeEntities, clean, normalizeDate, parseNameList } from "./names.js";
+import { cleanText, decodeEntities, normalizeDate, parseNameList } from "./names.js";
 import { dcValues } from "./epub.js";
+import { tokens, tagIs } from "./scan.js";
 import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 import { openZip } from "./zip.js";
 
-const MAX_CORE_BYTES = 1024 * 1024;
+/** core.xml is metadata: only its first 512 KB is read (R52). */
+const MAX_CORE_BYTES = 512 * 1024;
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Paragraph text of WordprocessingML in one linear pass (`<w:t>` runs, `<w:tab/>`, `<w:br/>`),
+ * stopping once MAX_TEXT_CHARS characters have been collected. Unclosed elements simply end the scan.
+ */
+export function docxText(xml: string): string {
+  const paragraphs: string[] = [];
+  let current = "";
+  let inText = false;
+  let total = 0;
+  const flush = () => {
+    if (current.trim()) paragraphs.push(current);
+    current = "";
+  };
+  for (const t of tokens(xml)) {
+    if (total >= MAX_TEXT_CHARS) break;
+    if (t.kind === "text") {
+      if (inText) {
+        const s = decodeEntities(t.text);
+        current += s;
+        total += s.length;
+      }
+      continue;
+    }
+    if (tagIs(t, "w:t")) inText = !t.end && !t.self;
+    else if (tagIs(t, "w:tab") && !t.end) current += " ";
+    else if (tagIs(t, "w:br") && !t.end) current += "\n";
+    else if (tagIs(t, "w:p") && (t.end || t.self)) flush();
+  }
+  flush();
+  return cleanText(paragraphs.join("\n")).slice(0, MAX_TEXT_CHARS);
+}
 
 export async function extractDocx(path: string): Promise<RawExtract> {
   const zip = await openZip(path);
@@ -25,17 +59,8 @@ export async function extractDocx(path: string): Promise<RawExtract> {
     }
     const doc = (await zip.read("word/document.xml", MAX_DOCUMENT_BYTES))?.toString("utf8");
     if (doc) {
-      const paragraphs: string[] = [];
-      let length = 0;
-      for (const p of doc.matchAll(/<w:p\b[^>]*>([\s\S]*?)<\/w:p>/gu)) {
-        const runs = [...p[1]!.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>|<w:tab\s*\/>|<w:br\s*\/>/gu)].map((r) => (r[1] !== undefined ? decodeEntities(r[1]) : " "));
-        const t = clean(runs.join(""));
-        if (!t) continue;
-        paragraphs.push(t);
-        length += t.length + 1;
-        if (length >= MAX_TEXT_CHARS) break;
-      }
-      if (paragraphs.length) out.text = paragraphs.join("\n");
+      const text = docxText(doc);
+      if (text) out.text = text;
     }
     return out;
   } finally {

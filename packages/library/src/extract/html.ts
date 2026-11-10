@@ -1,22 +1,17 @@
 /**
  * HTML: Highwire `citation_*`, then Dublin Core, then OpenGraph, then `<title>`. The page is
- * parsed as text with regular expressions: no DOM, no scripts, and nothing it references
- * (scripts, styles, images, frames, refresh targets) is ever fetched.
+ * scanned as text in linear time (scan.ts): no DOM, no scripts, and nothing it references
+ * (scripts, styles, images, frames, refresh targets) is ever fetched. Metadata is read from the
+ * first 512 KB only; body text stops once enough has been collected.
  */
 import * as fsp from "node:fs/promises";
 import type { Creator } from "@ao/core";
 import { clean, decodeEntities, markupToText, normalizeDate, parseName } from "./names.js";
-import type { RawExtract } from "./types.js";
+import { attrPairs, attrValue, textOf, tokens } from "./scan.js";
+import { MAX_TEXT_CHARS, type RawExtract } from "./types.js";
 
 const MAX_HTML_BYTES = 16 * 1024 * 1024;
-
-function attrs(tag: string): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const m of tag.matchAll(/([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/gu)) {
-    out.set(m[1]!.toLowerCase(), decodeEntities(m[2] ?? m[3] ?? m[4] ?? ""));
-  }
-  return out;
-}
+export const MAX_METADATA_SCAN = 512 * 1024;
 
 export async function extractHtml(path: string): Promise<RawExtract> {
   const fh = await fsp.open(path, "r");
@@ -29,20 +24,34 @@ export async function extractHtml(path: string): Promise<RawExtract> {
     await fh.close();
   }
 
+  // One linear pass over the first 512 KB: <meta>, <html lang>, the first complete <title>, <body>.
+  const head = html.slice(0, MAX_METADATA_SCAN);
   const meta = new Map<string, string[]>();
-  for (const m of html.matchAll(/<meta\b([^>]*)>/giu)) {
-    const a = attrs(m[1]!);
-    const key = (a.get("name") ?? a.get("property") ?? "").toLowerCase();
-    const content = clean(a.get("content") ?? "");
-    if (!key || !content) continue;
-    meta.set(key, [...(meta.get(key) ?? []), content]);
+  let lang: string | undefined;
+  let docTitle: string | undefined;
+  let titleOpen = -1;
+  let bodyAt = -1;
+  for (const t of tokens(head)) {
+    if (t.kind !== "tag") continue;
+    if (t.local === "meta" && !t.end) {
+      const a = new Map(attrPairs(t.attrs));
+      const key = (a.get("name") ?? a.get("property") ?? "").toLowerCase();
+      const content = clean(decodeEntities(a.get("content") ?? ""));
+      if (key && content) meta.set(key, [...(meta.get(key) ?? []), content]);
+    } else if (t.local === "html" && !t.end && lang === undefined) {
+      lang = attrValue(t.attrs, "lang");
+    } else if (t.local === "title" && docTitle === undefined) {
+      if (!t.end && !t.self) titleOpen = t.stop;
+      else if (t.end && titleOpen >= 0) docTitle = clean(decodeEntities(textOf(head.slice(titleOpen, t.start))));
+    } else if (t.local === "body" && !t.end && bodyAt < 0) {
+      bodyAt = t.start;
+    }
   }
   const first = (...keys: string[]) => keys.map((k) => meta.get(k)?.[0]).find((v) => v);
   const list = (...keys: string[]) => keys.map((k) => meta.get(k) ?? []).find((v) => v.length) ?? [];
 
   const out: RawExtract = {};
-  const docTitle = /<title\b[^>]*>([\s\S]*?)<\/title>/iu.exec(html)?.[1];
-  const title = first("citation_title", "dc.title", "dcterms.title", "og:title") ?? (docTitle ? clean(decodeEntities(docTitle)) : undefined);
+  const title = first("citation_title", "dc.title", "dcterms.title", "og:title") ?? (docTitle || undefined);
   if (title) out.title = title;
 
   let creators = list("citation_author").map((n) => parseName(n));
@@ -56,8 +65,8 @@ export async function extractHtml(path: string): Promise<RawExtract> {
   );
   if (issued) out.issued = issued;
 
-  const lang = first("citation_language", "dc.language", "dcterms.language") ?? attrs(/<html\b([^>]*)>/iu.exec(html)?.[1] ?? "").get("lang");
-  if (lang) out.language = clean(lang);
+  const language = first("citation_language", "dc.language", "dcterms.language") ?? (lang ? clean(decodeEntities(lang)) : undefined);
+  if (language) out.language = language;
 
   const dois = [...list("citation_doi"), ...list("dc.identifier", "dcterms.identifier").filter((v) => /10\.\d{4,9}\//u.test(v))].map((d) =>
     d.replace(/^(?:doi:\s*|https?:\/\/(?:dx\.)?doi\.org\/)/iu, ""),
@@ -65,8 +74,8 @@ export async function extractHtml(path: string): Promise<RawExtract> {
   const isbns = list("citation_isbn");
   if (dois.length || isbns.length) out.ids = { dois, isbns };
 
-  const body = /<body\b[\s\S]*/iu.exec(html)?.[0] ?? html.replace(/<head\b[\s\S]*?<\/head>/iu, " ");
-  const text = markupToText(body);
+  // Body text (head-only elements are skipped by markupToText when there is no <body>).
+  const text = markupToText(bodyAt >= 0 ? html.slice(bodyAt) : html, MAX_TEXT_CHARS);
   if (text) out.text = text;
   return out;
 }

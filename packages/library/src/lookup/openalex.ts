@@ -1,7 +1,7 @@
 /** OpenAlex: `https://api.openalex.org/works/doi:{doi}` and title search. */
 import type { SourceType } from "@ao/core";
 import { clean, normalizeDate, parseName } from "../extract/names.js";
-import type { LookupContext, LookupResult } from "./context.js";
+import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
 import { encodeDoi } from "./crossref.js";
 
 interface OpenAlexWork {
@@ -54,7 +54,7 @@ export async function openAlexWork(doi: string, ctx: LookupContext): Promise<Loo
   const w = await ctx.http.getJson<OpenAlexWork>(`https://api.openalex.org/works/doi:${encodeDoi(doi)}`, {
     cacheKey: `openalex:doi:${doi}`,
     ttlDays: 30,
-    sensitive: ctx.sensitive,
+    sensitive: isSensitive(ctx),
   });
   return w ? mapOpenAlex(w) : null;
 }
@@ -66,7 +66,7 @@ export async function openAlexSearch(title: string, creator: string | undefined,
   const res = await ctx.http.getJson<{ results?: OpenAlexWork[] }>(url, {
     cacheKey: `openalex:search:${q.toLowerCase()}`,
     ttlDays: 30,
-    sensitive: ctx.sensitive,
+    sensitive: isSensitive(ctx),
   });
   return (res?.results ?? []).map(mapOpenAlex).filter((r): r is LookupResult => r !== null);
 }

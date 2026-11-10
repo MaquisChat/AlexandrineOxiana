@@ -1,7 +1,7 @@
 /** Crossref REST API: `https://api.crossref.org/works/{doi}`. */
 import { toIsbn13, type Creator, type SourceType } from "@ao/core";
 import { clean } from "../extract/names.js";
-import type { LookupContext, LookupResult } from "./context.js";
+import { isSensitive, type LookupContext, type LookupResult } from "./context.js";
 
 interface CrossrefPerson {
   given?: string;
@@ -45,13 +45,15 @@ const TYPES: Record<string, SourceType> = {
 /** Path-encodes a DOI but keeps its slashes readable (Crossref and OpenAlex accept both). */
 export const encodeDoi = (doi: string) => encodeURIComponent(doi).replace(/%2F/giu, "/");
 
+/** Crossref date-parts to EDTF-lite; parts stop at the first missing one ([[2020, null, 5]] → "2020"). */
 export function datePartsToEdtf(dp: Array<Array<number | null>> | undefined): string | undefined {
-  const parts = dp?.[0]?.filter((n): n is number => typeof n === "number" && Number.isFinite(n));
-  if (!parts?.length || parts[0]! < 1000) return undefined;
-  return parts
-    .slice(0, 3)
-    .map((n, i) => (i === 0 ? String(n) : String(n).padStart(2, "0")))
-    .join("-");
+  const parts: number[] = [];
+  for (const n of (dp?.[0] ?? []).slice(0, 3)) {
+    if (typeof n !== "number" || !Number.isInteger(n)) break;
+    parts.push(n);
+  }
+  if (!parts.length || parts[0]! < 1000) return undefined;
+  return parts.map((n, i) => (i === 0 ? String(n) : String(n).padStart(2, "0"))).join("-");
 }
 
 function people(list: CrossrefPerson[] | undefined, role: Creator["role"]): Creator[] {
@@ -89,7 +91,7 @@ export async function crossrefWork(doi: string, ctx: LookupContext): Promise<Loo
   const res = await ctx.http.getJson<{ message?: CrossrefWork }>(`https://api.crossref.org/works/${encodeDoi(doi)}`, {
     cacheKey: `crossref:doi:${doi}`,
     ttlDays: 30,
-    sensitive: ctx.sensitive,
+    sensitive: isSensitive(ctx),
   });
   return res?.message ? mapCrossref(res.message, doi) : null;
 }
