@@ -175,6 +175,8 @@ export interface CopyOptions {
    * the decoded content.
    */
   decode?: (r: Readable) => Readable;
+  /** Open the source with O_NOFOLLOW where the platform has it: a symbolic link there fails (ELOOP). */
+  noFollow?: boolean;
   /** POSIX permission bits for `dest`, e.g. 0o600. Ignored on Windows. */
   mode?: number;
 }
@@ -192,10 +194,19 @@ export async function copyFileAtomic(
   // Open the temp file first so that every stream below gets its error
   // listeners attached synchronously, before any error can be emitted.
   const tmp = tempPathFor(dest);
-  let fh: fsp.FileHandle | undefined = await fsp.open(tmp, "wx", opts.mode);
+  // With noFollow, the source is opened first, without following a link at its path (ELOOP).
+  const nf = opts.noFollow ? fs.constants.O_NOFOLLOW : undefined;
+  const srcFh = nf ? await fsp.open(src, fs.constants.O_RDONLY | nf) : undefined;
+  let fh: fsp.FileHandle | undefined;
+  try {
+    fh = await fsp.open(tmp, "wx", opts.mode);
+  } catch (err) {
+    await srcFh?.close().catch(() => {});
+    throw err;
+  }
   const hash = createHash("sha256");
   let bytes = 0;
-  const raw = createReadStream(src);
+  const raw = srcFh ? srcFh.createReadStream() : createReadStream(src);
   const source: Readable = opts.decode ? opts.decode(raw) : raw;
   if (source !== raw) raw.on("error", (err) => source.destroy(err));
   const hasher = new Transform({

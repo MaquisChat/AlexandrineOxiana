@@ -37,18 +37,22 @@ function itemLabel(key: string): string {
 }
 
 /** Export and Calibre keys: `<file or folder name>@<12 hex>#<citation key | @n | book-id>`. */
-const EXPORT_KEY = /@[0-9a-f]{12}#(.*)$/su;
+const EXPORT_KEY_MARK = /@[0-9a-f]{12}#/gu;
 
 /**
  * The name an item has in a report (R68). Export and Calibre items: the citation key (or "item N",
- * "book-N") with the first 8 hex of the item's HMAC (the provenance `import-item` value), never the
- * export's name or path hash. Other items: their key (a path relative to the import's root).
+ * "book-N") after the LAST `@<12 hex>#` (a file name containing that pattern cannot inject a label,
+ * R70), with the first 8 hex of the item's HMAC (the provenance `import-item` value); never the
+ * export's name or path hash. `secret` null: no tag (the dry run, which has no batch secret yet).
+ * Other items: their key (a path relative to the import's root).
  */
-export function reportLabel(key: string, secret: string | undefined): string {
-  const m = EXPORT_KEY.exec(key);
-  if (!m) return itemLabel(key);
-  const tail = m[1] ?? "";
+export function reportLabel(key: string, secret: string | null | undefined): string {
+  let end = -1;
+  for (const m of key.matchAll(EXPORT_KEY_MARK)) end = m.index + m[0].length;
+  if (end < 0) return itemLabel(key);
+  const tail = key.slice(end);
   const name = !tail ? "export" : tail.startsWith("@") ? `item ${tail.slice(1).split("~")[0]}` : tail;
+  if (secret === null) return name;
   const tag = (secret ? itemKeyHash(secret, key) : createHash("sha256").update(key).digest("hex")).slice(0, 8);
   return `${name} (${tag})`;
 }

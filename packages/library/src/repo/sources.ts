@@ -44,6 +44,8 @@ export interface SourceInputFile {
   /** MIME type, e.g. the sniffed one (default: from the extension). */
   mime?: string;
   metadata?: Asset["metadata"];
+  /** Copy without following a symbolic link at `path` (Bulk Import passes checked real paths, R70). */
+  noFollow?: boolean;
 }
 
 export interface CreateSourceOptions {
@@ -383,7 +385,7 @@ async function writeNewSource(
       linked = { absolutePath: abs, libraryRelativePath: rel };
     } else {
       if (f.encrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
-      content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode, ...(f.encrypted ? { sourceEncrypted: true } : {}) });
+      content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode, ...(f.encrypted ? { sourceEncrypted: true } : {}), ...(f.noFollow ? { noFollow: true } : {}) });
     }
     const asset: Asset = {
       id: assetId,

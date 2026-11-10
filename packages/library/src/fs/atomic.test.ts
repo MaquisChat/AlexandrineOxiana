@@ -122,6 +122,16 @@ describe("atomic file writes", () => {
       expect((await readdir(dir)).sort()).toEqual(["dest.bin", "src.bin"]);
     });
 
+    it.skipIf(process.platform === "win32")("noFollow refuses a source that is a symbolic link (R70) and leaves no temp file", async () => {
+      const target = join(dir, "target.bin");
+      await writeFile(target, "secret");
+      const link = join(dir, "link.bin");
+      await realFs.symlink(target, link);
+      await expect(copyFileAtomic(link, join(dir, "dest.bin"), { noFollow: true })).rejects.toMatchObject({ code: "ELOOP" });
+      expect((await readdir(dir)).sort()).toEqual(["link.bin", "target.bin"]);
+      expect(await copyFileAtomic(target, join(dir, "ok.bin"), { noFollow: true })).toEqual({ sha256: sha256(Buffer.from("secret")), bytes: 6 });
+    });
+
     it("with a transform, hashes the source plaintext and writes the transformed bytes", async () => {
       const src = join(dir, "plain.txt");
       const dest = join(dir, "plain.txt.enc");

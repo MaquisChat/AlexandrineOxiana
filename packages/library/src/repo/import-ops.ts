@@ -20,7 +20,7 @@ export interface ImportOps {
   writeSource(before: SourceFile | null, sf: SourceFile): Promise<void>;
   deleteSource(id: string): Promise<SourceFile>;
   /** Copies a file into the source's `original/` folder as a further original; returns the asset (not yet written to the source). */
-  copyOriginal(sf: SourceFile, input: { fromPath: string; kind: string; ext: string; mime?: string; label: string; fromEncrypted?: boolean }): Promise<Asset>;
+  copyOriginal(sf: SourceFile, input: { fromPath: string; kind: string; ext: string; mime?: string; label: string; fromEncrypted?: boolean; noFollow?: boolean }): Promise<Asset>;
   /** Trashes one asset's file (a copied file inside the source folder; never a linked original). */
   trashAssetFile(a: Asset): Promise<void>;
   reviewEntries(): Promise<ReviewEntry[]>;
@@ -78,6 +78,7 @@ export function runImportChange<T>(
             encrypt: tx.encrypted,
             mode: fileMode(core, st, sf.source.provenance.identifiable),
             ...(input.fromEncrypted ? { sourceEncrypted: true } : {}),
+            ...(input.noFollow ? { noFollow: true } : {}),
           });
           return Asset.parse({
             id: newId(),

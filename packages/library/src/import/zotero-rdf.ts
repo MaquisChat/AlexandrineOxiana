@@ -24,6 +24,7 @@ import type { Creator, SourceType } from "@ao/core";
 import type { ImportSourceAdapter } from "./bulk/scan.js";
 import {
   ExportUnreadable,
+  MAX_EXPORT_RECORDS,
   REFMAN_REASONS,
   doiOf,
   exportAdapter,
@@ -52,6 +53,11 @@ export const RDF_REASONS = {
 
 const MAX_DEPTH = 256;
 const MAX_ATTRS = 256;
+/**
+ * Before a DOM is built (R70): top-level nodes ≤ MAX_EXPORT_RECORDS and elements in all ≤ 500,000
+ * (an xmldom element with its text costs about 1 KB, so this keeps a parse within a few hundred MB).
+ */
+const MAX_ELEMENTS = 500_000;
 const MAX_COLLECTION_DEPTH = 64;
 const CALL_NUMBERS = new Set(["LCC", "DDC", "UDC"]);
 const MAX_ABOUT_KEY = 256;
@@ -72,6 +78,8 @@ export function prescanXml(src: string): string | undefined {
   if (/<!\s*(?:doctype|entity)/iu.test(src)) return RDF_REASONS.declaration;
   let i = 0;
   let depth = 0;
+  let elements = 0;
+  let top = 0;
   const n = src.length;
   for (;;) {
     const lt = src.indexOf("<", i);
@@ -134,6 +142,9 @@ export function prescanXml(src: string): string | undefined {
       if (j >= n) return bad;
       j++;
       if (++attrs > MAX_ATTRS) return bad;
+    }
+    if (!end) {
+      if (++elements > MAX_ELEMENTS || (depth === 1 && ++top > MAX_EXPORT_RECORDS)) return REFMAN_REASONS.tooMany;
     }
     if (end) depth--;
     else if (!self && ++depth > MAX_DEPTH) return bad;

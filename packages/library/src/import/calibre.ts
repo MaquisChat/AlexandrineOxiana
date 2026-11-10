@@ -71,7 +71,9 @@ export async function copyCalibreDb(libraryDir: string, workDir: string): Promis
     const dest = join(dir, "metadata.db");
     await fsp.copyFile(src, dest);
     if (wal?.isFile()) await fsp.copyFile(`${src}-wal`, `${dest}-wal`);
-    if ((await fsp.stat(dest)).size > MAX_CALIBRE_DB_BYTES) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge); // grew while copied
+    // The originals may have grown while they were copied: the copies are what is opened.
+    const copied = (await fsp.stat(dest)).size + ((await fsp.stat(`${dest}-wal`).catch(() => null))?.size ?? 0);
+    if (copied > MAX_CALIBRE_DB_BYTES) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
     return { path: dest, remove };
   } catch (err) {
     await remove();
@@ -95,9 +97,28 @@ interface CalibreBook {
   files: Array<string | null>;
 }
 
-/** The names sqlite_master lists as real tables (views, triggers and the like are not). */
-const realTables = (db: Database.Database) =>
-  new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name));
+/**
+ * The names sqlite_master lists as plain tables: views, virtual tables (CREATE VIRTUAL TABLE, run
+ * by a module) and tables with generated columns (computed on read, e.g. a printf() that builds a
+ * gigabyte string; PRAGMA table_xinfo hidden 2 or 3) are left out, so a required one is refused.
+ */
+function plainTables(db: Database.Database): Set<string> {
+  const rows = db.prepare("SELECT name, substr(sql, 1, 64) AS head FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string; head: string | null }>;
+  const out = new Set<string>();
+  for (const r of rows) {
+    if (/^\s*create\s+virtual\b/iu.test(r.head ?? "")) continue;
+    out.add(r.name);
+  }
+  for (const t of [...REQUIRED_TABLES, "publishers", "books_publishers_link"]) {
+    if (!out.has(t)) continue;
+    const cols = db.prepare("SELECT hidden FROM pragma_table_xinfo(?)").all(t) as Array<{ hidden: number }>;
+    if (cols.some((c) => c.hidden === 2 || c.hidden === 3)) out.delete(t);
+  }
+  return out;
+}
+
+/** A text column read at most 64 KB long (SQL side, so a huge value is never built). */
+const t64 = (col: string, as: string) => `substr(${col}, 1, 65536) AS ${as}`;
 
 /**
  * Reads every book from a (copied) metadata.db. Every name read must be a real table (a view named
@@ -110,7 +131,7 @@ function readBooks(dbPath: string): CalibreBook[] {
   try {
     db.pragma("trusted_schema = OFF");
     db.pragma("query_only = ON");
-    const tables = realTables(db);
+    const tables = plainTables(db);
     for (const t of REQUIRED_TABLES) if (!tables.has(t)) throw new CalibreUnreadable(CALIBRE_REASONS.unreadable);
     const rows = <T>(sql: string, max: number): T[] => {
       const out: T[] = [];
@@ -120,7 +141,7 @@ function readBooks(dbPath: string): CalibreBook[] {
       }
       return out;
     };
-    const books = rows<BookRow>("SELECT id, title, path, pubdate, uuid FROM books ORDER BY id", MAX_BOOKS);
+    const books = rows<BookRow>(`SELECT id, ${t64("title", "title")}, ${t64("path", "path")}, ${t64("pubdate", "pubdate")}, ${t64("uuid", "uuid")} FROM books ORDER BY id`, MAX_BOOKS);
     const group = <T>(list: Array<{ book: number } & T>) => {
       const m = new Map<number, T[]>();
       for (const r of list) {
@@ -130,13 +151,13 @@ function readBooks(dbPath: string): CalibreBook[] {
       }
       return m;
     };
-    const authors = group(rows<{ book: number; name: string }>("SELECT l.book AS book, a.name AS name FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.book, l.id", MAX_LINK_ROWS));
-    const ids = group(rows<{ book: number; type: string; val: string }>("SELECT book, type, val FROM identifiers ORDER BY book, id", MAX_LINK_ROWS));
-    const tags = group(rows<{ book: number; name: string }>("SELECT l.book AS book, t.name AS name FROM books_tags_link l JOIN tags t ON t.id = l.tag ORDER BY l.book, l.id", MAX_LINK_ROWS));
-    const data = group(rows<{ book: number; format: string; name: string }>("SELECT book, format, name FROM data ORDER BY book, id", MAX_LINK_ROWS));
+    const authors = group(rows<{ book: number; name: string }>(`SELECT l.book AS book, ${t64("a.name", "name")} FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.book, l.id`, MAX_LINK_ROWS));
+    const ids = group(rows<{ book: number; type: string; val: string }>(`SELECT book, ${t64("type", "type")}, ${t64("val", "val")} FROM identifiers ORDER BY book, id`, MAX_LINK_ROWS));
+    const tags = group(rows<{ book: number; name: string }>(`SELECT l.book AS book, ${t64("t.name", "name")} FROM books_tags_link l JOIN tags t ON t.id = l.tag ORDER BY l.book, l.id`, MAX_LINK_ROWS));
+    const data = group(rows<{ book: number; format: string; name: string }>(`SELECT book, ${t64("format", "format")}, ${t64("name", "name")} FROM data ORDER BY book, id`, MAX_LINK_ROWS));
     const publishers =
       tables.has("books_publishers_link") && tables.has("publishers")
-        ? group(rows<{ book: number; name: string }>("SELECT l.book AS book, p.name AS name FROM books_publishers_link l JOIN publishers p ON p.id = l.publisher ORDER BY l.book, l.id", MAX_LINK_ROWS))
+        ? group(rows<{ book: number; name: string }>(`SELECT l.book AS book, ${t64("p.name", "name")} FROM books_publishers_link l JOIN publishers p ON p.id = l.publisher ORDER BY l.book, l.id`, MAX_LINK_ROWS))
         : new Map<number, Array<{ name: string }>>();
 
     return books.map((b): CalibreBook => {

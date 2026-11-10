@@ -110,6 +110,7 @@ export const ENGINE_FILE_NOTES = {
   unsupported: "attached file type not supported",
   vanished: "attached file no longer present",
   sameFile: "same file as another item in this batch",
+  changed: "attached file changed during import",
 } as const;
 
 export const REASONS = {
@@ -117,6 +118,7 @@ export const REASONS = {
   unsupported: "This kind of file cannot be imported. Import PDFs, EPUB or Kindle books, Word documents, images, audio or video.",
   unreadable: "The file could not be read; it may be damaged or protected with a password.",
   unsafe: "This file could not be opened safely, so it was not imported.",
+  changed: "The file changed during the import, so it was not imported.",
   failed: "The item could not be imported.",
   duplicateFile: "The same file is already in the project.",
   duplicateId: "A source with the same DOI or ISBN is already in the project.",
@@ -634,6 +636,8 @@ class Run {
     // a note; the item imports with the rest (metadata-only if none). An item with no reference
     // metadata (a plain file from a folder) has nothing else, so it fails as before.
     const kept: ScanItem["files"] = [];
+    /** The primary file's path as found (its name, and its sidecars, are where the item was found). */
+    const names: string[] = [];
     const dropped: Array<{ note: string; reason: string }> = [];
     for (const f of item.files) {
       const st = await fsp.stat(f.path).catch(() => null);
@@ -641,8 +645,10 @@ class Run {
         dropped.push({ note: ENGINE_FILE_NOTES.vanished, reason: REASONS.missing });
         continue;
       }
-      const real = await fsp.realpath(f.path).catch(() => resolve(f.path));
-      if (this.outside && !(await this.outside.check(f.path)).ok) {
+      // From here on the file is read through its checked real path (R70 I-2).
+      const checked = this.outside ? await this.outside.check(f.path) : { real: await fsp.realpath(f.path).catch(() => resolve(f.path)), ok: true };
+      const real = checked.real;
+      if (!checked.ok) {
         dropped.push({ note: OUTSIDE_NOTE, reason: OUTSIDE_REASON });
         continue;
       }
@@ -651,18 +657,19 @@ class Run {
         dropped.push({ note: ENGINE_FILE_NOTES.sameFile, reason: REASONS.duplicateFile });
         continue;
       }
-      const type = await fileTypeFromFile(f.path).catch(() => undefined);
+      const type = await fileTypeFromFile(real).catch(() => undefined);
       const stored = type ? acceptedType(type) : undefined;
       if (!type || !stored) {
         dropped.push({ note: ENGINE_FILE_NOTES.unsupported, reason: REASONS.unsupported });
         continue;
       }
       this.fileOwners.set(real, item.key);
-      kept.push(f);
+      kept.push({ ...f, path: real });
+      if (!names.length) names.push(f.path);
       if (!mime) mime = type.mime;
-      const sha = await sha256File(f.path);
+      const sha = await sha256File(real);
       shas.push(sha);
-      inputs.push({ path: f.path, role: "original", handling: opts.fileHandling === "link" && !fromArchive ? "link" : "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind });
+      inputs.push({ path: real, noFollow: true, role: "original", handling: opts.fileHandling === "link" && !fromArchive ? "link" : "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind });
     }
     // Same file → duplicate (whatever the duplicate policy).
     if (shas[0]) {
@@ -678,12 +685,12 @@ class Run {
       this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...dropped.map((d) => d.note)]);
     }
     const primaryFile = kept[0];
-    const name = primaryFile ? basename(primaryFile.path) : undefined;
+    const name = names[0] ? basename(names[0]) : undefined;
     let userParsedName;
     if (name && watchdog.active) userParsedName = (await watchdog.match(name)).parsed;
     const r = await resolveItem(
       {
-        ...(primaryFile ? { path: primaryFile.path, mime, sidecarPaths: await findSidecars(primaryFile.path), fileName: name } : {}),
+        ...(primaryFile ? { path: primaryFile.path, mime, sidecarPaths: await findSidecars(names[0]!), fileName: name } : {}),
         ...(item.referenceMetadata ? { referenceMetadata: item.referenceMetadata } : {}),
         ...(userParsedName ? { userParsedName } : {}),
       },
@@ -809,11 +816,44 @@ class Run {
   }
 
   /** Stores the queued group in one governed change; if that change is refused or fails, each item on its own. */
+  /**
+   * Re-checks an item's files right before they are stored (R70 I-2): each must still be a regular
+   * file at its checked real path (no link anywhere on the way now) and still allowed (R67); others
+   * are left out with a note. `fail`: nothing is left of a plain file item (no reference metadata).
+   * The copy itself opens the path with O_NOFOLLOW, so a last-moment swap of the file fails it.
+   */
+  private async revalidate(item: ScanItem, inputs: SourceInputFile[]): Promise<{ inputs: SourceInputFile[]; fail: boolean }> {
+    const kept: SourceInputFile[] = [];
+    let changed = 0;
+    for (const f of inputs) {
+      const r = await fsp.realpath(f.path).catch(() => null);
+      const st = r === f.path ? await fsp.lstat(f.path).catch(() => null) : null;
+      if (st?.isFile() && (!this.outside || (await this.outside.check(f.path)).ok)) kept.push(f);
+      else changed++;
+    }
+    if (!changed) return { inputs, fail: false };
+    if (!item.referenceMetadata && !kept.length) return { inputs: kept, fail: true };
+    this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...Array<string>(changed).fill(ENGINE_FILE_NOTES.changed)]);
+    return { inputs: kept, fail: false };
+  }
+
   private async flush(): Promise<void> {
-    const group = this.group;
-    if (!group.length) return;
+    const queued = this.group;
+    if (!queued.length) return;
     this.group = [];
     const dedupe = this.dedupe!;
+    const group: Queued[] = [];
+    for (const q of queued) {
+      const v = await this.revalidate(q.item, q.inputs);
+      if (v.fail) {
+        dedupe.dropPending([q.placeholder]);
+        this.latest.set(q.item.key, this.queue({ key: q.item.key, outcome: "failed", reason: REASONS.changed }));
+        continue;
+      }
+      q.inputs = v.inputs;
+      group.push(q);
+    }
+    if (!group.length) return;
     const flushLines = this.pending.length;
     const entries: JournalEntry[] = [];
     try {
@@ -865,7 +905,10 @@ class Run {
 
   /** Stores one new source in its own governed change. */
   private async createOne(q: Queued, dedupe: BatchDedupe): Promise<JournalEntry> {
-    const { item, r, inputs, draft, provenance, reviewItem } = q;
+    const v = await this.revalidate(q.item, q.inputs);
+    if (v.fail) return this.queue({ key: q.item.key, outcome: "failed", reason: REASONS.changed });
+    const { item, r, draft, provenance, reviewItem } = q;
+    const inputs = v.inputs;
     const outcome = reviewItem ? "needs-review" : "created";
     const flush = this.pending.length;
     let entry: JournalEntry | undefined;
@@ -918,6 +961,9 @@ class Run {
     method: Provenance["captureMethod"],
     dedupe: BatchDedupe,
   ): Promise<JournalEntry> {
+    const v = await this.revalidate(item, inputs);
+    if (v.fail) return this.queue({ key: item.key, outcome: "failed", reason: REASONS.changed });
+    inputs = v.inputs;
     const target = await this.repo.getSource(this.projectId, targetId);
     // Tags are found or created first (each its own change, recorded as the batch's for undo).
     const tagIds = await this.namedTags(item.tags);
@@ -944,7 +990,7 @@ class Run {
           if (have.has(sha)) continue;
           have.add(sha);
           if (f.handling === "link") added.push(await linkedAsset(repoLibrary(this.repo).root, f, targetId, sha));
-          else added.push(await ops.copyOriginal(cur, { fromPath: f.path, kind: f.kind!, ext: f.ext!, ...(f.mime ? { mime: f.mime } : {}), label: `${f.kind} added ${label}` }));
+          else added.push(await ops.copyOriginal(cur, { fromPath: f.path, kind: f.kind!, ext: f.ext!, ...(f.mime ? { mime: f.mime } : {}), label: `${f.kind} added ${label}`, ...(f.noFollow ? { noFollow: true } : {}) }));
         }
         const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, tx.at, tx.actor, tagIds);
         record = merged.record;
@@ -1171,7 +1217,7 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
         for (const x of item.files) {
           const c = await policy.check(x.path);
           if (c.ok) inside.push(x);
-          else summary.outsideFiles.push({ item: reportLabel(item.key, undefined), folder: dirname(c.real) });
+          else summary.outsideFiles.push({ item: reportLabel(item.key, null), folder: dirname(c.real) }); // no tag: no batch secret yet
         }
         item = { ...item, files: inside };
       }

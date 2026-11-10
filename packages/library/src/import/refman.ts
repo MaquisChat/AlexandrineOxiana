@@ -34,6 +34,8 @@ import type { ImportSourceAdapter, ScanFile, ScanItem } from "./bulk/scan.js";
 
 export const MAX_EXPORT_BYTES = 100 * 1024 * 1024;
 export const MAX_FIELD_CHARS = 64 * 1024;
+/** Records parsed from one export at most (R70); parsing stops as soon as it is passed. */
+export const MAX_EXPORT_RECORDS = 200_000;
 const MAX_TAGS = 100;
 const MAX_TAG_CHARS = 200;
 const MAX_FILES = 50;
@@ -47,6 +49,7 @@ export const FILE_NOTES = {
 } as const;
 
 export const REFMAN_REASONS = {
+  tooMany: "This export has too many references for one import; split it into smaller files.",
   encoding: "The export file is not in a text encoding that can be read (UTF-8 or UTF-16), so nothing was imported from it. Export it again as UTF-8.",
   empty: "The export file contains no references that could be read, so nothing was imported from it.",
   budget: "The export file's @string definitions or field values are too large to import safely, so nothing was imported from it.",
@@ -87,7 +90,8 @@ export function decodeExport(buf: Buffer, allowLegacy = false): { text: string; 
         s = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(buf);
       } catch (err) {
         if (!allowLegacy) throw err;
-        s = new TextDecoder("windows-1252").decode(buf);
+        const bom = buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+        s = new TextDecoder("windows-1252").decode(bom ? buf.subarray(3) : buf);
         legacy = true;
       }
     }
@@ -427,7 +431,11 @@ export function exportAdapter<R>(
       let records: R[];
       try {
         const { text, legacy } = decodeExport(await readExportBytes(path), allowLegacy);
-        records = [...parse(text)];
+        records = [];
+        for (const r of parse(text)) {
+          if (records.length >= MAX_EXPORT_RECORDS) throw new ExportUnreadable(REFMAN_REASONS.tooMany);
+          records.push(r);
+        }
         if (!records.length && text.trim()) throw new ExportUnreadable(REFMAN_REASONS.empty);
         if (legacy) ctx?.note?.(LEGACY_ENCODING_NOTE);
       } catch (err) {
@@ -1027,8 +1035,38 @@ const CSL_TYPES: Record<string, SourceType> = {
 
 type Json = Record<string, unknown>;
 
+/** JSON values (containers and comma-separated items) parsed from one CSL-JSON export at most. */
+const MAX_JSON_VALUES = 4_000_000;
+
+/**
+ * Before JSON.parse builds anything (R70): the number of top-level items (≤ MAX_EXPORT_RECORDS) and
+ * of values in all (≤ 4,000,000), counted by a linear scan that skips strings.
+ */
+function checkJsonSize(src: string): void {
+  let depth = 0;
+  let top = 0;
+  let values = 0;
+  for (let i = 0; i < src.length; i++) {
+    const c = src.charCodeAt(i);
+    if (c === 0x22) {
+      // a string: skip to its closing quote (escapes skipped)
+      for (i++; i < src.length && src.charCodeAt(i) !== 0x22; i++) if (src.charCodeAt(i) === 0x5c) i++;
+    } else if (c === 0x5b || c === 0x7b) {
+      if (depth === 1) top++;
+      depth++;
+      values++;
+    } else if (c === 0x5d || c === 0x7d) depth--;
+    else if (c === 0x2c) {
+      values++;
+      if (depth === 1) top++;
+    }
+    if (top > MAX_EXPORT_RECORDS || values > MAX_JSON_VALUES) throw new ExportUnreadable(REFMAN_REASONS.tooMany);
+  }
+}
+
 /** Items of a CSL-JSON export (an array, or one object). V8's JSON.parse is linear and non-recursive. */
 export function parseCslItems(src: string): Json[] {
+  checkJsonSize(src);
   const parsed = JSON.parse(src) as unknown;
   const list = Array.isArray(parsed) ? parsed : [parsed];
   return list.filter((x): x is Json => !!x && typeof x === "object" && !Array.isArray(x));

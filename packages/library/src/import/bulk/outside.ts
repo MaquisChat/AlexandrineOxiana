@@ -12,7 +12,7 @@
  * resumed batch honours the same approvals.
  */
 import * as fsp from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { itemKeyHash } from "./batch.js";
 
 export const OUTSIDE_NOTE = "attached file is outside the export's folder and was not approved";
@@ -23,7 +23,26 @@ export interface ApproveOutside {
   files?: string[];
 }
 
-const real = (p: string) => fsp.realpath(p).catch(() => resolve(p));
+/**
+ * The real path of `p`; for a path that does not exist (yet), the real path of its nearest existing
+ * parent with the rest appended (a work folder not yet created, under a library reached through a
+ * symbolic link, still compares equal to the files later found in it; R70).
+ */
+export async function real(p: string): Promise<string> {
+  const abs = resolve(p);
+  const rest: string[] = [];
+  for (let cur = abs; ; ) {
+    try {
+      const r = await fsp.realpath(cur);
+      return rest.length ? join(r, ...rest.reverse()) : r;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return abs;
+      rest.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
 
 const within = (folder: string, p: string) => {
   if (p === folder) return true;

@@ -110,6 +110,8 @@ export interface FileOptions {
   mode?: number;
   /** copyFile: the source is already in the project's encrypted format (decrypted on the way; hash of the plaintext). */
   sourceEncrypted?: boolean;
+  /** copyFile: open the source without following a symbolic link (O_NOFOLLOW where available). */
+  noFollow?: boolean;
 }
 
 export interface Tx {
@@ -242,9 +244,10 @@ class TxImpl implements Tx {
       const { key, keyId } = this.key();
       decode = (r) => r.pipe(decryptStream((id) => (id === keyId ? key : undefined)));
     }
-    if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode, ...(decode ? { decode } : {}) });
+    const nf = opts.noFollow ? { noFollow: true } : {};
+    if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}) });
     const { key, keyId } = this.key();
-    return copyFileAtomic(src, abs, { mode: opts.mode, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
+    return copyFileAtomic(src, abs, { mode: opts.mode, ...nf, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
   }
 
   async appendLine(rel: string, line: string, opts: { mode?: number } = {}): Promise<void> {

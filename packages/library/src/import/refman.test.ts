@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
-import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { buildCalibreLibrary } from "../../tests/fixtures/refman/calibre.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -21,10 +21,11 @@ import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
 import { projectCollectionsAndTags } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
-import { approvedFolders } from "./approved-folders.js";
-import { adapterFor, createBulkImport, folderAdapter, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
+import { approvedFolders, rememberApprovedFolders } from "./approved-folders.js";
+import { adapterFor, createBulkImport, folderAdapter, zipAdapter, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
+import { reportLabel } from "./bulk/report.js";
 import { CALIBRE_FILE_NOTE, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
-import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
+import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_EXPORT_RECORDS, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, exportIdentity, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/refman");
@@ -591,6 +592,97 @@ describe("review round 1: parser budgets and edge cases (R68)", () => {
   });
 });
 
+describe("review round 2 (R70)", () => {
+  const heapGrowth = async (fn: () => Promise<unknown>) => {
+    const before = process.memoryUsage().heapUsed;
+    let peak = before;
+    const timer = setInterval(() => (peak = Math.max(peak, process.memoryUsage().heapUsed)), 5);
+    try {
+      await fn();
+    } finally {
+      clearInterval(timer);
+    }
+    return Math.max(peak, process.memoryUsage().heapUsed) - before;
+  };
+  const TOO_MANY = /too many references for one import; split it into smaller files/;
+
+  it("C-1: an export over 200,000 records is refused early, without building every record", async () => {
+    const p = await writeExport("many.ris", "TY  - JOUR\nTI  - t\nER  - \n".repeat(300_000));
+    let items: ScanItem[] = [];
+    const t = performance.now();
+    const grew = await heapGrowth(async () => {
+      items = await collect(risAdapter(p));
+    });
+    expect(performance.now() - t).toBeLessThan(5000);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(TOO_MANY);
+    expect(grew).toBeLessThan(300 * MB);
+  });
+
+  it("C-1: the record cap applies to BibTeX, CSL-JSON and Zotero RDF too", async () => {
+    const bib = await writeExport("many.bib", "@misc{k, title={t}}\n".repeat(MAX_EXPORT_RECORDS + 1));
+    expect((await collect(bibtexAdapter(bib)))[0]!.unreadable).toMatch(TOO_MANY);
+    const csl = await writeExport("many.json", "[" + Array.from({ length: MAX_EXPORT_RECORDS + 1 }, () => '{"title":"t"}').join(",") + "]");
+    expect((await collect(cslJsonAdapter(csl)))[0]!.unreadable).toMatch(TOO_MANY);
+    const csl2 = await writeExport("deep.json", '[{"title":"t","x":[' + Array.from({ length: 5_000_000 }, () => "1").join(",") + "]}]");
+    expect((await collect(cslJsonAdapter(csl2)))[0]!.unreadable).toMatch(TOO_MANY);
+    const H = '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:bib="http://purl.org/net/biblio#">';
+    const rdf = await writeExport("many.rdf", H + '<bib:Book rdf:about="#x"><dc:title>t</dc:title></bib:Book>'.repeat(MAX_EXPORT_RECORDS + 1) + "</rdf:RDF>");
+    expect((await collect(zoteroRdfAdapter(rdf)))[0]!.unreadable).toMatch(TOO_MANY);
+  });
+
+  it("a UTF-8 BOM is stripped before the Windows-1252 fallback", async () => {
+    const ris = join(exp, "bom.ris");
+    await writeFile(ris, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("TY  - JOUR\nTI  - M", "latin1"), Buffer.from([0xfc]), Buffer.from("ller\nER  - \n", "latin1")]));
+    const items = await collect(risAdapter(ris));
+    expect(items.map(title)).toEqual(["Müller"]);
+  });
+
+  it("I-3: a Calibre table with a generated column is refused promptly", async () => {
+    const dir = join(tmp, "Gen Calibre");
+    const c = buildCalibreLibrary(dir, { pdf: pdfs["files/okafor2024feeding.pdf"]! });
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(c.db);
+    db.exec("ALTER TABLE tags RENAME TO tags_old; CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT GENERATED ALWAYS AS (printf('%.*c', 200000000, 'x')) VIRTUAL, link TEXT NOT NULL DEFAULT ''); INSERT INTO tags (id) VALUES (1), (2); DROP TABLE tags_old; VACUUM;");
+    db.close();
+    expect((await stat(c.db)).size).toBeLessThan(64 * 1024);
+    const t = performance.now();
+    const items = await collect(calibreAdapter(c.dir));
+    expect(performance.now() - t).toBeLessThan(2000);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(/Calibre library could not be read/);
+  });
+
+  it("I-3: a virtual table in place of a required table is refused", async () => {
+    const c = buildCalibreLibrary(join(tmp, "Virt Calibre"), { pdf: pdfs["files/okafor2024feeding.pdf"]! });
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(c.db);
+    db.exec("DROP TABLE identifiers; CREATE VIRTUAL TABLE identifiers USING fts5(book, type, val);");
+    db.close();
+    const items = await collect(calibreAdapter(c.dir));
+    expect(items).toHaveLength(1);
+    expect(items[0]!.unreadable).toMatch(/Calibre library could not be read/);
+  });
+
+  it("approved folders: only absolute paths; ids like __proto__ are safe; concurrent remembers all persist", async () => {
+    const cfg = join(tmp, "cfg");
+    const lib1 = { id: "__proto__", appConfigDir: cfg };
+    expect(await rememberApprovedFolders(lib1, ["relative/folder", join(tmp, "a")])).toBe(1);
+    expect(await approvedFolders(lib1)).toEqual([join(tmp, "a")]);
+    expect(await approvedFolders({ id: "constructor", appConfigDir: cfg })).toEqual([]);
+    const lib2 = { id: "lib-2", appConfigDir: cfg };
+    await Promise.all(Array.from({ length: 10 }, (_, i) => rememberApprovedFolders(lib2, [join(tmp, `f${i}`)])));
+    expect((await approvedFolders(lib2)).sort()).toEqual(Array.from({ length: 10 }, (_, i) => join(tmp, `f${i}`)).sort());
+    expect(await approvedFolders(lib1)).toEqual([join(tmp, "a")]);
+  });
+
+  it("report labels use the last @<hash># of the key (an export name cannot inject a label)", () => {
+    const key = `${exportIdentity(join(exp, "x@0123456789ab#evil-name.bib"))}#okafor2024feeding`;
+    expect(reportLabel(key, "00".repeat(32))).toMatch(/^okafor2024feeding \([0-9a-f]{8}\)$/);
+    expect(reportLabel(key, null)).toBe("okafor2024feeding");
+  });
+});
+
 describe("review round 1: Calibre reads (R68 I1)", () => {
   let calibre: ReturnType<typeof buildCalibreLibrary>;
   beforeEach(async () => {
@@ -927,6 +1019,65 @@ processing:
     }
   });
 
+  it.skipIf(process.platform === "win32")("I-1: a ZIP import works when the library's path goes through a symlink", async () => {
+    const realParent = join(tmp, "real-parent");
+    await mkdir(realParent);
+    await symlink(realParent, join(tmp, "link-parent"));
+    const lib2 = await createLibrary(join(tmp, "link-parent", "Lib2"), "Lib2", deps());
+    const handle2 = new IndexHandle(lib2.root);
+    const ring2 = new KeyRing();
+    const repo2 = await openTestRepo(lib2, ring2, { scryptN: FAST, actor: "tester", index: createIndexSink(handle2, { root: lib2.root, keyRing: ring2 }) });
+    try {
+      const p = (await repo2.createProject({ name: "Z", governanceYaml: GOV, encryption: { enabled: false } })).project;
+      const zip = join(tmp, "papers.zip");
+      await writeFile(zip, buildZip([{ name: "a.pdf", data: await buildPdf({ extra: "zip a" }) }, { name: "b.pdf", data: await buildPdf({ extra: "zip b" }) }]));
+      const bulk2 = createBulkImport({ repo: repo2, http: new HttpClient({ libraryRoot: lib2.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 }), index: handle2 });
+      expect((await bulk2.dryRun(p.id, zipAdapter(zip))).outsideFiles).toEqual([]);
+      const r = await (await bulk2.startBatch(p.id, zipAdapter(zip))).done;
+      expect(r.counts.failed).toBe(0);
+      expect(repo2.listSourceIds(p.id)).toHaveLength(2);
+    } finally {
+      handle2.close();
+      await lib2.close();
+      ring2.clear();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("I-2: a file swapped for a link to an outside file after its check is not stored", async () => {
+    const scanned = join(tmp, "Swap");
+    await mkdir(scanned);
+    const f0 = join(scanned, "f0.pdf");
+    await writeFile(f0, await buildPdf({ extra: "f0" }));
+    await writeFile(join(scanned, "f1.pdf"), await buildPdf({ extra: "f1" }));
+    const secretDir = join(tmp, "secret");
+    await mkdir(secretDir);
+    const secretBytes = await buildPdf({ extra: "SECRET" });
+    await writeFile(join(secretDir, "s.pdf"), secretBytes);
+    const secretSha = createHash("sha256").update(secretBytes).digest("hex");
+    const inner = folderAdapter(scanned);
+    const probe: ImportSourceAdapter = {
+      ...inner,
+      async *scan(signal, c) {
+        let i = 0;
+        for await (const it of inner.scan(signal, c)) {
+          yield it;
+          if (i++ === 0) {
+            await rm(f0);
+            await symlink(join(secretDir, "s.pdf"), f0);
+          }
+        }
+      },
+    };
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, probe);
+    const r = await h.done;
+    const sfs = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
+    expect(sfs.flatMap((sf) => sf.assets.map((a) => a.sha256))).not.toContain(secretSha);
+    expect(r.counts.failed).toBe(1);
+    expect((await bulk.batchReport(p.id, h.batchId)).failures.map((f) => f.reason)).toEqual([expect.stringMatching(/changed during the import/)]);
+  });
+
   describe("R67: files outside the expected folders need approval", () => {
     let outside: string;
     let outsidePdf: string;
@@ -944,7 +1095,8 @@ processing:
     it("dryRun lists the file with its folder", async () => {
       const p = await project();
       const s = await bulkImport().dryRun(p.id, bibtexAdapter(bib));
-      expect(s.outsideFiles).toEqual([{ item: expect.stringContaining("outref"), folder: await realpath(outside) }]);
+      // Dry-run labels have no HMAC tag (there is no batch secret yet; R70).
+      expect(s.outsideFiles).toEqual([{ item: "outref", folder: await realpath(outside) }]);
     });
 
     it("without approval the item imports metadata-only with a note", async () => {
