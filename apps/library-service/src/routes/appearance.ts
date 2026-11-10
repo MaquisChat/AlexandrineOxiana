@@ -48,10 +48,13 @@ function oneOf<T>(v: unknown, allowed: readonly T[], name: string): T {
   return v as T;
 }
 
+/** Characters a font family name may not hold (shared rule with the UI, R105): control characters, backslash, CSS/markup delimiters. */
+export const FONT_NAME_REFUSED = /[\u0000-\u001f\u007f-\u009f\\;{}<>]/;
+
 function font(v: unknown, name: string): FontChoice {
   if (!v || typeof v !== "object") throw badRequest(`"fonts.${name}" must be an object.`);
   const o = v as Obj;
-  if (typeof o.family !== "string" || !o.family.trim() || o.family.length > 300 || /[;{}<>]/.test(o.family)) throw badRequest(`"fonts.${name}.family" is not a font name.`);
+  if (typeof o.family !== "string" || !o.family.trim() || o.family.length > 300 || FONT_NAME_REFUSED.test(o.family)) throw badRequest(`"fonts.${name}.family" is not a font name.`);
   const source = oneOf(o.source, ["bundled", "system", "user-file"] as const, `fonts.${name}.source`);
   if (o.file !== undefined && (typeof o.file !== "string" || o.file.length > 4096)) throw badRequest(`"fonts.${name}.file" must be a path.`);
   return { family: o.family, source, ...(typeof o.file === "string" ? { file: o.file } : {}) };
@@ -115,8 +118,17 @@ export function registerAppearance(app: FastifyInstance, ctx: Ctx): void {
   app.get("/settings/appearance", async () => current());
 
   app.put("/settings/appearance", async (req) => {
-    const next = mergeAppearance(await current(), bodyOf(req));
-    await updateAppSetting<AppearanceSettings>(dir, FILE, () => next);
-    return next;
+    const patch = bodyOf(req);
+    mergeAppearance(DEFAULT_APPEARANCE, patch); // a bad value is refused before anything is written
+    // Merged inside the serialised read-modify-write, so concurrent PUTs all apply (R105).
+    return updateAppSetting<AppearanceSettings>(dir, FILE, (cur) => {
+      let base = DEFAULT_APPEARANCE;
+      try {
+        if (cur) base = mergeAppearance(DEFAULT_APPEARANCE, cur as unknown as Obj);
+      } catch {
+        // a hand-edited file that is not valid: start from the defaults
+      }
+      return mergeAppearance(base, patch);
+    });
   });
 }

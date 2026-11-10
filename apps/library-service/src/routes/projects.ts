@@ -70,7 +70,9 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     await s.repo.unlockProject(id, secret);
     // Work that waited for the key: viewing proxies and OCR of this project, and its daily backup (R99 I7).
     state.resumeProject(s, id);
-    state.track(state.runScheduledBackups(id), "backup after unlock");
+    state.startWork("backup", async () => {
+      await state.runScheduledBackups(id);
+    });
     state.publishState();
     return { unlocked: true };
   });

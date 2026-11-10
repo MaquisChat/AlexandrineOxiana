@@ -32,6 +32,8 @@ import {
   type Repo,
   type ToolsUpdate,
   type WorkerClient,
+  type CaptureOptions,
+  createLinkCapture,
   openLibrary,
 } from "@ao/library";
 import { ApiError } from "./errors.js";
@@ -108,6 +110,11 @@ export const MOVE_TOKEN_TTL_MS = 15 * 60_000;
 /** How long a running batch may take to reach a safe point when it is paused for shutdown or a move. */
 export const SUSPEND_TIMEOUT_MS = 60_000;
 
+/** Lets registered background work stop between its items (R106). */
+export interface WorkControl {
+  stopping: boolean;
+}
+
 export interface BackupRun {
   projectId: string;
   ok: boolean;
@@ -144,6 +151,119 @@ export class ServiceState {
     if (this.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
     const open = this.opts.openLibrary ?? openLibrary;
     return open(root, this.deps, { onLockLost: () => this.publishState() });
+  }
+
+  // ---- the work registry (R106 C1) -----------------------------------------------------
+
+  private workSeq = 0;
+  /** Background work running now: capture queues, profile captures, recheck jobs, retries, worker resumption, backups. */
+  private readonly work = new Map<number, { kind: string; ctl: WorkControl; done: Promise<void> }>();
+  /** Work stopped part-way for a move (or shutdown): continued on the library open afterwards. */
+  private stoppedWork: Array<(s: Session) => void> = [];
+  /** Mutating requests in progress (set by the server; the move waits for them, R106 I1). */
+  inFlightMutating: () => number = () => 0;
+  /** After a move whose new copy could not be opened: what to resume once it is (R106). */
+  private pendingResume: { root: string; batches: Array<{ projectId: string; batchId: string }> } | undefined;
+
+  /**
+   * Runs background work in the registry. `fn` checks `ctl.stopping` between its items; when it
+   * stops early it returns how to continue (given the library open then), which runs after the
+   * move. Work that cannot stop part-way simply finishes (it is drained).
+   */
+  startWork(kind: string, fn: (ctl: WorkControl) => Promise<((s: Session) => void) | void>): void {
+    const id = ++this.workSeq;
+    const ctl: WorkControl = { stopping: false };
+    const done = fn(ctl)
+      .then(
+        (cont) => {
+          if (cont) this.stoppedWork.push(cont);
+        },
+        (err: unknown) => this.opts.log.warn({ err: this.describe(err) }, `${kind} failed`),
+      )
+      .finally(() => this.work.delete(id));
+    this.work.set(id, { kind, ctl, done });
+    this.track(done, kind);
+  }
+
+  /** Background work running now, by kind (diagnostics, tests). */
+  workKinds(): string[] {
+    return [...this.work.values()].map((w) => w.kind);
+  }
+
+  /** Asks every registered item to stop between items and waits for all to end; false if one did not in time. */
+  async drainWork(timeoutMs: number): Promise<boolean> {
+    const items = [...this.work.values()];
+    for (const w of items) w.ctl.stopping = true;
+    const all = Promise.allSettled(items.map((w) => w.done)).then(() => true);
+    const ok = (await withTimeout(all, timeoutMs).catch(() => undefined)) === true;
+    if (!ok) for (const w of items) w.ctl.stopping = false; // rolled back: the rest carries on
+    return ok;
+  }
+
+  /** Continues the work stopped for a move, on the library open now. */
+  restartStoppedWork(): void {
+    const s = this.session;
+    if (!s) return;
+    for (const cont of this.stoppedWork.splice(0)) {
+      try {
+        cont(s);
+      } catch (err) {
+        this.opts.log.warn({ err: this.describe(err) }, "resuming stopped work failed");
+      }
+    }
+  }
+
+  /** Remembers what to resume when the library at `root` is opened (after a failed open). */
+  resumeWhenOpened(root: string, batches: Array<{ projectId: string; batchId: string }>): void {
+    this.pendingResume = { root, batches };
+  }
+
+  // ---- capture queues ----
+
+  private readonly captures = new Map<string, { projectId: string; done: number; total: number; finished: boolean }>();
+
+  /** The progress of a capture queue (also after a move). */
+  captureQueue(queueId: string): { projectId: string; done: number; total: number; finished: boolean } | undefined {
+    return this.captures.get(queueId);
+  }
+
+  /**
+   * Captures `urls` one at a time in the registry: progress as `capture.progress`; a move stops it
+   * between links and it continues with the rest on the moved library (R106 C1).
+   */
+  startCaptureQueue(queueId: string, projectId: string, urls: string[], opts: CaptureOptions, offset = 0, total = urls.length): void {
+    const info = this.captures.get(queueId) ?? { projectId, done: offset, total, finished: false };
+    this.captures.set(queueId, info);
+    this.startWork("capture", async (ctl) => {
+      const s = this.requireSession();
+      const worker = await this.workerClient();
+      const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
+      let outcomes: Awaited<ReturnType<typeof capture.captureUrls>>;
+      try {
+        outcomes = await capture.captureUrls(
+          projectId,
+          urls,
+          opts,
+          (done, _t, outcome) => {
+            info.done = offset + done;
+            info.finished = info.done === total;
+            this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished });
+          },
+          { shouldStop: () => ctl.stopping },
+        );
+      } catch (err) {
+        info.finished = true;
+        this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) });
+        return;
+      }
+      if (outcomes.length < urls.length) {
+        const rest = urls.slice(outcomes.length);
+        const at = offset + outcomes.length;
+        return () => this.startCaptureQueue(queueId, projectId, rest, opts, at, total);
+      }
+      info.finished = true;
+      return;
+    });
   }
 
   /** 503 MOVE_IN_PROGRESS while a library move runs. */
@@ -263,9 +383,9 @@ export class ServiceState {
           http: s.http,
           index: s.index,
           proxies,
-          queueOcr: async (p, sid) => {
-            // Awaited by the batch: the job is recorded before the batch moves on (and before it can be paused).
-            await ocr.enqueue(p, sid);
+          queueOcr: async (p, ids) => {
+            // Awaited by the batch: one governed change per group, recorded before the batch moves on (R106).
+            await ocr.enqueueMany(p, ids);
           },
         }) : undefined;
     s.unsubscribe.push(proxies.onResult((r) => this.events.publish("job.progress", { kind: "proxy", ...r })));
@@ -273,12 +393,21 @@ export class ServiceState {
     if (s.lib.mode === "read-write") {
       for (const p of s.repo.listProjects()) this.track(this.startWatches(s, p.id), "watched folders");
       // A backup that came due while the app was closed is made now (R99 I7).
-      this.track(this.runScheduledBackups(), "backups at open");
+      this.startWork("backup", async () => {
+        await this.runScheduledBackups();
+      });
     }
     if (this.worker) this.attachWorker(s, this.worker);
     else if (this.opts.autoStartWorker && this.opts.worker) this.track(this.ensureWorker(), "starting the media helper");
     this.startBackupScheduler();
     this.publishState();
+    // Opened at last after a move whose first open failed: what was paused for it resumes (R106).
+    if (this.pendingResume && this.pendingResume.root === s.lib.root && s.lib.mode === "read-write") {
+      const { batches } = this.pendingResume;
+      this.pendingResume = undefined;
+      this.resumeBatches(batches);
+      this.restartStoppedWork();
+    }
   }
 
   /** What every watched folder of the open library is started with (events included, R99). */
@@ -337,11 +466,17 @@ export class ServiceState {
    * Pauses every running batch at its next safe point and leaves it `paused` on disk (R99 I4/I5).
    * Returns the batches paused and those that did not reach a safe point in time (still running).
    */
-  async suspendBatches(s: Session): Promise<{ paused: Array<{ projectId: string; batchId: string }>; stuck: Array<{ projectId: string; batchId: string; handle: BatchHandle }> }> {
+  async suspendBatches(s: Session): Promise<{
+    paused: Array<{ projectId: string; batchId: string }>;
+    stuck: Array<{ projectId: string; batchId: string; handle: BatchHandle; pending: Promise<BatchResult | undefined> }>;
+  }> {
     const running = [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b }));
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     const results = await Promise.all(
-      running.map(async (b) => ({ b, r: await withTimeout(b.handle.suspend().catch(() => undefined as BatchResult | undefined), ms).catch(() => undefined) })),
+      running.map(async (b) => {
+        const pending = b.handle.suspend().catch(() => undefined as BatchResult | undefined);
+        return { b: { ...b, pending }, r: await withTimeout(pending, ms).catch(() => undefined) };
+      }),
     );
     return {
       paused: results.filter((x) => x.r?.state === "paused").map((x) => ({ projectId: x.b.projectId, batchId: x.b.batchId })),
@@ -357,17 +492,29 @@ export class ServiceState {
    * writes to the library while it is copied. Returns the batches to resume afterwards.
    */
   async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
+    const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
+    // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
+    if (!(await this.drainWork(ms))) {
+      this.restartStoppedWork();
+      throw new ApiError(409, "CONFLICT", "Some background work could not be paused in time, so the library was not moved; try again in a moment.");
+    }
     const { paused, stuck } = await this.suspendBatches(s);
     if (stuck.length) {
-      // Refused: everything paused for it carries on (R102 N3); a pause that has not taken effect is withdrawn.
-      for (const b of stuck) {
-        try {
-          b.handle.resume();
-        } catch {
-          // already ended
+      // Refused: everything paused for it carries on (R102 N3). A suspend that lands late is counted:
+      // it is awaited (a while longer) and that batch resumed; one that never lands is withdrawn.
+      const late = await Promise.all(stuck.map(async (b) => ({ b, r: await withTimeout(b.pending, ms).catch(() => undefined) })));
+      for (const { b, r } of late) {
+        if (r?.state === "paused") paused.push({ projectId: b.projectId, batchId: b.batchId });
+        else {
+          try {
+            b.handle.resume();
+          } catch {
+            // already ended
+          }
         }
       }
       this.resumeBatches(paused);
+      this.restartStoppedWork();
       throw new ApiError(409, "CONFLICT", "An import could not be paused in time, so the library was not moved; try again in a moment.");
     }
     try {
@@ -378,6 +525,7 @@ export class ServiceState {
     } catch (err) {
       this.activate(s);
       this.resumeBatches(paused);
+      this.restartStoppedWork();
       throw err;
     }
     return paused;
@@ -479,8 +627,11 @@ export class ServiceState {
     s.workerClient = client;
     proxyQueueFor(s.repo).setWorker(client);
     ocrQueueFor(s.repo).setWorker(client);
-    if (s.lib.mode !== "read-write") return;
-    this.track(client.resumePending(), "resuming interrupted worker jobs");
+    // During a move nothing is resumed: the library open after it resumes (R106 C1).
+    if (s.lib.mode !== "read-write" || this.moving) return;
+    this.startWork("worker-resume", async () => {
+      await client.resumePending();
+    });
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) this.resumeProject(s, p.id);
   }
 
@@ -570,7 +721,13 @@ export class ServiceState {
 
   private startBackupScheduler(): void {
     this.stopBackupScheduler();
-    const t = setInterval(() => this.track(this.runScheduledBackups(), "scheduled backups"), this.opts.backupCheckMs);
+    const t = setInterval(
+      () =>
+        this.startWork("backup", async () => {
+          await this.runScheduledBackups();
+        }),
+      this.opts.backupCheckMs,
+    );
     t.unref?.();
     this.backupTimer = t;
   }

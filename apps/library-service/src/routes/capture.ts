@@ -72,19 +72,10 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const opts = captureOptions(optObj(b, "options"));
     await checkCaptureAllowed(s.repo, projectId, urls); // 403 with the reason when denied
     requireAcknowledged(s, projectId, opts);
-    const worker = await state.workerClient(); // 503 when the media helper cannot run
+    await state.workerClient(); // 503 when the media helper cannot run
     const queueId = randomUUID();
-    const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
-    state.track(
-      capture
-        .captureUrls(projectId, urls, opts, (done, total, outcome) => {
-          state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: done === total });
-        })
-        .catch((err: unknown) => {
-          state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
-        }),
-      "capture",
-    );
+    // In the work registry: a library move stops it between links and it continues afterwards (R106).
+    state.startCaptureQueue(queueId, projectId, urls, opts);
     return { queueId };
   });
 
@@ -117,13 +108,15 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const worker = await state.workerClient();
     const queueId = randomUUID();
     const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
-    state.track(
-      capture
-        .captureProfile(projectId, url, opts, (done, total, outcome) => state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false }))
-        .then((report) => state.events.publish("capture.progress", { queueId, projectId, finished: true, report }))
-        .catch((err: unknown) => state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) })),
-      "profile capture",
-    );
+    // A profile run cannot stop part-way here: a move waits for it to finish (drained, R106).
+    state.startWork("profile-capture", async () => {
+      try {
+        const report = await capture.captureProfile(projectId, url, opts, (done, total, outcome) => state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false }));
+        state.events.publish("capture.progress", { queueId, projectId, finished: true, report });
+      } catch (err) {
+        state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
+      }
+    });
     return { queueId };
   });
 

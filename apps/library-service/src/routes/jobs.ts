@@ -36,8 +36,10 @@ export function registerJobs(app: FastifyInstance, ctx: Ctx): void {
     const projectId = str(b, "projectId", 64);
     if (!s.repo.listProjects().some((p) => p.id === projectId)) throw badRequest("That project is not in this library.");
     const sourceId = optStr(b, "sourceId", 64);
-    state.track(proxyQueueFor(s.repo).retryFailed(projectId, sourceId), "retrying viewing proxies");
-    state.track(ocrQueueFor(s.repo).retryFailed(projectId, sourceId), "retrying OCR");
+    state.startWork("retry", async () => {
+      await proxyQueueFor(s.repo).retryFailed(projectId, sourceId);
+      await ocrQueueFor(s.repo).retryFailed(projectId, sourceId);
+    });
     return { retrying: true };
   });
 }

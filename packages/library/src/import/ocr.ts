@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { newId, type PendingOcr, type SourceFile } from "@ao/core";
 import type { Library } from "../library.js";
 import { DestroyedParentError, MissingParentError, PolicyDeniedError, ProjectLockedError, ProxyRecordRefusedError } from "../repo/errors.js";
-import { addOcrAsset, editPendingOcr, repoLibrary, type Repo } from "../repo/repo.js";
+import { addOcrAsset, editPendingOcr, editPendingOcrMany, repoLibrary, type Repo } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WorkerJobError, WorkerUnavailableError, type WorkerClient } from "../worker-client.js";
 
@@ -91,10 +91,15 @@ export class OcrQueue {
    * Records OCR jobs for the source's PDF originals that have no OCR text and no job yet (governed),
    * then runs them after those already queued when a worker is available. Returns the jobs added.
    */
-  async enqueue(projectId: string, sourceId: string): Promise<number> {
-    if (this.disposed) return 0;
+  enqueue(projectId: string, sourceId: string): Promise<number> {
+    return this.enqueueMany(projectId, [sourceId]);
+  }
+
+  /** `enqueue` for several sources, recorded in one governed change (a Bulk Import group, R106). */
+  async enqueueMany(projectId: string, sourceIds: string[]): Promise<number> {
+    if (this.disposed || !sourceIds.length) return 0;
     let added = 0;
-    await editPendingOcr(this.repo, projectId, sourceId, (list, sf) => {
+    await editPendingOcrMany(this.repo, projectId, sourceIds, (list, sf) => {
       const done = new Set(sf.assets.filter((a) => a.role === "derived" && a.kind === "ocr-text").flatMap((a) => a.derivation?.parents ?? []));
       const queued = new Set(list.map((j) => j.assetId));
       const at = new Date().toISOString();
@@ -105,7 +110,7 @@ export class OcrQueue {
       }
       return list;
     });
-    if (this.worker) this.then(() => this.runSource(projectId, sourceId)).catch(() => {});
+    if (this.worker) for (const id of sourceIds) this.then(() => this.runSource(projectId, id)).catch(() => {});
     return added;
   }
 

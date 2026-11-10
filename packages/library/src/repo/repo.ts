@@ -8,7 +8,7 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
-import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
+import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, deleteTag, moveCollection, renameCollection, renameTag, setMembership, updateCollection, workspaceTags } from "./collections.js";
 import {
@@ -639,6 +639,11 @@ export function editPendingOcr(
   edit: (list: PendingOcr[], sf: SourceFile) => PendingOcr[],
 ): Promise<SourceFile> {
   return updatePendingOcr(cores.get(repo)!, projectId, sourceId, edit);
+}
+
+/** Package-internal (OCR queue, R106): edits the pending OCR jobs of several sources in one governed change. */
+export function editPendingOcrMany(repo: Repo, projectId: string, sourceIds: string[], edit: (list: PendingOcr[], sf: SourceFile) => PendingOcr[]): Promise<void> {
+  return updatePendingOcrMany(cores.get(repo)!, projectId, sourceIds, edit);
 }
 
 /** Package-internal (OCR queue): records the OCR text as a derived asset and removes its pending entry, in one governed change. */

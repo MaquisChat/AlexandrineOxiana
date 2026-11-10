@@ -194,6 +194,42 @@ export async function updatePendingOcr(
   );
 }
 
+/**
+ * Package-internal (OCR queue, R106): edits the pending OCR jobs of several sources in ONE governed
+ * change (each source's store request evaluated and audited about it). Unchanged sources are not written.
+ */
+export async function updatePendingOcrMany(
+  core: RepoCore,
+  projectId: string,
+  sourceIds: string[],
+  edit: (list: PendingOcr[], sf: SourceFile) => PendingOcr[],
+): Promise<void> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const ids = [...new Set(sourceIds)];
+  if (!ids.length) return;
+  const current = await Promise.all(ids.map((id) => readSourceFile(core, st, id)));
+  await runMutation(
+    core,
+    projectId,
+    current.map((sf) => storeRequest(sf.source.provenance)),
+    async (tx) => {
+      for (const id of ids) {
+        const cur = await readSourceFile(core, st, id);
+        const before = cur.pendingOcr ?? [];
+        const next = edit(structuredClone(before), cur);
+        if (JSON.stringify(next) === JSON.stringify(before)) continue;
+        const sf: SourceFile = { ...cur, source: { ...cur.source, modifiedAt: tx.at, modifiedBy: tx.actor } };
+        withPendingOcr(sf, next);
+        await writeSourceFile(core, tx, sf);
+        tx.record("source", id, cur.source, sf.source);
+      }
+    },
+    { op: "asset.ocr-pending", entityFor: (i) => ({ type: "source", id: ids[i]! }) },
+  );
+}
+
 /** Sets (or, when empty, removes) a source file's pending proxies. */
 function withPending(sf: SourceFile, list: PendingProxy[]): void {
   if (list.length) sf.pendingProxies = list;

@@ -98,8 +98,8 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof PolicyDeniedError) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
   if (err instanceof BatchRefusedError) {
     if (err.denied) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
-    // Running (e.g. still being paused for a move or shutdown) or already finished: a state conflict (R102).
-    if (/already (running|finished)/i.test(err.reason)) return new ApiError(409, "CONFLICT", err.reason);
+    // Running (being paused or undone) or already finished: a state conflict (R102, by kind — R106).
+    if (err.kind === "running" || err.kind === "finished") return new ApiError(409, "CONFLICT", err.reason);
     return new ApiError(400, "VALIDATION", err.reason);
   }
   if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");
@@ -140,7 +140,11 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof FolderNotEmptyError || err instanceof AlreadyALibraryError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof WrongLibraryError || err instanceof LibraryMovedError || err instanceof CorruptLibraryError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof LibraryNotWritableError) return new ApiError(409, "READ_ONLY", err.message);
-  if (err instanceof MoveNotAllowedError) return new ApiError(403, "POLICY_DENIED", "The library cannot be moved there.", err.message);
+  if (err instanceof MoveNotAllowedError) {
+    // Changes still being written are a passing conflict, not a rule (R106).
+    if (err.code === "pending-writes") return new ApiError(409, "CONFLICT", "Some changes are still being written. Try the move again in a moment.");
+    return new ApiError(403, "POLICY_DENIED", "The library cannot be moved there.", err.message);
+  }
   if (err instanceof InvalidConfirmTokenError) return new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires).");
   if (err instanceof WorkerUnavailableError) return new ApiError(503, "WORKER_UNAVAILABLE", "The media helper is not running.", err.message);
   if (err instanceof WorkerJobError) return new ApiError(502, "INTERNAL", "The media helper could not finish the job.", err.code);

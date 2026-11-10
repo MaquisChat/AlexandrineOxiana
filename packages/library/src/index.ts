@@ -146,6 +146,7 @@ export type {
   BatchCounts,
   BatchHandle,
   BatchProgress,
+  BatchRefusalKind,
   BatchResult,
   BatchSummary,
   BulkImport,

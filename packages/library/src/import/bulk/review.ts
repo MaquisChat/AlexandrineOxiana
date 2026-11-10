@@ -45,7 +45,7 @@ async function pendingEntry(repo: Repo, projectId: string, itemId: string): Prom
   const e = (await projectReviewEntries(repo, projectId)).find((x) => x.id === itemId);
   if (!e || !e.sourceId) throw new NotFoundError("Review item", itemId);
   if (e.kind !== "import") throw new BatchRefusedError("This review entry is not an import item; it is reviewed with the source's verification.");
-  if (e.status !== "pending") throw new BatchRefusedError("This item has already been reviewed.");
+  if (e.status !== "pending") throw new BatchRefusedError("This item has already been reviewed.", false, "finished");
   return e as ReviewEntry & { sourceId: string };
 }
 

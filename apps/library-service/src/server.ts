@@ -118,6 +118,9 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   let closingNow = false;
   /** Requests being answered (event streams excepted): shutdown waits for them (R101 M7). */
   let inFlight = 0;
+  /** Of those, the ones that may change something (not GET/HEAD/OPTIONS): a move waits for them (R106 I1). */
+  let inFlightMutating = 0;
+  state.inFlightMutating = () => inFlightMutating;
   let idleWaiters: Array<() => void> = [];
   const requestEnded = () => {
     inFlight--;
@@ -131,6 +134,10 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     if ((req.url.split("?")[0] ?? "") !== "/events") {
       inFlight++;
       reply.raw.once("close", requestEnded);
+      if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS") {
+        inFlightMutating++;
+        reply.raw.once("close", () => inFlightMutating--);
+      }
     }
     // 1. DNS rebinding: only our own host names, on our port.
     if (!hostAllowed(req.headers.host, port)) return fail(reply, new ApiError(403, "FORBIDDEN", "This host name is not allowed."));

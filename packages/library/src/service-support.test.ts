@@ -314,3 +314,23 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     expect(scrubPaths("see /lib/root/Projects/A b/x.pdf", ["/lib/root"])).toBe("see Projects/A b/x.pdf");
   });
 });
+
+describe("Task 30 review round 3 (R106)", () => {
+  it("OCR jobs of a group are recorded in one governed change", async () => {
+    const a = await pdfSource();
+    const b = await pdfSource();
+    const c = await pdfSource();
+    const q = new OcrQueue({ repo: kit.repo });
+    expect(await q.enqueueMany(p.id, [a.source.id, b.source.id, c.source.id])).toBe(3);
+    const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "asset.ocr-pending");
+    expect(ev).toHaveLength(3); // one store decision per source …
+    expect(new Set(ev.map((e) => e.details?.txn)).size).toBe(1); // … in one change
+  });
+
+  it("BatchRefusedError carries a kind", async () => {
+    const { BatchRefusedError } = await import("./import/bulk/run.js");
+    expect(new BatchRefusedError("x").kind).toBe("invalid");
+    expect(new BatchRefusedError("x", true).kind).toBe("denied");
+    expect(new BatchRefusedError("x", false, "running").kind).toBe("running");
+  });
+});

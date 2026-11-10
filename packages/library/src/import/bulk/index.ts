@@ -50,7 +50,7 @@ export function createBulkImport(deps: BulkImportDeps): BulkImport {
 }
 
 export { BatchRefusedError, REASONS as BULK_REASONS } from "./run.js";
-export type { BatchHandle, BatchProgress, BatchResult, BatchSummary, BulkImportDeps, ScanSummary, BatchCounts } from "./run.js";
+export type { BatchHandle, BatchProgress, BatchRefusalKind, BatchResult, BatchSummary, BulkImportDeps, ScanSummary, BatchCounts } from "./run.js";
 export type { ImportReport } from "./report.js";
 export type { ReviewDecision, ReviewPatch } from "./review.js";
 export type { UndoKept, UndoResult } from "./undo.js";

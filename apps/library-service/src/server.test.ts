@@ -1147,7 +1147,151 @@ describe("review round 2: minors", () => {
   it("a BatchRefusedError while a batch is being suspended is 409", async () => {
     const { toApiError } = await import("./errors.js");
     const { BatchRefusedError } = await import("@ao/library");
-    expect(toApiError(new BatchRefusedError("This import is already running.")).status).toBe(409);
-    expect(toApiError(new BatchRefusedError("This import has already finished.")).status).toBe(409);
+    expect(toApiError(new BatchRefusedError("This import is already running.", false, "running")).status).toBe(409);
+    expect(toApiError(new BatchRefusedError("This import has already finished.", false, "finished")).status).toBe(409);
+    // By kind, never by the English text (R106).
+    expect(toApiError(new BatchRefusedError("This import is already running.")).status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 30 review round 3 (R104–R106)
+
+/** A worker whose downloads take `ms` and then fail (each capture is audited, nothing stored). */
+function slowProvider(ms: number): WorkerProvider {
+  const client = {
+    async submit(): Promise<JobResult> {
+      await new Promise((r) => setTimeout(r, ms));
+      throw new WorkerJobError("TOOL_FAILED", "the tool failed");
+    },
+    async resumePending() {
+      return [];
+    },
+  } as unknown as WorkerClient;
+  return { start: async () => ({ clientFor: () => client, versions: async () => ({}), updateTools: async () => ({ ytDlp: { old: null, new: null, managed: false }, galleryDl: { version: null, pinned: true } }), stop: async () => {} }) };
+}
+
+const auditOps = async (pid: string) => ((await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Array<{ details?: { op?: string } }>).map((e) => e.details?.op);
+
+describe("review round 3: move and background work (R106)", () => {
+  it("a 15-link capture queue + move: stops between links, audit verifies, every capture audited, the rest resumes", async () => {
+    await start({ worker: slowProvider(40), autoStartWorker: true });
+    await openNewLibrary();
+    const pid = await newProject(`${OPEN_GOV}captureMethods: [manual_upload, downloader]\n`);
+    const urls = Array.from({ length: 15 }, (_, i) => `https://www.youtube.com/watch?v=aoTest${String(i).padStart(5, "0")}`);
+    const third = nextEvent((e) => e.type === "capture.progress" && e.data.done === 3);
+    const { queueId } = (await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls } })).json;
+    await third;
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(svc.state.session!.lib.root).toBe(join(tmp, "Moved"));
+    const finished = (await svc.state.idle(), true);
+    expect(finished).toBe(true);
+    expect((await call({ url: `/projects/${pid}/audit/verify` })).json.ok).toBe(true);
+    // Every link captured exactly once across the move (each capture's decision audited once).
+    expect((await auditOps(pid)).filter((o) => o === "capture.link")).toHaveLength(15);
+    const last = svc.state.captureQueue(queueId);
+    expect(last).toMatchObject({ done: 15, total: 15, finished: true });
+  });
+
+  it("an attach in flight when a move starts: the move waits for it, then succeeds", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(15, "att");
+    const { readdir } = await import("node:fs/promises");
+    const paths = (await readdir(dir)).map((f) => join(dir, f));
+    const attaching = call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths } });
+    await new Promise((r) => setTimeout(r, 30));
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    const att = await attaching;
+    expect(att.status).toBe(200);
+    expect(moved.body).toContain('"done":true');
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(15);
+    expect((await call({ url: `/projects/${pid}/audit/verify` })).json.ok).toBe(true);
+  });
+
+  it("M1: a suspend that lands after the timeout is counted: the batch is resumed, not left paused", async () => {
+    await start({ suspendTimeoutMs: 200 });
+    await openNewLibrary();
+    const pid = await newProject();
+    const dirA = await pdfFolder(20, "ma");
+    const dirB = await pdfFolder(20, "mb");
+    const pa = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const a = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirA } } })).json.batchId;
+    await pa;
+    const b = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirB } } })).json.batchId;
+    const ha = svc.state.session!.batches.get(a)!.handle;
+    const realA = ha.suspend.bind(ha);
+    ha.suspend = () => new Promise((r) => setTimeout(r, 300)).then(realA); // lands late
+    const hb = svc.state.session!.batches.get(b)!.handle;
+    hb.suspend = () => new Promise(() => {}); // never lands: the move is refused
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } })).status).toBe(409);
+    await svc.state.idle();
+    expect(await batchState(pid, a)).toBe("finished");
+    expect(await batchState(pid, b)).toBe("finished");
+  });
+
+  it("undo while the import runs → 409 (BatchRefusedError kind, not text)", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(20, "undo");
+    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 1);
+    const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
+    await p;
+    const r = await call({ method: "POST", url: `/imports/${id}/undo` });
+    expect(r.status).toBe(409);
+    expect(r.json.error.code).toBe("CONFLICT");
+    await svc.state.idle();
+  });
+
+  it("pending writes found by the move are 409 CONFLICT with a plain message, never POLICY_DENIED", async () => {
+    const { toApiError } = await import("./errors.js");
+    const { MoveNotAllowedError } = await import("@ao/library");
+    const e = toApiError(new MoveNotAllowedError("pending-writes" as never, "Some changes were interrupted"));
+    expect([e.status, e.code]).toEqual([409, "CONFLICT"]);
+  });
+
+  it("after a failed open of the moved copy, paused imports resume once it is opened", async () => {
+    let fails = 0;
+    const { openLibrary: realOpen } = await import("@ao/library");
+    const dest = join(tmp, "Moved");
+    await start({
+      openLibrary: async (root, d, o) => {
+        if (root === dest && fails < 2) {
+          fails++;
+          throw new Error("EIO");
+        }
+        return realOpen(root, d, o);
+      },
+    });
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(20, "fo");
+    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
+    await p;
+    const r = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(r.body).toContain("LIBRARY_OFFLINE");
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, id)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(20);
+  });
+});
+
+describe("review round 3: appearance (R105, service side)", () => {
+  beforeEach(() => start());
+  it("two concurrent PUTs both apply; font names refuse control characters and backslash", async () => {
+    const [a, b] = await Promise.all([
+      call({ method: "PUT", url: "/settings/appearance", body: { theme: "dark" } }),
+      call({ method: "PUT", url: "/settings/appearance", body: { textScale: 1.25 } }),
+    ]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    expect((await call({ url: "/settings/appearance" })).json).toMatchObject({ theme: "dark", textScale: 1.25 });
+    for (const family of ["Bad\u0007Font", "Bad\\\\Font", "Bad\nFont"]) {
+      expect((await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { interface: { family, source: "system" } } } })).status, JSON.stringify(family)).toBe(400);
+    }
   });
 });

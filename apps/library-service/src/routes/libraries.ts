@@ -158,7 +158,12 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     // From here every change is refused (503 MOVE_IN_PROGRESS) and background work waits (R102 N2).
     state.moving = true;
     try {
-      const paused = await state.quiesce(s); // 409 before the stream starts when an import cannot pause
+      // Changes already being made finish first (this request is one of the in-flight ones, R106 I1).
+      for (let waited = 0; state.inFlightMutating() > 1; waited += 25) {
+        if (waited >= 60_000) throw new ApiError(409, "CONFLICT", "Some changes are still being made. Try the move again in a moment.");
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const paused = await state.quiesce(s); // 409 before the stream starts when work cannot pause
       state.roots.add(dest);
       // Lines are dropped once the client is gone: the move itself always runs to its end (R102 N1).
       const write = ndjson(reply);
@@ -181,6 +186,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         if (state.session === s) {
           state.activate(s);
           state.resumeBatches(paused);
+          state.restartStoppedWork();
         }
         await write(ndjsonError(ctx, err));
         reply.raw.end();
@@ -189,6 +195,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       const r = moved;
       const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
       // The library now lives at the destination (the move closed the old copy): open it there, retrying once.
+      // If it still cannot be opened, what was paused resumes once it is (R106).
+      state.resumeWhenOpened(r.newRoot, paused);
       let lib: Library | undefined;
       for (let attempt = 0; attempt < 2 && !lib; attempt++) {
         try {
@@ -208,8 +216,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
         reply.raw.end();
         return;
       }
+      // Adopting it resumes the paused imports and the stopped work (resumeWhenOpened, in activate).
       await state.adopt(lib);
-      state.resumeBatches(paused);
       await write({
         done: true,
         result: { newRoot: r.newRoot, confirmToken: r.confirmToken, expiresAt: pending.expiresAt, fileCount: r.fileCount, totalBytes: r.totalBytes, filesCopied: r.filesCopied, projectsMovedAway: r.projectsMovedAway, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) },

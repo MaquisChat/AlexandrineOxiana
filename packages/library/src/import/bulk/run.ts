@@ -141,15 +141,25 @@ export const REASONS = {
     "Files cannot be linked in place in this project: its files must be encrypted at rest, and a linked file stays outside the library. Choose to copy the files instead.",
 } as const;
 
+/**
+ * Why a batch was refused, for callers that map it (R106): `denied` the project's rules; `running`
+ * the batch is running (or being paused or undone) now; `finished` it has already finished or been
+ * undone; `invalid` the options, the source or the record.
+ */
+export type BatchRefusalKind = "denied" | "running" | "finished" | "invalid";
+
 /** A batch could not start (or resume): the options or the project's rules do not allow it. */
 export class BatchRefusedError extends Error {
   override name = "BatchRefusedError";
+  readonly kind: BatchRefusalKind;
   constructor(
     readonly reason: string,
     /** The project's rules (governance) refused it, as opposed to options, the source or the record. */
     readonly denied: boolean = false,
+    kind?: BatchRefusalKind,
   ) {
     super(reason);
+    this.kind = kind ?? (denied ? "denied" : "invalid");
   }
 }
 
@@ -159,8 +169,11 @@ export interface BulkImportDeps {
   http: HttpClient;
   /** The library index (dedupe keys; TEMP schema for unlocked encrypted projects). */
   index: { db: IndexDb };
-  /** Queues OCR for a source whose PDF has no text layer (Task 15's worker), when `options.ocr`. */
-  queueOcr?: (projectId: string, sourceId: string) => void | Promise<void>;
+  /**
+   * Queues OCR for sources whose PDFs have no text layer (Task 15's worker), when `options.ocr`:
+   * called once per stored group with all of its sources (one governed change, R106).
+   */
+  queueOcr?: (projectId: string, sourceIds: string[]) => void | Promise<void>;
   /** Viewing proxies of photos and videos (R83); default: the library's queue (proxyQueueFor, R85). */
   proxies?: ProxyQueue;
   debug?: (note: string) => void;
@@ -1148,14 +1161,16 @@ class Run {
       );
       this.pending = this.pending.slice(flushLines);
       dedupe.dropPending(group.map((q) => q.placeholder));
+      const needOcr: string[] = [];
       for (const [i, sf] of stored.entries()) {
         this.latest.set(entries[i]!.key, entries[i]!);
         this.createdIds.add(sf.source.id);
         dedupe.add(sf);
         this.startProxies(sf);
         const q = group[i]!;
-        if (this.rec.options.ocr && q.r.needsOcr && q.inputs.length) await this.ocr(sf.source.id);
+        if (this.rec.options.ocr && q.r.needsOcr && q.inputs.length) needOcr.push(sf.source.id);
       }
+      if (needOcr.length) await this.ocr(needOcr);
     } catch (err) {
       if (err instanceof ProjectLockedError || (err as Error)?.name === "AbortError") throw err;
       // The group as a whole was refused (e.g. the rules changed during the run) or failed: each
@@ -1217,7 +1232,7 @@ class Run {
     this.createdIds.add(sf.source.id);
     dedupe.add(sf);
     this.startProxies(sf);
-    if (this.rec.options.ocr && r.needsOcr && inputs.length) await this.ocr(sf.source.id);
+    if (this.rec.options.ocr && r.needsOcr && inputs.length) await this.ocr([sf.source.id]);
     return entry!;
   }
 
@@ -1319,14 +1334,14 @@ class Run {
     return keys;
   }
 
-  private async ocr(sourceId: string): Promise<void> {
+  private async ocr(sourceIds: string[]): Promise<void> {
     if (!this.deps.queueOcr) {
       this.note("Some PDFs have no text layer; OCR was requested but no OCR worker is available, so they were not queued.");
       return;
     }
     try {
-      await this.deps.queueOcr(this.projectId, sourceId);
-      this.rec.ocrQueued = (this.rec.ocrQueued ?? 0) + 1;
+      await this.deps.queueOcr(this.projectId, sourceIds);
+      this.rec.ocrQueued = (this.rec.ocrQueued ?? 0) + sourceIds.length;
     } catch {
       this.note("Some PDFs could not be queued for OCR.");
     }
@@ -1679,12 +1694,12 @@ export async function startBatch(
  */
 export async function resumeBatch(deps: BulkImportDeps, projectId: string, batchId: string, adapter?: ImportSourceAdapter): Promise<BatchHandle> {
   // Checked and taken before anything is awaited: a second resume at the same time is refused (R61).
-  if (active.has(batchId)) throw new BatchRefusedError("This import is already running.");
+  if (active.has(batchId)) throw new BatchRefusedError("This import is already running.", false, "running");
   active.add(batchId);
   try {
     const rec = await findBatch(deps.repo, projectId, batchId);
     if (!rec) throw new NotFoundError("Import batch", batchId);
-    if (rec.state === "finished" || rec.state === "undone") throw new BatchRefusedError("This import has already finished.");
+    if (rec.state === "finished" || rec.state === "undone") throw new BatchRefusedError("This import has already finished.", false, "finished");
     if (rec.source.kind === "profile-capture") throw new BatchRefusedError("Profile captures are resumed by capturing the profile again.");
     const source = adapter ?? adapterFor(rec.source.kind, rec.source.location, rec.adapterOptions);
     if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");

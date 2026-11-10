@@ -60,7 +60,7 @@ export interface UndoResult {
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   // The batch's slot is taken before anything is awaited (R63): no resume, start or second undo meanwhile.
-  if (activeBatches.has(batchId)) throw new BatchRefusedError("This import is running or being undone; try again when it has stopped.");
+  if (activeBatches.has(batchId)) throw new BatchRefusedError("This import is running or being undone; try again when it has stopped.", false, "running");
   activeBatches.add(batchId);
   try {
     return await undoHeld(repo, projectId, batchId);
@@ -72,7 +72,7 @@ export async function undoBatch(repo: Repo, projectId: string, batchId: string):
 async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
-  if (rec.state === "undone") throw new BatchRefusedError("This import has already been undone.");
+  if (rec.state === "undone") throw new BatchRefusedError("This import has already been undone.", false, "finished");
   const projectRel = repo.getProject(projectId).folder;
   const journal = await readJournal(repo, projectId, rec.dir);
   const kept: UndoKept[] = [];

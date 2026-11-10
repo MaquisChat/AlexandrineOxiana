@@ -125,28 +125,30 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const jobId = randomUUID();
     const ids = s.repo.listSourceIds(projectId);
-    state.track(
-      (async () => {
-        let changed = 0;
-        let done = 0;
-        let failed = 0;
-        for (const id of ids) {
-          if (state.session !== s) break;
+    const total = ids.length;
+    const tally = { changed: 0, failed: 0 };
+    // In the work registry: a move stops it between sources; it continues on the moved library (R106).
+    const run = (from: number) =>
+      state.startWork("recheck", async (ctl) => {
+        let done = from;
+        for (const id of ids.slice(from)) {
+          if (ctl.stopping) return () => run(done);
+          const cur = state.session;
+          if (!cur) return;
           try {
-            const before = await s.repo.getSource(projectId, id);
-            const after = await s.repo.recheckSource(projectId, id);
-            if (after.source.modifiedAt !== before.source.modifiedAt) changed++;
+            const before = await cur.repo.getSource(projectId, id);
+            const after = await cur.repo.recheckSource(projectId, id);
+            if (after.source.modifiedAt !== before.source.modifiedAt) tally.changed++;
           } catch {
-            failed++;
+            tally.failed++;
           }
           done++;
-          state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total: ids.length, finished: false });
+          state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, finished: false });
         }
-        state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total: ids.length, changed, failed, finished: true });
-      })(),
-      "recheck",
-    );
-    return { jobId, total: ids.length };
+        state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, changed: tally.changed, failed: tally.failed, finished: true });
+      });
+    run(0);
+    return { jobId, total };
   });
 
   app.post("/projects/:id/attach", async (req) => {

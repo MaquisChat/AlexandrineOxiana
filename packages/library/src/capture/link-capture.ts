@@ -148,6 +148,8 @@ export interface LinkCapture {
     urls: string[],
     opts: CaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
+    /** `shouldStop` is asked before each link; when true the queue stops there (the outcomes so far are returned). */
+    control?: { shouldStop?: () => boolean },
   ): Promise<CaptureOutcome[]>;
 }
 
@@ -655,11 +657,14 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     urls: string[],
     opts: CaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
+    control: { shouldStop?: () => boolean } = {},
   ): Promise<CaptureOutcome[]> {
     // Ask once, before the queue starts.
     if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const out: CaptureOutcome[] = [];
     for (const url of urls) {
+      // Stopped between links (a library move, R106): the rest is for the caller to run again.
+      if (control.shouldStop?.()) break;
       let o: CaptureOutcome;
       try {
         o = await captureUrl(projectId, url, opts);
