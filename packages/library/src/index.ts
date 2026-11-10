@@ -177,6 +177,17 @@ export type { SecretName } from "./secrets.js";
 export { DEIDENTIFIED_NOTE, REFMAN_FORMATS, exportRefman, writeRefmanExport } from "./export/refman-export.js";
 export type { RefmanExportOptions, RefmanExportResult, RefmanFormat } from "./export/refman-export.js";
 export {
+  CSL_NS,
+  CUSTOM_STYLE_MAX_BYTES,
+  CustomStyleError,
+  addCustomStyle,
+  bundleAvailable,
+  bundledCslLoader,
+  libraryCslLoader,
+  listCustomStyles,
+  listStyles,
+} from "./citation/custom-styles.js";
+export {
   WATCH_REASONS,
   WATCH_STABILITY_MS,
   addWatchedFolder,
