@@ -128,11 +128,28 @@ function quantifierAt(src: string, i: number): { len: number; many: boolean } | 
   } else if (c === "?") {
     len = 1;
   } else if (c === "{") {
-    const m = /^\{(\d+)(,(\d*))?\}/u.exec(src.slice(i, i + 24));
-    if (!m) return null; // a literal brace
-    len = m[0].length;
-    const min = Number(m[1]);
-    const max = m[2] === undefined ? min : m[3] === "" ? Infinity : Number(m[3]);
+    // {digits}, {digits,} or {digits,digits}: read with plain scans (no window, linear).
+    const digits = (from: number) => {
+      let j = from;
+      while (j < src.length && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) j++;
+      return j;
+    };
+    const a = digits(i + 1);
+    if (a === i + 1) return null; // a literal brace
+    const value = (from: number, to: number) => {
+      const t = src.slice(from, to).replace(/^0+(?=\d)/u, "");
+      return t.length > 15 ? Infinity : Number(t);
+    };
+    const min = value(i + 1, a);
+    let max = min;
+    let end = a;
+    if (src[a] === ",") {
+      const b = digits(a + 1);
+      max = b === a + 1 ? Infinity : value(a + 1, b);
+      end = b;
+    }
+    if (src[end] !== "}") return null; // a literal brace
+    len = end + 1 - i;
     many = max > 1;
   } else return null;
   if (src[i + len] === "?") len++;

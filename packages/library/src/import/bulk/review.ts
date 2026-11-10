@@ -18,7 +18,7 @@ import type { ReviewEntry } from "../../repo/review.js";
 import { storeRequest } from "../../repo/sources.js";
 import { importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import type { LookupResult } from "../../lookup/index.js";
-import { PRIVATE_MODE, appendJournal, fileName, findBatch, readJournal, type JournalEntry } from "./batch.js";
+import { PRIVATE_MODE, appendJournal, fileName, findBatch, readJournal, runListeners, type JournalEntry } from "./batch.js";
 import { applyMerge, missingFields } from "./merge.js";
 import { BatchRefusedError } from "./run.js";
 
@@ -103,6 +103,7 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
   }
   const projectRel = repo.getProject(projectId).folder;
   const root = repoLibrary(repo).root;
+  let journaled: JournalEntry | undefined;
   await importChange(
     repo,
     projectId,
@@ -148,11 +149,16 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
         await ops.deleteSource(cur.source.id);
         line = { outcome: "skipped", sourceId: cur.source.id };
       }
-      if (batchDir && itemKey) await appendJournal(tx, projectRel, batchDir, [{ key: itemKey, ...line, decision: d.action }]);
+      if (batchDir && itemKey) {
+        journaled = { key: itemKey, ...line, decision: d.action };
+        await appendJournal(tx, projectRel, batchDir, [journaled]);
+      }
       await ops.updateReview({ ...entry, status: "resolved", resolvedAt: tx.at, decision: d.action });
     },
     { op: "review.decide", entity: { type: "source", id: entry.sourceId } },
   );
+  // A run of this batch in progress: its counts follow the decision (the line is already journaled).
+  if (journaled && entry.batchId) runListeners.get(entry.batchId)?.(journaled);
 }
 
 export async function bulkEditReview(repo: Repo, projectId: string, itemIds: string[], p: ReviewPatch): Promise<void> {

@@ -991,3 +991,120 @@ describe("review round 1: ZIP and link preflight (R61)", () => {
     await expect(preflightLink(repo, p.id)).resolves.toBe(true);
   });
 });
+
+describe("review round 2 (R63)", () => {
+  it("I1: no path from the import root reaches source.json, the change log or anywhere outside the batch folder", async () => {
+    const p = await project();
+    const src = join(tmp, "Private");
+    await mkdir(join(src, "Interviews", "Jane Doe"), { recursive: true });
+    await writeFile(join(src, "Interviews", "Jane Doe", "Jane Doe consent.pdf"), await buildPdf({ title: "Consent form", author: "Research Office", lines: ["Consent form"] }));
+    const { result } = await run(p, folderAdapter(src), { structure: "none" });
+    expect(result.counts.created + result.counts.needsReview).toBe(1);
+    const sf = await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!);
+    expect(sf.source.provenance.externalKeys?.["import-item"]).toMatch(/^[0-9a-f]{64}$/);
+    const hits: string[] = [];
+    const walk = async (d: string) => {
+      for (const e of await readdir(d, { withFileTypes: true })) {
+        const full = join(d, e.name);
+        if (e.name.includes("Jane Doe")) hits.push(relative(lib.root, full));
+        if (e.isDirectory()) {
+          if (full === join(lib.root, p.folder, "imports")) continue; // the batch folder holds the journal (the record of the import)
+          await walk(full);
+        } else if ((await readFile(full)).includes("Jane Doe")) hits.push(relative(lib.root, full));
+      }
+    };
+    await walk(lib.root);
+    expect(hits).toEqual([]);
+  });
+
+  it("I2: undo and resume of the same batch at once: one is refused, the state is consistent", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, folderAdapter(folder));
+    for await (const e of h.progress) if (e.done >= 5) { h.cancel(); break; }
+    await h.done;
+    const [u, r] = await Promise.allSettled([bulk.undoBatch(p.id, h.batchId), bulk.resumeBatch(p.id, h.batchId)]);
+    expect([u.status, r.status].filter((x) => x === "rejected")).toHaveLength(1);
+    if (r.status === "fulfilled") {
+      await r.value.done;
+      expect((await bulk.listBatches(p.id))[0]!.state).toBe("finished");
+    } else {
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      expect((await bulk.listBatches(p.id))[0]!.state).toBe("undone");
+    }
+  });
+
+  it("I2: two undos at once: one is refused", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const results = await Promise.allSettled([bulk.undoBatch(p.id, h.batchId), bulk.undoBatch(p.id, h.batchId)]);
+    expect(results.filter((x) => x.status === "rejected")).toHaveLength(1);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a parent kept because its batch-made child is in use says so", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const cols = (await projectCollectionsAndTags(repo, p.id)).collections;
+    const bundle = cols.find((c) => c.name === "Bundle")!;
+    const sub = cols.find((c) => c.name === "Sub" && c.parentId === bundle.id)!;
+    const own = await repo.createSource(p.id, plainDraft("Mine"), [], { provenance: plainProvenance() });
+    await repo.setMembership(p.id, own.source.id, { collectionIds: [sub.id] });
+    const u = await bulk.undoBatch(p.id, h.batchId);
+    expect(u.kept).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "collection", id: sub.id }),
+      { kind: "collection", id: bundle.id, reason: "contains a collection that is still in use; kept" },
+    ]));
+  });
+
+  it("dedupe: a dead in-batch DOI placeholder falls back to the index", async () => {
+    const p = await project();
+    const real = await repo.createSource(p.id, plainDraft("With a DOI", { identifiers: { doi: "10.5555/dead.placeholder" } }), [], { provenance: plainProvenance() });
+    const { BatchDedupe } = await import("./dedupe.js");
+    const { hasSource } = await import("../../repo/repo.js");
+    const d = new BatchDedupe(handle.db, p.id, (id) => hasSource(repo, p.id, id));
+    d.addPending("pending:1", { sha256s: [], doi: "10.5555/dead.placeholder", isbns: ["9780262033848"] });
+    d.dropPending(["pending:1"]);
+    expect(d.candidates({ sha256s: [], doi: "10.5555/dead.placeholder" }).map((c) => c.sourceId)).toEqual([real.source.id]);
+  });
+
+  it("revertedMerges counts only merges where undo reverted something", async () => {
+    const p = await project();
+    const existing = await repo.createSource(p.id, plainDraft("Same work", { identifiers: { doi: "10.5555/full" } }), [], { provenance: plainProvenance() });
+    const adapter: ImportSourceAdapter = {
+      kind: "csl-json",
+      location: "synthetic",
+      async *scan(): AsyncGenerator<ScanItem> {
+        yield { key: "one", files: [], referenceMetadata: { type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "Same work" }] }, identifiers: { doi: "10.5555/full" } } };
+      },
+    };
+    const { handle: h, result } = await run(p, adapter);
+    expect(result.counts.merged).toBe(1);
+    const u = await bulk.undoBatch(p.id, h.batchId);
+    expect(u.revertedMerges).toBe(0);
+    expect((await repo.getSource(p.id, existing.source.id)).source.identifiers.doi).toBe("10.5555/full");
+  });
+
+  it("a review decision taken while the run is paused: one decision line, and the batch record's counts match the report", async () => {
+    const p = await project();
+    const h = await bulk.startBatch(p.id, folderAdapter(folder));
+    let decided = false;
+    for await (const e of h.progress) {
+      if (!decided && e.done >= 8) {
+        h.pause();
+        await new Promise((r) => setTimeout(r, 300));
+        const [first] = await bulk.listReview(p.id, h.batchId);
+        await bulk.decideReview(p.id, first!.id, { action: "skip" });
+        decided = true;
+        h.resume();
+      }
+    }
+    await h.done;
+    const lines = (await readFile(join(lib.root, p.folder, "imports", "batch-0001", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as { key: string; decision?: string });
+    expect(lines.filter((l) => l.decision)).toHaveLength(1);
+    const rec = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0001", "batch.json"), "utf8")) as { counts: { needsReview: number; skipped: number } };
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(rec.counts.needsReview).toBe(report.counts.needsReview);
+    expect(rec.counts.skipped).toBe(report.counts.duplicates);
+    expect(report.counts.needsReview).toBe(report.pendingReview.length);
+  });
+});

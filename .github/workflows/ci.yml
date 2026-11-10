@@ -30,6 +30,8 @@ jobs:
         run: pnpm fetch-fixtures
       - run: pnpm -r typecheck
       - run: pnpm test
+      # Bulk Import at scale (10,000 items in < 120 s, RSS < 500 MB), on its own after the main suite.
+      - run: pnpm test:scale
       - run: pnpm test:scripts
       - run: pnpm test:py
       - run: pnpm report

@@ -58,7 +58,17 @@ export interface UndoResult {
 }
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
-  if (activeBatches.has(batchId)) throw new BatchRefusedError("This import is still running; cancel it first.");
+  // The batch's slot is taken before anything is awaited (R63): no resume, start or second undo meanwhile.
+  if (activeBatches.has(batchId)) throw new BatchRefusedError("This import is running or being undone; try again when it has stopped.");
+  activeBatches.add(batchId);
+  try {
+    return await undoHeld(repo, projectId, batchId);
+  } finally {
+    activeBatches.delete(batchId);
+  }
+}
+
+async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
   if (rec.state === "undone") throw new BatchRefusedError("This import has already been undone.");
@@ -81,8 +91,8 @@ export async function undoBatch(repo: Repo, projectId: string, batchId: string):
         const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor);
         for (const a of r.removed) await ops.trashAssetFile(a);
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
-        if (r.removed.length || r.next.source !== now.source) await ops.writeSource(now, r.next);
-        return true;
+        if (r.changed) await ops.writeSource(now, r.next);
+        return r.changed;
       },
       { op: "import.undo.merge", entity: { type: "source", id: e.mergedInto } },
     );
@@ -130,8 +140,10 @@ export async function undoBatch(repo: Repo, projectId: string, batchId: string):
         kept.push({ kind: "collection", id, reason: "a source outside the import is in it; kept" });
         continue;
       }
-      if (collections.some((c) => c.parentId === id)) {
-        kept.push({ kind: "collection", id, reason: "it holds a collection added after the import; kept" });
+      const children = collections.filter((c) => c.parentId === id);
+      if (children.length) {
+        const ours = children.every((c) => rec.createdCollectionIds.includes(c.id));
+        kept.push({ kind: "collection", id, reason: ours ? "contains a collection that is still in use; kept" : "it holds a collection added after the import; kept" });
         continue;
       }
       await repo.deleteCollection(projectId, id);

@@ -73,7 +73,7 @@ export function applyMerge(cur: SourceFile, added: Asset[], fill: FilledField[],
 }
 
 /** Reverts one merge on the source as it is now; returns the assets to remove and the fields kept (changed since). */
-export function revertMerge(cur: SourceFile, rec: MergeRecord, at: string, actor: string): { next: SourceFile; removed: Asset[]; kept: string[] } {
+export function revertMerge(cur: SourceFile, rec: MergeRecord, at: string, actor: string): { next: SourceFile; removed: Asset[]; kept: string[]; changed: boolean } {
   const ids = new Set(rec.addedAssetIds);
   const removed = cur.assets.filter((a) => ids.has(a.id));
   let source: Src = cur.source;
@@ -96,5 +96,6 @@ export function revertMerge(cur: SourceFile, rec: MergeRecord, at: string, actor
     },
     removed,
     kept,
+    changed,
   };
 }

@@ -189,7 +189,7 @@ describe("vetFileNamePattern (R49d)", () => {
     }
   });
   it("rejects nested quantifiers, backreferences, invalid and group-less patterns", () => {
-    for (const p of ["^(?<title>(a+)+)$", "(?<title>(\\w+\\s?)*)$", "(?<title>[(]+)+", "(?<title>(?:a{2,3}){2})", "(?<title>(?<x>\\d+)-)*", "(?<title>[^](a+)+])", "(?<title>[](a+)+)", "(?<title>x)\\1", "(?<title>x)\\k<title>", "(?<title>", "no groups", "x".repeat(501)]) {
+    for (const p of ["^(?<title>(a+)+)$", "(?<title>(\\w+\\s?)*)$", "(?<title>[(]+)+", "(?<title>(?:a{2,3}){2})", "(?<title>(?<x>\\d+)-)*", "(?<title>[^](a+)+])", "(?<title>[](a+)+)", "(?<title>(a+){2,})", `(?<title>(a+){${"0".repeat(30)}2,})`, `(?<title>(a+){1,${"0".repeat(30)}2})`, "(?<title>x)\\1", "(?<title>x)\\k<title>", "(?<title>", "no groups", "x".repeat(501)]) {
       const r = vetFileNamePattern(p);
       expect(r.ok, p).toBe(false);
       if (!r.ok) expect(r.reason).toMatch(/^The pattern/);

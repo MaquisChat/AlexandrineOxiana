@@ -11,6 +11,7 @@
  * plaintext. Unencrypted files are owner-only (0600). The index holds no batch data: these files
  * are the record.
  */
+import { createHmac } from "node:crypto";
 import { join } from "node:path";
 import { ImportBatch, encName, type PolicyDecision } from "@ao/core";
 import type { MergeRecord } from "./merge.js";
@@ -18,8 +19,16 @@ import { decryptBytes, namesIn, openLine, readMaybe, sealLine } from "../../repo
 import type { MutateRequest, Tx } from "../../repo/mutate.js";
 import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
 
-/** Batches running in this process (a `running` batch.json not listed here was interrupted, R45). */
+/** Batches running (or being undone) in this process (a `running` batch.json not listed here was interrupted, R45). */
 export const activeBatches = new Set<string>();
+
+/** Runs in progress that want to hear about review decisions on their items (keeps their counts current). */
+export const runListeners = new Map<string, (line: JournalEntry) => void>();
+
+/** The key a batch's sources carry for an item (R63): HMAC-SHA256 of the item key, never the key itself. */
+export function itemKeyHash(secret: string, key: string): string {
+  return createHmac("sha256", Buffer.from(secret, "hex")).update(key, "utf8").digest("hex");
+}
 
 export const JOURNAL_PURPOSE = "ao-import-journal";
 /** Batch bookkeeping is organizing data (like collections): no identifiable data of its own. */
@@ -69,6 +78,12 @@ export interface BatchRecord extends ImportBatch {
   /** Total items, when the source could count them. */
   total?: number;
   ocrQueued?: number;
+  /**
+   * 32 random bytes (hex) for this batch: new sources carry HMAC-SHA256(secret, item key) as their
+   * item key, so paths from the import's root never enter source.json or the change log (R63).
+   * Sealed with batch.json in encrypted projects.
+   */
+  secret?: string;
   /** Profile capture (Task 18): counts detail. */
   countsDetail?: Record<string, number>;
 }

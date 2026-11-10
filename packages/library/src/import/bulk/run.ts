@@ -28,6 +28,7 @@
  * library (LinkedRelativePath, R24) and copies nothing; it is refused in projects whose governance
  * requires encryption at rest or that are encrypted. Files unpacked from archives are always copied.
  */
+import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -76,6 +77,8 @@ import {
   PRIVATE_MODE,
   activeBatches,
   appendJournal,
+  itemKeyHash,
+  runListeners,
   batchDirs,
   countOutcomes,
   fileName,
@@ -368,6 +371,8 @@ class Run {
     private readonly rec: BatchRecord,
     private readonly adapter: ImportSourceAdapter,
     journal: JournalEntry[],
+    /** Resume guard: item-key hash → source of this batch found without a journal line. */
+    private readonly recovered: Map<string, string> = new Map(),
   ) {
     this.latest = latestByKey(journal);
     this.createdIds = new Set(rec.createdSourceIds);
@@ -383,6 +388,7 @@ class Run {
   /** Starts the run; whatever happens, `done` settles. */
   start(): void {
     this.run().catch((err: unknown) => {
+      runListeners.delete(this.rec.id);
       active.delete(this.rec.id);
       this.feed.end();
       this.fail(err);
@@ -464,6 +470,8 @@ class Run {
 
   async run(): Promise<void> {
     active.add(this.rec.id);
+    // A review decision on one of this run's items supersedes the outcome it recorded.
+    runListeners.set(this.rec.id, (line) => this.latest.set(line.key, line));
     const watchdog = new PatternWatchdog(this.rec.options.fileNamePatterns, this.deps.patternBudgetMs ?? PATTERN_BUDGET_MS);
     let state: BatchState = "finished";
     try {
@@ -484,6 +492,11 @@ class Run {
       for await (const item of scan) {
         if (seenKeys.has(item.key)) continue;
         seenKeys.add(item.key);
+        if (!this.latest.has(item.key) && this.recovered.size) {
+          // Resume guard: a source of this batch for this item exists although its line was lost.
+          const sid = this.recovered.get(itemKeyHash(this.rec.secret!, item.key));
+          if (sid) this.latest.set(item.key, this.queue({ key: item.key, outcome: "created", sourceId: sid }));
+        }
         if (this.latest.has(item.key)) {
           done++;
           total = Math.max(total, done);
@@ -536,6 +549,7 @@ class Run {
     } catch (err) {
       this.deps.debug?.(`bulk import: the batch record could not be saved (${err instanceof Error ? err.name : "error"})`);
     } finally {
+      runListeners.delete(this.rec.id);
       active.delete(this.rec.id);
       this.feed.end();
     }
@@ -685,7 +699,7 @@ class Run {
       identifiable,
       importBatchId: this.rec.id,
       ...(legalBasis ? { legalBasis } : {}),
-      externalKeys: { ...(item.externalKeys ?? {}), [ITEM_KEY]: item.key },
+      externalKeys: { ...(item.externalKeys ?? {}), [ITEM_KEY]: itemKeyHash(this.rec.secret!, item.key) },
     });
   }
 
@@ -945,6 +959,7 @@ export async function startBatch(deps: BulkImportDeps, projectId: string, adapte
       createdTagIds: [],
       governance,
       notes: [],
+      secret: randomBytes(32).toString("hex"),
     };
     // Written before anything is created, so an interrupted batch still has its record.
     await saveRecord(deps.repo, projectId, rec);
@@ -977,24 +992,24 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
     rec.governance = [...rec.governance.filter((g) => g.items !== undefined), ...governance];
     rec.state = "running";
     delete rec.finishedAt;
+    rec.secret ??= randomBytes(32).toString("hex");
     const journal = await readJournal(deps.repo, projectId, rec.dir);
-    // Resume guard: sources of this batch whose journal line is missing count as done.
-    const journaled = new Set(journal.map((e) => e.key));
-    const recovered: JournalEntry[] = [];
+    // Resume guard: sources of this batch (found by its id and their item-key hash) count as done
+    // even if their journal line was lost.
+    const journaledSources = new Set(journal.map((e) => e.sourceId).filter(Boolean));
+    const recovered = new Map<string, string>();
     for (const sid of deps.repo.listSourceIds(projectId)) {
+      if (journaledSources.has(sid)) continue;
       try {
         const prov = (await deps.repo.getSource(projectId, sid)).source.provenance;
-        const key = prov.externalKeys?.[ITEM_KEY];
-        if (prov.importBatchId === batchId && key && !journaled.has(key)) {
-          recovered.push({ key, outcome: "created", sourceId: sid });
-          journaled.add(key);
-        }
+        const h = prov.externalKeys?.[ITEM_KEY];
+        if (prov.importBatchId === batchId && h) recovered.set(h, sid);
       } catch {
         // unreadable source: not provably this batch's
       }
     }
-    await saveRecord(deps.repo, projectId, rec, recovered);
-    const run = new Run(deps, projectId, rec, source, [...journal, ...recovered]);
+    await saveRecord(deps.repo, projectId, rec);
+    const run = new Run(deps, projectId, rec, source, journal, recovered);
     run.start();
     return run.handle();
   } catch (err) {

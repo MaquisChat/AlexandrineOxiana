@@ -108,11 +108,14 @@ export class BatchDedupe {
     for (const h of c.sha256s) add(this.bySha(h), { sha256s: [h] });
     if (c.doi) {
       const d = normalizeDoi(c.doi);
-      add(this.doi.get(d) ?? this.indexed({ doi: d }), { sha256s: [], doi: d });
+      const inBatch = this.doi.get(d);
+      add(inBatch && this.alive(inBatch) ? inBatch : this.indexed({ doi: d }), { sha256s: [], doi: d });
     }
     for (const i of c.isbns ?? []) {
       const v = toIsbn13(i);
-      if (v) add(this.isbn.get(v) ?? this.indexed({ isbn: v }), { sha256s: [], isbns: [v] });
+      if (!v) continue;
+      const inBatch = this.isbn.get(v);
+      add(inBatch && this.alive(inBatch) ? inBatch : this.indexed({ isbn: v }), { sha256s: [], isbns: [v] });
     }
     const y = yearOf(c.year);
     if (c.title && c.firstCreatorFamily && y !== null) {
