@@ -1,6 +1,6 @@
 export {
   INDEX_FILE,
-  createIndexSink,
+  IndexHandle,
   findSourceBy,
   getMeta,
   indexProject,
@@ -8,11 +8,12 @@ export {
   normalizeDoi,
   normalizeIsbn13,
   openIndex,
-  recordStamps,
+  purgeProject,
   removeSource,
   setMeta,
 } from "./db.js";
-export type { IndexDb, SourceQuery, SourceRow } from "./db.js";
+export type { IndexDb, IndexSourceOptions, SourceQuery, SourceRow } from "./db.js";
+export { createIndexSink, indexUnlockedProject, recordStamps } from "./sink.js";
 export { rebuildIndex, isIndexStale } from "./rebuild.js";
 export type { RebuildOptions, RebuildResult } from "./rebuild.js";
 export { search } from "./search.js";

@@ -53,6 +53,9 @@ export function projectKey(data: ProjectJson, keyRing: KeyRing): { key: Uint8Arr
   return keyId && key ? { key, keyId } : undefined;
 }
 
+/** Test seam: library-relative project folders whose change logs were read (see index tests). */
+export const changeLogReads: string[] = [];
+
 /** Newest change id in a project's change logs (sealed lines are opened with `key` when given). */
 export async function newestProjectChangeId(
   root: string,
@@ -60,6 +63,7 @@ export async function newestProjectChangeId(
   projectId: string,
   key: Uint8Array | null,
 ): Promise<string> {
+  changeLogReads.push(rel);
   const dir = join(root, rel, "changes");
   let files: string[] = [];
   try {
@@ -97,16 +101,19 @@ export async function computeStamps(root: string, keyRing: KeyRing): Promise<Sta
   const stamps: Stamps = {};
   for (const e of await listProjectEntries(root)) {
     if (!e.data) continue;
-    const pid = e.data.project.id;
-    const k = projectKey(e.data, keyRing);
-    if (k === undefined) {
-      const st = await fsp.stat(join(root, e.rel, "manifest.json")).catch(() => null);
-      stamps[pid] = { mode: "manifest", mtimeMs: st ? st.mtimeMs : -1 };
-    } else {
-      stamps[pid] = { mode: "changes", id: await newestProjectChangeId(root, e.rel, pid, k ? k.key : null) };
-    }
+    stamps[e.data.project.id] = await stampFor(root, e.rel, e.data, keyRing);
   }
   return stamps;
+}
+
+/** The stamp of one project (reads only that project's change log, or manifest mtime when locked). */
+export async function stampFor(root: string, rel: string, data: ProjectJson, keyRing: KeyRing): Promise<Stamp> {
+  const k = projectKey(data, keyRing);
+  if (k === undefined) {
+    const st = await fsp.stat(join(root, rel, "manifest.json")).catch(() => null);
+    return { mode: "manifest", mtimeMs: st ? st.mtimeMs : -1 };
+  }
+  return { mode: "changes", id: await newestProjectChangeId(root, rel, data.project.id, k ? k.key : null) };
 }
 
 /** The newest change id across readable projects. */

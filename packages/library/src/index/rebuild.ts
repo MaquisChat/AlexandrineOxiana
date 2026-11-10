@@ -1,15 +1,20 @@
 /** Rebuild `library.sqlite` from the library's files, and detect when it is out of date. */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { SourceFile, newId } from "@ao/core";
+import { newId } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import { renameWithRetry } from "../fs/atomic.js";
 import type { Library } from "../library.js";
 import { ReadOnlyLibraryError } from "../repo/errors.js";
-import { decryptBytes, readMaybe } from "../repo/io.js";
+import { readMaybe } from "../repo/io.js";
 import type { Manifest } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, type Stamps } from "./changes.js";
-import { INDEX_FILE, getMeta, indexLockedSource, indexProject, indexSource, openIndexAt, setMeta, type IndexDb } from "./db.js";
+import {
+  INDEX_FILE, checkpointTruncate, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta,
+  type IndexDb, type IndexHandle,
+} from "./db.js";
+import { readExtractedText, readSource } from "./load.js";
+import { indexUnlockedProject } from "./sink.js";
 
 export interface RebuildResult {
   indexed: number;
@@ -19,11 +24,15 @@ export interface RebuildResult {
 }
 
 export interface RebuildOptions {
-  /** The open library; a read-only one cannot rebuild. */
-  library?: Pick<Library, "mode" | "readOnlyReason">;
   /** Test seam: runs after the new index is complete and closed, right before it replaces the old one. */
   beforeRename?: () => void | Promise<void>;
 }
+
+/**
+ * Tables that later tasks fill from files of their own (review items, import batches, jobs). Until
+ * those files exist the index is their only home, so a rebuild copies their rows over (ADR 0007).
+ */
+const CARRIED_TABLES = ["review_items", "import_batches", "jobs"] as const;
 
 const REBUILD_PREFIX = `${INDEX_FILE}.rebuild-`;
 
@@ -32,80 +41,93 @@ async function rmIndexFiles(path: string): Promise<void> {
 }
 
 /**
- * Builds a fresh index in `library.sqlite.rebuild-<id>` and atomically renames it over
- * `library.sqlite`. The old database stays usable until the rename; a failure or crash before it
- * leaves the old database untouched. Callers holding an open handle must reopen after this returns.
+ * Builds a fresh index in `library.sqlite.rebuild-<id>`, then closes the handle's live connection,
+ * removes its WAL/SHM, atomically renames the new file over `library.sqlite`, reopens and swaps the
+ * handle's connection, and reloads unlocked encrypted projects into memory. The old database stays
+ * usable until the rename; a failure or crash before it leaves it untouched (a failed checkpoint
+ * aborts the rebuild). A read-only library cannot rebuild.
  */
 export async function rebuildIndex(
-  root: string,
+  handle: IndexHandle,
   keyRing: KeyRing,
+  library: Pick<Library, "mode" | "readOnlyReason">,
   onProgress?: (done: number, total: number) => void,
   opts: RebuildOptions = {},
 ): Promise<RebuildResult> {
-  if (opts.library && opts.library.mode !== "read-write") throw new ReadOnlyLibraryError(opts.library.readOnlyReason);
+  if (library.mode !== "read-write") throw new ReadOnlyLibraryError(library.readOnlyReason);
+  const root = handle.root;
   // Leftovers of an earlier crashed rebuild (the library lock makes us the only writer).
-  for (const f of await fsp.readdir(root)) if (f.startsWith(REBUILD_PREFIX)) await rmIndexFiles(join(root, f.replace(/-(wal|shm|journal)$/, "")));
+  for (const f of await fsp.readdir(root)) {
+    if (f.startsWith(REBUILD_PREFIX)) await rmIndexFiles(join(root, f.replace(/-(wal|shm|journal)$/, "")));
+  }
 
   const dest = join(root, INDEX_FILE);
   const tmp = join(root, `${REBUILD_PREFIX}${newId()}`);
-  let db: IndexDb | undefined;
+  let nextDb: IndexDb | undefined;
   try {
-    db = openIndexAt(tmp);
-    const result = await populate(db, root, keyRing, onProgress);
-    // Leave a single self-contained file: no WAL to be mistaken for the old database's.
-    db.pragma("wal_checkpoint(TRUNCATE)");
-    db.pragma("journal_mode = DELETE");
-    db.close();
-    db = undefined;
+    const carried = readCarried(handle.isOpen ? handle.db : undefined);
+    nextDb = openIndexAt(tmp);
+    const result = await populate(nextDb, root, keyRing, carried, onProgress);
+    checkpointTruncate(nextDb);
+    nextDb.pragma("journal_mode = DELETE"); // one self-contained file
+    nextDb.close();
+    nextDb = undefined;
     await opts.beforeRename?.();
-    await retireOldWal(dest);
+    if (handle.isOpen) checkpointTruncate(handle.db); // failure here aborts with the old DB intact
+    handle.close();
+    await fsp.rm(`${dest}-wal`, { force: true });
+    await fsp.rm(`${dest}-shm`, { force: true });
     await renameWithRetry(tmp, dest);
+    handle.reopen();
+    for (const e of await listProjectEntries(root)) {
+      const d = e.data;
+      if (!d || !d.project.encryption.enabled || !projectKey(d, keyRing)) continue;
+      result.errors.push(...(await indexUnlockedProject(handle.db, root, keyRing, d.project.id)).errors);
+    }
     return result;
   } catch (err) {
     try {
-      db?.close();
+      nextDb?.close();
     } catch {
       // already closed
     }
     await rmIndexFiles(tmp);
+    if (!handle.isOpen) {
+      try {
+        handle.reopen(); // whichever database is at library.sqlite is intact
+      } catch {
+        // the original error is the useful one
+      }
+    }
     throw err;
   }
 }
 
-/** Folds the old database's WAL into it and removes the side files, so none can be replayed onto the new file. */
-async function retireOldWal(dest: string): Promise<void> {
-  if (!(await fsp.stat(dest).catch(() => null))) {
-    await fsp.rm(`${dest}-wal`, { force: true });
-    await fsp.rm(`${dest}-shm`, { force: true });
-    return;
+function readCarried(old: IndexDb | undefined): Record<string, Array<Record<string, unknown>>> {
+  const out: Record<string, Array<Record<string, unknown>>> = {};
+  for (const t of CARRIED_TABLES) {
+    try {
+      out[t] = old ? (old.prepare(`SELECT * FROM ${t}`).all() as Array<Record<string, unknown>>) : [];
+    } catch {
+      out[t] = []; // unreadable old database: nothing to carry
+    }
   }
-  try {
-    const old = openIndexAt(dest);
-    old.pragma("wal_checkpoint(TRUNCATE)");
-    old.close();
-  } catch {
-    // an unreadable old database is about to be replaced anyway
-  }
-  await fsp.rm(`${dest}-wal`, { force: true });
-  await fsp.rm(`${dest}-shm`, { force: true });
+  return out;
 }
 
 async function populate(
   db: IndexDb,
   root: string,
   keyRing: KeyRing,
+  carried: Record<string, Array<Record<string, unknown>>>,
   onProgress?: (done: number, total: number) => void,
 ): Promise<RebuildResult> {
   const result: RebuildResult = { indexed: 0, lockedProjects: [], errors: [] };
   // Stamps first: a change made while we walk then shows up as stale rather than being missed.
   const stamps: Stamps = await computeStamps(root, keyRing);
 
-  type Job = () => Promise<void>;
-  const jobs: Job[] = [];
-  let done = 0;
-  const entries = await listProjectEntries(root);
-
-  for (const e of entries) {
+  const jobs: Array<() => Promise<void>> = [];
+  for (const e of await listProjectEntries(root)) {
     if (!e.data) {
       result.errors.push({ folder: e.rel, message: e.error ?? "unreadable project" });
       continue;
@@ -113,9 +135,8 @@ async function populate(
     const data = e.data;
     const project = { ...data.project, folder: e.rel };
     const k = projectKey(data, keyRing);
-    const locked = k === undefined;
-    indexProject(db, project, locked);
-    if (locked) {
+    indexProject(db, project, k === undefined);
+    if (k === undefined) {
       result.lockedProjects.push(project.id);
       const raw = await readMaybe(join(root, e.rel, "manifest.json")).catch(() => null);
       let manifest: Manifest = { formatVersion: 1, sources: [] };
@@ -134,15 +155,10 @@ async function populate(
       }
       continue;
     }
-    // Unlocked: project-level entities are indexed too (a locked project's are identifying).
-    for (const c of data.collections) db.prepare("INSERT OR REPLACE INTO collections VALUES (?,?,?,?)").run(c.id, c.projectId, c.parentId ?? null, c.name);
-    for (const t of data.tags) db.prepare("INSERT OR REPLACE INTO tags VALUES (?,?,?,?)").run(t.id, t.scope, t.name, t.color ?? null);
-    for (const p of data.participants) db.prepare("INSERT OR REPLACE INTO participants VALUES (?,?,?)").run(p.id, p.projectId, p.code);
-    for (const s of data.sessions) db.prepare("INSERT OR REPLACE INTO sessions VALUES (?,?,?)").run(s.id, s.projectId, s.date);
-    for (const c of data.consents) {
-      db.prepare("INSERT OR REPLACE INTO consents VALUES (?,?,?,?,?,?,?)").run(c.id, c.projectId, c.participantId, c.scope, c.date, c.expires ?? null, c.withdrawn?.at ?? null);
-    }
-
+    // Plain projects are indexed fully here. An unlocked encrypted project gets manifest-level rows
+    // only; its content is loaded into memory after the new file is in place (R30).
+    const prot = k !== null;
+    if (!prot) indexProjectEntities(db, data, false);
     let names: string[] = [];
     try {
       names = await fsp.readdir(join(root, e.rel, "Sources"));
@@ -156,7 +172,8 @@ async function populate(
         try {
           const sf = await readSource(join(root, folder), k);
           if (!sf) return; // not a source folder
-          indexSource(db, sf);
+          if (prot) indexSource(db, sf, undefined, { protected: true, withTemp: false });
+          else indexSource(db, sf, await readExtractedText(root, sf, null));
           result.indexed++;
         } catch (err) {
           result.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
@@ -167,25 +184,20 @@ async function populate(
 
   const total = jobs.length;
   onProgress?.(0, total);
+  let done = 0;
   for (const job of jobs) {
     await job();
     onProgress?.(++done, total);
   }
+  for (const [table, rows] of Object.entries(carried)) {
+    for (const r of rows) {
+      const cols = Object.keys(r);
+      db.prepare(`INSERT OR REPLACE INTO ${table} (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`).run(...cols.map((c) => r[c]));
+    }
+  }
   setMeta(db, "projectStamps", JSON.stringify(stamps));
   setMeta(db, "lastChangeId", newestChangeId(stamps) ?? "");
   return result;
-}
-
-async function readSource(dir: string, k: { key: Uint8Array; keyId: string } | null | undefined): Promise<SourceFile | null> {
-  if (k) {
-    const raw = await readMaybe(join(dir, "source.json.enc"));
-    if (!raw) return null;
-    const text = await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
-    return SourceFile.parse(JSON.parse(text.toString("utf8")));
-  }
-  const raw = await readMaybe(join(dir, "source.json"));
-  if (!raw) return null;
-  return SourceFile.parse(JSON.parse(raw.toString("utf8")));
 }
 
 /**

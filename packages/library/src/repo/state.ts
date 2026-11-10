@@ -23,6 +23,13 @@ export interface IndexSink {
   indexSource(sf: SourceFile, extractedText?: string): void | Promise<void>;
   removeSource(id: string): void | Promise<void>;
   indexProject(p: Project): void | Promise<void>;
+  /**
+   * Called synchronously when an encrypted project is locked: drop everything held for it beyond
+   * manifest-level fields (R30). Optional; absent means nothing to drop.
+   */
+  purgeProject?(projectId: string): void;
+  /** Called after an encrypted project was unlocked so its content can be indexed again. Optional. */
+  projectUnlocked?(projectId: string): void | Promise<void>;
 }
 
 export const NOOP_INDEX: IndexSink = { indexSource() {}, removeSource() {}, indexProject() {} };

@@ -43,6 +43,6 @@ export function buildMatchQuery(text: string): string | undefined {
     }
   }
   const rest = text.replace(CJK_RUN, " ");
-  for (const m of rest.matchAll(WORD)) parts.push(`"${m[0]}"*`);
+  for (const m of rest.matchAll(WORD)) if (/[\p{L}\p{N}]/u.test(m[0])) parts.push(`"${m[0]}"*`); // lone marks are dropped
   return parts.length > 0 ? parts.join(" AND ") : undefined;
 }

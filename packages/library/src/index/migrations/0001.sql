@@ -1,4 +1,11 @@
--- Index schema v1. Everything here is derived from the library's files and can be rebuilt.
+-- Index schema v1. Everything here is a cache derived from the library's files and can be rebuilt
+-- (review_items, import_batches and jobs will be caches of files written by later tasks; until then
+-- a rebuild carries their rows over - see docs/adr/0007-index.md).
+--
+-- Encrypted projects (R30): only manifest-level fields (id, type, issued_year, folder, project id,
+-- locked flag) are stored here. Titles, creators, extracted text, dedupe keys, collection/tag names and
+-- consent records of an encrypted project live only in the connection's in-memory TEMP schema (see
+-- db.ts) while the project is unlocked.
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE projects (
@@ -31,6 +38,22 @@ CREATE INDEX sources_project ON sources (project_id);
 CREATE INDEX sources_platform_post ON sources (platform, platform_post_id);
 CREATE INDEX sources_doi ON sources (doi);
 CREATE INDEX sources_isbn13 ON sources (isbn13);
+
+-- Every project a source belongs to (ids only; not identifying).
+CREATE TABLE source_projects (
+  source_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  PRIMARY KEY (source_id, project_id)
+);
+CREATE INDEX source_projects_project ON source_projects (project_id);
+
+-- All valid ISBNs of a source, normalised to ISBN-13.
+CREATE TABLE source_isbns (
+  source_id TEXT NOT NULL,
+  isbn13 TEXT NOT NULL,
+  PRIMARY KEY (source_id, isbn13)
+);
+CREATE INDEX source_isbns_isbn ON source_isbns (isbn13);
 
 CREATE TABLE source_hashes (
   source_id TEXT NOT NULL,

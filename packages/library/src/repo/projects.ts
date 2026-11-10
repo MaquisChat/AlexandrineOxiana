@@ -209,10 +209,21 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
       await core.auditNow(st, { ...core.auditBase(st, at), action: "key.unlock", entity: { type: "project", id: projectId } });
     });
   }
+  try {
+    await core.index.projectUnlocked?.(projectId);
+  } catch (error) {
+    core.indexErrors.push({ op: "project.unlock", error });
+  }
 }
 
 export function lockProject(core: RepoCore, projectId: string): void {
   const keyId = core.state(projectId).project.encryption.keyId;
+  // Drop the project's in-memory index content first; a failure must not keep the project unlocked.
+  try {
+    core.index.purgeProject?.(projectId);
+  } catch (error) {
+    core.indexErrors.push({ op: "project.lock", error });
+  }
   if (keyId) core.keyRing.remove(keyId);
 }
 

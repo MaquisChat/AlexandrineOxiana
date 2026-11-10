@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Provenance, type SourceDraft } from "@ao/core";
@@ -10,15 +10,19 @@ import { ReadOnlyLibraryError, type Repo } from "../repo/index.js";
 import { openTestRepo } from "../repo/testing.js";
 import {
   INDEX_FILE,
+  IndexHandle,
   createIndexSink,
   findSourceBy,
   getMeta,
+  indexSource,
   isIndexStale,
   openIndex,
   rebuildIndex,
   search,
-  type IndexDb,
 } from "./index.js";
+import { changeLogReads } from "./changes.js";
+import { openIndexAt } from "./db.js";
+import { stripVtt } from "./load.js";
 import { buildMatchQuery, cjkBigrams } from "./text.js";
 
 const NOW = "2026-11-09T14:30:00.000Z";
@@ -34,7 +38,7 @@ let tmp: string;
 let lib: Library;
 let ring: KeyRing;
 let repo: Repo;
-let db: IndexDb;
+let handle: IndexHandle;
 let pdf: string;
 
 function deps(): Deps {
@@ -83,13 +87,13 @@ function prov(over: Partial<Provenance> = {}): Provenance {
 
 const files = () => [{ path: pdf, role: "original" as const, handling: "copy" as const }];
 
-async function mkRepo(sinkDb: IndexDb | undefined = db): Promise<Repo> {
+async function mkRepo(withSink = true): Promise<Repo> {
   return openTestRepo(lib, ring, {
     clock: () => new Date(NOW),
     tz: "UTC",
     actor: "tester",
     scryptN: 2 ** 10,
-    ...(sinkDb ? { index: createIndexSink(sinkDb, { root: lib.root, keyRing: ring }) } : {}),
+    ...(withSink ? { index: createIndexSink(handle, { root: lib.root, keyRing: ring }) } : {}),
   });
 }
 
@@ -105,13 +109,13 @@ beforeEach(async () => {
   lib = await createLibrary(join(tmp, "Lib"), "Lib", deps());
   pdf = join(tmp, "input.pdf");
   await writeFile(pdf, Buffer.from("%PDF-1.7\nhello\n%%EOF\n"));
-  db = openIndex(lib.root);
+  handle = new IndexHandle(lib.root);
   repo = await mkRepo();
 });
 
 afterEach(async () => {
   try {
-    db.close();
+    handle.close();
   } catch {
     // already closed
   }
@@ -120,25 +124,19 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
-/** Reopens the index after a rebuild replaced the file. */
-function reopen(): void {
-  db.close();
-  db = openIndex(lib.root);
-}
 
 describe("schema", () => {
   it("uses WAL, records schemaVersion 1 and creates the required tables", () => {
-    expect(db.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(getMeta(db, "schemaVersion")).toBe("1");
-    const names = (db.prepare("SELECT name FROM sqlite_master").all() as Array<{ name: string }>).map((r) => r.name);
+    expect(handle.db.pragma("journal_mode", { simple: true })).toBe("wal");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    const names = (handle.db.prepare("SELECT name FROM sqlite_master").all() as Array<{ name: string }>).map((r) => r.name);
     for (const t of [
       "projects", "sources", "assets", "collections", "tags", "source_collections", "source_tags", "participants",
       "sessions", "consents", "import_batches", "review_items", "jobs", "meta", "source_text", "source_hashes",
     ]) expect(names).toContain(t);
     // reopening does not re-run migrations
-    db.close();
-    db = openIndex(lib.root);
-    expect(getMeta(db, "schemaVersion")).toBe("1");
+    handle.reopen();
+    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
   });
 });
 
@@ -155,15 +153,15 @@ describe("search", () => {
       { provenance: prov() },
     );
     const cafe = await repo.createSource(pid, draft("Un Café en Madrid"), files(), { provenance: prov() });
-    const r = search(db, { text: "cooking" });
+    const r = search(handle.db, { text: "cooking" });
     expect(ids(r)).toEqual([es.source.id]);
     expect(r.items[0]!.title).toBe("Cocina familiar y memoria");
     expect(r.items[0]).toMatchObject({ projectId: pid, type: "article-journal", issuedYear: "2025", locked: false, needsReview: false });
-    expect(search(db, { text: "cafe" }).items.map((i) => i.id)).toEqual([cafe.source.id]);
-    expect(search(db, { text: "CAFÉ" }).total).toBe(1);
-    expect(search(db, { text: "fam" }).total).toBe(1); // prefix
-    expect(search(db, { text: "memory madrid" }).total).toBe(0); // AND
-    expect(search(db, { text: "Smith" }).total).toBe(2); // creators
+    expect(search(handle.db, { text: "cafe" }).items.map((i) => i.id)).toEqual([cafe.source.id]);
+    expect(search(handle.db, { text: "CAFÉ" }).total).toBe(1);
+    expect(search(handle.db, { text: "fam" }).total).toBe(1); // prefix
+    expect(search(handle.db, { text: "memory madrid" }).total).toBe(0); // AND
+    expect(search(handle.db, { text: "Smith" }).total).toBe(2); // creators
   });
 
   it("filters by project, type, collection, tags; empty text is filter-only; paging", async () => {
@@ -178,30 +176,29 @@ describe("search", () => {
     await repo.setMembership(p1, a.source.id, { collectionIds: [col.id], tagIds: [t1.id, t2.id] });
     await repo.setMembership(p1, b.source.id, { tagIds: [t1.id] });
 
-    expect(search(db, {}).total).toBe(3);
-    expect(search(db, { text: "   " }).total).toBe(3);
-    expect(ids(search(db, { projectId: p1 }))).toEqual([a.source.id, b.source.id].sort());
-    expect(ids(search(db, { types: ["book"] }))).toEqual([b.source.id]);
-    expect(ids(search(db, { collectionId: col.id }))).toEqual([a.source.id]);
-    expect(ids(search(db, { tagIds: [t1.id] }))).toEqual([a.source.id, b.source.id].sort());
-    expect(ids(search(db, { tagIds: [t1.id, t2.id] }))).toEqual([a.source.id]);
-    expect(ids(search(db, { text: "gamma", projectId: p1 }))).toEqual([]);
-    expect(ids(search(db, { text: "gamma", projectId: p2 }))).toEqual([c.source.id]);
-    const page = search(db, { limit: 2, offset: 0 });
+    expect(search(handle.db, {}).total).toBe(3);
+    expect(search(handle.db, { text: "   " }).total).toBe(3);
+    expect(ids(search(handle.db, { projectId: p1 }))).toEqual([a.source.id, b.source.id].sort());
+    expect(ids(search(handle.db, { types: ["book"] }))).toEqual([b.source.id]);
+    expect(ids(search(handle.db, { collectionId: col.id }))).toEqual([a.source.id]);
+    expect(ids(search(handle.db, { tagIds: [t1.id] }))).toEqual([a.source.id, b.source.id].sort());
+    expect(ids(search(handle.db, { tagIds: [t1.id, t2.id] }))).toEqual([a.source.id]);
+    expect(ids(search(handle.db, { text: "gamma", projectId: p1 }))).toEqual([]);
+    expect(ids(search(handle.db, { text: "gamma", projectId: p2 }))).toEqual([c.source.id]);
+    const page = search(handle.db, { limit: 2, offset: 0 });
     expect(page.total).toBe(3);
     expect(page.items).toHaveLength(2);
-    expect(search(db, { limit: 2, offset: 2 }).items).toHaveLength(1);
+    expect(search(handle.db, { limit: 2, offset: 2 }).items).toHaveLength(1);
   });
 
   it("keeps extracted text across metadata re-indexing", async () => {
     const pid = await openProject();
     const sf = await repo.createSource(pid, draft("Plain title"), files(), { provenance: prov() });
     // import pipeline path: indexSource with extracted text, then a metadata edit without it
-    const { indexSource } = await import("./db.js");
-    indexSource(db, sf, "the quick brown fox");
-    expect(search(db, { text: "fox" }).total).toBe(1);
+    indexSource(handle.db, sf, "the quick brown fox");
+    expect(search(handle.db, { text: "fox" }).total).toBe(1);
     await repo.updateSource(pid, sf.source.id, { publisher: "X" });
-    expect(search(db, { text: "fox" }).total).toBe(1);
+    expect(search(handle.db, { text: "fox" }).total).toBe(1);
   });
 
   it("is safe against FTS5 syntax in user text", async () => {
@@ -212,14 +209,14 @@ describe("search", () => {
       '"', '""', '"unterminated', "*", "**", "NEAR", "NEAR(a b)", "a NEAR/2 b", "AND", "OR", "NOT", "a OR b", "-far", "far -study",
       "title:foo", "cjk_bigrams:x", "{title_all}:x", "(", ")", "(((", "^far", "far*", "'; DROP TABLE sources; --", "\\", "\u0000", "a\"b",
     ];
-    for (const text of nasty) expect(() => search(db, { text }), JSON.stringify(text)).not.toThrow();
+    for (const text of nasty) expect(() => search(handle.db, { text }), JSON.stringify(text)).not.toThrow();
     // user text is data: '-far' means the word far, "NEAR" the word near, "*" matches nothing special
-    expect(ids(search(db, { text: "-far" }))).toEqual([a.source.id]);
-    expect(ids(search(db, { text: "NEAR" }))).toEqual([a.source.id]);
-    expect(ids(search(db, { text: '"near" far' }))).toEqual([a.source.id]);
-    expect(search(db, { text: "*" }).total).toBe(2); // nothing searchable: filter-only
-    expect(search(db, { text: "title:foo" }).total).toBe(0); // 'title' and 'foo' are plain words
-    expect(search(db, { text: "far OR nothing" }).total).toBe(0); // OR is a word, not an operator
+    expect(ids(search(handle.db, { text: "-far" }))).toEqual([a.source.id]);
+    expect(ids(search(handle.db, { text: "NEAR" }))).toEqual([a.source.id]);
+    expect(ids(search(handle.db, { text: '"near" far' }))).toEqual([a.source.id]);
+    expect(search(handle.db, { text: "*" }).total).toBe(2); // nothing searchable: filter-only
+    expect(search(handle.db, { text: "title:foo" }).total).toBe(0); // 'title' and 'foo' are plain words
+    expect(search(handle.db, { text: "far OR nothing" }).total).toBe(0); // OR is a word, not an operator
     expect(buildMatchQuery('x" OR "y')).toBe('"x"* AND "OR"* AND "y"*');
   });
 
@@ -227,12 +224,12 @@ describe("search", () => {
     const pid = await openProject();
     const jp = await repo.createSource(pid, draft([{ lang: "ja", kind: "original", value: "家庭料理の記憶" }]), files(), { provenance: prov() });
     await repo.createSource(pid, draft("English only"), files(), { provenance: prov() });
-    expect(ids(search(db, { text: "料理" }))).toEqual([jp.source.id]);
-    expect(ids(search(db, { text: "家庭料理の記憶" }))).toEqual([jp.source.id]);
-    expect(ids(search(db, { text: "憶" }))).toEqual([jp.source.id]); // last character
-    expect(ids(search(db, { text: "料" }))).toEqual([jp.source.id]); // single char
-    expect(search(db, { text: "料記" }).total).toBe(0); // not adjacent
-    expect(search(db, { text: "料理 english" }).total).toBe(0);
+    expect(ids(search(handle.db, { text: "料理" }))).toEqual([jp.source.id]);
+    expect(ids(search(handle.db, { text: "家庭料理の記憶" }))).toEqual([jp.source.id]);
+    expect(ids(search(handle.db, { text: "憶" }))).toEqual([jp.source.id]); // last character
+    expect(ids(search(handle.db, { text: "料" }))).toEqual([jp.source.id]); // single char
+    expect(search(handle.db, { text: "料記" }).total).toBe(0); // not adjacent
+    expect(search(handle.db, { text: "料理 english" }).total).toBe(0);
     expect(cjkBigrams("家庭料理の記憶 abc")).toBe("家庭 庭料 料理 理の の記 記憶 憶");
     expect(buildMatchQuery("料理")).toBe('cjk_bigrams : "料理"');
   });
@@ -257,47 +254,44 @@ describe("rebuildIndex", () => {
   it("rebuilding after deleting library.sqlite gives the same results", async () => {
     await seed();
     const queries = [{ text: "cooking" }, { text: "cafe" }, {}, { types: ["article-journal" as const] }];
-    const before = queries.map((q) => search(db, q));
-    db.close();
+    const before = queries.map((q) => search(handle.db, q));
+    handle.close();
     for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
     const progress: Array<[number, number]> = [];
-    const res = await rebuildIndex(lib.root, ring, (d, t) => progress.push([d, t]), { library: lib });
+    const res = await rebuildIndex(handle, ring, lib, (d, t) => progress.push([d, t]));
     expect(res).toEqual({ indexed: 2, lockedProjects: [], errors: [] });
     expect(progress.at(-1)).toEqual([2, 2]);
-    db = openIndex(lib.root);
-    expect(queries.map((q) => search(db, q))).toEqual(before);
+    expect(queries.map((q) => search(handle.db, q))).toEqual(before);
     expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
   });
 
   it("reports a corrupt source.json and indexes the others", async () => {
     const { pid, a } = await seed();
     const bad = await repo.createSource(pid, draft("Broken one"), files(), { provenance: prov() });
     await writeFile(join(lib.root, bad.source.folder, "source.json"), "{ not json");
-    const res = await rebuildIndex(lib.root, ring, undefined, { library: lib });
+    const res = await rebuildIndex(handle, ring, lib);
     expect(res.indexed).toBe(2);
     expect(res.errors).toHaveLength(1);
     expect(res.errors[0]!.folder).toBe(bad.source.folder);
     expect(res.errors[0]!.message).toBeTruthy();
-    reopen();
-    expect(search(db, { text: "cooking" }).items.map((i) => i.id)).toEqual([a.source.id]);
-    expect(search(db, { text: "broken" }).total).toBe(0);
+    expect(search(handle.db, { text: "cooking" }).items.map((i) => i.id)).toEqual([a.source.id]);
+    expect(search(handle.db, { text: "broken" }).total).toBe(0);
   });
 
   it("refuses to rebuild a read-only library", async () => {
-    await expect(rebuildIndex(lib.root, ring, undefined, { library: { mode: "read-only", readOnlyReason: "offline" } })).rejects.toBeInstanceOf(
+    await expect(rebuildIndex(handle, ring, { mode: "read-only", readOnlyReason: "offline" })).rejects.toBeInstanceOf(
       ReadOnlyLibraryError,
     );
   });
 
   it("a crash before the rename leaves the old database intact; the next rebuild cleans up", async () => {
     await seed();
-    const before = search(db, { text: "cooking" });
-    db.close();
+    const before = search(handle.db, { text: "cooking" });
+    handle.close();
     const oldBytes = await readFile(join(lib.root, INDEX_FILE));
     await expect(
-      rebuildIndex(lib.root, ring, undefined, {
-        library: lib,
+      rebuildIndex(handle, ring, lib, undefined, {
         beforeRename: () => {
           throw new Error("power cut");
         },
@@ -305,29 +299,26 @@ describe("rebuildIndex", () => {
     ).rejects.toThrow("power cut");
     expect(await readFile(join(lib.root, INDEX_FILE))).toEqual(oldBytes);
     expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
-    db = openIndex(lib.root);
-    expect(search(db, { text: "cooking" })).toEqual(before);
+    expect(search(handle.db, { text: "cooking" })).toEqual(before);
 
     // a hard kill leaves the temp file behind; the old DB still works and the next rebuild removes it
     await writeFile(join(lib.root, `${INDEX_FILE}.rebuild-dead`), "garbage");
-    await rebuildIndex(lib.root, ring, undefined, { library: lib });
+    await rebuildIndex(handle, ring, lib);
     expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
-    reopen();
-    expect(search(db, { text: "cooking" })).toEqual(before);
+    expect(search(handle.db, { text: "cooking" })).toEqual(before);
   });
 
   it("a failure while building (progress callback throws) leaves the old database intact", async () => {
     await seed();
-    db.close();
+    handle.close();
     const oldBytes = await readFile(join(lib.root, INDEX_FILE));
     await expect(
-      rebuildIndex(lib.root, ring, (d) => {
+      rebuildIndex(handle, ring, lib, (d) => {
         if (d === 1) throw new Error("boom");
       }),
     ).rejects.toThrow("boom");
     expect(await readFile(join(lib.root, INDEX_FILE))).toEqual(oldBytes);
     expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
-    db = openIndex(lib.root);
   });
 
   it("indexes a locked project from the manifest only: type and year, no titles, no text", async () => {
@@ -336,28 +327,26 @@ describe("rebuildIndex", () => {
     const sf = await repo.createSource(pid, draft("Very identifying title", { type: "interview" }), files(), {
       provenance: prov({ identifiable: true, legal: { status: "consented", basis: "consent form" } }),
     });
-    expect(search(db, { text: "identifying" }).total).toBe(1); // unlocked: indexed
+    expect(search(handle.db, { text: "identifying" }).total).toBe(1); // unlocked: indexed
     repo.lockProject(pid);
-    const res = await rebuildIndex(lib.root, ring, undefined, { library: lib });
+    const res = await rebuildIndex(handle, ring, lib);
     expect(res.lockedProjects).toEqual([pid]);
     expect(res.indexed).toBe(1);
-    reopen();
-    expect(search(db, { text: "identifying" }).total).toBe(0);
-    const rows = search(db, { projectId: pid }).items;
+    expect(search(handle.db, { text: "identifying" }).total).toBe(0);
+    const rows = search(handle.db, { projectId: pid }).items;
     expect(rows).toEqual([
       { id: sf.source.id, projectId: pid, type: "interview", title: "", creatorsText: "", issuedYear: "2025", folder: sf.source.folder, needsReview: false, locked: true },
     ]);
     // nothing identifying anywhere in the database file
     const raw = (await readFile(join(lib.root, INDEX_FILE))).toString("latin1");
     // (the folder name, taken from the plaintext manifest, is the only place a title can appear)
-    expect(db.prepare("SELECT COUNT(*) AS n FROM source_text").get()).toEqual({ n: 0 });
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM source_text").get()).toEqual({ n: 0 });
     expect(raw).not.toContain("Smith");
     // unlocking and rebuilding indexes it fully
     await repo.unlockProject(pid, "pw");
-    const res2 = await rebuildIndex(lib.root, ring, undefined, { library: lib });
+    const res2 = await rebuildIndex(handle, ring, lib);
     expect(res2.lockedProjects).toEqual([]);
-    reopen();
-    expect(search(db, { text: "identifying" }).items[0]).toMatchObject({ id: sf.source.id, locked: false, title: "Very identifying title" });
+    expect(search(handle.db, { text: "identifying" }).items[0]).toMatchObject({ id: sf.source.id, locked: false, title: "Very identifying title" });
   });
 });
 
@@ -365,14 +354,13 @@ describe("isIndexStale", () => {
   it("is true after an extra change is appended to the change log", async () => {
     const pid = await openProject();
     await repo.createSource(pid, draft("A"), files(), { provenance: prov() });
-    await rebuildIndex(lib.root, ring, undefined, { library: lib });
-    reopen();
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    await rebuildIndex(handle, ring, lib);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
     const dir = join(lib.root, "Projects", "P", "changes");
     const file = (await readdir(dir))[0]!;
     const change = { id: newId(), at: NOW, author: "x", device: "d", projectId: pid, entity: { type: "source", id: newId() }, op: "delete" };
     await appendFile(join(dir, file), `${JSON.stringify(change)}\n`);
-    expect(await isIndexStale(lib.root, db, ring)).toBe(true);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
   });
 
   it("is true for a fresh database with nothing recorded", async () => {
@@ -386,31 +374,30 @@ describe("isIndexStale", () => {
     const created = await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } });
     const pid = created.project.id;
     await repo.createSource(pid, draft("S"), files(), { provenance: prov({ identifiable: true, legal: { status: "consented", basis: "consent form" } }) });
-    await rebuildIndex(lib.root, ring, undefined, { library: lib });
-    reopen();
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
-    const stamps = JSON.parse(getMeta(db, "projectStamps")!) as Record<string, { mode: string; id?: string }>;
+    await rebuildIndex(handle, ring, lib);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+    const stamps = JSON.parse(getMeta(handle.db, "projectStamps")!) as Record<string, { mode: string; id?: string }>;
     expect(stamps[pid]!.mode).toBe("changes");
-    expect(getMeta(db, "lastChangeId")).toBe(stamps[pid]!.id);
+    expect(getMeta(handle.db, "lastChangeId")).toBe(stamps[pid]!.id);
 
     // a sealed line written by a later (unindexed) change is noticed while the key is in the ring
-    const another = await repo.updateSource(pid, (await repo.listSourceIds(pid))[0]!, { publisher: "Q" });
+    // a change made by something that does not feed the index (no sink)
+    const plain = await mkRepo(false);
+    const another = await plain.updateSource(pid, plain.listSourceIds(pid)[0]!, { publisher: "Q" });
     expect(another.source.publisher).toBe("Q");
-    expect(await isIndexStale(lib.root, db, ring)).toBe(true);
-    await rebuildIndex(lib.root, ring, undefined, { library: lib });
-    reopen();
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    await rebuildIndex(handle, ring, lib);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
 
     // lock: the project's stamp mode changes, so the index is stale until rebuilt, then by mtime
     repo.lockProject(pid);
-    expect(await isIndexStale(lib.root, db, ring)).toBe(true);
-    await rebuildIndex(lib.root, ring, undefined, { library: lib });
-    reopen();
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    await rebuildIndex(handle, ring, lib);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
     const manifest = join(lib.root, "Projects", "Secret", "manifest.json");
     const st = await stat(manifest);
     await utimes(manifest, st.atime, new Date(st.mtimeMs + 5000));
-    expect(await isIndexStale(lib.root, db, ring)).toBe(true);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
   });
 });
 
@@ -419,27 +406,27 @@ describe("IndexSink through openRepo", () => {
     const pid = await openProject();
     expect(repo.indexErrors).toEqual([]);
     const sf = await repo.createSource(pid, draft("Original words"), files(), { provenance: prov() });
-    expect(search(db, { text: "original" }).total).toBe(1);
-    expect(db.prepare("SELECT name FROM projects").all()).toEqual([{ name: "P" }]);
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    expect(search(handle.db, { text: "original" }).total).toBe(1);
+    expect(handle.db.prepare("SELECT name FROM projects").all()).toEqual([{ name: "P" }]);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
 
     await repo.updateSource(pid, sf.source.id, {
       title: { variants: [{ lang: "en", kind: "original", value: "Changed phrase" }] },
     });
-    expect(search(db, { text: "original" }).total).toBe(0);
-    expect(search(db, { text: "changed" }).total).toBe(1);
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    expect(search(handle.db, { text: "original" }).total).toBe(0);
+    expect(search(handle.db, { text: "changed" }).total).toBe(1);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
 
     const tag = await repo.createTag(pid, "x");
     await repo.setMembership(pid, sf.source.id, { tagIds: [tag.id] });
-    expect(search(db, { tagIds: [tag.id] }).total).toBe(1);
+    expect(search(handle.db, { tagIds: [tag.id] }).total).toBe(1);
 
     await repo.deleteSource(pid, sf.source.id);
-    expect(search(db, {}).total).toBe(0);
-    expect(search(db, { text: "changed" }).total).toBe(0);
-    expect(db.prepare("SELECT COUNT(*) AS n FROM assets").get()).toEqual({ n: 0 });
+    expect(search(handle.db, {}).total).toBe(0);
+    expect(search(handle.db, { text: "changed" }).total).toBe(0);
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM assets").get()).toEqual({ n: 0 });
     expect(repo.indexErrors).toEqual([]);
-    expect(await isIndexStale(lib.root, db, ring)).toBe(false);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
   });
 });
 
@@ -457,21 +444,234 @@ describe("findSourceBy", () => {
     const book = await repo.createSource(pid, draft("Book", { type: "book", identifiers: { isbn: ["0-306-40615-2"] } }), files(), { provenance: prov() });
     const rid = (r: Array<{ id: string }>) => r.map((x) => x.id);
 
-    expect(rid(findSourceBy(db, { platform: "youtube", postId: "abc123" }))).toEqual([yt.source.id]);
-    expect(findSourceBy(db, { platform: "instagram", postId: "abc123" })).toEqual([]);
-    expect(rid(findSourceBy(db, { doi: "https://doi.org/10.1000/xyz.1" }))).toEqual([art.source.id]);
-    expect(rid(findSourceBy(db, { doi: "10.1000/XYZ.1" }))).toEqual([art.source.id]);
-    expect(findSourceBy(db, { doi: "10.1/none" })).toEqual([]);
-    expect(rid(findSourceBy(db, { isbn: "9780306406157" }))).toEqual([book.source.id]);
-    expect(rid(findSourceBy(db, { isbn: "0306406152" }))).toEqual([book.source.id]);
-    expect(rid(findSourceBy(db, { isbn: "978-0-306-40615-7" }))).toEqual([book.source.id]);
-    expect(findSourceBy(db, { isbn: "garbage" })).toEqual([]);
-    expect(rid(findSourceBy(db, { sha256: hash }))).toEqual([yt.source.id]);
+    expect(rid(findSourceBy(handle.db, { platform: "youtube", postId: "abc123" }))).toEqual([yt.source.id]);
+    expect(findSourceBy(handle.db, { platform: "instagram", postId: "abc123" })).toEqual([]);
+    expect(rid(findSourceBy(handle.db, { doi: "https://doi.org/10.1000/xyz.1" }))).toEqual([art.source.id]);
+    expect(rid(findSourceBy(handle.db, { doi: "10.1000/XYZ.1" }))).toEqual([art.source.id]);
+    expect(findSourceBy(handle.db, { doi: "10.1/none" })).toEqual([]);
+    expect(rid(findSourceBy(handle.db, { isbn: "9780306406157" }))).toEqual([book.source.id]);
+    expect(rid(findSourceBy(handle.db, { isbn: "0306406152" }))).toEqual([book.source.id]);
+    expect(rid(findSourceBy(handle.db, { isbn: "978-0-306-40615-7" }))).toEqual([book.source.id]);
+    expect(findSourceBy(handle.db, { isbn: "garbage" })).toEqual([]);
+    expect(rid(findSourceBy(handle.db, { sha256: hash }))).toEqual([yt.source.id]);
     // asset hashes (the stored original file) match too
     const assetHash = yt.assets[0]!.sha256;
-    expect(rid(findSourceBy(db, { sha256: assetHash }))).toContain(yt.source.id);
-    expect(findSourceBy(db, { sha256: "b".repeat(64) })).toEqual([]);
-    const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>).map((r) => r.name);
+    expect(rid(findSourceBy(handle.db, { sha256: assetHash }))).toContain(yt.source.id);
+    expect(findSourceBy(handle.db, { sha256: "b".repeat(64) })).toEqual([]);
+    const idx = (handle.db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>).map((r) => r.name);
     expect(idx).toEqual(expect.arrayContaining(["sources_platform_post", "sources_doi", "sources_isbn13", "source_hashes_sha256"]));
+  });
+});
+
+const SECRET_GOV_LEGAL = { status: "consented" as const, basis: "consent form" };
+
+async function rawIndexBytes(): Promise<string> {
+  let out = "";
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      out += (await readFile(join(lib.root, INDEX_FILE + suffix))).toString("latin1");
+    } catch {
+      // side file absent
+    }
+  }
+  return out;
+}
+
+describe("R30: encrypted content stays out of the persistent database", () => {
+  it("indexes in memory only, purges on lock, and finds the source again after unlock", async () => {
+    const created = await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const pid = created.project.id;
+    const extra = join(tmp, "ocr.txt");
+    await writeFile(extra, "zzquuxtranscript distinctive body text");
+    const sf = await repo.createSource(
+      pid,
+      draft("Wolfsbane Interview Qxzv", {
+        type: "interview",
+        creators: [{ family: "Zzyzxfamily", given: "Pelagia", role: "interviewee" }],
+        identifiers: { doi: "10.9999/secret-doi", isbn: ["9780306406157"], platform: "other", platformPostId: "secretpost" },
+      }),
+      files(),
+      { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL, fileHashes: { "a.mp3": "c".repeat(64) } }) },
+    );
+    await repo.addDerivedAsset(pid, sf.source.id, {
+      fromPath: extra, kind: "ocr-text", tool: "t", ext: "txt",
+      derivation: { parents: [], operation: "ocr", provider: "local", ranAt: "local", params: {}, at: NOW, triggeredBy: "tester" },
+    });
+    const col = await repo.createCollection(pid, "Qcollectionname");
+    expect(col.name).toBe("Qcollectionname");
+
+    // everything is searchable while unlocked, by every key
+    expect(search(handle.db, { text: "Wolfsbane" }).items[0]).toMatchObject({ id: sf.source.id, locked: false, title: "Wolfsbane Interview Qxzv" });
+    expect(search(handle.db, { text: "Zzyzxfamily" }).total).toBe(1);
+    expect(search(handle.db, { text: "zzquuxtranscript" }).total).toBe(1);
+    expect(findSourceBy(handle.db, { doi: "10.9999/secret-doi" })).toHaveLength(1);
+    expect(findSourceBy(handle.db, { isbn: "9780306406157" })).toHaveLength(1);
+    expect(findSourceBy(handle.db, { platform: "other", postId: "secretpost" })).toHaveLength(1);
+    expect(findSourceBy(handle.db, { sha256: "c".repeat(64) })).toHaveLength(1);
+
+    const secrets = ["Wolfsbane", "Zzyzxfamily", "Pelagia", "zzquuxtranscript", "secret-doi", "secretpost", "Qcollectionname", "c".repeat(64)];
+    // while unlocked the persistent file already holds none of it (it is in memory only)
+    handle.db.pragma("wal_checkpoint(TRUNCATE)");
+    let raw = await rawIndexBytes();
+    // folder names come from the plaintext manifest; mask them before looking for the title
+    raw = raw.split(sf.source.folder).join("<folder>");
+    for (const x of secrets) expect(raw, x).not.toContain(x);
+
+    repo.lockProject(pid);
+    handle.db.pragma("wal_checkpoint(TRUNCATE)");
+    raw = (await rawIndexBytes()).split(sf.source.folder).join("<folder>");
+    for (const x of secrets) expect(raw, x).not.toContain(x);
+    expect(search(handle.db, { text: "Wolfsbane" }).total).toBe(0);
+    expect(search(handle.db, { text: "zzquuxtranscript" }).total).toBe(0);
+    expect(findSourceBy(handle.db, { doi: "10.9999/secret-doi" })).toEqual([]);
+    expect(findSourceBy(handle.db, { sha256: "c".repeat(64) })).toEqual([]);
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM temp.t_sources").get()).toEqual({ n: 0 });
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM temp.t_collections").get()).toEqual({ n: 0 });
+    // manifest-level row remains
+    expect(search(handle.db, { projectId: pid }).items).toEqual([
+      { id: sf.source.id, projectId: pid, type: "interview", title: "", creatorsText: "", issuedYear: "2025", folder: sf.source.folder, needsReview: false, locked: true },
+    ]);
+
+    await repo.unlockProject(pid, "pw");
+    expect(repo.indexErrors).toEqual([]);
+    expect(search(handle.db, { text: "Wolfsbane" }).items[0]).toMatchObject({ id: sf.source.id, locked: false });
+    expect(search(handle.db, { text: "zzquuxtranscript" }).total).toBe(1);
+    expect(findSourceBy(handle.db, { isbn: "9780306406157" })).toHaveLength(1);
+    handle.db.pragma("wal_checkpoint(TRUNCATE)");
+    raw = (await rawIndexBytes()).split(sf.source.folder).join("<folder>");
+    for (const x of secrets) expect(raw, x).not.toContain(x);
+  });
+
+  it("a rebuild with the project unlocked keeps it searchable (in memory) and persists nothing sensitive", async () => {
+    const pid = (await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const sf = await repo.createSource(pid, draft("Rebuilt Wolfsbane"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "wolfsbane" }).items[0]).toMatchObject({ id: sf.source.id, locked: false });
+    handle.db.pragma("wal_checkpoint(TRUNCATE)");
+    const raw = (await rawIndexBytes()).split(sf.source.folder).join("<folder>");
+    expect(raw).not.toContain("Wolfsbane");
+  });
+});
+
+describe("review fixes", () => {
+  it("I1: every valid ISBN is findable; invalid ones are skipped", async () => {
+    const pid = await openProject();
+    const b = await repo.createSource(
+      pid,
+      draft("Two editions", { type: "book", identifiers: { isbn: ["978-0-306-40615-7", "9780306406158", "0-306-40615-2", "0-19-852663-6"] } }),
+      files(),
+      { provenance: prov() },
+    );
+    expect(findSourceBy(handle.db, { isbn: "9780306406157" }).map((r) => r.id)).toEqual([b.source.id]);
+    expect(findSourceBy(handle.db, { isbn: "0198526636" }).map((r) => r.id)).toEqual([b.source.id]); // the second, distinct ISBN
+    expect(findSourceBy(handle.db, { isbn: "9780198526636" }).map((r) => r.id)).toEqual([b.source.id]);
+    expect(findSourceBy(handle.db, { isbn: "9780306406158" })).toEqual([]); // bad check digit
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM source_isbns").get()).toEqual({ n: 2 });
+  });
+
+  it("I2: sink writes after a rebuild land in the new database, and no WAL is orphaned", async () => {
+    const pid = await openProject();
+    await repo.createSource(pid, draft("Before rebuild"), files(), { provenance: prov() });
+    await rebuildIndex(handle, ring, lib);
+    expect(handle.isOpen).toBe(true);
+    await repo.createSource(pid, draft("After rebuild"), files(), { provenance: prov() });
+    expect(search(handle.db, { text: "after" }).total).toBe(1);
+    handle.close();
+    expect((await readdir(lib.root)).filter((f) => f.startsWith(INDEX_FILE)).sort()).toEqual([INDEX_FILE]);
+    const other = openIndexAt(join(lib.root, INDEX_FILE));
+    expect(search(other, { text: "after" }).total).toBe(1);
+    expect(search(other, { text: "before" }).total).toBe(1);
+    other.close();
+    handle.reopen();
+  });
+
+  it("I2: a checkpoint that cannot complete aborts the rebuild with the old database intact", async () => {
+    const pid = await openProject();
+    await repo.createSource(pid, draft("Keep me"), files(), { provenance: prov() });
+    // a reader pinned to an old snapshot keeps the WAL from being truncated
+    const reader = openIndexAt(join(lib.root, INDEX_FILE));
+    reader.prepare("BEGIN").run();
+    reader.prepare("SELECT COUNT(*) FROM meta").get();
+    await repo.createSource(pid, draft("Written after the snapshot"), files(), { provenance: prov() });
+    await expect(rebuildIndex(handle, ring, lib)).rejects.toThrow(/checkpoint/);
+    reader.close();
+    expect(handle.isOpen).toBe(true);
+    expect(search(handle.db, { text: "snapshot" }).total).toBe(1);
+    expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
+  });
+
+  it("I3: a read-only library cannot rebuild and the index is untouched", async () => {
+    const pid = await openProject();
+    await repo.createSource(pid, draft("Stays"), files(), { provenance: prov() });
+    await expect(rebuildIndex(handle, ring, { mode: "read-only", readOnlyReason: "offline" })).rejects.toBeInstanceOf(ReadOnlyLibraryError);
+    expect(search(handle.db, { text: "stays" }).total).toBe(1);
+  });
+
+  it("I4: rebuild carries review_items, import_batches and jobs over", async () => {
+    const pid = await openProject();
+    handle.db.prepare("INSERT INTO review_items VALUES ('r1', ?, NULL, NULL, 'import', 'pending', '{\"a\":1}', ?)").run(pid, NOW);
+    handle.db.prepare("INSERT INTO import_batches VALUES ('b1', ?, 1, ?, NULL, '{}')").run(pid, NOW);
+    handle.db.prepare("INSERT INTO jobs VALUES ('j1', ?, 'ocr', 'queued', '{}', ?)").run(pid, NOW);
+    await rebuildIndex(handle, ring, lib);
+    expect(handle.db.prepare("SELECT id, kind, status, payload_json FROM review_items").all()).toEqual([
+      { id: "r1", kind: "import", status: "pending", payload_json: '{"a":1}' },
+    ]);
+    expect(handle.db.prepare("SELECT id FROM import_batches").all()).toEqual([{ id: "b1" }]);
+    expect(handle.db.prepare("SELECT id FROM jobs").all()).toEqual([{ id: "j1" }]);
+  });
+
+  it("I5: rebuild restores extracted text from ocr-text and transcript (.vtt) assets, plain and encrypted", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Has derived"), files(), { provenance: prov() });
+    const ocr = join(tmp, "o.txt");
+    await writeFile(ocr, "older ocr words");
+    const ocr2 = join(tmp, "o2.txt");
+    await writeFile(ocr2, "newest ocr marmalade");
+    const vtt = join(tmp, "t.vtt");
+    await writeFile(vtt, "WEBVTT\n\n1\n00:00:01.000 --> 00:00:03.000\n<v Bob>spoken pineapple</v>\n\nNOTE hidden remark\n\n2\n00:00:04.000 --> 00:00:05.000\nsecond cue\n");
+    const mk = (fromPath: string, kind: string, ext: string, at: string) => ({
+      fromPath, kind, tool: "t", ext,
+      derivation: { parents: [], operation: kind, provider: "local", ranAt: "local", params: {}, at, triggeredBy: "tester" },
+    });
+    await repo.addDerivedAsset(pid, sf.source.id, mk(ocr, "ocr-text", "txt", "2026-11-09T10:00:00.000Z"));
+    await repo.addDerivedAsset(pid, sf.source.id, mk(ocr2, "ocr-text", "txt", "2026-11-09T11:00:00.000Z"));
+    await repo.addDerivedAsset(pid, sf.source.id, mk(vtt, "transcript", "vtt", "2026-11-09T11:00:00.000Z"));
+    expect(search(handle.db, { text: "marmalade" }).total).toBe(1); // live sink path
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "marmalade" }).total).toBe(1);
+    expect(search(handle.db, { text: "pineapple" }).total).toBe(1);
+    expect(search(handle.db, { text: "older" }).total).toBe(0); // only the newest ocr-text
+    expect(search(handle.db, { text: "hidden" }).total).toBe(0); // NOTE blocks stripped
+    expect(search(handle.db, { text: "Bob" }).total).toBe(0); // markup stripped
+    expect(search(handle.db, { text: "second cue" }).total).toBe(1);
+    expect(stripVtt("WEBVTT\n\n00:00:01.000 --> 00:00:02.000 align:start\nhi <b>there</b>\n")).toBe("hi there");
+
+    // encrypted project: restored into memory only
+    const epid = (await repo.createProject({ name: "Enc", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const es = await repo.createSource(epid, draft("Enc source"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    await repo.addDerivedAsset(epid, es.source.id, mk(ocr2, "ocr-text", "txt", "2026-11-09T11:00:00.000Z"));
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "marmalade", projectId: epid }).total).toBe(1);
+  });
+
+  it("I6: a mutation reads only its own project's change log", async () => {
+    const p1 = await openProject("One");
+    const p2 = await openProject("Two");
+    await repo.createSource(p2, draft("Other"), files(), { provenance: prov() });
+    changeLogReads.length = 0;
+    await repo.createSource(p1, draft("Mine"), files(), { provenance: prov() });
+    expect(changeLogReads.length).toBeGreaterThan(0);
+    expect(new Set(changeLogReads)).toEqual(new Set(["Projects/One"]));
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+  });
+
+  it("minor: terms without letters or digits are dropped; sha256 is case-insensitive", async () => {
+    const pid = await openProject();
+    const hash = "ab".repeat(32);
+    const s = await repo.createSource(pid, draft("Un Café"), files(), { provenance: prov({ fileHashes: { x: hash } }) });
+    expect(search(handle.db, { text: "cafe \u0301" }).items.map((i) => i.id)).toEqual([s.source.id]);
+    expect(buildMatchQuery("\u0301 !!")).toBeUndefined();
+    expect(findSourceBy(handle.db, { sha256: hash.toUpperCase() })).toHaveLength(1);
+    expect(findSourceBy(handle.db, { sha256: hash })).toHaveLength(1);
   });
 });
