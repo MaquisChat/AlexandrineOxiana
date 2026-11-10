@@ -12,6 +12,9 @@ import { join } from "node:path";
 
 const CHUNK = 1024 * 1024;
 
+/** Test seam: overwriting fails for the paths it matches (as an I/O error would). */
+export const shredSeams: { failFor?: (path: string) => boolean } = {};
+
 async function overwriteFile(path: string): Promise<void> {
   const fh = await fsp.open(path, "r+");
   try {
@@ -41,6 +44,7 @@ export async function shredPath(path: string): Promise<void> {
     await fsp.rm(path, { recursive: true, force: true });
     return;
   }
+  if (shredSeams.failFor?.(path)) throw new Error("simulated overwrite failure");
   if (st.isFile()) await overwriteFile(path);
   await fsp.rm(path, { force: true });
 }

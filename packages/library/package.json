@@ -19,17 +19,19 @@
     "better-sqlite3": "^12.11.1",
     "chokidar": "5.0.0",
     "exiftool-vendored": "39.0.1",
-    "fflate": "0.8.2",
     "file-type": "22.2.0",
     "pdfjs-dist": "6.4.299",
     "turndown": "7.2.4",
     "undici": "8.12.3",
-    "yauzl": "3.4.0"
+    "yauzl": "3.4.0",
+    "yazl": "3.3.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/turndown": "5.0.5",
     "@types/yauzl": "3.4.0",
+    "@types/yazl": "3.3.1",
+    "fflate": "0.8.2",
     "pdf-lib": "1.17.1"
   }
 }

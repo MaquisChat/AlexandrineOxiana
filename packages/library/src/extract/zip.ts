@@ -10,7 +10,7 @@
 import { createWriteStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { Transform } from "node:stream";
+import { Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import yauzl from "yauzl";
 import { UnsafeFileError } from "./errors.js";
@@ -143,6 +143,73 @@ export interface ExtractedEntry {
 }
 
 export const DUPLICATE_NAME_REASON = "duplicate name in archive";
+
+export interface ExtractOptions {
+  /** Runs after the names and declared sizes were checked, before anything is written (it may throw). */
+  beforeWrite?: (declaredTotalBytes: number) => Promise<void>;
+  /** Write runs of zeros as holes (sparse files), e.g. for restored backups. */
+  sparse?: boolean;
+}
+
+const ZERO_RUN = 64 * 1024;
+let zeros = Buffer.alloc(ZERO_RUN);
+
+/** A new file (`wx`, 0600) written by position, where all-zero chunks become holes; its length is set at the end. */
+async function sparseWriter(target: string): Promise<Writable> {
+  const fh = await fsp.open(target, "wx", 0o600);
+  let pos = 0;
+  return new Writable({
+    async write(chunk: Buffer, _enc, cb) {
+      try {
+        if (chunk.length > zeros.length) zeros = Buffer.alloc(chunk.length);
+        if (chunk.compare(zeros, 0, chunk.length) !== 0) {
+          for (let off = 0; off < chunk.length; ) off += (await fh.write(chunk, off, chunk.length - off, pos + off)).bytesWritten;
+        }
+        pos += chunk.length;
+        cb();
+      } catch (e) {
+        cb(e as Error);
+      }
+    },
+    async final(cb) {
+      try {
+        await fh.truncate(pos);
+        await fh.sync();
+        await fh.close();
+        cb();
+      } catch (e) {
+        cb(e as Error);
+      }
+    },
+    async destroy(err, cb) {
+      await fh.close().catch(() => {});
+      cb(err);
+    },
+  });
+}
+
+/**
+ * One entry's bytes (at most `maxBytes`) from an archive, or undefined when it has no such entry
+ * (backup.json of a backup, R92 I2). Only the central directory is walked; nothing is written.
+ */
+export async function readArchiveEntry(src: ZipSource, name: string, maxBytes = 4 * 1024 * 1024): Promise<Buffer | undefined> {
+  const zf = await open(src);
+  try {
+    const entry = await new Promise<yauzl.Entry | undefined>((res, rej) => {
+      zf.on("error", rej);
+      zf.on("end", () => res(undefined));
+      zf.on("entry", (e: yauzl.Entry) => (e.fileName === name ? res(e) : zf.readEntry()));
+      zf.readEntry();
+    });
+    if (!entry || entry.uncompressedSize > maxBytes) return undefined;
+    const stream = await new Promise<NodeJS.ReadableStream>((res, rej) => zf.openReadStream(entry, (err, s) => (err || !s ? rej(err ?? new Error("unreadable")) : res(s))));
+    const chunks: Buffer[] = [];
+    for await (const c of stream as AsyncIterable<Buffer>) chunks.push(c);
+    return Buffer.concat(chunks);
+  } finally {
+    zf.close();
+  }
+}
 const SIZE_MISMATCH_REASON = "A file inside the archive is larger than it says it is";
 
 /**
@@ -156,6 +223,7 @@ export async function extractArchive(
   destDir: string,
   limits: { maxEntries: number; maxEntryBytes: number; maxTotalBytes: number } = ARCHIVE_LIMITS,
   signal?: AbortSignal,
+  opts: ExtractOptions = {},
 ): Promise<ExtractedEntry[]> {
   let zf: yauzl.ZipFile;
   try {
@@ -184,6 +252,12 @@ export async function extractArchive(
       });
       zf.readEntry();
     });
+    // Before anything is written (e.g. a restore checks free space against the declared total).
+    try {
+      await opts.beforeWrite?.(declared);
+    } catch (err) {
+      throw new HookError(err);
+    }
     await fsp.mkdir(destDir, { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") await fsp.chmod(destDir, 0o700);
     const base = resolve(destDir);
@@ -211,17 +285,20 @@ export async function extractArchive(
       const stream = await new Promise<NodeJS.ReadableStream>((res, rej) =>
         zf.openReadStream(e, (err, s) => (err || !s ? rej(new UnsafeFileError("zip-invalid", "A file inside the archive could not be read")) : res(s))),
       );
+      const declaredSize = e.uncompressedSize;
       const counter = new Transform({
         transform(chunk: Buffer, _enc, cb) {
           bytes += chunk.length;
           total += chunk.length;
+          // Bomb protection by actual bytes: never more than the entry, or the archive, declared.
+          if (bytes > declaredSize || total > declared) return cb(new UnsafeFileError("zip-entry-too-large", SIZE_MISMATCH_REASON));
           if (bytes > limits.maxEntryBytes) return cb(new UnsafeFileError("zip-entry-too-large", `A file inside the archive is larger than ${mb(limits.maxEntryBytes)}`));
           if (total > limits.maxTotalBytes) return cb(new UnsafeFileError("zip-too-large", "The archive's contents are too large to import"));
           cb(null, chunk);
         },
       });
       try {
-        await pipeline(stream, counter, createWriteStream(target, { flags: "wx", mode: 0o600 }));
+        await pipeline(stream, counter, opts.sparse ? await sparseWriter(target) : createWriteStream(target, { flags: "wx", mode: 0o600 }));
       } catch (err) {
         if (err instanceof UnsafeFileError) throw err;
         // yauzl checks inflated sizes against the declared ones: more bytes than declared is a bomb.
@@ -232,6 +309,7 @@ export async function extractArchive(
     }
     return out;
   } catch (e) {
+    if (e instanceof HookError) throw e.inner; // the caller's own refusal, as it was thrown
     if (e instanceof UnsafeFileError) throw e;
     if ((e as Error)?.name === "AbortError") throw e;
     const msg = e instanceof Error ? e.message : String(e);
@@ -239,5 +317,11 @@ export async function extractArchive(
     throw new UnsafeFileError("zip-invalid", "The archive could not be read");
   } finally {
     zf.close();
+  }
+}
+
+class HookError extends Error {
+  constructor(readonly inner: unknown) {
+    super("beforeWrite refused");
   }
 }

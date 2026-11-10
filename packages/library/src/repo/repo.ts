@@ -2,7 +2,7 @@
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { DEFAULT_GOVERNANCE, effectivePolicy, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
+import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
 import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
@@ -670,10 +670,45 @@ export async function deletedRecordsTrouble(repo: Repo, projectId: string): Prom
   return (await readTombstones(core, st)).status === "unreadable" || (await deletedRecordsWarning(core, st));
 }
 
-/** The project's standing warnings (persisted ones, e.g. 'deleted-records-unreadable', R74 I2). */
+/** Persisted in the backups manifest (`failures`) when a backup of the project failed (R92); cleared by the next success. */
+export const BACKUP_FAILED_WARNING = "backup-failed";
+
+/**
+ * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
+ * 'backup-failed', R92).
+ */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
   const core = cores.get(repo)!;
-  return (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
+  const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
+  try {
+    const raw = await readMaybe(join(core.root, "Backups", "backups-manifest.json"));
+    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
+    if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
+  } catch {
+    // an unreadable manifest is handled (and rebuilt) by the backups module
+  }
+  return out;
+}
+
+/**
+ * Package-internal (citations, exports, R92): whether the project's rules pseudonymize the names of
+ * identifiable data — the engine's own decision for storing identifiable data carries the
+ * `pseudonymize-names` condition (not audited: nothing is stored). Unreadable rules: true (fail closed).
+ */
+export async function pseudonymizesIdentifiable(repo: Repo, projectId: string): Promise<boolean> {
+  const core = cores.get(repo)!;
+  const policy = await projectPolicy(repo, projectId);
+  if (!policy) return true;
+  const d = evaluate(policy, {
+    action: "store",
+    projectId,
+    actor: core.actor,
+    now: core.clock().toISOString(),
+    tz: core.tz,
+    store: { identifiable: true, hasLocation: false, legalBasis: "(evaluated for naming only)" },
+  });
+  if (d.result === "deny") return true;
+  return d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "pseudonymize-names");
 }
 
 export function hasSource(repo: Repo, projectId: string, id: string): boolean {
@@ -828,7 +863,7 @@ export function addKeyToRing(repo: Repo, keyId: string, key: Uint8Array): void {
 }
 
 /** Package-internal (restore, R90 b): makes an unpacked backup a new project of the library. */
-export function adoptRestoredProject(repo: Repo, s: StagedRestore): Promise<Project> {
+export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<typeof adoptRestoredIn> {
   return adoptRestoredIn(cores.get(repo)!, s);
 }
 

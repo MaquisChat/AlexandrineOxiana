@@ -125,16 +125,25 @@ const SLICE = 64 * 1024;
 
 /** A yauzl reader over the plaintext of a decrypted file (nothing is written to disk). */
 class DecryptingReader extends yauzl.RandomAccessReader {
+  /** The first authentication failure while reading (the ZIP reader reports it only as unreadable). */
+  failure: DecryptionError | undefined;
+
   constructor(private readonly file: DecryptedFile) {
     super();
   }
 
   override _readStreamForRange(start: number, end: number): Readable {
     const file = this.file;
+    const self = this;
     async function* gen() {
       for (let at = start; at < end; ) {
         const n = Math.min(SLICE, end - at);
-        yield await file.read(at, n);
+        try {
+          yield await file.read(at, n);
+        } catch (err) {
+          if (err instanceof DecryptionError) self.failure ??= err;
+          throw err;
+        }
         at += n;
       }
     }
@@ -146,7 +155,8 @@ class DecryptingReader extends yauzl.RandomAccessReader {
 export async function openSealedZip(
   path: string,
   getKey: (keyId: string) => Uint8Array | undefined,
-): Promise<{ reader: yauzl.RandomAccessReader; size: number; close(): Promise<void> }> {
+): Promise<{ reader: yauzl.RandomAccessReader; size: number; close(): Promise<void>; failure(): DecryptionError | undefined }> {
   const file = await openDecrypted(path, getKey);
-  return { reader: new DecryptingReader(file), size: file.size, close: () => file.close() };
+  const reader = new DecryptingReader(file);
+  return { reader, size: file.size, close: () => file.close(), failure: () => reader.failure };
 }

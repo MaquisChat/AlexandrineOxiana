@@ -48,6 +48,11 @@ export const Project = z.object({
    * Backups (spec 9, R90 b): `automatic` — a daily backup while the app is open (absent: on);
    * `keep` — how many backups of this project are kept (absent: 10).
    */
+  /**
+   * The IANA time zone the project's calendar rules are read in (e.g. the retention date, R92);
+   * absent: UTC.
+   */
+  timeZone: z.string().min(1).max(64).optional(),
   backups: z.object({ automatic: z.boolean().optional(), keep: z.number().int().min(1).max(1000).optional() }).optional(),
 });
 export type Project = z.infer<typeof Project>;

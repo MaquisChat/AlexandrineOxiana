@@ -11,6 +11,12 @@
  *      rewritten in every JSON file and JSON-lines record (sealed ones are opened and sealed again
  *      for the new project id); provenance is never touched (R76). Workspace tags keep their ids;
  *   3. a `project.restored` event naming the backup's sha256 is appended to the copy's audit log;
+ *   An encrypted copy keeps the data key, and key id, of the project it was made from (the
+ *   backup is sealed with it): unlocking either project unlocks both. Assets whose sha256 a
+ *   destruction certificate of this library lists are not brought back (marked destroyed, R92);
+ *   ids of import batches, review entries and pending jobs are new too, and so are the keys of
+ *   provenance.fileHashes and its importBatchId (the one exception to R76, restore only);
+ *   3b. the copy is anchored (R12) before it goes live, so a crash after the rename is no "missing anchor";
  *   4. the staging folder is renamed into place (the commit point: a crash before it leaves only a
  *      staging folder, which the next open removes), the project is loaded and anchored (R12).
  */
@@ -19,6 +25,7 @@ import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { newId, sanitizeSegment, verifyChain, withCollisionSuffix, type AuditEvent, type Project } from "@ao/core";
 import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { shredPath } from "../fs/shred.js";
 import { AuditStore } from "./audit-store.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
 import { loadProjectFolder, parseProjectJson, type RepoCore } from "./state.js";
@@ -68,12 +75,73 @@ function rewrite(v: Json, ids: ReadonlyMap<string, string>, oldRel: string, newR
   if (v && typeof v === "object") {
     const out: Record<string, Json> = {};
     for (const [k, x] of Object.entries(v as Record<string, Json>)) {
-      out[ids.get(k) ?? k] = k === "provenance" ? x : rewrite(x, ids, oldRel, newRel);
+      out[ids.get(k) ?? k] = k === "provenance" ? provenanceOf(x, ids) : rewrite(x, ids, oldRel, newRel);
     }
     return out;
   }
   return v;
 }
+
+/**
+ * Provenance never changes (R76), with one documented exception for a restore (R92): its
+ * `fileHashes` are keyed by asset id and the import batch is named by id, and both ids are new in
+ * the copy — so those keys and `importBatchId` follow; the hashes and everything else stay as captured.
+ */
+function provenanceOf(v: Json, ids: ReadonlyMap<string, string>): Json {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+  const p = { ...(v as Record<string, Json>) };
+  if (p.fileHashes && typeof p.fileHashes === "object" && !Array.isArray(p.fileHashes)) {
+    p.fileHashes = Object.fromEntries(Object.entries(p.fileHashes as Record<string, Json>).map(([k, h]) => [ids.get(k) ?? k, h]));
+  }
+  if (typeof p.importBatchId === "string" && ids.has(p.importBatchId)) p.importBatchId = ids.get(p.importBatchId)!;
+  return p;
+}
+
+/**
+ * The audit log may span earlier restores: each `project.restored` event moves it to the copy's
+ * project id (its `restoredFrom` naming the one before). Every other event must name the project
+ * the log belongs to at that point, and the last one this backup's project.
+ */
+function auditProjectProblem(events: AuditEvent[], projectId: string): string | null {
+  let current = events[0]?.projectId;
+  for (const e of events) {
+    if (e.action === "project.restored" && (e.details as { restoredFrom?: unknown } | undefined)?.restoredFrom === current) current = e.projectId;
+    else if (e.projectId !== current) return "an event names another project";
+  }
+  return current === projectId ? null : "it belongs to another project";
+}
+
+/** sha256 → time destroyed, from every readable destruction certificate of the library's projects. */
+async function destroyedHashes(core: RepoCore): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (const st of core.projects.values()) {
+    let names: string[];
+    try {
+      names = (await fsp.readdir(core.abs(`${st.rel}/retention`))).filter((n) => /^destruction-.*\.json(\.enc)?$/u.test(n));
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      try {
+        let raw: Buffer = await fsp.readFile(core.abs(`${st.rel}/retention/${n}`));
+        if (n.endsWith(".enc")) {
+          const keyId = st.project.encryption.keyId;
+          const k = keyId ? core.keyRing.get(keyId) : undefined;
+          if (!k) continue; // locked: its certificates cannot be read now
+          raw = await decryptBytes((id) => (id === keyId ? k : undefined), raw);
+        }
+        const cert = JSON.parse(raw.toString("utf8")) as { at?: string; assets?: Array<{ sha256?: string }> };
+        for (const a of cert.assets ?? []) if (typeof a.sha256 === "string" && typeof cert.at === "string") out.set(a.sha256, cert.at);
+      } catch {
+        // unreadable certificate: skipped
+      }
+    }
+  }
+  return out;
+}
+
+/** Test seam: the process "dies" right after the copy was renamed into place. */
+export const restoreSeams: { crashAfterRename?: boolean } = {};
 
 async function walkFiles(dir: string, base = ""): Promise<string[]> {
   const out: string[] = [];
@@ -91,7 +159,7 @@ const pretty = (text: string) => /\n\s/u.test(text);
  * Turns the unpacked backup in `s.staging` into a new project of the library. Caller holds nothing;
  * this runs in the repository's write queue. The staging folder is removed on failure.
  */
-export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Promise<Project> {
+export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Promise<{ project: Project; notes: string[] }> {
   core.assertWritable();
   return core.serial(async () => {
     core.assertWritable();
@@ -115,6 +183,8 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       if (s.expectedHead && (verify.head?.seq !== s.expectedHead.seq || verify.head.hash !== s.expectedHead.hash)) {
         throw new AuditChainInvalidError("it differs from the log the backup recorded");
       }
+      const wrongProject = auditProjectProblem(events as AuditEvent[], old.id);
+      if (wrongProject) throw new AuditChainInvalidError(wrongProject);
 
       // The key, for an encrypted project (the caller made sure it is in the key ring).
       const keyId = old.encryption.enabled ? old.encryption.keyId : undefined;
@@ -142,9 +212,59 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
         ids.set(sf.source.id, newId());
         for (const a of sf.assets) ids.set(a.id, newId());
         for (const a of sf.annotations) ids.set(a.id, newId());
+        // Pending viewing-proxy jobs (R31's file record of worker jobs).
+        for (const j of (sf as { pendingProxies?: Array<{ id: string }> }).pendingProxies ?? []) ids.set(j.id, newId());
         const annFile = f.replace(/source\.json(\.enc)?$/u, (_m, enc: string | undefined) => `annotations.json${enc ?? ""}`);
         if (files.includes(annFile)) for (const a of JSON.parse(await readText(join(staging, annFile))) as Array<{ id: string }>) ids.set(a.id, newId());
       }
+      // Import batches and review entries (R92: no id is shared with the original in the index).
+      for (const f of files.filter((x) => /(^|\/)batch\.json(\.enc)?$/u.test(x))) {
+        try {
+          const id = (JSON.parse(await readText(join(staging, f))) as { id?: unknown }).id;
+          if (typeof id === "string") ids.set(id, newId());
+        } catch {
+          throw new RestoreError("An import record in the backup cannot be read");
+        }
+      }
+      for (const f of files.filter((x) => x.endsWith(".jsonl") && !x.startsWith("audit/"))) {
+        for (const line of (await fsp.readFile(join(staging, f), "utf8")).split("\n")) {
+          if (!line.trim()) continue;
+          let o: { id?: unknown; ct?: unknown };
+          try {
+            o = JSON.parse(line) as { id?: unknown; ct?: unknown };
+          } catch {
+            continue; // an incomplete last line is kept as it is
+          }
+          if (typeof o.ct === "string" && key && f.startsWith("review/")) {
+            try {
+              o = JSON.parse(openLine(key, old.id, line, "ao-review")) as { id?: unknown };
+            } catch {
+              continue;
+            }
+          }
+          if (f.startsWith("review/") && typeof o.id === "string" && !ids.has(o.id)) ids.set(o.id, newId());
+        }
+      }
+
+      // Files destroyed under a retention rule are not brought back (R92): by their sha256 in the
+      // library's destruction certificates.
+      const destroyedAt = await destroyedHashes(core);
+      const notes: string[] = [];
+      let skipped = 0;
+      for (const [f, raw] of parsedSources) {
+        const sf = raw as { assets: Array<{ id: string; path: string; sha256: string; status?: string; destroyedAt?: string; linked?: unknown }> };
+        for (const a of sf.assets) {
+          const at = destroyedAt.get(a.sha256);
+          if (!at || a.status === "destroyed" || a.linked) continue;
+          if (a.path.startsWith(`${old.folder}/`)) await shredPath(join(staging, ...a.path.slice(old.folder.length + 1).split("/")));
+          a.status = "destroyed";
+          a.destroyedAt = at;
+          skipped++;
+        }
+        parsedSources.set(f, sf as unknown as Record<string, unknown>);
+      }
+      if (skipped) notes.push(`${skipped} ${skipped === 1 ? "file was" : "files were"} destroyed earlier under a retention rule and ${skipped === 1 ? "was" : "were"} not restored.`);
+
       const projectsDir = join(core.root, "Projects");
       const taken = await namesIn(projectsDir);
       const base = sanitizeSegment(`${old.name} (restored ${s.date})`).replace(/^\./u, "_.");
@@ -223,7 +343,10 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
         details: { backupSha256: s.backupSha256, restoredFrom: old.id, fromAuditHead: verify.head ? { seq: verify.head.seq, hash: verify.head.hash } : null },
       });
 
-      // 4. Into place (never over an existing folder), then loaded and anchored.
+      // Anchored before it goes live: a crash after the rename never looks like a missing anchor (R92).
+      if (store.head) await core.anchors.set(core.anchorKey(newProjectId), store.head, at).catch(() => {});
+
+      // 4. Into place (never over an existing folder), then loaded.
       const final = join(projectsDir, folderName);
       try {
         await fsp.mkdir(final);
@@ -232,6 +355,7 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       }
       await fsp.rmdir(final);
       await renameWithRetry(staging, final);
+      if (restoreSeams.crashAfterRename) throw new Error("simulated crash after the rename");
       const loaded = await loadProjectFolder(core, folderName);
       if (!loaded) throw new RestoreError("The restored project could not be opened");
       const st = loaded.st;
@@ -243,7 +367,7 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       } catch (error) {
         core.indexErrors.push({ op: "project.restored", error });
       }
-      return structuredClone(st.project);
+      return { project: structuredClone(st.project), notes };
     } catch (err) {
       await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
       throw err;

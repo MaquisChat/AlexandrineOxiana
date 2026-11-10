@@ -1,31 +1,44 @@
 /**
- * Project backups (spec 9, R90 b).
+ * Project backups (spec 9, R90 b, R92).
  *
  * `backupProject` zips the whole project folder (everything but temp files `*.tmp-<hex>` and any
- * `.tmp` folder; symbolic links are skipped, never followed) to `<Library>/Backups/<project> -
- * backup - modified <YYYY-MM-DD HHmm>.zip`, written to a temp name and renamed into place (0600,
- * fsync). The zip begins with `backup.json` (project id, time, audit head). For an encrypted project
- * the ENTIRE zip is sealed with the project key in the encrypted file format (`.zip.enc`): the zip
- * is streamed through the encryption, so no plaintext zip (and no file name) ever reaches the disk.
- * The project is read inside the repository's write queue, so the backup is one consistent state.
+ * `.tmp` folder; symbolic links are skipped, never followed) with yazl (Zip64 when needed, so
+ * projects over 4 GB and 65,535 files back up) to `<Library>/Backups/<project> - backup - modified
+ * <YYYY-MM-DD HHmm>.zip`, written to a temp name and renamed into place (0600, fsync). The zip
+ * begins with `backup.json` (project id and name, time, audit head, the ids of the assets whose
+ * files it holds). For an encrypted project the ENTIRE zip is sealed with the project key in the
+ * encrypted file format (`.zip.enc`): the zip is streamed through the encryption, so no plaintext
+ * zip (and no file name) ever reaches the disk.
+ *
+ * Consistency without holding the library's write queue for the whole zip (R92): the file list
+ * with sizes, modification times and inodes, the audit head and the asset ids are taken inside the
+ * write queue; the zip is written afterwards, while other changes go on. Append-only logs
+ * (`*.jsonl`: audit, change log, review, journals) are copied up to their snapshot size, which is
+ * exactly the state of the audit head taken (a rollback never cuts below it). Any other file that
+ * changed meanwhile (size, time, inode, gone) makes the backup start again once; if it changes
+ * again, the backup is kept with a warning (`warnings`). A backup that fails is recorded in the
+ * manifest (`failures`), which the project shows as the persisted warning `backup-failed` until a
+ * backup succeeds. Leftover temp files of interrupted backups are overwritten and removed.
  * Audited as `backup.create` (sha256, size, file count; no path).
  *
  * The sidecar manifest `Backups/backups-manifest.json` (0600) lists every backup the app made: file
- * name, project id, time, sha256, size, the audit head, the ids of the assets whose files it holds
- * (retention: backups holding destroyed data are found by it) and, for an encrypted project, the
- * project's key file (the data key wrapped by the passphrase and by the recovery code, as stored
- * in the project; never the key itself), so a backup can be restored with the passphrase even after
- * the project is gone. Pruning keeps the newest `keep` (default 10) and only ever removes files that
- * are listed in the manifest AND have the backup name of that project: nothing else in Backups/ is
- * touched.
+ * name, project id, time, sha256, size, the audit head, the asset ids it holds and, for an
+ * encrypted project, the project's key file (the data key wrapped by the passphrase and by the
+ * recovery code, as stored in the project — never the key itself; a backup keeps the passphrase
+ * the project had when it was made). A manifest that cannot be read is kept aside and rebuilt from
+ * each backup's own backup.json (sealed ones with the project key when it is unlocked; the key file
+ * is taken from the project again); files that cannot be read then are listed as `unresolved` and
+ * treated as possibly holding any project's data (R92 I2). Pruning keeps the newest `keep`
+ * (default 10) by the manifest's project id, and only ever removes manifest-listed files that have
+ * a backup's name: nothing else in Backups/ is touched.
  *
  * `restoreBackup` refuses anything that is not a safe archive (extractArchive: traversal, absolute
- * and symbolic-link entries refuse the whole archive; at most 100,000 entries and 2 GB in all —
- * the Bulk Import limits, except that one file may be as large as the whole, since field videos
- * exceed 50 MB), a sealed backup is read in place (crypto/random-access.ts: decrypted chunk by
- * chunk, never written out as a zip), its audit chain must verify (and match the head it
- * recorded), and it becomes a NEW project (repo/restore.ts): folder `<name> (restored <date>)`,
- * new ids, a `project.restored` event naming the backup's sha256. Nothing existing is overwritten.
+ * and symbolic-link entries refuse the whole archive; no entry, and no archive, may inflate to more
+ * than it declares — bomb protection by actual bytes), checks that the disk has room for what the
+ * archive declares, writes runs of zeros as holes, reads a sealed backup in place
+ * (crypto/random-access.ts: decrypted chunk by chunk, never written out as a zip), verifies its
+ * audit chain, and makes it a NEW project (repo/restore.ts). A restored encrypted project keeps the
+ * key (and key id) of the project it was made from: unlocking either unlocks both.
  *
  * `backupIfDue(projectId, now)` (Task 30's daily scheduler): a backup when automatic backups are on
  * (`project.backups.automatic`, default on), the project is unlocked, and the last backup is a day
@@ -35,15 +48,14 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { PassThrough, Transform, Writable } from "node:stream";
+import { Writable, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { Zip, ZipDeflate, ZipPassThrough } from "fflate";
-import { datedFileName, formatModified, newId, type Project } from "@ao/core";
+import yazl from "yazl";
+import { datedFileName, formatModified, newId, withCollisionSuffix, type Project } from "@ao/core";
 import { encryptStream, readKeyId } from "../crypto/format.js";
 import { unwrapKey, unwrapWithRecovery, WrongPassphraseError } from "../crypto/keys.js";
 import { openSealedZip } from "../crypto/random-access.js";
-import { ARCHIVE_LIMITS, extractArchive, type ZipSource } from "../extract/zip.js";
-import { UnsafeFileError } from "../extract/errors.js";
+import { extractArchive, readArchiveEntry, type ZipSource } from "../extract/zip.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
@@ -53,6 +65,7 @@ import { AuditChainInvalidError, RestoreError } from "../repo/restore.js";
 import {
   addKeyToRing,
   adoptRestoredProject,
+  appendLibraryEvent,
   keyFromRing,
   lookupPolicyInfo,
   repoClock,
@@ -63,16 +76,28 @@ import {
   type ProjectQueueContext,
   type Repo,
 } from "../repo/repo.js";
-import { withCollisionSuffix } from "@ao/core";
+import { isDue, projectTimeZone } from "../retention-date.js";
 
 export { AuditChainInvalidError, RestoreError };
 
 export const BACKUPS_MANIFEST = "backups-manifest.json";
 export const DEFAULT_KEEP = 10;
 const DAY_MS = 86_400_000;
-/** Restore limits: the Bulk Import archive limits, one file up to the whole (see above). */
-export const BACKUP_LIMITS = { ...ARCHIVE_LIMITS, maxEntryBytes: ARCHIVE_LIMITS.maxTotalBytes } as const;
+/** Restore limits: entry count only; sizes are bounded by free space and by what the archive declares (R92). */
+export const BACKUP_LIMITS = { maxEntries: 10_000_000, maxEntryBytes: Number.MAX_SAFE_INTEGER, maxTotalBytes: Number.MAX_SAFE_INTEGER } as const;
+/** Kept free on the disk beyond what a restore declares. */
+const FREE_MARGIN = 64 * 1024 * 1024;
 const TEMP_FILE = /\.tmp-[0-9a-f]+$/u;
+/** A backup's file name (any project name, date and collision suffix). */
+const BACKUP_NAME = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?$/u;
+
+/** Test seams. */
+export const backupSeams: {
+  failBackup?: boolean;
+  /** Runs after each snapshot, outside the write queue, before the zip is written. */
+  afterSnapshot?: () => Promise<void>;
+  freeBytes?: (dir: string) => Promise<number>;
+} = {};
 
 export interface BackupEntry {
   file: string;
@@ -83,8 +108,8 @@ export interface BackupEntry {
   encrypted: boolean;
   files: number;
   auditHead: { seq: number; hash: string } | null;
-  /** Ids of the assets whose files the backup holds (retention, R90 d). */
-  assets: string[];
+  /** Ids of the assets whose files the backup holds (retention, R90 d). Absent: unknown (treated as all). */
+  assets?: string[];
   /** Encrypted projects: the project's key file (wrapped keys only). */
   keyFile?: ProjectKeyFile;
 }
@@ -92,6 +117,10 @@ export interface BackupEntry {
 interface BackupManifest {
   formatVersion: 1;
   backups: BackupEntry[];
+  /** Projects whose last backup failed (R92): shown as the warning `backup-failed`. */
+  failures?: Record<string, { at: string; reason: string }>;
+  /** Backup-named files that could not be read when the manifest was rebuilt (R92 I2). */
+  unresolved?: string[];
 }
 
 export interface BackupResult {
@@ -100,19 +129,25 @@ export interface BackupResult {
   bytes: number;
   /** Backups removed by pruning (file names). */
   pruned: string[];
+  /** E.g. files that kept changing while the backup was made. */
+  warnings: string[];
 }
 
 const backupsDir = (repo: Repo) => join(repoLibrary(repo).root, "Backups");
 
+// ------------------------------------------------------------------------------------------
+// The manifest
+
 /** One manifest writer at a time per library folder (in-process; the library lock keeps other processes out). */
 const manifestLocks = new Map<string, Promise<unknown>>();
-function withManifest<T>(dir: string, fn: (m: BackupManifest) => Promise<T>): Promise<T> {
+function withManifest<T>(repo: Repo, fn: (m: BackupManifest) => Promise<T>): Promise<T> {
+  const dir = backupsDir(repo);
   const prev = manifestLocks.get(dir) ?? Promise.resolve();
   const run = prev.then(async () => {
-    const m = await readManifest(dir);
+    const m = await loadManifest(repo);
     const before = JSON.stringify(m);
     const out = await fn(m);
-    if (JSON.stringify(m) !== before) await writeFileAtomic(join(dir, BACKUPS_MANIFEST), `${JSON.stringify(m, null, 2)}\n`, { mode: 0o600 });
+    if (JSON.stringify(m) !== before) await writeManifest(dir, m);
     return out;
   });
   manifestLocks.set(
@@ -122,32 +157,108 @@ function withManifest<T>(dir: string, fn: (m: BackupManifest) => Promise<T>): Pr
   return run;
 }
 
-async function readManifest(dir: string): Promise<BackupManifest> {
+const writeManifest = async (dir: string, m: BackupManifest) => {
+  await fsp.mkdir(dir, { recursive: true });
+  await writeFileAtomic(join(dir, BACKUPS_MANIFEST), `${JSON.stringify(m, null, 2)}\n`, { mode: 0o600 });
+};
+
+/** The manifest; a damaged one is kept aside and rebuilt from the backups themselves (R92 I2). */
+async function loadManifest(repo: Repo): Promise<BackupManifest> {
+  const dir = backupsDir(repo);
   const raw = await readMaybe(join(dir, BACKUPS_MANIFEST));
   if (!raw) return { formatVersion: 1, backups: [] };
   try {
     const m = JSON.parse(raw.toString("utf8")) as BackupManifest;
     if (m.formatVersion !== 1 || !Array.isArray(m.backups)) throw new Error("bad manifest");
-    return { formatVersion: 1, backups: m.backups.filter((b) => b && typeof b.file === "string" && typeof b.projectId === "string") };
+    return {
+      formatVersion: 1,
+      backups: m.backups.filter((b) => b && typeof b.file === "string" && typeof b.projectId === "string"),
+      ...(m.failures && typeof m.failures === "object" ? { failures: m.failures } : {}),
+      ...(Array.isArray(m.unresolved) ? { unresolved: m.unresolved.filter((x) => typeof x === "string") } : {}),
+    };
   } catch {
-    // Unreadable: it is kept aside (never silently emptied), and nothing is pruned meanwhile.
-    const aside = join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`);
-    await fsp.rename(join(dir, BACKUPS_MANIFEST), aside).catch(() => {});
-    return { formatVersion: 1, backups: [] };
+    await fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {});
+    const rebuilt = await rebuildManifest(repo);
+    await writeManifest(dir, rebuilt);
+    return rebuilt;
   }
 }
 
-const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-/** The backup name of a project (any date, any collision suffix). */
-function backupNamePattern(projectName: string): RegExp {
-  const stem = datedFileName(`${projectName} - backup`, new Date(0), "zip").replace(/ - modified .*$/u, "");
-  return new RegExp(`^${escRe(stem)} - modified \\d{4}-\\d{2}-\\d{2} \\d{4}(?: \\(\\d+\\))?\\.zip(?:\\.enc)?$`, "u");
+async function sha256Of(path: string): Promise<string> {
+  const h = createHash("sha256");
+  for await (const c of createReadStream(path)) h.update(c as Buffer);
+  return h.digest("hex");
+}
+
+async function projectKeyFile(repo: Repo, projectId: string): Promise<ProjectKeyFile | undefined> {
+  try {
+    const p = repo.getProject(projectId);
+    const raw = await readMaybe(join(repoLibrary(repo).root, ...p.folder.split("/"), "keys", "project-key.json"));
+    return raw ? (JSON.parse(raw.toString("utf8")) as ProjectKeyFile) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Every backup-named file, read back from its own backup.json; unreadable ones are `unresolved`. */
+async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
+  const dir = backupsDir(repo);
+  const m: BackupManifest = { formatVersion: 1, backups: [], unresolved: [] };
+  let names: string[] = [];
+  try {
+    names = (await fsp.readdir(dir)).filter((n) => BACKUP_NAME.test(n)).sort();
+  } catch {
+    return m;
+  }
+  for (const file of names) {
+    const abs = join(dir, file);
+    let close: (() => Promise<void>) | undefined;
+    try {
+      let src: ZipSource = abs;
+      if (file.endsWith(".enc")) {
+        const keyId = await readKeyId(abs);
+        if (!keyFromRing(repo, keyId)) throw new Error("locked");
+        const z = await openSealedZip(abs, (id) => keyFromRing(repo, id));
+        src = { reader: z.reader, size: z.size };
+        close = z.close;
+      }
+      const raw = await readArchiveEntry(src, "backup.json");
+      if (!raw) throw new Error("no backup.json");
+      const h = JSON.parse(raw.toString("utf8")) as {
+        projectId?: unknown;
+        createdAt?: unknown;
+        encrypted?: unknown;
+        auditHead?: BackupEntry["auditHead"];
+        assets?: unknown;
+        files?: unknown;
+      };
+      if (typeof h.projectId !== "string" || typeof h.createdAt !== "string") throw new Error("bad backup.json");
+      const keyFile = file.endsWith(".enc") ? await projectKeyFile(repo, h.projectId) : undefined;
+      m.backups.push({
+        file,
+        projectId: h.projectId,
+        createdAt: h.createdAt,
+        sha256: await sha256Of(abs),
+        bytes: (await fsp.stat(abs)).size,
+        encrypted: file.endsWith(".enc"),
+        files: typeof h.files === "number" ? h.files : 0,
+        auditHead: h.auditHead ?? null,
+        ...(Array.isArray(h.assets) ? { assets: h.assets.filter((x): x is string => typeof x === "string") } : {}),
+        ...(keyFile ? { keyFile } : {}),
+      });
+    } catch {
+      m.unresolved!.push(file);
+    } finally {
+      await close?.().catch(() => {});
+    }
+  }
+  return m;
 }
 
 /** The project's backups the app made and that still exist, newest first. */
 export async function listBackups(repo: Repo, projectId: string): Promise<BackupEntry[]> {
   const dir = backupsDir(repo);
-  const m = await readManifest(dir);
+  const m = await withManifest(repo, async (x) => x);
   const out: BackupEntry[] = [];
   for (const b of m.backups) {
     if (b.projectId !== projectId) continue;
@@ -156,11 +267,33 @@ export async function listBackups(repo: Repo, projectId: string): Promise<Backup
   return out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
 }
 
+/**
+ * Package-internal (retention, R92 I2): backup files that could not be read when the manifest was
+ * rebuilt and whose name is the project's — they may hold its data.
+ */
+export async function unresolvedBackupsOf(repo: Repo, projectId: string): Promise<string[]> {
+  const m = await withManifest(repo, async (x) => x);
+  const stem = datedFileName(`${repo.getProject(projectId).name} - backup`, new Date(0), "zip").replace(/ - modified .*$/u, "");
+  const dir = backupsDir(repo);
+  const out: string[] = [];
+  for (const f of m.unresolved ?? []) {
+    if (!f.startsWith(`${stem} - modified `)) continue;
+    if (await fsp.stat(join(dir, f)).then((s) => s.isFile(), () => false)) out.push(f);
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------
+// Writing a backup
+
 interface FileToZip {
   rel: string;
   abs: string;
-  mtime: Date;
   size: number;
+  mtimeMs: number;
+  ino: number;
+  /** An append-only log: copied up to `size` (its state at the snapshot). */
+  appendOnly: boolean;
 }
 
 /** The project folder's files (no temp files, no .tmp folder, no symbolic links). */
@@ -175,10 +308,33 @@ async function filesOf(dir: string, base = ""): Promise<FileToZip[]> {
     if (e.isDirectory()) out.push(...(await filesOf(abs, rel)));
     else if (e.isFile()) {
       const st = await fsp.stat(abs);
-      out.push({ rel, abs, mtime: st.mtime, size: st.size });
+      out.push({ rel, abs, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, appendOnly: e.name.endsWith(".jsonl") });
     }
   }
   return out;
+}
+
+/** Whether a file is no longer as the snapshot saw it (append-only logs: only if shorter). */
+async function changedSince(files: FileToZip[]): Promise<boolean> {
+  for (const f of files) {
+    const st = await fsp.stat(f.abs).catch(() => null);
+    if (!st) return true;
+    if (f.appendOnly) {
+      if (st.size < f.size) return true;
+    } else if (st.size !== f.size || st.mtimeMs !== f.mtimeMs || st.ino !== f.ino) return true;
+  }
+  return false;
+}
+
+interface Snapshot {
+  files: FileToZip[];
+  project: Project;
+  at: string;
+  head: { seq: number; hash: string } | null;
+  assets: string[];
+  /** A copy of the data key (zeroed after the zip is written), encrypted projects only. */
+  key: { key: Buffer; keyId: string } | null;
+  keyFile?: ProjectKeyFile;
 }
 
 /** Ids of the stored (not destroyed) assets of every source of the project. */
@@ -191,57 +347,76 @@ async function storedAssetIds(repo: Repo, projectId: string): Promise<string[]> 
   return out;
 }
 
+async function snapshot(repo: Repo, projectId: string): Promise<Snapshot> {
+  return withProjectQueue(repo, projectId, async (ctx: ProjectQueueContext) => {
+    const projectDir = join(ctx.root, ...ctx.rel.split("/"));
+    const k = ctx.key();
+    let keyFile: ProjectKeyFile | undefined;
+    if (k) {
+      const raw = await readMaybe(join(projectDir, "keys", "project-key.json"));
+      if (raw) keyFile = JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
+    }
+    return {
+      files: await filesOf(projectDir),
+      project: ctx.project,
+      at: ctx.at(),
+      head: ctx.head(),
+      assets: await storedAssetIds(repo, projectId),
+      key: k ? { key: Buffer.from(k.key), keyId: k.keyId } : null,
+      ...(keyFile ? { keyFile } : {}),
+    };
+  });
+}
+
 const DOS_EPOCH = new Date("1980-01-02T00:00:00Z");
 
-/** Streams the zip of `files` (+ backup.json first) through `encrypt` (if any) into `tmp`. */
-async function writeZip(tmp: string, header: Record<string, unknown>, files: FileToZip[], encrypt?: Transform): Promise<{ sha256: string; bytes: number }> {
-  const out = new PassThrough();
-  let zipError: Error | undefined;
-  const zip = new Zip((err, data, final) => {
-    if (err) {
-      zipError = err;
-      out.destroy(err);
-      return;
+/** Streams the zip of the snapshot (backup.json first) through the encryption (if any) into `tmp`. */
+async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unknown>): Promise<{ sha256: string; bytes: number }> {
+  const zip = new yazl.ZipFile();
+  zip.addBuffer(Buffer.from(JSON.stringify(header, null, 2)), "backup.json", { mtime: new Date(snap.at), compress: true });
+  for (const f of snap.files) {
+    const mtime = new Date(Math.max(f.mtimeMs, DOS_EPOCH.getTime()));
+    if (f.size === 0) {
+      zip.addBuffer(Buffer.alloc(0), f.rel, { mtime });
+      continue;
     }
-    out.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-    if (final) out.end();
-  });
+    // `size` makes yazl fail when the file holds other than the snapshot's bytes; logs are cut at it.
+    zip.addReadStreamLazy(f.rel, { mtime, size: f.size, compress: !f.rel.endsWith(".enc") }, (cb) => {
+      const s = createReadStream(f.abs, f.appendOnly ? { start: 0, end: f.size - 1 } : {});
+      s.once("open", () => cb(null, s));
+      s.once("error", (err) => cb(err, s));
+    });
+  }
+  zip.end();
   const hash = createHash("sha256");
   let bytes = 0;
   const fh = await fsp.open(tmp, "wx", 0o600);
-  const sink = new Writable({
-    async write(chunk: Buffer, _enc, cb) {
-      try {
-        hash.update(chunk);
-        bytes += chunk.length;
-        for (let off = 0; off < chunk.length; ) off += (await fh.write(chunk, off)).bytesWritten;
-        cb();
-      } catch (e) {
-        cb(e as Error);
-      }
-    },
-  });
-  const writing = encrypt ? pipeline(out, encrypt, sink) : pipeline(out, sink);
-  writing.catch(() => {}); // awaited below; errors also stop the producer
-  const add = async (name: string, mtime: Date, deflate: boolean, chunks: AsyncIterable<Uint8Array> | Uint8Array[]) => {
-    const f: ZipDeflate | ZipPassThrough = deflate ? new ZipDeflate(name, { level: 6 }) : new ZipPassThrough(name);
-    f.mtime = mtime < DOS_EPOCH ? DOS_EPOCH : mtime;
-    zip.add(f);
-    for await (const c of chunks) {
-      if (zipError) throw zipError;
-      f.push(c);
-      if (out.writableNeedDrain) await new Promise<void>((r, j) => (out.once("drain", r), out.once("error", j)));
-    }
-    f.push(new Uint8Array(0), true);
-  };
   try {
-    await add("backup.json", new Date(), true, [Buffer.from(JSON.stringify(header, null, 2))]);
-    for (const f of files) {
-      // Encrypted files do not compress.
-      await add(f.rel, f.mtime, !f.rel.endsWith(".enc"), createReadStream(f.abs) as AsyncIterable<Buffer>);
+    const sink = new Writable({
+      async write(chunk: Buffer, _enc, cb) {
+        try {
+          hash.update(chunk);
+          bytes += chunk.length;
+          for (let off = 0; off < chunk.length; ) off += (await fh.write(chunk, off)).bytesWritten;
+          cb();
+        } catch (e) {
+          cb(e as Error);
+        }
+      },
+    });
+    const out = zip.outputStream as unknown as Readable;
+    // yazl reports a file-size mismatch (a file changed meanwhile) on the zip, not the stream.
+    const failed = new Promise<never>((_r, j) => zip.once("error", j));
+    failed.catch(() => {});
+    const done = snap.key ? pipeline(out, encryptStream(snap.key.key, snap.key.keyId), sink) : pipeline(out, sink);
+    done.catch(() => {});
+    try {
+      await Promise.race([done, failed]);
+    } catch (err) {
+      out.destroy();
+      sink.destroy();
+      throw err;
     }
-    zip.end();
-    await writing;
     await fh.sync();
   } finally {
     await fh.close();
@@ -249,99 +424,153 @@ async function writeZip(tmp: string, header: Record<string, unknown>, files: Fil
   return { sha256: hash.digest("hex"), bytes };
 }
 
+/** In-progress temp files of this process (never swept while running). */
+const activeTemps = new Set<string>();
+
+/** Overwrites and removes temp files left by interrupted backups (they may be plaintext zips). */
+async function sweepTemps(dir: string): Promise<void> {
+  let names: string[] = [];
+  try {
+    names = await fsp.readdir(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) if (TEMP_FILE.test(n) && !activeTemps.has(join(dir, n))) await shredPath(join(dir, n)).catch(() => {});
+}
+
+async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
+  const at = repoClock(repo)().toISOString();
+  await withManifest(repo, async (m) => {
+    m.failures = { ...m.failures, [projectId]: { at, reason: err instanceof Error ? err.name : "Error" } };
+  }).catch(() => {});
+}
+
 /**
  * Backs up the project to Backups/ and prunes its older backups to the newest `keep`
- * (default: the project's setting, else 10).
+ * (default: the project's setting, else 10). A failure is recorded as the project's warning
+ * `backup-failed` (and thrown).
  */
 export async function backupProject(repo: Repo, projectId: string, opts: { keep?: number; prune?: boolean } = {}): Promise<BackupResult> {
   const dir = backupsDir(repo);
   await fsp.mkdir(dir, { recursive: true });
-  const { tz } = await lookupPolicyInfo(repo, projectId);
-  const made = await withProjectQueue(repo, projectId, async (ctx: ProjectQueueContext) => {
-    const projectDir = join(ctx.root, ...ctx.rel.split("/"));
-    const files = await filesOf(projectDir);
-    const total = files.reduce((n, f) => n + f.size, 0);
-    if (total > BACKUP_LIMITS.maxTotalBytes || files.length + 1 > BACKUP_LIMITS.maxEntries) {
-      throw new UnsafeFileError("zip-too-large", "This project is too large to back up as one file (more than 2 GB or 100,000 files)");
+  await sweepTemps(dir);
+  const tz = repoTz(repo);
+  const warnings: string[] = [];
+  let made: { entry: BackupEntry; project: Project };
+  try {
+    if (backupSeams.failBackup) throw new Error("simulated backup failure");
+    let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string } | undefined;
+    for (let attempt = 0; attempt < 2 && !result; attempt++) {
+      const snap = await snapshot(repo, projectId);
+      try {
+        await backupSeams.afterSnapshot?.();
+        let name = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
+        if (snap.key) name = `${name}.enc`;
+        const taken = await namesIn(dir);
+        name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
+        const tmp = join(dir, `${name}.tmp-${randomBytes(6).toString("hex")}`);
+        activeTemps.add(tmp);
+        try {
+          const header = { formatVersion: 1, projectId, projectName: snap.project.name, createdAt: snap.at, encrypted: !!snap.key, auditHead: snap.head, files: snap.files.length, assets: snap.assets };
+          const r = await writeZip(tmp, snap, header);
+          if (await changedSince(snap.files)) {
+            if (attempt === 0) {
+              await shredPath(tmp);
+              continue;
+            }
+            warnings.push("Some files changed while the backup was made, twice; this backup may not be one consistent state.");
+          }
+          result = { snap, tmp, name, ...r };
+        } catch (err) {
+          await shredPath(tmp).catch(() => {});
+          activeTemps.delete(tmp);
+          // A file that changed size or went away while it was read: start again once.
+          if (attempt === 0 && (await changedSince(snap.files))) continue;
+          throw err;
+        }
+      } finally {
+        snap.key?.key.fill(0);
+      }
     }
-    const assets = await storedAssetIds(repo, projectId);
-    const key = ctx.key();
-    const at = ctx.at();
-    const head = ctx.head();
-    let name = datedFileName(`${ctx.project.name} - backup`, new Date(at), "zip", tz);
-    if (key) name = `${name}.enc`;
-    const taken = await namesIn(dir);
-    name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
-    const tmp = join(dir, `${name}.tmp-${randomBytes(6).toString("hex")}`);
-    let result: { sha256: string; bytes: number };
+    if (!result) throw new Error("the project kept changing while it was backed up");
     try {
-      result = await writeZip(tmp, { formatVersion: 1, projectId, createdAt: at, encrypted: !!key, auditHead: head }, files, key ? encryptStream(key.key, key.keyId) : undefined);
-      await fsp.rename(tmp, join(dir, name));
-    } catch (err) {
-      await fsp.rm(tmp, { force: true }).catch(() => {});
-      throw err;
+      await fsp.rename(result.tmp, join(dir, result.name));
+    } finally {
+      activeTemps.delete(result.tmp);
     }
-    let keyFile: ProjectKeyFile | undefined;
-    if (key) {
-      const raw = await readMaybe(join(projectDir, "keys", "project-key.json"));
-      if (raw) keyFile = JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
-    }
-    await ctx.audit("backup.create", { sha256: result.sha256, bytes: result.bytes, encrypted: !!key, files: files.length });
-    const entry: BackupEntry = {
-      file: name,
-      projectId,
-      createdAt: at,
-      sha256: result.sha256,
-      bytes: result.bytes,
-      encrypted: !!key,
-      files: files.length,
-      auditHead: head,
-      assets,
-      ...(keyFile ? { keyFile } : {}),
+    const { snap } = result;
+    await appendLibraryEvent(repo, projectId, "backup.create", { sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
+    made = {
+      project: snap.project,
+      entry: {
+        file: result.name,
+        projectId,
+        createdAt: snap.at,
+        sha256: result.sha256,
+        bytes: result.bytes,
+        encrypted: !!snap.key,
+        files: snap.files.length,
+        auditHead: snap.head,
+        assets: snap.assets,
+        ...(snap.keyFile ? { keyFile: snap.keyFile } : {}),
+      },
     };
-    return { entry, project: ctx.project };
-  });
-  await withManifest(dir, async (m) => {
+  } catch (err) {
+    await recordFailure(repo, projectId, err);
+    throw err;
+  }
+  await withManifest(repo, async (m) => {
     m.backups.push(made.entry);
+    if (m.failures && Object.hasOwn(m.failures, projectId)) {
+      const { [projectId]: _gone, ...rest } = m.failures;
+      m.failures = rest;
+    }
   });
   const pruned = opts.prune === false ? [] : await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
-  return { path: join(dir, made.entry.file), sha256: made.entry.sha256, bytes: made.entry.bytes, pruned };
+  return { path: join(dir, made.entry.file), sha256: made.entry.sha256, bytes: made.entry.bytes, pruned, warnings };
 }
 
-/** Removes the project's backups beyond the newest `keep` (manifest-listed, backup-named files only). */
+/** Removes the project's backups beyond the newest `keep`: by the manifest's project id, backup-named files only. */
 export async function pruneBackups(repo: Repo, projectId: string, keep: number): Promise<string[]> {
   if (!Number.isInteger(keep) || keep < 1) throw new TypeError("keep must be a whole number of at least 1");
   const dir = backupsDir(repo);
-  const pattern = backupNamePattern(repo.getProject(projectId).name);
-  return withManifest(dir, async (m) => {
-    const mine = m.backups.filter((b) => b.projectId === projectId && pattern.test(b.file) && b.file === basename(b.file));
+  return withManifest(repo, async (m) => {
+    const mine = m.backups.filter((b) => b.projectId === projectId && BACKUP_NAME.test(b.file) && b.file === basename(b.file));
     mine.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
     const removed: string[] = [];
     for (const b of mine.slice(keep)) {
       await fsp.rm(join(dir, b.file), { force: true });
       removed.push(b.file);
     }
-    m.backups = m.backups.filter((b) => !removed.includes(b.file) || b.projectId !== projectId);
+    m.backups = m.backups.filter((b) => !(b.projectId === projectId && removed.includes(b.file)));
     return removed;
   });
 }
 
 /**
- * Package-internal (retention, R90 d): overwrites and removes the named backups of the project
- * (manifest-listed ones only) and drops them from the manifest. Returns the names removed.
+ * Package-internal (retention, R90 d, R92 I3): overwrites and removes the named backups of the
+ * project one by one (manifest-listed ones), the manifest updated after each; a failure does not
+ * stop the others. Returns the names removed, and the first error, if any.
  */
-export async function destroyBackups(repo: Repo, projectId: string, files: string[]): Promise<string[]> {
+export async function destroyBackups(repo: Repo, projectId: string, files: string[]): Promise<{ deleted: string[]; error?: unknown }> {
   const dir = backupsDir(repo);
-  return withManifest(dir, async (m) => {
-    const removed: string[] = [];
-    for (const b of m.backups) {
-      if (b.projectId !== projectId || !files.includes(b.file) || b.file !== basename(b.file)) continue;
-      await shredPath(join(dir, b.file));
-      removed.push(b.file);
+  const deleted: string[] = [];
+  let first: unknown;
+  for (const f of files) {
+    if (f !== basename(f)) continue;
+    try {
+      await withManifest(repo, async (m) => {
+        if (!m.backups.some((b) => b.projectId === projectId && b.file === f)) return;
+        await shredPath(join(dir, f));
+        m.backups = m.backups.filter((b) => !(b.projectId === projectId && b.file === f));
+        deleted.push(f);
+      });
+    } catch (error) {
+      // The others are still tried; the first failure is reported.
+      first ??= error;
     }
-    m.backups = m.backups.filter((b) => !(b.projectId === projectId && removed.includes(b.file)));
-    return removed;
-  });
+  }
+  return first === undefined ? { deleted } : { deleted, error: first };
 }
 
 /** Sets the project's backup settings (governed, audited): `automatic` daily backups, how many to `keep`. */
@@ -352,7 +581,8 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
 /**
  * For the daily scheduler (Task 30): backs the project up when automatic backups are on (default),
  * the project is open for writing and unlocked, and its last backup is at least a day old. Null
- * when nothing was due (or it could not run now).
+ * when nothing was due (or it could not run now). A failure is thrown and stays as the project's
+ * warning `backup-failed`.
  */
 export async function backupIfDue(repo: Repo, projectId: string, now: Date): Promise<BackupResult | null> {
   const p = repo.getProject(projectId);
@@ -368,16 +598,23 @@ export async function backupIfDue(repo: Repo, projectId: string, now: Date): Pro
   }
 }
 
+// ------------------------------------------------------------------------------------------
+// Restore
+
 export interface RestoreResult {
   projectId: string;
   /** Library-relative folder of the new project. */
   folder: string;
+  /** What the restore left out or changed (plain text). */
+  notes: string[];
+  /** `retention-due`: the restored project's retention date has passed. */
+  warnings: string[];
 }
 
-async function sha256Of(path: string): Promise<string> {
-  const h = createHash("sha256");
-  for await (const c of createReadStream(path)) h.update(c as Buffer);
-  return h.digest("hex");
+async function freeBytes(dir: string): Promise<number> {
+  if (backupSeams.freeBytes) return backupSeams.freeBytes(dir);
+  const s = await fsp.statfs(dir);
+  return Number(s.bavail) * Number(s.bsize);
 }
 
 /**
@@ -392,13 +629,16 @@ export async function restoreBackup(repo: Repo, path: string, opts: { passphrase
   const sealed = abs.endsWith(".enc");
   const backupSha256 = await sha256Of(abs);
   // The manifest entry, when the backup is one of this library's.
-  const entry = resolve(dirname(abs)) === resolve(backupsDir(repo)) ? (await readManifest(backupsDir(repo))).backups.find((b) => b.file === basename(abs)) : undefined;
+  const entry = resolve(dirname(abs)) === resolve(backupsDir(repo)) ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs)) : undefined;
   if (entry && entry.sha256 !== backupSha256) throw new RestoreError("This backup was changed after it was made; it was not restored");
 
   let source: ZipSource = abs;
   let close: (() => Promise<void>) | undefined;
+  let decryptFailure: (() => unknown) | undefined;
   if (sealed) {
-    const keyId = await readKeyId(abs);
+    const keyId = await readKeyId(abs).catch(() => {
+      throw new RestoreError("This backup cannot be decrypted: it is damaged, or it is not a backup made by this app");
+    });
     if (!keyFromRing(repo, keyId)) {
       const kf = entry?.keyFile;
       if (!opts.passphrase || !kf || kf.keyId !== keyId) throw new RestoreError("This backup is encrypted: unlock its project, or give the project's passphrase");
@@ -414,15 +654,29 @@ export async function restoreBackup(repo: Repo, path: string, opts: { passphrase
       addKeyToRing(repo, keyId, key);
       key.fill(0);
     }
-    const z = await openSealedZip(abs, (id) => keyFromRing(repo, id));
+    const z = await openSealedZip(abs, (id) => keyFromRing(repo, id)).catch(() => {
+      throw new RestoreError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
+    });
     source = { reader: z.reader, size: z.size };
     close = z.close;
+    decryptFailure = z.failure;
   }
-  const staging = join(lib.root, "Projects", `.creating-${newId()}`);
+  const projectsDir = join(lib.root, "Projects");
+  const staging = join(projectsDir, `.creating-${newId()}`);
   try {
     let entries;
     try {
-      entries = await extractArchive(source, staging, BACKUP_LIMITS);
+      entries = await extractArchive(source, staging, BACKUP_LIMITS, undefined, {
+        sparse: true,
+        beforeWrite: async (declared) => {
+          if ((await freeBytes(projectsDir)) < declared + FREE_MARGIN) {
+            throw new RestoreError("There is not enough free space on this disk to restore this backup");
+          }
+        },
+      });
+    } catch (err) {
+      if (decryptFailure?.()) throw new RestoreError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
+      throw err;
     } finally {
       await close?.();
     }
@@ -437,8 +691,12 @@ export async function restoreBackup(repo: Repo, path: string, opts: { passphrase
       }
     }
     const date = formatModified(repoClock(repo)(), repoTz(repo)).slice(0, 10);
-    const project = await adoptRestoredProject(repo, { staging, backupSha256, ...(expectedHead !== undefined ? { expectedHead } : {}), date });
-    return { projectId: project.id, folder: project.folder };
+    const { project, notes } = await adoptRestoredProject(repo, { staging, backupSha256, ...(expectedHead !== undefined ? { expectedHead } : {}), date });
+    const warnings: string[] = [];
+    const { policy } = await lookupPolicyInfo(repo, project.id);
+    const due = policy?.retention.rawDataDestroyAfter;
+    if (due && isDue(due, repoClock(repo)(), projectTimeZone(repo, project.id))) warnings.push("retention-due");
+    return { projectId: project.id, folder: project.folder, notes, warnings };
   } catch (err) {
     await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
     throw err;
