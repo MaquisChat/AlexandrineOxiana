@@ -9,5 +9,6 @@
   "upload_date": "20210301",
   "language": "en",
   "webpage_url": "https://www.youtube.com/watch?v=aoTest00002",
-  "extractor": "youtube"
+  "extractor": "youtube",
+  "availability": "unlisted"
 }

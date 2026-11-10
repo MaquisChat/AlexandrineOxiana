@@ -1,0 +1,43 @@
+{
+  "category": "tiktok",
+  "subcategory": "post",
+  "id": "7000000000000000002",
+  "desc": "Market colours in three photos #market\nsecond line of a synthetic caption",
+  "createTime": 1604916000,
+  "author": {
+    "id": "6800000000000000000",
+    "uniqueId": "fake.dancer",
+    "nickname": "Fake Dancer",
+    "secUid": "MS4wLjABAAAAfakefakefake",
+    "verified": false,
+    "avatarThumb": "https://p16-sign-va.tiktokcdn.example/tos-maliva-avt-0068/fake~c5_100x100.jpeg?x-expires=1767225600&x-signature=FAKE%3D"
+  },
+  "authorStats": {
+    "followerCount": 12
+  },
+  "stats": {
+    "diggCount": 10,
+    "shareCount": 1,
+    "commentCount": 2,
+    "playCount": 100
+  },
+  "imagePost": {
+    "images": [
+      {
+        "imageURL": {
+          "urlList": [
+            "https://p16-sign-va.tiktokcdn.example/tos/fake1~tplv-photomode-image.jpeg?x-expires=1767225600&x-signature=FAKE1"
+          ]
+        }
+      }
+    ]
+  },
+  "music": {
+    "title": "original sound - fake.dancer",
+    "authorName": "Fake Dancer",
+    "playUrl": "https://sf16.tiktokcdn.example/obj/fake.mp3?x-expires=1767225600&x-signature=FAKE"
+  },
+  "count": 3,
+  "extension": "jpg",
+  "file_id": "fake1"
+}

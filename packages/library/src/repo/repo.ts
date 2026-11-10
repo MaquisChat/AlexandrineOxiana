@@ -36,6 +36,8 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
+import { stampFor, type Stamp } from "../index/changes.js";
+import { activeTemp } from "../tmp-registry.js";
 import { RecoveryPendingError } from "./errors.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 
@@ -162,7 +164,10 @@ async function sweep(core: RepoCore): Promise<void> {
     for (const n of names) if (await match(n)) await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
   };
   await clear(join(core.root, "Projects"), (n) => n.startsWith(".creating-"));
-  await clear(join(core.root, ".tmp"), (n) => (n.startsWith("trash-") && !markersLeft) || isOrphanBackup(core.root, n));
+  // Work folders of captures and worker jobs interrupted by a crash (decrypted inputs, raw tool
+  // output with request headers): never resumed, so removed unless in use in this process.
+  const staleWork = (n: string) => (n.startsWith("capture-") || n.startsWith("worker-")) && !activeTemp.has(n);
+  await clear(join(core.root, ".tmp"), (n) => staleWork(n) || (n.startsWith("trash-") && !markersLeft) || isOrphanBackup(core.root, n));
 }
 
 const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarning["kind"]; text: string }>> = {
@@ -398,9 +403,10 @@ export function relinkLinkedAsset(repo: Repo, projectId: string, sourceId: strin
 
 /**
  * Package-internal (worker client): evaluates a request for work that writes nothing by itself,
- * such as local processing; a deny is audited and thrown as PolicyDeniedError.
+ * such as local processing; a deny is audited and thrown as PolicyDeniedError. With `auditAllow`, an
+ * allow is audited too (link capture: the one audited capture decision).
  */
-export function authorizeProcessing(repo: Repo, projectId: string, req: MutateRequest, opts: MutateOptions = {}): ReturnType<typeof authorizeOnly> {
+export function authorizeProcessing(repo: Repo, projectId: string, req: MutateRequest, opts: Parameters<typeof authorizeOnly>[3] = {}): ReturnType<typeof authorizeOnly> {
   return authorizeOnly(cores.get(repo)!, projectId, req, opts);
 }
 
@@ -427,6 +433,28 @@ export async function projectPolicy(repo: Repo, projectId: string): Promise<Gove
   } catch {
     return null;
   }
+}
+
+/**
+ * Package-internal (link capture): `createSource` for a capture whose `capture` decision the caller
+ * has already evaluated and audited (authorizeProcessing with `auditAllow`); only `store` is
+ * evaluated and audited here, so the capture has exactly one audited capture decision.
+ */
+export function createSourcePreAuthorized(
+  repo: Repo,
+  projectId: string,
+  draft: SourceDraft,
+  files: SourceInputFile[],
+  opts: CreateSourceOptions,
+): Promise<SourceFile> {
+  return createSource(cores.get(repo)!, projectId, draft, files, opts, { captureAuthorized: true });
+}
+
+/** Package-internal (link capture): the project's change stamp as the index would record it now. */
+export async function projectStampNow(repo: Repo, projectId: string): Promise<Stamp> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  return stampFor(core.root, st.rel, st.data, core.keyRing);
 }
 
 /** Package-internal: the library a repo was opened on. */

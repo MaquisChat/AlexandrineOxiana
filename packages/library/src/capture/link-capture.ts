@@ -28,9 +28,10 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { applyVerification, verifyDraft, type Asset, type Provenance, type SourceFile } from "@ao/core";
 import type { IndexDb } from "../index/db.js";
-import { findSourceBy } from "../index/db.js";
+import { findSourceBy, getMeta } from "../index/db.js";
+import { activeTemp } from "../tmp-registry.js";
 import { decryptBytes, encryptBytes } from "../repo/io.js";
-import { authorizeProcessing, projectDataKey, projectPolicy, repoLibrary, type Repo } from "../repo/repo.js";
+import { authorizeProcessing, createSourcePreAuthorized, projectDataKey, projectPolicy, projectStampNow, repoLibrary, type Repo } from "../repo/repo.js";
 import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import type { SourceInputFile } from "../repo/sources.js";
 import { WorkerJobError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
@@ -50,6 +51,8 @@ export interface CaptureOptions {
   quality?: "best" | "1080p" | "720p";
   /** For a post already in the project: add a new dated platform-metadata snapshot. */
   refreshIfExists?: boolean;
+  /** Legal basis for this capture; default: the project's `consent.defaultLegalBasis['social-media']`. */
+  legalBasis?: string;
 }
 
 export type CaptureStatus = "created" | "duplicate" | "refreshed" | "incomplete" | "failed" | "needs-review";
@@ -103,6 +106,10 @@ function captionLang(file: string): string {
   return /^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/.test(lang) ? lang : "und";
 }
 
+/** The `consent.defaultLegalBasis` category link capture uses. */
+const LEGAL_CATEGORY = "social-media";
+const REVIEW_NOTE = "Some details could not be confirmed, so the source is in the review queue.";
+
 function failed(url: string, code: string, reason = plainReason(code)): CaptureOutcome {
   return { url, status: "failed", errorCode: code, reason };
 }
@@ -124,8 +131,12 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     const ids = new Set(repo.listSourceIds(projectId));
     if (deps.index) {
       try {
-        const hit = findSourceBy(deps.index.db, { platform, postId }).find((r) => r.projectId === projectId && ids.has(r.id));
-        return hit?.id;
+        const db = deps.index.db;
+        const hit = findSourceBy(db, { platform, postId }).find((r) => r.projectId === projectId && ids.has(r.id));
+        if (hit) return hit.id;
+        // A miss is final only when the index is current for this project: its recorded change stamp
+        // is the project's stamp now, and every source has its content (not only manifest rows) indexed.
+        if (await indexCurrent(db, projectId, ids)) return undefined;
       } catch {
         // index unusable: fall back to the files
       }
@@ -141,6 +152,18 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       }
     }
     return undefined;
+  }
+
+  async function indexCurrent(db: IndexDb, projectId: string, ids: Set<string>): Promise<boolean> {
+    const recorded = getMeta(db, "projectStamps");
+    if (!recorded) return false;
+    const stamp = (JSON.parse(recorded) as Record<string, unknown>)[projectId];
+    if (JSON.stringify(stamp) !== JSON.stringify(await projectStampNow(repo, projectId))) return false;
+    const indexed = new Set(
+      (db.prepare("SELECT id FROM v_sources WHERE project_id = ? AND locked = 0").all(projectId) as Array<{ id: string }>).map((r) => r.id),
+    );
+    for (const id of ids) if (!indexed.has(id)) return false;
+    return true;
   }
 
   async function readJson(path: string, encrypted: boolean, projectId: string): Promise<Record<string, unknown> | undefined> {
@@ -185,10 +208,11 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     });
   }
 
+  /** `info` is already stripped. */
   async function refresh(projectId: string, sourceId: string, info: Record<string, unknown>, work: string, encrypted: boolean): Promise<void> {
     const at = new Date();
     const stamp = at.toISOString().slice(0, 16).replace("T", " ").replace(":", "");
-    const path = await writeSnapshot(work, "refresh.platform-metadata.json", stripSnapshot(info), projectId, encrypted);
+    const path = await writeSnapshot(work, "refresh.platform-metadata.json", info, projectId, encrypted);
     await repo.addOriginalAsset(projectId, sourceId, {
       fromPath: path,
       kind: "platform-metadata",
@@ -222,50 +246,77 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     const lang = langs.length === 1 ? langs[0]! : langs.length > 1 ? "mul" : "und";
     const flagged = typeof meta.flaggedCount === "number" ? meta.flaggedCount : undefined;
     const at = new Date().toISOString();
-    for (const ext of ["vtt", "json"]) {
-      const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
-      if (!file) continue;
-      await repo.addDerivedAsset(projectId, sf.source.id, {
-        fromPath: file,
-        kind: "transcript",
-        lang,
-        tool: `whisper-${model}`,
-        ext,
-        ...(r.encrypted ? { fromEncrypted: true } : {}),
-        ...(flagged !== undefined ? { metadata: { flaggedSegments: flagged } } : {}),
-        derivation: {
-          parents: [media.id],
-          operation: "transcribe",
-          provider: "faster-whisper",
-          model,
-          ranAt: "local",
-          params: { model, detectedLanguages: langs },
-          at,
-          triggeredBy: "capture",
-        },
-      });
+    try {
+      for (const ext of ["vtt", "json"]) {
+        const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
+        if (!file) continue;
+        await repo.addDerivedAsset(projectId, sf.source.id, {
+          fromPath: file,
+          kind: "transcript",
+          lang,
+          tool: `whisper-${model}`,
+          ext,
+          ...(r.encrypted ? { fromEncrypted: true } : {}),
+          ...(flagged !== undefined ? { metadata: { flaggedSegments: flagged } } : {}),
+          derivation: {
+            parents: [media.id],
+            operation: "transcribe",
+            provider: "faster-whisper",
+            model,
+            ranAt: "local",
+            params: { model, detectedLanguages: langs },
+            at,
+            triggeredBy: "capture",
+          },
+        });
+      }
+    } catch {
+      return "The source was saved, but the transcript could not be stored.";
     }
     return undefined;
   }
 
   async function captureOne(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<CaptureOutcome> {
     const platform = c.platform;
-    // 2. Policy before anything is downloaded (a deny is audited and thrown).
-    await authorizeProcessing(repo, projectId, { action: "capture", capture: { method: "downloader", platform } }, { op: "capture.link" });
+    const cookies = !!opts.cookiesFromBrowser;
+    // 2. Policy before anything is downloaded. The capture decision is audited here, once, whatever
+    //    happens next (a deny is thrown); storing the result does not evaluate `capture` again.
+    await authorizeProcessing(
+      repo,
+      projectId,
+      { action: "capture", capture: { method: "downloader", platform } },
+      { op: "capture.link", auditAllow: { details: { platform, cookies } } },
+    );
     const policy = await projectPolicy(repo, projectId);
     const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-    await authorizeProcessing(repo, projectId, { action: "store", store: { identifiable, hasLocation: false } }, { op: "capture.link" });
-    // 3. The browser session needs the one-time acknowledgement.
-    if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
+    const legalBasis = opts.legalBasis?.trim() || policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
+    try {
+      await authorizeProcessing(
+        repo,
+        projectId,
+        { action: "store", store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } },
+        { op: "capture.link" },
+      );
+    } catch (err) {
+      if (err instanceof PolicyDeniedError && identifiable && policy?.consent.requireLegalBasis && !legalBasis) {
+        return failed(url, "LEGAL_BASIS_REQUIRED");
+      }
+      throw err;
+    }
 
     // 4. Known post id: duplicates are found before downloading.
     let existing = c.postId ? await findExisting(projectId, platform, c.postId) : undefined;
     if (existing && !opts.refreshIfExists) return { url, status: "duplicate", sourceId: existing };
 
     const root = repoLibrary(repo).root;
-    const work = join(root, ".tmp", `capture-${randomUUID()}`);
+    const name = `capture-${randomUUID()}`;
+    const work = join(root, ".tmp", name);
+    activeTemp.add(name);
     try {
-      // 5. Download.
+      await fsp.mkdir(join(root, ".tmp"), { recursive: true });
+      await fsp.mkdir(work, { mode: 0o700 });
+      if (process.platform !== "win32") await fsp.chmod(work, 0o700);
+      // 5. Download. The raw tool output (info JSON with request headers) stays in this folder.
       let result: JobResult;
       try {
         result = await download(projectId, c, opts, work, !!existing);
@@ -280,24 +331,25 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       const partialCode = meta.partial === true ? (typeof meta.errorCode === "string" ? meta.errorCode : "EXTRACTOR_ERROR") : undefined;
       const toolName = typeof meta.tool === "string" ? meta.tool : toolFor(c);
       const toolVersion = typeof meta.toolVersion === "string" && meta.toolVersion ? meta.toolVersion : "unknown";
+      const tool = (toolName === "gallery-dl" ? "gallery-dl" : "yt-dlp") as CaptureTool;
       const raw = infoFiles.length ? await readJson(infoFiles[0]!, result.encrypted, projectId) : undefined;
+      // Only the stripped form ever leaves the work folder.
+      const stored = stripSnapshot(raw ?? {}, { localPrefixes: [root] });
+      const snap = verificationSnapshot(stored, c, tool);
 
       // Post id known only now (short links): the duplicate check again.
-      const postId = c.postId ?? (raw && (typeof raw.id === "string" || typeof raw.id === "number") ? String(raw.id) : undefined);
+      const postId = c.postId ?? (typeof snap.id === "string" || typeof snap.id === "number" ? String(snap.id) : undefined);
       if (!existing && postId) existing = await findExisting(projectId, platform, postId);
       if (existing) {
         if (!opts.refreshIfExists) return { url, status: "duplicate", sourceId: existing };
         if (!raw) return failed(url, partialCode ?? "NOTHING_SAVED");
-        await refresh(projectId, existing, raw, work, result.encrypted);
+        await refresh(projectId, existing, stored, work, result.encrypted);
         return { url, status: "refreshed", sourceId: existing };
       }
       if (!raw && files.length === 0) return failed(url, partialCode ?? "NOTHING_SAVED");
 
       // 6. Draft, evidence, verification.
       const at = new Date().toISOString();
-      const tool = (toolName === "gallery-dl" ? "gallery-dl" : "yt-dlp") as CaptureTool;
-      const stored = stripSnapshot(raw ?? {});
-      const snap = verificationSnapshot(stored, c, tool);
       const { draft, evidence } = buildDraft(snap, stored, c, tool, at);
       const report = verifyDraft(draft, evidence, { platformSnapshot: snap });
 
@@ -328,14 +380,16 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
         fileHashes: {},
         platformSnapshot: snap,
         identification: { method: "platform-json", confidence: applyVerification(1, report) },
-        // Seen through a signed-in session, the post is not necessarily public.
-        legal: { status: opts.cookiesFromBrowser ? "unknown" : "public" },
+        // Public only when the platform itself says so and no signed-in session was used.
+        legal: { status: !cookies && raw?.availability === "public" ? "public" : "unknown", ...(legalBasis ? { basis: legalBasis } : {}) },
         identifiable,
+        access: cookies ? "signed-in-session" : "public",
       };
       const needsReview = report.overall === "needs-review";
-      // Something was saved but the tool stopped with an error: an incomplete source, labeled with why.
-      const incomplete = partialCode;
-      const sf = await repo.createSource(projectId, draft, inputs, {
+      // Something was saved but the tool stopped with an error, or no media file came back: an
+      // incomplete source, labeled with why.
+      const incomplete = partialCode ?? (media.length === 0 ? "NO_MEDIA" : undefined);
+      const sf = await createSourcePreAuthorized(repo, projectId, draft, inputs, {
         provenance,
         fieldEvidence: evidence,
         verification: report.fields,
@@ -352,43 +406,54 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
           : {}),
       });
 
-      // 7. Captions and transcript.
+      // 7. Captions and transcript. The source exists now: a failure here is reported, never as "nothing saved".
+      const notes: string[] = [];
       const firstMedia = sf.assets.find((a) => a.role === "original" && (a.kind === "video" || a.kind === "audio"));
       const parent = firstMedia ?? sf.assets.find((a) => a.role === "original" && a.kind !== "platform-metadata");
+      let captionsFailed = false;
       for (const f of captions) {
-        await repo.addDerivedAsset(projectId, sf.source.id, {
-          fromPath: f,
-          kind: "platform-captions",
-          lang: captionLang(f),
-          tool: "platform",
-          ext: extOf(f),
-          ...(result.encrypted ? { fromEncrypted: true } : {}),
-          derivation: {
-            parents: parent ? [parent.id] : [],
-            operation: "platform-captions",
-            provider: "platform",
-            ranAt: platform,
-            params: { tool: toolName },
-            at,
-            triggeredBy: "capture",
-          },
-        });
+        try {
+          await repo.addDerivedAsset(projectId, sf.source.id, {
+            fromPath: f,
+            kind: "platform-captions",
+            lang: captionLang(f),
+            tool: "platform",
+            ext: extOf(f),
+            ...(result.encrypted ? { fromEncrypted: true } : {}),
+            derivation: {
+              parents: parent ? [parent.id] : [],
+              operation: "platform-captions",
+              provider: "platform",
+              ranAt: platform,
+              params: { tool: toolName },
+              at,
+              triggeredBy: "capture",
+            },
+          });
+        } catch {
+          captionsFailed = true;
+        }
       }
+      if (captionsFailed) notes.push("The source was saved, but some captions could not be stored.");
       const wantTranscript = opts.transcribe === "project-default" ? repo.getProject(projectId).automation?.transcribeNewMedia === true : opts.transcribe;
-      let note: string | undefined;
-      if (wantTranscript && firstMedia) note = await transcribe(projectId, sf, firstMedia, opts, work);
-
-      if (incomplete) return { url, status: "incomplete", sourceId: sf.source.id, errorCode: incomplete, reason: incompleteReason(incomplete) };
-      if (needsReview) {
-        return { url, status: "needs-review", sourceId: sf.source.id, reason: note ?? "Some details could not be confirmed, so the source is in the review queue." };
+      if (wantTranscript && firstMedia) {
+        const note = await transcribe(projectId, sf, firstMedia, opts, work);
+        if (note) notes.push(note);
       }
-      return { url, status: "created", sourceId: sf.source.id, ...(note ? { reason: note } : {}) };
+
+      const base = { url, sourceId: sf.source.id };
+      if (incomplete) return { ...base, status: "incomplete", errorCode: incomplete, reason: [incompleteReason(incomplete), ...notes].join(" ") };
+      if (needsReview) return { ...base, status: "needs-review", reason: [REVIEW_NOTE, ...notes].join(" ") };
+      return { ...base, status: "created", ...(notes.length ? { reason: notes.join(" ") } : {}) };
     } finally {
       await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+      activeTemp.delete(name);
     }
   }
 
   async function captureUrl(projectId: string, url: string, opts: CaptureOptions): Promise<CaptureOutcome> {
+    // The browser session needs the one-time acknowledgement, whatever the link is.
+    if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(url);
     if (c.kind === "profile" || c.kind === "playlist") {
       return deps.captureProfile ? deps.captureProfile(projectId, url, opts) : failed(url, "PROFILE_CAPTURE_UNAVAILABLE");

@@ -184,12 +184,16 @@ export async function createSource(
   draftIn: SourceDraft,
   files: SourceInputFile[],
   opts: CreateSourceOptions,
+  /** Package-internal: the caller already evaluated and audited this capture (link capture), so only `store` is evaluated here. */
+  internal: { captureAuthorized?: boolean } = {},
 ): Promise<SourceFile> {
   core.assertWritable();
   const draft = SourceDraft.parse(draftIn);
   const provenance = Provenance.parse(opts.provenance);
   const reqs: MutateRequest[] = [
-    { action: "capture", capture: { method: provenance.captureMethod, ...(draft.identifiers.platform ? { platform: draft.identifiers.platform } : {}) } },
+    ...(internal.captureAuthorized
+      ? []
+      : [{ action: "capture" as const, capture: { method: provenance.captureMethod, ...(draft.identifiers.platform ? { platform: draft.identifiers.platform } : {}) } }]),
     storeRequest(provenance),
   ];
   return runMutation(

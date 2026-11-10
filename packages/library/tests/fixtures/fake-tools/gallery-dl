@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Fake gallery-dl for tests (no network). Behaviour from FAKE_TOOL_MODE: ok (default), login, partial,
-// notfound. Uses tests/fixtures/capture/instagram-carousel.json when its post_shortcode is in the URL:
-// writes one image plus one metadata JSON (gallery-dl --write-metadata) per carousel item.
+// notfound. Writes one image plus one metadata JSON (gallery-dl --write-metadata) per item of the
+// matching fixture (see below).
 // FAKE_ARGV_FILE (optional) receives the arguments as JSON.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -28,16 +28,26 @@ if (mode === "notfound") {
   console.error("[instagram][error] NotFoundError: Requested post could not be found (404)");
   process.exit(4);
 }
-const post = JSON.parse(readFileSync(join(fixtures, "instagram-carousel.json"), "utf8"));
-if (!url.includes(post.post_shortcode)) {
+// gallery-dl fixtures: every capture/*.json except yt-dlp's *.info.json; the one whose
+// post_shortcode (Instagram) or id (TikTok) is in the URL.
+let post;
+for (const f of readdirSync(fixtures).filter((n) => n.endsWith(".json") && !n.endsWith(".info.json"))) {
+  const j = JSON.parse(readFileSync(join(fixtures, f), "utf8"));
+  const key = j.post_shortcode ?? j.id;
+  if (key && url.includes(String(key))) post = j;
+}
+if (!post) {
   console.error("[gallery-dl][error] No suitable extractor found");
   process.exit(64);
 }
-const n = mode === "partial" ? 1 : post.count;
+const key = post.post_shortcode ?? post.id;
+const total = post.count ?? 1;
+const n = mode === "partial" ? 1 : total;
 for (let i = 1; i <= n; i++) {
-  const name = `${post.post_shortcode}_${i}.jpg`;
+  const name = `${key}_${i}.jpg`;
   writeFileSync(join(out, name), Buffer.from(`\xff\xd8\xff\xe0 fake jpeg ${i}`, "latin1"));
-  writeFileSync(join(out, `${name}.json`), JSON.stringify({ ...post, num: i, shortcode: `${post.post_shortcode}x${i}`, filename: `${post.post_shortcode}_${i}` }));
+  const extra = post.post_shortcode ? { shortcode: `${key}x${i}` } : {};
+  writeFileSync(join(out, `${name}.json`), JSON.stringify({ ...post, ...extra, num: i, filename: `${key}_${i}` }));
   console.log(join(out, name));
 }
 if (mode === "partial") {

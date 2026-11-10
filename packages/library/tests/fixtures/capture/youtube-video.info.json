@@ -7,7 +7,7 @@
   "channel_id": "UCfakeChannel000000000001",
   "uploader": "Ama Test Channel",
   "uploader_id": "@amatest_fake",
-  "uploader_url": "https://www.youtube.com/@amatest_fake",
+  "uploader_url": "https://www.youtube.com/@amatest_fake?si=track",
   "timestamp": 1604916000,
   "upload_date": "20201109",
   "duration": 61,
@@ -15,18 +15,95 @@
   "view_count": 1234,
   "like_count": 56,
   "webpage_url": "https://www.youtube.com/watch?v=aoTest00001",
-  "original_url": "https://www.youtube.com/watch?v=aoTest00001&si=trackingvalue",
+  "original_url": "https://youtu.be/aoTest00001?si=FAKEtrackingSI123",
   "extractor": "youtube",
   "extractor_key": "Youtube",
   "_type": "video",
   "_filename": "/home/someone/.tmp/aoTest00001.mp4",
   "filepath": "/home/someone/.tmp/aoTest00001.mp4",
-  "thumbnails": [{ "url": "https://i.ytimg.example/vi/aoTest00001/maxresdefault.webp", "id": "0" }],
-  "formats": [{ "format_id": "18", "url": "https://rr1.example/videoplayback?sig=SECRET", "http_headers": { "Cookie": "SID=fake-secret-cookie" } }],
-  "requested_formats": [{ "format_id": "18", "url": "https://rr1.example/videoplayback?sig=SECRET" }],
-  "requested_downloads": [{ "filepath": "/home/someone/.tmp/aoTest00001.mp4" }],
-  "requested_subtitles": { "en": { "ext": "vtt", "url": "https://example.invalid/timedtext?sig=SECRET" } },
-  "http_headers": { "User-Agent": "Mozilla/5.0", "Cookie": "SID=fake-secret-cookie" },
+  "thumbnails": [
+    {
+      "url": "https://i.ytimg.example/vi/aoTest00001/hqdefault.jpg?sqp=-oaymwFAKE&rs=AOn4CLBFAKE",
+      "id": "0",
+      "height": 360,
+      "width": 480
+    }
+  ],
+  "formats": [
+    {
+      "format_id": "18",
+      "url": "https://rr1.example/videoplayback?sig=SECRET",
+      "http_headers": {
+        "Cookie": "SID=fake-secret-cookie"
+      }
+    }
+  ],
+  "requested_formats": [
+    {
+      "format_id": "18",
+      "url": "https://rr1.example/videoplayback?sig=SECRET"
+    }
+  ],
+  "requested_downloads": [
+    {
+      "filepath": "/home/someone/.tmp/aoTest00001.mp4"
+    }
+  ],
+  "requested_subtitles": {
+    "en": {
+      "ext": "vtt",
+      "url": "https://example.invalid/timedtext?sig=SECRET"
+    }
+  },
+  "http_headers": {
+    "User-Agent": "Mozilla/5.0",
+    "Cookie": "SID=fake-secret-cookie"
+  },
   "cookies": "SID=fake-secret-cookie; Domain=.youtube.com",
-  "player": { "visitor_token": "fake-visitor-token", "Authorization": "Bearer fake", "client": "web" }
+  "player": {
+    "visitor_token": "fake-visitor-token",
+    "Authorization": "Bearer fake",
+    "client": "web"
+  },
+  "availability": "public",
+  "channel_url": "https://www.youtube.com/channel/UCfakeChannel000000000001",
+  "url": "https://rr3---sn-fake.googlevideo.example/videoplayback?expire=1767225600&ei=x&ip=203.0.113.7&id=o-FAKE&itag=18&sig=AOq0QJ8wRgIhAFAKE&lsig=FAKE",
+  "manifest_url": "https://manifest.googlevideo.example/api/manifest/dash/expire/1767225600/ip/203.0.113.7/sig/FAKE?expire=1767225600&ip=203.0.113.7",
+  "fragment_base_url": "https://rr3---sn-fake.googlevideo.example/videoplayback/expire/1767225600/ip/203.0.113.7/?sig=FAKE",
+  "fragments": [
+    {
+      "url": "https://rr3.example/frag1?expire=1767225600&sig=FAKE",
+      "duration": 5
+    }
+  ],
+  "thumbnail": "https://i.ytimg.example/vi_webp/aoTest00001/maxresdefault.webp?sqp=FAKE&rs=AOn4CLFAKEsignature",
+  "subtitles": {
+    "en": [
+      {
+        "ext": "vtt",
+        "url": "https://www.youtube.com/api/timedtext?v=aoTest00001&expire=1767225600&signature=FAKE.SIG&key=yt8&lang=en&fmt=vtt",
+        "name": "English"
+      }
+    ]
+  },
+  "automatic_captions": {
+    "en": [
+      {
+        "ext": "vtt",
+        "url": "https://www.youtube.com/api/timedtext?v=aoTest00001&caps=asr&expire=1767225600&sparams=ip&signature=FAKE.ASR&lang=en&fmt=vtt"
+      }
+    ]
+  },
+  "download_dir": "/home/someone/Downloads/yt",
+  "chapters": [
+    {
+      "title": "Intro",
+      "start_time": 0,
+      "end_time": 10
+    }
+  ],
+  "tags": [
+    "market",
+    "kumasi"
+  ]
 }

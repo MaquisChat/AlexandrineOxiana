@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake yt-dlp for tests (no network). Behaviour from FAKE_TOOL_MODE: ok (default), login, partial,
-// notfound. The fixture is the tests/fixtures/capture/*.info.json whose "id" appears in the URL.
+// notfound, infoonly. FAKE_FIXTURE names the fixture for links without an id (short links). The fixture is the tests/fixtures/capture/*.info.json whose "id" appears in the URL.
 // FAKE_ARGV_FILE (optional) receives the arguments as JSON.
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -33,6 +33,7 @@ for (const f of readdirSync(fixtures).filter((n) => n.endsWith(".info.json"))) {
   const j = JSON.parse(readFileSync(join(fixtures, f), "utf8"));
   if (url.includes(String(j.id))) info = j;
 }
+if (!info && process.env.FAKE_FIXTURE) info = JSON.parse(readFileSync(join(fixtures, process.env.FAKE_FIXTURE), "utf8")); // short links
 if (!info) {
   console.error("ERROR: Unsupported URL: no fake fixture for this link");
   process.exit(1);
@@ -40,6 +41,7 @@ if (!info) {
 const id = info.id;
 writeFileSync(join(out, `${id}.info.json`), JSON.stringify(info));
 if (args.includes("--skip-download")) process.exit(0);
+if (mode === "infoonly") process.exit(0); // the post's data but no media file
 writeFileSync(join(out, `${id}.mp4`), Buffer.from("\0\0\0\x18ftypmp42 fake video bytes " + id));
 for (const pct of [25, 50, 100]) console.log(`[download] ${pct.toFixed(1).padStart(5)}% of 1.00MiB at 1.00MiB/s ETA 00:00`);
 if (mode === "partial") {

@@ -3,7 +3,7 @@
   "subcategory": "post",
   "post_id": "3000000000000000001",
   "post_shortcode": "CfAkEcArO01",
-  "post_url": "https://www.instagram.com/p/CfAkEcArO01/",
+  "post_url": "https://www.instagram.com/p/CfAkEcArO01/?igsh=FAKE",
   "owner_id": "100000001",
   "username": "fake_photographer",
   "fullname": "Fake Photographer",
@@ -13,5 +13,20 @@
   "count": 3,
   "likes": 42,
   "sidecar_media_id": "3000000000000000001",
-  "extension": "jpg"
+  "extension": "jpg",
+  "display_url": "https://scontent-fra5-1.cdninstagram.example/v/t51.29350-15/fake_n.jpg?stp=dst-jpg&_nc_ht=scontent.example&_nc_cat=1&_nc_ohc=FAKE&oh=00_AfFAKE&oe=67000000",
+  "video_url": null,
+  "_http_headers": {
+    "Referer": "https://www.instagram.com/"
+  },
+  "tags": [
+    "rivers",
+    "markets"
+  ],
+  "location_slug": null,
+  "coauthors": [],
+  "width": 1080,
+  "height": 1350,
+  "media_id": "3000000000000000002",
+  "sidecar_shortcode": "CfAkEcArO01"
 }

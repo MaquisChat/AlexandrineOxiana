@@ -108,7 +108,7 @@ async function runTranscribe(body: SubmittedJob): Promise<Record<string, unknown
 }
 
 /** Starts the stand-in worker on 127.0.0.1 (random port). */
-export async function startToolWorker(): Promise<ToolWorker> {
+export async function startToolWorker(opts: { beforeCapture?: (job: SubmittedJob) => void | Promise<void> } = {}): Promise<ToolWorker> {
   const jobs = new Map<string, { type: string; final: Record<string, unknown> }>();
   const submitted: SubmittedJob[] = [];
   let n = 0;
@@ -130,6 +130,7 @@ export async function startToolWorker(): Promise<ToolWorker> {
       state.maxConcurrent = Math.max(state.maxConcurrent, active);
       let final: Record<string, unknown>;
       try {
+        if (body.type === "capture.download") await opts.beforeCapture?.(body);
         final = body.type === "capture.download" ? await runCapture(body) : body.type === "audio.transcribe" ? await runTranscribe(body) : { status: "failed", error: { code: "UNSUPPORTED", message: "stub" } };
       } catch (err) {
         final = { status: "failed", error: { code: "STUB_ERROR", message: String(err) } };

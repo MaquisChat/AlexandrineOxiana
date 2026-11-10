@@ -41,6 +41,8 @@ export const Provenance = z.object({
     basis: z.string().optional(),
   }),
   identifiable: z.boolean(),
+  /** How the item was reached: through the researcher's signed-in browser session, or without one. Never the session itself. */
+  access: z.enum(["signed-in-session", "public"]).optional(),
 });
 export type Provenance = z.infer<typeof Provenance>;
 

@@ -9,7 +9,9 @@
  *      and thrown as PolicyDeniedError before the worker is contacted. `capture.download` is not
  *      evaluated here: the caller has already passed a `capture` decision.
  *   2. a `jobs` row (status queued → running → done | failed | cancelled) so that a job the app
- *      did not see finish is resubmitted on the next launch (`resumePending`). For an encrypted
+ *      did not see finish is resubmitted on the next launch (`resumePending`). `capture.download`
+ *      is never resumed (its capture decision and caller are gone): it is marked failed
+ *      `INTERRUPTED`, and leftover `.tmp/capture-*` / `worker-*` folders are swept. For an encrypted
  *      project the row's payload is sealed with the project key.
  *   3. a private temp folder `<Library>/.tmp/worker-<id>/` (0700): an encrypted input is decrypted
  *      into it (0600), and the worker writes its outputs there.
@@ -28,6 +30,7 @@ import type { EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
 import type { IndexDb } from "./index/db.js";
+import { activeTemp } from "./tmp-registry.js";
 import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 
@@ -154,10 +157,17 @@ export class WorkerClient {
     if (!this.db) return [];
     await this.removeStaleTemp();
     const rows = this.db
-      .prepare("SELECT id, project_id, payload_json FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at, id")
-      .all() as Array<{ id: string; project_id: string; payload_json: string }>;
+      .prepare("SELECT id, project_id, kind, payload_json FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at, id")
+      .all() as Array<{ id: string; project_id: string; kind: string; payload_json: string }>;
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
     for (const row of rows) {
+      if (row.kind === "capture.download") {
+        // Never resumed: its caller (and the capture decision it made) is gone, and its output
+        // folder has been swept. The researcher captures the link again.
+        this.setStatus(row.id, "failed", true);
+        out.push({ id: row.id, projectId: row.project_id, error: new WorkerJobError("INTERRUPTED", "the capture was interrupted; capture the link again") });
+        continue;
+      }
       try {
         const stored = await this.unseal(row.project_id, row.payload_json);
         out.push({ id: row.id, projectId: row.project_id, result: await this.run(row.id, row.project_id, stored, false) });
@@ -199,6 +209,7 @@ export class WorkerClient {
     const root = repoLibrary(this.repo).root;
     const tmp = join(root, ".tmp", `worker-${id}`);
     this.active.add(id);
+    activeTemp.add(`worker-${id}`);
     try {
       await fsp.mkdir(join(root, ".tmp"), { recursive: true });
       await fsp.rm(tmp, { recursive: true, force: true });
@@ -244,6 +255,7 @@ export class WorkerClient {
     } finally {
       this.active.delete(id);
       await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
+      activeTemp.delete(`worker-${id}`);
     }
   }
 
@@ -344,7 +356,7 @@ export class WorkerClient {
       return;
     }
     for (const n of names) {
-      if (n.startsWith("worker-") && !this.active.has(n.slice("worker-".length))) {
+      if ((n.startsWith("worker-") || n.startsWith("capture-")) && !activeTemp.has(n) && !this.active.has(n.slice("worker-".length))) {
         await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
       }
     }

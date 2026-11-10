@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { REQUIRED_FIELDS, type AuditEvent, type SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { IndexHandle } from "../index/db.js";
@@ -54,7 +54,7 @@ let handle: IndexHandle;
 let worker: ToolWorker;
 let client: WorkerClient;
 let capture: LinkCapture;
-const savedEnv = { PATH: process.env.PATH, FAKE_TOOL_MODE: process.env.FAKE_TOOL_MODE, FAKE_ARGV_FILE: process.env.FAKE_ARGV_FILE };
+const savedEnv = { PATH: process.env.PATH, FAKE_TOOL_MODE: process.env.FAKE_TOOL_MODE, FAKE_ARGV_FILE: process.env.FAKE_ARGV_FILE, FAKE_FIXTURE: process.env.FAKE_FIXTURE };
 const closers: Array<() => Promise<void> | void> = [];
 
 function deps(): Deps {
@@ -97,6 +97,7 @@ beforeEach(async () => {
   process.env.PATH = `${FAKE_TOOLS_DIR}${delimiter}${savedEnv.PATH ?? ""}`;
   delete process.env.FAKE_TOOL_MODE;
   delete process.env.FAKE_ARGV_FILE;
+  delete process.env.FAKE_FIXTURE;
   worker = await startToolWorker();
   client = new WorkerClient({ repo, worker, index: { db: handle.db }, pollMs: 5 });
   capture = createLinkCapture({ repo, worker: client, index: handle });
@@ -448,4 +449,214 @@ describe("with the real Python media worker", () => {
     await wrap("login");
     expect(await real.captureUrl(p.id, YT_CONFLICT, { transcribe: false })).toMatchObject({ status: "failed", errorCode: "LOGIN_REQUIRED", reason: LOGIN_SENTENCE });
   }, 60_000);
+});
+
+describe("fix round 1", () => {
+  const GDPR_GOV = (basis?: string) => `profiles: [gdpr]
+identifiability:
+  containsIdentifiable: true
+encryption:
+  atRest: required
+captureMethods: [downloader]
+${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}`;
+  const TT_PHOTO = "https://www.tiktok.com/@fake.dancer/photo/7000000000000000002";
+  const SECRETS = ["sig=", "si=", "expire=", "ip=", "oh=", "oe=", "signature", "x-expires", "_nc_", "FAKECOOKIE", "tt_chain_token", "/home/someone", "googlevideo"];
+  const noSecrets = (label: string, text: string) => {
+    for (const s of SECRETS) expect([label, s, text.includes(s)]).toEqual([label, s, false]);
+  };
+  const plainText = async (sf: SourceFile, kind: string) => {
+    const a = fileOf(sf, kind)[0]!;
+    const raw = await readFile(join(lib.root, a.path));
+    return a.encrypted ? (await decryptBytes((id) => ring.get(id), raw)).toString("utf8") : raw.toString("utf8");
+  };
+  const captureEvents = async (folder: string) => (await auditEvents(folder)).filter((e) => e.action === "capture");
+
+  it("C1: signed, expiring and tracking URLs and local paths never reach the stored snapshot or provenance (yt-dlp and gallery-dl)", async () => {
+    const p = await project();
+    for (const url of [YT, TT, IG, TT_PHOTO]) {
+      const out = await capture.captureUrl(p.id, url, { transcribe: false });
+      expect([url, out.status]).toEqual([url, "created"]);
+      const sf = await repo.getSource(p.id, out.sourceId!);
+      noSecrets(`${url} file`, await plainText(sf, "platform-metadata"));
+      noSecrets(`${url} provenance`, JSON.stringify(sf.source.provenance));
+      noSecrets(`${url} source.json`, JSON.stringify(sf));
+    }
+    const yt = await repo.getSource(p.id, (await capture.captureUrl(p.id, YT, { transcribe: false })).sourceId!);
+    const snap = yt.source.provenance.platformSnapshot as Record<string, unknown>;
+    expect(snap.original_url).toBe("https://www.youtube.com/watch?v=aoTest00001");
+    expect(snap.webpage_url).toBe("https://www.youtube.com/watch?v=aoTest00001");
+    expect(snap.uploader_url).toBe("https://www.youtube.com/@amatest_fake");
+    for (const k of ["url", "manifest_url", "fragment_base_url", "fragments", "subtitles", "automatic_captions", "thumbnail", "thumbnails", "download_dir"]) expect(snap).not.toHaveProperty(k);
+    expect(snap.chapters).toEqual([{ title: "Intro", start_time: 0, end_time: 10 }]);
+  });
+
+  it("I4: the key rule drops secrets by word and keeps author, authors, authority and header_image", () => {
+    const s = stripSnapshot({
+      author: { uniqueId: "a", nickname: "A" }, authors: ["x"], authority: "y", header_image: "z.jpg", headerImage: "h",
+      sessionId: 1, session_id: 2, apikey: 3, xsrf_token: 4, csrfToken: 5, "Set-Cookie": 6, passwd: 7, client_secret: 8, sig: 9, bearer: 10,
+      headers: {}, _http_headers: {}, HTTP_HEADERS: {}, authorization: 11, AuthToken: 12,
+      page: "https://example.org/a/b?token=1#x", local: "/tmp/ao/x.mp4", list: ["/home/u/a", "keep"],
+    });
+    expect(s).toEqual({
+      author: { uniqueId: "a", nickname: "A" }, authors: ["x"], authority: "y", header_image: "z.jpg", headerImage: "h",
+      page: "https://example.org/a/b", list: ["keep"],
+    });
+  });
+
+  it("I4: a TikTok photo post (gallery-dl, author{uniqueId,nickname}) gets a verified creator and keeps the author object", async () => {
+    const p = await project();
+    const out = await capture.captureUrl(p.id, TT_PHOTO, { transcribe: false });
+    expect(out.status).toBe("created");
+    const sf = await repo.getSource(p.id, out.sourceId!);
+    expect(sf.source.type).toBe("social-post");
+    expect(sf.source.provenance.tool.name).toBe("gallery-dl");
+    expect(fileOf(sf, "image")).toHaveLength(3);
+    expect(sf.source.creators).toEqual([{ literal: "Fake Dancer", role: "uploader", handle: "fake.dancer" }]);
+    expect(sf.source.title.variants[0]!.value).toBe("Market colours in three photos #market");
+    for (const f of REQUIRED_FIELDS["social-post"]) expect([f, sf.verification[f]?.status]).toEqual([f, "verified"]);
+    expect((sf.source.provenance.platformSnapshot as { author?: unknown }).author).toMatchObject({ uniqueId: "fake.dancer", nickname: "Fake Dancer" });
+  });
+
+  it("I1: an identifiable GDPR project without a legal basis fails plainly before downloading; with the project default or an override it captures", async () => {
+    const p = await project(GDPR_GOV(), true);
+    const out = await capture.captureUrl(p.id, YT, { transcribe: false });
+    expect(out).toEqual({ url: YT, status: "failed", errorCode: "LEGAL_BASIS_REQUIRED", reason: "Record a legal basis for this project's social-media data, then try again." });
+    expect(worker.submitted).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+
+    const q = await project(GDPR_GOV("public task (Art. 6(1)(e))"), true);
+    const ok = await capture.captureUrl(q.id, YT, { transcribe: false });
+    expect(ok.status).toBe("created");
+    const sf = await repo.getSource(q.id, ok.sourceId!);
+    expect(sf.source.provenance.legal).toEqual({ status: "public", basis: "public task (Art. 6(1)(e))" });
+    expect(sf.source.provenance.identifiable).toBe(true);
+    expect(sf.assets.every((a) => a.encrypted)).toBe(true);
+
+    const over = await capture.captureUrl(p.id, TT, { transcribe: false, legalBasis: "consent (Art. 6(1)(a))" });
+    expect(over.status).toBe("created");
+    expect((await repo.getSource(p.id, over.sourceId!)).source.provenance.legal.basis).toBe("consent (Art. 6(1)(a))");
+  });
+
+  it("I2: every capture path leaves exactly one audited capture decision (created, duplicate, refreshed, short-link duplicate, failed)", async () => {
+    const p = await project();
+    let before = 0;
+    const once = async (url: string, opts: Parameters<LinkCapture["captureUrl"]>[2], status: string) => {
+      const out = await capture.captureUrl(p.id, url, opts);
+      expect([url, out.status]).toEqual([url, status]);
+      const evs = await captureEvents(p.folder);
+      expect([status, evs.length - before]).toEqual([status, 1]);
+      before = evs.length;
+      const last = evs.at(-1)!;
+      expect(last.decision?.result).toBe("allow");
+      expect(last.details).toMatchObject({ platform: url.includes("tiktok") ? "tiktok" : "youtube", cookies: false });
+      expect(JSON.stringify(last)).not.toContain("http");
+    };
+    await once(TT, { transcribe: false }, "created");
+    await once(TT, { transcribe: false }, "duplicate");
+    await once(TT, { transcribe: false, refreshIfExists: true }, "refreshed");
+    process.env.FAKE_FIXTURE = "tiktok-video.info.json";
+    await once("https://vm.tiktok.com/ZMfake123/", { transcribe: false }, "duplicate");
+    delete process.env.FAKE_FIXTURE;
+    process.env.FAKE_TOOL_MODE = "login";
+    await once(YT, { transcribe: false }, "failed");
+  });
+
+  it("I3: capture jobs are never resumed, leftovers are swept, and the work folder is private", async () => {
+    const p = await project();
+    // a capture.download job left running by a crash
+    handle.db.prepare("INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES ('j-old', ?, 'capture.download', 'running', ?, ?)")
+      .run(p.id, JSON.stringify({ type: "capture.download", input: YT, output: join(lib.root, ".tmp", "capture-old"), params: {} }), new Date().toISOString());
+    const stale = join(lib.root, ".tmp", "capture-old");
+    await mkdir(stale, { recursive: true });
+    await writeFile(join(stale, "aoTest00001.info.json"), '{"http_headers":{"Cookie":"SID=x"}}');
+    const res = await client.resumePending();
+    expect(res).toHaveLength(1);
+    expect((res[0]!.error as { code?: string }).code).toBe("INTERRUPTED");
+    expect(handle.db.prepare("SELECT status FROM jobs WHERE id = 'j-old'").get()).toEqual({ status: "failed" });
+    expect(worker.submitted).toEqual([]);
+    expect(existsSync(stale)).toBe(false);
+
+    // leftovers are also removed when the library is opened
+    await mkdir(join(lib.root, ".tmp", "capture-crashed"), { recursive: true });
+    await mkdir(join(lib.root, ".tmp", "worker-crashed"), { recursive: true });
+    await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester" });
+    expect(existsSync(join(lib.root, ".tmp", "capture-crashed"))).toBe(false);
+    expect(existsSync(join(lib.root, ".tmp", "worker-crashed"))).toBe(false);
+
+    // the work folder exists (0700) while the download runs, and is gone afterwards
+    const modes: number[] = [];
+    const w2 = await startToolWorker({
+      beforeCapture: async () => {
+        for (const n of await readdir(join(lib.root, ".tmp"))) if (n.startsWith("capture-")) modes.push((await stat(join(lib.root, ".tmp", n))).mode & 0o777);
+      },
+    });
+    closers.push(() => w2.close());
+    const c2 = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w2, pollMs: 5 }), index: handle });
+    expect((await c2.captureUrl(p.id, YT, { transcribe: false })).status).toBe("created");
+    if (process.platform !== "win32") expect(modes).toEqual([0o700]);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("capture-"))).toEqual([]);
+  });
+
+  it("I5/M3: storing captions or the transcript can fail after the source exists; the outcome says what was saved", async () => {
+    const p = await project();
+    const spy = vi.spyOn(repo, "addDerivedAsset").mockRejectedValue(new Error("disk full"));
+    const out = await capture.captureUrl(p.id, YT_CONFLICT, { transcribe: true, transcribeModel: "tiny" });
+    spy.mockRestore();
+    expect(out.status).toBe("needs-review");
+    expect(out.reason).toContain("Some details could not be confirmed, so the source is in the review queue.");
+    expect(out.reason).toContain("The source was saved, but some captions could not be stored.");
+    expect(out.reason).toContain("The source was saved, but the transcript could not be stored.");
+    expect(repo.listSourceIds(p.id)).toEqual([out.sourceId]);
+    const spy2 = vi.spyOn(repo, "addDerivedAsset").mockRejectedValue(new Error("disk full"));
+    const [o] = await capture.captureUrls(p.id, [YT], { transcribe: false }, () => {});
+    spy2.mockRestore();
+    expect(o).toMatchObject({ status: "created", reason: "The source was saved, but some captions could not be stored." });
+  });
+
+  it("I6: a miss in a stale index falls back to reading the sources", async () => {
+    const p = await project();
+    const first = await capture.captureUrl(p.id, YT, { transcribe: false });
+    // content out of date while ids are present, and the recorded stamp no longer matches
+    handle.db.prepare("UPDATE sources SET platform_post_id = NULL").run();
+    handle.db.prepare("UPDATE meta SET value = '{}' WHERE key = 'projectStamps'").run();
+    expect(await capture.captureUrl(p.id, YT, { transcribe: false })).toMatchObject({ status: "duplicate", sourceId: first.sourceId });
+    // rows missing entirely
+    handle.db.prepare("DELETE FROM sources").run();
+    expect(await capture.captureUrl(p.id, YT, { transcribe: false })).toMatchObject({ status: "duplicate", sourceId: first.sourceId });
+    expect(worker.submitted.filter((j) => j.type === "capture.download")).toHaveLength(1);
+  });
+
+  it("I7/M5: 'public' only for a post the platform marks public, seen without a session; access is recorded", async () => {
+    const p = await project();
+    const pub = await repo.getSource(p.id, (await capture.captureUrl(p.id, YT, { transcribe: false })).sourceId!);
+    expect(pub.source.provenance.legal.status).toBe("public");
+    expect(pub.source.provenance.access).toBe("public");
+    const unlisted = await repo.getSource(p.id, (await capture.captureUrl(p.id, YT_CONFLICT, { transcribe: false })).sourceId!);
+    expect(unlisted.source.provenance.legal.status).toBe("unknown");
+    const ig = await repo.getSource(p.id, (await capture.captureUrl(p.id, IG, { transcribe: false })).sourceId!);
+    expect(ig.source.provenance.legal.status).toBe("unknown"); // gallery-dl gives no availability
+    await repo.acknowledge(p.id, "cookies");
+    const signed = await repo.getSource(p.id, (await capture.captureUrl(p.id, TT, { transcribe: false, cookiesFromBrowser: "brave" })).sourceId!);
+    expect(signed.source.provenance.legal.status).toBe("unknown");
+    expect(signed.source.provenance.access).toBe("signed-in-session");
+    expect(JSON.stringify(signed.source.provenance)).not.toContain("brave");
+  });
+
+  it("M1: the acknowledgement is asked before a profile link is handed on", async () => {
+    const p = await project();
+    let called = false;
+    const c = createLinkCapture({ repo, worker: client, captureProfile: async (_p, url) => ((called = true), { url, status: "created" }) });
+    await expect(c.captureUrl(p.id, "https://www.instagram.com/fake_photographer/", { transcribe: false, cookiesFromBrowser: "chrome" })).rejects.toBeInstanceOf(AcknowledgementRequiredError);
+    expect(called).toBe(false);
+  });
+
+  it("M2: the post's data without any media file is an incomplete source", async () => {
+    const p = await project();
+    process.env.FAKE_TOOL_MODE = "infoonly";
+    const out = await capture.captureUrl(p.id, YT, { transcribe: true });
+    expect(out).toMatchObject({ status: "incomplete", errorCode: "NO_MEDIA" });
+    const sf = await repo.getSource(p.id, out.sourceId!);
+    expect(sf.source.availability.status).toBe("incomplete");
+    expect(sf.assets.map((a) => a.kind)).toEqual(["platform-metadata"]);
+  });
 });

@@ -35,6 +35,9 @@ const REASONS: Record<string, string> = {
   PROFILE_CAPTURE_UNAVAILABLE: "Whole profiles, channels and playlists are captured with the profile archive, which is not available here.",
   NOTHING_SAVED: "The downloader finished but saved no media or platform data for this link.",
   CANCELLED: "The capture was cancelled. Nothing was saved.",
+  NO_MEDIA: "The post's details were saved, but no media file came back from the platform.",
+  LEGAL_BASIS_REQUIRED: "Record a legal basis for this project's social-media data, then try again.",
+  INTERRUPTED: "The capture was interrupted before it finished. Capture the link again.",
 };
 const FALLBACK = "Something went wrong while saving this link. Nothing was saved.";
 

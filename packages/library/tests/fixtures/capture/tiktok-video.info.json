@@ -10,5 +10,20 @@
   "upload_date": "20201109",
   "language": "not a language tag!",
   "webpage_url": "https://www.tiktok.com/@fake.dancer/video/7000000000000000001",
-  "extractor": "TikTok"
+  "extractor": "TikTok",
+  "availability": "public",
+  "uploader_url": "https://www.tiktok.com/@fake.dancer",
+  "channel_url": "https://www.tiktok.com/@MS4wLjABAAAAfakefakefake",
+  "url": "https://v16-webapp-prime.tiktok.example/video/tos/useast2a/fake/?a=1988&bti=FAKE&ch=0&expire=1767225600&l=FAKE&policy=2&signature=FAKEsig&tk=tt_chain_token",
+  "thumbnail": "https://p16-sign-va.tiktokcdn.example/obj/fake~tplv-photomode.jpeg?x-expires=1767225600&x-signature=FAKE%3D",
+  "original_url": "https://www.tiktok.com/@fake.dancer/video/7000000000000000001?is_from_webapp=1&sender_device=pc",
+  "artists": [
+    "fake.dancer"
+  ],
+  "track": "original sound",
+  "duration": 15,
+  "http_headers": {
+    "Referer": "https://www.tiktok.com/",
+    "Cookie": "tt_chain_token=FAKECOOKIE"
+  }
 }

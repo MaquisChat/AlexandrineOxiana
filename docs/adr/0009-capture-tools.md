@@ -49,13 +49,20 @@ each capture. Using these tools may conflict with platform terms of service.
   conflict with platform terms and that using a logged-in session puts that account at some risk.
   The Node side checks a `capture` policy decision before submitting a download job.
 - **Link capture on the Node side** (`packages/library/src/capture/`): `captureUrl` evaluates the
-  one `capture` decision (method `downloader`, platform) and a `store` pre-check before anything is
-  downloaded; the worker client does not evaluate `capture.download` again. Using the browser
-  session needs the project's recorded acknowledgement (`repo.acknowledge(projectId, "cookies")`,
-  audited). The platform JSON is stored as an original `platform-metadata` asset with
-  `formats`, `http_headers`, `requested_*`, cookies, local file paths and every key matching
-  `/cookie|token|auth|header/i` removed at any depth. Captures against one platform run one at a
-  time.
+  one `capture` decision (method `downloader`, platform) and audits it right then, allow or deny,
+  with `{platform, cookies}` (no URL); storing the result evaluates only `store`, so every capture
+  attempt has exactly one audited capture decision. A `store` pre-check (with the legal basis:
+  `CaptureOptions.legalBasis`, else governance `consent.defaultLegalBasis['social-media']`) runs
+  before anything is downloaded. The worker client does not evaluate `capture.download`, and never
+  resumes it after a restart (marked failed `INTERRUPTED`; `.tmp/capture-*` work folders, 0700, are
+  swept on open). Using the browser session needs the project's recorded acknowledgement
+  (`repo.acknowledge(projectId, "cookies")`, audited); provenance records `access` but never the
+  browser. The platform JSON is stored as an original `platform-metadata` asset without request
+  headers, secrets (keys whose words include cookie, token, auth, session, signature …), signed or
+  expiring media links (`url`, `formats`, `subtitles`, `thumbnails`, `display_url` …), local paths,
+  and with every remaining URL reduced to its canonical form or to scheme, host and path. User text
+  (titles, descriptions) is kept as written. `legal.status` is `public` only when the platform marks
+  the post public and no session was used. Captures against one platform run one at a time.
 
 ## Consequences
 
