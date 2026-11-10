@@ -707,3 +707,95 @@ describe("review round 4", () => {
     expect(r.fields["/identifiers/isbn"]!.reason).toMatch(/no longer matches the value the researcher confirmed/);
   });
 });
+
+describe("review round 5", () => {
+  const aiDate = (issued: string, quote: string) =>
+    verifyDraft(draft({ issued }), [ev("/issued", issued, "ai", { quote })], { documentText: `Front matter. ${quote} end.` }).fields["/issued"]!.status;
+
+  it("a volume, issue or page number next to a month is not the day", () => {
+    expect(aiDate("2020-05-03", "Vol. 12, No. 3, May 2020, pp. 1-20")).toBe("unverified");
+    expect(aiDate("2020-05-12", "Volume 12 May 2020 issue")).toBe("unverified");
+    expect(aiDate("2020-05-17", "page 17 of May 2020 newsletter")).toBe("unverified");
+    expect(aiDate("2020-05-03", "Nr. 3 Mai 2020 der Zeitschrift")).toBe("unverified");
+    expect(aiDate("2020-05-03", "núm. 3 de mayo de 2020")).toBe("unverified");
+    expect(aiDate("2020-05-03", "issue 3, May 2020 of the journal")).toBe("unverified");
+    expect(aiDate("2020-05", "Heft 5/2020 der Zeitschrift")).toBe("unverified");
+    expect(aiDate("2020-05-17", "doi 10.1101/2020.05.17.123456 preprint")).toBe("unverified");
+    expect(aiDate("2020-05", "the results may 2020 vary")).toBe("unverified");
+    // the month and year of a masthead are still stated
+    expect(aiDate("2020-05", "Vol. 12, No. 3, May 2020, pp. 1-20")).toBe("verified");
+    expect(aiDate("2020-05", "Volume 12 May 2020 issue")).toBe("verified");
+  });
+  it("keeps the usual written date forms", () => {
+    for (const q of [
+      "first published May 17, 2020 by", "first published 17 May 2020 by", "erschienen am 17. Mai 2020 bei", "publicado el 17 de mayo de 2020",
+      "received 17 May 2020; accepted 2 July 2020", "Sunday, 17 May 2020", "published on the 17th of May, 2020", "publié le 17 mai 2020 chez",
+      "publicado em 17 de maio de 2020", "posted May the 17th, 2020 online",
+    ]) expect([q, aiDate("2020-05-17", q)]).toEqual([q, "verified"]);
+    expect(aiDate("2020-06-05", "published 5 June, 2020 online")).toBe("verified");
+    expect(aiDate("2020-06-05", "June 5th 2020 edition")).toBe("verified");
+    expect(aiDate("2020-05", "May, 2020 edition of")).toBe("verified");
+    expect(aiDate("2020-05-01", "publié le 1er mai 2020")).toBe("verified");
+  });
+
+  it("C18: an AI creator quote must show the given name, or the initial next to the family name", () => {
+    const ai = (given: string, quote: string) => {
+      const creators = [{ family: "Okafor", given, role: "author" }];
+      return verifyDraft(draft({ creators }), [ev("/creators", creators, "ai", { quote })], { documentText: `Intro. ${quote} end.` }).fields["/creators"]!.status;
+    };
+    expect(ai("Bola", "written by A. Okafor in 2020")).toBe("unverified");
+    expect(ai("Bola", "written by Okafor in 2020")).toBe("unverified");
+    expect(ai("Ada", "written by A. Okafor in 2020")).toBe("unverified");
+    expect(ai("B.", "written by A. Okafor in 2020")).toBe("unverified");
+    expect(ai("A.", "a paper written by Okafor in 2020")).toBe("unverified"); // "a" is there, but not next to the name
+    expect(ai("Ada", "written by Ada Okafor in 2020")).toBe("verified");
+    expect(ai("Ada", "written by Okafor, Ada in 2020")).toBe("verified");
+    expect(ai("A.", "written by A. Okafor in 2020")).toBe("verified");
+    expect(ai("A", "written by Okafor, A. in 2020")).toBe("verified");
+    expect(ai("A. B.", "written by A.B. Okafor in 2020")).toBe("verified");
+  });
+
+  describe("every original or romanized title variant must be supported", () => {
+    const tv = (vs: [string, string][]) => ({ variants: vs.map(([kind, value]) => ({ lang: kind === "original" ? "es" : "en", kind, value })) });
+    const fake = tv([["original", "Ríos inventados de la nada"], ["translated", "Rivers of Memory"]]);
+    const real = tv([["original", "Ríos de la memoria"], ["translated", "Rivers of Memory"]]);
+    const DOC = "Rivers of Memory by A. Okafor";
+    it("G4: evidence for the translation does not support a fabricated original", () => {
+      const v = verifyDraft(draft({ title: fake }), [ev("/title", mt("Rivers of Memory"), "embedded")], {}).fields["/title"]!;
+      expect(v.status).toBe("conflict");
+      expect(verifyDraft(draft({ title: real }), [ev("/title", "Ríos de la memoria", "embedded")], {}).fields["/title"]!.status).toBe("single-source");
+      expect(verifyDraft(draft({ container: fake }), [ev("/container", "Rivers of Memory", "embedded")], {}).fields["/container"]!.status).toBe("conflict");
+    });
+    it("G5: an AI quote of the translation does not verify a fabricated original", () => {
+      const r = verifyDraft(draft({ title: fake }), [ev("/title", fake, "ai", { quote: DOC })], { documentText: DOC });
+      expect(r.fields["/title"]!.status).toBe("unverified");
+      const ok = verifyDraft(draft({ title: real }), [ev("/title", real, "ai", { quote: "Ríos de la memoria, por A. Okafor" })], { documentText: "Ríos de la memoria, por A. Okafor" });
+      expect(ok.fields["/title"]!.status).toBe("verified");
+    });
+    it("G6: the translation found in the text does not ground a fabricated original", () => {
+      expect(verifyDraft(draft({ title: fake }), [ev("/title", fake, "filename")], { documentText: DOC }).fields["/title"]!.status).toBe("unverified");
+      expect(verifyDraft(draft({ title: fake }), [ev("/title", fake, "filename")], { platformSnapshot: { title: DOC } }).fields["/title"]!.status).toBe("unverified");
+      expect(verifyDraft(draft({ title: real }), [ev("/title", real, "filename")], { documentText: "Ríos de la memoria. Okafor." }).fields["/title"]!.status).toBe("verified");
+    });
+    it("a romanized variant no source gives is named, and the title is unverified", () => {
+      const t = { variants: [{ lang: "ja", kind: "original", value: "記憶の川" }, { lang: "ja-Latn", kind: "romanized", value: "Kioku no kawa" }] };
+      const v = verifyDraft(draft({ title: t }), [ev("/title", "記憶の川", "embedded")], {}).fields["/title"]!;
+      expect(v.status).toBe("unverified");
+      expect(v.reason).toContain("Kioku no kawa");
+      expect(v.reason).not.toContain("記憶の川");
+      expect(verifyDraft(draft({ title: t }), [ev("/title", t, "embedded")], {}).fields["/title"]!.status).toBe("single-source");
+    });
+  });
+
+  it("K1: a given name with a handle does not match a handle-only record outside social types", () => {
+    const creators = [{ given: "Invented", handle: "real", role: "author" }];
+    const evs = [ev("/creators", [{ handle: "real" }], "embedded")];
+    expect(verifyDraft(draft({ type: "webpage", creators }), evs, {}).fields["/creators"]!.status).toBe("conflict");
+    expect(verifyDraft(draft({ type: "social-post", creators }), evs, {}).fields["/creators"]!.status).toBe("single-source");
+    expect(verifyDraft(draft({ type: "webpage", creators }), [], { platformSnapshot: { uploader_id: "real" } }).fields["/creators"]?.status).not.toBe("verified");
+    // identical given-only records agree; same family with a different handle does not
+    expect(verifyDraft(draft({ creators: [{ given: "Ada", role: "author" }] }), [ev("/creators", [{ given: "Ada" }], "embedded")], {}).fields["/creators"]!.status).toBe("single-source");
+    const h = draft({ type: "webpage", creators: [{ family: "Okafor", handle: "fake", role: "author" }] });
+    expect(verifyDraft(h, [ev("/creators", [{ family: "Okafor", handle: "real" }], "embedded")], {}).fields["/creators"]!.status).toBe("conflict");
+  });
+});

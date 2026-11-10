@@ -218,60 +218,60 @@ const MONTH_NAMES: string[][] = [
  * Portuguese "set" and "out" are left out: they are everyday English words ("3 out of 2020 items").
  */
 const MONTH_OF: ReadonlyMap<string, number> = new Map(MONTH_NAMES.flatMap((names, i) => names.map((n) => [n, i + 1] as const)));
-/** Little words allowed inside a written date: "17 de mayo de 2020", "the 17th of May". */
-const DATE_CONNECTORS: ReadonlySet<string> = new Set(["de", "del", "do", "da", "di", "of", "the", "le", "den", "des", "d"]);
-
-const dayOf = (tok: string | undefined): number | undefined => {
-  const m = tok === undefined ? null : /^(\d{1,2})(?:st|nd|rd|th|er|e|o|a)?$/.exec(tok);
-  const n = m ? Number(m[1]) : NaN;
-  return n >= 1 && n <= 31 ? n : undefined;
-};
+const MONTH_RE = [...MONTH_OF.keys()].sort((a, b) => b.length - a.length).join("|");
+const ORDINAL = "(?:st|nd|rd|th|er|e|o|a)?";
+/** 17 May 2020 · 17. Mai 2020 · 17 de mayo de 2020 · the 17th of May, 2020 · 17-May-2020. No comma between day and month. */
+const DAY_MONTH_YEAR = new RegExp(
+  `(?<![\\p{L}\\p{N}])(?<!\\d[.,:/-])(\\d{1,2})${ORDINAL}(?:\\.?\\s+(?:(?:de|of|do|da|di|del|den|des)\\s+)?|-)(${MONTH_RE})(?![\\p{L}])(?:\\.?,?\\s+(?:(?:de|del|of|do|da)\\s+)?|-)(\\d{4})(?!\\d)`, "giu");
+/** May 17, 2020 · June 5th 2020 · May the 17th, 2020 */
+const MONTH_DAY_YEAR = new RegExp(`(?<![\\p{L}])(${MONTH_RE})(?![\\p{L}])\\.?\\s+(?:the\\s+)?(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(?:of\\s+)?(\\d{4})(?!\\d)`, "giu");
+/** May 2020 · May, 2020 · mayo de 2020 · Sept. 2020 */
+const MONTH_YEAR = new RegExp(`(?<![\\p{L}])(${MONTH_RE})(?![\\p{L}])\\.?,?\\s+(?:(?:de|del|of|do|da)\\s+)?(\\d{4})(?!\\d)`, "giu");
+/** A number right after one of these is a volume, issue or page number, never a day or month. */
+const NUMBER_LABEL = /(?:^|[^\p{L}\p{N}])(?:no|nr|n|num|vol|volume|issue|iss|p|pp|page|pages|heft|bd|t|s|art|article)[.°]?\s*$/iu;
+const fold = (s: string) => s.normalize("NFKD").replace(/\p{M}+/gu, "");
+const labelled = (s: string, index: number) => NUMBER_LABEL.test(fold(s.slice(0, index)));
 
 /**
  * Does the quoted passage state this date, with every component the date gives (year; month; day)
  * together in one recognizable date expression? A year alone only backs a year-only date.
+ * Works on the raw passage (punctuation kept, whitespace collapsed), so "No. 3, May 2020" is not a day.
  * Recognized: 2020-05-17, 2020/05, 17.05.2020 or 5/17/2020 (only when day and month cannot be
  * swapped), 05/2020, 2020年5月17日, and month names: "17 May 2020", "May 17, 2020",
  * "17 de mayo de 2020", "le 1er mai 2020", "17. Mai 2020", "March 2020".
+ * Not a day or month: a number right after a label such as "No.", "Vol.", "p.", "Heft".
  */
 export function quoteStatesDate(quote: string, date: Edtf): boolean {
-  const text = quote.normalize("NFKC");
+  const text = quote.normalize("NFKC").replace(/\s+/gu, " ");
   const stated: Edtf[] = [];
-  if (new RegExp(`(?<!\\d)${String(date.y).padStart(4, "0")}(?!\\d)`).test(text)) stated.push({ y: date.y });
-  const num = (re: RegExp, read: (m: RegExpExecArray) => Edtf | undefined) => {
-    for (const m of text.matchAll(re)) {
-      const e = read(m as RegExpExecArray);
-      if (e && e.m !== undefined && e.m >= 1 && e.m <= 12 && (e.d === undefined || (e.d >= 1 && e.d <= 31))) stated.push(e);
-    }
+  const add = (e: Edtf | undefined) => {
+    if (e && (e.m === undefined || (e.m >= 1 && e.m <= 12)) && (e.d === undefined || (e.d >= 1 && e.d <= 31))) stated.push(e);
   };
+  if (new RegExp(`(?<!\\d)${String(date.y).padStart(4, "0")}(?!\\d)`).test(text)) add({ y: date.y });
   const n = (s: string | undefined) => (s === undefined ? undefined : Number(s));
-  num(/(?<!\d)(\d{4})[-/.](\d{1,2})(?:[-/.](\d{1,2}))?(?!\d)/g, (m) => ({ y: Number(m[1]), m: n(m[2]), d: n(m[3]) }));
-  num(/(?<!\d)(\d{4})\s*[年년]\s*(\d{1,2})\s*[月월](?:\s*(\d{1,2})\s*[日일])?/g, (m) => ({ y: Number(m[1]), m: n(m[2]), d: n(m[3]) }));
-  num(/(?<!\d)(?<!\d[-/.])(\d{1,2})[-/.](\d{4})(?!\d)/g, (m) => ({ y: Number(m[2]), m: n(m[1]) }));
-  num(/(?<!\d)(\d{1,2})([-/.])(\d{1,2})\2(\d{4})(?!\d)/g, (m) => {
+  // Numeric forms. A date is not part of a longer dotted/slashed number (a DOI, a section number).
+  for (const m of text.matchAll(/(?<![\d./-])(\d{4})[-/.](\d{1,2})(?:[-/.](\d{1,2}))?(?![./-]?\d)/g)) add({ y: Number(m[1]), m: n(m[2]), d: n(m[3]) });
+  for (const m of text.matchAll(/(?<!\d)(\d{4})\s*[年년]\s*(\d{1,2})\s*[月월](?:\s*(\d{1,2})\s*[日일])?/g)) add({ y: Number(m[1]), m: n(m[2]), d: n(m[3]) });
+  for (const m of text.matchAll(/(?<![\d./-])(\d{1,2})[-/.](\d{4})(?![./-]?\d)/g)) {
+    if (!labelled(text, m.index)) add({ y: Number(m[2]), m: n(m[1]) }); // 05/2020, but not "Heft 5/2020"
+  }
+  for (const m of text.matchAll(/(?<![\d./-])(\d{1,2})([-/.])(\d{1,2})\2(\d{4})(?![./-]?\d)/g)) {
     const a = Number(m[1]), b = Number(m[3]), y = Number(m[4]);
-    if (a === b) return { y, m: a, d: a };
-    if (a > 12 && b <= 12) return { y, m: b, d: a };
-    if (b > 12 && a <= 12) return { y, m: a, d: b };
-    return undefined; // 05/06/2020: day and month could be either way round
-  });
-
-  const toks = text.normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-  const skip = (i: number, step: 1 | -1) => {
-    let hops = 0;
-    while (hops < 2 && DATE_CONNECTORS.has(toks[i] ?? "")) { i += step; hops++; }
-    return i;
-  };
-  const yearAt = (i: number) => (/^\d{4}$/.test(toks[i] ?? "") ? Number(toks[i]) : undefined);
-  toks.forEach((tok, i) => {
-    const mo = MONTH_OF.get(tok);
-    if (mo === undefined) return;
-    const after = skip(i + 1, 1);
-    const y1 = yearAt(after);
-    if (y1 !== undefined) stated.push({ y: y1, m: mo, d: dayOf(toks[skip(i - 1, -1)]) }); // 17 [de] May [de] 2020, May 2020
-    const y2 = dayOf(toks[after]) !== undefined ? yearAt(skip(after + 1, 1)) : undefined;
-    if (y2 !== undefined) stated.push({ y: y2, m: mo, d: dayOf(toks[after]) }); // May 17, 2020
-  });
-
+    if (a === b) add({ y, m: a, d: a });
+    else if (a > 12 && b <= 12) add({ y, m: b, d: a });
+    else if (b > 12 && a <= 12) add({ y, m: a, d: b });
+    // else 05/06/2020: day and month could be either way round, so it backs neither
+  }
+  // Month names.
+  const f = fold(text);
+  const month = (name: string) => MONTH_OF.get(name.toLowerCase());
+  for (const m of f.matchAll(DAY_MONTH_YEAR)) {
+    if (!labelled(f, m.index)) add({ y: Number(m[3]), m: month(m[2]!), d: Number(m[1]) });
+  }
+  for (const m of f.matchAll(MONTH_DAY_YEAR)) add({ y: Number(m[3]), m: month(m[1]!), d: Number(m[2]) });
+  for (const m of f.matchAll(MONTH_YEAR)) {
+    // Lower-case "may" and "march" directly before a year are ordinary English words ("results may 2020 vary").
+    if (m[1] !== "may" && m[1] !== "march") add({ y: Number(m[2]), m: month(m[1]!) });
+  }
   return stated.some((s) => s.y === date.y && (date.m === undefined || s.m === date.m) && (date.d === undefined || s.d === date.d));
 }

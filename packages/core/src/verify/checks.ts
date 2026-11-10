@@ -93,10 +93,13 @@ function personAgree(x: Person, y: Person, handleRescue: boolean): boolean {
     if (x.whole && y.whole) return x.whole === y.whole;
     return x.whole ? wholeVsStructured(x.whole, y) : wholeVsStructured(y.whole!, x);
   }
-  if (x.family && y.family) return x.family === y.family && (!x.given || !y.given || x.given === y.given);
-  if (x.handle && y.handle && !x.family && !y.family) return x.handle === y.handle;
-  if (handleRescue && x.handle && y.handle) return x.handle === y.handle;
-  return false;
+  const sameHandle = !!x.handle && x.handle === y.handle;
+  const handlesCompatible = !x.handle || !y.handle || x.handle === y.handle;
+  if (x.family && y.family) return x.family === y.family && (!x.given || !y.given || x.given === y.given) && handlesCompatible;
+  // One side carries a name (family or given) the other does not have: only a handle could link them.
+  if (x.family || y.family || !x.given !== !y.given) return handleRescue && sameHandle;
+  if (x.given && y.given) return x.given === y.given && handlesCompatible;
+  return sameHandle;
 }
 /** The full ordered creator lists match: same length, and each position the same person. */
 export function creatorsAgree(a: unknown, b: unknown, type?: string): boolean {
@@ -174,6 +177,23 @@ export function agree(field: string, a: unknown, b: unknown, type?: string): boo
 }
 
 export type Match = "exact" | "near" | "differ";
+const sameText = (x: string, among: string[]) => normalizeTitle(x) !== "" && among.some((y) => normalizeTitle(x) === normalizeTitle(y));
+
+/**
+ * The title/container texts that must each be supported: every variant that is not a translation
+ * (original, romanized). Translations are labelled as such and need no source, but they cannot stand
+ * in for an unsupported original. Empty when the value has only translations.
+ */
+function requiredTexts(v: unknown): string[] {
+  if (typeof v === "string") return [v];
+  if (!isRecord(v) || !Array.isArray(v.variants)) return [];
+  return v.variants.flatMap((x) => (isRecord(x) && typeof x.value === "string" && x.kind !== "translated" ? [x.value] : []));
+}
+/** Every required text passes; a value with only translations passes if any of them does. */
+function everyRequired(v: unknown, ok: (text: string) => boolean): boolean {
+  const req = requiredTexts(v);
+  return req.length > 0 ? req.every(ok) : textVariants(v).some(ok);
+}
 
 /**
  * How well does an evidence value support the CURRENT value? "near" = close but not enough.
@@ -181,8 +201,9 @@ export type Match = "exact" | "near" | "differ";
  */
 export function matchDraft(field: string, evValue: unknown, draftValue: unknown, type?: string): Match {
   if (field === "/title" || field === "/container") {
-    const dv = textVariants(draftValue), ev = textVariants(evValue);
-    if (dv.some((x) => ev.some((y) => normalizeTitle(x) !== "" && normalizeTitle(x) === normalizeTitle(y)))) return "exact";
+    const ev = textVariants(evValue);
+    if (everyRequired(draftValue, (x) => sameText(x, ev))) return "exact";
+    const dv = requiredTexts(draftValue).length > 0 ? requiredTexts(draftValue) : textVariants(draftValue);
     return dv.some((x) => ev.some((y) => titleSimilarity(x, y) >= 0.9)) ? "near" : "differ";
   }
   if (field === "/issued") {
@@ -267,7 +288,7 @@ export function checkPlatformIdentity(field: string, c: CheckCtx): FieldVerifica
     const bad = withHandle.find((x) => !handles.includes(handleKey(x.handle as string)));
     if (bad) return result("conflict", ["platform-handle"], `The handle "${clip(bad.handle)}" does not match the account recorded by the platform.`);
     // The handle says nothing about a family name; only social posts and videos are identified by handle alone.
-    const byHandleAlone = SOCIAL.has(c.type) || list.every((x) => !person(x).family && !person(x).whole);
+    const byHandleAlone = SOCIAL.has(c.type) || list.every((x) => !person(x).family && !person(x).given && !person(x).whole);
     if (byHandleAlone && withHandle.length > 0 && withHandle.length === list.length) return result("verified", ["platform-handle"]);
   }
   return undefined;
@@ -373,6 +394,18 @@ function quoteFound(e: FieldEvidence, c: CheckCtx): boolean {
   return hasTokens(c.docNorm, q) || snapNorm(c.snapshot, [...PLATFORM_TEXT_KEYS, ...PLATFORM_NAME_KEYS]).some((x) => hasTokens(x, q));
 }
 
+/**
+ * A given name must be in the quote too. A full given name anywhere (token-bounded); initials only
+ * directly next to the family name ("A. Okafor", "Okafor, A.", "A.B. Okafor").
+ */
+function givenInQuote(p: Person, q: string): boolean {
+  if (!p.given) return true;
+  const parts = p.given.split(" ");
+  if (parts.some((w) => Array.from(w).length > 1 || NO_SPACE_SCRIPT.test(w))) return hasTokens(q, p.given);
+  if (!p.family) return false;
+  return [p.given, parts.join("")].some((g) => hasTokens(q, `${g} ${p.family}`) || hasTokens(q, `${p.family} ${g}`));
+}
+
 /** The quote exists in the document/snapshot, is long enough, and actually contains the whole value it supports. */
 function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
   if (typeof e.quote !== "string" || !quoteFound(e, c)) return false;
@@ -387,10 +420,14 @@ function quoteSupports(field: string, e: FieldEvidence, c: CheckCtx): boolean {
     return list.length > 0 && list.every((x) => {
       const n = creatorName(x, SOCIAL.has(c.type));
       const nn = n ? normalizeTitle(n) : "";
-      return !!nn && longEnough(nn, "name") && hasTokens(q, nn);
+      return !!nn && longEnough(nn, "name") && hasTokens(q, nn) && givenInQuote(person(x), q);
     });
   }
   const inQuote = (v: string) => !!v && longEnough(v, "title") && hasTokens(q, v);
+  if (field === "/title" || field === "/container") {
+    // The evidence matched the current value, so check the current value: every original/romanized variant must be quoted.
+    return everyRequired(getByPointer(c.draft, field), (t) => inQuote(normalizeTitle(t)));
+  }
   // A list (ISBNs etc.) is backed only when the quote contains every one of its values.
   if (Array.isArray(e.value)) return e.value.length > 0 && e.value.every((x) => textVariants(x).map(normalizeTitle).some(inQuote));
   return textVariants(e.value).map(normalizeTitle).some(inQuote);
@@ -406,10 +443,12 @@ function creatorNames(c: CheckCtx): (string | undefined)[] {
 /** Is the field's current value found in the document text or the platform snapshot? */
 export function checkGrounding(field: string, c: CheckCtx): FieldVerification | undefined {
   if (field === "/title") {
-    const titles = textVariants(c.draft.title).map(normalizeTitle).filter(Boolean);
-    if (titles.some((t) => groundedIn(c.docNorm, t, "title"))) return result("verified", ["found-in-document-text"]);
+    // Every original/romanized variant must be found; a translation found in the text grounds nothing else.
+    const inDoc = (t: string) => groundedIn(c.docNorm, normalizeTitle(t), "title");
+    if (everyRequired(c.draft.title, inDoc)) return result("verified", ["found-in-document-text"]);
     const snaps = snapNorm(c.snapshot, PLATFORM_TEXT_KEYS);
-    if (titles.some((t) => snaps.some((s) => groundedIn(s, t, "title")))) return result("verified", ["found-in-platform-data"]);
+    const inSnap = (t: string) => snaps.some((s) => groundedIn(s, normalizeTitle(t), "title"));
+    if (everyRequired(c.draft.title, (t) => inDoc(t) || inSnap(t))) return result("verified", ["found-in-platform-data"]);
     return undefined;
   }
   if (field === "/creators") {
@@ -496,6 +535,15 @@ export function verifyField(field: string, c: CheckCtx, required: boolean): Fiel
     return result("unverified", ["draft-vs-evidence"], missing.length > 0
       ? `${label}: ${names} ${missing.length === 1 ? "is" : "are"} not listed by any source, so ${missing.length === 1 ? "it" : "they"} may be mistyped or invented.`
       : `${label}: no single source lists all of the values recorded here, so the list could not be confirmed as a whole.`);
+  }
+  if (agreeing.length === 0 && near.length > 0 && (field === "/title" || field === "/container") && requiredTexts(value).length > 1) {
+    // Several original/romanized variants: say which ones no source gives.
+    const given = evs.flatMap((e) => textVariants(e.value));
+    const missing = requiredTexts(value).filter((t) => !sameText(t, given));
+    const names = missing.slice(0, 3).map((x) => `"${clip(x)}"`).join(", ");
+    return result("unverified", ["draft-vs-evidence"], missing.length > 0
+      ? `${label}: the version${missing.length === 1 ? "" : "s"} ${names} ${missing.length === 1 ? "is" : "are"} not given by any source.`
+      : `${label}: no single source gives every version recorded here, so it could not be confirmed as a whole.`);
   }
   if (agreeing.length === 0 && near.length > 0) {
     const n = near[0]!;
