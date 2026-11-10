@@ -137,4 +137,23 @@ export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/res
 export type { Resolution, ResolveContext, ResolveInput } from "./import/resolve.js";
 export { ACCEPTED_EXTENSIONS, FOLDER_REASON, LOCATION_REASON, createAttach } from "./import/attach.js";
 export type { Attach, AttachDeps, AttachOutcome, AttachStatus } from "./import/attach.js";
+export { BULK_REASONS, BatchRefusedError, PATTERN_BUDGET_MS, adapterFor, createBulkImport, folderAdapter, zipAdapter } from "./import/bulk/index.js";
+export type {
+  BatchCounts,
+  BatchHandle,
+  BatchProgress,
+  BatchResult,
+  BatchSummary,
+  BulkImport,
+  BulkImportDeps,
+  ImportReport,
+  ImportSourceAdapter,
+  ReviewDecision,
+  ReviewPatch,
+  ScanContext,
+  ScanFile,
+  ScanItem,
+  ScanSummary,
+} from "./import/bulk/index.js";
+export { ARCHIVE_LIMITS } from "./extract/zip.js";
 export * from "./lookup/index.js";

@@ -15,9 +15,11 @@
  *   5. otherwise a new source, `created` at or above `options.autoAcceptThreshold`, else created and
  *      queued for review (`review/pending.jsonl` with the batch id, R31). Folders become nested
  *      collections or tags (`options.structure`).
- * Every store is one governed change (R26: txn marker, change log, audit) in which `capture` and
- * `store` are evaluated again right before writing (R42); its journal line is written in the same
- * change. A deny fails that item with the policy's reason and the batch goes on. Location-
+ * Every store is governed (R26: txn marker, change log, audit): each item's `capture` and `store`
+ * are evaluated again right before writing (R42) and audited as events about its own source, and
+ * its journal line is written in the same change. New sources are stored in groups of up to 32 per
+ * change (shared fixed costs); a group the policy refuses is stored item by item, so a deny fails
+ * only the items concerned, with the policy's reason, and the batch goes on. Location-
  * conditioned media are refused (R56, LOCATION_REASON). Journal lines of items that stored nothing
  * (duplicates, failures) are written with the next store or at the next checkpoint; after a crash
  * such an item is simply processed again, with the same result.
@@ -366,6 +368,15 @@ class Run {
       this.fail = rej;
     });
     this.done.catch(() => {});
+  }
+
+  /** Starts the run; whatever happens, `done` settles. */
+  start(): void {
+    this.run().catch((err: unknown) => {
+      active.delete(this.rec.id);
+      this.feed.end();
+      this.fail(err);
+    });
   }
 
   handle(): BatchHandle {
@@ -937,7 +948,7 @@ export async function startBatch(deps: BulkImportDeps, projectId: string, adapte
   // Written before anything is created, so an interrupted batch still has its record.
   await saveRecord(deps.repo, projectId, rec);
   const run = new Run(deps, projectId, rec, adapter, []);
-  void run.run().catch(() => {});
+  run.start();
   return run.handle();
 }
 
@@ -959,7 +970,7 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
   delete rec.finishedAt;
   await saveRecord(deps.repo, projectId, rec);
   const run = new Run(deps, projectId, rec, source, await readJournal(deps.repo, projectId, rec.dir));
-  void run.run().catch(() => {});
+  run.start();
   return run.handle();
 }
 

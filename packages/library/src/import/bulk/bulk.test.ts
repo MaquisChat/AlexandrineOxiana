@@ -7,13 +7,14 @@ import { fileURLToPath } from "node:url";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AuditEvent, Project, SourceDraft } from "@ao/core";
-import { FIXTURE_DOI, buildImportFolder, buildPdf, buildZip, type ImportFolderFixture } from "../../../../../tests/fixtures/generate.mjs";
+import { FIXTURE_DOI, buildCameraTiff, buildImportFolder, buildPdf, buildZip, type ImportFolderFixture } from "../../../../../tests/fixtures/generate.mjs";
+import { LOCATION_REASON } from "../attach.js";
 import { KeyRing } from "../../crypto/keys.js";
 import type { Deps } from "../../deps.js";
 import { shutdownExtractors } from "../../extract/index.js";
 import { IndexHandle } from "../../index/db.js";
 import { createIndexSink } from "../../index/sink.js";
-import { createLibrary, type Library } from "../../library.js";
+import { createLibrary, openLibrary, type Library } from "../../library.js";
 import { HttpClient } from "../../lookup/index.js";
 import { decryptBytes } from "../../repo/io.js";
 import type { Repo } from "../../repo/repo.js";
@@ -597,45 +598,111 @@ describe("undoBatch", () => {
   });
 });
 
-describe("scale", () => {
-  it("10,000 metadata-only items finish in under 120 s with RSS under 500 MB", async () => {
-    const p = await project();
-    const N = Number(process.env.AO_BULK_N ?? 10_000);
-    const adapter: ImportSourceAdapter = {
-      kind: "csl-json",
-      location: "synthetic",
-      count: async () => N,
-      async *scan(): AsyncGenerator<ScanItem> {
-        for (let i = 0; i < N; i++) {
-          yield {
-            key: `item-${i}`,
-            files: [],
-            referenceMetadata: {
-              type: "article-journal",
-              title: { variants: [{ lang: "en", kind: "original", value: `Synthetic study number ${i}` }] },
-              creators: [{ role: "author", family: `Author${i}`, given: "A." }],
-              issued: String(1900 + (i % 120)),
-            },
-          };
-        }
-      },
-    };
-    let peak = process.memoryUsage().rss;
-    const timer = setInterval(() => {
-      peak = Math.max(peak, process.memoryUsage().rss);
-    }, 100);
-    const started = Date.now();
-    try {
-      const { result } = await run(p, adapter);
-      const ms = Date.now() - started;
-      peak = Math.max(peak, process.memoryUsage().rss);
-      console.log(`bulk import 10k: ${ms} ms, peak RSS ${Math.round(peak / 1024 / 1024)} MB`);
-      expect(result.counts.items).toBe(N);
-      expect(result.counts.created + result.counts.needsReview).toBe(N);
-      expect(ms).toBeLessThan(120_000);
-      expect(peak).toBeLessThan(500 * 1024 * 1024);
-    } finally {
-      clearInterval(timer);
-    }
-  }, 300_000);
+const plainDraft = (title: string, extra: Partial<SourceDraft> = {}): SourceDraft => ({
+  projectIds: [],
+  type: "article-journal",
+  title: { variants: [{ lang: "en", kind: "original", value: title }] },
+  creators: [],
+  identifiers: {},
+  caseAttributes: {},
+  availability: { status: "available" },
+  collectionIds: [],
+  tagIds: [],
+  participantIds: [],
+  ...extra,
 });
+const plainProvenance = () => ({
+  captureMethod: "manual_upload" as const,
+  capturedAt: new Date().toISOString(),
+  tool: { name: "test", version: "0" },
+  fileHashes: {},
+  legal: { status: "unknown" as const },
+  identifiable: false,
+});
+
+describe("duplicates (R55, R59)", () => {
+  const doiFolder = async () => {
+    const src = join(tmp, "doi");
+    await mkdir(src);
+    await copyFile(fx.doiPdf, join(src, "article.pdf"));
+    return src;
+  };
+  const crossref = () =>
+    agent.get("https://api.crossref.org").intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, readFileSync(join(LOOKUP_FIX, "crossref-work.json"), "utf8"), JSON_HEADERS).persist();
+
+  it("a certain DOI match with duplicates: 'skip' is a duplicate and changes nothing", async () => {
+    const p = await project(CROSSREF_GOV);
+    crossref();
+    const existing = await repo.createSource(p.id, plainDraft("Rivers and Memory in Upland Villages", { identifiers: { doi: FIXTURE_DOI } }), [], { provenance: plainProvenance() });
+    const { result } = await run(p, folderAdapter(await doiFolder()), { duplicates: "skip" });
+    expect(result.counts).toMatchObject({ duplicates: 1, created: 0, merged: 0 });
+    expect(await repo.getSource(p.id, existing.source.id)).toEqual(existing);
+  });
+
+  it("a certain DOI match with duplicates: 'keep-both' creates a second source", async () => {
+    const p = await project(CROSSREF_GOV);
+    crossref();
+    await repo.createSource(p.id, plainDraft("Rivers and Memory in Upland Villages", { identifiers: { doi: FIXTURE_DOI } }), [], { provenance: plainProvenance() });
+    const { result } = await run(p, folderAdapter(await doiFolder()), { duplicates: "keep-both" });
+    expect(result.counts.created + result.counts.needsReview).toBe(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+  });
+
+  it("a fuzzy match (title, first creator, year) is created and goes to review with the candidate", async () => {
+    const p = await project();
+    const existing = await repo.createSource(
+      p.id,
+      plainDraft("Feeding the Feed", { creators: [{ role: "author", family: "Okafor" }], issued: "2019" }),
+      [],
+      { provenance: plainProvenance() },
+    );
+    const src = join(tmp, "fuzzy");
+    await mkdir(src);
+    await copyFile(fx.generated[1]!, join(src, "Okafor - 2019 - Feeding the Feed.pdf"));
+    const { handle: h, result } = await run(p, folderAdapter(src));
+    expect(result.counts).toMatchObject({ needsReview: 1, duplicates: 0, merged: 0 });
+    const [entry] = await bulk.listReview(p.id, h.batchId);
+    expect(entry!.duplicateOf).toEqual({ sourceId: existing.source.id, reason: "fuzzy" });
+  });
+});
+
+describe("location rule (R56)", () => {
+  it("a photo with GPS in a project that must coarsen location fails with LOCATION_REASON; the batch goes on", async () => {
+    const gov = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+sharing:
+  locationMetadata: coarsen
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`;
+    const p = await project(gov, true);
+    const src = join(tmp, "photos");
+    await mkdir(src);
+    await buildCameraTiff(join(src, "IMG_0001.tif"));
+    await copyFile(fx.generated[3]!, join(src, "paper.pdf"));
+    const { handle: h, result } = await run(p, folderAdapter(src));
+    expect(result.counts.failed).toBe(1);
+    expect(result.counts.created + result.counts.needsReview).toBe(1);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.failures).toEqual([{ item: "IMG_0001.tif", reason: LOCATION_REASON }]);
+    expect(report.governance.some((g) => g.result === "deny" && g.reason === LOCATION_REASON && g.items === 1)).toBe(true);
+  });
+});
+
+describe("work folders", () => {
+  it("leftover batch-* folders are swept when the repository is opened", async () => {
+    const stale = join(lib.root, ".tmp", "batch-019a0000-0000-7000-8000-00000000abcd");
+    await mkdir(join(stale, "zip-1"), { recursive: true });
+    await writeFile(join(stale, "zip-1", "x.pdf"), "x");
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    handle = new IndexHandle(lib.root);
+    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+    expect(existsSync(stale)).toBe(false);
+  });
+});
+

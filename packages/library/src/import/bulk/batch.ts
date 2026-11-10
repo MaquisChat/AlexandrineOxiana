@@ -177,10 +177,11 @@ export function latestByKey(entries: JournalEntry[]): Map<string, JournalEntry> 
   return m;
 }
 
-/** Counts by outcome over the newest line per key. */
+/** Counts by outcome over the newest line per key (lines of review decisions are not items). */
 export function countOutcomes(latest: Iterable<JournalEntry>): { created: number; needsReview: number; duplicates: number; merged: number; failed: number; items: number } {
   const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, failed: 0, items: 0 };
   for (const e of latest) {
+    if (e.decision) continue; // a later review decision (e.g. a merge), not an item of the source
     c.items++;
     if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
     else if (e.outcome === "needs-review") c.needsReview++;
