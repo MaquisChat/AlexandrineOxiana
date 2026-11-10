@@ -28,6 +28,51 @@ if (mode === "notfound") {
   console.error("[instagram][error] NotFoundError: Requested post could not be found (404)");
   process.exit(4);
 }
+// A synthetic Instagram profile (FAKE_PROFILE_FILE with platform "instagram"): the profile link
+// writes one metadata JSON per post (with --no-download no images), a /p/<code>/ link one post.
+if (process.env.FAKE_PROFILE_FILE) {
+  const prof = JSON.parse(readFileSync(process.env.FAKE_PROFILE_FILE, "utf8"));
+  if (prof.platform === "instagram") profileRun(prof);
+}
+
+function profileRun(prof) {
+  const user = {
+    username: prof.handle, full_name: prof.displayName, biography: prof.bio, external_url: (prof.links ?? [])[0],
+    follower_count: prof.followers, following_count: prof.following, media_count: prof.items.length,
+    profile_pic_url: prof.avatar, is_verified: prof.verified ?? false,
+  };
+  const date = (ts) => new Date(ts * 1000).toISOString().slice(0, 19).replace("T", " ");
+  const meta = (it) => ({
+    category: "instagram", subcategory: "post", post_shortcode: it.id, shortcode: it.id, post_id: `3${it.id.length}000`, description: it.caption,
+    username: prof.handle, fullname: prof.displayName, owner_id: "9990001", post_date: date(it.timestamp), date: date(it.timestamp),
+    post_url: `https://www.instagram.com/p/${it.id}/`, display_url: "https://scontent.example/x.jpg?_nc_ht=SECRET&oh=1&oe=2", user,
+  });
+  const code = /\/p\/([\w-]+)/.exec(url)?.[1];
+  if (code) {
+    const pos = prof.items.findIndex((it) => it.id === code);
+    if (pos < 0) return;
+    if (mode === "ratelimit" && pos >= (prof.rateLimitAfter ?? 3)) {
+      console.error("[instagram][error] HttpError: '429 Too Many Requests'");
+      process.exit(4);
+    }
+    const it = prof.items[pos];
+    if (!args.includes("--no-download")) writeFileSync(join(out, `${it.id}_1.jpg`), Buffer.from(`\xff\xd8\xff\xe0 fake jpeg ${it.id}`, "latin1"));
+    writeFileSync(join(out, `${it.id}_1.jpg.json`), JSON.stringify({ ...meta(it), num: 1 }));
+    process.exit(0);
+  }
+  if (!url.includes(`instagram.com/${prof.handle}/`)) return;
+  let items = prof.items;
+  const range = args.indexOf("--range");
+  if (range >= 0) items = items.slice(0, Number(args[range + 1].split("-")[1]));
+  if (mode === "enumpartial") items = items.slice(0, prof.cutAfter ?? 7);
+  for (const it of items) writeFileSync(join(out, `${it.id}_1.jpg.json`), JSON.stringify({ ...meta(it), num: 1 }));
+  if (mode === "enumpartial" || mode === "enumratelimit") {
+    console.error("[instagram][error] HttpError: '429 Too Many Requests'");
+    process.exit(4);
+  }
+  process.exit(0);
+}
+
 // gallery-dl fixtures: every capture/*.json except yt-dlp's *.info.json; the one whose
 // post_shortcode (Instagram) or id (TikTok) is in the URL.
 let post;

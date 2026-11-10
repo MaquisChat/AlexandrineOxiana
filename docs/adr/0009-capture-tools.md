@@ -63,6 +63,27 @@ each capture. Using these tools may conflict with platform terms of service.
   and with every remaining URL reduced to its canonical form or to scheme, host and path. User text
   (titles, descriptions) is kept as written. `legal.status` is `public` only when the platform marks
   the post public and no session was used. Captures against one platform run one at a time.
+  The secret-key rule also drops the word pairs api/access/private/secret + `key` and the words
+  credential(s) and jwt, but keeps a bare `key` (`extractor_key`). Immediately before storing, the
+  `capture` decision is evaluated again without auditing an allow; a deny (governance edited, a
+  protocol expired during the download) stops with `POLICY_CHANGED`, nothing stored, one deny audited.
+- **Profile capture** (`profile-capture.ts`, spec 5.5): one audited `capture` decision per run;
+  the profile is listed with `flatList`/metadata only, then each post not yet known goes through the
+  link-capture per-item path with the run's ImportBatch (kind `profile-capture`,
+  `imports/batch-<NNNN>/{batch.json, journal.jsonl}`) id in provenance. State lives in
+  `profiles/<platform>-<handle or P-code>/` (`profile.json` with `knownPostIds`, `archive.txt` in
+  download-archive format written by the library after each stored post, dated `snapshots/` and
+  `reports/`), encrypted in encrypted projects, and the folder and collection use the participant
+  code when names are pseudonymized. The enumeration never gets the archive (yt-dlp would leave
+  archived posts out of the list, which would break removed-post detection); the library skips
+  known posts itself. Posts missing from a list are marked `unavailable-on-platform` only when the
+  list was complete (not cut short, not filtered, not paused). Edited captions add a dated
+  platform-metadata original and a title variant; the first snapshot is never changed. Rate limits:
+  waits of 60, 120 and 240 s, then the run pauses (`paused-rate-limited`) and a re-run resumes.
+  Comments (`includeComments`, off by default) need a `store` decision with `identifiable: true`
+  before any download; the worker's yt-dlp `--write-comments` output is moved to
+  `<id>.comments.json` and stored, stripped, as a separate `platform-comments` original (gallery-dl:
+  unsupported, `commentsUnsupported`).
 
 ## Consequences
 

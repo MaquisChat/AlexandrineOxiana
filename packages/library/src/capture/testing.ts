@@ -2,11 +2,11 @@
  * Test-only helpers for link capture (not exported from the package): an in-process stand-in for
  * the media worker's HTTP API that runs `capture.download` with whatever `yt-dlp` / `gallery-dl` is
  * first on PATH (the fake tools in tests/fixtures/fake-tools), mirroring the Python worker's
- * arguments, output listing and error mapping, and answers `audio.transcribe` with a canned
+ * arguments, output listing (comments split out, partial enumerations) and error mapping, and answers `audio.transcribe` with a canned
  * transcript (one of two segments flagged).
  */
 import { spawn } from "node:child_process";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,25 +67,50 @@ async function runCapture(body: SubmittedJob): Promise<Record<string, unknown>> 
   let args: string[];
   if (tool === "yt-dlp") {
     args = ["--ignore-config", "-o", join(out, "%(id)s.%(ext)s"), "--write-info-json", "--write-subs", "--write-auto-subs", "--write-thumbnail"];
+    if (p.archiveFile) args.push("--download-archive", String(p.archiveFile));
+    if (p.flatList) args.push("--flat-playlist");
+    if (p.maxItems) args.push("--playlist-end", String(p.maxItems));
+    if (p.dateAfter) args.push("--dateafter", String(p.dateAfter));
+    if (p.dateBefore) args.push("--datebefore", String(p.dateBefore));
     if (p.metadataOnly) args.push("--skip-download");
+    if (p.includeComments) args.push("--write-comments");
   } else {
     args = ["--config-ignore", "--write-metadata", "-D", out];
+    if (p.archiveFile) args.push("--download-archive", String(p.archiveFile));
+    if (p.maxItems) args.push("--range", `1-${Number(p.maxItems)}`);
     if (p.metadataOnly) args.push("--no-download");
   }
   if (p.cookiesFromBrowser) args.push("--cookies-from-browser", String(p.cookiesFromBrowser));
   args.push("--", body.input);
   const version = (await run(tool, ["--version"])).stdout.trim().split("\n")[0] ?? null;
   const r = await run(tool, args);
+  // yt-dlp's comments move out of the info JSON into <id>.comments.json (as the worker does).
+  if (p.includeComments && tool === "yt-dlp") {
+    for (const n of (await readdir(out)).filter((x) => x.endsWith(".info.json"))) {
+      const info = JSON.parse(await readFile(join(out, n), "utf8")) as Record<string, unknown>;
+      if (!("comments" in info)) continue;
+      const { comments, ...rest } = info;
+      await writeFile(join(out, n.replace(/\.info\.json$/, ".comments.json")), JSON.stringify(Array.isArray(comments) ? comments : []));
+      await writeFile(join(out, n), JSON.stringify(rest));
+    }
+  }
   const files: string[] = [];
   const infos: string[] = [];
+  const comments: string[] = [];
   for (const n of (await readdir(out)).sort()) {
+    if (n.endsWith(".comments.json")) {
+      comments.push(join(out, n));
+      continue;
+    }
     const isInfo = tool === "yt-dlp" ? n.endsWith(".info.json") : n.endsWith(".json");
     (isInfo ? infos : files).push(join(out, n));
   }
-  const meta: Record<string, unknown> = { files, infoJson: infos, tool, toolVersion: version, partial: false };
+  const meta: Record<string, unknown> = { files, infoJson: infos, comments, tool, toolVersion: version, partial: false };
+  if (p.includeComments && tool !== "yt-dlp") meta.commentsUnsupported = true;
   if (r.code !== 0) {
     const code = mapError(r.stderr);
-    if (files.length === 0) return { status: "failed", error: { code, message: `${tool} failed (${code})` } };
+    const enumeration = !!(p.flatList || p.metadataOnly);
+    if (files.length === 0 && !(enumeration && infos.length > 0)) return { status: "failed", error: { code, message: `${tool} failed (${code})` } };
     Object.assign(meta, { partial: true, errorCode: code, errorDetail: "redacted" });
   }
   return { status: "done", result: { output: out, meta } };

@@ -3,8 +3,10 @@
  * SourceDraft with field evidence (spec 5.1, 5.8).
  *
  * The stored snapshot (`stripSnapshot`) never keeps:
- * - request headers, cookies, tokens, signatures, sessions or passwords: any key one of whose words
- *   (split on `_ - .` and camelCase) is in SECRET_WORDS, plus `headers`/`http_headers`;
+ * - request headers, cookies, tokens, signatures, sessions, passwords, credentials or JWTs: any key
+ *   one of whose words (split on `_ - .` and camelCase) is in SECRET_WORDS, or that has the word pair
+ *   api/access/private/secret + key (a bare `key`, e.g. `extractor_key`, is kept), plus
+ *   `headers`/`http_headers`;
  * - signed, expiring or tracking media links: `url`, `formats`, `requested_*`, `subtitles`,
  *   `automatic_captions`, `thumbnail(s)`, `manifest_url`, `fragment_base_url`, `fragments`,
  *   gallery-dl's `display_url`/`video_url`;
@@ -28,7 +30,10 @@ const DROP_KEYS = new Set([
 const SECRET_WORDS = new Set([
   "cookie", "cookies", "token", "tokens", "auth", "authorization", "authentication", "bearer", "csrf", "xsrf",
   "password", "passwd", "secret", "signature", "sig", "session", "sessionid", "apikey",
+  "credential", "credentials", "jwt",
 ]);
+/** Words that name a secret when directly followed by `key` (`api_key`, `AccessKeyId`); a bare `key` is kept (`extractor_key`). */
+const KEY_PREFIXES = new Set(["api", "access", "private", "secret"]);
 /** Absolute paths that point into a user's home, a temp folder or a library (never stored). */
 const LOCAL_PATH = /^(\/home\/|\/Users\/|\/root\/|\/tmp\/|\/var\/folders\/|\/private\/(var|tmp)\/|[A-Za-z]:\\(Users|Windows\\Temp)\\|~\/)/;
 
@@ -47,7 +52,8 @@ export function keyWords(k: string): string[] {
 function dropKey(k: string): boolean {
   const lower = k.toLowerCase();
   if (DROP_KEYS.has(lower) || lower.startsWith("requested_") || k.startsWith("__") || lower.endsWith("_filename") || lower.endsWith("_filepath")) return true;
-  return keyWords(k).some((w) => SECRET_WORDS.has(w));
+  const words = keyWords(k);
+  return words.some((w, i) => SECRET_WORDS.has(w) || (w === "key" && i > 0 && KEY_PREFIXES.has(words[i - 1]!)));
 }
 
 /** A URL without credentials, query or fragment; a platform page link in its canonical form. */
@@ -122,7 +128,7 @@ export function verificationSnapshot(stripped: Record<string, unknown>, c: Class
   return s;
 }
 
-function firstLine(text: string | undefined, max = 120): string | undefined {
+export function firstLine(text: string | undefined, max = 120): string | undefined {
   const line = text?.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
   if (!line) return undefined;
   const chars = Array.from(line);

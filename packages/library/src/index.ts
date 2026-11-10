@@ -130,3 +130,4 @@ export { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, incompleteReason
 export { stripSnapshot } from "./capture/snapshot.js";
 export { createLinkCapture } from "./capture/link-capture.js";
 export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps } from "./capture/link-capture.js";
+export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";

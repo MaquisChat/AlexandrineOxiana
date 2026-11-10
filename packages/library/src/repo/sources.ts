@@ -334,7 +334,14 @@ export function listSourceIds(core: RepoCore, projectId: string): string[] {
 
 const FIXED_FIELDS = ["folder", "createdAt", "createdBy"] as const;
 
-export async function updateSource(core: RepoCore, projectId: string, id: string, patch: SourcePatch): Promise<SourceFile> {
+export async function updateSource(
+  core: RepoCore,
+  projectId: string,
+  id: string,
+  patch: SourcePatch,
+  /** Package-internal: also replace the source file's field evidence and verification (a recheck after a machine change). */
+  extra: { fieldEvidence?: (cur: SourceFile) => FieldEvidence[]; verification?: (next: SourceFile) => Record<string, FieldVerification> } = {},
+): Promise<SourceFile> {
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -361,7 +368,8 @@ export async function updateSource(core: RepoCore, projectId: string, id: string
         modifiedAt: tx.at,
         modifiedBy: tx.actor,
       });
-      const sf: SourceFile = { ...cur, source };
+      let sf: SourceFile = { ...cur, source, ...(extra.fieldEvidence ? { fieldEvidence: extra.fieldEvidence(cur) } : {}) };
+      if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
       tx.index((sink) => sink.indexSource(sf));

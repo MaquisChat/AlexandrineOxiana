@@ -36,6 +36,7 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
+import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { activeTemp } from "../tmp-registry.js";
 import { RecoveryPendingError } from "./errors.js";
@@ -455,6 +456,39 @@ export async function projectStampNow(repo: Repo, projectId: string): Promise<St
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   return stampFor(core.root, st.rel, st.data, core.keyRing);
+}
+
+/**
+ * Package-internal (profile capture): `updateSource` that also recomputes the source file's field
+ * evidence and verification inside the same governed change (a machine edit, then its recheck).
+ */
+export function updateSourceRechecked(
+  repo: Repo,
+  projectId: string,
+  id: string,
+  patch: SourcePatch,
+  extra: Parameters<typeof updateSource>[4],
+): Promise<SourceFile> {
+  return updateSource(cores.get(repo)!, projectId, id, patch, extra);
+}
+
+/**
+ * Package-internal (profile capture): the participant code the project's pseudonym map gives one
+ * of `names` (compared case-insensitively), if any. Needs the unlocked project key.
+ */
+export async function pseudonymCodeFor(repo: Repo, projectId: string, names: string[]): Promise<string | undefined> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  if (!core.encrypted(st)) return undefined;
+  const map = await loadPseudonyms(core, st);
+  const wanted = new Set(names.filter(Boolean).map((n) => n.normalize("NFC").toLowerCase()));
+  for (const [k, code] of map) if (wanted.has(k.normalize("NFC").toLowerCase())) return code;
+  return undefined;
+}
+
+/** Package-internal: the researcher's time zone the repo names dated files in. */
+export function repoTz(repo: Repo): string | undefined {
+  return cores.get(repo)!.tz;
 }
 
 /** Package-internal: the library a repo was opened on. */

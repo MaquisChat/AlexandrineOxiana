@@ -20,6 +20,13 @@
  *   7. platform captions → derived `platform-captions`; transcription (when asked, or when the
  *      project's automation says so) → derived `transcript` (.vtt and segments.json).
  *
+ * Immediately before anything is stored, the `capture` decision is evaluated again without
+ * auditing an allow (R42): governance edited, or a protocol that expired, during the download
+ * stops the capture with `POLICY_CHANGED` (one deny audited) and nothing is saved.
+ *
+ * Profile, channel and playlist links go to `captureProfile` (profile-capture.ts), which shares
+ * the per-platform queue and the per-item path (`captureItem`).
+ *
  * Reasons in outcomes are fixed plain-language sentences (errors.ts): never cookies, tokens, URLs
  * or file paths. Captures against one platform never run in parallel.
  */
@@ -37,6 +44,7 @@ import type { SourceInputFile } from "../repo/sources.js";
 import { WorkerJobError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
 import { AcknowledgementRequiredError, incompleteReason, plainReason } from "./errors.js";
 import { classifyUrl, type ClassifiedUrl, type Platform } from "./platforms.js";
+import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport } from "./profile-capture.js";
 import { buildDraft, stripSnapshot, verificationSnapshot, type CaptureTool } from "./snapshot.js";
 
 export type BrowserName = "chrome" | "firefox" | "safari" | "edge" | "brave";
@@ -70,12 +78,49 @@ export interface LinkCaptureDeps {
   worker: WorkerClient;
   /** The library index (an IndexHandle or `{ db }`), for duplicate lookups; without it the project's sources are read. */
   index?: { readonly db: IndexDb };
-  /** Profile and playlist capture (Task 18). Without it such links fail with a plain reason. */
+  /** Replaces the built-in profile capture for profile and playlist links handed to `captureUrl`. */
   captureProfile?: (projectId: string, url: string, opts: CaptureOptions) => Promise<CaptureOutcome>;
+  /** Waits between rate-limited attempts of a profile run (default: a real timer). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** How one post of a profile run is captured (the run already holds the audited capture decision). */
+export interface ItemContext {
+  /** The store decision's inputs the run already checked. */
+  identifiable: boolean;
+  legalBasis?: string;
+  importBatchId: string;
+  collectionIds: string[];
+  /** Also download the post's comments (stored as a separate `platform-comments` original). */
+  includeComments: boolean;
+  metadataOnly: boolean;
+}
+
+/** The shared machinery of link and profile capture (package-internal). */
+export interface CaptureCore {
+  repo: Repo;
+  worker: WorkerClient;
+  sleep: (ms: number) => Promise<void>;
+  inLane<T>(p: Platform, fn: () => Promise<T>): Promise<T>;
+  acknowledged(projectId: string): boolean;
+  findExisting(projectId: string, platform: Platform, postId: string): Promise<string | undefined>;
+  /** Re-evaluates `capture` (no allow audited); false after an audited deny. */
+  stillAllowed(projectId: string, platform: Platform): Promise<boolean>;
+  readJson(path: string, encrypted: boolean, projectId: string): Promise<unknown>;
+  writeJson(work: string, name: string, data: unknown, projectId: string, encrypted: boolean): Promise<string>;
+  makeWork(): Promise<{ work: string; done: () => Promise<void> }>;
+  captureItem(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item: ItemContext): Promise<CaptureOutcome>;
 }
 
 export interface LinkCapture {
   captureUrl(projectId: string, url: string, opts: CaptureOptions): Promise<CaptureOutcome>;
+  /** A whole profile, channel or playlist (profile-capture.ts). */
+  captureProfile(
+    projectId: string,
+    profileUrl: string,
+    opts: ProfileCaptureOptions,
+    onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
+  ): Promise<ProfileCaptureReport>;
   /** One link at a time, in order; `onProgress(done, total, outcome)` after each. */
   captureUrls(
     projectId: string,
@@ -109,6 +154,7 @@ function captionLang(file: string): string {
 /** The `consent.defaultLegalBasis` category link capture uses. */
 const LEGAL_CATEGORY = "social-media";
 const REVIEW_NOTE = "Some details could not be confirmed, so the source is in the review queue.";
+const COMMENTS_UNSUPPORTED_NOTE = "Comments cannot be saved for this kind of post, so none were saved.";
 
 function failed(url: string, code: string, reason = plainReason(code)): CaptureOutcome {
   return { url, status: "failed", errorCode: code, reason };
@@ -116,6 +162,7 @@ function failed(url: string, code: string, reason = plainReason(code)): CaptureO
 
 export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
   const { repo, worker } = deps;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   /** Per-platform queue: captures against one platform never overlap. */
   const lanes = new Map<Platform, Promise<unknown>>();
   const inLane = <T>(p: Platform, fn: () => Promise<T>): Promise<T> => {
@@ -166,18 +213,55 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return true;
   }
 
-  async function readJson(path: string, encrypted: boolean, projectId: string): Promise<Record<string, unknown> | undefined> {
+  async function readAny(path: string, encrypted: boolean, projectId: string): Promise<unknown> {
     try {
       let raw: Buffer = await fsp.readFile(path);
       if (encrypted) {
         const k = projectDataKey(repo, projectId)!;
         raw = await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
       }
-      const v = JSON.parse(raw.toString("utf8")) as unknown;
-      return isRecord(v) ? v : undefined;
+      return JSON.parse(raw.toString("utf8")) as unknown;
     } catch {
       return undefined;
     }
+  }
+
+  async function readJson(path: string, encrypted: boolean, projectId: string): Promise<Record<string, unknown> | undefined> {
+    const v = await readAny(path, encrypted, projectId);
+    return isRecord(v) ? v : undefined;
+  }
+
+  async function stillAllowed(projectId: string, platform: Platform): Promise<boolean> {
+    try {
+      await authorizeProcessing(repo, projectId, { action: "capture", capture: { method: "downloader", platform } }, { op: "capture.recheck" });
+      return true;
+    } catch (err) {
+      if (err instanceof PolicyDeniedError) return false;
+      throw err;
+    }
+  }
+
+  /** A private work folder `<Library>/.tmp/capture-<id>/` (0700), swept if the process dies. */
+  async function makeWork(): Promise<{ work: string; done: () => Promise<void> }> {
+    const root = repoLibrary(repo).root;
+    const name = `capture-${randomUUID()}`;
+    const work = join(root, ".tmp", name);
+    activeTemp.add(name);
+    try {
+      await fsp.mkdir(join(root, ".tmp"), { recursive: true });
+      await fsp.mkdir(work, { mode: 0o700 });
+      if (process.platform !== "win32") await fsp.chmod(work, 0o700);
+    } catch (err) {
+      activeTemp.delete(name);
+      throw err;
+    }
+    return {
+      work,
+      done: async () => {
+        await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+        activeTemp.delete(name);
+      },
+    };
   }
 
   /** Writes the stripped snapshot next to the downloads (encrypted like them) for storing as an original. */
@@ -193,7 +277,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return path;
   }
 
-  async function download(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, work: string, metadataOnly: boolean): Promise<JobResult> {
+  async function download(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, work: string, metadataOnly: boolean, comments = false): Promise<JobResult> {
     const tool = toolFor(c);
     return worker.submit(projectId, {
       type: "capture.download",
@@ -204,6 +288,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
         ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
         ...(opts.quality && tool === "yt-dlp" ? { quality: opts.quality } : {}),
         ...(metadataOnly ? { metadataOnly: true } : {}),
+        ...(comments ? { includeComments: true } : {}),
       },
     });
   }
@@ -276,32 +361,39 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return undefined;
   }
 
-  async function captureOne(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<CaptureOutcome> {
+  async function captureOne(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item?: ItemContext): Promise<CaptureOutcome> {
     const platform = c.platform;
     const cookies = !!opts.cookiesFromBrowser;
-    // 2. Policy before anything is downloaded. The capture decision is audited here, once, whatever
-    //    happens next (a deny is thrown); storing the result does not evaluate `capture` again.
-    await authorizeProcessing(
-      repo,
-      projectId,
-      { action: "capture", capture: { method: "downloader", platform } },
-      { op: "capture.link", auditAllow: { details: { platform, cookies } } },
-    );
-    const policy = await projectPolicy(repo, projectId);
-    const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-    const legalBasis = opts.legalBasis?.trim() || policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
-    try {
+    let identifiable: boolean;
+    let legalBasis: string | undefined;
+    if (item) {
+      // A profile run: its one audited capture decision and the store checks are already made.
+      ({ identifiable, legalBasis } = item);
+    } else {
+      // 2. Policy before anything is downloaded. The capture decision is audited here, once, whatever
+      //    happens next (a deny is thrown); storing the result does not evaluate `capture` again.
       await authorizeProcessing(
         repo,
         projectId,
-        { action: "store", store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } },
-        { op: "capture.link" },
+        { action: "capture", capture: { method: "downloader", platform } },
+        { op: "capture.link", auditAllow: { details: { platform, cookies } } },
       );
-    } catch (err) {
-      if (err instanceof PolicyDeniedError && identifiable && policy?.consent.requireLegalBasis && !legalBasis) {
-        return failed(url, "LEGAL_BASIS_REQUIRED");
+      const policy = await projectPolicy(repo, projectId);
+      identifiable = policy?.identifiability.containsIdentifiable ?? true;
+      legalBasis = opts.legalBasis?.trim() || policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
+      try {
+        await authorizeProcessing(
+          repo,
+          projectId,
+          { action: "store", store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } },
+          { op: "capture.link" },
+        );
+      } catch (err) {
+        if (err instanceof PolicyDeniedError && identifiable && policy?.consent.requireLegalBasis && !legalBasis) {
+          return failed(url, "LEGAL_BASIS_REQUIRED");
+        }
+        throw err;
       }
-      throw err;
     }
 
     // 4. Known post id: duplicates are found before downloading.
@@ -309,17 +401,12 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     if (existing && !opts.refreshIfExists) return { url, status: "duplicate", sourceId: existing };
 
     const root = repoLibrary(repo).root;
-    const name = `capture-${randomUUID()}`;
-    const work = join(root, ".tmp", name);
-    activeTemp.add(name);
+    const { work, done } = await makeWork();
     try {
-      await fsp.mkdir(join(root, ".tmp"), { recursive: true });
-      await fsp.mkdir(work, { mode: 0o700 });
-      if (process.platform !== "win32") await fsp.chmod(work, 0o700);
       // 5. Download. The raw tool output (info JSON with request headers) stays in this folder.
       let result: JobResult;
       try {
-        result = await download(projectId, c, opts, work, !!existing);
+        result = await download(projectId, c, opts, work, !!existing || !!item?.metadataOnly, !existing && !!item?.includeComments);
       } catch (err) {
         if (err instanceof WorkerJobError) return failed(url, err.code);
         if (err instanceof WorkerUnavailableError) return failed(url, "WORKER_UNAVAILABLE");
@@ -343,6 +430,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       if (existing) {
         if (!opts.refreshIfExists) return { url, status: "duplicate", sourceId: existing };
         if (!raw) return failed(url, partialCode ?? "NOTHING_SAVED");
+        if (!(await stillAllowed(projectId, platform))) return failed(url, "POLICY_CHANGED");
         await refresh(projectId, existing, stored, work, result.encrypted);
         return { url, status: "refreshed", sourceId: existing };
       }
@@ -372,12 +460,21 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
         const path = await writeSnapshot(work, "snapshot.platform-metadata.json", stored, projectId, result.encrypted);
         inputs.push({ path, role: "original", handling: "copy", kind: "platform-metadata", metadata: { capturedAt: at }, ...enc });
       }
+      // Comments (third-party personal data): stripped like the snapshot, a separate original.
+      const commentFiles = (Array.isArray(meta.comments) ? meta.comments : []).filter((f): f is string => typeof f === "string").sort();
+      for (const [i, f] of commentFiles.entries()) {
+        const list = await readAny(f, result.encrypted, projectId);
+        if (!Array.isArray(list)) continue;
+        const path = await writeSnapshot(work, `comments-${i}.platform-comments.json`, stripSnapshot(list, { localPrefixes: [root] }), projectId, result.encrypted);
+        inputs.push({ path, role: "original", handling: "copy", kind: "platform-comments", metadata: { capturedAt: at }, ...enc });
+      }
       const provenance: Provenance = {
         captureMethod: "downloader",
         capturedAt: at,
         originalUrl: c.canonicalUrl,
         tool: { name: toolName, version: toolVersion },
         fileHashes: {},
+        ...(item ? { importBatchId: item.importBatchId } : {}),
         platformSnapshot: snap,
         identification: { method: "platform-json", confidence: applyVerification(1, report) },
         // Public only when the platform itself says so and no signed-in session was used.
@@ -388,7 +485,10 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       const needsReview = report.overall === "needs-review";
       // Something was saved but the tool stopped with an error, or no media file came back: an
       // incomplete source, labeled with why.
-      const incomplete = partialCode ?? (media.length === 0 ? "NO_MEDIA" : undefined);
+      const incomplete = partialCode ?? (media.length === 0 && !item?.metadataOnly ? "NO_MEDIA" : undefined);
+      if (item) draft.collectionIds = [...item.collectionIds];
+      // Immediately before storing: the rules may have changed during the download (R42).
+      if (!(await stillAllowed(projectId, platform))) return failed(url, "POLICY_CHANGED");
       const sf = await createSourcePreAuthorized(repo, projectId, draft, inputs, {
         provenance,
         fieldEvidence: evidence,
@@ -408,6 +508,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
 
       // 7. Captions and transcript. The source exists now: a failure here is reported, never as "nothing saved".
       const notes: string[] = [];
+      if (item?.includeComments && meta.commentsUnsupported === true) notes.push(COMMENTS_UNSUPPORTED_NOTE);
       const firstMedia = sf.assets.find((a) => a.role === "original" && (a.kind === "video" || a.kind === "audio"));
       const parent = firstMedia ?? sf.assets.find((a) => a.role === "original" && a.kind !== "platform-metadata");
       let captionsFailed = false;
@@ -446,17 +547,32 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       if (needsReview) return { ...base, status: "needs-review", reason: [REVIEW_NOTE, ...notes].join(" ") };
       return { ...base, status: "created", ...(notes.length ? { reason: notes.join(" ") } : {}) };
     } finally {
-      await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
-      activeTemp.delete(name);
+      await done();
     }
   }
+
+  const core: CaptureCore = {
+    repo,
+    worker,
+    sleep,
+    inLane,
+    acknowledged,
+    findExisting,
+    stillAllowed,
+    readJson: readAny,
+    writeJson: writeSnapshot,
+    makeWork,
+    captureItem: captureOne,
+  };
+  const profiles = createProfileCapture(core);
 
   async function captureUrl(projectId: string, url: string, opts: CaptureOptions): Promise<CaptureOutcome> {
     // The browser session needs the one-time acknowledgement, whatever the link is.
     if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(url);
     if (c.kind === "profile" || c.kind === "playlist") {
-      return deps.captureProfile ? deps.captureProfile(projectId, url, opts) : failed(url, "PROFILE_CAPTURE_UNAVAILABLE");
+      if (deps.captureProfile) return deps.captureProfile(projectId, url, opts);
+      return profiles.outcomeOf(url, await profiles.captureProfile(projectId, url, opts));
     }
     if (c.platform === "other") return failed(url, "UNSUPPORTED_URL");
     return inLane(c.platform, () => captureOne(projectId, url, c, opts));
@@ -491,5 +607,5 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return out;
   }
 
-  return { captureUrl, captureUrls };
+  return { captureUrl, captureUrls, captureProfile: profiles.captureProfile };
 }

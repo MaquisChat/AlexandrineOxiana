@@ -367,10 +367,13 @@ describe("captureUrl", () => {
     expect(handle.db.prepare("SELECT source_id, payload_json FROM review_items").all()).toEqual([{ source_id: out.sourceId, payload_json: JSON.stringify({ fields: { "/issued": "conflict" } }) }]);
   });
 
-  it("profile and playlist links are handed to captureProfile when given, else fail plainly", async () => {
+  it("profile and playlist links go to the profile capture (or the captureProfile given)", async () => {
     const p = await project();
+    // the built-in profile capture: the fake tools have no such channel, so listing it fails plainly
     const out = await capture.captureUrl(p.id, "https://www.youtube.com/@amatest_fake", { transcribe: false });
-    expect(out).toMatchObject({ status: "failed", errorCode: "PROFILE_CAPTURE_UNAVAILABLE" });
+    expect(out).toMatchObject({ status: "failed", errorCode: "EXTRACTOR_ERROR" });
+    expect(worker.submitted.map((j) => [j.input, j.params.flatList])).toEqual([["https://www.youtube.com/@amatest_fake", true]]);
+    worker.submitted.length = 0;
     const seen: string[] = [];
     const withProfile = createLinkCapture({
       repo, worker: client, index: handle,
@@ -500,6 +503,19 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     expect(s).toEqual({
       author: { uniqueId: "a", nickname: "A" }, authors: ["x"], authority: "y", header_image: "z.jpg", headerImage: "h",
       page: "https://example.org/a/b", list: ["keep"],
+    });
+  });
+
+  it("R42a: drops api/access/private/secret + key pairs, credential(s) and jwt, but keeps a bare key and extractor_key", () => {
+    const s = stripSnapshot({
+      api_key: 1, apiKey: 2, "X-Api-Key": 3, access_key: 4, AccessKeyId: 5, private_key: 6, privateKey: 7, secret_key: 8, SecretKey: 9,
+      credential: 10, credentials: 11, aws_credentials: 12, jwt: 13, jwtToken: 14, id_jwt: 15,
+      key: "k", extractor_key: "Youtube", keywords: ["a"], monkey: "m", access: "public", private: false, api: "v2", key_frames: 3,
+      nested: [{ apiKeyName: "x", ok: 1 }],
+    });
+    expect(s).toEqual({
+      key: "k", extractor_key: "Youtube", keywords: ["a"], monkey: "m", access: "public", private: false, api: "v2", key_frames: 3,
+      nested: [{ ok: 1 }],
     });
   });
 
@@ -658,5 +674,44 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     const sf = await repo.getSource(p.id, out.sourceId!);
     expect(sf.source.availability.status).toBe("incomplete");
     expect(sf.assets.map((a) => a.kind)).toEqual(["platform-metadata"]);
+  });
+
+  it("R42b: governance changed during the download → POLICY_CHANGED, nothing stored, one deny audited after the one allow", async () => {
+    const p = await project();
+    const w2 = await startToolWorker({
+      beforeCapture: async () => {
+        await writeFile(join(lib.root, p.folder, "governance.yaml"), NO_DOWNLOADER_GOV);
+      },
+    });
+    closers.push(() => w2.close());
+    const c2 = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w2, pollMs: 5 }), index: handle });
+    const out = await c2.captureUrl(p.id, YT, { transcribe: false });
+    expect(out).toEqual({
+      url: YT,
+      status: "failed",
+      errorCode: "POLICY_CHANGED",
+      reason: "This project's rules changed during the download, so nothing was saved.",
+    });
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    const evs = await captureEvents(p.folder);
+    expect(evs.map((e) => e.decision?.result)).toEqual(["allow", "deny"]);
+    expect((await auditEvents(p.folder)).filter((e) => e.action === "store" && e.details?.op !== "project.create")).toEqual([]);
+    expect((await readdir(join(lib.root, ".tmp"))).filter((n) => n.startsWith("capture-"))).toEqual([]);
+  });
+
+  it("R42b: an expired protocol mid-download also stops a refresh before the new snapshot is stored", async () => {
+    const p = await project();
+    const first = await capture.captureUrl(p.id, YT, { transcribe: false });
+    const before = (await repo.getSource(p.id, first.sourceId!)).assets.length;
+    const w2 = await startToolWorker({
+      beforeCapture: async () => {
+        await writeFile(join(lib.root, p.folder, "governance.yaml"), `${GOV}protocol:\n  number: "X-1"\n  expires: "2020-01-01"\n`);
+      },
+    });
+    closers.push(() => w2.close());
+    const c2 = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w2, pollMs: 5 }), index: handle });
+    const out = await c2.captureUrl(p.id, YT, { transcribe: false, refreshIfExists: true });
+    expect(out).toMatchObject({ status: "failed", errorCode: "POLICY_CHANGED" });
+    expect((await repo.getSource(p.id, first.sourceId!)).assets.length).toBe(before);
   });
 });

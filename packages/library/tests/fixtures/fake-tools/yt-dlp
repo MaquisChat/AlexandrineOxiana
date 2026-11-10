@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Fake yt-dlp for tests (no network). Behaviour from FAKE_TOOL_MODE: ok (default), login, partial,
 // notfound, infoonly. FAKE_FIXTURE names the fixture for links without an id (short links). The fixture is the tests/fixtures/capture/*.info.json whose "id" appears in the URL.
-// FAKE_ARGV_FILE (optional) receives the arguments as JSON.
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+// FAKE_ARGV_FILE (optional) receives the arguments as JSON (FAKE_ARGV_LOG: appended, one line per run).
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,6 +12,7 @@ if (args.includes("--version")) {
   process.exit(0);
 }
 if (process.env.FAKE_ARGV_FILE) writeFileSync(process.env.FAKE_ARGV_FILE, JSON.stringify(args));
+if (process.env.FAKE_ARGV_LOG) appendFileSync(process.env.FAKE_ARGV_LOG, JSON.stringify(args) + "\n");
 const template = args[args.indexOf("-o") + 1];
 const out = dirname(template);
 mkdirSync(out, { recursive: true });
@@ -28,6 +29,71 @@ if (mode === "notfound") {
   console.error("ERROR: [youtube] aoTest00001: Video unavailable. This video has been removed by the uploader");
   process.exit(1);
 }
+// A synthetic profile (FAKE_PROFILE_FILE, JSON; tests change it between runs): the profile link is
+// enumerated (--flat-playlist: one playlist info JSON with the entries), an item link is downloaded.
+// Modes: ratelimit (items from position `rateLimitAfter`, default 3, fail with 429), enumpartial
+// (only the first `cutAfter` entries, default 7, then 429), enumratelimit (the enumeration fails with 429).
+if (process.env.FAKE_PROFILE_FILE) {
+  const prof = JSON.parse(readFileSync(process.env.FAKE_PROFILE_FILE, "utf8"));
+  if (prof.platform !== "instagram") profileRun(prof);
+}
+
+function profileRun(prof) {
+  const yt = prof.platform === "youtube";
+  const itemUrl = (it) => (yt ? `https://www.youtube.com/watch?v=${it.id}` : `https://www.tiktok.com/@${prof.handle}/video/${it.id}`);
+  const idOf = (u) => (yt ? /[?&]v=([\w-]+)/.exec(u)?.[1] : /\/video\/(\d+)/.exec(u)?.[1]);
+  const id = idOf(url);
+  const pos = id === undefined ? -1 : prof.items.findIndex((it) => it.id === id);
+  if (id !== undefined && pos < 0) return; // not one of the profile's posts: the fixtures below
+  if (id === undefined && !url.includes(`@${prof.handle}`)) return;
+  if (pos >= 0) {
+    if (mode === "ratelimit" && pos >= (prof.rateLimitAfter ?? 3)) {
+      console.error(`ERROR: [${yt ? "youtube" : "TikTok"}] ${id}: HTTP Error 429: Too Many Requests`);
+      process.exit(1);
+    }
+    const it = prof.items[pos];
+    const info = {
+      id: it.id, title: yt ? it.caption.split("\n")[0] : `TikTok video #${it.id}`, description: it.caption,
+      channel: prof.displayName, uploader: yt ? prof.displayName : prof.handle, uploader_id: yt ? `@${prof.handle}` : "7000000000000000999",
+      timestamp: it.timestamp, webpage_url: itemUrl(it), original_url: `${itemUrl(it)}?is_from_webapp=1`, availability: "public",
+      extractor: yt ? "youtube" : "TikTok", extractor_key: yt ? "Youtube" : "TikTok", language: "en",
+      http_headers: { Cookie: "sessionid=FAKECOOKIE" }, formats: [{ url: "https://v16.example/v.mp4?x-expires=1&signature=SECRET" }],
+    };
+    if (args.includes("--write-comments")) {
+      info.comment_count = 2;
+      info.comments = [
+        { id: "c1", author: "commenter_one", author_id: "111", text: "Lovely!", timestamp: it.timestamp + 60, author_thumbnail: "https://p16.example/a.jpg?x-expires=1&signature=SECRET" },
+        { id: "c2", author: "commenter_two", author_id: "222", text: "Where is this?", timestamp: it.timestamp + 120 },
+      ];
+    }
+    writeFileSync(join(out, `${it.id}.info.json`), JSON.stringify(info));
+    if (!args.includes("--skip-download")) writeFileSync(join(out, `${it.id}.mp4`), Buffer.from("\0\0\0\x18ftypmp42 fake profile video " + it.id));
+    process.exit(0);
+  }
+  if (mode === "enumratelimit") {
+    console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: HTTP Error 429: Too Many Requests`);
+    process.exit(1);
+  }
+  let items = prof.items;
+  const end = args.indexOf("--playlist-end");
+  if (end >= 0) items = items.slice(0, Number(args[end + 1]));
+  if (mode === "enumpartial") items = items.slice(0, prof.cutAfter ?? 7);
+  const playlist = {
+    _type: "playlist", id: yt ? "UCfakeProfile0000000001" : prof.handle, title: yt ? `${prof.displayName} - Videos` : prof.handle,
+    channel: prof.displayName, uploader: yt ? prof.displayName : prof.handle, uploader_id: yt ? `@${prof.handle}` : "7000000000000000999",
+    description: prof.bio, channel_follower_count: prof.followers, playlist_count: prof.items.length, channel_is_verified: prof.verified ?? false,
+    webpage_url: url, original_url: `${url}?lang=en`, extractor_key: yt ? "YoutubeTab" : "TikTokUser",
+    thumbnails: [{ id: "avatar_uncropped", url: prof.avatar }], links: prof.links ?? [],
+    entries: items.map((it) => ({ _type: "url", ie_key: yt ? "Youtube" : "TikTok", id: it.id, url: `${itemUrl(it)}?si=track`, title: it.caption.split("\n")[0], description: it.caption, timestamp: it.timestamp })),
+  };
+  writeFileSync(join(out, `${playlist.id}.info.json`), JSON.stringify(playlist));
+  if (mode === "enumpartial") {
+    console.error(`ERROR: [${yt ? "youtube:tab" : "tiktok:user"}] ${prof.handle}: HTTP Error 429: Too Many Requests`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
 let info;
 for (const f of readdirSync(fixtures).filter((n) => n.endsWith(".info.json"))) {
   const j = JSON.parse(readFileSync(join(fixtures, f), "utf8"));
