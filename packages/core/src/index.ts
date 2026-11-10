@@ -58,3 +58,5 @@ export { REQUIRED_FIELDS, applyVerification, recheckSourceFile, verifyDraft } fr
 export type { VerificationReport, VerifyContext } from "./verify/recheck.js";
 
 export * from "./import/index.js";
+
+export * from "./citation/index.js";

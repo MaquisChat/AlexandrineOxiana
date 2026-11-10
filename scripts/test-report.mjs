@@ -14,6 +14,8 @@ export const AREA_NAMES = {
   "audit.test.ts": "Audit log",
   "governance.test.ts": "Data governance",
   "citations.test.ts": "Citations",
+  "citation.test.ts": "Citations",
+  "custom-styles.test.ts": "Custom citation styles",
   "library.test.ts": "Library folder",
   "test-report.test.mjs": "Test report",
 };
