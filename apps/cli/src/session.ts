@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { newId, type Project } from "@ao/core";
@@ -46,17 +46,29 @@ function deviceId(dir: string): string {
     }
   })();
   try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(file, JSON.stringify({ deviceId: id }));
+    ensurePrivateDir(dir);
+    writeFileSync(file, JSON.stringify({ deviceId: id }), { mode: 0o600 });
   } catch {
     // an unwritable config folder: the id is just not remembered
   }
   return id;
 }
 
+/** The CLI's settings folder holds device ids, approved folders and audit anchors: private (0700). */
+function ensurePrivateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      // not ours to change (a shared folder given in AO_CONFIG_DIR): left as it is
+    }
+  }
+}
+
 export function makeDeps(): Deps {
   const dir = configDir();
-  mkdirSync(dir, { recursive: true });
+  ensurePrivateDir(dir);
   return {
     clock: () => new Date(),
     deviceId: deviceId(dir),

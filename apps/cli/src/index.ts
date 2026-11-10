@@ -11,6 +11,7 @@ import { registerProject } from "./commands/project.js";
 import { registerRecheck } from "./commands/recheck.js";
 import { registerTools } from "./commands/tools.js";
 import { registerTranscribe } from "./commands/transcribe.js";
+import { lastIntegrityWarnings } from "./commands/common.js";
 import { EXIT, describeError } from "./errors.js";
 import { hasEnvPassphrase, zoteroKeyFromEnv } from "./prompt.js";
 import { openSessions } from "./session.js";
@@ -72,6 +73,11 @@ export async function run(argv: string[]): Promise<number> {
     }
     if ((err as { cancelled?: boolean }).cancelled) return 130;
     const d = describeError(err);
+    if (args.includes("--json")) {
+      // A machine-readable error too, with whatever integrity problems opening the library found.
+      const warnings = lastIntegrityWarnings();
+      process.stdout.write(`${JSON.stringify({ error: d.message, ...(d.hint ? { hint: d.hint } : {}), code: d.code, ...(warnings.length ? { integrityWarnings: warnings } : {}) }, null, 2)}\n`);
+    }
     process.stderr.write(`${d.message}\n`);
     if (d.hint) process.stderr.write(`${d.hint}\n`);
     if (process.env.AO_DEBUG && err instanceof Error && err.stack) process.stderr.write(`${err.stack}\n`);

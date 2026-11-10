@@ -5,7 +5,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -744,6 +744,45 @@ describe("import, export, secrets and maintenance", () => {
     expect(missing.code).toBe(1);
     expect(missing.stderr).toMatch(/folder .*does not exist/u);
   }, 60_000);
+
+  it("review round 2 (R82): a deleted anchor does not hide a truncated or emptied log", async () => {
+    await projectWith("AnchT", GOV_NO_LOOKUPS);
+    await projectWith("AnchE", GOV_NO_LOOKUPS);
+    expect((await run(["import", papers, "--project", "AnchT"])).code).toBe(0); // a log with several events
+    const segs = async (name: string) => {
+      const d = join(lib, "Projects", name, "audit");
+      return (await readdir(d)).sort().map((f) => join(d, f));
+    };
+    const anchors = join(tmp, "config", "audit-anchors.json");
+    const t = (await segs("AnchT")).at(-1)!;
+    const lines = (await readFile(t, "utf8")).split("\n").filter(Boolean);
+    await writeFile(t, `${lines.slice(0, -1).join("\n")}\n`);
+    for (const f of await segs("AnchE")) await writeFile(f, "");
+    await rm(anchors);
+
+    const v1 = await run(["--json", "verify-audit", "--project", "AnchT"]);
+    expect(v1.code).toBe(1);
+    expect(json(v1).problem.kind).toBe("anchor-missing");
+    const ve = await run(["verify-audit", "--project", "AnchE"]);
+    expect(ve.code).toBe(1);
+
+    const any = await run(["list", "--project", "AnchT"]);
+    expect(any.code, any.stderr).toBe(0);
+    expect(any.stderr).toMatch(/Warning: AnchT: .*record of the log's head is missing/u);
+    const events = (await Promise.all((await segs("AnchT")).map((f) => readFile(f, "utf8")))).join("");
+    expect(events).toContain('"action":"audit.anchor-missing"');
+    const v2 = await run(["verify-audit", "--project", "AnchT"]);
+    expect(v2.code).toBe(1);
+    expect(v2.stdout).toMatch(/found altered on/u);
+
+    // --json errors carry the integrity warnings too (the earlier open recorded AnchE's state: tamper again).
+    for (const f of await segs("AnchE")) await writeFile(f, "");
+    const err = await run(["--json", "export", "--project", "AnchE", "--format", "endnote", "--output", join(tmp, "x.ris")]);
+    expect(err.code).toBe(1);
+    expect(JSON.parse(err.stdout)).toMatchObject({ error: expect.any(String), code: 1, integrityWarnings: expect.arrayContaining([expect.objectContaining({ project: "AnchE" })]) });
+    // The CLI's own settings folder is private.
+    expect((await stat(join(tmp, "config"))).mode & 0o777).toBe(0o700);
+  }, 180_000);
 
   it("import zotero needs --data-dir or --web; a bad --web is refused", async () => {
     const none = await run(["import", "zotero", "--project", "Imp"]);

@@ -31,6 +31,10 @@ export function integrityViews(s: Session): IntegrityView[] {
   }));
 }
 
+/** The integrity warnings of the library most recently opened (for --json error output). */
+let lastWarnings: IntegrityView[] = [];
+export const lastIntegrityWarnings = (): IntegrityView[] => lastWarnings;
+
 /**
  * Runs a command body with the library open (and always closed again). Integrity warnings found
  * when the library was opened (R81 C1) are printed on stderr and added to the --json document.
@@ -46,6 +50,7 @@ export async function withSession<T>(
   const s = await openSession({ library: opts.library, write, ...(open.noHeal ? { noHeal: true } : {}) });
   try {
     const warnings = integrityViews(s);
+    lastWarnings = warnings;
     for (const w of warnings) plain.progress(`Warning: ${w.project}: ${w.detail}`);
     const out: Out = warnings.length
       ? { ...plain, data: (v) => plain.data(v && typeof v === "object" && !Array.isArray(v) ? { ...(v as object), integrityWarnings: warnings } : v) }

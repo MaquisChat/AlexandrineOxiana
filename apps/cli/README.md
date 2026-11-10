@@ -311,9 +311,10 @@ pnpm ao verify-audit --project "Market study"
 
 `verify-audit` only reads: it never repairs or re-records anything. It says **NOT intact** (exit
 code 1) when the log was shortened, emptied or edited, or when an earlier run of `ao` already
-found it altered ("the audit log was found altered on <date>"). On a computer that has never
-opened this project, it cannot compare with a recorded head and says **UNVERIFIED (no anchor on
-this device)** (exit code 0, with a warning). Every other command also prints a warning when it
+found it altered ("the audit log was found altered on <date>"). An empty log is never intact, and
+neither is a log this computer wrote to whose recorded head has gone missing. On a computer that
+has never written to this project's log, it cannot compare with a recorded head and says
+**UNVERIFIED (no anchor on this device)** (exit code 0, with a warning). Every other command also prints a warning when it
 notices such a problem while opening the library.
 
 Rebuild the search index if searches seem out of date (your files are not touched):

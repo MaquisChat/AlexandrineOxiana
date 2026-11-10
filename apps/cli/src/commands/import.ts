@@ -130,10 +130,13 @@ function summaryLines(s: ScanSummary): string[] {
  * `{batchId, state}` so a script knows which batch to look at.
  */
 async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnType<typeof createBulkImport>, start: () => Promise<BatchHandle>): Promise<void> {
-  let handle: BatchHandle | undefined;
   let closing = false;
+  const starting = start();
+  starting.catch(() => {});
   s.beforeClose(async () => {
     closing = true;
+    // A batch still starting is waited for, then cancelled like a running one.
+    const handle = await starting.catch(() => undefined);
     if (!handle) return;
     handle.cancel();
     const r = await handle.done.catch(() => undefined);
@@ -141,11 +144,10 @@ async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnT
   });
   let h: BatchHandle;
   try {
-    h = await start();
+    h = await starting;
   } catch (err) {
     refused(err);
   }
-  handle = h;
   if (closing) h.cancel();
   let last = "";
   const progress = (async () => {
