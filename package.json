@@ -12,10 +12,12 @@
     "e2e": "node scripts/run-e2e.mjs",
     "report": "node scripts/test-report.mjs",
     "setup:py": "node scripts/setup-py.mjs",
-    "fetch-fixtures": "node scripts/fetch-fixtures.mjs"
+    "fetch-fixtures": "node scripts/fetch-fixtures.mjs",
+    "ao": "tsx apps/cli/src/index.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   }
