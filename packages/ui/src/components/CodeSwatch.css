@@ -1,0 +1,23 @@
+.ao-code-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+}
+
+.ao-code-swatch__glyph {
+  flex: none;
+  width: 1em;
+  height: 1em;
+  /* A thin outline keeps light code colours visible on light chips and dark ones on dark chips. */
+  stroke: var(--line-strong);
+  stroke-width: 0.6;
+}
+
+.ao-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

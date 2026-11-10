@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CVD_KINDS, MACHADO_2009, deltaE2000, hexToLab, minPairwiseDeltaE, simulate } from "./colorVision";
 import { contrastRatio } from "./contrast";
+import { CODE_FAMILIES, CODE_MIN_CHROMA, CODE_MIN_LIGHTNESS, inHueRange, lch } from "./codePalette";
 import { CODE_PALETTE_SIZE, THEMES, codeColors } from "./themes";
 import { THEME_NAMES } from "./tokenFile";
 
@@ -57,7 +58,12 @@ describe("colour-vision simulation (Machado, Oliveira & Fernandes 2009, severity
   });
 });
 
-describe("qualitative code palette", () => {
+describe("qualitative code palette (R103)", () => {
+  it("names the twelve hue families in a fixed order", () => {
+    expect(CODE_FAMILIES.map((f) => f.name)).toEqual(["red", "orange", "gold", "olive", "green", "teal", "cyan", "blue", "indigo", "purple", "magenta", "brown"]);
+    expect(CODE_PALETTE_SIZE).toBe(12);
+  });
+
   for (const theme of THEME_NAMES) {
     describe(theme, () => {
       const colors = codeColors(theme);
@@ -67,9 +73,24 @@ describe("qualitative code palette", () => {
         expect(new Set(colors).size).toBe(12);
       });
 
-      it("every pair differs by ΔE2000 ≥ 15 with normal vision and under deuteranopia, protanopia and tritanopia", () => {
+      it("--code-n stays in its hue family, reads as a colour (minimum chroma) and is not near-black", () => {
+        const bad: string[] = [];
+        colors.forEach((c, i) => {
+          const f = CODE_FAMILIES[i]!;
+          const { L, C, h } = lch(c);
+          if (!inHueRange(h, f.hue)) bad.push(`--code-${i + 1} ${c} (${f.name}): hue ${h.toFixed(0)} outside ${f.hue.join("–")}`);
+          if (C < f.minChroma) bad.push(`--code-${i + 1} ${c} (${f.name}): chroma ${C.toFixed(0)} < ${f.minChroma}`);
+          if (f.maxChroma !== undefined && C > f.maxChroma) bad.push(`--code-${i + 1} ${c} (${f.name}): chroma ${C.toFixed(0)} > ${f.maxChroma}`);
+          if (f.maxLightness !== undefined && L > f.maxLightness) bad.push(`--code-${i + 1} ${c} (${f.name}): L* ${L.toFixed(0)} > ${f.maxLightness}`);
+          if (L < CODE_MIN_LIGHTNESS) bad.push(`--code-${i + 1} ${c} (${f.name}): L* ${L.toFixed(0)} is near-black`);
+          if (C < CODE_MIN_CHROMA) bad.push(`--code-${i + 1} ${c}: chroma below the palette minimum`);
+        });
+        expect(bad).toEqual([]);
+      });
+
+      it("every pair differs by ΔE2000 ≥ 15 with normal vision and ≥ 12 under deuteranopia, protanopia and tritanopia", () => {
         expect(minPairwiseDeltaE(colors, null)).toBeGreaterThanOrEqual(15);
-        for (const kind of CVD_KINDS) expect(minPairwiseDeltaE(colors, kind), kind).toBeGreaterThanOrEqual(15);
+        for (const kind of CVD_KINDS) expect(minPairwiseDeltaE(colors, kind), kind).toBeGreaterThanOrEqual(12);
       });
 
       it("every colour stands out from --bg and --surface (≥ 3:1, WCAG non-text contrast)", () => {
@@ -78,7 +99,9 @@ describe("qualitative code palette", () => {
     });
   }
 
-  it("light and dark have their own variants", () => {
+  it("light and dark have their own variants of the same families", () => {
     expect(codeColors("light")).not.toEqual(codeColors("dark"));
+    expect(codeColors("light-hc")).toEqual(codeColors("light"));
+    expect(codeColors("dark-hc")).toEqual(codeColors("dark"));
   });
 });

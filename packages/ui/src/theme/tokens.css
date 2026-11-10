@@ -3,11 +3,12 @@
  * uses var(--token), enforced by stylelint (color-no-hex, color-named, no colour functions).
  *
  * light and dark: the approved mockup's .ao-light / .ao-dark values, unchanged.
- * --code-1 ... --code-12: the qualitative code palette. Every pair differs by CIEDE2000 >= 15 with
- *   normal vision and under simulated deuteranopia, protanopia and tritanopia (Machado et al. 2009),
- *   and every colour reaches 3:1 against --bg and --surface. Light and dark each have their own set,
- *   found by search; --code-n is paired with the closest-hue colour of the other set, but the two
- *   sets do not share hues (no shared-hue set reached these limits). Users can recolour any code.
+ * --code-1 ... --code-12: the qualitative code palette (R103). --code-n keeps the same hue family in
+ *   every theme: red, orange, gold, olive, green, teal, cyan, blue, indigo, purple, magenta, brown
+ *   (ranges in src/theme/codePalette.ts). Every pair differs by CIEDE2000 >= 15 with normal vision
+ *   and >= 12 under simulated deuteranopia, protanopia and tritanopia (Machado et al. 2009); every
+ *   colour has a minimum chroma, is not near-black and reaches 3:1 against --bg and --surface.
+ *   Codes are never shown by colour alone (CodeSwatch adds a shape and the name).
  *   Checked by src/theme/palette.test.ts.
  * light-hc and dark-hc: generated from light and dark (src/theme/tokenFile.ts) so that every text
  *   token reaches 7:1 on the backgrounds it is drawn on.
@@ -48,18 +49,18 @@
   --amber-ink: #8A5A00;
   --deny: #9A2B1F;
   --backdrop: #E9E7E1;
-  --code-1: #774D49;
-  --code-2: #5A0706;
-  --code-3: #C00D00;
-  --code-4: #A37B6C;
-  --code-5: #E66706;
-  --code-6: #1C92ED;
-  --code-7: #203B81;
-  --code-8: #8E8C9F;
-  --code-9: #050039;
-  --code-10: #665F74;
-  --code-11: #6F01F8;
-  --code-12: #36252F;
+  --code-1: #D07176;
+  --code-2: #7C2E00;
+  --code-3: #955B00;
+  --code-4: #94900A;
+  --code-5: #00844D;
+  --code-6: #005855;
+  --code-7: #009BAF;
+  --code-8: #0064CE;
+  --code-9: #847DFB;
+  --code-10: #78007C;
+  --code-11: #D12384;
+  --code-12: #50352C;
 }
 
 [data-theme="dark"] {
@@ -97,18 +98,18 @@
   --amber-ink: #E9C46A;
   --deny: #F08A7E;
   --backdrop: #0B0B0A;
-  --code-1: #E8CACA;
-  --code-2: #836E0C;
-  --code-3: #98FF00;
-  --code-4: #FEFFC1;
-  --code-5: #99AD06;
-  --code-6: #76A87E;
-  --code-7: #C7D4FB;
-  --code-8: #5E6E58;
-  --code-9: #AF92FD;
-  --code-10: #C78AAA;
-  --code-11: #8A3CFB;
-  --code-12: #B33A82;
+  --code-1: #D60700;
+  --code-2: #E17700;
+  --code-3: #FFB600;
+  --code-4: #637749;
+  --code-5: #00F294;
+  --code-6: #93C7B1;
+  --code-7: #009FA8;
+  --code-8: #0071B1;
+  --code-9: #A282F4;
+  --code-10: #FFC0FC;
+  --code-11: #CE0078;
+  --code-12: #A58D79;
 }
 
 /* BEGIN GENERATED: high-contrast themes, derived from light and dark by `pnpm --filter @ao/ui gen:tokens`. Do not edit by hand. */
@@ -147,18 +148,18 @@
   --amber-ink: #6C4600;
   --deny: #8F281D;
   --backdrop: #E9E7E1;
-  --code-1: #774D49;
-  --code-2: #5A0706;
-  --code-3: #C00D00;
-  --code-4: #A37B6C;
-  --code-5: #E66706;
-  --code-6: #1C92ED;
-  --code-7: #203B81;
-  --code-8: #8E8C9F;
-  --code-9: #050039;
-  --code-10: #665F74;
-  --code-11: #6F01F8;
-  --code-12: #36252F;
+  --code-1: #D07176;
+  --code-2: #7C2E00;
+  --code-3: #955B00;
+  --code-4: #94900A;
+  --code-5: #00844D;
+  --code-6: #005855;
+  --code-7: #009BAF;
+  --code-8: #0064CE;
+  --code-9: #847DFB;
+  --code-10: #78007C;
+  --code-11: #D12384;
+  --code-12: #50352C;
 }
 
 [data-theme="dark-hc"] {
@@ -196,17 +197,17 @@
   --amber-ink: #E9C46A;
   --deny: #F3A097;
   --backdrop: #0B0B0A;
-  --code-1: #E8CACA;
-  --code-2: #836E0C;
-  --code-3: #98FF00;
-  --code-4: #FEFFC1;
-  --code-5: #99AD06;
-  --code-6: #76A87E;
-  --code-7: #C7D4FB;
-  --code-8: #5E6E58;
-  --code-9: #AF92FD;
-  --code-10: #C78AAA;
-  --code-11: #8A3CFB;
-  --code-12: #B33A82;
+  --code-1: #D60700;
+  --code-2: #E17700;
+  --code-3: #FFB600;
+  --code-4: #637749;
+  --code-5: #00F294;
+  --code-6: #93C7B1;
+  --code-7: #009FA8;
+  --code-8: #0071B1;
+  --code-9: #A282F4;
+  --code-10: #FFC0FC;
+  --code-11: #CE0078;
+  --code-12: #A58D79;
 }
 /* END GENERATED */
