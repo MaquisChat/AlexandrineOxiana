@@ -19,6 +19,28 @@ export const LibraryRelativePath = z
   .refine((p) => !p.split("/").includes(".."), { message: "must not contain .. segments" })
   .refine((p) => !/^[A-Za-z]:/.test(p), { message: "must not start with a drive letter" });
 
+/**
+ * Where a linked (not copied) file is, relative to the library root, with forward slashes (R24).
+ * Like LibraryRelativePath, except that it may start with ".." segments: a file linked in place
+ * may live outside the library folder. ".." is allowed only before the first named segment, and
+ * "." or empty segments are not.
+ */
+export const LinkedRelativePath = z
+  .string()
+  .min(1)
+  .refine((p) => !p.startsWith("/"), { message: "must not start with /" })
+  .refine((p) => !p.includes("\\"), { message: "must not contain backslashes" })
+  .refine((p) => !/^[A-Za-z]:/.test(p), { message: "must not start with a drive letter" })
+  .refine(
+    (p) => {
+      const segs = p.split("/");
+      const firstNamed = segs.findIndex((s) => s !== "..");
+      if (firstNamed < 0) return false;
+      return segs.slice(firstNamed).every((s) => s !== "" && s !== "." && s !== "..");
+    },
+    { message: "\"..\" only at the start, and no empty or \".\" segments" },
+  );
+
 const DAYS = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 function validEdtfLite(s: string): boolean {

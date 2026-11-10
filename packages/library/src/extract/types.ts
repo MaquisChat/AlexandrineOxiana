@@ -41,6 +41,8 @@ export interface Extracted {
   text?: string;
   needsOcr?: boolean;
   media?: MediaMetadata;
+  /** A document (PDF) that could not be parsed at all: damaged, truncated or password-protected. */
+  readFailed?: boolean;
 }
 
 /** What one format extractor returns: identifiers from metadata fields go in `ids` (raw); the

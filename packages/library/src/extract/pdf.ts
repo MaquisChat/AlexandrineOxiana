@@ -101,7 +101,8 @@ export async function extractPdf(path: string): Promise<RawExtract> {
     out.needsOcr = (pages[0] ?? "").replace(/\s+/gu, "").length < OCR_THRESHOLD_CHARS;
     return out;
   } catch {
-    return {};
+    // Not a readable PDF (damaged, truncated, or encrypted with a password).
+    return { readFailed: true };
   } finally {
     await task.destroy().catch(() => {});
   }

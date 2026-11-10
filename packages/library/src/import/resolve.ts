@@ -43,6 +43,7 @@
  */
 import { basename, extname } from "node:path";
 import {
+  AUTO_ACCEPT_THRESHOLD,
   DOC_TEXT_LIMIT,
   EdtfLite,
   SourceDraft,
@@ -60,6 +61,7 @@ import {
   type FieldEvidence,
   type FileNamePattern,
   type LookupEvidence,
+  type ParsedFileName,
   type SourceType,
   type VerificationReport,
 } from "@ao/core";
@@ -69,11 +71,10 @@ import { LookupHttpError, lookupDoi, lookupIsbn, searchTitle, type LookupContext
 import { readSidecar, type SidecarMetadata } from "./sidecar.js";
 
 /**
- * Items at or above this confidence are accepted without review. Neither the project model nor the
- * governance model has a per-project setting for it yet (Bulk Import's per-batch
- * `ImportOptions.autoAcceptThreshold` is a batch option), so this is the default (R53).
+ * Items at or above this confidence are accepted without review (R53). Defined in core, where it is
+ * also the default of Bulk Import's per-batch `ImportOptions.autoAcceptThreshold` (R54, R59).
  */
-export const AUTO_ACCEPT_THRESHOLD = 0.9;
+export { AUTO_ACCEPT_THRESHOLD };
 /** Candidate matches kept for the review queue. */
 export const MAX_CANDIDATES = 3;
 /** Identifier lookups tried per item (the first pages may cite other works' DOIs). */
@@ -83,13 +84,19 @@ const CONFLICT_CONFIDENCE = 0.6;
 const AGREE = 0.9;
 
 export interface ResolveInput {
-  path: string;
-  /** The sniffed MIME type. */
-  mime: string;
+  /** The file; absent for a metadata-only item (reference metadata, no file): nothing is extracted. */
+  path?: string;
+  /** The sniffed MIME type ("" for a metadata-only item). */
+  mime?: string;
   referenceMetadata?: Partial<SourceDraft>;
   sidecarPaths?: string[];
   /** The name file-name patterns are matched against (default: the path's base name). */
   fileName?: string;
+  /**
+   * What a user pattern made of the name, when the caller ran the user patterns itself (Bulk Import
+   * runs them under a watchdog, R49d). Given: used instead of the user patterns in `ctx.patterns`.
+   */
+  userParsedName?: ParsedFileName;
 }
 
 export interface ResolveContext {
@@ -120,6 +127,8 @@ export interface Resolution {
   identifierHints: string[];
   /** The file carries location data (GPS): location governance applies when it is stored (R54a). */
   hasLocation: boolean;
+  /** The document could not be parsed at all (a damaged or password-protected PDF). */
+  unreadable: boolean;
 }
 
 interface Fields {
@@ -219,9 +228,10 @@ const arxivDoi = (id: string) => `10.48550/arxiv.${id.replace(/v\d+$/u, "").toLo
 export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Promise<Resolution> {
   const at = (ctx.clock?.() ?? new Date()).toISOString();
   const lookup = ctx.lookup;
-  const extracted: Extracted = await extractMetadata(input.path, input.mime);
-  const fileName = input.fileName ?? basename(input.path);
-  const parsedName = parseFileName(fileName, ctx.patterns);
+  const mime = input.mime ?? "";
+  const extracted: Extracted = input.path ? await extractMetadata(input.path, mime) : { identifiers: { dois: [], isbns: [], arxiv: [] } };
+  const fileName = input.fileName ?? (input.path ? basename(input.path) : "");
+  const parsedName = !fileName ? null : (input.userParsedName ?? parseFileName(fileName, ctx.patterns));
   const ref = input.referenceMetadata ?? {};
 
   const values: Fields = {};
@@ -461,7 +471,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
 
   // Nothing named the item: its file name stands in for the title.
   if (!values.title) {
-    const stem = basename(fileName, extname(fileName)).trim() || "Untitled";
+    const stem = (fileName ? basename(fileName, extname(fileName)).trim() : "") || "Untitled";
     offer({ title: stem }, { kind: "filename" }, false);
   }
   if (confidence === 0) confidence = scoreConfidence({ method: "none" });
@@ -478,7 +488,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     tagIds: [],
     participantIds: [],
     ...stripResolved(ref),
-    type: values.type ?? typeFromMime(input.mime),
+    type: values.type ?? typeFromMime(mime),
     title: titleMt,
     creators: values.creators ?? [],
     ...(values.container ? { container: ref.container && values.container === refFields.container ? ref.container : mt(values.container) } : {}),
@@ -517,7 +527,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     verification: report,
     titleConflict,
     identifierHints: hints.slice(0, 10),
-    hasLocation: mayHaveLocation(input.mime, extracted),
+    hasLocation: mayHaveLocation(mime, extracted),
+    unreadable: extracted.readFailed === true,
   };
 }
 

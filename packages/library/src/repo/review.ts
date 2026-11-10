@@ -6,9 +6,9 @@
  * is a cache of this file; for encrypted projects it holds only field names and statuses.
  */
 import { newId } from "@ao/core";
-import { openLine, sealLine } from "./io.js";
+import { openLine, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
-import type { RepoCore } from "./state.js";
+import type { ProjectState, RepoCore } from "./state.js";
 
 export const REVIEW_FILE = "review/pending.jsonl";
 const PURPOSE = "ao-review";
@@ -34,6 +34,11 @@ export interface ReviewEntry {
   duplicateOf?: { sourceId: string; reason: string };
   /** Import items: identifiers found in the file that no lookup confirmed (e.g. "doi:10.1/x"). */
   hints?: string[];
+  /** Import items: the import batch that queued it (Bulk Import). */
+  batchId?: string;
+  /** Resolved entries: when, and the decision taken (e.g. "accept", "skip", "merge"). */
+  resolvedAt?: string;
+  decision?: string;
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */
@@ -47,6 +52,7 @@ export interface ReviewInput {
   candidates?: unknown[];
   duplicateOf?: { sourceId: string; reason: string };
   hints?: string[];
+  batchId?: string;
 }
 
 /** A `review_items` row; `payload` is safe for the persistent index (nothing identifying when `encrypted`). */
@@ -72,6 +78,7 @@ export function reviewRow(e: ReviewEntry, encrypted: boolean): ReviewItemRow {
     id: e.id,
     projectId: e.projectId,
     ...(e.sourceId ? { sourceId: e.sourceId } : {}),
+    ...(e.batchId ? { batchId: e.batchId } : {}),
     kind: e.kind,
     status: e.status,
     payload: encrypted ? safe : { ...safe, reasons: e.reasons, ...(e.candidates ? { candidates: e.candidates } : {}), ...(e.hints ? { hints: e.hints } : {}) },
@@ -100,7 +107,29 @@ export async function appendReviewEntry(
     ...(input.candidates?.length ? { candidates: input.candidates } : {}),
     ...(input.duplicateOf ? { duplicateOf: input.duplicateOf } : {}),
     ...(input.hints?.length ? { hints: input.hints } : {}),
+    ...(input.batchId ? { batchId: input.batchId } : {}),
   };
+  await writeReviewLine(core, tx, entry);
+  return entry;
+}
+
+/**
+ * Appends a later version of an entry (same id) inside a running mutation, e.g. marking it
+ * resolved with the decision taken; the newest line per id wins when the file is read.
+ */
+export async function appendReviewUpdate(core: RepoCore, tx: Tx, entry: ReviewEntry): Promise<void> {
+  await writeReviewLine(core, tx, entry);
+}
+
+/** Every review entry of a project (newest version per id); sealed lines need the unlocked key. */
+export async function readReviewEntries(core: RepoCore, st: ProjectState): Promise<ReviewEntry[]> {
+  const raw = await readMaybe(core.abs(`${st.rel}/${REVIEW_FILE}`));
+  if (!raw) return [];
+  return parseReviewFile(raw.toString("utf8"), st.project.id, core.encrypted(st) ? core.key(st).key : null).entries;
+}
+
+async function writeReviewLine(core: RepoCore, tx: Tx, entry: ReviewEntry): Promise<void> {
+  const st = tx.state;
   const json = JSON.stringify(entry);
   const encrypted = core.encrypted(st);
   if (encrypted) {
@@ -111,7 +140,6 @@ export async function appendReviewEntry(
   }
   const row = reviewRow(entry, encrypted);
   tx.index((sink) => sink.indexReviewItem?.(row));
-  return entry;
 }
 
 /**

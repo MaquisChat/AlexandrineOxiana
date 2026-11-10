@@ -31,15 +31,17 @@ import {
   listSourceIds,
   relinkLinkedAsset as relinkLinkedAssetIn,
   updateSource,
+  type CreateInTx,
   type CreateSourceOptions,
   type SourceInputFile,
   type SourcePatch,
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
+import { runImportChange, type ImportOps } from "./import-ops.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
-import { activeTemp } from "../tmp-registry.js";
+import { isStaleWorkDir } from "../tmp-registry.js";
 import { RecoveryPendingError } from "./errors.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 
@@ -180,7 +182,8 @@ async function sweep(core: RepoCore): Promise<void> {
   await clear(join(core.root, "Projects"), (n) => n.startsWith(".creating-"));
   // Work folders of captures and worker jobs interrupted by a crash (decrypted inputs, raw tool
   // output with request headers): never resumed, so removed unless in use in this process.
-  const staleWork = (n: string) => (n.startsWith("capture-") || n.startsWith("worker-")) && !activeTemp.has(n);
+  // Bulk Import's unpacked archives (batch-*) too: a resumed batch unpacks its archives again.
+  const staleWork = isStaleWorkDir;
   await clear(join(core.root, ".tmp"), (n) => staleWork(n) || (n.startsWith("trash-") && !markersLeft) || isOrphanBackup(core.root, n));
 }
 
@@ -508,8 +511,30 @@ export function createSourceRefusing(
   files: SourceInputFile[],
   opts: CreateSourceOptions,
   refuse: RefuseHook,
+  /** More writes in the same change (Bulk Import: the batch journal line). */
+  inTx?: CreateInTx,
 ): Promise<SourceFile> {
-  return createSource(cores.get(repo)!, projectId, draft, files, opts, { refuse });
+  return createSource(cores.get(repo)!, projectId, draft, files, opts, { refuse, ...(inTx ? { inTx } : {}) });
+}
+
+/**
+ * Package-internal (Bulk Import): one governed change (R26 txn, change log, audit) whose body
+ * reads, writes and deletes sources, copies originals in and updates review entries.
+ */
+export function importChange<T>(
+  repo: Repo,
+  projectId: string,
+  reqs: MutateRequest | MutateRequest[],
+  fn: (ops: ImportOps) => Promise<T>,
+  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
+): Promise<T> {
+  return runImportChange(cores.get(repo)!, projectId, reqs, fn, opts);
+}
+
+/** Package-internal: whether the project's files are encrypted at rest. */
+export function projectEncrypted(repo: Repo, projectId: string): boolean {
+  const core = cores.get(repo)!;
+  return core.encrypted(core.state(projectId));
 }
 
 /** Package-internal (link capture): the project's change stamp as the index would record it now. */

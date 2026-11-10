@@ -6,6 +6,7 @@ import {
   ImportBatch,
   ImportOptions,
   LibraryRelativePath,
+  LinkedRelativePath,
   Source,
   SourceFile,
   inLang,
@@ -116,6 +117,20 @@ describe("SourceFile", () => {
   });
 });
 
+describe("LinkedRelativePath (R24)", () => {
+  it("allows leading .. segments only", () => {
+    for (const p of ["../Papers/x.pdf", "../../a/b.pdf", "a/b.pdf"]) expect(LinkedRelativePath.safeParse(p).success, p).toBe(true);
+    for (const p of ["..", "../..", "a/../b", "../a/../b", "/abs", "C:/x", "a\\b", "", "./a", "../a//b"]) expect(LinkedRelativePath.safeParse(p).success, p).toBe(false);
+  });
+  it("a linked asset's path may point outside the library; an unlinked one may not", () => {
+    const base = fixture().assets[0]!;
+    const linked = { ...base, path: "../P/x.pdf", encrypted: false, linked: { absolutePath: "/home/u/P/x.pdf", libraryRelativePath: "../P/x.pdf" } };
+    expect(Asset.safeParse(linked).success).toBe(true);
+    expect(Asset.safeParse({ ...linked, path: "other.pdf" }).success).toBe(false);
+    expect(Asset.safeParse({ ...base, path: "../P/x.pdf" }).success).toBe(false);
+  });
+});
+
 describe("LibraryRelativePath", () => {
   it("rejects unsafe paths", () => {
     for (const p of ["/etc/x", "a\\b", "a/../b", "..", "C:/x", "c:x", ""]) {
@@ -185,7 +200,8 @@ describe("ImportOptions / ImportBatch", () => {
       duplicates: "merge",
       ocr: true,
       transcribe: false,
-      autoAcceptThreshold: 0.8,
+      autoAcceptThreshold: 0.9,
+      fileNamePatterns: [],
     });
   });
 

@@ -5,6 +5,7 @@ import * as fsp from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   LibraryRelativePath,
+  LinkedRelativePath,
   Provenance,
   Source,
   SourceDraft,
@@ -57,6 +58,9 @@ export interface CreateSourceOptions {
 }
 
 export type SourcePatch = Partial<Omit<Source, "id">>;
+
+/** Package-internal: more writes in the same change, after the new source is written (e.g. an import journal line). */
+export type CreateInTx = (tx: Tx, sf: SourceFile) => Promise<void>;
 
 /** Types whose folder name starts with the full date rather than the year (spec 4.1 examples). */
 const FULL_DATE_TYPES = new Set([
@@ -191,7 +195,7 @@ export async function createSource(
   files: SourceInputFile[],
   opts: CreateSourceOptions,
   /** Package-internal: the caller already evaluated and audited this capture (link capture), so only `store` is evaluated here. */
-  internal: { captureAuthorized?: boolean; refuse?: RefuseHook } = {},
+  internal: { captureAuthorized?: boolean; refuse?: RefuseHook; inTx?: CreateInTx } = {},
 ): Promise<SourceFile> {
   core.assertWritable();
   const draft = SourceDraft.parse(draftIn);
@@ -266,13 +270,17 @@ export async function createSource(
           if (tx.encrypted) {
             throw new GovernanceViolationError("This project is encrypted; linked files would stay unencrypted, so copy them instead");
           }
+          // A linked file may be outside the library (R24): its path relative to the library root
+          // may start with "..". It cannot be on another drive, nor in the library's work folder.
           const abs = resolve(f.path);
           const r = relative(resolve(core.root), abs);
-          if (r.startsWith("..") || isAbsolute(r)) {
-            throw new Error("Linked files must be inside the library folder (paths stored in the library are library-relative)");
+          const rel = r.split(sep).join("/");
+          if (isAbsolute(r) || !LinkedRelativePath.safeParse(rel).success) {
+            throw new Error("This file cannot be linked from where it is (another drive than the library); copy it instead");
           }
+          if (rel === ".tmp" || rel.startsWith(".tmp/")) throw new Error("Files in the library's work folder cannot be linked");
           content = await sha256File(abs);
-          linked = { absolutePath: abs, libraryRelativePath: r.split(sep).join("/") };
+          linked = { absolutePath: abs, libraryRelativePath: rel };
         } else {
           if (f.encrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
           content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode, ...(f.encrypted ? { sourceEncrypted: true } : {}) });
@@ -321,6 +329,7 @@ export async function createSource(
       tx.record("source", id, null, source);
       for (const a of assets) tx.record("asset", a.id, null, a);
       if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
+      if (internal.inTx) await internal.inTx(tx, sf);
       tx.onCommit(() => st.sources.set(id, folder));
       tx.index((sink) => sink.indexSource(sf));
       return sf;
@@ -395,6 +404,19 @@ export async function editSource(core: RepoCore, tx: Tx, id: string, edit: (s: S
   tx.record("source", id, cur.source, source);
   tx.index((sink) => sink.indexSource(sf));
   return sf;
+}
+
+/** Deletes one source inside a running mutation (its folder is trashed; linked originals are not touched). */
+export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string): Promise<SourceFile> {
+  const st = tx.state;
+  const cur = await readSourceFile(core, st, id);
+  await tx.trash(cur.source.folder);
+  if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
+  for (const a of cur.assets) tx.record("asset", a.id, a, null);
+  tx.record("source", id, cur.source, null);
+  tx.onCommit(() => st.sources.delete(id));
+  tx.index((sink) => sink.removeSource(id));
+  return cur;
 }
 
 export async function deleteSource(core: RepoCore, projectId: string, id: string): Promise<void> {

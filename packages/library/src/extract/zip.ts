@@ -2,7 +2,16 @@
  * Bounded ZIP reading for EPUB and DOCX (R50): at most 10,000 entries, each at most 50 MB and all
  * together at most 200 MB uncompressed (as declared, and enforced while inflating), and no
  * absolute or `..` entry names. Violations throw UnsafeFileError; nothing is ever written to disk.
+ *
+ * `extractArchive` (Bulk Import, R59) unpacks a user's ZIP archive into a private folder with the
+ * archive limits: at most 100,000 entries, each at most 50 MB, at most 2 GB in all (declared and
+ * enforced while inflating); traversal, absolute and symbolic-link entries refuse the whole archive.
  */
+import { createWriteStream } from "node:fs";
+import * as fsp from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import yauzl from "yauzl";
 import { UnsafeFileError } from "./errors.js";
 
@@ -19,6 +28,13 @@ export interface SafeZip {
   read(name: string, maxBytes?: number): Promise<Buffer | undefined>;
   close(): void;
 }
+
+/** Limits for a user's archive unpacked by Bulk Import. */
+export const ARCHIVE_LIMITS = {
+  maxEntries: 100_000,
+  maxEntryBytes: 50 * 1024 * 1024,
+  maxTotalBytes: 2 * 1024 * 1024 * 1024,
+} as const;
 
 function unsafeName(name: string): boolean {
   if (name.includes("\0")) return true;
@@ -99,4 +115,107 @@ export async function openZip(path: string): Promise<SafeZip> {
       }),
     close: () => zf.close(),
   };
+}
+
+const PATH_REASON = "The archive contains a file name that points outside it";
+
+/** A symbolic link entry (Unix mode in the external attributes). */
+function isSymlink(e: yauzl.Entry): boolean {
+  const made = (e.versionMadeBy >> 8) & 0xff;
+  if (made !== 3 && made !== 19) return false; // Unix or OS X
+  return ((e.externalFileAttributes >>> 16) & 0o170000) === 0o120000;
+}
+
+export interface ExtractedEntry {
+  /** The entry's name in the archive ("/"-separated). */
+  name: string;
+  /** Where it was written. */
+  path: string;
+  bytes: number;
+}
+
+/**
+ * Unpacks `zipPath` into `destDir` (created 0700; files 0600). Every entry is checked before
+ * anything is written: a traversal, absolute or symbolic-link name, or a limit exceeded refuses the
+ * whole archive with UnsafeFileError (what was written so far is the caller's to remove: it lives
+ * in the caller's private work folder). `limits` is a test seam.
+ */
+export async function extractArchive(
+  zipPath: string,
+  destDir: string,
+  limits: { maxEntries: number; maxEntryBytes: number; maxTotalBytes: number } = ARCHIVE_LIMITS,
+  signal?: AbortSignal,
+): Promise<ExtractedEntry[]> {
+  let zf: yauzl.ZipFile;
+  try {
+    zf = await open(zipPath);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/relative path|absolute path|invalid characters/iu.test(msg)) throw new UnsafeFileError("zip-path", PATH_REASON);
+    throw new UnsafeFileError("zip-invalid", "The archive could not be read");
+  }
+  try {
+    if (zf.entryCount > limits.maxEntries) throw new UnsafeFileError("zip-too-many-entries", `The archive has more than ${limits.maxEntries} files`);
+    // First pass: names and declared sizes only.
+    const entries: yauzl.Entry[] = [];
+    let declared = 0;
+    await new Promise<void>((res, rej) => {
+      zf.on("error", rej);
+      zf.on("end", res);
+      zf.on("entry", (e: yauzl.Entry) => {
+        if (unsafeName(e.fileName) || isSymlink(e)) return rej(new UnsafeFileError("zip-path", PATH_REASON));
+        if (e.uncompressedSize > limits.maxEntryBytes) return rej(new UnsafeFileError("zip-entry-too-large", "A file inside the archive is larger than 50 MB"));
+        declared += e.uncompressedSize;
+        if (declared > limits.maxTotalBytes) return rej(new UnsafeFileError("zip-too-large", "The archive's contents are too large to import"));
+        if (entries.length >= limits.maxEntries) return rej(new UnsafeFileError("zip-too-many-entries", `The archive has more than ${limits.maxEntries} files`));
+        entries.push(e);
+        zf.readEntry();
+      });
+      zf.readEntry();
+    });
+    await fsp.mkdir(destDir, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") await fsp.chmod(destDir, 0o700);
+    const base = resolve(destDir);
+    const out: ExtractedEntry[] = [];
+    let total = 0;
+    for (const e of entries) {
+      signal?.throwIfAborted();
+      const name = e.fileName.replace(/\\/gu, "/");
+      const segs = name.split("/").filter((x) => x !== "" && x !== ".");
+      if (name.endsWith("/") || segs.length === 0) continue;
+      const target = join(base, ...segs);
+      const rel = relative(base, target);
+      if (rel.startsWith("..") || rel.split(sep).includes("..")) throw new UnsafeFileError("zip-path", PATH_REASON);
+      await fsp.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      let bytes = 0;
+      const stream = await new Promise<NodeJS.ReadableStream>((res, rej) =>
+        zf.openReadStream(e, (err, s) => (err || !s ? rej(new UnsafeFileError("zip-invalid", "A file inside the archive could not be read")) : res(s))),
+      );
+      const counter = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          bytes += chunk.length;
+          total += chunk.length;
+          if (bytes > limits.maxEntryBytes) return cb(new UnsafeFileError("zip-entry-too-large", "A file inside the archive is larger than 50 MB"));
+          if (total > limits.maxTotalBytes) return cb(new UnsafeFileError("zip-too-large", "The archive's contents are too large to import"));
+          cb(null, chunk);
+        },
+      });
+      try {
+        await pipeline(stream, counter, createWriteStream(target, { flags: "wx", mode: 0o600 }));
+      } catch (err) {
+        if (err instanceof UnsafeFileError) throw err;
+        throw new UnsafeFileError("zip-invalid", "A file inside the archive could not be read");
+      }
+      out.push({ name: segs.join("/"), path: target, bytes });
+    }
+    return out;
+  } catch (e) {
+    if (e instanceof UnsafeFileError) throw e;
+    if ((e as Error)?.name === "AbortError") throw e;
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/relative path|absolute path|invalid characters/iu.test(msg)) throw new UnsafeFileError("zip-path", PATH_REASON);
+    throw new UnsafeFileError("zip-invalid", "The archive could not be read");
+  } finally {
+    zf.close();
+  }
 }

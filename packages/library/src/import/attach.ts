@@ -35,20 +35,21 @@
  * message. Not wired here: purging the lookup client's sensitive memory cache when a project is
  * locked (`HttpClient.purgeSensitive`); the Repo has no lock hook or event yet (carried to Task 30).
  */
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileTypeFromFile } from "file-type";
-import { findDuplicate, primary, type DupKey, type FileNamePattern, type PolicyDecision, type PolicyRequest, type Provenance, type SourceFile } from "@ao/core";
+import { findDuplicate, type DupKey, type FileNamePattern, type SourceFile } from "@ao/core";
 import { UnsafeFileError, extractMetadata } from "../extract/index.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
-import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectPolicy, type Repo } from "../repo/repo.js";
-import { AUTO_ACCEPT_THRESHOLD, LOCATED_MEDIA, mayHaveLocation, resolveItem, type Resolution } from "./resolve.js";
+import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, type Repo } from "../repo/repo.js";
+import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
+import { LOCATED_MEDIA, mayHaveLocation, resolveItem } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
+
+export { LOCATION_REASON };
 
 const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
 
@@ -85,19 +86,8 @@ const REASONS = {
   locked: "The project is locked. Unlock it, then try again.",
   noSource: "The source to attach to could not be found.",
   failed: "The file could not be attached.",
-  review: "Some details could not be confirmed, so the source is in the review queue.",
-  likelyDuplicate: "This may be a duplicate of a source already in the project, so it is in the review queue.",
-  lowConfidence: "The item could not be identified with enough confidence.",
+  ...ITEM_REASONS,
 };
-
-/** R56: until GPS coarsening/stripping exists (Task 27), media whose store needs it are refused. */
-export const LOCATION_REASON =
-  "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
-const refuseLocation = (d: PolicyDecision, req: PolicyRequest): string | undefined =>
-  req.action === "store" && d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "location") ? LOCATION_REASON : undefined;
-
-/** The `consent.defaultLegalBasis` category manual uploads use (docs/governance/README.md). */
-const LEGAL_CATEGORY = "manual-upload";
 
 /**
  * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
@@ -121,41 +111,6 @@ export function acceptedType(type: { ext: string; mime: string }): { ext: string
   // The MIME table's type and kind where it knows the extension, else file-type's MIME and the prefix.
   const known = mimeFor(type.ext) !== "application/octet-stream";
   return { ext: type.ext, mime: known ? mimeFor(type.ext) : mime, kind: known ? kindFor(type.ext) : media! };
-}
-
-async function sha256File(path: string): Promise<string> {
-  const h = createHash("sha256");
-  for await (const chunk of createReadStream(path) as AsyncIterable<Buffer>) h.update(chunk);
-  return h.digest("hex");
-}
-
-function dupKey(sf: SourceFile): DupKey & { sourceId: string } {
-  const s = sf.source;
-  const c = s.creators[0];
-  const family = c?.family ?? c?.literal;
-  return {
-    sourceId: s.id,
-    sha256s: sf.assets.filter((a) => a.role === "original").map((a) => a.sha256),
-    ...(s.identifiers.doi ? { doi: s.identifiers.doi } : {}),
-    ...(s.identifiers.isbn?.length ? { isbns: s.identifiers.isbn } : {}),
-    ...(primary(s.title) ? { title: primary(s.title) } : {}),
-    ...(family ? { firstCreatorFamily: family } : {}),
-    ...(s.issued ? { year: s.issued.slice(0, 4) } : {}),
-  };
-}
-
-function candidateKey(r: Resolution, sha256: string): DupKey {
-  const d = r.draft;
-  const c = d.creators[0];
-  const family = c?.family ?? c?.literal;
-  return {
-    sha256s: [sha256],
-    ...(d.identifiers.doi ? { doi: d.identifiers.doi } : {}),
-    ...(d.identifiers.isbn?.length ? { isbns: d.identifiers.isbn } : {}),
-    title: primary(d.title),
-    ...(family ? { firstCreatorFamily: family } : {}),
-    ...(d.issued ? { year: d.issued.slice(0, 4) } : {}),
-  };
 }
 
 const failed = (path: string, reason: string): AttachOutcome => ({ path, outcome: "failed", reason });
@@ -228,20 +183,7 @@ export function createAttach(deps: AttachDeps): Attach {
   }
   type Session = ReturnType<typeof session>;
 
-  /** Projects whose legacy `manual_upload` legal-basis key was already reported. */
-  const legacyNoted = new Set<string>();
-
-  async function storeInputs(projectId: string): Promise<{ identifiable: boolean; legalBasis?: string }> {
-    const policy = await projectPolicy(repo, projectId);
-    // The governance loader reads the legacy key as `manual-upload` (and warns); say so once here.
-    if (policy && Object.prototype.hasOwnProperty.call(policy.consent.defaultLegalBasis, "manual_upload") && !legacyNoted.has(projectId)) {
-      legacyNoted.add(projectId);
-      deps.debug?.('governance: consent.defaultLegalBasis.manual_upload is the old spelling of "manual-upload"; please rename it');
-    }
-    const identifiable = policy?.identifiability.containsIdentifiable ?? true;
-    const legalBasis = policy?.consent.defaultLegalBasis?.[LEGAL_CATEGORY]?.trim() || undefined;
-    return { identifiable, ...(legalBasis ? { legalBasis } : {}) };
-  }
+  const storeInputs = (projectId: string) => sharedStoreInputs(repo, projectId, undefined, deps.debug);
 
   type Stored = { ext: string; mime: string; kind: string };
 
@@ -267,28 +209,18 @@ export function createAttach(deps: AttachDeps): Attach {
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
 
     const r = await resolveItem({ path, mime, sidecarPaths: await findSidecars(path) }, { projectId, patterns, lookup: await s.lookup() });
-    const dup = findDuplicate(candidateKey(r, sha256), keys);
+    const dup = findDuplicate(candidateKey(r, [sha256]), keys);
     if (dup?.certainty === "certain") return { path, outcome: "duplicate", sourceId: dup.sourceId };
-    const needsReview = !!dup || r.confidence < AUTO_ACCEPT_THRESHOLD || r.verification.overall === "needs-review";
+    const reviewItem = reviewFor(r, dup);
+    const needsReview = !!reviewItem;
 
     const { identifiable, legalBasis } = await storeInputs(projectId);
-    const provenance: Provenance = {
+    const provenance = itemProvenance(r, {
       captureMethod: "manual_upload",
-      capturedAt: new Date().toISOString(),
       tool: { name: "drag-and-drop", version: VERSION },
-      fileHashes: {},
-      identification: { method: r.evidence.method, confidence: r.confidence },
-      legal: { status: "unknown", ...(legalBasis ? { basis: legalBasis } : {}) },
       identifiable,
-    };
-    const flagged = Object.fromEntries(
-      Object.entries(r.verification.fields).filter(([, v]) => v.status === "conflict" || v.status === "unverified").map(([k, v]) => [k, v.status]),
-    );
-    const reasons = [
-      ...(dup ? [REASONS.likelyDuplicate] : []),
-      ...r.verification.reasons,
-      ...(r.confidence < AUTO_ACCEPT_THRESHOLD && r.verification.reasons.length === 0 ? [REASONS.lowConfidence] : []),
-    ];
+      ...(legalBasis ? { legalBasis } : {}),
+    });
     // createSource evaluates capture and store again, right before writing (R42).
     // A location condition (coarsen/strip) cannot be honoured yet: an audited deny, nothing stored (R56).
     const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind }], {
@@ -296,20 +228,7 @@ export function createAttach(deps: AttachDeps): Attach {
       fieldEvidence: r.fieldEvidence,
       verification: r.verification.fields,
       ...(r.hasLocation ? { hasLocation: true } : {}),
-      ...(needsReview
-        ? {
-            reviewItem: {
-              kind: "import" as const,
-              fields: flagged,
-              reasons,
-              confidence: r.confidence,
-              method: r.evidence.method,
-              candidates: r.candidates,
-              ...(dup ? { duplicateOf: { sourceId: dup.sourceId, reason: dup.reason } } : {}),
-              ...(r.identifierHints.length ? { hints: r.identifierHints } : {}),
-            },
-          }
-        : {}),
+      ...(reviewItem ? { reviewItem } : {}),
     }, refuseLocation);
     keys.push(dupKey(sf));
     if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id };

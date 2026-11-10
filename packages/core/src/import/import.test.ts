@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { findIdentifiers } from "./identifiers.js";
-import { parseFileName } from "./filename-patterns.js";
+import { parseFileName, vetFileNamePattern } from "./filename-patterns.js";
 import { scoreConfidence } from "./confidence.js";
 import { findDuplicate } from "./dedupe.js";
 
@@ -179,5 +179,20 @@ describe("findDuplicate", () => {
     expect(findDuplicate({ sha256s: [], ...t, year: "2024-03", doi: "10.1/a" }, [{ sourceId: "x", sha256s: [], ...t, year: "2024", doi: "10.1/b" }])).toBeNull();
     expect(findDuplicate({ sha256s: [], ...t, year: "2024", isbns: ["9780306406157"] }, [{ sourceId: "x", sha256s: [], ...t, year: "2024", isbns: ["9780804429573"] }])).toBeNull();
     expect(findDuplicate({ sha256s: [], ...t, year: "2024-03" }, [{ sourceId: "x", sha256s: [], ...t, year: "2024", doi: "10.1/b" }])?.reason).toBe("fuzzy");
+  });
+});
+
+describe("vetFileNamePattern (R49d)", () => {
+  it("accepts ordinary patterns, including optional groups that contain repetition", () => {
+    for (const p of ["^(?<title>.+)$", "^(?<creator>\\w+)_(?<year>\\d{4})_(?<title>.+)$", "(?<title>(?:ab)+)", "(?<title>(a+)?)", "(?<title>a{1,}b)", "(?<title>[(+]+)"]) {
+      expect(vetFileNamePattern(p), p).toEqual({ ok: true });
+    }
+  });
+  it("rejects nested quantifiers, backreferences, invalid and group-less patterns", () => {
+    for (const p of ["^(?<title>(a+)+)$", "(?<title>(\\w+\\s?)*)$", "(?<title>[(]+)+", "(?<title>(?:a{2,3}){2})", "(?<title>(?<x>\\d+)-)*", "(?<title>x)\\1", "(?<title>x)\\k<title>", "(?<title>", "no groups", "x".repeat(501)]) {
+      const r = vetFileNamePattern(p);
+      expect(r.ok, p).toBe(false);
+      if (!r.ok) expect(r.reason).toMatch(/^The pattern/);
+    }
   });
 });

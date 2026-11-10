@@ -11,7 +11,7 @@
  *   2. a `jobs` row (status queued → running → done | failed | cancelled) so that a job the app
  *      did not see finish is resubmitted on the next launch (`resumePending`). `capture.download`
  *      is never resumed (its capture decision and caller are gone): it is marked failed
- *      `INTERRUPTED`, and leftover `.tmp/capture-*` / `worker-*` folders are swept. For an encrypted
+ *      `INTERRUPTED`, and leftover `.tmp/capture-*` / `worker-*` / `batch-*` folders are swept. For an encrypted
  *      project the row's payload is sealed with the project key.
  *   3. a private temp folder `<Library>/.tmp/worker-<id>/` (0700): an encrypted input is decrypted
  *      into it (0600), and the worker writes its outputs there.
@@ -30,7 +30,7 @@ import type { EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
 import type { IndexDb } from "./index/db.js";
-import { activeTemp } from "./tmp-registry.js";
+import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
 import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 
@@ -356,7 +356,7 @@ export class WorkerClient {
       return;
     }
     for (const n of names) {
-      if ((n.startsWith("worker-") || n.startsWith("capture-")) && !activeTemp.has(n) && !this.active.has(n.slice("worker-".length))) {
+      if (isStaleWorkDir(n) && !this.active.has(n.slice("worker-".length))) {
         await fsp.rm(join(dir, n), { recursive: true, force: true }).catch(() => {});
       }
     }
