@@ -117,6 +117,8 @@ export interface OpenSessionOptions {
   library?: string | undefined;
   /** The command writes: a read-only library is refused. */
   write: boolean;
+  /** Open for checking only (verify-audit): nothing is repaired, re-anchored or recorded. */
+  noHeal?: boolean;
 }
 
 export async function openSession(opts: OpenSessionOptions): Promise<Session> {
@@ -136,6 +138,7 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
     index = lib.mode === "read-write" ? new IndexHandle(lib.root) : undefined;
     repo = await openRepo(lib, ring, {
       actor: safeUser(),
+      ...(opts.noHeal ? { noHeal: true } : {}),
       ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }) } : {}),
     });
   } catch (err) {

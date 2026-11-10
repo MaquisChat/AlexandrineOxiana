@@ -177,6 +177,12 @@ First look before you import (nothing is imported):
 pnpm ao import "Downloads/Papers" --project "Market study" --dry-run
 ```
 
+On Windows, write the folder the Windows way, in quotes:
+
+```
+pnpm ao import "C:\Users\you\Downloads\Papers" --project "Market study" --dry-run
+```
+
 It counts what it found, what is already in the project, and which files cannot be imported.
 Then import for real:
 
@@ -218,6 +224,12 @@ From Zotero on this computer (close Zotero first if it says it is busy):
 pnpm ao import zotero --data-dir "/Users/you/Zotero" --project "Market study"
 ```
 
+On Windows:
+
+```
+pnpm ao import zotero --data-dir "C:\Users\you\Zotero" --project "Market study"
+```
+
 The data folder is shown in Zotero under Settings, Advanced, Files and Folders. Collections,
 tags, notes and PDF highlights come along. Running the same command again later brings in only
 what changed; sources you deleted here are not brought back.
@@ -231,8 +243,27 @@ pnpm ao secrets set zotero-api-key
 
 The key is kept only in your computer's keychain (Keychain on a Mac, Credential Manager on
 Windows, the keyring on Linux), never in a file, and is never printed. `ao` never accepts a key
-typed on the command line itself. For a script, put it in the `AO_ZOTERO_API_KEY` environment
-variable for that one command. If your computer has no keychain, `ao` says so and saves nothing.
+typed on the command line itself, and never repeats what you typed in its messages. If your
+computer has no keychain, `ao` says so and saves nothing.
+
+`AO_ZOTERO_API_KEY` is only for saving the key from a script, with `ao secrets set` (the import
+itself always reads the key from the keychain). On a Mac or Linux:
+
+```
+AO_ZOTERO_API_KEY="your key" pnpm ao secrets set zotero-api-key
+```
+
+On Windows, in PowerShell:
+
+```
+$env:AO_ZOTERO_API_KEY = "your key"; pnpm ao secrets set zotero-api-key; Remove-Item Env:AO_ZOTERO_API_KEY
+```
+
+On Windows, in the Command Prompt (cmd):
+
+```
+set AO_ZOTERO_API_KEY=your key && pnpm ao secrets set zotero-api-key && set AO_ZOTERO_API_KEY=
+```
 
 Then import your own library (your user ID is on the same Security page) or a group library:
 
@@ -278,11 +309,27 @@ Check that a project's audit log has not been changed outside the app:
 pnpm ao verify-audit --project "Market study"
 ```
 
+`verify-audit` only reads: it never repairs or re-records anything. It says **NOT intact** (exit
+code 1) when the log was shortened, emptied or edited, or when an earlier run of `ao` already
+found it altered ("the audit log was found altered on <date>"). On a computer that has never
+opened this project, it cannot compare with a recorded head and says **UNVERIFIED (no anchor on
+this device)** (exit code 0, with a warning). Every other command also prints a warning when it
+notices such a problem while opening the library.
+
 Rebuild the search index if searches seem out of date (your files are not touched):
 
 ```
 pnpm ao rebuild-index
 ```
+
+## 14. Stopping an import, and carrying on
+
+Press Ctrl+C to stop an import. `ao` finishes the item it is working on, records where it
+stopped and closes the library safely; nothing half-saved is left behind. With `--json`, it
+prints the batch's id and state (`{"batchId": "…", "state": "cancelled"}`).
+
+To carry on, run the same `ao import` command again: what is already in the project is
+recognised (as duplicates, or as unchanged for Zotero) and skipped, and the rest is imported.
 
 ## A note about platform terms
 

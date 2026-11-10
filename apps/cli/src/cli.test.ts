@@ -654,6 +654,97 @@ describe("import, export, secrets and maintenance", () => {
     expect(JSON.parse(await readFile(dump, "utf8"))).not.toContain("AO_ZOTERO_API_KEY");
   }, 60_000);
 
+  it("review round 1 (R81 C1): verify-audit never heals; a truncated or emptied log exits 1; other commands show integrity warnings", async () => {
+    await projectWith("AuditT", GOV_NO_LOOKUPS);
+    await projectWith("AuditE", GOV_NO_LOOKUPS);
+    for (const name of ["AuditT", "AuditE"]) expect((await run(["import", papers, "--project", name])).code).toBe(0);
+    const segs = async (name: string) => {
+      const d = join(lib, "Projects", name, "audit");
+      return (await readdir(d)).sort().map((f) => join(d, f));
+    };
+    // Truncate the tail of one log; empty the other.
+    const tSegs = await segs("AuditT");
+    const last = tSegs.at(-1)!;
+    const lines = (await readFile(last, "utf8")).split("\n").filter(Boolean);
+    await writeFile(last, `${lines.slice(0, -2).join("\n")}\n`);
+    for (const f of await segs("AuditE")) await writeFile(f, "");
+    const before = await readFile(last, "utf8");
+
+    const t = await run(["--json", "verify-audit", "--project", "AuditT"]);
+    expect(t.code).toBe(1);
+    expect(json(t)).toMatchObject({ ok: false, problem: { kind: "truncated" } });
+    const e = await run(["verify-audit", "--project", "AuditE"]);
+    expect(e.code).toBe(1);
+    expect(e.stdout).toMatch(/NOT intact/u);
+    // Nothing healed: the log is as it was, and checking again still fails.
+    expect(await readFile(last, "utf8")).toBe(before);
+    expect((await run(["verify-audit", "--project", "AuditT"])).code).toBe(1);
+
+    // Any other command reports the problem (stderr, and --json), and records it in the log.
+    const listed = await run(["--json", "list", "--project", "AuditT"]);
+    expect(listed.code, listed.stderr).toBe(0);
+    expect(listed.stderr).toMatch(/Warning: .*AuditT.*changed outside the app/u);
+    expect(listed.stderr).not.toContain(tmp);
+    expect(json(listed).integrityWarnings).toEqual(expect.arrayContaining([expect.objectContaining({ project: "AuditT", kind: "truncated" })]));
+    const after = await run(["verify-audit", "--project", "AuditT"]);
+    expect(after.code).toBe(1);
+    expect(after.stdout).toMatch(/the audit log was found altered on \d{4}-\d{2}-\d{2}/u);
+  }, 180_000);
+
+  it("verify-audit on a computer without the project's anchor: UNVERIFIED, exit 0 with a warning", async () => {
+    const r = await run(["verify-audit", "--project", "RefsB"], { AO_CONFIG_DIR: join(tmp, "fresh-config") });
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toContain("UNVERIFIED (no anchor on this device)");
+    expect(r.stderr).toMatch(/Warning/u);
+  }, 60_000);
+
+  it("review round 1 (R81 I1): the whole secrets group never echoes what was typed", async () => {
+    const SECRET = "zk-SECRET-echo-check-987";
+    for (const args of [
+      ["secrets", "set", SECRET],
+      ["secrets", "set", "zotero-api-key", SECRET],
+      ["secrets", SECRET],
+      ["secrets", `--${SECRET}`],
+      ["secrets", "delete", SECRET],
+      ["secrets", "delete", "zotero-api-key", SECRET],
+      ["secrets", "set", "zotero-api-key", "--api-key", SECRET],
+    ]) {
+      const r = await run(args);
+      expect(r.code, args.join(" ")).not.toBe(0);
+      expect(r.stdout + r.stderr, args.join(" ")).not.toContain(SECRET);
+    }
+  }, 120_000);
+
+  it("review round 1: dry run honours the approve flags and reports a governance denial (exit 2); options are checked", async () => {
+    const bibDir = join(tmp, "Refs2");
+    await mkdir(bibDir, { recursive: true });
+    await writeFile(join(bibDir, "b.bib"), `@book{dry2019, title = {Dry}, author = {Doe, Jane}, year = {2019}, file = {${join(elsewhere, "linked.pdf")}}}\n`);
+    await projectWith("DryA", GOV_NO_LOOKUPS.replace("processing", "captureMethods: [manual_upload, refman_import]\nprocessing"));
+    const approved = await run(["--json", "import", join(bibDir, "b.bib"), "--project", "DryA", "--dry-run", "--approve-file", join(elsewhere, "linked.pdf")]);
+    expect(approved.code, approved.stderr).toBe(0);
+    expect(json(approved).outsideFiles).toEqual([]);
+    const denied = await run(["import", papers, "--project", "NoUpload", "--dry-run"]);
+    expect(denied.code).toBe(2);
+    expect(denied.stderr).toMatch(/rules do not allow/u);
+    const zoteroOnly = await run(["import", papers, "--project", "Imp", "--web", "user:1"]);
+    expect(zoteroOnly.code).toBe(1);
+    expect(zoteroOnly.stderr).toContain("only with `import zotero`");
+    const webDry = await run(["import", "zotero", "--project", "Imp", "--web", "user:42", "--dry-run"]);
+    // No keyring on this test machine: a plain message about reading the key (not about saving it).
+    expect([1, 4]).toContain(webDry.code);
+    expect(webDry.stderr).not.toMatch(/was not saved/u);
+  }, 120_000);
+
+  it("review round 1: export --output to a folder or into a missing folder gives a plain message", async () => {
+    const dir = await run(["export", "--project", "RefsB", "--format", "ris", "--output", tmp]);
+    expect(dir.code).toBe(1);
+    expect(dir.stderr).toMatch(/is a folder/u);
+    expect(dir.stderr).not.toContain(tmp);
+    const missing = await run(["export", "--project", "RefsB", "--format", "ris", "--output", join(tmp, "nope", "x.ris")]);
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toMatch(/folder .*does not exist/u);
+  }, 60_000);
+
   it("import zotero needs --data-dir or --web; a bad --web is refused", async () => {
     const none = await run(["import", "zotero", "--project", "Imp"]);
     expect(none.code).toBe(1);

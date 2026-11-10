@@ -1,4 +1,5 @@
-import { basename } from "node:path";
+import { stat } from "node:fs/promises";
+import { basename, dirname } from "node:path";
 import type { Command } from "commander";
 import { REFMAN_FORMATS, writeRefmanExport, type RefmanFormat } from "@ao/library";
 import { EXIT, ExitError } from "../errors.js";
@@ -26,6 +27,12 @@ export function registerExport(program: Command): void {
           ? await Promise.all(refs.map(async (r) => (await resolveSource(s.repo, project.id, r)).source.id))
           : (await findSourceFiles(s.repo, project.id)).sort((a, b) => a.source.createdAt.localeCompare(b.source.createdAt)).map((sf) => sf.source.id);
         const output = resolveUserPath(String(o.output));
+        if ((await stat(output).catch(() => null))?.isDirectory()) {
+          throw new ExitError(`"${basename(output)}" is a folder. Give the name of the file to write, for example refs.${format === "bibtex" ? "bib" : format === "ris" ? "ris" : "json"}.`, EXIT.failure);
+        }
+        if (!(await stat(dirname(output)).catch(() => null))?.isDirectory()) {
+          throw new ExitError(`The folder to write "${basename(output)}" into does not exist. Create it first, or choose another place.`, EXIT.failure);
+        }
         // A governance deny throws PolicyDeniedError (exit 2); nothing is written then.
         const r = await writeRefmanExport(s.repo, project.id, ids, format, output, { includeTags: o.includeTags === true });
         out.data({ project: project.name, format, file: basename(output), exported: r.exported, excluded: r.excluded.length, notes: r.notes });

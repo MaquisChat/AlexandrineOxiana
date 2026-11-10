@@ -18,7 +18,7 @@ import { undoBatch, type UndoResult } from "./undo.js";
 
 export interface BulkImport {
   /** Wizard step 2: what a batch would find; nothing is written. */
-  dryRun(projectId: string, adapter: ImportSourceAdapter): Promise<ScanSummary>;
+  dryRun(projectId: string, adapter: ImportSourceAdapter, opts?: { approveOutside?: { folders?: string[]; files?: string[] } }): Promise<ScanSummary>;
   startBatch(projectId: string, adapter: ImportSourceAdapter, options?: ImportOptionsInput): Promise<BatchHandle>;
   /** Folder, ZIP, reference-manager export and Calibre batches find their source from the record; other kinds need the adapter. */
   resumeBatch(projectId: string, batchId: string, adapter?: ImportSourceAdapter): Promise<BatchHandle>;
@@ -33,7 +33,7 @@ export interface BulkImport {
 export function createBulkImport(deps: BulkImportDeps): BulkImport {
   const { repo } = deps;
   return {
-    dryRun: (p, a) => dryRun(deps, p, a),
+    dryRun: (p, a, o) => dryRun(deps, p, a, o),
     startBatch: (p, a, o) => startBatch(deps, p, a, o),
     resumeBatch: (p, b, a) => resumeBatch(deps, p, b, a),
     listBatches: (p) => listBatches(repo, p),

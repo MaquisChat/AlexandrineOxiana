@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import { COOKIES_ACKNOWLEDGEMENT, type BrowserName, type CaptureOutcome } from "@ao/library";
 import type { Project, SourceFile } from "@ao/core";
-import { EXIT, ExitError } from "../errors.js";
+import { EXIT, ExitError, scrubPaths } from "../errors.js";
 import { createOut, itemView, type ItemView, type Out } from "../output.js";
 import { confirm, isInteractive } from "../prompt.js";
 import { openProject, openSession, type Session } from "../session.js";
@@ -14,15 +14,42 @@ export interface GlobalOpts {
 }
 
 /** Runs a command body with the library open (and always closed again). */
+export interface IntegrityView {
+  /** The project's name, or "library" for the library as a whole. */
+  project: string;
+  kind: string;
+  detail: string;
+}
+
+/** The library's integrity warnings (repo.integrityWarnings), in plain words without paths. */
+export function integrityViews(s: Session): IntegrityView[] {
+  const names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]));
+  return s.repo.integrityWarnings.map((w) => ({
+    project: w.projectId === "*" ? "library" : (names.get(w.projectId) ?? "a project"),
+    kind: w.kind,
+    detail: scrubPaths(w.detail),
+  }));
+}
+
+/**
+ * Runs a command body with the library open (and always closed again). Integrity warnings found
+ * when the library was opened (R81 C1) are printed on stderr and added to the --json document.
+ */
 export async function withSession<T>(
   cmd: Command,
   write: boolean,
   body: (s: Session, out: Out, opts: Record<string, unknown>) => Promise<T>,
+  open: { noHeal?: boolean } = {},
 ): Promise<T> {
   const opts = cmd.optsWithGlobals() as GlobalOpts & Record<string, unknown>;
-  const out = createOut(opts.json === true);
-  const s = await openSession({ library: opts.library, write });
+  const plain = createOut(opts.json === true);
+  const s = await openSession({ library: opts.library, write, ...(open.noHeal ? { noHeal: true } : {}) });
   try {
+    const warnings = integrityViews(s);
+    for (const w of warnings) plain.progress(`Warning: ${w.project}: ${w.detail}`);
+    const out: Out = warnings.length
+      ? { ...plain, data: (v) => plain.data(v && typeof v === "object" && !Array.isArray(v) ? { ...(v as object), integrityWarnings: warnings } : v) }
+      : plain;
     return await body(s, out, opts);
   } finally {
     await s.close();

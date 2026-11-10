@@ -5,12 +5,14 @@ import type { ImportOptionsInput, Project } from "@ao/core";
 import {
   BatchRefusedError,
   HttpClient,
+  SecretStoreUnavailableError,
   ZOTERO_WEB_REASONS,
   bibtexAdapter,
   calibreAdapter,
   createBulkImport,
   cslJsonAdapter,
   folderAdapter,
+  getSecret,
   risAdapter,
   startZoteroWebImport,
   zipAdapter,
@@ -72,9 +74,27 @@ function choice<T extends string>(v: unknown, allowed: readonly T[], what: strin
   return v as T;
 }
 
+/**
+ * The Zotero API key must be saved before a Web import or its preview: none saved → exit 4 (save
+ * one, then run again); no keyring → exit 1. The key itself is only checked for, never kept here.
+ */
+export async function requireWebKey(): Promise<void> {
+  let present = false;
+  try {
+    present = (await getSecret("zotero-api-key")) !== null;
+  } catch (err) {
+    if (err instanceof SecretStoreUnavailableError) throw new ExitError(ZOTERO_WEB_REASONS.noStore, EXIT.failure, "On Linux, a keyring service (such as GNOME Keyring or KWallet) must be running.");
+    throw err;
+  }
+  if (!present) throw new ExitError(ZOTERO_WEB_REASONS.noKey, EXIT.needsAction, "Save it with: ao secrets set zotero-api-key");
+}
+
+function approvals(o: Record<string, unknown>): { folders: string[]; files: string[] } {
+  return { folders: ((o.approveFolder as string[] | undefined) ?? []).map(resolveUserPath), files: ((o.approveFile as string[] | undefined) ?? []).map(resolveUserPath) };
+}
+
 function batchOptions(o: Record<string, unknown>): ImportOptionsInput {
-  const folders = ((o.approveFolder as string[] | undefined) ?? []).map(resolveUserPath);
-  const files = ((o.approveFile as string[] | undefined) ?? []).map(resolveUserPath);
+  const { folders, files } = approvals(o);
   if (o.rememberFolder && !folders.length) throw new ExitError("--remember-folder remembers the folders given with --approve-folder; add one.", EXIT.failure);
   const structure = choice(o.structure, STRUCTURES, "structure");
   const duplicates = choice(o.duplicates, DUPLICATES, "way to handle duplicates");
@@ -104,11 +124,29 @@ function summaryLines(s: ScanSummary): string[] {
   return lines;
 }
 
-async function runBatch(s: Session, project: Project, out: Out, h: BatchHandle, bulk: ReturnType<typeof createBulkImport>): Promise<void> {
+/**
+ * Starts the batch and reports it. The Ctrl+C hook is registered before the batch starts, so a
+ * batch started while the program is closing is cancelled at once; with --json, Ctrl+C prints
+ * `{batchId, state}` so a script knows which batch to look at.
+ */
+async function startAndRun(s: Session, project: Project, out: Out, bulk: ReturnType<typeof createBulkImport>, start: () => Promise<BatchHandle>): Promise<void> {
+  let handle: BatchHandle | undefined;
+  let closing = false;
   s.beforeClose(async () => {
-    h.cancel();
-    await h.done.catch(() => {});
+    closing = true;
+    if (!handle) return;
+    handle.cancel();
+    const r = await handle.done.catch(() => undefined);
+    if (out.json && r && r.state !== "finished") process.stdout.write(`${JSON.stringify({ batchId: r.batchId, state: r.state })}\n`);
   });
+  let h: BatchHandle;
+  try {
+    h = await start();
+  } catch (err) {
+    refused(err);
+  }
+  handle = h;
+  if (closing) h.cancel();
   let last = "";
   const progress = (async () => {
     for await (const p of h.progress) {
@@ -146,6 +184,19 @@ async function runBatch(s: Session, project: Project, out: Out, h: BatchHandle, 
   if (r.state !== "finished" || c.failed > 0) process.exitCode = EXIT.failure;
 }
 
+/** A dry run, with governance refusals mapped like a real start (exit 2). */
+async function preview(out: Out, run: () => Promise<ScanSummary>): Promise<void> {
+  let summary: ScanSummary;
+  try {
+    summary = await run();
+  } catch (err) {
+    refused(err);
+  }
+  out.data(summary);
+  for (const l of summaryLines(summary)) out.line(l);
+  if (summary.items === 1 && summary.unreadable.length === 1 && summary.unreadable[0]!.path === "zotero-web:") process.exitCode = EXIT.failure;
+}
+
 /** A refused batch: governance → exit 2; a missing Zotero key → exit 4 (save one, then run again); else 1. */
 function refused(err: unknown): never {
   if (err instanceof BatchRefusedError) {
@@ -179,6 +230,10 @@ export function registerImport(program: Command): void {
         const deps: BulkImportDeps = { repo: s.repo, http: new HttpClient({ libraryRoot: s.lib.root }), index: s.index };
         const bulk = createBulkImport(deps);
         const zotero = target === "zotero" && (o.dataDir !== undefined || o.web !== undefined || !(await exists(resolveUserPath(target))));
+        if (!zotero && (o.dataDir !== undefined || o.web !== undefined || o.full)) {
+          throw new ExitError("--data-dir, --web and --full work only with `import zotero` (for example: ao import zotero --web user:<id> --project <name>).", EXIT.failure);
+        }
+        if (zotero && o.web === undefined && o.full) throw new ExitError("--full works only with --web.", EXIT.failure);
         if (zotero && o.dataDir === undefined && o.web === undefined) {
           throw new ExitError("Say which Zotero library: --data-dir <folder> (Zotero on this computer) or --web user:<id> / group:<id> (zotero.org).", EXIT.failure);
         }
@@ -186,21 +241,13 @@ export function registerImport(program: Command): void {
 
         if (zotero && o.web !== undefined) {
           const lib = parseWeb(String(o.web));
+          await requireWebKey();
           if (o.dryRun) {
             const since = o.full ? undefined : zoteroWebSince(s.repo, project.id, `${lib.libraryType}:${lib.libraryId}`);
-            const summary = await bulk.dryRun(project.id, zoteroWebAdapter({ ...lib, ...(since !== undefined ? { since } : {}) }));
-            out.data(summary);
-            for (const l of summaryLines(summary)) out.line(l);
-            if (summary.items === 1 && summary.unreadable.length === 1 && summary.unreadable[0]!.path === "zotero-web:") process.exitCode = EXIT.failure;
+            await preview(out, () => bulk.dryRun(project.id, zoteroWebAdapter({ ...lib, ...(since !== undefined ? { since } : {}) }), { approveOutside: approvals(o) }));
             return;
           }
-          let h: BatchHandle;
-          try {
-            h = await startZoteroWebImport(deps, project.id, { ...lib, ...(o.full ? { full: true } : {}) }, options);
-          } catch (err) {
-            refused(err);
-          }
-          await runBatch(s, project, out, h, bulk);
+          await startAndRun(s, project, out, bulk, () => startZoteroWebImport(deps, project.id, { ...lib, ...(o.full ? { full: true } : {}) }, options));
           return;
         }
 
@@ -213,18 +260,10 @@ export function registerImport(program: Command): void {
           adapter = await adapterForPath(resolveUserPath(target));
         }
         if (o.dryRun) {
-          const summary = await bulk.dryRun(project.id, adapter);
-          out.data(summary);
-          for (const l of summaryLines(summary)) out.line(l);
+          await preview(out, () => bulk.dryRun(project.id, adapter, { approveOutside: approvals(o) }));
           return;
         }
-        let h: BatchHandle;
-        try {
-          h = await bulk.startBatch(project.id, adapter, options);
-        } catch (err) {
-          refused(err);
-        }
-        await runBatch(s, project, out, h, bulk);
+        await startAndRun(s, project, out, bulk, () => bulk.startBatch(project.id, adapter, options));
       });
     });
 }

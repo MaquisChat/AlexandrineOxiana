@@ -37,6 +37,7 @@ import {
   Asset,
   ImportOptions,
   LinkedRelativePath,
+  evaluate,
   findDuplicate,
   newId,
   vetFileNamePattern,
@@ -1539,13 +1540,38 @@ export async function listBatches(repo: Repo, projectId: string): Promise<BatchS
 }
 
 /**
+ * The capture and store a batch of this kind would ask for, evaluated without writing anything
+ * (a dry run writes no audit event): a deny is BatchRefusedError with `denied`.
+ */
+async function dryRunPolicy(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"]): Promise<void> {
+  const policy = await projectPolicyOrDefault(repo, projectId);
+  if (!policy) throw new BatchRefusedError("This project's governance settings could not be read, so nothing may be imported.", true);
+  const method = CAPTURE_METHOD[kind];
+  const { identifiable, legalBasis } = await storeInputs(repo, projectId, legalCategory(method));
+  const base = { projectId, actor: "dry-run", now: new Date().toISOString().replace(/\.\d{3}Z$/u, "Z") };
+  for (const req of [
+    { ...base, action: "capture" as const, capture: { method } },
+    { ...base, action: "store" as const, store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } },
+  ]) {
+    const d = evaluate(policy, req);
+    if (d.result === "deny") throw new BatchRefusedError(d.reason, true);
+  }
+}
+
+/**
  * Dry run (wizard step 2): what a batch from `adapter` would find. Nothing is written to the
  * library: archives are unpacked into a private work folder that is removed before this returns;
  * nothing is looked up online and no audit event is written.
  */
-export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: ImportSourceAdapter): Promise<ScanSummary> {
+export async function dryRun(
+  deps: BulkImportDeps,
+  projectId: string,
+  adapter: ImportSourceAdapter,
+  opts: { approveOutside?: { folders?: string[]; files?: string[] } } = {},
+): Promise<ScanSummary> {
   const repo = deps.repo;
   repo.getProject(projectId);
+  await dryRunPolicy(repo, projectId, adapter.kind);
   const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
   const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [], outsideFiles: [] };
   const name = `batch-dry-${newId()}`;
@@ -1569,7 +1595,9 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
       },
       dryRun: true,
     });
-    const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))]);
+    // The approvals the batch would be given count here too (kept in memory only, under a throwaway secret).
+    const secret = randomBytes(32).toString("hex");
+    const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
     for await (const scanned of scan) {
       let item = scanned;
       summary.items++;

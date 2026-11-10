@@ -5,8 +5,11 @@ import { createOut } from "../output.js";
 import { ask, isInteractive, zoteroKeyFromEnv } from "../prompt.js";
 import type { GlobalOpts } from "./common.js";
 
+/** What the group says when its input is not understood: never what was typed (it may be a key, R81 I1). */
+const NOT_UNDERSTOOD = `That is not a secrets command ao understands (what you typed is not shown, in case it was a key).\nUse: ao secrets set ${SECRET_NAMES[0]}   or   ao secrets delete ${SECRET_NAMES[0]}\n`;
+
 function secretName(v: string): SecretName {
-  if (!(SECRET_NAMES as readonly string[]).includes(v)) throw new ExitError(`"${v}" is not a key ao keeps.`, EXIT.failure, `Keys: ${SECRET_NAMES.join(", ")}`);
+  if (!(SECRET_NAMES as readonly string[]).includes(v)) throw new ExitError("That is not a key ao keeps (the name you typed is not shown, in case it was a key).", EXIT.failure, `Keys: ${SECRET_NAMES.join(", ")}`);
   return v as SecretName;
 }
 
@@ -21,7 +24,13 @@ function storeError(err: unknown): never {
  * typed at a hidden prompt, or given once in AO_ZOTERO_API_KEY (read and removed at startup).
  */
 export function registerSecrets(program: Command): void {
-  const secrets = program.command("secrets").description("Save or remove API keys (kept only in your system's keychain, never in files)");
+  const secrets = program
+    .command("secrets")
+    .description("Save or remove API keys (kept only in your system's keychain, never in files)")
+    // Commander's own errors repeat the unknown word (an unknown subcommand, option or extra
+    // argument): inside this group they are replaced by a fixed message. Subcommands inherit this.
+    .configureOutput({ outputError: (_str, write) => write(NOT_UNDERSTOOD) })
+    .showHelpAfterError(false);
   secrets
     .command("set")
     .description("Save a key: you are asked for it (what you type is hidden)")
@@ -58,7 +67,10 @@ export function registerSecrets(program: Command): void {
     .command("delete")
     .description("Remove a saved key")
     .argument("<name>", `which key: ${SECRET_NAMES.join(", ")}`)
+    .allowExcessArguments(true)
+    .allowUnknownOption(true)
     .action(async (name: string, _o: unknown, cmd: Command) => {
+      if (cmd.args.length > 1 || name.startsWith("-")) throw new ExitError(NOT_UNDERSTOOD.trim(), EXIT.failure);
       const out = createOut((cmd.optsWithGlobals() as GlobalOpts).json === true);
       const n = secretName(name);
       let removed = false;

@@ -27,18 +27,31 @@ export function registerMaintenance(program: Command): void {
 
   program
     .command("verify-audit")
-    .description("Check that a project's audit log is intact (its hash chain, and the head recorded outside the library)")
+    .description("Check that a project's audit log is intact (its hash chain, and the head recorded on this computer); changes nothing")
     .requiredOption("--project <name>", "the project")
     .action(async (_o: unknown, cmd: Command) => {
-      await withSession(cmd, false, async (s, out, o) => {
-        const project = findProject(s.repo, o.project as string | undefined);
-        const r = await s.repo.verifyAudit(project.id);
-        out.data({ project: project.name, ok: r.ok, events: r.events, anchored: r.anchored, ...(r.problem ? { problem: r.problem } : {}) });
-        if (r.ok) out.line(`The audit log of "${project.name}" is intact (${r.events} events${r.anchored ? ", matching the recorded head" : ""}).`);
-        else {
-          out.line(`The audit log of "${project.name}" is NOT intact: ${r.problem?.detail ?? "unknown problem"}.`);
-          process.exitCode = EXIT.failure;
-        }
-      });
+      // Opened without healing (R81 C1): no recovery, no re-anchoring, nothing recorded.
+      await withSession(
+        cmd,
+        false,
+        async (s, out, o) => {
+          const project = findProject(s.repo, o.project as string | undefined);
+          const r = await s.repo.verifyAudit(project.id);
+          const altered = r.alteredAt.map((at) => at.slice(0, 10));
+          out.data({ project: project.name, ok: r.ok, events: r.events, anchored: r.anchored, alteredAt: r.alteredAt, ...(r.problem ? { problem: r.problem } : {}) });
+          if (!r.ok) {
+            out.line(`The audit log of "${project.name}" is NOT intact.`);
+            if (r.problem) out.line(`  ${r.problem.detail}.`);
+            for (const d of [...new Set(altered)]) out.line(`  the audit log was found altered on ${d}.`);
+            process.exitCode = EXIT.failure;
+          } else if (!r.anchored) {
+            out.line(`The audit log of "${project.name}" is consistent (${r.events} events), but UNVERIFIED (no anchor on this device).`);
+            out.progress("Warning: this computer has no record of the log's head to compare with, so a shortened or replaced log cannot be detected here.");
+          } else {
+            out.line(`The audit log of "${project.name}" is intact (${r.events} events, matching the recorded head).`);
+          }
+        },
+        { noHeal: true },
+      );
     });
 }
