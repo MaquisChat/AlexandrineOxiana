@@ -133,4 +133,8 @@ export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCa
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";
 
 export * from "./extract/index.js";
+export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/resolve.js";
+export type { Resolution, ResolveContext, ResolveInput } from "./import/resolve.js";
+export { FOLDER_REASON, createAttach } from "./import/attach.js";
+export type { Attach, AttachDeps, AttachOutcome, AttachStatus } from "./import/attach.js";
 export * from "./lookup/index.js";

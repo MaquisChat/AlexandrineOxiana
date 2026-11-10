@@ -1,7 +1,7 @@
 /** Derived assets: new dated files under `derived/`, never overwriting (spec 4.2). */
-import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix } from "@ao/core";
+import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix, type Provenance } from "@ao/core";
 import { foldName, mimeFor, namesIn } from "./io.js";
-import { runMutation } from "./mutate.js";
+import { runMutation, type MutateRequest } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
 import type { RepoCore } from "./state.js";
 
@@ -101,15 +101,26 @@ export async function addDerivedAsset(
  * snapshot is a new, dated original next to the first one). Named `<source> - <label>.<ext>` in
  * `original/`, governed and audited like any change to the source.
  */
-export async function addOriginalAsset(core: RepoCore, projectId: string, sourceId: string, input: OriginalAssetInput): Promise<Asset> {
+export async function addOriginalAsset(
+  core: RepoCore,
+  projectId: string,
+  sourceId: string,
+  input: OriginalAssetInput,
+  /** Package-internal: a newly captured file (e.g. a drop onto the source): its capture method is evaluated and audited in the same change. */
+  internal: { captureMethod?: Provenance["captureMethod"] } = {},
+): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
   const current = await readSourceFile(core, st, sourceId);
+  const reqs: MutateRequest[] = [
+    ...(internal.captureMethod ? [{ action: "capture" as const, capture: { method: internal.captureMethod } }] : []),
+    storeRequest(current.source.provenance),
+  ];
   return runMutation(
     core,
     projectId,
-    storeRequest(current.source.provenance),
+    reqs,
     async (tx) => {
       const cur = await readSourceFile(core, st, sourceId);
       const folder = cur.source.folder;

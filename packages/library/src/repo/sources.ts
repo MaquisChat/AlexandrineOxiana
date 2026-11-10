@@ -27,7 +27,7 @@ import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe
 import { runMutation, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
-import { appendReviewEntry } from "./review.js";
+import { appendReviewEntry, type ReviewInput } from "./review.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
 export interface SourceInputFile {
@@ -38,6 +38,8 @@ export interface SourceInputFile {
   kind?: string;
   /** The file is already in this project's encrypted format (e.g. a media worker output). Copy only. */
   encrypted?: boolean;
+  /** Stored file extension, e.g. from the sniffed type (default: the path's extension). */
+  ext?: string;
   metadata?: Asset["metadata"];
 }
 
@@ -47,7 +49,7 @@ export interface CreateSourceOptions {
   verification?: Record<string, FieldVerification>;
   availability?: Availability;
   /** Also queue the new source for review (written to `review/pending.jsonl` in the same change, R31). */
-  reviewItem?: { fields: Record<string, string>; reasons: string[] };
+  reviewItem?: Omit<ReviewInput, "sourceId">;
 }
 
 export type SourcePatch = Partial<Omit<Source, "id">>;
@@ -246,7 +248,8 @@ export async function createSource(
       const hashes: Record<string, string> = {};
       for (const f of files) {
         const assetId = newId();
-        const ext = extname(f.encrypted ? f.path.replace(/\.enc$/i, "") : f.path).slice(1).toLowerCase() || "bin";
+        const ext =
+          f.ext?.replace(/^\.+/, "").toLowerCase() || extname(f.encrypted ? f.path.replace(/\.enc$/i, "") : f.path).slice(1).toLowerCase() || "bin";
         let name = originalFileName(folderBase, ext);
         if (tx.encrypted) name = encName(name);
         name = withCollisionSuffix(name, (n) => used.has(foldName(n)));

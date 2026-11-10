@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { effectivePolicy, parseGovernance, recheckSourceFile } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Session, SourceDraft, SourceFile, Tag, VerifyContext } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -460,6 +460,20 @@ export function createSourcePreAuthorized(
   opts: CreateSourceOptions,
 ): Promise<SourceFile> {
   return createSource(cores.get(repo)!, projectId, draft, files, opts, { captureAuthorized: true });
+}
+
+/**
+ * Package-internal (drag-and-drop attach): adds a newly captured file as an original of an existing
+ * source in one governed change that evaluates and audits both its capture method and `store`.
+ */
+export function addCapturedOriginal(
+  repo: Repo,
+  projectId: string,
+  sourceId: string,
+  input: OriginalAssetInput,
+  captureMethod: Provenance["captureMethod"],
+): Promise<Asset> {
+  return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, { captureMethod });
 }
 
 /** Package-internal (link capture): the project's change stamp as the index would record it now. */

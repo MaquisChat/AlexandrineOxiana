@@ -24,6 +24,26 @@ export interface ReviewEntry {
   fields: Record<string, string>;
   /** Plain-language reasons (may quote titles and names). */
   reasons: string[];
+  /** Import items: the identification confidence the resolution reached. */
+  confidence?: number;
+  /** Import items: the identification method (`Evidence.method`). */
+  method?: string;
+  /** Import items: up to 3 candidate matches from lookups (may quote titles and names). */
+  candidates?: unknown[];
+  /** Import items: an existing source this one may duplicate. */
+  duplicateOf?: { sourceId: string; reason: string };
+}
+
+/** What a caller queues; the entry's id, project, status and time are filled in. */
+export interface ReviewInput {
+  sourceId?: string;
+  kind?: ReviewEntry["kind"];
+  fields: Record<string, string>;
+  reasons: string[];
+  confidence?: number;
+  method?: string;
+  candidates?: unknown[];
+  duplicateOf?: { sourceId: string; reason: string };
 }
 
 /** A `review_items` row; `payload` is safe for the persistent index (nothing identifying when `encrypted`). */
@@ -39,13 +59,19 @@ export interface ReviewItemRow {
 }
 
 export function reviewRow(e: ReviewEntry, encrypted: boolean): ReviewItemRow {
+  const safe = {
+    fields: e.fields,
+    ...(e.confidence !== undefined ? { confidence: e.confidence } : {}),
+    ...(e.method ? { method: e.method } : {}),
+    ...(e.duplicateOf ? { duplicateOf: e.duplicateOf } : {}),
+  };
   return {
     id: e.id,
     projectId: e.projectId,
     ...(e.sourceId ? { sourceId: e.sourceId } : {}),
     kind: e.kind,
     status: e.status,
-    payload: encrypted ? { fields: e.fields } : { fields: e.fields, reasons: e.reasons },
+    payload: encrypted ? safe : { ...safe, reasons: e.reasons, ...(e.candidates ? { candidates: e.candidates } : {}) },
     createdAt: e.createdAt,
   };
 }
@@ -54,7 +80,7 @@ export function reviewRow(e: ReviewEntry, encrypted: boolean): ReviewItemRow {
 export async function appendReviewEntry(
   core: RepoCore,
   tx: Tx,
-  input: { sourceId?: string; kind?: ReviewEntry["kind"]; fields: Record<string, string>; reasons: string[] },
+  input: ReviewInput,
 ): Promise<ReviewEntry> {
   const st = tx.state;
   const entry: ReviewEntry = {
@@ -66,6 +92,10 @@ export async function appendReviewEntry(
     createdAt: tx.at,
     fields: input.fields,
     reasons: input.reasons,
+    ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
+    ...(input.method ? { method: input.method } : {}),
+    ...(input.candidates?.length ? { candidates: input.candidates } : {}),
+    ...(input.duplicateOf ? { duplicateOf: input.duplicateOf } : {}),
   };
   const json = JSON.stringify(entry);
   const encrypted = core.encrypted(st);

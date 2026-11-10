@@ -4,6 +4,8 @@ export declare function buildZip(entries: { name: string; data: Buffer | string;
 export declare function tinyPng(): Buffer;
 export declare function tinyTiff(): Buffer;
 export declare function buildMobi(opts?: { exth?: [number, string][]; fullName?: string; corruptExth?: boolean }): Buffer;
+export declare function buildPdf(opts?: { title?: string; author?: string; lines?: string[]; extra?: string }): Promise<Buffer>;
+export declare function buildDoiPdf(): Promise<Buffer>;
 export interface GeneratedFixtures {
   doiPdf: string;
   scannedPdf: string;

@@ -16,6 +16,7 @@
     "@ao/core": "workspace:*",
     "better-sqlite3": "^12.11.1",
     "exiftool-vendored": "39.0.1",
+    "file-type": "22.2.0",
     "pdfjs-dist": "6.4.299",
     "undici": "8.12.3",
     "yauzl": "3.4.0"

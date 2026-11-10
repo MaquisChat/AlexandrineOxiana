@@ -190,6 +190,31 @@ async function pdfWithDoi() {
   return Buffer.from(await doc.save({ useObjectStreams: false }));
 }
 
+/**
+ * A simple text PDF for import tests: optional Info title/author, the given lines on page 1.
+ * Deterministic (fixed dates). `extra` adds bytes to a comment so otherwise identical PDFs differ.
+ * @param {{ title?: string, author?: string, lines?: string[], extra?: string }} [opts]
+ */
+export async function buildPdf(opts = {}) {
+  const { PDFDocument, StandardFonts } = requireLib("pdf-lib");
+  const doc = await PDFDocument.create({ updateMetadata: false });
+  if (opts.title) doc.setTitle(opts.title);
+  if (opts.author) doc.setAuthor(opts.author);
+  doc.setCreationDate(FIXED_DATE);
+  doc.setModificationDate(FIXED_DATE);
+  doc.setProducer("ao-fixtures");
+  if (opts.extra) doc.setSubject(opts.extra);
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage([595, 842]);
+  (opts.lines ?? []).forEach((l, i) => page.drawText(l, { x: 50, y: 780 - i * 22, size: 11, font }));
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+/** The DOI article PDF (`doiPdf` of generateFixtures) as bytes. */
+export function buildDoiPdf() {
+  return pdfWithDoi();
+}
+
 async function scannedPdf() {
   const { PDFDocument } = requireLib("pdf-lib");
   const doc = await PDFDocument.create({ updateMetadata: false });

@@ -9,7 +9,7 @@ export type { CreateProjectInput, ProjectKeyFile } from "./projects.js";
 export type { CreateSourceOptions, SourceInputFile, SourcePatch } from "./sources.js";
 export type { DerivedAssetInput, OriginalAssetInput } from "./assets.js";
 export type { AcknowledgementKind } from "./acknowledge.js";
-export type { ReviewEntry, ReviewItemRow } from "./review.js";
+export type { ReviewEntry, ReviewInput, ReviewItemRow } from "./review.js";
 export { REVIEW_FILE } from "./review.js";
 export type { ConsentInput, ParticipantInput, SessionInput } from "./fieldwork.js";
 export {
