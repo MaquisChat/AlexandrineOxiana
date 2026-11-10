@@ -18,6 +18,7 @@ import { openTestRepo } from "../repo/testing.js";
 import { SECRET_STORE_UNAVAILABLE, getSecret, setSecret } from "../secrets.js";
 import { useMemorySecrets, useNoSecretStore } from "../secrets-testing.js";
 import { BatchRefusedError, createBulkImport, type ScanContext, type ScanItem } from "./bulk/index.js";
+import { LOCATION_REASON } from "./common.js";
 import {
   ZOTERO_STORAGE_HOSTS,
   ZOTERO_WEB_FILE_NOTES,
@@ -747,6 +748,24 @@ processing:
     expect(r.counts.failed).toBe(1);
     expect((await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId)).failures).toEqual([{ item: expect.stringContaining("LOCPHOT1"), reason: LOCATION_NEEDS_ENCRYPTION }]);
     expect((await sources(p)).some((s) => s.source.provenance.externalKeys?.zoteroKey === "LOCPHOT1")).toBe(false);
+  });
+
+  it("R83 allowed path: in an encrypted coarsen project the located photo is stored encrypted, with a coarsened proxy pending", async () => {
+    const p = (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: GOV, encryption: { enabled: true, passphrase: "pw" } })).project;
+    await serveLocatedPhoto("LOCPHOT2", "LOCATT02", 41);
+    const h = await startZoteroWebImport(bulkDeps(), p.id, web);
+    const r = await h.done;
+    expect(r.counts).toMatchObject({ failed: 0, created: 1 });
+    const report = await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId);
+    expect(report.failures).toEqual([]);
+    expect(report.notes).toContain(LOCATION_REASON);
+    const sf = (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === "LOCPHOT2")!;
+    const photo = sf.assets.find((a) => a.role === "original" && a.kind === "image")!;
+    expect(photo.encrypted).toBe(true);
+    expect(sf.pendingProxies?.map((j) => [j.type, j.location, j.assetId])).toEqual([["image.proxy", "coarsen", photo.id]]);
+    // The original (with its GPS) is on disk only as an encrypted file.
+    expect(photo.path).toMatch(/\.enc$/u);
+    expect((await readFile(join(lib.root, photo.path))).subarray(0, 4).toString("latin1")).not.toBe("II*\0");
   });
 
   it("since is recorded only when nothing failed: a failed item or a failed download leaves it unchanged", async () => {

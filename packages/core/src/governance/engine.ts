@@ -38,7 +38,7 @@ export type PolicyDecision = { warnings: string[] } & (
  * (`locationMetadata` coarsen or strip) but is not encrypted (R85 M5): the decision carries both an
  * `encrypt` and a `location` condition, and an unencrypted project cannot honour them.
  */
-export const LOCATION_NEEDS_ENCRYPTION = "This project hides locations, so photos with a location can only be stored in an encrypted project.";
+export const LOCATION_NEEDS_ENCRYPTION = "This project hides locations, so files with a location can only be stored in an encrypted project.";
 
 const DAY_MS = 86_400_000;
 const EXPIRY_WARNING_DAYS = 30;

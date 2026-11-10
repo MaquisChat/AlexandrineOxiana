@@ -126,7 +126,7 @@ describe("store", () => {
     }
     expect(evaluate(cfg("encryption: { atRest: optional }\nsharing: { locationMetadata: keep }"), st({ hasLocation: true })).result).toBe("allow");
     expect(evaluate(cfg("encryption: { atRest: optional }"), st({ hasLocation: false })).result).toBe("allow");
-    expect(LOCATION_NEEDS_ENCRYPTION).toBe("This project hides locations, so photos with a location can only be stored in an encrypted project.");
+    expect(LOCATION_NEEDS_ENCRYPTION).toBe("This project hides locations, so files with a location can only be stored in an encrypted project.");
   });
   it("allows location data when encryption is off but location is kept", () => {
     const d = evaluate(cfg("encryption: { atRest: off }\nsharing: { locationMetadata: keep }"), st({ hasLocation: true }));
