@@ -8,7 +8,7 @@
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { SimulatedCrash, seams } from "./seams.js";
 import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
 
@@ -216,6 +216,6 @@ export class AnchorStore {
     anchors[key] = { seq: head.seq, hash: head.hash, at };
     await fsp.mkdir(join(this.path, ".."), { recursive: true });
     const body: AnchorsJson = { formatVersion: 1, anchors };
-    await writeFileAtomic(this.path, JSON.stringify(body, null, 2), { mode: 0o600 });
+    await writeSmallFileAtomic(this.path, JSON.stringify(body, null, 2), { mode: 0o600 });
   }
 }

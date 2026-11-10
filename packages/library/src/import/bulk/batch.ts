@@ -1,0 +1,192 @@
+/**
+ * An import batch's files (spec 3.8, R31): `<Project>/imports/batch-<NNNN>/`
+ *
+ *   batch.json      the ImportBatch record plus state, created ids, notes and governance decisions
+ *   journal.jsonl   one line per finished item `{ key, outcome, sourceId?, reason?, mergedInto?, snapshot? }`
+ *   snapshots/      pre-merge copies of merged sources' source.json (for undo)
+ *   report.md/.json the import report
+ *
+ * In encrypted projects every file is encrypted (`.enc`) and every journal line is sealed with the
+ * project key, the way profile capture writes them (Task 18), so nothing about the items sits in
+ * plaintext. Unencrypted files are owner-only (0600). The index holds no batch data: these files
+ * are the record.
+ */
+import { join } from "node:path";
+import { ImportBatch, encName, type PolicyDecision } from "@ao/core";
+import { decryptBytes, namesIn, openLine, readMaybe, sealLine } from "../../repo/io.js";
+import type { MutateRequest, Tx } from "../../repo/mutate.js";
+import { projectDataKey, repoLibrary, type Repo } from "../../repo/repo.js";
+
+/** Batches running in this process (a `running` batch.json not listed here was interrupted, R45). */
+export const activeBatches = new Set<string>();
+
+export const JOURNAL_PURPOSE = "ao-import-journal";
+/** Batch bookkeeping is organizing data (like collections): no identifiable data of its own. */
+export const BOOKKEEPING: MutateRequest = { action: "store", store: { identifiable: false, hasLocation: false } };
+export const PRIVATE_MODE = 0o600;
+
+export type BatchState = "running" | "paused" | "cancelled" | "finished" | "failed" | "undone";
+/** As shown: a `running` batch no process is running is `interrupted` (R45). */
+export type ShownState = BatchState | "interrupted";
+
+export type ItemOutcome = "created" | "needs-review" | "duplicate" | "merged" | "failed" | "incomplete";
+
+export interface JournalEntry {
+  key: string;
+  outcome: ItemOutcome | string;
+  sourceId?: string;
+  reason?: string;
+  /** Merges: the existing source the item was merged into, and the pre-merge snapshot (project-relative). */
+  mergedInto?: string;
+  snapshot?: string;
+  reviewId?: string;
+  /** A review decision taken later (decideReview), journaled for undo. */
+  decision?: string;
+}
+
+export interface GovernanceNote {
+  action: string;
+  result: PolicyDecision["result"];
+  reason?: string;
+  conditions?: unknown[];
+  /** Items this applied to (per-item denies). */
+  items?: number;
+}
+
+export interface BatchRecord extends ImportBatch {
+  state: BatchState;
+  /** Batch folder, relative to the project folder (`imports/batch-0001`). */
+  dir: string;
+  createdSourceIds: string[];
+  createdCollectionIds: string[];
+  createdTagIds: string[];
+  governance: GovernanceNote[];
+  /** Plain-language notes for the report (pattern timeouts, OCR not available, ...). */
+  notes: string[];
+  /** Total items, when the source could count them. */
+  total?: number;
+  ocrQueued?: number;
+  /** Profile capture (Task 18): counts detail. */
+  countsDetail?: Record<string, number>;
+}
+
+/** `<project folder>/imports`. */
+export const importsRel = (projectRel: string) => `${projectRel}/imports`;
+
+export function fileName(name: string, encrypted: boolean): string {
+  return encrypted ? encName(name) : name;
+}
+
+/** Reads a project-relative file (decrypting it in encrypted projects); undefined when absent. */
+export async function readProjectText(repo: Repo, projectId: string, rel: string): Promise<string | undefined> {
+  const key = projectDataKey(repo, projectId);
+  const root = repoLibrary(repo).root;
+  const raw = await readMaybe(join(root, ...(key ? encName(rel) : rel).split("/")));
+  if (!raw) return undefined;
+  if (!key) return raw.toString("utf8");
+  return (await decryptBytes((id) => (id === key.keyId ? key.key : undefined), raw)).toString("utf8");
+}
+
+/** The batch folders of a project, `batch-NNNN` names with their numbers, ascending. */
+export async function batchDirs(repo: Repo, projectId: string): Promise<Array<{ name: string; number: number }>> {
+  const projectRel = repo.getProject(projectId).folder;
+  const abs = join(repoLibrary(repo).root, ...importsRel(projectRel).split("/"));
+  return [...(await namesIn(abs))]
+    .map((n) => ({ name: n, m: /^batch-(\d+)$/.exec(n) }))
+    .filter((x) => x.m)
+    .map((x) => ({ name: x.name, number: Number(x.m![1]) }))
+    .sort((a, b) => a.number - b.number);
+}
+
+/** Reads one batch.json (any batch kind; profile-capture records have no `dir`). */
+export async function readBatchAt(repo: Repo, projectId: string, dirName: string): Promise<BatchRecord | undefined> {
+  const projectRel = repo.getProject(projectId).folder;
+  const text = await readProjectText(repo, projectId, `${importsRel(projectRel)}/${dirName}/batch.json`);
+  if (!text) return undefined;
+  const raw = JSON.parse(text) as Partial<BatchRecord>;
+  return {
+    ...(raw as BatchRecord),
+    dir: `imports/${dirName}`,
+    createdSourceIds: raw.createdSourceIds ?? [],
+    createdCollectionIds: raw.createdCollectionIds ?? [],
+    createdTagIds: raw.createdTagIds ?? [],
+    governance: raw.governance ?? [],
+    notes: raw.notes ?? [],
+    state: (raw.state ?? "finished") as BatchState,
+  };
+}
+
+/** Finds a batch by id among the project's batch folders. */
+export async function findBatch(repo: Repo, projectId: string, batchId: string): Promise<BatchRecord | undefined> {
+  for (const d of (await batchDirs(repo, projectId)).reverse()) {
+    try {
+      const r = await readBatchAt(repo, projectId, d.name);
+      if (r?.id === batchId) return r;
+    } catch {
+      // an unreadable batch record is not this one
+    }
+  }
+  return undefined;
+}
+
+/** Writes batch.json inside a running change. */
+export async function writeBatchRecord(tx: Tx, projectRel: string, rec: BatchRecord): Promise<void> {
+  const dir = `${projectRel}/${rec.dir}`;
+  await tx.mkdir(dir);
+  const { dir: _d, ...body } = rec;
+  ImportBatch.parse(body); // fail loud on a malformed record
+  await tx.writeFile(`${dir}/${fileName("batch.json", tx.encrypted)}`, JSON.stringify(body, null, 2), {
+    encrypt: tx.encrypted,
+    ...(tx.encrypted ? {} : { mode: PRIVATE_MODE }),
+  });
+}
+
+/** Appends journal lines inside a running change (sealed in encrypted projects). */
+export async function appendJournal(tx: Tx, projectRel: string, dir: string, entries: JournalEntry[]): Promise<void> {
+  for (const e of entries) {
+    const json = JSON.stringify(e);
+    const line = tx.encrypted ? sealLine(tx.key().key, tx.key().keyId, tx.projectId, json, JOURNAL_PURPOSE) : json;
+    await tx.appendLine(`${projectRel}/${dir}/journal.jsonl`, line, tx.encrypted ? {} : { mode: PRIVATE_MODE });
+  }
+}
+
+/** Every journal line of a batch, in order (unreadable lines skipped). */
+export async function readJournal(repo: Repo, projectId: string, dir: string): Promise<JournalEntry[]> {
+  const projectRel = repo.getProject(projectId).folder;
+  const raw = await readMaybe(join(repoLibrary(repo).root, ...`${projectRel}/${dir}/journal.jsonl`.split("/")));
+  if (!raw) return [];
+  const key = projectDataKey(repo, projectId);
+  const out: JournalEntry[] = [];
+  for (const line of raw.toString("utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const json = key ? openLine(key.key, projectId, line, JOURNAL_PURPOSE) : line;
+      const e = JSON.parse(json) as JournalEntry;
+      if (typeof e?.key === "string") out.push(e);
+    } catch {
+      // torn or foreign line
+    }
+  }
+  return out;
+}
+
+/** The newest journal line per key (a later review decision supersedes the run's outcome). */
+export function latestByKey(entries: JournalEntry[]): Map<string, JournalEntry> {
+  const m = new Map<string, JournalEntry>();
+  for (const e of entries) m.set(e.key, e);
+  return m;
+}
+
+/** Counts by outcome over the newest line per key. */
+export function countOutcomes(latest: Iterable<JournalEntry>): { created: number; needsReview: number; duplicates: number; merged: number; failed: number; items: number } {
+  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, failed: 0, items: 0 };
+  for (const e of latest) {
+    c.items++;
+    if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
+    else if (e.outcome === "needs-review") c.needsReview++;
+    else if (e.outcome === "duplicate" || e.outcome === "skipped") c.duplicates++;
+    else if (e.outcome === "merged") c.merged++;
+    else if (e.outcome === "failed") c.failed++;
+  }
+  return c;
+}

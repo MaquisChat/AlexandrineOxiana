@@ -5,6 +5,7 @@
  * worst a stray temp file that cleanupTempFiles removes later.
  */
 import { createHash, randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -106,6 +107,59 @@ export async function writeFileAtomic(
     await removeQuietly(tmp);
     throw err;
   }
+}
+
+/**
+ * `writeFileAtomic`, synchronously: for small bookkeeping files written on every step of a
+ * transaction (the write-ahead marker), where a thread-pool round trip per call costs more than the
+ * write itself. Same guarantees: temp file, fsync, rename, directory fsync (best effort).
+ */
+export function writeFileAtomicSync(path: string, data: Uint8Array | string, opts: WriteOptions = {}): void {
+  const tmp = tempPathFor(path);
+  const fd = fs.openSync(tmp, "wx", opts.mode);
+  try {
+    try {
+      if (opts.mode !== undefined && process.platform !== "win32") fs.fchmodSync(fd, opts.mode);
+      fs.writeFileSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (process.platform === "win32" || _renameRetry.force) {
+      // The Windows retry needs to wait between attempts: keep the asynchronous path's behaviour.
+      throw new SyncRenameUnavailable();
+    }
+    fs.renameSync(tmp, path);
+  } catch (err) {
+    if (err instanceof SyncRenameUnavailable) throw err;
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // already gone
+    }
+    throw err;
+  }
+  try {
+    const dfd = fs.openSync(dirname(path), "r");
+    try {
+      fs.fsyncSync(dfd);
+    } finally {
+      fs.closeSync(dfd);
+    }
+  } catch {
+    // best effort
+  }
+}
+
+class SyncRenameUnavailable extends Error {}
+
+/**
+ * Writes `path` atomically, synchronously where the platform allows (see writeFileAtomicSync),
+ * else through writeFileAtomic (Windows: rename retries).
+ */
+export async function writeSmallFileAtomic(path: string, data: Uint8Array | string, opts: WriteOptions = {}): Promise<void> {
+  if (process.platform === "win32" || _renameRetry.force) return writeFileAtomic(path, data, opts);
+  writeFileAtomicSync(path, data, opts);
 }
 
 export interface CopyOptions {

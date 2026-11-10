@@ -1,5 +1,6 @@
 /** Small file and crypto helpers shared by the repository modules. */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import { LibraryRelativePath } from "@ao/core";
@@ -37,13 +38,18 @@ export async function exists(path: string): Promise<boolean> {
  * of its nearest existing ancestor folder must lie inside the real path of
  * `base` (which itself must not be a symbolic link).
  */
-export async function assertContained(base: string, target: string): Promise<void> {
-  const baseStat = await fsp.lstat(base).catch(() => null);
-  if (!baseStat || baseStat.isSymbolicLink()) throw new PathEscapeError(target);
-  const realBase = await fsp.realpath(base);
+export async function assertContained(base: string, target: string, cache?: ContainmentCache): Promise<void> {
+  let realBase = cache?.realBase;
+  if (realBase === undefined) {
+    const baseStat = await fsp.lstat(base).catch(() => null);
+    if (!baseStat || baseStat.isSymbolicLink()) throw new PathEscapeError(target);
+    realBase = await fsp.realpath(base);
+    if (cache) cache.realBase = realBase;
+  }
   const t = await fsp.lstat(target).catch(() => null);
   if (t?.isSymbolicLink()) throw new PathEscapeError(target);
   let p = dirname(target);
+  if (cache?.dirs.has(p)) return;
   while (!(await exists(p))) {
     const up = dirname(p);
     if (up === p) throw new PathEscapeError(target);
@@ -51,6 +57,19 @@ export async function assertContained(base: string, target: string): Promise<voi
   }
   const real = await fsp.realpath(p);
   if (real !== realBase && !real.startsWith(realBase + sep)) throw new PathEscapeError(target);
+  // Only a folder that exists and was checked is remembered (one that did not exist yet is checked
+  // again once it does).
+  if (cache && p === dirname(target)) cache.dirs.add(p);
+}
+
+/**
+ * Per-transaction memo for assertContained: the base's real path and the folders already found
+ * inside it. Within one transaction (which holds the repository's write lock) a checked folder
+ * stays checked; the target itself is still checked for being a symbolic link every time.
+ */
+export interface ContainmentCache {
+  realBase?: string;
+  dirs: Set<string>;
 }
 
 /** Lower-cased NFC names in `dir` (empty when missing), for case-insensitive collision checks. */
@@ -104,31 +123,48 @@ export async function appendDurable(
   mode?: number,
   onPlan?: (u: AppendUndo) => Promise<void>,
 ): Promise<AppendUndo> {
+  // Small appends (log lines) are done with synchronous calls: one thread-pool round trip per
+  // call would cost more than the write itself. The steps and guarantees are the same.
   let prevSize = 0;
   let created = false;
   try {
-    const st = await fsp.lstat(path);
+    const st = fs.lstatSync(path);
     if (st.isSymbolicLink()) throw new PathEscapeError(path);
     prevSize = st.size;
-    if (st.isFile() && prevSize > 0 && !(await endsWithNewline(path, prevSize))) throw new TornFileError(path);
+    if (st.isFile() && prevSize > 0 && !endsWithNewlineSync(path, prevSize)) throw new TornFileError(path);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     created = true;
   }
   const undo = { path, prevSize, created };
   await onPlan?.(undo);
-  const fh = await fsp.open(path, "a", mode);
+  const fd = fs.openSync(path, "a", mode);
   try {
-    if (mode !== undefined && process.platform !== "win32") await fh.chmod(mode);
-    await fh.write(text);
-    await fh.sync();
+    if (mode !== undefined && process.platform !== "win32") fs.fchmodSync(fd, mode);
+    fs.writeSync(fd, text);
+    fs.fsyncSync(fd);
   } catch (err) {
-    await fh.close().catch(() => {});
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // closing failed too
+    }
     await undoAppend(undo).catch(() => {});
     throw err;
   }
-  await fh.close();
+  fs.closeSync(fd);
   return undo;
+}
+
+function endsWithNewlineSync(path: string, size: number): boolean {
+  const fd = fs.openSync(path, "r");
+  try {
+    const b = Buffer.alloc(1);
+    fs.readSync(fd, b, 0, 1, size - 1);
+    return b[0] === 0x0a;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 async function endsWithNewline(path: string, size: number): Promise<boolean> {

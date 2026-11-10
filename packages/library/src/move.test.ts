@@ -335,7 +335,7 @@ describe("planMove", () => {
     const month = (await readdir(join(dir, "changes")))[0]!;
     await rm(join(dir, "changes", month));
     await mkdir(join(dir, "changes", month));
-    seams.failUndo = "created";
+    seams.failUndo = "dir"; // the new source folder's undo step (its files have none of their own)
     await expect(repo.createSource(a.id, draft("X"), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() })).rejects.toThrow();
     seams.failUndo = undefined;
     // Remove the marker so only the in-memory recoveryPending flag remains.

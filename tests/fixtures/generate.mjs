@@ -8,7 +8,7 @@
 //
 // Real camera files (DNG, CR3) cannot be generated; scripts/fetch-fixtures.mjs downloads them.
 import { createRequire } from "node:module";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { crc32, deflateRawSync, deflateSync } from "node:zlib";
@@ -25,7 +25,10 @@ export const FIXTURE_ISBN = "9780262033848";
 // ZIP writer (stored or deflated entries, fixed timestamps). `declaredSize` lets a test lie about
 // an entry's uncompressed size to exercise the extractor's limits without building a huge file.
 
-/** @param {{name: string, data: Buffer|string, store?: boolean, declaredSize?: number}[]} entries */
+/**
+ * `unixMode` (e.g. 0o120777 for a symbolic link) marks the entry as made on Unix with that mode.
+ * @param {{name: string, data: Buffer|string, store?: boolean, declaredSize?: number, unixMode?: number}[]} entries
+ */
 export function buildZip(entries) {
   const locals = [];
   const centrals = [];
@@ -55,7 +58,7 @@ export function buildZip(entries) {
     locals.push(local, name, body);
     const central = Buffer.alloc(46);
     central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(e.unixMode !== undefined ? (3 << 8) | 20 : 20, 4);
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0x0800, 8);
     central.writeUInt16LE(method, 10);
@@ -65,6 +68,7 @@ export function buildZip(entries) {
     central.writeUInt32LE(body.length, 20);
     central.writeUInt32LE(size, 24);
     central.writeUInt16LE(name.length, 28);
+    if (e.unixMode !== undefined) central.writeUInt32LE((e.unixMode << 16) >>> 0, 38);
     central.writeUInt32LE(offset, 42);
     centrals.push(central, name);
     offset += 30 + name.length + body.length;
@@ -472,6 +476,47 @@ export async function generateFixtures(outDir) {
   writeFileSync(files.truncatedMobi, mobi.subarray(0, 120));
   await cameraTiff(files.cameraTiff);
   return files;
+}
+
+/**
+ * The Bulk Import fixture folder: 20 generated PDFs in nested folders (5 at the top, including the
+ * DOI article; Fieldwork/2021 and Fieldwork/2022 with 4 each; Theory with 4; Theory/Classics with
+ * 3), one ZIP archive holding 2 more PDFs (one in a folder), one corrupt PDF and one exact
+ * duplicate of a top-level PDF (in Theory). 24 importable items.
+ * @param {string} dir
+ */
+export async function buildImportFolder(dir) {
+  const write = (rel, data) => {
+    const p = join(dir, ...rel.split("/"));
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, data);
+    return p;
+  };
+  const names = [
+    ["", ["Okafor - 2019 - Feeding the Feed", "Lindqvist - 2020 - Harbour Voices", "Mensah - 2018 - Weather Talk", "Novak - 2017 - Kitchen Archives"]],
+    ["Fieldwork/2021", ["Ito - 2021 - Market Days", "Haddad - 2021 - Bus Routes", "Silva - 2021 - Night Shifts", "Kowalski - 2021 - Allotments"]],
+    ["Fieldwork/2022", ["Ndiaye - 2022 - River Crossings", "Petrov - 2022 - Village Radio", "Garcia - 2022 - Street Saints", "Olsen - 2022 - Ferry Timetables"]],
+    ["Theory", ["Weber - 1922 - Economy and Society Notes", "Arendt - 1958 - On Labour", "Bourdieu - 1979 - Taste Maps", "Ostrom - 1990 - Commons Revisited"]],
+    ["Theory/Classics", ["Durkheim - 1897 - Suicide Rates", "Simmel - 1903 - Metropolis", "Mauss - 1925 - The Gift Economy"]],
+  ];
+  const files = { doiPdf: write("doi-article.pdf", await pdfWithDoi()) };
+  const all = [files.doiPdf];
+  for (const [folder, list] of names) {
+    for (const n of list) {
+      const [creator, , title] = n.split(" - ");
+      const bytes = await buildPdf({ title, author: creator, lines: [title, `by ${creator}`, "Generated for the bulk import tests."] });
+      all.push(write(`${folder ? `${folder}/` : ""}${n}.pdf`, bytes));
+    }
+  }
+  const zipped = [
+    { name: "Zipped Notes - 2015 - Inside the Archive.pdf", data: await buildPdf({ title: "Inside the Archive", author: "Zipped", lines: ["Inside the Archive"] }) },
+    { name: "Sub/Packed - 2016 - Second Entry.pdf", data: await buildPdf({ title: "Second Entry", author: "Packed", lines: ["Second Entry"] }) },
+  ];
+  files.zip = write("Bundle.zip", buildZip(zipped));
+  files.corruptPdf = write("Damaged - 2020 - Broken Scan.pdf", Buffer.from("%PDF-1.4\n1 0 obj << /Type /Catalog >> broken\n%%EOF garbage", "latin1"));
+  files.duplicate = write("Theory/copy of Feeding the Feed.pdf", readFileSync(all[1]));
+  files.generated = all;
+  return { ...files, items: 24 };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -32,7 +32,7 @@
 import * as fsp from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { LibraryRelativePath, isId, newId, verifyChain, type AuditEvent } from "@ao/core";
-import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { AuditStore, type Head } from "./audit-store.js";
 import { PathEscapeError } from "./errors.js";
 import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
@@ -67,6 +67,11 @@ export const fromRel = (root: string, rel: string): string => join(root, ...rel.
 export class TxnLog {
   readonly marker: TxnMarker;
   private backups = 0;
+  /** Folders this transaction created: their contents go with them on undo. */
+  private readonly newDirs: string[] = [];
+  /** Files already appended to in this transaction: undo truncates them to the first recorded size. */
+  private readonly appended = new Set<string>();
+  private dirReady = false;
 
   constructor(
     private readonly root: string,
@@ -93,12 +98,23 @@ export class TxnLog {
   /** Durably records a step before it is taken. */
   async add(entry: MarkerEntry): Promise<void> {
     this.marker.entries.push(entry);
-    await fsp.mkdir(this.dir, { recursive: true });
-    await writeFileAtomic(this.path, JSON.stringify(this.marker));
+    if (!this.dirReady) {
+      await fsp.mkdir(this.dir, { recursive: true });
+      this.dirReady = true;
+    }
+    await writeSmallFileAtomic(this.path, JSON.stringify(this.marker));
+  }
+
+  /** Inside a folder this transaction created (undoing that folder removes it). */
+  private inNewDir(rel: string): boolean {
+    return this.newDirs.some((d) => rel.startsWith(`${d}/`));
   }
 
   async created(abs: string) {
-    await this.add({ kind: "created", path: toRel(this.root, abs) });
+    const rel = toRel(this.root, abs);
+    // A file in a folder this transaction created needs no step of its own.
+    if (this.inNewDir(rel)) return;
+    await this.add({ kind: "created", path: rel });
   }
 
   /** Copies the current file aside (same mode, so 0600 stays 0600), then records it. */
@@ -110,7 +126,10 @@ export class TxnLog {
   }
 
   async createdDir(abs: string) {
-    await this.add({ kind: "dir", path: toRel(this.root, abs) });
+    const rel = toRel(this.root, abs);
+    if (this.inNewDir(rel)) return;
+    this.newDirs.push(rel);
+    await this.add({ kind: "dir", path: rel });
   }
 
   async trashed(from: string, to: string) {
@@ -118,7 +137,11 @@ export class TxnLog {
   }
 
   async append(u: AppendUndo) {
-    await this.add({ kind: "append", path: toRel(this.root, u.path), prevSize: u.prevSize, created: u.created });
+    const rel = toRel(this.root, u.path);
+    // A later append to the same file is covered by the first step (undo truncates to its size).
+    if (this.appended.has(rel) || this.inNewDir(rel)) return;
+    this.appended.add(rel);
+    await this.add({ kind: "append", path: rel, prevSize: u.prevSize, created: u.created });
   }
 
   /** Undoes every recorded step in reverse. Returns false if any step failed. */

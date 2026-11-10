@@ -36,12 +36,14 @@ import {
 } from "@ao/core";
 import type { Readable } from "node:stream";
 import { decryptStream, encryptStream } from "../crypto/format.js";
-import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
+import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
+
+const SMALL_FILE_BYTES = 256 * 1024;
 import type { AuditInput } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
 import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
-import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
+import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo, type ContainmentCache } from "./io.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
@@ -69,6 +71,11 @@ export type RefuseHook = (d: Readonly<PolicyDecision>, req: Readonly<PolicyReque
 /** Options of the package-internal write path; the public `Repo.mutate` takes only MutateOptions. */
 export interface InternalMutateOptions extends MutateOptions {
   refuse?: RefuseHook;
+  /**
+   * The entity each allow event is about, by request index (one change storing several sources,
+   * Bulk Import): consulted when the events are written, after `fn` ran. Default: the change's entity.
+   */
+  entityFor?: (index: number) => { type: EntityType; id: string } | undefined;
 }
 
 export const REFUSED_GENERIC = "Refused by an internal check";
@@ -169,9 +176,10 @@ class TxImpl implements Tx {
   key() {
     return this.core.key(this.state);
   }
+  private readonly containment: ContainmentCache = { dirs: new Set() };
   /** PathEscapeError unless `abs` stays inside the project folder (no symlink escapes). */
   guard(abs: string): Promise<void> {
-    return assertContained(this.core.abs(this.state.rel), abs);
+    return assertContained(this.core.abs(this.state.rel), abs, this.containment);
   }
   exists(rel: string) {
     return exists(this.core.abs(rel));
@@ -200,7 +208,10 @@ class TxImpl implements Tx {
     const bytes = await this.payload(data, opts);
     if (await exists(abs)) await this.log.replaced(abs, (await fsp.stat(abs)).mode & 0o777);
     else await this.log.created(abs);
-    await writeFileAtomic(abs, bytes, { mode: opts.mode });
+    // Small files (source.json, project.json, batch records) are written synchronously: cheaper
+    // than the thread-pool round trips of the asynchronous path, with the same guarantees.
+    if (bytes.length <= SMALL_FILE_BYTES) await writeSmallFileAtomic(abs, bytes, { mode: opts.mode });
+    else await writeFileAtomic(abs, bytes, { mode: opts.mode });
   }
 
   async copyFile(src: string, rel: string, opts: FileOptions = {}): Promise<{ sha256: string; bytes: number }> {
@@ -229,6 +240,7 @@ class TxImpl implements Tx {
   async trash(rel: string): Promise<void> {
     const from = this.core.abs(rel);
     await this.guard(from);
+    this.containment.dirs.clear(); // folders move away: check again from here on
     const dir = join(this.core.root, ".tmp");
     await fsp.mkdir(dir, { recursive: true });
     const to = join(dir, `trash-${this.log.id}-${randomBytes(8).toString("hex")}`);
@@ -422,7 +434,7 @@ export async function runMutation<T>(
         await st.audit.append({
           ...core.auditBase(st, at),
           action: req.action,
-          entity: tx.auditEntity,
+          entity: opts.entityFor?.(i) ?? tx.auditEntity,
           decision: auditDecision(d),
           details: { op, txn: log.id, changes: tx.changes.length, ...(d.warnings.length ? { warnings: d.warnings } : {}) },
         }, onPlan);

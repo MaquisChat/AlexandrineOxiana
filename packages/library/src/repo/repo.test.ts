@@ -985,7 +985,9 @@ describe("recovery safety (fix round 2)", () => {
   it("N4: keeps the marker and blocks writes when an in-process undo step fails", async () => {
     await rm(join(dir, "changes/2026-11.jsonl"));
     await mkdir(join(dir, "changes/2026-11.jsonl"));
-    seams.failUndo = "created";
+    // The new source's folder is the step whose undo fails (files inside a folder the change
+    // created are removed with it and have no step of their own).
+    seams.failUndo = "dir";
     await expect(repo.createSource(pid, draft(), pdfFile(), { provenance: provenance() })).rejects.toThrow();
     expect((await tmpNames()).filter((n) => n.endsWith(".json"))).toHaveLength(1);
     await expect(repo.createCollection(pid, "x")).rejects.toBeInstanceOf(RecoveryPendingError);

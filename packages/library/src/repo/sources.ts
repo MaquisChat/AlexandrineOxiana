@@ -1,6 +1,6 @@
 /** Sources: create (capture + store), read, update, delete; source.json / source.json.enc and manifest.json. */
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
@@ -168,14 +168,43 @@ function citationKeyFor(name: string | undefined, d: SourceDraft): string {
   return `${clean(name ?? "") || "anon"}${d.issued?.slice(0, 4) ?? ""}${word ?? ""}`;
 }
 
+/** Per project's source map: the short ids its folder names use (kept current as sources are created). */
+const shortIdCache = new WeakMap<Map<string, string>, Set<string>>();
+
 /** Short ids already used by folder names in the project (`[xxxx]` suffix). */
 function takenShortIds(st: ProjectState): Set<string> {
-  const out = new Set<string>();
-  for (const f of st.sources.values()) {
-    const m = /\[([0-9a-z]+)\](?: \(\d+\))?$/.exec(f);
-    if (m) out.add(m[1]!);
+  let out = shortIdCache.get(st.sources);
+  if (!out) {
+    out = new Set<string>();
+    for (const f of st.sources.values()) {
+      const m = /\[([0-9a-z]+)\](?: \(\d+\))?$/.exec(f);
+      if (m) out.add(m[1]!);
+    }
+    shortIdCache.set(st.sources, out);
   }
   return out;
+}
+
+/** Folded names in a folder, re-read only when the folder changed since (its mtime) — `Sources/` grows with every source. */
+const namesCache = new Map<string, { mtimeMs: number; names: Set<string> }>();
+
+async function folderNames(dir: string): Promise<Set<string>> {
+  const st = await fsp.stat(dir).catch(() => null);
+  if (!st) return new Set();
+  const c = namesCache.get(dir);
+  if (c && c.mtimeMs === st.mtimeMs) return c.names;
+  const names = await namesIn(dir);
+  namesCache.set(dir, { mtimeMs: st.mtimeMs, names });
+  return names;
+}
+
+/** Records a folder this process just created in `dir`, keeping the cached listing current. */
+async function noteFolder(dir: string, name: string): Promise<void> {
+  const c = namesCache.get(dir);
+  const st = await fsp.stat(dir).catch(() => null);
+  if (!c || !st) return;
+  c.names.add(foldName(name));
+  c.mtimeMs = st.mtimeMs;
 }
 
 async function sha256File(path: string): Promise<{ sha256: string; bytes: number }> {
@@ -186,6 +215,16 @@ async function sha256File(path: string): Promise<{ sha256: string; bytes: number
     bytes += chunk.length;
   }
   return { sha256: h.digest("hex"), bytes };
+}
+
+/** The policy requests creating a source evaluates: its capture method (unless pre-authorized) and `store`. */
+function createRequests(draft: SourceDraft, provenance: Provenance, opts: CreateSourceOptions, captureAuthorized: boolean): MutateRequest[] {
+  return [
+    ...(captureAuthorized
+      ? []
+      : [{ action: "capture" as const, capture: { method: provenance.captureMethod, ...(draft.identifiers.platform ? { platform: draft.identifiers.platform } : {}) } }]),
+    storeRequest(provenance, opts.hasLocation === true),
+  ];
 }
 
 export async function createSource(
@@ -200,142 +239,198 @@ export async function createSource(
   core.assertWritable();
   const draft = SourceDraft.parse(draftIn);
   const provenance = Provenance.parse(opts.provenance);
-  const reqs: MutateRequest[] = [
-    ...(internal.captureAuthorized
-      ? []
-      : [{ action: "capture" as const, capture: { method: provenance.captureMethod, ...(draft.identifiers.platform ? { platform: draft.identifiers.platform } : {}) } }]),
-    storeRequest(provenance, opts.hasLocation === true),
-  ];
+  return runMutation(
+    core,
+    projectId,
+    createRequests(draft, provenance, opts, internal.captureAuthorized === true),
+    (tx) => writeNewSource(core, tx, projectId, draft, provenance, files, opts, internal.inTx),
+    { op: "source.create", ...(internal.refuse ? { refuse: internal.refuse } : {}) },
+  );
+}
+
+export interface NewSourceInput {
+  draft: SourceDraft;
+  files: SourceInputFile[];
+  opts: CreateSourceOptions;
+  inTx?: CreateInTx;
+}
+
+/**
+ * Package-internal (Bulk Import): creates several sources in ONE governed change. Every source's
+ * capture and store requests are evaluated (right before anything is written, R42) and each allow
+ * is audited as an event about its own source; a deny of any of them stores none (the caller may
+ * then create them one by one). Each source is written exactly as `createSource` writes it.
+ */
+export async function createSources(core: RepoCore, projectId: string, items: NewSourceInput[], refuse?: RefuseHook): Promise<SourceFile[]> {
+  core.assertWritable();
+  const parsed = items.map((it) => ({ ...it, draft: SourceDraft.parse(it.draft), provenance: Provenance.parse(it.opts.provenance) }));
+  const reqs: MutateRequest[] = [];
+  const owner: number[] = [];
+  parsed.forEach((it, i) => {
+    for (const r of createRequests(it.draft, it.provenance, it.opts, false)) {
+      reqs.push(r);
+      owner.push(i);
+    }
+  });
+  const ids: string[] = [];
   return runMutation(
     core,
     projectId,
     reqs,
     async (tx) => {
-      const st = tx.state;
-      const id = newId();
-      tx.entity("source", id);
-      const short = shortId(id, takenShortIds(st));
-
-      // Names, pseudonymized when the decision requires it (spec 4.4).
-      let creator = creatorName(draft);
-      let title = shortTitle(draft);
-      const participantIds = [...draft.participantIds];
-      if (tx.pseudonymize) {
-        const map = await loadPseudonyms(core, st);
-        const data = await readFullData(core, st);
-        const { codes, participantIds: ids, changed } = assignCodes(draft.creators, map, data, tx);
-        for (const pid of ids) if (!participantIds.includes(pid)) participantIds.push(pid);
-        if (changed) {
-          await savePseudonyms(tx, map);
-          await writeProjectData(core, tx, data);
-        }
-        creator = codes.find((c) => c !== undefined) ?? (draft.creators.length ? "Unknown" : undefined);
-        // Every name form of each creator (handle with and without "@", literal, family, given,
-        // "given family") maps to its code; pseudonymize() matches the longest first.
-        const text = new Map(map);
-        draft.creators.forEach((c, i) => {
-          const code = codes[i];
-          if (!code) return;
-          const bare = c.handle?.replace(/^@+/, "");
-          for (const n of [c.handle, bare, c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) {
-            if (n?.trim() && !text.has(n.trim())) text.set(n.trim(), code);
-          }
-        });
-        title = pseudonymize(title, text);
+      const out: SourceFile[] = [];
+      for (const it of parsed) {
+        const sf = await writeNewSource(core, tx, projectId, it.draft, it.provenance, it.files, it.opts, it.inTx);
+        ids.push(sf.source.id);
+        out.push(sf);
       }
-      const folderBase = sourceFolderName({ dateOrYear: folderDate(draft, provenance), primaryCreator: creator, shortTitle: title, shortId: short });
-      const sourcesDir = `${st.rel}/Sources`;
-      const taken = await namesIn(core.abs(sourcesDir));
-      const folderName = withCollisionSuffix(folderBase, (n) => taken.has(foldName(n)), { isFile: false });
-      const folder = `${sourcesDir}/${folderName}`;
-      await tx.mkdir(`${folder}/original`);
-
-      const mode = fileMode(core, st, provenance.identifiable);
-      const used = new Set<string>();
-      const assets: Asset[] = [];
-      const hashes: Record<string, string> = {};
-      for (const f of files) {
-        const assetId = newId();
-        const ext =
-          f.ext?.replace(/^\.+/, "").toLowerCase() || extname(f.encrypted ? f.path.replace(/\.enc$/i, "") : f.path).slice(1).toLowerCase() || "bin";
-        let name = originalFileName(folderBase, ext);
-        if (tx.encrypted) name = encName(name);
-        name = withCollisionSuffix(name, (n) => used.has(foldName(n)));
-        used.add(foldName(name));
-        const rel = `${folder}/original/${name}`;
-        let content: { sha256: string; bytes: number };
-        let linked: Asset["linked"];
-        if (f.handling === "link") {
-          if (f.encrypted) throw new TypeError("an encrypted input file cannot be linked");
-          if (tx.encrypted) {
-            throw new GovernanceViolationError("This project is encrypted; linked files would stay unencrypted, so copy them instead");
-          }
-          // A linked file may be outside the library (R24): its path relative to the library root
-          // may start with "..". It cannot be on another drive, nor in the library's work folder.
-          const abs = resolve(f.path);
-          const r = relative(resolve(core.root), abs);
-          const rel = r.split(sep).join("/");
-          if (isAbsolute(r) || !LinkedRelativePath.safeParse(rel).success) {
-            throw new Error("This file cannot be linked from where it is (another drive than the library); copy it instead");
-          }
-          if (rel === ".tmp" || rel.startsWith(".tmp/")) throw new Error("Files in the library's work folder cannot be linked");
-          content = await sha256File(abs);
-          linked = { absolutePath: abs, libraryRelativePath: rel };
-        } else {
-          if (f.encrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
-          content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode, ...(f.encrypted ? { sourceEncrypted: true } : {}) });
-        }
-        const asset: Asset = {
-          id: assetId,
-          sourceId: id,
-          role: "original",
-          kind: f.kind ?? kindFor(ext),
-          path: linked ? linked.libraryRelativePath : rel,
-          encrypted: tx.encrypted && !linked,
-          sha256: content.sha256,
-          bytes: content.bytes,
-          mime: f.mime ?? mimeFor(ext),
-          ...(linked ? { linked } : {}),
-          ...(f.metadata ? { metadata: f.metadata } : {}),
-        };
-        assets.push(asset);
-        hashes[assetId] = content.sha256;
-      }
-
-      const name = tx.pseudonymize ? creator : creatorName(draft);
-      const source = Source.parse({
-        ...draft,
-        id,
-        projectIds: [projectId, ...draft.projectIds.filter((p) => p !== projectId)],
-        participantIds,
-        folder,
-        citationKey: draft.citationKey ?? citationKeyFor(name, draft),
-        provenance: { ...provenance, fileHashes: { ...provenance.fileHashes, ...hashes } },
-        availability: opts.availability ?? draft.availability,
-        createdAt: tx.at,
-        createdBy: tx.actor,
-        modifiedAt: tx.at,
-        modifiedBy: tx.actor,
-      });
-      const sf = SourceFile.parse({
-        formatVersion: 1,
-        source,
-        assets,
-        annotations: [],
-        fieldEvidence: opts.fieldEvidence ?? [],
-        verification: opts.verification ?? {},
-      });
-      await writeSourceFile(core, tx, sf);
-      tx.record("source", id, null, source);
-      for (const a of assets) tx.record("asset", a.id, null, a);
-      if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
-      if (internal.inTx) await internal.inTx(tx, sf);
-      tx.onCommit(() => st.sources.set(id, folder));
-      tx.index((sink) => sink.indexSource(sf));
-      return sf;
+      return out;
     },
-    { op: "source.create", ...(internal.refuse ? { refuse: internal.refuse } : {}) },
+    {
+      op: "source.create",
+      ...(refuse ? { refuse } : {}),
+      entityFor: (i) => (ids[owner[i]!] ? { type: "source" as const, id: ids[owner[i]!]! } : undefined),
+    },
   );
+}
+
+/** Writes one new source inside a running change (the body of `createSource`). */
+async function writeNewSource(
+  core: RepoCore,
+  tx: Tx,
+  projectId: string,
+  draft: SourceDraft,
+  provenance: Provenance,
+  files: SourceInputFile[],
+  opts: CreateSourceOptions,
+  inTx: CreateInTx | undefined,
+): Promise<SourceFile> {
+  const st = tx.state;
+  const id = newId();
+  tx.entity("source", id);
+  const short = shortId(id, takenShortIds(st));
+
+  // Names, pseudonymized when the decision requires it (spec 4.4).
+  let creator = creatorName(draft);
+  let title = shortTitle(draft);
+  const participantIds = [...draft.participantIds];
+  if (tx.pseudonymize) {
+    const map = await loadPseudonyms(core, st);
+    const data = await readFullData(core, st);
+    const { codes, participantIds: ids, changed } = assignCodes(draft.creators, map, data, tx);
+    for (const pid of ids) if (!participantIds.includes(pid)) participantIds.push(pid);
+    if (changed) {
+      await savePseudonyms(tx, map);
+      await writeProjectData(core, tx, data);
+    }
+    creator = codes.find((c) => c !== undefined) ?? (draft.creators.length ? "Unknown" : undefined);
+    // Every name form of each creator (handle with and without "@", literal, family, given,
+    // "given family") maps to its code; pseudonymize() matches the longest first.
+    const text = new Map(map);
+    draft.creators.forEach((c, i) => {
+      const code = codes[i];
+      if (!code) return;
+      const bare = c.handle?.replace(/^@+/, "");
+      for (const n of [c.handle, bare, c.literal, c.family, c.given, [c.given, c.family].filter(Boolean).join(" ")]) {
+        if (n?.trim() && !text.has(n.trim())) text.set(n.trim(), code);
+      }
+    });
+    title = pseudonymize(title, text);
+  }
+  const folderBase = sourceFolderName({ dateOrYear: folderDate(draft, provenance), primaryCreator: creator, shortTitle: title, shortId: short });
+  const sourcesDir = `${st.rel}/Sources`;
+  // A cached listing is fine only if the folder did not change since (mtime); the name chosen
+  // is checked on disk once more.
+  const taken = await folderNames(core.abs(sourcesDir));
+  const folderName = withCollisionSuffix(folderBase, (n) => taken.has(foldName(n)) || existsSync(core.abs(`${sourcesDir}/${n}`)), { isFile: false });
+  const folder = `${sourcesDir}/${folderName}`;
+  await tx.mkdir(`${folder}/original`);
+  await noteFolder(core.abs(sourcesDir), folderName);
+  takenShortIds(st).add(short);
+
+  const mode = fileMode(core, st, provenance.identifiable);
+  const used = new Set<string>();
+  const assets: Asset[] = [];
+  const hashes: Record<string, string> = {};
+  for (const f of files) {
+    const assetId = newId();
+    const ext =
+      f.ext?.replace(/^\.+/, "").toLowerCase() || extname(f.encrypted ? f.path.replace(/\.enc$/i, "") : f.path).slice(1).toLowerCase() || "bin";
+    let name = originalFileName(folderBase, ext);
+    if (tx.encrypted) name = encName(name);
+    name = withCollisionSuffix(name, (n) => used.has(foldName(n)));
+    used.add(foldName(name));
+    const rel = `${folder}/original/${name}`;
+    let content: { sha256: string; bytes: number };
+    let linked: Asset["linked"];
+    if (f.handling === "link") {
+      if (f.encrypted) throw new TypeError("an encrypted input file cannot be linked");
+      if (tx.encrypted) {
+        throw new GovernanceViolationError("This project is encrypted; linked files would stay unencrypted, so copy them instead");
+      }
+      // A linked file may be outside the library (R24): its path relative to the library root
+      // may start with "..". It cannot be on another drive, nor in the library's work folder.
+      const abs = resolve(f.path);
+      const r = relative(resolve(core.root), abs);
+      const rel = r.split(sep).join("/");
+      if (isAbsolute(r) || !LinkedRelativePath.safeParse(rel).success) {
+        throw new Error("This file cannot be linked from where it is (another drive than the library); copy it instead");
+      }
+      if (rel === ".tmp" || rel.startsWith(".tmp/")) throw new Error("Files in the library's work folder cannot be linked");
+      content = await sha256File(abs);
+      linked = { absolutePath: abs, libraryRelativePath: rel };
+    } else {
+      if (f.encrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
+      content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode, ...(f.encrypted ? { sourceEncrypted: true } : {}) });
+    }
+    const asset: Asset = {
+      id: assetId,
+      sourceId: id,
+      role: "original",
+      kind: f.kind ?? kindFor(ext),
+      path: linked ? linked.libraryRelativePath : rel,
+      encrypted: tx.encrypted && !linked,
+      sha256: content.sha256,
+      bytes: content.bytes,
+      mime: f.mime ?? mimeFor(ext),
+      ...(linked ? { linked } : {}),
+      ...(f.metadata ? { metadata: f.metadata } : {}),
+    };
+    assets.push(asset);
+    hashes[assetId] = content.sha256;
+  }
+
+  const name = tx.pseudonymize ? creator : creatorName(draft);
+  const source = Source.parse({
+    ...draft,
+    id,
+    projectIds: [projectId, ...draft.projectIds.filter((p) => p !== projectId)],
+    participantIds,
+    folder,
+    citationKey: draft.citationKey ?? citationKeyFor(name, draft),
+    provenance: { ...provenance, fileHashes: { ...provenance.fileHashes, ...hashes } },
+    availability: opts.availability ?? draft.availability,
+    createdAt: tx.at,
+    createdBy: tx.actor,
+    modifiedAt: tx.at,
+    modifiedBy: tx.actor,
+  });
+  const sf = SourceFile.parse({
+    formatVersion: 1,
+    source,
+    assets,
+    annotations: [],
+    fieldEvidence: opts.fieldEvidence ?? [],
+    verification: opts.verification ?? {},
+  });
+  await writeSourceFile(core, tx, sf);
+  tx.record("source", id, null, source);
+  for (const a of assets) tx.record("asset", a.id, null, a);
+  if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
+  if (inTx) await inTx(tx, sf);
+  tx.onCommit(() => st.sources.set(id, folder));
+  tx.index((sink) => sink.indexSource(sf));
+  return sf;
 }
 
 export async function getSource(core: RepoCore, projectId: string, id: string): Promise<SourceFile> {

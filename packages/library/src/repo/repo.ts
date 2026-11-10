@@ -23,9 +23,10 @@ import {
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
 import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
-import { createProject, isUnlocked, lockProject, unlockProject, type CreateProjectInput } from "./projects.js";
+import { createProject, isUnlocked, lockProject, readFullData, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
   createSource,
+  createSources,
   deleteSource,
   getSource,
   listSourceIds,
@@ -33,11 +34,13 @@ import {
   updateSource,
   type CreateInTx,
   type CreateSourceOptions,
+  type NewSourceInput,
   type SourceInputFile,
   type SourcePatch,
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
+import { readReviewEntries, type ReviewEntry } from "./review.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
@@ -518,6 +521,14 @@ export function createSourceRefusing(
 }
 
 /**
+ * Package-internal (Bulk Import): several new sources in one governed change, each source's capture
+ * and store evaluated and audited about it (see sources.ts `createSources`).
+ */
+export function createSourcesRefusing(repo: Repo, projectId: string, items: NewSourceInput[], refuse: RefuseHook): Promise<SourceFile[]> {
+  return createSources(cores.get(repo)!, projectId, items, refuse);
+}
+
+/**
  * Package-internal (Bulk Import): one governed change (R26 txn, change log, audit) whose body
  * reads, writes and deletes sources, copies originals in and updates review entries.
  */
@@ -529,6 +540,21 @@ export function importChange<T>(
   opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
 ): Promise<T> {
   return runImportChange(cores.get(repo)!, projectId, reqs, fn, opts);
+}
+
+/** Package-internal (Bulk Import): the project's collections and tags (project.json). */
+export async function projectCollectionsAndTags(repo: Repo, projectId: string): Promise<{ collections: Collection[]; tags: Tag[] }> {
+  const core = cores.get(repo)!;
+  const data = await readFullData(core, core.state(projectId));
+  return { collections: data.collections, tags: data.tags };
+}
+
+/** Package-internal (Bulk Import): the project's review entries (newest version per id; needs the unlocked key). */
+export function projectReviewEntries(repo: Repo, projectId: string): Promise<ReviewEntry[]> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  return readReviewEntries(core, st);
 }
 
 /** Package-internal: whether the project's files are encrypted at rest. */
