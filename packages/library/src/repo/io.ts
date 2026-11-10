@@ -242,6 +242,28 @@ const MIME: Record<string, string> = {
   wav: "audio/wav",
   ogg: "audio/ogg",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  mobi: "application/x-mobipocket-ebook",
+  azw: "application/vnd.amazon.ebook",
+  azw3: "application/vnd.amazon.mobi8-ebook",
+  heif: "image/heif",
+  avif: "image/avif",
+  bmp: "image/bmp",
+  cr2: "image/x-canon-cr2",
+  cr3: "image/x-canon-cr3",
+  dng: "image/x-adobe-dng",
+  nef: "image/x-nikon-nef",
+  arw: "image/x-sony-arw",
+  orf: "image/x-olympus-orf",
+  rw2: "image/x-panasonic-rw2",
+  raf: "image/x-fujifilm-raf",
+  mkv: "video/x-matroska",
+  avi: "video/vnd.avi",
+  m4v: "video/x-m4v",
+  "3gp": "video/3gpp",
+  mpg: "video/mpeg",
+  flac: "audio/flac",
+  aac: "audio/aac",
+  opus: "audio/opus",
 };
 
 export function mimeFor(ext: string): string {
@@ -253,6 +275,7 @@ export function kindFor(ext: string): string {
   const mime = mimeFor(ext);
   if (mime === "application/pdf") return "pdf";
   if (mime === "application/epub+zip") return "epub";
+  if (mime === "application/x-mobipocket-ebook" || mime.startsWith("application/vnd.amazon.")) return "ebook";
   for (const k of ["image", "video", "audio", "text"]) if (mime.startsWith(`${k}/`)) return k;
   return "file";
 }

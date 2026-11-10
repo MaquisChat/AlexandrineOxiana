@@ -7,18 +7,18 @@ import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FIXTURE_DOI, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
+import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import { shutdownExtractors } from "../extract/index.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient, lookupContextFor } from "../lookup/index.js";
 import { parseReviewFile, REVIEW_FILE, type ReviewEntry } from "../repo/review.js";
-import { openLine } from "../repo/io.js";
+import { kindFor, mimeFor, openLine } from "../repo/io.js";
 import type { Repo } from "../repo/repo.js";
 import { projectDataKey } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
-import { createAttach, type Attach } from "./attach.js";
+import { ACCEPTED_EXTENSIONS, createAttach, type Attach } from "./attach.js";
 import { AUTO_ACCEPT_THRESHOLD, resolveItem } from "./resolve.js";
 
 const FAST = 2 ** 10;
@@ -275,13 +275,13 @@ describe("attachFiles: drop on the library", () => {
   it("a likely (fuzzy) duplicate goes to review with the candidate recorded", async () => {
     const p = await project(NO_LOOKUP_GOV);
     const a = await put(
-      "songs.pdf",
+      "Okafor - 2021 - Songs of the River Delta.pdf",
       await buildPdf({ title: "Songs of the River Delta", author: "Amara Okafor", lines: ["Songs of the River Delta", "Amara Okafor"] }),
     );
     const [first] = await attach.attachFiles(p.id, [a]);
     expect(first!.outcome).toBe("needs-review");
     const b = await put(
-      "songs (preprint).pdf",
+      "Okafor - 2021 - Songs of the River Delta (preprint).pdf",
       await buildPdf({ title: "Songs of the River Delta", author: "Amara Okafor", lines: ["Songs of the River Delta", "Amara Okafor", "Preprint version"], extra: "v2" }),
     );
     const [second] = await attach.attachFiles(p.id, [b]);
@@ -476,5 +476,179 @@ describe("resolveItem", () => {
     expect(r.evidence.method).toBe("identifier+lookup");
     expect(r.confidence).toBe(0.97);
     expect(r.draft.identifiers.doi).toBe(MISMATCH_DOI);
+  });
+});
+
+describe("review round 1 (R55)", () => {
+  const harvestCiting = () =>
+    buildPdf({
+      title: "Harvest Songs of the Northern Coast",
+      author: "Mara Ilunga",
+      lines: ["Harvest Songs of the Northern Coast", "Mara Ilunga", `As shown by Okafor (https://doi.org/${FIXTURE_DOI}), rivers matter.`],
+    });
+
+  it("1: a paper citing a DOI already in the library is not its duplicate (lookups on); the cited DOI is only a hint", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    const [first] = await attach.attachFiles(p.id, [await put("doi-article.pdf", await buildDoiPdf())]);
+    expect(first!.outcome).toBe("created");
+    const [second] = await attach.attachFiles(p.id, [await put("harvest.pdf", await harvestCiting())]);
+    expect(["needs-review", "created"]).toContain(second!.outcome);
+    expect(second!.sourceId).toBeDefined();
+    expect(second!.sourceId).not.toBe(first!.sourceId);
+    const sf = await repo.getSource(p.id, second!.sourceId!);
+    expect(sf.source.identifiers.doi).toBeUndefined();
+    expect(sf.source.title.variants[0]!.value).toBe("Harvest Songs of the Northern Coast");
+    const entry = (await reviewEntries(p.id, p.folder)).find((e) => e.sourceId === second!.sourceId)!;
+    expect(entry.hints).toContain(`doi:${FIXTURE_DOI}`);
+  });
+
+  it("1: the same with metadata_lookup off: never a duplicate, no unconfirmed DOI in the draft, sent to review", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const [first] = await attach.attachFiles(p.id, [await put("doi-article.pdf", await buildDoiPdf())]);
+    expect(first!.outcome).toBe("needs-review");
+    expect((await repo.getSource(p.id, first!.sourceId!)).source.identifiers.doi).toBeUndefined();
+    const [second] = await attach.attachFiles(p.id, [await put("harvest.pdf", await harvestCiting())]);
+    expect(second!.outcome).toBe("needs-review");
+    expect(second!.sourceId).not.toBe(first!.sourceId);
+    expect((await repo.getSource(p.id, second!.sourceId!)).source.identifiers.doi).toBeUndefined();
+    const entry = (await reviewEntries(p.id, p.folder)).find((e) => e.sourceId === second!.sourceId)!;
+    expect(entry.hints).toContain(`doi:${FIXTURE_DOI}`);
+    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+  });
+
+  it("2: a lookup title not grounded in the document text (no local title) goes to review", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${MISMATCH_DOI}`, method: "GET" }).reply(200, crossrefFor(MISMATCH_DOI), JSON_HEADERS).times(1);
+    const path = await put("scan0003.pdf", await buildPdf({ lines: ["Minutes of the village water committee, spring meeting.", `Background reading: doi:${MISMATCH_DOI}`] }));
+    const [r] = await attach.attachFiles(p.id, [path]);
+    expect(r!.outcome).toBe("needs-review");
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.provenance.identification!.confidence).toBeLessThanOrEqual(0.6);
+    expect(sf.source.identifiers.doi).toBeUndefined();
+  });
+
+  it("2: an image (no text) identified only by a lookup goes to review", async () => {
+    const p = await project();
+    const lookup = await lookupContextFor(repo, p.id, http);
+    crossref().intercept({ path: `/works/${MISMATCH_DOI}`, method: "GET" }).reply(200, crossrefFor(MISMATCH_DOI), JSON_HEADERS).times(1);
+    const path = await put("figure.png", tinyPng());
+    const r = await resolveItem(
+      { path, mime: "image/png", referenceMetadata: { identifiers: { doi: MISMATCH_DOI } } },
+      { projectId: p.id, patterns: [], lookup },
+    );
+    expect(r.confidence).toBeLessThanOrEqual(0.6);
+  });
+
+  it("4: dropping onto an identifiable source uses the source's own legal basis (GDPR, no manual-upload default)", async () => {
+    const p = await project(
+      `profiles: [gdpr]
+identifiability:
+  containsIdentifiable: true
+encryption:
+  atRest: required
+captureMethods: [manual_upload]
+`,
+      true,
+    );
+    const pdf = await put("interview notes.pdf", await slidesPdf());
+    const sf = await repo.createSource(
+      p.id,
+      {
+        projectIds: [],
+        type: "other",
+        title: { variants: [{ lang: "en", kind: "original", value: "Interview notes" }] },
+        creators: [],
+        identifiers: {},
+        caseAttributes: {},
+        collectionIds: [],
+        tagIds: [],
+        participantIds: [],
+        availability: { status: "available" },
+      },
+      [{ path: pdf, role: "original", handling: "copy" }],
+      {
+        provenance: {
+          captureMethod: "manual_upload",
+          capturedAt: new Date().toISOString(),
+          tool: { name: "test", version: "0" },
+          fileHashes: {},
+          legal: { status: "consented", basis: "consent (GDPR Art. 6(1)(a))" },
+          identifiable: true,
+        },
+      },
+    );
+    const png = await put("figure.png", tinyPng());
+    expect(await attach.attachFiles(p.id, [png], { toSourceId: sf.source.id })).toEqual([{ path: png, outcome: "attached", sourceId: sf.source.id }]);
+  });
+
+  it("5 (R54a): dropped media with GPS sends hasLocation: denied where location must be stripped without encryption", async () => {
+    const p = await project(`identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: "off"
+sharing:
+  locationMetadata: strip
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`);
+    const tif = join(files, "IMG_0001.tif");
+    await buildCameraTiff(tif);
+    expect(await attach.attachFiles(p.id, [tif])).toEqual([
+      { path: tif, outcome: "failed", reason: "Location data requires encryption or locationMetadata: keep" },
+    ]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+    const denies = (await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny");
+    expect(denies.map((e) => e.action)).toEqual(["store"]);
+  });
+
+  it("6 (R54b): file dates never fill issued", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const [r] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.issued).toBeUndefined();
+    expect(sf.fieldEvidence.some((e) => e.field === "/issued")).toBe(false);
+  });
+
+  it("7: the default legal basis category is 'manual-upload'", async () => {
+    const p = await project(`identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+consent:
+  requireLegalBasis: true
+  defaultLegalBasis:
+    manual-upload: "legitimate interest; ethics approval 2026-01"
+encryption:
+  atRest: optional
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`);
+    const [r] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    expect(r!.outcome).toBe("needs-review");
+    expect((await repo.getSource(p.id, r!.sourceId!)).source.provenance.legal.basis).toBe("legitimate interest; ethics approval 2026-01");
+  });
+
+  it("8: every accepted media type has its MIME type and kind", () => {
+    const cases: Array<[string, string, string]> = [
+      ["mobi", "application/x-mobipocket-ebook", "ebook"],
+      ["azw", "application/vnd.amazon.ebook", "ebook"],
+      ["azw3", "application/vnd.amazon.mobi8-ebook", "ebook"],
+      ["cr3", "image/x-canon-cr3", "image"],
+      ["dng", "image/x-adobe-dng", "image"],
+      ["nef", "image/x-nikon-nef", "image"],
+      ["heif", "image/heif", "image"],
+      ["heic", "image/heic", "image"],
+      ["avif", "image/avif", "image"],
+      ["mkv", "video/x-matroska", "video"],
+      ["avi", "video/vnd.avi", "video"],
+      ["m4v", "video/x-m4v", "video"],
+      ["3gp", "video/3gpp", "video"],
+      ["flac", "audio/flac", "audio"],
+      ["aac", "audio/aac", "audio"],
+    ];
+    for (const [ext, mime, kind] of cases) expect([ext, mimeFor(ext), kindFor(ext)]).toEqual([ext, mime, kind]);
+    for (const ext of ACCEPTED_EXTENSIONS) expect([ext, mimeFor(ext)]).not.toEqual([ext, "application/octet-stream"]);
   });
 });

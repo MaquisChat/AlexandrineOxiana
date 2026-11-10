@@ -48,6 +48,8 @@ export interface CreateSourceOptions {
   fieldEvidence?: FieldEvidence[];
   verification?: Record<string, FieldVerification>;
   availability?: Availability;
+  /** A file being stored carries location data (e.g. GPS in a photo): location governance applies (R54a). */
+  hasLocation?: boolean;
   /** Also queue the new source for review (written to `review/pending.jsonl` in the same change, R31). */
   reviewItem?: Omit<ReviewInput, "sourceId">;
 }
@@ -67,10 +69,10 @@ export function fileMode(core: RepoCore, st: ProjectState, identifiable: boolean
 }
 
 /** The store request for writing data that belongs to a source. */
-export function storeRequest(p: Provenance): MutateRequest {
+export function storeRequest(p: Provenance, hasLocation = false): MutateRequest {
   return {
     action: "store",
-    store: { identifiable: p.identifiable, hasLocation: false, ...(p.legal.basis ? { legalBasis: p.legal.basis } : {}) },
+    store: { identifiable: p.identifiable, hasLocation, ...(p.legal.basis ? { legalBasis: p.legal.basis } : {}) },
   };
 }
 
@@ -196,7 +198,7 @@ export async function createSource(
     ...(internal.captureAuthorized
       ? []
       : [{ action: "capture" as const, capture: { method: provenance.captureMethod, ...(draft.identifiers.platform ? { platform: draft.identifiers.platform } : {}) } }]),
-    storeRequest(provenance),
+    storeRequest(provenance, opts.hasLocation === true),
   ];
   return runMutation(
     core,

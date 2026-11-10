@@ -69,7 +69,7 @@ export async function extractHtml(path: string): Promise<RawExtract> {
   if (cs.length) out.creators = cs;
 
   const issued = normalizeDate(
-    first("citation_publication_date", "citation_date", "citation_online_date", "dc.date", "dcterms.issued", "dcterms.created", "article:published_time"),
+    first("citation_publication_date", "citation_date", "citation_online_date", "dc.date", "dcterms.issued", "article:published_time"),
   );
   if (issued) out.issued = issued;
 

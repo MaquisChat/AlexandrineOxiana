@@ -22,15 +22,25 @@
  * at least one local title (reference, embedded, file name), when any exists. Otherwise the local
  * values stay in the draft, the lookup becomes a candidate, the confidence is 0.6 and `/title` is
  * a conflict: the item goes to review (a DOI in a PDF's first pages may well be a cited work's).
+ * With no local title, the lookup's title must be found in the document text (`groundedIn`, as
+ * verification does); a lookup with nothing of the file's own to back it is capped at 0.6.
+ *
+ * R55: an identifier taken from the file is written to the draft (and so used for duplicate
+ * detection) only when a lookup confirmed it as above. Unconfirmed ones are returned as
+ * `identifierHints` for the review queue, and the item goes to review. Identifiers from reference
+ * metadata or a sidecar file are trusted as given.
  *
  * Lookups run only through the LookupContext the caller built with `lookupContextFor` (policy per
  * provider, sensitive for encrypted projects); `null` means no lookups at all.
  */
 import { basename, extname } from "node:path";
 import {
+  DOC_TEXT_LIMIT,
   EdtfLite,
   SourceDraft,
   applyVerification,
+  groundedIn,
+  normalizeTitle,
   parseFileName,
   primary,
   scoreConfidence,
@@ -98,6 +108,10 @@ export interface Resolution {
   verification: VerificationReport;
   /** An identifier lookup's title disagreed with the file's own title (R49e). */
   titleConflict: boolean;
+  /** Identifiers found in the file that no lookup confirmed, e.g. "doi:10.1/x" (never in the draft or used for dedupe). */
+  identifierHints: string[];
+  /** The file carries location data (GPS): location governance applies when it is stored (R54a). */
+  hasLocation: boolean;
 }
 
 interface Fields {
@@ -210,6 +224,10 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   let confidence = 0;
   let method: Evidence = { method: "none" };
   let titleConflict = false;
+  /** Identifiers found in the file that no lookup confirmed (never in the draft, R55). */
+  const hints: string[] = [];
+  /** The item's identity rests on an unconfirmed identifier: it goes to review. */
+  let unconfirmed = false;
   const done = () => confidence >= AUTO_ACCEPT_THRESHOLD;
 
   const record = (k: keyof Fields, value: unknown, source: EvidenceSource) => {
@@ -281,51 +299,90 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     record("title", extracted.title, { kind: "embedded" });
   }
 
-  // 3. Identifiers (+ lookup).
+  // 3. Identifiers (+ lookup). An identifier from the file (metadata fields or the first pages'
+  //    text) is written to the draft only once a lookup confirms it: its title agrees with the
+  //    file's own title, or, with no such title, is found in the document text (R55). Anything
+  //    else (a cited work's DOI, an unanswered lookup) is only a hint for the review queue.
   if (!done()) {
     const localTitles = [refFields.title, extracted.title, parsedName?.title].filter((t): t is string => !!t);
-    const agrees = (t: string) => localTitles.length === 0 || localTitles.some((l) => titleSimilarity(l, t) >= AGREE);
-    const ids: Array<{ kind: "doi" | "isbn"; id: string; arxiv?: string }> = [];
-    for (const d of [refFields.doi, ...extracted.identifiers.dois]) if (d && !ids.some((x) => x.id === d.toLowerCase())) ids.push({ kind: "doi", id: d.toLowerCase() });
-    for (const i of [...(refFields.isbn ?? []), ...extracted.identifiers.isbns]) {
+    const docNorm = extracted.text ? normalizeTitle(extracted.text.slice(0, DOC_TEXT_LIMIT)) : "";
+    const ids: Array<{ kind: "doi" | "isbn"; id: string; arxiv?: string; trusted: boolean }> = [];
+    const addId = (x: (typeof ids)[number]) => {
+      if (!ids.some((y) => y.id === x.id)) ids.push(x);
+    };
+    if (refFields.doi) addId({ kind: "doi", id: refFields.doi.toLowerCase(), trusted: true });
+    for (const i of refFields.isbn ?? []) {
       const v = toIsbn13(i);
-      if (v && !ids.some((x) => x.id === v)) ids.push({ kind: "isbn", id: v });
+      if (v) addId({ kind: "isbn", id: v, trusted: true });
     }
-    for (const a of [refFields.arxiv, ...extracted.identifiers.arxiv]) if (a) ids.push({ kind: "doi", id: arxivDoi(a), arxiv: a });
-    let conflict: { r: LookupResult; id: (typeof ids)[number]; sim: number } | undefined;
-    let accepted = false;
+    if (refFields.arxiv) addId({ kind: "doi", id: arxivDoi(refFields.arxiv), arxiv: refFields.arxiv, trusted: true });
+    for (const d of extracted.identifiers.dois) addId({ kind: "doi", id: d.toLowerCase(), trusted: false });
+    for (const i of extracted.identifiers.isbns) {
+      const v = toIsbn13(i);
+      if (v) addId({ kind: "isbn", id: v, trusted: false });
+    }
+    for (const x of extracted.identifiers.arxiv) addId({ kind: "doi", id: arxivDoi(x), arxiv: x, trusted: false });
+
+    type Hit = { r: LookupResult; id: (typeof ids)[number]; sim: number };
+    let accepted: Hit | undefined;
+    let ungrounded: Hit | undefined;
+    let conflict: Hit | undefined;
     if (lookup) {
       for (const id of ids.slice(0, MAX_IDENTIFIER_LOOKUPS)) {
         const r = await ask(() => (id.kind === "doi" ? lookupDoi(id.id, lookup) : lookupIsbn(id.id, lookup)), null);
         if (!r) continue;
         lookups.push({ provider: r.provider, matchedIdentifier: id.id, title: r.title, ...(r.creators.length ? { creators: r.creators } : {}), ...(r.issued ? { issued: r.issued } : {}) });
         addCandidate(r);
-        if (agrees(r.title)) {
-          const fields = fromLookup(r);
-          if (id.kind === "doi" && !id.arxiv) fields.doi = id.id;
-          if (id.kind === "isbn") fields.isbn = [...new Set([id.id, ...(fields.isbn ?? [])])];
-          if (id.arxiv) fields.arxiv = id.arxiv;
-          step(scoreConfidence({ method: "identifier+lookup" }), { method: "identifier+lookup" }, fields, { kind: "lookup", provider: r.provider });
-          accepted = true;
+        const sim = Math.max(0, ...localTitles.map((l) => titleSimilarity(l, r.title)));
+        const hit = { r, id, sim };
+        if (localTitles.length > 0) {
+          if (sim >= AGREE) {
+            accepted = hit;
+            break;
+          }
+          conflict ??= hit;
+        } else if (docNorm && groundedIn(docNorm, normalizeTitle(r.title), "title")) {
+          accepted = hit;
           break;
+        } else {
+          // No title of the file's own, and the lookup's title is not in its text (or it has none).
+          ungrounded ??= hit;
         }
-        conflict ??= { r, id, sim: Math.max(0, ...localTitles.map((l) => titleSimilarity(l, r.title))) };
       }
     }
-    if (!accepted && conflict) {
+    const idFields = (h: Hit, base: Fields): Fields => {
+      const fields = { ...base };
+      if (h.id.arxiv) fields.arxiv = h.id.arxiv;
+      else if (h.id.kind === "doi") fields.doi = h.id.id;
+      else fields.isbn = [...new Set([h.id.id, ...(fields.isbn ?? [])])];
+      return fields;
+    };
+    const confirmed = accepted?.id.id;
+    for (const id of ids) {
+      if (id.trusted || id.id === confirmed) continue;
+      hints.push(id.arxiv ? `arxiv:${id.arxiv}` : `${id.kind}:${id.id}`);
+    }
+    if (accepted) {
+      step(scoreConfidence({ method: "identifier+lookup" }), { method: "identifier+lookup" }, idFields(accepted, fromLookup(accepted.r)), {
+        kind: "lookup",
+        provider: accepted.r.provider,
+      });
+    } else if (ungrounded) {
+      // Nothing of the file's own backs the lookup: its values are offered for review, without its
+      // identifiers (unconfirmed), and the confidence is capped.
+      const { doi: _d, isbn: _i, issn: _s, ...rest } = fromLookup(ungrounded.r);
+      offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, { kind: "lookup", provider: ungrounded.r.provider }, true);
+      confidence = CONFLICT_CONFIDENCE;
+      method = { method: "identifier+lookup" };
+      unconfirmed = true;
+    } else if (conflict) {
       // R49(e): keep the file's own values; the lookup is a candidate and its title is evidence.
       titleConflict = true;
-      const src: EvidenceSource = { kind: "lookup", provider: conflict.r.provider };
-      record("title", conflict.r.title, src);
-      const idField: Fields = conflict.id.arxiv ? { arxiv: conflict.id.arxiv } : conflict.id.kind === "doi" ? { doi: conflict.id.id } : { isbn: [conflict.id.id] };
-      offer(idField, { kind: "embedded", ref: "identifier" }, false);
+      record("title", conflict.r.title, { kind: "lookup", provider: conflict.r.provider });
       confidence = CONFLICT_CONFIDENCE;
       method = { method: "identifier+lookup", titleSimilarity: Math.round(conflict.sim * 1000) / 1000 };
-    } else if (!accepted && ids.length === 1) {
-      // Nothing confirmed it (lookups off or unanswered): a single identifier is still kept.
-      const only = ids[0]!;
-      offer(only.arxiv ? { arxiv: only.arxiv } : only.kind === "doi" ? { doi: only.id } : { isbn: [only.id] }, { kind: "embedded", ref: "identifier" }, false);
     }
+    if (!accepted && hints.length > 0) unconfirmed = true;
   }
 
   // 4. Sidecar files.
@@ -408,7 +465,12 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     report.fields["/title"] = { status: "conflict", checks: ["identifier-title"], reason };
     report.reasons.push(reason);
   }
-  if (titleConflict) report.overall = "needs-review";
+  if (titleConflict || unconfirmed) report.overall = "needs-review";
+  if (unconfirmed && !titleConflict) {
+    report.reasons.push(
+      "An identifier found in the file could not be confirmed as this item's own (it may belong to a cited work), so it was not recorded.",
+    );
+  }
   return {
     draft,
     confidence: applyVerification(confidence, report),
@@ -418,6 +480,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     fieldEvidence,
     verification: report,
     titleConflict,
+    identifierHints: hints.slice(0, 10),
+    hasLocation: !!extracted.media?.gps,
   };
 }
 

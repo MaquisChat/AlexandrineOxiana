@@ -6,6 +6,7 @@ export declare function tinyTiff(): Buffer;
 export declare function buildMobi(opts?: { exth?: [number, string][]; fullName?: string; corruptExth?: boolean }): Buffer;
 export declare function buildPdf(opts?: { title?: string; author?: string; lines?: string[]; extra?: string }): Promise<Buffer>;
 export declare function buildDoiPdf(): Promise<Buffer>;
+export declare function buildCameraTiff(path: string): Promise<void>;
 export interface GeneratedFixtures {
   doiPdf: string;
   scannedPdf: string;

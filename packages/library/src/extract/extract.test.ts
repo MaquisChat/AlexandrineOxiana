@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { FIXTURE_DOI, FIXTURE_ISBN, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
+import { FIXTURE_DOI, FIXTURE_ISBN, buildPdf, buildZip, generateFixtures, type GeneratedFixtures } from "../../../../tests/fixtures/generate.mjs";
 import { docxText } from "./docx.js";
 import { elements } from "./scan.js";
 import { MAX_TEXT_CHARS, UnsafeFileError, extractMetadata, mediaFromTags, shutdownExtractors } from "./index.js";
@@ -39,6 +39,14 @@ afterAll(async () => {
 });
 
 describe("PDF", () => {
+  it("never takes issued from the Info CreationDate/ModDate or xmp:CreateDate (R54b)", async () => {
+    const p = join(tmp, "dated.pdf");
+    await writeFile(p, await buildPdf({ title: "Field Notes on Market Days", lines: ["Field Notes on Market Days"] }));
+    const x = await extractMetadata(p, "application/pdf");
+    expect(x.issued).toBeUndefined();
+    expect(x.fileCreated).toBe("2021-03-04");
+  });
+
   it("finds the DOI on page 1 and reads Info + XMP", async () => {
     const x = await extractMetadata(fx.doiPdf, "application/pdf");
     expect(x.identifiers.dois[0]).toBe(FIXTURE_DOI);
@@ -109,7 +117,9 @@ describe("DOCX", () => {
     const x = await extractMetadata(fx.docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     expect(x.title).toBe("Field Report on Market Days");
     expect(x.creators).toEqual([{ given: "Priya", family: "Raman", role: "author" }]);
-    expect(x.issued).toBe("2020-11-02");
+    // dcterms:created is the file's date, never the publication date (R54b).
+    expect(x.issued).toBeUndefined();
+    expect(x.fileCreated).toBe("2020-11-02");
     expect(x.language).toBe("en-GB");
     expect(x.identifiers.dois).toEqual(["10.5555/ao.docx.7"]);
     expect(x.text).toContain("See also doi:10.5555/ao.docx.7 for the earlier survey.");

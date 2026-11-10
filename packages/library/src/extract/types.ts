@@ -30,7 +30,10 @@ export interface MediaMetadata {
 export interface Extracted {
   title?: string;
   creators?: Creator[];
+  /** Publication date (dc:date, prism:publicationDate/coverDate, citation_* or OPF dc:date) only. */
   issued?: string;
+  /** The file's own creation date (PDF Info CreationDate, xmp:CreateDate, DOCX dcterms:created): never a publication date. */
+  fileCreated?: string;
   language?: string;
   identifiers: FoundIdentifiers;
   text?: string;

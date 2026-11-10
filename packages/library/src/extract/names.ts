@@ -8,14 +8,27 @@ type Role = Creator["role"];
  * A person's name as written ("Family, Given" or "Given Family") to a Creator. Trailing
  * cataloguing punctuation ("Adebayo, Ngozi,") is dropped; a single word becomes `literal`.
  */
+/** Longest name text considered; longer input is cut first (keeps every step linear, R55). */
+export const MAX_NAME_CHARS = 2000;
+const TRAILING = new Set([" ", ",", ";", ":"]);
+const isLetter = (ch: string | undefined) => !!ch && /^\p{L}$/u.test(ch);
+
 export function parseName(raw: string, role: Role = "author"): Creator | undefined {
-  let s = clean(raw).replace(/[\s,;:]+$/u, "");
-  if (/\p{L}{2,}\.$/u.test(s)) s = s.slice(0, -1); // "Tomás." but keep the initial in "Smith, J."
+  let s = clean(raw.slice(0, MAX_NAME_CHARS));
+  // Trailing cataloguing punctuation, scanned from the end (no backtracking regex).
+  let end = s.length;
+  while (end > 0 && TRAILING.has(s[end - 1]!)) end--;
+  s = s.slice(0, end);
+  // "Tomás." loses its full stop, but the initial in "Smith, J." keeps it (two letters before the dot).
+  const chars = Array.from(s);
+  if (chars.length >= 3 && chars[chars.length - 1] === "." && isLetter(chars[chars.length - 2]) && isLetter(chars[chars.length - 3])) s = s.slice(0, -1);
   if (!s) return undefined;
   const comma = s.indexOf(",");
   if (comma > 0) {
     const family = s.slice(0, comma).trim();
-    const given = s.slice(comma + 1).trim().replace(/,.*$/u, "").trim();
+    const rest = s.slice(comma + 1);
+    const next = rest.indexOf(",");
+    const given = (next >= 0 ? rest.slice(0, next) : rest).trim();
     return given ? { family, given, role } : { family, role };
   }
   const parts = s.split(/\s+/u);
@@ -25,7 +38,9 @@ export function parseName(raw: string, role: Role = "author"): Creator | undefin
 
 /** Splits a free-text author list ("A; B", "A and B", "A & B") into Creators. */
 export function parseNameList(raw: string, role: Role = "author"): Creator[] {
-  const parts = raw.includes(";") ? raw.split(";") : raw.split(/\s+(?:and|&)\s+/iu);
+  // Whitespace collapsed first, so the separator pattern never rescans a long run of spaces.
+  const t = clean(raw.slice(0, MAX_NAME_CHARS * 10));
+  const parts = t.includes(";") ? t.split(";") : t.split(/ (?:and|&) /iu);
   return parts.map((p) => parseName(p, role)).filter((c): c is Creator => c !== undefined);
 }
 

@@ -12,6 +12,16 @@ import { clean, decodeEntities, normalizeDate, parseName } from "../extract/name
 
 export const SIDECAR_EXTS = [".bib", ".ris", ".json", ".opf"] as const;
 const MAX_SIDECAR_BYTES = 1024 * 1024;
+/** Each field is cut to this many characters before anything else looks at it (R55). */
+export const MAX_FIELD_CHARS = 2000;
+const cap = (s: string) => s.slice(0, MAX_FIELD_CHARS);
+
+/** `s` without trailing `ch` characters, scanned from the end (no backtracking regex). */
+function trimEnd(s: string, ch: string): string {
+  let end = s.length;
+  while (end > 0 && s[end - 1] === ch) end--;
+  return s.slice(0, end);
+}
 
 export interface SidecarMetadata {
   type?: SourceType;
@@ -98,7 +108,7 @@ export function parseRis(text: string): SidecarMetadata {
   for (const line of text.split(/\r?\n/u)) {
     if (line.length < 5 || line[2] !== " " || line[3] !== " " || line[4] !== "-") continue;
     const tag = line.slice(0, 2).toUpperCase();
-    const v = clean(line.slice(6));
+    const v = clean(cap(line.slice(6)));
     if (tag === "ER") break;
     if (!v) continue;
     if (tag === "TY") m.type ??= RIS_TYPES[v.toUpperCase()] ?? "other";
@@ -109,7 +119,7 @@ export function parseRis(text: string): SidecarMetadata {
     } else if (tag === "A2" || tag === "ED") {
       const c = parseName(v, "editor");
       if (c) creators.push(c);
-    } else if ((tag === "PY" || tag === "Y1" || tag === "DA") && !m.issued) m.issued = normalizeDate(v.replace(/\/+$/u, "").replace(/\//gu, "-"));
+    } else if ((tag === "PY" || tag === "Y1" || tag === "DA") && !m.issued) m.issued = normalizeDate(trimEnd(v, "/").replaceAll("/", "-"));
     else if ((tag === "JO" || tag === "JF" || tag === "T2" || tag === "BT") && !m.container) m.container = v;
     else if (tag === "PB" && !m.publisher) m.publisher = v;
     else if (tag === "DO" && !m.doi) m.doi = doiOf(v);
@@ -126,12 +136,41 @@ const BIB_TYPES: Record<string, SourceType> = {
 };
 
 /** The first `@type{key, field = {value} | "value" | number, ...}` entry, braces balanced by counting. */
+/** Index just past the brace (or parenthesis) block opening at `open`, counting nesting; text.length if unclosed. */
+function blockEnd(text: string, open: number): number {
+  const o = text[open]!;
+  const c = o === "(" ? ")" : "}";
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === o) depth++;
+    else if (text[i] === c && --depth === 0) return i + 1;
+  }
+  return text.length;
+}
+
+const NON_ENTRIES = new Set(["string", "comment", "preamble"]);
+
 export function parseBibtex(text: string): SidecarMetadata {
-  const at = text.indexOf("@");
-  if (at < 0) return {};
-  const open = text.indexOf("{", at);
+  // The first real entry: @string, @comment and @preamble blocks are skipped whole.
+  let at = text.indexOf("@");
+  let open = -1;
+  let kind = "";
+  while (at >= 0) {
+    let j = at + 1;
+    while (j < text.length && /[A-Za-z]/u.test(text[j]!)) j++;
+    kind = text.slice(at + 1, j).toLowerCase();
+    while (j < text.length && /\s/u.test(text[j]!)) j++;
+    if (text[j] === "{" || text[j] === "(") {
+      if (!NON_ENTRIES.has(kind)) {
+        open = j;
+        break;
+      }
+      at = text.indexOf("@", blockEnd(text, j));
+    } else {
+      at = text.indexOf("@", j);
+    }
+  }
   if (open < 0) return {};
-  const kind = text.slice(at + 1, open).trim().toLowerCase();
   const fields = new Map<string, string>();
   let i = text.indexOf(",", open);
   if (i < 0) return {};
@@ -166,14 +205,14 @@ export function parseBibtex(text: string): SidecarMetadata {
       while (i < n && text[i] !== "," && text[i] !== "}") i++;
       value = text.slice(start, i);
     }
-    if (name && !fields.has(name)) fields.set(name, clean(value.replace(/[{}]/gu, "")));
+    if (name && !fields.has(name)) fields.set(name, clean(cap(value).replace(/[{}]/gu, "")));
   }
   const m: SidecarMetadata = { type: BIB_TYPES[kind] ?? "other" };
   const get = (k: string) => fields.get(k) || undefined;
   if (get("title")) m.title = get("title");
   const people = (k: string, role: Creator["role"]) =>
     (get(k) ?? "")
-      .split(/\s+and\s+/iu)
+      .split(/ and /iu)
       .map((s) => parseName(s, role))
       .filter((c): c is Creator => !!c);
   const creators = [...people("author", "author"), ...people("editor", "editor")];
@@ -199,17 +238,17 @@ export function parseCslJson(text: string): SidecarMetadata {
   const parsed = JSON.parse(text) as unknown;
   const item = (Array.isArray(parsed) ? parsed[0] : parsed) as Record<string, unknown> | undefined;
   if (!item || typeof item !== "object") return {};
-  const s = (k: string) => (typeof item[k] === "string" && clean(item[k] as string) ? clean(item[k] as string) : undefined);
+  const s = (k: string) => (typeof item[k] === "string" && clean(cap(item[k] as string)) ? clean(cap(item[k] as string)) : undefined);
   const m: SidecarMetadata = {};
   if (typeof item.type === "string") m.type = CSL_TYPES[item.type] ?? "other";
   if (s("title")) m.title = s("title");
   const people = (k: string, role: Creator["role"]): Creator[] =>
     (Array.isArray(item[k]) ? (item[k] as Array<Record<string, unknown>>) : []).flatMap((p): Creator[] => {
       if (!p || typeof p !== "object") return [];
-      const family = typeof p.family === "string" ? clean(p.family) : "";
-      const given = typeof p.given === "string" ? clean(p.given) : "";
+      const family = typeof p.family === "string" ? clean(cap(p.family)) : "";
+      const given = typeof p.given === "string" ? clean(cap(p.given)) : "";
       if (family) return [{ family, ...(given ? { given } : {}), role }];
-      return typeof p.literal === "string" && clean(p.literal) ? [{ literal: clean(p.literal), role }] : [];
+      return typeof p.literal === "string" && clean(cap(p.literal)) ? [{ literal: clean(cap(p.literal)), role }] : [];
     });
   const creators = [...people("author", "author"), ...people("editor", "editor")];
   if (creators.length) m.creators = creators;
@@ -233,20 +272,24 @@ export function parseCslJson(text: string): SidecarMetadata {
 
 export function parseOpf(text: string): SidecarMetadata {
   const m: SidecarMetadata = { type: "book" };
-  const title = dcValues(text, "title")[0]?.value;
+  const first = (tag: string) => {
+    const v = dcValues(text, tag)[0]?.value;
+    return v ? cap(v) : undefined;
+  };
+  const title = first("title");
   if (title) m.title = title;
   const creators = dcValues(text, "creator")
-    .map((c) => parseName(c.value))
+    .map((c) => parseName(cap(c.value)))
     .filter((c): c is Creator => !!c);
   if (creators.length) m.creators = creators;
-  const issued = normalizeDate(dcValues(text, "date")[0]?.value);
+  const issued = normalizeDate(first("date"));
   if (issued) m.issued = issued;
-  const publisher = dcValues(text, "publisher")[0]?.value;
+  const publisher = first("publisher");
   if (publisher) m.publisher = decodeEntities(publisher);
   const isbns: string[] = [];
   for (const id of dcValues(text, "identifier")) {
-    const v = id.value.replace(/^urn:/iu, "");
-    if (/^isbn[:\s]/iu.test(v) || /opf:scheme\s*=\s*["']isbn/iu.test(id.attrs)) isbns.push(v.replace(/^isbn[:\s]*/iu, ""));
+    const v = cap(id.value).replace(/^urn:/iu, "");
+    if (/^isbn[:\s]/iu.test(v) || /opf:scheme\s*=\s*["']isbn/iu.test(cap(id.attrs))) isbns.push(v.replace(/^isbn[:\s]*/iu, ""));
     else if (!m.doi) m.doi = doiOf(v);
   }
   if (!m.doi) delete m.doi;

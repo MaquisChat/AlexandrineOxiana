@@ -107,7 +107,7 @@ export async function addOriginalAsset(
   sourceId: string,
   input: OriginalAssetInput,
   /** Package-internal: a newly captured file (e.g. a drop onto the source): its capture method is evaluated and audited in the same change. */
-  internal: { captureMethod?: Provenance["captureMethod"] } = {},
+  internal: { captureMethod?: Provenance["captureMethod"]; hasLocation?: boolean } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -115,7 +115,7 @@ export async function addOriginalAsset(
   const current = await readSourceFile(core, st, sourceId);
   const reqs: MutateRequest[] = [
     ...(internal.captureMethod ? [{ action: "capture" as const, capture: { method: internal.captureMethod } }] : []),
-    storeRequest(current.source.provenance),
+    storeRequest(current.source.provenance, internal.hasLocation === true),
   ];
   return runMutation(
     core,

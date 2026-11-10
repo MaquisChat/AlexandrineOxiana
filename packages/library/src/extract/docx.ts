@@ -55,8 +55,9 @@ export async function extractDocx(path: string): Promise<RawExtract> {
       const creator = dcValues(core, "creator")[0]?.value;
       const creators = creator ? parseNameList(creator) : [];
       if (creators.length) out.creators = creators;
-      const issued = normalizeDate(dcValues(core, "created")[0]?.value);
-      if (issued) out.issued = issued;
+      // dcterms:created is when the file was made, never the publication date (R54b).
+      const fileCreated = normalizeDate(dcValues(core, "created")[0]?.value);
+      if (fileCreated) out.fileCreated = fileCreated;
       const language = dcValues(core, "language")[0]?.value;
       if (language) out.language = language;
     }

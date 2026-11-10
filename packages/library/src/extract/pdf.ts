@@ -60,8 +60,19 @@ export async function extractPdf(path: string): Promise<RawExtract> {
     if (!creators.length && str(inf.Author)) creators = parseNameList(str(inf.Author)!);
     if (creators.length) out.creators = creators;
 
-    const issued = normalizeDate(str(metadata?.get("dc:date")) ?? str(metadata?.get("xmp:createdate")) ?? str(inf.CreationDate));
+    // Publication dates only (R54b): the Info CreationDate/ModDate and xmp:CreateDate are the
+    // file's own dates, kept apart as `fileCreated` and never used as `issued`.
+    const firstStr = (v: unknown) => str(Array.isArray(v) ? v[0] : v);
+    const issued = normalizeDate(
+      firstStr(metadata?.get("prism:publicationdate")) ??
+        firstStr(metadata?.get("prism:publicationDate")) ??
+        firstStr(metadata?.get("prism:coverdate")) ??
+        firstStr(metadata?.get("prism:coverDate")) ??
+        firstStr(metadata?.get("dc:date")),
+    );
     if (issued) out.issued = issued;
+    const fileCreated = normalizeDate(firstStr(metadata?.get("xmp:createdate")) ?? str(inf.CreationDate));
+    if (fileCreated) out.fileCreated = fileCreated;
     const lang = str(metadata?.get("dc:language")) ?? str(inf.Language);
     if (lang) out.language = lang;
 

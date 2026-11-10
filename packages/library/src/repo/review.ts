@@ -32,6 +32,8 @@ export interface ReviewEntry {
   candidates?: unknown[];
   /** Import items: an existing source this one may duplicate. */
   duplicateOf?: { sourceId: string; reason: string };
+  /** Import items: identifiers found in the file that no lookup confirmed (e.g. "doi:10.1/x"). */
+  hints?: string[];
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */
@@ -44,6 +46,7 @@ export interface ReviewInput {
   method?: string;
   candidates?: unknown[];
   duplicateOf?: { sourceId: string; reason: string };
+  hints?: string[];
 }
 
 /** A `review_items` row; `payload` is safe for the persistent index (nothing identifying when `encrypted`). */
@@ -71,7 +74,7 @@ export function reviewRow(e: ReviewEntry, encrypted: boolean): ReviewItemRow {
     ...(e.sourceId ? { sourceId: e.sourceId } : {}),
     kind: e.kind,
     status: e.status,
-    payload: encrypted ? safe : { ...safe, reasons: e.reasons, ...(e.candidates ? { candidates: e.candidates } : {}) },
+    payload: encrypted ? safe : { ...safe, reasons: e.reasons, ...(e.candidates ? { candidates: e.candidates } : {}), ...(e.hints ? { hints: e.hints } : {}) },
     createdAt: e.createdAt,
   };
 }
@@ -96,6 +99,7 @@ export async function appendReviewEntry(
     ...(input.method ? { method: input.method } : {}),
     ...(input.candidates?.length ? { candidates: input.candidates } : {}),
     ...(input.duplicateOf ? { duplicateOf: input.duplicateOf } : {}),
+    ...(input.hints?.length ? { hints: input.hints } : {}),
   };
   const json = JSON.stringify(entry);
   const encrypted = core.encrypted(st);

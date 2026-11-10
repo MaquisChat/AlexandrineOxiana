@@ -472,8 +472,9 @@ export function addCapturedOriginal(
   sourceId: string,
   input: OriginalAssetInput,
   captureMethod: Provenance["captureMethod"],
+  opts: { hasLocation?: boolean } = {},
 ): Promise<Asset> {
-  return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, { captureMethod });
+  return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, { captureMethod, hasLocation: opts.hasLocation === true });
 }
 
 /** Package-internal (link capture): the project's change stamp as the index would record it now. */

@@ -7,8 +7,9 @@
  *   1. a folder → `failed`, "Use Bulk Import for folders" (Task 23 handles folders);
  *   2. the type is sniffed from the content with `file-type` (the extension is never trusted);
  *      only PDF, EPUB, MOBI/AZW, DOCX, images, audio and video are accepted;
- *   3. policy, once per call and before any lookup: `capture` (manual_upload) and `store`; a deny
- *      is audited and every file gets `failed` with the policy's plain-language reason;
+ *   3. policy, once per call and before any lookup: `capture` (manual_upload) and `store` (with the
+ *      target source's own legal basis, or the project's `consent.defaultLegalBasis['manual-upload']`
+ *      for new sources); a deny is audited and every file gets `failed` with the policy's reason;
  *   4. drop on a source: same SHA-256 as one of its files → `duplicate`; else the file is added as
  *      an original under `original/` in one governed change (capture + store evaluated and audited,
  *      R26 txn); the source's metadata is not touched;
@@ -18,6 +19,10 @@
  *      `duplicate`; a likely one (fuzzy) → created and queued for review with the candidate; an item
  *      below AUTO_ACCEPT_THRESHOLD or whose verification needs review → created and queued
  *      (`review/pending.jsonl`, sealed in encrypted projects, R31); else `created`.
+ *
+ * Identifiers found in a file but not confirmed by a lookup are never recorded or used to find
+ * duplicates (R55): they go on the review entry as `hints`. Media with GPS are stored with
+ * `hasLocation: true`, so location governance applies (R54a).
  *
  * Each stored file is one governed mutation (`createSource` / an original added to a source): the
  * `capture` and `store` decisions are evaluated again inside it, right before anything is written
@@ -33,10 +38,11 @@ import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileTypeFromFile } from "file-type";
 import { findDuplicate, primary, type DupKey, type FileNamePattern, type Provenance, type SourceFile } from "@ao/core";
-import { UnsafeFileError } from "../extract/index.js";
+import { UnsafeFileError, extractMetadata } from "../extract/index.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { kindFor } from "../repo/io.js";
+import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, projectPolicy, type Repo } from "../repo/repo.js";
 import { AUTO_ACCEPT_THRESHOLD, resolveItem, type Resolution } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
@@ -81,17 +87,19 @@ const REASONS = {
   lowConfidence: "The item could not be identified with enough confidence.",
 };
 
-/** The `consent.defaultLegalBasis` category manual uploads use. */
-const LEGAL_CATEGORY = "manual_upload";
+/** The `consent.defaultLegalBasis` category manual uploads use (docs/governance/README.md). */
+const LEGAL_CATEGORY = "manual-upload";
 
-const ACCEPTED = new Set([
-  "application/pdf",
-  "application/epub+zip",
-  "application/x-mobipocket-ebook",
-  "application/vnd.amazon.ebook",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+/**
+ * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
+ * raw), audio and video. Each has its MIME type and asset kind in repo/io.ts.
+ */
+export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
+  "pdf", "epub", "mobi", "azw", "azw3", "docx",
+  "jpg", "png", "gif", "webp", "heic", "heif", "avif", "bmp", "tif", "cr2", "cr3", "dng", "nef", "arw", "orf", "rw2", "raf",
+  "mp4", "mov", "webm", "mkv", "avi", "m4v", "3gp", "mpg",
+  "mp3", "m4a", "wav", "ogg", "flac", "aac", "opus",
 ]);
-const accepted = (mime: string) => ACCEPTED.has(mime) || /^(?:image|audio|video)\//u.test(mime);
 
 async function sha256File(path: string): Promise<string> {
   const h = createHash("sha256");
@@ -139,24 +147,40 @@ export function createAttach(deps: AttachDeps): Attach {
   const { repo, http } = deps;
   const patterns = deps.patterns ?? [];
 
-  /** Per call: the policy decision, the lookup context and the project's duplicate keys, each made once. */
-  function session(projectId: string) {
+  /** Per call: the target source, the policy decision, the lookup context and the duplicate keys, each made once. */
+  function session(projectId: string, toSourceId: string | undefined) {
+    let target: Promise<SourceFile | null> | undefined;
     let allowed: Promise<string | null> | undefined;
     let lookup: Promise<LookupContext> | undefined;
     let keys: Promise<Array<DupKey & { sourceId: string }>> | undefined;
-    return {
-      /** null when allowed, else the plain-language reason (the deny is audited once). */
+    const self = {
+      /** The source dropped onto (null when it does not exist). */
+      target: () =>
+        (target ??= (async () => {
+          try {
+            return await repo.getSource(projectId, toSourceId!);
+          } catch (err) {
+            if (err instanceof NotFoundError) return null;
+            throw err;
+          }
+        })()),
+      /**
+       * null when allowed, else the plain-language reason (the deny is audited once). The store
+       * check uses what the transaction will use: the target source's own provenance (its legal
+       * basis), or the project's defaults for a new source.
+       */
       policy: () =>
         (allowed ??= (async () => {
           try {
             await authorizeProcessing(repo, projectId, { action: "capture", capture: { method: "manual_upload" } }, { op: "attach" });
-            const { identifiable, legalBasis } = await storeInputs(projectId);
-            await authorizeProcessing(
-              repo,
-              projectId,
-              { action: "store", store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } },
-              { op: "attach" },
-            );
+            const sf = toSourceId ? await self.target() : null;
+            const store = sf
+              ? storeRequest(sf.source.provenance)
+              : await (async () => {
+                  const { identifiable, legalBasis } = await storeInputs(projectId);
+                  return { action: "store" as const, store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } };
+                })();
+            await authorizeProcessing(repo, projectId, store, { op: "attach" });
             return null;
           } catch (err) {
             if (err instanceof PolicyDeniedError) return err.reason;
@@ -178,6 +202,7 @@ export function createAttach(deps: AttachDeps): Attach {
           return out;
         })()),
     };
+    return self;
   }
   type Session = ReturnType<typeof session>;
 
@@ -188,17 +213,15 @@ export function createAttach(deps: AttachDeps): Attach {
     return { identifiable, ...(legalBasis ? { legalBasis } : {}) };
   }
 
-  async function ontoSource(projectId: string, path: string, sourceId: string, ext: string, sha256: string): Promise<AttachOutcome> {
-    let sf: SourceFile;
-    try {
-      sf = await repo.getSource(projectId, sourceId);
-    } catch (err) {
-      if (err instanceof NotFoundError) return failed(path, REASONS.noSource);
-      throw err;
-    }
-    if (sf.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
+  async function ontoSource(projectId: string, path: string, sf: SourceFile, mime: string, ext: string, sha256: string): Promise<AttachOutcome> {
+    const sourceId = sf.source.id;
+    // Files added in this call count too.
+    const current = await repo.getSource(projectId, sourceId);
+    if (current.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
+    // Media with GPS: location governance applies to the store (R54a).
+    const hasLocation = /^(?:image|video)\//u.test(mime) && !!(await extractMetadata(path, mime).catch(() => undefined))?.media?.gps;
     const kind = kindFor(ext);
-    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, label: addedLabel(kind, new Date()) }, "manual_upload");
+    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, label: addedLabel(kind, new Date()) }, "manual_upload", { hasLocation });
     return { path, outcome: "attached", sourceId };
   }
 
@@ -235,6 +258,7 @@ export function createAttach(deps: AttachDeps): Attach {
       provenance,
       fieldEvidence: r.fieldEvidence,
       verification: r.verification.fields,
+      ...(r.hasLocation ? { hasLocation: true } : {}),
       ...(needsReview
         ? {
             reviewItem: {
@@ -245,6 +269,7 @@ export function createAttach(deps: AttachDeps): Attach {
               method: r.evidence.method,
               candidates: r.candidates,
               ...(dup ? { duplicateOf: { sourceId: dup.sourceId, reason: dup.reason } } : {}),
+              ...(r.identifierHints.length ? { hints: r.identifierHints } : {}),
             },
           }
         : {}),
@@ -265,17 +290,19 @@ export function createAttach(deps: AttachDeps): Attach {
     } catch {
       return failed(path, REASONS.missing);
     }
-    if (!type || !accepted(type.mime)) return failed(path, REASONS.unsupported);
+    if (!type || !ACCEPTED_EXTENSIONS.has(type.ext)) return failed(path, REASONS.unsupported);
+    const target = toSourceId ? await s.target() : null;
+    if (toSourceId && !target) return failed(path, REASONS.noSource);
     const denied = await s.policy();
     if (denied) return failed(path, denied);
     const sha256 = await sha256File(path);
-    if (toSourceId) return ontoSource(projectId, path, toSourceId, type.ext, sha256);
+    if (target) return ontoSource(projectId, path, target, type.mime, type.ext, sha256);
     return ontoLibrary(projectId, path, type.mime, type.ext, sha256, s);
   }
 
   async function attachFiles(projectId: string, paths: string[], opts: { toSourceId?: string } = {}): Promise<AttachOutcome[]> {
     repo.getProject(projectId); // NotFoundError for an unknown project
-    const s = session(projectId);
+    const s = session(projectId, opts.toSourceId);
     const out: AttachOutcome[] = [];
     for (const path of paths) {
       try {

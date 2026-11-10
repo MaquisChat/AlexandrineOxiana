@@ -159,6 +159,7 @@ const XMP = `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
    <dc:creator><rdf:Seq><rdf:li>Amara Okafor</rdf:li><rdf:li>Lindqvist, Henrik</rdf:li></rdf:Seq></dc:creator>
    <dc:language><rdf:Bag><rdf:li>en</rdf:li></rdf:Bag></dc:language>
    <prism:doi>${FIXTURE_DOI}</prism:doi>
+   <prism:publicationDate>2021-03-04</prism:publicationDate>
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
@@ -399,6 +400,11 @@ export function buildMobi(opts = {}) {
 }
 
 // ---------------------------------------------------------------------------------------------
+
+/** Writes the camera TIFF fixture (iPhone EXIF incl. GPS) to `path`. */
+export function buildCameraTiff(path) {
+  return cameraTiff(path);
+}
 
 async function cameraTiff(path) {
   const { ExifTool } = requireLib("exiftool-vendored");

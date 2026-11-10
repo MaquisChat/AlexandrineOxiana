@@ -49,9 +49,12 @@ When `consent.requireLegalBasis` is on (the GDPR profile turns it on), identifia
 consent:
   defaultLegalBasis:
     social-media: "public task (GDPR Art. 6(1)(e)); approved by the ethics board on 2026-10-01"
+    manual-upload: "legitimate interest (GDPR Art. 6(1)(f)); see the data management plan, section 3"
 ```
 
 Link capture from YouTube, Instagram and TikTok uses the `social-media` entry, unless the researcher gives a basis for that one capture. The basis is stored in each source's provenance. If no basis is recorded, the capture stops before anything is downloaded and says so in plain language. The software records the basis you state; it does not judge whether it is valid.
+
+Files you drag and drop onto the library (drag-and-drop attach) use the `manual-upload` entry for each new source. A file dropped onto an existing source is stored under that source's own recorded basis instead. Without a basis, an identifiable project refuses the drop and says why.
 
 ## Enforcement status
 
