@@ -346,3 +346,13 @@ describe("originalFileName hardening", () => {
     expect(originalFileName("A [a1b2]", ".p/df")).toBe("A.p-df");
   });
 });
+
+describe("datedFileName", () => {
+  it("names a dated file '<stem> - modified <YYYY-MM-DD HHmm>.<ext>' in the given time zone", async () => {
+    const { datedFileName } = await import("./naming.js");
+    const at = new Date("2026-11-10T09:05:00.000Z");
+    expect(datedFileName("profile-snapshot", at, "json", "UTC")).toBe("profile-snapshot - modified 2026-11-10 0905.json");
+    expect(datedFileName("capture", at, "md", "Asia/Tokyo")).toBe("capture - modified 2026-11-10 1805.md");
+    expect(datedFileName("a/b:c", at, ".JSON", "UTC")).toBe("a-b-c - modified 2026-11-10 0905.json");
+  });
+});

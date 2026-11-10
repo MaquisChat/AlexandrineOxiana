@@ -145,6 +145,16 @@ export function derivedFileName(
   return `${render(templates.derivedFile, values)}.${ext}`;
 }
 
+/**
+ * A dated file that belongs to no source, e.g. a profile snapshot or a capture report:
+ * `<stem> - modified <YYYY-MM-DD HHmm>.<ext>`, the time in `tz` (the researcher's).
+ */
+export function datedFileName(stem: string, modified: Date, ext: string, tz?: string): string {
+  const safeExt = sanitizeExt(ext).toLowerCase();
+  const tail = ` - modified ${formatModified(modified, tz)}.${safeExt}`;
+  return `${sanitizeSegment(stem, Math.max(MAX_BASE_NAME_BYTES - byteLength(tail), 16))}${tail}`;
+}
+
 /** Splits a name into stem and extension tail (`.vtt`, `.tar.gz`, `.vtt.enc`, ...). */
 function splitName(name: string, isFile: boolean): { stem: string; tail: string } {
   if (!isFile) return { stem: name, tail: "" };

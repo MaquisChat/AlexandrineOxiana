@@ -6,6 +6,7 @@ export { isId, newId, shortId } from "./ids.js";
 export * from "./model/index.js";
 
 export {
+  datedFileName,
   defaultTemplates,
   derivedFileName,
   encName,
