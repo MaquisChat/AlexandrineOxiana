@@ -138,7 +138,11 @@ export const REASONS = {
 /** A batch could not start (or resume): the options or the project's rules do not allow it. */
 export class BatchRefusedError extends Error {
   override name = "BatchRefusedError";
-  constructor(readonly reason: string) {
+  constructor(
+    readonly reason: string,
+    /** The project's rules (governance) refused it, as opposed to options, the source or the record. */
+    readonly denied: boolean = false,
+  ) {
     super(reason);
   }
 }
@@ -328,7 +332,7 @@ async function preflightDeleted(repo: Repo, projectId: string, adapter: { increm
 /** Policy and option checks a batch must pass before it starts (or resumes). */
 async function preflight(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], options: ImportOptions): Promise<GovernanceNote[]> {
   repo.getProject(projectId); // NotFoundError for an unknown project
-  if (options.fileHandling === "link" && (await preflightLink(repo, projectId))) throw new BatchRefusedError(REASONS.linkEncrypted);
+  if (options.fileHandling === "link" && (await preflightLink(repo, projectId))) throw new BatchRefusedError(REASONS.linkEncrypted, true);
   const method = CAPTURE_METHOD[kind];
   const { identifiable, legalBasis } = await storeInputs(repo, projectId, legalCategory(method));
   const notes: GovernanceNote[] = [];
@@ -341,7 +345,7 @@ async function preflight(repo: Repo, projectId: string, kind: ImportBatch["sourc
       ),
     );
   } catch (err) {
-    if (err instanceof PolicyDeniedError) throw new BatchRefusedError(err.reason);
+    if (err instanceof PolicyDeniedError) throw new BatchRefusedError(err.reason, true);
     if (err instanceof ProjectLockedError) throw new BatchRefusedError("The project is locked. Unlock it, then try again.");
     throw err;
   }

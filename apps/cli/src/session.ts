@@ -103,6 +103,8 @@ export interface Session {
   worker?: CaptureWorker;
   /** Starts the media worker (once) and returns it. */
   needWorker(): Promise<CaptureWorker>;
+  /** Runs before the library is closed (e.g. cancelling a running import on Ctrl+C). */
+  beforeClose(fn: () => Promise<void>): void;
   /** Stops the worker, closes the index and releases the library. Safe to call twice. */
   close(): Promise<void>;
 }
@@ -142,6 +144,7 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
     throw err;
   }
   let closing: Promise<void> | undefined;
+  const hooks: Array<() => Promise<void>> = [];
   const session: Session = {
     deps,
     lib,
@@ -152,10 +155,14 @@ export async function openSession(opts: OpenSessionOptions): Promise<Session> {
       session.worker ??= await startCaptureWorker({ repo, index });
       return session.worker;
     },
+    beforeClose(fn) {
+      hooks.push(fn);
+    },
     // One shared promise: the Ctrl+C handler and the command's own `finally` both wait for the
     // same shutdown, so the lock is released before the process exits whichever gets there first.
     close() {
       closing ??= (async () => {
+        for (const h of hooks) await h().catch(() => {});
         await session.worker?.stop().catch(() => {});
         try {
           index?.close();

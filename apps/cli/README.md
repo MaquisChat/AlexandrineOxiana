@@ -1,4 +1,4 @@
-# `ao`: capture links and profiles from a terminal
+# `ao`: capture, import and export from a terminal
 
 `ao` is the first usable part of Alexandrine Oxiana. It saves YouTube, Instagram and TikTok
 links (or a whole profile) into a **library** on your computer, as **governed** sources: every
@@ -149,7 +149,7 @@ why. `recheck` also saves the new result in the project (and records it in the a
 
 Exit codes, if you use `ao` in a script: 0 success, 1 something failed, 2 refused by the
 project's rules, 3 cookie confirmation needed, 4 you must do something and run it again (supply a
-legal basis, or wait and re-run a profile capture that the platform paused).
+legal basis, wait and re-run a profile capture that the platform paused, or save a Zotero API key).
 Add `--json` to any command for machine-readable output (paths are library-relative; no tokens).
 
 ## 9. Update yt-dlp
@@ -164,6 +164,125 @@ pnpm ao tools versions
 
 `update` shows the old and new version (for example `yt-dlp 2026.09.01 → 2026.10.22`).
 If yt-dlp was installed by you or your system, `ao` reports its version but leaves it alone.
+
+## 10. Import files and references
+
+`ao import` brings in many files or references at once: a folder of PDFs, books and media, a ZIP
+archive, an export from a reference manager (BibTeX `.bib`, RIS `.ris`, CSL-JSON `.json`, Zotero
+RDF `.rdf`), or a Calibre library folder. Your own files are copied, never moved or changed.
+
+First look before you import (nothing is imported):
+
+```
+pnpm ao import "Downloads/Papers" --project "Market study" --dry-run
+```
+
+It counts what it found, what is already in the project, and which files cannot be imported.
+Then import for real:
+
+```
+pnpm ao import "Downloads/Papers" --project "Market study"
+```
+
+Options:
+
+- `--structure collections` (the default) turns subfolders into collections, `--structure tags`
+  into tags, `--structure none` ignores them.
+- `--duplicates merge` (the default) adds a duplicate's files and missing details to the source
+  you already have; `--duplicates skip` leaves it out; `--duplicates keep-both` keeps both.
+- `--link` leaves the files where they are and only points to them (not possible in encrypted projects).
+
+**Files outside the folder you import.** A reference export may point to PDFs somewhere else on
+your computer. `ao` does not take those without asking: `--dry-run` lists them with their folder,
+and the import leaves them out (the reference is still imported, with a note). To include them:
+
+```
+pnpm ao import "references.bib" --project "Market study" --approve-folder "/Users/you/Zotero/storage"
+```
+
+```
+pnpm ao import "references.bib" --project "Market study" --approve-file "/Users/you/Desktop/paper.pdf"
+```
+
+`--approve-folder` and `--approve-file` can be repeated. Add `--remember-folder` to remember the
+approved folders for later imports into this library (on this computer only).
+
+Items that could not be identified with enough confidence are imported and put in the review
+queue: see them with `pnpm ao list --project "Market study" --needs-review`.
+
+## 11. Import from Zotero
+
+From Zotero on this computer (close Zotero first if it says it is busy):
+
+```
+pnpm ao import zotero --data-dir "/Users/you/Zotero" --project "Market study"
+```
+
+The data folder is shown in Zotero under Settings, Advanced, Files and Folders. Collections,
+tags, notes and PDF highlights come along. Running the same command again later brings in only
+what changed; sources you deleted here are not brought back.
+
+From your library on zotero.org: first save your Zotero API key (create one at zotero.org, under
+Settings, Security; read-only access is enough). You are asked for it and what you type is hidden:
+
+```
+pnpm ao secrets set zotero-api-key
+```
+
+The key is kept only in your computer's keychain (Keychain on a Mac, Credential Manager on
+Windows, the keyring on Linux), never in a file, and is never printed. `ao` never accepts a key
+typed on the command line itself. For a script, put it in the `AO_ZOTERO_API_KEY` environment
+variable for that one command. If your computer has no keychain, `ao` says so and saves nothing.
+
+Then import your own library (your user ID is on the same Security page) or a group library:
+
+```
+pnpm ao import zotero --web user:1234567 --project "Market study"
+```
+
+```
+pnpm ao import zotero --web group:7654321 --project "Market study"
+```
+
+The next run asks Zotero only for what changed since the last one (add `--full` to read
+everything again). Items you deleted in Zotero are not deleted here; the summary says how many.
+To remove the saved key: `pnpm ao secrets delete zotero-api-key`.
+
+## 12. Export references
+
+Export a project's references for Zotero, EndNote, Mendeley or LaTeX:
+
+```
+pnpm ao export --project "Market study" --format bibtex --output "market-study.bib"
+```
+
+```
+pnpm ao export --project "Market study" --format ris --output "market-study.ris"
+```
+
+```
+pnpm ao export --project "Market study" --format csl-json --output "market-study.json"
+```
+
+Citation keys are kept. Only the reference details are exported: never file locations, notes,
+highlights or the record of how a source was captured. Add `--include-tags` to export tags as
+keywords, and `--source <short code>` (repeatable) to export only some sources. If the project's
+rules allow only de-identified exports, sources that hold identifiable data are left out and the
+summary says so. If the rules refuse the export, nothing is written and the exit code is 2.
+
+## 13. Checking and repairing
+
+Check that a project's audit log has not been changed outside the app:
+
+```
+pnpm ao verify-audit --project "Market study"
+```
+
+Rebuild the search index if searches seem out of date (your files are not touched):
+
+```
+pnpm ao rebuild-index
+```
 
 ## A note about platform terms
 
@@ -193,7 +312,15 @@ so you can open it again straight away. A capture that was running is not saved.
 | `pnpm ao recheck <source> or --all --project <name>` | list details that need checking |
 | `pnpm ao list --project <name> [--needs-review]` | list sources |
 | `pnpm ao tools update` / `pnpm ao tools versions` | update or show the capture tools |
+| `pnpm ao import <folder or file> --project <name> [--dry-run]` | import files or a reference export |
+| `pnpm ao import zotero --data-dir <folder> --project <name>` | import from Zotero on this computer |
+| `pnpm ao import zotero --web user:<id> --project <name>` | import from zotero.org |
+| `pnpm ao secrets set zotero-api-key` | save your Zotero API key in the keychain |
+| `pnpm ao export --project <name> --format bibtex --output <file>` | export references |
+| `pnpm ao verify-audit --project <name>` | check a project's audit log |
+| `pnpm ao rebuild-index` | rebuild the search index |
 
 Settings you can put in the environment: `AO_LIBRARY` (library folder), `AO_PASSPHRASE`
-(passphrase for encrypted projects, for scripts), `AO_CONFIG_DIR` (where `ao` keeps its small
+(passphrase for encrypted projects, for scripts), `AO_ZOTERO_API_KEY` (only for
+`ao secrets set zotero-api-key` in a script; read once and removed), `AO_CONFIG_DIR` (where `ao` keeps its small
 settings file), `AO_WORKER_BIN` (a packaged media helper instead of the Python one).

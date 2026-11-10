@@ -1,6 +1,10 @@
 import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { registerCapture } from "./commands/capture.js";
+import { registerExport } from "./commands/export.js";
+import { registerImport } from "./commands/import.js";
+import { registerMaintenance } from "./commands/maintenance.js";
+import { registerSecrets } from "./commands/secrets.js";
 import { registerLibrary } from "./commands/library.js";
 import { registerList } from "./commands/list.js";
 import { registerProject } from "./commands/project.js";
@@ -8,14 +12,14 @@ import { registerRecheck } from "./commands/recheck.js";
 import { registerTools } from "./commands/tools.js";
 import { registerTranscribe } from "./commands/transcribe.js";
 import { EXIT, describeError } from "./errors.js";
-import { hasEnvPassphrase } from "./prompt.js";
+import { hasEnvPassphrase, zoteroKeyFromEnv } from "./prompt.js";
 import { openSessions } from "./session.js";
 
 export const packageName = "@ao/cli";
 
 export function buildProgram(): Command {
   const program = new Command("ao")
-    .description("Alexandrine Oxiana: capture links and profiles into a governed research library")
+    .description("Alexandrine Oxiana: capture links and profiles, and import or export references, in a governed research library")
     .option("--library <path>", "the library folder (default: AO_LIBRARY, else the one you used last)")
     .option("--json", "print machine-readable JSON instead of text")
     .showHelpAfterError()
@@ -27,6 +31,10 @@ export function buildProgram(): Command {
   registerRecheck(program);
   registerList(program);
   registerTools(program);
+  registerImport(program);
+  registerExport(program);
+  registerMaintenance(program);
+  registerSecrets(program);
   return program;
 }
 
@@ -49,6 +57,7 @@ export async function run(argv: string[]): Promise<number> {
   const args = argv.slice(2);
   if (args[0] === "--") args.shift(); // `pnpm ao -- <args>`
   hasEnvPassphrase(); // reads AO_PASSPHRASE now and removes it from the environment, before anything is started
+  zoteroKeyFromEnv(); // the same for AO_ZOTERO_API_KEY
   installSignalHandlers();
   const program = buildProgram();
   try {

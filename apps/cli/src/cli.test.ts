@@ -5,12 +5,13 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { devWorkerPython, openLibrary } from "@ao/library";
+import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const ENTRY = join(REPO_ROOT, "apps/cli/src/index.ts");
@@ -489,6 +490,179 @@ describe.skipIf(!HAVE_WORKER)("capture, with the real media worker and the fake 
     expect(json(u).ytDlp).toMatchObject({ managed: false, old: "2026.10.22", new: "2026.10.22" });
     const ut = await ao(["tools", "update"]);
     expect(ut.stdout).toContain("provided by your system");
+  }, 60_000);
+});
+
+describe("import, export, secrets and maintenance", () => {
+  let lib: string;
+  let papers: string;
+  let elsewhere: string;
+  const GOV_NO_LOOKUPS = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\nprocessing:\n  metadata_lookup: []\n";
+  const run = (args: string[], env: NodeJS.ProcessEnv = {}) => ao(args, { AO_LIBRARY: lib, ...env });
+  /** A project with the given governance.yaml (written over the one `project create` made). */
+  async function projectWith(name: string, yaml: string): Promise<void> {
+    const r = await run(["project", "create", name, "--not-identifiable"]);
+    expect(r.code, r.stderr).toBe(0);
+    await writeFile(join(lib, "Projects", name, "governance.yaml"), yaml);
+  }
+
+  beforeAll(async () => {
+    lib = await newLibrary("Imports");
+    papers = join(tmp, "Papers");
+    elsewhere = join(tmp, "Elsewhere");
+    await mkdir(join(papers, "Sub"), { recursive: true });
+    await mkdir(elsewhere, { recursive: true });
+    await writeFile(join(papers, "Okafor - 2024 - Feeding the City.pdf"), await buildPdf({ title: "Feeding the City", author: "Ngozi Okafor", extra: "cli one" }));
+    await writeFile(join(papers, "Sub", "Bello - 2022 - Trader Survey.pdf"), await buildPdf({ title: "Trader Survey", author: "Amina Bello", extra: "cli two" }));
+    await writeFile(join(elsewhere, "linked.pdf"), await buildPdf({ title: "Street Food and the State", author: "Tunde Adebayo", extra: "cli linked" }));
+    await projectWith("Imp", GOV_NO_LOOKUPS);
+    await projectWith("NoUpload", "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [refman_import]\n");
+  }, 60_000);
+
+  it("--dry-run --json prints a ScanSummary and exits 0 (nothing imported)", async () => {
+    const r = await run(["--json", "import", papers, "--project", "Imp", "--dry-run"]);
+    expect(r.code, r.stderr).toBe(0);
+    const s = json(r);
+    expect(s).toMatchObject({ items: 2, byType: { pdf: 2 }, alreadyImported: 0, outsideFiles: [], unreadable: [] });
+    expect(s.totalBytes).toBeGreaterThan(0);
+    const listed = await run(["--json", "list", "--project", "Imp"]);
+    expect(json(listed).sources).toEqual([]);
+  }, 60_000);
+
+  it("a denied import exits 2 with the reason on stderr", async () => {
+    const r = await run(["import", papers, "--project", "NoUpload"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toMatch(/rules do not allow/u);
+    expect(r.stderr).toMatch(/manual_upload/u);
+    expect(r.stderr).not.toContain(tmp);
+  }, 60_000);
+
+  it("imports a folder, then the same folder again finds the duplicates", async () => {
+    const r = await run(["--json", "import", papers, "--project", "Imp", "--structure", "tags", "--duplicates", "skip"]);
+    expect(r.code, r.stderr).toBe(0);
+    const out = json(r);
+    expect(out.state).toBe("finished");
+    expect(out.counts.created + out.counts.needsReview).toBe(2);
+    expect(JSON.stringify(out)).not.toContain(tmp);
+    const again = await run(["import", papers, "--project", "Imp"]);
+    expect(again.code, again.stderr).toBe(0);
+    expect(again.stdout).toMatch(/duplicates 2/u);
+  }, 120_000);
+
+  it("R67 in the CLI: --dry-run lists outside files; --approve-folder / --approve-file attach them; --remember-folder remembers", async () => {
+    const bibDir = join(tmp, "Refs");
+    await mkdir(bibDir, { recursive: true });
+    const bib = (key: string) => `@book{${key}, title = {Street Food and the State}, author = {Adebayo, Tunde}, year = {2019}, file = {${join(elsewhere, "linked.pdf")}}}\n`;
+    await writeFile(join(bibDir, "a.bib"), bib("adebayo2019"));
+    await projectWith("RefsA", GOV_NO_LOOKUPS.replace("processing", "captureMethods: [manual_upload, refman_import]\nprocessing"));
+    await projectWith("RefsB", GOV_NO_LOOKUPS.replace("processing", "captureMethods: [manual_upload, refman_import]\nprocessing"));
+    await projectWith("RefsC", GOV_NO_LOOKUPS.replace("processing", "captureMethods: [manual_upload, refman_import]\nprocessing"));
+
+    const dry = await run(["--json", "import", join(bibDir, "a.bib"), "--project", "RefsA", "--dry-run"]);
+    expect(dry.code, dry.stderr).toBe(0);
+    expect(json(dry).outsideFiles).toEqual([{ item: expect.any(String), folder: await realpath(elsewhere) }]);
+    const dryText = await run(["import", join(bibDir, "a.bib"), "--project", "RefsA", "--dry-run"]);
+    expect(dryText.stdout).toContain("--approve-folder");
+
+    const plain = await run(["--json", "import", join(bibDir, "a.bib"), "--project", "RefsA"]);
+    expect(plain.code, plain.stderr).toBe(0);
+    expect(json(plain).report.fileNotes).toEqual([expect.objectContaining({ note: expect.stringMatching(/not approved/u) })]);
+
+    const folder = await run(["--json", "import", join(bibDir, "a.bib"), "--project", "RefsB", "--approve-folder", elsewhere, "--approve-folder", bibDir, "--remember-folder"]);
+    expect(folder.code, folder.stderr).toBe(0);
+    expect(json(folder).report.fileNotes).toEqual([]);
+    expect(await readFile(join(tmp, "config", "approved-import-folders.json"), "utf8")).toContain(await realpath(elsewhere));
+
+    const file = await run(["--json", "import", join(bibDir, "a.bib"), "--project", "RefsC", "--approve-file", join(elsewhere, "linked.pdf")]);
+    expect(file.code, file.stderr).toBe(0);
+    expect(json(file).report.fileNotes).toEqual([]);
+
+    const bad = await run(["import", join(bibDir, "a.bib"), "--project", "RefsC", "--remember-folder"]);
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain("--approve-folder");
+  }, 120_000);
+
+  it("export writes the chosen file atomically; a governance denial exits 2", async () => {
+    const out = join(tmp, "exported.ris");
+    const r = await run(["--json", "export", "--project", "RefsB", "--format", "ris", "--output", out]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(json(r)).toMatchObject({ format: "ris", exported: 1, excluded: 0 });
+    const text = await readFile(out, "utf8");
+    expect(text).toContain("TY  - BOOK");
+    expect(text).toContain("ID  - adebayo2019");
+    expect(text).not.toContain("linked.pdf");
+    const bib = await run(["export", "--project", "RefsB", "--format", "bibtex", "--output", join(tmp, "exported.bib")]);
+    expect(bib.code, bib.stderr).toBe(0);
+    expect(bib.stdout).toContain("Exported 1 source");
+    const badFormat = await run(["export", "--project", "RefsB", "--format", "endnote", "--output", out]);
+    expect(badFormat.code).toBe(1);
+
+    await projectWith("Broken", GOV_NO_LOOKUPS);
+    await run(["import", papers, "--project", "Broken"]);
+    await writeFile(join(lib, "Projects", "Broken", "governance.yaml"), "identifiability: [not, valid\n");
+    const denied = await run(["export", "--project", "Broken", "--format", "csl-json", "--output", join(tmp, "denied.json")]);
+    expect(denied.code).toBe(2);
+    expect(existsSync(join(tmp, "denied.json"))).toBe(false);
+  }, 120_000);
+
+  it("verify-audit checks the chain (exit 1 when it was changed); rebuild-index rebuilds", async () => {
+    const ok = await run(["--json", "verify-audit", "--project", "Imp"]);
+    expect(ok.code, ok.stderr).toBe(0);
+    expect(json(ok)).toMatchObject({ ok: true, anchored: true });
+    expect(json(ok).events).toBeGreaterThan(0);
+    const auditDir = join(lib, "Projects", "Imp", "audit");
+    const seg = join(auditDir, (await readdir(auditDir)).sort()[0]!);
+    const lines = (await readFile(seg, "utf8")).split("\n");
+    lines[0] = lines[0]!.replace('"actor":"', '"actor":"x');
+    await writeFile(seg, lines.join("\n"));
+    const broken = await run(["verify-audit", "--project", "Imp"]);
+    expect(broken.code).toBe(1);
+    expect(broken.stdout + broken.stderr).toMatch(/changed outside the app/u);
+
+    const rb = await run(["--json", "rebuild-index"]);
+    expect(rb.code, rb.stderr).toBe(0);
+    expect(json(rb).indexed).toBeGreaterThanOrEqual(2);
+  }, 120_000);
+
+  it("the Zotero API key is never accepted on argv; AO_ZOTERO_API_KEY is read once and removed; no keyring → a plain refusal", async () => {
+    const SECRET = "zk-SECRET-never-on-argv-123";
+    const argv = await run(["secrets", "set", "zotero-api-key", SECRET]);
+    expect(argv.code).toBe(1);
+    expect(argv.stdout + argv.stderr).not.toContain(SECRET);
+    const opt = await run(["secrets", "set", "zotero-api-key", `--key=${SECRET}`]);
+    expect(opt.code).toBe(1);
+    expect(opt.stdout + opt.stderr).not.toContain(SECRET);
+
+    const env = await run(["--json", "secrets", "set", "zotero-api-key"], { AO_ZOTERO_API_KEY: SECRET });
+    // This test machine has no keyring (no Secret Service): refused, nothing stored anywhere.
+    expect([0, 1]).toContain(env.code);
+    expect(env.stdout + env.stderr).not.toContain(SECRET);
+    if (env.code === 1) expect(env.stderr).toContain("No secure key store");
+    for (const f of await readdir(join(tmp, "config"))) expect(await readFile(join(tmp, "config", f), "utf8").catch(() => "")).not.toContain(SECRET);
+
+    const unknown = await run(["secrets", "set", "github-token"], { AO_ZOTERO_API_KEY: SECRET });
+    expect(unknown.code).toBe(1);
+
+    // The worker (and anything else started) never sees it.
+    const dump = join(tmp, "worker-env-zotero.json");
+    const r = await ao(["tools", "versions"], {
+      AO_WORKER_BIN: join(REPO_ROOT, "apps/cli/tests/stub-transcribe-worker.mjs"),
+      AO_TEST_ENV_DUMP: dump,
+      AO_ZOTERO_API_KEY: SECRET,
+    });
+    expect(r.code, r.stderr).toBe(0);
+    expect(JSON.parse(await readFile(dump, "utf8"))).not.toContain("AO_ZOTERO_API_KEY");
+  }, 60_000);
+
+  it("import zotero needs --data-dir or --web; a bad --web is refused", async () => {
+    const none = await run(["import", "zotero", "--project", "Imp"]);
+    expect(none.code).toBe(1);
+    expect(none.stderr).toContain("--data-dir");
+    const bad = await run(["import", "zotero", "--project", "Imp", "--web", "user:abc"]);
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain("user:<id>");
+    const missing = await run(["import", "zotero", "--project", "Imp", "--data-dir", join(tmp, "NoZotero")]);
+    expect(missing.code).toBe(1);
   }, 60_000);
 });
 

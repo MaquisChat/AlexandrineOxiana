@@ -84,3 +84,15 @@ export async function readPassphrase(prompt: string, confirmTwice: boolean, io?:
   }
   return first;
 }
+
+let envApiKey: string | undefined | null = null;
+
+/** AO_ZOTERO_API_KEY, read once (at startup) and removed from the environment, like AO_PASSPHRASE. */
+export function zoteroKeyFromEnv(): string | undefined {
+  if (envApiKey === null) {
+    const v = process.env.AO_ZOTERO_API_KEY;
+    delete process.env.AO_ZOTERO_API_KEY;
+    envApiKey = v !== undefined && v.trim() !== "" ? v.trim() : undefined;
+  }
+  return envApiKey;
+}
