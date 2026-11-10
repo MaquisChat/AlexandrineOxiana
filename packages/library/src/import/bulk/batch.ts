@@ -54,6 +54,8 @@ export interface JournalEntry {
   decision?: string;
   /** Merges: what the merge added (reverted exactly by undo, R61). */
   merge?: MergeRecord;
+  /** The item's file notes (ScanItem.fileNotes; never a path), for the report. */
+  notes?: string[];
 }
 
 export interface GovernanceNote {

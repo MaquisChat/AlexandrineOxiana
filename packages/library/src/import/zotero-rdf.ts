@@ -1,5 +1,5 @@
 /**
- * Zotero RDF export for Bulk Import (spec 5.4; Task 24, R65). Provenance `refman_import`.
+ * Zotero RDF export for Bulk Import (spec 5.4; Task 24, R65). Provenance `zotero_import` (R66).
  *
  * Safety: the file is first checked by a linear scan that refuses any document type or entity
  * declaration (`<!DOCTYPE`, `<!ENTITY`: no entity expansion, no external entities, no "billion

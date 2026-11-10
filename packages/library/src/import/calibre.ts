@@ -10,10 +10,11 @@
  *
  * `books.path` and `data.name` come from a file anyone could edit, so each format file must
  * resolve inside the Calibre library folder, lexically and after following symbolic links: an
- * absolute path, a ".." escape or a link pointing out makes that book an unreadable item with a
- * plain reason (nothing outside the library is read). A missing format file, or one that is not a
- * regular file, makes the book unreadable too (refman.ts `checkFiles`); a book with no formats is a
- * metadata-only item.
+ * absolute path, a ".." escape or a link pointing out skips that format file with a file note
+ * (CALIBRE_FILE_NOTE; nothing outside the library is read) and the book's metadata still imports
+ * (R66). A missing format file, or one that is not a regular file, is skipped with a note too
+ * (refman.ts `checkFiles`); a book left with no files is a metadata-only item. Only a library whose
+ * metadata.db cannot be read is an unreadable item.
  *
  * Item keys are `<library folder name>@<hash of its absolute path>#book-<id>` (stable; R63 HMAC in
  * provenance); `externalKeys` keeps the Calibre book id and uuid.
@@ -25,12 +26,14 @@ import Database from "better-sqlite3";
 import type { Creator } from "@ao/core";
 import { parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanContext, ScanItem } from "./bulk/scan.js";
-import { exportIdentity, isbnsOf, recordItem, referenceMetadata, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
+import { exportIdentity, isbnsOf, recordItem, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
 
 export const CALIBRE_REASONS = {
   unreadable: "The Calibre library could not be read (its metadata.db is missing or damaged), so nothing was imported from it.",
-  outside: "This book's file location points outside the Calibre library, so the book was not imported.",
 } as const;
+
+/** File note for a format file whose recorded location points outside the library (never the path). */
+export const CALIBRE_FILE_NOTE = "attached file is outside the Calibre library";
 
 /** Calibre's "no date" (UNDEFINED_DATE) and anything before year 1000 are not dates. */
 const isRealDate = (d: string) => /^\d{4}/u.test(d) && Number(d.slice(0, 4)) >= 1000;
@@ -73,8 +76,8 @@ interface CalibreBook {
   id: number;
   fields: RecordFields;
   uuid?: string;
-  /** Relative format file locations, or null when a row points outside the library. */
-  files: string[] | null;
+  /** Relative format file locations (null: the row points outside the library). */
+  files: Array<string | null>;
 }
 
 const tableExists = (db: Database.Database, name: string) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
@@ -140,19 +143,16 @@ function safeRelative(p: string): boolean {
   return !p.split(/[\\/]/u).some((s) => s === "..");
 }
 
-/** `<path>/<name>.<format>` for each data row (relative to the library), or null if any escapes it. */
-function formatFiles(path: string | null, rows: Array<{ format: string; name: string }>): string[] | null {
-  if (!rows.length) return [];
+/** `<path>/<name>.<format>` for each data row (relative to the library); null for a row that escapes it. */
+function formatFiles(path: string | null, rows: Array<{ format: string; name: string }>): Array<string | null> {
   const dir = path ?? "";
-  if (!safeRelative(dir)) return null;
-  const out: string[] = [];
-  for (const r of rows) {
+  const dirOk = safeRelative(dir);
+  return rows.map((r) => {
     const name = r.name ?? "";
     const format = (r.format ?? "").toLowerCase();
-    if (!safeRelative(name) || name.includes("/") || name.includes("\\") || !/^[a-z0-9_]{1,16}$/u.test(format)) return null;
-    out.push(`${dir}/${name}.${format}`);
-  }
-  return out;
+    if (!dirOk || !safeRelative(name) || name.includes("/") || name.includes("\\") || !/^[a-z0-9_]{1,16}$/u.test(format)) return null;
+    return `${dir}/${name}.${format}`;
+  });
 }
 
 const inside = (root: string, p: string) => {
@@ -160,17 +160,21 @@ const inside = (root: string, p: string) => {
   return rel !== "" && !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
 };
 
-/** Absolute paths of a book's files, or null if one resolves (lexically or through links) outside the library. */
-async function locate(root: string, realRoot: string, rels: string[]): Promise<string[] | null> {
-  const out: string[] = [];
+/** Absolute paths of a book's files inside the library, and how many resolve (lexically or through links) outside it. */
+async function locate(root: string, realRoot: string, rels: Array<string | null>): Promise<{ paths: string[]; outside: number }> {
+  const paths: string[] = [];
+  let outside = 0;
   for (const rel of rels) {
-    const p = resolve(root, ...rel.split(/[\\/]/u));
-    if (!inside(root, p)) return null;
-    const real = await fsp.realpath(p).catch(() => null);
-    if (real && !inside(realRoot, real)) return null;
-    out.push(p);
+    const p = rel === null ? null : resolve(root, ...rel.split(/[\\/]/u));
+    // A file that does not exist is not refused here: checkFiles notes it as not found.
+    const real = p && inside(root, p) ? await fsp.realpath(p).catch(() => undefined) : null;
+    if (!p || real === null || (real !== undefined && !inside(realRoot, real))) {
+      outside++;
+      continue;
+    }
+    paths.push(p);
   }
-  return out;
+  return { paths, outside };
 }
 
 async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanContext | undefined): AsyncGenerator<ScanItem> {
@@ -200,12 +204,8 @@ async function* scanCalibre(libraryDir: string, signal: AbortSignal, ctx: ScanCo
     signal.throwIfAborted();
     const key = `${prefix}#book-${b.id}`;
     const externalKeys = { "calibre-book": String(b.id), ...(b.uuid ? { "calibre-uuid": b.uuid } : {}) };
-    const paths = b.files ? await locate(root, realRoot, b.files) : null;
-    if (!paths) {
-      yield { key, files: [], referenceMetadata: referenceMetadata(b.fields), externalKeys, unreadable: CALIBRE_REASONS.outside };
-      continue;
-    }
-    yield await recordItem(key, b.fields, paths, { externalKeys });
+    const { paths, outside } = await locate(root, realRoot, b.files);
+    yield await recordItem(key, b.fields, paths, { externalKeys, notes: Array<string>(outside).fill(CALIBRE_FILE_NOTE) });
   }
 }
 

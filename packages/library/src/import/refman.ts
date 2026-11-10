@@ -2,7 +2,8 @@
  * Reference-manager exports for Bulk Import (spec 5.4 "Import sources"; Task 24, R65): BibTeX
  * (incl. BibLaTeX, Better BibTeX, JabRef), RIS and CSL-JSON files as `ImportSourceAdapter`s.
  * Zotero RDF is in zotero-rdf.ts and Calibre libraries in calibre.ts; they share the helpers here.
- * The adapters only read: every write goes through the Task 23 engine (provenance `refman_import`).
+ * The adapters only read: every write goes through the Task 23 engine (provenance `refman_import`;
+ * Zotero RDF is `zotero_import`, Calibre `calibre_import`).
  *
  * Parsing is our own and linear (no backtracking regular expressions on the input, no recursion):
  * citation-js was evaluated and set aside, because a 64 KB field nested deeply in braces overflows
@@ -12,9 +13,10 @@
  *
  * Linked files (`file` fields, RIS L1/L2/L4) may be absolute, relative to the export file, or
  * `file:` URLs; the Zotero/JabRef form `desc:path:mime` (several separated by ";", "\:" escapes)
- * is understood. Only regular files are attached. An item whose file is missing, or is a folder,
- * FIFO or device, is yielded with `unreadable` set (a plain reason; never the path), so the batch
- * reports it instead of crashing or silently dropping the file.
+ * is understood. Only regular files are attached. A linked file that is missing, unreadable, or a
+ * folder, FIFO or device is left out with a per-item `fileNotes` entry (FILE_NOTES; never the
+ * path): the reference itself still imports, metadata-only if no file is left (R66), and the
+ * batch report lists the note. Only an export that cannot be read as a whole is an unreadable item.
  *
  * Item keys are `<export file name>@<hash of its absolute path>#<citation key>` (or `#@<n>` for an
  * entry without a key; a repeated key gets `~2`, `~3`, ...): stable across scans of the same export,
@@ -36,9 +38,14 @@ const MAX_TAGS = 100;
 const MAX_TAG_CHARS = 200;
 const MAX_FILES = 50;
 
+/** Per-item notes for linked files that were left out (shown in the batch report; never a path). */
+export const FILE_NOTES = {
+  missing: "attached file not found",
+  notRegular: "attached file is not a regular file",
+  unreadable: "attached file could not be read",
+} as const;
+
 export const REFMAN_REASONS = {
-  missingFile: "A file linked from this reference could not be found, so the reference was not imported. Check that the export's files are where it says, then import again.",
-  notRegular: "A file linked from this reference is not a regular file (it is a folder or a device), so the reference was not imported.",
   tooLarge: "The export file is too large to import (more than 100 MB). Split it into smaller exports, then import each.",
   unreadable: "The export file could not be read, so nothing was imported from it.",
 } as const;
@@ -261,37 +268,51 @@ export function resolveLinked(raw: string, baseDir: string): string | undefined 
   return isAbsolute(p) ? p : resolve(baseDir, p);
 }
 
-/** Checks each linked file: ScanFiles, or the plain reason the item is unreadable. */
-export async function checkFiles(paths: string[]): Promise<{ files: ScanFile[] } | { unreadable: string }> {
+/** Checks each linked file: the regular files as ScanFiles, and a note (FILE_NOTES) for each one left out. */
+export async function checkFiles(paths: string[]): Promise<{ files: ScanFile[]; notes: string[] }> {
   const files: ScanFile[] = [];
+  const notes: string[] = [];
   for (const path of paths) {
-    const st = await fsp.stat(path).catch(() => null);
-    if (!st) return { unreadable: REFMAN_REASONS.missingFile };
-    if (!st.isFile()) return { unreadable: REFMAN_REASONS.notRegular };
+    let st;
+    try {
+      st = await fsp.stat(path);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      notes.push(code === "ENOENT" || code === "ENOTDIR" ? FILE_NOTES.missing : FILE_NOTES.unreadable);
+      continue;
+    }
+    if (!st.isFile()) {
+      notes.push(FILE_NOTES.notRegular);
+      continue;
+    }
     const t = await fileTypeFromFile(path).catch(() => undefined);
     files.push({ path, mime: t?.mime ?? "application/octet-stream", bytes: st.size });
   }
-  return { files };
+  return { files, notes };
 }
 
-/** One ScanItem from a parsed record and its linked files (`undefined` entries: links that are not local files). */
+/**
+ * One ScanItem from a parsed record and its linked files (`undefined` entries: links that are not
+ * local files). `notes` are file notes the adapter already has (e.g. a Calibre path refused).
+ */
 export async function recordItem(
   key: string,
   f: RecordFields,
   linked: Array<string | undefined>,
-  extra: Pick<ScanItem, "folderPath"> & { externalKeys?: Record<string, string> } = {},
+  extra: Pick<ScanItem, "folderPath"> & { externalKeys?: Record<string, string>; notes?: string[] } = {},
 ): Promise<ScanItem> {
   const paths = [...new Set(linked.filter((p): p is string => !!p))];
   const checked = await checkFiles(paths);
+  const notes = [...(extra.notes ?? []), ...checked.notes];
   const externalKeys = { ...(f.citekey ? { citekey: f.citekey } : {}), ...(extra.externalKeys ?? {}) };
   return {
     key,
-    files: "files" in checked ? checked.files : [],
+    files: checked.files,
     referenceMetadata: referenceMetadata(f),
     ...(f.tags?.length ? { tags: f.tags } : {}),
     ...(extra.folderPath?.length ? { folderPath: extra.folderPath } : {}),
     ...(Object.keys(externalKeys).length ? { externalKeys } : {}),
-    ...("unreadable" in checked ? { unreadable: checked.unreadable } : {}),
+    ...(notes.length ? { fileNotes: notes } : {}),
   };
 }
 

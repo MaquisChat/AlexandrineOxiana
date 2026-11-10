@@ -1,9 +1,11 @@
 /**
  * Merging an item into an existing source, and reverting exactly that merge (R61). A merge adds
- * originals and fills only the fields the source lacks; it records what it added (asset ids, each
- * filled field with its value before and after, the evidence added) in the batch journal. Undo
- * removes those assets and puts back only the fields that still hold the value the merge set: a
- * field the user changed since is kept (and reported), and other batches' files are never touched.
+ * originals, the item's tags the source lacks (R66), and fills only the fields the source lacks; it
+ * records what it added (asset ids, tag ids, each filled field with its value before and after, the
+ * evidence added) in the batch journal. Undo removes those assets and tags and puts back only the
+ * fields that still hold the value the merge set: a field the user changed since is kept (and
+ * reported), and other batches' files are never touched. Whether a tag the batch created is then
+ * deleted is undo's tag rule (kept while a surviving source uses it, R61).
  */
 import { isDeepStrictEqual } from "node:util";
 import type { Asset, FieldEvidence, Source, SourceDraft, SourceFile } from "@ao/core";
@@ -20,6 +22,8 @@ export interface MergeRecord {
   addedAssetIds: string[];
   filled: FilledField[];
   addedEvidence: FieldEvidence[];
+  /** Tag ids the merge put on the source (absent in records written before R66). */
+  addedTagIds?: string[];
 }
 
 type Src = SourceFile["source"];
@@ -61,14 +65,24 @@ export function missingFields(cur: SourceFile, d: SourceDraft): FilledField[] {
 }
 
 /** The merged source file and the record of what the merge added. */
-export function applyMerge(cur: SourceFile, added: Asset[], fill: FilledField[], evidence: FieldEvidence[], at: string, actor: string): { next: SourceFile; record: MergeRecord } {
+export function applyMerge(
+  cur: SourceFile,
+  added: Asset[],
+  fill: FilledField[],
+  evidence: FieldEvidence[],
+  at: string,
+  actor: string,
+  tagIds: string[] = [],
+): { next: SourceFile; record: MergeRecord } {
   let source: Src = { ...cur.source, modifiedAt: at, modifiedBy: actor };
   for (const f of fill) source = setAt(source, f.path, f.after);
+  const addedTagIds = [...new Set(tagIds)].filter((t) => !cur.source.tagIds.includes(t));
+  if (addedTagIds.length) source = { ...source, tagIds: [...source.tagIds, ...addedTagIds] };
   const paths = new Set(fill.map((f) => f.path));
   const addedEvidence = evidence.filter((e) => paths.has(e.field));
   return {
     next: { ...cur, source, assets: [...cur.assets, ...added], fieldEvidence: [...cur.fieldEvidence, ...addedEvidence] },
-    record: { addedAssetIds: added.map((a) => a.id), filled: fill, addedEvidence },
+    record: { addedAssetIds: added.map((a) => a.id), filled: fill, addedEvidence, ...(addedTagIds.length ? { addedTagIds } : {}) },
   };
 }
 
@@ -85,8 +99,10 @@ export function revertMerge(cur: SourceFile, rec: MergeRecord, at: string, actor
       reverted.add(f.path);
     } else kept.push(f.path);
   }
+  const dropTags = new Set((rec.addedTagIds ?? []).filter((t) => source.tagIds.includes(t)));
+  if (dropTags.size) source = { ...source, tagIds: source.tagIds.filter((t) => !dropTags.has(t)) };
   const drop = new Set(rec.addedEvidence.filter((e) => reverted.has(e.field)).map((e) => JSON.stringify(e)));
-  const changed = removed.length > 0 || reverted.size > 0;
+  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0;
   return {
     next: {
       ...cur,

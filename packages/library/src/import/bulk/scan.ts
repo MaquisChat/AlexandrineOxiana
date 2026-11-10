@@ -49,6 +49,12 @@ export interface ScanItem {
   notes?: string[];
   /** Recorded in the source's provenance (e.g. a Zotero item key). */
   externalKeys?: Record<string, string>;
+  /**
+   * Linked files that were left out (missing, not a regular file, outside a Calibre library): one
+   * plain note each, never a path. The item still imports with the files it has (metadata-only if
+   * none); the notes are journaled with its outcome and listed in the batch report (R66).
+   */
+  fileNotes?: string[];
   /** The item could not be read at all (e.g. a refused archive): it fails with this plain reason. */
   unreadable?: string;
 }

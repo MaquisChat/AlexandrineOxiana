@@ -20,6 +20,8 @@ export interface ImportReport {
   finishedAt?: string;
   counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; failed: number };
   failures: Array<{ item: string; reason: string }>;
+  /** Items imported without some of their linked files (e.g. "attached file not found"); never a path (R66). */
+  fileNotes: Array<{ item: string; note: string }>;
   pendingReview: Array<{ reviewId: string; sourceId?: string; reasons: string[] }>;
   governance: GovernanceNote[];
   notes: string[];
@@ -52,6 +54,11 @@ function markdown(r: ImportReport): string {
     for (const f of r.failures) lines.push(`- ${f.item}: ${f.reason}`);
     lines.push("");
   }
+  if (r.fileNotes.length) {
+    lines.push("## Files not attached", "");
+    for (const f of r.fileNotes) lines.push(`- ${f.item}: ${f.note}`);
+    lines.push("");
+  }
   if (r.pendingReview.length) {
     lines.push("## Still waiting for review", "", `${r.pendingReview.length} item(s) are in the review queue.`, "");
   }
@@ -75,7 +82,11 @@ function markdown(r: ImportReport): string {
 export async function batchReport(repo: Repo, projectId: string, batchId: string): Promise<ImportReport> {
   const rec = await findBatch(repo, projectId, batchId);
   if (!rec) throw new NotFoundError("Import batch", batchId);
-  const latest = latestByKey(await readJournal(repo, projectId, rec.dir));
+  const journal = await readJournal(repo, projectId, rec.dir);
+  const latest = latestByKey(journal);
+  // File notes from any line of the item (a later review decision's line does not repeat them).
+  const notesByKey = new Map<string, string[]>();
+  for (const e of journal) if (e.notes?.length && !notesByKey.has(e.key)) notesByKey.set(e.key, e.notes);
   const c = countOutcomes(latest.values());
   const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.batchId === batchId && e.status === "pending");
   const report: ImportReport = {
@@ -87,6 +98,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
     counts: c,
     failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: itemLabel(e.key), reason: e.reason ?? "The item could not be imported." })),
+    fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: itemLabel(key), note }))),
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),
     governance: rec.governance,
     notes: rec.notes,

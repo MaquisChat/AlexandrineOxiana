@@ -22,8 +22,8 @@ import type { Repo } from "../repo/repo.js";
 import { projectCollectionsAndTags } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
-import { calibreAdapter, copyCalibreDb } from "./calibre.js";
-import { MAX_EXPORT_BYTES, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
+import { CALIBRE_FILE_NOTE, calibreAdapter, copyCalibreDb } from "./calibre.js";
+import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/refman");
@@ -126,13 +126,14 @@ describe("bibtexAdapter", () => {
     expect(items[3]!.unreadable).toBeUndefined();
   });
 
-  it("a missing linked file yields the item with an unreadable note, not a crash", async () => {
+  it("a missing linked file keeps the reference (metadata only) with a file note, not a crash", async () => {
     const items = await collect(bibtexAdapter(join(exp, "sample.bib")));
     const gone = items[2]!;
     expect(gone.key).toContain("doe2020missing");
     expect(gone.files).toEqual([]);
-    expect(gone.unreadable).toMatch(/could not be found/);
-    expect(gone.unreadable).not.toContain("missing.pdf");
+    expect(gone.unreadable).toBeUndefined();
+    expect(gone.fileNotes).toEqual([FILE_NOTES.missing]);
+    expect(title(gone)).toBe("A Chapter Whose File Is Gone");
     expect(gone.referenceMetadata?.citationKey).toBe("doe2020missing");
   });
 
@@ -163,11 +164,20 @@ describe("bibtexAdapter", () => {
     expect(items[0]!.files.map((f) => f.path)).toEqual([abs]);
     expect(items[1]!.files.map((f) => f.path)).toEqual([abs]);
     expect(items[2]!.files.map((f) => f.path)).toEqual([abs]);
-    expect(items[3]!.unreadable).toMatch(/could not be found/);
+    expect(items[3]!.unreadable).toBeUndefined();
+    expect(items[3]!.fileNotes).toEqual([FILE_NOTES.missing]);
     expect(new Set(items.map((i) => i.key)).size).toBe(4);
   });
 
-  it.skipIf(process.platform === "win32")("only regular files are attached: directories and FIFOs get an unreadable note", async () => {
+  it("an entry with one present and one missing file keeps the present one and notes the other", async () => {
+    const p = await writeExport("partial.bib", "@article{p, title={Partial}, file={A:files/okafor2024feeding.pdf:PDF;B:files/nope.pdf:PDF}}");
+    const [i] = await collect(bibtexAdapter(p));
+    expect(i!.unreadable).toBeUndefined();
+    expect(i!.files.map((f) => f.path)).toEqual([join(exp, "files/okafor2024feeding.pdf")]);
+    expect(i!.fileNotes).toEqual([FILE_NOTES.missing]);
+  });
+
+  it.skipIf(process.platform === "win32")("only regular files are attached: directories and FIFOs get a file note", async () => {
     execFileSync("mkfifo", [join(exp, "files", "pipe.pdf")]);
     await symlink(join(exp, "files", "pipe.pdf"), join(exp, "files", "link-to-pipe.pdf"));
     const p = await writeExport(
@@ -178,7 +188,8 @@ describe("bibtexAdapter", () => {
     expect(items).toHaveLength(3);
     for (const i of items) {
       expect(i.files).toEqual([]);
-      expect(i.unreadable).toMatch(/not a regular file/);
+      expect(i.unreadable).toBeUndefined();
+      expect(i.fileNotes).toEqual([FILE_NOTES.notRegular]);
     }
   });
 
@@ -231,7 +242,8 @@ describe("risAdapter", () => {
     expect(items[1]!.referenceMetadata?.identifiers).toMatchObject({ isbn: ["9780262033848"], url: "https://example.org/markets" });
     expect(items[1]!.files.map((f) => f.path)).toEqual([join(exp, "files/adebayo2019markets.pdf")]);
     expect(items[2]!.referenceMetadata?.type).toBe("chapter");
-    expect(items[2]!.unreadable).toMatch(/could not be found/);
+    expect(items[2]!.unreadable).toBeUndefined();
+    expect(items[2]!.fileNotes).toEqual([FILE_NOTES.missing]);
   });
 
   it("reads file: URLs and continuation lines", async () => {
@@ -257,7 +269,8 @@ describe("cslJsonAdapter", () => {
     expect(items[1]!.referenceMetadata?.issued).toBe("2019");
     expect(items[1]!.files.map((f) => f.path)).toEqual([join(exp, "files/adebayo2019markets.pdf")]);
     expect(items[2]!.referenceMetadata?.issued).toBe("2020");
-    expect(items[2]!.unreadable).toMatch(/could not be found/);
+    expect(items[2]!.unreadable).toBeUndefined();
+    expect(items[2]!.fileNotes).toEqual([FILE_NOTES.missing]);
   });
 
   it("an export that is not valid CSL-JSON is one unreadable item", async () => {
@@ -300,7 +313,8 @@ describe("zoteroRdfAdapter", () => {
       { family: "Roe", given: "Richard", role: "editor" },
     ]);
     expect(chap.folderPath ?? []).toEqual([]);
-    expect(chap.unreadable).toMatch(/could not be found/);
+    expect(chap.unreadable).toBeUndefined();
+    expect(chap.fileNotes).toEqual([FILE_NOTES.missing]);
     expect(new Set(items.map((i) => i.key)).size).toBe(3);
   });
 
@@ -364,10 +378,14 @@ describe("calibreAdapter", () => {
     expect(items[1]!.referenceMetadata?.issued).toBe("2019-01-01");
     expect(items[2]!.referenceMetadata?.issued).toBeUndefined(); // Calibre's "undefined" date
     for (const i of items.slice(2, 5)) {
+      // Traversal: the format file is skipped with a note; the book's metadata still imports.
       expect(i.files).toEqual([]);
-      expect(i.unreadable).toMatch(/outside the Calibre library/);
+      expect(i.unreadable).toBeUndefined();
+      expect(i.fileNotes).toEqual([CALIBRE_FILE_NOTE]);
+      expect(i.referenceMetadata?.title).toBeDefined();
     }
-    expect(items[5]!.unreadable).toMatch(/could not be found/);
+    expect(items[5]!.unreadable).toBeUndefined();
+    expect(items[5]!.fileNotes).toEqual([FILE_NOTES.missing]);
 
     // Original untouched; the private copy is gone.
     expect(await sha(calibre.db)).toBe(before);
@@ -540,8 +558,8 @@ processing:
     const r = await h.done;
     expect(r.state).toBe("finished");
     expect(r.counts.items).toBe(4);
-    expect(r.counts.failed).toBe(1); // the missing file
-    expect(r.counts.created + r.counts.needsReview).toBe(3);
+    expect(r.counts.failed).toBe(0); // the entry whose file is missing is imported metadata-only
+    expect(r.counts.created + r.counts.needsReview).toBe(4);
 
     const sfs = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
     const ok = sfs.find((sf) => sf.source.citationKey === "okafor2024feeding")!;
@@ -558,6 +576,17 @@ processing:
     const book = sfs.find((sf) => sf.source.citationKey === "adebayo2019markets")!;
     expect(book.assets).toHaveLength(2);
     expect(sfs.find((sf) => sf.source.citationKey === "who2021report")!.assets).toHaveLength(0);
+    const gone = sfs.find((sf) => sf.source.citationKey === "doe2020missing")!;
+    expect(gone.assets).toHaveLength(0);
+    expect(gone.source.creators.map((c) => c.family)).toEqual(["Doe"]);
+
+    // The report lists the missing file per item, never its path.
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.fileNotes).toEqual([{ item: expect.stringContaining("doe2020missing"), note: "attached file not found" }]);
+    expect(JSON.stringify(report)).not.toContain("missing.pdf");
+    expect(JSON.stringify(report)).not.toContain(exp);
+    const md = await readFile(join(lib.root, p.folder, "imports", "batch-0001", "report.md"), "utf8");
+    expect(md).toMatch(/doe2020missing.*: attached file not found/);
 
     // The item key (export path + citation key) never reaches the library in clear.
     const sourceJson = await readFile(join(lib.root, ok.source.folder, "source.json"), "utf8");
@@ -568,7 +597,7 @@ processing:
     expect(adapterFor("bibtex", bibPath)?.kind).toBe("bibtex");
   });
 
-  it("an identifiable project stores RIS and Zotero RDF imports under the 'refman-import' legal basis", async () => {
+  it("an identifiable project stores RIS under 'refman-import' and Zotero RDF under 'zotero-import' (zotero_import provenance)", async () => {
     const gdpr = async () =>
       (await repo.createProject({
         name: `GDPR${Math.random().toString(36).slice(2, 7)}`,
@@ -579,9 +608,10 @@ consent:
   requireLegalBasis: true
   defaultLegalBasis:
     refman-import: "legitimate interest; bibliographic records"
+    zotero-import: "legitimate interest; Zotero library"
 encryption:
   atRest: optional
-captureMethods: [refman_import]
+captureMethods: [refman_import, zotero_import]
 processing:
   metadata_lookup: []
 `,
@@ -592,12 +622,13 @@ processing:
       const p = await gdpr();
       const r = await (await bulk.startBatch(p.id, adapter)).done;
       expect(r.state).toBe("finished");
-      expect(r.counts.failed).toBe(1); // the missing file
+      expect(r.counts.failed).toBe(0); // the missing file: metadata only
       const sfs = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
-      expect(sfs).toHaveLength(2);
+      expect(sfs).toHaveLength(3);
+      const rdf = adapter.kind === "zotero-rdf";
       for (const sf of sfs) {
-        expect(sf.source.provenance.captureMethod).toBe("refman_import");
-        expect(sf.source.provenance.legal.basis).toBe("legitimate interest; bibliographic records");
+        expect(sf.source.provenance.captureMethod).toBe(rdf ? "zotero_import" : "refman_import");
+        expect(sf.source.provenance.legal.basis).toBe(rdf ? "legitimate interest; Zotero library" : "legitimate interest; bibliographic records");
       }
       if (adapter.kind === "zotero-rdf") {
         // RDF collections arrive through the engine as nested collections.
@@ -615,10 +646,55 @@ processing:
     const h = await bulkImport().startBatch(p.id, calibreAdapter(calibre.dir));
     const r = await h.done;
     expect(r.counts.items).toBe(6);
-    expect(r.counts.failed).toBe(4);
+    expect(r.counts.failed).toBe(0);
     const sfs = await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)));
-    expect(sfs).toHaveLength(2);
+    expect(sfs).toHaveLength(6);
+    // The traversal books import metadata-only; nothing outside the library was read.
+    const outside = sfs.find((sf) => sf.source.title.variants[0]?.value === "Outside the Library")!;
+    expect(outside.assets).toHaveLength(0);
+    const report = await bulkImport().batchReport(p.id, h.batchId);
+    expect(report.fileNotes.filter((n) => n.note === "attached file is outside the Calibre library")).toHaveLength(3);
+    expect(report.fileNotes.filter((n) => n.note === "attached file not found")).toHaveLength(1);
     expect(sfs.every((sf) => sf.source.provenance.captureMethod === "calibre_import")).toBe(true);
     expect(await readdir(join(lib.root, ".tmp")).then((ns) => ns.filter((n) => n.startsWith("batch-")))).toEqual([]);
+  });
+
+  it("a merge adds the item's missing tags, and undo takes them off again (a tag still in use is kept)", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    // Batch 1: the article without keywords, and another source tagged "Lagos".
+    const first = await writeExport(
+      "first.bib",
+      [
+        "@article{okafor2024feeding, title={Feeding the City: Informal Markets in Lagos}, author={Okafor, Ngozi}, year={2024}, doi={10.5555/ao.urban.2024.017}}",
+        "@misc{other2020, title={Another Study}, author={Roe, R.}, year={2020}, keywords={Lagos}}",
+      ].join("\n"),
+    );
+    const b1 = await (await bulk.startBatch(p.id, bibtexAdapter(first))).done;
+    expect(b1.counts.failed).toBe(0);
+    const okId = (await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)))).find((sf) => sf.source.citationKey === "okafor2024feeding")!.source.id;
+    const otherId = repo.listSourceIds(p.id).find((id) => id !== okId)!;
+    expect((await repo.getSource(p.id, okId)).source.tagIds).toEqual([]);
+
+    // Batch 2: the full export, merged: "food systems" (new) and "Lagos" (existing) are added to the article.
+    const h2 = await bulk.startBatch(p.id, bibtexAdapter(join(exp, "sample.bib")), { duplicates: "merge" });
+    const b2 = await h2.done;
+    expect(b2.counts.merged).toBe(1);
+    const tagName = async (ids: string[]) => {
+      const { tags } = await projectCollectionsAndTags(repo, p.id);
+      return ids.map((id) => tags.find((t) => t.id === id)?.name).sort();
+    };
+    expect(await tagName((await repo.getSource(p.id, okId)).source.tagIds)).toEqual(["Lagos", "food systems"]);
+    const foodId = (await projectCollectionsAndTags(repo, p.id)).tags.find((t) => t.name === "food systems")!.id;
+
+    // The user puts the batch's new tag on a source outside batch 2: undo must keep that tag.
+    await repo.setMembership(p.id, otherId, { tagIds: [...(await repo.getSource(p.id, otherId)).source.tagIds, foodId] });
+
+    const u = await bulk.undoBatch(p.id, h2.batchId);
+    expect(u.revertedMerges).toBe(1);
+    expect((await repo.getSource(p.id, okId)).source.tagIds).toEqual([]);
+    const { tags } = await projectCollectionsAndTags(repo, p.id);
+    expect(tags.map((t) => t.name).sort()).toEqual(["Lagos", "food systems"]);
+    expect(u.kept).toContainEqual(expect.objectContaining({ kind: "tag", id: foodId }));
   });
 });

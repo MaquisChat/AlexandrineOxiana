@@ -195,7 +195,7 @@ const CAPTURE_METHOD: Record<ImportBatch["source"]["kind"], Provenance["captureM
   attach: "manual_upload",
   "zotero-local": "zotero_import",
   "zotero-web": "zotero_import",
-  "zotero-rdf": "refman_import", // an export file, like BibTeX/RIS/CSL-JSON (R65)
+  "zotero-rdf": "zotero_import", // the provenance says the data came from Zotero (R66)
   bibtex: "refman_import",
   ris: "refman_import",
   "csl-json": "refman_import",
@@ -352,6 +352,8 @@ class Run {
   private readonly createdIds: Set<string>;
   private readonly denies = new Map<string, number>();
   private workDir: string | null = null;
+  /** File notes per item key (ScanItem.fileNotes), added to the item's journal line. */
+  private fileNotes = new Map<string, string[]>();
   private readonly workName: string;
   private structureCache = new Map<string, { collectionIds: string[]; tagIds: string[] }>();
   private projectTags: { collections: Array<{ id: string; name: string; parentId?: string }>; tags: Array<{ id: string; name: string }> } | null = null;
@@ -559,6 +561,7 @@ class Run {
   /** Processes one item (null: queued in the current group); never throws for item-level problems (they become `failed`). */
   private async item(item: ScanItem, dedupe: BatchDedupe, watchdog: PatternWatchdog): Promise<JournalEntry | null> {
     try {
+      if (item.fileNotes?.length) this.fileNotes.set(item.key, item.fileNotes.slice(0, 50).map((n) => n.slice(0, 200)));
       if (item.unreadable) return this.queue({ key: item.key, outcome: "failed", reason: item.unreadable });
       return await this.importItem(item, dedupe, watchdog);
     } catch (err) {
@@ -582,8 +585,15 @@ class Run {
   }
 
   private queue(e: JournalEntry): JournalEntry {
-    this.pending.push(e);
-    return e;
+    const line = this.withNotes(e);
+    this.pending.push(line);
+    return line;
+  }
+
+  /** The journal line with the item's file notes, if it has any (R66). */
+  private withNotes(e: JournalEntry): JournalEntry {
+    const notes = this.fileNotes.get(e.key);
+    return notes?.length ? { ...e, notes } : e;
   }
 
   private async importItem(item: ScanItem, dedupe: BatchDedupe, watchdog: PatternWatchdog): Promise<JournalEntry | null> {
@@ -766,7 +776,7 @@ class Run {
             ...(q.reviewItem ? { reviewItem: { ...q.reviewItem, batchId: this.rec.id } } : {}),
           },
           inTx: async (tx, sf) => {
-            const entry: JournalEntry = { key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id };
+            const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id });
             entries[i] = entry;
             await appendJournal(tx, this.projectRel, this.rec.dir, i === 0 ? [...this.pending.slice(0, flushLines), entry] : [entry]);
           },
@@ -821,7 +831,7 @@ class Run {
       },
       refuseLocation,
       async (tx, created) => {
-        entry = { key: item.key, outcome, sourceId: created.source.id };
+        entry = this.withNotes({ key: item.key, outcome, sourceId: created.source.id });
         await appendJournal(tx, this.projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
       },
     );
@@ -855,6 +865,8 @@ class Run {
     dedupe: BatchDedupe,
   ): Promise<JournalEntry> {
     const target = await this.repo.getSource(this.projectId, targetId);
+    // Tags are found or created first (each its own change, recorded as the batch's for undo).
+    const tagIds = await this.namedTags(item.tags);
     const flush = this.pending.length;
     const n = ++this.snapshots;
     const snapshotRel = `${this.rec.dir}/snapshots/${targetId}-${Date.now()}-${n}.json`;
@@ -880,13 +892,13 @@ class Run {
           if (f.handling === "link") added.push(await linkedAsset(repoLibrary(this.repo).root, f, targetId, sha));
           else added.push(await ops.copyOriginal(cur, { fromPath: f.path, kind: f.kind!, ext: f.ext!, ...(f.mime ? { mime: f.mime } : {}), label: `${f.kind} added ${label}` }));
         }
-        const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, tx.at, tx.actor);
+        const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, tx.at, tx.actor, tagIds);
         record = merged.record;
         const next = merged.next;
         await ops.writeSource(cur, next);
         await appendJournal(tx, projectRel, this.rec.dir, [
           ...this.pending.slice(0, flush),
-          { key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: record },
+          this.withNotes({ key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: record }),
         ]);
         return next;
       },
@@ -894,7 +906,7 @@ class Run {
     );
     this.pending = this.pending.slice(flush);
     dedupe.add(sf);
-    return { key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, ...(record ? { merge: record } : {}) };
+    return this.withNotes({ key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, ...(record ? { merge: record } : {}) });
   }
 }
 
