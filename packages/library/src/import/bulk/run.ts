@@ -31,7 +31,7 @@
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import {
   Asset,
@@ -56,6 +56,7 @@ import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../../repo
 import type { SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
+  appendLibraryEvent,
   authorizeProcessing,
   createSourceRefusing,
   createSourcesRefusing,
@@ -71,6 +72,7 @@ import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
 import { MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs } from "../common.js";
 import { resolveItem, type Resolution } from "../resolve.js";
+import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
 import { findSidecars } from "../sidecar.js";
 import {
   BOOKKEEPING,
@@ -95,7 +97,8 @@ import {
 } from "./batch.js";
 import { BatchDedupe } from "./dedupe.js";
 import { applyMerge, missingFields, type MergeRecord } from "./merge.js";
-import { writeBatchReport } from "./report.js";
+import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./outside.js";
+import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
 
@@ -186,6 +189,11 @@ export interface ScanSummary {
   unreadable: Array<{ path: string; reason: string }>;
   /** Scan notes (e.g. how many empty records an export had). */
   notes: string[];
+  /**
+   * Files outside the source's folders and the library's approved folders (R67), for the wizard to
+   * ask about: the item's label and the folder the file is in. Never written anywhere.
+   */
+  outsideFiles: Array<{ item: string; folder: string }>;
 }
 
 export interface BatchSummary {
@@ -363,6 +371,8 @@ class Run {
   private workDir: string | null = null;
   /** File notes per item key (ScanItem.fileNotes), added to the item's journal line. */
   private fileNotes = new Map<string, string[]>();
+  /** Files outside the adapter's roots need approval (R67); undefined when the adapter declares no roots. */
+  private outside: OutsidePolicy | undefined;
   /** Real path of each file attached in this run → the item it went to (a second item gets a note). */
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
@@ -491,6 +501,12 @@ class Run {
       const dedupe = new BatchDedupe(this.deps.index.db, this.projectId, (id) => hasSource(this.repo, this.projectId, id));
       this.dedupe = dedupe;
       this.lookup = await lookupContextFor(this.repo, this.projectId, this.deps.http, this.deps.debug ? { debug: this.deps.debug } : {});
+      this.outside = await OutsidePolicy.create(
+        this.adapter.roots,
+        [join(repoLibrary(this.repo).root, ".tmp", this.workName), ...(await approvedFolders(repoLibrary(this.repo)))],
+        this.rec.secret,
+        this.rec.outsideApprovals ?? [],
+      );
       let total = 0;
       try {
         total = (await this.adapter.count?.(this.abort.signal)) ?? 0;
@@ -626,6 +642,10 @@ class Run {
         continue;
       }
       const real = await fsp.realpath(f.path).catch(() => resolve(f.path));
+      if (this.outside && !(await this.outside.check(f.path)).ok) {
+        dropped.push({ note: OUTSIDE_NOTE, reason: OUTSIDE_REASON });
+        continue;
+      }
       const owner = this.fileOwners.get(real);
       if (owner !== undefined && owner !== item.key) {
         dropped.push({ note: ENGINE_FILE_NOTES.sameFile, reason: REASONS.duplicateFile });
@@ -999,9 +1019,17 @@ export async function startBatch(deps: BulkImportDeps, projectId: string, adapte
   const id = newId();
   active.add(id);
   try {
-    const options = acceptOptions(input);
+    const { approveOutside, ...options } = acceptOptions(input);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
     const number = await allocateBatchNumber(deps.repo, projectId);
+    const secret = randomBytes(32).toString("hex");
+    // Approvals are kept as HMACs only (R67); remembered folders join the library's approved folders.
+    const remember = approveOutside?.rememberFolders ?? [];
+    const outsideApprovals = await approvalHashes(secret, { folders: [...(approveOutside?.folders ?? []), ...remember], files: approveOutside?.files ?? [] });
+    if (remember.length) {
+      const added = await rememberApprovedFolders(repoLibrary(deps.repo), remember);
+      if (added) await appendLibraryEvent(deps.repo, projectId, "import.approve-folders", { batchId: id, added });
+    }
     const rec: BatchRecord = {
       id,
       projectId,
@@ -1017,7 +1045,8 @@ export async function startBatch(deps: BulkImportDeps, projectId: string, adapte
       createdTagIds: [],
       governance,
       notes: [],
-      secret: randomBytes(32).toString("hex"),
+      secret,
+      ...(outsideApprovals.length ? { outsideApprovals } : {}),
     };
     // Written before anything is created, so an interrupted batch still has its record.
     await saveRecord(deps.repo, projectId, rec);
@@ -1108,7 +1137,7 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
   const repo = deps.repo;
   repo.getProject(projectId);
   const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
-  const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [] };
+  const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [], outsideFiles: [] };
   const name = `batch-dry-${newId()}`;
   const dir = join(repoLibrary(repo).root, ".tmp", name);
   let made = false;
@@ -1129,11 +1158,22 @@ export async function dryRun(deps: BulkImportDeps, projectId: string, adapter: I
         if (!summary.notes.includes(t)) summary.notes.push(t);
       },
     });
-    for await (const item of scan) {
+    const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))]);
+    for await (const scanned of scan) {
+      let item = scanned;
       summary.items++;
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
+      }
+      if (policy && item.files.length) {
+        const inside: ScanItem["files"] = [];
+        for (const x of item.files) {
+          const c = await policy.check(x.path);
+          if (c.ok) inside.push(x);
+          else summary.outsideFiles.push({ item: reportLabel(item.key, undefined), folder: dirname(c.real) });
+        }
+        item = { ...item, files: inside };
       }
       const f = item.files[0];
       if (!f) {

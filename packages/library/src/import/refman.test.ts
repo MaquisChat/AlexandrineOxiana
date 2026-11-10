@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,7 +21,8 @@ import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
 import { projectCollectionsAndTags } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
-import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
+import { approvedFolders } from "./approved-folders.js";
+import { adapterFor, createBulkImport, folderAdapter, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import { CALIBRE_FILE_NOTE, MAX_CALIBRE_DB_BYTES, calibreAdapter, copyCalibreDb } from "./calibre.js";
 import { FILE_NOTES, MAX_EXPORT_BYTES, MAX_FIELD_CHARS, bibtexAdapter, cslJsonAdapter, risAdapter } from "./refman.js";
 import { zoteroRdfAdapter } from "./zotero-rdf.js";
@@ -682,7 +683,7 @@ describe("through the Bulk Import engine", () => {
   containsIdentifiable: false
 encryption:
   atRest: optional
-captureMethods: [refman_import, calibre_import]
+captureMethods: [refman_import, calibre_import, manual_upload]
 processing:
   metadata_lookup: []
 `;
@@ -890,6 +891,92 @@ processing:
       expect(t).not.toContain("labels.bib");
       expect(t).not.toMatch(/@[0-9a-f]{12}#/);
     }
+  });
+
+  describe("R67: files outside the expected folders need approval", () => {
+    let outside: string;
+    let outsidePdf: string;
+    let bib: string;
+    beforeEach(async () => {
+      outside = join(tmp, "outside");
+      await mkdir(outside, { recursive: true });
+      outsidePdf = join(outside, "x.pdf");
+      await writeFile(outsidePdf, await buildPdf({ extra: "outside" }));
+      bib = await writeExport("out.bib", "@article{outref, title={Outside Reference}, author={Doe, J.}, file={../outside/x.pdf}}\n");
+    });
+    const sourceOf = async (p: Project, key: string) =>
+      (await Promise.all(repo.listSourceIds(p.id).map((id) => repo.getSource(p.id, id)))).find((sf) => sf.source.citationKey === key)!;
+
+    it("dryRun lists the file with its folder", async () => {
+      const p = await project();
+      const s = await bulkImport().dryRun(p.id, bibtexAdapter(bib));
+      expect(s.outsideFiles).toEqual([{ item: expect.stringContaining("outref"), folder: await realpath(outside) }]);
+    });
+
+    it("without approval the item imports metadata-only with a note", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      const h = await bulk.startBatch(p.id, bibtexAdapter(bib));
+      expect((await h.done).counts.failed).toBe(0);
+      expect((await sourceOf(p, "outref")).assets).toEqual([]);
+      expect((await bulk.batchReport(p.id, h.batchId)).fileNotes.map((n) => n.note)).toEqual(["attached file is outside the export's folder and was not approved"]);
+    });
+
+    it("an approved folder or file is attached; the batch record keeps no plaintext path", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      const h = await bulk.startBatch(p.id, bibtexAdapter(bib), { approveOutside: { folders: [outside] } });
+      await h.done;
+      expect((await sourceOf(p, "outref")).assets).toHaveLength(1);
+      const batchJson = await readFile(join(lib.root, p.folder, "imports", "batch-0001", "batch.json"), "utf8");
+      expect(batchJson).not.toContain(outside);
+      expect(batchJson).not.toContain("approveOutside");
+      const p2 = await project();
+      await (await bulk.startBatch(p2.id, bibtexAdapter(bib), { approveOutside: { files: [outsidePdf] } })).done;
+      expect((await sourceOf(p2, "outref")).assets).toHaveLength(1);
+    });
+
+    it("rememberFolders adds the folder to the library's approved folders (audited); later batches attach without asking", async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      await (await bulk.startBatch(p.id, bibtexAdapter(bib), { approveOutside: { rememberFolders: [outside] } })).done;
+      expect(await approvedFolders(lib)).toEqual([await realpath(outside)]);
+      const p2 = await project();
+      expect((await bulk.dryRun(p2.id, bibtexAdapter(bib))).outsideFiles).toEqual([]);
+      await (await bulk.startBatch(p2.id, bibtexAdapter(bib))).done;
+      expect((await sourceOf(p2, "outref")).assets).toHaveLength(1);
+      const audit = (await readdir(join(lib.root, p.folder, "audit"))).map((f) => join(lib.root, p.folder, "audit", f));
+      const lines = (await Promise.all(audit.map((f) => readFile(f, "utf8")))).join("\n");
+      expect(lines).toContain("import.approve-folders");
+      expect(lines).not.toContain(outside);
+    });
+
+    it.skipIf(process.platform === "win32")("a symlink inside the export's folder pointing outside is treated as outside", async () => {
+      await symlink(outsidePdf, join(exp, "files", "link.pdf"));
+      const linkBib = await writeExport("link.bib", "@article{linkref, title={Linked Reference}, author={Doe, J.}, file={files/link.pdf}}\n");
+      const p = await project();
+      const bulk = bulkImport();
+      expect((await bulk.dryRun(p.id, bibtexAdapter(linkBib))).outsideFiles).toEqual([{ item: expect.stringContaining("linkref"), folder: await realpath(outside) }]);
+      await (await bulk.startBatch(p.id, bibtexAdapter(linkBib))).done;
+      expect((await sourceOf(p, "linkref")).assets).toEqual([]);
+    });
+
+    it.skipIf(process.platform === "win32")("a symlink inside a scanned folder pointing outside is listed, and attached only when approved", async () => {
+      const scanned = join(tmp, "Scanned");
+      await mkdir(scanned);
+      await writeFile(join(scanned, "inside.pdf"), await buildPdf({ extra: "inside" }));
+      await symlink(outsidePdf, join(scanned, "link.pdf"));
+      const p = await project();
+      const bulk = bulkImport();
+      expect((await bulk.dryRun(p.id, folderAdapter(scanned))).outsideFiles).toEqual([{ item: "link.pdf", folder: await realpath(outside) }]);
+      const r = await (await bulk.startBatch(p.id, folderAdapter(scanned))).done;
+      expect(r.counts.failed).toBe(1);
+      expect(repo.listSourceIds(p.id)).toHaveLength(1);
+      const p2 = await project();
+      const r2 = await (await bulk.startBatch(p2.id, folderAdapter(scanned), { approveOutside: { folders: [outside] } })).done;
+      expect(r2.counts.failed).toBe(0);
+      expect(repo.listSourceIds(p2.id)).toHaveLength(2);
+    });
   });
 
   it("a merge adds the item's missing tags, and undo takes them off again (a tag still in use is kept)", async () => {

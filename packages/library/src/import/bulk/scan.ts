@@ -4,7 +4,8 @@
  * ../zotero-rdf.ts and ../calibre.ts for reference-manager exports and Calibre (Task 24), and by
  * Tasks 25–26 for Zotero.
  *
- * A folder scan never follows symbolic links, skips hidden files and the sidecar metadata files
+ * A folder scan never follows symbolic links to folders (a link to a file is an item, attached only
+ * if it really points inside the folder or is approved, R67), skips hidden files and the sidecar metadata files
  * that resolution reads next to an item (`.bib`, `.ris`, `.json`, `.opf`), and yields one item per
  * file, keyed by its path relative to the folder ("/"-separated): stable across runs, so a resumed
  * or repeated batch recognises its items. ZIP archives are unpacked with the archive limits
@@ -90,8 +91,8 @@ const skipName = (n: string) => n.startsWith(".") || SKIP_NAMES.has(n.toLowerCas
 const isZip = (n: string) => extname(n).toLowerCase() === ".zip";
 const isSidecar = (n: string) => SIDECARS.has(extname(n).toLowerCase());
 
-async function sniff(path: string): Promise<ScanFile | null> {
-  const st = await fsp.lstat(path).catch(() => null);
+async function sniff(path: string, follow = false): Promise<ScanFile | null> {
+  const st = await (follow ? fsp.stat(path) : fsp.lstat(path)).catch(() => null);
   if (!st?.isFile()) return null;
   const t = await fileTypeFromFile(path).catch(() => undefined);
   return { path, mime: t?.mime ?? "application/octet-stream", bytes: st.size };
@@ -166,8 +167,13 @@ async function* walk(root: string, rel: string[], signal: AbortSignal, ctx: Scan
       }
       const f = await sniff(path);
       if (f) yield { key, files: [f], folderPath: rel };
+    } else if (e.isSymbolicLink() && !isSidecar(e.name) && !isZip(e.name)) {
+      // A link to a file is an item like any other; the engine checks where it really points (a
+      // file outside the folder needs approval, R67). Links to folders are never followed.
+      const f = await sniff(join(dir, e.name), true);
+      if (f) yield { key, files: [f], folderPath: rel };
     }
-    // symbolic links and special files are never followed or imported
+    // special files are never imported
   }
 }
 
@@ -209,6 +215,7 @@ async function countFolder(root: string, rel: string[], signal: AbortSignal): Pr
     if (skipName(e.name)) continue;
     if (e.isDirectory()) n += await countFolder(root, [...rel, e.name], signal);
     else if (e.isFile() && !isSidecar(e.name)) n += isZip(e.name) ? await zipEntryCount(join(root, ...rel, e.name)) : 1;
+    else if (e.isSymbolicLink() && !isSidecar(e.name) && !isZip(e.name) && (await fsp.stat(join(root, ...rel, e.name)).catch(() => null))?.isFile()) n++;
   }
   return n;
 }

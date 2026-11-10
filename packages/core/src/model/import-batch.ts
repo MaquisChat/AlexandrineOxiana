@@ -21,6 +21,18 @@ export const ImportOptions = z.object({
   transcribe: z.boolean().default(false),
   autoAcceptThreshold: z.number().min(0).max(1).default(AUTO_ACCEPT_THRESHOLD),
   fileNamePatterns: z.array(FileNamePatternOption).max(50).default([]),
+  /**
+   * Files outside the source's own folders that the user approved (R67): whole folders and/or
+   * single files, and folders to remember as the library's approved folders. Used when the batch
+   * starts; the batch record keeps only HMACs of the approved paths, never this field.
+   */
+  approveOutside: z
+    .object({
+      folders: z.array(z.string().min(1).max(4096)).max(1000).default([]),
+      files: z.array(z.string().min(1).max(4096)).max(100_000).default([]),
+      rememberFolders: z.array(z.string().min(1).max(4096)).max(1000).default([]),
+    })
+    .optional(),
 });
 export type ImportOptions = z.infer<typeof ImportOptions>;
 /** What a caller passes (every field optional; defaults filled in by `ImportOptions.parse`). */

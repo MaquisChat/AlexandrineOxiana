@@ -86,6 +86,8 @@ export interface BatchRecord extends ImportBatch {
    * Sealed with batch.json in encrypted projects.
    */
   secret?: string;
+  /** Files approved outside the source's folders (R67): HMACs of their real paths, never the paths. */
+  outsideApprovals?: string[];
   /** Profile capture (Task 18): counts detail. */
   countsDetail?: Record<string, number>;
 }
