@@ -20,6 +20,7 @@ Node 22+, pnpm 10 (pnpm 9 or later works), Python 3.12+.
 | Command | What it does |
 |---|---|
 | `pnpm install` | Install dependencies |
+| `pnpm fetch-csl` | Build the citation style bundle (`packages/core/csl/`: pinned CSL styles and locales, CC BY-SA 3.0; not committed, needed by the citation tests and the app) |
 | `pnpm -r typecheck` | Type-check every package |
 | `pnpm test` | Run all TypeScript tests (writes `reports/vitest.json`) |
 | `pnpm test:scripts` | Test the report script itself |

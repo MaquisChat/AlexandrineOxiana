@@ -14,6 +14,7 @@
     "report": "node scripts/test-report.mjs",
     "setup:py": "node scripts/setup-py.mjs",
     "fetch-fixtures": "node scripts/fetch-fixtures.mjs",
+    "fetch-csl": "node scripts/fetch-csl.mjs",
     "ao": "tsx apps/cli/src/index.ts"
   },
   "devDependencies": {

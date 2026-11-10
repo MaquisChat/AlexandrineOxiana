@@ -11,6 +11,8 @@
   "dependencies": {
     "@noble/hashes": "^2.4.0",
     "canonicalize": "^5.1.0",
+    "citeproc": "2.4.63",
+    "fflate": "0.8.2",
     "uuidv7": "^1.2.1",
     "yaml": "^2.9.1",
     "zod": "^3.25.76"

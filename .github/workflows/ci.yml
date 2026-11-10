@@ -28,6 +28,8 @@ jobs:
           PYTHON: python
       - name: Pinned test fixtures
         run: pnpm fetch-fixtures
+      - name: CSL styles and locales (pinned commits + sha256; generated, not committed)
+        run: pnpm fetch-csl
       - run: pnpm -r typecheck
       - run: pnpm test
       # Bulk Import at scale (10,000 items in < 120 s, RSS < 500 MB), on its own after the main suite.
