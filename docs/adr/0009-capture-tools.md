@@ -48,6 +48,14 @@ each capture. Using these tools may conflict with platform terms of service.
   explicitly (governance `captureMethods`), with a one-time explanation that downloading may
   conflict with platform terms and that using a logged-in session puts that account at some risk.
   The Node side checks a `capture` policy decision before submitting a download job.
+- **Link capture on the Node side** (`packages/library/src/capture/`): `captureUrl` evaluates the
+  one `capture` decision (method `downloader`, platform) and a `store` pre-check before anything is
+  downloaded; the worker client does not evaluate `capture.download` again. Using the browser
+  session needs the project's recorded acknowledgement (`repo.acknowledge(projectId, "cookies")`,
+  audited). The platform JSON is stored as an original `platform-metadata` asset with
+  `formats`, `http_headers`, `requested_*`, cookies, local file paths and every key matching
+  `/cookie|token|auth|header/i` removed at any depth. Captures against one platform run one at a
+  time.
 
 ## Consequences
 

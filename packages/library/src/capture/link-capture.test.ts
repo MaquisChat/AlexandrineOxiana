@@ -355,6 +355,15 @@ describe("captureUrl", () => {
     for (const s of ["Harvest", "Ama Test", "issued", out.sourceId!]) expect(text).not.toContain(s);
     const row = handle.db.prepare("SELECT payload_json FROM review_items").get() as { payload_json: string };
     expect(JSON.parse(row.payload_json)).toEqual({ fields: { "/issued": "conflict" } });
+    // locked: the sealed file cannot be read, so a rebuild keeps the row it had
+    repo.lockProject(p.id);
+    await rebuildIndex(handle, ring, lib);
+    expect(handle.db.prepare("SELECT source_id FROM review_items").all()).toEqual([{ source_id: out.sourceId }]);
+    // unlocked: rebuilt from the file
+    await repo.unlockProject(p.id, "pw");
+    handle.db.prepare("DELETE FROM review_items").run();
+    await rebuildIndex(handle, ring, lib);
+    expect(handle.db.prepare("SELECT source_id, payload_json FROM review_items").all()).toEqual([{ source_id: out.sourceId, payload_json: JSON.stringify({ fields: { "/issued": "conflict" } }) }]);
   });
 
   it("profile and playlist links are handed to captureProfile when given, else fail plainly", async () => {
