@@ -131,3 +131,6 @@ export { stripSnapshot } from "./capture/snapshot.js";
 export { NoMediaError, createLinkCapture } from "./capture/link-capture.js";
 export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps, TranscribeSourceResult } from "./capture/link-capture.js";
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";
+
+export * from "./extract/index.js";
+export * from "./lookup/index.js";

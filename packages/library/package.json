@@ -14,9 +14,15 @@
   },
   "dependencies": {
     "@ao/core": "workspace:*",
-    "better-sqlite3": "^12.11.1"
+    "better-sqlite3": "^12.11.1",
+    "exiftool-vendored": "39.0.1",
+    "pdfjs-dist": "6.4.299",
+    "undici": "8.12.3",
+    "yauzl": "3.4.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^9.6.0"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/yauzl": "3.4.0",
+    "pdf-lib": "1.17.1"
   }
 }

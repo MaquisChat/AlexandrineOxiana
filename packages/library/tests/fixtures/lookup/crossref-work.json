@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message-version": "1.0.0",
+  "message": {
+    "DOI": "10.5555/ao.fixture.2021.001",
+    "type": "journal-article",
+    "title": ["Rivers and Memory in Upland Villages"],
+    "author": [
+      { "given": "Amara", "family": "Okafor", "sequence": "first", "affiliation": [] },
+      { "given": "Henrik", "family": "Lindqvist", "sequence": "additional", "affiliation": [] }
+    ],
+    "container-title": ["Journal of Upland Studies"],
+    "publisher": "Example University Press",
+    "issued": { "date-parts": [[2021, 3, 4]] },
+    "ISSN": ["1234-5679"],
+    "URL": "https://doi.org/10.5555/ao.fixture.2021.001"
+  }
+}

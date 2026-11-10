@@ -1,0 +1,12 @@
+{
+  "key": "/books/OL1000001M",
+  "title": "The Weaver's Almanac",
+  "subtitle": "A Year at the Loom",
+  "authors": [{ "key": "/authors/OL2000001A" }, { "key": "/authors/OL2000002A" }],
+  "publishers": ["Harbour Books"],
+  "publish_date": "May 1, 2009",
+  "isbn_13": ["9780262033848"],
+  "isbn_10": ["0262033844"],
+  "languages": [{ "key": "/languages/eng" }],
+  "number_of_pages": 312
+}

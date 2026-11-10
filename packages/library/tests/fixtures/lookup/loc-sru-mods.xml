@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<zs:searchRetrieveResponse xmlns:zs="http://www.loc.gov/zing/srw/">
+  <zs:version>1.1</zs:version>
+  <zs:numberOfRecords>1</zs:numberOfRecords>
+  <zs:records>
+    <zs:record>
+      <zs:recordSchema>mods</zs:recordSchema>
+      <zs:recordPacking>xml</zs:recordPacking>
+      <zs:recordData>
+        <mods xmlns="http://www.loc.gov/mods/v3" version="3.8">
+          <titleInfo><nonSort>The </nonSort><title>weaver&apos;s almanac</title><subTitle>a year at the loom</subTitle></titleInfo>
+          <name type="personal" usage="primary"><namePart>Adebayo, Ngozi,</namePart><namePart type="date">1970-</namePart><role><roleTerm type="text">author.</roleTerm></role></name>
+          <name type="personal"><namePart>Herrera, Tomás.</namePart><role><roleTerm type="text">translator.</roleTerm></role></name>
+          <typeOfResource>text</typeOfResource>
+          <originInfo>
+            <place><placeTerm type="text">Boston</placeTerm></place>
+            <publisher>Harbour Books</publisher>
+            <dateIssued>2009</dateIssued>
+          </originInfo>
+          <identifier type="isbn">9780262033848 (hardcover)</identifier>
+          <identifier type="lccn">2008000001</identifier>
+        </mods>
+      </zs:recordData>
+      <zs:recordPosition>1</zs:recordPosition>
+    </zs:record>
+  </zs:records>
+</zs:searchRetrieveResponse>

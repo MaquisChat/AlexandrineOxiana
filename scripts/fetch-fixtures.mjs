@@ -25,6 +25,13 @@ export const FIXTURES = [
     url: "https://raw.pixls.us/getfile.php/2204/nice/Canon%20-%20EOS%205D%20Mark%20III%20-%2014bit%2014bit%20(2.3471882640587).dng",
     sha256: "1d77dcc6cdb839b10c1948f0b4471984ab48cf15e973fb77520584cee72b603e",
   },
+  {
+    // raw.pixls.us sample, Canon EOS R6, C-RAW 1.6x crop (3:2) CR3 (file id 4659, 5.0 MB); CC0 1.0.
+    // Task 21: camera metadata (DateTimeOriginal with OffsetTimeOriginal, lens) in extract.test.ts.
+    name: "canon-eos-r6-craw-crop.cr3",
+    url: "https://raw.pixls.us/getfile.php/4659/nice/Canon%20-%20EOS%20R6%20-%203:2.CR3",
+    sha256: "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778",
+  },
 ];
 
 const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");

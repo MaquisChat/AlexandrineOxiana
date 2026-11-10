@@ -497,6 +497,21 @@ export async function pseudonymCodeFor(repo: Repo, projectId: string, names: str
   return undefined;
 }
 
+/**
+ * Package-internal (metadata lookups, R50): the project's effective policy (null when unreadable),
+ * the acting user, time zone and clock, and whether the project is encrypted (lookups for it are
+ * then `sensitive`: cached in memory only).
+ */
+export async function lookupPolicyInfo(
+  repo: Repo,
+  projectId: string,
+): Promise<{ policy: GovernanceConfig | null; actor: string; tz?: string; clock: () => Date; sensitive: boolean }> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  const policy = await projectPolicy(repo, projectId);
+  return { policy, actor: core.actor, ...(core.tz ? { tz: core.tz } : {}), clock: core.clock, sensitive: core.encrypted(st) };
+}
+
 /** Package-internal: the researcher's time zone the repo names dated files in. */
 export function repoTz(repo: Repo): string | undefined {
   return cores.get(repo)!.tz;

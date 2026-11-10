@@ -1,0 +1,17 @@
+{
+  "id": "https://openalex.org/W1000000001",
+  "doi": "https://doi.org/10.5555/ao.fixture.2021.001",
+  "title": "Rivers and Memory in Upland Villages",
+  "display_name": "Rivers and Memory in Upland Villages",
+  "publication_year": 2021,
+  "publication_date": "2021-03-04",
+  "type": "article",
+  "authorships": [
+    { "author_position": "first", "author": { "id": "https://openalex.org/A1", "display_name": "Amara Okafor" }, "raw_author_name": "Amara Okafor" },
+    { "author_position": "last", "author": { "id": "https://openalex.org/A2", "display_name": "Henrik Lindqvist" }, "raw_author_name": "Henrik Lindqvist" }
+  ],
+  "primary_location": {
+    "source": { "id": "https://openalex.org/S1", "display_name": "Journal of Upland Studies", "issn_l": "1234-5679", "host_organization_name": "Example University Press" }
+  },
+  "ids": { "openalex": "https://openalex.org/W1000000001", "doi": "https://doi.org/10.5555/ao.fixture.2021.001" }
+}

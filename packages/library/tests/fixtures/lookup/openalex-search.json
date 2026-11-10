@@ -1,0 +1,25 @@
+{
+  "meta": { "count": 2, "page": 1, "per_page": 5 },
+  "results": [
+    {
+      "id": "https://openalex.org/W1000000001",
+      "doi": "https://doi.org/10.5555/ao.fixture.2021.001",
+      "title": "Rivers and Memory in Upland Villages",
+      "publication_year": 2021,
+      "publication_date": "2021-03-04",
+      "type": "article",
+      "authorships": [{ "author": { "display_name": "Amara Okafor" } }, { "author": { "display_name": "Henrik Lindqvist" } }],
+      "primary_location": { "source": { "display_name": "Journal of Upland Studies" } }
+    },
+    {
+      "id": "https://openalex.org/W1000000002",
+      "doi": null,
+      "title": "Rivers of Memory",
+      "publication_year": 1999,
+      "publication_date": "1999-01-01",
+      "type": "book",
+      "authorships": [{ "author": { "display_name": "Joan Rivers" } }],
+      "primary_location": null
+    }
+  ]
+}
