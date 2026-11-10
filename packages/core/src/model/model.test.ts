@@ -198,6 +198,7 @@ describe("ImportOptions / ImportBatch", () => {
       fileHandling: "copy",
       linkedFiles: "link",
       includeDeleted: false,
+      resetDeletedRecords: false,
       structure: "collections",
       duplicates: "merge",
       ocr: true,

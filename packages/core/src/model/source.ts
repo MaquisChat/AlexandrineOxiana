@@ -136,7 +136,15 @@ export const SourceFile = z.object({
   formatVersion: z.literal(1),
   source: Source,
   assets: z.array(Asset),
+  /**
+   * In memory: all the source's annotations. On disk (R74 I4) they live in the source folder's
+   * annotations.json (annotations.json.enc, sealed, in encrypted projects); source.json keeps `[]`
+   * plus annotationCount and annotationsSha256 (of the file's JSON). A source.json from before
+   * that still holds them inline is read as is and moved on its next write.
+   */
   annotations: z.array(Annotation),
+  annotationCount: z.number().int().min(0).optional(),
+  annotationsSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   fieldEvidence: z.array(FieldEvidence).default([]),
   verification: z.record(z.string(), FieldVerification).default({}),
 });

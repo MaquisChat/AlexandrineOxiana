@@ -14,7 +14,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { Annotation, newId, primary, type Asset, type FieldEvidence, type MultiText, type SourceDraft, type SourceFile } from "@ao/core";
-import { getAt, type FilledField } from "./merge.js";
+import { annotationHash, getAt, unedited, type FilledField } from "./merge.js";
 import type { ScanAnnotation } from "./scan.js";
 
 /** The fields an update may change, as JSON pointers (the ones resolution records evidence for, and the URL). */
@@ -127,19 +127,84 @@ export function toAnnotation(a: ScanAnnotation, sourceId: string, actor: string,
       : [];
   // A page number with no asset to anchor in is kept as the label.
   const pageLabel = a.pageLabel ?? (a.anchor?.kind === "pdf" && !anchors.length ? String(a.anchor.page) : undefined);
-  return Annotation.parse({
-    id: newId(),
-    sourceId,
+  const content = {
     kind: a.kind,
     anchors,
     ...(a.body ? { body: a.body } : {}),
     ...(a.quote ? { quote: a.quote } : {}),
     ...(a.color ? { color: a.color } : {}),
     ...(pageLabel ? { pageLabel: pageLabel.slice(0, 64) } : {}),
+  };
+  return Annotation.parse({
+    id: newId(),
+    sourceId,
+    ...content,
     externalKey: a.key.slice(0, 256),
+    externalHash: annotationHash(content),
     author: a.author || actor,
     createdAt: a.createdAt ?? new Date().toISOString(),
   });
+}
+
+/** Per source (R74 I4): at most this many annotations, and this much of their text in all. */
+export const MAX_SOURCE_ANNOTATIONS = 10_000;
+export const MAX_SOURCE_ANNOTATION_TEXT = 16 * 1024 * 1024;
+
+const textOf = (a: { body?: string; quote?: string }) => (a.body?.length ?? 0) + (a.quote?.length ?? 0);
+
+/** Takes annotations while the source stays within the caps (given what it already has); counts the rest. */
+export function capAnnotations<T extends { body?: string; quote?: string }>(have: Array<{ body?: string; quote?: string }>, list: T[]): { kept: T[]; dropped: number } {
+  let count = have.length;
+  let chars = have.reduce((n, a) => n + textOf(a), 0);
+  const kept: T[] = [];
+  for (const a of list) {
+    const t = textOf(a);
+    if (count + 1 > MAX_SOURCE_ANNOTATIONS || chars + t > MAX_SOURCE_ANNOTATION_TEXT) continue;
+    count++;
+    chars += t;
+    kept.push(a);
+  }
+  return { kept, dropped: list.length - kept.length };
+}
+
+export interface AnnotationPlan {
+  added: Annotation[];
+  updated: Array<{ before: Annotation; after: Annotation }>;
+  /** External keys of annotations changed at the source but edited here: kept. */
+  kept: string[];
+  dropped: number;
+}
+
+/**
+ * A re-import's annotations (R75): new ones (by external key) are added within the caps; one
+ * changed at the source is updated while it is still as last imported (its content hash), and kept
+ * (reported) when it was edited here since.
+ */
+export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make: (a: ScanAnnotation) => Annotation): AnnotationPlan {
+  const byKey = new Map(sf.annotations.filter((a) => a.externalKey).map((a) => [a.externalKey!, a]));
+  const plan: AnnotationPlan = { added: [], updated: [], kept: [], dropped: 0 };
+  const fresh: Annotation[] = [];
+  const seen = new Set<string>();
+  for (const s of scanned) {
+    if (seen.has(s.key)) continue;
+    seen.add(s.key);
+    const ex = byKey.get(s.key);
+    const next = make(s);
+    if (!ex) {
+      fresh.push(next);
+      continue;
+    }
+    if (ex.externalHash === next.externalHash) continue; // unchanged at the source
+    if (!unedited(ex)) {
+      plan.kept.push(s.key);
+      continue;
+    }
+    plan.updated.push({ before: ex, after: { ...next, id: ex.id, author: ex.author, createdAt: ex.createdAt } });
+  }
+  const capped = capAnnotations(sf.annotations, fresh);
+  plan.added = capped.kept;
+  plan.dropped = capped.dropped;
+  return plan;
 }
 
 /** `key`, or `key` + a, b, … z, aa, ab … — the first one not in `taken` (then taken). */

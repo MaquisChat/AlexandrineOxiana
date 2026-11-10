@@ -19,6 +19,7 @@ import { storeRequest } from "../../repo/sources.js";
 import { importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import type { LookupResult } from "../../lookup/index.js";
 import { PRIVATE_MODE, appendJournal, fileName, findBatch, readJournal, runListeners, type JournalEntry } from "./batch.js";
+import { zoteroKeysOf } from "../../repo/tombstones.js";
 import { applyMerge, missingFields } from "./merge.js";
 import { BatchRefusedError } from "./run.js";
 
@@ -141,13 +142,15 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
           const ext = a.path.replace(/\.enc$/u, "").split(".").pop() ?? "bin";
           added.push(await ops.copyOriginal(tgt, { fromPath: join(root, ...a.path.split("/")), kind: a.kind, ext, mime: a.mime, label: `${a.kind} added ${label}`, ...(a.encrypted ? { fromEncrypted: true } : {}) }));
         }
-        const merged = applyMerge(tgt, added, missingFields(tgt, cur.source as unknown as SourceDraft), cur.fieldEvidence, tx.at, tx.actor);
+        // The Zotero items the reviewed source stands for are remembered on the target (R74 M5).
+        const merged = applyMerge(tgt, added, missingFields(tgt, cur.source as unknown as SourceDraft), cur.fieldEvidence, tx.at, tx.actor, [], zoteroKeysOf(cur));
         await ops.writeSource(tgt, merged.next);
-        await ops.deleteSource(cur.source.id);
-        line = { outcome: "merged", sourceId: tgt.source.id, mergedInto: tgt.source.id, ...(snapshot ? { snapshot } : {}), merge: merged.record };
+        const { tombstoned } = await ops.deleteSource(cur.source.id);
+        line = { outcome: "merged", sourceId: tgt.source.id, mergedInto: tgt.source.id, ...(snapshot ? { snapshot } : {}), merge: merged.record, ...(tombstoned.length ? { tombstoned } : {}) };
       } else if (d.action === "skip") {
-        await ops.deleteSource(cur.source.id);
-        line = { outcome: "skipped", sourceId: cur.source.id };
+        // A skip is the user's deletion: recorded (R73), and journaled so undo takes it back (R74 I3).
+        const { tombstoned } = await ops.deleteSource(cur.source.id);
+        line = { outcome: "skipped", sourceId: cur.source.id, ...(tombstoned.length ? { tombstoned } : {}) };
       }
       if (batchDir && itemKey) {
         journaled = { key: itemKey, ...line, decision: d.action };

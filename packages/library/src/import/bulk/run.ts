@@ -66,6 +66,7 @@ import {
   projectEncrypted,
   hasSource,
   deletedHere,
+  deletedRecordsTrouble,
   projectPolicyOrDefault,
   repoLibrary,
   type Repo,
@@ -73,7 +74,7 @@ import {
 import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
 import { MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, refuseLocation, reviewFor, sha256File, storeInputs } from "../common.js";
-import { resolveItem, type Resolution } from "../resolve.js";
+import { LOCATED_MEDIA, mayHaveLocation, resolveItem, type Resolution } from "../resolve.js";
 import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
 import { findSidecars } from "../sidecar.js";
 import {
@@ -103,7 +104,7 @@ import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./o
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
-import { planUpdate, toAnnotation, uniqueKey } from "./update.js";
+import { capAnnotations, planAnnotations, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../../../package.json") as { version: string }).version;
 const TOOL = { name: "bulk-import", version: VERSION };
@@ -128,6 +129,8 @@ export const REASONS = {
   duplicateFile: "The same file is already in the project.",
   duplicateId: "A source with the same DOI or ISBN is already in the project.",
   deletedHere: "You deleted this item's source here after an earlier import, so it was not imported again.",
+  deletedRecordsUnreadable:
+    "This project's record of sources deleted here could not be read, so a Zotero import could bring back sources you deleted. Import again with \u201creset deleted records\u201d to start a new record (sources deleted before then may come back).",
   linkEncrypted:
     "Files cannot be linked in place in this project: its files must be encrypted at rest, and a linked file stays outside the library. Choose to copy the files instead.",
 } as const;
@@ -170,6 +173,8 @@ export interface BatchCounts {
   /** Incremental re-import (R72): items imported before that changed, and those that did not. */
   updated: number;
   unchanged: number;
+  /** Items whose source was deleted here after an earlier import, not re-imported (R73, R74 M7). */
+  deletedHere: number;
   failed: number;
 }
 
@@ -308,6 +313,18 @@ export async function preflightLink(repo: Repo, projectId: string): Promise<bool
   return !policy || policy.encryption.atRest === "required";
 }
 
+/**
+ * Incremental imports (R74 I2): the record of sources deleted here must be readable and its warning
+ * clear, or the batch refuses — unless it runs with resetDeletedRecords, which sets the record
+ * aside, starts a new one and clears the warning (one governed, audited change).
+ */
+async function preflightDeleted(repo: Repo, projectId: string, adapter: { incremental?: boolean }, options: ImportOptions): Promise<void> {
+  if (!adapter.incremental || !(await deletedRecordsTrouble(repo, projectId))) return;
+  if (!options.resetDeletedRecords) throw new BatchRefusedError(REASONS.deletedRecordsUnreadable);
+  await importChange(repo, projectId, BOOKKEEPING, (ops) => ops.resetDeletions(), { op: "import.reset-deleted-records" });
+  await appendLibraryEvent(repo, projectId, "import.reset-deleted-records", {});
+}
+
 /** Policy and option checks a batch must pass before it starts (or resumes). */
 async function preflight(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"], options: ImportOptions): Promise<GovernanceNote[]> {
   repo.getProject(projectId); // NotFoundError for an unknown project
@@ -406,10 +423,18 @@ class Run {
   private readonly workName: string;
   /** Incremental import (R72): identity → the source and version token the newest journal line recorded. */
   private known = new Map<string, { sourceId: string; version: string }>();
-  /** Whether a Zotero item's source was deleted here (R73). */
+  /** Whether a Zotero item's source was deleted here (R73); re-read for each group and whenever a known source is gone (R74 M4). */
   private deletedHere: (zoteroKey: string) => boolean = () => false;
+  private async refreshDeleted(): Promise<void> {
+    const f = await deletedHere(this.repo, this.projectId);
+    // Unreadable (R74 I2): the batch stops rather than bring back sources deleted here.
+    if (!f) throw new BatchRefusedError(REASONS.deletedRecordsUnreadable);
+    this.deletedHere = f;
+  }
   /** Item key → Zotero item key of items imported again although deleted here (includeDeleted): their records are cleared. */
   private restored = new Map<string, string>();
+  /** Item key → annotations left out over the per-source caps (journaled with its outcome). */
+  private annotationsDropped = new Map<string, number>();
   /** Item key → its identity and version token (journaled with its outcome). */
   private versions = new Map<string, { id: string; version: string }>();
   private structureCache = new Map<string, { collectionIds: string[]; tagIds: string[] }>();
@@ -506,7 +531,7 @@ class Run {
   private syncRecord(state: BatchState): void {
     const c = this.counts();
     this.rec.state = state;
-    this.rec.counts = { created: c.created, merged: c.merged + c.updated, skipped: c.duplicates + c.unchanged, failed: c.failed, needsReview: c.needsReview };
+    this.rec.counts = { created: c.created, merged: c.merged + c.updated, skipped: c.duplicates + c.unchanged + c.deletedHere, failed: c.failed, needsReview: c.needsReview };
     this.rec.createdSourceIds = [...this.createdIds];
     this.rec.governance = [
       ...this.rec.governance.filter((g) => g.items === undefined),
@@ -545,7 +570,7 @@ class Run {
       );
       if (this.adapter.incremental) {
         this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind);
-        this.deletedHere = await deletedHere(this.repo, this.projectId);
+        await this.refreshDeleted();
       }
       let total = 0;
       try {
@@ -609,7 +634,7 @@ class Run {
       await watchdog.close();
       await this.cleanup();
     }
-    const deleted = [...this.latest.values()].filter((e) => e.reason === REASONS.deletedHere).length;
+    const deleted = [...this.latest.values()].filter((e) => e.outcome === "deleted-here").length;
     this.rec.notes = this.rec.notes.filter((n) => !DELETED_NOTE.test(n));
     if (deleted) this.note(deletedNote(deleted));
     for (const id of watchdog.disabled) {
@@ -637,6 +662,7 @@ class Run {
       if (this.adapter.incremental && item.version) {
         this.versions.set(item.key, item.version);
         const k = this.known.get(item.version.id);
+        if (k && !hasSource(this.repo, this.projectId, k.sourceId)) await this.refreshDeleted(); // deleted meanwhile?
         if (k && hasSource(this.repo, this.projectId, k.sourceId)) {
           if (k.version === item.version.version) return this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId });
           await this.flush(); // the source may be in the current group
@@ -645,7 +671,7 @@ class Run {
         // Deleted here after an earlier import: stays deleted unless the options say otherwise (R73).
         const zk = item.externalKeys?.zoteroKey;
         if (zk && this.deletedHere(zk)) {
-          if (!this.rec.options.includeDeleted) return this.queue({ key: item.key, outcome: "skipped", reason: REASONS.deletedHere });
+          if (!this.rec.options.includeDeleted) return this.queue({ key: item.key, outcome: "deleted-here", reason: REASONS.deletedHere });
           this.restored.set(item.key, zk);
         }
       }
@@ -681,14 +707,26 @@ class Run {
     const notes = this.fileNotes.get(e.key);
     const v = WITH_VERSION.has(e.outcome) && e.sourceId ? this.versions.get(e.key) : undefined;
     if (v) this.known.set(v.id, { sourceId: e.sourceId!, version: v.version });
-    return { ...e, ...(notes?.length ? { notes } : {}), ...(v ? { ext: { id: v.id, version: v.version } } : {}) };
+    const dropped = e.outcome === "created" || e.outcome === "needs-review" ? this.annotationsDropped.get(e.key) : undefined;
+    return { ...e, ...(notes?.length ? { notes } : {}), ...(v ? { ext: { id: v.id, version: v.version } } : {}), ...(dropped ? { annotationsDropped: dropped } : {}) };
   }
 
   /** Clears the deletion records of items imported again with includeDeleted (one bookkeeping change). */
   private async clearRestored(): Promise<void> {
     const keys = [...this.restored].filter(([k]) => WITH_VERSION.has(String(this.latest.get(k)?.outcome))).map(([, zk]) => zk);
     if (!keys.length) return;
-    await importChange(this.repo, this.projectId, BOOKKEEPING, (ops) => ops.clearDeletions(keys), { op: "import.clear-deleted" });
+    await importChange(
+      this.repo,
+      this.projectId,
+      BOOKKEEPING,
+      async (ops) => {
+        const cleared = await ops.clearDeletions(keys);
+        // Recorded with the batch, so undo puts them back (R74 I3).
+        this.rec.clearedDeletions = [...new Set([...(this.rec.clearedDeletions ?? []), ...cleared])];
+        await writeBatchRecord(ops.tx, this.projectRel, this.rec);
+      },
+      { op: "import.clear-deleted" },
+    );
     this.restored.clear();
   }
 
@@ -902,7 +940,19 @@ class Run {
     };
     if (this.adapter.uniqueCitationKeys) {
       const keys = await this.citationKeys();
-      if (draft.citationKey) keys.add(draft.citationKey);
+      if (draft.citationKey) {
+        // An explicit key (Better BibTeX, Extra) is never changed; one already in use is reported.
+        if (keys.has(draft.citationKey)) this.note(`The citation key "${draft.citationKey}" from Zotero is also used by another source in this project.`);
+        keys.add(draft.citationKey);
+      }
+    }
+    if (item.annotations?.length) {
+      // At most MAX_SOURCE_ANNOTATIONS per source, and so much text (R74 I4); the rest is counted.
+      const capped = capAnnotations([], item.annotations);
+      if (capped.dropped) {
+        this.annotationsDropped.set(item.key, capped.dropped);
+        item = { ...item, annotations: capped.kept };
+      }
     }
     const provenance = await this.provenanceFor(r, method, item);
     // Unpacked files are removed once the scan moves past their archive, and located media may be
@@ -943,6 +993,7 @@ class Run {
   private async flush(): Promise<void> {
     const queued = this.group;
     if (!queued.length) return;
+    if (this.adapter.incremental) await this.refreshDeleted();
     this.group = [];
     const dedupe = this.dedupe!;
     const group: Queued[] = [];
@@ -1100,13 +1151,20 @@ class Run {
     const target = await this.repo.getSource(this.projectId, targetId);
     // Tags are found or created first (each its own change, recorded as the batch's for undo).
     const tagIds = await this.namedTags(item.tags, item.tagColors);
-    const out = await this.changeSource(item, targetId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, r.hasLocation)], "import.merge", async (ops, cur) => {
+    const haveSha = new Set(target.assets.map((a) => a.sha256));
+    // Every new file is checked for a location, not only the one resolution read (R74 I1).
+    const located = r.hasLocation || (await this.located(v.inputs.filter((f) => !haveSha.has(prep.shaOf.get(f.path) ?? ""))));
+    const zk = item.externalKeys?.zoteroKey;
+    let dropped = 0;
+    const out = await this.changeSource(item, targetId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, located)], "import.merge", async (ops, cur) => {
       const added = await this.addFiles(ops, cur, v.inputs);
-      const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, ops.tx.at, ops.tx.actor, tagIds);
-      const anns = this.newAnnotations(item, merged.next, prep, ops.tx.actor);
-      const next = anns.length ? { ...merged.next, annotations: [...merged.next.annotations, ...anns] } : merged.next;
-      return { next, record: anns.length ? { ...merged.record, addedAnnotationIds: anns.map((a) => a.id) } : merged.record, outcome: "merged" };
-    });
+      // The Zotero item merged in is remembered on the target (R74 M5).
+      const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, ops.tx.at, ops.tx.actor, tagIds, zk ? [zk] : []);
+      const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
+      dropped = ann.dropped;
+      const next = ann.added.length ? { ...merged.next, annotations: [...merged.next.annotations, ...ann.added] } : merged.next;
+      return { next, record: ann.added.length ? { ...merged.record, addedAnnotationIds: ann.added.map((a) => a.id) } : merged.record, outcome: "merged" };
+    }, () => (dropped ? { annotationsDropped: dropped } : {}));
     dedupe.add(out.sf);
     return out.entry;
   }
@@ -1128,32 +1186,67 @@ class Run {
     const evSource = item.referenceSource ?? { kind: "refman" as const, ref: "reference" };
     const ref = item.referenceMetadata ?? {};
     const haveSha = new Set(target.assets.map((a) => a.sha256));
-    const haveAnn = new Set(target.annotations.map((a) => a.externalKey).filter(Boolean));
+    const newInputs = inputs.filter((f) => !haveSha.has(prep.shaOf.get(f.path) ?? ""));
     const pre = planUpdate(target, ref, evSource, new Date().toISOString());
+    const preAnn = this.annotationPlan(item, target, prep, "");
     this.projectTags ??= await projectCollectionsAndTags(this.repo, this.projectId);
     const known = this.projectTags.tags;
     const newTags = (item.tags ?? []).some((n) => {
       const t = known.find((x) => x.name.toLowerCase() === n.toLowerCase());
       return !t || !target.source.tagIds.includes(t.id);
     });
-    const anything =
-      pre.filled.length || pre.evidence.length || inputs.some((f) => !haveSha.has(prep.shaOf.get(f.path) ?? "")) || (item.annotations ?? []).some((a) => !haveAnn.has(a.key)) || newTags;
-    if (!anything) return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(pre.kept.length ? { merge: emptyRecord(pre.kept) } : {}) });
+    const kept = [...pre.kept, ...preAnn.kept.map((k) => `annotation ${k}`)];
+    const anything = pre.filled.length || pre.evidence.length || newInputs.length || preAnn.added.length || preAnn.updated.length || newTags;
+    if (!anything) {
+      return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(kept.length ? { merge: emptyRecord(kept) } : {}), ...(preAnn.dropped ? { annotationsDropped: preAnn.dropped } : {}) });
+    }
     const tagIds = await this.namedTags(item.tags, item.tagColors);
-    const out = await this.changeSource(item, sourceId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance)], "import.update", async (ops, cur) => {
-      const plan = planUpdate(cur, ref, evSource, ops.tx.at);
-      const added = await this.addFiles(ops, cur, inputs);
-      const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
-      // Evidence of values that were already current is recorded too (not reverted by undo: it is true either way).
-      const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field));
-      const anns = this.newAnnotations(item, merged.next, prep, ops.tx.actor);
-      const record: MergeRecord = { ...merged.record, ...(anns.length ? { addedAnnotationIds: anns.map((a) => a.id) } : {}), ...(plan.kept.length ? { kept: plan.kept } : {}) };
-      const changed = plan.filled.length > 0 || added.length > 0 || anns.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
-      if (!changed) return { next: null, record, outcome: "unchanged" };
-      const next: SourceFile = { ...merged.next, annotations: [...merged.next.annotations, ...anns], fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence] };
-      return { next, record, outcome: "updated" };
-    });
+    // New files may carry a location: location governance applies to them (R56, R57; R74 I1).
+    const located = await this.located(newInputs);
+    let dropped = 0;
+    const out = await this.changeSource(
+      item,
+      sourceId,
+      [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, located)],
+      "import.update",
+      async (ops, cur) => {
+        const plan = planUpdate(cur, ref, evSource, ops.tx.at);
+        const added = await this.addFiles(ops, cur, inputs);
+        const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
+        // Evidence of values that were already current is recorded too (not reverted by undo: it is true either way).
+        const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field));
+        const ann = this.annotationPlan(item, merged.next, prep, ops.tx.actor);
+        dropped = ann.dropped;
+        const keptAll = [...plan.kept, ...ann.kept.map((k) => `annotation ${k}`)];
+        const record: MergeRecord = {
+          ...merged.record,
+          ...(ann.added.length ? { addedAnnotationIds: ann.added.map((a) => a.id) } : {}),
+          ...(ann.updated.length ? { updatedAnnotations: ann.updated } : {}),
+          ...(keptAll.length ? { kept: keptAll } : {}),
+        };
+        const changed = plan.filled.length > 0 || added.length > 0 || ann.added.length > 0 || ann.updated.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
+        if (!changed) return { next: null, record, outcome: "unchanged" };
+        const replaced = new Map(ann.updated.map((u) => [u.after.id, u.after]));
+        const next: SourceFile = {
+          ...merged.next,
+          annotations: [...merged.next.annotations.map((a) => replaced.get(a.id) ?? a), ...ann.added],
+          fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence],
+        };
+        return { next, record, outcome: "updated" };
+      },
+      () => (dropped ? { annotationsDropped: dropped } : {}),
+    );
     return out.entry;
+  }
+
+  /** Whether any of these new files may carry a location (GPS, or media whose metadata cannot be read; R57). */
+  private async located(inputs: SourceInputFile[]): Promise<boolean> {
+    for (const f of inputs) {
+      const mime = f.mime ?? "";
+      if (!LOCATED_MEDIA.test(mime)) continue;
+      if (mayHaveLocation(mime, await extractMetadata(f.path, mime))) return true;
+    }
+    return false;
   }
 
   /**
@@ -1167,6 +1260,8 @@ class Run {
     reqs: Parameters<typeof importChange>[2],
     op: string,
     fn: (ops: Parameters<Parameters<typeof importChange>[3]>[0], cur: SourceFile) => Promise<{ next: SourceFile | null; record: MergeRecord; outcome: "merged" | "updated" | "unchanged" }>,
+    /** More fields for the journal line, known once `fn` ran. */
+    extra: () => Partial<JournalEntry> = () => ({}),
   ): Promise<{ sf: SourceFile; entry: JournalEntry }> {
     const flush = this.pending.length;
     const n = ++this.snapshots;
@@ -1186,9 +1281,9 @@ class Run {
           const snapName = `${projectRel}/${snapshotRel.slice(0, snapshotRel.lastIndexOf("/"))}/${fileName(basename(snapshotRel), tx.encrypted)}`;
           await tx.writeFile(snapName, JSON.stringify(cur), { encrypt: tx.encrypted, ...(tx.encrypted ? {} : { mode: PRIVATE_MODE }) });
           await ops.writeSource(cur, r.next);
-          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record });
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record, ...extra() });
         } else {
-          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, ...(r.record.kept?.length ? { merge: r.record } : {}) });
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, ...(r.record.kept?.length ? { merge: r.record } : {}), ...extra() });
         }
         await appendJournal(tx, projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
         return r.next ?? cur;
@@ -1214,22 +1309,15 @@ class Run {
     return added;
   }
 
-  /** The item's annotations the source does not have yet (by external key), anchored in its assets by file hash. */
-  private newAnnotations(item: ScanItem, sf: SourceFile, prep: Prepared, actor: string): Annotation[] {
-    const have = new Set(sf.annotations.map((a) => a.externalKey).filter(Boolean));
-    const out: Annotation[] = [];
-    for (const a of item.annotations ?? []) {
-      if (have.has(a.key)) continue;
-      have.add(a.key);
-      out.push(
-        toAnnotation(a, sf.source.id, actor, (file) => {
-          const real = prep.realOf.get(file);
-          const sha = real ? prep.shaOf.get(real) : undefined;
-          return sha ? sf.assets.find((x) => x.sha256 === sha) : undefined;
-        }),
-      );
-    }
-    return out;
+  /** The item's annotations against the source (new, changed at the source, kept), anchored in its assets by file hash. */
+  private annotationPlan(item: ScanItem, sf: SourceFile, prep: Prepared, actor: string): AnnotationPlan {
+    return planAnnotations(sf, item.annotations ?? [], (a) =>
+      toAnnotation(a, sf.source.id, actor, (file) => {
+        const real = prep.realOf.get(file);
+        const sha = real ? prep.shaOf.get(real) : undefined;
+        return sha ? sf.assets.find((x) => x.sha256 === sha) : undefined;
+      }),
+    );
   }
 }
 
@@ -1319,6 +1407,7 @@ export async function startBatch(deps: BulkImportDeps, projectId: string, adapte
   try {
     const { approveOutside, ...options } = acceptOptions(input);
     const governance = await preflight(deps.repo, projectId, adapter.kind, options);
+    await preflightDeleted(deps.repo, projectId, adapter, options);
     const number = await allocateBatchNumber(deps.repo, projectId);
     const secret = randomBytes(32).toString("hex");
     // Approvals are kept as HMACs only (R67); remembered folders join the library's approved folders.
@@ -1374,6 +1463,7 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
     const source = adapter ?? adapterFor(rec.source.kind, rec.source.location);
     if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
     const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
+    await preflightDeleted(deps.repo, projectId, source, rec.options);
     rec.governance = [...rec.governance.filter((g) => g.items !== undefined), ...governance];
     rec.state = "running";
     delete rec.finishedAt;

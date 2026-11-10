@@ -20,6 +20,12 @@ export const Annotation = z.object({
   pageLabel: z.string().max(64).optional(),
   /** Where it was imported from (e.g. "zotero:ABCD2345"): an import never adds it twice. */
   externalKey: z.string().max(256).optional(),
+  /**
+   * Hash of the content as last imported (kind, body, quote, colour, page label, anchors): a
+   * re-import updates the annotation only while its content still has this hash, i.e. nobody
+   * edited it here (R75); undo keeps one edited since (R74 M3).
+   */
+  externalHash: z.string().max(128).optional(),
   codeId: Id.optional(),
   codebookVersion: z.number().int().optional(),
   author: z.string(),

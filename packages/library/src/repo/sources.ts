@@ -103,20 +103,29 @@ export function sourceFolderOf(st: ProjectState, id: string): string {
   return folder;
 }
 
+/** The annotations file of a source folder (R74 I4). */
+const annotationsRel = (folder: string, encrypted: boolean) => `${folder}/${encrypted ? "annotations.json.enc" : "annotations.json"}`;
+
 export async function readSourceFile(core: RepoCore, st: ProjectState, id: string): Promise<SourceFile> {
   const folder = sourceFolderOf(st, id);
-  let text: string;
-  if (core.encrypted(st)) {
+  const encrypted = core.encrypted(st);
+  const read = async (rel: string): Promise<string | null> => {
+    const raw = await readMaybe(core.abs(rel));
+    if (!raw) return null;
+    if (!encrypted) return raw.toString("utf8");
     const { key, keyId } = core.key(st);
-    const raw = await readMaybe(core.abs(`${folder}/source.json.enc`));
-    if (!raw) throw new NotFoundError("Source", id);
-    text = (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
-  } else {
-    const raw = await readMaybe(core.abs(`${folder}/source.json`));
-    if (!raw) throw new NotFoundError("Source", id);
-    text = raw.toString("utf8");
+    return (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
+  };
+  const text = await read(encrypted ? `${folder}/source.json.enc` : `${folder}/source.json`);
+  if (text === null) throw new NotFoundError("Source", id);
+  const sf = SourceFile.parse(JSON.parse(text));
+  // Annotations in their own file; a source.json from before keeps them inline (moved on its next write).
+  if (!sf.annotations.length && sf.annotationCount) {
+    const anns = await read(annotationsRel(folder, encrypted));
+    if (anns === null) throw new NotFoundError("Source annotations", id);
+    sf.annotations = Annotation.array().parse(JSON.parse(anns));
   }
-  return SourceFile.parse(JSON.parse(text));
+  return sf;
 }
 
 /** Manifest edits made earlier in the same transaction (state is only updated on commit). */
@@ -141,11 +150,30 @@ function manifestEntry(sf: SourceFile): ManifestEntry {
   return e;
 }
 
-/** Writes source.json, or source.json.enc plus the manifest entry in encrypted projects. */
+/**
+ * Writes source.json, or source.json.enc plus the manifest entry in encrypted projects. The
+ * annotations go to annotations.json(.enc) — only when they changed since they were read (their
+ * hash), so an edit of the source's fields never rewrites thousands of annotations (R74 I4);
+ * source.json keeps their count and hash.
+ */
 export async function writeSourceFile(core: RepoCore, tx: Tx, sf: SourceFile): Promise<void> {
-  const parsed = SourceFile.parse(sf);
+  const full = SourceFile.parse(sf);
+  const folder = full.source.folder;
+  const annRel = annotationsRel(folder, tx.encrypted);
+  const { annotationCount: _c, annotationsSha256: readSha, ...rest } = full;
+  let meta: { annotationCount?: number; annotationsSha256?: string } = {};
+  if (full.annotations.length) {
+    const annJson = JSON.stringify(full.annotations);
+    const sha = createHash("sha256").update(annJson).digest("hex");
+    if (sha !== readSha || !(await tx.exists(annRel))) {
+      await tx.writeFile(annRel, annJson, tx.encrypted ? { encrypt: true } : { mode: fileMode(core, tx.state, full.source.provenance.identifiable) });
+    }
+    meta = { annotationCount: full.annotations.length, annotationsSha256: sha };
+  } else if (await tx.exists(annRel)) {
+    await tx.trash(annRel);
+  }
+  const parsed: SourceFile = { ...rest, annotations: [], ...meta };
   const json = JSON.stringify(parsed, null, 2);
-  const folder = parsed.source.folder;
   if (core.encrypted(tx.state)) {
     await tx.writeFile(`${folder}/source.json.enc`, json, { encrypt: true });
     await putManifest(tx, (m) => {
@@ -525,17 +553,18 @@ export async function editSource(core: RepoCore, tx: Tx, id: string, edit: (s: S
  * (Zotero) leaves a deletion record so a later run does not bring it back (R73), except when the
  * deletion is a batch undo (`undo`), which is not the user's.
  */
-export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean } = {}): Promise<SourceFile> {
+export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
   const st = tx.state;
   const cur = await readSourceFile(core, st, id);
-  if (!opts.undo) await recordDeletion(core, tx, cur);
+  const tombstoned = opts.undo ? [] : await recordDeletion(core, tx, cur);
   await tx.trash(cur.source.folder);
   if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
   for (const a of cur.assets) tx.record("asset", a.id, a, null);
+  for (const a of cur.annotations) tx.record("annotation", a.id, a, null);
   tx.record("source", id, cur.source, null);
   tx.onCommit(() => st.sources.delete(id));
   tx.index((sink) => sink.removeSource(id));
-  return cur;
+  return { sf: cur, tombstoned };
 }
 
 export async function deleteSource(core: RepoCore, projectId: string, id: string): Promise<void> {

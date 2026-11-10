@@ -26,6 +26,12 @@ export const ImportOptions = z.object({
    * deletion records cleared.
    */
   includeDeleted: z.boolean().default(false),
+  /**
+   * The record of sources deleted here could not be read (R74 I2): a Zotero import refuses until
+   * it is run with this, which sets the unreadable record aside, starts a new one (sources deleted
+   * before may come back) and clears the project warning; audited.
+   */
+  resetDeletedRecords: z.boolean().default(false),
   structure: z.enum(["collections", "tags", "none"]).default("collections"),
   duplicates: z.enum(["merge", "skip", "keep-both"]).default("merge"),
   ocr: z.boolean().default(true),

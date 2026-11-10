@@ -42,7 +42,7 @@ async function readProjectRel(repo: Repo, projectId: string, rel: string): Promi
 }
 
 export interface UndoKept {
-  kind: "tag" | "collection" | "field";
+  kind: "tag" | "collection" | "field" | "annotation";
   /** The tag or collection id, or the field's JSON pointer. */
   id: string;
   /** For fields: the source. */
@@ -91,6 +91,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
         const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor);
         for (const a of r.removed) await ops.trashAssetFile(a);
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
+        for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },
@@ -159,6 +160,23 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
         await ops.deleteTags(tagsToDelete, []);
       }, { op: "import.undo.tags" });
     }
+  }
+
+  // 3b. Deletion records (R74 I3): those the batch's review decisions wrote come off; those its
+  //     includeDeleted run cleared go back.
+  const written = [...new Set(journal.flatMap((e) => e.tombstoned ?? []))];
+  const cleared = rec.clearedDeletions ?? [];
+  if (written.length || cleared.length) {
+    await importChange(
+      repo,
+      projectId,
+      BOOKKEEPING,
+      async (ops) => {
+        if (written.length) await ops.clearDeletions(written);
+        if (cleared.length) await ops.addDeletions(cleared);
+      },
+      { op: "import.undo.deleted-records" },
+    );
   }
 
   // 4. Profile capture: forget the posts whose sources this undo removed (R44).

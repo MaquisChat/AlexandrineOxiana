@@ -10,7 +10,7 @@ import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mut
 import { readFullData, writeProjectData } from "./projects.js";
 import { appendReviewEntry, appendReviewUpdate, readReviewEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
-import { clearDeletions } from "./tombstones.js";
+import { addDeletions, clearDeletions, resetDeletions } from "./tombstones.js";
 import type { RepoCore } from "./state.js";
 
 export interface ImportOps {
@@ -19,10 +19,14 @@ export interface ImportOps {
   readSource(id: string): Promise<SourceFile>;
   /** Writes the source file (recorded in the change log and indexed after commit). */
   writeSource(before: SourceFile | null, sf: SourceFile): Promise<void>;
-  /** Deletes a source (a deletion record is kept for incrementally imported ones, R73; `undo`: none). */
-  deleteSource(id: string, opts?: { undo?: boolean }): Promise<SourceFile>;
-  /** Clears the deletion records of these Zotero item keys (re-imported with includeDeleted, R73). */
-  clearDeletions(zoteroKeys: string[]): Promise<number>;
+  /** Deletes a source (a deletion record is kept for incrementally imported ones, R73; `undo`: none); returns the keys newly recorded. */
+  deleteSource(id: string, opts?: { undo?: boolean }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
+  /** Clears the deletion records of these Zotero item keys (R73); returns those that were recorded. */
+  clearDeletions(zoteroKeys: string[]): Promise<string[]>;
+  /** Records these Zotero item keys as deleted here (undo puts back what it cleared, R74 I3); returns those newly recorded. */
+  addDeletions(zoteroKeys: string[]): Promise<string[]>;
+  /** resetDeletedRecords (R74 I2): sets an unreadable record aside and clears the warning. */
+  resetDeletions(): Promise<boolean>;
   /** Copies a file into the source's `original/` folder as a further original; returns the asset (not yet written to the source). */
   copyOriginal(sf: SourceFile, input: { fromPath: string; kind: string; ext: string; mime?: string; label: string; fromEncrypted?: boolean; noFollow?: boolean }): Promise<Asset>;
   /** Trashes one asset's file (a copied file inside the source folder; never a linked original). */
@@ -70,6 +74,8 @@ export function runImportChange<T>(
         },
         deleteSource: (id, o) => deleteSourceInTx(core, tx, id, o),
         clearDeletions: (keys) => clearDeletions(core, tx, keys),
+        addDeletions: (keys) => addDeletions(core, tx, keys),
+        resetDeletions: () => resetDeletions(core, tx),
         async copyOriginal(sf, input) {
           const folder = sf.source.folder;
           const folderName = folder.slice(folder.lastIndexOf("/") + 1);

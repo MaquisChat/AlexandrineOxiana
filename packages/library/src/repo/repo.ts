@@ -41,7 +41,7 @@ import {
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
 import { readReviewEntries, type ReviewEntry } from "./review.js";
-import { readTombstones, tombstoneHash } from "./tombstones.js";
+import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
@@ -574,13 +574,31 @@ export async function projectPolicyOrDefault(repo: Repo, projectId: string): Pro
 }
 
 /** Package-internal: whether the project has this source now (in memory, O(1)). */
-/** Package-internal (R73): whether a Zotero item's source was deleted in this app (its deletion record), by item key. */
-export async function deletedHere(repo: Repo, projectId: string): Promise<(zoteroKey: string) => boolean> {
+/**
+ * Package-internal (R73): whether a Zotero item's source was deleted in this app (its deletion
+ * record), by item key; null when the record exists but cannot be read (fail closed, R74 I2).
+ */
+export async function deletedHere(repo: Repo, projectId: string): Promise<((zoteroKey: string) => boolean) | null> {
   const core = cores.get(repo)!;
-  const t = await readTombstones(core, core.state(projectId));
-  if (!t?.zotero.length) return () => false;
-  const set = new Set(t.zotero);
-  return (k) => set.has(tombstoneHash(t.secret, k));
+  const r = await readTombstones(core, core.state(projectId));
+  if (r.status === "unreadable") return null;
+  if (r.status === "missing" || !r.t.zotero.length) return () => false;
+  const { secret } = r.t;
+  const set = new Set(r.t.zotero);
+  return (k) => set.has(tombstoneHash(secret, k));
+}
+
+/** Package-internal (R74 I2): whether the record of sources deleted here is unreadable, or its warning stands. */
+export async function deletedRecordsTrouble(repo: Repo, projectId: string): Promise<boolean> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  return (await readTombstones(core, st)).status === "unreadable" || (await deletedRecordsWarning(core, st));
+}
+
+/** The project's standing warnings (persisted ones, e.g. 'deleted-records-unreadable', R74 I2). */
+export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
+  const core = cores.get(repo)!;
+  return (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
 }
 
 export function hasSource(repo: Repo, projectId: string, id: string): boolean {

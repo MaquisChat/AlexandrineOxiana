@@ -40,7 +40,7 @@ export type BatchState = "running" | "paused" | "cancelled" | "finished" | "fail
 export type ShownState = BatchState | "interrupted";
 
 /** `updated` / `unchanged`: incremental re-import of an item imported before (R72). */
-export type ItemOutcome = "created" | "needs-review" | "duplicate" | "merged" | "updated" | "unchanged" | "failed" | "incomplete";
+export type ItemOutcome = "created" | "needs-review" | "duplicate" | "merged" | "updated" | "unchanged" | "deleted-here" | "failed" | "incomplete";
 
 export interface JournalEntry {
   key: string;
@@ -63,6 +63,10 @@ export interface JournalEntry {
    * that was not undone is what a re-import compares with.
    */
   ext?: { id: string; version: string };
+  /** Zotero item keys this line's deletion recorded as deleted here (review skip/merge); undo takes them back (R74 I3). */
+  tombstoned?: string[];
+  /** Annotations of the item left out over the per-source limit (R74 I4). */
+  annotationsDropped?: number;
 }
 
 export interface GovernanceNote {
@@ -95,6 +99,8 @@ export interface BatchRecord extends ImportBatch {
   secret?: string;
   /** Files approved outside the source's folders (R67): HMACs of their real paths, never the paths. */
   outsideApprovals?: string[];
+  /** Zotero item keys whose deletion records this batch cleared (includeDeleted); undo puts them back (R74 I3). */
+  clearedDeletions?: string[];
   /** Profile capture (Task 18): counts detail. */
   countsDetail?: Record<string, number>;
 }
@@ -214,10 +220,11 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
   merged: number;
   updated: number;
   unchanged: number;
+  deletedHere: number;
   failed: number;
   items: number;
 } {
-  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, failed: 0, items: 0 };
+  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, deletedHere: 0, failed: 0, items: 0 };
   for (const e of latest) {
     c.items++;
     if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
@@ -226,6 +233,7 @@ export function countOutcomes(latest: Iterable<JournalEntry>): {
     else if (e.outcome === "merged") c.merged++;
     else if (e.outcome === "updated") c.updated++;
     else if (e.outcome === "unchanged") c.unchanged++;
+    else if (e.outcome === "deleted-here") c.deletedHere++;
     else if (e.outcome === "failed") c.failed++;
   }
   return c;

@@ -1,12 +1,12 @@
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
-import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { NOTE_HTML, buildZoteroFixture } from "../../tests/fixtures/zotero/build-fixture.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -16,16 +16,19 @@ import { createIndexSink } from "../index/sink.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
-import { projectCollectionsAndTags } from "../repo/repo.js";
+import { importChange, projectCollectionsAndTags, projectWarnings } from "../repo/repo.js";
+import { encryptBytes } from "../repo/io.js";
 import { openTestRepo } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
 import { OUTSIDE_NOTE } from "./bulk/outside.js";
 import { ENGINE_FILE_NOTES } from "./bulk/run.js";
+import { bibtexAdapter } from "./refman.js";
 import { IMAGE_PLACEHOLDER, MAX_NOTE_CHARS, noteToMarkdown } from "./note-html.js";
 import { RDF_REASONS } from "./zotero-rdf.js";
 import { ZOTERO_NOTES, ZOTERO_REASONS, zoteroAnnotation, zoteroCopyReason, zoteroLocalAdapter } from "./zotero-local.js";
 
 const FAST = 2 ** 10;
+const DELETED_UNREADABLE = /record of sources deleted here could not be read/u;
 
 let tmp: string;
 let dataDir: string;
@@ -683,7 +686,7 @@ processing:
     expect(JSON.parse(tomb).zotero).toHaveLength(1);
 
     const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
-    expect((await h.done).counts).toMatchObject({ created: 0, needsReview: 0, unchanged: 4 });
+    expect((await h.done).counts).toMatchObject({ created: 0, needsReview: 0, unchanged: 4, deletedHere: 1 });
     expect(repo.listSourceIds(p.id)).toHaveLength(4);
     expect((await bulk.batchReport(p.id, h.batchId)).notes.some((n) => DELETED_NOTE.test(n))).toBe(true);
 
@@ -718,6 +721,263 @@ processing:
     expect(raw).not.toContain("CCCC3333");
     const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
     expect(r.counts).toMatchObject({ created: 0, needsReview: 0, unchanged: 4 });
+  });
+
+  // ---- R74 (engine review round 1) ----
+  const LOCATION_REASON =
+    "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
+  const locGov = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+sharing:
+  locationMetadata: coarsen
+captureMethods: [zotero_import]
+processing:
+  metadata_lookup: []
+`;
+  const projectWith = async (gov: string, encrypted: boolean): Promise<Project> =>
+    (await repo.createProject({ name: `P${Math.random().toString(36).slice(2, 7)}`, governanceYaml: gov, encryption: encrypted ? { enabled: true, passphrase: "pw" } : { enabled: false } }))
+      .project;
+  const bumpItem = (db: Database.Database, id: number, at: string) => db.prepare("UPDATE items SET clientDateModified = ? WHERE itemID = ?").run(at, id);
+  /** Edits an annotation the way the app would (one governed change). */
+  const editAnnotation = async (p: Project, sourceId: string, externalKey: string, body: string) =>
+    importChange(repo, p.id, { action: "store", store: { identifiable: true, hasLocation: false, legalBasis: "legitimate interest; Zotero library" } }, async (ops) => {
+      const cur = await ops.readSource(sourceId);
+      await ops.writeSource(cur, { ...cur, annotations: cur.annotations.map((a) => (a.externalKey === externalKey ? { ...a, body } : a)) });
+    }, { op: "test.edit-annotation" });
+
+  it("R74 I1: a located file added in Zotero after the first import is refused on re-run (coarsen, encrypted)", async () => {
+    const p = await projectWith(locGov, true);
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    await mkdir(join(dataDir, "storage", "TIFFKEY1"), { recursive: true });
+    await buildCameraTiff(join(dataDir, "storage", "TIFFKEY1", "photo.tif"));
+    zoteroEdit((db) => {
+      db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (30, 2, 1, 'TIFFKEY1', 1, '2024-07-01 08:00:00', '2024-07-01 08:00:00', '2024-07-01 08:00:00')").run();
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (30, 3, 0, 'image/tiff', 'storage:photo.tif')").run();
+    });
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    const r = await h.done;
+    expect(r.counts.failed).toBe(1);
+    expect((await bulk.batchReport(p.id, h.batchId)).failures).toEqual([{ item: "zotero:CCCC3333", reason: LOCATION_REASON }]);
+    expect(byZoteroKey(await sources(p), "CCCC3333").assets).toEqual([]);
+  });
+
+  it("R74 I2: an unreadable (truncated) deletion record fails closed until reset; the reset is audited", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    await repo.deleteSource(p.id, byZoteroKey(await sources(p), "CCCC3333").source.id);
+    const file = join(lib.root, p.folder, "imports", "deleted-items.json");
+    await writeFile(file, (await readFile(file)).subarray(0, 10));
+    // A re-import refuses even before any other deletion.
+    await expect(bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).rejects.toThrow(DELETED_UNREADABLE);
+    // A deletion moves the unreadable file aside, raises the warning and starts a new record.
+    await repo.deleteSource(p.id, byZoteroKey(await sources(p), "DDDD4444").source.id);
+    expect((await readdir(join(lib.root, p.folder, "imports"))).some((n) => n.startsWith("deleted-items.unreadable-"))).toBe(true);
+    expect(await projectWarnings(repo, p.id)).toContain("deleted-records-unreadable");
+    await expect(bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).rejects.toThrow(DELETED_UNREADABLE);
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), resetDeletedRecords: true });
+    const r = await h.done;
+    expect(await projectWarnings(repo, p.id)).not.toContain("deleted-records-unreadable");
+    // The record of DDDD4444 (written after the reset point) stands; CCCC3333's was lost and it comes back.
+    expect(r.counts).toMatchObject({ created: 1, deletedHere: 1 });
+    const events = (await readdir(join(lib.root, p.folder, "audit"))).length;
+    expect(events).toBeGreaterThan(0);
+    const audit = (await Promise.all((await readdir(join(lib.root, p.folder, "audit"))).map((f) => readFile(join(lib.root, p.folder, "audit", f), "utf8")))).join("\n");
+    expect(audit).toContain("import.reset-deleted-records");
+  });
+
+  it("R74 I2: a sealed deletion record with the wrong key id fails closed", async () => {
+    const p = await project(true);
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    await repo.deleteSource(p.id, byZoteroKey(await sources(p), "CCCC3333").source.id);
+    const file = join(lib.root, p.folder, "imports", "deleted-items.json.enc");
+    await writeFile(file, await encryptBytes(new Uint8Array(32).fill(7), randomUUID(), JSON.stringify({ secret: "0".repeat(64), zotero: [] })));
+    await expect(bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).rejects.toThrow(DELETED_UNREADABLE);
+    const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), resetDeletedRecords: true })).done;
+    expect(r.counts.created).toBe(1);
+  });
+
+  it("R74 I3: undoing an includeDeleted batch puts the deletion records back", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    await repo.deleteSource(p.id, byZoteroKey(await sources(p), "CCCC3333").source.id);
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), includeDeleted: true });
+    expect((await h.done).counts.created).toBe(1);
+    await bulk.undoBatch(p.id, h.batchId);
+    expect(repo.listSourceIds(p.id)).toHaveLength(4);
+    const again = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(again.counts).toMatchObject({ created: 0, needsReview: 0, deletedHere: 1 });
+  });
+
+  it("R74 I3: undoing a batch takes back the deletion records its review skip and merge decisions wrote", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), autoAcceptThreshold: 1 });
+    expect((await h.done).counts.needsReview).toBe(5);
+    const review = await bulk.listReview(p.id, h.batchId);
+    const sid = (k: string) => byZoteroKey(sourcesNow, k).source.id;
+    let sourcesNow = await sources(p);
+    const entryFor = (k: string) => review.find((e) => e.sourceId === sid(k))!;
+    await bulk.decideReview(p.id, entryFor("CCCC3333").id, { action: "skip" });
+    sourcesNow = await sources(p);
+    await bulk.decideReview(p.id, entryFor("DDDD4444").id, { action: "merge", sourceId: sid("EEEE5555") });
+    expect(JSON.parse(await readFile(join(lib.root, p.folder, "imports", "deleted-items.json"), "utf8")).zotero).toHaveLength(2);
+    await bulk.undoBatch(p.id, h.batchId);
+    expect(JSON.parse(await readFile(join(lib.root, p.folder, "imports", "deleted-items.json"), "utf8")).zotero).toEqual([]);
+    const again = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(again.counts.created + again.counts.needsReview).toBe(5);
+  });
+
+  it("R74 I4: annotations live in annotations.json (count in source.json), capped per source; an unrelated edit does not rewrite them", async () => {
+    zoteroEdit((db) => {
+      const item = db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (?, 1, 1, ?, 1, '2024-05-03 09:00:00', '2024-05-03 09:00:00', '2024-05-03 09:00:00')");
+      const ann = db.prepare("INSERT INTO itemAnnotations (itemID, parentItemID, type, authorName, text, comment, color, pageLabel, sortIndex, position, isExternal) VALUES (?, 7, 1, '', ?, '', '#ffd400', '1', '00000|000000|00000', ?, 0)");
+      db.transaction(() => {
+        for (let i = 0; i < 10_050; i++) {
+          item.run(1000 + i, `H${String(i).padStart(7, "0")}`);
+          ann.run(1000 + i, `highlight ${i}`, JSON.stringify({ pageIndex: 0, rects: [[1, 2, 3, 4]] }));
+        }
+      })();
+    });
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    expect(a.annotations).toHaveLength(10_000);
+    const folder = join(lib.root, a.source.folder);
+    const sourceJson = JSON.parse(await readFile(join(folder, "source.json"), "utf8"));
+    expect(sourceJson.annotations).toEqual([]);
+    expect(sourceJson.annotationCount).toBe(10_000);
+    const annFile = join(folder, "annotations.json");
+    expect(JSON.parse(await readFile(annFile, "utf8"))).toHaveLength(10_000);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain("53 annotations over the per-source limit (10,000 annotations or 16 MB of text) were not imported.");
+    const mtime = (await stat(annFile)).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+    await repo.updateSource(p.id, a.source.id, { title: { variants: [{ lang: "en", kind: "original", value: "Renamed" }] } });
+    expect((await stat(annFile)).mtimeMs).toBe(mtime);
+    expect((await repo.getSource(p.id, a.source.id)).annotations).toHaveLength(10_000);
+  }, 120_000);
+
+  it("R74 I4: annotations still inside an older source.json move to annotations.json on the next write", async () => {
+    const p = await project();
+    await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    const folder = join(lib.root, a.source.folder);
+    const old = JSON.parse(await readFile(join(folder, "source.json"), "utf8"));
+    const anns = JSON.parse(await readFile(join(folder, "annotations.json"), "utf8"));
+    delete old.annotationCount;
+    delete old.annotationsSha256;
+    await writeFile(join(folder, "source.json"), JSON.stringify({ ...old, annotations: anns }));
+    await rm(join(folder, "annotations.json"));
+    expect((await repo.getSource(p.id, a.source.id)).annotations).toHaveLength(3);
+    await repo.updateSource(p.id, a.source.id, { publisher: "Somebody" });
+    expect(JSON.parse(await readFile(join(folder, "source.json"), "utf8")).annotations).toEqual([]);
+    expect(JSON.parse(await readFile(join(folder, "annotations.json"), "utf8"))).toHaveLength(3);
+  });
+
+  it("R74 M1: deleting a source logs its annotations' removal in the change log", async () => {
+    const p = await project();
+    await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    await repo.deleteSource(p.id, a.source.id);
+    const dir = join(lib.root, p.folder, "changes");
+    const lines = (await Promise.all((await readdir(dir)).map((f) => readFile(join(dir, f), "utf8")))).join("\n").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const removed = lines.filter((c) => c.entity.type === "annotation" && c.op === "delete").map((c) => c.entity.id).sort();
+    expect(removed).toEqual(a.annotations.map((x) => x.id).sort());
+  });
+
+  it("re-import updates an imported note still as Zotero left it; one edited here is kept and reported", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    zoteroEdit((db) => {
+      db.prepare("UPDATE itemNotes SET note = '<p>Revised reading notes</p>' WHERE itemID = 8").run();
+      bumpItem(db, 8, "2024-07-02 08:00:00");
+      db.prepare("UPDATE itemAnnotations SET comment = 'key claim, revised' WHERE itemID = 9").run();
+      bumpItem(db, 9, "2024-07-02 08:00:00");
+    });
+    const a0 = byZoteroKey(await sources(p), "AAAA1111");
+    await editAnnotation(p, a0.source.id, "zotero:ANNO0001", "my own comment");
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    expect((await h.done).counts.updated).toBe(1);
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    expect(a.annotations.find((x) => x.externalKey === "zotero:NOTE0001")?.body).toBe("Revised reading notes");
+    expect(a.annotations.find((x) => x.externalKey === "zotero:ANNO0001")?.body).toBe("my own comment");
+    expect((await bulk.batchReport(p.id, h.batchId)).keptFields).toEqual([{ item: "zotero:AAAA1111", fields: ["annotation zotero:ANNO0001"] }]);
+    // Undo puts the note back as it was.
+    await bulk.undoBatch(p.id, h.batchId);
+    expect(byZoteroKey(await sources(p), "AAAA1111").annotations.find((x) => x.externalKey === "zotero:NOTE0001")?.body).toContain("Reading notes");
+  });
+
+  it("R74 M3: undo keeps an annotation the user edited after the update added it, and says so", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    zoteroEdit((db) => {
+      db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (21, 3, 1, 'NOTE0002', 1, '2024-06-02 08:00:00', '2024-06-02 08:00:00', '2024-06-02 08:00:00')").run();
+      db.prepare("INSERT INTO itemNotes (itemID, parentItemID, note, title) VALUES (21, 1, '<p>second thoughts</p>', 'second')").run();
+    });
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    await editAnnotation(p, a.source.id, "zotero:NOTE0002", "second thoughts, edited");
+    const u = await bulk.undoBatch(p.id, h.batchId);
+    expect(byZoteroKey(await sources(p), "AAAA1111").annotations.find((x) => x.externalKey === "zotero:NOTE0002")?.body).toBe("second thoughts, edited");
+    expect(u.kept).toContainEqual(expect.objectContaining({ kind: "annotation", sourceId: a.source.id }));
+  });
+
+  it("R74 M4: a source deleted while a run is going is not brought back by that run", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const inner = zoteroLocalAdapter(dataDir);
+    const c = byZoteroKey(await sources(p), "CCCC3333").source.id;
+    const adapter: ImportSourceAdapter = {
+      ...inner,
+      async *scan(signal, sctx) {
+        for await (const item of inner.scan(signal, sctx)) {
+          if (item.key === "zotero:CCCC3333") await repo.deleteSource(p.id, c);
+          yield item;
+        }
+      },
+    };
+    const r = await (await bulk.startBatch(p.id, adapter, approve())).done;
+    expect(r.counts).toMatchObject({ created: 0, needsReview: 0, deletedHere: 1 });
+  });
+
+  it("R74 M5: a Zotero item merged into another source is remembered there; deleting that source keeps it deleted", async () => {
+    const p = await projectWith(GOV.replace("captureMethods: [zotero_import]", "captureMethods: [zotero_import, refman_import]").replace('zotero-import: "legitimate interest; Zotero library"', 'zotero-import: "legitimate interest; Zotero library"\n    refman-import: "legitimate interest; references"'), false);
+    const bulk = bulkImport();
+    const bib = join(tmp, "own.bib");
+    await writeFile(bib, "@article{mine, title={Feeding the City: Informal Markets in Lagos}, author={Okafor, Ngozi}, year={2024}, doi={10.5555/ao.urban.2024.017}}\n");
+    await (await bulk.startBatch(p.id, bibtexAdapter(bib))).done;
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    expect((await h.done).counts.merged).toBe(1);
+    const mine = (await sources(p)).find((sf) => sf.source.citationKey === "mine")!;
+    expect(mine.source.provenance.externalKeys?.zoteroMergedKeys).toBe("AAAA1111");
+    await repo.deleteSource(p.id, mine.source.id);
+    const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r.counts).toMatchObject({ created: 0, needsReview: 0, deletedHere: 1 });
+  });
+
+  it("explicit citation keys are never changed; ones already used in the project are reported", async () => {
+    zoteroEdit((db) => {
+      db.prepare("INSERT INTO itemDataValues (valueID, value) VALUES (950, 'Citation Key: adebayo2019markets')").run();
+      db.prepare("INSERT INTO itemData (itemID, fieldID, valueID) VALUES (14, (SELECT fieldID FROM fields WHERE fieldName = 'extra'), 950)").run();
+    });
+    const p = await project();
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir, { libraryId: 2 }));
+    await h.done;
+    expect((await sources(p)).filter((sf) => sf.source.citationKey === "adebayo2019markets")).toHaveLength(2);
+    expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain('The citation key "adebayo2019markets" from Zotero is also used by another source in this project.');
   });
 
   it("undo of an incremental update reverts the update (and its new annotation) like a merge", async () => {

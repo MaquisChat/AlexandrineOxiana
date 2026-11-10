@@ -21,7 +21,7 @@ export interface ImportReport {
   state: ShownState;
   startedAt: string;
   finishedAt?: string;
-  counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; updated: number; unchanged: number; failed: number };
+  counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; updated: number; unchanged: number; deletedHere: number; failed: number };
   failures: Array<{ item: string; reason: string }>;
   /** Items imported without some of their linked files (e.g. "attached file not found"); never a path (R66). */
   fileNotes: Array<{ item: string; note: string }>;
@@ -59,6 +59,10 @@ export function reportLabel(key: string, secret: string | null | undefined): str
   return `${name} (${tag})`;
 }
 
+/** Annotations left out over the per-source caps (R74 I4), as a report note. */
+const droppedNote = (n: number): string[] =>
+  n ? [`${n.toLocaleString("en-US")} ${n === 1 ? "annotation" : "annotations"} over the per-source limit (10,000 annotations or 16 MB of text) ${n === 1 ? "was" : "were"} not imported.`] : [];
+
 function markdown(r: ImportReport): string {
   const lines = [
     `# Import report: batch ${r.number}`,
@@ -73,6 +77,7 @@ function markdown(r: ImportReport): string {
     `- Duplicates (not imported again): ${r.counts.duplicates}`,
     `- Merged into existing sources: ${r.counts.merged}`,
     ...(r.counts.updated || r.counts.unchanged ? [`- Updated from a newer version: ${r.counts.updated}`, `- Unchanged since the last import: ${r.counts.unchanged}`] : []),
+    ...(r.counts.deletedHere ? [`- Deleted here — not re-imported: ${r.counts.deletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
     "",
   ];
@@ -134,7 +139,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),
     keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
     governance: rec.governance,
-    notes: rec.notes,
+    notes: [...rec.notes, ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
   };
   return report;
 }

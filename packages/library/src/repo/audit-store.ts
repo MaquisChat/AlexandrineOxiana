@@ -35,7 +35,9 @@ export interface IntegrityWarning {
     /** Such a line was found but left in place: read-only library, or an unresolved interrupted change. */
     | "incomplete-audit-line-pending"
     /** An audit event could not be appended while opening; the project refuses writes until reopened. */
-    | "audit-append-failed-at-open";
+    | "audit-append-failed-at-open"
+    /** The project's record of sources deleted here could not be read; set aside (R74 I2). */
+    | "deleted-records-unreadable";
   detail: string;
   /** Library-relative file, for the two incomplete-line kinds. */
   file?: string;
