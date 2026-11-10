@@ -55,6 +55,12 @@ export interface MutateOptions {
   op?: string;
   /** Entity for the audit events, when known before `fn` runs (deny events). */
   entity?: { type: EntityType; id: string };
+  /**
+   * Package-internal: turns an allowed decision the caller cannot honour into a deny with the
+   * returned reason (audited and thrown like any deny, before anything is written). E.g. attach
+   * refuses media whose store carries a location condition until coarsening exists (R56).
+   */
+  refuse?: (d: PolicyDecision, req: PolicyRequest) => string | undefined;
 }
 
 export interface FileOptions {
@@ -269,6 +275,7 @@ async function decide(
   at: string,
   op: string,
   entity: MutateOptions["entity"],
+  refuse?: MutateOptions["refuse"],
 ): Promise<Array<{ req: PolicyRequest; d: PolicyDecision }>> {
   let cfg: ReturnType<typeof parseGovernance> | undefined;
   let cfgError: string | undefined;
@@ -280,7 +287,9 @@ async function decide(
   const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
   for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
     const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.tz };
-    const d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
+    let d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
+    const refused = d.result !== "deny" ? refuse?.(d, req) : undefined;
+    if (refused) d = denyOf(refused, d.warnings);
     if (d.result === "deny") {
       await core.auditNow(st, {
         ...core.auditBase(st, at),
@@ -319,7 +328,7 @@ export async function authorizeOnly(
     core.assertUnlocked(st);
     const at = core.clock().toISOString();
     const op = opts.op ?? "authorize";
-    const [first] = await decide(core, st, req, at, op, opts.entity);
+    const [first] = await decide(core, st, req, at, op, opts.entity, opts.refuse);
     if (opts.auditAllow) {
       await core.auditNow(st, {
         ...core.auditBase(st, at),
@@ -351,7 +360,7 @@ export async function runMutation<T>(
     const op = opts.op ?? "mutate";
 
     // 1. Policy (a deny is audited and thrown).
-    const allowed = await decide(core, st, reqs, at, op, opts.entity);
+    const allowed = await decide(core, st, reqs, at, op, opts.entity, opts.refuse);
     const conditions: Condition[] = [];
     for (const { d } of allowed) {
       if (d.result !== "allow_with_conditions") continue;

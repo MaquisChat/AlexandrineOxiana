@@ -24,7 +24,7 @@ import {
 } from "@ao/core";
 import { GovernanceViolationError, ImmutableProvenanceError, NotFoundError } from "./errors.js";
 import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe } from "./io.js";
-import { runMutation, type MutateRequest, type Tx } from "./mutate.js";
+import { runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { appendReviewEntry, type ReviewInput } from "./review.js";
@@ -189,7 +189,7 @@ export async function createSource(
   files: SourceInputFile[],
   opts: CreateSourceOptions,
   /** Package-internal: the caller already evaluated and audited this capture (link capture), so only `store` is evaluated here. */
-  internal: { captureAuthorized?: boolean } = {},
+  internal: { captureAuthorized?: boolean; refuse?: MutateOptions["refuse"] } = {},
 ): Promise<SourceFile> {
   core.assertWritable();
   const draft = SourceDraft.parse(draftIn);
@@ -323,7 +323,7 @@ export async function createSource(
       tx.index((sink) => sink.indexSource(sf));
       return sf;
     },
-    { op: "source.create" },
+    { op: "source.create", ...(internal.refuse ? { refuse: internal.refuse } : {}) },
   );
 }
 

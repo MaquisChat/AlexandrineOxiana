@@ -1,7 +1,7 @@
 /** Derived assets: new dated files under `derived/`, never overwriting (spec 4.2). */
 import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix, type Provenance } from "@ao/core";
 import { foldName, mimeFor, namesIn } from "./io.js";
-import { runMutation, type MutateRequest } from "./mutate.js";
+import { runMutation, type MutateOptions, type MutateRequest } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
 import type { RepoCore } from "./state.js";
 
@@ -107,7 +107,7 @@ export async function addOriginalAsset(
   sourceId: string,
   input: OriginalAssetInput,
   /** Package-internal: a newly captured file (e.g. a drop onto the source): its capture method is evaluated and audited in the same change. */
-  internal: { captureMethod?: Provenance["captureMethod"]; hasLocation?: boolean } = {},
+  internal: { captureMethod?: Provenance["captureMethod"]; hasLocation?: boolean; refuse?: MutateOptions["refuse"] } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -159,6 +159,6 @@ export async function addOriginalAsset(
       tx.index((sink) => sink.indexSource(sf));
       return asset;
     },
-    { op: "asset.add-original", entity: { type: "source", id: sourceId } },
+    { op: "asset.add-original", entity: { type: "source", id: sourceId }, ...(internal.refuse ? { refuse: internal.refuse } : {}) },
   );
 }

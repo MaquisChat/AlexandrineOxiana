@@ -652,3 +652,51 @@ processing:
     for (const ext of ACCEPTED_EXTENSIONS) expect([ext, mimeFor(ext)]).not.toEqual([ext, "application/octet-stream"]);
   });
 });
+
+describe("R56: location-conditioned media fail closed until coarsening exists", () => {
+  const LOCATION_REASON =
+    "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
+  const gov = (mode: string) => `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+sharing:
+  locationMetadata: ${mode}
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`;
+
+  for (const mode of ["coarsen", "strip"]) {
+    it(`locationMetadata ${mode}: a dropped photo with GPS is refused, nothing stored, refusal audited`, async () => {
+      const p = await project(gov(mode), true);
+      const tif = join(files, "IMG_0001.tif");
+      await buildCameraTiff(tif);
+      expect(await attach.attachFiles(p.id, [tif])).toEqual([{ path: tif, outcome: "failed", reason: LOCATION_REASON }]);
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      expect(await readdir(join(lib.root, p.folder, "Sources")).catch(() => [])).toEqual([]);
+      const denies = (await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny");
+      expect(denies.map((e) => [e.action, e.decision?.reason])).toEqual([["store", LOCATION_REASON]]);
+    });
+  }
+
+  it("locationMetadata coarsen: dropping a photo with GPS onto a source is refused too", async () => {
+    const p = await project(gov("coarsen"), true);
+    const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    const tif = join(files, "IMG_0002.tif");
+    await buildCameraTiff(tif);
+    expect(await attach.attachFiles(p.id, [tif], { toSourceId: made!.sourceId! })).toEqual([{ path: tif, outcome: "failed", reason: LOCATION_REASON }]);
+    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(1);
+  });
+
+  it("locationMetadata keep: the photo is stored", async () => {
+    const p = await project(gov("keep"), true);
+    const tif = join(files, "IMG_0003.tif");
+    await buildCameraTiff(tif);
+    const [r] = await attach.attachFiles(p.id, [tif]);
+    // No title or creator in the photo: stored, and queued for review.
+    expect(["created", "needs-review"]).toContain(r!.outcome);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.assets[0]!.encrypted).toBe(true);
+  });
+});

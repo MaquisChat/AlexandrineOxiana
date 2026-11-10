@@ -22,7 +22,9 @@
  *
  * Identifiers found in a file but not confirmed by a lookup are never recorded or used to find
  * duplicates (R55): they go on the review entry as `hints`. Media with GPS are stored with
- * `hasLocation: true`, so location governance applies (R54a).
+ * `hasLocation: true`, so location governance applies (R54a); while a location condition (coarsen or
+ * strip) cannot be carried out for dropped files, such a store is refused as an audited deny with
+ * LOCATION_REASON and nothing is stored (R56; Task 27 adds the coarsening).
  *
  * Each stored file is one governed mutation (`createSource` / an original added to a source): the
  * `capture` and `store` decisions are evaluated again inside it, right before anything is written
@@ -37,13 +39,13 @@ import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileTypeFromFile } from "file-type";
-import { findDuplicate, primary, type DupKey, type FileNamePattern, type Provenance, type SourceFile } from "@ao/core";
+import { findDuplicate, primary, type DupKey, type FileNamePattern, type PolicyDecision, type PolicyRequest, type Provenance, type SourceFile } from "@ao/core";
 import { UnsafeFileError, extractMetadata } from "../extract/index.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { kindFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
-import { addCapturedOriginal, authorizeProcessing, projectPolicy, type Repo } from "../repo/repo.js";
+import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectPolicy, type Repo } from "../repo/repo.js";
 import { AUTO_ACCEPT_THRESHOLD, resolveItem, type Resolution } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
 
@@ -86,6 +88,12 @@ const REASONS = {
   likelyDuplicate: "This may be a duplicate of a source already in the project, so it is in the review queue.",
   lowConfidence: "The item could not be identified with enough confidence.",
 };
+
+/** R56: until GPS coarsening/stripping exists (Task 27), media whose store needs it are refused. */
+export const LOCATION_REASON =
+  "This file contains location data that this project requires to be coarsened or removed; that step is not available for dropped files yet.";
+const refuseLocation = (d: PolicyDecision, req: PolicyRequest): string | undefined =>
+  req.action === "store" && d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "location") ? LOCATION_REASON : undefined;
 
 /** The `consent.defaultLegalBasis` category manual uploads use (docs/governance/README.md). */
 const LEGAL_CATEGORY = "manual-upload";
@@ -221,7 +229,10 @@ export function createAttach(deps: AttachDeps): Attach {
     // Media with GPS: location governance applies to the store (R54a).
     const hasLocation = /^(?:image|video)\//u.test(mime) && !!(await extractMetadata(path, mime).catch(() => undefined))?.media?.gps;
     const kind = kindFor(ext);
-    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, label: addedLabel(kind, new Date()) }, "manual_upload", { hasLocation });
+    await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, label: addedLabel(kind, new Date()) }, "manual_upload", {
+      hasLocation,
+      refuse: refuseLocation,
+    });
     return { path, outcome: "attached", sourceId };
   }
 
@@ -254,7 +265,8 @@ export function createAttach(deps: AttachDeps): Attach {
       ...(r.confidence < AUTO_ACCEPT_THRESHOLD && r.verification.reasons.length === 0 ? [REASONS.lowConfidence] : []),
     ];
     // createSource evaluates capture and store again, right before writing (R42).
-    const sf = await repo.createSource(projectId, r.draft, [{ path, role: "original", handling: "copy", ext }], {
+    // A location condition (coarsen/strip) cannot be honoured yet: an audited deny, nothing stored (R56).
+    const sf = await createSourceRefusing(repo, projectId, r.draft, [{ path, role: "original", handling: "copy", ext }], {
       provenance,
       fieldEvidence: r.fieldEvidence,
       verification: r.verification.fields,
@@ -273,7 +285,7 @@ export function createAttach(deps: AttachDeps): Attach {
             },
           }
         : {}),
-    });
+    }, refuseLocation);
     keys.push(dupKey(sf));
     if (!needsReview) return { path, outcome: "created", sourceId: sf.source.id };
     return { path, outcome: "needs-review", sourceId: sf.source.id, reason: dup ? REASONS.likelyDuplicate : REASONS.review };

@@ -472,9 +472,29 @@ export function addCapturedOriginal(
   sourceId: string,
   input: OriginalAssetInput,
   captureMethod: Provenance["captureMethod"],
-  opts: { hasLocation?: boolean } = {},
+  opts: { hasLocation?: boolean; refuse?: MutateOptions["refuse"] } = {},
 ): Promise<Asset> {
-  return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, { captureMethod, hasLocation: opts.hasLocation === true });
+  return addOriginalAsset(cores.get(repo)!, projectId, sourceId, input, {
+    captureMethod,
+    hasLocation: opts.hasLocation === true,
+    ...(opts.refuse ? { refuse: opts.refuse } : {}),
+  });
+}
+
+/**
+ * Package-internal (drag-and-drop attach): `createSource` (capture and store evaluated and audited
+ * in the change) where `refuse` turns an allowed decision the caller cannot honour into an audited
+ * deny before anything is written.
+ */
+export function createSourceRefusing(
+  repo: Repo,
+  projectId: string,
+  draft: SourceDraft,
+  files: SourceInputFile[],
+  opts: CreateSourceOptions,
+  refuse: NonNullable<MutateOptions["refuse"]>,
+): Promise<SourceFile> {
+  return createSource(cores.get(repo)!, projectId, draft, files, opts, { refuse });
 }
 
 /** Package-internal (link capture): the project's change stamp as the index would record it now. */
