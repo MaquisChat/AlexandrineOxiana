@@ -39,6 +39,7 @@ const REASONS: Record<string, string> = {
   LEGAL_BASIS_REQUIRED: "Record a legal basis for this project's social-media data, then try again.",
   INTERRUPTED: "The capture was interrupted before it finished. Capture the link again.",
   POLICY_CHANGED: "This project's rules changed during the download, so nothing was saved.",
+  POLICY_CHANGED_RUN: "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved.",
   RATE_LIMITED_PAUSED: "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.",
   INVALID_OPTIONS: "Some profile capture options are not valid. Check the dates (YYYY-MM-DD) and the maximum number of items.",
 };

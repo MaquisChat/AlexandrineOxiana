@@ -38,7 +38,7 @@ if (process.env.FAKE_PROFILE_FILE) {
 function profileRun(prof) {
   const user = {
     username: prof.handle, full_name: prof.displayName, biography: prof.bio, external_url: (prof.links ?? [])[0],
-    follower_count: prof.followers, following_count: prof.following, media_count: prof.items.length,
+    follower_count: prof.followers, following_count: prof.following, media_count: prof.items.filter((it) => (it.listing ?? "posts") === "posts").length,
     profile_pic_url: prof.avatar, is_verified: prof.verified ?? false,
   };
   const date = (ts) => new Date(ts * 1000).toISOString().slice(0, 19).replace("T", " ");
@@ -61,11 +61,15 @@ function profileRun(prof) {
     process.exit(0);
   }
   if (!url.includes(`instagram.com/${prof.handle}/`)) return;
-  let items = prof.items;
-  const range = args.indexOf("--range");
-  if (range >= 0) items = items.slice(0, Number(args[range + 1].split("-")[1]));
+  // `listing`: posts (default) or reels (`/<handle>/reels/`); `count`: images of a carousel. Like
+  // gallery-dl, --range counts files, not posts.
+  const listing = /\/reels\/?$/.test(url) ? "reels" : "posts";
+  let items = prof.items.filter((it) => (it.listing ?? "posts") === listing);
   if (mode === "enumpartial") items = items.slice(0, prof.cutAfter ?? 7);
-  for (const it of items) writeFileSync(join(out, `${it.id}_1.jpg.json`), JSON.stringify({ ...meta(it), num: 1 }));
+  let files = items.flatMap((it) => Array.from({ length: it.count ?? 1 }, (_, i) => [it, i + 1]));
+  const range = args.indexOf("--range");
+  if (range >= 0) files = files.slice(0, Number(args[range + 1].split("-")[1]));
+  for (const [it, n] of files) writeFileSync(join(out, `${it.id}_${n}.jpg.json`), JSON.stringify({ ...meta(it), num: n }));
   if (mode === "enumpartial" || mode === "enumratelimit") {
     console.error("[instagram][error] HttpError: '429 Too Many Requests'");
     process.exit(4);

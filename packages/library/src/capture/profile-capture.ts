@@ -48,6 +48,7 @@ import {
   sanitizeSegment,
   verifyDraft,
   withCollisionSuffix,
+  type Availability,
   type FieldEvidence,
   type MultiText,
   type Provenance,
@@ -113,6 +114,14 @@ export interface ProfileCaptureReport {
   reason?: string;
 }
 
+/** A known post: the listing (tab) it was found in, and what to restore if it disappears and returns. */
+export interface KnownPost {
+  /** videos, shorts, posts, reels, highlights or playlist. */
+  listing: string;
+  /** The availability before the post was marked unavailable on the platform. */
+  previousAvailability?: Availability;
+}
+
 /** `profiles/<platform>-<handle or P-code>/profile.json` (encrypted in encrypted projects). */
 export interface ProfileRecord {
   platform: Platform;
@@ -122,7 +131,22 @@ export interface ProfileRecord {
   firstCapturedAt: string;
   lastCapturedAt: string;
   knownPostIds: string[];
+  /** Per known post (older records have only knownPostIds: the main listing is assumed). */
+  knownPosts?: Record<string, KnownPost>;
 }
+
+/** One listing (tab) of a profile: its link, its name, and whether it is the profile's main list. */
+interface Listing {
+  url: string;
+  listing: string;
+  main: boolean;
+}
+interface ListingResult {
+  listing: Listing;
+  docs: unknown[];
+  partialCode?: string;
+}
+type ListedEntry = ProfileEntry & { listing: string };
 
 const BACKOFF_MS = [60_000, 120_000, 240_000];
 const LEGAL_CATEGORY = "social-media";
@@ -154,17 +178,25 @@ function linkKey(c: ClassifiedUrl): string {
   return u.searchParams.get("list") ?? u.pathname.split("/").filter(Boolean).at(-1) ?? "profile";
 }
 
-/** The links to enumerate for the chosen content types. */
-function enumerationUrls(c: ClassifiedUrl, types: ProfileContentType[] | undefined): string[] {
-  if (!types?.length || c.kind === "playlist") return [c.canonicalUrl];
+/**
+ * The listings to enumerate. YouTube channels are listed through their tabs (`/videos`, and
+ * `/shorts` when chosen): the bare channel lists its tabs, not posts.
+ */
+function listingsFor(c: ClassifiedUrl, types: ProfileContentType[] | undefined): Listing[] {
+  if (c.kind === "playlist") return [{ url: c.canonicalUrl, listing: "playlist", main: true }];
   const base = c.canonicalUrl.replace(/\/+$/, "");
-  const out = new Set<string>();
-  for (const t of types) {
-    if (c.platform === "youtube") out.add(t === "shorts" ? `${base}/shorts` : `${base}/videos`);
-    else if (c.platform === "instagram") out.add(t === "reels" ? `${base}/reels/` : t === "highlights" ? `${base}/highlights/` : `${base}/`);
-    else out.add(base);
+  const wanted = types?.length ? types : [c.platform === "instagram" ? "posts" : "videos"];
+  const out = new Map<string, Listing>();
+  for (const t of wanted) {
+    if (c.platform === "youtube") {
+      const l = t === "shorts" ? "shorts" : "videos";
+      out.set(l, { url: `${base}/${l}`, listing: l, main: l === "videos" });
+    } else if (c.platform === "instagram") {
+      const l = t === "reels" ? "reels" : t === "highlights" ? "highlights" : "posts";
+      out.set(l, { url: l === "posts" ? `${base}/` : `${base}/${l}/`, listing: l, main: l === "posts" });
+    } else out.set("videos", { url: base, listing: "videos", main: true });
   }
-  return [...out];
+  return [...out.values()];
 }
 
 const ymd = (s: string) => s.replaceAll("-", "");
@@ -247,7 +279,9 @@ export function createProfileCapture(core: CaptureCore) {
       }
     };
     if (!(await storeCheck(identifiable, "capture.profile"))) return failedReport("LEGAL_BASIS_REQUIRED");
-    // Comments are third-party personal data: identifiable storage must be allowed before any download.
+    // Comments are third-party personal data: they always need a legal basis, and identifiable
+    // storage must be allowed, before any download.
+    if (includeComments && !legalBasis) return failedReport("LEGAL_BASIS_REQUIRED");
     if (includeComments && !(await storeCheck(true, "capture.profile.comments"))) return failedReport("LEGAL_BASIS_REQUIRED");
     const pseudonymize = !!policy?.identifiability.pseudonymizeFileNames && identifiable;
     const storeReq: MutateRequest = { action: "store", store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } };
@@ -273,41 +307,61 @@ export function createProfileCapture(core: CaptureCore) {
       return true;
     };
     const pause = () => Object.assign(report, { status: "paused-rate-limited" as const, reason: plainReason("RATE_LIMITED_PAUSED") });
-    const policyChanged = () => Object.assign(report, { status: "failed" as const, errorCode: "POLICY_CHANGED", reason: plainReason("POLICY_CHANGED") });
+    const policyChanged = () => Object.assign(report, { status: "failed" as const, errorCode: "POLICY_CHANGED", reason: plainReason("POLICY_CHANGED_RUN") });
 
-    // 2. Enumerate.
-    let docs: unknown[] = [];
-    let partial = false;
+    // 2. Enumerate each listing (tab).
+    let results: ListingResult[] = [];
     let toolVersion = "unknown";
     for (;;) {
       const r = await enumerate(projectId, c, opts, tool);
-      // Rate limited, even part-way through the list: wait and list again, or pause.
-      if (r.error === "RATE_LIMITED" || r.partialCode === "RATE_LIMITED") {
+      // Rate limited, even part-way through a list: wait and list again, or pause.
+      if (r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED")) {
         if (await backOff()) continue;
         pause();
         return audited(projectId, platform, report);
       }
       if (r.error) return audited(projectId, platform, failedReport(r.error));
-      ({ docs, toolVersion } = r);
-      partial = !!r.partialCode;
+      ({ results, toolVersion } = r);
       break;
     }
-    const { profile, entries: listed } = readEnumeration(docs, c, tool);
+    let profile: ProfileMeta | undefined;
+    const listed: ListedEntry[] = [];
+    const listedIds = new Set<string>();
+    /** Listings that did not come back whole: cut short, nested, or shorter than the platform's own count. */
+    const incompleteListings = new Set<string>();
+    for (const res of results) {
+      const en = readEnumeration(res.docs, c, tool);
+      if (!profile || (!profile.handle && en.profile.handle)) profile = en.profile;
+      const unique = en.entries.filter((e) => !listedIds.has(e.id));
+      if (res.partialCode || en.nested || (res.listing.main && en.reportedCount !== undefined && en.reportedCount > en.entries.length)) {
+        incompleteListings.add(res.listing.listing);
+      }
+      for (const e of unique) {
+        listedIds.add(e.id);
+        listed.push({ ...e, listing: res.listing.listing });
+      }
+    }
+    profile ??= { links: [] };
     const sinceTs = opts.since ? Date.parse(`${opts.since}T00:00:00Z`) / 1000 : undefined;
     const untilTs = opts.until ? Date.parse(`${opts.until}T00:00:00Z`) / 1000 + 86400 : undefined;
     let entries = listed.filter((e) => e.timestamp === undefined || ((sinceTs === undefined || e.timestamp >= sinceTs) && (untilTs === undefined || e.timestamp < untilTs)));
     if (opts.maxItems !== undefined) entries = entries.slice(0, opts.maxItems);
-    const filtered = !!(opts.since || opts.until || opts.contentTypes?.length || (opts.maxItems !== undefined && listed.length >= opts.maxItems));
+    // Any date or number limit (gallery-dl's range counts files, not posts): never a whole list.
+    const filtered = !!(opts.since || opts.until || opts.maxItems !== undefined);
 
-    // 3. The profile: record, source, collection, snapshot.
+    // 3. Batch record first, then the profile: record, source, collection, snapshot.
     if (!(await core.stillAllowed(projectId, platform))) return audited(projectId, platform, policyChanged());
     const handle = c.handle ?? profile.handle;
     const label = handle ?? linkKey(c);
     const names = [label, label.replace(/^@+/, ""), `@${label.replace(/^@+/, "")}`, ...(profile.handle ? [profile.handle] : [])];
     const projectRel = repo.getProject(projectId).folder;
-    const folderOf = (name: string) => `${platform}-${sanitizeSegment(name.replace(/^@+/, ""), 100)}`;
+    const fold = platform === "youtube" || platform === "tiktok";
+    const folderOf = (name: string, isCode: boolean) => {
+      const bare = name.replace(/^@+/, "");
+      return `${platform}-${sanitizeSegment(fold && !isCode ? bare.toLowerCase() : bare, 100)}`;
+    };
     let code = pseudonymize ? await pseudonymCodeFor(repo, projectId, names) : undefined;
-    let folderName = pseudonymize ? (code ? folderOf(code) : undefined) : folderOf(label);
+    let folderName = pseudonymize ? (code ? folderOf(code, true) : undefined) : folderOf(label, false);
     let record: ProfileRecord | undefined;
     if (folderName) {
       const text = await readProjectFile(projectId, `${projectRel}/profiles/${folderName}/profile.json`);
@@ -318,40 +372,6 @@ export function createProfileCapture(core: CaptureCore) {
     report.batchId = batchId;
     const createdSourceIds: string[] = [];
     const createdCollectionIds: string[] = [];
-    let profileSourceId = record && repo.listSourceIds(projectId).includes(record.profileSourceId) ? record.profileSourceId : undefined;
-    const snapshot = profileSnapshot(platform, profile, at, [root]);
-    if (!profileSourceId) {
-      profileSourceId = await createProfileSource(projectId, c, profile, snapshot, { tool, toolVersion, batchId, identifiable, legalBasis, cookies, at });
-      createdSourceIds.push(profileSourceId);
-    }
-    report.profileSourceId = profileSourceId;
-    if (pseudonymize) {
-      code ??= await pseudonymCodeFor(repo, projectId, names);
-      // Fail closed: never fall back to the handle in a name.
-      if (!code) throw new Error("the profile has no participant code, so its folder cannot be named");
-      folderName = folderOf(code);
-    }
-    const dirRel = `${projectRel}/profiles/${folderName!}`;
-    const collectionLabel = code ?? label;
-    let profileSf = await repo.getSource(projectId, profileSourceId);
-    let collectionId = record?.collectionId && profileSf.source.collectionIds.includes(record.collectionId) ? record.collectionId : undefined;
-    if (!collectionId) {
-      collectionId = (await repo.createCollection(projectId, `Profile: ${collectionLabel}`)).id;
-      createdCollectionIds.push(collectionId);
-      await repo.setMembership(projectId, profileSourceId, { collectionIds: [...profileSf.source.collectionIds, collectionId] });
-      profileSf = await repo.getSource(projectId, profileSourceId);
-    }
-    const known = new Set(record?.knownPostIds ?? []);
-    const archive = new Set((await readProjectFile(projectId, `${dirRel}/archive.txt`))?.split("\n").filter(Boolean) ?? []);
-    const rec: ProfileRecord = {
-      platform,
-      handle: handle ?? label,
-      profileSourceId,
-      collectionId,
-      firstCapturedAt: record?.firstCapturedAt ?? at,
-      lastCapturedAt: at,
-      knownPostIds: [...known],
-    };
     const mode = anyIdentifiable ? 0o600 : undefined;
     let needsReview = 0;
     const importsAbs = join(root, ...projectRel.split("/"), "imports");
@@ -388,33 +408,91 @@ export function createProfileCapture(core: CaptureCore) {
         },
         { op: "capture.profile.files" },
       );
-    const recordFiles = () => [
-      { rel: `${dirRel}/profile.json`, data: JSON.stringify({ ...rec, knownPostIds: [...known] }, null, 2) },
-      { rel: `${dirRel}/archive.txt`, data: [...archive].map((l) => `${l}\n`).join("") },
-    ];
-
-    // The batch record (kind profile-capture), written before any post is captured.
-    const batchJson = (finishedAt?: string) =>
-      JSON.stringify(
+    const batchFile = (state: "running" | "finished" | "paused" | "failed", finishedAt?: string) => ({
+      rel: `${batchRel}/batch.json`,
+      data: JSON.stringify(
         {
           ...ImportBatch.parse({
             id: batchId,
             projectId,
             number,
-            source: { kind: "profile-capture", location: `profiles/${folderName!}` },
+            // The folder is known once the profile is (a new pseudonymized profile gets its code first).
+            source: { kind: "profile-capture", location: `profiles/${folderName ?? `${platform}-(new profile)`}` },
             options: ImportOptions.parse({ transcribe: opts.transcribe === true, ocr: false }),
             startedAt: at,
             ...(finishedAt ? { finishedAt } : {}),
-            counts: { created: report.created, merged: 0, skipped: report.duplicates, failed: report.failed + report.incomplete, needsReview: needsReview },
+            // A post saved only in part is a created source (counted again in countsDetail), not a failure.
+            counts: { created: report.created + report.incomplete, merged: 0, skipped: report.duplicates, failed: report.failed, needsReview },
           }),
+          state,
+          countsDetail: { createdIncomplete: report.incomplete },
           createdSourceIds,
           createdCollectionIds,
         },
         null,
         2,
-      );
+      ),
+    });
+    // Written before anything is created, so an interrupted run still has its batch record.
+    await save([batchFile("running")]);
+
+    let profileSourceId = record && repo.listSourceIds(projectId).includes(record.profileSourceId) ? record.profileSourceId : undefined;
+    // No record (first run, or interrupted before it was written): the profile source may exist already.
+    profileSourceId ??= await findProfileSource(projectId, c);
+    const snapshot = profileSnapshot(platform, profile, at, [root]);
+    if (!profileSourceId) {
+      profileSourceId = await createProfileSource(projectId, c, profile, snapshot, { tool, toolVersion, batchId, identifiable, legalBasis, cookies, at });
+      createdSourceIds.push(profileSourceId);
+      await save([batchFile("running")]);
+    }
+    report.profileSourceId = profileSourceId;
+    if (pseudonymize) {
+      code ??= await pseudonymCodeFor(repo, projectId, names);
+      // Fail closed: never fall back to the handle in a name.
+      if (!code) throw new Error("the profile has no participant code, so its folder cannot be named");
+      folderName = folderOf(code, true);
+      if (!record) {
+        const text = await readProjectFile(projectId, `${projectRel}/profiles/${folderName}/profile.json`);
+        if (text) record = JSON.parse(text) as ProfileRecord;
+      }
+    }
+    const dirRel = `${projectRel}/profiles/${folderName!}`;
+    const collectionLabel = code ?? label;
+    let profileSf = await repo.getSource(projectId, profileSourceId);
+    let collectionId = record?.collectionId && profileSf.source.collectionIds.includes(record.collectionId) ? record.collectionId : undefined;
+    if (!collectionId) {
+      collectionId = (await repo.createCollection(projectId, `Profile: ${collectionLabel}`)).id;
+      createdCollectionIds.push(collectionId);
+      await repo.setMembership(projectId, profileSourceId, { collectionIds: [...profileSf.source.collectionIds, collectionId] });
+      profileSf = await repo.getSource(projectId, profileSourceId);
+    }
+    // Known posts and the listing each was found in (older records: knownPostIds, the main listing).
+    const fallbackListing = c.kind === "playlist" ? "playlist" : platform === "instagram" ? "posts" : "videos";
+    const knownPosts: Record<string, KnownPost> = {};
+    for (const id of record?.knownPostIds ?? []) knownPosts[id] = { listing: fallbackListing };
+    for (const [id, k] of Object.entries(record?.knownPosts ?? {})) if (isRecord(k) && typeof k.listing === "string") knownPosts[id] = structuredClone(k);
+    const knownBefore = structuredClone(knownPosts);
+    const isKnown = (id: string) => Object.hasOwn(knownPosts, id);
+    const archive = new Set((await readProjectFile(projectId, `${dirRel}/archive.txt`))?.split("\n").filter(Boolean) ?? []);
+    const rec = {
+      platform,
+      handle: handle ?? label,
+      profileSourceId,
+      collectionId,
+      firstCapturedAt: record?.firstCapturedAt ?? at,
+      lastCapturedAt: at,
+    };
+    const recordFiles = () => [
+      { rel: `${dirRel}/profile.json`, data: JSON.stringify({ ...rec, knownPostIds: Object.keys(knownPosts), knownPosts } satisfies ProfileRecord, null, 2) },
+      { rel: `${dirRel}/archive.txt`, data: [...archive].map((l) => `${l}\n`).join("") },
+    ];
+    const remember = (e: ListedEntry) => {
+      knownPosts[e.id] ??= { listing: e.listing };
+      archive.add(archiveLine(platform, e.id));
+    };
+
     const snapName = datedFileName("profile-snapshot", new Date(at), "json", repoTz(repo));
-    await save([{ rel: `${batchRel}/batch.json`, data: batchJson() }, ...recordFiles(), { rel: `${dirRel}/snapshots/${snapName}`, data: JSON.stringify(snapshot, null, 2), dated: true }]);
+    await save([batchFile("running"), ...recordFiles(), { rel: `${dirRel}/snapshots/${snapName}`, data: JSON.stringify(snapshot, null, 2), dated: true }]);
     await addSnapshotAsset(projectId, profileSourceId, snapshot, platform, tool, at);
 
     // 4. New posts, one at a time.
@@ -426,16 +504,16 @@ export function createProfileCapture(core: CaptureCore) {
       includeComments,
       metadataOnly: opts.metadataOnly === true,
     };
-    const fresh = entries.filter((e) => !known.has(e.id));
+    const fresh = entries.filter((e) => !isKnown(e.id));
+    const freshIds = new Set(fresh.map((e) => e.id));
     let done = 0;
     let stopped = false;
     for (const e of fresh) {
       const existing = await core.findExisting(projectId, platform, e.id);
       let out: CaptureOutcome;
       if (existing) {
-        // Already in the project (captured before, or stored just before an interruption).
-        known.add(e.id);
-        archive.add(archiveLine(platform, e.id));
+        // Already in the project (captured on its own before, or stored just before an interruption).
+        remember(e);
         out = { url: e.url, status: "duplicate", sourceId: existing };
         report.duplicates++;
         await save(recordFiles(), { key: e.id, outcome: "duplicate", sourceId: existing });
@@ -459,8 +537,7 @@ export function createProfileCapture(core: CaptureCore) {
           if (out.status === "needs-review") needsReview++;
         }
         if (out.sourceId) {
-          known.add(e.id);
-          archive.add(archiveLine(platform, e.id));
+          remember(e);
           if (out.status !== "duplicate") createdSourceIds.push(out.sourceId);
         }
         await save(out.sourceId ? recordFiles() : [], { key: e.id, outcome: out.status, ...(out.sourceId ? { sourceId: out.sourceId } : {}), ...(out.errorCode ? { errorCode: out.errorCode } : {}) });
@@ -475,34 +552,45 @@ export function createProfileCapture(core: CaptureCore) {
       }
     }
 
-    // 5–6. Known posts: edits, reappearance; removed detection only for a complete list.
-    report.listComplete = !partial && !filtered && !(entries.length === 0 && known.size > 0);
+    // 5–6. Known posts: edits, reappearance; removed detection only for whole lists.
+    const wholeListings = new Set(results.map((r) => r.listing.listing).filter((l) => !incompleteListings.has(l)));
+    const checked = Object.entries(knownBefore).filter(([, k]) => wholeListings.has(k.listing)).map(([id]) => id);
+    const overlap = checked.filter((id) => listedIds.has(id)).length;
+    // Sanity guard: a list that shares less than half of the known posts is more likely the wrong
+    // list (or a login wall) than half the profile deleted.
+    const plausible = checked.length === 0 || overlap * 2 >= checked.length;
+    report.listComplete = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
     if (!stopped && (await core.stillAllowed(projectId, platform))) {
-      const listedIds = new Set(entries.map((e) => e.id));
-      const freshIds = new Set(fresh.map((e) => e.id));
       for (const e of entries) {
-        if (!known.has(e.id) || freshIds.has(e.id)) continue;
+        if (!isKnown(e.id) || freshIds.has(e.id)) continue;
         const sid = await core.findExisting(projectId, platform, e.id);
         if (!sid) continue;
         const sf = await repo.getSource(projectId, sid);
         if (sf.source.availability.status === "unavailable-on-platform") {
-          await repo.updateSource(projectId, sid, { availability: { status: "available" } });
+          const k = knownPosts[e.id]!;
+          const restore = k.previousAvailability ?? { status: "available" as const };
+          delete k.previousAvailability;
+          await repo.updateSource(projectId, sid, { availability: restore });
+          await save(recordFiles());
           report.reappeared++;
         }
-        const edit = await recordEdit(projectId, sid, e, platform, tool);
+        const edit = await recordEdit(projectId, sid, e, platform, tool, opts);
         if (edit === "policy-changed") {
           policyChanged();
           break;
         }
         if (edit === "edited") report.edited++;
       }
-      if (report.listComplete && report.status === "completed") {
-        for (const id of known) {
+      if (!filtered && plausible && report.status === "completed") {
+        for (const id of checked) {
           if (listedIds.has(id)) continue;
           const sid = await core.findExisting(projectId, platform, id);
           if (!sid) continue;
           const sf = await repo.getSource(projectId, sid);
           if (sf.source.availability.status === "unavailable-on-platform") continue; // noticed once
+          // The earlier availability (e.g. incomplete) is kept, to be restored if the post returns.
+          knownPosts[id] = { ...knownPosts[id]!, previousAvailability: sf.source.availability };
+          await save(recordFiles());
           await repo.updateSource(projectId, sid, { availability: { status: "unavailable-on-platform", firstNoticedAt: new Date().toISOString() } });
           report.newlyUnavailable++;
         }
@@ -511,16 +599,31 @@ export function createProfileCapture(core: CaptureCore) {
       policyChanged();
     }
 
-    // 7. Report, batch record, audit.
+    // 7. Report, batch record, audit (written after a stop too: they record what happened).
     const finishedAt = new Date().toISOString();
     rec.lastCapturedAt = finishedAt;
     const reportName = datedFileName("capture", new Date(finishedAt), "md", repoTz(repo));
+    const state = report.status === "completed" ? "finished" : report.status === "paused-rate-limited" ? "paused" : "failed";
     await save([
       ...recordFiles(),
-      { rel: `${batchRel}/batch.json`, data: batchJson(finishedAt) },
+      batchFile(state, finishedAt),
       { rel: `${dirRel}/reports/${reportName}`, data: reportText(platform, collectionLabel, report, at, finishedAt), dated: true },
     ]);
     return audited(projectId, platform, report);
+  }
+
+  /** A profile source of this link already in the project (an earlier run interrupted before its record). */
+  async function findProfileSource(projectId: string, c: ClassifiedUrl): Promise<string | undefined> {
+    for (const id of repo.listSourceIds(projectId)) {
+      try {
+        const sf = await repo.getSource(projectId, id);
+        const s = sf.source;
+        if (s.caseAttributes.genre === "profile" && s.identifiers.platform === c.platform && s.identifiers.url === c.canonicalUrl) return id;
+      } catch {
+        // unreadable source: not a match
+      }
+    }
+    return undefined;
   }
 
   /** Records the run in the audit log (counts only: no handle, link or path) and returns the report. */
@@ -576,18 +679,17 @@ export function createProfileCapture(core: CaptureCore) {
     c: ClassifiedUrl,
     opts: ProfileCaptureOptions,
     tool: CaptureTool,
-  ): Promise<{ docs: unknown[]; partialCode?: string; error?: string; toolVersion: string }> {
-    const docs: unknown[] = [];
-    let partialCode: string | undefined;
+  ): Promise<{ results: ListingResult[]; error?: string; toolVersion: string }> {
+    const results: ListingResult[] = [];
     let toolVersion = "unknown";
-    for (const input of enumerationUrls(c, opts.contentTypes)) {
+    for (const listing of listingsFor(c, opts.contentTypes)) {
       const { work, done } = await core.makeWork();
       try {
         let r;
         try {
           r = await worker.submit(projectId, {
             type: "capture.download",
-            input,
+            input: listing.url,
             output: work,
             params: {
               tool,
@@ -600,23 +702,25 @@ export function createProfileCapture(core: CaptureCore) {
             },
           });
         } catch (err) {
-          if (err instanceof WorkerJobError) return { docs, error: err.code, toolVersion };
-          if (err instanceof WorkerUnavailableError) return { docs, error: "WORKER_UNAVAILABLE", toolVersion };
+          if (err instanceof WorkerJobError) return { results, error: err.code, toolVersion };
+          if (err instanceof WorkerUnavailableError) return { results, error: "WORKER_UNAVAILABLE", toolVersion };
           throw err;
         }
         const meta = r.meta;
         if (typeof meta.toolVersion === "string" && meta.toolVersion) toolVersion = meta.toolVersion;
-        if (meta.partial === true) partialCode ??= typeof meta.errorCode === "string" ? meta.errorCode : "EXTRACTOR_ERROR";
+        const partialCode = meta.partial === true ? (typeof meta.errorCode === "string" ? meta.errorCode : "EXTRACTOR_ERROR") : undefined;
+        const docs: unknown[] = [];
         const infos = (Array.isArray(meta.infoJson) ? meta.infoJson : []).filter((f): f is string => typeof f === "string").sort();
         for (const f of infos) {
           const d = await core.readJson(f, r.encrypted, projectId);
           if (d !== undefined) docs.push(d);
         }
+        results.push({ listing, docs, ...(partialCode ? { partialCode } : {}) });
       } finally {
         await done();
       }
     }
-    return { docs, ...(partialCode ? { partialCode } : {}), toolVersion };
+    return { results, toolVersion };
   }
 
   async function createProfileSource(
@@ -636,11 +740,13 @@ export function createProfileCapture(core: CaptureCore) {
       { ...(profile.displayName ? { literal: profile.displayName } : {}), role: platform === "youtube" ? "channel" : "uploader", ...(handle ? { handle } : {}) },
     ];
     if (profile.displayName || handle) ev("/creators", creators, handle ? "/handle" : "/displayName");
+    if (profile.url === c.canonicalUrl) ev("/identifiers/url", c.canonicalUrl, "/webpage_url");
     // The snapshot used for verification and kept in provenance, with the identity keys the checks read.
     const vsnap: Record<string, unknown> = {
       ...snapshot,
       ...(profile.displayName ? { title: profile.displayName, channel: profile.displayName } : {}),
       ...(handle ? { uploader_id: handle, owner_username: handle.replace(/^@+/, "") } : {}),
+      ...(profile.url ? { webpage_url: profile.url } : {}),
     };
     const draft: SourceDraft = {
       projectIds: [],
@@ -702,8 +808,10 @@ export function createProfileCapture(core: CaptureCore) {
   }
 
   /**
-   * A known post whose listed caption (or YouTube title) differs from its latest stored snapshot:
-   * a new dated platform-metadata original and, when the title changes, a title variant (rechecked).
+   * A known post whose listed caption (YouTube: title only, since listings truncate descriptions)
+   * differs from its latest stored snapshot is fetched in full (metadata only). Only when the full
+   * metadata differs too is it stored, as a new dated platform-metadata original, plus a title
+   * variant when the title changes (rechecked).
    */
   async function recordEdit(
     projectId: string,
@@ -711,6 +819,7 @@ export function createProfileCapture(core: CaptureCore) {
     e: ProfileEntry,
     platform: Platform,
     tool: CaptureTool,
+    opts: ProfileCaptureOptions,
   ): Promise<"edited" | "unchanged" | "policy-changed"> {
     const root = repoLibrary(repo).root;
     const sf = await repo.getSource(projectId, sourceId);
@@ -721,13 +830,18 @@ export function createProfileCapture(core: CaptureCore) {
     if (!latest) return "unchanged";
     const stored = await core.readJson(join(root, ...latest.path.split("/")), latest.encrypted, projectId);
     if (!isRecord(stored)) return "unchanged";
-    const now = stripSnapshot(e.raw, { localPrefixes: [root] });
-    const oldCap = captionOf(stored);
+    const differs = (a: unknown, b: unknown) => typeof a === "string" && typeof b === "string" && norm(a) !== norm(b);
+    const flat = stripSnapshot(e.raw, { localPrefixes: [root] });
+    const suspect = platform === "youtube" ? differs(stored.title, flat.title) : differs(captionOf(stored), captionOf(flat));
+    if (!suspect) return "unchanged";
+    const now = await core.fetchMetadata(projectId, classifyUrl(e.url), {
+      transcribe: false,
+      ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
+    });
+    if (!now) return "unchanged";
     const newCap = captionOf(now);
-    const capChanged = typeof oldCap === "string" && typeof newCap === "string" && norm(oldCap) !== norm(newCap);
     const newYtTitle = platform === "youtube" && typeof now.title === "string" ? now.title : undefined;
-    const titleChanged = typeof stored.title === "string" && newYtTitle !== undefined && norm(stored.title) !== norm(newYtTitle);
-    if (!capChanged && !titleChanged) return "unchanged";
+    if (!differs(captionOf(stored), newCap) && !(platform === "youtube" && differs(stored.title, newYtTitle))) return "unchanged";
     // Immediately before storing (R42).
     if (!(await core.stillAllowed(projectId, platform))) return "policy-changed";
 

@@ -76,8 +76,19 @@ each capture. Using these tools may conflict with platform terms of service.
   `reports/`), encrypted in encrypted projects, and the folder and collection use the participant
   code when names are pseudonymized. The enumeration never gets the archive (yt-dlp would leave
   archived posts out of the list, which would break removed-post detection); the library skips
-  known posts itself. Posts missing from a list are marked `unavailable-on-platform` only when the
-  list was complete (not cut short, not filtered, not paused). Edited captions add a dated
+  known posts itself. `profile.json` also keeps `knownPosts` (per post: the listing/tab it was
+  found in, and the availability to restore if it disappears and returns). YouTube channels are
+  listed through their tabs (`/videos`, `/shorts`), never the bare channel (which lists tabs).
+  Posts missing from a list are marked `unavailable-on-platform` only for listings that came back
+  whole in this run: not cut short, not nested, not shorter than the platform's own count, no
+  date or number limit (gallery-dl's range counts files, not posts), the run not paused, and the
+  list sharing at least half of the known posts of those listings (sanity guard). Bookkeeping files
+  (`profile.json`, `archive.txt`, the batch record, the report) are still written after a run stops
+  (rate limit, `POLICY_CHANGED`): they record what happened, not new captured data. The batch
+  record is written first (`state: running`), before the profile source; a run interrupted later
+  finds its profile source again by link and `genre: profile`. Edits: YouTube compares only titles
+  in listings (descriptions there are truncated); a suspected edit is confirmed by fetching the
+  post's full metadata, which is what gets stored. Comments always need a legal basis. Edited captions add a dated
   platform-metadata original and a title variant; the first snapshot is never changed. Rate limits:
   waits of 60, 120 and 240 s, then the run pauses (`paused-rate-limited`) and a re-run resumes.
   Comments (`includeComments`, off by default) need a `store` decision with `identifiable: true`

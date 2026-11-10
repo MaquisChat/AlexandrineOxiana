@@ -109,6 +109,8 @@ export interface CaptureCore {
   readJson(path: string, encrypted: boolean, projectId: string): Promise<unknown>;
   writeJson(work: string, name: string, data: unknown, projectId: string, encrypted: boolean): Promise<string>;
   makeWork(): Promise<{ work: string; done: () => Promise<void> }>;
+  /** One post's full platform metadata (metadata-only download), stripped; undefined when it cannot be read. */
+  fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<Record<string, unknown> | undefined>;
   captureItem(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item: ItemContext): Promise<CaptureOutcome>;
 }
 
@@ -551,6 +553,24 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     }
   }
 
+  async function fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<Record<string, unknown> | undefined> {
+    const { work, done } = await makeWork();
+    try {
+      let r: JobResult;
+      try {
+        r = await download(projectId, c, opts, work, true);
+      } catch (err) {
+        if (err instanceof WorkerJobError || err instanceof WorkerUnavailableError) return undefined;
+        throw err;
+      }
+      const infos = (Array.isArray(r.meta.infoJson) ? r.meta.infoJson : []).filter((f): f is string => typeof f === "string").sort();
+      const raw = infos.length ? await readJson(infos[0]!, r.encrypted, projectId) : undefined;
+      return raw ? stripSnapshot(raw, { localPrefixes: [repoLibrary(repo).root] }) : undefined;
+    } finally {
+      await done();
+    }
+  }
+
   const core: CaptureCore = {
     repo,
     worker,
@@ -562,6 +582,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     readJson: readAny,
     writeJson: writeSnapshot,
     makeWork,
+    fetchMetadata,
     captureItem: captureOne,
   };
   const profiles = createProfileCapture(core);

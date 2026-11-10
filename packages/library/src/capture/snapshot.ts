@@ -29,7 +29,7 @@ const DROP_KEYS = new Set([
 ]);
 const SECRET_WORDS = new Set([
   "cookie", "cookies", "token", "tokens", "auth", "authorization", "authentication", "bearer", "csrf", "xsrf",
-  "password", "passwd", "secret", "signature", "sig", "session", "sessionid", "apikey",
+  "password", "passwd", "secret", "signature", "sig", "session", "sessionid", "apikey", "accesskey", "privatekey", "secretkey",
   "credential", "credentials", "jwt",
 ]);
 /** Words that name a secret when directly followed by `key` (`api_key`, `AccessKeyId`); a bare `key` is kept (`extractor_key`). */

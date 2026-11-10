@@ -372,7 +372,7 @@ describe("captureUrl", () => {
     // the built-in profile capture: the fake tools have no such channel, so listing it fails plainly
     const out = await capture.captureUrl(p.id, "https://www.youtube.com/@amatest_fake", { transcribe: false });
     expect(out).toMatchObject({ status: "failed", errorCode: "EXTRACTOR_ERROR" });
-    expect(worker.submitted.map((j) => [j.input, j.params.flatList])).toEqual([["https://www.youtube.com/@amatest_fake", true]]);
+    expect(worker.submitted.map((j) => [j.input, j.params.flatList])).toEqual([["https://www.youtube.com/@amatest_fake/videos", true]]);
     worker.submitted.length = 0;
     const seen: string[] = [];
     const withProfile = createLinkCapture({
@@ -508,6 +508,7 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
 
   it("R42a: drops api/access/private/secret + key pairs, credential(s) and jwt, but keeps a bare key and extractor_key", () => {
     const s = stripSnapshot({
+      accesskey: 16, privatekey: 17, secretkey: 18, AccessKey: 19,
       api_key: 1, apiKey: 2, "X-Api-Key": 3, access_key: 4, AccessKeyId: 5, private_key: 6, privateKey: 7, secret_key: 8, SecretKey: 9,
       credential: 10, credentials: 11, aws_credentials: 12, jwt: 13, jwtToken: 14, id_jwt: 15,
       key: "k", extractor_key: "Youtube", keywords: ["a"], monkey: "m", access: "public", private: false, api: "v2", key_frames: 3,

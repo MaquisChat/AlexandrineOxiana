@@ -7,7 +7,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { AuditEvent, SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { IndexHandle } from "../index/db.js";
@@ -427,7 +427,7 @@ describe("captureProfile", { timeout: 120_000 }, () => {
 
   it("includeComments in a project that does not allow identifiable storage: PolicyDeniedError before any download", async () => {
     const p = await project(NO_IDENTIFIABLE_GOV);
-    await expect(capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true })).rejects.toBeInstanceOf(PolicyDeniedError);
+    await expect(capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true, legalBasis: "consent" })).rejects.toBeInstanceOf(PolicyDeniedError);
     expect(worker.submitted).toEqual([]);
     expect(repo.listSourceIds(p.id)).toEqual([]);
     const denies = (await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny");
@@ -500,7 +500,7 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     closers.push(() => w2.close());
     const c2 = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w2, pollMs: 5 }), index: handle, sleep: async () => {} });
     const r = await c2.captureProfile(p.id, TT_PROFILE, { transcribe: false });
-    expect(r).toMatchObject({ status: "failed", errorCode: "POLICY_CHANGED", created: 1, reason: "This project's rules changed during the download, so nothing was saved." });
+    expect(r).toMatchObject({ status: "failed", errorCode: "POLICY_CHANGED", created: 1, reason: "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved." });
     expect(await posts(p.id)).toHaveLength(1);
     expect(w2.submitted).toHaveLength(3);
     const caps = (await auditEvents(p.folder)).filter((e) => e.action === "capture");
@@ -530,11 +530,11 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await posts(p.id)).every((sf) => sf.source.identifiers.platform === "instagram")).toBe(true);
   });
 
-  it("a YouTube channel: chosen content types list each tab once, posts are not repeated, and the list counts as filtered", async () => {
+  it("a YouTube channel: chosen content types list each tab once, posts are not repeated", async () => {
     await setProfile({ ...synthetic("youtube"), handle: "amatest_fake", displayName: "Ama Test Channel", items: synthetic("youtube").items.map((it) => ({ ...it, id: `aoProf${it.id.slice(-6)}` })) });
     const p = await project();
     const r = await capture.captureProfile(p.id, "https://www.youtube.com/@amatest_fake/videos?si=x", { transcribe: false, contentTypes: ["videos", "shorts"] });
-    expect(r).toMatchObject({ status: "completed", created: 12, listComplete: false });
+    expect(r).toMatchObject({ status: "completed", created: 12, listComplete: true });
     expect(worker.submitted.filter((j) => j.params.flatList).map((j) => j.input)).toEqual([
       "https://www.youtube.com/@amatest_fake/videos",
       "https://www.youtube.com/@amatest_fake/shorts",
@@ -574,5 +574,181 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, since: "2026-02-30" })).toMatchObject({ status: "failed", errorCode: "INVALID_OPTIONS" });
     expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 0 })).toMatchObject({ status: "failed", errorCode: "INVALID_OPTIONS" });
     expect(worker.submitted).toEqual([]);
+  });
+});
+
+describe("captureProfile fix round 1 (R43)", { timeout: 120_000 }, () => {
+  const recordOf = async (folder: string, dir: string) =>
+    JSON.parse(await readFile(join(lib.root, folder, "profiles", dir, "profile.json"), "utf8")) as {
+      knownPostIds: string[];
+      knownPosts: Record<string, { listing: string; previousAvailability?: unknown }>;
+    };
+
+  it("C1: Instagram carousels with maxItems (gallery-dl counts files) never mark posts removed", async () => {
+    const prof = synthetic("instagram");
+    await setProfile({ ...prof, items: prof.items.map((it) => ({ ...it, count: 3 })) });
+    const p = await project();
+    expect(await capture.captureProfile(p.id, IG_PROFILE, { transcribe: false })).toMatchObject({ created: 12, listComplete: true });
+    const r = await capture.captureProfile(p.id, IG_PROFILE, { transcribe: false, maxItems: 5 });
+    expect(r).toMatchObject({ listComplete: false, newlyUnavailable: 0 });
+    for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
+  });
+
+  it("C1: a list shorter than the platform's own post count (no error) never marks posts removed", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    process.env.FAKE_TOOL_MODE = "enumshort";
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ status: "completed", listComplete: false, newlyUnavailable: 0 });
+    for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
+  });
+
+  it("I1: a default run after a reels run does not flag the reels; posts are still checked", async () => {
+    const prof = synthetic("instagram");
+    const items = prof.items.map((it, i) => (i < 4 ? { ...it, listing: "reels" } : it));
+    await setProfile({ ...prof, items });
+    const p = await project();
+    expect(await capture.captureProfile(p.id, IG_PROFILE, { transcribe: false, contentTypes: ["reels"] })).toMatchObject({ created: 4 });
+    expect(worker.submitted[0]!.input).toBe("https://www.instagram.com/fake_photographer/reels/");
+    const r = await capture.captureProfile(p.id, IG_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ created: 8, newlyUnavailable: 0, listComplete: true });
+    for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
+    const rec = await recordOf(p.folder, "instagram-fake_photographer");
+    expect(rec.knownPosts[items[0]!.id]).toMatchObject({ listing: "reels" });
+    expect(rec.knownPosts[items[5]!.id]).toMatchObject({ listing: "posts" });
+    // one post gone from the grid: flagged; the reels are not
+    const gone = items[6]!;
+    await setProfile({ ...prof, items: items.filter((it) => it !== gone) });
+    expect(await capture.captureProfile(p.id, IG_PROFILE, { transcribe: false })).toMatchObject({ newlyUnavailable: 1 });
+    expect((await byPost(p.id, gone.id)).source.availability.status).toBe("unavailable-on-platform");
+    expect((await byPost(p.id, items[0]!.id)).source.availability.status).toBe("available");
+  });
+
+  it("I1: a list that barely overlaps the known posts marks nothing (sanity guard)", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    await setProfile({ ...synthetic(), items: Array.from({ length: 12 }, (_, i) => item(40 - i)) });
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ created: 12, newlyUnavailable: 0, listComplete: false });
+  });
+
+  it("I1: a bare YouTube channel is listed through its videos tab; nested tab listings count as incomplete", async () => {
+    await setProfile({ ...synthetic("youtube"), handle: "amatest_fake", displayName: "Ama Test Channel", items: synthetic("youtube").items.map((it) => ({ ...it, id: `aoProf${it.id.slice(-6)}` })) });
+    const p = await project();
+    const r = await capture.captureProfile(p.id, "https://www.youtube.com/@amatest_fake", { transcribe: false });
+    expect(r).toMatchObject({ created: 12, listComplete: true });
+    expect(worker.submitted.filter((j) => j.params.flatList).map((j) => j.input)).toEqual(["https://www.youtube.com/@amatest_fake/videos"]);
+    const { readEnumeration } = await import("./profile-snapshot.js");
+    const nested = readEnumeration(
+      [{ _type: "playlist", id: "UC1", entries: [{ _type: "url", ie_key: "YoutubeTab", url: "https://www.youtube.com/@amatest_fake/videos" }] }],
+      { platform: "youtube", kind: "profile", canonicalUrl: "https://www.youtube.com/@amatest_fake", handle: "@amatest_fake" },
+      "yt-dlp",
+    );
+    expect(nested).toMatchObject({ entries: [], nested: true });
+  });
+
+  it("I1: an old profile.json with only knownPostIds is migrated", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    const file = join(lib.root, p.folder, "profiles", "tiktok-fake.dancer", "profile.json");
+    const { knownPosts: _drop, ...old } = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    await writeFile(file, JSON.stringify(old));
+    const prof = synthetic();
+    await setProfile({ ...prof, items: prof.items.slice(1) });
+    expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).toMatchObject({ newlyUnavailable: 1 });
+    expect(Object.keys((await recordOf(p.folder, "tiktok-fake.dancer")).knownPosts)).toHaveLength(12);
+  });
+
+  it("I2: YouTube's truncated listing descriptions are no edit; a title change fetches and stores the full metadata", async () => {
+    const yt = { ...synthetic("youtube"), handle: "amatest_fake", displayName: "Ama Test Channel", items: synthetic("youtube").items.map((it) => ({ ...it, id: `aoProf${it.id.slice(-6)}` })) };
+    await setProfile(yt);
+    const p = await project();
+    await capture.captureProfile(p.id, "https://www.youtube.com/@amatest_fake", { transcribe: false });
+    expect((await capture.captureProfile(p.id, "https://www.youtube.com/@amatest_fake", { transcribe: false })).edited).toBe(0);
+    const target = yt.items[2]!;
+    await setProfile({ ...yt, items: yt.items.map((it) => (it === target ? { ...it, caption: "A new title for the market walk\n#dance #market" } : it)) });
+    const before = worker.submitted.length;
+    const r = await capture.captureProfile(p.id, "https://www.youtube.com/@amatest_fake", { transcribe: false });
+    expect(r.edited).toBe(1);
+    const fetched = worker.submitted.slice(before).filter((j) => !j.params.flatList);
+    expect(fetched.map((j) => [j.input, j.params.metadataOnly])).toEqual([[`https://www.youtube.com/watch?v=${target.id}`, true]]);
+    const sf = await byPost(p.id, target.id);
+    const metas = sf.assets.filter((a) => a.kind === "platform-metadata");
+    expect(metas).toHaveLength(2);
+    const added = JSON.parse(await readFile(join(lib.root, metas[1]!.path), "utf8")) as Record<string, unknown>;
+    expect(added).toMatchObject({ title: "A new title for the market walk", description: "A new title for the market walk\n#dance #market", channel: "Ama Test Channel" });
+    expect(sf.source.title.variants.map((v) => v.value)).toContain("A new title for the market walk");
+  });
+
+  it("I3: a post that comes back gets its earlier availability (incomplete) back; batch counts it as created-incomplete", async () => {
+    const prof = synthetic();
+    const flaky = { ...prof.items[3]!, noMedia: true };
+    const items = prof.items.map((it, i) => (i === 3 ? flaky : it));
+    await setProfile({ ...prof, items });
+    const p = await project();
+    const first = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(first).toMatchObject({ created: 11, incomplete: 1, failed: 0 });
+    const batch = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0001", "batch.json"), "utf8")) as {
+      counts: Record<string, number>;
+      countsDetail: Record<string, number>;
+    };
+    expect(batch.counts).toMatchObject({ created: 12, failed: 0 });
+    expect(batch.countsDetail).toEqual({ createdIncomplete: 1 });
+    const original = (await byPost(p.id, flaky.id)).source.availability;
+    expect(original).toMatchObject({ status: "incomplete" });
+    await setProfile({ ...prof, items: items.filter((it) => it !== flaky) });
+    expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).toMatchObject({ newlyUnavailable: 1 });
+    expect((await recordOf(p.folder, "tiktok-fake.dancer")).knownPosts[flaky.id]!.previousAvailability).toEqual(original);
+    await setProfile({ ...prof, items });
+    expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).toMatchObject({ reappeared: 1 });
+    expect((await byPost(p.id, flaky.id)).source.availability).toEqual(original);
+    expect((await recordOf(p.folder, "tiktok-fake.dancer")).knownPosts[flaky.id]!.previousAvailability).toBeUndefined();
+  });
+
+  it("I4: the batch is written first; after a crash past the profile source a re-run reuses it", async () => {
+    const p = await project();
+    const spy = vi.spyOn(repo, "createCollection").mockRejectedValueOnce(new Error("simulated crash"));
+    await expect(capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).rejects.toThrow("simulated crash");
+    spy.mockRestore();
+    const b1 = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0001", "batch.json"), "utf8")) as { state: string; createdSourceIds: string[]; finishedAt?: string };
+    expect(b1.state).toBe("running");
+    expect(b1.finishedAt).toBeUndefined();
+    const profiles = () => sources(p.id).then((l) => l.filter((sf) => sf.source.caseAttributes.genre === "profile"));
+    expect(await profiles()).toHaveLength(1);
+    const first = (await profiles())[0]!.source.id;
+    expect(b1.createdSourceIds).toEqual([first]);
+    const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ status: "completed", created: 12, profileSourceId: first });
+    expect(await profiles()).toHaveLength(1);
+    const b2 = JSON.parse(await readFile(join(lib.root, p.folder, "imports", "batch-0002", "batch.json"), "utf8")) as { state: string; createdSourceIds: string[] };
+    expect(b2.state).toBe("finished");
+    expect(b2.createdSourceIds).not.toContain(first);
+  });
+
+  it("minor 6: comments always need a legal basis, even when the project does not require one", async () => {
+    const p = await project(`identifiability:
+  containsIdentifiable: false
+  pseudonymizeFileNames: false
+encryption:
+  atRest: optional
+captureMethods: [downloader]
+consent:
+  requireLegalBasis: false
+`);
+    expect(await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true })).toMatchObject({ status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" });
+    expect(worker.submitted).toEqual([]);
+    expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, includeComments: true, maxItems: 1, legalBasis: "consent" })).created).toBe(1);
+  });
+
+  it("minor 9: TikTok handles are case-folded in folder names; the profile URL is platform-json evidence", async () => {
+    const p = await project();
+    const r = await capture.captureProfile(p.id, "https://www.tiktok.com/@Fake.Dancer", { transcribe: false, maxItems: 2 });
+    expect(r.created).toBe(2);
+    expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-fake.dancer"]);
+    const again = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 2 });
+    expect(again).toMatchObject({ created: 0, profileSourceId: r.profileSourceId });
+    expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-fake.dancer"]);
+    const prof = await repo.getSource(p.id, r.profileSourceId!);
+    expect(prof.fieldEvidence.find((e) => e.field === "/identifiers/url")).toMatchObject({ source: { kind: "platform-json" } });
   });
 });

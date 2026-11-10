@@ -15,6 +15,8 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 
 export interface ProfileMeta {
+  /** The profile's canonical link as the listing gives it (platform JSON `webpage_url`). */
+  url?: string;
   /** As the platform shows it: `@name` on YouTube and TikTok, `name` on Instagram. */
   handle?: string;
   displayName?: string;
@@ -80,7 +82,18 @@ const linksOf = (v: unknown): string[] =>
  * The profile and its posts from the enumeration's metadata files (already parsed). Posts keep the
  * listing's order; a post listed twice (gallery-dl writes one file per image of a carousel) once.
  */
-export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: CaptureTool): { profile: ProfileMeta; entries: ProfileEntry[] } {
+export interface Enumeration {
+  profile: ProfileMeta;
+  entries: ProfileEntry[];
+  /** The listing contained other listings (a channel's tabs) instead of posts: not a list of posts. */
+  nested: boolean;
+  /** The platform's own count of this listing's posts, when it gives one. */
+  reportedCount?: number;
+}
+
+export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: CaptureTool): Enumeration {
+  let nested = false;
+  let reportedCount: number | undefined;
   const platform = c.platform;
   const entries: ProfileEntry[] = [];
   const seen = new Set<string>();
@@ -98,6 +111,9 @@ export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: Capture
       const handle =
         platform === "youtube" ? (str(list.uploader_id)?.startsWith("@") ? str(list.uploader_id) : c.handle) : platform === "tiktok" ? (str(list.uploader) ? `@${str(list.uploader)!.replace(/^@+/, "")}` : c.handle) : c.handle;
       const thumbs = Array.isArray(list.thumbnails) ? list.thumbnails.filter(isRecord) : [];
+      const page = str(list.webpage_url) ? classifyUrl(str(list.webpage_url)!) : undefined;
+      if (page && page.platform === platform && page.kind === c.kind && page.canonicalUrl === c.canonicalUrl) profile.url = page.canonicalUrl;
+      reportedCount = num(list.playlist_count);
       Object.assign(profile, {
         ...(handle ? { handle } : {}),
         ...(str(list.channel) ?? str(list.uploader) ? { displayName: str(list.channel) ?? str(list.uploader) } : {}),
@@ -110,6 +126,12 @@ export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: Capture
       });
       for (const e of (lists.length ? lists : [list]).flatMap((l) => (Array.isArray(l.entries) ? (l.entries as unknown[]) : []))) {
         if (!isRecord(e)) continue;
+        // A nested listing (a channel's tabs): not a post.
+        const target = str(e.url) ? classifyUrl(str(e.url)!) : undefined;
+        if (e._type === "playlist" || /tab$/i.test(String(e.ie_key ?? "")) || target?.kind === "profile" || target?.kind === "playlist") {
+          nested = true;
+          continue;
+        }
         const id = str(e.id);
         const url = id ? entryLink(platform, id, e.url ?? e.webpage_url, handle) : undefined;
         if (!id || !url) continue;
@@ -143,7 +165,8 @@ export function readEnumeration(docs: unknown[], c: ClassifiedUrl, tool: Capture
       add({ id, url, ...(typeof captionOf(d) === "string" ? { caption: captionOf(d) } : {}), ...(ts !== undefined ? { timestamp: ts } : {}), raw: d });
     }
   }
-  return { profile, entries };
+  if (tool === "gallery-dl") reportedCount = profile.posts;
+  return { profile, entries, nested, ...(reportedCount !== undefined ? { reportedCount } : {}) };
 }
 
 /** The stored, dated profile snapshot (stripped). */
