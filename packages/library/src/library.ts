@@ -32,7 +32,11 @@ export interface Library {
   name: string;
   root: string;
   mode: "read-write" | "read-only";
-  readOnlyReason?: "locked-by-other-device" | "newer-format" | "offline" | "not-writable";
+  /**
+   * `moved`: the library was moved elsewhere and this folder is the old copy (MOVED.json).
+   * `move-incomplete`: a move into this folder has not finished (.move-journal.json).
+   */
+  readOnlyReason?: "locked-by-other-device" | "newer-format" | "offline" | "not-writable" | "moved" | "move-incomplete";
   /** App-level config folder (outside the library), from Deps; holds the registry and audit anchors. */
   appConfigDir: string;
   /** This device's id, from Deps; recorded in audit events and change log entries. */
@@ -78,6 +82,11 @@ export class AlreadyALibraryError extends Error {
     this.name = "AlreadyALibraryError";
   }
 }
+
+/** Left in the old folder (or old project folder) after a library move. */
+export const MOVED_MARKER = "MOVED.json";
+/** Journal of a library move, in the destination until the move has finished. */
+export const MOVE_JOURNAL = ".move-journal.json";
 
 const metaPath = (root: string) => join(root, "library.json");
 const hintFor = (root: string, deps: Deps) => `${deps.hostname}:${basename(root)}`;
@@ -156,7 +165,17 @@ async function readMeta(root: string): Promise<LibraryJson> {
   };
 }
 
-export async function openLibrary(root: string, deps: Deps, opts: OpenOptions = {}): Promise<Library> {
+export function openLibrary(root: string, deps: Deps, opts: OpenOptions = {}): Promise<Library> {
+  return openLibraryInternal(root, deps, opts, {});
+}
+
+/** Package-internal: `ignoreMoveJournal` lets the move itself open its destination before the move has finished. */
+export async function openLibraryInternal(
+  root: string,
+  deps: Deps,
+  opts: OpenOptions,
+  internal: { ignoreMoveJournal?: boolean },
+): Promise<Library> {
   const meta = await readMeta(root);
   const key = resolve(root);
   const readOnly = (reason: NonNullable<Library["readOnlyReason"]>): Library => ({
@@ -175,6 +194,9 @@ export async function openLibrary(root: string, deps: Deps, opts: OpenOptions = 
     await note(root, meta, deps);
     return readOnly("newer-format");
   }
+  // A moved-away copy or an unfinished move: read-only, and not recorded as the library's location.
+  if (await exists(join(root, MOVED_MARKER))) return readOnly("moved");
+  if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
   // Same-process double open: the lock on disk is ours, so the lock rules
   // alone would let a second handle through.
   const onDisk = await readLock(root);

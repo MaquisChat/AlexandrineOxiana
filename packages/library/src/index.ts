@@ -48,14 +48,28 @@ export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, p
 export type { Location, LocationEnv, MountInfo } from "./location.js";
 export {
   InvalidConfirmTokenError,
+  MOVED_MARKER,
   MOVE_JOURNAL,
   MoveNotAllowedError,
   MoveVerificationError,
+  completeMove,
   deleteOldCopy,
   executeMove,
+  listPendingOldCopies,
   planMove,
 } from "./move.js";
-export type { DeleteOldCopyResult, MoveOptions, MovePlan, MoveProgress, MoveRefusal, MoveResult, PlanOptions, ProjectPlan } from "./move.js";
+export type {
+  DeleteOldCopyResult,
+  MoveOptions,
+  MovePlan,
+  MoveProgress,
+  MoveRefusal,
+  MoveResult,
+  PendingOldCopy,
+  PlanOptions,
+  ProjectPlan,
+  SwitchStep,
+} from "./move.js";
 export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
@@ -13,10 +13,15 @@ import {
   InvalidConfirmTokenError,
   MoveNotAllowedError,
   MoveVerificationError,
+  SimulatedMoveCrash,
+  completeMove,
   deleteOldCopy,
   executeMove,
+  listPendingOldCopies,
+  moveSeams,
   planMove,
 } from "./move.js";
+import { acquireLock, releaseLock } from "./lock.js";
 import { listLibraries } from "./registry.js";
 import type { Repo } from "./repo/index.js";
 import { openTestRepo, seams } from "./repo/testing.js";
@@ -148,12 +153,13 @@ beforeEach(async () => {
   now = new Date(NOW);
   ring = new KeyRing();
   open = [];
-  env = { homeDir: join(tmp, "home"), platform: "linux", mounts: [] };
+  env = { homeDir: join(tmp, "home"), platform: "linux", mounts: [{ path: "/", removable: false, network: false }] };
   pdf = join(tmp, "input.pdf");
   await writeFile(pdf, "%PDF-1.7\nhello research\n%%EOF\n");
 });
 afterEach(async () => {
   seams.failUndo = undefined;
+  moveSeams.crashAfter = undefined;
   for (const l of open) await l.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -167,29 +173,31 @@ describe("classifyLocation", () => {
     expect(classifyLocation("/Users/ana/Library/Mobile Documents/com~apple~CloudDocs/Research", mac())).toEqual({
       kind: "cloud_folder",
       cloudFolderId: "icloud",
+      certain: true,
     });
   });
   it("recognises OneDrive, Dropbox and Google Drive under ~/Library/CloudStorage", () => {
-    expect(classifyLocation("/Users/ana/Library/CloudStorage/OneDrive-Contoso/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso" });
-    expect(classifyLocation("/Users/ana/Library/CloudStorage/Dropbox-Personal/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox" });
+    expect(classifyLocation("/Users/ana/Library/CloudStorage/OneDrive-Contoso/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso", certain: true });
+    expect(classifyLocation("/Users/ana/Library/CloudStorage/Dropbox-Personal/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox", certain: true });
     expect(classifyLocation("/Users/ana/Library/CloudStorage/GoogleDrive-ana@uni.edu/My Drive/Lib", mac())).toEqual({
       kind: "cloud_folder",
       cloudFolderId: "googledrive:ana@uni.edu",
+      certain: true,
     });
   });
   it("recognises ~/Dropbox on any platform", () => {
-    expect(classifyLocation("/Users/ana/Dropbox/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox" });
-    expect(classifyLocation("/home/ana/Dropbox", { homeDir: "/home/ana", platform: "linux", mounts: [] })).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox" });
-    expect(classifyLocation("C:\\Users\\ana\\Dropbox\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox" });
+    expect(classifyLocation("/Users/ana/Dropbox/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox", certain: true });
+    expect(classifyLocation("/home/ana/Dropbox", { homeDir: "/home/ana", platform: "linux", mounts: [] })).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox", certain: true });
+    expect(classifyLocation("C:\\Users\\ana\\Dropbox\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "dropbox", certain: true });
   });
   it("recognises Windows OneDrive folders (case-insensitively) and Google Drive's G:\\My Drive", () => {
-    expect(classifyLocation("C:\\Users\\ana\\OneDrive - Contoso\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso" });
-    expect(classifyLocation("c:\\users\\ANA\\OneDrive\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Personal" });
-    expect(classifyLocation("G:\\My Drive\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "googledrive" });
+    expect(classifyLocation("C:\\Users\\ana\\OneDrive - Contoso\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso", certain: true });
+    expect(classifyLocation("c:\\users\\ANA\\OneDrive\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Personal", certain: true });
+    expect(classifyLocation("G:\\My Drive\\Lib", win())).toEqual({ kind: "cloud_folder", cloudFolderId: "googledrive", certain: true });
   });
   it("does not mistake a sibling folder for a cloud folder", () => {
-    expect(classifyLocation("/Users/ana/DropboxOld/Lib", mac())).toEqual({ kind: "device" });
-    expect(classifyLocation("/Users/bob/Dropbox/Lib", mac())).toEqual({ kind: "device" });
+    expect(classifyLocation("/Users/ana/DropboxOld/Lib", mac())).toMatchObject({ kind: "device" });
+    expect(classifyLocation("/Users/bob/Dropbox/Lib", mac())).toMatchObject({ kind: "device" });
   });
   it("uses the longest matching mount: removable, network, else device", () => {
     const linux: LocationEnv = {
@@ -201,19 +209,42 @@ describe("classifyLocation", () => {
         { path: "/mnt/nas", removable: false, network: true },
       ],
     };
-    expect(classifyLocation("/media/ana/USB/Lib", linux)).toEqual({ kind: "removable" });
-    expect(classifyLocation("/mnt/nas/share/Lib", linux)).toEqual({ kind: "network" });
-    expect(classifyLocation("/mnt/nasty/Lib", linux)).toEqual({ kind: "device" });
-    expect(classifyLocation("/home/ana/Lib", linux)).toEqual({ kind: "device" });
+    expect(classifyLocation("/media/ana/USB/Lib", linux)).toEqual({ kind: "removable", certain: true });
+    expect(classifyLocation("/mnt/nas/share/Lib", linux)).toEqual({ kind: "network", certain: true });
+    expect(classifyLocation("/home/ana/Lib", linux)).toEqual({ kind: "device", certain: true });
   });
   it("matches Windows drive letters from the mount list", () => {
     const w = win([
       { path: "E:\\", removable: true, network: false },
       { path: "Z:\\", removable: false, network: true },
     ]);
-    expect(classifyLocation("e:\\Lib", w)).toEqual({ kind: "removable" });
-    expect(classifyLocation("Z:\\lab\\Lib", w)).toEqual({ kind: "network" });
-    expect(classifyLocation("C:\\Research\\Lib", w)).toEqual({ kind: "device" });
+    expect(classifyLocation("e:\\Lib", w)).toEqual({ kind: "removable", certain: true });
+    expect(classifyLocation("Z:\\lab\\Lib", w)).toEqual({ kind: "network", certain: true });
+    // C: is not in this mount list: a guess.
+    expect(classifyLocation("C:\\Research\\Lib", w)).toEqual({ kind: "device", certain: false });
+  });
+  it("treats any ~/Library/CloudStorage folder as a cloud folder", () => {
+    expect(classifyLocation("/Users/ana/Library/CloudStorage/Box-Box/Lib", mac())).toEqual({ kind: "cloud_folder", cloudFolderId: "box-box", certain: true });
+  });
+  it("treats Windows UNC paths as network shares", () => {
+    expect(classifyLocation("\\\\nas\\lab\\Lib", win())).toEqual({ kind: "network", certain: true });
+  });
+  it("recognises OneDrive folders named by environment variables", () => {
+    const w: LocationEnv = { ...win(), vars: { OneDriveCommercial: "D:\\Sync\\OneDrive - Uni", OneDriveConsumer: "D:\\Home Sync" } };
+    expect(classifyLocation("D:\\Sync\\OneDrive - Uni\\Lib", w)).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Uni", certain: true });
+    expect(classifyLocation("d:\\home sync\\Lib", w)).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Personal", certain: true });
+  });
+  it("treats Linux /media, /run/media and /mnt/* as removable", () => {
+    const linux: LocationEnv = { homeDir: "/home/ana", platform: "linux", mounts: [{ path: "/", removable: false, network: false }] };
+    expect(classifyLocation("/media/ana/Stick/Lib", linux)).toEqual({ kind: "removable", certain: true });
+    expect(classifyLocation("/run/media/ana/Stick/Lib", linux)).toEqual({ kind: "removable", certain: true });
+    expect(classifyLocation("/mnt/disk/Lib", linux)).toEqual({ kind: "removable", certain: true });
+  });
+  it("is uncertain when the mount list is unknown or does not cover the path", () => {
+    expect(classifyLocation("/home/ana/Lib", { homeDir: "/home/ana", platform: "linux", mounts: [] })).toEqual({ kind: "device", certain: false });
+    expect(
+      classifyLocation("/home/ana/Lib", { homeDir: "/home/ana", platform: "linux", mounts: [{ path: "/", removable: false, network: false }], mountsKnown: false }),
+    ).toEqual({ kind: "device", certain: false });
   });
 });
 
@@ -267,7 +298,7 @@ describe("planMove", () => {
     const { lib, a, b } = await fixture(HIPAA_GOV, true);
     const dest = join(env.homeDir, "Library/CloudStorage/OneDrive-Contoso/Lib");
     const plan = await planMove(lib, dest, { ...env, platform: "darwin" });
-    expect(plan.destination).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso" });
+    expect(plan.destination).toEqual({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso", certain: true });
     const byId = Object.fromEntries(plan.perProject.map((p) => [p.projectId, p]));
     expect(byId[a.id]!.decision.result).toBe("allow");
     expect(byId[b.id]!.decision.result).toBe("deny");
@@ -307,7 +338,7 @@ describe("planMove", () => {
     // Remove the marker so only the in-memory recoveryPending flag remains.
     for (const n of await readdir(join(lib.root, ".tmp"))) await rm(join(lib.root, ".tmp", n), { recursive: true });
     await expect(planMove(lib, join(tmp, "Dest"), env)).resolves.toBeDefined();
-    await expect(planMove(lib, join(tmp, "Dest"), env, { repo })).rejects.toMatchObject({ code: "pending-writes" });
+    await expect(planMove(lib, join(tmp, "Dest"), env, { sourceRepo: repo })).rejects.toMatchObject({ code: "pending-writes" });
   });
 
   it("refuses a destination inside the source, or a source inside the destination", async () => {
@@ -367,10 +398,13 @@ describe("executeMove", () => {
     }
     expect(Object.keys(after).filter((r) => !(r in before))).toEqual([]);
     expect(after[".move-journal.json"]).toBeUndefined();
-    // Old copy untouched, lock released.
-    expect(await hashes(lib.root)).toEqual(before);
-    expect(lib.mode).toBe("read-write");
+    // Old copy untouched except for its MOVED.json marker; lock released; it now opens read-only.
+    expect(await hashes(lib.root, (r) => r === "MOVED.json")).toEqual(before);
+    const marker = JSON.parse(await readFile(join(lib.root, "MOVED.json"), "utf8"));
+    expect(marker).toEqual({ libraryId: lib.id, movedAt: NOW, toHint: "host-A:Lib" });
     await expect(stat(join(lib.root, ".lock"))).rejects.toThrow();
+    const old = await openLibrary(lib.root, mkDeps());
+    expect([old.mode, old.readOnlyReason]).toEqual(["read-only", "moved"]);
     // Modes preserved.
     expect((await stat(join(dest, "Exports", "private.txt"))).mode & 0o777).toBe(0o600);
     // Same library id, new location hint, registry points at the new root.
@@ -568,13 +602,12 @@ describe("deleteOldCopy", () => {
 
   it("refuses while the old copy is open on another device, without using up the token", async () => {
     const { lib, res } = await moved();
-    const other = await openLibrary(lib.root, { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1 });
-    open.push(other);
-    expect(other.mode).toBe("read-write");
+    const depsB = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1 };
+    // The old copy only opens read-only now; a device holding its lock (e.g. an older app) still blocks deletion.
+    expect((await acquireLock(lib.root, depsB)).acquired).toBe(true);
     await expect(deleteOldCopy(lib.root, res.confirmToken)).rejects.toMatchObject({ code: "old-copy-in-use" });
-    await other.close();
-    // Opening it there recorded a new location in library.json, so that file changed and is kept.
-    await expect(deleteOldCopy(lib.root, res.confirmToken)).resolves.toMatchObject({ kept: ["library.json"], rootRemoved: false });
+    await releaseLock(lib.root, depsB);
+    await expect(deleteOldCopy(lib.root, res.confirmToken)).resolves.toMatchObject({ kept: [], rootRemoved: true });
   });
 
   it("never deletes outside the old root and keeps files changed since the move", async () => {
@@ -612,3 +645,170 @@ describe("deleteOldCopy", () => {
   });
 });
 
+
+describe("review fixes (R33)", () => {
+  const DEVICE_ONLY_GOV = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: optional
+residency:
+  allowed: [device]
+`;
+
+  it("C1: with the source repo passed, library.move goes to the destination and the source audit is unchanged", async () => {
+    const { lib, repo, a, b } = await fixture();
+    const srcAudit = await hashes(join(lib.root, a.folder, "audit"));
+    const dest = join(tmp, "Dest");
+    await executeMove(lib, dest, { deps: mkDeps(), env, sourceRepo: repo });
+    expect(await hashes(join(lib.root, a.folder, "audit"))).toEqual(srcAudit);
+    for (const p of [a, b]) expect((await auditOf(dest, p.folder)).at(-1)!.action).toBe("library.move");
+    const meta = JSON.parse(await readFile(join(dest, "library.json"), "utf8"));
+    expect(meta.locationHistory.at(-1).hint).toBe("host-A:Dest");
+    const moved = await openLibrary(dest, mkDeps());
+    open.push(moved);
+    expect(moved.mode).toBe("read-write");
+    const r = await openTestRepo(moved, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    expect(r.integrityWarnings).toEqual([]);
+  });
+
+  it("C2: a destination reached through a symbolic link is classified by its real path too", async () => {
+    const { lib, b } = await fixture(HIPAA_GOV, true);
+    const home = await realpath(join(tmp));
+    const macEnv: LocationEnv = { homeDir: join(home, "home"), platform: "darwin", mounts: [{ path: "/", removable: false, network: false }] };
+    const cloud = join(macEnv.homeDir, "Library/CloudStorage/OneDrive-Contoso");
+    await mkdir(cloud, { recursive: true });
+    await symlink(cloud, join(tmp, "Innocent"));
+    const plan = await planMove(lib, join(tmp, "Innocent", "Lib"), macEnv);
+    expect(plan.destinations.map((d) => d.kind)).toEqual(["device", "cloud_folder"]);
+    expect(plan.destination).toMatchObject({ kind: "cloud_folder", cloudFolderId: "onedrive:Contoso" });
+    expect(plan.perProject.find((p) => p.projectId === b.id)!.decision.result).toBe("deny");
+    await expect(executeMove(lib, join(tmp, "Innocent", "Lib"), { deps: mkDeps(), env: macEnv })).rejects.toMatchObject({ code: "policy-denied" });
+  });
+
+  it("I3: an uncertain destination is evaluated as every plausible kind", async () => {
+    const { lib, a, b } = await fixture(DEVICE_ONLY_GOV);
+    const unknownEnv: LocationEnv = { ...env, mounts: [], mountsKnown: false };
+    const plan = await planMove(lib, join(tmp, "Dest"), unknownEnv);
+    expect(plan.destination).toEqual({ kind: "device", certain: false });
+    const db = plan.perProject.find((p) => p.projectId === b.id)!.decision;
+    expect(db.result).toBe("deny");
+    expect(db.result === "deny" && db.reason).toMatch(/^Destination type could not be determined/);
+    // A project allowing device and removable but not network is denied too.
+    expect(plan.perProject.find((p) => p.projectId === a.id)!.decision.result).toBe("deny");
+    const certain = await planMove(lib, join(tmp, "Dest"), env);
+    expect(certain.perProject.every((p) => p.decision.result === "allow")).toBe(true);
+  });
+
+  it("I4: refuses a project folder without a readable project.json, naming it", async () => {
+    const { lib } = await fixture();
+    await mkdir(join(lib.root, "Projects", "Orphan", "Sources"), { recursive: true });
+    await writeFile(join(lib.root, "Projects", "Orphan", "governance.yaml"), HIPAA_GOV);
+    const err = await planMove(lib, join(tmp, "Dest"), env).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "unreadable-project" });
+    expect((err as Error).message).toContain("Projects/Orphan");
+    await writeFile(join(lib.root, "Projects", "Orphan", "project.json"), "{ torn");
+    await expect(planMove(lib, join(tmp, "Dest"), env)).rejects.toMatchObject({ code: "unreadable-project" });
+    // A plain folder under Projects is ordinary content.
+    await rm(join(lib.root, "Projects", "Orphan"), { recursive: true });
+    await mkdir(join(lib.root, "Projects", "notes"));
+    await expect(planMove(lib, join(tmp, "Dest"), env)).resolves.toBeDefined();
+  });
+
+  it("I7: refuses names that collide under case folding or Unicode normalization", async () => {
+    const { lib } = await fixture();
+    await writeFile(join(lib.root, "Exports", "Note.txt"), "a");
+    await writeFile(join(lib.root, "Exports", "note.txt"), "b");
+    await writeFile(join(lib.root, "Exports", "café.txt"), "c");
+    await writeFile(join(lib.root, "Exports", "café.txt"), "d");
+    const err = await planMove(lib, join(tmp, "Dest"), env).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "name-collision" });
+    expect((err as Error).message).toContain("Exports/Note.txt ↔ Exports/note.txt");
+    expect((err as Error).message).toContain("Exports/café.txt ↔ Exports/café.txt");
+  });
+
+  it("I5: split move marks moved project folders, which the remaining library no longer loads; library.split is audited", async () => {
+    const { lib, a, b } = await fixture(HIPAA_GOV, true);
+    const dest = join(tmp, "Dest");
+    await executeMove(lib, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] });
+    expect(JSON.parse(await readFile(join(lib.root, a.folder, "MOVED.json"), "utf8"))).toMatchObject({ libraryId: lib.id, toHint: "host-A:Dest" });
+    const ev = (await auditOf(lib.root, b.folder)).at(-1)!;
+    expect(ev.action).toBe("library.split");
+    expect(ev.details).toMatchObject({ projectsMoved: [a.id], projectsRemaining: [b.id] });
+    expect(JSON.stringify(ev)).not.toContain(tmp);
+    const rest = await openLibrary(lib.root, mkDeps());
+    open.push(rest);
+    expect(rest.mode).toBe("read-write");
+    const r = await openTestRepo(rest, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    expect(r.listProjects().map((p) => p.id)).toEqual([b.id]);
+  });
+
+  it("I5: the old copy can be deleted after a restart from the persisted record, within 24 hours", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    await executeMove(lib, dest, { deps: mkDeps(), env });
+    const pending = await listPendingOldCopies(mkDeps());
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ oldRoot: lib.root, newRoot: dest, libraryId: lib.id, expired: false });
+    await expect(deleteOldCopy(lib.root, { confirm: true })).rejects.toBeInstanceOf(InvalidConfirmTokenError); // no deps
+    now = new Date(now.getTime() + 24 * 3600_000 + 1);
+    await expect(deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).rejects.toThrow(/expired/);
+    expect((await listPendingOldCopies(mkDeps()))[0]!.expired).toBe(true);
+    now = new Date(NOW);
+    const out = await deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() });
+    expect(out.rootRemoved).toBe(true);
+    expect(await listPendingOldCopies(mkDeps())).toEqual([]);
+    await expect(deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() })).rejects.toBeInstanceOf(InvalidConfirmTokenError);
+  });
+
+  async function assertFinished(lib: Library, dest: string, folders: string[]) {
+    expect(await readdir(dest)).not.toContain(".move-journal.json");
+    for (const f of folders) expect((await auditOf(dest, f)).filter((e) => e.action === "library.move")).toHaveLength(1);
+    const reg = await listLibraries(mkDeps());
+    expect(reg.find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(dest);
+    const d = await openLibrary(dest, mkDeps());
+    expect(d.mode).toBe("read-write");
+    await d.close();
+    expect(await listPendingOldCopies(mkDeps())).toHaveLength(1);
+  }
+
+  for (const step of ["register", "mark-old", "close-source", "audit-move"] as const) {
+    it(`I6: a crash after "${step}" is finished by completeMove`, async () => {
+      const { lib, a, b } = await fixture();
+      const dest = join(tmp, "Dest");
+      moveSeams.crashAfter = step;
+      await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+      await lib.close(); // the process died; its lock goes with it
+      const half = await openLibrary(dest, mkDeps());
+      expect([half.mode, half.readOnlyReason]).toEqual(["read-only", "move-incomplete"]);
+      const res = await completeMove(dest, mkDeps(), env);
+      expect(res.verified).toBe(true);
+      await assertFinished(lib, dest, [a.folder, b.folder]);
+      const old = await openLibrary(lib.root, mkDeps());
+      expect(old.readOnlyReason).toBe("moved");
+    });
+  }
+
+  it("I6: rerunning executeMove after a crash in a split switch finishes it without duplicate audit events", async () => {
+    const { lib, a, b } = await fixture(HIPAA_GOV, true);
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "audit-split";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    // Simulate the interrupted step not having been recorded: drop it from the journal so it runs again.
+    const jp = join(dest, ".move-journal.json");
+    const j = JSON.parse(await readFile(jp, "utf8"));
+    expect(j.phase).toBe("switching");
+    expect(JSON.stringify(j)).not.toContain(tmp);
+    j.switch.done = j.switch.done.filter((s: string) => s !== "audit-split");
+    await writeFile(jp, JSON.stringify(j));
+    const rest = await openLibrary(lib.root, mkDeps());
+    const res = await executeMove(rest, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] });
+    expect(res.verified).toBe(true);
+    await assertFinished(lib, dest, [a.folder]);
+    expect((await auditOf(lib.root, b.folder)).filter((e) => e.action === "library.split")).toHaveLength(1);
+  });
+
+  it("I6: completeMove refuses when no verified move is waiting", async () => {
+    await mkdir(join(tmp, "Empty"));
+    await expect(completeMove(join(tmp, "Empty"), mkDeps(), env)).rejects.toMatchObject({ code: "nothing-to-complete" });
+  });
+});

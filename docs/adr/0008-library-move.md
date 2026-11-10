@@ -9,19 +9,58 @@ Spec 4.5 lets a researcher move the whole library to another disk, a removable o
 
 ## Decision
 
-- **Where is the destination?** `classifyLocation(path, env)` maps a path to a `ResidencyKind` from the path alone, with the environment (home folder, platform, mounts) injected so the rules are pure and testable for any OS (`path.win32` / `path.posix` by `env.platform`, case-insensitive on macOS and Windows). Cloud-synced folders win over the disk they sit on: iCloud Drive → `icloud`; `~/Library/CloudStorage/OneDrive-<x>` and Windows `%USERPROFILE%\OneDrive[ - <x>]` → `onedrive:<x>` (a plain `OneDrive` is `onedrive:Personal`); Dropbox → `dropbox`; `~/Library/CloudStorage/GoogleDrive-<account>` → `googledrive:<account>`, Windows `X:\My Drive` → `googledrive` (the account is not in that path). Otherwise the longest mount containing the path decides `removable` / `network`, else `device`. `defaultLocationEnv()` probes the machine best effort (`/proc/mounts` + `/sys/block/*/removable`, macOS `mount`, Windows `wmic`/PowerShell drive types); failures give no mounts.
-- **Plan.** `planMove` evaluates `move` for every project with the classified destination, the system time zone and now. It refuses (`MoveNotAllowedError`) a read-only library, any `.tmp/txn-*.json` marker or `recoveryPending` project ("finish or resolve pending writes first"), a destination that is, contains, or is inside the library (real paths), and a non-empty destination unless it holds this library's `.move-journal.json` (a resume). Symbolic links or special files inside the library abort with `MoveVerificationError` naming them (the repository never writes through links).
-- **What is copied.** Everything except `.lock`, `.tmp/`, `library.sqlite-wal/-shm/-journal` and the journal. A passed `IndexHandle` is checkpointed first; otherwise `library.sqlite` is copied as is (it is rebuildable). File permission bits are preserved (0600 stays 0600). When projects are excluded, their folders are not copied, and neither is library-level derived data that may hold their content: `library.sqlite`, `Exports/`, `Backups/`, `.cache/` stay with them (the destination rebuilds its index; empty library folders are recreated).
-- **Copy, resumably.** The move holds the source lock throughout. Each file goes through `copyFileAtomic`. `<dest>/.move-journal.json` `{ libraryId, fromHint, startedAt, filesDone }` (relative paths, no absolute paths) is rewritten atomically every 50 files or 5 s and whenever the copy stops with an error (a throwing progress callback counts as an interruption). A rerun skips a journaled file only if its destination copy's SHA-256 and mode still match the source; stray `*.tmp-<hex>` files of an interrupted copy are removed.
-- **Verify, independently.** After copying, both sides are re-read and hashed; the copy's own hash is not trusted. Missing, different, or mode-changed files, files that appeared in the source meanwhile, and unexpected files at the destination all fail with `MoveVerificationError` (up to 20 paths). The registry and source stay untouched; the destination and its journal are kept for inspection, and a rerun resumes.
-- **Switch.** Register the new path first (registry), then, if projects were excluded, give the old folder a new `libraryId` and the name `<name> (remaining projects)` and register it as a separate library (written while the source lock is still held). Release the source lock, open the destination (which records its `locationHistory` hint), append `library.move` to every moved project through a repo opened on the destination (fromHint, toHint, destinationKind, cloudFolderId, projects moved/excluded, fileCount, totalBytes, verified) — hints are `host:folder-name`, never absolute paths — then remove the journal. The destination keeps the original `libraryId`: it is the same library, so its audit anchors still match.
-- **Delete the old copy only on confirmation.** `executeMove` returns a random `confirmToken`, held in memory, single-use, bound to the old root and library id, valid 24 h. `deleteOldCopy(oldRoot, token)` refuses while the old copy is open on a device, deletes only files that were verified at the destination and still hash the same, never through a symbolic link or outside `oldRoot` (`assertContained`), and then removes folders that are empty. If the old folder kept excluded projects it is a separate library, so only the moved projects' folders are deleted there. Files that changed since the move are kept and listed. Recorded as `library.old-copy-deleted` in the destination's projects.
-- **Audit failures after the switch** are returned as `warnings` and do not undo the switch: the data is already verified at the destination.
+- **Where is the destination?** `classifyLocation(path, env)` maps a path to `{ kind, cloudFolderId?, certain }` from the path alone. The environment (home folder, platform, mounts, whether the mount probe worked, and the `OneDrive*` variables) is injected, so the rules are pure and testable for any OS (`path.win32` / `path.posix` by `env.platform`, case-insensitive on macOS and Windows).
+  - Cloud-synced folders win over the disk they sit on:
+    - iCloud Drive → `icloud`
+    - `~/Library/CloudStorage/OneDrive-<x>` and Windows `%USERPROFILE%\OneDrive[ - <x>]` or the folders named by `%OneDrive%`, `%OneDriveCommercial%`, `%OneDriveConsumer%` → `onedrive:<x>` (a plain `OneDrive` is `onedrive:Personal`)
+    - Dropbox → `dropbox`
+    - `GoogleDrive-<account>` → `googledrive:<account>`; Windows `X:\My Drive` → `googledrive` (the account is not in that path)
+    - any other `~/Library/CloudStorage/<X>` → `<x>` lowercased
+  - Windows UNC paths are `network`.
+  - Otherwise the longest mount containing the path decides `network` / `removable`. On Linux, `/media`, `/run/media` and `/mnt/*` are `removable`.
+  - What remains is `device`, which is `certain` only when the mount list is known and covers the path.
+  - `defaultLocationEnv()` probes the machine best effort (`/proc/mounts` + `/sys/block/*/removable`, macOS `mount`, Windows `wmic`/PowerShell). A failure gives `mountsKnown: false`.
+- **Plan.** `planMove` classifies both the typed destination and its real path (symbolic links in existing ancestors resolved), and evaluates `move` for every project against each classification. An uncertain classification is evaluated as device, removable and network as well. Any deny denies the project ("Destination type could not be determined …" when the deny came from a guess).
+  - It refuses (`MoveNotAllowedError`) in these cases:
+    - a read-only library
+    - any `.tmp/txn-*.json` marker, or a `recoveryPending` project in the passed `sourceRepo` ("finish or resolve pending writes first")
+    - a destination that is the library, inside it, or contains it (real paths)
+    - a non-empty destination, unless it holds this library's `.move-journal.json` from the copy phase (a resume)
+    - a `Projects/<n>` folder that looks like a project (governance.yaml, Sources or project.json) but has no readable project.json, since its governance cannot be checked
+    - paths that collide under case folding or NFC normalization, whatever the platform, since the destination file system may fold them
+  - Symbolic links or special files inside the library abort with `MoveVerificationError` naming them.
+- **What is copied.** Everything except `.lock`, `.tmp/`, `library.sqlite-wal/-shm/-journal`, move markers, and project folders already marked MOVED.json.
+  - A passed `IndexHandle` is checkpointed first. Otherwise `library.sqlite` is copied as is, since it is rebuildable.
+  - Permission bits are preserved.
+  - When projects are excluded, their folders are not copied, and neither is library-level derived data that may hold their content: `library.sqlite`, `Exports/`, `Backups/` and `.cache/` stay with them.
+- **Copy, resumably.** The move holds the source lock throughout and copies with `copyFileAtomic`.
+  - `<dest>/.move-journal.json` is rewritten atomically every 50 files or 5 s, and whenever the copy stops with an error. A throwing progress callback counts as an interruption.
+  - A rerun skips a journaled file only if its destination copy's SHA-256 and mode still match the source.
+- **Verify, independently.** After copying, both sides are re-read and hashed. Missing, different or mode-changed files, files that appeared in the source, and unexpected destination files fail with `MoveVerificationError` (up to 20 paths). The registry and source are untouched, and the destination and journal are kept for inspection.
+  - Limit: right after the copy, the destination is usually re-read from the OS page cache, not from the medium. This catches copy and logic errors and later tampering, but not every write error a device would only show on a cold read. A full cold check belongs to the reconnect integrity check (spec 4.5).
+- **Switch, crash-safe.** Before the first registry write, the journal is rewritten with `phase: "switching"` and the full step plan. The plan holds no absolute paths: the old root and the verified hashes live in the pending old-copy record in the app config folder. The steps are recorded as done one by one, and each is idempotent:
+  1. **register:** the registry gets the new path first.
+  2. **mark-old:** without exclusions, write `<old>/MOVED.json` `{ libraryId, movedAt, toHint }`. With exclusions, give the old `library.json` a new id (planned in advance) and the name `<name> (remaining projects)`, register it, and write `Projects/<moved>/MOVED.json`. Only these paths may be written in the old folder (allow-list, `assertContained`).
+  3. **close-source:** release the source lock.
+  4. **audit-split:** with exclusions only, append `library.split` to the excluded projects through the remaining library.
+  5. **audit-move:** open the destination, which records its location hint, or use `destRepo`. Append `library.move` to every moved project. Audit events carry a `moveId`, so a step that is rerun never records an event twice.
+  6. **finalize:** mark the pending record complete and remove the journal.
+
+  `completeMove(dest, deps, env)` runs the steps not yet done after a crash, and so does rerunning `executeMove`. While the journal exists the destination opens read-only (`move-incomplete`). The old copy opens read-only (`moved`) and is not recorded as the library's location. The repo and the index skip project folders marked MOVED.json.
+- **Close after switch, a deviation from the controller ruling.** The ruling asked to close the source before the switch. We release the source lock after the first two switch steps instead: registering the destination and marking or splitting the old folder happen while the move still holds the old folder's lock, so no other device can open it read-write in between. The source repo is never written to after that.
+- **Delete the old copy only on confirmation.** `deleteOldCopy(oldRoot, token | { confirm: true }, { deps, destRepo })` accepts the in-memory single-use token from the move, or, after a restart, `{ confirm: true }` for a record listed by `listPendingOldCopies(deps)`. Either way it must be within 24 h of the move; otherwise it refuses with a clear message and the old copy stays read-only.
+  - It holds the old folder's lock while deleting, and refuses if another device holds it.
+  - It deletes only files that were verified and still hash the same, never through a symbolic link or outside `oldRoot`.
+  - The MOVED.json marker is removed only when nothing of that copy was kept, then empty folders are pruned.
+  - In a split library only `Projects/<moved>/` is touched.
+  - It is recorded as `library.old-copy-deleted` at the destination.
+- **Audit failures after the switch** are returned as `warnings` and do not undo it: the data is already verified at the destination.
 
 ## Consequences
 
-- A move never deletes or changes source data before verification; the worst case of any failure is a stray destination folder with a journal.
-- Until `deleteOldCopy`, two folders carry the same library id (no exclusions). Opening the old one shows a `truncated` audit warning, because the anchor moved on with the destination; reconnection should prefer the registry's first path.
-- With exclusions, the remaining library keeps the moved projects' folders and a stale `library.sqlite` until `deleteOldCopy`; its excluded projects get fresh audit anchors under the new library id.
-- The confirmation token does not survive an app restart; the old copy must then be deleted by hand (or a later task persists a deletion offer).
-- Moving to the sync server or S3 (Phase 5) will need a different copy back end but the same plan / verify / switch rules.
+- A move never deletes or changes source data before verification. A failed copy leaves at worst a destination folder with a journal (opens read-only). A crash during the switch is finished by `completeMove`.
+- The old copy is read-only until deleted, so two writable libraries with the same id never exist.
+- Excluded projects get fresh audit anchors under the remaining library's new id, and their `library.split` event records the split.
+- `findLibrary` / "search for library" (Task 14) must flag folders with MOVED.json or an unfinished move journal instead of offering them as the library.
+- The pending old-copy record is per device: a move interrupted during the switch can only be finished on the device that started it.
+- Moving to the sync server or S3 (Phase 5) will need a different copy back end but the same plan, verify and switch rules.

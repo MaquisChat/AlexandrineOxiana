@@ -5,7 +5,7 @@ import type { Asset, Collection, ConsentRecord, Participant, Project, Session, S
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { addDerivedAsset, type DerivedAssetInput } from "./assets.js";
-import { AnchorsUnreadableError, checkAnchor, type IntegrityWarning } from "./audit-store.js";
+import { AnchorsUnreadableError, AuditStore, checkAnchor, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
   createConsent,
@@ -352,13 +352,23 @@ function reportIncompleteLines(core: RepoCore, projectId: string, lines: Incompl
  * library, unresolved recovery) and the external anchor updated. Not exported
  * from the package: callers outside it cannot write arbitrary audit events.
  */
-export async function appendLibraryEvent(repo: Repo, projectId: string, action: string, details: Record<string, unknown>): Promise<void> {
+export async function appendLibraryEvent(
+  repo: Repo,
+  projectId: string,
+  action: string,
+  details: Record<string, unknown> & { moveId?: string },
+): Promise<void> {
   const core = cores.get(repo)!;
   core.assertWritable();
   return core.serial(async () => {
     core.assertWritable();
     const st = core.state(projectId);
     if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    // Idempotent per move: a move completed after a crash does not record the same step twice.
+    if (details.moveId !== undefined) {
+      const events = await AuditStore.read(st.audit.dir);
+      if (events.some((e) => e?.action === action && e.details?.moveId === details.moveId)) return;
+    }
     const at = core.clock().toISOString();
     await core.auditNow(st, {
       ...core.auditBase(st, at),
@@ -368,6 +378,11 @@ export async function appendLibraryEvent(repo: Repo, projectId: string, action: 
       details,
     });
   });
+}
+
+/** Package-internal: the library a repo was opened on. */
+export function repoLibrary(repo: Repo): Library {
+  return cores.get(repo)!.library;
 }
 
 /** Package-internal: ids of projects that refuse writes until the library is reopened. */

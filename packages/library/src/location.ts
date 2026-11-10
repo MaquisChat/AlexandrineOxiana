@@ -20,11 +20,20 @@ export interface LocationEnv {
   homeDir: string;
   platform: NodeJS.Platform;
   mounts: MountInfo[];
+  /** False when the mount list could not be probed; classifications that depend on it are then uncertain. Default true. */
+  mountsKnown?: boolean;
+  /** Environment variables that name sync folders: `OneDrive`, `OneDriveCommercial`, `OneDriveConsumer`. */
+  vars?: Partial<Record<"OneDrive" | "OneDriveCommercial" | "OneDriveConsumer", string>>;
 }
 
 export interface Location {
   kind: ResidencyKind;
   cloudFolderId?: string;
+  /**
+   * False when the kind is a guess: the mount list is unknown, or the path is not under any
+   * known mount. Callers must then treat the destination as possibly device, removable or network.
+   */
+  certain: boolean;
 }
 
 const pathFor = (platform: NodeJS.Platform) => (platform === "win32" ? path.win32 : path.posix);
@@ -72,9 +81,16 @@ function cloudFolder(p: string, env: LocationEnv): string | null {
       if (/^dropbox/i.test(top)) return "dropbox";
       const gd = /^googledrive-(.+)$/i.exec(top);
       if (gd) return `googledrive:${gd[1]}`;
+      // Every File Provider sync folder lives here (Box, pCloud, ...): a cloud folder in any case.
+      return top.toLowerCase();
     }
   }
   if (below(p, P.join(home, "Dropbox"), env)) return "dropbox";
+  for (const [name, dir] of Object.entries(env.vars ?? {})) {
+    if (!dir || !below(p, dir, env)) continue;
+    const base = pathFor(env.platform).basename(pathFor(env.platform).normalize(dir));
+    return oneDriveId(base) ?? `onedrive:${name === "OneDriveCommercial" ? "Business" : "Personal"}`;
+  }
   if (env.platform === "win32") {
     const inHome = below(p, home, env);
     const top = inHome?.[0];
@@ -94,17 +110,25 @@ function cloudFolder(p: string, env: LocationEnv): string | null {
  */
 export function classifyLocation(p: string, env: LocationEnv): Location {
   const cloud = cloudFolder(p, env);
-  if (cloud) return { kind: "cloud_folder", cloudFolderId: cloud };
+  if (cloud) return { kind: "cloud_folder", cloudFolderId: cloud, certain: true };
+  const P = pathFor(env.platform);
+  // Windows UNC paths (\\server\share) are network shares whatever the mount list says.
+  if (env.platform === "win32" && /^[\\/]{2}[^\\/?.]/.test(p)) return { kind: "network", certain: true };
   let best: { depth: number; m: MountInfo } | null = null;
   for (const m of env.mounts) {
     const rel = below(p, m.path, env);
     if (rel === null) continue;
-    const depth = pathFor(env.platform).normalize(m.path).length;
+    const depth = P.normalize(m.path).length;
     if (!best || depth > best.depth) best = { depth, m };
   }
-  if (best?.m.removable) return { kind: "removable" };
-  if (best?.m.network) return { kind: "network" };
-  return { kind: "device" };
+  if (best?.m.network) return { kind: "network", certain: true };
+  if (best?.m.removable) return { kind: "removable", certain: true };
+  // Where Linux desktops mount external drives.
+  if (env.platform === "linux") {
+    for (const base of ["/media", "/run/media"]) if ((below(p, base, env)?.length ?? 0) > 0) return { kind: "removable", certain: true };
+    if ((below(p, "/mnt", env)?.length ?? 0) > 0) return { kind: "removable", certain: true };
+  }
+  return { kind: "device", certain: env.mountsKnown !== false && best !== null };
 }
 
 const NETWORK_FS = new Set(["nfs", "nfs4", "cifs", "smbfs", "smb3", "afpfs", "webdav", "davfs", "fuse.sshfs", "sshfs", "9p", "ncpfs"]);
@@ -166,7 +190,8 @@ async function linuxRemovable(dev: string): Promise<boolean> {
   }
 }
 
-async function probeMounts(platform: NodeJS.Platform): Promise<MountInfo[]> {
+/** The mount list, or null when it could not be probed. */
+async function probeMounts(platform: NodeJS.Platform): Promise<MountInfo[] | null> {
   try {
     if (platform === "win32") {
       try {
@@ -183,11 +208,14 @@ async function probeMounts(platform: NodeJS.Platform): Promise<MountInfo[]> {
     for (const d of devs) if (await linuxRemovable(d)) removable.add(d);
     return parseProcMounts(text, (d) => removable.has(d));
   } catch {
-    return [];
+    return null;
   }
 }
 
-/** This machine's environment; mount probing is best effort (failures give an empty list). */
+/** This machine's environment; mount probing is best effort (a failure gives no mounts and `mountsKnown: false`). */
 export async function defaultLocationEnv(): Promise<LocationEnv> {
-  return { homeDir: homedir(), platform: process.platform, mounts: await probeMounts(process.platform) };
+  const mounts = await probeMounts(process.platform);
+  const vars: LocationEnv["vars"] = {};
+  for (const k of ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"] as const) if (process.env[k]) vars[k] = process.env[k];
+  return { homeDir: homedir(), platform: process.platform, mounts: mounts ?? [], mountsKnown: mounts !== null && mounts.length > 0, vars };
 }
