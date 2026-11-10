@@ -12,7 +12,7 @@ import {
   type AuditEvent,
 } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
-import { MOVED_MARKER, type Library } from "../library.js";
+import { projectMovedAway, type Library } from "../library.js";
 import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from "./audit-store.js";
 import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import { absPath, readMaybe } from "./io.js";
@@ -214,7 +214,7 @@ export async function loadProjects(
   for (const name of names.sort()) {
     if (name.startsWith(".")) continue;
     // A project moved to another library (split move): its old folder is not part of this one.
-    if (await readMaybe(join(projectsDir, name, MOVED_MARKER))) continue;
+    if (await projectMovedAway(core.root, name)) continue;
     const raw = await readMaybe(join(projectsDir, name, "project.json"));
     if (!raw) continue;
     const data = parseProjectJson(JSON.parse(raw.toString("utf8")));

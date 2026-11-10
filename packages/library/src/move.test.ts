@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
@@ -22,6 +22,7 @@ import {
   planMove,
 } from "./move.js";
 import { acquireLock, releaseLock } from "./lock.js";
+import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
 import { listLibraries } from "./registry.js";
 import type { Repo } from "./repo/index.js";
 import { openTestRepo, seams } from "./repo/testing.js";
@@ -810,5 +811,113 @@ residency:
   it("I6: completeMove refuses when no verified move is waiting", async () => {
     await mkdir(join(tmp, "Empty"));
     await expect(completeMove(join(tmp, "Empty"), mkDeps(), env)).rejects.toMatchObject({ code: "nothing-to-complete" });
+  });
+});
+
+describe("review fixes round 2", () => {
+  it("N1: after a crash right after the first switch step the source is not writable, and completion puts the destination first", async () => {
+    for (const step of ["register", "mark-old"] as const) {
+      const { lib } = await fixture();
+      const dest = join(tmp, `Dest-${step}`);
+      moveSeams.crashAfter = step;
+      await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+      await lib.close();
+      const src = await openLibrary(lib.root, mkDeps());
+      expect(src.mode).toBe("read-only");
+      expect(["moved", "move-incomplete"]).toContain(src.readOnlyReason);
+      await completeMove(dest, mkDeps(), env);
+      const reg = await listLibraries(mkDeps());
+      expect(reg.find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(dest);
+      expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
+      await rm(lib.root, { recursive: true, force: true });
+      await rm(join(tmp, "config"), { recursive: true, force: true });
+    }
+  });
+
+  async function splitThenRest() {
+    const f = await fixture(HIPAA_GOV, true);
+    await executeMove(f.lib, join(tmp, "Dest"), { deps: mkDeps(), env, excludeProjectIds: [f.b.id] });
+    const rest = await openLibrary(f.lib.root, mkDeps());
+    open.push(rest);
+    return { ...f, rest };
+  }
+
+  it("N2: a valid project marker is reported as moved away in the plan and the result", async () => {
+    const { rest, a, b } = await splitThenRest();
+    const plan = await planMove(rest, join(tmp, "Dest2"), env);
+    expect(plan.projectsMovedAway).toEqual([a.folder]);
+    expect(plan.perProject.map((p) => p.projectId)).toEqual([b.id]);
+    const res = await executeMove(rest, join(tmp, "Dest2"), { deps: mkDeps(), env });
+    expect(res.projectsMovedAway).toEqual([a.folder]);
+    expect(await walkFiles(join(tmp, "Dest2", a.folder))).toEqual([]);
+  });
+
+  it("N2: a marker from another library, or one older than its project.json, does not hide the project", async () => {
+    const { lib, a } = await fixture();
+    const markerPath = join(lib.root, a.folder, "MOVED.json");
+    await writeFile(markerPath, JSON.stringify({ libraryId: "someone-else", movedAt: NOW, toHint: "x:y" }));
+    let plan = await planMove(lib, join(tmp, "Dest"), env);
+    expect(plan.projectsMovedAway).toEqual([]);
+    expect(plan.perProject.map((p) => p.projectId)).toContain(a.id);
+    await writeFile(markerPath, JSON.stringify({ libraryId: lib.id, movedAt: NOW, toHint: "x:y" }));
+    const later = new Date(Date.now() + 3600_000);
+    await utimes(join(lib.root, a.folder, "project.json"), later, later);
+    plan = await planMove(lib, join(tmp, "Dest"), env);
+    expect(plan.projectsMovedAway).toEqual([]);
+    expect(plan.perProject.map((p) => p.projectId)).toContain(a.id);
+    await writeFile(markerPath, "{ torn");
+    plan = await planMove(lib, join(tmp, "Dest"), env);
+    expect(plan.perProject.map((p) => p.projectId)).toContain(a.id);
+  });
+
+  it("N2: deleteOldCopy keeps library.json and MOVED.json over unverified leftovers and lists them", async () => {
+    const { lib } = await fixture();
+    const res = await executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env });
+    await writeFile(join(lib.root, "Exports", "added-later.txt"), "not in the move");
+    const out = await deleteOldCopy(lib.root, res.confirmToken);
+    expect(out.leftovers).toEqual(["Exports/added-later.txt"]);
+    expect(out.rootRemoved).toBe(false);
+    expect(out.warnings.join(" ")).toMatch(/left/i);
+    expect((await walkFiles(lib.root)).sort()).toEqual(["Exports/added-later.txt", "MOVED.json", "library.json"]);
+    expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
+  });
+});
+
+describe("review fixes round 2: minors", () => {
+  it("{ confirm: true } uses the most recent non-expired record for that folder", async () => {
+    const { lib } = await fixture();
+    const old = { ...mkDeps(), clock: () => new Date(Date.parse(NOW) - 25 * 3600_000) };
+    const stale = await addPendingOldCopy(old, { oldRoot: lib.root, newRoot: join(tmp, "Gone"), libraryId: lib.id, split: false, movedFolders: [], movedProjectIds: [] }, { files: {}, dirs: [] });
+    await markPendingComplete(old, stale.id);
+    await executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env });
+    const out = await deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() });
+    expect(out.rootRemoved).toBe(true);
+  });
+
+  it("keeps the verified-hash folder owner-only", async () => {
+    const { lib } = await fixture();
+    await executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env });
+    expect((await stat(join(tmp, "config", "old-copies"))).mode & 0o777).toBe(0o700);
+  });
+
+  it("records whether the destination kind was certain", async () => {
+    const { lib, a } = await fixture();
+    await executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env });
+    expect((await auditOf(join(tmp, "Dest"), a.folder)).at(-1)!.details).toMatchObject({ destinationKind: "device", destinationCertain: true });
+  });
+
+  it("treats unknown FUSE file systems as uncertain", () => {
+    const mounts = parseProcMounts("/dev/sda1 / ext4 rw 0 0\nremote: /home/ana/cloud fuse.rclone rw 0 0\n/dev/sdc1 /data fuseblk rw 0 0", () => false);
+    expect(mounts).toEqual([
+      { path: "/", removable: false, network: false },
+      { path: "/home/ana/cloud", removable: false, network: false, uncertain: true },
+      { path: "/data", removable: false, network: false },
+    ]);
+    const e: LocationEnv = { homeDir: "/home/ana", platform: "linux", mounts };
+    expect(classifyLocation("/home/ana/cloud/Lib", e)).toEqual({ kind: "device", certain: false });
+    expect(classifyLocation("/data/Lib", e)).toEqual({ kind: "device", certain: true });
+    expect(parseMacMount("rclone@remote on /Volumes/cloud (macfuse, nodev, nosuid, synchronous, mounted by ana)")).toEqual([
+      { path: "/Volumes/cloud", removable: false, network: false, uncertain: true },
+    ]);
   });
 });

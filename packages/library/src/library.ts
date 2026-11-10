@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { newId } from "@ao/core";
 import type { Deps } from "./deps.js";
@@ -25,6 +25,8 @@ export interface LibraryJson {
   formatVersion: 1;
   createdAt: string;
   locationHistory: Array<{ at: string; hint: string }>;
+  /** Set on the library left behind by a move that excluded projects: the id of the library it was split from. */
+  splitFrom?: string;
 }
 
 export interface Library {
@@ -87,6 +89,28 @@ export class AlreadyALibraryError extends Error {
 export const MOVED_MARKER = "MOVED.json";
 /** Journal of a library move, in the destination until the move has finished. */
 export const MOVE_JOURNAL = ".move-journal.json";
+
+/**
+ * True when `Projects/<folderName>` holds a valid marker of a project moved to
+ * another library: it parses, names this library or the one it was split
+ * from, and its project.json has not changed since the marker was written.
+ * Anything else is an ordinary project folder (governed, loaded, moved).
+ */
+export async function projectMovedAway(root: string, folderName: string): Promise<boolean> {
+  const dir = join(root, "Projects", folderName);
+  try {
+    const mst = await lstat(join(dir, MOVED_MARKER));
+    if (!mst.isFile()) return false;
+    const m = JSON.parse(await readFile(join(dir, MOVED_MARKER), "utf8")) as { libraryId?: unknown; movedAt?: unknown };
+    if (typeof m.libraryId !== "string" || typeof m.movedAt !== "string" || Number.isNaN(Date.parse(m.movedAt))) return false;
+    const meta = JSON.parse(await readFile(metaPath(root), "utf8")) as Partial<LibraryJson>;
+    if (m.libraryId !== meta.libraryId && m.libraryId !== meta.splitFrom) return false;
+    const pj = await lstat(join(dir, "project.json")).catch(() => null);
+    return !(pj && pj.mtimeMs > Math.max(Date.parse(m.movedAt), mst.mtimeMs));
+  } catch {
+    return false;
+  }
+}
 
 const metaPath = (root: string) => join(root, "library.json");
 const hintFor = (root: string, deps: Deps) => `${deps.hostname}:${basename(root)}`;

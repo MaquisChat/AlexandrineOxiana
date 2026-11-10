@@ -14,6 +14,8 @@ export interface MountInfo {
   path: string;
   removable: boolean;
   network: boolean;
+  /** The file system type says nothing reliable about where data goes (e.g. `fuse.rclone`, macFUSE). */
+  uncertain?: boolean;
 }
 
 export interface LocationEnv {
@@ -123,6 +125,7 @@ export function classifyLocation(p: string, env: LocationEnv): Location {
   }
   if (best?.m.network) return { kind: "network", certain: true };
   if (best?.m.removable) return { kind: "removable", certain: true };
+  if (best?.m.uncertain) return { kind: "device", certain: false };
   // Where Linux desktops mount external drives.
   if (env.platform === "linux") {
     for (const base of ["/media", "/run/media"]) if ((below(p, base, env)?.length ?? 0) > 0) return { kind: "removable", certain: true };
@@ -132,6 +135,8 @@ export function classifyLocation(p: string, env: LocationEnv): Location {
 }
 
 const NETWORK_FS = new Set(["nfs", "nfs4", "cifs", "smbfs", "smb3", "afpfs", "webdav", "davfs", "fuse.sshfs", "sshfs", "9p", "ncpfs"]);
+/** FUSE file systems known to store data on a local disk. */
+const LOCAL_FUSE = new Set(["fuse.ntfs-3g", "fuseblk", "fuse.exfat", "fuse.bindfs"]);
 const VIRTUAL_FS = new Set(["proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "securityfs", "debugfs", "tracefs", "pstore", "bpf", "mqueue", "hugetlbfs", "configfs", "fusectl", "autofs", "binfmt_misc", "overlay", "nsfs", "rpc_pipefs", "devfs", "squashfs"]);
 
 /** `/proc/mounts`; `isRemovableDevice` answers for a device such as `/dev/sdb1`. Octal escapes (`\040`) are decoded. */
@@ -142,7 +147,8 @@ export function parseProcMounts(text: string, isRemovableDevice: (device: string
     if (!dev || !mnt || !fstype || VIRTUAL_FS.has(fstype)) continue;
     const p = mnt.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
     const network = NETWORK_FS.has(fstype) || dev.startsWith("//");
-    out.push({ path: p, removable: !network && isRemovableDevice(dev), network });
+    const uncertain = !network && (fstype.startsWith("fuse.") || fstype === "fuse") && !LOCAL_FUSE.has(fstype);
+    out.push({ path: p, removable: !network && isRemovableDevice(dev), network, ...(uncertain ? { uncertain } : {}) });
   }
   return out;
 }
@@ -157,7 +163,8 @@ export function parseMacMount(text: string): MountInfo[] {
     if (fstype === "devfs" || fstype === "autofs") continue;
     const network = NETWORK_FS.has(fstype) || dev.startsWith("//");
     const local = flags.split(",").map((s) => s.trim()).includes("local");
-    out.push({ path: mnt, removable: !network && local && mnt.startsWith("/Volumes/"), network });
+    const uncertain = !network && /fuse/i.test(fstype);
+    out.push({ path: mnt, removable: !network && !uncertain && local && mnt.startsWith("/Volumes/"), network, ...(uncertain ? { uncertain } : {}) });
   }
   return out;
 }

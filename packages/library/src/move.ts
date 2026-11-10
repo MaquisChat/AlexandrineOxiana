@@ -24,7 +24,7 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { copyFileAtomic, writeFileAtomic } from "./fs/atomic.js";
 import { checkpointTruncate, INDEX_FILE, type IndexHandle } from "./index/db.js";
-import { MOVED_MARKER, MOVE_JOURNAL, openLibraryInternal, type Library, type LibraryJson } from "./library.js";
+import { MOVED_MARKER, MOVE_JOURNAL, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
 import { classifyLocation, type Location, type LocationEnv } from "./location.js";
 import { acquireLock, peekLock, readLock, releaseLock } from "./lock.js";
 import {
@@ -138,6 +138,8 @@ export interface MovePlan {
   /** Every classification considered: the typed path, and its real path when different. */
   destinations: Location[];
   perProject: ProjectPlan[];
+  /** `Projects/<n>` folders validly marked as moved to another library: not projects of this library, not copied. */
+  projectsMovedAway: string[];
   /** Everything that would be copied with no project excluded. */
   totalBytes: number;
   fileCount: number;
@@ -173,6 +175,8 @@ export interface MoveResult {
   totalBytes: number;
   /** Files copied by this run (a resumed run skips files already copied and verified). */
   filesCopied: number;
+  /** `Projects/<n>` folders validly marked as moved to another library; they were not moved. */
+  projectsMovedAway: string[];
   /** Problems after the switch that did not undo it (e.g. an audit event that could not be appended). */
   warnings: string[];
 }
@@ -197,6 +201,7 @@ interface SwitchPlan {
   movedFolders: string[];
   movedProjectIds: string[];
   excludedProjectIds: string[];
+  projectsMovedAway: string[];
   fileCount: number;
   totalBytes: number;
   details: Record<string, unknown>;
@@ -359,7 +364,7 @@ async function readProjects(root: string): Promise<{ projects: Array<{ id: strin
     const folder = `Projects/${n}`;
     const dir = join(root, "Projects", n);
     if (!(await fsp.lstat(dir).then((s) => s.isDirectory(), () => false))) continue;
-    if (await isFile(join(dir, MOVED_MARKER))) {
+    if (await projectMovedAway(root, n)) {
       movedAway.push(folder);
       continue;
     }
@@ -391,6 +396,8 @@ function skipper(excludedFolders: string[], split: boolean): (rel: string) => bo
   return (rel) => {
     if (!rel.includes("/") && NEVER_COPIED.has(rel)) return true;
     if (split && !rel.includes("/") && SHARED_DERIVED.has(rel)) return true;
+    // A project-level marker that did not validate stays behind: copied, it might validate at the destination.
+    if (/^Projects\/[^/]+\/MOVED\.json$/.test(rel)) return true;
     return excludedFolders.some((f) => rel === f || rel.startsWith(`${f}/`));
   };
 }
@@ -482,7 +489,7 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
   const w = await walk(lib.root, skipper(movedAway, false));
   abortOnOdd(w);
   assertNoCollisions(w);
-  return { destination, destinations, perProject, fileCount: w.files.length, totalBytes: w.files.reduce((s, f) => s + f.size, 0) };
+  return { destination, destinations, perProject, projectsMovedAway: movedAway, fileCount: w.files.length, totalBytes: w.files.reduce((s, f) => s + f.size, 0) };
 }
 
 /** In-memory confirmation tokens → their persisted pending record. */
@@ -651,12 +658,13 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
     moveId,
     pendingId: rec.id,
     libraryName: lib.name,
-    steps: ["register", "mark-old", "close-source", ...(split ? (["audit-split"] as const) : []), "audit-move", "finalize"],
+    steps: ["mark-old", "register", "close-source", ...(split ? (["audit-split"] as const) : []), "audit-move", "finalize"],
     done: [],
     ...(split ? { remainingLibraryId: newId() } : {}),
     movedFolders: moved.map((p) => p.folder),
     movedProjectIds,
     excludedProjectIds: exclude,
+    projectsMovedAway: movedAway,
     fileCount,
     totalBytes,
     details: {
@@ -664,6 +672,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
       fromHint,
       toHint: hintFor(dest, deps),
       destinationKind: plan.destination.kind,
+      destinationCertain: plan.destinations.every((d) => d.certain),
       ...(plan.destination.cloudFolderId ? { cloudFolderId: plan.destination.cloudFolderId } : {}),
       projectsMoved: movedProjectIds,
       projectsExcluded: exclude,
@@ -705,6 +714,9 @@ export async function completeMove(destRoot: string, deps: Deps, _env?: Location
 
 async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: Deps, ctx: SwitchContext): Promise<MoveResult> {
   const sw = j.switch!;
+  // Registering is an idempotent upsert; always redo it so the destination is first even if
+  // the old copy was opened (and re-registered) between a crash and this completion.
+  sw.done = sw.done.filter((s) => s !== "register");
   const warnings: string[] = [];
   const oldRoot = rec.oldRoot;
   const step = async (name: SwitchStep, fn: () => Promise<void>) => {
@@ -725,22 +737,24 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
     await writeFileAtomic(p, data);
   };
 
-  await step("register", () => registerLibrary({ libraryId: j.libraryId, name: sw.libraryName, path: dest }, deps));
+  // The old copy is marked first, so it can never be opened read-write after the switch began.
   await step("mark-old", async () => {
     const marker = JSON.stringify({ libraryId: j.libraryId, movedAt: deps.clock().toISOString(), toHint: sw.details.toHint }, null, 2);
     if (!rec.split) {
       await oldWrite(MOVED_MARKER, marker);
       return;
     }
-    // The old folder keeps the excluded projects as a separate library with its own id.
+    // Moved project folders first (valid while library.json still names this library), then the
+    // old folder becomes a separate library with its own id, remembering the one it was split from.
+    for (const f of sw.movedFolders) await oldWrite(`${f}/${MOVED_MARKER}`, marker);
     const meta = JSON.parse(await fsp.readFile(join(oldRoot, "library.json"), "utf8")) as LibraryJson;
     const restName = meta.libraryId === sw.remainingLibraryId ? meta.name : `${sw.libraryName} (remaining projects)`;
     if (meta.libraryId !== sw.remainingLibraryId) {
-      await oldWrite("library.json", JSON.stringify({ ...meta, libraryId: sw.remainingLibraryId, name: restName }, null, 2));
+      await oldWrite("library.json", JSON.stringify({ ...meta, libraryId: sw.remainingLibraryId, name: restName, splitFrom: j.libraryId }, null, 2));
     }
     await registerLibrary({ libraryId: sw.remainingLibraryId!, name: restName, path: oldRoot }, deps);
-    for (const f of sw.movedFolders) await oldWrite(`${f}/${MOVED_MARKER}`, marker);
   });
+  await step("register", () => registerLibrary({ libraryId: j.libraryId, name: sw.libraryName, path: dest }, deps));
   await step("close-source", async () => {
     // The source repo, if any, is never written after this: its library handle is closed.
     if (ctx.source && resolve(ctx.source.root) === oldRoot) await ctx.source.close();
@@ -761,7 +775,16 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
 
   const confirmToken = randomBytes(32).toString("hex");
   tokens.set(confirmToken, { pendingId: rec.id, deps, tz: ctx.tz, actor: ctx.actor });
-  return { newRoot: dest, verified: true, confirmToken, fileCount: sw.fileCount, totalBytes: sw.totalBytes, filesCopied: 0, warnings };
+  return {
+    newRoot: dest,
+    verified: true,
+    confirmToken,
+    fileCount: sw.fileCount,
+    totalBytes: sw.totalBytes,
+    filesCopied: 0,
+    projectsMovedAway: sw.projectsMovedAway ?? [],
+    warnings,
+  };
 }
 
 /**
@@ -809,6 +832,8 @@ async function auditIn(
 
 export interface DeleteOldCopyResult {
   filesDeleted: number;
+  /** Up to 50 library-relative paths in the old copy that were not part of the verified move; they and the library's identity files were kept. */
+  leftovers: string[];
   /** Library-relative files of the old copy that were kept: changed since the move, or not safely inside it. */
   kept: string[];
   /** The old folder itself was removed (it was empty at the end). */
@@ -851,8 +876,9 @@ export async function deleteOldCopy(
   } else {
     if (auth?.confirm !== true || !opts.deps) throw new InvalidConfirmTokenError("unknown");
     deps = opts.deps;
-    rec = (await listPendingOldCopies(deps)).find((r) => r.oldRoot === root);
-    if (!rec) throw new InvalidConfirmTokenError("unknown");
+    const forRoot = (await listPendingOldCopies(deps)).filter((r) => r.oldRoot === root).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (forRoot.length === 0) throw new InvalidConfirmTokenError("unknown");
+    rec = forRoot.find((r) => !r.expired) ?? forRoot[0]!;
   }
   if (!rec.complete) throw new InvalidConfirmTokenError("unknown");
   if (root !== rec.oldRoot) throw new InvalidConfirmTokenError("wrong-root");
@@ -874,14 +900,32 @@ export async function deleteOldCopy(
   if (typeof auth === "string") tokens.delete(auth);
 
   const kept: string[] = [];
+  const warnings: string[] = [];
+  let leftovers: string[] = [];
   let filesDeleted = 0;
   let rootRemoved = false;
   try {
     const hashes = await readVerifiedHashes(rec);
     // With a split, only the moved projects' folders may be touched (allow-list).
     const inScope = (rel: string) => !rec.split || rec.movedFolders.some((f) => rel === f || rel.startsWith(`${f}/`));
+    // Content that was never part of the verified move (added since, or never copied): never deleted,
+    // and while any is left the old copy keeps its identity (library.json, MOVED.json) and stays read-only.
+    const ignorable = new Set([".lock", MOVED_MARKER, `${INDEX_FILE}-wal`, `${INDEX_FILE}-shm`, ...rec.movedFolders.map((f) => `${f}/${MOVED_MARKER}`)]);
+    const unverified: string[] = [];
+    for (const base of rec.split ? rec.movedFolders : [""]) {
+      const w = await walk(base ? abs(root, base) : root, () => false).catch(() => ({ files: [], dirs: [], odd: [] }) as Walked);
+      for (const rel of [...w.files.map((f) => f.rel), ...w.odd].map((r) => (base ? `${base}/${r}` : r))) {
+        if (!ignorable.has(rel) && !(rel in hashes.files)) unverified.push(rel);
+      }
+    }
+    leftovers = unverified.sort().slice(0, 50);
+    if (unverified.length > 0) {
+      warnings.push(`${unverified.length} file(s) in the old copy were not part of the move and were left in place; the old copy stays read-only until you remove them`);
+    }
+    const hasLeft = (prefix: string) => unverified.some((r) => !prefix || r.startsWith(`${prefix}/`));
     for (const [rel, hash] of Object.entries(hashes.files)) {
       if (!inScope(rel)) continue;
+      if (!rec.split && rel === "library.json" && unverified.length > 0) continue;
       const p = abs(root, rel);
       const st = await fsp.lstat(p).catch(() => null);
       if (st === null) continue;
@@ -909,9 +953,9 @@ export async function deleteOldCopy(
       // SQLite side files of the (checkpointed or rebuildable) index; never copied.
       for (const n of [`${INDEX_FILE}-wal`, `${INDEX_FILE}-shm`]) if (await isFile(join(root, n))) await fsp.unlink(join(root, n));
       // The marker keeps the old copy read-only while anything of it is left.
-      if (kept.length === 0) await removeMarker(MOVED_MARKER);
+      if (kept.length === 0 && !hasLeft("")) await removeMarker(MOVED_MARKER);
     } else {
-      for (const f of rec.movedFolders) if (!kept.some((k) => k.startsWith(`${f}/`))) await removeMarker(`${f}/${MOVED_MARKER}`);
+      for (const f of rec.movedFolders) if (!kept.some((k) => k.startsWith(`${f}/`)) && !hasLeft(f)) await removeMarker(`${f}/${MOVED_MARKER}`);
     }
     // Remove folders that are now empty, deepest first; rmdir never removes content or follows a link.
     const dirs = [...hashes.dirs.filter(inScope), ...(rec.split ? [] : [".tmp"])].sort((a, b) => b.split("/").length - a.split("/").length);
@@ -922,16 +966,15 @@ export async function deleteOldCopy(
   if (!rec.split) rootRemoved = await fsp.rmdir(root).then(() => true, () => false);
   await removePendingOldCopy(deps, rec.id);
 
-  const warnings: string[] = [];
   await auditIn(
     rec.newRoot,
     deps,
     { repo: opts.destRepo, tz, actor },
     rec.movedProjectIds,
     "library.old-copy-deleted",
-    { oldHint: hintFor(root, deps), scope: rec.split ? "moved-projects-only" : "whole-library", filesDeleted, filesKept: kept.length, rootRemoved },
+    { oldHint: hintFor(root, deps), scope: rec.split ? "moved-projects-only" : "whole-library", filesDeleted, filesKept: kept.length, leftovers: leftovers.length, rootRemoved },
     warnings,
     { expectId: rec.libraryId },
   );
-  return { filesDeleted, kept: kept.sort(), rootRemoved, warnings };
+  return { filesDeleted, kept: kept.sort(), leftovers, rootRemoved, warnings };
 }

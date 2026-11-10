@@ -1,7 +1,7 @@
 /** Reading project folders and change logs for index staleness. */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { MOVED_MARKER } from "../library.js";
+import { projectMovedAway } from "../library.js";
 import { openLine } from "../repo/io.js";
 import { parseProjectJson, type ProjectJson } from "../repo/state.js";
 import type { KeyRing } from "../crypto/keys.js";
@@ -29,7 +29,7 @@ export async function listProjectEntries(root: string): Promise<ProjectEntry[]> 
   for (const name of names.sort()) {
     if (name.startsWith(".")) continue;
     const rel = `Projects/${name}`;
-    if (await fsp.stat(join(root, rel, MOVED_MARKER)).then(() => true, () => false)) continue; // moved to another library
+    if (await projectMovedAway(root, name)) continue; // moved to another library
     let raw: string;
     try {
       raw = await fsp.readFile(join(root, rel, "project.json"), "utf8");

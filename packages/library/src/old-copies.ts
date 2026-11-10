@@ -61,7 +61,8 @@ export async function addPendingOldCopy(
 ): Promise<PendingOldCopy> {
   const id = randomBytes(12).toString("hex");
   const dir = join(deps.appConfigDir, "old-copies");
-  await fsp.mkdir(dir, { recursive: true });
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await fsp.chmod(dir, 0o700);
   const verifiedHashesFile = join(dir, `${id}.json`);
   await writeFileAtomic(verifiedHashesFile, JSON.stringify(hashes), { mode: 0o600 });
   const full: PendingOldCopy = { ...rec, id, verifiedHashesFile, createdAt: deps.clock().toISOString(), complete: false };
