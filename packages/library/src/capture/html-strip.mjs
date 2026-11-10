@@ -81,6 +81,13 @@ export function cleanCss(css) {
     const c = cleanUrl(u.trim());
     return c === null ? "url()" : `url(${q}${c}${q})`;
   });
+  // image-set("a.png?x" 1x, …): its candidates may be bare strings.
+  s = s.replace(/image-set\(([^)]*)\)/gi, (_m, inner) =>
+    `image-set(${inner.replace(/(["'])([^"']*)\1/g, (_q, q, u) => {
+      const c = cleanUrl(u.trim());
+      return c === null ? `${q}${q}` : `${q}${c}${q}`;
+    })})`,
+  );
   s = s.replace(/@import\s+(["'])([^"']*)\1/gi, (_m, q, u) => {
     const c = cleanUrl(u.trim());
     return c === null ? "" : `@import ${q}${c}${q}`;
@@ -115,9 +122,17 @@ function jsonHasSecret(value) {
   }
 }
 
+function looksLikeUrl(v) {
+  const t = String(v).trim();
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|\/|\.\.?\/)/i.test(t)) return true;
+  return !/\s/.test(t) && /[?#]/.test(t) && /[./]/.test(t);
+}
+
 const attr = (el, name) => el.attrs.find((a) => a.name.toLowerCase() === name)?.value;
 
 function cleanMeta(el) {
+  // The page's own CSP is irrelevant to a stored copy; ours is prefixed to every snapshot.
+  if ((attr(el, "http-equiv") ?? "").toLowerCase() === "content-security-policy") return false;
   const label = attr(el, "name") ?? attr(el, "property") ?? attr(el, "http-equiv") ?? attr(el, "itemprop") ?? "";
   if (secretName(label)) return false;
   const equiv = (attr(el, "http-equiv") ?? "").toLowerCase();
@@ -144,7 +159,10 @@ function keepElement(el) {
   if (DROP_ELEMENTS.has(tag)) return false;
   if (tag === "meta" && !cleanMeta(el)) return false;
   if (tag === "input") {
-    if ((attr(el, "type") ?? "").toLowerCase() === "password") return false;
+    const type = (attr(el, "type") ?? "").toLowerCase();
+    if (type === "password") return false;
+    // Hidden fields carry state (often tokens): their values are never kept.
+    if (type === "hidden") el.attrs = el.attrs.filter((a) => a.name.toLowerCase() !== "value");
     if (secretName(attr(el, "name") ?? "") || secretName(attr(el, "id") ?? "")) return false;
   }
   return true;
@@ -171,6 +189,13 @@ function cleanAttrs(el) {
       out.push({ ...a, value: cleanCss(a.value) });
       continue;
     }
+    // A data-* value that is a URL loses its query and fragment too.
+    if (name.startsWith("data-") && looksLikeUrl(a.value)) {
+      const c = cleanUrl(a.value);
+      if (c === null) continue;
+      out.push({ ...a, value: c });
+      continue;
+    }
     // Any other value that is a URL with a scheme we refuse (e.g. SVG `values`, `to`, `from`).
     if (cleanUrl(a.value) === null && /^[\s\u0000- ]*[a-z]+\s*:/i.test(a.value)) continue;
     out.push(a);
@@ -178,36 +203,125 @@ function cleanAttrs(el) {
   el.attrs = out;
 }
 
-/** The HTML snapshot as stored (see the module comment). */
-export function stripHtml(html) {
+const HTML_NS = "http://www.w3.org/1999/xhtml";
+/** Elements that let markup change meaning between parse and re-parse (mXSS) outside HTML. */
+const FOREIGN_DROP = new Set(["style", "mglyph", "malignmark"]);
+const isMalformed = (tag) => !/^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)?$/i.test(tag);
+
+/**
+ * The kept children of `node`, in order, built in one linear pass: comments and dropped elements
+ * removed; a malformed element (e.g. "scr<script" from a split tag) replaced by its own children.
+ */
+function keptChildren(node) {
+  const out = [];
+  const stack = [[node.childNodes ?? [], 0]];
+  while (stack.length) {
+    const top = stack[stack.length - 1];
+    if (top[1] >= top[0].length) {
+      stack.pop();
+      continue;
+    }
+    const k = top[0][top[1]++];
+    if (k.nodeName === "#comment") continue;
+    if (k.tagName) {
+      if (isMalformed(k.tagName)) {
+        stack.push([k.childNodes ?? [], 0]);
+        continue;
+      }
+      if (FOREIGN_DROP.has(k.tagName.toLowerCase()) && node.namespaceURI !== undefined && node.namespaceURI !== HTML_NS) continue;
+      if (!keepElement(k)) continue;
+    }
+    k.parentNode = node;
+    out.push(k);
+  }
+  return out;
+}
+
+/** One parse → clean → serialise round. */
+export function stripOnce(html) {
   const doc = parse(String(html));
   const stack = [doc];
   while (stack.length) {
     const node = stack.pop();
-    const kids = node.childNodes;
-    if (!kids) continue;
-    const next = [];
-    for (const k of kids) {
-      if (k.nodeName === "#comment") continue;
-      // A malformed name (e.g. "scr<script" from a split tag): the element goes, its content stays (cleaned).
-      if (k.tagName && !/^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)?$/i.test(k.tagName)) {
-        const inner = (k.childNodes ?? []).map((c) => ((c.parentNode = node), c));
-        kids.splice(kids.indexOf(k) + 1, 0, ...inner);
-        continue;
-      }
-      if (k.tagName && !keepElement(k)) continue;
-      next.push(k);
-    }
-    node.childNodes = next;
+    if (!node.childNodes) continue;
+    node.childNodes = keptChildren(node);
     for (const k of node.childNodes) {
-      if (k.tagName) {
-        cleanAttrs(k);
-        if (k.tagName.toLowerCase() === "style") {
-          for (const t of k.childNodes ?? []) if (t.nodeName === "#text") t.value = cleanCss(t.value);
-        }
-        stack.push(k);
-      }
+      if (!k.tagName) continue;
+      cleanAttrs(k);
+      if (k.tagName.toLowerCase() === "style") for (const t of k.childNodes ?? []) if (t.nodeName === "#text") t.value = cleanCss(t.value);
+      stack.push(k);
     }
   }
   return serialize(doc);
+}
+
+/** Prefixed to every stored snapshot (R104): defence in depth for a copy opened directly. */
+export const SNAPSHOT_CSP = `<meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">`;
+
+export const PRESCAN_LIMITS = { depth: 2_000, attributes: 50_000, elements: 200_000 };
+const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr", "keygen", "command"]);
+
+/**
+ * A cheap linear count of tags before parse5 runs (R104 I2): nesting depth (void and self-closed
+ * elements excluded), elements and attributes. Returns why the page is refused, or null.
+ */
+export function prescan(html) {
+  const s = String(html);
+  let depth = 0;
+  let maxDepth = 0;
+  let elements = 0;
+  let attributes = 0;
+  for (let i = s.indexOf("<"); i >= 0 && i < s.length; i = s.indexOf("<", i + 1)) {
+    const c = s.charCodeAt(i + 1);
+    if (c === 47) {
+      // </name>
+      if (depth > 0) depth--;
+      continue;
+    }
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122))) continue;
+    let j = i + 1;
+    while (j < s.length && /[A-Za-z0-9:-]/.test(s[j])) j++;
+    const name = s.slice(i + 1, j).toLowerCase();
+    elements++;
+    // Attributes: `=` outside quotes until the tag ends.
+    let quote = 0;
+    let k = j;
+    for (; k < s.length; k++) {
+      const ch = s.charCodeAt(k);
+      if (quote) {
+        if (ch === quote) quote = 0;
+      } else if (ch === 34 || ch === 39) quote = ch;
+      else if (ch === 61) attributes++;
+      else if (ch === 62) break;
+    }
+    const selfClosed = s.charCodeAt(k - 1) === 47;
+    if (!VOID.has(name) && !selfClosed) {
+      depth++;
+      if (depth > maxDepth) maxDepth = depth;
+    }
+    if (maxDepth > PRESCAN_LIMITS.depth) return "too deeply nested";
+    if (elements > PRESCAN_LIMITS.elements) return "too many elements";
+    if (attributes > PRESCAN_LIMITS.attributes) return "too many attributes";
+    i = k;
+  }
+  return null;
+}
+
+export class SnapshotRefused extends Error {}
+
+/**
+ * The HTML snapshot as stored (see the module comment): pre-scanned, then stripped until a round
+ * changes nothing (at most 3 rounds, R104 I1 — markup that keeps changing is refused), then
+ * prefixed with SNAPSHOT_CSP. Throws SnapshotRefused when the page is refused.
+ */
+export function stripHtml(html) {
+  const why = prescan(html);
+  if (why) throw new SnapshotRefused(why);
+  let cur = stripOnce(html);
+  for (let round = 1; ; round++) {
+    const next = stripOnce(cur);
+    if (next === cur) return SNAPSHOT_CSP + cur;
+    if (round >= 3) throw new SnapshotRefused("its markup does not settle");
+    cur = next;
+  }
 }

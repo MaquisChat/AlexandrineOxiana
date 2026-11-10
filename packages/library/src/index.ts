@@ -239,7 +239,7 @@ export {
 } from "./source-actions.js";
 export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";
-export { BROWSER_CAPTURE_LIMITS, captureBrowserPage } from "./capture/browser-capture.js";
+export { BROWSER_CAPTURE_LIMITS, HtmlSnapshotRefusedError, captureBrowserPage, htmlStripStats } from "./capture/browser-capture.js";
 export type { BrowserCaptureInput, BrowserCaptureResult, ExtractedPage } from "./capture/browser-capture.js";
 export { startMediaWorker } from "./media-worker.js";
 export type { MediaWorker, ToolsUpdate } from "./media-worker.js";

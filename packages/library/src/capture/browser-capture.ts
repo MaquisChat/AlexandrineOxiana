@@ -63,6 +63,8 @@ export interface BrowserCaptureInput {
 
 export interface BrowserCaptureResult {
   sourceId: string;
+  /** Why the page's HTML was not stored (its screenshot was), if so. */
+  htmlNote?: string;
   /** "created": a browser-captured source; "merged": added to the source the downloader made. */
   status: "created" | "merged";
   /** The downloader's outcome, when `alsoDownload` was asked for. */
@@ -123,7 +125,17 @@ export async function captureBrowserPage(
 ): Promise<BrowserCaptureResult> {
   const v = validate(input);
   const { url, png, ex } = v;
-  const html = v.html === undefined ? undefined : await stripHtmlSnapshot(v.html);
+  let html: string | undefined;
+  let htmlNote: string | undefined;
+  if (v.html !== undefined) {
+    try {
+      html = await stripHtmlSnapshot(v.html);
+    } catch (err) {
+      // The HTML is refused; the screenshot (if any) is still the page as seen (R104).
+      if (!(err instanceof HtmlSnapshotRefusedError) || !png) throw err;
+      htmlNote = err.message;
+    }
+  }
   const root = repoLibrary(repo).root;
   const name = `capture-${randomUUID()}`;
   const work = join(root, ".tmp", name);
@@ -160,7 +172,7 @@ export async function captureBrowserPage(
             verification: (next) => recheckSourceFile(next, {}).verification,
           });
         }
-        return { sourceId, status: "merged", download };
+        return { sourceId, status: "merged", download, ...(htmlNote ? { htmlNote } : {}) };
       }
     }
 
@@ -203,7 +215,7 @@ export async function captureBrowserPage(
       { provenance, fieldEvidence: evidence },
     );
     await repo.recheckSource(projectId, sf.source.id);
-    return { sourceId: sf.source.id, status: "created", ...(download ? { download } : {}) };
+    return { sourceId: sf.source.id, status: "created", ...(download ? { download } : {}), ...(htmlNote ? { htmlNote } : {}) };
   } finally {
     await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
     activeTemp.delete(name);
@@ -213,21 +225,38 @@ export async function captureBrowserPage(
 // ------------------------------------------------------------------------------------------
 // HTML snapshot stripping (R41/R42 applied to markup; R101 N1/N2, R102 N4)
 
-/** How long one snapshot may take to strip, and the worker's heap cap. */
+/** How long one snapshot may take to strip, and each worker's heap cap (R104 I2). */
 export const HTML_STRIP_TIMEOUT_MS = 30_000;
-const HTML_STRIP_HEAP_MB = 512;
+const HTML_STRIP_HEAP_MB = 256;
+/** Workers stripping at the same time; more requests wait their turn (R104 I2). */
+export const HTML_STRIP_MAX_WORKERS = 2;
 const STRIP_WORKER = new URL("./html-strip-worker.mjs", import.meta.url);
 
-/**
- * The page's HTML as stored: parsed with parse5 and serialised from the cleaned tree (see
- * html-strip.mjs for what is removed and cleaned), in a worker thread so a large or adversarial
- * page never blocks the service's event loop. InvalidInputError when it cannot be processed.
- *
- * Archived snapshots are only ever rendered in a sandboxed iframe — no allow-scripts, no
- * allow-same-origin, CSP `script-src 'none'`, served from a separate origin or a blob — never in
- * the app's webview (R101, binding for Tasks 33/34). This stripping is defence in depth.
- */
-export function stripHtmlSnapshot(html: string): Promise<string> {
+/** The page's HTML was not stored (too large or deep, or markup that does not settle); the screenshot still is. */
+export class HtmlSnapshotRefusedError extends InvalidInputError {
+  override name = "HtmlSnapshotRefusedError";
+}
+
+let active = 0;
+let peak = 0;
+const waiting: Array<() => void> = [];
+
+/** Workers running now and the most seen at once (tests, diagnostics). */
+export function htmlStripStats(): { active: number; peak: number; queued: number } {
+  return { active, peak, queued: waiting.length };
+}
+
+async function slot(): Promise<() => void> {
+  if (active >= HTML_STRIP_MAX_WORKERS) await new Promise<void>((r) => waiting.push(r));
+  active++;
+  peak = Math.max(peak, active);
+  return () => {
+    active--;
+    waiting.shift()?.();
+  };
+}
+
+function runWorker(html: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(STRIP_WORKER, { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
     let settled = false;
@@ -238,11 +267,33 @@ export function stripHtmlSnapshot(html: string): Promise<string> {
       void worker.terminate().catch(() => {});
       fn();
     };
-    const timer = setTimeout(() => finish(() => reject(new InvalidInputError("The page's HTML could not be processed in time."))), HTML_STRIP_TIMEOUT_MS);
-    worker.once("message", (m: { ok: boolean; html?: string }) =>
-      finish(() => (m.ok && typeof m.html === "string" ? resolve(m.html) : reject(new InvalidInputError("The page's HTML could not be processed.")))),
+    const timer = setTimeout(() => finish(() => reject(new HtmlSnapshotRefusedError("The page's HTML could not be processed in time, so only its screenshot was kept."))), HTML_STRIP_TIMEOUT_MS);
+    worker.once("message", (m: { ok: boolean; html?: string; refused?: boolean; reason?: string }) =>
+      finish(() =>
+        m.ok && typeof m.html === "string"
+          ? resolve(m.html)
+          : reject(new HtmlSnapshotRefusedError(m.refused ? `The page's HTML was not kept (${m.reason ?? "refused"}); its screenshot was.` : "The page's HTML could not be processed, so only its screenshot was kept.")),
+      ),
     );
-    worker.once("error", () => finish(() => reject(new InvalidInputError("The page's HTML could not be processed."))));
-    worker.once("exit", () => finish(() => reject(new InvalidInputError("The page's HTML could not be processed."))));
+    worker.once("error", () => finish(() => reject(new HtmlSnapshotRefusedError("The page's HTML could not be processed, so only its screenshot was kept."))));
+    worker.once("exit", () => finish(() => reject(new HtmlSnapshotRefusedError("The page's HTML could not be processed, so only its screenshot was kept."))));
   });
+}
+
+/**
+ * The page's HTML as stored (html-strip.mjs: pre-scan limits, parse5 to a fixpoint, CSP meta
+ * prefixed), in a worker thread from a pool of HTML_STRIP_MAX_WORKERS so a large or adversarial page
+ * never blocks the service's event loop or its memory. HtmlSnapshotRefusedError when not kept.
+ *
+ * Archived snapshots are only ever rendered in a sandboxed iframe — no allow-scripts, no
+ * allow-same-origin, CSP `script-src 'none'`, served from a separate origin or a blob — never in
+ * the app's webview (R101, binding for Tasks 33/34). This stripping is defence in depth.
+ */
+export async function stripHtmlSnapshot(html: string): Promise<string> {
+  const release = await slot();
+  try {
+    return await runWorker(html);
+  } finally {
+    release();
+  }
 }
