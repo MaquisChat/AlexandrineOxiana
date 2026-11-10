@@ -27,6 +27,7 @@ import { encName } from "@ao/core";
 import { decryptBytes, readMaybe } from "../../repo/io.js";
 import { projectDataKey } from "../../repo/repo.js";
 import { join } from "node:path";
+import { zoteroKeysOf } from "../../repo/tombstones.js";
 import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, writeBatchRecord } from "./batch.js";
 import { revertMerge } from "./merge.js";
 import { BatchRefusedError } from "./run.js";
@@ -164,15 +165,27 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
 
   // 3b. Deletion records (R74 I3): those the batch's review decisions wrote come off; those its
   //     includeDeleted run cleared go back.
-  const written = [...new Set(journal.flatMap((e) => e.tombstoned ?? []))];
+  //     Each review deletion is taken back once (another deletion that recorded the same key keeps
+  //     it, R77), and never for a key a surviving source still carries (zoteroKey or merged keys).
+  const written = journal.flatMap((e) => e.tombstoned ?? []);
   const cleared = rec.clearedDeletions ?? [];
   if (written.length || cleared.length) {
+    const carried = new Set<string>();
+    if (written.length) {
+      for (const id of repo.listSourceIds(projectId)) {
+        try {
+          for (const k of zoteroKeysOf(await repo.getSource(projectId, id))) carried.add(k);
+        } catch {
+          // unreadable: cannot tell what it carries
+        }
+      }
+    }
     await importChange(
       repo,
       projectId,
       BOOKKEEPING,
       async (ops) => {
-        if (written.length) await ops.clearDeletions(written);
+        for (const keys of journal.filter((e) => e.tombstoned?.length).map((e) => e.tombstoned!)) await ops.releaseDeletions(keys, carried);
         if (cleared.length) await ops.addDeletions(cleared);
       },
       { op: "import.undo.deleted-records" },

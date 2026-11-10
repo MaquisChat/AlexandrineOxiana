@@ -152,10 +152,13 @@ export const MAX_SOURCE_ANNOTATION_TEXT = 16 * 1024 * 1024;
 
 const textOf = (a: { body?: string; quote?: string }) => (a.body?.length ?? 0) + (a.quote?.length ?? 0);
 
-/** Takes annotations while the source stays within the caps (given what it already has); counts the rest. */
-export function capAnnotations<T extends { body?: string; quote?: string }>(have: Array<{ body?: string; quote?: string }>, list: T[]): { kept: T[]; dropped: number } {
-  let count = have.length;
-  let chars = have.reduce((n, a) => n + textOf(a), 0);
+/** Takes annotations while the source stays within the caps (given what it already has, or its count and text); counts the rest. */
+export function capAnnotations<T extends { body?: string; quote?: string }>(
+  have: Array<{ body?: string; quote?: string }> | { count: number; chars: number },
+  list: T[],
+): { kept: T[]; dropped: number } {
+  let count = Array.isArray(have) ? have.length : have.count;
+  let chars = Array.isArray(have) ? have.reduce((n, a) => n + textOf(a), 0) : have.chars;
   const kept: T[] = [];
   for (const a of list) {
     const t = textOf(a);
@@ -201,9 +204,22 @@ export function planAnnotations(sf: SourceFile, scanned: ScanAnnotation[], make:
     }
     plan.updated.push({ before: ex, after: { ...next, id: ex.id, author: ex.author, createdAt: ex.createdAt } });
   }
-  const capped = capAnnotations(sf.annotations, fresh);
+  // Updates may grow the text too: within the 16 MB cap, in order; the rest is left as it is (counted).
+  let chars = sf.annotations.reduce((n, a) => n + textOf(a), 0);
+  const updates: AnnotationPlan["updated"] = [];
+  for (const u of plan.updated) {
+    const grown = chars - textOf(u.before) + textOf(u.after);
+    if (grown > MAX_SOURCE_ANNOTATION_TEXT) {
+      plan.dropped++;
+      continue;
+    }
+    chars = grown;
+    updates.push(u);
+  }
+  plan.updated = updates;
+  const capped = capAnnotations({ count: sf.annotations.length, chars }, fresh);
   plan.added = capped.kept;
-  plan.dropped = capped.dropped;
+  plan.dropped += capped.dropped;
   return plan;
 }
 

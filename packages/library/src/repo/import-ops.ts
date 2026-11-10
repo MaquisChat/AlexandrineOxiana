@@ -10,7 +10,7 @@ import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mut
 import { readFullData, writeProjectData } from "./projects.js";
 import { appendReviewEntry, appendReviewUpdate, readReviewEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
-import { addDeletions, clearDeletions, resetDeletions } from "./tombstones.js";
+import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
 import type { RepoCore } from "./state.js";
 
 export interface ImportOps {
@@ -25,6 +25,8 @@ export interface ImportOps {
   clearDeletions(zoteroKeys: string[]): Promise<string[]>;
   /** Records these Zotero item keys as deleted here (undo puts back what it cleared, R74 I3); returns those newly recorded. */
   addDeletions(zoteroKeys: string[]): Promise<string[]>;
+  /** Undo (R77): takes back one deletion each for these keys, except those a surviving source carries. */
+  releaseDeletions(zoteroKeys: string[], keep: ReadonlySet<string>): Promise<void>;
   /** resetDeletedRecords (R74 I2): sets an unreadable record aside and clears the warning. */
   resetDeletions(): Promise<boolean>;
   /** Copies a file into the source's `original/` folder as a further original; returns the asset (not yet written to the source). */
@@ -75,6 +77,7 @@ export function runImportChange<T>(
         deleteSource: (id, o) => deleteSourceInTx(core, tx, id, o),
         clearDeletions: (keys) => clearDeletions(core, tx, keys),
         addDeletions: (keys) => addDeletions(core, tx, keys),
+        releaseDeletions: (keys, keep) => releaseDeletions(core, tx, keys, keep),
         resetDeletions: () => resetDeletions(core, tx),
         async copyOriginal(sf, input) {
           const folder = sf.source.folder;

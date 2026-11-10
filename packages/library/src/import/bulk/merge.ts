@@ -40,7 +40,7 @@ export interface MergeRecord {
   addedAnnotationIds?: string[];
   /** Imported annotations an update changed (R75): undo puts back `before` while the annotation is still `after`. */
   updatedAnnotations?: Array<{ before: Annotation; after: Annotation }>;
-  /** Zotero item keys a merge added to the target's provenance `zoteroMergedKeys` (R74 M5). */
+  /** Zotero item keys a merge added to the target's `mergedExternalKeys.zotero` (R74 M5; outside provenance, R76). */
   addedMergedKeys?: string[];
   /** Updates (R72): fields kept because they were changed after the last import (JSON pointers). */
   kept?: string[];
@@ -93,7 +93,7 @@ export function applyMerge(
   at: string,
   actor: string,
   tagIds: string[] = [],
-  /** Zotero item keys merged in (R74 M5): remembered in the target's provenance, so deleting it keeps them deleted. */
+  /** Zotero item keys merged in (R74 M5): remembered in the target's `mergedExternalKeys` (never provenance, R76), so deleting it keeps them deleted. */
   mergedKeys: string[] = [],
 ): { next: SourceFile; record: MergeRecord } {
   let source: Src = { ...cur.source, modifiedAt: at, modifiedBy: actor };

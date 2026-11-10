@@ -109,7 +109,10 @@ function safeHref(raw: string | undefined): string | undefined {
  * a link's address, and whitespace, percent-encoded (R75 I3): the URL is inert text.
  */
 export function encodeHref(v: string): string {
-  return v.replace(/[()[\]<>*_!`"'\\\s]/gu, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+  // Non-ASCII (U+2028, U+00A0 …) as its UTF-8 bytes; the ASCII characters above as %XX.
+  return v.replace(/[()[\]<>*_!`"'\\\s]|[^\u0000-\u007f]/gu, (c) =>
+    c.charCodeAt(0) > 0x7f ? encodeURIComponent(c) : `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+  );
 }
 
 type El = MiniElement;
@@ -266,7 +269,9 @@ export function sanitizeNoteHtml(htmlIn: string): El {
       continue;
     }
     if (name === "img") {
-      append({ tag: "X-IMAGE", kids: ["image"] }); // not blank, so turndown keeps it
+      // Images count toward the element cap; past it, the placeholder is plain text.
+      if (++elements > MAX_ELEMENTS) text(` ${IMAGE_PLACEHOLDER} `);
+      else append({ tag: "X-IMAGE", kids: ["image"] }); // not blank, so turndown keeps it
       continue;
     }
     if (!KEEP.has(name)) continue; // unknown or presentational: the tag goes, its text stays

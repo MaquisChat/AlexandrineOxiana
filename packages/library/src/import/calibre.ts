@@ -24,7 +24,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Creator } from "@ao/core";
 import { parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanContext, ScanItem } from "./bulk/scan.js";
-import { CopyNoSpace, CopyTooLarge, CopyUnstable, cappedRows, copyDatabases, openCopy, plainTables, t64 } from "./sqlite-copy.js";
+import { CopyNoSpace, CopyTooLarge, CopyUnstable, CopyUnusual, UNUSUAL_STATE_REASON, cappedRows, copyDatabases, openCopy, plainTables, t64 } from "./sqlite-copy.js";
 import { exportIdentity, isbnsOf, recordItem, skippedNote, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
 
 export const CALIBRE_REASONS = {
@@ -32,6 +32,7 @@ export const CALIBRE_REASONS = {
   tooLarge: "The Calibre library is too large to import (its metadata.db is over 1 GB or lists too many books), so nothing was imported from it.",
   busy: "Calibre is busy saving — try again in a moment or close Calibre.",
   noSpace: "There is not enough free disk space to read the Calibre library; free some space and try again.",
+  unusual: UNUSUAL_STATE_REASON,
 } as const;
 
 /** The largest metadata.db copied (R68 I1). */
@@ -66,6 +67,7 @@ export async function copyCalibreDb(libraryDir: string, workDir: string, signal?
     if (err instanceof CopyTooLarge) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
     if (err instanceof CopyUnstable) throw new CalibreUnreadable(CALIBRE_REASONS.busy);
     if (err instanceof CopyNoSpace) throw new CalibreUnreadable(CALIBRE_REASONS.noSpace);
+    if (err instanceof CopyUnusual) throw new CalibreUnreadable(CALIBRE_REASONS.unusual);
     throw err;
   }
 }

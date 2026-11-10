@@ -37,7 +37,11 @@ export interface IntegrityWarning {
     /** An audit event could not be appended while opening; the project refuses writes until reopened. */
     | "audit-append-failed-at-open"
     /** The project's record of sources deleted here could not be read; set aside (R74 I2). */
-    | "deleted-records-unreadable";
+    | "deleted-records-unreadable"
+    /** A source's annotations file is missing or damaged; the source is read without annotations (R77). */
+    | "annotations-unreadable"
+    /** A source's annotations file does not match its recorded hash; read as it is (R77). */
+    | "annotations-hash-mismatch";
   detail: string;
   /** Library-relative file, for the two incomplete-line kinds. */
   file?: string;

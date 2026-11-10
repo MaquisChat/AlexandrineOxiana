@@ -139,13 +139,48 @@ export async function readSourceFile(core: RepoCore, st: ProjectState, id: strin
   const text = await read(encrypted ? `${folder}/source.json.enc` : `${folder}/source.json`);
   if (text === null) throw new NotFoundError("Source", id);
   const sf = SourceFile.parse(JSON.parse(text));
-  // Annotations in their own file; a source.json from before keeps them inline (moved on its next write).
+  // Annotations in their own file; a source.json from before keeps them inline (moved on its next
+  // write). A missing or damaged file never makes the source unreadable (R77): no annotations,
+  // and an integrity warning; a file whose hash differs from the recorded one is read, with a warning.
   if (!sf.annotations.length && sf.annotationCount) {
-    const anns = await read(annotationsRel(folder, encrypted));
-    if (anns === null) throw new NotFoundError("Source annotations", id);
-    sf.annotations = Annotation.array().parse(JSON.parse(anns));
+    const rel = annotationsRel(folder, encrypted);
+    let anns: string | null = null;
+    try {
+      anns = await read(rel);
+      if (anns === null) throw new Error("missing");
+      sf.annotations = Annotation.array().parse(JSON.parse(anns));
+      if (sf.annotationsSha256 && createHash("sha256").update(anns).digest("hex") !== sf.annotationsSha256) {
+        annotationWarning(core, st, rel, "annotations-hash-mismatch", "The annotations file of a source was changed outside the app; it was read as it is.");
+      }
+    } catch {
+      sf.annotations = [];
+      annotationWarning(core, st, rel, "annotations-unreadable", "The annotations file of a source is missing or damaged; the source is shown without annotations.");
+    }
   }
   return sf;
+}
+
+/** Records an annotation-file integrity warning once per file (R77). */
+function annotationWarning(core: RepoCore, st: ProjectState, file: string, kind: "annotations-unreadable" | "annotations-hash-mismatch", detail: string): void {
+  if (core.integrityWarnings.some((w) => w.kind === kind && w.file === file)) return;
+  core.integrityWarnings.push({ projectId: st.project.id, kind, detail, file });
+}
+
+/** The annotations file as it is on disk now: missing, unreadable (cannot be decrypted or parsed), or its hash. */
+async function annotationsOnDisk(core: RepoCore, tx: Tx, rel: string): Promise<{ status: "missing" | "unreadable" } | { status: "ok"; sha: string }> {
+  const raw = await readMaybe(core.abs(rel));
+  if (!raw) return { status: "missing" };
+  try {
+    let text: string;
+    if (tx.encrypted) {
+      const { key, keyId } = tx.key();
+      text = (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
+    } else text = raw.toString("utf8");
+    Annotation.array().parse(JSON.parse(text));
+    return { status: "ok", sha: createHash("sha256").update(text).digest("hex") };
+  } catch {
+    return { status: "unreadable" };
+  }
 }
 
 /** Manifest edits made earlier in the same transaction (state is only updated on commit). */
@@ -181,16 +216,25 @@ export async function writeSourceFile(core: RepoCore, tx: Tx, sf: SourceFile): P
   const folder = full.source.folder;
   await assertProvenanceUnchanged(core, tx, full);
   const annRel = annotationsRel(folder, tx.encrypted);
-  const { annotationCount: _c, annotationsSha256: readSha, ...rest } = full;
+  const { annotationCount: _c, annotationsSha256: _s, ...rest } = full;
   let meta: { annotationCount?: number; annotationsSha256?: string } = {};
+  // Compared with the file as it is on disk now, never with a hash the caller brought (R77).
+  let disk = await annotationsOnDisk(core, tx, annRel);
+  if (disk.status === "unreadable") {
+    // A damaged file is set aside, not overwritten or deleted: it may still be recoverable.
+    const stamp = tx.at.replace(/[:.]/gu, "-");
+    await tx.copyFile(core.abs(annRel), `${folder}/annotations.unreadable-${stamp}.json${tx.encrypted ? ".enc" : ""}`, { mode: 0o600 });
+    await tx.trash(annRel);
+    disk = { status: "missing" };
+  }
   if (full.annotations.length) {
     const annJson = JSON.stringify(full.annotations);
     const sha = createHash("sha256").update(annJson).digest("hex");
-    if (sha !== readSha || !(await tx.exists(annRel))) {
+    if (disk.status !== "ok" || disk.sha !== sha) {
       await tx.writeFile(annRel, annJson, tx.encrypted ? { encrypt: true } : { mode: fileMode(core, tx.state, full.source.provenance.identifiable) });
     }
     meta = { annotationCount: full.annotations.length, annotationsSha256: sha };
-  } else if (await tx.exists(annRel)) {
+  } else if (disk.status === "ok") {
     await tx.trash(annRel);
   }
   const parsed: SourceFile = { ...rest, annotations: [], ...meta };

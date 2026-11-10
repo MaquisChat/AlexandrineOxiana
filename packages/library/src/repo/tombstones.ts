@@ -30,6 +30,11 @@ export interface Tombstones {
   secret: string;
   /** HMACs of Zotero item keys. */
   zotero: string[];
+  /**
+   * How many deletions recorded each HMAC (absent: 1). Undo releases only its own (R77): a record a
+   * later deletion also made — e.g. of the source a key was merged into — stays.
+   */
+  counts?: Record<string, number>;
 }
 
 export type TombstoneRead = { status: "missing" } | { status: "unreadable" } | { status: "ok"; t: Tombstones };
@@ -60,7 +65,15 @@ export async function readTombstones(core: RepoCore, st: ProjectState): Promise<
     if (typeof t.secret !== "string" || !/^[0-9a-f]{64}$/u.test(t.secret) || !Array.isArray(t.zotero) || !t.zotero.every((h) => typeof h === "string")) {
       return { status: "unreadable" };
     }
-    return { status: "ok", t: { secret: t.secret, zotero: t.zotero } };
+    const counts: Record<string, number> = Object.create(null) as Record<string, number>;
+    if (t.counts !== undefined) {
+      if (!t.counts || typeof t.counts !== "object" || Array.isArray(t.counts)) return { status: "unreadable" };
+      for (const [h, n] of Object.entries(t.counts)) {
+        if (!Number.isInteger(n) || n < 1) return { status: "unreadable" };
+        counts[h] = n;
+      }
+    }
+    return { status: "ok", t: { secret: t.secret, zotero: t.zotero, counts } };
   } catch {
     return { status: "unreadable" };
   }
@@ -104,24 +117,53 @@ async function load(core: RepoCore, tx: Tx, raiseWarning: boolean): Promise<Tomb
   return fresh;
 }
 
-/** Inside a deletion: records the source's Zotero item keys; returns those newly recorded. */
+/** Inside a deletion: records the source's Zotero item keys; returns the keys it recorded (counted). */
 export async function recordDeletion(core: RepoCore, tx: Tx, sf: SourceFile): Promise<string[]> {
   return addDeletions(core, tx, zoteroKeysOf(sf));
 }
 
-/** Records these Zotero item keys as deleted here; returns those newly recorded. */
+/** Records these Zotero item keys as deleted here (one more deletion each); returns them. */
 export async function addDeletions(core: RepoCore, tx: Tx, keys: string[]): Promise<string[]> {
-  if (!keys.length) return [];
+  const unique = [...new Set(keys)];
+  if (!unique.length) return [];
   const t = await load(core, tx, true);
-  const added: string[] = [];
-  for (const key of keys) {
+  const counts = { ...(t.counts ?? {}) };
+  for (const key of unique) {
     const h = tombstoneHash(t.secret, key);
-    if (t.zotero.includes(h)) continue;
-    t.zotero.push(h);
-    added.push(key);
+    if (t.zotero.includes(h)) counts[h] = (counts[h] ?? 1) + 1;
+    else {
+      t.zotero.push(h);
+      counts[h] = 1;
+    }
   }
-  if (added.length) await write(tx, t);
-  return added;
+  await write(tx, { ...t, counts });
+  return unique;
+}
+
+/**
+ * Undo (R74 I3, R77): takes back one deletion each for these keys — the record goes when no other
+ * deletion made it too — except for keys in `keep` (a surviving source still carries them).
+ */
+export async function releaseDeletions(core: RepoCore, tx: Tx, keys: string[], keep: ReadonlySet<string>): Promise<void> {
+  const r = await readTombstones(core, tx.state);
+  if (r.status !== "ok") return;
+  const t = r.t;
+  const counts = { ...(t.counts ?? {}) };
+  let zotero = t.zotero;
+  let changed = false;
+  for (const key of new Set(keys)) {
+    if (keep.has(key)) continue;
+    const h = tombstoneHash(t.secret, key);
+    if (!zotero.includes(h)) continue;
+    const n = (counts[h] ?? 1) - 1;
+    changed = true;
+    if (n >= 1) counts[h] = n;
+    else {
+      delete counts[h];
+      zotero = zotero.filter((x) => x !== h);
+    }
+  }
+  if (changed) await write(tx, { ...t, zotero, counts });
 }
 
 /** Clears the records of these Zotero item keys; returns those that were recorded. */
@@ -132,7 +174,8 @@ export async function clearDeletions(core: RepoCore, tx: Tx, keys: string[]): Pr
   const cleared = keys.filter((k) => t.zotero.includes(tombstoneHash(t.secret, k)));
   if (!cleared.length) return [];
   const drop = new Set(cleared.map((k) => tombstoneHash(t.secret, k)));
-  await write(tx, { ...t, zotero: t.zotero.filter((h) => !drop.has(h)) });
+  const counts = Object.fromEntries(Object.entries(t.counts ?? {}).filter(([h]) => !drop.has(h)));
+  await write(tx, { ...t, zotero: t.zotero.filter((h) => !drop.has(h)), counts });
   return cleared;
 }
 

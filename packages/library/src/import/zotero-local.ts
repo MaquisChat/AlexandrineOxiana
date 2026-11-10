@@ -48,7 +48,7 @@ import type { Creator, SourceType } from "@ao/core";
 import type { ImportSourceAdapter, ScanAnnotation, ScanContext, ScanFile, ScanItem, ScanRect } from "./bulk/scan.js";
 import { MAX_NOTE_CHARS, noteToMarkdown } from "./note-html.js";
 import { arxivOf, checkFiles, doiOf, isbnsOf, issnOf, referenceMetadata, tagList, text, type RecordFields } from "./refman.js";
-import { CopyNoSpace, CopyTooLarge, CopyUnstable, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
+import { CopyNoSpace, CopyTooLarge, CopyUnstable, CopyUnusual, UNUSUAL_STATE_REASON, cappedRows, columnsOf, copyDatabases, openCopy, plainTables, t64, tN } from "./sqlite-copy.js";
 
 export const ZOTERO_REASONS = {
   unreadable: "The Zotero library could not be read (its zotero.sqlite is missing or damaged), so nothing was imported from it.",
@@ -56,6 +56,7 @@ export const ZOTERO_REASONS = {
   busy: "Zotero is busy saving — try again in a moment or close Zotero.",
   locked: "Zotero is keeping its database locked; close Zotero and try again.",
   noSpace: "There is not enough free disk space to read the Zotero library; free some space and try again.",
+  unusual: UNUSUAL_STATE_REASON,
 } as const;
 
 export const ZOTERO_FILE_NOTES = {
@@ -181,6 +182,7 @@ export function zoteroCopyReason(err: unknown): string {
   if (err instanceof CopyTooLarge) return ZOTERO_REASONS.tooLarge;
   if (err instanceof CopyUnstable) return ZOTERO_REASONS.busy;
   if (err instanceof CopyNoSpace) return ZOTERO_REASONS.noSpace;
+  if (err instanceof CopyUnusual) return ZOTERO_REASONS.unusual;
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   if (code === "EBUSY" || (process.platform === "win32" && (code === "EPERM" || code === "EACCES"))) return ZOTERO_REASONS.locked;
   return ZOTERO_REASONS.unreadable;
@@ -379,7 +381,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
     libraryId,
   ).filter((r) => typeof r.key === "string" && KEY.test(r.key));
   const byId = new Map(items.map((r) => [r.id, r]));
-  const deleted = new Set(cappedRows<{ id: number }>(db, "SELECT itemID AS id FROM deletedItems", MAX_LINK_ROWS, tooLarge).map((r) => r.id));
+  const deleted = new Set(cappedRows<{ id: number }>(db, `SELECT ${int("itemID", "id")} FROM deletedItems`, MAX_LINK_ROWS, tooLarge).map((r) => r.id));
 
   const attachments = new Map<number, AttachmentRow>();
   const childAttachments = new Map<number, AttachmentRow[]>();
@@ -456,7 +458,7 @@ function readSnapshot(db: Database.Database, libraryId: number, bbtDb: Database.
     return out;
   };
   const collectionPaths = new Map<number, string[][]>();
-  for (const ci of cappedRows<{ coll: number; item: number }>(db, "SELECT collectionID AS coll, itemID AS item FROM collectionItems ORDER BY itemID, collectionID", MAX_LINK_ROWS, tooLarge)) {
+  for (const ci of cappedRows<{ coll: number; item: number }>(db, `SELECT ${int("collectionID", "coll")}, ${int("itemID", "item")} FROM collectionItems ORDER BY itemID, collectionID`, MAX_LINK_ROWS, tooLarge)) {
     if (!byId.has(ci.item) || !collById.has(ci.coll)) continue;
     const p = collPath(ci.coll);
     if (!p) continue;

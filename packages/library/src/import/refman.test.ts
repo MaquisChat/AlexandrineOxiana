@@ -12,6 +12,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
 import { buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { buildCalibreLibrary } from "../../tests/fixtures/refman/calibre.mjs";
+import { writeCraftedJournal } from "../../tests/fixtures/sqlite/crafted-journal.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
@@ -421,6 +422,16 @@ describe("calibreAdapter", () => {
       live.exec("ROLLBACK");
       live.close();
     }
+  });
+
+  it("R77 C1: a hot journal naming a super-journal is refused; the named file survives", async () => {
+    const victim = join(tmp, "victim.txt");
+    await writeFile(victim, "keep me");
+    writeCraftedJournal(calibre.db, { victim });
+    const items = await collect(calibreAdapter(calibre.dir));
+    expect(items).toEqual([expect.objectContaining({ unreadable: CALIBRE_REASONS.unusual })]);
+    expect(CALIBRE_REASONS.unusual).toBe("This library's database is in an unusual state; open it in Zotero (or Calibre) once and try again.");
+    expect(await readFile(victim, "utf8")).toBe("keep me");
   });
 
   it("R75 I2: a virtual table is refused promptly whatever its SQL looks like", async () => {

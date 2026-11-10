@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Project, SourceFile } from "@ao/core";
+import type { Annotation, Project, SourceFile } from "@ao/core";
 import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
 import { NOTE_HTML, buildZoteroFixture } from "../../tests/fixtures/zotero/build-fixture.mjs";
 import { KeyRing } from "../crypto/keys.js";
@@ -22,10 +22,13 @@ import { ImmutableProvenanceError } from "../repo/errors.js";
 import { applyMerge } from "./bulk/merge.js";
 import { openTestRepo } from "../repo/testing.js";
 import { adapterFor, createBulkImport, type ImportSourceAdapter, type ScanContext, type ScanItem } from "./bulk/index.js";
+import type { ScanAnnotation } from "./bulk/scan.js";
 import { OUTSIDE_NOTE } from "./bulk/outside.js";
 import { ENGINE_FILE_NOTES } from "./bulk/run.js";
 import { bibtexAdapter } from "./refman.js";
-import { IMAGE_PLACEHOLDER, MAX_NOTE_CHARS, noteToMarkdown } from "./note-html.js";
+import { IMAGE_PLACEHOLDER, MAX_NOTE_CHARS, encodeHref, noteToMarkdown } from "./note-html.js";
+import { planAnnotations } from "./bulk/update.js";
+import { writeCraftedJournal } from "../../tests/fixtures/sqlite/crafted-journal.mjs";
 import { RDF_REASONS } from "./zotero-rdf.js";
 import { ZOTERO_NOTES, ZOTERO_REASONS, zoteroAnnotation, zoteroCopyReason, zoteroLocalAdapter } from "./zotero-local.js";
 
@@ -468,6 +471,60 @@ describe("R75: adapter review round 1", () => {
     expect(zoteroCopyReason(Object.assign(new Error("busy"), { code: "EBUSY" }))).toBe(ZOTERO_REASONS.locked);
     expect(zoteroCopyReason(Object.assign(new Error("x"), { code: "ENOENT" }))).toBe(ZOTERO_REASONS.unreadable);
     expect(ZOTERO_REASONS.busy).toBe("Zotero is busy saving — try again in a moment or close Zotero.");
+  });
+});
+
+describe("R77: review round 2 (adapter)", () => {
+  const UNUSUAL = "This library's database is in an unusual state; open it in Zotero (or Calibre) once and try again.";
+
+  it("C1: a hot journal naming a super-journal is refused before any read-write open; the named file survives", async () => {
+    const victim = join(tmp, "victim.txt");
+    await writeFile(victim, "keep me");
+    writeCraftedJournal(fx.db, { victim });
+    const items = await collect(zoteroLocalAdapter(dataDir));
+    expect(items).toEqual([expect.objectContaining({ unreadable: UNUSUAL })]);
+    expect(ZOTERO_REASONS.unusual).toBe(UNUSUAL);
+    expect(await readFile(victim, "utf8")).toBe("keep me");
+    expect(await readdir(work)).toEqual([]);
+  });
+
+  it("C1: journal headers with an invalid page size or sector size are refused", async () => {
+    for (const bad of [{ pageSize: 1000 }, { sectorSize: 100 }, { sectorSize: 1 << 20 }]) {
+      writeCraftedJournal(fx.db, bad);
+      expect(await collect(zoteroLocalAdapter(dataDir)), JSON.stringify(bad)).toEqual([expect.objectContaining({ unreadable: UNUSUAL })]);
+    }
+  });
+
+  it("encodeHref encodes non-ASCII as UTF-8 (U+2028, U+00A0)", () => {
+    expect(encodeHref("https://example.org/a\u2028b\u00a0c")).toBe("https://example.org/a%E2%80%A8b%C2%A0c");
+    expect(noteToMarkdown('<a href="https://example.org/a\u2028b">t</a>')).toBe("t (https://example.org/a%E2%80%A8b)");
+  });
+
+  it("images count toward the element cap: a 1 MB <img> flood converts in under 1 s, past the cap as text", () => {
+    const html = "<img>".repeat(Math.floor((1024 * 1024) / 5));
+    noteToMarkdown(html.slice(0, 5000));
+    const t = performance.now();
+    const md = noteToMarkdown(html);
+    expect(performance.now() - t).toBeLessThan(1_000);
+    // The first 20,000 as elements, the rest as text, until the 1 MB output cap.
+    expect(md.split("image").length - 1).toBeGreaterThan(100_000);
+    expect(md.length).toBeLessThanOrEqual(MAX_NOTE_CHARS);
+  });
+
+  it("the update path keeps a source within 16 MB of annotation text", () => {
+    const sf = { annotations: [{ id: "x", sourceId: "s", kind: "note", anchors: [], body: "a".repeat(10 * 1024 * 1024), externalKey: "zotero:K1", author: "a", createdAt: new Date().toISOString() }] } as unknown as SourceFile;
+    sf.annotations[0]!.externalHash = undefined;
+    const big = (key: string, n: number) => ({ key, kind: "note" as const, body: "b".repeat(n) });
+    const make = (a: ScanAnnotation): Annotation => ({ id: `id-${a.key}`, sourceId: "s", kind: a.kind, anchors: [], body: a.body ?? "", externalKey: a.key, externalHash: `h-${a.key}-${a.body?.length ?? 0}`, author: "a", createdAt: new Date().toISOString() });
+    // Growing the existing note past the cap, and a new one past it: both left out and counted.
+    const plan = planAnnotations(sf, [big("zotero:K1", 17 * 1024 * 1024), big("zotero:K2", 7 * 1024 * 1024)], make);
+    expect(plan.updated).toEqual([]);
+    expect(plan.added).toEqual([]);
+    expect(plan.dropped).toBe(2);
+    // Within the cap both go through.
+    const ok = planAnnotations(sf, [big("zotero:K1", 12 * 1024 * 1024), big("zotero:K2", 3 * 1024 * 1024)], make);
+    expect(ok.updated).toHaveLength(1);
+    expect(ok.added).toHaveLength(1);
   });
 });
 
@@ -1028,6 +1085,87 @@ processing:
     await h.done;
     expect((await sources(p)).filter((sf) => sf.source.citationKey === "adebayo2019markets")).toHaveLength(2);
     expect((await bulk.batchReport(p.id, h.batchId)).notes).toContain('The citation key "adebayo2019markets" from Zotero is also used by another source in this project.');
+  });
+
+  // ---- R77 (review round 2) ----
+  it("R77 C1: the import reports the refusal of a crafted journal", async () => {
+    const victim = join(tmp, "victim.txt");
+    await writeFile(victim, "keep me");
+    writeCraftedJournal(fx.db, { victim });
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    expect((await h.done).counts.failed).toBe(1);
+    expect((await bulk.batchReport(p.id, h.batchId)).failures[0]?.reason).toBe(ZOTERO_REASONS.unusual);
+    expect(await readFile(victim, "utf8")).toBe("keep me");
+  });
+
+  it("R77 #3: undo keeps a review-merge deletion record that a later deletion also made", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), autoAcceptThreshold: 1 });
+    await h.done;
+    const review = await bulk.listReview(p.id, h.batchId);
+    const all = await sources(p);
+    const d = byZoteroKey(all, "DDDD4444").source.id;
+    const e = byZoteroKey(all, "EEEE5555").source.id;
+    await bulk.decideReview(p.id, review.find((x) => x.sourceId === d)!.id, { action: "merge", sourceId: e });
+    await repo.deleteSource(p.id, e); // the user deletes the target, which carries DDDD4444 too
+    await bulk.undoBatch(p.id, h.batchId);
+    const r = await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    expect(r.counts).toMatchObject({ deletedHere: 2 });
+    expect(r.counts.created + r.counts.needsReview).toBe(3);
+  });
+
+  describe("R77 #4: annotation files are read tolerantly", () => {
+    const setup = async () => {
+      const p = await project();
+      const bulk = bulkImport();
+      const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+      await h.done;
+      const a = byZoteroKey(await sources(p), "AAAA1111");
+      return { p, bulk, h, a, file: join(lib.root, a.source.folder, "annotations.json") };
+    };
+    const warned = (kind: string) => repo.integrityWarnings.some((w) => w.kind === kind);
+
+    it("a missing file: no annotations, a warning; get, delete and undo still work", async () => {
+      const { p, bulk, h, a, file } = await setup();
+      await rm(file);
+      expect((await repo.getSource(p.id, a.source.id)).annotations).toEqual([]);
+      expect(warned("annotations-unreadable")).toBe(true);
+      expect((await bulk.undoBatch(p.id, h.batchId)).removedSources).toBe(5);
+    });
+
+    it("a corrupt file: no annotations, a warning; the next write sets it aside instead of losing it", async () => {
+      const { p, a, file } = await setup();
+      await writeFile(file, "[{ not json");
+      expect((await repo.getSource(p.id, a.source.id)).annotations).toEqual([]);
+      expect(warned("annotations-unreadable")).toBe(true);
+      await repo.updateSource(p.id, a.source.id, { publisher: "Someone" });
+      const names = await readdir(join(lib.root, a.source.folder));
+      expect(names.some((n) => n.startsWith("annotations.unreadable-"))).toBe(true);
+      await repo.deleteSource(p.id, a.source.id);
+    });
+
+    it("a hash mismatch is read, with a warning", async () => {
+      const { p, a, file } = await setup();
+      const anns = JSON.parse(await readFile(file, "utf8"));
+      anns[0].body = "changed outside the app";
+      await writeFile(file, JSON.stringify(anns));
+      expect((await repo.getSource(p.id, a.source.id)).annotations[0]?.body).toBe("changed outside the app");
+      expect(warned("annotations-hash-mismatch")).toBe(true);
+    });
+
+    it("skipping the rewrite compares with the file on disk, not the hash the caller brought", async () => {
+      const { p, a, file } = await setup();
+      const req = { action: "store" as const, store: { identifiable: true, hasLocation: false, legalBasis: "legitimate interest; Zotero library" } };
+      await importChange(repo, p.id, req, async (ops) => {
+        const cur = await ops.readSource(a.source.id);
+        await writeFile(file, "[]"); // the file changes after it was read
+        await ops.writeSource(cur, { ...cur, source: { ...cur.source, publisher: "X" } });
+      }, { op: "test.write" });
+      expect(JSON.parse(await readFile(file, "utf8"))).toHaveLength(3);
+    });
   });
 
   it("undo of an incremental update reverts the update (and its new annotation) like a merge", async () => {

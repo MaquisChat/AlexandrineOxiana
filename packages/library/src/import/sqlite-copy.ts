@@ -50,6 +50,14 @@ export class CopyUnstable extends Error {
   override name = "CopyUnstable";
 }
 
+/** The copy's rollback journal is not one this importer settles (R77 C1): refused, the copy unread. */
+export class CopyUnusual extends Error {
+  override name = "CopyUnusual";
+}
+
+/** Shown for CopyUnusual, by Zotero and Calibre alike. */
+export const UNUSUAL_STATE_REASON = "This library's database is in an unusual state; open it in Zotero (or Calibre) once and try again.";
+
 /** Not enough free disk space for the copy. */
 export class CopyNoSpace extends Error {
   override name = "CopyNoSpace";
@@ -80,9 +88,54 @@ async function copyOne(src: string, dest: string, signal: AbortSignal | undefine
   await pipeline(createReadStream(src), createWriteStream(dest, { mode: 0o600, flags: "wx" }), ...(signal ? [{ signal }] : []));
 }
 
+const JOURNAL_MAGIC = Buffer.from([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]);
+const pow2 = (n: number, lo: number, hi: number) => n >= lo && n <= hi && (n & (n - 1)) === 0;
+
+/**
+ * Whether a copied rollback journal may be rolled back (R77 C1). A journal SQLite would not treat
+ * as hot (empty, or starting with a zero byte) needs nothing: false. One it would roll back must
+ * have a valid header — the journal magic, a sector size and a page size that are powers of two
+ * in SQLite's ranges — and no super-journal record (the journal magic in its last 8 bytes, after a
+ * name length): during rollback SQLite opens, and may delete, the super-journal the record names
+ * by absolute path, i.e. any file. Anything else throws CopyUnusual.
+ */
+async function journalToSettle(journal: string): Promise<boolean> {
+  const fh = await fsp.open(journal, "r");
+  try {
+    const { size } = await fh.stat();
+    if (size === 0) return false;
+    const head = Buffer.alloc(28);
+    const { bytesRead } = await fh.read(head, 0, 28, 0);
+    if (head[0] === 0) return false; // not hot: SQLite ignores it
+    if (bytesRead < 28 || !head.subarray(0, 8).equals(JOURNAL_MAGIC)) throw new CopyUnusual();
+    const sector = head.readUInt32BE(20);
+    const page = head.readUInt32BE(24);
+    if (!pow2(sector, 32, 65536) || !pow2(page, 512, 65536)) throw new CopyUnusual();
+    if (size >= 16) {
+      const tail = Buffer.alloc(16);
+      await fh.read(tail, 0, 16, size - 16);
+      if (tail.subarray(8, 16).equals(JOURNAL_MAGIC)) throw new CopyUnusual(); // a super-journal record, whatever its length
+    }
+    return true;
+  } finally {
+    await fh.close();
+  }
+}
+
 /**
  * Rolls back a hot journal in a private copy: opening it read-write once lets SQLite do that (and
- * nothing else: no statement but a read of the schema table runs).
+ * nothing else: no statement but a read of the schema table runs). Called only after
+ * journalToSettle accepted the journal.
+ *
+ * What this open can touch (R77 C1, reasoned through): SQLite opens the database file given (in the
+ * private copy folder; a plain path, never a "file:" URI, so no URI parameters), and next to it
+ * `<db>-journal`, `<db>-wal` and `<db>-shm` — all in the copy folder, which it may also create or
+ * delete there. The only file name a database or journal can carry is the rollback journal's
+ * super-journal record, which journalToSettle refuses; a WAL file names no other file, and the
+ * database header names none. No SQL runs but the schema read (no ATTACH, no triggers, no virtual
+ * table modules; trusted_schema off). SQLite's own temporary files go to the system temp folder
+ * under names SQLite chooses, never names from the files. So nothing outside the copy folder is
+ * opened, changed or deleted.
  */
 function settleCopy(path: string): void {
   const db = new Database(path, { fileMustExist: true });
@@ -160,7 +213,9 @@ export async function copyDatabases(
       for (const n of present) for (const s of ["", ...COMPANIONS]) copied += (await stampOf(join(dir, n + s)))?.size ?? 0;
       if (copied > maxBytes) throw new CopyTooLarge();
       if (before.every((b, i) => same(b, after[i]!))) {
-        for (const dest of paths.values()) if ((await stampOf(`${dest}-journal`)) !== null) settleCopy(dest);
+        for (const dest of paths.values()) {
+          if ((await stampOf(`${dest}-journal`)) !== null && (await journalToSettle(`${dest}-journal`))) settleCopy(dest);
+        }
         return { paths, dir, remove };
       }
       if (attempt >= COPY_TRIES) throw new CopyUnstable();
