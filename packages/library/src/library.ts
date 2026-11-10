@@ -13,6 +13,7 @@ import {
   startHeartbeat,
   type LockInfo,
 } from "./lock.js";
+import { movedToFor } from "./old-copies.js";
 import { registerLibrary } from "./registry.js";
 
 export const FORMAT_VERSION = 1;
@@ -39,6 +40,11 @@ export interface Library {
    * `move-incomplete`: a move into this folder has not finished (.move-journal.json).
    */
   readOnlyReason?: "locked-by-other-device" | "newer-format" | "offline" | "not-writable" | "moved" | "move-incomplete";
+  /**
+   * For a `moved` old copy: where it went, from this device's records. `unfinished` means the
+   * move's switch did not finish; complete it with `completeMove(newRoot, …)`.
+   */
+  movedTo?: { newRoot: string; unfinished: boolean };
   /** App-level config folder (outside the library), from Deps; holds the registry and audit anchors. */
   appConfigDir: string;
   /** This device's id, from Deps; recorded in audit events and change log entries. */
@@ -219,7 +225,10 @@ export async function openLibraryInternal(
     return readOnly("newer-format");
   }
   // A moved-away copy or an unfinished move: read-only, and not recorded as the library's location.
-  if (await exists(join(root, MOVED_MARKER))) return readOnly("moved");
+  if (await exists(join(root, MOVED_MARKER))) {
+    const movedTo = await movedToFor(deps, resolve(root), meta.libraryId).catch(() => undefined);
+    return { ...readOnly("moved"), ...(movedTo ? { movedTo } : {}) };
+  }
   if (!internal.ignoreMoveJournal && (await exists(join(root, MOVE_JOURNAL)))) return readOnly("move-incomplete");
   // Same-process double open: the lock on disk is ours, so the lock rules
   // alone would let a second handle through.

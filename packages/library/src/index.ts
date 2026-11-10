@@ -56,6 +56,7 @@ export {
   deleteOldCopy,
   executeMove,
   listPendingOldCopies,
+  listUnfinishedMoves,
   planMove,
 } from "./move.js";
 export type {
@@ -70,7 +71,7 @@ export type {
   ProjectPlan,
   SwitchStep,
 } from "./move.js";
-export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
+export { addKnownPath, forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 
 export * from "./repo/index.js";

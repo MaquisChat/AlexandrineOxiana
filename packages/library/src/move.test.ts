@@ -18,6 +18,7 @@ import {
   deleteOldCopy,
   executeMove,
   listPendingOldCopies,
+  listUnfinishedMoves,
   moveSeams,
   planMove,
 } from "./move.js";
@@ -161,6 +162,7 @@ beforeEach(async () => {
 afterEach(async () => {
   seams.failUndo = undefined;
   moveSeams.crashAfter = undefined;
+  moveSeams.unreadableDir = undefined;
   for (const l of open) await l.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -626,6 +628,9 @@ describe("deleteOldCopy", () => {
     expect(out.kept.sort()).toEqual([changed, linked].sort());
     expect(out.rootRemoved).toBe(false);
     expect(await readFile(join(lib.root, changed), "utf8")).toBe("edited after the move");
+    // Kept files keep the old copy's identity: it still opens, read-only.
+    expect((await walkFiles(lib.root)).sort()).toEqual(["MOVED.json", changed, "library.json", linked].sort());
+    expect((await openLibrary(lib.root, mkDeps())).readOnlyReason).toBe("moved");
   });
 
   it("split library: deletes only moved projects, keeps the remaining library usable", async () => {
@@ -887,7 +892,7 @@ describe("review fixes round 2: minors", () => {
   it("{ confirm: true } uses the most recent non-expired record for that folder", async () => {
     const { lib } = await fixture();
     const old = { ...mkDeps(), clock: () => new Date(Date.parse(NOW) - 25 * 3600_000) };
-    const stale = await addPendingOldCopy(old, { oldRoot: lib.root, newRoot: join(tmp, "Gone"), libraryId: lib.id, split: false, movedFolders: [], movedProjectIds: [] }, { files: {}, dirs: [] });
+    const stale = await addPendingOldCopy(old, { oldRoot: lib.root, newRoot: join(tmp, "Gone"), libraryId: lib.id, split: false, movedFolders: [], movedProjectIds: [], moveId: "stale" }, { files: {}, dirs: [] });
     await markPendingComplete(old, stale.id);
     await executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env });
     const out = await deleteOldCopy(lib.root, { confirm: true }, { deps: mkDeps() });
@@ -919,5 +924,73 @@ describe("review fixes round 2: minors", () => {
     expect(parseMacMount("rclone@remote on /Volumes/cloud (macfuse, nodev, nosuid, synchronous, mounted by ana)")).toEqual([
       { path: "/Volumes/cloud", removable: false, network: false, uncertain: true },
     ]);
+  });
+});
+
+describe("review fixes round 3", () => {
+  it("a crash between mark-old and register is recoverable from the registry and the unfinished-move list (whole library)", async () => {
+    const { lib } = await fixture();
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "mark-old";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    await lib.close();
+    const entry = (await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!;
+    expect(entry.lastKnownPaths[0]).toBe(lib.root);
+    expect(entry.lastKnownPaths).toContain(dest);
+    const src = await openLibrary(entry.lastKnownPaths[0]!, mkDeps());
+    expect(src.readOnlyReason).toBe("moved");
+    expect(src.movedTo).toEqual({ newRoot: dest, unfinished: true });
+    const unfinished = await listUnfinishedMoves(mkDeps());
+    expect(unfinished).toEqual([{ libraryId: lib.id, oldRoot: lib.root, newRoot: dest, moveId: expect.any(String), startedAt: NOW }]);
+    await completeMove(src.movedTo!.newRoot, mkDeps(), env);
+    expect((await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(dest);
+    const d = await openLibrary(dest, mkDeps());
+    expect(d.mode).toBe("read-write");
+    await d.close();
+    const again = await openLibrary(lib.root, mkDeps());
+    expect(again.movedTo).toEqual({ newRoot: dest, unfinished: false });
+    expect(await listUnfinishedMoves(mkDeps())).toEqual([]);
+  });
+
+  it("a crash between mark-old and register is recoverable (split)", async () => {
+    const { lib, b } = await fixture(HIPAA_GOV, true);
+    const dest = join(tmp, "Dest");
+    moveSeams.crashAfter = "mark-old";
+    await expect(executeMove(lib, dest, { deps: mkDeps(), env, excludeProjectIds: [b.id] })).rejects.toBeInstanceOf(SimulatedMoveCrash);
+    await lib.close();
+    const entry = (await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!;
+    expect(entry.lastKnownPaths).toContain(dest);
+    const [u] = await listUnfinishedMoves(mkDeps());
+    expect(u).toMatchObject({ libraryId: lib.id, newRoot: dest });
+    await completeMove(u!.newRoot, mkDeps(), env);
+    expect((await listLibraries(mkDeps())).find((e) => e.libraryId === lib.id)!.lastKnownPaths[0]).toBe(dest);
+    const d = await openLibrary(dest, mkDeps());
+    expect(d.mode).toBe("read-write");
+    await d.close();
+  });
+
+  it("deleteOldCopy fails closed when part of the old copy cannot be read", async () => {
+    const { lib } = await fixture();
+    const res = await executeMove(lib, join(tmp, "Dest"), { deps: mkDeps(), env });
+    moveSeams.unreadableDir = "Exports";
+    const out = await deleteOldCopy(lib.root, res.confirmToken);
+    expect(out.warnings.join(" ")).toMatch(/could not be read/);
+    expect(out.leftovers).toContain("Exports/");
+    expect(out.rootRemoved).toBe(false);
+    expect(await walkFiles(lib.root)).toEqual(expect.arrayContaining(["MOVED.json", "library.json"]));
+  });
+
+  it("moving a split remainder whole: its moved-away folders are not leftovers and stay untouched", async () => {
+    const f = await fixture(HIPAA_GOV, true);
+    await executeMove(f.lib, join(tmp, "Dest"), { deps: mkDeps(), env, excludeProjectIds: [f.b.id] });
+    const rest = await openLibrary(f.lib.root, mkDeps());
+    const keepA = await hashes(join(f.lib.root, f.a.folder));
+    const res = await executeMove(rest, join(tmp, "Dest2"), { deps: mkDeps(), env });
+    expect(res.projectsMovedAway).toEqual([f.a.folder]);
+    const out = await deleteOldCopy(f.lib.root, res.confirmToken);
+    expect(out.leftovers).toEqual([]);
+    expect(out.movedAwayKept).toEqual([f.a.folder]);
+    expect(await hashes(join(f.lib.root, f.a.folder))).toEqual(keepA);
+    expect(await walkFiles(f.lib.root)).not.toContain("library.json");
   });
 });

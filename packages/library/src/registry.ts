@@ -110,6 +110,19 @@ export async function recordLocation(libraryId: string, path: string, deps: RegD
   await save(deps, entries);
 }
 
+/**
+ * Adds `path` to the library's known paths right after the current first one
+ * (no-op when already known, or when the library is not registered). Used to
+ * make a move's destination findable before it becomes the library's location.
+ */
+export async function addKnownPath(libraryId: string, path: string, deps: RegDeps): Promise<void> {
+  const entries = await loadForUpdate(deps);
+  const e = entries.find((x) => x.libraryId === libraryId);
+  if (!e || e.lastKnownPaths.includes(path)) return;
+  e.lastKnownPaths = [...e.lastKnownPaths.slice(0, 1), path, ...e.lastKnownPaths.slice(1)].slice(0, MAX_PATHS);
+  await save(deps, entries);
+}
+
 export async function forgetLibrary(libraryId: string, deps: RegDeps): Promise<void> {
   const entries = await loadForUpdate(deps);
   const rest = entries.filter((e) => e.libraryId !== libraryId);

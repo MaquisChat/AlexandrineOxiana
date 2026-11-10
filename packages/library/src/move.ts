@@ -32,19 +32,20 @@ import {
   getPendingOldCopy,
   isExpired,
   listPendingOldCopies,
+  listUnfinishedMoves,
   markPendingComplete,
   readVerifiedHashes,
   removePendingOldCopy,
   type PendingOldCopy,
 } from "./old-copies.js";
-import { registerLibrary } from "./registry.js";
+import { addKnownPath, registerLibrary } from "./registry.js";
 import { PathEscapeError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
 import { appendLibraryEvent, openRepo, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
 import { parseProjectJson } from "./repo/state.js";
 
 export { MOVE_JOURNAL, MOVED_MARKER };
-export { listPendingOldCopies };
+export { listPendingOldCopies, listUnfinishedMoves };
 export type { PendingOldCopy } from "./old-copies.js";
 
 /** Library folders every library has (see createLibrary); recreated at the destination when not copied. */
@@ -217,7 +218,7 @@ interface Journal {
 }
 
 /** Test seams: simulate a crash right after a switch step. */
-export const moveSeams: { crashAfter?: SwitchStep } = {};
+export const moveSeams: { crashAfter?: SwitchStep; /** deleteOldCopy: reading this old-copy folder fails. */ unreadableDir?: string } = {};
 export class SimulatedMoveCrash extends Error {
   override name = "SimulatedMoveCrash";
 }
@@ -639,6 +640,9 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   // Switch: plan every step, record it, then run the steps.
   await progress({ phase: "switch", filesDone: fileCount, fileCount, bytesDone: totalBytes, totalBytes });
   const movedProjectIds = moved.map((p) => p.projectId).sort();
+  const moveId = newId();
+  // Durably, before the old copy is marked: the destination stays findable after any crash
+  // (listUnfinishedMoves, Library.movedTo, and the registry's known paths).
   const rec = await addPendingOldCopy(
     deps,
     {
@@ -648,10 +652,12 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
       split,
       movedFolders: moved.map((p) => p.folder),
       movedProjectIds,
+      movedAway,
+      moveId,
     },
     { files: hashes, dirs: src.dirs.map((d) => d.rel) },
   );
-  const moveId = newId();
+  await addKnownPath(lib.id, dest, deps);
   j.phase = "switching";
   j.filesDone = [...done];
   j.switch = {
@@ -830,12 +836,53 @@ async function auditIn(
   }
 }
 
+/**
+ * Files (and links or special files) under `bases` of the old copy, without following links.
+ * A folder that cannot be read is reported as `<rel>/` in `unreadable` (fail closed).
+ */
+async function scanOldCopy(
+  root: string,
+  bases: string[],
+  skipFolders: string[],
+): Promise<{ files: string[]; unreadable: string[]; movedAwayPresent: string[] }> {
+  const out = { files: [] as string[], unreadable: [] as string[], movedAwayPresent: [] as string[] };
+  const visit = async (rel: string, isBase: boolean): Promise<void> => {
+    let entries: Array<import("node:fs").Dirent>;
+    try {
+      if (moveSeams.unreadableDir !== undefined && moveSeams.unreadableDir === rel) {
+        throw Object.assign(new Error("permission denied (simulated)"), { code: "EACCES" });
+      }
+      entries = await fsp.readdir(rel ? abs(root, rel) : root, { withFileTypes: true });
+    } catch (err) {
+      if (isBase && (err as NodeJS.ErrnoException).code === "ENOENT") return;
+      out.unreadable.push(`${rel}/`);
+      return;
+    }
+    for (const e of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (skipFolders.includes(r)) {
+          out.movedAwayPresent.push(r);
+          continue;
+        }
+        await visit(r, false);
+      } else {
+        out.files.push(r);
+      }
+    }
+  };
+  for (const b of bases) await visit(b, true);
+  return out;
+}
+
 export interface DeleteOldCopyResult {
   filesDeleted: number;
   /** Up to 50 library-relative paths in the old copy that were not part of the verified move; they and the library's identity files were kept. */
   leftovers: string[];
   /** Library-relative files of the old copy that were kept: changed since the move, or not safely inside it. */
   kept: string[];
+  /** `Projects/<n>` folders moved away by an earlier move: not part of this one, left untouched. */
+  movedAwayKept: string[];
   /** The old folder itself was removed (it was empty at the end). */
   rootRemoved: boolean;
   warnings: string[];
@@ -902,6 +949,7 @@ export async function deleteOldCopy(
   const kept: string[] = [];
   const warnings: string[] = [];
   let leftovers: string[] = [];
+  let movedAwayKept: string[] = [];
   let filesDeleted = 0;
   let rootRemoved = false;
   try {
@@ -911,38 +959,50 @@ export async function deleteOldCopy(
     // Content that was never part of the verified move (added since, or never copied): never deleted,
     // and while any is left the old copy keeps its identity (library.json, MOVED.json) and stays read-only.
     const ignorable = new Set([".lock", MOVED_MARKER, `${INDEX_FILE}-wal`, `${INDEX_FILE}-shm`, ...rec.movedFolders.map((f) => `${f}/${MOVED_MARKER}`)]);
-    const unverified: string[] = [];
-    for (const base of rec.split ? rec.movedFolders : [""]) {
-      const w = await walk(base ? abs(root, base) : root, () => false).catch(() => ({ files: [], dirs: [], odd: [] }) as Walked);
-      for (const rel of [...w.files.map((f) => f.rel), ...w.odd].map((r) => (base ? `${base}/${r}` : r))) {
-        if (!ignorable.has(rel) && !(rel in hashes.files)) unverified.push(rel);
-      }
+    // Folders moved away by an earlier move were deliberately not part of this one: left untouched, reported apart.
+    const movedAway = rec.split ? [] : (rec.movedAway ?? []);
+    const scan = await scanOldCopy(root, rec.split ? rec.movedFolders : [""], movedAway);
+    const unverified = [...scan.files.filter((rel) => !ignorable.has(rel) && !(rel in hashes.files)), ...scan.unreadable].sort();
+    movedAwayKept = scan.movedAwayPresent;
+    leftovers = unverified.slice(0, 50);
+    if (scan.unreadable.length > 0) {
+      warnings.push(`${scan.unreadable.length} folder(s) of the old copy could not be read; they and the old copy's library.json and MOVED.json were kept`);
     }
-    leftovers = unverified.sort().slice(0, 50);
-    if (unverified.length > 0) {
-      warnings.push(`${unverified.length} file(s) in the old copy were not part of the move and were left in place; the old copy stays read-only until you remove them`);
+    const added = unverified.length - scan.unreadable.length;
+    if (added > 0) {
+      warnings.push(`${added} file(s) in the old copy were not part of the move and were left in place; the old copy stays read-only until you remove them`);
     }
     const hasLeft = (prefix: string) => unverified.some((r) => !prefix || r.startsWith(`${prefix}/`));
-    for (const [rel, hash] of Object.entries(hashes.files)) {
-      if (!inScope(rel)) continue;
-      if (!rec.split && rel === "library.json" && unverified.length > 0) continue;
+    const deleteVerified = async (rel: string, hash: string) => {
       const p = abs(root, rel);
-      const st = await fsp.lstat(p).catch(() => null);
-      if (st === null) continue;
+      const st = await fsp.lstat(p).catch((e: NodeJS.ErrnoException) => (e.code === "ENOENT" ? null : ("error" as const)));
+      if (st === null) return;
+      if (st === "error") {
+        kept.push(rel); // cannot tell what is there: fail closed
+        return;
+      }
       try {
         await assertContained(root, p);
       } catch (err) {
         if (!(err instanceof PathEscapeError)) throw err;
         kept.push(rel);
-        continue;
+        return;
       }
       if (!st.isFile() || (await sha256File(p)) !== hash) {
         kept.push(rel);
-        continue;
+        return;
       }
       await fsp.unlink(p);
       filesDeleted++;
+    };
+    for (const [rel, hash] of Object.entries(hashes.files)) {
+      if (!inScope(rel) || (!rec.split && rel === "library.json")) continue;
+      await deleteVerified(rel, hash);
     }
+    // library.json last: it goes only when nothing of the old copy is left (kept or unverified),
+    // so whatever remains still opens as a library, read-only (MOVED.json).
+    const libHash = hashes.files["library.json"];
+    if (!rec.split && libHash !== undefined && kept.length === 0 && unverified.length === 0) await deleteVerified("library.json", libHash);
     const removeMarker = async (rel: string) => {
       const p = abs(root, rel);
       if (!(await isFile(p))) return;
@@ -976,5 +1036,5 @@ export async function deleteOldCopy(
     warnings,
     { expectId: rec.libraryId },
   );
-  return { filesDeleted, kept: kept.sort(), leftovers, rootRemoved, warnings };
+  return { filesDeleted, kept: kept.sort(), leftovers, movedAwayKept, rootRemoved, warnings };
 }

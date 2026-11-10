@@ -26,6 +26,9 @@ export interface PendingOldCopy {
   split: boolean;
   movedFolders: string[];
   movedProjectIds: string[];
+  /** `Projects/<n>` folders of the old copy already moved away earlier (not part of this move; never deleted by it). */
+  movedAway?: string[];
+  moveId: string;
   /** False while the move's switch has not finished. */
   complete: boolean;
 }
@@ -68,6 +71,26 @@ export async function addPendingOldCopy(
   const full: PendingOldCopy = { ...rec, id, verifiedHashesFile, createdAt: deps.clock().toISOString(), complete: false };
   await save(deps, [...(await load(deps)), full]);
   return full;
+}
+
+/**
+ * Moves whose switch has started but not finished (e.g. the app crashed): the
+ * old copy may already be read-only. Finish each with `completeMove(newRoot, …)`.
+ */
+export async function listUnfinishedMoves(
+  deps: CfgDeps,
+): Promise<Array<{ libraryId: string; oldRoot: string; newRoot: string; moveId: string; startedAt: string }>> {
+  return (await load(deps))
+    .filter((r) => !r.complete)
+    .map((r) => ({ libraryId: r.libraryId, oldRoot: r.oldRoot, newRoot: r.newRoot, moveId: r.moveId, startedAt: r.createdAt }));
+}
+
+/** Where the library at `oldRoot` was moved, from this device's records (newest first). */
+export async function movedToFor(deps: CfgDeps, oldRoot: string, libraryId: string): Promise<{ newRoot: string; unfinished: boolean } | undefined> {
+  const r = (await load(deps))
+    .filter((x) => x.oldRoot === oldRoot && x.libraryId === libraryId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+  return r ? { newRoot: r.newRoot, unfinished: !r.complete } : undefined;
 }
 
 export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<PendingOldCopy | undefined> {
