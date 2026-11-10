@@ -41,6 +41,7 @@ import { isClosed, type Library } from "../library.js";
 import type { HttpClient } from "../lookup/index.js";
 import { addWatchedFolderEntry, projectEncrypted, removeWatchedFolderEntry, type Repo } from "../repo/repo.js";
 import { createAttach, type Attach, type AttachStatus } from "./attach.js";
+import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
 
 /** How long a file's size must stay unchanged before it is imported (R78). */
 export const WATCH_STABILITY_MS = 2000;
@@ -70,6 +71,8 @@ export interface WatchEvent {
 }
 
 export interface WatchDeps {
+  /** Viewing proxies (R83); default: the library's queue (proxyQueueFor). */
+  proxies?: ProxyQueue;
   repo: Repo;
   http: HttpClient;
   lib: Library;
@@ -137,7 +140,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       // a listener's error never stops the watch
     }
   };
-  const attach = deps.attach ?? createAttach({ repo: deps.repo, http: deps.http, ...(deps.debug ? { debug: deps.debug } : {}) });
+  // Viewing proxies go through the library's one queue (R85), unless the caller gives one.
+  const attach = deps.attach ?? createAttach({ repo: deps.repo, http: deps.http, proxies: deps.proxies ?? proxyQueueFor(deps.repo), ...(deps.debug ? { debug: deps.debug } : {}) });
   const stability = deps.stabilityMs ?? WATCH_STABILITY_MS;
   let stopped = false;
   /** The folder is gone (waiting for it to come back). */

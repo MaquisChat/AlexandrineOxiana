@@ -25,6 +25,7 @@ import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+  LOCATION_NEEDS_ENCRYPTION,
   diffToChanges,
   evaluate,
   parseGovernance,
@@ -301,6 +302,7 @@ function denyOf(reason: string, warnings: string[] = []): PolicyDecision {
 function enforceConditions(core: RepoCore, st: ProjectState, d: PolicyDecision): PolicyDecision {
   if (d.result !== "allow_with_conditions") return d;
   const encrypted = core.encrypted(st);
+  if (!encrypted && d.conditions.some((c) => c.type === "location")) return denyOf(LOCATION_NEEDS_ENCRYPTION, d.warnings);
   for (const c of d.conditions) {
     if (c.type === "encrypt" && !encrypted) {
       return denyOf("Governance requires encryption at rest, but this project is not encrypted", d.warnings);

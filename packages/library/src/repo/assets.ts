@@ -1,6 +1,20 @@
 /** Derived assets: new dated files under `derived/`, never overwriting (spec 4.2). */
-import { Asset, derivedFileName, encName, newId, originalFileName, withCollisionSuffix, type PendingProxy, type Provenance, type SourceFile } from "@ao/core";
-import { foldName, mimeFor, namesIn } from "./io.js";
+import {
+  Asset,
+  DEFAULT_GOVERNANCE,
+  derivedFileName,
+  effectivePolicy,
+  encName,
+  newId,
+  originalFileName,
+  parseGovernance,
+  withCollisionSuffix,
+  type PendingProxy,
+  type Provenance,
+  type SourceFile,
+} from "@ao/core";
+import { MissingParentError, ProxyRecordRefusedError } from "./errors.js";
+import { foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type RefuseHook, type MutateRequest } from "./mutate.js";
 import { fileMode, readSourceFile, storeRequest, writeSourceFile } from "./sources.js";
 import type { RepoCore } from "./state.js";
@@ -37,8 +51,13 @@ export async function addDerivedAsset(
   projectId: string,
   sourceId: string,
   input: DerivedAssetInput,
-  /** Package-internal (R83): the pending proxy (source.json `pendingProxies` id) this asset completes, removed in the same change. */
-  internal: { completesPendingProxy?: string } = {},
+  /**
+   * Package-internal (R83, R85): the pending proxy (source.json `pendingProxies` id) this asset
+   * completes, removed in the same change; refused (ProxyRecordRefusedError) when that entry is
+   * gone, or when the project's location rule is now stricter than `location`, the rule the proxy
+   * was checked against.
+   */
+  internal: { completesPendingProxy?: string; location?: LocationMode } = {},
 ): Promise<Asset> {
   core.assertWritable();
   const st = core.state(projectId);
@@ -50,6 +69,19 @@ export async function addDerivedAsset(
     storeRequest(current.source.provenance),
     async (tx) => {
       const cur = await readSourceFile(core, st, sourceId);
+      // A derived asset's parents must still exist (e.g. not removed by an import's undo, R85 I1).
+      for (const parent of input.derivation.parents) {
+        if (!cur.assets.some((a) => a.id === parent)) {
+          if (internal.completesPendingProxy) throw new ProxyRecordRefusedError("ORIGINAL_GONE");
+          throw new MissingParentError(parent);
+        }
+      }
+      if (internal.completesPendingProxy) {
+        // Recorded once (R85 I2), and only if it satisfies the rule as it is now (R85 C1).
+        if (!(cur.pendingProxies ?? []).some((j) => j.id === internal.completesPendingProxy && !j.failed)) throw new ProxyRecordRefusedError("ALREADY_RECORDED");
+        const now = await currentLocationMode(core, st.rel);
+        if (stricterLocation(now, internal.location ?? "keep") !== (internal.location ?? "keep")) throw new ProxyRecordRefusedError("RULE_CHANGED");
+      }
       const folder = cur.source.folder;
       // The folder name is already pseudonymized; drop its "[id]" (and any collision suffix).
       const folderName = folder.slice(folder.lastIndexOf("/") + 1);
@@ -99,6 +131,24 @@ export async function addDerivedAsset(
     },
     { op: "asset.derive" },
   );
+}
+
+export type LocationMode = "keep" | "coarsen" | "strip";
+const LOCATION_ORDER: LocationMode[] = ["keep", "coarsen", "strip"];
+
+/** The stricter of two location rules (strip > coarsen > keep). */
+export function stricterLocation(a: LocationMode, b: LocationMode): LocationMode {
+  return LOCATION_ORDER.indexOf(a) >= LOCATION_ORDER.indexOf(b) ? a : b;
+}
+
+/** The project's location rule as its governance.yaml says now (effective policy); unreadable → strip (fail closed). */
+export async function currentLocationMode(core: RepoCore, projectRel: string): Promise<LocationMode> {
+  try {
+    const raw = await readMaybe(core.abs(`${projectRel}/governance.yaml`));
+    return effectivePolicy(raw ? parseGovernance(raw.toString("utf8")) : DEFAULT_GOVERNANCE).policy.sharing.locationMetadata;
+  } catch {
+    return "strip";
+  }
 }
 
 /** Sets (or, when empty, removes) a source file's pending proxies. */

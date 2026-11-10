@@ -33,6 +33,13 @@ export type PolicyDecision = { warnings: string[] } & (
   | { result: "allow_with_conditions"; conditions: Condition[] }
 );
 
+/**
+ * The reason a store with location data is refused in a project that hides locations
+ * (`locationMetadata` coarsen or strip) but is not encrypted (R85 M5): the decision carries both an
+ * `encrypt` and a `location` condition, and an unencrypted project cannot honour them.
+ */
+export const LOCATION_NEEDS_ENCRYPTION = "This project hides locations, so photos with a location can only be stored in an encrypted project.";
+
 const DAY_MS = 86_400_000;
 const EXPIRY_WARNING_DAYS = 30;
 /** Deterministic order in which conditions are reported. */
@@ -181,6 +188,9 @@ function store(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Pol
   if (s.identifiable && p.identifiability.pseudonymizeFileNames) conditions.push({ type: "pseudonymize-names" });
   if (s.hasLocation && p.sharing.locationMetadata !== "keep") {
     if (p.encryption.atRest === "off") return deny("Location data requires encryption or locationMetadata: keep", warnings);
+    // R85 M5: an original that has (or may have) a location is kept only encrypted when the project
+    // hides locations; an unencrypted project cannot honour that (LOCATION_NEEDS_ENCRYPTION).
+    if (!conditions.some((c) => c.type === "encrypt")) conditions.push({ type: "encrypt" });
     conditions.push({ type: "location", mode: p.sharing.locationMetadata });
   }
   if (s.identifiable && p.consent.requireLegalBasis && !s.legalBasis) {

@@ -133,7 +133,10 @@ export function revertMerge(
   actor: string,
 ): { next: SourceFile; removed: Asset[]; kept: string[]; keptAnnotations: string[]; changed: boolean } {
   const ids = new Set(rec.addedAssetIds);
+  // Derived assets made from a removed original (its viewing proxy, R85 I1) go with it.
+  for (const a of cur.assets) if (a.derivation?.parents.some((p) => ids.has(p))) ids.add(a.id);
   const removed = cur.assets.filter((a) => ids.has(a.id));
+  const pendingLeft = (cur.pendingProxies ?? []).filter((j) => !ids.has(j.assetId));
   let source: Src = cur.source;
   const kept: string[] = [];
   const reverted = new Set<string>();
@@ -170,12 +173,14 @@ export function revertMerge(
     mergedExternalKeys = left.length ? { ...others, zotero: left } : Object.keys(others).length ? others : undefined;
   }
   const droppedAnnotations = annIds.size > 0 || restore.size > 0;
-  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations || dropKeys.size > 0;
-  const { mergedExternalKeys: _m, ...base } = cur;
+  const droppedPending = pendingLeft.length !== (cur.pendingProxies ?? []).length;
+  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending;
+  const { mergedExternalKeys: _m, pendingProxies: _p, ...base } = cur;
   return {
     next: {
       ...base,
       ...(mergedExternalKeys ? { mergedExternalKeys } : {}),
+      ...(pendingLeft.length ? { pendingProxies: pendingLeft } : {}),
       source: changed ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
       assets: cur.assets.filter((a) => !ids.has(a.id)),
       // An annotation anchored in a removed asset goes with it.

@@ -25,8 +25,10 @@ import { decryptStream } from "../crypto/format.js";
 import { extractMetadata } from "../extract/index.js";
 import { checkProxyLocation } from "../extract/exif.js";
 import { copyFileAtomic } from "../fs/atomic.js";
-import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
-import { addProxyAsset, editPendingProxies, projectDataKey, repoLibrary, type Repo } from "../repo/repo.js";
+import { stricterLocation } from "../repo/assets.js";
+import { PolicyDeniedError, ProjectLockedError, ProxyRecordRefusedError } from "../repo/errors.js";
+import { addProxyAsset, currentProjectLocationMode, editPendingProxies, projectDataKey, repoLibrary, type Repo } from "../repo/repo.js";
+import type { Library } from "../library.js";
 import { activeTemp } from "../tmp-registry.js";
 import { WorkerJobError, WorkerUnavailableError, type WorkerClient } from "../worker-client.js";
 import { LOCATION_REASON, type LocationMode } from "./common.js";
@@ -205,6 +207,8 @@ export class ProxyQueue {
       await editPendingProxies(this.repo, projectId, sourceId, (list) => list.filter((j) => j.id !== job.id)).catch(() => {});
       return { ...base, ok: false, code: "ORIGINAL_GONE" };
     }
+    // The rule as it is now, if stricter than when the job was queued (R85 C1).
+    const mode = stricterLocation(job.location, await currentProjectLocationMode(this.repo, projectId));
     const root = repoLibrary(this.repo).root;
     const input = asset.linked ? asset.linked.absolutePath : join(root, ...asset.path.split("/"));
     const ext = job.type === "image.proxy" ? "jpg" : "mp4";
@@ -219,7 +223,7 @@ export class ProxyQueue {
         input,
         inputEncrypted: asset.encrypted,
         output: join(work, `proxy.${ext}`),
-        params: { location: job.location },
+        params: { location: mode },
         entity: { type: "asset", id: asset.id },
       });
       const file = r.files[0];
@@ -232,7 +236,7 @@ export class ProxyQueue {
         check = join(work, `check.${ext}`);
         await copyFileAtomic(file, check, { transform: (rs) => rs.pipe(decryptStream((id) => (id === k.keyId ? k.key : undefined))), mode: 0o600 });
       }
-      const verdict = await checkProxyLocation(check, job.location);
+      const verdict = await checkProxyLocation(check, mode);
       if (!verdict.ok) {
         this.debug?.(`viewing proxy discarded: ${verdict.reason}`);
         return await this.fail(projectId, sourceId, job, "LOCATION_MISMATCH");
@@ -252,17 +256,23 @@ export class ProxyQueue {
             operation: job.type,
             provider: "ao-worker",
             ranAt: "local",
-            params: { location: job.location },
+            params: { location: mode },
             at: new Date().toISOString(),
             triggeredBy: "import",
           },
         },
         job.id,
+        mode,
       );
       return { ...base, ok: true, assetId: added.id };
     } catch (err) {
       // No worker reachable, or the project locked: the job stays pending and runs later.
       if (err instanceof WorkerUnavailableError || err instanceof ProjectLockedError) return { ...base, ok: false, code: "PENDING" };
+      if (err instanceof ProxyRecordRefusedError) {
+        // RULE_CHANGED: stays pending and is made again under the stricter rule; ALREADY_RECORDED: another run did it.
+        if (err.code === "ORIGINAL_GONE") await editPendingProxies(this.repo, projectId, sourceId, (list) => list.filter((j) => j.id !== job.id)).catch(() => {});
+        return { ...base, ok: false, code: err.code };
+      }
       if (err instanceof PolicyDeniedError) return await this.fail(projectId, sourceId, job, "POLICY_DENIED");
       if (err instanceof WorkerJobError) return await this.fail(projectId, sourceId, job, err.code);
       this.debug?.(`viewing proxy failed: ${err instanceof Error ? err.name : "error"}`);
@@ -272,4 +282,21 @@ export class ProxyQueue {
       activeTemp.delete(name);
     }
   }
+}
+
+/** One queue per library (R85 I2): attach, Bulk Import and watched folders share it. */
+const queues = new WeakMap<Library, ProxyQueue>();
+
+/**
+ * The library's viewing-proxy queue, made on first use (with no worker: jobs stay pending until
+ * `setWorker` and `resumePending`). Callers that are given a queue explicitly use that one.
+ */
+export function proxyQueueFor(repo: Repo): ProxyQueue {
+  const lib = repoLibrary(repo);
+  let q = queues.get(lib);
+  if (!q) {
+    q = new ProxyQueue({ repo });
+    queues.set(lib, q);
+  }
+  return q;
 }

@@ -85,3 +85,23 @@ export class NotFoundError extends Error {
     super(`${kind} ${id} not found`);
   }
 }
+
+/**
+ * A viewing proxy was not recorded (R85): its pending entry is gone (already recorded: recording is
+ * idempotent), its original no longer exists, or the project's location rule became stricter than
+ * the one the proxy was checked against. Nothing was written.
+ */
+export class ProxyRecordRefusedError extends Error {
+  override name = "ProxyRecordRefusedError";
+  constructor(readonly code: "ALREADY_RECORDED" | "ORIGINAL_GONE" | "RULE_CHANGED") {
+    super(`the viewing proxy was not recorded (${code})`);
+  }
+}
+
+/** A derived asset names a parent asset the source no longer has (R85 I1). */
+export class MissingParentError extends Error {
+  override name = "MissingParentError";
+  constructor(readonly assetId: string) {
+    super(`the parent asset ${assetId} no longer exists`);
+  }
+}

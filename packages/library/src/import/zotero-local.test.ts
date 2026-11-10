@@ -26,6 +26,12 @@ import type { ScanAnnotation } from "./bulk/scan.js";
 import { OUTSIDE_NOTE } from "./bulk/outside.js";
 import { ENGINE_FILE_NOTES } from "./bulk/run.js";
 import { LOCATION_REASON } from "./common.js";
+import { ExifTool } from "exiftool-vendored";
+import { existsSync } from "node:fs";
+import { ProxyQueue } from "./proxies.js";
+import { proxyStub } from "./proxy-testing.js";
+import { WorkerClient } from "../worker-client.js";
+import { stubWorker } from "../worker-testing.js";
 import { bibtexAdapter } from "./refman.js";
 import { IMAGE_PLACEHOLDER, MAX_NOTE_CHARS, encodeHref, noteToMarkdown } from "./note-html.js";
 import { planAnnotations } from "./bulk/update.js";
@@ -836,6 +842,56 @@ processing:
     expect(sf.pendingProxies?.map((j) => [j.type, j.location, j.assetId])).toEqual([["image.proxy", "coarsen", photo.id]]);
     const store = (await auditEvents(p)).filter((e) => e.action === "store" && e.entity?.id === sf.source.id).pop()!;
     expect(store.decision?.conditions).toContainEqual({ type: "location", mode: "coarsen" });
+  });
+
+  it("R85 I1: undoing the re-run that added a located photo also removes its viewing proxy and pending jobs", async () => {
+    const et = new ExifTool({ maxProcs: 1 });
+    const closers: Array<() => Promise<void> | void> = [];
+    try {
+      const w = await stubWorker(proxyStub(et), { closers, pollsUntilDone: 1 });
+      const proxies = new ProxyQueue({ repo, worker: new WorkerClient({ repo, worker: w, pollMs: 5 }) });
+      const p = await projectWith(locGov, true);
+      const bulk = createBulkImport({ repo, http: new HttpClient({ libraryRoot: lib.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 }), index: handle, proxies });
+      await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+      await mkdir(join(dataDir, "storage", "TIFFKEY1"), { recursive: true });
+      await buildCameraTiff(join(dataDir, "storage", "TIFFKEY1", "photo.tif"));
+      zoteroEdit((db) => {
+        db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (30, 2, 1, 'TIFFKEY1', 1, '2024-07-01 08:00:00', '2024-07-01 08:00:00', '2024-07-01 08:00:00')").run();
+        db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (30, 3, 0, 'image/tiff', 'storage:photo.tif')").run();
+      });
+      const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+      expect((await h.done).counts.updated).toBe(1);
+      await proxies.idle();
+      const withProxy = byZoteroKey(await sources(p), "CCCC3333");
+      const proxy = withProxy.assets.find((a) => a.kind === "proxy")!;
+      expect(proxy).toBeDefined();
+      expect(existsSync(join(lib.root, ...proxy.path.split("/")))).toBe(true);
+      await bulk.undoBatch(p.id, h.batchId);
+      const after = byZoteroKey(await sources(p), "CCCC3333");
+      expect(after.assets.filter((a) => a.kind === "image" || a.kind === "proxy")).toEqual([]);
+      expect(after.pendingProxies ?? []).toEqual([]);
+      expect(existsSync(join(lib.root, ...proxy.path.split("/")))).toBe(false);
+    } finally {
+      for (const c of closers) await c();
+      await et.end();
+    }
+  });
+
+  it("R85 I1: a pending proxy whose original was removed by undo is dropped, never recorded", async () => {
+    const p = await projectWith(locGov, true);
+    const bulk = bulkImport();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    await mkdir(join(dataDir, "storage", "TIFFKEY1"), { recursive: true });
+    await buildCameraTiff(join(dataDir, "storage", "TIFFKEY1", "photo.tif"));
+    zoteroEdit((db) => {
+      db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (30, 2, 1, 'TIFFKEY1', 1, '2024-07-01 08:00:00', '2024-07-01 08:00:00', '2024-07-01 08:00:00')").run();
+      db.prepare("INSERT INTO itemAttachments (itemID, parentItemID, linkMode, contentType, path) VALUES (30, 3, 0, 'image/tiff', 'storage:photo.tif')").run();
+    });
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    expect(byZoteroKey(await sources(p), "CCCC3333").pendingProxies).toHaveLength(1);
+    await bulk.undoBatch(p.id, h.batchId);
+    expect(byZoteroKey(await sources(p), "CCCC3333").pendingProxies ?? []).toEqual([]);
   });
 
   it("R74 I2: an unreadable (truncated) deletion record fails closed until reset; the reset is audited", async () => {

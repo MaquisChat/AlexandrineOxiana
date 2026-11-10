@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
-import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { ExifTool } from "exiftool-vendored";
+import { buildCameraTiff, buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { WorkerClient } from "../worker-client.js";
+import { stubWorker } from "../worker-testing.js";
+import { proxyQueueFor } from "./proxies.js";
+import { proxyStub } from "./proxy-testing.js";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
@@ -369,5 +374,36 @@ describe("watched-folder settings (R69)", () => {
     expect(aside).toHaveLength(1);
     expect(await readFile(join(tmp, "config", aside[0]!), "utf8")).toBe("{ not json");
     expect(await readFile(join(tmp, "config", "watched-folders.json"), "utf8")).toContain(wf.id);
+  });
+});
+
+describe("watched folders and viewing proxies (R85)", () => {
+  it("a located photo in a watched folder goes through the library's proxy queue (proxyQueueFor)", async () => {
+    const et = new ExifTool({ maxProcs: 1 });
+    const closers: Array<() => Promise<void> | void> = [];
+    const queue = proxyQueueFor(repo);
+    try {
+      const w = await stubWorker(proxyStub(et), { closers, pollsUntilDone: 1 });
+      queue.setWorker(new WorkerClient({ repo, worker: w, pollMs: 5 }));
+      const { project: p } = await repo.createProject({
+        name: `P${Math.random().toString(36).slice(2, 7)}`,
+        governanceYaml: GOV.replace("atRest: optional", "atRest: required") + "sharing:\n  locationMetadata: coarsen\n",
+        encryption: { enabled: true, passphrase: "pw" },
+      });
+      const { w: watch, events } = start(p, { stabilityMs: 200 });
+      await watch.ready;
+      // Built elsewhere (the fixture is written in two steps), then moved in whole.
+      await buildCameraTiff(join(tmp, "IMG_0001.tif"));
+      await rename(join(tmp, "IMG_0001.tif"), join(inbox, "IMG_0001.tif"));
+      await until(() => events.some((e) => e.kind === "imported"));
+      await queue.idle();
+      const sf = await repo.getSource(p.id, repo.listSourceIds(p.id)[0]!);
+      expect(sf.assets.filter((a) => a.kind === "proxy")).toHaveLength(1);
+      expect(sf.pendingProxies ?? []).toEqual([]);
+    } finally {
+      queue.setWorker(null);
+      for (const c of closers) await c();
+      await et.end();
+    }
   });
 });

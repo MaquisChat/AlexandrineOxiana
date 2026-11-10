@@ -105,6 +105,8 @@ export interface BatchRecord extends ImportBatch {
   countsDetail?: Record<string, number>;
   /** Device import (R83): the session and participants every new source is linked to. */
   fieldwork?: { sessionId?: string; participantIds?: string[] };
+  /** The adapter's resume options (ImportSourceAdapter.resumeOptions), e.g. device import's researcher name. */
+  adapterOptions?: { researcherName?: string };
 }
 
 /** `<project folder>/imports`. */

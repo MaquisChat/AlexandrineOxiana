@@ -8,7 +8,7 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
-import { addDerivedAsset, addOriginalAsset, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
+import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
@@ -534,8 +534,22 @@ export function addCapturedOriginal(
 }
 
 /** Package-internal (R83): records a viewing proxy as a derived asset and removes its pending entry, in one governed change. */
-export function addProxyAsset(repo: Repo, projectId: string, sourceId: string, input: DerivedAssetInput, pendingId: string): Promise<Asset> {
-  return addDerivedAsset(cores.get(repo)!, projectId, sourceId, input, { completesPendingProxy: pendingId });
+export function addProxyAsset(
+  repo: Repo,
+  projectId: string,
+  sourceId: string,
+  input: DerivedAssetInput,
+  pendingId: string,
+  /** The location rule the proxy was checked against (R85 C1). */
+  location: "keep" | "coarsen" | "strip",
+): Promise<Asset> {
+  return addDerivedAsset(cores.get(repo)!, projectId, sourceId, input, { completesPendingProxy: pendingId, location });
+}
+
+/** Package-internal (R85 C1): the project's location rule as its governance says now (unreadable → strip). */
+export function currentProjectLocationMode(repo: Repo, projectId: string): Promise<"keep" | "coarsen" | "strip"> {
+  const core = cores.get(repo)!;
+  return currentLocationMode(core, core.state(projectId).rel);
 }
 
 /** Package-internal (R83): edits a source's pending viewing proxies in one governed change. */

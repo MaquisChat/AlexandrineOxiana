@@ -49,7 +49,7 @@ export type { ProfileRules } from "./governance/profiles/index.js";
 export { applyMinimum, effectivePolicy } from "./governance/merge.js";
 export type { EffectivePolicy, Violation } from "./governance/merge.js";
 
-export { evaluate } from "./governance/engine.js";
+export { LOCATION_NEEDS_ENCRYPTION, evaluate } from "./governance/engine.js";
 export type { Condition, PolicyAction, PolicyDecision, PolicyRequest } from "./governance/engine.js";
 
 export { DOC_TEXT_LIMIT, groundedIn, normalizeTitle, titleSimilarity } from "./verify/evidence.js";

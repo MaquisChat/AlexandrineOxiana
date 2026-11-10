@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Project, SourceFile } from "@ao/core";
+import { LOCATION_NEEDS_ENCRYPTION, type Project, type SourceFile } from "@ao/core";
 import { buildCameraTiff, buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
@@ -18,7 +18,6 @@ import { openTestRepo } from "../repo/testing.js";
 import { SECRET_STORE_UNAVAILABLE, getSecret, setSecret } from "../secrets.js";
 import { useMemorySecrets, useNoSecretStore } from "../secrets-testing.js";
 import { BatchRefusedError, createBulkImport, type ScanContext, type ScanItem } from "./bulk/index.js";
-import { LOCATION_REASON } from "./common.js";
 import {
   ZOTERO_STORAGE_HOSTS,
   ZOTERO_WEB_FILE_NOTES,
@@ -734,16 +733,14 @@ processing:
     agent.get(STORAGE).intercept({ path: `/${attKey}`, method: "GET" }).reply(200, await readFile(tiffPath));
   }
 
-  it("R83: a located photo goes through the shared location flow: stored as the decision allows, its coarsened proxy pending (no worker)", async () => {
+  it("R83/R85 M5: a located photo goes through the shared location flow: in this unencrypted coarsen project its store is denied", async () => {
     const p = await project();
     await serveLocatedPhoto("LOCPHOT1", "LOCATT01", 40);
     const h = await startZoteroWebImport(bulkDeps(), p.id, web);
     const r = await h.done;
-    expect(r.counts.failed).toBe(0);
-    const sf = (await sources(p)).find((s) => s.source.provenance.externalKeys?.zoteroKey === "LOCPHOT1")!;
-    const photo = sf.assets.find((a) => a.kind === "image")!;
-    expect(sf.pendingProxies?.map((j) => [j.type, j.location, j.assetId])).toEqual([["image.proxy", "coarsen", photo.id]]);
-    expect((await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId)).notes).toContain(LOCATION_REASON);
+    expect(r.counts.failed).toBe(1);
+    expect((await createBulkImport(bulkDeps()).batchReport(p.id, h.batchId)).failures).toEqual([{ item: expect.stringContaining("LOCPHOT1"), reason: LOCATION_NEEDS_ENCRYPTION }]);
+    expect((await sources(p)).some((s) => s.source.provenance.externalKeys?.zoteroKey === "LOCPHOT1")).toBe(false);
   });
 
   it("since is recorded only when nothing failed: a failed item or a failed download leaves it unchanged", async () => {

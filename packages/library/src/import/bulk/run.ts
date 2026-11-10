@@ -78,7 +78,7 @@ import {
 import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
 import { LOCATION_REASON, MANUAL_UPLOAD_CATEGORY, candidateKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs, type LocationMode } from "../common.js";
-import { pendingFor, planProxies, type ProxyPlan, type ProxyQueue } from "../proxies.js";
+import { pendingFor, planProxies, proxyQueueFor, type ProxyPlan, type ProxyQueue } from "../proxies.js";
 import { resolveItem, type Resolution } from "../resolve.js";
 import { approvedFolders, rememberApprovedFolders } from "../approved-folders.js";
 import { serialStore, storeTurn } from "../project-queue.js";
@@ -161,7 +161,7 @@ export interface BulkImportDeps {
   index: { db: IndexDb };
   /** Queues OCR for a source whose PDF has no text layer (Task 15's worker), when `options.ocr`. */
   queueOcr?: (projectId: string, sourceId: string) => void | Promise<void>;
-  /** Viewing proxies of photos and videos (R83); absent: no media worker is configured (proxies stay pending, LOCATION_REASON). */
+  /** Viewing proxies of photos and videos (R83); default: the library's queue (proxyQueueFor, R85). */
   proxies?: ProxyQueue;
   debug?: (note: string) => void;
   /** Test seam: the watchdog budget per pattern per name (default 50 ms). */
@@ -1193,7 +1193,7 @@ class Run {
    * that must wait for a media worker is noted on the item and in the report (R83, LOCATION_REASON).
    */
   private notePending(key: string, sf: SourceFile, mode: LocationMode | undefined): void {
-    if (!mode || !sf.pendingProxies?.some((j) => !j.failed) || this.deps.proxies?.available) return;
+    if (!mode || !sf.pendingProxies?.some((j) => !j.failed) || this.proxies.available) return;
     const notes = this.fileNotes.get(key) ?? [];
     if (!notes.includes(LOCATION_REASON)) this.fileNotes.set(key, [...notes, LOCATION_REASON]);
     this.note(LOCATION_REASON);
@@ -1201,7 +1201,12 @@ class Run {
 
   /** Starts the stored source's viewing-proxy jobs (they stay pending in its source.json without a worker). */
   private startProxies(sf: SourceFile): void {
-    if (sf.pendingProxies?.length) this.deps.proxies?.enqueue(this.projectId, sf.source.id);
+    if (sf.pendingProxies?.length) this.proxies.enqueue(this.projectId, sf.source.id);
+  }
+
+  /** The proxy queue: the one given, else the library's (R85 I2). */
+  private get proxies(): ProxyQueue {
+    return this.deps.proxies ?? proxyQueueFor(this.repo);
   }
 
   /** The item's proxy plan against the files actually stored (some may have been left out since it was made). */
@@ -1613,6 +1618,7 @@ export async function startBatch(
       secret,
       ...(outsideApprovals.length ? { outsideApprovals } : {}),
       ...(internal.fieldwork && (internal.fieldwork.sessionId || internal.fieldwork.participantIds?.length) ? { fieldwork: internal.fieldwork } : {}),
+      ...(adapter.resumeOptions && Object.keys(adapter.resumeOptions).length ? { adapterOptions: { ...adapter.resumeOptions } } : {}),
     };
     // Written before anything is created, so an interrupted batch still has its record.
     await saveRecord(deps.repo, projectId, rec);
@@ -1647,7 +1653,7 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
     if (!rec) throw new NotFoundError("Import batch", batchId);
     if (rec.state === "finished" || rec.state === "undone") throw new BatchRefusedError("This import has already finished.");
     if (rec.source.kind === "profile-capture") throw new BatchRefusedError("Profile captures are resumed by capturing the profile again.");
-    const source = adapter ?? adapterFor(rec.source.kind, rec.source.location);
+    const source = adapter ?? adapterFor(rec.source.kind, rec.source.location, rec.adapterOptions);
     if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
     const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
     await preflightDeleted(deps.repo, projectId, source, rec.options);

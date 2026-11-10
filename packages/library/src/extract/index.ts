@@ -86,7 +86,8 @@ function capText(t: string): string {
 export async function extractMetadata(path: string, mime: string): Promise<Extracted> {
   const kind = kindOf(path, mime);
   if (!kind) return { identifiers: { dois: [], isbns: [], arxiv: [] } };
-  const raw = await EXTRACTORS[kind](path);
+  // Video: embedded and timed metadata too (-ee), e.g. a GPS track recorded with the frames (R85).
+  const raw = kind === "media" && /^video\//iu.test(mime) ? await extractExif(path, { embedded: true }) : await EXTRACTORS[kind](path);
   const text = raw.text ? capText(raw.text) : undefined;
   const { ids: _ids, text: _text, ...rest } = raw;
   return { ...rest, identifiers: mergeIdentifiers(raw, text), ...(text ? { text } : {}) };

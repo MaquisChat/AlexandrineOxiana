@@ -33,7 +33,7 @@ import { createBulkImport, type BulkImport } from "./bulk/index.js";
 import { LOCATION_REASON } from "./common.js";
 import { locationTagsMatch } from "../extract/exif.js";
 import { DEVICE_RESEARCHER_NOTE, deviceAdapter, groupDeviceFiles, type DeviceFile } from "./device.js";
-import { ProxyQueue } from "./proxies.js";
+import { ProxyQueue, proxyQueueFor } from "./proxies.js";
 import { gpsOf as sharedGpsOf, locationTags as sharedLocationTags, proxyStub } from "./proxy-testing.js";
 
 const FAST = 2 ** 10;
@@ -266,6 +266,20 @@ describe("groupDeviceFiles (pairing rules)", () => {
     expect(otherFolder).toHaveLength(2);
   });
 
+  it("R85: RAW and JPEG are compared by wall clock when only one states its time zone (CR2 without offset, JPEG with +02:00)", () => {
+    const g = groupDeviceFiles([
+      file("/d/IMG_4711.CR2", { capturedAt: "2026-05-01T14:00:00" }),
+      file("/d/IMG_4711.JPG", { capturedAt: "2026-05-01T14:00:01+02:00", tzOffset: "+02:00" }),
+    ]);
+    expect(g.map((x) => x.kind)).toEqual(["raw+jpeg"]);
+    // both zoned: the instants are compared (2 h apart: not one shot)
+    const both = groupDeviceFiles([
+      file("/d/B.CR2", { capturedAt: "2026-05-01T14:00:00+00:00" }),
+      file("/d/B.JPG", { capturedAt: "2026-05-01T14:00:00+02:00" }),
+    ]);
+    expect(both).toHaveLength(2);
+  });
+
   it("maps extensions to source types", () => {
     const g = groupDeviceFiles([file("/d/a.m4a"), file("/d/b.WAV"), file("/d/c.mp3"), file("/d/d.png"), file("/d/e.mp4"), file("/d/f.RAF")]);
     expect(Object.fromEntries(g.map((x) => [basename(x.files[0]!.path), x.type]))).toEqual({
@@ -297,7 +311,6 @@ describe("locationTagsMatch (proxy re-read rule, R83)", () => {
       "Keys:GPSCoordinates": "40.7 -74 0",
       "Keys:Location": "+40.7-074.0/",
       "UserData:LocationInformation": "(none) Role=shooting Lat=40.70000 Lon=-74.00000 Alt=0.00 Body=earth Notes=",
-      "GPS:GPSAltitude": 12.5,
     };
     expect(locationTagsMatch(coarse, "coarsen")).toEqual({ ok: true });
     expect(locationTagsMatch({ ...coarse, "GPS:GPSLongitude": 74.006 }, "coarsen").ok).toBe(false);
@@ -312,12 +325,74 @@ describe("locationTagsMatch (proxy re-read rule, R83)", () => {
     expect(r.ok ? "" : r.reason).not.toContain("40.7128");
   });
 
+  it("R85: coarsen rejects what the worker never writes: altitude, time stamps, speed, track, direction, a precise third coordinate, place names", () => {
+    const base = { "GPS:GPSLatitude": 40.7, "GPS:GPSLongitude": 74, "GPS:GPSLatitudeRef": "N", "GPS:GPSVersionID": "2 2 0 0" };
+    expect(locationTagsMatch(base, "coarsen")).toEqual({ ok: true });
+    for (const extra of [
+      { "GPS:GPSAltitude": 12.5 },
+      { "GPS:GPSTimeStamp": "10:15:30" },
+      { "GPS:GPSDateStamp": "2026:03:14" },
+      { "GPS:GPSSpeed": 3 },
+      { "GPS:GPSTrack": 120.5 },
+      { "GPS:GPSImgDirection": 271.2 },
+      { "Keys:GPSCoordinates": "40.7 -74 10.5" },
+      { "Keys:Location": "+40.7-074.0+010.000/" },
+      { "XMP-photoshop:City": "Gotham" },
+      { "IPTC:Sub-location": "Main Street" },
+    ]) {
+      expect(locationTagsMatch({ ...base, ...extra }, "coarsen").ok, JSON.stringify(extra)).toBe(false);
+    }
+  });
+
+  it("R85: strip rejects IPTC/XMP place names too (City, Province-State, Sub-location, Country, LocationCreated/Shown)", () => {
+    for (const t of [
+      { "XMP-photoshop:City": "Gotham" },
+      { "IPTC:Province-State": "NY" },
+      { "XMP-photoshop:State": "NY" },
+      { "IPTC:Sub-location": "Main Street" },
+      { "XMP-iptcCore:Location": "Main Street" },
+      { "IPTC:Country-PrimaryLocationName": "USA" },
+      { "XMP-photoshop:Country": "USA" },
+      { "XMP-iptcExt:LocationCreatedCity": "Gotham" },
+      { "XMP-iptcExt:LocationShownSublocation": "Pier 1" },
+    ]) {
+      expect(locationTagsMatch(t, "strip").ok, JSON.stringify(t)).toBe(false);
+    }
+  });
+
   it("keep: anything", () => {
     expect(locationTagsMatch({ "GPS:GPSLatitude": 40.7128 }, "keep")).toEqual({ ok: true });
   });
 });
 
-describe.skipIf(!HAVE_MEDIA_TOOLS)("device import (R83)", () => {
+describe("device import without media tools (R85: these never need them)", () => {
+  it("deviceAdapter: kind 'device', the scanned folder is its root", () => {
+    const a = deviceAdapter(folder);
+    expect(a.kind).toBe("device");
+    expect(a.roots).toEqual([folder]);
+  });
+
+  it("an unknown session or participant refuses the import before anything is stored", async () => {
+    const { bulk } = await setup();
+    const p = await project(gov(), true);
+    await expect(bulk.importDeviceFolder(p.id, folder, { sessionId: "019a0000-0000-7000-8000-000000000000" })).rejects.toThrow(/session/iu);
+    await expect(bulk.importDeviceFolder(p.id, folder, { participantIds: ["019a0000-0000-7000-8000-000000000001"] })).rejects.toThrow(/participant/iu);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("proxyQueueFor: one queue per library, shared by attach, Bulk Import and watched folders", () => {
+    const q = proxyQueueFor(repo);
+    expect(proxyQueueFor(repo)).toBe(q);
+    expect(q.available).toBe(false);
+  });
+});
+
+// In CI the media tools must be there: the suite fails instead of skipping (R85).
+describe.skipIf(!HAVE_MEDIA_TOOLS && !process.env.CI)("device import (R83)", () => {
+  beforeEach(() => {
+    if (!HAVE_MEDIA_TOOLS) throw new Error("the device import suite needs the media worker's venv (pnpm setup:py) and ffmpeg");
+  });
+
   it("4 sources (live photo, raw+jpeg, video, audio); the duplicate HEIC is skipped by hash; titles, creator, provenance", async () => {
     const { bulk, proxies } = await setup();
     const p = await project(gov(), true);
@@ -435,13 +510,6 @@ describe.skipIf(!HAVE_MEDIA_TOOLS)("device import (R83)", () => {
     for (const s of all) expect(created.some((e) => e.entity?.id === s.source.id)).toBe(true);
   });
 
-  it("an unknown session or participant refuses the import before anything is stored", async () => {
-    const { bulk } = await setup();
-    const p = await project(gov(), true);
-    await expect(bulk.importDeviceFolder(p.id, folder, { sessionId: "019a0000-0000-7000-8000-000000000000" })).rejects.toThrow(/session/iu);
-    expect(repo.listSourceIds(p.id)).toEqual([]);
-  });
-
   it("no worker: the originals are stored, the source is flagged proxy pending, and the jobs run once a worker is available", async () => {
     const { bulk, proxies } = await setup({ noWorker: true });
     const p = await project(gov({ mode: "coarsen" }), true);
@@ -496,10 +564,86 @@ describe.skipIf(!HAVE_MEDIA_TOOLS)("device import (R83)", () => {
     expect(all.every((s) => s.source.provenance.legal.basis === "consent (GDPR Art. 6(1)(a)); fieldwork consent forms")).toBe(true);
   });
 
-  it("deviceAdapter: kind 'device', the scanned folder is its root", () => {
-    const a = deviceAdapter(folder);
-    expect(a.kind).toBe("device");
-    expect(a.roots).toEqual([folder]);
+  it("R85 C1: a mode made stricter after queueing (keep → strip, coarsen → strip) is what the recorded proxy satisfies", async () => {
+    for (const from of ["keep", "coarsen"] as const) {
+      const { bulk } = await setup({ noWorker: true });
+      const p = await project(gov({ mode: from }), true);
+      await (await bulk.importDeviceFolder(p.id, folder, { researcherName: "R" })).done;
+      const live = byStem(await sourcesOf(p), "IMG_0001")!;
+      expect(live.pendingProxies?.map((j) => j.location)).toEqual([from, from]);
+      await writeFile(join(lib.root, p.folder, "governance.yaml"), gov({ mode: "strip" }));
+      const q = new ProxyQueue({ repo, worker: client });
+      queues.push(q);
+      const results = await q.resumePending(p.id);
+      expect(results.filter((r) => r.sourceId === live.source.id).every((r) => r.ok)).toBe(true);
+      const after = await repo.getSource(p.id, live.source.id);
+      const derived = after.assets.filter((a) => a.role === "derived");
+      expect(derived).toHaveLength(2);
+      for (const d of derived) {
+        expect(d.derivation!.params).toEqual({ location: "strip" });
+        expect(await locationTags(await plainCopy(p, d.path, true))).toEqual([]);
+      }
+      expect([...worker.jobs.values()].every((j) => j.body.params.location === "strip")).toBe(true);
+    }
+  });
+
+  it("R85 C1: the rule made stricter while the proxy is being made: recording is refused, the job stays pending and the next run makes a strip proxy", async () => {
+    const { bulk } = await setup({ noWorker: true });
+    const p = await project(gov({ mode: "keep" }), true);
+    await (await bulk.importDeviceFolder(p.id, folder, { researcherName: "R" })).done;
+    const live = byStem(await sourcesOf(p), "IMG_0001")!;
+    let changed = false;
+    const play = proxyStub(et);
+    const w = await stubWorker(async (job) => {
+      if (!changed) {
+        changed = true;
+        await writeFile(join(lib.root, p.folder, "governance.yaml"), gov({ mode: "strip" }));
+      }
+      return play(job);
+    }, { closers, pollsUntilDone: 1 });
+    const q = new ProxyQueue({ repo, worker: new WorkerClient({ repo, worker: w, pollMs: 5 }) });
+    queues.push(q);
+    const first = await q.resumePending(p.id);
+    expect(first.find((r) => r.sourceId === live.source.id)).toMatchObject({ ok: false, code: "RULE_CHANGED" });
+    const mid = await repo.getSource(p.id, live.source.id);
+    expect(mid.pendingProxies?.some((j) => !j.failed)).toBe(true);
+    await q.resumePending(p.id);
+    const after = await repo.getSource(p.id, live.source.id);
+    expect(after.pendingProxies ?? []).toEqual([]);
+    for (const d of after.assets.filter((a) => a.role === "derived")) {
+      expect(d.derivation!.params).toEqual({ location: "strip" });
+      expect(await locationTags(await plainCopy(p, d.path, true))).toEqual([]);
+    }
+  });
+
+  it("R85 I2: running the same pending jobs twice at once records each proxy once", async () => {
+    const { bulk } = await setup({ noWorker: true });
+    const p = await project(gov({ mode: "coarsen" }), true);
+    await (await bulk.importDeviceFolder(p.id, folder, { researcherName: "R" })).done;
+    const a = new ProxyQueue({ repo, worker: client });
+    const b = new ProxyQueue({ repo, worker: client });
+    queues.push(a, b);
+    await Promise.all([a.resumePending(p.id), b.resumePending(p.id)]);
+    for (const sf of await sourcesOf(p)) {
+      const originals = sf.assets.filter((x) => x.role === "original" && (x.kind === "image" || x.kind === "video"));
+      const proxies = sf.assets.filter((x) => x.kind === "proxy");
+      expect(proxies).toHaveLength(originals.length);
+      expect(new Set(proxies.map((x) => x.derivation!.parents[0])).size).toBe(originals.length);
+      expect(sf.pendingProxies ?? []).toEqual([]);
+    }
+  });
+
+  it("R85: the researcher name is kept in batch.json, so a resumed device import still names the photographer", async () => {
+    const { bulk } = await setup();
+    const p = await project(gov(), true);
+    const h = await bulk.importDeviceFolder(p.id, folder, { researcherName: "Dr. Ada Field" });
+    h.cancel();
+    await h.done;
+    const r = await (await bulk.resumeBatch(p.id, h.batchId)).done;
+    expect(r.state).toBe("finished");
+    const all = await sourcesOf(p);
+    expect(all).toHaveLength(4);
+    expect(all.every((s) => s.source.creators[0]?.literal === "Dr. Ada Field")).toBe(true);
   });
 
   it.skipIf(!existsSync(PY))("the real media worker coarsens the HEIC proxy (re-read: 40.7, -74.0)", async () => {

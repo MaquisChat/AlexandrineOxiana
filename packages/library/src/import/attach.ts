@@ -48,7 +48,7 @@ import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, type Repo } from "../repo/repo.js";
 import { ITEM_REASONS, LOCATION_REASON, candidateKey, dupKey, itemProvenance, locationRule, reviewFor, sha256File, storeInputs as sharedStoreInputs } from "./common.js";
-import { pendingFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
+import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./proxies.js";
 import { serialStore, storeTurn } from "./project-queue.js";
 import { LOCATED_MEDIA, mayHaveLocation, resolveItem } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
@@ -77,7 +77,7 @@ export interface AttachDeps {
   patterns?: FileNamePattern[];
   /** Receives short notes (lookup providers skipped or failed). */
   debug?: (note: string) => void;
-  /** Viewing proxies of located photos and videos (R83); absent: no media worker is configured (proxies stay pending). */
+  /** Viewing proxies of located photos and videos (R83); default: the library's queue (proxyQueueFor, R85). */
   proxies?: ProxyQueue;
 }
 
@@ -237,8 +237,9 @@ export function createAttach(deps: AttachDeps): Attach {
   /** Starts the stored file's proxy jobs; the note when they must wait for a media worker (R83). */
   function proxyNote(projectId: string, sourceId: string, plan: ProxyPlan, mode: string | undefined): { note?: string } {
     if (!mode || !plan.proxies.length) return {};
-    if (deps.proxies?.available) {
-      deps.proxies.enqueue(projectId, sourceId);
+    const proxies = deps.proxies ?? proxyQueueFor(repo);
+    if (proxies.available) {
+      proxies.enqueue(projectId, sourceId);
       return {};
     }
     return { note: LOCATION_REASON };

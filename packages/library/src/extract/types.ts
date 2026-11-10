@@ -20,6 +20,8 @@ export interface MediaMetadata {
   /** The camera model alone (EXIF/QuickTime Model), e.g. "iPhone 15 Pro". */
   model?: string;
   lens?: string;
+  /** A place named without coordinates (IPTC/XMP City, Sub-location, State, Country, LocationCreated/Shown ...): still a location (R85). */
+  locationText?: boolean;
   /** Raw coordinates as stored; coarsening/stripping is governed elsewhere (spec 5.3). */
   gps?: { lat: number; lon: number; alt?: number };
   durationSec?: number;

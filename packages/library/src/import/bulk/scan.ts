@@ -154,6 +154,8 @@ export interface ImportSourceAdapter {
    * location condition get one (R83).
    */
   viewingProxies?: boolean;
+  /** Options to keep with the batch record and give `adapterFor` again when the batch is resumed (e.g. device import's researcher name). */
+  resumeOptions?: { researcherName?: string };
 }
 
 const SIDECARS: ReadonlySet<string> = new Set(SIDECAR_EXTS);
@@ -317,7 +319,7 @@ export function zipAdapter(zipPath: string): ImportSourceAdapter {
 }
 
 /** The adapter a batch's recorded source names (for resuming without one), or undefined. */
-export function adapterFor(kind: ImportBatch["source"]["kind"], location: string): ImportSourceAdapter | undefined {
+export function adapterFor(kind: ImportBatch["source"]["kind"], location: string, options: ImportSourceAdapter["resumeOptions"] = {}): ImportSourceAdapter | undefined {
   if (kind === "folder") return folderAdapter(location);
   if (kind === "zip") return zipAdapter(location);
   if (kind === "bibtex") return bibtexAdapter(location);
@@ -327,6 +329,6 @@ export function adapterFor(kind: ImportBatch["source"]["kind"], location: string
   if (kind === "calibre") return calibreAdapter(location);
   if (kind === "zotero-local") return zoteroLocalAdapter(location);
   if (kind === "zotero-web") return zoteroWebAdapterFor(location);
-  if (kind === "device") return deviceAdapter(location);
+  if (kind === "device") return deviceAdapter(location, options?.researcherName ? { researcherName: options.researcherName } : {});
   return undefined;
 }

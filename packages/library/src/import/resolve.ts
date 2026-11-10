@@ -538,11 +538,11 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
 export const LOCATED_MEDIA = /^(?:image|video|audio)\//u;
 
 /**
- * GPS found, or an image, video or audio file whose metadata could not be read: location
- * governance must apply (fail closed, R57, R58).
+ * GPS found, a place named without coordinates (R85), or an image, video or audio file whose
+ * metadata could not be read: location governance must apply (fail closed, R57, R58).
  */
 export function mayHaveLocation(mime: string, extracted: Pick<Extracted, "media">): boolean {
-  if (extracted.media?.gps) return true;
+  if (extracted.media?.gps || extracted.media?.locationText) return true;
   return LOCATED_MEDIA.test(mime) && extracted.media?.readFailed === true;
 }
 

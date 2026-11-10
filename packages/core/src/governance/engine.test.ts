@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluate, type PolicyRequest } from "./engine.js";
+import { LOCATION_NEEDS_ENCRYPTION, evaluate, type PolicyRequest } from "./engine.js";
 import { parseGovernance, type GovernanceConfig } from "./schema.js";
 
 const cfg = (yaml = ""): GovernanceConfig => parseGovernance(yaml);
@@ -118,6 +118,15 @@ describe("store", () => {
   it("denies location data when encryption is off and location is not kept", () => {
     const d = evaluate(cfg("encryption: { atRest: off }"), st({ hasLocation: true }));
     expect(denyReason(d)).toBe("Location data requires encryption or locationMetadata: keep");
+  });
+  it("R85 M5: location data under coarsen/strip must be stored encrypted (encrypt condition, also when encryption is optional)", () => {
+    for (const mode of ["coarsen", "strip"]) {
+      const d = evaluate(cfg(`encryption: { atRest: optional }\nsharing: { locationMetadata: ${mode} }`), st({ hasLocation: true }));
+      expect(conditions(d)).toEqual([{ type: "encrypt" }, { type: "location", mode }]);
+    }
+    expect(evaluate(cfg("encryption: { atRest: optional }\nsharing: { locationMetadata: keep }"), st({ hasLocation: true })).result).toBe("allow");
+    expect(evaluate(cfg("encryption: { atRest: optional }"), st({ hasLocation: false })).result).toBe("allow");
+    expect(LOCATION_NEEDS_ENCRYPTION).toBe("This project hides locations, so photos with a location can only be stored in an encrypted project.");
   });
   it("allows location data when encryption is off but location is kept", () => {
     const d = evaluate(cfg("encryption: { atRest: off }\nsharing: { locationMetadata: keep }"), st({ hasLocation: true }));

@@ -97,11 +97,35 @@ function typeOf(path: string): SourceType {
   return "field-photo";
 }
 
-const timeOf = (f: DeviceFile): number | undefined => {
+const ZONE = /(?:Z|[+-]\d{2}:\d{2})$/u;
+
+/** The capture instant, when the time zone is known (stated in the time or as the offset). */
+function instantOf(f: DeviceFile): number | undefined {
   if (!f.capturedAt) return undefined;
-  const t = Date.parse(f.capturedAt);
+  const zoned = ZONE.test(f.capturedAt) ? f.capturedAt : f.tzOffset ? `${f.capturedAt}${f.tzOffset}` : undefined;
+  const t = zoned ? Date.parse(zoned) : NaN;
   return Number.isFinite(t) ? t : undefined;
-};
+}
+
+/** The capture time as the camera's clock showed it (any zone dropped), in ms. */
+function wallClockOf(f: DeviceFile): number | undefined {
+  if (!f.capturedAt) return undefined;
+  const t = Date.parse(`${f.capturedAt.replace(ZONE, "")}Z`);
+  return Number.isFinite(t) ? t : undefined;
+}
+
+/**
+ * How far apart two capture times are: the instants when both zones are known, else the wall-clock
+ * times (a camera often states the zone in the JPEG but not in the RAW file, R85).
+ */
+function apartMs(a: DeviceFile, b: DeviceFile): number | undefined {
+  const ia = instantOf(a);
+  const ib = instantOf(b);
+  if (ia !== undefined && ib !== undefined) return Math.abs(ia - ib);
+  const wa = wallClockOf(a);
+  const wb = wallClockOf(b);
+  return wa !== undefined && wb !== undefined ? Math.abs(wa - wb) : undefined;
+}
 
 const byPath = (a: DeviceFile, b: DeviceFile) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
 
@@ -134,17 +158,12 @@ export function groupDeviceFiles(files: DeviceFile[]): DeviceGroup[] {
   // RAW + JPEG.
   for (const raw of sorted) {
     if (used.has(raw) || !RAW_EXTS.has(extOf(raw.path))) continue;
-    const t = timeOf(raw);
-    if (t === undefined) continue;
-    const jpeg = sorted.find(
-      (f) =>
-        !used.has(f) &&
-        JPEG_EXTS.has(extOf(f.path)) &&
-        dirname(f.path) === dirname(raw.path) &&
-        stemOf(f.path).toLowerCase() === stemOf(raw.path).toLowerCase() &&
-        timeOf(f) !== undefined &&
-        Math.abs(timeOf(f)! - t) <= RAW_JPEG_WINDOW_MS,
-    );
+    const jpeg = sorted.find((f) => {
+      if (used.has(f) || !JPEG_EXTS.has(extOf(f.path)) || dirname(f.path) !== dirname(raw.path)) return false;
+      if (stemOf(f.path).toLowerCase() !== stemOf(raw.path).toLowerCase()) return false;
+      const d = apartMs(raw, f);
+      return d !== undefined && d <= RAW_JPEG_WINDOW_MS;
+    });
     if (!jpeg) continue;
     used.add(raw).add(jpeg);
     groups.push({ kind: "raw+jpeg", type: "field-photo", files: [jpeg, raw] });
@@ -294,6 +313,8 @@ export function deviceAdapter(dir: string, opts: DeviceAdapterOptions = {}): Imp
     roots: [root],
     tool: { name: "device-import", version: VERSION },
     viewingProxies: true,
+    // Kept in batch.json (sealed in encrypted projects), so a resumed batch names the photographer too.
+    ...(researcher ? { resumeOptions: { researcherName: researcher } } : {}),
     async *scan(signal: AbortSignal, ctx?: ScanContext): AsyncGenerator<ScanItem> {
       const note = (t: string) => ctx?.note?.(t);
       if (!researcher) note(DEVICE_RESEARCHER_NOTE);

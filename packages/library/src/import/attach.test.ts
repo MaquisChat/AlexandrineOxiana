@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
-import { DEFAULT_GOVERNANCE, findDuplicate, parseGovernanceWithWarnings } from "@ao/core";
+import { DEFAULT_GOVERNANCE, LOCATION_NEEDS_ENCRYPTION, findDuplicate, parseGovernanceWithWarnings } from "@ao/core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ExifTool } from "exiftool-vendored";
 import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
@@ -769,6 +769,36 @@ processing:
     const sf = await repo.getSource(p.id, r!.sourceId!);
     expect(sf.assets.filter((a) => a.role === "derived")).toEqual([]);
     expect(sf.pendingProxies?.[0]?.failed?.code).toBe("LOCATION_MISMATCH");
+  });
+
+  for (const mode of ["coarsen", "strip"] as const) {
+    it(`R85 M5: locationMetadata ${mode} in a project that is not encrypted: a photo with a location is refused with a plain reason`, async () => {
+      const p = await project(gov(mode).replace("atRest: required", "atRest: optional"), false);
+      const tif = join(files, "IMG_0001.tif");
+      await buildCameraTiff(tif);
+      expect(await attach.attachFiles(p.id, [tif])).toEqual([{ path: tif, outcome: "failed", reason: LOCATION_NEEDS_ENCRYPTION }]);
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      const denies = (await auditEvents(p.folder)).filter((e) => e.decision?.result === "deny");
+      expect(denies.map((e) => [e.action, e.decision?.reason])).toEqual([["store", LOCATION_NEEDS_ENCRYPTION]]);
+    });
+  }
+
+  it("R85: a place name alone (IPTC/XMP City, Sub-location, LocationCreated) counts as a location", async () => {
+    const enc = await project(gov("coarsen"), true);
+    const plain = await project(gov("coarsen").replace("atRest: required", "atRest: optional"), false);
+    for (const tags of [{ City: "Gotham" }, { "Sub-location": "Main Street" }, { LocationCreatedCity: "Gotham" }]) {
+      setExifReaderForTests(() => Promise.resolve({ Make: "Apple", ...tags }));
+      try {
+        const unique = () => Buffer.concat([tinyPng(), Buffer.from(Math.random().toString(36))]);
+        const [r] = await attach.attachFiles(enc.id, [await put(`p-${Object.keys(tags)[0]}.png`, unique())]);
+        expect(r).toMatchObject({ note: LOCATION_REASON });
+        expect((await repo.getSource(enc.id, r!.sourceId!)).pendingProxies?.map((j) => j.location)).toEqual(["coarsen"]);
+        const [d] = await attach.attachFiles(plain.id, [await put(`q-${Object.keys(tags)[0]}.png`, unique())]);
+        expect(d).toMatchObject({ outcome: "failed", reason: LOCATION_NEEDS_ENCRYPTION });
+      } finally {
+        setExifReaderForTests(undefined);
+      }
+    }
   });
 
   it("locationMetadata keep: the photo is stored, no proxy is needed", async () => {
