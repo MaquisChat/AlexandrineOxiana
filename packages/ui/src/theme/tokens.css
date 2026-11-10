@@ -1,0 +1,212 @@
+/*
+ * Design tokens (spec 8A.1). The only file in the UI where colours are written: everything else
+ * uses var(--token), enforced by stylelint (color-no-hex, color-named, no colour functions).
+ *
+ * light and dark: the approved mockup's .ao-light / .ao-dark values, unchanged.
+ * --code-1 ... --code-12: the qualitative code palette. Every pair differs by CIEDE2000 >= 15 with
+ *   normal vision and under simulated deuteranopia, protanopia and tritanopia (Machado et al. 2009),
+ *   and every colour reaches 3:1 against --bg and --surface. Light and dark each have their own set,
+ *   found by search; --code-n is paired with the closest-hue colour of the other set, but the two
+ *   sets do not share hues (no shared-hue set reached these limits). Users can recolour any code.
+ *   Checked by src/theme/palette.test.ts.
+ * light-hc and dark-hc: generated from light and dark (src/theme/tokenFile.ts) so that every text
+ *   token reaches 7:1 on the backgrounds it is drawn on.
+ */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #F6F5F1;
+  --surface: #FFFFFF;
+  --surface-2: #FBFAF7;
+  --ink: #1C1B19;
+  --ink-2: #3A3832;
+  --ink-3: #4A473F;
+  --muted: #5F5B52;
+  --line: #E2DFD7;
+  --line-soft: #EEEBE4;
+  --line-strong: #CFCBC1;
+  --chip: #F1EFE9;
+  --accent: #1F5E63;
+  --accent-ink: #163F43;
+  --on-accent: #FFFFFF;
+  --accent-soft: #E6EFEE;
+  --accent-soft2: #F2F7F6;
+  --dropline: #B9C9C6;
+  --accent-soft-ink: #2D4B48;
+  --ok: #2E7D4F;
+  --ok-soft: #EEF5F1;
+  --ok-line: #C6DDD1;
+  --ok-soft2: #DDEFE6;
+  --ok-ink: #1F5A3C;
+  --violet-soft: #E8E4F3;
+  --violet-soft2: #EEEAF7;
+  --violet-ink: #3F3473;
+  --warn-soft: #FBE8D6;
+  --warn-ink: #7A3A0C;
+  --warn-ink2: #8A3B12;
+  --warn-line: #E3B897;
+  --amber-ink: #8A5A00;
+  --deny: #9A2B1F;
+  --backdrop: #E9E7E1;
+  --code-1: #774D49;
+  --code-2: #5A0706;
+  --code-3: #C00D00;
+  --code-4: #A37B6C;
+  --code-5: #E66706;
+  --code-6: #1C92ED;
+  --code-7: #203B81;
+  --code-8: #8E8C9F;
+  --code-9: #050039;
+  --code-10: #665F74;
+  --code-11: #6F01F8;
+  --code-12: #36252F;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #161614;
+  --surface: #201F1C;
+  --surface-2: #1B1A18;
+  --ink: #ECE9E1;
+  --ink-2: #D9D5CB;
+  --ink-3: #C6C1B5;
+  --muted: #AAA598;
+  --line: #35332E;
+  --line-soft: #2B2A26;
+  --line-strong: #4C4942;
+  --chip: #2B2A26;
+  --accent: #6FB7B3;
+  --accent-ink: #A7D8D5;
+  --on-accent: #0E1A1B;
+  --accent-soft: #1F3534;
+  --accent-soft2: #1A2928;
+  --dropline: #3E5E5B;
+  --accent-soft-ink: #A7D8D5;
+  --ok: #5FBF86;
+  --ok-soft: #1B2C23;
+  --ok-line: #2F4D3C;
+  --ok-soft2: #1D3227;
+  --ok-ink: #9ED9B5;
+  --violet-soft: #2C2740;
+  --violet-soft2: #2C2740;
+  --violet-ink: #C9C0F0;
+  --warn-soft: #3A2616;
+  --warn-ink: #F2B88A;
+  --warn-ink2: #F2B88A;
+  --warn-line: #6B4528;
+  --amber-ink: #E9C46A;
+  --deny: #F08A7E;
+  --backdrop: #0B0B0A;
+  --code-1: #E8CACA;
+  --code-2: #836E0C;
+  --code-3: #98FF00;
+  --code-4: #FEFFC1;
+  --code-5: #99AD06;
+  --code-6: #76A87E;
+  --code-7: #C7D4FB;
+  --code-8: #5E6E58;
+  --code-9: #AF92FD;
+  --code-10: #C78AAA;
+  --code-11: #8A3CFB;
+  --code-12: #B33A82;
+}
+
+/* BEGIN GENERATED: high-contrast themes, derived from light and dark by `pnpm --filter @ao/ui gen:tokens`. Do not edit by hand. */
+[data-theme="light-hc"] {
+  color-scheme: light;
+  --bg: #F6F5F1;
+  --surface: #FFFFFF;
+  --surface-2: #FBFAF7;
+  --ink: #1C1B19;
+  --ink-2: #3A3832;
+  --ink-3: #4A473F;
+  --muted: #534F47;
+  --line: #8E8C87;
+  --line-soft: #EEEBE4;
+  --line-strong: #8F8C85;
+  --chip: #F1EFE9;
+  --accent: #1F5E63;
+  --accent-ink: #163F43;
+  --on-accent: #FFFFFF;
+  --accent-soft: #E6EFEE;
+  --accent-soft2: #F2F7F6;
+  --dropline: #B9C9C6;
+  --accent-soft-ink: #2D4B48;
+  --ok: #2E7D4F;
+  --ok-soft: #EEF5F1;
+  --ok-line: #C6DDD1;
+  --ok-soft2: #DDEFE6;
+  --ok-ink: #1E573A;
+  --violet-soft: #E8E4F3;
+  --violet-soft2: #EEEAF7;
+  --violet-ink: #3F3473;
+  --warn-soft: #FBE8D6;
+  --warn-ink: #7A3A0C;
+  --warn-ink2: #823711;
+  --warn-line: #E3B897;
+  --amber-ink: #6C4600;
+  --deny: #8F281D;
+  --backdrop: #E9E7E1;
+  --code-1: #774D49;
+  --code-2: #5A0706;
+  --code-3: #C00D00;
+  --code-4: #A37B6C;
+  --code-5: #E66706;
+  --code-6: #1C92ED;
+  --code-7: #203B81;
+  --code-8: #8E8C9F;
+  --code-9: #050039;
+  --code-10: #665F74;
+  --code-11: #6F01F8;
+  --code-12: #36252F;
+}
+
+[data-theme="dark-hc"] {
+  color-scheme: dark;
+  --bg: #161614;
+  --surface: #201F1C;
+  --surface-2: #1B1A18;
+  --ink: #ECE9E1;
+  --ink-2: #D9D5CB;
+  --ink-3: #C6C1B5;
+  --muted: #B9B5AB;
+  --line: #6C6A66;
+  --line-soft: #2B2A26;
+  --line-strong: #6C6A64;
+  --chip: #2B2A26;
+  --accent: #6FB7B3;
+  --accent-ink: #A7D8D5;
+  --on-accent: #0E1A1B;
+  --accent-soft: #1F3534;
+  --accent-soft2: #1A2928;
+  --dropline: #3E5E5B;
+  --accent-soft-ink: #A7D8D5;
+  --ok: #5FBF86;
+  --ok-soft: #1B2C23;
+  --ok-line: #2F4D3C;
+  --ok-soft2: #1D3227;
+  --ok-ink: #9ED9B5;
+  --violet-soft: #2C2740;
+  --violet-soft2: #2C2740;
+  --violet-ink: #C9C0F0;
+  --warn-soft: #3A2616;
+  --warn-ink: #F2B88A;
+  --warn-ink2: #F2B88A;
+  --warn-line: #6B4528;
+  --amber-ink: #E9C46A;
+  --deny: #F3A097;
+  --backdrop: #0B0B0A;
+  --code-1: #E8CACA;
+  --code-2: #836E0C;
+  --code-3: #98FF00;
+  --code-4: #FEFFC1;
+  --code-5: #99AD06;
+  --code-6: #76A87E;
+  --code-7: #C7D4FB;
+  --code-8: #5E6E58;
+  --code-9: #AF92FD;
+  --code-10: #C78AAA;
+  --code-11: #8A3CFB;
+  --code-12: #B33A82;
+}
+/* END GENERATED */
