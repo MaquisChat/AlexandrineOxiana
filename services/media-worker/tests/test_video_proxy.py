@@ -70,3 +70,46 @@ def test_odd_source_height_gives_even_output_and_no_workdir_left(worker, tmp_pat
     assert job["status"] == "done", job
     assert probe(out)["streams"][0]["height"] == 240
     assert not any(p.name.startswith(".work-") for p in tmp_path.iterdir())
+
+
+def _mov_with_apple_location(path):
+    """An iPhone-style MOV: the location only in the Apple key (com.apple.quicktime.location.ISO6709) and ©xyz."""
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=1",
+            "-c:v", "mpeg4", "-movflags", "use_metadata_tags",
+            "-metadata", "com.apple.quicktime.location.ISO6709=+40.7128-074.0060+010.000/",
+            "-metadata", "location=+40.7128-074.0060/",
+            "-metadata", "com.apple.quicktime.make=Apple",
+            str(path),
+        ],
+        check=True,
+    )
+
+
+def test_apple_location_key_coarsened(worker, tmp_path):
+    from ao_worker.location import parse_iso6709
+
+    src = tmp_path / "IMG_0001.MOV"
+    _mov_with_apple_location(src)
+    assert "com.apple.quicktime.location.iso6709" in tags(probe(src))
+    out = tmp_path / "o.mp4"
+    job = worker.run("video.proxy", str(src), str(out), {"location": "coarsen"}, timeout=300)
+    assert job["status"] == "done", job
+    t = tags(probe(out))
+    located = {k: v for k, v in t.items() if "location" in k or "xyz" in k}
+    assert located, t
+    for v in located.values():
+        assert parse_iso6709(v) == (40.7, -74.0), located
+    assert t.get("com.apple.quicktime.make") == "Apple"
+
+
+def test_apple_location_key_stripped(worker, tmp_path):
+    src = tmp_path / "IMG_0001.MOV"
+    _mov_with_apple_location(src)
+    out = tmp_path / "o.mp4"
+    job = worker.run("video.proxy", str(src), str(out), {"location": "strip"}, timeout=300)
+    assert job["status"] == "done", job
+    t = tags(probe(out))
+    assert not any("location" in k or "xyz" in k for k in t), t
+    assert b"+40.7128" not in out.read_bytes()

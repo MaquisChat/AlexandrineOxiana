@@ -56,7 +56,7 @@ Link capture from YouTube, Instagram and TikTok uses the `social-media` entry, u
 
 Files you drag and drop onto the library (drag-and-drop attach) use the `manual-upload` entry for each new source. A file dropped onto an existing source is stored under that source's own recorded basis instead. Without a basis, an identifiable project refuses the drop and says why.
 
-Bulk Import uses one entry per kind of source: folders and ZIP archives use `manual-upload`; reference-manager exports (BibTeX, RIS and CSL-JSON files) use `refman-import`; Zotero RDF exports use `zotero-import` (their provenance says the data came from Zotero); Calibre libraries use `calibre-import`. The capture methods behind them (`refman_import`, `zotero_import`, `calibre_import`) must be listed under `captureMethods`. They are by default.
+Bulk Import uses one entry per kind of source: folders and ZIP archives use `manual-upload`; reference-manager exports (BibTeX, RIS and CSL-JSON files) use `refman-import`; Zotero RDF exports use `zotero-import` (their provenance says the data came from Zotero); Calibre libraries use `calibre-import`; photos, videos and recordings imported from a phone or camera folder (iPhone and camera media import) use `device-import`. The capture methods behind them (`refman_import`, `zotero_import`, `calibre_import`, `device_import`) must be listed under `captureMethods`. They are by default.
 
 ```yaml
 consent:
@@ -64,7 +64,17 @@ consent:
     refman-import: "legitimate interest (GDPR Art. 6(1)(f)); bibliographic records only"
     zotero-import: "legitimate interest (GDPR Art. 6(1)(f)); the researcher's Zotero library"
     calibre-import: "legitimate interest (GDPR Art. 6(1)(f)); the researcher's own e-book library"
+    device-import: "consent (GDPR Art. 6(1)(a)); fieldwork consent forms, see the data management plan"
 ```
+
+### Location data in photos, videos and recordings
+
+Phones and many cameras record where a photo, video or voice memo was made (GPS). `sharing.locationMetadata` says what happens to that location: `keep`, `coarsen` (latitude and longitude rounded to one decimal place, about 11 km, roughly a city) or `strip` (every location tag removed: EXIF GPS, XMP, and the QuickTime location atoms).
+
+- The original file is never changed. It is stored with its location only when the project's rules allow it: with `coarsen` or `strip`, encryption at rest must not be `off`, otherwise the file is refused with the reason "Location data requires encryption or locationMetadata: keep". In a project that requires encryption the original is stored encrypted.
+- The viewing copies (a JPEG for photos, an MP4 for videos) follow the rule. Each viewing copy is checked after it is made: its location is read back from the file, and a copy whose location does not match the rule is thrown away and never stored.
+- If the media helper is not running, the original is still stored as above, and the source shows that its viewing copy is pending ("proxy pending"). The copy is made, with the rule applied, as soon as the media helper is available.
+- Voice memos and other recordings have no viewing copy; their location stays only in the original, stored under the same rule.
 
 ## Enforcement status
 

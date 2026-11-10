@@ -31,6 +31,7 @@ import { WorkerClient, devWorkerPython, startWorker } from "../worker-client.js"
 import { stubWorker, type StubWorker } from "../worker-testing.js";
 import { createBulkImport, type BulkImport } from "./bulk/index.js";
 import { LOCATION_REASON } from "./common.js";
+import { locationTagsMatch } from "../extract/exif.js";
 import { DEVICE_RESEARCHER_NOTE, deviceAdapter, groupDeviceFiles, type DeviceFile } from "./device.js";
 import { ProxyQueue } from "./proxies.js";
 import { gpsOf as sharedGpsOf, locationTags as sharedLocationTags, proxyStub } from "./proxy-testing.js";
@@ -275,6 +276,44 @@ describe("groupDeviceFiles (pairing rules)", () => {
       "e.mp4": "field-video",
       "f.RAF": "field-photo",
     });
+  });
+});
+
+describe("locationTagsMatch (proxy re-read rule, R83)", () => {
+  it("strip: any location tag fails; none passes", () => {
+    expect(locationTagsMatch({}, "strip")).toEqual({ ok: true });
+    expect(locationTagsMatch({ "Keys:GPSCoordinates": "40.7 -74" }, "strip").ok).toBe(false);
+    expect(locationTagsMatch({ "XMP-exif:GPSLatitude": 40.7 }, "strip").ok).toBe(false);
+  });
+
+  it("coarsen: coordinates must be at one decimal, in numbers, position strings and QuickTime location text", () => {
+    const coarse = {
+      "GPS:GPSLatitude": 40.7,
+      "GPS:GPSLongitude": 74,
+      "GPS:GPSLatitudeRef": "N",
+      "GPS:GPSVersionID": "2 2 0 0",
+      "Composite:GPSLatitude": 40.7,
+      "Composite:GPSLongitude": -74,
+      "Keys:GPSCoordinates": "40.7 -74 0",
+      "Keys:Location": "+40.7-074.0/",
+      "UserData:LocationInformation": "(none) Role=shooting Lat=40.70000 Lon=-74.00000 Alt=0.00 Body=earth Notes=",
+      "GPS:GPSAltitude": 12.5,
+    };
+    expect(locationTagsMatch(coarse, "coarsen")).toEqual({ ok: true });
+    expect(locationTagsMatch({ ...coarse, "GPS:GPSLongitude": 74.006 }, "coarsen").ok).toBe(false);
+    expect(locationTagsMatch({ ...coarse, "Keys:GPSCoordinates": "40.7128 -74.006 0" }, "coarsen").ok).toBe(false);
+    expect(locationTagsMatch({ ...coarse, "Keys:Location": "+40.7128-074.0060/" }, "coarsen").ok).toBe(false);
+    expect(locationTagsMatch({ ...coarse, "UserData:LocationInformation": "Role=shooting Lat=40.71280 Lon=-74.00600" }, "coarsen").ok).toBe(false);
+    expect(locationTagsMatch({ "XMP-exif:GPSLatitude": "40,42.768N" }, "coarsen").ok).toBe(false);
+    // a location tag the check does not understand is not allowed in a coarsened copy
+    expect(locationTagsMatch({ "GPS:GPSDestBearing": 12.34 }, "coarsen").ok).toBe(false);
+    // reasons name tags, never values
+    const r = locationTagsMatch({ "GPS:GPSLatitude": 40.7128 }, "coarsen");
+    expect(r.ok ? "" : r.reason).not.toContain("40.7128");
+  });
+
+  it("keep: anything", () => {
+    expect(locationTagsMatch({ "GPS:GPSLatitude": 40.7128 }, "keep")).toEqual({ ok: true });
   });
 });
 

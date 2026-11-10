@@ -195,13 +195,20 @@ export async function checkProxyLocation(path: string, mode: "keep" | "coarsen" 
   if (mode === "keep") return { ok: true };
   const tags = await readLocationTags(path);
   if (!tags) return { ok: false, reason: "the copy's metadata could not be read" };
+  return locationTagsMatch(tags, mode);
+}
+
+/** The rule of `checkProxyLocation` on location tags already read ("Group:Tag" → value, ExifTool -n). Pure. */
+export function locationTagsMatch(tags: Record<string, unknown>, mode: "keep" | "coarsen" | "strip"): { ok: true } | { ok: false; reason: string } {
+  if (mode === "keep") return { ok: true };
   const names = Object.keys(tags);
   if (mode === "strip") return names.length ? { ok: false, reason: `the copy still has location tags (${names.slice(0, 5).join(", ")})` } : { ok: true };
   for (const [k, v] of Object.entries(tags)) {
     const tag = k.slice(k.indexOf(":") + 1);
     if (/Ref$|Version|Altitude|TimeStamp|DateStamp|Datum|MapDatum|ProcessingMethod|Status|MeasureMode|DOP|Accuracy|Speed|Track|ImgDirection|Body|Role/iu.test(tag)) continue;
     if (COORDINATE_TAG.test(tag)) {
-      const n = typeof v === "number" ? v : numbersIn(String(v))[0];
+      // One plain decimal number (ExifTool -n); anything else (e.g. "40,42.768N") is not understood: fail closed.
+      const n = typeof v === "number" ? v : /^\s*[+-]?\d+(?:\.\d+)?\s*$/u.test(String(v)) ? Number(v) : undefined;
       if (n === undefined || !isCoarse(n)) return { ok: false, reason: `${k} is not coarsened` };
     } else if (POSITION_TAG.test(tag)) {
       const text = String(v);
