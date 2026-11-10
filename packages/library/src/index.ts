@@ -44,6 +44,18 @@ export {
 export type { Library, LibraryJson, OpenOptions } from "./library.js";
 export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, releaseLock, startHeartbeat } from "./lock.js";
 export type { LockInfo } from "./lock.js";
+export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, parseWindowsDrives } from "./location.js";
+export type { Location, LocationEnv, MountInfo } from "./location.js";
+export {
+  InvalidConfirmTokenError,
+  MOVE_JOURNAL,
+  MoveNotAllowedError,
+  MoveVerificationError,
+  deleteOldCopy,
+  executeMove,
+  planMove,
+} from "./move.js";
+export type { DeleteOldCopyResult, MoveOptions, MovePlan, MoveProgress, MoveRefusal, MoveResult, PlanOptions, ProjectPlan } from "./move.js";
 export { forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 

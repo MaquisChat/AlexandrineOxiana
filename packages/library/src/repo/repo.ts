@@ -33,10 +33,16 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
+import { RecoveryPendingError } from "./errors.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 
+/** Repo → its core, for package-internal helpers below (not part of the public Repo API). */
+const cores = new WeakMap<Repo, RepoCore>();
+
 export class Repo {
-  constructor(private readonly core: RepoCore) {}
+  constructor(private readonly core: RepoCore) {
+    cores.set(this, core);
+  }
 
   /** Audit logs that changed outside the app, found when the repo was opened (R12). */
   get integrityWarnings(): readonly IntegrityWarning[] {
@@ -338,6 +344,35 @@ function reportIncompleteLines(core: RepoCore, projectId: string, lines: Incompl
             : `${what}; it is left in place until the interrupted change reported for this library is resolved`,
     });
   }
+}
+
+/**
+ * Package-internal (library move): appends a library-level audit event such as
+ * `library.move` to one project, with the same guards as any write (read-only
+ * library, unresolved recovery) and the external anchor updated. Not exported
+ * from the package: callers outside it cannot write arbitrary audit events.
+ */
+export async function appendLibraryEvent(repo: Repo, projectId: string, action: string, details: Record<string, unknown>): Promise<void> {
+  const core = cores.get(repo)!;
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    const st = core.state(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    const at = core.clock().toISOString();
+    await core.auditNow(st, {
+      ...core.auditBase(st, at),
+      action,
+      entity: { type: "project", id: projectId },
+      decision: { result: "allow" },
+      details,
+    });
+  });
+}
+
+/** Package-internal: ids of projects that refuse writes until the library is reopened. */
+export function recoveryPendingProjects(repo: Repo): string[] {
+  return [...cores.get(repo)!.projects.values()].filter((s) => s.recoveryPending).map((s) => s.project.id);
 }
 
 export type { RepoOptions };
