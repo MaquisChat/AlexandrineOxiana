@@ -32,7 +32,7 @@
  * here stay deleted (R73 tombstones, as for the local import).
  */
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -43,12 +43,13 @@ import { request, type Dispatcher } from "undici";
 import type { ImportOptionsInput } from "@ao/core";
 import { extractArchive } from "../extract/zip.js";
 import { USER_AGENT, retryAfterMs } from "../lookup/http.js";
+import { statfsFree } from "./sqlite-copy.js";
 import { recordZoteroWebLibraryVersion, type Repo } from "../repo/repo.js";
-import { SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, getSecret, type SecretName } from "../secrets.js";
+import { SecretStoreUnavailableError, getSecret, type SecretName } from "../secrets.js";
 import type { ImportSourceAdapter, ScanAnnotation, ScanContext, ScanFile, ScanItem } from "./bulk/scan.js";
 import { MAX_NOTE_CHARS, noteToMarkdown } from "./note-html.js";
 import { checkFiles, referenceMetadata, text } from "./refman.js";
-import { extraCitationKey, recordFields, zoteroAnnotation, zoteroCreator, zoteroTimestamp } from "./zotero-common.js";
+import { extraCitationKey, ownValue, recordFields, zoteroAnnotation, zoteroCreator, zoteroTimestamp } from "./zotero-common.js";
 import { ZOTERO_NOTES, type NotImported } from "./zotero-local.js";
 import type { BatchHandle, BulkImportDeps } from "./bulk/run.js";
 
@@ -77,6 +78,10 @@ const MAX_COLLECTION_DEPTH = 64;
 const MAX_FOLDER_PATHS = 20;
 const MAX_RELATED = 100;
 const KEY = /^[A-Za-z0-9]{1,32}$/u;
+/** Restarts of a scan whose library changed while it was read (R80 I2). */
+const MAX_RESTARTS = 3;
+/** Free space kept beyond a download (as for the local copy, sqlite-copy.ts). */
+const SPACE_MARGIN = 64 * 1024 * 1024;
 
 export const ZOTERO_WEB_REASONS = {
   noKey: "No Zotero API key is saved on this computer, so nothing was imported from Zotero online. Save your key first.",
@@ -84,7 +89,9 @@ export const ZOTERO_WEB_REASONS = {
   notFound: "Zotero has no library with that ID (or the key cannot see it), so nothing was imported.",
   unavailable: "Zotero's online service could not be reached or answered with an error, so nothing was imported. Try again later.",
   tooLarge: "Zotero sent a response that is too large or too many items, so nothing was imported.",
-  noStore: SECRET_STORE_UNAVAILABLE,
+  noStore:
+    "No secure key store (the system keychain or credential manager) is available on this computer, so the Zotero API key cannot be read and nothing was imported from Zotero online.",
+  changing: "The Zotero library kept changing while it was being read, so nothing was imported. Try again when it is not syncing.",
 } as const;
 
 export const ZOTERO_WEB_FILE_NOTES = {
@@ -93,13 +100,19 @@ export const ZOTERO_WEB_FILE_NOTES = {
   tooLarge: "attached file is larger than 2 GB and was not downloaded",
   failed: "attached file could not be downloaded",
   checksum: "attached file did not match Zotero's checksum and was not imported",
+  noSpace: "attached file was not downloaded: not enough free disk space",
 } as const;
+
+/** File notes that a later run may not get again (worth retrying): the item's version token is marked (R80). */
+const RETRYABLE: ReadonlySet<string> = new Set([ZOTERO_WEB_FILE_NOTES.failed, ZOTERO_WEB_FILE_NOTES.checksum, ZOTERO_WEB_FILE_NOTES.noSpace, ZOTERO_WEB_FILE_NOTES.redirectRefused]);
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 export const ZOTERO_WEB_NOTES = {
   snapshots: (n: number) => `Not imported from Zotero: ${plural(n, "web page snapshot", "web page snapshots")}.`,
   pendingDownloads: (n: number) => `${plural(n, "file is", "files are")} downloaded from Zotero when the import runs (not in this preview).`,
+  groupLinked: (n: number) =>
+    `Not imported from Zotero: ${plural(n, "linked file in a group library", "linked files in a group library")} (linked files live on the computer of the member who added them).`,
   deleted: (n: number) =>
     `${plural(n, "item was", "items were")} deleted in Zotero since the last import; ${n === 1 ? "it was" : "they were"} not deleted here.`,
 } as const;
@@ -109,6 +122,9 @@ class ZoteroWebError extends Error {
     super(reason);
   }
 }
+
+/** The library changed while the scan read it (412, or a different Last-Modified-Version). */
+class LibraryChanged extends Error {}
 
 export interface ZoteroWebOptions {
   libraryType: "user" | "group";
@@ -127,6 +143,8 @@ export interface ZoteroWebOptions {
   maxWaitMs?: number;
   maxPageBytes?: number;
   maxFileBytes?: number;
+  /** Free bytes in a folder (default: statfs), checked before each download. */
+  freeSpace?: (dir: string) => Promise<number>;
 }
 
 export interface ZoteroWebScanResult {
@@ -136,6 +154,8 @@ export interface ZoteroWebScanResult {
   deletedInZotero: number;
   /** The scan read the whole library (or every change) without stopping. */
   completed: boolean;
+  /** Downloads that failed in a way a later run may fix (network, checksum, disk space, redirect). */
+  downloadsFailed: number;
 }
 
 export interface ZoteroWebAdapter extends ImportSourceAdapter {
@@ -159,6 +179,12 @@ const header = (h: Headers, n: string): string | undefined => {
 /** The Web API, with the key, Backoff and retries. Errors are ZoteroWebError with a fixed reason (never the key or the server's text). */
 class ZoteroApi {
   private nextAt = 0;
+  /**
+   * The library version the scan is reading (from the first page). Later item and collection
+   * requests send it as If-Unmodified-Since-Version; a 412 or another Last-Modified-Version means the
+   * library changed under the scan (LibraryChanged).
+   */
+  scanVersion: number | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxRetries: number;
   private readonly maxWait: number;
@@ -196,14 +222,14 @@ class ZoteroApi {
   }
 
   /** One GET with retries on 429/5xx/network errors. `accept(status)` decides which answers are final. */
-  private async get(url: URL, withKey: boolean, accept: (s: number) => boolean): Promise<Dispatcher.ResponseData> {
+  private async get(url: URL, withKey: boolean, accept: (s: number) => boolean, extra: Record<string, string> = {}): Promise<Dispatcher.ResponseData> {
     for (let attempt = 0; ; attempt++) {
       if (withKey) await this.waitTurn();
       let res: Dispatcher.ResponseData | undefined;
       try {
         res = await request(url, {
           method: "GET",
-          headers: this.headers(withKey),
+          headers: { ...this.headers(withKey), ...extra },
           dispatcher: this.o.dispatcher,
           signal: this.signal,
           headersTimeout: 60_000,
@@ -223,6 +249,7 @@ class ZoteroApi {
         await this.sleep(this.retryWait(attempt, res.headers));
         continue;
       }
+      if (s === 412) throw new LibraryChanged();
       if (s === 403 || s === 401) throw new ZoteroWebError(ZOTERO_WEB_REASONS.keyRefused);
       if (s === 404) throw new ZoteroWebError(ZOTERO_WEB_REASONS.notFound);
       throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
@@ -230,10 +257,21 @@ class ZoteroApi {
   }
 
   /** A JSON document from the API, with its headers. */
-  async json(path: string, query: Record<string, string | number> = {}): Promise<{ body: unknown; headers: Headers }> {
+  async json(path: string, query: Record<string, string | number> = {}, versioned = false): Promise<{ body: unknown; headers: Headers }> {
     const url = new URL(path, ZOTERO_API_ORIGIN);
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, String(v));
-    const res = await this.get(url, true, (s) => s === 200);
+    const pinned: Record<string, string> = versioned && this.scanVersion !== undefined ? { "if-unmodified-since-version": String(this.scanVersion) } : {};
+    const res = await this.get(url, true, (s) => s === 200, pinned);
+    if (versioned) {
+      const v = libraryVersionOf(res.headers);
+      if (v !== undefined) {
+        if (this.scanVersion === undefined) this.scanVersion = v;
+        else if (v !== this.scanVersion) {
+          await res.body.dump().catch(() => {});
+          throw new LibraryChanged();
+        }
+      }
+    }
     const max = this.o.maxPageBytes ?? MAX_ZOTERO_PAGE_BYTES;
     const len = Number(header(res.headers, "content-length"));
     if (Number.isFinite(len) && len > max) {
@@ -268,6 +306,9 @@ class ZoteroApi {
    */
   async file(prefix: string, attKey: string, dest: string, md5: string | undefined): Promise<{ path: string } | { note: string }> {
     const max = this.o.maxFileBytes ?? MAX_ZOTERO_FILE_BYTES;
+    const dir = dest.slice(0, dest.lastIndexOf("/")) || ".";
+    const free = () => (this.o.freeSpace ?? statfsFree)(dir);
+    if ((await free()) < SPACE_MARGIN) return { note: ZOTERO_WEB_FILE_NOTES.noSpace };
     let res: Dispatcher.ResponseData;
     try {
       res = await this.get(new URL(`${prefix}/items/${attKey}/file`, ZOTERO_API_ORIGIN), true, (s) => s === 200 || (s >= 300 && s < 400));
@@ -302,6 +343,10 @@ class ZoteroApi {
     if (Number.isFinite(len) && len > max) {
       res.body.destroy();
       return { note: ZOTERO_WEB_FILE_NOTES.tooLarge };
+    }
+    if (Number.isFinite(len) && (await free()) < len * (compressed ? 2 : 1) + SPACE_MARGIN) {
+      res.body.destroy();
+      return { note: ZOTERO_WEB_FILE_NOTES.noSpace };
     }
     const target = compressed ? `${dest}.zip` : dest;
     const hash = createHash("md5");
@@ -340,6 +385,15 @@ class ZoteroApi {
       const want = dest.slice(dest.lastIndexOf("/") + 1);
       const e = entries.find((x) => !x.refused && x.name === want) ?? entries.find((x) => !x.refused && x.path);
       if (!e) return { note: ZOTERO_WEB_FILE_NOTES.failed };
+      // Zotero's MD5 is of the file itself, so it is checked after unpacking.
+      if (md5 && /^[0-9a-f]{32}$/iu.test(md5)) {
+        const h = createHash("md5");
+        for await (const c of createReadStream(e.path) as AsyncIterable<Buffer>) h.update(c);
+        if (h.digest("hex") !== md5.toLowerCase()) {
+          await fsp.rm(out, { recursive: true, force: true });
+          return { note: ZOTERO_WEB_FILE_NOTES.checksum };
+        }
+      }
       return { path: e.path };
     } catch (err) {
       if (this.signal.aborted) throw this.signal.reason ?? err;
@@ -372,7 +426,7 @@ const asItem = (x: WebItem): WebItem => ({ key: x.key, version: Number.isInteger
 async function* pages(api: ZoteroApi, path: string, query: Record<string, string | number>): AsyncGenerator<{ items: WebItem[]; headers: Headers }> {
   let start = 0;
   for (;;) {
-    const { body, headers } = await api.json(path, { format: "json", include: "data", limit: PAGE, start, ...query });
+    const { body, headers } = await api.json(path, { format: "json", include: "data", limit: PAGE, start, ...query }, true);
     if (!Array.isArray(body)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
     yield { items: body.filter(isItem).map(asItem), headers };
     start += body.length;
@@ -443,7 +497,7 @@ async function changedTree(api: ZoteroApi, prefix: string, since: number, result
     );
     if (!missing.length) break;
     for (let i = 0; i < missing.length; i += 50) {
-      const { body } = await api.json(`${prefix}/items`, { format: "json", include: "data", itemKey: missing.slice(i, i + 50).join(","), limit: 50 });
+      const { body } = await api.json(`${prefix}/items`, { format: "json", include: "data", itemKey: missing.slice(i, i + 50).join(","), limit: 50 }, true);
       if (!Array.isArray(body)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
       for (const x of body.filter(isItem).map(asItem)) tree.add(x);
     }
@@ -542,7 +596,7 @@ const ANNOTATION_TYPE: Readonly<Record<string, number>> = { highlight: 1, note: 
 
 function annotationOf(a: WebItem, file: string | undefined): ScanAnnotation | undefined {
   const d = a.data;
-  const type = ANNOTATION_TYPE[str(d.annotationType)];
+  const type = ownValue(ANNOTATION_TYPE, str(d.annotationType));
   if (!type) return undefined;
   const cut = (v: unknown) => str(v).slice(0, 65536);
   return zoteroAnnotation(
@@ -582,6 +636,7 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   const fail = (reason: string): ScanItem => ({ key: "zotero-web:", files: [], unreadable: reason });
   result.completed = false;
   result.deletedInZotero = 0;
+  result.downloadsFailed = 0;
   delete result.libraryVersion;
   if (!ctx) {
     yield fail(ZOTERO_WEB_REASONS.unavailable);
@@ -601,14 +656,26 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   const api = new ZoteroApi(apiKey, o, signal);
   apiKey = null;
   const prefix = `/${o.libraryType === "user" ? "users" : "groups"}/${o.libraryId}`;
-  let tree: Tree;
+  let tree!: Tree;
   let tops: Set<string> | undefined;
-  let pathsOf: (keys: unknown) => string[][];
+  let pathsOf!: (keys: unknown) => string[][];
   let colors: Map<string, string>;
   try {
-    if (o.since === undefined) tree = await fullTree(api, prefix, result);
-    else ({ tree, tops } = await changedTree(api, prefix, o.since, result));
-    pathsOf = await collectionPaths(api, prefix);
+    // Read everything at one library version: a change under the scan restarts it (R80 I2).
+    for (let attempt = 0; ; attempt++) {
+      api.scanVersion = undefined;
+      delete result.libraryVersion;
+      try {
+        if (o.since === undefined) tree = await fullTree(api, prefix, result);
+        else ({ tree, tops } = await changedTree(api, prefix, o.since, result));
+        pathsOf = await collectionPaths(api, prefix);
+        break;
+      } catch (err) {
+        if (!(err instanceof LibraryChanged)) throw err;
+        if (attempt >= MAX_RESTARTS) throw new ZoteroWebError(ZOTERO_WEB_REASONS.changing);
+      }
+    }
+    result.libraryVersion = api.scanVersion ?? result.libraryVersion;
     colors = await tagColorsOf(api, prefix);
     if (o.since !== undefined) {
       const { body } = await api.json(`${prefix}/deleted`, { since: o.since });
@@ -625,6 +692,7 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   const counts: NotImported = { standaloneNotes: 0, attachmentNotes: 0, linkedUrls: 0, embeddedImages: 0, baseRelative: 0 };
   let snapshots = 0;
   let pendingDownloads = 0;
+  let groupLinked = 0;
   const work = join(await ctx.workDir(), "zotero-web");
   await fsp.mkdir(work, { recursive: true, mode: 0o700 });
 
@@ -663,7 +731,14 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
             const dir = join(work, a.key);
             await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
             const got = await api.file(prefix, a.key, join(dir, safeName(ad.filename)), typeof ad.md5 === "string" ? ad.md5 : undefined);
-            if ("note" in got) fileNotes.push(got.note);
+            if ("note" in got) {
+              fileNotes.push(got.note);
+              if (RETRYABLE.has(got.note)) {
+                // Not recorded as done: the token differs from a later successful run's, so that run retries it.
+                result.downloadsFailed++;
+                stamp.push(`download-failed:${a.key}`);
+              }
+            }
             else {
               const st = await fsp.stat(got.path);
               const t = await fileTypeFromFile(got.path).catch(() => undefined);
@@ -673,7 +748,9 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
           }
         } else if (mode === "linked_file") {
           const p = str(ad.path);
-          if (p.startsWith("attachments:")) counts.baseRelative++;
+          // In a group library a linked file is a path on another member's computer: never followed.
+          if (o.libraryType === "group") groupLinked++;
+          else if (p.startsWith("attachments:")) counts.baseRelative++;
           else if (p && !p.includes("\u0000") && (p.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(p) || p.startsWith("\\\\"))) {
             links.push({ paths: [p] });
             linked.add(p);
@@ -764,6 +841,7 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   const left = ZOTERO_NOTES.notImported(counts);
   if (left) ctx.note?.(left);
   if (snapshots) ctx.note?.(ZOTERO_WEB_NOTES.snapshots(snapshots));
+  if (groupLinked) ctx.note?.(ZOTERO_WEB_NOTES.groupLinked(groupLinked));
   if (pendingDownloads) ctx.note?.(ZOTERO_WEB_NOTES.pendingDownloads(pendingDownloads));
   if (result.deletedInZotero) ctx.note?.(ZOTERO_WEB_NOTES.deleted(result.deletedInZotero));
   result.completed = true;
@@ -777,7 +855,7 @@ export function zoteroWebAdapter(opts: ZoteroWebOptions): ZoteroWebAdapter {
   if (typeof opts.libraryId !== "string" || !/^\d{1,12}$/u.test(opts.libraryId)) throw new TypeError("libraryId must be a numeric Zotero user or group ID");
   if (opts.since !== undefined && (!Number.isInteger(opts.since) || opts.since < 0)) throw new TypeError("since must be a library version");
   const ref = `${opts.libraryType}:${opts.libraryId}`;
-  const result: ZoteroWebScanResult = { deletedInZotero: 0, completed: false };
+  const result: ZoteroWebScanResult = { deletedInZotero: 0, completed: false, downloadsFailed: 0 };
   return {
     kind: "zotero-web",
     location: ref,
@@ -834,7 +912,8 @@ export async function startZoteroWebImport(
   const h = await startBatch(deps, projectId, adapter, options);
   const done = h.done.then(async (r) => {
     const s = adapter.scanResult();
-    if (r.state === "finished" && s.completed && s.libraryVersion !== undefined && s.libraryVersion !== since) {
+    // Only a run where nothing failed moves `since` on; otherwise the next run asks for the same changes again (R80 I1).
+    if (r.state === "finished" && r.counts.failed === 0 && s.completed && s.downloadsFailed === 0 && s.libraryVersion !== undefined && s.libraryVersion !== since) {
       try {
         await recordZoteroWebLibraryVersion(deps.repo, projectId, ref, s.libraryVersion);
       } catch (err) {

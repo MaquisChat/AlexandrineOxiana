@@ -75,7 +75,8 @@ export interface CopyOptions {
   freeSpace?: (dir: string) => Promise<number>;
 }
 
-async function statfsFree(dir: string): Promise<number> {
+/** Free bytes in `dir` (statfs); Infinity when it cannot tell. */
+export async function statfsFree(dir: string): Promise<number> {
   try {
     const st = await fsp.statfs(dir);
     return Number(st.bavail) * Number(st.bsize);

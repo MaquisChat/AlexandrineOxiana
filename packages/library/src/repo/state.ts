@@ -44,6 +44,11 @@ export interface RepoOptions {
   clock?: () => Date;
   actor?: string;
   device?: string;
+  /**
+   * Open without healing anything (`ao verify-audit`): no crash recovery, no trimming, no
+   * anchor-mismatch events and no re-anchoring; problems are only reported in integrityWarnings.
+   */
+  noHeal?: boolean;
 }
 
 /** `<Project>/project.json`. */
@@ -124,6 +129,7 @@ export class RepoCore {
     opts: RepoOptions & InternalOptions,
   ) {
     this.anchors = AnchorStore.forConfigDir(library.appConfigDir);
+    this.noHeal = opts.noHeal === true;
     this.index = opts.index ?? NOOP_INDEX;
     this.tz = opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
     this.clock = opts.clock ?? (() => new Date());
@@ -141,8 +147,11 @@ export class RepoCore {
     return absPath(this.root, rel);
   }
 
+  /** Opened for checking only (RepoOptions.noHeal): nothing is written. */
+  readonly noHeal: boolean;
+
   assertWritable(): void {
-    if (this.library.mode !== "read-write") throw new ReadOnlyLibraryError(this.library.readOnlyReason);
+    if (this.library.mode !== "read-write" || this.noHeal) throw new ReadOnlyLibraryError(this.noHeal ? "not-writable" : this.library.readOnlyReason);
   }
 
   /** Runs write operations one at a time, so audit sequence numbers and files never interleave. */

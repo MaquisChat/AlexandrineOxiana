@@ -4,7 +4,7 @@
  * rejected, R66), each read back exactly by our import adapters (refman.ts; round-trip tests):
  *
  *   - BibTeX: UTF-8; every value braced; `\ { } % & $ # _ ~ ^` escaped (`\textbackslash{}`,
- *     `\{`, `\%` …, `\textasciitilde{}`, `\textasciicircum{}`), `--` kept literal (`-{}-`), line
+ *     `\textbraceleft{}`, `\%` …, `\textasciitilde{}`, `\textasciicircum{}`), `--` kept literal (`-{}-`), line
  *     breaks become spaces; names `{Family}, {Given}` (literal names `{Whole Name}`); URLs and DOIs
  *     verbatim with `{ } \` and spaces percent-encoded. Citation keys are kept; characters BibTeX
  *     cannot hold in a key become `_` (noted).
@@ -77,8 +77,9 @@ const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029
 
 const BIB_ESCAPES: Readonly<Record<string, string>> = {
   "\\": "\\textbackslash{}",
-  "{": "\\{",
-  "}": "\\}",
+  // Braces as commands, so no reader that only counts braces (or skips `\{`) is ever unbalanced (R80 I4).
+  "{": "\\textbraceleft{}",
+  "}": "\\textbraceright{}",
   "%": "\\%",
   "&": "\\&",
   $: "\\$",
@@ -256,11 +257,8 @@ function refOf(s: Source, tagNames: Map<string, string>, includeTags: boolean): 
   };
 }
 
-/**
- * The export text of `sourceIds` (in that order). Throws PolicyDeniedError when the project's
- * rules refuse the export of any of them (audited; nothing is produced).
- */
-export async function exportRefman(
+/** The export (governance evaluated per source); not yet audited as an export. */
+async function buildExport(
   repo: Repo,
   projectId: string,
   sourceIds: string[],
@@ -305,8 +303,26 @@ export async function exportRefman(
   const notes: string[] = [];
   if (excluded.length) notes.push(EXPORT_NOTES.deidentified(excluded.length));
   if (changedKeys) notes.push(EXPORT_NOTES.keyChanged(changedKeys));
-  await appendLibraryEvent(repo, projectId, "export.refman", { format, exported: refs.length, excluded: excluded.length, includeTags: opts.includeTags === true });
   return { text, exported: refs.length, excluded, notes };
+}
+
+const auditExport = (repo: Repo, projectId: string, format: RefmanFormat, r: RefmanExportResult, opts: RefmanExportOptions) =>
+  appendLibraryEvent(repo, projectId, "export.refman", { format, exported: r.exported, excluded: r.excluded.length, includeTags: opts.includeTags === true });
+
+/**
+ * The export text of `sourceIds` (in that order), audited as handed out. Throws PolicyDeniedError
+ * when the project's rules refuse the export of any of them (audited; nothing is produced).
+ */
+export async function exportRefman(
+  repo: Repo,
+  projectId: string,
+  sourceIds: string[],
+  format: RefmanFormat,
+  opts: RefmanExportOptions = {},
+): Promise<RefmanExportResult> {
+  const r = await buildExport(repo, projectId, sourceIds, format, opts);
+  await auditExport(repo, projectId, format, r, opts);
+  return r;
 }
 
 /** a … z, aa, ab … */
@@ -327,7 +343,9 @@ export async function writeRefmanExport(
   outputPath: string,
   opts: RefmanExportOptions = {},
 ): Promise<RefmanExportResult> {
-  const r = await exportRefman(repo, projectId, sourceIds, format, opts);
+  const r = await buildExport(repo, projectId, sourceIds, format, opts);
   await writeFileAtomic(outputPath, r.text, { mode: 0o600 });
+  // Audited once the file exists: a failed write is not an export.
+  await auditExport(repo, projectId, format, r, opts);
   return r;
 }

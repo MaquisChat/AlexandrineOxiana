@@ -8,6 +8,10 @@ import type { Creator, SourceType } from "@ao/core";
 import type { ScanAnnotation, ScanRect } from "./bulk/scan.js";
 import { arxivOf, doiOf, isbnsOf, issnOf, tagList, text, type RecordFields } from "./refman.js";
 
+/** A table lookup that never reaches Object.prototype ("constructor", "__proto__" … are unknown keys). */
+export const ownValue = <T>(table: Readonly<Record<string | number, T>>, key: string | number): T | undefined =>
+  Object.hasOwn(table, key) ? table[key] : undefined;
+
 const MAX_RECTS = 1000;
 const MAX_INK_POINTS = 100_000;
 const MAX_PAGE_INDEX = 100_000;
@@ -147,7 +151,7 @@ export interface ZoteroAnnotationRow {
 
 /** One `itemAnnotations` row → ScanAnnotation anchored in `file` (undefined for an unknown type). */
 export function zoteroAnnotation(row: ZoteroAnnotationRow, file: string | undefined): ScanAnnotation | undefined {
-  const kind = ANNOTATION_KINDS[row.type];
+  const kind = ownValue(ANNOTATION_KINDS, row.type);
   if (!kind) return undefined;
   const quote = text(row.text);
   const comment = text(row.comment);
@@ -181,7 +185,7 @@ export function recordFields(type: string, f: Map<string, string>, creators: Cre
     return "";
   };
   const extra = f.get("extra") ?? "";
-  const out: RecordFields = { type: ITEM_TYPES[type] ?? "other" };
+  const out: RecordFields = { type: ownValue(ITEM_TYPES, type) ?? "other" };
   const title = first(TITLE_FIELDS);
   if (title) out.title = title;
   if (creators.length) out.creators = creators;
@@ -217,7 +221,7 @@ export function recordFields(type: string, f: Map<string, string>, creators: Cre
 
 /** A Zotero creator → Creator (role from CREATOR_ROLES): a single-field name is a literal; a name without a first name is a family name. */
 export function zoteroCreator(first: unknown, last: unknown, singleField: boolean, type: unknown): Creator | undefined {
-  const role = CREATOR_ROLES[String(type)] ?? "contributor";
+  const role = ownValue(CREATOR_ROLES, String(type)) ?? "contributor";
   const l = text(typeof last === "string" ? last : "");
   const f = text(typeof first === "string" ? first : "");
   if (singleField || !f) {

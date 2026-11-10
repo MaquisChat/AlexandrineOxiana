@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MockAgent } from "undici";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from "undici";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
-import { buildPdf } from "../../../../tests/fixtures/generate.mjs";
+import { buildCameraTiff, buildPdf, buildZip } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
@@ -53,7 +53,18 @@ afterEach(async () => {
   await rm(tmp, { recursive: true, force: true });
 });
 
+// Guard: nothing in this suite may reach the network, even through a forgotten dispatcher option.
+let previousDispatcher: Dispatcher;
+const guard = new MockAgent();
+guard.disableNetConnect();
+beforeAll(() => {
+  previousDispatcher = getGlobalDispatcher();
+  setGlobalDispatcher(guard);
+});
+
 afterAll(async () => {
+  setGlobalDispatcher(previousDispatcher);
+  await guard.close();
   await shutdownExtractors();
 });
 
@@ -119,7 +130,7 @@ function serveCollections(collections: Array<{ key: string; name: string; parent
     .get(API)
     .intercept({ path: (p) => p.startsWith(`${prefix}/collections?`), method: "GET" })
     .reply(200, JSON.stringify(collections.map((c) => ({ key: c.key, version: 1, data: { key: c.key, name: c.name, parentCollection: c.parentCollection ?? false } }))), {
-      headers: { ...JSON_HEADERS, "total-results": String(collections.length), "last-modified-version": "1" },
+      headers: { ...JSON_HEADERS, "total-results": String(collections.length) },
     })
     .persist();
 }
@@ -246,7 +257,7 @@ describe("zoteroWebAdapter", () => {
   it("no keyring → a plain refusal; no key saved → a plain refusal", async () => {
     const none = useNoSecretStore();
     try {
-      expect((await collect()).items).toEqual([{ key: "zotero-web:", files: [], unreadable: SECRET_STORE_UNAVAILABLE }]);
+      expect((await collect()).items).toEqual([{ key: "zotero-web:", files: [], unreadable: ZOTERO_WEB_REASONS.noStore }]);
     } finally {
       none.restore();
     }
@@ -400,9 +411,175 @@ describe("zoteroWebAdapter", () => {
     expect(out.map((i) => i.key)).toEqual(["zotero:PARENT06"]);
     expect(out[0]!.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.notInStorage]);
     expect(out[0]!.annotations).toEqual([expect.objectContaining({ key: "zotero:ANNO0006", kind: "underline", quote: "new" })]);
-    expect(a.scanResult()).toEqual({ libraryVersion: 21, deletedInZotero: 3, completed: true });
+    expect(a.scanResult()).toEqual({ libraryVersion: 21, deletedInZotero: 3, completed: true, downloadsFailed: 0 });
     expect(notes).toContain("3 items were deleted in Zotero since the last import; they were not deleted here.");
     expect(seen.filter((p) => p.startsWith("/users/42/items?") && page(p).has("since"))).toHaveLength(1);
+  });
+
+  it("pages after the first send If-Unmodified-Since-Version; a library that changes mid-scan restarts it (item 5 removed before page 2)", async () => {
+    let items = Array.from({ length: 150 }, (_, i) => article(`MOVE${String(i).padStart(4, "0")}`, `Item ${i}`));
+    let version = 10;
+    const sent: Array<{ start: string | null; ius: string | undefined }> = [];
+    agent
+      .get(API)
+      .intercept({ path: (p) => p.startsWith("/users/42/items?"), method: "GET" })
+      .reply((req) => {
+        const q = page(req.path);
+        const h = req.headers as Record<string, string>;
+        const ius = h["If-Unmodified-Since-Version"] ?? h["if-unmodified-since-version"];
+        sent.push({ start: q.get("start"), ius });
+        if (q.get("start") === "0" && version === 10 && sent.length === 1) {
+          // Page 1 served at version 10; then item 5 is deleted in Zotero (version 11).
+          const out = items.slice(0, 100);
+          items = items.filter((i) => i.key !== "MOVE0005");
+          version = 11;
+          return { statusCode: 200, data: JSON.stringify(out), responseOptions: { headers: { ...JSON_HEADERS, "total-results": "150", "last-modified-version": "10" } } };
+        }
+        if (ius !== undefined && Number(ius) !== version) return { statusCode: 412, data: "Library has been modified since specified version" };
+        const start = Number(q.get("start"));
+        return {
+          statusCode: 200,
+          data: JSON.stringify(items.slice(start, start + 100)),
+          responseOptions: { headers: { ...JSON_HEADERS, "total-results": String(items.length), "last-modified-version": String(version) } },
+        };
+      })
+      .persist();
+    serveCollections([]);
+    serveTagColors();
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {} });
+    const work = join(tmp, "work");
+    await mkdir(work, { recursive: true });
+    const out: ScanItem[] = [];
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work })) out.push(i);
+    const keys = out.map((i) => i.key);
+    expect(new Set(keys).size).toBe(149);
+    expect(keys).not.toContain("zotero:MOVE0005");
+    expect(keys).toContain("zotero:MOVE0100"); // the item that moved onto page 1 is not missed
+    expect(sent[1]).toEqual({ start: "100", ius: "10" });
+    expect(sent.filter((x) => x.start === "100").at(-1)!.ius).toBe("11");
+    expect(a.scanResult()).toMatchObject({ libraryVersion: 11, completed: true });
+  });
+
+  it("a library that keeps changing stops the scan after 3 restarts (since is not recorded)", async () => {
+    let version = 1;
+    agent
+      .get(API)
+      .intercept({ path: (p) => p.startsWith("/users/42/items?"), method: "GET" })
+      .reply((req) => {
+        version++;
+        const start = Number(page(req.path).get("start"));
+        const items = Array.from({ length: 100 }, (_, i) => article(`BUSY${String(start + i).padStart(4, "0")}`, `x${i}`));
+        return { statusCode: 200, data: JSON.stringify(items), responseOptions: { headers: { ...JSON_HEADERS, "total-results": "200", "last-modified-version": String(version) } } };
+      })
+      .persist();
+    serveCollections([]);
+    serveTagColors();
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {} });
+    const out: ScanItem[] = [];
+    const work = join(tmp, "work");
+    await mkdir(work, { recursive: true });
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work })) out.push(i);
+    expect(out).toEqual([{ key: "zotero-web:", files: [], unreadable: ZOTERO_WEB_REASONS.changing }]);
+    expect(a.scanResult().completed).toBe(false);
+  });
+
+  it("checks free space before each download", async () => {
+    serveItems(
+      [
+        article("SPACE001", "No room"),
+        { key: "SPACEAT1", version: 5, data: { key: "SPACEAT1", version: 5, itemType: "attachment", parentItem: "SPACE001", linkMode: "imported_file", contentType: "application/pdf", filename: "x.pdf", tags: [] } },
+      ],
+      8,
+    );
+    serveCollections([]);
+    serveTagColors();
+    const file = vi.fn(() => ({ statusCode: 302, data: "", responseOptions: { headers: { location: `${STORAGE}/x` } } }));
+    agent.get(API).intercept({ path: "/users/42/items/SPACEAT1/file", method: "GET" }).reply(file);
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: agent, sleep: async () => {}, freeSpace: async () => 1024 });
+    const out: ScanItem[] = [];
+    const work = join(tmp, "work");
+    await mkdir(work, { recursive: true });
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work })) out.push(i);
+    expect(out[0]!.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.noSpace]);
+    expect(ZOTERO_WEB_FILE_NOTES.noSpace).toMatch(/not enough free disk space/u);
+    expect(file).not.toHaveBeenCalled();
+    expect(a.scanResult().downloadsFailed).toBe(1);
+  });
+
+  it("a compressed file is unpacked and its MD5 checked after decompression", async () => {
+    const pdf = await buildPdf({ extra: "zipped" });
+    const md5 = createHash("md5").update(pdf).digest("hex");
+    const zip = buildZip([{ name: "z.pdf", data: pdf }]);
+    const att = (key: string, parent: string, m: string): WebItem => ({ key, version: 5, data: { key, version: 5, itemType: "attachment", parentItem: parent, linkMode: "imported_file", contentType: "application/pdf", filename: "z.pdf", md5: m, tags: [] } });
+    serveItems([article("ZIPOK001", "Good zip"), att("ZIPATT01", "ZIPOK001", md5), article("ZIPBAD01", "Bad zip", 5, { DOI: "10.5555/other" }), att("ZIPATT02", "ZIPBAD01", "0".repeat(32))], 8);
+    serveCollections([]);
+    serveTagColors();
+    for (const k of ["ZIPATT01", "ZIPATT02"]) {
+      agent.get(API).intercept({ path: `/users/42/items/${k}/file`, method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/${k}`, "zotero-file-compressed": "Yes" } });
+      agent.get(STORAGE).intercept({ path: `/${k}`, method: "GET" }).reply(200, zip);
+    }
+    const { items } = await collect();
+    const ok = items.find((i) => i.key === "zotero:ZIPOK001")!;
+    expect(ok.files).toHaveLength(1);
+    expect(createHash("md5").update(await readFile(ok.files[0]!.path)).digest("hex")).toBe(md5);
+    const bad = items.find((i) => i.key === "zotero:ZIPBAD01")!;
+    expect(bad.files).toEqual([]);
+    expect(bad.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.checksum]);
+  });
+
+  it("a failed download changes the item's version token, so the next run retries it", async () => {
+    const pdf = await buildPdf({ extra: "retry" });
+    const items: WebItem[] = [
+      article("RETRYDL1", "Retry me"),
+      { key: "RETRYAT1", version: 5, data: { key: "RETRYAT1", version: 5, itemType: "attachment", parentItem: "RETRYDL1", linkMode: "imported_file", contentType: "application/pdf", filename: "r.pdf", tags: [] } },
+    ];
+    serveItems(items, 8, { times: 30 });
+    serveCollections([]);
+    serveTagColors();
+    agent.get(API).intercept({ path: "/users/42/items/RETRYAT1/file", method: "GET" }).reply(500, "boom");
+    const first = await collect({ maxRetries: 0 });
+    expect(first.items[0]!.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.failed]);
+    agent.get(API).intercept({ path: "/users/42/items/RETRYAT1/file", method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/r` } }).times(2);
+    agent.get(STORAGE).intercept({ path: "/r", method: "GET" }).reply(200, pdf).times(2);
+    await rm(join(tmp, "work"), { recursive: true, force: true });
+    const second = await collect();
+    await rm(join(tmp, "work"), { recursive: true, force: true });
+    const third = await collect();
+    expect(second.items[0]!.files).toHaveLength(1);
+    expect(second.items[0]!.version!.version).not.toBe(first.items[0]!.version!.version);
+    expect(third.items[0]!.version!.version).toBe(second.items[0]!.version!.version);
+  });
+
+  it("a group library: group: ids and paths; other members' linked files are left out with a count note", async () => {
+    serveItems(
+      [
+        article("GROUP001", "Shared paper", 3, { collections: ["GCOLL001"] }),
+        { key: "GLINK001", version: 3, data: { key: "GLINK001", version: 3, itemType: "attachment", parentItem: "GROUP001", linkMode: "linked_file", path: "/Users/someone-else/paper.pdf", contentType: "application/pdf", tags: [] } },
+      ],
+      40,
+      { prefix: "/groups/777" },
+    );
+    serveCollections([{ key: "GCOLL001", name: "Shared" }], "/groups/777");
+    serveTagColors("/groups/777");
+    const { items, notes } = await collect({ libraryType: "group", libraryId: "777" });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      key: "zotero:GROUP001",
+      folderPath: ["Shared"],
+      files: [],
+      externalKeys: expect.objectContaining({ libraryId: "group:777" }),
+      version: { id: "group:777/GROUP001", version: expect.any(String) },
+    });
+    expect(items[0]!.fileNotes).toBeUndefined();
+    expect(notes.join(" ")).toMatch(/1 linked file in a group library/u);
+  });
+
+  it("odd item and creator types never reach Object.prototype", async () => {
+    serveItems([article("PROTO001", "Proto", 5, { itemType: "constructor", creators: [{ creatorType: "__proto__", firstName: "A", lastName: "B" }] })], 3);
+    serveCollections([]);
+    serveTagColors();
+    const { items } = await collect();
+    expect(items[0]!.referenceMetadata).toMatchObject({ type: "other", creators: [{ family: "B", given: "A", role: "contributor" }] });
   });
 
   it("a dry run downloads nothing", async () => {
@@ -527,6 +704,42 @@ processing:
     expect(first.source.title.variants[0]!.value).toBe("First title, revised");
   });
 
+  it("since is recorded only when nothing failed: a failed item or a failed download leaves it unchanged", async () => {
+    const p = await project();
+    const tiffPath = join(tmp, "camera.tif");
+    await buildCameraTiff(tiffPath);
+    const tiff = await readFile(tiffPath);
+    serveItems(
+      [
+        article("FAIL0001", "Located photo"),
+        { key: "FAILATT1", version: 5, data: { key: "FAILATT1", version: 5, itemType: "attachment", parentItem: "FAIL0001", linkMode: "imported_file", contentType: "image/tiff", filename: "c.tif", tags: [] } },
+      ],
+      30,
+    );
+    serveCollections([]);
+    serveTagColors();
+    agent.get(API).intercept({ path: "/users/42/items/FAILATT1/file", method: "GET" }).reply(302, "", { headers: { location: `${STORAGE}/c` } });
+    agent.get(STORAGE).intercept({ path: "/c", method: "GET" }).reply(200, tiff);
+    // Location data the project requires to be coarsened: the item fails (R56).
+    const r = await (await startZoteroWebImport(bulkDeps(), p.id, web)).done;
+    expect(r.state).toBe("finished");
+    expect(r.counts.failed).toBe(1);
+    expect(zoteroWebSince(repo, p.id, "user:42")).toBeUndefined();
+
+    const p2 = await project();
+    serveItems(
+      [
+        article("DLFAIL01", "Download fails"),
+        { key: "DLFAILA1", version: 5, data: { key: "DLFAILA1", version: 5, itemType: "attachment", parentItem: "DLFAIL01", linkMode: "imported_file", contentType: "application/pdf", filename: "d.pdf", tags: [] } },
+      ],
+      31,
+    );
+    agent.get(API).intercept({ path: "/users/42/items/DLFAILA1/file", method: "GET" }).reply(503, "busy").persist();
+    const r2 = await (await startZoteroWebImport(bulkDeps(), p2.id, { ...web, maxRetries: 0 })).done;
+    expect(r2.counts.failed).toBe(0);
+    expect(zoteroWebSince(repo, p2.id, "user:42")).toBeUndefined();
+  });
+
   it("a source deleted here is not brought back by a later full Web import (R73)", async () => {
     const p = await project();
     serveItems([article("TOMB0001", "Tombstoned")], 4);
@@ -567,7 +780,7 @@ processing:
     const p = await project();
     const none = useNoSecretStore();
     try {
-      await expect(startZoteroWebImport(bulkDeps(), p.id, web)).rejects.toThrow(new BatchRefusedError(SECRET_STORE_UNAVAILABLE));
+      await expect(startZoteroWebImport(bulkDeps(), p.id, web)).rejects.toThrow(new BatchRefusedError(ZOTERO_WEB_REASONS.noStore));
     } finally {
       none.restore();
     }

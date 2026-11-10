@@ -10,7 +10,7 @@ import { PolicyDeniedError } from "../repo/errors.js";
 import type { Repo } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import type { ImportSourceAdapter, ScanItem } from "../import/bulk/scan.js";
-import { bibtexAdapter, cslJsonAdapter, risAdapter } from "../import/refman.js";
+import { bibtexAdapter, cslJsonAdapter, parseBibtexEntries, risAdapter } from "../import/refman.js";
 import { DEIDENTIFIED_NOTE, escapeBibtex, exportRefman, risLine, writeRefmanExport, type RefmanFormat } from "./refman-export.js";
 
 const FAST = 2 ** 10;
@@ -187,7 +187,7 @@ const expected = (r: Ref) => ({
 describe("escaping", () => {
   it("BibTeX: braces, % & $ # _ { } ~ ^ \\ and -- survive our parser exactly", async () => {
     const nasty = 'Braces {nested} and 50% of $5 & #1_x ~ ^ \\ back -- dash --- "quoted" Ünïcödé @home';
-    expect(escapeBibtex("{%}")).toBe("\\{\\%\\}");
+    expect(escapeBibtex("{%}")).toBe("\\textbraceleft{}\\%\\textbraceright{}");
     const p = await project();
     const id = await addSource(p, { type: "article-journal", title: nasty, creators: [{ family: "O'Brien {Jr}", given: "Mary & Ann", role: "author" }], citationKey: "obrien" });
     const { text } = await exportRefman(repo, p.id, [id], "bibtex");
@@ -197,6 +197,43 @@ describe("escaping", () => {
     expect(back!.referenceMetadata!.title!.variants[0]!.value).toBe(nasty);
     expect(back!.referenceMetadata!.creators).toEqual([{ family: "O'Brien {Jr}", given: "Mary & Ann", role: "author" }]);
     expect(back!.referenceMetadata!.citationKey).toBe("obrien");
+  });
+
+  it("BibTeX: brace depth is 0 at the end of every entry, and an @misc(...) injection yields exactly one entry", async () => {
+    const p = await project();
+    const injection = "x}, title = {pwned}}\n@misc(evil, title = {y}) {{{";
+    const id = await addSource(p, {
+      type: "article-journal",
+      title: injection,
+      creators: [{ family: "Brace } and {", given: "{Open", role: "author" }],
+      container: "}}}",
+      citationKey: "inj",
+    });
+    const id2 = await addSource(p, { ...REFS[0]!, citationKey: "second" });
+    const { text } = await exportRefman(repo, p.id, [id, id2], "bibtex");
+    // A plain brace-counting reader (no escape rules at all): depth returns to 0 after each entry.
+    const entries: string[] = [];
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === "@" && depth === 0) start = i;
+      if (c === "{") depth++;
+      if (c === "}") {
+        depth--;
+        expect(depth).toBeGreaterThanOrEqual(0);
+        if (depth === 0 && start >= 0) {
+          entries.push(text.slice(start, i + 1));
+          start = -1;
+        }
+      }
+    }
+    expect(depth).toBe(0);
+    expect(entries).toHaveLength(2);
+    expect([...parseBibtexEntries(text)].map((e) => e.key)).toEqual(["inj", "second"]);
+    const [back] = await readBack("bibtex", text);
+    expect(back!.referenceMetadata!.title!.variants[0]!.value).toBe(injection.replace("\n", " "));
+    expect(back!.referenceMetadata!.creators).toEqual([{ family: "Brace } and {", given: "{Open", role: "author" }]);
   });
 
   it("RIS: a value with an embedded newline and 'ER  -' cannot end the record or inject tags", async () => {
@@ -275,6 +312,14 @@ describe("governance", () => {
     await expect(stat(out)).rejects.toThrow();
     const audit = (await Promise.all((await readdir(join(lib.root, p.folder, "audit"))).map((f) => readFile(join(lib.root, p.folder, "audit", f), "utf8")))).join("");
     expect(audit).toMatch(/"action":"export".*"result":"deny"/u);
+  });
+
+  it("the export is audited only after the file was written", async () => {
+    const p = await project();
+    const id = await addSource(p, REFS[0]!);
+    await expect(writeRefmanExport(repo, p.id, [id], "bibtex", join(tmp, "no-such-folder", "x.bib"))).rejects.toThrow();
+    const audit = (await Promise.all((await readdir(join(lib.root, p.folder, "audit"))).map((f) => readFile(join(lib.root, p.folder, "audit", f), "utf8")))).join("");
+    expect(audit).not.toContain('"action":"export.refman"');
   });
 
   it("writes atomically: an existing file is replaced whole, and no temp file is left", async () => {

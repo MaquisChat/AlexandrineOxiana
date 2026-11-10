@@ -332,7 +332,7 @@ export function rdfRecords(src: string): RdfRecord[] {
     const isBibType = e.namespaceURI === NS.bib && ELEMENT_TYPES[e.localName ?? ""] !== undefined;
     if (is(e, NS.z, "Attachment") || is(e, NS.z, "Collection") || itemType === "attachment" || itemType === "note") continue;
     if (!isBibType && !itemType) continue;
-    const f: RecordFields = { type: ITEM_TYPES[itemType] ?? ELEMENT_TYPES[e.localName ?? ""] ?? "other" };
+    const f: RecordFields = { type: (Object.hasOwn(ITEM_TYPES, itemType) ? ITEM_TYPES[itemType] : undefined) ?? (Object.hasOwn(ELEMENT_TYPES, e.localName ?? "") ? ELEMENT_TYPES[e.localName ?? ""] : undefined) ?? "other" };
     const title = childText(e, NS.dc, "title");
     if (title) f.title = title;
     const creators = creatorsOf(e);

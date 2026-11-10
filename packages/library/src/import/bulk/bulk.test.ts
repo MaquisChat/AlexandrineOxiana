@@ -766,7 +766,7 @@ describe("review round 1: undo (R61)", () => {
     expect(u2.kept).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "collection", id: fieldwork.id })]));
     const left = (await projectCollectionsAndTags(repo, p2.id)).collections.map((c) => c.id).sort();
     expect(left).toEqual([fieldwork.id, mine.id].sort());
-  });
+  }, 30_000); // two whole-folder imports (PDF text extraction, exiftool) and two undos: ~3-4 s alone, more under a loaded full run
 
   it("merge undo reverts only what the merge added: a user rename and a user edit of a filled field are kept", async () => {
     const p = await project(CROSSREF_GOV);

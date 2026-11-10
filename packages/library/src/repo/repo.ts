@@ -143,10 +143,16 @@ export class Repo {
       }
       const anchor = anchors?.[core.anchorKey(projectId)];
       const problem = checkAnchor(events, verify, anchor);
+      // Alterations found (and recorded) when the library was opened earlier.
+      const alteredAt = events
+        .filter((e): e is AuditEvent => !!e && e.action === "audit.anchor-mismatch")
+        .map((e) => e.at)
+        .filter((at): at is string => typeof at === "string");
       return {
-        ok: !problem && anchors !== undefined,
+        ok: !problem && anchors !== undefined && alteredAt.length === 0,
         events: events.length,
         anchored: !!anchor,
+        alteredAt,
         ...(problem ? { problem } : anchors === undefined ? { problem: { kind: "anchors-unreadable" as const, detail: "the record of audit heads kept outside the library could not be read" } } : {}),
       };
     });
@@ -266,8 +272,8 @@ async function readAnchors(core: RepoCore, writable: boolean) {
  * `audit.anchor-mismatch` event. Projects without an anchor get one.
  */
 export function openRepo(library: Library, keyRing: KeyRing, opts: RepoOptions = {}): Promise<Repo> {
-  const { index, tz, clock, actor, device } = opts;
-  return openRepoInternal(library, keyRing, { index, tz, clock, actor, device });
+  const { index, tz, clock, actor, device, noHeal } = opts;
+  return openRepoInternal(library, keyRing, { index, tz, clock, actor, device, ...(noHeal ? { noHeal } : {}) });
 }
 
 /** openRepo plus internal (test-only) options; reached from tests through testing.ts. */
@@ -277,7 +283,7 @@ export async function openRepoInternal(
   opts: RepoOptions & InternalOptions,
 ): Promise<Repo> {
   const core = new RepoCore(library, keyRing, opts);
-  const writable = library.mode === "read-write";
+  const writable = library.mode === "read-write" && !opts.noHeal;
   const anchors = await readAnchors(core, writable);
   // Projects with a marker that is still unresolved: no writes, no audit appends and no trimming
   // until it is resolved. An invalid marker may name one project and point into another's folder,
@@ -726,7 +732,9 @@ export interface AuditCheck {
   ok: boolean;
   /** Events in the log. */
   events: number;
-  /** Whether a head was recorded outside the library to compare with. */
+  /** Whether a head was recorded outside the library to compare with (false: unverified on this device). */
   anchored: boolean;
+  /** When earlier opens of the library found the log altered (its `audit.anchor-mismatch` events). */
+  alteredAt: string[];
   problem?: { kind: "chain-broken" | "head-mismatch" | "truncated" | "anchors-unreadable"; detail: string };
 }
