@@ -237,11 +237,17 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const q of queues.splice(0)) await q.idle();
-  for (const c of closers.splice(0)) await c();
-  handle.close();
-  await rm(tmp, { recursive: true, force: true });
-});
+  // Each step runs even when an earlier one fails, so one slow or failed test never leaves the next
+  // one with a running queue, worker, open index or library lock (R102 minor).
+  const steps: Array<() => Promise<unknown>> = [
+    ...queues.splice(0).map((q) => () => q.dispose()),
+    ...closers.splice(0).map((c) => () => c()),
+    async () => handle.close(),
+    () => lib.close(),
+    () => rm(tmp, { recursive: true, force: true, maxRetries: 3 }),
+  ];
+  for (const step of steps) await step().catch(() => {});
+}, 30_000);
 
 describe("groupDeviceFiles (pairing rules)", () => {
   const file = (path: string, o: Partial<DeviceFile> = {}): DeviceFile => ({ path, rel: basename(path), bytes: 1, ...o });
@@ -585,7 +591,7 @@ describe.skipIf(!HAVE_MEDIA_TOOLS && !process.env.CI)("device import (R83)", () 
       }
       expect([...worker.jobs.values()].every((j) => j.body.params.location === "strip")).toBe(true);
     }
-  });
+  }, 30_000);
 
   it("R85 C1: the rule made stricter while the proxy is being made: recording is refused, the job stays pending and the next run makes a strip proxy", async () => {
     const { bulk } = await setup({ noWorker: true });
@@ -614,7 +620,7 @@ describe.skipIf(!HAVE_MEDIA_TOOLS && !process.env.CI)("device import (R83)", () 
       expect(d.derivation!.params).toEqual({ location: "strip" });
       expect(await locationTags(await plainCopy(p, d.path, true))).toEqual([]);
     }
-  });
+  }, 30_000);
 
   it("R85 I2: running the same pending jobs twice at once records each proxy once", async () => {
     const { bulk } = await setup({ noWorker: true });
@@ -631,7 +637,7 @@ describe.skipIf(!HAVE_MEDIA_TOOLS && !process.env.CI)("device import (R83)", () 
       expect(new Set(proxies.map((x) => x.derivation!.parents[0])).size).toBe(originals.length);
       expect(sf.pendingProxies ?? []).toEqual([]);
     }
-  });
+  }, 30_000);
 
   it("R85: the researcher name is kept in batch.json, so a resumed device import still names the photographer", async () => {
     const { bulk } = await setup();

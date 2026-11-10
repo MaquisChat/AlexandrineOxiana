@@ -20,6 +20,7 @@
     "chokidar": "5.0.0",
     "exiftool-vendored": "39.0.1",
     "file-type": "22.2.0",
+    "parse5": "8.0.1",
     "pdfjs-dist": "6.4.299",
     "turndown": "7.2.4",
     "undici": "8.12.3",

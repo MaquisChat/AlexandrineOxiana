@@ -12,8 +12,13 @@
  *
  * Everything goes through the governed repository; the inputs are written only to a private work
  * folder under the library's `.tmp/` (0700, swept if the process dies).
+ *
+ * SECURITY (R101, binding for Tasks 33/34): a stored HTML snapshot is only ever rendered in a
+ * sandboxed iframe (no allow-scripts, no allow-same-origin, CSP script-src 'none', separate origin
+ * or blob), never in the app's webview. See stripHtmlSnapshot.
  */
 import { randomUUID } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
@@ -21,14 +26,14 @@ import { InvalidInputError } from "../repo/errors.js";
 import { addCapturedOriginal, projectPolicy, repoLibrary, updateSourceRechecked, type Repo } from "../repo/repo.js";
 import { activeTemp } from "../tmp-registry.js";
 import { classifyUrl } from "./platforms.js";
-import { keyWords, stripSnapshot } from "./snapshot.js";
+import { stripSnapshot } from "./snapshot.js";
 import type { CaptureOutcome, LinkCapture } from "./link-capture.js";
 
 export const BROWSER_CAPTURE_LIMITS = {
   /** Decoded screenshot bytes. */
   screenshotBytes: 25 * 1024 * 1024,
-  /** HTML snapshot characters. */
-  htmlChars: 10 * 1024 * 1024,
+  /** HTML snapshot characters (R101 N2). */
+  htmlChars: 5 * 1024 * 1024,
   /** Each extracted text field. */
   fieldChars: 20_000,
 } as const;
@@ -84,7 +89,7 @@ function validate(input: BrowserCaptureInput): { url: URL; png?: Buffer; html?: 
     if (png.length > BROWSER_CAPTURE_LIMITS.screenshotBytes) throw new InvalidInputError("the screenshot is too large");
     if (!png.subarray(0, 8).equals(PNG_MAGIC)) throw new InvalidInputError("the screenshot must be a PNG image");
   }
-  if (input.html !== undefined && (typeof input.html !== "string" || input.html.length > BROWSER_CAPTURE_LIMITS.htmlChars)) throw new InvalidInputError("html must be text of at most 10 MB");
+  if (input.html !== undefined && (typeof input.html !== "string" || input.html.length > BROWSER_CAPTURE_LIMITS.htmlChars)) throw new InvalidInputError("html must be text of at most 5 MB");
   if (!png && !input.html) throw new InvalidInputError("a screenshot or the page's HTML is needed");
   // What the extension read goes through the same stripping as a platform snapshot (R41/R42, R99 I8).
   const e = stripSnapshot((input.extracted ?? {}) as Record<string, unknown>);
@@ -93,7 +98,7 @@ function validate(input: BrowserCaptureInput): { url: URL; png?: Buffer; html?: 
     const v = text(e[k]);
     if (v) ex[k] = v;
   }
-  return { url, ...(png ? { png } : {}), ...(input.html ? { html: stripHtmlSnapshot(input.html) } : {}), ex };
+  return { url, ...(png ? { png } : {}), ...(input.html ? { html: input.html } : {}), ex };
 }
 
 const DAY = /^(\d{4}-\d{2}-\d{2})/;
@@ -116,7 +121,9 @@ export async function captureBrowserPage(
   input: BrowserCaptureInput,
   opts: { linkCapture?: LinkCapture } = {},
 ): Promise<BrowserCaptureResult> {
-  const { url, png, html, ex } = validate(input);
+  const v = validate(input);
+  const { url, png, ex } = v;
+  const html = v.html === undefined ? undefined : await stripHtmlSnapshot(v.html);
   const root = repoLibrary(repo).root;
   const name = `capture-${randomUUID()}`;
   const work = join(root, ".tmp", name);
@@ -204,75 +211,38 @@ export async function captureBrowserPage(
 }
 
 // ------------------------------------------------------------------------------------------
-// HTML snapshot stripping (R41/R42 applied to the page's HTML)
+// HTML snapshot stripping (R41/R42 applied to markup; R101 N1/N2, R102 N4)
 
-/** Words that make an attribute, meta or form field a credential (same rule as snapshot keys). */
-const SECRET_WORDS = new Set(["csrf", "xsrf", "token", "tokens", "auth", "authorization", "session", "sessionid", "password", "passwd", "secret", "signature", "sig", "nonce", "jwt", "credential", "credentials", "apikey", "cookie", "cookies"]);
-const secretName = (n: string) => keyWords(n).some((w) => SECRET_WORDS.has(w)) || /^authenticity_token$/i.test(n);
-const URL_ATTRS = new Set(["href", "src", "action", "poster", "data-src", "data-href", "formaction", "cite", "background"]);
-const ATTR = /([^\s=/>"']+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>"']+))?/g;
-
-/** An http(s) link without its query and fragment (signed, expiring or tracking parameters). */
-function bareUrl(v: string): string {
-  const m = /^(\s*https?:\/\/[^?#\s]*)[?#][^\s]*/i.exec(v);
-  return m ? m[1]! : v;
-}
-
-function cleanTag(tag: string): string {
-  const m = /^<\s*([A-Za-z][A-Za-z0-9-]*)([\s\S]*?)(\/?)>$/.exec(tag);
-  if (!m) return tag; // closing tags, comments, doctype: kept as they are
-  const name = m[1]!.toLowerCase();
-  const attrs: Array<[string, string | undefined]> = [];
-  for (const a of m[2]!.matchAll(ATTR)) {
-    const raw = a[2];
-    const value = raw === undefined ? undefined : raw.startsWith('"') || raw.startsWith("'") ? raw.slice(1, -1) : raw;
-    attrs.push([a[1]!, value]);
-  }
-  const get = (k: string) => attrs.find(([n]) => n.toLowerCase() === k)?.[1];
-  // A meta or form field carrying a token is dropped whole.
-  if (name === "meta" && secretName(get("name") ?? get("property") ?? get("http-equiv") ?? "")) return "";
-  if (name === "input" && (secretName(get("name") ?? "") || (get("type") ?? "").toLowerCase() === "password")) return "";
-  const out: string[] = [];
-  for (const [k, v] of attrs) {
-    const lk = k.toLowerCase();
-    if (lk.startsWith("on")) continue; // inline event handlers
-    if (lk === "nonce" || lk === "integrity" || secretName(lk.replace(/^data-/, ""))) continue;
-    if (v === undefined) {
-      out.push(k);
-      continue;
-    }
-    let val = v;
-    if (URL_ATTRS.has(lk)) val = bareUrl(val);
-    else if (lk === "srcset") val = val.split(",").map((p) => bareUrl(p.trim()).trim() + (p.trim().split(/\s+/)[1] ? ` ${p.trim().split(/\s+/)[1]}` : "")).join(", ");
-    else if (/^\s*javascript:/i.test(val)) val = "";
-    out.push(`${k}="${val.replace(/"/g, "&quot;")}"`);
-  }
-  return `<${m[1]}${out.length ? ` ${out.join(" ")}` : ""}${m[3]}>`;
-}
+/** How long one snapshot may take to strip, and the worker's heap cap. */
+export const HTML_STRIP_TIMEOUT_MS = 30_000;
+const HTML_STRIP_HEAP_MB = 512;
+const STRIP_WORKER = new URL("./html-strip-worker.mjs", import.meta.url);
 
 /**
- * The page's HTML as stored: scripts removed (with their contents; an unclosed one to the end),
- * inline event handlers, nonces and `javascript:` links dropped, meta tags and form fields that
- * carry tokens or passwords removed, and links lose their query and fragment (signed or tracking
- * parameters). Linear in the input's length.
+ * The page's HTML as stored: parsed with parse5 and serialised from the cleaned tree (see
+ * html-strip.mjs for what is removed and cleaned), in a worker thread so a large or adversarial
+ * page never blocks the service's event loop. InvalidInputError when it cannot be processed.
+ *
+ * Archived snapshots are only ever rendered in a sandboxed iframe — no allow-scripts, no
+ * allow-same-origin, CSP `script-src 'none'`, served from a separate origin or a blob — never in
+ * the app's webview (R101, binding for Tasks 33/34). This stripping is defence in depth.
  */
-export function stripHtmlSnapshot(html: string): string {
-  // 1. Scripts, found case-insensitively by position (no backtracking).
-  const lower = html.toLowerCase();
-  let noScripts = "";
-  let i = 0;
-  for (;;) {
-    const open = lower.indexOf("<script", i);
-    if (open < 0) {
-      noScripts += html.slice(i);
-      break;
-    }
-    noScripts += html.slice(i, open);
-    const close = lower.indexOf("</script", open + 7);
-    if (close < 0) break;
-    const end = lower.indexOf(">", close);
-    i = end < 0 ? html.length : end + 1;
-  }
-  // 2. Every remaining tag, attribute by attribute.
-  return noScripts.replace(/<[^<>]*>/g, cleanTag);
+export function stripHtmlSnapshot(html: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(STRIP_WORKER, { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void worker.terminate().catch(() => {});
+      fn();
+    };
+    const timer = setTimeout(() => finish(() => reject(new InvalidInputError("The page's HTML could not be processed in time."))), HTML_STRIP_TIMEOUT_MS);
+    worker.once("message", (m: { ok: boolean; html?: string }) =>
+      finish(() => (m.ok && typeof m.html === "string" ? resolve(m.html) : reject(new InvalidInputError("The page's HTML could not be processed.")))),
+    );
+    worker.once("error", () => finish(() => reject(new InvalidInputError("The page's HTML could not be processed."))));
+    worker.once("exit", () => finish(() => reject(new InvalidInputError("The page's HTML could not be processed."))));
+  });
 }

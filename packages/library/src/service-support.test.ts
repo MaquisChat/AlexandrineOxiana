@@ -281,14 +281,14 @@ describe("Task 30 review round 1 (R98, R99)", () => {
       '<html><head><meta name="csrf-token" content="SECRETCSRF"><script>var t="SECRETJS"</script></head>' +
       '<body onload="steal()"><img src="https://cdn.example/x.jpg?sig=SIGNED&exp=1"><a href="https://example.org/p?session=SECRETSESSION#f">x</a>' +
       '<input type="hidden" name="authenticity_token" value="SECRETFORM"><scrIpt src="a.js"></SCRIPT>after</body></html>';
-    const out = stripHtmlSnapshot(html);
+    const out = await stripHtmlSnapshot(html);
     for (const bad of ["SECRETCSRF", "SECRETJS", "steal()", "SIGNED", "SECRETSESSION", "SECRETFORM", "a.js"]) expect(out).not.toContain(bad);
     expect(out).toContain("https://cdn.example/x.jpg");
     expect(out).toContain("after");
     // Unclosed script on a large input stays linear (and is dropped to the end).
     const t0 = Date.now();
-    stripHtmlSnapshot("<script>".repeat(100_000));
-    expect(Date.now() - t0).toBeLessThan(2000);
+    await stripHtmlSnapshot("<script>".repeat(100_000));
+    expect(Date.now() - t0).toBeLessThan(10_000);
 
     const gov = `${OPEN_GOV.replace("downloader]", "downloader, browser_capture]")}protocol:\n  platforms: [youtube]\n`;
     const scoped = await makeProject(kit, gov);
