@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+// Fake gallery-dl for tests (no network). Behaviour from FAKE_TOOL_MODE: ok (default), login, partial,
+// notfound. Uses tests/fixtures/capture/instagram-carousel.json when its post_shortcode is in the URL:
+// writes one image plus one metadata JSON (gallery-dl --write-metadata) per carousel item.
+// FAKE_ARGV_FILE (optional) receives the arguments as JSON.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  console.log("1.30.10");
+  process.exit(0);
+}
+if (process.env.FAKE_ARGV_FILE) writeFileSync(process.env.FAKE_ARGV_FILE, JSON.stringify(args));
+const out = args[args.indexOf("-D") + 1];
+mkdirSync(out, { recursive: true });
+const url = args[args.length - 1];
+const mode = process.env.FAKE_TOOL_MODE || "ok";
+const fixtures = join(dirname(fileURLToPath(import.meta.url)), "..", "capture");
+
+if (mode === "login") {
+  console.error("[instagram][error] HttpError: 'Redirect to login page' - login required");
+  console.error("ERROR: login required");
+  process.exit(4);
+}
+if (mode === "notfound") {
+  console.error("[instagram][error] NotFoundError: Requested post could not be found (404)");
+  process.exit(4);
+}
+const post = JSON.parse(readFileSync(join(fixtures, "instagram-carousel.json"), "utf8"));
+if (!url.includes(post.post_shortcode)) {
+  console.error("[gallery-dl][error] No suitable extractor found");
+  process.exit(64);
+}
+const n = mode === "partial" ? 1 : post.count;
+for (let i = 1; i <= n; i++) {
+  const name = `${post.post_shortcode}_${i}.jpg`;
+  writeFileSync(join(out, name), Buffer.from(`\xff\xd8\xff\xe0 fake jpeg ${i}`, "latin1"));
+  writeFileSync(join(out, `${name}.json`), JSON.stringify({ ...post, num: i, shortcode: `${post.post_shortcode}x${i}`, filename: `${post.post_shortcode}_${i}` }));
+  console.log(join(out, name));
+}
+if (mode === "partial") {
+  console.error("[instagram][error] HttpError: '429 Too Many Requests'");
+  process.exit(4);
+}
+process.exit(0);

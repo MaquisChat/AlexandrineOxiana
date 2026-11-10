@@ -27,12 +27,18 @@ import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe
 import { runMutation, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
+import { appendReviewEntry } from "./review.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
 export interface SourceInputFile {
   path: string;
   role: "original";
   handling: "copy" | "link";
+  /** Asset kind (default: from the extension), e.g. "platform-metadata" or "thumbnail". */
+  kind?: string;
+  /** The file is already in this project's encrypted format (e.g. a media worker output). Copy only. */
+  encrypted?: boolean;
+  metadata?: Asset["metadata"];
 }
 
 export interface CreateSourceOptions {
@@ -40,6 +46,8 @@ export interface CreateSourceOptions {
   fieldEvidence?: FieldEvidence[];
   verification?: Record<string, FieldVerification>;
   availability?: Availability;
+  /** Also queue the new source for review (written to `review/pending.jsonl` in the same change, R31). */
+  reviewItem?: { fields: Record<string, string>; reasons: string[] };
 }
 
 export type SourcePatch = Partial<Omit<Source, "id">>;
@@ -234,7 +242,7 @@ export async function createSource(
       const hashes: Record<string, string> = {};
       for (const f of files) {
         const assetId = newId();
-        const ext = extname(f.path).slice(1).toLowerCase() || "bin";
+        const ext = extname(f.encrypted ? f.path.replace(/\.enc$/i, "") : f.path).slice(1).toLowerCase() || "bin";
         let name = originalFileName(folderBase, ext);
         if (tx.encrypted) name = encName(name);
         name = withCollisionSuffix(name, (n) => used.has(foldName(n)));
@@ -243,6 +251,7 @@ export async function createSource(
         let content: { sha256: string; bytes: number };
         let linked: Asset["linked"];
         if (f.handling === "link") {
+          if (f.encrypted) throw new TypeError("an encrypted input file cannot be linked");
           if (tx.encrypted) {
             throw new GovernanceViolationError("This project is encrypted; linked files would stay unencrypted, so copy them instead");
           }
@@ -254,19 +263,21 @@ export async function createSource(
           content = await sha256File(abs);
           linked = { absolutePath: abs, libraryRelativePath: r.split(sep).join("/") };
         } else {
-          content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode });
+          if (f.encrypted && !tx.encrypted) throw new TypeError("an encrypted input file needs an encrypted project");
+          content = await tx.copyFile(f.path, rel, { encrypt: tx.encrypted, mode, ...(f.encrypted ? { sourceEncrypted: true } : {}) });
         }
         const asset: Asset = {
           id: assetId,
           sourceId: id,
           role: "original",
-          kind: kindFor(ext),
+          kind: f.kind ?? kindFor(ext),
           path: linked ? linked.libraryRelativePath : rel,
           encrypted: tx.encrypted && !linked,
           sha256: content.sha256,
           bytes: content.bytes,
           mime: mimeFor(ext),
           ...(linked ? { linked } : {}),
+          ...(f.metadata ? { metadata: f.metadata } : {}),
         };
         assets.push(asset);
         hashes[assetId] = content.sha256;
@@ -298,6 +309,7 @@ export async function createSource(
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, null, source);
       for (const a of assets) tx.record("asset", a.id, null, a);
+      if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
       tx.onCommit(() => st.sources.set(id, folder));
       tx.index((sink) => sink.indexSource(sf));
       return sf;

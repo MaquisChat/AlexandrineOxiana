@@ -34,6 +34,8 @@ export const Asset = z.object({
         .object({ lat: z.number(), lon: z.number(), precision: z.enum(["exact", "coarse"]) })
         .optional(),
       pairedAssetId: Id.optional(),
+      /** Transcripts: how many segments the hallucination checks flagged for review (spec 5.8). */
+      flaggedSegments: z.number().int().min(0).optional(),
     })
     .optional(),
 });

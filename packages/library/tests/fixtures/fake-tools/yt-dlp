@@ -1,0 +1,51 @@
+#!/usr/bin/env node
+// Fake yt-dlp for tests (no network). Behaviour from FAKE_TOOL_MODE: ok (default), login, partial,
+// notfound. The fixture is the tests/fixtures/capture/*.info.json whose "id" appears in the URL.
+// FAKE_ARGV_FILE (optional) receives the arguments as JSON.
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  console.log("2026.10.22");
+  process.exit(0);
+}
+if (process.env.FAKE_ARGV_FILE) writeFileSync(process.env.FAKE_ARGV_FILE, JSON.stringify(args));
+const template = args[args.indexOf("-o") + 1];
+const out = dirname(template);
+mkdirSync(out, { recursive: true });
+const url = args[args.length - 1];
+const mode = process.env.FAKE_TOOL_MODE || "ok";
+const fixtures = join(dirname(fileURLToPath(import.meta.url)), "..", "capture");
+
+if (mode === "login") {
+  console.log(`[youtube] Extracting URL`);
+  console.error("ERROR: [youtube] aoTest00001: Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies for the authentication.");
+  process.exit(1);
+}
+if (mode === "notfound") {
+  console.error("ERROR: [youtube] aoTest00001: Video unavailable. This video has been removed by the uploader");
+  process.exit(1);
+}
+let info;
+for (const f of readdirSync(fixtures).filter((n) => n.endsWith(".info.json"))) {
+  const j = JSON.parse(readFileSync(join(fixtures, f), "utf8"));
+  if (url.includes(String(j.id))) info = j;
+}
+if (!info) {
+  console.error("ERROR: Unsupported URL: no fake fixture for this link");
+  process.exit(1);
+}
+const id = info.id;
+writeFileSync(join(out, `${id}.info.json`), JSON.stringify(info));
+if (args.includes("--skip-download")) process.exit(0);
+writeFileSync(join(out, `${id}.mp4`), Buffer.from("\0\0\0\x18ftypmp42 fake video bytes " + id));
+for (const pct of [25, 50, 100]) console.log(`[download] ${pct.toFixed(1).padStart(5)}% of 1.00MiB at 1.00MiB/s ETA 00:00`);
+if (mode === "partial") {
+  console.error(`ERROR: [youtube] ${id}: HTTP Error 429: Too Many Requests`);
+  process.exit(1);
+}
+writeFileSync(join(out, `${id}.en.vtt`), "WEBVTT\n\n00:00.000 --> 00:01.000\nplatform caption words\n");
+writeFileSync(join(out, `${id}.webp`), Buffer.from("RIFF\0\0\0\0WEBPfake thumbnail"));
+process.exit(0);

@@ -34,13 +34,14 @@ import {
   type PolicyDecision,
   type PolicyRequest,
 } from "@ao/core";
-import { encryptStream } from "../crypto/format.js";
+import type { Readable } from "node:stream";
+import { decryptStream, encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import type { AuditInput } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
 import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError, RecoveryPendingError } from "./errors.js";
-import { assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
+import { appendDurable, assertContained, encryptBytes, exists, readMaybe, sealLine, type AppendUndo } from "./io.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 import { TxnLog } from "./txn.js";
 import type { IndexSink, ProjectState, RepoCore } from "./state.js";
@@ -61,6 +62,8 @@ export interface FileOptions {
   encrypt?: boolean;
   /** POSIX mode, e.g. 0o600 for unencrypted identifiable files (R19). */
   mode?: number;
+  /** copyFile: the source is already in the project's encrypted format (decrypted on the way; hash of the plaintext). */
+  sourceEncrypted?: boolean;
 }
 
 export interface Tx {
@@ -82,6 +85,8 @@ export interface Tx {
   writeFile(rel: string, data: Uint8Array | string, opts?: FileOptions): Promise<void>;
   /** Copies (or encrypts) a file to a new library path; refuses to overwrite. */
   copyFile(src: string, rel: string, opts?: FileOptions): Promise<{ sha256: string; bytes: number }>;
+  /** Appends one line (a newline is added) to a project file, durably; undone on rollback. */
+  appendLine(rel: string, line: string, opts?: { mode?: number }): Promise<void>;
   /** Moves a file or folder to `.tmp/` (restored on rollback, purged after commit). */
   trash(rel: string): Promise<void>;
   /** Records the change(s) between `before` and `after` (null = create/delete). */
@@ -169,9 +174,22 @@ class TxImpl implements Tx {
     await this.guard(abs);
     if (await exists(abs)) throw new Error(`refusing to overwrite ${rel}`);
     await this.log.created(abs);
-    if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode });
+    let decode: ((r: Readable) => Readable) | undefined;
+    if (opts.sourceEncrypted) {
+      const { key, keyId } = this.key();
+      decode = (r) => r.pipe(decryptStream((id) => (id === keyId ? key : undefined)));
+    }
+    if (!opts.encrypt) return copyFileAtomic(src, abs, { mode: opts.mode, ...(decode ? { decode } : {}) });
     const { key, keyId } = this.key();
-    return copyFileAtomic(src, abs, { mode: opts.mode, transform: (r) => r.pipe(encryptStream(key, keyId)) });
+    return copyFileAtomic(src, abs, { mode: opts.mode, ...(decode ? { decode } : {}), transform: (r) => r.pipe(encryptStream(key, keyId)) });
+  }
+
+  async appendLine(rel: string, line: string, opts: { mode?: number } = {}): Promise<void> {
+    if (line.includes("\n")) throw new TypeError("appendLine: the line must not contain a newline");
+    const abs = this.core.abs(rel);
+    await this.mkdir(rel.slice(0, rel.lastIndexOf("/")));
+    await this.guard(abs);
+    await appendDurable(abs, `${line}\n`, opts.mode, (u) => this.log.append(u));
   }
 
   async trash(rel: string): Promise<void> {

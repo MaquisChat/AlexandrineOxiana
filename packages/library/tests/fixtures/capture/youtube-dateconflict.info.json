@@ -1,0 +1,13 @@
+{
+  "id": "aoTest00002",
+  "title": "Harvest songs recorded in a synthetic village",
+  "description": "Synthetic fixture whose upload date disagrees with its timestamp.",
+  "channel": "Ama Test Channel",
+  "uploader": "Ama Test Channel",
+  "uploader_id": "@amatest_fake",
+  "timestamp": 1604916000,
+  "upload_date": "20210301",
+  "language": "en",
+  "webpage_url": "https://www.youtube.com/watch?v=aoTest00002",
+  "extractor": "youtube"
+}

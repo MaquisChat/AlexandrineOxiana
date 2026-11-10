@@ -115,6 +115,12 @@ export interface CopyOptions {
    * stream and returns the stream to write; it must consume all of `r`.
    */
   transform?: (r: Readable) => Readable;
+  /**
+   * Optional decoding of the source before it is hashed (e.g. `r => r.pipe(decryptStream(getKey))`
+   * for a source already in the library's encrypted format): the SHA-256 and byte count are then of
+   * the decoded content.
+   */
+  decode?: (r: Readable) => Readable;
   /** POSIX permission bits for `dest`, e.g. 0o600. Ignored on Windows. */
   mode?: number;
 }
@@ -135,7 +141,9 @@ export async function copyFileAtomic(
   let fh: fsp.FileHandle | undefined = await fsp.open(tmp, "wx", opts.mode);
   const hash = createHash("sha256");
   let bytes = 0;
-  const source = createReadStream(src);
+  const raw = createReadStream(src);
+  const source: Readable = opts.decode ? opts.decode(raw) : raw;
+  if (source !== raw) raw.on("error", (err) => source.destroy(err));
   const hasher = new Transform({
     transform(chunk: Buffer, _enc, cb) {
       hash.update(chunk);
@@ -165,6 +173,7 @@ export async function copyFileAtomic(
     await commit(tmp, dest);
     return { sha256: hash.digest("hex"), bytes };
   } catch (err) {
+    raw.destroy();
     source.destroy();
     hasher.destroy();
     out.destroy();

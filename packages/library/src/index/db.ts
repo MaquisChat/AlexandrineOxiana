@@ -12,6 +12,7 @@ import Database from "better-sqlite3";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { primary, type ConsentRecord, type Collection, type Participant, type Project, type Session, type SourceFile, type SourceType, type Tag } from "@ao/core";
+import type { ReviewItemRow } from "../repo/review.js";
 import { cjkBigrams } from "./text.js";
 
 export type IndexDb = Database.Database;
@@ -441,6 +442,13 @@ export function indexProjectEntities(
       db.prepare(`INSERT OR REPLACE INTO ${S.consents} VALUES (?,?,?,?,?,?,?)`).run(c.id, c.projectId, c.participantId, c.scope, c.date, c.expires ?? null, c.withdrawn?.at ?? null);
     }
   })();
+}
+
+/** Inserts or replaces a review-queue row (a cache of `review/pending.jsonl`, R31). */
+export function upsertReviewItem(db: IndexDb, row: ReviewItemRow): void {
+  db.prepare("INSERT OR REPLACE INTO review_items (id, project_id, batch_id, source_id, kind, status, payload_json, created_at) VALUES (?,?,?,?,?,?,?,?)").run(
+    row.id, row.projectId, row.batchId ?? null, row.sourceId ?? null, row.kind, row.status, JSON.stringify(row.payload), row.createdAt,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------

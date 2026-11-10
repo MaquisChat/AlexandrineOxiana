@@ -7,10 +7,11 @@ import { renameWithRetry } from "../fs/atomic.js";
 import type { Library } from "../library.js";
 import { ReadOnlyLibraryError } from "../repo/errors.js";
 import { readMaybe } from "../repo/io.js";
+import { REVIEW_FILE, parseReviewFile, reviewRow, type ReviewItemRow } from "../repo/review.js";
 import type { Manifest } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, type Stamps } from "./changes.js";
 import {
-  INDEX_FILE, checkpointTruncate, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta,
+  INDEX_FILE, checkpointTruncate, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta, upsertReviewItem,
   type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource } from "./load.js";
@@ -35,6 +36,8 @@ export interface RebuildOptions {
 /**
  * Tables that later tasks fill from files of their own (review items, import batches, jobs). Until
  * those files exist the index is their only home, so a rebuild copies their rows over (ADR 0007).
+ * Review items now also live in `review/pending.jsonl` (R31): rows read from those files replace
+ * carried ones; rows of locked encrypted projects are carried as they were.
  */
 const CARRIED_TABLES = ["review_items", "import_batches", "jobs"] as const;
 
@@ -162,6 +165,7 @@ async function populate(
   const stamps: Stamps = await computeStamps(root, keyRing);
 
   const jobs: Array<() => Promise<void>> = [];
+  const reviewRows: ReviewItemRow[] = [];
   for (const e of await listProjectEntries(root)) {
     if (!e.data) {
       result.errors.push({ folder: e.rel, message: e.error ?? "unreadable project" });
@@ -189,6 +193,17 @@ async function populate(
         });
       }
       continue;
+    }
+    // The review queue's file record (R31) is read for every project whose key is available.
+    try {
+      const raw = await readMaybe(join(root, e.rel, ...REVIEW_FILE.split("/")));
+      if (raw) {
+        const { entries, skipped } = parseReviewFile(raw.toString("utf8"), project.id, k ? k.key : null);
+        for (const r of entries) reviewRows.push(reviewRow(r, k !== null));
+        if (skipped) result.errors.push({ folder: `${e.rel}/${REVIEW_FILE}`, message: `${skipped} unreadable line(s) skipped` });
+      }
+    } catch (err) {
+      result.errors.push({ folder: `${e.rel}/${REVIEW_FILE}`, message: err instanceof Error ? err.message : String(err) });
     }
     // Plain projects are indexed fully here. An unlocked encrypted project gets manifest-level rows
     // only; its content is loaded into memory after the new file is in place (R30).
@@ -230,6 +245,8 @@ async function populate(
       db.prepare(`INSERT OR REPLACE INTO ${table} (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`).run(...cols.map((c) => r[c]));
     }
   }
+  // The files win over carried rows: they are the record (rows of locked projects stay as carried).
+  for (const r of reviewRows) upsertReviewItem(db, r);
   setMeta(db, "projectStamps", JSON.stringify(stamps));
   setMeta(db, "lastChangeId", newestChangeId(stamps) ?? "");
   return result;

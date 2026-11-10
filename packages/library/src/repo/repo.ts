@@ -1,10 +1,12 @@
 /** `openRepo` and the `Repo` facade: one per open library. */
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
-import type { Asset, Collection, ConsentRecord, Participant, Project, Session, SourceDraft, SourceFile, Tag } from "@ao/core";
+import { effectivePolicy, parseGovernance } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, Project, Session, SourceDraft, SourceFile, Tag } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
-import { addDerivedAsset, type DerivedAssetInput } from "./assets.js";
+import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
+import { addDerivedAsset, addOriginalAsset, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type IntegrityWarning } from "./audit-store.js";
 import { createCollection, createTag, deleteCollection, moveCollection, setMembership, workspaceTags } from "./collections.js";
 import {
@@ -18,7 +20,7 @@ import {
   type SessionInput,
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
-import { foldName } from "./io.js";
+import { foldName, readMaybe } from "./io.js";
 import { authorizeOnly, runMutation, type MutateOptions, type MutateRequest, type Tx } from "./mutate.js";
 import { createProject, isUnlocked, lockProject, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
@@ -95,6 +97,14 @@ export class Repo {
   }
   addDerivedAsset(projectId: string, sourceId: string, input: DerivedAssetInput): Promise<Asset> {
     return addDerivedAsset(this.core, projectId, sourceId, input);
+  }
+  /** Adds a further original (e.g. a refreshed, dated platform-metadata snapshot); originals are never replaced. */
+  addOriginalAsset(projectId: string, sourceId: string, input: OriginalAssetInput): Promise<Asset> {
+    return addOriginalAsset(this.core, projectId, sourceId, input);
+  }
+  /** Records (and audits) that the researcher acknowledged a one-time capture explanation (spec 5.1). */
+  acknowledge(projectId: string, kind: AcknowledgementKind): Promise<Project> {
+    return acknowledge(this.core, projectId, kind);
   }
 
   createCollection(projectId: string, name: string, parentId?: string): Promise<Collection> {
@@ -402,6 +412,21 @@ export function projectDataKey(repo: Repo, projectId: string): { key: Uint8Array
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   return core.encrypted(st) ? core.key(st) : null;
+}
+
+/**
+ * Package-internal (link capture): the project's effective governance policy (profile minimums
+ * applied), or null when governance.yaml cannot be read or parsed (every request is then denied).
+ */
+export async function projectPolicy(repo: Repo, projectId: string): Promise<GovernanceConfig | null> {
+  const core = cores.get(repo)!;
+  const st = core.state(projectId);
+  try {
+    const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+    return raw ? effectivePolicy(parseGovernance(raw.toString("utf8"))).policy : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Package-internal: the library a repo was opened on. */

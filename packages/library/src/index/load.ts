@@ -46,7 +46,8 @@ export function stripVtt(vtt: string): string {
 export async function readExtractedText(root: string, sf: SourceFile, k: ProjectKey | null | undefined): Promise<string | undefined> {
   const parts: string[] = [];
   for (const kind of ["ocr-text", "transcript"]) {
-    const cands = sf.assets.filter((a) => a.role === "derived" && a.kind === kind);
+    // A transcript's segments.json sits next to its .vtt with the same kind; only the text forms count.
+    const cands = sf.assets.filter((a) => a.role === "derived" && a.kind === kind && a.mime !== "application/json");
     if (cands.length === 0) continue;
     const newest = cands.reduce((best, a) => ((a.derivation?.at ?? "") >= (best.derivation?.at ?? "") ? a : best));
     try {

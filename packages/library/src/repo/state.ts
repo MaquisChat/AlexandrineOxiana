@@ -17,6 +17,7 @@ import { AnchorStore, AuditStore, type AuditInput, type IntegrityWarning } from 
 import { NotFoundError, ProjectLockedError, ReadOnlyLibraryError } from "./errors.js";
 import { absPath, readMaybe } from "./io.js";
 import type { InternalOptions } from "./seams.js";
+import type { ReviewItemRow } from "./review.js";
 
 /** Search-index port (Task 12). Called last in a mutation, after files, change log and audit. */
 export interface IndexSink {
@@ -30,6 +31,8 @@ export interface IndexSink {
   purgeProject?(projectId: string): void;
   /** Called after an encrypted project was unlocked so its content can be indexed again. Optional. */
   projectUnlocked?(projectId: string): void | Promise<void>;
+  /** A review-queue entry was written to `review/pending.jsonl` (R31). Optional. */
+  indexReviewItem?(row: ReviewItemRow): void | Promise<void>;
 }
 
 export const NOOP_INDEX: IndexSink = { indexSource() {}, removeSource() {}, indexProject() {} };

@@ -5,7 +5,7 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { IndexSink, ProjectJson } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, stampFor, type Stamps } from "./changes.js";
 import {
-  getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, type IndexDb, type IndexHandle,
+  getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource } from "./load.js";
 
@@ -133,6 +133,9 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     },
     purgeProject(projectId) {
       purgeProject(handle.db, projectId);
+    },
+    indexReviewItem(row) {
+      upsertReviewItem(handle.db, row);
     },
     async projectUnlocked(projectId) {
       if (!ctx) return;

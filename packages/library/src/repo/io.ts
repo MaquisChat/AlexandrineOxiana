@@ -177,19 +177,20 @@ export async function undoAppend(u: AppendUndo): Promise<void> {
  * Seals one JSON line for an encrypted project's change log: AES-256-GCM under
  * the project data key, AAD = "ao-changes|" + projectId. Lines carry no plaintext entity data.
  */
-export function sealLine(key: Uint8Array, keyId: string, projectId: string, json: string): string {
+/** Seals one JSON line with the project key; `purpose` binds it to its file kind (AAD `<purpose>|<projectId>`). */
+export function sealLine(key: Uint8Array, keyId: string, projectId: string, json: string, purpose = "ao-changes"): string {
   const nonce = randomBytes(12);
   const c = createCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
-  c.setAAD(Buffer.from(`ao-changes|${projectId}`, "utf8"));
+  c.setAAD(Buffer.from(`${purpose}|${projectId}`, "utf8"));
   const ct = Buffer.concat([c.update(json, "utf8"), c.final(), c.getAuthTag()]);
   return JSON.stringify({ v: 1, alg: "aes-256-gcm", keyId, nonce: nonce.toString("base64"), ct: ct.toString("base64") });
 }
 
-export function openLine(key: Uint8Array, projectId: string, line: string): string {
+export function openLine(key: Uint8Array, projectId: string, line: string, purpose = "ao-changes"): string {
   const o = JSON.parse(line) as { nonce: string; ct: string };
   const ct = Buffer.from(o.ct, "base64");
   const d = createDecipheriv("aes-256-gcm", key, Buffer.from(o.nonce, "base64"), { authTagLength: 16 });
-  d.setAAD(Buffer.from(`ao-changes|${projectId}`, "utf8"));
+  d.setAAD(Buffer.from(`${purpose}|${projectId}`, "utf8"));
   d.setAuthTag(ct.subarray(ct.length - 16));
   return Buffer.concat([d.update(ct.subarray(0, ct.length - 16)), d.final()]).toString("utf8");
 }
