@@ -89,6 +89,8 @@ export interface ResolveInput {
   /** The sniffed MIME type ("" for a metadata-only item). */
   mime?: string;
   referenceMetadata?: Partial<SourceDraft>;
+  /** The evidence kind of the reference metadata (default refman; Zotero items: zotero, R72). */
+  referenceSource?: FieldEvidence["source"];
   sidecarPaths?: string[];
   /** The name file-name patterns are matched against (default: the path's base name). */
   fileName?: string;
@@ -305,7 +307,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
 
   // 1. Reference metadata.
   const refFields = fromReference(ref);
-  if (refFields.title) step(scoreConfidence({ method: "reference-metadata" }), { method: "reference-metadata" }, refFields, { kind: "refman", ref: "reference" });
+  if (refFields.title) step(scoreConfidence({ method: "reference-metadata" }), { method: "reference-metadata" }, refFields, input.referenceSource ?? { kind: "refman", ref: "reference" });
 
   // 2. Embedded metadata.
   if (!done() && (extracted.title || extracted.creators?.length)) {

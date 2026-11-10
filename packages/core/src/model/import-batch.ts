@@ -15,6 +15,11 @@ export const FileNamePatternOption = z.object({ id: z.string().min(1).max(100), 
 
 export const ImportOptions = z.object({
   fileHandling: z.enum(["copy", "link"]).default("copy"),
+  /**
+   * Files the source itself links in place (Zotero linked attachments, R72): linked in place too
+   * ("link", the default) or copied ("copy"). Projects that keep files encrypted always copy them.
+   */
+  linkedFiles: z.enum(["link", "copy"]).default("link"),
   structure: z.enum(["collections", "tags", "none"]).default("collections"),
   duplicates: z.enum(["merge", "skip", "keep-both"]).default("merge"),
   ocr: z.boolean().default(true),

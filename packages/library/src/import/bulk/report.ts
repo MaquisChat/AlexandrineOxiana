@@ -21,11 +21,13 @@ export interface ImportReport {
   state: ShownState;
   startedAt: string;
   finishedAt?: string;
-  counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; failed: number };
+  counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; updated: number; unchanged: number; failed: number };
   failures: Array<{ item: string; reason: string }>;
   /** Items imported without some of their linked files (e.g. "attached file not found"); never a path (R66). */
   fileNotes: Array<{ item: string; note: string }>;
   pendingReview: Array<{ reviewId: string; sourceId?: string; reasons: string[] }>;
+  /** Re-imports (R72): fields not updated because they were changed after the last import (JSON pointers). */
+  keptFields: Array<{ item: string; fields: string[] }>;
   governance: GovernanceNote[];
   notes: string[];
 }
@@ -70,6 +72,7 @@ function markdown(r: ImportReport): string {
     `- Waiting for review: ${r.counts.needsReview}`,
     `- Duplicates (not imported again): ${r.counts.duplicates}`,
     `- Merged into existing sources: ${r.counts.merged}`,
+    ...(r.counts.updated || r.counts.unchanged ? [`- Updated from a newer version: ${r.counts.updated}`, `- Unchanged since the last import: ${r.counts.unchanged}`] : []),
     `- Failed: ${r.counts.failed}`,
     "",
   ];
@@ -81,6 +84,11 @@ function markdown(r: ImportReport): string {
   if (r.fileNotes.length) {
     lines.push("## Files not attached", "");
     for (const f of r.fileNotes) lines.push(`- ${f.item}: ${f.note}`);
+    lines.push("");
+  }
+  if (r.keptFields.length) {
+    lines.push("## Fields kept because they were edited after the last import", "");
+    for (const k of r.keptFields) lines.push(`- ${k.item}: ${k.fields.join(", ")}`);
     lines.push("");
   }
   if (r.pendingReview.length) {
@@ -124,6 +132,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: reportLabel(e.key, rec.secret), reason: e.reason ?? "The item could not be imported." })),
     fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),
+    keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
     governance: rec.governance,
     notes: rec.notes,
   };

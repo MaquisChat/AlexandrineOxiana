@@ -196,6 +196,7 @@ describe("ImportOptions / ImportBatch", () => {
   it("defaults", () => {
     expect(ImportOptions.parse({})).toEqual({
       fileHandling: "copy",
+      linkedFiles: "link",
       structure: "collections",
       duplicates: "merge",
       ocr: true,

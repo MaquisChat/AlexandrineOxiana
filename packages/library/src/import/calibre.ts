@@ -19,13 +19,12 @@
  * Item keys are `<library folder name>@<hash of its absolute path>#book-<id>` (stable; R63 HMAC in
  * provenance); `externalKeys` keeps the Calibre book id and uuid.
  */
-import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import Database from "better-sqlite3";
 import type { Creator } from "@ao/core";
 import { parseName } from "../extract/names.js";
 import type { ImportSourceAdapter, ScanContext, ScanItem } from "./bulk/scan.js";
+import { CopyTooLarge, cappedRows, copyDatabases, openCopy, plainTables, t64 } from "./sqlite-copy.js";
 import { exportIdentity, isbnsOf, recordItem, skippedNote, tagList, text, doiOf, issnOf, type RecordFields } from "./refman.js";
 
 export const CALIBRE_REASONS = {
@@ -56,27 +55,13 @@ export interface CalibreCopy {
   remove(): Promise<void>;
 }
 
-/** Copies `<libraryDir>/metadata.db` (and its -wal, if any) into a new 0700 folder inside `workDir`. */
+/** Copies `<libraryDir>/metadata.db` (and its -wal/-shm, if any) into a new 0700 folder inside `workDir` (sqlite-copy.ts). */
 export async function copyCalibreDb(libraryDir: string, workDir: string): Promise<CalibreCopy> {
-  const dir = join(workDir, `calibre-${randomBytes(6).toString("hex")}`);
-  await fsp.mkdir(dir, { mode: 0o700 });
-  const remove = () => fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
   try {
-    if (process.platform !== "win32") await fsp.chmod(dir, 0o700);
-    const src = join(libraryDir, "metadata.db");
-    const st = await fsp.stat(src);
-    if (!st.isFile()) throw new Error("metadata.db is not a file");
-    const wal = await fsp.stat(`${src}-wal`).catch(() => null);
-    if (st.size + (wal?.isFile() ? wal.size : 0) > MAX_CALIBRE_DB_BYTES) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
-    const dest = join(dir, "metadata.db");
-    await fsp.copyFile(src, dest);
-    if (wal?.isFile()) await fsp.copyFile(`${src}-wal`, `${dest}-wal`);
-    // The originals may have grown while they were copied: the copies are what is opened.
-    const copied = (await fsp.stat(dest)).size + ((await fsp.stat(`${dest}-wal`).catch(() => null))?.size ?? 0);
-    if (copied > MAX_CALIBRE_DB_BYTES) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
-    return { path: dest, remove };
+    const copy = await copyDatabases(libraryDir, { required: ["metadata.db"] }, workDir, "calibre", MAX_CALIBRE_DB_BYTES);
+    return { path: copy.paths.get("metadata.db")!, remove: copy.remove };
   } catch (err) {
-    await remove();
+    if (err instanceof CopyTooLarge) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
     throw err;
   }
 }
@@ -98,49 +83,17 @@ interface CalibreBook {
 }
 
 /**
- * The names sqlite_master lists as plain tables: views, virtual tables (CREATE VIRTUAL TABLE, run
- * by a module) and tables with generated columns (computed on read, e.g. a printf() that builds a
- * gigabyte string; PRAGMA table_xinfo hidden 2 or 3) are left out, so a required one is refused.
- */
-function plainTables(db: Database.Database): Set<string> {
-  const rows = db.prepare("SELECT name, substr(sql, 1, 64) AS head FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string; head: string | null }>;
-  const out = new Set<string>();
-  for (const r of rows) {
-    if (/^\s*create\s+virtual\b/iu.test(r.head ?? "")) continue;
-    out.add(r.name);
-  }
-  for (const t of [...REQUIRED_TABLES, "publishers", "books_publishers_link"]) {
-    if (!out.has(t)) continue;
-    const cols = db.prepare("SELECT hidden FROM pragma_table_xinfo(?)").all(t) as Array<{ hidden: number }>;
-    if (cols.some((c) => c.hidden === 2 || c.hidden === 3)) out.delete(t);
-  }
-  return out;
-}
-
-/** A text column read at most 64 KB long (SQL side, so a huge value is never built). */
-const t64 = (col: string, as: string) => `substr(${col}, 1, 65536) AS ${as}`;
-
-/**
  * Reads every book from a (copied) metadata.db. Every name read must be a real table (a view named
  * `books` could run any query, e.g. an endless recursive CTE); `trusted_schema` is off so schema
  * objects cannot call functions with side effects; rows are read with iterate() under caps (books
  * ≤ 200,000; each link/data table ≤ 2,000,000), past which the library is refused (R68 I1).
  */
 function readBooks(dbPath: string): CalibreBook[] {
-  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  const db = openCopy(dbPath);
   try {
-    db.pragma("trusted_schema = OFF");
-    db.pragma("query_only = ON");
-    const tables = plainTables(db);
+    const tables = plainTables(db, [...REQUIRED_TABLES, "publishers", "books_publishers_link"]);
     for (const t of REQUIRED_TABLES) if (!tables.has(t)) throw new CalibreUnreadable(CALIBRE_REASONS.unreadable);
-    const rows = <T>(sql: string, max: number): T[] => {
-      const out: T[] = [];
-      for (const r of db.prepare(sql).iterate() as IterableIterator<T>) {
-        if (out.length >= max) throw new CalibreUnreadable(CALIBRE_REASONS.tooLarge);
-        out.push(r);
-      }
-      return out;
-    };
+    const rows = <T>(sql: string, max: number): T[] => cappedRows<T>(db, sql, max, () => new CalibreUnreadable(CALIBRE_REASONS.tooLarge));
     const books = rows<BookRow>(`SELECT id, ${t64("title", "title")}, ${t64("path", "path")}, ${t64("pubdate", "pubdate")}, ${t64("uuid", "uuid")} FROM books ORDER BY id`, MAX_BOOKS);
     const group = <T>(list: Array<{ book: number } & T>) => {
       const m = new Map<number, T[]>();

@@ -48,6 +48,8 @@ const NS = {
 } as const;
 
 export const RDF_REASONS = {
+  /** R71: a library too large for an RDF export can be imported straight from Zotero's data folder (Task 25). */
+  tooMany: "This export has too many references for one import; split it into smaller files, or import directly from Zotero.",
   declaration: "The export file contains a document type or entity declaration, which is not allowed for safety, so nothing was imported from it.",
 } as const;
 
@@ -404,7 +406,15 @@ export function rdfRecords(src: string): RdfRecord[] {
 
 /** Zotero RDF export (Zotero's "Export Library…" → Zotero RDF, with files). */
 export function zoteroRdfAdapter(path: string): ImportSourceAdapter {
-  return exportAdapter("zotero-rdf", path, rdfRecords, async (r, keys, baseDir) =>
+  const inner = exportAdapter("zotero-rdf", path, rdfRecords, async (r, keys, baseDir) =>
     recordItem(keys.next(r.key || undefined), r.fields, r.files.map((p) => linkFromPath(p, baseDir)), { folderPath: r.folderPath }),
   );
+  return {
+    ...inner,
+    async *scan(signal, ctx) {
+      for await (const item of inner.scan(signal, ctx)) {
+        yield item.unreadable === REFMAN_REASONS.tooMany ? { ...item, unreadable: RDF_REASONS.tooMany } : item;
+      }
+    },
+  };
 }

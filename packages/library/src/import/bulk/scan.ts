@@ -18,18 +18,55 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import yauzl from "yauzl";
 import { fileTypeFromFile } from "file-type";
-import type { Annotation, ImportBatch, SourceDraft } from "@ao/core";
+import type { FieldEvidence, ImportBatch, SourceDraft } from "@ao/core";
 import { UnsafeFileError } from "../../extract/errors.js";
 import { extractArchive } from "../../extract/zip.js";
 import { calibreAdapter } from "../calibre.js";
 import { bibtexAdapter, cslJsonAdapter, risAdapter } from "../refman.js";
 import { SIDECAR_EXTS } from "../sidecar.js";
+import { zoteroLocalAdapter } from "../zotero-local.js";
 import { zoteroRdfAdapter } from "../zotero-rdf.js";
 
 export interface ScanFile {
   path: string;
   mime: string;
   bytes: number;
+  /**
+   * The source links this file in place (a Zotero linked attachment): it is linked in place too,
+   * unless the options say `linkedFiles: 'copy'` or the project keeps files encrypted (R24), where it
+   * is copied with the note ENGINE_FILE_NOTES.linkedCopied.
+   */
+  link?: boolean;
+}
+
+/** A rectangle on a PDF page, in PDF points from the page's origin. */
+export interface ScanRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * An annotation or note that comes with an item (Zotero reader annotations and notes, R72). It is
+ * stored with the source (source.json, sealed in encrypted projects) as an Annotation; its anchor
+ * points into the asset stored from `file`. On a re-import, one whose `key` the source already has
+ * is not added again.
+ */
+export interface ScanAnnotation {
+  /** Stable key at the source, e.g. "zotero:ABCD2345" (kept as Annotation.externalKey). */
+  key: string;
+  kind: "highlight" | "underline" | "note" | "image" | "ink";
+  body?: string;
+  quote?: string;
+  color?: string;
+  pageLabel?: string;
+  author?: string;
+  /** ISO timestamp (default: when it is stored). */
+  createdAt?: string;
+  /** The item file (ScanFile.path) the anchor is in. */
+  file?: string;
+  anchor?: { kind: "pdf"; page: number; rects: ScanRect[] } | { kind: "epub-cfi"; cfi: string };
 }
 
 export interface ScanItem {
@@ -45,9 +82,20 @@ export interface ScanItem {
    * adds those the existing source lacks, recorded in the merge record so undo takes them off (R66).
    */
   tags?: string[];
-  /** e.g. Zotero annotations (Task 24; not stored by the folder/zip import). */
-  annotations?: Annotation[];
-  notes?: string[];
+  /** Further collection paths the item is in (a Zotero item can be in several collections). */
+  moreFolderPaths?: string[][];
+  /** Colours of the item's tags, by tag name (used when the tag is created). */
+  tagColors?: Record<string, string>;
+  /** Annotations and notes (Zotero, R72). */
+  annotations?: ScanAnnotation[];
+  /** The evidence kind of the reference metadata (default: refman). Zotero items: kind 'zotero'. */
+  referenceSource?: FieldEvidence["source"];
+  /**
+   * Incremental import (adapters with `incremental`): the item's identity at its source and a token
+   * that changes whenever the item (or anything under it) changes. Re-running skips an item whose
+   * token is unchanged and updates one whose token changed (R72).
+   */
+  version?: { id: string; version: string };
   /** Recorded in the source's provenance (e.g. a Zotero item key). */
   externalKeys?: Record<string, string>;
   /**
@@ -78,6 +126,13 @@ export interface ImportSourceAdapter {
    */
   roots?: string[];
   scan(signal: AbortSignal, ctx?: ScanContext): AsyncIterable<ScanItem>;
+  /**
+   * Items carry `version`: an item already imported (by a batch of the same kind that was not
+   * undone) is skipped when unchanged and updated when changed, instead of being imported again.
+   */
+  incremental?: boolean;
+  /** Generated citation keys are made unique within the project (a, b, c … appended). */
+  uniqueCitationKeys?: boolean;
   /** How many items the scan will yield (for progress), when it can tell cheaply. */
   count?(signal: AbortSignal): Promise<number>;
 }
@@ -251,5 +306,6 @@ export function adapterFor(kind: ImportBatch["source"]["kind"], location: string
   if (kind === "csl-json") return cslJsonAdapter(location);
   if (kind === "zotero-rdf") return zoteroRdfAdapter(location);
   if (kind === "calibre") return calibreAdapter(location);
+  if (kind === "zotero-local") return zoteroLocalAdapter(location);
   return undefined;
 }

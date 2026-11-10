@@ -24,17 +24,21 @@ export interface MergeRecord {
   addedEvidence: FieldEvidence[];
   /** Tag ids the merge put on the source (absent in records written before R66). */
   addedTagIds?: string[];
+  /** Annotations (and notes) the merge or update added (R72). */
+  addedAnnotationIds?: string[];
+  /** Updates (R72): fields kept because they were changed after the last import (JSON pointers). */
+  kept?: string[];
 }
 
 type Src = SourceFile["source"];
 
-function getAt(s: Src, path: string): unknown {
+export function getAt(s: Src, path: string): unknown {
   const [, a, b] = path.split("/");
   const v = (s as unknown as Record<string, unknown>)[a!];
   return b === undefined ? v : (v as Record<string, unknown> | undefined)?.[b];
 }
 
-function setAt(s: Src, path: string, value: unknown): Src {
+export function setAt(s: Src, path: string, value: unknown): Src {
   const [, a, b] = path.split("/");
   const out = { ...s } as unknown as Record<string, unknown>;
   if (b === undefined) {
@@ -102,12 +106,16 @@ export function revertMerge(cur: SourceFile, rec: MergeRecord, at: string, actor
   const dropTags = new Set((rec.addedTagIds ?? []).filter((t) => source.tagIds.includes(t)));
   if (dropTags.size) source = { ...source, tagIds: source.tagIds.filter((t) => !dropTags.has(t)) };
   const drop = new Set(rec.addedEvidence.filter((e) => reverted.has(e.field)).map((e) => JSON.stringify(e)));
-  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0;
+  const annIds = new Set(rec.addedAnnotationIds ?? []);
+  const droppedAnnotations = cur.annotations.some((a) => annIds.has(a.id));
+  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations;
   return {
     next: {
       ...cur,
       source: changed ? { ...source, modifiedAt: at, modifiedBy: actor } : source,
       assets: cur.assets.filter((a) => !ids.has(a.id)),
+      // An annotation anchored in a removed asset goes with it.
+      annotations: cur.annotations.filter((a) => !annIds.has(a.id)).map((a) => ({ ...a, anchors: a.anchors.filter((x) => !ids.has(x.assetId)) })),
       fieldEvidence: cur.fieldEvidence.filter((e) => !drop.has(JSON.stringify(e))),
     },
     removed,

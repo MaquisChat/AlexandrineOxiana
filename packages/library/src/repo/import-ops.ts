@@ -57,6 +57,10 @@ export function runImportChange<T>(
           for (const a of parsed.assets) if (!old.has(a.id)) tx.record("asset", a.id, null, a);
           const now = new Set(parsed.assets.map((a) => a.id));
           for (const a of before?.assets ?? []) if (!now.has(a.id)) tx.record("asset", a.id, a, null);
+          const oldAnn = new Set((before?.annotations ?? []).map((a) => a.id));
+          for (const a of parsed.annotations) if (!oldAnn.has(a.id)) tx.record("annotation", a.id, null, a);
+          const nowAnn = new Set(parsed.annotations.map((a) => a.id));
+          for (const a of before?.annotations ?? []) if (!nowAnn.has(a.id)) tx.record("annotation", a.id, a, null);
           if (!st.sources.has(parsed.source.id)) tx.onCommit(() => st.sources.set(parsed.source.id, parsed.source.folder));
           tx.index((sink) => sink.indexSource(parsed));
         },

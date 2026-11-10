@@ -45,6 +45,7 @@ import {
   type ImportOptionsInput,
   type PolicyDecision,
   type Provenance,
+  type Annotation,
   type SourceDraft,
   type SourceFile,
 } from "@ao/core";
@@ -53,7 +54,7 @@ import { extractMetadata } from "../../extract/index.js";
 import type { IndexDb } from "../../index/db.js";
 import { lookupContextFor, type HttpClient, type LookupContext } from "../../lookup/index.js";
 import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../../repo/errors.js";
-import type { SourceInputFile } from "../../repo/sources.js";
+import type { CreateSourceOptions, SourceInputFile } from "../../repo/sources.js";
 import { storeRequest } from "../../repo/sources.js";
 import {
   appendLibraryEvent,
@@ -101,6 +102,7 @@ import { OUTSIDE_NOTE, OUTSIDE_REASON, OutsidePolicy, approvalHashes } from "./o
 import { reportLabel, writeBatchReport } from "./report.js";
 import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
+import { planUpdate, toAnnotation, uniqueKey } from "./update.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../../../package.json") as { version: string }).version;
 const TOOL = { name: "bulk-import", version: VERSION };
@@ -111,6 +113,8 @@ export const ENGINE_FILE_NOTES = {
   vanished: "attached file no longer present",
   sameFile: "same file as another item in this batch",
   changed: "attached file changed during import",
+  /** A file the source links in place (a Zotero linked attachment) was copied: the project keeps files encrypted (R24, R72). */
+  linkedCopied: "linked file copied into the library, because this project keeps its files encrypted",
 } as const;
 
 export const REASONS = {
@@ -161,6 +165,9 @@ export interface BatchCounts {
   needsReview: number;
   duplicates: number;
   merged: number;
+  /** Incremental re-import (R72): items imported before that changed, and those that did not. */
+  updated: number;
+  unchanged: number;
   failed: number;
 }
 
@@ -348,9 +355,26 @@ const GROUP = 32;
 const PLACEHOLDER = "pending:";
 const isPlaceholder = (id: string | undefined) => !!id && id.startsWith(PLACEHOLDER);
 
+/** An item's checked files (prepareFiles). */
+interface Prepared {
+  inputs: SourceInputFile[];
+  shas: string[];
+  kept: ScanItem["files"];
+  /** The primary file's path as found (its name, and its sidecars, are where the item was found). */
+  names: string[];
+  mime: string;
+  dropped: Array<{ note: string; reason: string }>;
+  /** Linked files copied because the project refuses links (R24). */
+  copiedLinks: number;
+  /** Adapter path → checked real path, and real path → sha256 (for anchoring annotations). */
+  realOf: Map<string, string>;
+  shaOf: Map<string, string>;
+}
+
 interface Queued {
   item: ScanItem;
   r: Resolution;
+  prep: Prepared;
   inputs: SourceInputFile[];
   draft: SourceDraft;
   provenance: Provenance;
@@ -378,6 +402,10 @@ class Run {
   /** Real path of each file attached in this run → the item it went to (a second item gets a note). */
   private fileOwners = new Map<string, string>();
   private readonly workName: string;
+  /** Incremental import (R72): identity → the source and version token the newest journal line recorded. */
+  private known = new Map<string, { sourceId: string; version: string }>();
+  /** Item key → its identity and version token (journaled with its outcome). */
+  private versions = new Map<string, { id: string; version: string }>();
   private structureCache = new Map<string, { collectionIds: string[]; tagIds: string[] }>();
   private projectTags: { collections: Array<{ id: string; name: string; parentId?: string }>; tags: Array<{ id: string; name: string }> } | null = null;
   private snapshots = 0;
@@ -472,7 +500,7 @@ class Run {
   private syncRecord(state: BatchState): void {
     const c = this.counts();
     this.rec.state = state;
-    this.rec.counts = { created: c.created, merged: c.merged, skipped: c.duplicates, failed: c.failed, needsReview: c.needsReview };
+    this.rec.counts = { created: c.created, merged: c.merged + c.updated, skipped: c.duplicates + c.unchanged, failed: c.failed, needsReview: c.needsReview };
     this.rec.createdSourceIds = [...this.createdIds];
     this.rec.governance = [
       ...this.rec.governance.filter((g) => g.items === undefined),
@@ -509,6 +537,7 @@ class Run {
         this.rec.secret,
         this.rec.outsideApprovals ?? [],
       );
+      if (this.adapter.incremental) this.known = await knownVersions(this.repo, this.projectId, this.rec.source.kind);
       let total = 0;
       try {
         total = (await this.adapter.count?.(this.abort.signal)) ?? 0;
@@ -592,6 +621,15 @@ class Run {
     try {
       if (item.fileNotes?.length) this.fileNotes.set(item.key, item.fileNotes.slice(0, 50).map((n) => n.slice(0, 200)));
       if (item.unreadable) return this.queue({ key: item.key, outcome: "failed", reason: item.unreadable });
+      if (this.adapter.incremental && item.version) {
+        this.versions.set(item.key, item.version);
+        const k = this.known.get(item.version.id);
+        if (k && hasSource(this.repo, this.projectId, k.sourceId)) {
+          if (k.version === item.version.version) return this.queue({ key: item.key, outcome: "unchanged", sourceId: k.sourceId });
+          await this.flush(); // the source may be in the current group
+          return await this.update(item, k.sourceId);
+        }
+      }
       return await this.importItem(item, dedupe, watchdog);
     } catch (err) {
       return this.itemError(item, err);
@@ -622,55 +660,75 @@ class Run {
   /** The journal line with the item's file notes, if it has any (R66). */
   private withNotes(e: JournalEntry): JournalEntry {
     const notes = this.fileNotes.get(e.key);
-    return notes?.length ? { ...e, notes } : e;
+    const v = WITH_VERSION.has(e.outcome) && e.sourceId ? this.versions.get(e.key) : undefined;
+    if (v) this.known.set(v.id, { sourceId: e.sourceId!, version: v.version });
+    return { ...e, ...(notes?.length ? { notes } : {}), ...(v ? { ext: { id: v.id, version: v.version } } : {}) };
   }
 
-  private async importItem(item: ScanItem, dedupe: BatchDedupe, watchdog: PatternWatchdog): Promise<JournalEntry | null> {
+  /**
+   * Checks an item's files (R66, R67, R68 I2, R70 I-2): each that vanished, is not supported, is
+   * outside the expected folders without approval, or went to another item of this run is left out
+   * with a note; the rest become store inputs at their checked real paths. A file the source links
+   * in place (ScanFile.link) is linked too, unless the options say copy or the project keeps files
+   * encrypted (R24: then it is copied, with the note linkedCopied).
+   */
+  private async prepareFiles(item: ScanItem): Promise<Prepared> {
     const opts = this.rec.options;
-    const method = CAPTURE_METHOD[this.rec.source.kind];
     const fromArchive = item.key.includes("!/");
-    const inputs: SourceInputFile[] = [];
-    const shas: string[] = [];
-    let mime = "";
-    // Files that vanished, are not supported, or went to another item of this run are left out with
-    // a note; the item imports with the rest (metadata-only if none). An item with no reference
-    // metadata (a plain file from a folder) has nothing else, so it fails as before.
-    const kept: ScanItem["files"] = [];
-    /** The primary file's path as found (its name, and its sidecars, are where the item was found). */
-    const names: string[] = [];
-    const dropped: Array<{ note: string; reason: string }> = [];
+    const out: Prepared = { inputs: [], shas: [], kept: [], names: [], mime: "", dropped: [], copiedLinks: 0, realOf: new Map(), shaOf: new Map() };
     for (const f of item.files) {
       const st = await fsp.stat(f.path).catch(() => null);
       if (!st?.isFile()) {
-        dropped.push({ note: ENGINE_FILE_NOTES.vanished, reason: REASONS.missing });
+        out.dropped.push({ note: ENGINE_FILE_NOTES.vanished, reason: REASONS.missing });
         continue;
       }
       // From here on the file is read through its checked real path (R70 I-2).
       const checked = this.outside ? await this.outside.check(f.path) : { real: await fsp.realpath(f.path).catch(() => resolve(f.path)), ok: true };
       const real = checked.real;
       if (!checked.ok) {
-        dropped.push({ note: OUTSIDE_NOTE, reason: OUTSIDE_REASON });
+        out.dropped.push({ note: OUTSIDE_NOTE, reason: OUTSIDE_REASON });
         continue;
       }
       const owner = this.fileOwners.get(real);
       if (owner !== undefined && owner !== item.key) {
-        dropped.push({ note: ENGINE_FILE_NOTES.sameFile, reason: REASONS.duplicateFile });
+        out.dropped.push({ note: ENGINE_FILE_NOTES.sameFile, reason: REASONS.duplicateFile });
         continue;
       }
       const type = await fileTypeFromFile(real).catch(() => undefined);
       const stored = type ? acceptedType(type) : undefined;
       if (!type || !stored) {
-        dropped.push({ note: ENGINE_FILE_NOTES.unsupported, reason: REASONS.unsupported });
+        out.dropped.push({ note: ENGINE_FILE_NOTES.unsupported, reason: REASONS.unsupported });
         continue;
       }
       this.fileOwners.set(real, item.key);
-      kept.push({ ...f, path: real });
-      if (!names.length) names.push(f.path);
-      if (!mime) mime = type.mime;
+      out.kept.push({ ...f, path: real });
+      out.realOf.set(f.path, real);
+      if (!out.names.length) out.names.push(f.path);
+      if (!out.mime) out.mime = type.mime;
       const sha = await sha256File(real);
-      shas.push(sha);
-      inputs.push({ path: real, noFollow: true, role: "original", handling: opts.fileHandling === "link" && !fromArchive ? "link" : "copy", ext: stored.ext, mime: stored.mime, kind: stored.kind });
+      out.shas.push(sha);
+      out.shaOf.set(real, sha);
+      const sourceLinks = f.link === true && opts.linkedFiles === "link";
+      const wantsLink = !fromArchive && (opts.fileHandling === "link" || sourceLinks);
+      if (wantsLink && sourceLinks && opts.fileHandling !== "link" && (await this.linkRefused())) out.copiedLinks++;
+      const handling = wantsLink && !(await this.linkRefused()) ? "link" : "copy";
+      out.inputs.push({ path: real, noFollow: true, role: "original", handling, ext: stored.ext, mime: stored.mime, kind: stored.kind });
     }
+    return out;
+  }
+
+  /** Whether this project refuses linking in place (R24), asked once per run. */
+  private linkRefusedCache: Promise<boolean> | null = null;
+  private linkRefused(): Promise<boolean> {
+    this.linkRefusedCache ??= preflightLink(this.repo, this.projectId);
+    return this.linkRefusedCache;
+  }
+
+  private async importItem(item: ScanItem, dedupe: BatchDedupe, watchdog: PatternWatchdog): Promise<JournalEntry | null> {
+    const opts = this.rec.options;
+    const method = CAPTURE_METHOD[this.rec.source.kind];
+    const prep = await this.prepareFiles(item);
+    const { inputs, shas, kept, names, mime, dropped } = prep;
     // Same file → duplicate (whatever the duplicate policy).
     if (shas[0]) {
       let same = dedupe.bySha(shas[0]);
@@ -682,8 +740,8 @@ class Run {
     }
     if (dropped.length) {
       if (!item.referenceMetadata && !kept.length) return this.queue({ key: item.key, outcome: "failed", reason: dropped[0]!.reason });
-      this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...dropped.map((d) => d.note)]);
     }
+    this.addFileNotes(item, prep);
     const primaryFile = kept[0];
     const name = names[0] ? basename(names[0]) : undefined;
     let userParsedName;
@@ -692,6 +750,7 @@ class Run {
       {
         ...(primaryFile ? { path: primaryFile.path, mime, sidecarPaths: await findSidecars(names[0]!), fileName: name } : {}),
         ...(item.referenceMetadata ? { referenceMetadata: item.referenceMetadata } : {}),
+        ...(item.referenceSource ? { referenceSource: item.referenceSource } : {}),
         ...(userParsedName ? { userParsedName } : {}),
       },
       { projectId: this.projectId, patterns: [], lookup: this.lookup },
@@ -710,11 +769,17 @@ class Run {
       if (opts.duplicates === "skip") return this.queue({ key: item.key, outcome: "duplicate", sourceId: dup.sourceId, reason: REASONS.duplicateId });
       if (opts.duplicates === "merge") {
         await this.flush();
-        return this.merge(item, dup.sourceId, r, inputs, method, dedupe);
+        return this.merge(item, dup.sourceId, r, prep, method, dedupe);
       }
     }
     const reviewItem = reviewFor(r, dup?.certainty === "likely" ? dup : null, opts.autoAcceptThreshold);
-    return this.create(item, r, inputs, shas, method, reviewItem, dedupe);
+    return this.create(item, r, prep, method, reviewItem, dedupe);
+  }
+
+  /** The item's dropped files and copied links as file notes (journaled with its outcome, R66). */
+  private addFileNotes(item: ScanItem, prep: Prepared): void {
+    const notes = [...prep.dropped.map((d) => d.note), ...Array<string>(prep.copiedLinks).fill(ENGINE_FILE_NOTES.linkedCopied)];
+    if (notes.length) this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...notes]);
   }
 
   private async structure(folderPath: string[]): Promise<{ collectionIds: string[]; tagIds: string[] }> {
@@ -747,7 +812,7 @@ class Run {
   }
 
   /** Ids of the project's tags with these names (case-insensitive), creating the missing ones as the batch's. */
-  private async namedTags(names: string[] | undefined): Promise<string[]> {
+  private async namedTags(names: string[] | undefined, colors?: Record<string, string>): Promise<string[]> {
     if (!names?.length) return [];
     this.projectTags ??= await projectCollectionsAndTags(this.repo, this.projectId);
     const known = this.projectTags;
@@ -758,7 +823,8 @@ class Run {
       seen.add(name.toLowerCase());
       let t = known.tags.find((x) => x.name.toLowerCase() === name.toLowerCase());
       if (!t) {
-        t = await this.repo.createTag(this.projectId, name);
+        const color = colors && Object.hasOwn(colors, name) ? colors[name] : undefined;
+        t = await this.repo.createTag(this.projectId, name, color);
         known.tags.push(t);
         this.rec.createdTagIds.push(t.id);
         await this.checkpoint("running"); // recorded at once, so undo finds it after a crash
@@ -788,31 +854,41 @@ class Run {
   private async create(
     item: ScanItem,
     r: Resolution,
-    inputs: SourceInputFile[],
-    shas: string[],
+    prep: Prepared,
     method: Provenance["captureMethod"],
     reviewItem: ReturnType<typeof reviewFor>,
     dedupe: BatchDedupe,
   ): Promise<JournalEntry | null> {
-    const struct = await this.structure(item.folderPath ?? []);
-    const own = await this.namedTags(item.tags);
+    const { inputs, shas } = prep;
+    const collectionIds: string[] = [];
+    const structTags: string[] = [];
+    for (const fp of [item.folderPath ?? [], ...(item.moreFolderPaths ?? [])]) {
+      const struct = await this.structure(fp);
+      collectionIds.push(...struct.collectionIds);
+      structTags.push(...struct.tagIds);
+    }
+    const own = await this.namedTags(item.tags, item.tagColors);
     const draft: SourceDraft = {
       ...r.draft,
-      collectionIds: [...new Set([...r.draft.collectionIds, ...struct.collectionIds])],
-      tagIds: [...new Set([...r.draft.tagIds, ...struct.tagIds, ...own])],
+      collectionIds: [...new Set([...r.draft.collectionIds, ...collectionIds])],
+      tagIds: [...new Set([...r.draft.tagIds, ...structTags, ...own])],
     };
+    if (this.adapter.uniqueCitationKeys) {
+      const keys = await this.citationKeys();
+      if (draft.citationKey) keys.add(draft.citationKey);
+    }
     const provenance = await this.provenanceFor(r, method, item);
     // Unpacked files are removed once the scan moves past their archive, and located media may be
     // refused on their own: those are stored at once, one by one.
     if (!r.hasLocation && !item.key.includes("!/")) {
       const placeholder = `${PLACEHOLDER}${++this.placeholders}`;
       dedupe.addPending(placeholder, candidateKey(r, shas));
-      this.group.push({ item, r, inputs, draft, provenance, reviewItem, placeholder });
+      this.group.push({ item, r, prep, inputs, draft, provenance, reviewItem, placeholder });
       if (this.group.length >= GROUP) await this.flush();
       return null;
     }
     await this.flush();
-    return this.createOne({ item, r, inputs, draft, provenance, reviewItem, placeholder: "" }, dedupe);
+    return this.createOne({ item, r, prep, inputs, draft, provenance, reviewItem, placeholder: "" }, dedupe);
   }
 
   /** Stores the queued group in one governed change; if that change is refused or fails, each item on its own. */
@@ -868,6 +944,7 @@ class Run {
             fieldEvidence: q.r.fieldEvidence,
             verification: q.r.verification.fields,
             ...(q.reviewItem ? { reviewItem: { ...q.reviewItem, batchId: this.rec.id } } : {}),
+            ...this.extraCreateOpts(q.item, q.prep, q.inputs),
           },
           inTx: async (tx, sf) => {
             const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id });
@@ -925,6 +1002,7 @@ class Run {
         verification: r.verification.fields,
         ...(r.hasLocation ? { hasLocation: true } : {}),
         ...(reviewItem ? { reviewItem: { ...reviewItem, batchId: this.rec.id } } : {}),
+        ...this.extraCreateOpts(item, q.prep, inputs),
       },
       refuseLocation,
       async (tx, created) => {
@@ -937,6 +1015,42 @@ class Run {
     dedupe.add(sf);
     if (this.rec.options.ocr && r.needsOcr && inputs.length) await this.ocr(sf.source.id);
     return entry!;
+  }
+
+  /** The item's annotations and the citation-key rule, as createSource options. */
+  private extraCreateOpts(item: ScanItem, prep: Prepared, inputs: SourceInputFile[]): Pick<CreateSourceOptions, "annotations" | "uniqueCitationKey"> {
+    const keys = this.adapter.uniqueCitationKeys ? this.citationKeySet : null;
+    return {
+      ...(item.annotations?.length
+        ? {
+            annotations: (sourceId: string, assets: Asset[], actor: string) =>
+              item.annotations!.map((a) =>
+                toAnnotation(a, sourceId, actor, (file) => {
+                  const real = prep.realOf.get(file);
+                  const i = real ? inputs.findIndex((f) => f.path === real) : -1;
+                  return i >= 0 ? assets[i] : undefined;
+                }),
+              ),
+          }
+        : {}),
+      ...(keys ? { uniqueCitationKey: (k: string) => uniqueKey(keys, k) } : {}),
+    };
+  }
+
+  /** Citation keys in use in the project (read once per run, on first need), kept current by the run. */
+  private citationKeySet: Set<string> | null = null;
+  private async citationKeys(): Promise<Set<string>> {
+    if (this.citationKeySet) return this.citationKeySet;
+    const keys = new Set<string>();
+    for (const id of this.repo.listSourceIds(this.projectId)) {
+      try {
+        keys.add((await this.repo.getSource(this.projectId, id)).source.citationKey);
+      } catch {
+        // unreadable: its key is not known
+      }
+    }
+    this.citationKeySet = keys;
+    return keys;
   }
 
   private async ocr(sourceId: string): Promise<void> {
@@ -953,61 +1067,168 @@ class Run {
   }
 
   /** Adds the item's files and the fields the existing source lacks (snapshot kept as a record; the journal records what was added, for undo). */
-  private async merge(
-    item: ScanItem,
-    targetId: string,
-    r: Resolution,
-    inputs: SourceInputFile[],
-    method: Provenance["captureMethod"],
-    dedupe: BatchDedupe,
-  ): Promise<JournalEntry> {
-    const v = await this.revalidate(item, inputs);
+  private async merge(item: ScanItem, targetId: string, r: Resolution, prep: Prepared, method: Provenance["captureMethod"], dedupe: BatchDedupe): Promise<JournalEntry> {
+    const v = await this.revalidate(item, prep.inputs);
     if (v.fail) return this.queue({ key: item.key, outcome: "failed", reason: REASONS.changed });
-    inputs = v.inputs;
     const target = await this.repo.getSource(this.projectId, targetId);
     // Tags are found or created first (each its own change, recorded as the batch's for undo).
-    const tagIds = await this.namedTags(item.tags);
+    const tagIds = await this.namedTags(item.tags, item.tagColors);
+    const out = await this.changeSource(item, targetId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, r.hasLocation)], "import.merge", async (ops, cur) => {
+      const added = await this.addFiles(ops, cur, v.inputs);
+      const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, ops.tx.at, ops.tx.actor, tagIds);
+      const anns = this.newAnnotations(item, merged.next, prep, ops.tx.actor);
+      const next = anns.length ? { ...merged.next, annotations: [...merged.next.annotations, ...anns] } : merged.next;
+      return { next, record: anns.length ? { ...merged.record, addedAnnotationIds: anns.map((a) => a.id) } : merged.record, outcome: "merged" };
+    });
+    dedupe.add(out.sf);
+    return out.entry;
+  }
+
+  /**
+   * Incremental re-import (R72): the item was imported before (as `sourceId`) and changed at its
+   * source. Fields still holding the previous import's values are updated, the others kept and
+   * reported; new files, tags and annotations are added; provenance is never touched. Governed and
+   * audited like a merge, and recorded like one (MergeRecord), so undo reverts it the same way (R61).
+   * Nothing to change: `unchanged` (the new version is still recorded).
+   */
+  private async update(item: ScanItem, sourceId: string): Promise<JournalEntry> {
+    const method = CAPTURE_METHOD[this.rec.source.kind];
+    const prep = await this.prepareFiles(item);
+    this.addFileNotes(item, prep);
+    const v = await this.revalidate(item, prep.inputs);
+    const inputs = v.inputs;
+    const target = await this.repo.getSource(this.projectId, sourceId);
+    const evSource = item.referenceSource ?? { kind: "refman" as const, ref: "reference" };
+    const ref = item.referenceMetadata ?? {};
+    const haveSha = new Set(target.assets.map((a) => a.sha256));
+    const haveAnn = new Set(target.annotations.map((a) => a.externalKey).filter(Boolean));
+    const pre = planUpdate(target, ref, evSource, new Date().toISOString());
+    this.projectTags ??= await projectCollectionsAndTags(this.repo, this.projectId);
+    const known = this.projectTags.tags;
+    const newTags = (item.tags ?? []).some((n) => {
+      const t = known.find((x) => x.name.toLowerCase() === n.toLowerCase());
+      return !t || !target.source.tagIds.includes(t.id);
+    });
+    const anything =
+      pre.filled.length || pre.evidence.length || inputs.some((f) => !haveSha.has(prep.shaOf.get(f.path) ?? "")) || (item.annotations ?? []).some((a) => !haveAnn.has(a.key)) || newTags;
+    if (!anything) return this.queue({ key: item.key, outcome: "unchanged", sourceId, ...(pre.kept.length ? { merge: emptyRecord(pre.kept) } : {}) });
+    const tagIds = await this.namedTags(item.tags, item.tagColors);
+    const out = await this.changeSource(item, sourceId, [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance)], "import.update", async (ops, cur) => {
+      const plan = planUpdate(cur, ref, evSource, ops.tx.at);
+      const added = await this.addFiles(ops, cur, inputs);
+      const merged = applyMerge(cur, added, plan.filled, plan.evidence, ops.tx.at, ops.tx.actor, tagIds);
+      // Evidence of values that were already current is recorded too (not reverted by undo: it is true either way).
+      const extraEvidence = plan.evidence.filter((e) => !plan.filled.some((f) => f.path === e.field));
+      const anns = this.newAnnotations(item, merged.next, prep, ops.tx.actor);
+      const record: MergeRecord = { ...merged.record, ...(anns.length ? { addedAnnotationIds: anns.map((a) => a.id) } : {}), ...(plan.kept.length ? { kept: plan.kept } : {}) };
+      const changed = plan.filled.length > 0 || added.length > 0 || anns.length > 0 || (record.addedTagIds?.length ?? 0) > 0 || extraEvidence.length > 0;
+      if (!changed) return { next: null, record, outcome: "unchanged" };
+      const next: SourceFile = { ...merged.next, annotations: [...merged.next.annotations, ...anns], fieldEvidence: [...merged.next.fieldEvidence, ...extraEvidence] };
+      return { next, record, outcome: "updated" };
+    });
+    return out.entry;
+  }
+
+  /**
+   * One governed change to an existing source (merge or update): snapshot of its source.json in the
+   * batch folder (a record), the new source file, and the item's journal line in the same change.
+   * `fn` returning `next: null` writes only the journal line (outcome as returned).
+   */
+  private async changeSource(
+    item: ScanItem,
+    targetId: string,
+    reqs: Parameters<typeof importChange>[2],
+    op: string,
+    fn: (ops: Parameters<Parameters<typeof importChange>[3]>[0], cur: SourceFile) => Promise<{ next: SourceFile | null; record: MergeRecord; outcome: "merged" | "updated" | "unchanged" }>,
+  ): Promise<{ sf: SourceFile; entry: JournalEntry }> {
     const flush = this.pending.length;
     const n = ++this.snapshots;
     const snapshotRel = `${this.rec.dir}/snapshots/${targetId}-${Date.now()}-${n}.json`;
     const projectRel = this.projectRel;
-    let record: MergeRecord | undefined;
+    let entry: JournalEntry | undefined;
     const sf = await importChange(
       this.repo,
       this.projectId,
-      [{ action: "capture", capture: { method } }, storeRequest(target.source.provenance, r.hasLocation)],
+      reqs,
       async (ops) => {
         const { tx } = ops;
         const cur = await ops.readSource(targetId);
-        await tx.mkdir(`${projectRel}/${this.rec.dir}/snapshots`);
-        const snapName = `${projectRel}/${snapshotRel.slice(0, snapshotRel.lastIndexOf("/"))}/${fileName(basename(snapshotRel), tx.encrypted)}`;
-        await tx.writeFile(snapName, JSON.stringify(cur), { encrypt: tx.encrypted, ...(tx.encrypted ? {} : { mode: PRIVATE_MODE }) });
-        const have = new Set(cur.assets.map((a) => a.sha256));
-        const added = [];
-        const label = `${tx.at.slice(0, 16).replace("T", " ").replace(":", "")}`;
-        for (const f of inputs) {
-          const sha = await sha256File(f.path);
-          if (have.has(sha)) continue;
-          have.add(sha);
-          if (f.handling === "link") added.push(await linkedAsset(repoLibrary(this.repo).root, f, targetId, sha));
-          else added.push(await ops.copyOriginal(cur, { fromPath: f.path, kind: f.kind!, ext: f.ext!, ...(f.mime ? { mime: f.mime } : {}), label: `${f.kind} added ${label}`, ...(f.noFollow ? { noFollow: true } : {}) }));
+        const r = await fn(ops, cur);
+        if (r.next) {
+          await tx.mkdir(`${projectRel}/${this.rec.dir}/snapshots`);
+          const snapName = `${projectRel}/${snapshotRel.slice(0, snapshotRel.lastIndexOf("/"))}/${fileName(basename(snapshotRel), tx.encrypted)}`;
+          await tx.writeFile(snapName, JSON.stringify(cur), { encrypt: tx.encrypted, ...(tx.encrypted ? {} : { mode: PRIVATE_MODE }) });
+          await ops.writeSource(cur, r.next);
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record });
+        } else {
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, ...(r.record.kept?.length ? { merge: r.record } : {}) });
         }
-        const merged = applyMerge(cur, added, missingFields(cur, r.draft), r.fieldEvidence, tx.at, tx.actor, tagIds);
-        record = merged.record;
-        const next = merged.next;
-        await ops.writeSource(cur, next);
-        await appendJournal(tx, projectRel, this.rec.dir, [
-          ...this.pending.slice(0, flush),
-          this.withNotes({ key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: record }),
-        ]);
-        return next;
+        await appendJournal(tx, projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
+        return r.next ?? cur;
       },
-      { op: "import.merge", entity: { type: "source", id: targetId }, refuse: refuseLocation },
+      { op, entity: { type: "source", id: targetId }, refuse: refuseLocation },
     );
     this.pending = this.pending.slice(flush);
-    dedupe.add(sf);
-    return this.withNotes({ key: item.key, outcome: "merged", sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, ...(record ? { merge: record } : {}) });
+    return { sf, entry: entry! };
   }
+
+  /** Copies (or links) the files the source does not have yet (by hash) as further originals. */
+  private async addFiles(ops: Parameters<Parameters<typeof importChange>[3]>[0], cur: SourceFile, inputs: SourceInputFile[]): Promise<Asset[]> {
+    const have = new Set(cur.assets.map((a) => a.sha256));
+    const added: Asset[] = [];
+    const label = `${ops.tx.at.slice(0, 16).replace("T", " ").replace(":", "")}`;
+    for (const f of inputs) {
+      const sha = await sha256File(f.path);
+      if (have.has(sha)) continue;
+      have.add(sha);
+      if (f.handling === "link") added.push(await linkedAsset(repoLibrary(this.repo).root, f, cur.source.id, sha));
+      else added.push(await ops.copyOriginal(cur, { fromPath: f.path, kind: f.kind!, ext: f.ext!, ...(f.mime ? { mime: f.mime } : {}), label: `${f.kind} added ${label}`, ...(f.noFollow ? { noFollow: true } : {}) }));
+    }
+    return added;
+  }
+
+  /** The item's annotations the source does not have yet (by external key), anchored in its assets by file hash. */
+  private newAnnotations(item: ScanItem, sf: SourceFile, prep: Prepared, actor: string): Annotation[] {
+    const have = new Set(sf.annotations.map((a) => a.externalKey).filter(Boolean));
+    const out: Annotation[] = [];
+    for (const a of item.annotations ?? []) {
+      if (have.has(a.key)) continue;
+      have.add(a.key);
+      out.push(
+        toAnnotation(a, sf.source.id, actor, (file) => {
+          const real = prep.realOf.get(file);
+          const sha = real ? prep.shaOf.get(real) : undefined;
+          return sha ? sf.assets.find((x) => x.sha256 === sha) : undefined;
+        }),
+      );
+    }
+    return out;
+  }
+}
+
+/** A merge record that changes nothing and only lists fields kept (R72). */
+const emptyRecord = (kept: string[]): MergeRecord => ({ addedAssetIds: [], filled: [], addedEvidence: [], kept });
+
+/** Outcomes whose journal line records the item's version (R72). */
+const WITH_VERSION = new Set(["created", "needs-review", "merged", "updated", "unchanged"]);
+
+/**
+ * Incremental import (R72): for each item identity, the source and version token recorded by the
+ * newest journal line of the project's batches of this kind that were not undone.
+ */
+async function knownVersions(repo: Repo, projectId: string, kind: ImportBatch["source"]["kind"]): Promise<Map<string, { sourceId: string; version: string }>> {
+  const out = new Map<string, { sourceId: string; version: string }>();
+  for (const d of await batchDirs(repo, projectId)) {
+    let rec: BatchRecord | undefined;
+    try {
+      rec = await readBatchAt(repo, projectId, d.name);
+    } catch {
+      continue;
+    }
+    if (!rec || rec.source.kind !== kind || rec.state === "undone") continue;
+    for (const e of await readJournal(repo, projectId, rec.dir)) if (e.ext && e.sourceId) out.set(e.ext.id, { sourceId: e.sourceId, version: e.ext.version });
+  }
+  return out;
 }
 
 /** A linked original (merge with `fileHandling: 'link'`): nothing is copied (R24). */

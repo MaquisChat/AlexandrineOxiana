@@ -39,7 +39,8 @@ export type BatchState = "running" | "paused" | "cancelled" | "finished" | "fail
 /** As shown: a `running` batch no process is running is `interrupted` (R45). */
 export type ShownState = BatchState | "interrupted";
 
-export type ItemOutcome = "created" | "needs-review" | "duplicate" | "merged" | "failed" | "incomplete";
+/** `updated` / `unchanged`: incremental re-import of an item imported before (R72). */
+export type ItemOutcome = "created" | "needs-review" | "duplicate" | "merged" | "updated" | "unchanged" | "failed" | "incomplete";
 
 export interface JournalEntry {
   key: string;
@@ -56,6 +57,12 @@ export interface JournalEntry {
   merge?: MergeRecord;
   /** The item's file notes (ScanItem.fileNotes; never a path), for the report. */
   notes?: string[];
+  /**
+   * Incremental import (R72): the item's identity at its source and the version token this line
+   * brought the source to (created, merged, updated or unchanged). The newest such line of a batch
+   * that was not undone is what a re-import compares with.
+   */
+  ext?: { id: string; version: string };
 }
 
 export interface GovernanceNote {
@@ -200,14 +207,25 @@ export function latestByKey(entries: JournalEntry[]): Map<string, JournalEntry> 
 }
 
 /** Counts by outcome over the newest line per key (a review decision's line supersedes the run's). */
-export function countOutcomes(latest: Iterable<JournalEntry>): { created: number; needsReview: number; duplicates: number; merged: number; failed: number; items: number } {
-  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, failed: 0, items: 0 };
+export function countOutcomes(latest: Iterable<JournalEntry>): {
+  created: number;
+  needsReview: number;
+  duplicates: number;
+  merged: number;
+  updated: number;
+  unchanged: number;
+  failed: number;
+  items: number;
+} {
+  const c = { created: 0, needsReview: 0, duplicates: 0, merged: 0, updated: 0, unchanged: 0, failed: 0, items: 0 };
   for (const e of latest) {
     c.items++;
     if (e.outcome === "created" || e.outcome === "incomplete") c.created++;
     else if (e.outcome === "needs-review") c.needsReview++;
     else if (e.outcome === "duplicate" || e.outcome === "skipped") c.duplicates++;
     else if (e.outcome === "merged") c.merged++;
+    else if (e.outcome === "updated") c.updated++;
+    else if (e.outcome === "unchanged") c.unchanged++;
     else if (e.outcome === "failed") c.failed++;
   }
   return c;

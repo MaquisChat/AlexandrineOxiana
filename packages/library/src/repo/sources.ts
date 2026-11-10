@@ -18,6 +18,7 @@ import {
   shortId,
   sourceFolderName,
   withCollisionSuffix,
+  Annotation,
   type Asset,
   type Availability,
   type FieldEvidence,
@@ -57,6 +58,17 @@ export interface CreateSourceOptions {
   hasLocation?: boolean;
   /** Also queue the new source for review (written to `review/pending.jsonl` in the same change, R31). */
   reviewItem?: Omit<ReviewInput, "sourceId">;
+  /**
+   * Package-internal (Bulk Import, R72): annotations stored with the new source (in source.json,
+   * sealed in encrypted projects), given its id, its stored assets (in the order of `files`) and the
+   * actor (the author of annotations whose source names none).
+   */
+  annotations?: (sourceId: string, assets: Asset[], actor: string) => Annotation[];
+  /**
+   * Package-internal: when the citation key is generated (the draft has none), this turns it into
+   * one not yet used in the project (e.g. by appending a, b, c …).
+   */
+  uniqueCitationKey?: (generated: string) => string;
 }
 
 export type SourcePatch = Partial<Omit<Source, "id">>;
@@ -411,7 +423,7 @@ async function writeNewSource(
     projectIds: [projectId, ...draft.projectIds.filter((p) => p !== projectId)],
     participantIds,
     folder,
-    citationKey: draft.citationKey ?? citationKeyFor(name, draft),
+    citationKey: draft.citationKey ?? (opts.uniqueCitationKey ?? ((k: string) => k))(citationKeyFor(name, draft)),
     provenance: { ...provenance, fileHashes: { ...provenance.fileHashes, ...hashes } },
     availability: opts.availability ?? draft.availability,
     createdAt: tx.at,
@@ -423,13 +435,14 @@ async function writeNewSource(
     formatVersion: 1,
     source,
     assets,
-    annotations: [],
+    annotations: (opts.annotations?.(id, assets, tx.actor) ?? []).map((a) => Annotation.parse(a)),
     fieldEvidence: opts.fieldEvidence ?? [],
     verification: opts.verification ?? {},
   });
   await writeSourceFile(core, tx, sf);
   tx.record("source", id, null, source);
   for (const a of assets) tx.record("asset", a.id, null, a);
+  for (const a of sf.annotations) tx.record("annotation", a.id, null, a);
   if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
   if (inTx) await inTx(tx, sf);
   tx.onCommit(() => st.sources.set(id, folder));
