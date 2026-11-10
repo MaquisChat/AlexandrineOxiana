@@ -101,7 +101,7 @@ describe("refuse hook (R57 I1)", () => {
     expect(ev.decision).toEqual({ result: "allow_with_conditions", conditions: [{ type: "encrypt" }] });
   });
 
-  it("a hook that throws is an audited deny (reason without paths); nothing runs", async () => {
+  it("a hook that throws is an audited deny with the generic reason only (no message); nothing runs", async () => {
     const p = await project();
     let ran = false;
     const err = await mutateRefusing(
@@ -120,7 +120,7 @@ describe("refuse hook (R57 I1)", () => {
     expect(ran).toBe(false);
     const deny = (await auditEvents(p.folder)).find((e) => e.details?.op === "test.throw")!;
     expect(deny.decision?.result).toBe("deny");
-    expect(deny.decision?.reason).toContain("boom");
-    expect(deny.decision?.reason).not.toContain("/home/someone");
+    expect(deny.decision?.reason).toBe("Refused by an internal check");
+    expect((err as PolicyDeniedError).reason).toBe("Refused by an internal check");
   });
 });

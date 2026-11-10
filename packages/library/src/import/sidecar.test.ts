@@ -62,6 +62,14 @@ describe("parseBibtex", () => {
     expect(parseBibtex("@comment{never closed\n@book{k, title = {Also good}}").title).toBe("Also good");
   });
 
+  it("an unbalanced skip block also ends at an indented line starting with @ (R58)", () => {
+    expect(parseBibtex("@comment{never closed\n  @article{k,title={Good}}").title).toBe("Good");
+    expect(parseBibtex("@string{x = \"{\"}\n\t @book{k, title = {Also good}}").title).toBe("Also good");
+    const t0 = performance.now();
+    expect(parseBibtex(`@comment{${"\n \t".repeat(300_000)}x\n @article{k,title={Late}}`).title).toBe("Late");
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+
   it("skips @string, @comment and @preamble blocks and reads the first real entry", () => {
     const m = parseBibtex(`@string{jcs = {Journal of Craft Studies}}
 @comment{ exported by a tool, title = {Not this} }

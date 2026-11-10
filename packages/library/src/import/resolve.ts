@@ -19,7 +19,12 @@
  * draft that needs review.
  *
  * R49(e): an identifier lookup scores 0.97 only when its title agrees (titleSimilarity ≥ 0.9) with
- * at least one local title (reference, embedded, file name), when any exists. Otherwise the local
+ * at least one local title (reference, embedded, file name), when any exists. An identifier found
+ * in the file (not given as reference metadata) is confirmed by an embedded or file-name title only
+ * when the two are equal after normalizeTitle (R58: a review titled "Review: <work>" citing the
+ * work's DOI is not the work); a reference title keeps the ≥ 0.9 rule. A near match (≥ 0.9, not
+ * equal) keeps the local values, leaves the identifier a hint and caps the confidence at 0.6, so
+ * the item goes to review. Otherwise the local
  * values stay in the draft, the lookup becomes a candidate, the confidence is 0.6 and `/title` is
  * a conflict: the item goes to review (a DOI in a PDF's first pages may well be a cited work's).
  * With no local title, an identifier found only in the file's text is never the item's own (R57):
@@ -231,6 +236,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   const hints: string[] = [];
   /** The item's identity rests on an unconfirmed identifier: it goes to review. */
   let unconfirmed = false;
+  /** Upper bound on the final confidence (R58 near match). */
+  let cap = 1;
   const done = () => confidence >= AUTO_ACCEPT_THRESHOLD;
 
   const record = (k: keyof Fields, value: unknown, source: EvidenceSource) => {
@@ -307,7 +314,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   //    file's own title, or, with no such title, is found in the document text (R55). Anything
   //    else (a cited work's DOI, an unanswered lookup) is only a hint for the review queue.
   if (!done()) {
-    const localTitles = [refFields.title, extracted.title, parsedName?.title].filter((t): t is string => !!t);
+    const fileTitles = [extracted.title, parsedName?.title].filter((t): t is string => !!t);
+    const localTitles = refFields.title ? [refFields.title, ...fileTitles] : fileTitles;
     const docNorm = extracted.text ? normalizeTitle(extracted.text.slice(0, DOC_TEXT_LIMIT)) : "";
     const ids: Array<{ kind: "doi" | "isbn"; id: string; arxiv?: string; trusted: boolean }> = [];
     const addId = (x: (typeof ids)[number]) => {
@@ -330,6 +338,8 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
     let accepted: Hit | undefined;
     let ungrounded: Hit | undefined;
     let conflict: Hit | undefined;
+    /** A file identifier whose lookup title only nearly matches the file's own (R58). */
+    let nearMatch: Hit | undefined;
     if (lookup) {
       for (const id of ids.slice(0, MAX_IDENTIFIER_LOOKUPS)) {
         const r = await ask(() => (id.kind === "doi" ? lookupDoi(id.id, lookup) : lookupIsbn(id.id, lookup)), null);
@@ -340,8 +350,19 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
         const hit = { r, id, sim };
         if (localTitles.length > 0) {
           if (sim >= AGREE) {
-            accepted = hit;
-            break;
+            // R58: an identifier from the file needs a reference title that agrees, or an embedded
+            // or file-name title equal to the lookup's after normalization.
+            const lookupNorm = normalizeTitle(r.title);
+            const confirmedBy =
+              id.trusted ||
+              (!!refFields.title && titleSimilarity(refFields.title, r.title) >= AGREE) ||
+              fileTitles.some((t) => normalizeTitle(t) === lookupNorm);
+            if (confirmedBy) {
+              accepted = hit;
+              break;
+            }
+            nearMatch ??= hit;
+            continue;
           }
           conflict ??= hit;
         } else if (id.trusted && docNorm && groundedIn(docNorm, normalizeTitle(r.title), "title")) {
@@ -379,6 +400,14 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
       offer(ungrounded.id.trusted ? idFields(ungrounded, rest) : rest, { kind: "lookup", provider: ungrounded.r.provider }, true);
       confidence = CONFLICT_CONFIDENCE;
       method = { method: "identifier+lookup" };
+      unconfirmed = true;
+    } else if (nearMatch) {
+      // R58: the file's own values stay; the lookup is a candidate, its title evidence, and its
+      // identifier a hint. Review, at most 0.6 whatever later steps find.
+      record("title", nearMatch.r.title, { kind: "lookup", provider: nearMatch.r.provider });
+      confidence = CONFLICT_CONFIDENCE;
+      cap = CONFLICT_CONFIDENCE;
+      method = { method: "identifier+lookup", titleSimilarity: Math.round(nearMatch.sim * 1000) / 1000 };
       unconfirmed = true;
     } else if (conflict) {
       // R49(e): keep the file's own values; the lookup is a candidate and its title is evidence.
@@ -480,7 +509,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   }
   return {
     draft,
-    confidence: applyVerification(confidence, report),
+    confidence: Math.min(applyVerification(confidence, report), cap),
     evidence: method,
     candidates: candidates.slice(0, MAX_CANDIDATES),
     needsOcr: extracted.needsOcr === true,
@@ -492,13 +521,16 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   };
 }
 
+/** Media whose metadata may carry a location: images, video and audio (voice memos carry one too, R58). */
+export const LOCATED_MEDIA = /^(?:image|video|audio)\//u;
+
 /**
- * GPS found, or an image or video whose metadata could not be read: location governance must
- * apply (fail closed, R57).
+ * GPS found, or an image, video or audio file whose metadata could not be read: location
+ * governance must apply (fail closed, R57, R58).
  */
 export function mayHaveLocation(mime: string, extracted: Pick<Extracted, "media">): boolean {
   if (extracted.media?.gps) return true;
-  return /^(?:image|video)\//u.test(mime) && extracted.media?.readFailed === true;
+  return LOCATED_MEDIA.test(mime) && extracted.media?.readFailed === true;
 }
 
 /** Reference fields resolution does not decide (collections, tags, case attributes ...). */

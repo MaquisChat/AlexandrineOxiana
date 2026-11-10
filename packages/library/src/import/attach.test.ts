@@ -6,12 +6,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
-import { DEFAULT_GOVERNANCE, parseGovernanceWithWarnings } from "@ao/core";
+import { DEFAULT_GOVERNANCE, findDuplicate, parseGovernanceWithWarnings } from "@ao/core";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
 import { shutdownExtractors } from "../extract/index.js";
-import { setExifReaderForTests } from "../extract/exif.js";
+import { extractExif, setExifReaderForTests } from "../extract/exif.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient, lookupContextFor } from "../lookup/index.js";
@@ -20,8 +20,8 @@ import { kindFor, mimeFor, openLine } from "../repo/io.js";
 import type { Repo } from "../repo/repo.js";
 import { projectDataKey } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
-import { ACCEPTED_EXTENSIONS, LOCATION_REASON, createAttach, type Attach } from "./attach.js";
-import { AUTO_ACCEPT_THRESHOLD, resolveItem } from "./resolve.js";
+import { ACCEPTED_EXTENSIONS, LOCATION_REASON, acceptedType, createAttach, type Attach } from "./attach.js";
+import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem } from "./resolve.js";
 
 const FAST = 2 ** 10;
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/lookup");
@@ -826,5 +826,134 @@ processing:
     expect((await repo.getSource(p.id, r!.sourceId!)).source.provenance.legal.basis).toBe("legitimate interest; legacy key");
     await noting.attachFiles(p.id, [await put("other slides.pdf", await buildPdf({ title: "Other Slides", lines: ["Other Slides"] }))]);
     expect(notes.filter((n) => n.includes("manual_upload"))).toHaveLength(1);
+  });
+});
+
+describe("review round 3 (R58)", () => {
+  const reviewPdf = () =>
+    buildPdf({
+      title: "Review: Rivers and Memory in Upland Villages",
+      lines: ["Book reviews", `Rivers and Memory in Upland Villages doi:${FIXTURE_DOI}`, "Reviewed by Sana Mirza"],
+    });
+  const COARSEN = `identifiability:
+  containsIdentifiable: false
+encryption:
+  atRest: required
+sharing:
+  locationMetadata: coarsen
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`;
+  const oggBytes = () => {
+    const oga = Buffer.alloc(64);
+    oga.write("OggS", 0);
+    Buffer.from([0x7f, 0x46, 0x4c, 0x41, 0x43]).copy(oga, 28);
+    return oga;
+  };
+
+  it("I-1: a review PDF whose embedded title only nearly matches the cited DOI's → review, no DOI, capped at 0.6 (empty project)", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, JSON.stringify({ results: [] }), JSON_HEADERS).persist();
+    const [r] = await attach.attachFiles(p.id, [await put("review.pdf", await reviewPdf())]);
+    expect(r!.outcome).toBe("needs-review");
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.identifiers.doi).toBeUndefined();
+    expect(sf.source.title.variants[0]!.value).toBe("Review: Rivers and Memory in Upland Villages");
+    expect(sf.source.provenance.identification!.confidence).toBeLessThanOrEqual(0.6);
+    const entry = (await reviewEntries(p.id, p.folder)).find((e) => e.sourceId === r!.sourceId)!;
+    expect(entry.hints).toContain(`doi:${FIXTURE_DOI}`);
+    expect(sf.assets.filter((a) => a.role === "original")).toHaveLength(1);
+  });
+
+  it("I-1: the review PDF in a project already holding doi-article.pdf is stored, never its duplicate", async () => {
+    const p = await project();
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    openalex().intercept({ path: searchPath, method: "GET" }).reply(200, JSON.stringify({ results: [] }), JSON_HEADERS).persist();
+    const [first] = await attach.attachFiles(p.id, [await put("doi-article.pdf", await buildDoiPdf())]);
+    expect(first!.outcome).toBe("created");
+    const [r] = await attach.attachFiles(p.id, [await put("review.pdf", await reviewPdf())]);
+    expect(r!.outcome).toBe("needs-review");
+    expect(r!.sourceId).toBeDefined();
+    expect(r!.sourceId).not.toBe(first!.sourceId);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.identifiers.doi).toBeUndefined();
+    expect(sf.assets.filter((a) => a.role === "original")).toHaveLength(1);
+    expect(repo.listSourceIds(p.id)).toHaveLength(2);
+  });
+
+  it("I-1 regression: doi-article.pdf gets its DOI at 0.97; another PDF with a normalized-equal title and the same DOI is a same-doi duplicate", async () => {
+    const p = await project();
+    const lookup = await lookupContextFor(repo, p.id, http);
+    crossref().intercept({ path: `/works/${FIXTURE_DOI}`, method: "GET" }).reply(200, fixture("crossref-work.json"), JSON_HEADERS).times(1);
+    const path = await put("doi-article.pdf", await buildDoiPdf());
+    const res = await resolveItem({ path, mime: "application/pdf" }, { projectId: p.id, patterns: [], lookup });
+    expect(res.draft.identifiers.doi).toBe(FIXTURE_DOI);
+    expect(res.confidence).toBe(0.97);
+    const [first] = await attach.attachFiles(p.id, [path]);
+    expect(first!.outcome).toBe("created");
+    expect((await repo.getSource(p.id, first!.sourceId!)).source.identifiers.doi).toBe(FIXTURE_DOI);
+    const other = await put(
+      "other.pdf",
+      await buildPdf({ title: "RIVERS AND MEMORY in upland villages.", author: "Amara Okafor", lines: ["Rivers and Memory in Upland Villages", `doi:${FIXTURE_DOI}`] }),
+    );
+    const res2 = await resolveItem({ path: other, mime: "application/pdf" }, { projectId: p.id, patterns: [], lookup });
+    expect(res2.draft.identifiers.doi).toBe(FIXTURE_DOI);
+    const keys = [{ sourceId: first!.sourceId!, sha256s: [], doi: FIXTURE_DOI }];
+    expect(findDuplicate({ sha256s: ["x"], doi: res2.draft.identifiers.doi!, title: "t" }, keys)).toMatchObject({ certainty: "certain", reason: "same-doi" });
+    expect((await attach.attachFiles(p.id, [other]))[0]).toMatchObject({ outcome: "duplicate", sourceId: first!.sourceId });
+  });
+
+  it("I-2: an exiftool result carrying an Error counts as unreadable: a PNG is refused in a coarsen project (library and source)", async () => {
+    const p = await project(COARSEN, true);
+    const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    setExifReaderForTests(() => Promise.resolve({ Error: "File format error", errors: ["File format error"] }));
+    try {
+      const png = await put("photo.png", tinyPng());
+      expect(await attach.attachFiles(p.id, [png])).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
+      expect(await attach.attachFiles(p.id, [png], { toSourceId: made!.sourceId! })).toEqual([{ path: png, outcome: "failed", reason: LOCATION_REASON }]);
+    } finally {
+      setExifReaderForTests(undefined);
+    }
+    expect(repo.listSourceIds(p.id)).toEqual([made!.sourceId]);
+    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(1);
+  });
+
+  it("I-2: errors alone count too; warnings alone do not", async () => {
+    setExifReaderForTests(() => Promise.resolve({ errors: ["Truncated"] }));
+    try {
+      expect((await extractExif("x.png")).media).toEqual({ readFailed: true });
+      setExifReaderForTests(() => Promise.resolve({ Error: "", errors: [], warnings: ["Minor issue"], ImageWidth: 4 }));
+      expect((await extractExif("x.png")).media).toEqual({ width: 4 });
+    } finally {
+      setExifReaderForTests(undefined);
+    }
+  });
+
+  it("audio is checked for location like images and video: GPS or an unreadable file is refused (library and source)", async () => {
+    const p = await project(COARSEN, true);
+    const [made] = await attach.attachFiles(p.id, [await put("conference_slides.pdf", await slidesPdf())]);
+    const memo = await put("memo.bin", oggBytes());
+    try {
+      setExifReaderForTests(() => Promise.resolve({ GPSLatitude: 51.5, GPSLongitude: -0.12 }));
+      expect(await attach.attachFiles(p.id, [memo])).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
+      expect(await attach.attachFiles(p.id, [memo], { toSourceId: made!.sourceId! })).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
+      setExifReaderForTests(() => Promise.reject(new Error("exiftool timed out")));
+      expect(await attach.attachFiles(p.id, [memo])).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
+      expect(await attach.attachFiles(p.id, [memo], { toSourceId: made!.sourceId! })).toEqual([{ path: memo, outcome: "failed", reason: LOCATION_REASON }]);
+    } finally {
+      setExifReaderForTests(undefined);
+    }
+    expect(repo.listSourceIds(p.id)).toEqual([made!.sourceId]);
+    expect((await repo.getSource(p.id, made!.sourceId!)).assets).toHaveLength(1);
+    expect(mayHaveLocation("audio/mp4", { media: { readFailed: true } })).toBe(true);
+  });
+
+  it("the MIME-prefix fallback refuses SVG as unsupported", () => {
+    expect(acceptedType({ ext: "svg", mime: "image/svg+xml" })).toBeUndefined();
+    expect(acceptedType({ ext: "oga", mime: "audio/ogg" })).toEqual({ ext: "oga", mime: "audio/ogg", kind: "audio" });
+    expect(acceptedType({ ext: "png", mime: "image/png" })).toEqual({ ext: "png", mime: "image/png", kind: "image" });
+    expect(acceptedType({ ext: "xml", mime: "application/xml" })).toBeUndefined();
   });
 });

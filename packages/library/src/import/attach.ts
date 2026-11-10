@@ -21,10 +21,11 @@
  *      (`review/pending.jsonl`, sealed in encrypted projects, R31); else `created`.
  *
  * Identifiers found in a file but not confirmed by a lookup are never recorded or used to find
- * duplicates (R55): they go on the review entry as `hints`. Media with GPS are stored with
- * `hasLocation: true`, so location governance applies (R54a); while a location condition (coarsen or
- * strip) cannot be carried out for dropped files, such a store is refused as an audited deny with
- * LOCATION_REASON and nothing is stored (R56; Task 27 adds the coarsening).
+ * duplicates (R55): they go on the review entry as `hints`. Media (images, video, audio) with GPS,
+ * or whose metadata could not be read, are stored with `hasLocation: true`, so location governance
+ * applies (R54a, R57, R58); while a location condition (coarsen or strip) cannot be carried out
+ * for dropped files, such a store is refused as an audited deny with LOCATION_REASON and nothing is
+ * stored (R56; Task 27 adds the coarsening).
  *
  * Each stored file is one governed mutation (`createSource` / an original added to a source): the
  * `capture` and `store` decisions are evaluated again inside it, right before anything is written
@@ -46,7 +47,7 @@ import { NotFoundError, PolicyDeniedError, ProjectLockedError } from "../repo/er
 import { kindFor, mimeFor } from "../repo/io.js";
 import { storeRequest } from "../repo/sources.js";
 import { addCapturedOriginal, authorizeProcessing, createSourceRefusing, projectPolicy, type Repo } from "../repo/repo.js";
-import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem, type Resolution } from "./resolve.js";
+import { AUTO_ACCEPT_THRESHOLD, LOCATED_MEDIA, mayHaveLocation, resolveItem, type Resolution } from "./resolve.js";
 import { findSidecars } from "./sidecar.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
@@ -102,7 +103,7 @@ const LEGAL_CATEGORY = "manual-upload";
  * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
  * raw), audio and video, each with its MIME type and asset kind in repo/io.ts. Anything else that
  * file-type reports as image/*, audio/* or video/* is accepted too (kind from the prefix, MIME
- * from file-type).
+ * from file-type), except SVG (a document with scripts and links, not a picture to store).
  */
 export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
   "pdf", "epub", "mobi", "azw", "azw3", "docx",
@@ -110,6 +111,17 @@ export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
   "mp4", "mov", "webm", "mkv", "avi", "m4v", "3gp", "mpg",
   "mp3", "m4a", "wav", "ogg", "flac", "aac", "opus",
 ]);
+
+/** What attach stores for a sniffed type (`file-type`'s ext and MIME), or undefined when it is not accepted. */
+export function acceptedType(type: { ext: string; mime: string }): { ext: string; mime: string; kind: string } | undefined {
+  const mime = type.mime.split(";")[0]!.trim();
+  if (mime.toLowerCase() === "image/svg+xml") return undefined;
+  const media = /^(image|audio|video)\//u.exec(mime)?.[1];
+  if (!ACCEPTED_EXTENSIONS.has(type.ext) && !media) return undefined;
+  // The MIME table's type and kind where it knows the extension, else file-type's MIME and the prefix.
+  const known = mimeFor(type.ext) !== "application/octet-stream";
+  return { ext: type.ext, mime: known ? mimeFor(type.ext) : mime, kind: known ? kindFor(type.ext) : media! };
+}
 
 async function sha256File(path: string): Promise<string> {
   const h = createHash("sha256");
@@ -240,7 +252,7 @@ export function createAttach(deps: AttachDeps): Attach {
     if (current.assets.some((a) => a.sha256 === sha256)) return { path, outcome: "duplicate", sourceId };
     // Media with GPS: location governance applies to the store (R54a).
     // Unreadable metadata counts as located (fail closed, R57); a thrown error is not swallowed.
-    const hasLocation = /^(?:image|video)\//u.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
+    const hasLocation = LOCATED_MEDIA.test(mime) && mayHaveLocation(mime, await extractMetadata(path, mime));
     const { ext, kind } = stored;
     await addCapturedOriginal(repo, projectId, sourceId, { fromPath: path, kind, ext, mime: stored.mime, label: addedLabel(kind, new Date()) }, "manual_upload", {
       hasLocation,
@@ -315,12 +327,8 @@ export function createAttach(deps: AttachDeps): Attach {
     } catch {
       return failed(path, REASONS.missing);
     }
-    if (!type) return failed(path, REASONS.unsupported);
-    const media = /^(image|audio|video)\//u.exec(type.mime)?.[1];
-    if (!ACCEPTED_EXTENSIONS.has(type.ext) && !media) return failed(path, REASONS.unsupported);
-    // The MIME table's type and kind where it knows the extension, else file-type's MIME and the prefix.
-    const known = mimeFor(type.ext) !== "application/octet-stream";
-    const stored = { ext: type.ext, mime: known ? mimeFor(type.ext) : type.mime.split(";")[0]!.trim(), kind: known ? kindFor(type.ext) : media! };
+    const stored = type ? acceptedType(type) : undefined;
+    if (!type || !stored) return failed(path, REASONS.unsupported);
     const target = toSourceId ? await s.target() : null;
     if (toSourceId && !target) return failed(path, REASONS.noSource);
     const denied = await s.policy();

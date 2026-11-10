@@ -133,11 +133,15 @@ export function setExifReaderForTests(reader: ExifReader | undefined): void {
 /**
  * A file exiftool could not read (error, timeout, helper failed to start) is reported as
  * `media: { readFailed: true }`, never as "no GPS": callers treat it as possibly located (R57).
+ * exiftool-vendored resolves rather than rejects for a file it cannot parse, with `Error` and
+ * `errors` set: that is a failed read too (R58); `warnings` alone are not.
  */
 export async function extractExif(path: string): Promise<RawExtract> {
   try {
-    const tags = await (readerOverride ?? ((p: string) => exiftool().read(p)))(path);
-    return { media: mediaFromTags(tags as Partial<Tags> & Record<string, unknown>) };
+    const tags = (await (readerOverride ?? ((p: string) => exiftool().read(p)))(path)) as Partial<Tags> & Record<string, unknown>;
+    const errors = tags.errors;
+    if ((tags.Error != null && String(tags.Error).trim() !== "") || (Array.isArray(errors) && errors.length > 0)) return { media: { readFailed: true } };
+    return { media: mediaFromTags(tags) };
   } catch {
     return { media: { readFailed: true } };
   }

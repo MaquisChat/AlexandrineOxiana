@@ -61,8 +61,8 @@ export interface MutateOptions {
  * Package-internal: turns an allowed decision the caller cannot honour into a deny with the returned
  * reason, e.g. attach refusing media whose store carries a location condition until coarsening
  * exists (R56). It receives frozen deep copies, so it cannot change the decision; a hook that
- * throws is a deny too (fail closed). The deny is audited and thrown like any other, before
- * anything is written.
+ * throws is a deny too (fail closed), always with REFUSED_GENERIC as its reason (R58). The deny is
+ * audited and thrown like any other, before anything is written.
  */
 export type RefuseHook = (d: Readonly<PolicyDecision>, req: Readonly<PolicyRequest>) => string | undefined;
 
@@ -81,23 +81,13 @@ function deepFreeze<T>(v: T): T {
   return v;
 }
 
-/** A hook's error message without file paths (and short), or the generic reason. */
-function scrubbed(err: unknown): string {
-  const msg = err instanceof Error ? err.message : "";
-  const clean = msg
-    .slice(0, 300)
-    .replace(/(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s"'`]*/gu, "<path>")
-    .replace(/\s+/gu, " ")
-    .trim();
-  return clean && clean !== "<path>" ? `${REFUSED_GENERIC}: ${clean}` : REFUSED_GENERIC;
-}
-
 function runRefuse(refuse: RefuseHook | undefined, d: PolicyDecision, req: PolicyRequest): string | undefined {
   if (!refuse || d.result === "deny") return undefined;
   try {
     return refuse(deepFreeze(structuredClone(d)), deepFreeze(structuredClone(req)));
-  } catch (err) {
-    return scrubbed(err);
+  } catch {
+    // Never the error's message: it may name files or data.
+    return REFUSED_GENERIC;
   }
 }
 
