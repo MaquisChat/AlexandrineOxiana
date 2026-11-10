@@ -10,13 +10,24 @@ describe("findIdentifiers", () => {
     expect(findIdentifiers("a 10.1000/abc; b 10.1000/abc, c").dois).toEqual(["10.1000/abc"]);
   });
   it("normalises ISBN-10 and ISBN-13 to ISBN-13", () => {
-    expect(findIdentifiers("0-306-40615-2").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("ISBN 0-306-40615-2").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("isbn: 0306406152").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("ISBN-10 0306406152").isbns).toEqual(["9780306406157"]);
+    expect(findIdentifiers("978-0-306-40615-7").isbns).toEqual(["9780306406157"]);
     expect(findIdentifiers("ISBN-13: 978-0-306-40615-7").isbns).toEqual(["9780306406157"]);
     expect(findIdentifiers("ISBN 978 0 306 40615 7").isbns).toEqual(["9780306406157"]);
     expect(findIdentifiers("ISBN 0306406152 and 9780306406157").isbns).toEqual(["9780306406157"]);
   });
   it("allows X check digit in ISBN-10", () => {
     expect(findIdentifiers("ISBN 0-8044-2957-X").isbns).toEqual(["9780804429573"]);
+  });
+  it("ignores unlabelled ISBN-10, phone-like numbers, ISMN and wrong labels", () => {
+    expect(findIdentifiers("0-306-40615-2").isbns).toEqual([]);
+    expect(findIdentifiers("Tel 555-123-4002").isbns).toEqual([]);
+    expect(findIdentifiers("ISMN 9790000000018").isbns).toEqual([]);
+    expect(findIdentifiers("9791000000015").isbns).toEqual(["9791000000015"]);
+    expect(findIdentifiers("ISBN\n\n0306406152").isbns).toEqual([]);
+    expect(findIdentifiers("ISBN " + " ".repeat(30) + "0306406152").isbns).toEqual([]);
   });
   it("ignores invalid checksums and arbitrary digit runs", () => {
     expect(findIdentifiers("0-306-40615-3").isbns).toEqual([]);
@@ -26,6 +37,24 @@ describe("findIdentifiers", () => {
   it("finds arXiv ids, new and old style", () => {
     const r = findIdentifiers("arXiv:2401.12345v2 and hep-th/9901001");
     expect(r.arxiv).toEqual(["2401.12345v2", "hep-th/9901001"]);
+  });
+  it("finds arXiv ids in URLs and prefixes", () => {
+    expect(findIdentifiers("https://arxiv.org/abs/2401.12345v2").arxiv).toEqual(["2401.12345v2"]);
+    expect(findIdentifiers("https://arxiv.org/pdf/2401.12345.pdf").arxiv).toEqual(["2401.12345"]);
+    expect(findIdentifiers("arXiv:1406.1234").arxiv).toEqual(["1406.1234"]);
+    expect(findIdentifiers("10.48550/arXiv.2401.12345").arxiv).toEqual(["2401.12345"]);
+    expect(findIdentifiers("https://arxiv.org/abs/hep-th/9901001").arxiv).toEqual(["hep-th/9901001"]);
+    expect(findIdentifiers("arXiv:math.GT/0309136").arxiv).toEqual(["math.GT/0309136"]);
+  });
+  it("validates arXiv YYMM and suffix length", () => {
+    for (const bad of ["2024.12345", "2413.12345", "1999.9999", "3141.59265", "1501.1234", "1412.12345", "2401.1234"])
+      expect(findIdentifiers(bad).arxiv).toEqual([]);
+    expect(findIdentifiers("1412.1234 and 1501.12345").arxiv).toEqual(["1412.1234", "1501.12345"]);
+  });
+  it("keeps balanced parentheses in DOIs", () => {
+    expect(findIdentifiers("10.1000/abc(1)").dois).toEqual(["10.1000/abc(1)"]);
+    expect(findIdentifiers("(see 10.1000/abc(1)).").dois).toEqual(["10.1000/abc(1)"]);
+    expect(findIdentifiers("[10.1000/abc]").dois).toEqual(["10.1000/abc"]);
   });
 });
 
@@ -46,12 +75,15 @@ describe("parseFileName", () => {
     ];
     expect(parseFileName("2024_Okafor_Feeding.pdf", patterns)).toEqual({ creator: "Okafor", year: "2024", title: "Feeding" });
   });
-  it("caps user regex input and stays fast on pathological names", () => {
-    const evil = "a".repeat(100_000) + "!";
-    const t = Date.now();
-    parseFileName(evil + ".pdf", [{ id: "x", regex: "^(a+)+$" }]);
-    parseFileName(evil + ".pdf");
-    expect(Date.now() - t).toBeLessThan(1000);
+  it("caps the name given to user patterns at 255 characters (this is NOT ReDoS protection)", () => {
+    const long = "x".repeat(300);
+    const r = parseFileName(long + ".pdf", [{ id: "all", regex: "^(?<title>.*)$" }]);
+    expect(r?.title).toHaveLength(255);
+  });
+  it("allows hyphens in the creator and trims leading separators from titles", () => {
+    expect(parseFileName("Smith-Jones - 2024 - Title.pdf")).toEqual({ creator: "Smith-Jones", year: "2024", title: "Title" });
+    expect(parseFileName("Okafor 2024 - Title.pdf")).toEqual({ creator: "Okafor", year: "2024", title: "Title" });
+    expect(parseFileName("Okafor 2024 _–Title.pdf")?.title).toBe("Title");
   });
 });
 
@@ -64,6 +96,10 @@ describe("scoreConfidence", () => {
     expect(scoreConfidence({ method: "embedded", hasTitle: true })).toBe(0.55);
     expect(scoreConfidence({ method: "filename" })).toBe(0.5);
     expect(scoreConfidence({ method: "none" })).toBe(0.2);
+  });
+  it("clamps similarity", () => {
+    expect(scoreConfidence({ method: "filename+lookup", titleSimilarity: 5 })).toBe(0.8);
+    expect(scoreConfidence({ method: "filename+lookup", titleSimilarity: -1 })).toBe(0.5);
   });
   it("filename+lookup depends on similarity", () => {
     expect(scoreConfidence({ method: "filename+lookup", titleSimilarity: 0.95 })).toBe(0.785);
@@ -111,5 +147,18 @@ describe("findDuplicate", () => {
       [{ sourceId: "a", sha256s: [], title: "A Title", firstCreatorFamily: "okafor", year: "2024" }],
     );
     expect(r?.reason).toBe("fuzzy");
+  });
+  it("canonicalises ISBNs and DOIs and lowercases hashes", () => {
+    expect(findDuplicate({ sha256s: ["ABC"] }, [{ sourceId: "h", sha256s: ["abc"] }])?.reason).toBe("same-file");
+    expect(findDuplicate({ sha256s: [""] }, [{ sourceId: "e", sha256s: [""] }])).toBeNull();
+    expect(findDuplicate({ sha256s: [], isbns: ["0-306-40615-2"] }, [{ sourceId: "i", sha256s: [], isbns: ["978-0-306-40615-7"] }])?.reason).toBe("same-isbn");
+    expect(findDuplicate({ sha256s: [], doi: "https://doi.org/10.1/ABC" }, [{ sourceId: "d", sha256s: [], doi: "doi:10.1/abc" }])?.reason).toBe("same-doi");
+    expect(findDuplicate({ sha256s: [], doi: "http://dx.doi.org/10.1/abc" }, [{ sourceId: "d", sha256s: [], doi: "10.1/abc" }])?.reason).toBe("same-doi");
+  });
+  it("vetoes fuzzy matches on conflicting DOIs or ISBNs; year uses first four digits", () => {
+    const t = { title: "Feeding the Feed", firstCreatorFamily: "Okafor" };
+    expect(findDuplicate({ sha256s: [], ...t, year: "2024-03", doi: "10.1/a" }, [{ sourceId: "x", sha256s: [], ...t, year: "2024", doi: "10.1/b" }])).toBeNull();
+    expect(findDuplicate({ sha256s: [], ...t, year: "2024", isbns: ["9780306406157"] }, [{ sourceId: "x", sha256s: [], ...t, year: "2024", isbns: ["9780804429573"] }])).toBeNull();
+    expect(findDuplicate({ sha256s: [], ...t, year: "2024-03" }, [{ sourceId: "x", sha256s: [], ...t, year: "2024", doi: "10.1/b" }])?.reason).toBe("fuzzy");
   });
 });

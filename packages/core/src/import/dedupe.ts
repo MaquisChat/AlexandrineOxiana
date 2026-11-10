@@ -1,4 +1,5 @@
 /** Duplicate detection against existing sources. Pure and platform-neutral. */
+import { toIsbn13 } from "./identifiers.js";
 import { normalizeTitle, titleSimilarity } from "../verify/evidence.js";
 
 export type DupKey = {
@@ -18,16 +19,39 @@ export type DupMatch = {
 
 export const FUZZY_THRESHOLD = 0.92;
 
+function canonDoi(d: string | undefined): string {
+  return (d ?? "").trim().replace(/^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)/i, "").trim().toLowerCase();
+}
+
+function canonIsbns(xs: string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const x of xs ?? []) {
+    const v = toIsbn13(x);
+    if (v) out.push(v);
+  }
+  return out;
+}
+
+function canonShas(xs: string[]): string[] {
+  return xs.map((h) => h.trim().toLowerCase()).filter((h) => h !== "");
+}
+
+function yearOf(y: string | undefined): number | null {
+  const m = y?.match(/\d{4}/);
+  return m ? Number(m[0]) : null;
+}
+
 /**
  * Finds the best duplicate. Precedence across all existing items: same-file > same-doi >
  * same-isbn > fuzzy (fuzzy is only ever `likely`). The first existing item wins within a reason.
+ * Identifiers are canonicalised first; a fuzzy match is vetoed by conflicting DOIs or ISBNs.
  */
 export function findDuplicate(candidate: DupKey, existing: Iterable<DupKey & { sourceId: string }>): DupMatch | null {
-  const shas = new Set(candidate.sha256s);
-  const doi = candidate.doi?.trim().toLowerCase();
-  const isbns = new Set(candidate.isbns ?? []);
+  const shas = new Set(canonShas(candidate.sha256s));
+  const doi = canonDoi(candidate.doi);
+  const isbns = new Set(canonIsbns(candidate.isbns));
   const family = candidate.firstCreatorFamily ? normalizeTitle(candidate.firstCreatorFamily) : "";
-  const year = candidate.year && /^\d{4}$/.test(candidate.year) ? Number(candidate.year) : null;
+  const year = yearOf(candidate.year);
   const title = candidate.title ? normalizeTitle(candidate.title) : "";
 
   let doiHit: string | undefined;
@@ -35,11 +59,15 @@ export function findDuplicate(candidate: DupKey, existing: Iterable<DupKey & { s
   let fuzzyHit: string | undefined;
 
   for (const e of existing) {
-    if (e.sha256s.some((h) => shas.has(h))) return { sourceId: e.sourceId, reason: "same-file", certainty: "certain" };
-    if (doiHit === undefined && doi && e.doi?.trim().toLowerCase() === doi) doiHit = e.sourceId;
-    if (isbnHit === undefined && isbns.size && e.isbns?.some((i) => isbns.has(i))) isbnHit = e.sourceId;
-    if (fuzzyHit === undefined && title && family && year !== null && e.title && e.firstCreatorFamily && e.year) {
-      const ey = /^\d{4}$/.test(e.year) ? Number(e.year) : null;
+    if (canonShas(e.sha256s).some((h) => shas.has(h))) return { sourceId: e.sourceId, reason: "same-file", certainty: "certain" };
+    const eDoi = canonDoi(e.doi);
+    const eIsbns = canonIsbns(e.isbns);
+    if (doiHit === undefined && doi && eDoi === doi) doiHit = e.sourceId;
+    if (isbnHit === undefined && isbns.size && eIsbns.some((i) => isbns.has(i))) isbnHit = e.sourceId;
+    if (fuzzyHit === undefined && title && family && year !== null && e.title && e.firstCreatorFamily) {
+      const ey = yearOf(e.year);
+      if (doi && eDoi && doi !== eDoi) continue;
+      if (isbns.size && eIsbns.length && !eIsbns.some((i) => isbns.has(i))) continue;
       if (
         ey !== null &&
         Math.abs(ey - year) <= 1 &&

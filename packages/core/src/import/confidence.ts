@@ -27,7 +27,7 @@ export function scoreConfidence(e: Evidence): number {
     case "filename": return 0.5;
     case "filename+lookup":
     case "lookup-title-match": {
-      const sim = e.titleSimilarity ?? 0;
+      const sim = Math.min(1, Math.max(0, e.titleSimilarity ?? 0)) || 0;
       return sim >= 0.9 ? round3(0.5 + 0.3 * sim) : 0.5;
     }
     case "none": return 0.2;
