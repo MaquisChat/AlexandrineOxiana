@@ -356,8 +356,10 @@ async function governanceOf(core: RepoCore, st: ProjectState) {
  * Step 1 of a mutation: evaluates each request with the researcher's tz and `now` (R17). A
  * governance file that cannot be read or parsed denies (fail closed); conditions the project cannot
  * honour deny. A deny is audited and thrown as PolicyDeniedError. Caller holds `core.serial`.
+ * Exported (package-internal) only so a backup can be decided again at its commit point (R138), in
+ * the same write-queue turn as its commit; nothing else here changes.
  */
-async function decide(
+export async function decide(
   core: RepoCore,
   st: ProjectState,
   reqs: MutateRequest | MutateRequest[],

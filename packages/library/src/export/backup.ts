@@ -68,6 +68,7 @@
  * (`project.backups.automatic`, default on), the project is unlocked, and the last backup is a day
  * old (or there is none).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -82,6 +83,7 @@ import { openSealedZip } from "../crypto/random-access.js";
 import { extractArchive, readArchiveEntry, type ZipSource } from "../extract/zip.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
+import { scrubPaths } from "../app-settings.js";
 import { defaultLocationEnv, type LocationEnv } from "../location.js";
 import { candidates, locate } from "../move.js";
 import { AuditStore } from "../repo/audit-store.js";
@@ -137,6 +139,8 @@ export const backupSeams: {
   crashAt?: BackupCrashPoint;
   /** Runs after old backups are removed, before their `backup.prune` event is written. */
   beforePruneAudit?: () => Promise<void>;
+  /** Runs once the archive is complete and recorded, before it is named and committed (R138 probes). */
+  beforeCommit?: () => Promise<void>;
 } = {};
 
 function crashPoint(point: BackupCrashPoint): void {
@@ -642,6 +646,34 @@ const activeTemps = new Set<string>();
 /** Backups and prunes running in this process (their pending records are not settled meanwhile). */
 const activeOps = new Set<string>();
 
+// ------------------------------------------------------------------------------------------
+// The maintenance lock (R138 a): backup, prune, restore and destruction of raw data run one at a
+// time per project. It is not the repository's write queue: ordinary changes go on meanwhile. It is
+// re-entrant within one operation (destruction makes a fresh backup and prunes while holding it).
+// In-process only: the library lock keeps other processes out of a writable library.
+
+const heldMaintenance = new AsyncLocalStorage<ReadonlySet<string>>();
+const maintenanceTails = new Map<string, Promise<unknown>>();
+
+/** Package-internal: runs `fn` holding the project's maintenance lock (waits for the one before). */
+export function withProjectMaintenance<T>(repo: Repo, projectId: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${repoLibrary(repo).root}\u0000${projectId}`;
+  const mine = heldMaintenance.getStore();
+  if (mine?.has(key)) return fn();
+  const prev = maintenanceTails.get(key) ?? Promise.resolve();
+  const run = prev.then(() => heldMaintenance.run(new Set([...(mine ?? []), key]), fn));
+  // A thrown error (or a simulated crash) releases it like a success.
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  maintenanceTails.set(key, tail);
+  void tail.then(() => {
+    if (maintenanceTails.get(key) === tail) maintenanceTails.delete(key);
+  });
+  return run;
+}
+
 /** Overwrites and removes temp files left by interrupted backups (they may be plaintext zips), except those still pending. */
 async function sweepTemps(dir: string): Promise<void> {
   let names: string[] = [];
@@ -654,15 +686,30 @@ async function sweepTemps(dir: string): Promise<void> {
   for (const n of names) if (BACKUP_TEMP.test(n) && !activeTemps.has(join(dir, n)) && !pending.has(n)) await shredPath(join(dir, n)).catch(() => {});
 }
 
-/** Plain text kept with `backup-failed`: the engine's reason for a refusal, else what failed (never a message that may hold a path). */
-function failureOf(err: unknown, at: string): BackupFailure {
-  if (err instanceof PolicyDeniedError) return { at, reason: err.reason, refused: true };
-  if (err instanceof BackupNotRecordedError) return { at, reason: err.message };
-  return { at, reason: err instanceof Error ? err.name : "Error" };
+/** Raw data destroyed since the snapshot, a changed archive (R138 b, d): the backup was not kept. */
+export class BackupDiscardedError extends Error {
+  override name = "BackupDiscardedError";
+}
+
+const DESTROYED_MEANWHILE = "Raw data was destroyed under the retention rule while this backup was being made; the backup was not kept.";
+const CHANGED_ON_DISK = "The backup file changed after it was written; the backup was not kept.";
+
+/**
+ * Package-internal (also retention): plain text for why a backup was not made: the engine's reason
+ * for a refusal, the library's own message for its errors, else what failed with paths scrubbed.
+ */
+export function backupFailureReason(repo: Repo, err: unknown): string {
+  if (err instanceof PolicyDeniedError) return err.reason;
+  if (err instanceof BackupNotRecordedError || err instanceof BackupDiscardedError) return err.message;
+  const msg = err instanceof Error ? scrubPaths(err.message, [repoLibrary(repo).root]).trim() : "";
+  return `The backup could not be made (${msg || (err instanceof Error ? err.name : "unknown error")}).`;
 }
 
 async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
-  const f = failureOf(err, repoClock(repo)().toISOString());
+  // A locked project or a read-only library: nothing failed, it cannot run now (M3).
+  if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return;
+  const at = repoClock(repo)().toISOString();
+  const f: BackupFailure = { at, reason: backupFailureReason(repo, err), ...(err instanceof PolicyDeniedError ? { refused: true as const } : {}) };
   await withState(repo, (s) => {
     s.failures[projectId] = f;
   }).catch(() => {});
@@ -678,6 +725,82 @@ async function hasEvent(repo: Repo, projectId: string, action: string, key: stri
 }
 
 const projectExists = (repo: Repo, projectId: string) => repo.listProjects().some((p) => p.id === projectId);
+
+/** Runs `fn` in the manifest's queue (the manifest and the state are written there). */
+function underManifestLock<T>(repo: Repo, fn: () => Promise<T>): Promise<T> {
+  const dir = backupsDir(repo);
+  const prev = manifestLocks.get(dir) ?? Promise.resolve();
+  const run = prev.then(fn);
+  manifestLocks.set(
+    dir,
+    run.catch(() => {}),
+  );
+  return run;
+}
+
+/**
+ * Reserves a backup name not taken in Backups/ nor by another backup in progress (R138 b), and
+ * records it (with the temp file, if given) in the backup's pending record.
+ */
+function reserveName(repo: Repo, backupId: string, wanted: string, tmp?: string): Promise<string> {
+  const dir = backupsDir(repo);
+  return underManifestLock(repo, async () => {
+    const taken = await namesIn(dir);
+    let out = wanted;
+    await editStateNow(dir, (s) => {
+      const reserved = new Set(
+        Object.entries(s.pending).flatMap(([id, op]) => (id !== backupId && op.kind === "create" && op.file ? [foldName(op.file)] : [])),
+      );
+      out = withCollisionSuffix(wanted, (n) => taken.has(foldName(n)) || reserved.has(foldName(n)));
+      const p = s.pending[backupId];
+      if (p?.kind === "create") Object.assign(p, { file: out, ...(tmp ? { tmp } : {}) });
+    });
+    return out;
+  });
+}
+
+/**
+ * Gives the finished temp file its backup name WITHOUT ever replacing a file (R138 b): a hard link
+ * (fails if the name exists); where links are not supported, a rename checked under the manifest
+ * queue (no other writer in this process; the library lock keeps other processes out). False: taken.
+ */
+async function placeExclusive(repo: Repo, tmp: string, final: string): Promise<boolean> {
+  try {
+    await fsp.link(tmp, final);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") return false;
+    if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS", "EMLINK", "EACCES"].includes(code ?? "")) throw err;
+  }
+  return underManifestLock(repo, async () => {
+    if (await fsp.lstat(final).then(() => true, () => false)) return false;
+    await fsp.rename(tmp, final);
+    return true;
+  });
+}
+
+/** Whether `final` is the backup's own file: the temp file's other name, or (temp gone) the recorded bytes. */
+async function isOurs(final: string, tmp: string | undefined, sha256: string | undefined): Promise<boolean> {
+  const f = await fsp.stat(final).catch(() => null);
+  if (!f) return false;
+  const t = tmp ? await fsp.stat(tmp).catch(() => null) : null;
+  if (t) return t.ino === f.ino && t.dev === f.dev;
+  return sha256 !== undefined && (await sha256Of(final)) === sha256;
+}
+
+/** Removes everything of an uncommitted backup: its backup name (only if it is ours) and its temp file. */
+async function discardArchive(dir: string, op: { tmp?: string; file?: string; entry?: BackupEntry }): Promise<void> {
+  const tmp = op.tmp ? join(dir, op.tmp) : undefined;
+  if (op.file) {
+    const final = join(dir, op.file);
+    if (await isOurs(final, tmp, op.entry?.sha256)) {
+      if (tmp && (await exists(tmp))) await fsp.rm(final, { force: true });
+      else await shredPath(final);
+    }
+  }
+  if (tmp) await shredPath(tmp);
+}
 
 /**
  * Settles backups and prunes that were interrupted (a crash, or a failure this process could not
@@ -703,24 +826,43 @@ async function settlePending(repo: Repo): Promise<void> {
 }
 
 /**
- * A backup whose `backup.create` event is in the audit log is finished: renamed to its backup name
- * (if the crash came first) and listed in the manifest. One without it is not a backup: its temp
- * file is overwritten and removed, and the project shows `backup-failed`.
+ * A backup whose `backup.create` event is in the audit log is finished: given its name (if the
+ * crash came first), checked against the recorded sha256 (M2) and listed. One without it is not a
+ * backup: its files are removed, and the project shows `backup-failed`.
  */
 async function settleCreate(repo: Repo, id: string, op: Extract<PendingOp, { kind: "create" }>): Promise<"committed" | "dropped"> {
   const dir = backupsDir(repo);
   const known = projectExists(repo, op.projectId);
   const committed = known && (await hasEvent(repo, op.projectId, "backup.create", "backupId", id));
+  const at = repoClock(repo)().toISOString();
+  const fail = (reason: string) =>
+    withState(repo, (s) => {
+      if (known) s.failures[op.projectId] = { at, reason };
+      delete s.pending[id];
+    });
   if (committed && op.file && op.entry) {
+    const entry = op.entry;
     const tmp = op.tmp ? join(dir, op.tmp) : undefined;
     const final = join(dir, op.file);
-    if (tmp && !(await exists(final)) && (await exists(tmp))) await fsp.rename(tmp, final);
-    const entry = op.entry;
-    if (await exists(final)) {
-      await withManifest(repo, async (m) => {
-        if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
-      });
+    if (tmp && (await exists(tmp))) {
+      if (await exists(final)) {
+        if (await isOurs(final, tmp, entry.sha256)) await fsp.rm(tmp, { force: true });
+      } else if (!(await placeExclusive(repo, tmp, final))) throw new Error("the backup's name is taken");
+      else if (await exists(tmp)) await fsp.rm(tmp, { force: true });
     }
+    if (!(await exists(final))) {
+      await fail("The finished backup is missing from the Backups folder; it was not listed.");
+      return "dropped";
+    }
+    if ((await sha256Of(final)) !== entry.sha256) {
+      // Changed on disk after it was made: never listed as a backup (it would not restore).
+      await shredPath(final);
+      await fail("The finished backup was damaged on disk before it was listed; it was removed.");
+      return "dropped";
+    }
+    await withManifest(repo, async (m) => {
+      if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
+    });
     await withState(repo, (s) => {
       s.owners[entry.file] = op.projectId;
       delete s.failures[op.projectId]; // a backup succeeded
@@ -728,12 +870,8 @@ async function settleCreate(repo: Repo, id: string, op: Extract<PendingOp, { kin
     });
     return "committed";
   }
-  if (op.tmp) await shredPath(join(dir, op.tmp));
-  const at = repoClock(repo)().toISOString();
-  await withState(repo, (s) => {
-    if (known) s.failures[op.projectId] = { at, reason: BACKUP_INTERRUPTED };
-    delete s.pending[id];
-  });
+  await discardArchive(dir, op);
+  await fail(BACKUP_INTERRUPTED);
   return "dropped";
 }
 
@@ -777,13 +915,21 @@ export interface BackupOptions {
   locationEnv?: LocationEnv;
 }
 
+/** The commit could not be appended (as opposed to a refusal or a discard at the commit point). */
+class CommitAppendError extends Error {}
+
 /**
  * Backs up the project to Backups/ and prunes its older backups to the newest `keep`
- * (default: the project's setting, else 10). Governed and audited (R125, see the top of this file):
- * a refusal throws PolicyDeniedError and creates nothing. A failure or refusal is recorded as the
+ * (default: the project's setting, else 10). Governed and audited (R125, R138; see the top of this
+ * file): a refusal throws PolicyDeniedError and creates nothing. One at a time per project, with
+ * pruning, restore and destruction (the maintenance lock). A failure or refusal is recorded as the
  * project's warning `backup-failed` (and thrown).
  */
-export async function backupProject(repo: Repo, projectId: string, opts: BackupOptions = {}): Promise<BackupResult> {
+export function backupProject(repo: Repo, projectId: string, opts: BackupOptions = {}): Promise<BackupResult> {
+  return withProjectMaintenance(repo, projectId, () => backupLocked(repo, projectId, opts));
+}
+
+async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions): Promise<BackupResult> {
   const dir = backupsDir(repo);
   await fsp.mkdir(dir, { recursive: true });
   await settlePending(repo);
@@ -800,6 +946,8 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
   try {
     if (backupSeams.failBackup) throw new Error("simulated backup failure");
     const destinations = await backupDestinations(dir, opts.locationEnv ?? (await defaultLocationEnv()));
+    const request = { action: "backup" as const, backup: { destinations } };
+    const entity = { type: "project" as const, id: projectId };
     // Recorded first, so an interruption from here on is settled (and shown) later.
     activeOps.add(backupId);
     await withState(repo, (s) => {
@@ -807,16 +955,11 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
     });
     recorded = true;
     // 1. The decision, audited either way (a deny is audited and thrown by authorizeProcessing).
-    const decision = await authorizeProcessing(
-      repo,
-      projectId,
-      { action: "backup", backup: { destinations } },
-      { op: "backup.create", entity: { type: "project", id: projectId }, auditAllow: { details: { backupId } } },
-    );
+    const decision = await authorizeProcessing(repo, projectId, request, { op: "backup.create", entity, auditAllow: { details: { backupId } } });
     const mustSeal = decision.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
     crashPoint("after-decision");
 
-    // 2. The zip, complete and fsynced under its temp name.
+    // 2. The zip, complete and fsynced under its temp name; the backup name reserved.
     let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string } | undefined;
     for (let attempt = 0; attempt < 2 && !result; attempt++) {
       const snap = await snapshot(repo, projectId);
@@ -824,17 +967,12 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
         // Never an unsealed backup of a project whose rules require encryption (the engine's condition).
         if (mustSeal && !snap.key) throw new PolicyDeniedError("Governance requires encryption at rest, but this project is not encrypted", "backup");
         await backupSeams.afterSnapshot?.();
-        let name = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
-        if (snap.key) name = `${name}.enc`;
-        const taken = await namesIn(dir);
-        name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
-        const tmp = join(dir, `${name}.tmp-${randomBytes(6).toString("hex")}`);
+        let wanted = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
+        if (snap.key) wanted = `${wanted}.enc`;
+        const tmp = join(dir, `${wanted}.tmp-${randomBytes(6).toString("hex")}`);
         activeTemps.add(tmp);
         temps.push(tmp);
-        await withState(repo, (s) => {
-          const p = s.pending[backupId];
-          if (p?.kind === "create") p.tmp = basename(tmp);
-        });
+        const name = await reserveName(repo, backupId, wanted, basename(tmp));
         try {
           const header = { formatVersion: 1, projectId, projectName: snap.project.name, createdAt: snap.at, encrypted: !!snap.key, auditHead: snap.head, files: snap.files.length, assets: snap.assets };
           const r = await writeZip(tmp, snap, header);
@@ -862,8 +1000,8 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
     if (!result) throw new Error("the project kept changing while it was backed up");
     crashPoint("after-zip");
     const { snap } = result;
-    const entry: BackupEntry = {
-      file: result.name,
+    const entryOf = (file: string): BackupEntry => ({
+      file,
       projectId,
       createdAt: snap.at,
       sha256: result.sha256,
@@ -873,28 +1011,53 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
       auditHead: snap.head,
       assets: snap.assets,
       ...(snap.keyFile ? { keyFile: snap.keyFile } : {}),
-    };
+    });
     await withState(repo, (s) => {
       const p = s.pending[backupId];
-      if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry });
+      if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry: entryOf(result.name) });
     });
+    await backupSeams.beforeCommit?.();
+
+    // 3. Its name, never over an existing file (a taken name gets the next counter), then the
+    // bytes under that name checked against what was recorded (R138 b).
+    let name = result.name;
+    while (!(await placeExclusive(repo, result.tmp, join(dir, name)))) {
+      name = await reserveName(repo, backupId, result.name);
+      await withState(repo, (s) => {
+        const p = s.pending[backupId];
+        if (p?.kind === "create") Object.assign(p, { file: name, entry: entryOf(name) });
+      });
+    }
+    const entry = entryOf(name);
+    const final = join(dir, name);
+    if ((await sha256Of(final)) !== result.sha256) throw new BackupDiscardedError(CHANGED_ON_DISK);
     crashPoint("before-commit");
 
-    // 3. The commit point: the `backup.create` event. If it cannot be written, the audit log decides
-    // (it may have been written after all); without it the backup is not kept.
-    try {
-      await appendLibraryEvent(repo, projectId, "backup.create", { backupId, file: result.name, sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
-    } catch (err) {
+    // 4. The commit point, in one write-queue turn (R138 c, d): the decision again, against the
+    // governance in force now (a deny is audited and thrown); no raw data destroyed since the
+    // snapshot; then the `backup.create` event.
+    await withProjectQueue(repo, projectId, async (ctx) => {
+      await ctx.decide(request, { op: "backup.create", entity });
+      const destroyed = await destroyedAssetIds(repo, projectId);
+      if (snap.assets.some((id) => destroyed.has(id))) throw new BackupDiscardedError(DESTROYED_MEANWHILE);
+      try {
+        await ctx.audit("backup.create", { backupId, file: name, sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
+      } catch (err) {
+        throw new CommitAppendError("append failed", { cause: err });
+      }
+    }).catch(async (err: unknown) => {
+      if (!(err instanceof CommitAppendError)) throw err;
+      // The audit log decides: the event may have been written after all.
       activeTemps.delete(result.tmp);
-      const outcome = await settleCreate(repo, backupId, { kind: "create", projectId, at: snap.at, tmp: basename(result.tmp), file: result.name, entry }).catch(() => "unsettled" as const);
+      const outcome = await settleCreate(repo, backupId, { kind: "create", projectId, at: snap.at, tmp: basename(result.tmp), file: name, entry }).catch(() => "unsettled" as const);
       if (outcome === "unsettled") undecided = true;
-      if (outcome !== "committed") throw new BackupNotRecordedError({ cause: err });
-    }
+      if (outcome !== "committed") throw new BackupNotRecordedError({ cause: err.cause });
+    });
     crashPoint("after-commit");
 
-    // 4. Its name, then the manifest.
+    // 5. The temp name goes; the manifest lists it.
     try {
-      if (await exists(result.tmp)) await fsp.rename(result.tmp, join(dir, result.name));
+      if ((await exists(result.tmp)) && (await isOurs(final, result.tmp, undefined))) await fsp.rm(result.tmp, { force: true });
     } finally {
       activeTemps.delete(result.tmp);
     }
@@ -913,7 +1076,7 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
     if (recorded && !undecided) {
       // Nothing was committed (a committed backup does not get here): anything left of it goes.
       const p = (await readState(dir)).pending[backupId];
-      if (p?.kind === "create" && p.tmp) await shredPath(join(dir, p.tmp)).catch(() => {});
+      if (p?.kind === "create") await discardArchive(dir, p).catch(() => {});
       await withState(repo, (s) => {
         delete s.pending[backupId];
       }).catch(() => {});
@@ -927,7 +1090,7 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
   let pruned: string[] = [];
   if (opts.prune !== false) {
     try {
-      pruned = await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
+      pruned = await pruneLocked(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
     } catch (err) {
       // The backup itself is made and recorded; a removal that could not be recorded is said, not hidden.
       if (!(err instanceof PruneNotRecordedError)) throw err;
@@ -938,14 +1101,28 @@ export async function backupProject(repo: Repo, projectId: string, opts: BackupO
   return { path: join(dir, made.entry.file), sha256: made.entry.sha256, bytes: made.entry.bytes, pruned, warnings };
 }
 
+/** Ids of the project's destroyed assets (retention). */
+async function destroyedAssetIds(repo: Repo, projectId: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const id of repo.listSourceIds(projectId)) {
+    const sf = await repo.getSource(projectId, id);
+    for (const a of sf.assets) if (a.status === "destroyed") out.add(a.id);
+  }
+  return out;
+}
+
 /**
  * Removes the project's backups beyond the newest `keep`: by the manifest's project id, backup-named
  * files only; a plain delete (R91). Audited by file name: one `backup.prune` event per run that
  * removed anything (R125). If that event cannot be written, the files stay removed and
- * PruneNotRecordedError is thrown; the removal is recorded later.
+ * PruneNotRecordedError is thrown; the removal is recorded later. Holds the maintenance lock (R138).
  */
-export async function pruneBackups(repo: Repo, projectId: string, keep: number): Promise<string[]> {
-  if (!Number.isInteger(keep) || keep < 1) throw new TypeError("keep must be a whole number of at least 1");
+export function pruneBackups(repo: Repo, projectId: string, keep: number): Promise<string[]> {
+  if (!Number.isInteger(keep) || keep < 1) return Promise.reject(new TypeError("keep must be a whole number of at least 1"));
+  return withProjectMaintenance(repo, projectId, () => pruneLocked(repo, projectId, keep));
+}
+
+async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise<string[]> {
   const dir = backupsDir(repo);
   await settlePending(repo);
   const pruneId = newId();
@@ -992,6 +1169,7 @@ export async function pruneBackups(repo: Repo, projectId: string, keep: number):
   }
 }
 
+
 /**
  * Package-internal (retention, R90 d, R92 I3): overwrites and removes the named backups of the
  * project one by one (manifest-listed ones), the manifest updated after each; a failure does not
@@ -1030,7 +1208,13 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
  * as the project's warning `backup-failed`, with its reason. A refused one is asked again a day
  * later, not at every pass of the scheduler (one denial in the audit log a day, not one an hour).
  */
-export async function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
+export function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
+  // Whether one is due is decided while holding the project (R138 a): a manual backup running at
+  // the same time makes this one not due, instead of a second backup.
+  return withProjectMaintenance(repo, projectId, () => backupIfDueLocked(repo, projectId, now, opts));
+}
+
+async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv">): Promise<BackupResult | null> {
   const p = repo.getProject(projectId);
   if (p.backups?.automatic === false) return null;
   if (!repo.isUnlocked(projectId)) return null;
@@ -1071,6 +1255,16 @@ async function freeBytes(dir: string): Promise<number> {
  * (or the recovery code), checked against the key file the backup manifest kept.
  */
 export async function restoreBackup(repo: Repo, path: string, opts: { passphrase?: string } = {}): Promise<RestoreResult> {
+  // One of this library's backups is restored holding its project's maintenance lock (R138 a), so a
+  // destruction or a prune cannot remove it meanwhile. A file from elsewhere belongs to no project here.
+  const abs = resolve(path);
+  const owner =
+    resolve(dirname(abs)) === resolve(backupsDir(repo)) ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs))?.projectId : undefined;
+  if (owner && projectExists(repo, owner)) return withProjectMaintenance(repo, owner, () => restoreLocked(repo, path, opts));
+  return restoreLocked(repo, path, opts);
+}
+
+async function restoreLocked(repo: Repo, path: string, opts: { passphrase?: string }): Promise<RestoreResult> {
   const lib = repoLibrary(repo);
   if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
   const abs = resolve(path);

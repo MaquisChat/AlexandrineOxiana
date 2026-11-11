@@ -170,8 +170,14 @@ describe("R125: the commit point is the `backup.create` audit event", () => {
     await addSource(kit, p, { title: "x" });
     backupSeams.crashAt = point;
     await expect(backupProject(kit.repo, p.id)).rejects.toBeInstanceOf(SimulatedCrash);
-    // Before anything else looks: no backup is presented as made.
-    if (!committed) expect((await backupFiles()).filter((n) => !n.includes(".tmp-"))).toEqual([]);
+    // Before anything else looks: no backup is presented as made. The manifest lists none; at
+    // before-commit the archive already has its name (R138: placed before the commit, never listed
+    // until it); earlier it has none.
+    if (!committed) {
+      const m = JSON.parse(await readFile(join(backupsDir(), BACKUPS_MANIFEST), "utf8").catch(() => '{"backups":[]}')) as { backups: unknown[] };
+      expect(m.backups).toEqual([]);
+      if (point !== "before-commit") expect((await backupFiles()).filter((n) => !n.includes(".tmp-"))).toEqual([]);
+    }
     const again = await kit.reopen();
     const created = await events(p, "backup.create");
     if (committed) {

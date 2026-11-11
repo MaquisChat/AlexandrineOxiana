@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -46,7 +46,7 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
-import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
+import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { createProject, isUnlocked, lockProject, readFullData, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
   createSource,
@@ -1010,6 +1010,11 @@ export interface ProjectQueueContext {
   at(): string;
   /** Appends one audit event about the project (decision allow), anchored. */
   audit(action: string, details: Record<string, unknown>): Promise<void>;
+  /**
+   * Evaluates a request in this turn, against the governance in force now (a backup's commit
+   * point, R138 c): a deny is audited and thrown as PolicyDeniedError, as in any governed write.
+   */
+  decide(req: MutateRequest, opts: { op: string; entity?: { type: EntityType; id: string } }): Promise<PolicyDecision>;
 }
 
 /**
@@ -1035,6 +1040,10 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
       audit: async (action, details) => {
         const at = core.clock().toISOString();
         await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision: { result: "allow" }, details });
+      },
+      decide: async (req, o) => {
+        const [first] = await decide(core, st, req, core.clock().toISOString(), o.op, o.entity);
+        return first!.d;
       },
     });
   });

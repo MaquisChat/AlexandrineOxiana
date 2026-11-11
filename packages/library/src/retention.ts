@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { basename, join } from "node:path";
 import { formatModified, type Asset } from "@ao/core";
-import { backupProject, destroyBackups, listBackups, pruneBackups, unresolvedBackupsOf, DEFAULT_KEEP } from "./export/backup.js";
+import { backupFailureReason, backupProject, destroyBackups, listBackups, pruneBackups, unresolvedBackupsOf, withProjectMaintenance, DEFAULT_KEEP } from "./export/backup.js";
 import { decryptBytes } from "./repo/io.js";
 import { NotFoundError } from "./repo/errors.js";
 import {
@@ -86,6 +86,10 @@ interface CertificateBackups {
   containing: string[];
   deleted: string[];
   freshBackup?: string;
+  /** Why no fresh backup could be made after the destruction (R138 e: the holding backups are removed regardless). */
+  freshBackupFailed?: string;
+  /** Plain words for a reader of the certificate when the project was left with no backup. */
+  note?: string;
   /** Why the last attempt stopped (plain; retried). */
   lastError?: string;
 }
@@ -124,12 +128,24 @@ const baseName = (rel: string) => rel.slice(rel.lastIndexOf("/") + 1);
  * Destroys the given raw originals (see above). Throws for an id that is not a stored, copied
  * original of this project. Returns the certificate's absolute path and content.
  */
-export async function destroyRaw(
+export function destroyRaw(
   repo: Repo,
   projectId: string,
   assetIds: string[],
   by: string,
   opts: DestroyOptions = {},
+): Promise<{ certificatePath: string; certificate: Record<string, unknown> }> {
+  // Never at the same time as a backup, prune or restore of the project (R138 a): a backup in
+  // progress is finished first, and then found among the backups that hold the data.
+  return withProjectMaintenance(repo, projectId, () => destroyRawLocked(repo, projectId, assetIds, by, opts));
+}
+
+async function destroyRawLocked(
+  repo: Repo,
+  projectId: string,
+  assetIds: string[],
+  by: string,
+  opts: DestroyOptions,
 ): Promise<{ certificatePath: string; certificate: Record<string, unknown> }> {
   if (typeof by !== "string" || !by.trim()) throw new TypeError("by: the person destroying the data must be named");
   const wanted = new Set(assetIds);
@@ -239,7 +255,8 @@ async function readCertificate(repo: Repo, projectId: string, rel: string): Prom
 }
 
 const union = (a: string[], b: string[]) => [...new Set([...a, ...b])];
-const plainError = (err: unknown) => `${err instanceof Error ? err.name : "Error"}: the step will be tried again`;
+/** Any failure, in plain words with paths scrubbed (R138 e: not only a refusal), and that it is retried. */
+const plainError = (repo: Repo, err: unknown) => `${backupFailureReason(repo, err).replace(/[.]$/u, "")}; the step will be tried again`;
 
 /**
  * The backups step of a destruction (R92 I3): the backups holding destroyed files are worked out
@@ -261,20 +278,34 @@ async function settleBackups(repo: Repo, projectId: string, certificateRel: stri
     deleted: [...b.deleted],
   };
   const unresolvedLeft = held.unresolved.length > 0;
-  try {
-    if (held.files.length && !next.freshBackup) {
+  // A fresh backup first, when it can be made (R90 d); the holding backups are removed whether or
+  // not it could (R138 e): destruction never depends on a new backup succeeding.
+  if (held.files.length && !next.freshBackup) {
+    try {
       const fresh = await backupProject(repo, projectId, { prune: false });
       next.freshBackup = `Backups/${basename(fresh.path)}`;
+      delete next.freshBackupFailed;
+      delete next.note;
+    } catch (err) {
+      // backupProject has recorded `backup-failed` with the same reason.
+      const reason = backupFailureReason(repo, err);
+      next.freshBackupFailed = reason;
+      next.note = `The earlier backups that held the destroyed files were removed. No new backup could be made afterwards: ${reason}${/[.!?]$/u.test(reason) ? "" : "."} This project has no backup until one succeeds.`;
     }
+  }
+  try {
     const r = await destroyBackups(repo, projectId, held.files);
     next.deleted = union(next.deleted, r.deleted.map((f) => `Backups/${f}`));
     if (r.error) throw r.error;
     delete next.lastError;
     next.status = unresolvedLeft ? "unknown-pending" : "deleted";
-    await pruneBackups(repo, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP);
   } catch (err) {
     next.status = unresolvedLeft ? "unknown-pending" : "pending";
-    next.lastError = plainError(err);
+    next.lastError = plainError(repo, err);
+  }
+  if (next.status === "deleted") {
+    // Pruning keeps its own record when it cannot be audited (backup-audit-pending): not this step's failure.
+    await pruneBackups(repo, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP).catch(() => {});
   }
   const updated = { ...cert, backups: next };
   await repo.mutate(
@@ -293,7 +324,11 @@ async function settleBackups(repo: Repo, projectId: string, certificateRel: stri
  * Finishes (or retries) destructions whose backups step is not done (a crash, a quit or a failure
  * after the destruction): returns the certificates (absolute paths) worked on. For Task 30, at start.
  */
-export async function resumeDestruction(repo: Repo, projectId: string): Promise<string[]> {
+export function resumeDestruction(repo: Repo, projectId: string): Promise<string[]> {
+  return withProjectMaintenance(repo, projectId, () => resumeLocked(repo, projectId));
+}
+
+async function resumeLocked(repo: Repo, projectId: string): Promise<string[]> {
   const root = repoLibrary(repo).root;
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
   let names: string[];

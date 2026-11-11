@@ -216,7 +216,7 @@ describe("destroyRaw", () => {
 });
 
 describe("R92", () => {
-  it("I3: a failed fresh backup keeps the step pending with lastError; resumeDestruction retries it", async () => {
+  it("I3, as R138 e changed it: a failed fresh backup no longer keeps the holding backups; they are removed and the certificate says no new backup could be made", async () => {
     const p = await makeProject(kit, GOV(false));
     const sf = await rawSource(p);
     const old = await backupProject(kit.repo, p.id);
@@ -228,15 +228,14 @@ describe("R92", () => {
     } finally {
       backupSeams.failBackup = false;
     }
-    expect(r.certificate.backups).toMatchObject({ status: "pending", deleted: [], lastError: expect.any(String) });
-    expect(existsSync(old.path)).toBe(true);
-    kit.clock.now = new Date("2026-12-02T10:20:00.000Z");
-    const done = await resumeDestruction(kit.repo, p.id);
-    expect(done).toHaveLength(1);
+    expect(r.certificate.backups).toMatchObject({
+      status: "deleted",
+      deleted: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`],
+      freshBackupFailed: "The backup could not be made (simulated backup failure).",
+    });
     expect(existsSync(old.path)).toBe(false);
-    const cert = JSON.parse(await readFile(done[0]!, "utf8"));
-    expect(cert.backups).toMatchObject({ status: "deleted", deleted: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`] });
-    expect(cert.backups.lastError).toBeUndefined();
+    expect((r.certificate.backups as { lastError?: string }).lastError).toBeUndefined();
+    expect(await resumeDestruction(kit.repo, p.id)).toEqual([]);
   });
 
   it("I3: a partly failed backup deletion reports exactly what was deleted, the manifest follows each deletion, and a retry finishes", async () => {
