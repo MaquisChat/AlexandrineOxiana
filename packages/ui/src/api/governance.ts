@@ -35,6 +35,13 @@ export interface ProtocolDocument {
   encrypted: boolean;
 }
 
+export interface ProtocolDocumentResult {
+  file: string;
+  outcome: "added" | "failed";
+  document?: ProtocolDocument;
+  reason?: string;
+}
+
 export interface RetentionDue {
   destroyAfter: string | null;
   due: Array<{ sourceId: string; title: string; assetIds: string[] }>;
@@ -96,7 +103,7 @@ export interface ConsentRecord {
   scope: string;
   date: string;
   expires?: string;
-  withdrawn?: { at: string };
+  withdrawn?: { at: string; reason?: string };
 }
 
 export interface PolicyDecision {
@@ -179,7 +186,9 @@ export function governanceApi(client: ApiClient) {
       r<GovernanceSaved>("PUT", `${p(projectId)}/governance`, { body: { yaml, baseSha256, ...(reason ? { reason } : {}) } }),
 
     protocolDocuments: (projectId: string) => r<{ documents: ProtocolDocument[] }>("GET", `${p(projectId)}/protocol/documents`),
-    addProtocolDocuments: (projectId: string, paths: string[]) => r<{ documents: ProtocolDocument[] }>("POST", `${p(projectId)}/protocol/documents`, { body: { paths } }),
+    /** One result per file (R117 I6) and the documents now held. */
+    addProtocolDocuments: (projectId: string, paths: string[]) =>
+      r<{ results: ProtocolDocumentResult[]; documents: ProtocolDocument[] }>("POST", `${p(projectId)}/protocol/documents`, { body: { paths } }),
 
     retention: (projectId: string) => r<RetentionDue>("GET", `${p(projectId)}/retention`),
     destroyRaw: (projectId: string, assetIds: string[]) =>
@@ -195,7 +204,8 @@ export function governanceApi(client: ApiClient) {
     /** Without a code the service gives the next `P-NNN`. */
     createParticipant: (projectId: string, body: { code?: string; details?: Record<string, string>; legalBasis?: string }) =>
       r<Participant>("POST", `${p(projectId)}/participants`, { body }),
-    updateParticipant: (projectId: string, id: string, body: { code?: string; details?: Record<string, string> | null; legalBasis?: string }) =>
+    /** Details only: participant codes never change (R117 C1). */
+    updateParticipant: (projectId: string, id: string, body: { details?: Record<string, string> | null; legalBasis?: string }) =>
       r<Participant>("PATCH", `${p(projectId)}/participants/${encodeURIComponent(id)}`, { body }),
     deleteParticipant: (projectId: string, id: string) => r<{ deleted: true }>("DELETE", `${p(projectId)}/participants/${encodeURIComponent(id)}`),
     createSession: (projectId: string, body: { date: string; place?: string; participantIds?: string[]; notes?: string; legalBasis?: string }) =>
@@ -205,12 +215,13 @@ export function governanceApi(client: ApiClient) {
     deleteSession: (projectId: string, id: string) => r<{ deleted: true }>("DELETE", `${p(projectId)}/sessions/${encodeURIComponent(id)}`),
     createConsent: (projectId: string, body: { participantId: string; scope: string; date: string; expires?: string }) =>
       r<ConsentRecord>("POST", `${p(projectId)}/consents`, { body }),
-    updateConsent: (projectId: string, id: string, body: { scope?: string; date?: string; expires?: string | null }) =>
+    /** The document is set only by attachConsentDocument; detaching needs a reason (R117 I3). */
+    updateConsent: (projectId: string, id: string, body: { scope?: string; date?: string; expires?: string | null; documentAssetId?: null; detachReason?: string }) =>
       r<ConsentRecord>("PATCH", `${p(projectId)}/consents/${encodeURIComponent(id)}`, { body }),
     withdrawConsent: (projectId: string, id: string, reason?: string) =>
       r<{ consent: ConsentRecord; flaggedSourceIds: string[] }>("POST", `${p(projectId)}/consents/${encodeURIComponent(id)}/withdraw`, { body: reason ? { reason } : {} }),
     attachConsentDocument: (projectId: string, id: string, path: string) =>
-      r<{ consent: ConsentRecord; sourceId: string; assetId: string }>("POST", `${p(projectId)}/consents/${encodeURIComponent(id)}/document`, { body: { path } }),
+      r<{ consent: ConsentRecord; sourceId: string; assetId: string; note?: string }>("POST", `${p(projectId)}/consents/${encodeURIComponent(id)}/document`, { body: { path } }),
 
     movePlan: (dest: string) => r<MovePlan>("POST", "/libraries/move/plan", { body: { dest } }),
     /** Streams the move's progress; ends with `done` (verified and switched) or `error`. */

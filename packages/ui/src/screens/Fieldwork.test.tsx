@@ -94,18 +94,82 @@ describe("Fieldwork", () => {
     expect(db.calls[0]).toEqual({ method: "POST", path: "/participants", body: {} });
   });
 
-  it("edits a participant's code", async () => {
+  it("never offers to change a participant's code (R117 C1)", async () => {
     render(<Fieldwork api={makeApi()} projectId={PID} />);
     await screen.findByRole("region", { name: "Participants" });
     const user = userEvent.setup();
     await addParticipant(user);
-    await user.click(within(section("Participants")).getByRole("button", { name: "Edit P-001" }));
-    const code = within(section("Participants")).getByRole("textbox", { name: "Code" });
-    await user.clear(code);
-    await user.type(code, "P-014");
-    await user.click(within(section("Participants")).getByRole("button", { name: "Save" }));
-    expect(await within(section("Participants")).findByText("P-014")).toBeTruthy();
-    expect(db.calls.at(-1)).toMatchObject({ method: "PATCH", body: { code: "P-014" } });
+    expect(within(section("Participants")).queryByRole("button", { name: /Edit P-001/ })).toBeNull();
+    expect(within(section("Participants")).queryByRole("textbox", { name: "Code" })).toBeNull();
+  });
+
+  it("asks before deleting a participant", async () => {
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await screen.findByRole("region", { name: "Participants" });
+    const user = userEvent.setup();
+    await addParticipant(user);
+    await user.click(within(section("Participants")).getByRole("button", { name: "Delete P-001" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete participant P-001" });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(db.calls.some((c) => c.method === "DELETE")).toBe(false);
+    await user.click(within(section("Participants")).getByRole("button", { name: "Delete P-001" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Delete participant P-001" })).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(db.calls.at(-1)).toMatchObject({ method: "DELETE" }));
+    await waitFor(() => expect(within(section("Participants")).queryByText("P-001")).toBeNull());
+  });
+
+  it("edits a session's and a consent record's details (never the participant's code)", async () => {
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await screen.findByRole("region", { name: "Participants" });
+    const user = userEvent.setup();
+    await addParticipant(user);
+    db.sessions.push({ id: id(), date: "2026-03-14", place: "Lima", participantIds: [] });
+    db.consents.push({ id: id(), participantId: db.participants[0].id, scope: "audio", date: "2026-03-14" });
+    server.use(
+      http.patch(P("/sessions/:fid"), async ({ request, params }) => {
+        const b = (await request.json()) as any;
+        db.calls.push({ method: "PATCH", path: `/sessions/${params.fid}`, body: b });
+        const s = db.sessions.find((x) => x.id === params.fid);
+        Object.assign(s, b);
+        return HttpResponse.json(s);
+      }),
+      http.patch(P("/consents/:fid"), async ({ request, params }) => {
+        const b = (await request.json()) as any;
+        db.calls.push({ method: "PATCH", path: `/consents/${params.fid}`, body: b });
+        const c = db.consents.find((x) => x.id === params.fid);
+        Object.assign(c, b);
+        return HttpResponse.json(c);
+      }),
+    );
+    // Reload with the new records.
+    await user.click(within(section("Participants")).getByRole("button", { name: "Add participant" }));
+    await user.click(await within(section("Sessions")).findByRole("button", { name: "Edit the session of 2026-03-14" }));
+    const place = within(section("Sessions")).getByRole("textbox", { name: "Place of this session" });
+    await user.clear(place);
+    await user.type(place, "Callao");
+    await user.click(within(section("Sessions")).getByRole("button", { name: "Save session" }));
+    await waitFor(() => expect(db.calls.at(-1)).toMatchObject({ method: "PATCH", body: { place: "Callao" } }));
+    await user.click(within(section("Consent records")).getByRole("button", { name: "Edit consent of P-001" }));
+    const scope = within(section("Consent records")).getByRole("textbox", { name: "Scope of this consent" });
+    await user.clear(scope);
+    await user.type(scope, "audio and photos");
+    await user.click(within(section("Consent records")).getByRole("button", { name: "Save consent" }));
+    await waitFor(() => expect(db.calls.at(-1)).toMatchObject({ method: "PATCH", body: { scope: "audio and photos" } }));
+    expect(db.calls.filter((c) => c.method === "PATCH").every((c) => !("code" in c.body) && !("documentAssetId" in c.body))).toBe(true);
+  });
+
+  it("says so when several forms are dropped on one consent record", async () => {
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    await screen.findByRole("region", { name: "Participants" });
+    const user = userEvent.setup();
+    await addParticipant(user);
+    db.consents.push({ id: id(), participantId: db.participants[0].id, scope: "audio", date: "2026-03-14" });
+    await user.click(within(section("Participants")).getByRole("button", { name: "Add participant" }));
+    const c = section("Consent records");
+    const f = (n: string) => Object.assign(new File(["%PDF"], n), { path: `/Users/ana/${n}` });
+    fireEvent.drop(await within(c).findByText(/Drop the signed consent form here/), { dataTransfer: { files: [f("a.pdf"), f("b.pdf")], types: ["Files"] } });
+    expect((await within(c).findByRole("alert")).textContent).toMatch(/one signed form at a time/);
+    expect(db.calls.some((x) => x.path.endsWith("/document"))).toBe(false);
   });
 
   it("refuses to delete a participant something links to, and says why", async () => {
@@ -115,6 +179,7 @@ describe("Fieldwork", () => {
     await addParticipant(user);
     db.consents.push({ id: id(), participantId: db.participants[0].id, scope: "audio", date: "2026-03-14" });
     await user.click(within(section("Participants")).getByRole("button", { name: "Delete P-001" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Delete participant P-001" })).getByRole("button", { name: "Delete" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be deleted: 1 consent record/);
     expect(within(section("Participants")).getByText("P-001")).toBeTruthy();
   });
@@ -157,7 +222,7 @@ describe("Fieldwork", () => {
     await user.click(within(dialog).getByRole("button", { name: "Withdraw consent" }));
     expect((await screen.findByRole("status", { name: "Fieldwork result" })).textContent).toMatch(/2 sources were flagged for review; nothing was deleted/);
     expect(db.calls.at(-1)).toMatchObject({ method: "POST", body: { reason: "Asked by phone" } });
-    await waitFor(() => expect(within(c).getByText(/Withdrawn on 2026-11-11/)).toBeTruthy());
+    await waitFor(() => expect(within(c).getByText((_, el) => el?.tagName === "STRONG" && /Withdrawn on 2026-11-11/.test(el.textContent ?? ""))).toBeTruthy());
     expect(within(c).queryByRole("button", { name: "Withdraw consent of P-001" })).toBeNull();
   });
 });

@@ -1,13 +1,31 @@
 /**
- * A drop target for documents (protocol approvals, consent forms). The desktop shell gives dropped
- * files their path on disk; the service copies them from there. For keyboard use (and when a path
- * is not available) the full path can be typed instead.
+ * A drop target for documents (protocol approvals, consent forms). The service copies files from
+ * their path on disk, so the drop needs paths, not file contents.
+ *
+ * Paths (Task 37, the Tauri shell): a webview's DOM drop event carries File objects without a path.
+ * The shell is expected to handle drops itself (Tauri's drag-drop event, which gives absolute
+ * paths) and either set `path` on the dropped File objects before this handler sees them, or call
+ * `onPaths` directly. Until it does, a drop without paths shows a message, and for keyboard use the
+ * full path can always be typed instead.
  */
 import { useId, useState, type DragEvent } from "react";
 
 type WithPath = File & { path?: string };
 
-export function FileDrop({ prompt, fieldLabel, onPaths, disabled }: { prompt: string; fieldLabel: string; onPaths: (paths: string[]) => void; disabled?: boolean }) {
+export function FileDrop({
+  prompt,
+  fieldLabel,
+  onPaths,
+  disabled,
+  single,
+}: {
+  prompt: string;
+  fieldLabel: string;
+  onPaths: (paths: string[]) => void;
+  disabled?: boolean;
+  /** Only one file at a time (e.g. a consent record's signed form): several dropped → a message, nothing added. */
+  single?: { message: string };
+}) {
   const id = useId();
   const [over, setOver] = useState(false);
   const [typed, setTyped] = useState("");
@@ -20,6 +38,10 @@ export function FileDrop({ prompt, fieldLabel, onPaths, disabled }: { prompt: st
     const files = [...(e.dataTransfer?.files ?? [])] as WithPath[];
     const paths = files.map((f) => f.path).filter((p): p is string => typeof p === "string" && p !== "");
     if (!files.length) return;
+    if (single && files.length > 1) {
+      setProblem(single.message);
+      return;
+    }
     if (paths.length !== files.length) {
       setProblem("Where these files are on disk could not be read. Type the full path below instead.");
       return;
