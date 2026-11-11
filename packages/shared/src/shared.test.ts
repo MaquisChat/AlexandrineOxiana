@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -31,5 +31,14 @@ describe("@ao/shared", () => {
     expect(inferGenericFamily("Consolas")).toBe("monospace");
     expect(inferGenericFamily("Some Unknown Face")).toBeUndefined();
     expect(splitFontFamilies("'A, B', \"C\", D")).toEqual(["'A, B'", '"C"', "D"]);
+  });
+
+  it("media ticket addresses (R135): /media/ and 43 base64url characters, nothing else", () => {
+    const t = "A".repeat(42) + "_";
+    expect(isMediaTicketPath(`/media/${t}`)).toBe(true);
+    expect(MEDIA_TICKET_PATH.test(`/media/${t}`)).toBe(true);
+    for (const bad of [`/media/${t}?x=1`, `/media/${t}#f`, `/media/${t}/`, `/media/${t}A`, `/media/${"A".repeat(42)}`, `/media/${"A".repeat(42)}=`, `//media/${t}`, `http://127.0.0.1:1/media/${t}`, `/media/../${t}`]) {
+      expect(isMediaTicketPath(bad), bad).toBe(false);
+    }
   });
 });
