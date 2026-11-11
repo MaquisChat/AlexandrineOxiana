@@ -1,0 +1,272 @@
+diff --git a/e2e/fixtures.ts b/e2e/fixtures.ts
+index daae1f4..3e1cb0a 100644
+--- a/e2e/fixtures.ts
++++ b/e2e/fixtures.ts
+@@ -218,6 +218,40 @@ export interface StartOptions {
+   command?: string[];
+   /** How long to wait for `AO_SERVICE_READY` (default 60 s). */
+   readyTimeoutMs?: number;
++  /** Told of the child the moment it is spawned, before it is ready (so a caller can always kill it). */
++  onSpawn?: (child: ChildProcess) => void;
++}
++
++/**
++ * Every service process a test spawned that has not been seen to exit. Teardown closes it: what is
++ * still running then (a service still starting when the test timed out, or one still stopping) is
++ * killed with everything it started, and a child spawned after that is killed at once.
++ */
++export class SpawnedServices {
++  private readonly live = new Set<ChildProcess>();
++  private closed = false;
++
++  track(child: ChildProcess): void {
++    if (this.closed) {
++      void killTree(child);
++      return;
++    }
++    this.live.add(child);
++    child.once("exit", () => this.live.delete(child));
++  }
++
++  get isClosed(): boolean {
++    return this.closed;
++  }
++
++  /** Kills every service still running (and what it started); returns one line per service killed. */
++  async close(): Promise<string[]> {
++    this.closed = true;
++    const left = [...this.live].filter((c) => c.exitCode === null && c.signalCode === null);
++    await Promise.all(left.map((c) => killTree(c)));
++    this.live.clear();
++    return left.map((c) => `A service process (pid ${c.pid}) was still running at teardown and was killed with what it started.`);
++  }
+ }
+ 
+ /**
+@@ -239,6 +273,7 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
+   });
+   const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];
+   const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
++  opts.onSpawn?.(child);
+   const log: string[] = [];
+   createInterface({ input: child.stderr! }).on("line", (l) => log.push(`[stderr] ${l}`));
+   const readyMs = opts.readyTimeoutMs ?? 60_000;
+@@ -309,9 +344,11 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
+     /** The output of every service this test started (a restart starts another). */
+     const logs: string[][] = [];
+     const restartListeners: Array<() => Promise<void>> = [];
++    const spawned = new SpawnedServices();
++    const start = () => startService(root, { onSpawn: (c) => spawned.track(c) });
+     try {
+       await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
+-      svc = await startService(root);
++      svc = await start();
+       logs.push(svc.log);
+       const harness: AppHarness = {
+         root,
+@@ -343,7 +380,9 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
+           problems.push(...(await stopService(old.child)));
+           expect(problems, "the service and the processes it started stop cleanly before a restart").toEqual([]);
+           await whileStopped?.();
+-          svc = await startService(root);
++          // The test may have ended (timed out) meanwhile: never start a service after teardown began.
++          if (spawned.isClosed) throw new Error("The test ended while the service was being restarted.");
++          svc = await start();
+           logs.push(svc.log);
+           harness.port = svc.port;
+           harness.baseUrl = `http://127.0.0.1:${svc.port}`;
+@@ -356,6 +395,8 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
+     } finally {
+       try {
+         if (svc) problems.push(...(await stopService(svc.child)));
++        // Anything else still running: a service still starting or stopping when the test ended.
++        problems.push(...(await spawned.close()));
+         if (logs.length && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
+           await testInfo.attach("service-log", { body: logs.map((l) => l.join("\n")).join("\n--- the service was restarted ---\n"), contentType: "text/plain" });
+         }
+@@ -427,8 +468,8 @@ export const OPEN_RULES = "identifiability:\n  containsIdentifiable: false\nencr
+ /**
+  * Test set-up through the service: a library at `librariesDir/<folder>` and a project in it with
+  * `governanceYaml` (encrypted with `passphrase` when one is given, else not), then the page loaded
+- * onto the library screen with that project selected. (The UI has no "New project" control yet; the
+- * library chooser itself is covered by the smoke test.)
++ * onto the library screen with that project selected. (The library chooser and the New project dialog
++ * are covered by the smoke test; the scenarios here are about what comes after.)
+  */
+ export async function libraryWithProject(
+   app: AppHarness,
+@@ -447,31 +488,36 @@ export async function libraryWithProject(
+   return { libraryPath, projectId: created.body.project.id, projectFolder: created.body.project.folder };
+ }
+ 
++/** A recorded defect (Task 45 report): its id and the step it blocks, in words. */
++export interface Defect {
++  id: string;
++  title: string;
++}
++
++/** How long the assertion that decides a defect test may wait: the state it reads is already there. */
++export const DEFECT_TIMEOUT = 5_000;
++
+ /**
+- * A step the product cannot do yet because of a recorded defect: it is not run, it shows in the
+- * report as a skipped step named "FIXME <defect>: <title>", and the test carries a "fixme"
+- * annotation naming the defect. The body is the step as it should pass once the defect is fixed:
+- * replace `blockedBy(...)` with `test.step(...)` then. The scenario goes on after it as far as it can.
+- *
+- * With AO_E2E_CHECK_DEFECTS=1 the body is run instead, and the step fails if it passes: a check that
+- * each recorded defect still reproduces (a body that fails may leave the page elsewhere; the steps
+- * after a blocked one start from a known address for that reason).
++ * Inside a scenario, where a step cannot be done yet because of `d`: the step shows in the report as
++ * skipped, "BLOCKED <id>: <title>", and the test carries a "blocked" annotation. The scenario goes on
++ * after it as far as it can. The step itself runs in its own test, `defectTest(d, …)`, which notices
++ * when the defect is fixed.
+  */
+-export async function blockedBy(defect: string, title: string, body: () => Promise<void>): Promise<void> {
+-  test.info().annotations.push({ type: "fixme", description: `${defect}: ${title}` });
+-  if (process.env.AO_E2E_CHECK_DEFECTS === "1") {
+-    await test.step(`DEFECT CHECK ${defect}: ${title}`, async () => {
+-      const outcome = await body().then(
+-        () => "passed",
+-        // (without the colour codes of Playwright's messages)
+-        (err: unknown) => `reproduces: ${String(err instanceof Error ? err.message : err).replace(/\u001b\[[0-9;]*m/gu, "").split("\n")[0]}`,
+-      );
+-      test.info().annotations.push({ type: "defect-check", description: `${defect} ${outcome}` });
+-      if (outcome === "passed") throw new Error(`${defect} no longer reproduces ("${title}" passes): replace blockedBy with test.step.`);
+-    });
+-    return;
+-  }
+-  await test.step.skip(`FIXME ${defect}: ${title}`, body);
++export async function blockedBy(d: Defect): Promise<void> {
++  test.info().annotations.push({ type: "blocked", description: `${d.id}: ${d.title}` });
++  await test.step.skip(`BLOCKED ${d.id}: ${d.title} (checked by the test "${d.id}: …")`, async () => {});
++}
++
++/**
++ * From this call on, the running test is expected to fail because of `d` (Playwright's test.fail):
++ * it is reported "expected to fail" while the defect reproduces, and it fails the run as soon as it
++ * passes, i.e. once the defect is fixed (then turn the step in its scenario back into a test.step and
++ * delete the defect test). Set-up done before this call fails the test as usual, so only the
++ * assertions after it are covered. Use `DEFECT_TIMEOUT` on them.
++ */
++export function expectDefect(d: Defect): void {
++  test.info().annotations.push({ type: "defect", description: `${d.id}: ${d.title}` });
++  test.fail(true, `${d.id}: ${d.title}`);
+ }
+ 
+ /**
+diff --git a/e2e/harness.spec.ts b/e2e/harness.spec.ts
+index 8553b3e..c9514ea 100644
+--- a/e2e/harness.spec.ts
++++ b/e2e/harness.spec.ts
+@@ -86,7 +86,7 @@ test("a restart relaunches the service on the same settings: new port and token,
+   blocked.length = 0;
+ });
+ 
+-test("a request to anywhere but the app and its service is refused",async ({ page, app, blocked }) => {
++test("a request to anywhere but the app and its service is refused", async ({ page, app, blocked }) => {
+   // The app's CSP already refuses other sites; another loopback port is what it would let through.
+   // (A low port such as 1 would be refused by WebKit's own list of unsafe ports, before the harness sees it.)
+   const elsewhere = `http://127.0.0.1:${app.port < 65535 ? app.port + 1 : app.port - 1}/`;
+diff --git a/e2e/import.spec.ts b/e2e/import.spec.ts
+index 9194e34..718681a 100644
+--- a/e2e/import.spec.ts
++++ b/e2e/import.spec.ts
+@@ -96,28 +96,68 @@ const ZOTERO_TITLES = ["Feeding the City: Informal Markets in Lagos", "Markets a
+ const REVIEWED = "Street Vendors in Accra";
+ const REVIEWED_AS = "Street Vendors in Accra, 2018–2020";
+ 
+-test("scenario 3: bulk import of a Zotero data folder — collections, review, report, undo, import again", async ({ page, app }) => {
++const D1: Defect = { id: "D1", title: "back from the review queue to the import's report and its Undo" };
++const D2: Defect = { id: "D2", title: "after a decision in the review queue, the library row no longer carries “Needs review” (R137)" };
++const D4: Defect = { id: "D4", title: "with “Copy into the library”, an approved Zotero linked file is copied in, and the report gives the files copied and the files left as links (R136)" };
++
++/** A library and project, the Zotero fixture data folder, and readers of what the service holds. */
++async function zoteroSetUp(app: AppHarness, page: Page) {
+   const dataDir = join(app.root, "sources", "Zotero");
+   const linkedDir = join(app.root, "sources", "linked");
+-  let projectId = "";
+-  let libraryPath = "";
+-  let projectFolder = "";
+-  const sourcesOnDisk = () => readdirSync(join(libraryPath, projectFolder, "Sources")).filter((n) => !n.startsWith("."));
+-  const listed = async () => (await app.api<SourceList>("GET", `/projects/${projectId}/sources?limit=500`)).body;
+-  const collections = async () => (await app.api<{ collections: Array<{ id: string; name: string; parentId?: string }> }>("GET", `/projects/${projectId}/collections`)).body.collections;
+-  const batches = async () => (await app.api<{ batches: Batch[] }>("GET", `/projects/${projectId}/imports`)).body.batches;
+-  /** The PDF of "Markets and Memory": in Zotero a linked file outside the data folder. */
+-  const linkedPdfAsset = async () => {
+-    const book = (await listed()).items.find((i) => i.title === "Markets and Memory")!;
+-    const stored = (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${book.id}`)).body;
+-    return stored.assets.find((a) => a.role === "original" && a.mime === "application/pdf");
++  // Five items in the user library (two in collections Urban > Food), one linked PDF outside the data folder.
++  const fx = buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "okafor zotero" }), linkedPdf: await buildPdf({ extra: "adebayo linked" }), linkedDir });
++  const { projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Urban food library", project: "Market studies" });
++  const listed = async (query = "") => (await app.api<SourceList>("GET", `/projects/${projectId}/sources?limit=500${query}`)).body;
++  return {
++    dataDir,
++    linkedDir,
++    linkedPdfPath: fx.linkedPdf,
++    projectId,
++    libraryPath,
++    projectFolder,
++    listed,
++    sourcesOnDisk: () => readdirSync(join(libraryPath, projectFolder, "Sources")).filter((n) => !n.startsWith(".")),
++    collections: async () => (await app.api<{ collections: Array<{ id: string; name: string; parentId?: string }> }>("GET", `/projects/${projectId}/collections`)).body.collections,
++    batches: async () => (await app.api<{ batches: Batch[] }>("GET", `/projects/${projectId}/imports`)).body.batches,
++    /** The PDF of "Markets and Memory": in Zotero a linked file outside the data folder. */
++    linkedPdfAsset: async () => {
++      const book = (await listed()).items.find((i) => i.title === "Markets and Memory")!;
++      const stored = (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${book.id}`)).body;
++      return stored.assets.find((a) => a.role === "original" && a.mime === "application/pdf");
++    },
+   };
++}
++
++/** The wizard's Zotero import with its defaults ("Copy into the library"), the outside folder approved. */
++async function importZotero(page: Page, dataDir: string): Promise<void> {
++  await page.getByRole("link", { name: "Back to library" }).or(page.getByRole("link", { name: "Import", exact: true })).first().isVisible();
++  await openWizard(page, "Zotero library", "Zotero data folder", dataDir);
++  await scanAndRun(page, () => page.getByRole("checkbox", { name: "Approve this folder and its subfolders" }).check());
++}
++
++/** From the report: the review queue, and a plain Accept of its one item. */
++async function acceptTheReviewItem(page: Page): Promise<void> {
++  await page.getByRole("link", { name: "Open the review queue (1 item)" }).click();
++  await expect(page.getByRole("list", { name: "Items waiting for review (1)" })).toBeVisible();
++  await page.getByRole("group", { name: "Decide this item" }).getByRole("button", { name: "Accept" }).click();
++  await expect(page.getByText("Nothing is waiting for review in this import.")).toBeVisible();
++}
++
++test("scenario 3: bulk import of a Zotero data folder — collections, review, report, undo, import again", async ({ page, app }) => {
++  // Three imports and two undos against the real service: three times the usual time on a slow machine.
++  test.slow();
++  let z!: Awaited<ReturnType<typeof zoteroSetUp>>;
++  let projectId = "";
++  const listed = (query = "") => z.listed(query);
++  const collections = () => z.collections();
++  const batches = () => z.batches();
++  const sourcesOnDisk = () => z.sourcesOnDisk();
+ 
+   await test.step("set-up: the Zotero fixture data folder, a library and a project (through the service)", async () => {
+-    // Five items in the user library (two in collections Urban > Food), one linked PDF outside the data folder.
+-    buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "okafor zotero" }), linkedPdf: await buildPdf({ extra: "adebayo linked" }), linkedDir });
+-    ({ projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Urban food library", project: "Market studies" }));
++    z = await zoteroSetUp(app, page);
++    projectId = z.projectId;
+   });
++  const { dataDir, linkedDir } = z;
+ 
+   await test.step("the wizard scans the Zotero data folder and asks about the file outside it", async () => {
+     await openWizard(page, "Zotero library", "Zotero data folder", dataDir);
+diff --git a/e2e/paths.ts b/e2e/paths.ts
+index 621c35c..2f2742c 100644
+--- a/e2e/paths.ts
++++ b/e2e/paths.ts
+@@ -5,7 +5,7 @@ export const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
+ export const UI_DIST = fileURLToPath(new URL("../packages/ui/dist/", import.meta.url));
+ /** @ao/library: its sources (run with tsx) and dependencies serve test set-up and checks. */
+ export const LIBRARY_DIR = fileURLToPath(new URL("../packages/library/", import.meta.url));
+-export const SERVICE_DIR =fileURLToPath(new URL("../apps/library-service/", import.meta.url));
++export const SERVICE_DIR = fileURLToPath(new URL("../apps/library-service/", import.meta.url));
+ /** Fake yt-dlp and gallery-dl: put first on the worker's PATH so no capture reaches the network. */
+ export const FAKE_TOOLS = fileURLToPath(new URL("../packages/library/tests/fixtures/fake-tools", import.meta.url));
+ /** Recorded metadata answers (answers.json) replayed by the service under NODE_ENV=test. */

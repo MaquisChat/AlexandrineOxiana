@@ -419,10 +419,10 @@ Update after every task; commit and push.
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | not started | | unblocked (43, 60 done); starts when Task 45 has merged, since both may extend `e2e/fixtures.ts` |
-| 45 Scenarios 3, 4, 6, 8 | fix round 1 | 7089d9f (worktree branch) | spec met; 3 Important in the test code; defects D1–D7 for Task 46 (R136, R137) |
+| 45 Scenarios 3, 4, 6, 8 | paused, fix round 1 | cdc42d7; `docs/handoff/wip/task-45-*.patch` | spec met; 3 Important in the test code; defects D1–D7 for Task 46 (R136, R137) |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
-| 34a Service additions | in review | 0dd43ae (worktree branch) | adversarial security review dispatched |
+| 34a Service additions | paused, in review | 0dd43ae; `docs/handoff/wip/task-34a-committed.patch` | usage limit stopped the reviewer at the start |
 | 34b Capture screen | not started | | |
 | 34c Transcript viewer | not started | | |
 | 34d Verification badges | not started | | |
@@ -430,9 +430,9 @@ Update after every task; commit and push.
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | in review | 23d4ee8 (worktree branch) | adversarial review dispatched |
+| 49 Backups governed | paused, fix round 1 | 23d4ee8; `docs/handoff/wip/task-49-committed.patch` | reviewed: 1 Critical, 4 Important (R138) |
 | 50 No silent refusals | not started | | |
-| 51 Job records in files | in progress | | implementer dispatched |
+| 51 Job records in files | paused, early | `docs/handoff/wip/task-51-uncommitted.patch` | usage limit stopped the implementer |
 | 61 New recovery code | not started | | found by the Task 60 review |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
@@ -482,6 +482,7 @@ Each phase gets its own plan when it starts.
 - 2026-11-11: owner approved the plan. Milestone I started: handoff docs merged and corrected (39), rulings R120–R128 recorded (40), build fixed (38), CI extended (42), three reviewers dispatched for the never-reviewed commits (41a, 41b).
 - 2026-11-11: reviews of the never-reviewed commits found 1 Critical and 9 Important defects (ledger, R131); fixes dispatched. Task 43 built the harness: real UI, service and worker pass in Chromium and WebKit with the service unchanged. It found that the UI cannot create a project: Task 60 added.
 - 2026-11-11: Task 37e done (ADR 0014, R133). Task 52 done and sent to the owner. Task 60 built, in review. Task 41a in fix round 2. GitHub's runners cannot reach the Ubuntu mirror today; CI has time limits now but no completed run yet.
+- 2026-11-11, 17:00 UTC: the account's usage limit (resets 19:20 UTC) stopped four agents; their unmerged work is saved under `docs/handoff/wip/`. Milestone I is complete; Tasks 43, 60, 52 and 37e are done; Tasks 34a, 45, 49 and 51 are paused.
 
 ## 12. What the ledger check changed
 
