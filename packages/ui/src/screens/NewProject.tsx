@@ -9,11 +9,12 @@
  * is decided by @ao/core's own governance code on the rules as they would be sent without
  * encryption, the same check the service makes before it refuses (projects.ts in @ao/library).
  *
- * An encrypted project's recovery code is returned by the service once. It is shown here once,
- * through UserText, with a copy button; it is never logged, put in the address or stored, and the
- * dialog cannot be closed until the researcher confirms it is saved. Until then nothing in the app
- * takes it away (R134 I2): unloading asks first, in-app links and Back/Forward are refused with a
- * plain message, and a library closed underneath waits for the confirmation.
+ * An encrypted project's recovery code is returned by the service once. It is shown here once by
+ * RecoveryCodeStep (shared with the new-recovery-code dialog, Task 61): through UserText, with a copy
+ * button; it is never logged, put in the address or stored, and the dialog cannot be closed until the
+ * researcher confirms it is saved. Until then nothing in the app takes it away (R134 I2): unloading
+ * asks first, in-app links and Back/Forward are refused with a plain message, and a library closed
+ * underneath waits for the confirmation.
  *
  * An answer lost after sending (the service unreachable, a 5xx, an unreadable answer) leaves the
  * outcome unknown (R134 I1). The project list read just before sending is compared with a fresh one:
@@ -35,8 +36,8 @@ import { parseGovernance } from "@ao/core/src/governance/schema";
 import { ApiClientError } from "../api/client";
 import type { Profile } from "../api/governance";
 import { errorText, type LibraryApi, type ProjectSummary } from "../api/library";
+import { RecoveryCodeStep } from "../components/RecoveryCodeStep";
 import { UserText } from "../components/UserText";
-import { blockNavigation } from "../navigation";
 import { PROFILE_LABEL, PROFILE_REQUIREMENTS, PROFILE_VENDOR_RULES, PROFILES, profileOnEntries, readConfig, setManyIn } from "./governanceModel";
 import "../components/library.css";
 import "./NewProject.css";
@@ -158,7 +159,7 @@ const outcomeUnknown = (err: unknown) => !(err instanceof ApiClientError) || err
 /** After an answer was lost: being checked, or the check could not be made. */
 type Uncertain = "checking" | "cannot-tell";
 
-export const LEAVE_REFUSED = "Save the recovery code first. It is shown only here, and leaving now would lose it for good. Tick “I have saved the recovery code”, then choose Done.";
+export { LEAVE_REFUSED } from "../components/RecoveryCodeStep";
 
 export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed }: NewProjectProps) {
   const id = useId();
@@ -174,10 +175,6 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   const [busy, setBusy] = useState(false);
   /** After creating an encrypted project: the project and its recovery code, until confirmed. */
   const [made, setMade] = useState<{ project: ProjectSummary; code: string } | null>(null);
-  const [saved, setSaved] = useState(false);
-  const [copied, setCopied] = useState<string | null>(null);
-  /** An attempt to leave the recovery code was refused. */
-  const [leaveRefused, setLeaveRefused] = useState(false);
   /** The answer to a create was lost (R134 I1). */
   const [uncertain, setUncertain] = useState<Uncertain | null>(null);
   /** A project found after a lost answer: created, but its recovery code was never shown. */
@@ -199,7 +196,6 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   const passRef = useRef<HTMLInputElement>(null);
   const againRef = useRef<HTMLInputElement>(null);
   const alertRef = useRef<HTMLParagraphElement>(null);
-  const codeHeading = useRef<HTMLHeadingElement>(null);
   const [host] = useState(() => document.createElement("div"));
   const returnTo = useRef(returnFocusTo);
   returnTo.current = returnFocusTo;
@@ -224,56 +220,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   }, [host]);
 
   useEffect(() => {
-    if (made) codeHeading.current?.focus();
-  }, [made]);
-  useEffect(() => {
     if (found) foundHeading.current?.focus();
   }, [found]);
-
-  // While the recovery code is on screen and not confirmed, nothing may take it away (R134 I2):
-  // unloading asks first; in-app links and navigate() are refused; Back and Forward land on a copy
-  // of this same address (pushed now, without state) and are refused too. All of it ends when the
-  // code is confirmed or the dialog goes.
-  const pendingRef = useRef(onRecoveryPending);
-  pendingRef.current = onRecoveryPending;
-  const guarding = made !== null;
-  /** Ends the guards at once (Done: whatever the parent does next, such as leaving a closed library, may navigate). */
-  const releaseGuard = useRef<(() => void) | null>(null);
-  useEffect(() => {
-    if (!guarding) return;
-    pendingRef.current?.(true);
-    const refuse = () => setLeaveRefused(true);
-    const onUnload = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = ""; // older engines ask only when this is set
-    };
-    window.addEventListener("beforeunload", onUnload);
-    const unblock = blockNavigation(refuse);
-    const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    window.history.pushState(null, "", here);
-    let restoring = false;
-    const onPop = () => {
-      if (restoring) return;
-      refuse();
-      restoring = true;
-      window.history.pushState(null, "", here);
-      // Screens that already followed the address follow it back (in the same task, before React renders).
-      window.dispatchEvent(new PopStateEvent("popstate"));
-      restoring = false;
-    };
-    window.addEventListener("popstate", onPop);
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      window.removeEventListener("beforeunload", onUnload);
-      window.removeEventListener("popstate", onPop);
-      unblock();
-      pendingRef.current?.(false);
-    };
-    releaseGuard.current = release;
-    return release;
-  }, [guarding]);
 
   const requirement = encryptionRequirement({ profiles, identifiable });
   const mandatory = requirement.required || serviceNeedsEncryption;
@@ -396,22 +344,11 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     onCancel(uncertain === "cannot-tell" && p ? p : undefined);
   };
 
-  const copy = async () => {
-    if (!made) return;
-    try {
-      if (!navigator.clipboard) throw new Error("no clipboard");
-      await navigator.clipboard.writeText(made.code);
-      setCopied("Copied.");
-    } catch {
-      setCopied("Copying did not work here. Select the code and copy it, or write it down.");
-    }
-  };
-
+  /** The recovery code is saved (RecoveryCodeStep has ended its guards). */
   const finish = () => {
-    if (!made || !saved) return;
+    if (!made) return;
     const project = made.project;
     setMade(null); // the code is not kept once confirmed
-    releaseGuard.current?.();
     onCreated(project);
   };
 
@@ -453,48 +390,24 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     <div className="ao-newproject-backdrop">
       <div ref={box} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-busy={busy || undefined} className="ao-newproject" onKeyDown={onKeyDown}>
         {made ? (
-          <>
-            <h2 id={titleId} ref={codeHeading} tabIndex={-1}>
-              Save the recovery code
-            </h2>
-            {leaveRefused && (
-              <p role="alert" className="ao-error">
-                {LEAVE_REFUSED}
-              </p>
-            )}
-            {libraryClosed && (
-              <p role="status" className="ao-newproject__warning">
-                The library was closed while this was open. The project was created; once you have saved its recovery code, you return to choosing a library.
-              </p>
-            )}
+          <RecoveryCodeStep
+            titleId={titleId}
+            code={made.code}
+            onPendingChange={onRecoveryPending}
+            onDone={finish}
+            notice={
+              libraryClosed && (
+                <p role="status" className="ao-newproject__warning">
+                  The library was closed while this was open. The project was created; once you have saved its recovery code, you return to choosing a library.
+                </p>
+              )
+            }
+          >
             <p>
               <UserText>{made.project.name}</UserText> is created and encrypted. This is its recovery code. This is the only time it is shown: the app does not keep a copy.
             </p>
             <p className="ao-newproject__warning">Without the passphrase or this recovery code, no one can open this project — not you, and not anyone who helps you.</p>
-            <UserText as="p" className="ao-newproject__code">
-              {made.code}
-            </UserText>
-            <div className="ao-row">
-              <button type="button" onClick={() => void copy()}>
-                Copy recovery code
-              </button>
-              {copied && (
-                <span role="status" className="ao-muted">
-                  {copied}
-                </span>
-              )}
-            </div>
-            <p className="ao-muted">Keep it somewhere safe and separate from this computer, such as a password manager or a printed copy in a locked drawer.</p>
-            <label className="ao-newproject__choice">
-              <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} />
-              I have saved the recovery code
-            </label>
-            <div className="ao-row ao-newproject__actions">
-              <button type="button" disabled={!saved} onClick={finish}>
-                Done
-              </button>
-            </div>
-          </>
+          </RecoveryCodeStep>
         ) : found ? (
           <>
             <h2 id={titleId} ref={foundHeading} tabIndex={-1}>
