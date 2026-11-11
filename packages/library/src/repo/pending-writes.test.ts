@@ -328,6 +328,41 @@ describe("pending writes: the resolve is durable before it acts (R131 c, d)", ()
     });
   }
 
+  it("N1: a crash while the txn.resolve line is being written (roll back): the next open trims the torn line, completes and audits once", async () => {
+    const { repo, pid } = await uncommittedOnReopen();
+    const [pw] = await repo.pendingWrites();
+    seams.crashAt = "torn-audit";
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(SimulatedCrash);
+    expect(await markers()).toHaveLength(1);
+    await finishedAfterReopen(pw!.txn, pid);
+  });
+
+  it("N1: a torn txn.resolve line, then resolving again in the same session, finishes it, audited once", async () => {
+    const { repo, pid } = await uncommittedOnReopen();
+    const [pw] = await repo.pendingWrites();
+    seams.crashAt = "torn-audit";
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(SimulatedCrash);
+    await repo.resolvePendingWrite(pw!.txn, "roll-back");
+    expect(await markers()).toEqual([]);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toHaveLength(1);
+    await add(repo, pid, "After");
+  });
+
+  it("N1: a crash while the txn.resolve line is being written (keep): the next open trims the torn line, completes and audits once", async () => {
+    let repo = await repoFor();
+    const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    seams.crashAt = "before-marker-delete";
+    await expect(add(repo, pid, "Committed")).rejects.toBeInstanceOf(SimulatedCrash);
+    const [pw] = await repo.pendingWrites();
+    seams.crashAt = "torn-audit";
+    await expect(repo.resolvePendingWrite(pw!.txn, "keep")).rejects.toBeInstanceOf(SimulatedCrash);
+    repo = await reopen();
+    expect(await markers()).toEqual([]);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve").map((e) => e.details)).toEqual([expect.objectContaining({ txn: pw!.txn, choice: "keep" })]);
+    expect(repo.integrityWarnings.map((w) => w.kind)).not.toContain("incomplete-audit-line-pending");
+    await add(repo, pid, "After");
+  });
+
   it("keep: a crash after the audit event leaves a marker the next open removes, with no second record", async () => {
     let repo = await repoFor();
     const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;

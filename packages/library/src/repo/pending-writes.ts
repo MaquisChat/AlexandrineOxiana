@@ -21,9 +21,11 @@
  * records the mismatch first. Runs serialised with every other write, so no marker of a change in
  * progress is ever listed or touched.
  */
-import { posix } from "node:path";
+import { createHash } from "node:crypto";
+import { join, posix } from "node:path";
 import { verifyChain, type AuditEvent } from "@ao/core";
-import { AuditStore, checkAnchor, type Head } from "./audit-store.js";
+import { AuditStore, auditSegments, checkAnchor, type Head } from "./audit-store.js";
+import { assertContained, incompleteTail, truncateDurable } from "./io.js";
 import { NotFoundError, PendingWriteChoiceError, PendingWriteIncompleteError } from "./errors.js";
 import { scanIncompleteLines } from "./incomplete-lines.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
@@ -114,6 +116,24 @@ function whyNot(i: MarkerInspection, choice: PendingWriteChoice): string {
 }
 
 /**
+ * Cuts an incomplete last line off the project's last audit segment (41a N1). While a marker holds
+ * the project nothing else appends to its audit log, so such a line is a `txn.resolve` event torn by
+ * an earlier attempt (or a line cut off before the marker, which is never a committed record
+ * either, R28). Returns its size and hash, recorded in the `txn.resolve` event.
+ */
+async function trimTornAuditLine(core: RepoCore, projectFolder: string): Promise<{ bytes: number; sha256: string } | undefined> {
+  const dir = core.abs(`${projectFolder}/audit`);
+  const last = (await auditSegments(dir)).at(-1);
+  if (!last) return undefined;
+  const path = join(dir, last);
+  await assertContained(core.abs(projectFolder), path);
+  const found = await incompleteTail(path);
+  if (!found) return undefined;
+  await truncateDurable(path, found.keep);
+  return { bytes: found.tail.length, sha256: createHash("sha256").update(found.tail).digest("hex") };
+}
+
+/**
  * Carries out a choice, durably (R131 c): records it in the marker, does it (repeatably), appends
  * the `txn.resolve` event through `audit`, then removes the marker. A recorded choice whose event is
  * already written only has its marker removed. Throws PendingWriteIncompleteError when a step failed
@@ -140,7 +160,9 @@ async function carryOut(
       );
     }
     maybeCrash("before-audit");
-    await audit({ txn: m.txn, choice, status: rec.status, steps: m.entries.length });
+    // A txn.resolve line torn by an earlier attempt would refuse every append after it (41a N1).
+    const trimmed = await trimTornAuditLine(core, m.projectFolder);
+    await audit({ txn: m.txn, choice, status: rec.status, steps: m.entries.length, ...(trimmed ? { trimmedIncompleteLine: trimmed } : {}) });
     maybeCrash("before-marker-delete");
   }
   await removeMarker(core.root, m);
