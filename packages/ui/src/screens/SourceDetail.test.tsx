@@ -383,6 +383,15 @@ describe("SourceDetail: background work for the source (R84)", () => {
     expect(within(work).getByText(/could not be made/)).toBeTruthy();
   });
 
+  it("text recognition that did not finish is listed too, with the same retry", async () => {
+    const ocr = { ...SOURCE_FILE, fields: [], pendingOcr: [{ id: "o1", assetId: "a1", queuedAt: "2026-11-01T10:00:00Z", failed: { code: "SOMETHING_NEW", at: "2026-11-01T10:01:00Z" } }] };
+    server.use(...sourceHandlers(ocr));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    expect(within(work).getByRole("listitem").textContent).toBe("Text recognition of smith-2019.pdf did not finish: the media helper could not finish it (1 attempt).");
+    expect(within(work).getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
   it("no background work: no such section", async () => {
     server.use(...sourceHandlers(VERIFIED_SOURCE));
     render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);

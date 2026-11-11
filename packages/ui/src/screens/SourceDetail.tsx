@@ -239,8 +239,8 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       return a ? baseName(a.path) : "a file";
     };
     return [
-      ...(file?.pendingProxies ?? []).map((j) => ({ job: j, what: "viewing copy", name: name(j.assetId) })),
-      ...(file?.pendingOcr ?? []).map((j) => ({ job: j, what: "text recognition", name: name(j.assetId) })),
+      ...(file?.pendingProxies ?? []).map((j) => ({ job: j, what: "viewing copy" as const, name: name(j.assetId) })),
+      ...(file?.pendingOcr ?? []).map((j) => ({ job: j, what: "text recognition" as const, name: name(j.assetId) })),
     ];
   }, [file]);
   const anyFailed = jobs.some((j) => j.job.failed);
@@ -522,18 +522,34 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   );
 }
 
-function JobRow({ job, what, name }: { job: PendingJob; what: string; name: string }) {
+function JobRow({ job, what, name }: { job: PendingJob; what: "viewing copy" | "text recognition"; name: string }) {
   const f = job.failed;
   const attempts = f?.attempts ?? 1;
+  const tries = `(${attempts} ${attempts === 1 ? "attempt" : "attempts"})`;
+  if (what === "text recognition") {
+    return (
+      <li>
+        {f ? (
+          <>
+            Text recognition of <UserText>{name}</UserText> did not finish: {jobReason(f.code)} {tries}.
+          </>
+        ) : (
+          <>
+            Text recognition of <UserText>{name}</UserText> has not run yet. It runs in the background once the media helper is available.
+          </>
+        )}
+      </li>
+    );
+  }
   return (
     <li>
       {f ? (
         <>
-          The {what} of <UserText>{name}</UserText> could not be made: {jobReason(f.code)} ({attempts} {attempts === 1 ? "attempt" : "attempts"}).
+          The viewing copy of <UserText>{name}</UserText> could not be made: {jobReason(f.code)} {tries}.
         </>
       ) : (
         <>
-          The {what} of <UserText>{name}</UserText> has not been made yet. It is made in the background once the media helper is available.
+          The viewing copy of <UserText>{name}</UserText> has not been made yet. It is made in the background once the media helper is available.
         </>
       )}
     </li>
