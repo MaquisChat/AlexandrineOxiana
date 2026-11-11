@@ -3,16 +3,31 @@
  * publisher through the governed PATCH route (other title variants are kept); it is off while the
  * library is read-only. Archived HTML snapshots are never rendered here: captured HTML is shown
  * only through SnapshotFrame (R101).
+ *
+ * Task 34d: a verification badge beside each checked field (its evidence and Confirm in a popover;
+ * R37–R40), **Recheck** for the source, the source's pictures (screenshots, image viewing copies)
+ * read with the token and shown as blob URLs that are revoked when no longer shown (R135 1), its
+ * viewing copies and text recognition that failed or are still waiting, with their plain reasons
+ * and a retry (R84), and a link to the transcript viewer when it has a transcript. Badges come only
+ * from the record's field checks: a cleared review item does not make them say "confirmed by you"
+ * (R137). Every answer is dropped when the source changed, the screen closed or the project locked
+ * in the meantime.
  */
-import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { errorText, isProjectLocked, type Creator, type LibraryApi, type SourceFile, type SourcePatch } from "../api/library";
+import { FIELD_LABELS } from "@ao/core/src/verify/checks";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { errorText, isProjectLocked, type Asset, type Creator, type LibraryApi, type SourcePatch } from "../api/library";
+import { isShowablePicture, type FieldReview, type PendingJob, type VerifiedSource } from "../api/verification";
 import { CitePanel } from "../components/CitePanel";
 import { typeLabel } from "../components/SourceTable";
+import { TranscriptLink } from "../components/TranscriptLink";
 import { UserText } from "../components/UserText";
+import { FieldCheck } from "../components/VerificationBadge";
+import { valueText } from "../components/FieldEvidencePopover";
 import "../components/library.css";
+import "../components/verification.css";
 
 export interface SourceDetailProps {
-  api: Pick<LibraryApi, "sources" | "citations">;
+  api: Pick<LibraryApi, "sources" | "citations" | "verification">;
   projectId: string;
   sourceId: string;
   readOnly: boolean;
@@ -20,6 +35,8 @@ export interface SourceDetailProps {
   onChanged?: () => void;
   /** The service said the project is locked (R114 I4): the shell shows UnlockProject. */
   onLocked?: () => void;
+  /** Changing it reads the source again (a project-wide recheck finished, R99). */
+  refreshKey?: number;
 }
 
 const IDENTIFIER_LABELS: Record<string, string> = { doi: "DOI", isbn: "ISBN", issn: "ISSN", pmid: "PubMed ID", pmcid: "PubMed Central ID", arxiv: "arXiv", url: "Web address" };
@@ -31,6 +48,7 @@ export function creatorName(c: Creator): string {
 
 const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).at(-1) ?? p;
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
+const fieldLabel = (pointer: string) => FIELD_LABELS[pointer] ?? pointer.replace(/^\//, "").replace(/\//g, " ");
 
 function formatBytes(n: number | undefined): string {
   if (n === undefined) return "";
@@ -39,12 +57,57 @@ function formatBytes(n: number | undefined): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked }: SourceDetailProps) {
-  const [file, setFile] = useState<SourceFile | undefined>();
+/** The value a JSON pointer names in the source ("/identifiers/doi"). */
+function valueAt(src: Record<string, unknown>, pointer: string): unknown {
+  let cur: unknown = src;
+  for (const part of pointer.split("/").slice(1)) {
+    if (!cur || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[part.replace(/~1/g, "/").replace(/~0/g, "~")];
+  }
+  return cur;
+}
+
+const PICTURE_LABELS: Record<string, string> = { proxy: "Viewing copy", screenshot: "Page screenshot", thumbnail: "Thumbnail" };
+
+/**
+ * The pictures to show: stored raster pictures a browser can display (R135 1), except an original
+ * that has a viewing copy (the copy is what may be shown under the project's location rule).
+ */
+function picturesOf(assets: Asset[]): Asset[] {
+  const live = assets.filter((a) => a.status !== "destroyed");
+  const copied = new Set(
+    live.filter((a) => a.role === "derived" && isShowablePicture(a.mime)).flatMap((a) => ((a.derivation as { parents?: unknown } | undefined)?.parents as string[] | undefined) ?? []),
+  );
+  return live.filter((a) => isShowablePicture(a.mime) && !(a.role === "original" && copied.has(a.id)));
+}
+
+/** What a failed job's code means, in plain words (packages/library/src/import/proxies.ts and the media worker). */
+const JOB_REASONS: Record<string, string> = {
+  LOCATION_MISMATCH: "it still carried a location the project's rules do not allow, so it was discarded",
+  POLICY_DENIED: "the project's rules did not allow it to be stored",
+  NOT_DECRYPTABLE: "the stored file could not be decrypted to make it",
+  INPUT_NOT_DECRYPTABLE: "the stored file could not be decrypted to make it",
+  ENCRYPTION_REQUIRED: "the project requires encryption and the copy could not be encrypted",
+  ORIGINAL_GONE: "the original file is no longer there",
+  NO_OUTPUT: "the media helper produced no file",
+  FFMPEG_FAILED: "the video tool could not convert the file",
+  INPUT_NOT_FOUND: "the media helper could not find the stored file",
+  CANCELLED: "it was cancelled",
+};
+const jobReason = (code: string) => JOB_REASONS[code] ?? "the media helper could not finish it";
+
+type Picture = { url: string } | { error: string };
+
+export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked, refreshKey = 0 }: SourceDetailProps) {
+  const [file, setFile] = useState<VerifiedSource | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({ title: "", issued: "", publisher: "" });
   const [saving, setSaving] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
+  const [recheckNote, setRecheckNote] = useState<string | undefined>();
+  const [pictures, setPictures] = useState<Record<string, Picture>>({});
+  const [retry, setRetry] = useState<{ state: "idle" | "running" | "started"; error?: string }>({ state: "idle" });
   const id = useId();
 
   // Read again only when the source changes (not when the parent re-renders with a new api object).
@@ -52,29 +115,170 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   apiRef.current = api;
   const lockedRef = useRef(onLocked);
   lockedRef.current = onLocked;
+  const changedRef = useRef(onChanged);
+  changedRef.current = onChanged;
+
+  /** Moves on whenever the source shown changes or the screen closes: older answers are dropped. */
+  const gen = useRef(0);
+  const shown = useRef("");
+  useEffect(
+    () => () => {
+      gen.current++;
+    },
+    [],
+  );
+
+  /** A failure: PROJECT_LOCKED returns to unlocking; the plain-words message otherwise. */
+  const failed = useCallback((err: unknown, fallback: string): string => {
+    if (isProjectLocked(err)) lockedRef.current?.();
+    return message(err, fallback);
+  }, []);
+
   useEffect(() => {
     const api = apiRef.current;
+    const key = `${projectId}\n${sourceId}`;
+    if (shown.current !== key) {
+      shown.current = key;
+      gen.current++;
+      setFile(undefined);
+      setError(undefined);
+      setEditing(false);
+      setRechecking(false);
+      setRecheckNote(undefined);
+      setRetry({ state: "idle" });
+    }
+    const g = gen.current;
     let live = true;
-    setFile(undefined);
-    setError(undefined);
-    setEditing(false);
     api.sources
       .get(projectId, sourceId)
-      .then((f) => live && setFile(f))
+      .then((f) => {
+        if (live && g === gen.current) setFile(f as VerifiedSource);
+      })
       .catch((err: unknown) => {
-        if (!live) return;
-        if (isProjectLocked(err)) lockedRef.current?.();
-        setError(message(err, "This source could not be read."));
+        if (!live || g !== gen.current) return;
+        setError(failed(err, "This source could not be read."));
       });
     return () => {
       live = false;
     };
-  }, [projectId, sourceId]);
+  }, [projectId, sourceId, refreshKey, failed]);
 
   const src = file?.source;
   const variants = src?.title?.variants ?? [];
   const title = variants[0]?.value ?? "";
 
+  // ---- pictures: fetched with the token, shown as blob URLs, revoked when no longer shown (R135 1) ----
+  const pics = useMemo(() => (file ? picturesOf(file.assets) : []), [file]);
+  const picKey = pics.map((a) => a.id).join("\n");
+  useEffect(() => {
+    setPictures({});
+    if (!picKey) return;
+    const api = apiRef.current;
+    const ac = new AbortController();
+    const urls: string[] = [];
+    let live = true;
+    for (const aid of picKey.split("\n")) {
+      api.verification
+        .picture(projectId, sourceId, aid, { signal: ac.signal })
+        .then((blob) => {
+          if (!live) return;
+          const u = URL.createObjectURL(blob);
+          urls.push(u);
+          setPictures((p) => ({ ...p, [aid]: { url: u } }));
+        })
+        .catch((err: unknown) => {
+          if (!live) return;
+          const text = failed(err, "The library service did not send it.");
+          setPictures((p) => ({ ...p, [aid]: { error: text } }));
+        });
+    }
+    return () => {
+      live = false;
+      ac.abort();
+      for (const u of urls) URL.revokeObjectURL(u);
+    };
+  }, [projectId, sourceId, picKey, failed]);
+
+  // ---- verification ----
+  const confirm = async (field: string, value: unknown) => {
+    const g = gen.current;
+    try {
+      const f = await api.verification.confirmField(projectId, sourceId, field, value);
+      if (g !== gen.current) return;
+      setFile(f);
+      onChanged?.();
+    } catch (err) {
+      throw new Error(failed(err, "The library service did not answer."));
+    }
+  };
+
+  const recheck = async () => {
+    if (rechecking || readOnly) return;
+    const g = gen.current;
+    setRechecking(true);
+    setRecheckNote(undefined);
+    setError(undefined);
+    try {
+      const f = await api.verification.recheckSource(projectId, sourceId);
+      if (g !== gen.current) return;
+      setFile(f);
+      setRecheckNote("Rechecked. The badges show the result.");
+      onChanged?.();
+    } catch (err) {
+      if (g !== gen.current) return;
+      setError(failed(err, "The source could not be rechecked."));
+    } finally {
+      if (g === gen.current) setRechecking(false);
+    }
+  };
+
+  // ---- background work: failed or waiting viewing copies and text recognition (R84) ----
+  const jobs = useMemo(() => {
+    const name = (aid: string) => {
+      const a = file?.assets.find((x) => x.id === aid);
+      return a ? baseName(a.path) : "a file";
+    };
+    return [
+      ...(file?.pendingProxies ?? []).map((j) => ({ job: j, what: "viewing copy", name: name(j.assetId) })),
+      ...(file?.pendingOcr ?? []).map((j) => ({ job: j, what: "text recognition", name: name(j.assetId) })),
+    ];
+  }, [file]);
+  const anyFailed = jobs.some((j) => j.job.failed);
+  const anyWaiting = jobs.some((j) => !j.job.failed);
+
+  const retryJobs = async () => {
+    const g = gen.current;
+    setRetry({ state: "running" });
+    try {
+      await api.verification.retryJobs(projectId, sourceId);
+      if (g !== gen.current) return;
+      setRetry({ state: "started" });
+      const f = await api.sources.get(projectId, sourceId);
+      if (g === gen.current) setFile(f as VerifiedSource);
+    } catch (err) {
+      if (g !== gen.current) return;
+      setRetry({ state: "idle", error: failed(err, "The work could not be started again.") });
+    }
+  };
+
+  // After a retry, the record is read again every few seconds while work is still waiting.
+  useEffect(() => {
+    if (retry.state !== "started" || !anyWaiting) return;
+    const g = gen.current;
+    let n = 0;
+    const t = setInterval(() => {
+      if (++n > 30 || g !== gen.current) return clearInterval(t);
+      apiRef.current.sources
+        .get(projectId, sourceId)
+        .then((f) => {
+          if (g === gen.current) setFile(f as VerifiedSource);
+        })
+        .catch(() => {});
+    }, 3000);
+    return () => clearInterval(t);
+  }, [retry.state, anyWaiting, projectId, sourceId]);
+
+  // ---- editing ----
   const startEdit = () => {
     setDraft({ title, issued: typeof src?.issued === "string" ? src.issued : "", publisher: typeof src?.publisher === "string" ? src.publisher : "" });
     setEditing(true);
@@ -92,19 +296,33 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     if (draft.issued.trim() !== (src.issued ?? "")) patch.issued = draft.issued.trim();
     if (draft.publisher.trim() !== (src.publisher ?? "")) patch.publisher = draft.publisher.trim();
     if (!Object.keys(patch).length) return setEditing(false);
+    const g = gen.current;
     setSaving(true);
     setError(undefined);
     try {
-      setFile(await api.sources.update(projectId, sourceId, patch));
+      const f = await api.sources.update(projectId, sourceId, patch);
+      if (g !== gen.current) return;
+      setFile(f as VerifiedSource);
       setEditing(false);
       onChanged?.();
     } catch (err) {
-      if (isProjectLocked(err)) onLocked?.();
-      setError(message(err, "The change could not be saved."));
+      if (g !== gen.current) return;
+      setError(failed(err, "The change could not be saved."));
     } finally {
       setSaving(false);
     }
   };
+
+  // ---- badges ----
+  const reviews = new Map<string, FieldReview>((Array.isArray(file?.fields) ? file.fields : []).map((r) => [r.field, r]));
+  const placed = new Set<string>();
+  const badge = (pointer: string, label = fieldLabel(pointer)): ReactNode => {
+    const review = reviews.get(pointer);
+    if (!review || !src) return null;
+    placed.add(pointer);
+    return <FieldCheck key={`check-${pointer}`} review={review} label={label} value={valueAt(src, pointer)} readOnly={readOnly} onConfirm={confirm} />;
+  };
+  const hasTranscript = !!file?.assets.some((a) => a.kind === "transcript" && a.status !== "destroyed");
 
   return (
     <section aria-label="Source details" className="ao-detail">
@@ -115,18 +333,28 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
         <button type="button" disabled={readOnly || !src} onClick={startEdit} aria-expanded={editing}>
           Edit details
         </button>
+        <button type="button" disabled={readOnly || !src || rechecking} onClick={() => void recheck()}>
+          {rechecking ? "Rechecking…" : "Recheck"}
+        </button>
+        {src && hasTranscript && <TranscriptLink projectId={projectId} sourceId={sourceId} />}
       </div>
       {error && (
         <p role="alert" className="ao-error">
           {error}
         </p>
       )}
+      <p role="status" className="ao-muted">
+        {recheckNote}
+      </p>
       {!src && !error && <p aria-live="polite">Loading…</p>}
       {src && (
         <>
-          <h2>
-            <UserText lang={variants[0]?.lang}>{title || "Untitled"}</UserText>
-          </h2>
+          <div className="ao-row">
+            <h2>
+              <UserText lang={variants[0]?.lang}>{title || "Untitled"}</UserText>
+            </h2>
+            {badge("/title")}
+          </div>
           {variants.slice(1).map((v, i) => (
             <p key={i} className="ao-muted">
               <UserText lang={v.lang}>{v.value}</UserText>
@@ -158,7 +386,10 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
           )}
           <dl>
             <dt>Type</dt>
-            <dd>{typeLabel(src.type)}</dd>
+            <dd>
+              {typeLabel(src.type)}
+              {badge("/type", "Type")}
+            </dd>
             {src.creators.length > 0 && (
               <>
                 <dt>Creators</dt>
@@ -170,6 +401,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
                       </li>
                     ))}
                   </ul>
+                  {badge("/creators")}
                 </dd>
               </>
             )}
@@ -178,6 +410,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
                 <dt>Date</dt>
                 <dd>
                   <UserText>{src.issued}</UserText>
+                  {badge("/issued")}
                 </dd>
               </>
             )}
@@ -186,11 +419,12 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
                 <dt>Publisher</dt>
                 <dd>
                   <UserText>{src.publisher}</UserText>
+                  {badge("/publisher")}
                 </dd>
               </>
             )}
             {Object.entries(src.identifiers ?? {}).map(([k, v]) => (
-              <IdentifierRow key={k} label={IDENTIFIER_LABELS[k] ?? k.toUpperCase()} value={String(v)} />
+              <IdentifierRow key={k} label={IDENTIFIER_LABELS[k] ?? k.toUpperCase()} value={String(v)} check={badge(`/identifiers/${k}`, IDENTIFIER_LABELS[k] ?? fieldLabel(`/identifiers/${k}`))} />
             ))}
             {src.citationKey && (
               <>
@@ -202,7 +436,73 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
                 </dd>
               </>
             )}
+            {/* Checked fields not listed above (a container, a series, a missing required field…). */}
+            {[...reviews.keys()]
+              .filter((p) => !placed.has(p))
+              .map((p) => {
+                const v = valueAt(src, p);
+                const empty = v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
+                return (
+                  <ExtraRow key={p} label={fieldLabel(p)} check={badge(p)}>
+                    {empty ? <span className="ao-muted">Not recorded</span> : <UserText>{valueText(v)}</UserText>}
+                  </ExtraRow>
+                );
+              })}
           </dl>
+          {pics.length > 0 && (
+            <>
+              <h3 className="ao-pane-subtitle">Pictures</h3>
+              <div className="ao-pictures">
+                {pics.map((a) => {
+                  const p = pictures[a.id];
+                  const label = `${PICTURE_LABELS[a.kind] ?? "Picture"}: ${baseName(a.path)}`;
+                  return (
+                    <figure key={a.id} className="ao-picture">
+                      {p && "url" in p ? (
+                        <img src={p.url} alt={label} />
+                      ) : p && "error" in p ? (
+                        <p className="ao-error">
+                          <UserText>{baseName(a.path)}</UserText> could not be shown. {p.error}
+                        </p>
+                      ) : (
+                        <p className="ao-muted" aria-live="polite">
+                          Loading <UserText>{baseName(a.path)}</UserText>…
+                        </p>
+                      )}
+                      {p && "url" in p && (
+                        <figcaption>
+                          <UserText>{label}</UserText>
+                        </figcaption>
+                      )}
+                    </figure>
+                  );
+                })}
+              </div>
+            </>
+          )}
+          {jobs.length > 0 && (
+            <section aria-label="Viewing copies and text recognition">
+              <h3 className="ao-pane-subtitle">Viewing copies and text recognition</h3>
+              <ul className="ao-plain-list">
+                {jobs.map(({ job, what, name }) => (
+                  <JobRow key={job.id} job={job} what={what} name={name} />
+                ))}
+              </ul>
+              {anyFailed && (
+                <button type="button" disabled={readOnly || retry.state === "running"} onClick={() => void retryJobs()}>
+                  Try again
+                </button>
+              )}
+              {retry.error && (
+                <p role="alert" className="ao-error">
+                  {retry.error}
+                </p>
+              )}
+              <p role="status" className="ao-muted">
+                {retry.state === "started" ? "Trying again. This list follows the work as it finishes." : ""}
+              </p>
+            </section>
+          )}
           <h3 className="ao-pane-subtitle">Files</h3>
           {file.assets.length === 0 ? (
             <p className="ao-muted">No files attached.</p>
@@ -222,12 +522,43 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   );
 }
 
-function IdentifierRow({ label, value }: { label: string; value: string }) {
+function JobRow({ job, what, name }: { job: PendingJob; what: string; name: string }) {
+  const f = job.failed;
+  const attempts = f?.attempts ?? 1;
+  return (
+    <li>
+      {f ? (
+        <>
+          The {what} of <UserText>{name}</UserText> could not be made: {jobReason(f.code)} ({attempts} {attempts === 1 ? "attempt" : "attempts"}).
+        </>
+      ) : (
+        <>
+          The {what} of <UserText>{name}</UserText> has not been made yet. It is made in the background once the media helper is available.
+        </>
+      )}
+    </li>
+  );
+}
+
+function IdentifierRow({ label, value, check }: { label: string; value: string; check?: ReactNode }) {
   return (
     <>
       <dt>{label}</dt>
       <dd>
         <UserText>{value}</UserText>
+        {check}
+      </dd>
+    </>
+  );
+}
+
+function ExtraRow({ label, check, children }: { label: string; check: ReactNode; children: ReactNode }) {
+  return (
+    <>
+      <dt>{label}</dt>
+      <dd>
+        {children}
+        {check}
       </dd>
     </>
   );

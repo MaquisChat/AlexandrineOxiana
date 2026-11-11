@@ -171,9 +171,10 @@ export function installBlobUrls() {
     created,
     revoked,
     live: () => created.filter((c) => !revoked.has(c.url)).map((c) => c.url),
+    /** Back to jsdom's (which has none: a no-op stays, so a late unmount's revoke does not throw). */
     restore: () => {
-      URL.createObjectURL = origCreate;
-      URL.revokeObjectURL = origRevoke;
+      URL.createObjectURL = origCreate ?? ((() => "blob:none") as typeof URL.createObjectURL);
+      URL.revokeObjectURL = origRevoke ?? (() => {});
     },
   };
 }
