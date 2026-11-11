@@ -39,11 +39,12 @@ makes `apps/library-service/dist/library-service/`:
 
 | Path | What |
 | --- | --- |
-| `service.mjs` | the service and every pure-JavaScript dependency, bundled by esbuild (0.28.2, the version the workspace already had through tsx and Vite; now a pinned dev dependency of the service) |
+| `service.mjs` | the entry point (`scripts/launcher.mjs`): refuses to start if `NODE_OPTIONS`, `NODE_PATH` or `NAPI_RS_NATIVE_LIBRARY_PATH` is set (R153) or if `build-info.json` names another platform, architecture, C library or Node ABI; empties Node's global module folders; then loads `main.mjs` |
+| `main.mjs` | the service and every pure-JavaScript dependency, bundled by esbuild (0.28.2, the version the workspace already had through tsx and Vite; now a pinned dev dependency of the service) |
 | `workers/` | the citation sandbox and HTML cleaner worker scripts |
 | `migrations/` | the SQL migrations |
 | `csl/` | `styles.zip`, `locales/`, the CSL notice and licence, the CPAL-1.0 text |
-| `node_modules/` | packages kept outside the bundle, unmodified, with their runtime dependencies, for this platform and architecture only: `better-sqlite3`, `@napi-rs/keyring`, `pdfjs-dist` (with `@napi-rs/canvas`), `exiftool-vendored` (with `exiftool-vendored.pl`), `citeproc`, `file-type` |
+| `node_modules/` | packages kept outside the bundle, unmodified, with their whole runtime dependency closure, for this platform and architecture only: `better-sqlite3` and `@napi-rs/keyring` (native), `pdfjs-dist` (loads its worker module by path; with the native `@napi-rs/canvas`), `exiftool-vendored` (finds `exiftool-vendored.pl` by package resolution), `citeproc` (CPAL: shipped unmodified, loaded by the sandbox worker), `file-type` (imports `strtok3` by a computed name). Plus stub packages for names a shipped file may load that are not part of the build (the napi-rs binaries of other platforms, `supports-color` for `debug`): each throws `MODULE_NOT_FOUND`, as a missing module would, so Node never looks outside the folder |
 | `licences/` | `THIRD-PARTY-NOTICES.md` (every npm package in the folder, its version, licence and whether bundled or copied), each package's licence files, the typefaces' OFL texts (R100), the CSL and citeproc-js notice and licences |
 | `build-info.json` | platform, architecture, libc, the Node version and ABI it was built with, the native module files |
 | `START.txt` | how to start it |
@@ -52,9 +53,25 @@ Every non-code file is found through one resolver, `packages/library/src/resourc
 source it finds them where they always were; in the built folder (the build defines
 `__AO_BUNDLE__`) it finds them only inside the folder and reports a missing one in plain words,
 without a path. The native modules and the other kept packages are found by Node's own module
-resolution from `service.mjs`, in the folder's `node_modules/`. The build refuses a bundle that
-loads a module through a computed name (a bundler cannot follow it); such a package is kept
-outside the bundle instead (`file-type`).
+resolution from the bundle, in the folder's `node_modules/`.
+
+**The folder loads code only from itself (R153).** A `require` or `import` that misses in
+`<folder>/node_modules` would make Node go on looking in parent folders, `~/.node_modules`,
+`~/.node_libraries` and `NODE_PATH`, so a file planted there would run inside the service. The build
+therefore checks every package name any shipped file can load: each must be a builtin, a copied
+package or a stub, and every load by a computed name must be on a list with its reason (the
+napi-rs override variable, bindings' path to its own `.node`, exiftool-vendored's `.pl` package,
+file-type's `strtok3`, pdf.js's own worker module); otherwise the build fails. The launcher also
+empties Node's global folders. Three variables can still redirect loading and cannot be undone from
+inside the program: `NODE_OPTIONS` (applied before any of our code runs), `NODE_PATH` and
+`NAPI_RS_NATIVE_LIBRARY_PATH`. The launcher refuses to start when any is set, which stops a careless
+launcher but not a preload already applied; so **whoever starts the folder must give it an
+allow-listed environment, never its own** (the desktop shell, Task 37c). The service uses only:
+`PATH`, `HOME`, `TMPDIR` (`TEMP`/`TMP` on Windows), `LANG` and `LC_*`, `TZ`, `AO_SERVICE_PORT`,
+`AO_CONFIG_DIR`, `AO_LIBRARY`, `AO_WORKER_BIN` or `AO_NO_WORKER`, and, passed on to the media worker,
+`AO_MODELS_DIR`, `AO_TOOLS_DIR`, `TESSDATA_PREFIX`, `XDG_*`, the proxy variables and
+`SSL_CERT_FILE`/`SSL_CERT_DIR` when needed. It must not be given `NODE_OPTIONS`, `NODE_PATH`,
+`NAPI_RS_NATIVE_LIBRARY_PATH` or `AO_SERVICE_TOKEN`.
 
 **The documented way to start the folder** (also in its `START.txt`):
 
@@ -63,18 +80,23 @@ node --max-old-space-size=512 service.mjs
 ```
 
 run with the folder as the working directory or by its full path, with the Node 22 release the
-folder was built with (`build-info.json`). The access token is passed as the service reads it
-(standard input once Task 37b lands, R98); `AO_WORKER_BIN` names the packaged media worker
+folder was built with (`build-info.json`), and the allow-listed environment above. The access token
+is written on standard input as one line (R98); the service refuses to start if `AO_SERVICE_TOKEN`
+is set or if it is given any argument. `AO_WORKER_BIN` names the packaged media worker
 (Task 37d), which is not part of this folder. The service prints `AO_SERVICE_READY port=<n>` when
 it listens and stops cleanly on SIGTERM.
 
 The smoke run (`pnpm --filter @ao/library-service run smoke`, and a CI step on Linux) builds the
-folder, copies it to an empty temporary folder outside the repository, starts it exactly like
-that, with a test-only guard preloaded that makes the repository unreachable, and over HTTP creates
+folder, copies it to an empty temporary folder outside the repository, plants a module that leaves
+a marker file under every package name the build reports (and some generic optional ones) in the
+home folder's `.node_modules` and `.node_libraries` and in a `node_modules` of the folder's parent,
+starts it exactly like that (token on standard input), with a test-only guard preloaded that makes
+the repository unreachable and refuses any module resolved from outside the folder, and over HTTP creates
 a library and a project, attaches a PDF and a photo, renders a citation with a bundled and with an
 imported style, cleans an HTML snapshot and searches; it checks that every native module mapped
-into the process and the running ExifTool come from the copied folder, and that nothing is left
-running after SIGTERM.
+into the process and the running ExifTool come from the copied folder, that nothing is left
+running after SIGTERM and that no planted module was loaded. It then starts the folder with
+`NODE_PATH` pointing at more planted modules and checks that it refuses to start and loads none.
 
 ### Why not a single executable
 
@@ -87,7 +109,9 @@ running after SIGTERM.
   copy of the Node binary, which breaks Node's signature; the result must be re-signed, and the
   injection step is one more thing that can go wrong in the Mac build. Beside the bundle, the
   official Node binary and each `.node` file are signed once with our identity like every other
-  file in the app (V8 needs the JIT entitlements in either case).
+  file in the app (V8 needs the JIT entitlements in either case). Until Developer ID signing
+  arrives (R151: the first Mac builds of Task 37f are ad-hoc signed; Developer ID in Task 37g), the
+  same holds for the ad-hoc signature, which injection breaks just the same.
 - **Worker threads and ES modules.** Node 22's single executables take one CommonJS script; the
   two worker-thread scripts and pdf.js's own worker module are separate files and would have to be
   extracted or embedded in other ways.
@@ -111,6 +135,12 @@ running after SIGTERM.
 - A new dependency that loads files by a path relative to its own source, or a module by a computed
   name, either goes through `resources.ts` or is added to the kept packages in the build script; the
   build's check and the smoke run catch the cases they can see.
+- The desktop shell (Task 37c) starts the service, and the worker, with an allow-listed
+  environment built from the list above, never its own (R153), and writes the token on standard
+  input. A new environment variable the service needs is added to that list here and in START.txt.
+- A dependency that loads a package the folder does not contain fails the build until the package
+  is copied or a stub with a reason is added; the smoke run's planted modules catch what a static
+  scan of `require`/`import` cannot see (an aliased `require`).
 - `dist/` is not committed; CI builds and smoke-runs the folder on Linux on every push.
 - Revisit if Node's single executables gain native-module and multi-file support that removes the
   extraction and signing steps, or if the app moves to a different shell.
