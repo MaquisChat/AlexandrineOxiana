@@ -29,6 +29,8 @@ export const seams: {
   failAuditAppendFor?: string;
   /** Receives a newly issued recovery code before the change is written (crash tests, Task 61). */
   onRecoveryCode?: (code: string) => void;
+  /** Makes removing the staged key file fail after the new one is active (M-b, Task 61). */
+  failRecoveryCleanup?: boolean;
 } = {};
 
 /** Thrown at a crash point; the mutation does NOT roll back (as if the process died). */

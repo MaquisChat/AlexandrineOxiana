@@ -1,5 +1,6 @@
 /** Projects: creation, project.json persistence, key files, lock/unlock. */
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -281,6 +282,8 @@ export async function issueRecoveryCode(core: RepoCore, projectId: string, passp
   const keyFile: ProjectKeyFile = { keyId: file.keyId, passphrase: file.passphrase, recovery: next.file };
   const staged: StagedKeyFile = { formatVersion: 1, issueId, keyFile };
   const stagedRel = `${st.rel}/${STAGED_KEY_FILE}`;
+  const stagedBytes = JSON.stringify(staged, null, 2);
+  const stagedSha256 = sha256Hex(stagedBytes);
   const unshownRel = `${st.rel}/${UNSHOWN_FILE}`;
 
   /** What stopped activation after the commit (a simulated crash in tests, or a real failure). */
@@ -294,7 +297,7 @@ export async function issueRecoveryCode(core: RepoCore, projectId: string, passp
       if (!now || !now.equals(raw)) throw new KeyFileChangedError();
       maybeCrash("recovery-before-stage");
       // A staged file left by an earlier issue whose activation failed is superseded by this one.
-      await tx.writeFile(stagedRel, JSON.stringify(staged, null, 2), { mode: KEY_FILE_MODE });
+      await tx.writeFile(stagedRel, stagedBytes, { mode: KEY_FILE_MODE });
       // A new code supersedes one that was activated on open and may not have been shown.
       if (await tx.exists(unshownRel)) await tx.trash(unshownRel);
       // Activation runs after the commit, still inside the write queue. `tx.index` is the only
@@ -308,62 +311,127 @@ export async function issueRecoveryCode(core: RepoCore, projectId: string, passp
         }
       });
     },
-    { op: ISSUE_OP, entity: { type: "project", id: projectId }, auditDetails: { issueId } },
+    // The staged file's sha256 binds it to this event (R148): only these exact bytes are ever activated.
+    { op: ISSUE_OP, entity: { type: "project", id: projectId }, auditDetails: { issueId, stagedSha256 } },
   );
   if (activation instanceof SimulatedCrash) throw activation; // tests: the process "died" here
+  if (activation instanceof ActivationIncomplete) {
+    // The new file is active but the staged one could not be removed (M-b): the new code works and
+    // was not shown; the old one no longer works. The next writable open finishes it, with a warning.
+    throw new Error("A new recovery code was put in place, but the app could not finish, so it could not be shown. The earlier recovery code no longer works; the passphrase still does. Ask for a new recovery code again");
+  }
   if (activation !== null) {
-    // Committed but not active: the old code still works, and this code would not. The next writable
-    // open completes it (with a warning); asking again supersedes it now.
+    // Committed but not active: the old code still works, and this code would not. Asking again supersedes it.
     throw new Error("The new recovery code was recorded but could not be put in place, so it was not shown. The current recovery code still works. Ask for a new recovery code again");
   }
   maybeCrash("recovery-after-activate");
   return { recoveryCode: next.recoveryCode };
 }
 
+const sha256Hex = (data: string | Uint8Array): string => createHash("sha256").update(data).digest("hex");
+
+/** The new key file is active, but a later step failed (M-b). */
+class ActivationIncomplete extends Error {
+  override name = "ActivationIncomplete";
+}
+
 /** Makes a staged key file active: the active file replaced atomically (0600), then the staged one removed. Idempotent. */
 async function activateStaged(core: RepoCore, st: ProjectState, staged: StagedKeyFile): Promise<void> {
   await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged.keyFile, null, 2), { mode: KEY_FILE_MODE });
   maybeCrash("recovery-mid-activate");
-  await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+  try {
+    if (seams.failRecoveryCleanup) throw new Error("simulated failure removing the staged key file");
+    await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+  } catch (err) {
+    if (err instanceof SimulatedCrash) throw err;
+    throw new ActivationIncomplete(err instanceof Error ? err.message : String(err));
+  }
 }
 
 /**
- * Writable open, for a project with no unresolved interrupted change (R141 b): a staged key file whose
- * issue is committed in the audit log (an allow event of this operation with its issue id) is made
- * active, a persistent warning that the code may never have been shown is raised (UNSHOWN_FILE, until
- * another code is issued), and the completion is audited. A staged file whose issue is not committed
- * is left over from a change that was rolled back: it is removed. Throws when the audit append fails
- * (the caller blocks the project, R28); the activation itself is then already done and the warning raised.
+ * Writable open, for a project with no unresolved interrupted change (R141 b, R148). A staged key
+ * file is activated only if ALL hold:
+ *   1. its sha256 equals `stagedSha256` in the allow event of its issue;
+ *   2. that event is the newest allowed issue of the project, and no `key.recovery-activated` event
+ *      follows it;
+ *   3. its key id and passphrase wrapping are identical to the active key file's;
+ *   4. the audit chain verifies (`chainOk`).
+ * Then the persistent warning that the code may never have been shown is raised (UNSHOWN_FILE, until
+ * another code is issued), the active file is replaced and the completion audited. Otherwise the active
+ * file is untouched: with a chain that verifies the staged file is not the committed one, so it is
+ * removed and reported ('recovery-staging-discarded'); with a chain that does not verify nothing can
+ * be decided, so it is left in place and reported ('recovery-staging-unverifiable'). The replaced
+ * active file is never kept aside: that would keep a revoked code usable. Throws when the audit
+ * append fails (the caller blocks the project, R28); the activation and warning are then already done.
  */
-export async function completeRecoveryActivation(core: RepoCore, st: ProjectState, events: ReadonlyArray<AuditEvent | null>, at: string): Promise<void> {
-  const raw = await readMaybe(core.abs(`${st.rel}/${STAGED_KEY_FILE}`));
+export async function completeRecoveryActivation(
+  core: RepoCore,
+  st: ProjectState,
+  events: ReadonlyArray<AuditEvent | null>,
+  chainOk: boolean,
+  at: string,
+): Promise<void> {
+  const stagedAbs = core.abs(`${st.rel}/${STAGED_KEY_FILE}`);
+  const raw = await readMaybe(stagedAbs);
   if (!raw) return;
-  let staged: StagedKeyFile | undefined;
-  try {
-    const s = JSON.parse(raw.toString("utf8")) as StagedKeyFile;
-    if (s?.formatVersion === 1 && typeof s.issueId === "string" && s.keyFile?.keyId === st.project.encryption.keyId) staged = s;
-  } catch {
-    // unreadable: not activated, removed below
-  }
-  const committed =
-    staged !== undefined &&
-    events.some((e) => {
-      const d = e?.details as { op?: unknown; issueId?: unknown } | undefined;
-      return e?.decision?.result !== "deny" && d?.op === ISSUE_OP && d.issueId === staged!.issueId;
-    });
-  if (!committed) {
-    await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+  const report = (kind: "recovery-staging-discarded" | "recovery-staging-unverifiable", detail: string) =>
+    core.integrityWarnings.push({ projectId: st.project.id, kind, detail });
+  if (!chainOk) {
+    report("recovery-staging-unverifiable", "a new recovery code waiting to be put in place was left as it is, because the project's audit log does not verify, so it cannot show whether that code was really issued; the current recovery code is unchanged");
     return;
   }
-  await writeFileAtomic(core.abs(`${st.rel}/${UNSHOWN_FILE}`), JSON.stringify({ formatVersion: 1, issueId: staged!.issueId, activatedAt: at }), { mode: KEY_FILE_MODE });
-  await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged!.keyFile, null, 2), { mode: KEY_FILE_MODE });
+  const why = await stagedProblem(core, st, raw, events);
+  if (why) {
+    await fsp.rm(stagedAbs, { force: true });
+    report("recovery-staging-discarded", `a key file waiting to be put in place was removed and not used (${why}); the current recovery code and passphrase are unchanged`);
+    return;
+  }
+  const staged = JSON.parse(raw.toString("utf8")) as StagedKeyFile;
+  await writeFileAtomic(core.abs(`${st.rel}/${UNSHOWN_FILE}`), JSON.stringify({ formatVersion: 1, issueId: staged.issueId, activatedAt: at }), { mode: KEY_FILE_MODE });
+  await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged.keyFile, null, 2), { mode: KEY_FILE_MODE });
   await core.auditNow(st, {
     ...core.auditBase(st, at),
     action: "key.recovery-activated",
     entity: { type: "project", id: st.project.id },
-    details: { issueId: staged!.issueId, reason: "a new recovery code was issued, but the app stopped before it could be shown; it was put in place when the library was next opened" },
+    details: { issueId: staged.issueId, reason: "a new recovery code was issued, but the app stopped before it could be shown; it was put in place when the library was next opened" },
   });
-  await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+  await fsp.rm(stagedAbs, { force: true });
+}
+
+/** Why a staged key file is not the committed one (R148 conditions 1–3), or null when it is. */
+async function stagedProblem(core: RepoCore, st: ProjectState, raw: Buffer, events: ReadonlyArray<AuditEvent | null>): Promise<string | null> {
+  let staged: StagedKeyFile;
+  try {
+    staged = JSON.parse(raw.toString("utf8")) as StagedKeyFile;
+  } catch {
+    return "it could not be read";
+  }
+  if (staged?.formatVersion !== 1 || typeof staged.issueId !== "string" || typeof staged.keyFile !== "object" || staged.keyFile === null) return "it is not in the expected form";
+  // 2. The newest allowed issue, with no activation recorded after it.
+  let newest = -1;
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    const d = e?.details as { op?: unknown } | undefined;
+    if (e && e.decision?.result !== "deny" && d?.op === ISSUE_OP) newest = i;
+  }
+  if (newest < 0) return "no new recovery code was recorded as issued";
+  const issue = events[newest]!.details as { issueId?: unknown; stagedSha256?: unknown };
+  if (issue.issueId !== staged.issueId) return "it belongs to an earlier new recovery code, not the latest one recorded";
+  if (events.slice(newest + 1).some((e) => e?.action === "key.recovery-activated")) return "the latest new recovery code was already put in place";
+  // 1. Exactly the bytes recorded with the issue.
+  if (typeof issue.stagedSha256 !== "string" || issue.stagedSha256 !== sha256Hex(raw)) return "its content is not what was recorded when the code was issued";
+  // 3. Same key, same passphrase wrapping as the active file.
+  const activeRaw = await readMaybe(core.abs(`${st.rel}/keys/project-key.json`));
+  let active: ProjectKeyFile | undefined;
+  try {
+    active = activeRaw ? (JSON.parse(activeRaw.toString("utf8")) as ProjectKeyFile) : undefined;
+  } catch {
+    active = undefined;
+  }
+  if (!active) return "the project's key file could not be read";
+  if (staged.keyFile.keyId !== active.keyId || staged.keyFile.keyId !== st.project.encryption.keyId) return "it is for another key";
+  if (!isDeepStrictEqual(staged.keyFile.passphrase, active.passphrase)) return "its passphrase wrapping differs from the project's";
+  return null;
 }
 
 /** Whether the project carries the warning that a new recovery code may never have been shown (R141 b). */

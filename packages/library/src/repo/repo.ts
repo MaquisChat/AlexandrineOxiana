@@ -551,7 +551,7 @@ export async function openRepoInternal(
       // A new recovery code committed but not yet put in place when the app stopped (R141 b).
       if (core.encrypted(st)) {
         const headBefore = st.audit.head?.seq;
-        await completeRecoveryActivation(core, st, events, at);
+        await completeRecoveryActivation(core, st, events, verify.ok, at);
         if (st.audit.head?.seq !== headBefore) appended = true;
       }
       if (!problem && !appended && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { KeyRing, WrongPassphraseError, normalizeRecoveryCode } from "../crypto/keys.js";
+import { KeyRing, WrongPassphraseError, normalizeRecoveryCode, wrapKey } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { backupProject, restoreBackup } from "../export/backup.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
@@ -65,6 +65,7 @@ afterEach(async () => {
   seams.failUndo = undefined;
   seams.failAuditAppendFor = undefined;
   seams.onRecoveryCode = undefined;
+  seams.failRecoveryCleanup = undefined;
   await lib.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -328,6 +329,140 @@ describe("issueRecoveryCode: staged, then activated after the commit point (R26,
     expect(failed[0]!.reason).toBeInstanceOf(KeyFileChangedError);
     expect(await opens(pid, ok[0]!.value.recoveryCode)).toBe(true);
     expect(await issued(pid)).toHaveLength(1);
+  });
+});
+
+/** A genuine issue stopped after the commit point, before its staged file was activated. */
+async function committedNotActivated(pid: string): Promise<string> {
+  let shown: string | undefined;
+  seams.onRecoveryCode = (x) => (shown = x);
+  seams.crashAt = "recovery-before-activate";
+  await expect(repo.issueRecoveryCode(pid, PASS)).rejects.toBeInstanceOf(SimulatedCrash);
+  seams.onRecoveryCode = undefined;
+  return shown!;
+}
+const warningKinds = () => repo.integrityWarnings.map((w) => w.kind);
+
+describe("a staged file is activated only when it is the committed one (R148)", () => {
+  it("PLANT: an earlier, already activated issue id with damaged wrappings is never activated: the passphrase and the current code still open; the file is removed and reported", async () => {
+    const { pid } = await encrypted();
+    const a = (await repo.issueRecoveryCode(pid, PASS)).recoveryCode;
+    const issueA = (await issued(pid))[0]!.details as { issueId: string };
+    const active = JSON.parse((await keyFileBytes(pid)).toString("utf8"));
+    const before = await keyFileBytes(pid);
+    const junk = { keyId: active.keyId, kdf: active.passphrase.kdf, nonce: "AAAAAAAAAAAAAAAA", wrapped: Buffer.alloc(48).toString("base64") };
+    await writeFile(stagingPath(pid), JSON.stringify({ formatVersion: 1, issueId: issueA.issueId, keyFile: { keyId: active.keyId, passphrase: junk, recovery: junk } }, null, 2));
+    repo = await reopen();
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    expect(await opens(pid, PASS)).toBe(true);
+    expect(await opens(pid, a)).toBe(true);
+    expect(await exists(stagingPath(pid))).toBe(false);
+    expect(warningKinds()).toContain("recovery-staging-discarded");
+    expect(await projectWarnings(repo, pid)).not.toContain(RECOVERY_CODE_UNSHOWN_WARNING);
+    expect((await audit(pid)).some((e) => e.action === "key.recovery-activated")).toBe(false);
+  });
+
+  it("PLANT2: issue A's genuine staged file put back after issue B was activated is not activated: B's code works, the revoked codes do not", async () => {
+    const { pid, code } = await encrypted();
+    // A stops halfway through activation; its staged file is copied, then the next open completes it.
+    let a: string | undefined;
+    seams.onRecoveryCode = (x) => (a = x);
+    seams.crashAt = "recovery-mid-activate";
+    await expect(repo.issueRecoveryCode(pid, PASS)).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.onRecoveryCode = undefined;
+    const stagedA = await readFile(stagingPath(pid));
+    repo = await reopen();
+    await repo.unlockProject(pid, PASS);
+    const b = (await repo.issueRecoveryCode(pid, PASS)).recoveryCode;
+    await writeFile(stagingPath(pid), stagedA); // a sync client restores the deleted file
+    const before = await keyFileBytes(pid);
+    repo = await reopen();
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    expect(await opens(pid, b)).toBe(true);
+    expect(await opens(pid, a!)).toBe(false);
+    expect(await opens(pid, code)).toBe(false);
+    expect(await exists(stagingPath(pid))).toBe(false);
+    expect(warningKinds()).toContain("recovery-staging-discarded");
+  });
+
+  it("the committed issue's file put back after it was activated on open is not activated again", async () => {
+    const { pid } = await encrypted();
+    const shown = await committedNotActivated(pid);
+    const staged = await readFile(stagingPath(pid));
+    repo = await reopen(); // activates, audits key.recovery-activated
+    await writeFile(stagingPath(pid), staged);
+    const before = await keyFileBytes(pid);
+    repo = await reopen();
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    expect((await audit(pid)).filter((e) => e.action === "key.recovery-activated")).toHaveLength(1);
+    expect(warningKinds()).toContain("recovery-staging-discarded");
+    expect(await opens(pid, shown)).toBe(true);
+  });
+
+  it("a staged file whose bytes differ from the sha256 recorded with the issue is not activated", async () => {
+    const { pid, code } = await encrypted();
+    const shown = await committedNotActivated(pid);
+    const before = await keyFileBytes(pid);
+    // Same content, other bytes: compact JSON instead of the indented form that was recorded.
+    await writeFile(stagingPath(pid), JSON.stringify(JSON.parse(await readFile(stagingPath(pid), "utf8"))));
+    repo = await reopen();
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    expect(await opens(pid, code)).toBe(true);
+    expect(await opens(pid, shown)).toBe(false);
+    expect(await exists(stagingPath(pid))).toBe(false);
+    expect(warningKinds()).toContain("recovery-staging-discarded");
+    expect(await projectWarnings(repo, pid)).not.toContain(RECOVERY_CODE_UNSHOWN_WARNING);
+  });
+
+  it("a staged file whose passphrase wrapping differs from the active file's is not activated", async () => {
+    const { pid, code } = await encrypted();
+    const shown = await committedNotActivated(pid);
+    // The active file's passphrase wrapping changed meanwhile (same passphrase, fresh salt).
+    const active = JSON.parse((await keyFileBytes(pid)).toString("utf8"));
+    const key = ring.get(active.keyId)!;
+    active.passphrase = await wrapKey(key, PASS, active.keyId, { N: 2 ** 10 });
+    await writeFile(keyFilePath(pid), JSON.stringify(active, null, 2));
+    const before = await keyFileBytes(pid);
+    repo = await reopen();
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    expect(await opens(pid, PASS)).toBe(true);
+    expect(await opens(pid, code)).toBe(true);
+    expect(await opens(pid, shown)).toBe(false);
+    expect(await exists(stagingPath(pid))).toBe(false);
+    expect(warningKinds()).toContain("recovery-staging-discarded");
+  });
+
+  it("an audit chain that does not verify: nothing is activated, the staged file is left in place and reported", async () => {
+    const { pid, code } = await encrypted();
+    const shown = await committedNotActivated(pid);
+    const before = await keyFileBytes(pid);
+    const staged = await readFile(stagingPath(pid));
+    const seg = join(lib.root, repo.getProject(pid).folder, "audit", "0001.jsonl");
+    const lines = (await readFile(seg, "utf8")).split("\n");
+    const ev = JSON.parse(lines[0]!);
+    ev.actor = "mallory";
+    lines[0] = JSON.stringify(ev);
+    await writeFile(seg, lines.join("\n"));
+    repo = await reopen();
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    expect((await readFile(stagingPath(pid))).equals(staged)).toBe(true);
+    expect(warningKinds()).toContain("recovery-staging-unverifiable");
+    expect(await opens(pid, code)).toBe(true);
+    expect(await opens(pid, shown)).toBe(false);
+  });
+
+  it("M-b: a failure after the new file is in place is reported as activated but not shown", async () => {
+    const { pid, code } = await encrypted();
+    let shown: string | undefined;
+    seams.onRecoveryCode = (x) => (shown = x);
+    seams.failRecoveryCleanup = true;
+    const err = await repo.issueRecoveryCode(pid, PASS).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/put in place/i);
+    expect((err as Error).message).toMatch(/could not be shown/i);
+    expect((err as Error).message).not.toMatch(/still works/i);
+    expect(await opens(pid, code)).toBe(false);
+    expect(await opens(pid, shown!)).toBe(true);
   });
 });
 
