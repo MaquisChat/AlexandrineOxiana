@@ -676,9 +676,12 @@ describe("entry point", () => {
     const entry = fileURLToPath(new URL("./main.ts", import.meta.url));
     const child = spawn(process.execPath, ["--import", "tsx", entry], {
       cwd: fileURLToPath(new URL("../", import.meta.url)),
-      env: { ...process.env, AO_SERVICE_TOKEN: TOKEN, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_LIBRARY: path, AO_NO_WORKER: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      // The token goes on standard input (R98), never in the environment.
+      env: { ...process.env, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_LIBRARY: path, AO_NO_WORKER: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    child.stdin!.on("error", () => {});
+    child.stdin!.write(`${TOKEN}\n`);
     let out = "";
     let err = "";
     child.stderr!.on("data", (d: Buffer) => (err += d.toString()));
