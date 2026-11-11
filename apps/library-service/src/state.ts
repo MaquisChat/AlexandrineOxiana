@@ -38,6 +38,7 @@ import {
 } from "@ao/library";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
+import { MediaTickets } from "./media.js";
 
 /** A running media worker, shared by every library the service opens. */
 export interface ServiceWorker {
@@ -133,6 +134,8 @@ const actor = (): string => {
 export class ServiceState {
   session: Session | undefined;
   readonly events = new EventBus();
+  /** Media tickets (R135): memory only; all end when the library closes or moves, or the service stops. */
+  readonly media = new MediaTickets(() => this.opts.now().getTime());
   private worker: ServiceWorker | undefined;
   private workerStarting: Promise<ServiceWorker> | undefined;
   private readonly tasks = new Set<Promise<unknown>>();
@@ -513,6 +516,8 @@ export class ServiceState {
    * writes to the library while it is copied. Returns the batches to resume afterwards.
    */
   async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
+    // A ticket never outlives the library where it was issued (R135 2): ended as the move starts.
+    this.media.revokeAll();
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
@@ -587,6 +592,8 @@ export class ServiceState {
 
   /** Closes the open library: running batches cancelled, watches stopped, queues disposed of, lock released. */
   async closeLibrary(): Promise<void> {
+    // Media tickets end with the library (R135 2), and so do their streams.
+    this.media.revokeAll();
     const s = this.session;
     if (!s) return;
     this.session = undefined;

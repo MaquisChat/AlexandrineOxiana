@@ -13,7 +13,9 @@
  *    opens (or a route needs it). If start-up fails, the child and anything it started are killed
  *    before the temporary folder is removed;
  *  - on teardown stops the service with SIGTERM (its graceful shutdown stops the worker), checks it
- *    exited cleanly, and fails the test if any process it started is still running.
+ *    exited cleanly, and fails the test if any process it started is still running;
+ *  - `app.restart()` does the same mid-test and starts a new service on the same settings folder (a
+ *    relaunch of the app), with a new port and token that the page is handed on its next load.
  *
  * Per test, `page`: the built UI (packages/ui/dist) under the desktop shell's own origin,
  * http://tauri.localhost, answered from disk by Playwright (pushState paths fall back to index.html),
@@ -36,7 +38,7 @@ import { tmpdir } from "node:os";
 import { delimiter, extname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { test as base, expect, type Page } from "@playwright/test";
-import { FAKE_TOOLS, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
+import { FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
 export const APP_ORIGIN = "http://tauri.localhost";
@@ -53,10 +55,10 @@ export interface AppHarness {
   configDir: string;
   /** An empty folder for the test's libraries. */
   librariesDir: string;
-  /** http://127.0.0.1:<port> */
+  /** http://127.0.0.1:<port> (of the service running now: a restart changes it). */
   baseUrl: string;
   port: number;
-  /** The UI token (for direct calls in test set-up; the page gets it through window.__AO_SERVICE__). */
+  /** The UI token (for direct calls in test set-up; the page gets it through window.__AO_SERVICE__). A restart changes it. */
   token: string;
   /** A direct call to the service with the UI token, as test set-up (no Origin header: not a browser). */
   api<T = unknown>(method: string, path: string, body?: unknown): Promise<ApiAnswer<T>>;
@@ -64,6 +66,15 @@ export interface AppHarness {
   childProcesses(): string[];
   /** The service's output so far (stdout and stderr), for failure messages. */
   log(): string;
+  /**
+   * Quits and relaunches the service as the desktop shell would: SIGTERM, checked to stop cleanly
+   * with everything it started; then `whileStopped` (e.g. renaming the library folder outside the
+   * app); then a new service on the same app settings folder, with a new port and token. The page
+   * gets the new connection on its next load (navigate or reload after this); the old address is refused.
+   */
+  restart(whileStopped?: () => Promise<void>): Promise<void>;
+  /** Called after each restart (the page fixture hands the new connection over with it). */
+  onRestart(listener: () => Promise<void>): void;
 }
 
 /** Requests the page made to anywhere but the app's origin and the service: refused, and the test fails. */
@@ -207,6 +218,40 @@ export interface StartOptions {
   command?: string[];
   /** How long to wait for `AO_SERVICE_READY` (default 60 s). */
   readyTimeoutMs?: number;
+  /** Told of the child the moment it is spawned, before it is ready (so a caller can always kill it). */
+  onSpawn?: (child: ChildProcess) => void;
+}
+
+/**
+ * Every service process a test spawned that has not been seen to exit. Teardown closes it: what is
+ * still running then (a service still starting when the test timed out, or one still stopping) is
+ * killed with everything it started, and a child spawned after that is killed at once.
+ */
+export class SpawnedServices {
+  private readonly live = new Set<ChildProcess>();
+  private closed = false;
+
+  track(child: ChildProcess): void {
+    if (this.closed) {
+      void killTree(child);
+      return;
+    }
+    this.live.add(child);
+    child.once("exit", () => this.live.delete(child));
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** Kills every service still running (and what it started); returns one line per service killed. */
+  async close(): Promise<string[]> {
+    this.closed = true;
+    const left = [...this.live].filter((c) => c.exitCode === null && c.signalCode === null);
+    await Promise.all(left.map((c) => killTree(c)));
+    this.live.clear();
+    return left.map((c) => `A service process (pid ${c.pid}) was still running at teardown and was killed with what it started.`);
+  }
 }
 
 /**
@@ -228,6 +273,7 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
   });
   const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];
   const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+  opts.onSpawn?.(child);
   const log: string[] = [];
   createInterface({ input: child.stderr! }).on("line", (l) => log.push(`[stderr] ${l}`));
   const readyMs = opts.readyTimeoutMs ?? 60_000;
@@ -294,23 +340,27 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     const configDir = join(root, "config");
     const librariesDir = join(root, "libraries");
     let svc: Awaited<ReturnType<typeof startService>> | undefined;
-    let problems: string[] = [];
+    const problems: string[] = [];
+    /** The output of every service this test started (a restart starts another). */
+    const logs: string[][] = [];
+    const restartListeners: Array<() => Promise<void>> = [];
+    const spawned = new SpawnedServices();
+    const start = () => startService(root, { onSpawn: (c) => spawned.track(c) });
     try {
       await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
-      svc = await startService(root);
-      const { port, token, log, child } = svc;
-      const baseUrl = `http://127.0.0.1:${port}`;
+      svc = await start();
+      logs.push(svc.log);
       const harness: AppHarness = {
         root,
         configDir,
         librariesDir,
-        baseUrl,
-        port,
-        token,
+        baseUrl: `http://127.0.0.1:${svc.port}`,
+        port: svc.port,
+        token: svc.token,
         async api<T>(method: string, path: string, body?: unknown) {
-          const res = await fetch(`${baseUrl}${path}`, {
+          const res = await fetch(`${harness.baseUrl}${path}`, {
             method,
-            headers: { authorization: `Bearer ${token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+            headers: { authorization: `Bearer ${harness.token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
             ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
           });
           const text = await res.text();
@@ -322,15 +372,33 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
           }
           return { status: res.status, body: parsed as T };
         },
-        childProcesses: () => (child.pid ? descendants(child.pid).map((p) => p.command) : []),
-        log: () => log.join("\n"),
+        childProcesses: () => (svc?.child.pid ? descendants(svc.child.pid).map((p) => p.command) : []),
+        log: () => logs.map((l) => l.join("\n")).join("\n--- the service was restarted ---\n"),
+        async restart(whileStopped) {
+          const old = svc!;
+          svc = undefined;
+          problems.push(...(await stopService(old.child)));
+          expect(problems, "the service and the processes it started stop cleanly before a restart").toEqual([]);
+          await whileStopped?.();
+          // The test may have ended (timed out) meanwhile: never start a service after teardown began.
+          if (spawned.isClosed) throw new Error("The test ended while the service was being restarted.");
+          svc = await start();
+          logs.push(svc.log);
+          harness.port = svc.port;
+          harness.baseUrl = `http://127.0.0.1:${svc.port}`;
+          harness.token = svc.token;
+          for (const l of restartListeners) await l();
+        },
+        onRestart: (listener) => void restartListeners.push(listener),
       };
       await use(harness);
     } finally {
       try {
-        if (svc) problems = await stopService(svc.child);
-        if (svc && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
-          await testInfo.attach("service-log", { body: svc.log.join("\n"), contentType: "text/plain" });
+        if (svc) problems.push(...(await stopService(svc.child)));
+        // Anything else still running: a service still starting or stopping when the test ended.
+        problems.push(...(await spawned.close()));
+        if (logs.length && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
+          await testInfo.attach("service-log", { body: logs.map((l) => l.join("\n")).join("\n--- the service was restarted ---\n"), contentType: "text/plain" });
         }
       } finally {
         await rm(root, { recursive: true, force: true });
@@ -351,7 +419,8 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
 
   page: async ({ page, app, blocked, browserName }, use) => {
     const context = page.context();
-    const service = new URL(app.baseUrl).host;
+    // Read at each request: a restart moves the service to another port (and the old one is refused).
+    const service = () => new URL(app.baseUrl).host;
     // Chromium's Local Network Access treats a page Playwright answers itself as public, so its
     // calls to the loopback service need the permission a user (or the shell) would grant; without
     // it every call fails with "Permission was denied for this request to access the `loopback`
@@ -359,7 +428,7 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     if (browserName === "chromium") await context.grantPermissions(["local-network-access"], { origin: APP_ORIGIN });
     // Everything but the service goes through here: the app's origin is answered from disk, the rest is refused.
     await context.route(
-      (url) => url.host !== service,
+      (url) => url.host !== service(),
       async (route) => {
         const url = new URL(route.request().url());
         if (url.origin !== APP_ORIGIN) {
@@ -372,16 +441,106 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
       },
     );
     // As the desktop shell will: the connection on window before any app code runs, in the app's own
-    // top-level document only (never in a snapshot frame or any other origin).
-    await context.addInitScript(
-      ({ baseUrl, token, origin }) => {
-        if (window === window.top && window.location.origin === origin) (window as unknown as { __AO_SERVICE__?: unknown }).__AO_SERVICE__ = { baseUrl, token };
-      },
-      { baseUrl: app.baseUrl, token: app.token, origin: APP_ORIGIN },
-    );
+    // top-level document only (never in a snapshot frame or any other origin). After a restart the
+    // shell hands over the new connection: a later init script runs after this one and replaces it.
+    const handOver = async () => {
+      await context.addInitScript(
+        ({ baseUrl, token, origin }) => {
+          if (window === window.top && window.location.origin === origin) (window as unknown as { __AO_SERVICE__?: unknown }).__AO_SERVICE__ = { baseUrl, token };
+        },
+        { baseUrl: app.baseUrl, token: app.token, origin: APP_ORIGIN },
+      );
+    };
+    await handOver();
+    app.onRestart(handOver);
     await page.goto(`${APP_ORIGIN}/`);
     await use(page);
   },
 });
+
+/**
+ * Rules of a project without identifiable data and without online lookups: the default rules
+ * require encryption (the service refuses them without it), and a lookup with no recorded answer
+ * fails on purpose. Scenarios that need neither use these.
+ */
+export const OPEN_RULES = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\nprocessing:\n  metadata_lookup: []\n";
+
+/**
+ * Test set-up through the service: a library at `librariesDir/<folder>` and a project in it with
+ * `governanceYaml` (encrypted with `passphrase` when one is given, else not), then the page loaded
+ * onto the library screen with that project selected. (The library chooser and the New project dialog
+ * are covered by the smoke test; the scenarios here are about what comes after.)
+ */
+export async function libraryWithProject(
+  app: AppHarness,
+  page: Page,
+  o: { library: string; folder?: string; project: string; governanceYaml?: string; passphrase?: string },
+): Promise<{ libraryPath: string; projectId: string; projectFolder: string }> {
+  const libraryPath = join(app.librariesDir, o.folder ?? o.library);
+  const lib = await app.api("POST", "/libraries", { path: libraryPath, name: o.library });
+  expect(lib.status, JSON.stringify(lib.body)).toBe(200);
+  const encryption = o.passphrase ? { enabled: true, passphrase: o.passphrase } : { enabled: false };
+  const created = await app.api<{ project: { id: string; folder: string } }>("POST", "/projects", { name: o.project, governanceYaml: o.governanceYaml ?? OPEN_RULES, encryption });
+  expect(created.status, JSON.stringify(created.body)).toBe(200);
+  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(created.body.project.id)}`);
+  await expect(page.getByRole("heading", { level: 1, name: o.library })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: o.project })).toHaveAttribute("aria-current", "true");
+  return { libraryPath, projectId: created.body.project.id, projectFolder: created.body.project.folder };
+}
+
+/** A recorded defect (Task 45 report): its id and the step it blocks, in words. */
+export interface Defect {
+  id: string;
+  title: string;
+}
+
+/** How long the assertion that decides a defect test may wait: the state it reads is already there. */
+export const DEFECT_TIMEOUT = 5_000;
+
+/**
+ * Inside a scenario, where a step cannot be done yet because of `d`: the step shows in the report as
+ * skipped, "BLOCKED <id>: <title>", and the test carries a "blocked" annotation. The scenario goes on
+ * after it as far as it can. The step itself runs in its own test, `defectTest(d, …)`, which notices
+ * when the defect is fixed.
+ */
+export async function blockedBy(d: Defect): Promise<void> {
+  test.info().annotations.push({ type: "blocked", description: `${d.id}: ${d.title}` });
+  await test.step.skip(`BLOCKED ${d.id}: ${d.title} (checked by the test "${d.id}: …")`, async () => {});
+}
+
+/**
+ * From this call on, the running test is expected to fail because of `d` (Playwright's test.fail):
+ * it is reported "expected to fail" while the defect reproduces, and it fails the run as soon as it
+ * passes, i.e. once the defect is fixed (then turn the step in its scenario back into a test.step and
+ * delete the defect test). Set-up done before this call fails the test as usual, so only the
+ * assertions after it are covered. Use `DEFECT_TIMEOUT` on them.
+ */
+export function expectDefect(d: Defect): void {
+  test.info().annotations.push({ type: "defect", description: `${d.id}: ${d.title}` });
+  test.fail(true, `${d.id}: ${d.title}`);
+}
+
+/**
+ * The plaintext of a file the service stored encrypted, decrypted with the library's own code (the
+ * project key unwrapped from `keys/project-key.json` with the passphrase) in a child process run from
+ * packages/library, so the test reads exactly what the app would. The plaintext is written to
+ * `output`, which must be inside the test's temporary folder; the passphrase goes by environment,
+ * never on a command line.
+ */
+export function decryptStoredFile(app: AppHarness, o: { projectRoot: string; file: string; passphrase: string; output: string }): void {
+  if (!resolve(o.output).startsWith(app.root + sep)) throw new Error("decryptStoredFile writes only inside the test's temporary folder");
+  const code = [
+    'import { readFile, writeFile } from "node:fs/promises";',
+    'import { unwrapKey } from "./src/crypto/keys.ts";',
+    'import { decryptBytes } from "./src/repo/io.ts";',
+    "const o = JSON.parse(process.env.AO_E2E_DECRYPT);",
+    'const kf = JSON.parse(await readFile(o.keyFile, "utf8"));',
+    "const key = await unwrapKey(kf.passphrase, o.passphrase);",
+    "await writeFile(o.output, await decryptBytes((id) => (id === kf.keyId ? key : undefined), await readFile(o.file)));",
+  ].join("\n");
+  const env = { ...process.env, AO_E2E_DECRYPT: JSON.stringify({ keyFile: join(o.projectRoot, "keys", "project-key.json"), passphrase: o.passphrase, file: o.file, output: o.output }) };
+  const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: LIBRARY_DIR, env, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) throw new Error(`Decrypting a stored file failed (status ${r.status}): ${r.stderr}`);
+}
 
 export { expect, type Page };
