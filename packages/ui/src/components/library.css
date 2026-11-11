@@ -415,7 +415,7 @@ button:disabled,
 }
 
 /* ---- interrupted changes (R27) ---- */
-.ao-backdrop {
+.ao-pending-backdrop {
   position: fixed;
   inset: 0;
   z-index: 10;
@@ -426,7 +426,7 @@ button:disabled,
   background: color-mix(in srgb, var(--backdrop) 80%, var(--bg) 20%);
 }
 
-.ao-dialog {
+.ao-pending-dialog {
   max-width: 40rem;
   max-height: calc(100vh - 2 * var(--space-3));
   overflow: auto;

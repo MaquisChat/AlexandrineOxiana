@@ -227,8 +227,8 @@ export function PendingWritesDialog({ api, readOnly, onClose, onResolved, change
   };
 
   return createPortal(
-    <div className="ao-backdrop">
-      <div ref={box} role="dialog" aria-modal="true" aria-labelledby="ao-pending-title" className="ao-dialog" onKeyDown={onKeyDown}>
+    <div className="ao-pending-backdrop">
+      <div ref={box} role="dialog" aria-modal="true" aria-labelledby="ao-pending-title" className="ao-pending-dialog" onKeyDown={onKeyDown}>
         <h2 id="ao-pending-title" ref={heading} tabIndex={-1}>
           Interrupted changes
         </h2>
