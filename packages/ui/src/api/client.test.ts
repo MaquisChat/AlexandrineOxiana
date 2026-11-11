@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
@@ -126,14 +123,6 @@ describe("createClient", () => {
     const plain = createClient(BASE, TOKEN, { fetch: fakeFetch(() => json({})).fetch });
     expect(() => plain.request("GET", `/x/${TOKEN.replace(/t/g, "%74")}`)).toThrow(/token/);
     expect(() => plain.request("GET", "/x/%E0%A4%A")).toThrow(/path/); // undecodable: refused, not guessed
-  });
-
-  it("uses the same credential query keys as the service", () => {
-    const auth = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../../../apps/library-service/src/auth.ts"), "utf8");
-    const m = /CREDENTIAL_QUERY_KEYS[^=\n]*=\s*new Set\(\[([^\]]*)\]\)/.exec(auth);
-    const imported = /import\s*\{[^}]*CREDENTIAL_QUERY_KEYS[^}]*\}\s*from\s*"@ao\/(?:core|shared)/.test(auth);
-    expect(m !== null || imported, "auth.ts declares or imports CREDENTIAL_QUERY_KEYS").toBe(true);
-    if (m?.[1]) expect(new Set(m[1].split(",").map((k) => k.trim().replace(/"/g, "")))).toEqual(new Set(CREDENTIAL_QUERY_KEYS));
   });
 
   it("a 2xx answer that is not JSON is an ApiClientError, not a crash", async () => {

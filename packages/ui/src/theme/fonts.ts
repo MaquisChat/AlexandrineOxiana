@@ -6,9 +6,9 @@
  * matches the choice's generic family (R105), so a sans or monospace choice never falls back to a
  * serif face.
  */
-import { isUsableFontFamily } from "@ao/shared";
+import { inferGenericFamily, isUsableFontFamily, splitFontFamilies, type GenericFamily } from "@ao/shared";
 
-export type GenericFamily = "serif" | "sans-serif" | "monospace";
+export type { GenericFamily };
 
 export interface FontChoice {
   family: string;
@@ -41,26 +41,6 @@ export const FALLBACKS_BY_GENERIC: Record<GenericFamily, string> = {
 /** Generic families that end a stack; they are dropped from the choice and the right one ends it. */
 const TRAILING_GENERICS = new Set(["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace"]);
 
-/** Faces offered in the picker (and common ones) that are not serif. */
-const KNOWN_GENERIC: Record<string, GenericFamily> = {
-  inter: "sans-serif",
-  "atkinson hyperlegible": "sans-serif",
-  opendyslexic: "sans-serif",
-  "system-ui": "sans-serif",
-  "ui-sans-serif": "sans-serif",
-  arial: "sans-serif",
-  helvetica: "sans-serif",
-  "helvetica neue": "sans-serif",
-  "segoe ui": "sans-serif",
-  roboto: "sans-serif",
-  "ui-monospace": "monospace",
-  menlo: "monospace",
-  consolas: "monospace",
-  "courier new": "monospace",
-  sfmono: "monospace",
-  "sfmono-regular": "monospace",
-};
-
 /** Whether a family name (or list) can be used; the same rule as the service (@ao/shared). */
 export function isUsableFamily(family: string): boolean {
   return isUsableFontFamily(family);
@@ -74,43 +54,14 @@ function cssFamily(name: string): string {
   return `'${n.replace(/'/g, "\\'")}'`;
 }
 
-const unquote = (n: string) => n.trim().replace(/^['"]|['"]$/g, "");
-
-/** Splits a font-family list on commas outside quotes. */
-function splitFamilies(list: string): string[] {
-  const out: string[] = [];
-  let cur = "";
-  let quote: string | null = null;
-  for (const ch of list) {
-    if (quote) {
-      if (ch === quote) quote = null;
-    } else if (ch === "'" || ch === '"') quote = ch;
-    else if (ch === ",") {
-      out.push(cur.trim());
-      cur = "";
-      continue;
-    }
-    cur += ch;
-  }
-  if (cur.trim()) out.push(cur.trim());
-  return out;
-}
+const splitFamilies = splitFontFamilies;
 
 /**
  * The generic family of a choice: its `generic`, else the generic keyword that ends its list, else a
- * known face's kind, else serif.
+ * known face's kind, else serif (the inference is shared with the service: @ao/shared, R109).
  */
 export function genericOf(choice: FontChoice): GenericFamily {
-  if (choice.generic) return choice.generic;
-  const names = splitFamilies(choice.family).map((n) => unquote(n).toLowerCase());
-  for (let i = names.length - 1; i >= 0; i--) {
-    const n = names[i]!;
-    if (n === "serif" || n === "ui-serif") return "serif";
-    if (n === "sans-serif" || n === "ui-sans-serif") return "sans-serif";
-    if (n === "monospace") return "monospace";
-  }
-  for (const n of names) if (KNOWN_GENERIC[n]) return KNOWN_GENERIC[n];
-  return "serif";
+  return choice.generic ?? inferGenericFamily(choice.family) ?? "serif";
 }
 
 /**

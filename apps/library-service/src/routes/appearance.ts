@@ -4,6 +4,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import { readAppSetting, updateAppSetting } from "@ao/library";
+import { GENERIC_FAMILIES, inferGenericFamily, isGenericFamily, isUsableFontFamily, type GenericFamily } from "@ao/shared";
 import { badRequest } from "../errors.js";
 import { bodyOf, type Ctx, type Obj } from "./util.js";
 
@@ -15,6 +16,8 @@ export interface FontChoice {
   family: string;
   source: "bundled" | "system" | "user-file";
   file?: string;
+  /** The kind of face, for the UI's fallbacks (R105, R109); inferred from the family when not given. */
+  generic?: GenericFamily;
 }
 export interface AppearanceSettings {
   theme: "system" | "light" | "dark";
@@ -31,11 +34,11 @@ export const DEFAULT_APPEARANCE: AppearanceSettings = {
   theme: "system",
   highContrast: false,
   fonts: {
-    interface: { family: GOUDY, source: "bundled" },
-    reading: { family: GOUDY, source: "bundled" },
-    transcript: { family: GOUDY, source: "bundled" },
-    notes: { family: GOUDY, source: "bundled" },
-    mono: { family: MONO, source: "system" },
+    interface: { family: GOUDY, source: "bundled", generic: "serif" },
+    reading: { family: GOUDY, source: "bundled", generic: "serif" },
+    transcript: { family: GOUDY, source: "bundled", generic: "serif" },
+    notes: { family: GOUDY, source: "bundled", generic: "serif" },
+    mono: { family: MONO, source: "system", generic: "monospace" },
   },
   textScale: 1,
   lineSpacing: 1.5,
@@ -48,16 +51,18 @@ function oneOf<T>(v: unknown, allowed: readonly T[], name: string): T {
   return v as T;
 }
 
-/** Characters a font family name may not hold (shared rule with the UI, R105): control characters, backslash, CSS/markup delimiters. */
-export const FONT_NAME_REFUSED = /[\u0000-\u001f\u007f-\u009f\\;{}<>]/;
-
 function font(v: unknown, name: string): FontChoice {
   if (!v || typeof v !== "object") throw badRequest(`"fonts.${name}" must be an object.`);
   const o = v as Obj;
-  if (typeof o.family !== "string" || !o.family.trim() || o.family.length > 300 || FONT_NAME_REFUSED.test(o.family)) throw badRequest(`"fonts.${name}.family" is not a font name.`);
+  // The same rule as the UI (@ao/shared, R105/R108): no control, bidi or zero-width characters, no CSS delimiters.
+  if (typeof o.family !== "string" || !isUsableFontFamily(o.family)) throw badRequest(`"fonts.${name}.family" is not a font name.`);
   const source = oneOf(o.source, ["bundled", "system", "user-file"] as const, `fonts.${name}.source`);
   if (o.file !== undefined && (typeof o.file !== "string" || o.file.length > 4096)) throw badRequest(`"fonts.${name}.file" must be a path.`);
-  return { family: o.family, source, ...(typeof o.file === "string" ? { file: o.file } : {}) };
+  const given = o.generic;
+  if (given !== undefined && !isGenericFamily(given)) throw badRequest(`"fonts.${name}.generic" must be one of: ${GENERIC_FAMILIES.join(", ")}.`);
+  // Absent: inferred the way the UI infers it (R109), or left out when the family does not say.
+  const generic = given ?? inferGenericFamily(o.family);
+  return { family: o.family, source, ...(typeof o.file === "string" ? { file: o.file } : {}), ...(generic ? { generic } : {}) };
 }
 
 /** `patch` applied to `cur`, every value checked. */

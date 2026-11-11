@@ -26,7 +26,9 @@ import {
   type WorkerJob,
 } from "@ao/library";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
+import * as authModule from "./auth.js";
 import { readServiceToken } from "./auth.js";
+import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -1428,4 +1430,147 @@ describe("review round 4: stopped work, in-flight changes, refusals, resumes (R1
     expect(await batchState(pid, batchId)).toBe("finished");
     expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(20);
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Integration after the Task 31/32 merge: shared rules (R109) and the extension's routes (R111)
+describe("integration: shared rules from @ao/shared (R105, R108, R109)", () => {
+  beforeEach(() => start());
+
+  it("credential query keys come from @ao/shared (no copy in auth.ts); every one of them is refused", async () => {
+    expect("CREDENTIAL_QUERY_KEYS" in authModule).toBe(false);
+    for (const key of CREDENTIAL_QUERY_KEYS) {
+      for (const k of [key, key.toUpperCase()]) expect((await call({ url: `/libraries?${k}=x` })).status, k).toBe(401);
+    }
+    expect((await call({ url: "/libraries?sessionId=x" })).status).not.toBe(401);
+  });
+
+  it("font family names follow isUsableFontFamily: C1, bidi, zero-width and separator characters are refused", async () => {
+    for (const cp of [0x85, 0x202e, 0x2066, 0x200b, 0x200e, 0xfeff, 0x2028, 0x2029]) {
+      const family = `Font${String.fromCodePoint(cp)}Name`;
+      const r = await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { reading: { family, source: "system" } } } });
+      expect(r.status, cp.toString(16)).toBe(400);
+    }
+    expect((await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { reading: { family: "Noto Sans العربية", source: "system" } } } })).status).toBe(200);
+  });
+
+  it("fonts.*.generic is stored and returned: a typed monospace font comes back as monospace", async () => {
+    const put = await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { mono: { family: "Fira Code", source: "system", generic: "monospace" } } } });
+    expect(put.status, put.body).toBe(200);
+    expect(put.json.fonts.mono).toEqual({ family: "Fira Code", source: "system", generic: "monospace" });
+    const got = (await call({ url: "/settings/appearance" })).json;
+    expect(got.fonts.mono).toEqual({ family: "Fira Code", source: "system", generic: "monospace" });
+    // The defaults carry theirs.
+    expect(got.fonts.reading.generic).toBe("serif");
+  });
+
+  it("generic must be serif, sans-serif or monospace; when absent it is inferred as the UI does, or left out", async () => {
+    for (const generic of ["cursive", "Monospace", 3, null]) {
+      const r = await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { notes: { family: "Inter", source: "system", generic } } } });
+      expect(r.status, JSON.stringify(generic)).toBe(400);
+    }
+    const inter = await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { notes: { family: "Inter", source: "system" } } } });
+    expect(inter.json.fonts.notes).toEqual({ family: "Inter", source: "system", generic: "sans-serif" });
+    const unknown = await call({ method: "PUT", url: "/settings/appearance", body: { fonts: { notes: { family: "Some Unknown Face", source: "system" } } } });
+    expect(unknown.json.fonts.notes).toEqual({ family: "Some Unknown Face", source: "system" });
+    // A stored file written before generic existed: inferred on read.
+    await writeFile(join(deps.appConfigDir, "appearance.json"), JSON.stringify({ fonts: { transcript: { family: "Menlo, monospace", source: "system" } } }));
+    expect((await call({ url: "/settings/appearance" })).json.fonts.transcript).toEqual({ family: "Menlo, monospace", source: "system", generic: "monospace" });
+  });
+});
+
+describe("integration: the extension's routes (R111)", () => {
+  const EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+  const OTHER = "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba";
+  const LINKS_GOV = `${OPEN_GOV}captureMethods: [manual_upload, browser_capture, downloader]\n`;
+
+  async function pair(origin = EXT): Promise<string> {
+    const p = await call({ method: "POST", url: "/extension/pair" });
+    const c = await svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin, "content-type": "application/json" }, payload: JSON.stringify({ code: p.json.code }) });
+    expect(c.statusCode, c.body).toBe(200);
+    return c.json().token as string;
+  }
+  async function ext(token: string, method: "GET" | "POST", url: string, body?: unknown, origin: string | null = EXT) {
+    const res = await svc.app.inject({
+      method,
+      url,
+      headers: { authorization: `Bearer ${token}`, ...(origin !== null ? { origin } : {}), ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+      ...(body !== undefined ? { payload: JSON.stringify(body) } : {}),
+    });
+    return { status: res.statusCode, json: res.json(), body: res.body };
+  }
+
+  it("R111(1): with the extension token, no Origin is accepted on GET /projects only; a different Origin stays 403", async () => {
+    await start({ pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    await pair(OTHER); // another extension is paired too: its origin is still not this token's
+    const listed = await ext(token, "GET", "/projects", undefined, null);
+    expect(listed.status, listed.body).toBe(200);
+    expect(listed.json.projects.map((p: { id: string }) => p.id)).toEqual([pid]);
+    // Every extension POST needs the paired Origin.
+    const page = { projectId: pid, url: "https://example.org/a", extracted: { platform: "web", kind: "page" }, alsoDownload: false };
+    for (const [url, body] of [["/capture/browser", page], ["/capture/browser/links", { projectId: pid, urls: ["https://example.org/a"] }]] as const) {
+      const r = await ext(token, "POST", url, body, null);
+      expect(r.status, url).toBe(403);
+      expect(r.json.error.code).toBe("FORBIDDEN");
+    }
+    for (const origin of [OTHER, "https://evil.example", "null"]) {
+      const r = await ext(token, "GET", "/projects", undefined, origin);
+      expect(r.status, origin).toBe(403);
+    }
+    // Other routes stay out of reach without an Origin as well.
+    expect((await ext(token, "GET", "/libraries", undefined, null)).status).toBe(403);
+    // The UI token: unchanged (no Origin fine; the shell's fine; a foreign one 403).
+    expect((await call({ url: "/projects" })).status).toBe(200);
+    expect((await call({ url: "/projects", headers: { origin: "tauri://localhost" } })).status).toBe(200);
+    expect((await call({ url: "/projects", headers: { origin: "https://evil.example" } })).status).toBe(403);
+  });
+
+  it("R111(2): POST /capture/browser/links queues the links (work registry, capture.progress) for the extension token", async () => {
+    await start({ worker: fakeProvider({ fail: 99 }), pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const urls = ["https://www.youtube.com/watch?v=aoTest00001", "https://www.youtube.com/watch?v=aoTest00002"];
+    const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ queueId: expect.any(String) });
+    expect(svc.state.captureQueue(r.json.queueId)).toMatchObject({ projectId: pid, total: 2 });
+    await svc.state.idle();
+    const progress = events.filter((e) => e.type === "capture.progress" && e.data.queueId === r.json.queueId);
+    expect(progress.at(-1)?.data).toMatchObject({ projectId: pid, done: 2, total: 2, finished: true });
+  });
+
+  it("R111(2): refusals — over 500 links, non-web schemes, long links, unknown project, policy, the UI token", async () => {
+    await start({ worker: fakeProvider({ fail: 99 }), pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const many = Array.from({ length: 501 }, (_, i) => `https://example.org/p/${i}`);
+    expect((await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: many })).status).toBe(400);
+    expect((await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: many.slice(0, 500) })).status).toBe(200);
+    for (const bad of ["file:///etc/passwd", "javascript:alert(1)", "ftp://example.org/x", "data:text/html,x", "//example.org/x", `https://example.org/${"a".repeat(2048)}`]) {
+      const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: ["https://example.org/ok", bad] });
+      expect(r.status, bad.slice(0, 30)).toBe(400);
+      expect(r.json.error.code).toBe("VALIDATION");
+    }
+    for (const body of [{ projectId: pid, urls: [] }, { projectId: pid }, { urls: ["https://example.org/x"] }, { projectId: pid, urls: "https://example.org/x" }]) {
+      expect((await ext(token, "POST", "/capture/browser/links", body)).status, JSON.stringify(body)).toBe(400);
+    }
+    expect((await ext(token, "POST", "/capture/browser/links", { projectId: "nope", urls: ["https://example.org/x"] })).status).toBe(404);
+    // The project's rules: no downloader → 403 POLICY_DENIED with the reason.
+    const strict = await newProject(`${OPEN_GOV}captureMethods: [manual_upload, browser_capture]\n`, false, "Strict");
+    const denied = await ext(token, "POST", "/capture/browser/links", { projectId: strict, urls: ["https://www.youtube.com/watch?v=aoTest00001"] });
+    expect(denied.status).toBe(403);
+    expect(denied.json.error.code).toBe("POLICY_DENIED");
+    expect(denied.json.error.reason).toMatch(/downloader/i);
+    // The desktop UI keeps /projects/:id/capture: this route is the extension's only.
+    const ui = await call({ method: "POST", url: "/capture/browser/links", body: { projectId: pid, urls: ["https://example.org/x"] } });
+    expect(ui.status).toBe(403);
+    expect(ui.json.error.code).toBe("FORBIDDEN");
+  });
 });

@@ -129,7 +129,7 @@ export async function startStubService(): Promise<StubService> {
       if (route === "POST /capture/browser/links") {
         const b = body as { projectId?: unknown; urls?: unknown };
         const okUrls = Array.isArray(b?.urls) && b.urls.length >= 1 && b.urls.length <= 500 && b.urls.every((u) => typeof u === "string" && /^https?:\/\//.test(u) && u.length <= 2048);
-        if (typeof b?.projectId !== "string" || !okUrls) return refuse(res, 400, "BAD_REQUEST", "projectId and 1–500 urls are needed");
+        if (typeof b?.projectId !== "string" || !okUrls) return refuse(res, 400, "VALIDATION", "projectId and 1–500 urls are needed");
         linkLists.push(r);
         return send(res, 200, { queueId: `q-${linkLists.length}` }, origin);
       }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, isCredentialQueryKey, isUsableFontFamily } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -16,5 +16,20 @@ describe("@ao/shared", () => {
     }
     expect(isUsableFontFamily("Noto Sans العربية")).toBe(true);
     for (const bad of ["", "  ", "a;b", "a{b", "a}b", "<x>", "a\\b", "a\nb", "a\u0000b", "a\u007fb", "x".repeat(301)]) expect(isUsableFontFamily(bad), JSON.stringify(bad)).toBe(false);
+  });
+
+  it("generic families (R105, R109): the keyword that ends the list, else a known face, else undefined", () => {
+    expect([...GENERIC_FAMILIES]).toEqual(["serif", "sans-serif", "monospace"]);
+    expect(isGenericFamily("monospace")).toBe(true);
+    expect(isGenericFamily("cursive")).toBe(false);
+    expect(isGenericFamily(undefined)).toBe(false);
+    expect(inferGenericFamily("'Goudy Old Style', 'Sorts Mill Goudy', Garamond, Georgia, serif")).toBe("serif");
+    expect(inferGenericFamily("ui-monospace, SFMono-Regular, Menlo, Consolas, monospace")).toBe("monospace");
+    expect(inferGenericFamily("system-ui, sans-serif")).toBe("sans-serif");
+    expect(inferGenericFamily("Inter")).toBe("sans-serif");
+    expect(inferGenericFamily("'Atkinson Hyperlegible'")).toBe("sans-serif");
+    expect(inferGenericFamily("Consolas")).toBe("monospace");
+    expect(inferGenericFamily("Some Unknown Face")).toBeUndefined();
+    expect(splitFontFamilies("'A, B', \"C\", D")).toEqual(["'A, B'", '"C"', "D"]);
   });
 });

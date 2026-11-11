@@ -5,8 +5,9 @@
  *    environment), sent as `Authorization: Bearer <token>` and compared in constant time. Tokens
  *    are never accepted in the query string (a request carrying one there is refused).
  *  - The browser extension holds its own token, issued by pairing and valid only for
- *    `POST /capture/browser` and `GET /projects`. Only its SHA-256 is stored, in the device's app
- *    settings (`extension-pairings.json`), with the extension origin recorded at pairing.
+ *    `POST /capture/browser`, `POST /capture/browser/links` and `GET /projects`. Only its SHA-256 is stored, in the device's app
+ *    settings (`extension-pairings.json`), with the extension origin recorded at pairing. Its routes
+ *    are listed in server.ts (EXTENSION_ROUTES).
  *  - Host must be `127.0.0.1:<port>` or `localhost:<port>` (DNS-rebinding defence); a request with
  *    an Origin is refused unless it is the desktop shell (`tauri://localhost`,
  *    `http://tauri.localhost`) or a paired extension. Allowed origins get that exact origin back in
@@ -17,6 +18,7 @@
  */
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { readAppSetting, updateAppSetting } from "@ao/library";
+import { isCredentialQueryKey } from "@ao/shared";
 
 /** The UI token from the environment, which is then removed from it (child processes never see it). */
 export function readServiceToken(env: NodeJS.ProcessEnv = process.env): string {
@@ -40,13 +42,11 @@ export function bearerOf(header: string | string[] | undefined): string | undefi
   return m?.[1];
 }
 
-/** Query-string keys that carry a credential: refused outright (R96, exact names per R98). */
-export const CREDENTIAL_QUERY_KEYS: ReadonlySet<string> = new Set(["access_token", "token", "auth", "authorization", "key", "apikey", "api_key", "secret", "password", "passphrase", "code", "bearer"]);
-
+/** Whether a query string carries a credential-named key (@ao/shared CREDENTIAL_QUERY_KEYS, R96/R98): refused outright. */
 export function queryCarriesToken(url: string): boolean {
   const q = url.indexOf("?");
   if (q < 0) return false;
-  for (const key of new URLSearchParams(url.slice(q + 1)).keys()) if (CREDENTIAL_QUERY_KEYS.has(key.toLowerCase())) return true;
+  for (const key of new URLSearchParams(url.slice(q + 1)).keys()) if (isCredentialQueryKey(key)) return true;
   return false;
 }
 

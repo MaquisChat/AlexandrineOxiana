@@ -72,8 +72,13 @@ declare module "fastify" {
   }
 }
 
-/** What the extension token may reach (R96). */
-const EXTENSION_ROUTES = new Set(["POST /capture/browser", "GET /projects"]);
+/** What the extension token may reach (R96, R111). */
+const EXTENSION_ROUTES = new Set(["POST /capture/browser", "POST /capture/browser/links", "GET /projects"]);
+/**
+ * Extension routes reached without an Origin header (R111): Chrome sends none on a GET to a host the
+ * extension has permission for. Only this read; every POST needs the paired origin.
+ */
+const EXTENSION_NO_ORIGIN_ROUTES = new Set(["GET /projects"]);
 /** Reached without a token: the pairing code is the credential (rate-limited, 5 attempts). */
 const OPEN_ROUTES = new Set(["POST /extension/pair/confirm"]);
 
@@ -172,7 +177,9 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     if (!ext) return fail(reply, new ApiError(401, "UNAUTHORIZED", "A valid token is needed."));
     // 4. The extension token: its own routes only, from its own origin.
     if (!EXTENSION_ROUTES.has(route)) return fail(reply, new ApiError(403, "FORBIDDEN", "The browser extension cannot use this."));
-    if (origin !== ext.origin) return fail(reply, new ApiError(403, "FORBIDDEN", "This token belongs to another extension."));
+    // From its own origin; with none at all only where Chrome omits it (R111). A different one: 403.
+    const originOk = origin === ext.origin || (origin === undefined && EXTENSION_NO_ORIGIN_ROUTES.has(route));
+    if (!originOk) return fail(reply, new ApiError(403, "FORBIDDEN", origin === undefined ? "Requests from the browser extension must carry its origin." : "This token belongs to another extension."));
     req.caller = "extension";
   });
 

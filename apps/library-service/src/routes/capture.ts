@@ -1,7 +1,7 @@
 /**
  * Capture (spec 5.1, 5.5): links queued for the downloader (per-item outcomes as `capture.progress`
  * events), whole profiles, transcription of a source, the capture tools' versions and update, and
- * browser capture from the paired extension (its pairing too).
+ * browser capture from the paired extension (its pairing too, and its link lists: R111).
  *
  * The `capture` decision is evaluated before anything is queued, so a capture the project's rules
  * deny answers 403 POLICY_DENIED with the reason at once (the deny is audited).
@@ -55,28 +55,48 @@ function requireAcknowledged(s: Session, projectId: string, opts: CaptureOptions
   }
 }
 
+/** Links queued at once (R111: also the extension's link lists). */
+export const MAX_QUEUED_LINKS = 500;
+
+/** A list of web addresses (http or https only, at most 2048 characters each). */
 function urlList(b: Obj, key: string, max: number): string[] {
   const urls = strArray(b, key, { max, itemMax: 2048 });
-  for (const u of urls) if (!/^https?:\/\//i.test(u)) throw badRequest(`"${key}" must be web addresses.`);
+  for (const u of urls) if (!isWebAddress(u)) throw badRequest(`"${key}" must be web addresses.`);
   return urls;
+}
+
+function isWebAddress(u: string): boolean {
+  if (!/^https?:\/\//i.test(u)) return false;
+  try {
+    const p = new URL(u);
+    return (p.protocol === "http:" || p.protocol === "https:") && p.hostname.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   const { state, pairing } = ctx;
 
-  app.post("/projects/:id/capture", async (req) => {
-    const s = state.requireWritable();
-    const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
-    const urls = urlList(b, "urls", 500);
-    const opts = captureOptions(optObj(b, "options"));
+  /** Queues `urls` for the downloader after the project's capture decision (403 POLICY_DENIED with the reason). */
+  async function queueLinks(s: Session, projectId: string, urls: string[], opts: CaptureOptions): Promise<{ queueId: string }> {
     await checkCaptureAllowed(s.repo, projectId, urls); // 403 with the reason when denied
     requireAcknowledged(s, projectId, opts);
     await state.workerClient(); // 503 when the media helper cannot run
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
+    // The legal basis is checked per link as it is stored, as for every capture.
     state.startCaptureQueue(queueId, projectId, urls, opts);
     return { queueId };
+  }
+
+  app.post("/projects/:id/capture", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    const urls = urlList(b, "urls", MAX_QUEUED_LINKS);
+    const opts = captureOptions(optObj(b, "options"));
+    return queueLinks(s, projectId, urls, opts);
   });
 
   app.post("/projects/:id/capture-profile", async (req) => {
@@ -163,6 +183,21 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   app.delete("/extension/pairings/:pid", async (req) => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");
     return { removed: true };
+  });
+
+  // The extension's "profile as I scroll" list (R111): the same decision, queue and capture.progress
+  // events as /projects/:id/capture, reached with the extension token only (the desktop app uses that
+  // route). No browser-session (cookies) option from here; a legal basis may be given.
+  app.post("/capture/browser/links", async (req) => {
+    if (req.caller !== "extension") throw new ApiError(403, "FORBIDDEN", "This is the browser extension's route; the desktop app queues links with /projects/:id/capture.");
+    const s = state.requireWritable();
+    const b = bodyOf(req);
+    const projectId = str(b, "projectId", 64);
+    if (!s.repo.listProjects().some((p) => p.id === projectId)) throw notFound("That project");
+    const urls = urlList(b, "urls", MAX_QUEUED_LINKS);
+    if (!urls.length) throw badRequest('"urls" must list at least one web address.');
+    const legalBasis = optStr(b, "legalBasis", 2000);
+    return queueLinks(s, projectId, urls, { transcribe: "project-default", ...(legalBasis ? { legalBasis } : {}) });
   });
 
   app.post("/capture/browser", { bodyLimit: BROWSER_CAPTURE_BODY_LIMIT }, async (req) => {
