@@ -405,11 +405,11 @@ Update after every task; commit and push.
 | 38 Fix the red build | done | 8500d33 | 47 CLI tests pass locally; CI run on GitHub pending |
 | 39 Handoff docs in and corrected | done | 1597ad7, 8747f80 | |
 | 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
-| 41a Review: library and service | re-review 2 | | round 2 fixes in; reviewer checking |
+| 41a Review: library and service | done | f5d47a3 | 1 Critical and 5 Important fixed over two rounds and re-reviewed (R131, R132) |
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762, b207182 | GitHub's runners cannot resolve ubuntu.com; mirror fallback added; done when a run is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | re-review | | round 1 fixes in; reviewer checking |
+| 60 New-project dialog | fix round 2 | | one path of I1 open (duplicate after a failed check) |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | in progress | | implementer dispatched |
 | 46 Fix scenario findings | not started | | |
