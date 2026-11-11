@@ -2,6 +2,18 @@
 
 *Updated 2026-11-11 by the next coordinator. The open-task list below is superseded by `docs/PLAN.md`. Corrections made to this file are listed in `docs/PLAN.md` section 12 and in the git history.*
 
+## Current state (kept up to date by the coordinator; last updated 2026-11-11, end of Milestone I)
+
+Read this block first; the rest of this file is the 2026-11-11 morning snapshot.
+
+- **Where the work is:** branch `claude/amanuensis-handoff-0x6u5m`, pushed after every completed task. `main` is the owner-approved state (still at `0ad6506`; nothing has been merged to it yet).
+- **What to do next:** `docs/PLAN.md` section 8 is the task table (status and commit per task); section 9 lists what waits for the owner. The tail of `docs/handoff/LEDGER.md` (from "Checkpoint 2026-11-11") is the running record: every dispatch, review result, ruling (R120 onward) and deferred minor.
+- **Done:** Milestone I (Tasks 38–42: build fixed, docs corrected, decisions recorded, every never-reviewed commit reviewed and fixed, CI extended), Task 43 (end-to-end harness), Task 60 (new-project dialog), Task 52 (owner review pages), Task 37e (Mac research, ADR 0014).
+- **Paused on 2026-11-11 at 17:00 UTC by the account's usage limit (resets 19:20 UTC):** Tasks 34a (review), 45 and 49 (fix rounds) and 51 (early). Their unmerged work is saved as patches in `docs/handoff/wip/`; its README says how to restore each. Rulings they need: R135 (34a), R138 (49), R136 and R137 (45), R31 (51).
+- **How tasks run:** each implementer works in its own git worktree under `.claude/worktrees/` on a local branch `worktree-agent-<id>`; the coordinator merges it after review. **Those branches exist only in the coordinator's container until merged.** If a session ends with tasks "in progress" in the PLAN table, that work is lost unless its branch was pushed: check `git branch --list 'worktree-agent-*'` and the ledger's last "dispatched" lines, and re-dispatch what is missing.
+- **Checks to run before trusting the tree:** `pnpm install --frozen-lockfile && pnpm fetch-csl && pnpm setup:py && pnpm -r typecheck && pnpm test` (2,112 tests at `f5d47a3`), `pnpm --filter @ao/ui run build && pnpm e2e -- --trace off` (extension 4, app 14).
+- **CI on GitHub:** one job per push to a working branch; docs-only pushes start no run. On 2026-11-11 GitHub's runners could not resolve the Ubuntu mirrors; the workflow falls back to another mirror. The first green run since the morning was at `27d7c6c`. A temporary "Network check" step is still in `ci.yml`; remove it with the next code push.
+
 ## Project and status
 **Alexandrine Oxiana** is a local-first research workbench for social scientists. It combines Zotero-style references, Obsidian-style notes and Scrivener-style writing, with three further features:
 - Archival capture of web, Instagram, TikTok and YouTube material, plus transcription.
