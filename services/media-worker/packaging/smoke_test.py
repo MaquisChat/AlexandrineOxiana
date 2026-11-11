@@ -423,10 +423,13 @@ def run_without_tools(res: Results, exe: Path, root: Path, fx: dict) -> None:
         res.check("OCR without tesseract fails clearly", j["status"] == "failed" and j["error"]["code"] == "MISSING_DEPENDENCY", j.get("error"))
         res.info["ocrWithoutTesseract"] = j.get("error")
 
+        name = "video proxy without ffmpeg fails (no crash)"
         if "clip" in fx:
             j = w.run("video.proxy", fx["clip"], out / "clip.mp4")
-            res.check("video proxy without ffmpeg fails (no crash)", j["status"] == "failed", j.get("error"))
+            res.check(name, j["status"] == "failed", j.get("error"))
             res.info["videoWithoutFfmpeg"] = j.get("error")
+        else:
+            res.missing(name, "ffmpeg", "no test video: this machine has no ffmpeg to make one")
 
         if SPEECH_CLIP.exists():
             j = w.run("audio.transcribe", SPEECH_CLIP, out / "t", {"model": "tiny", "language": "en"})
