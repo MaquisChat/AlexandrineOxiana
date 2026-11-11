@@ -2,7 +2,7 @@
 
 - **Written:** 2026-11-11, at commit `0ad6506` (35 of 37 Phase 1 tasks delivered).
 - **Status of this plan:** DRAFT, waiting for the owner's approval. Nothing in it has been started.
-- **Ledger check:** NOT DONE. `docs/handoff/LEDGER.md` (the 119 binding rulings) had not reached GitHub when this was written. Tasks marked **[ledger]** must be checked against it before they are dispatched.
+- **Ledger check:** done on 2026-11-11 against `docs/handoff/LEDGER.md` at `0832c77` (branch `handoff/2026-11-11`). Section 12 lists what the check changed. `docs/handoff/LEDGER-INDEX.md` gives one line per ruling. Tasks marked **[ledger]** name the rulings that bind them; the brief for each must quote those rulings in full.
 - **Scope:** Phase 1 in detail. Phases 2–6 and Windows are outlined at the end.
 
 This file is the working plan. The original 37-task plan (`docs/superpowers/plans/2026-11-09-phase-1-foundation.md`) stays as the specification for Tasks 34 and 37; this plan splits them and adds the work found at the 2026-11-11 checkpoint. Task numbers continue from 38 so that "Task NN" in commit messages stays unambiguous.
@@ -15,7 +15,7 @@ This file is the working plan. The original 37-task plan (`docs/superpowers/plan
 | Task 34 (capture screen, transcript viewer, verification badges, extension pairing) | Not started. Nothing exists in `packages/ui`. |
 | Task 37 (desktop shell, packaging, end-to-end tests) | Not started. No `apps/desktop`, no `e2e/`. |
 | Build | Red. One stale assertion at `apps/cli/src/cli.test.ts:563` fails two tests (the second is a knock-on). GitHub CI has failed on every push since `4cad0e3`. |
-| Last integration batch (`0432261..0ad6506`) | Never reviewed. |
+| Review | The last integration commits were never reviewed, and the final fix rounds of Tasks 31, 32, 33, 35 and 36 were never re-reviewed (Tasks 41a, 41b). |
 | The app as a whole | Cannot be started. The UI has only run against mock responses; the service refuses every browser origin except the future desktop shell. |
 
 Checks run on 2026-11-11: type-check passes (7 packages); `pnpm test` 2,053 pass, 2 fail, 1 opt-in skip; `pnpm test:py` 79 pass; `pnpm test:scale` passes at 117.8 s against a 120 s limit; extension end-to-end 4 of 4; UI build, font, CSS and colour checks pass.
@@ -29,34 +29,35 @@ Task 40 enters these in the ledger as rulings R120 onward.
 3. **Branches.** `main` exists (created at `0ad6506`) and is the approved state. Work happens on a working branch and reaches `main` only with the owner's approval.
 4. **Citation engine licence.** citeproc-js is used under **CPAL-1.0**. The project's own licence is not chosen yet; AGPL-3.0 is the likely later choice and must stay possible. No project `LICENSE` file is added until the owner decides. (Closes the open half of R87.)
 5. **Citation review.** The owner will review the five citation styles from a prepared page.
-6. **Backups.** Making a backup becomes a governed, audited action like every other.
-7. **Optional tools.** On first use the app asks which tools the researcher needs (speech model, video downloader, OCR) and downloads only those.
+6. **Backups.** Making a backup becomes a governed, audited action like every other. Whether a backup may also be kept outside the library folder is a separate question that is still open (Task 49, section 9).
+7. **Optional tools.** On first use the app asks which tools the researcher needs (speech model, video downloader, OCR) and downloads only those. This replaces the old Task 37 instruction to bundle ffmpeg, tesseract and ghostscript inside the app.
 8. **Review depth.** As in `docs/handoff/PROCESS.md`: up to three fix rounds per implementer, then a fresh one.
 
 ## 3. How we work
 
 `docs/handoff/PROCESS.md` remains the process (controller dispatches an implementer, then an adversarial reviewer, then fix rounds; tests first). Changes from this checkpoint:
 
-- **The ledger is kept in git.** New rulings are appended to `docs/handoff/LEDGER.md` directly and committed, not kept in a git-excluded folder.
+- **The ledger is kept in git.** New rulings are appended to `docs/handoff/LEDGER.md` directly and committed, not kept in a git-excluded folder. This replaces R2; Task 40 records it. The ledger stops just before the R118 integration commits, so "not shown as done in the ledger" does not always mean "not done": check the code.
 - **Push after every completed task.** The handoff on 2026-11-11 was invisible to the next session because it was committed but not pushed.
 - **Branches.** Working branch: `claude/amanuensis-handoff-0x6u5m`. `main` changes only with the owner's approval, normally at a milestone boundary. The `claude/eager-sagan-ndp8ku*` branches are frozen.
 - **After each task:** update the status table in section 8, commit, push.
 - **Models.** The controller keeps decomposition, rulings, review of results and integration. Implementation and review go to Opus sub-agents; mechanical or narrow tasks go to Sonnet; lookups to Haiku. Each task below names its tier.
-- **A task that fails review twice** comes back to the controller to be re-scoped.
-- **Do not loosen timing tests.** Re-run a load-sensitive failure alone before treating it as real.
+- **Fix rounds** follow PROCESS.md (most earlier tasks needed three or four). If a second implementer also cannot get a task through review, the controller takes it back and re-scopes it.
+- **Do not loosen timing tests**, including the linear-time and regular-expression budgets (R65, R75). Re-run a load-sensitive failure alone before treating it as real (R81, R102). `test:scale` runs alone (R63).
+- **Standing rules from the ledger that every brief repeats:** pin every dependency to an exact version (R65, R72, R78, R86, R92, R101, R110, R113); pin every download by checksum and fail closed (R7, R86, R100); tests block the network (R79, R80); device suites fail rather than skip under CI (R85); a test-only switch is honoured only in test mode (R47); lint is `lint:css` and `lint:colours` (R105, R109); reviewers' probes stay inside the temporary folder.
 
 ## 4. Milestones
 
 | | Milestone | Done when |
 |---|---|---|
-| I | Green, documented baseline | CI is green; handoff docs are in the repo and match the code; checkpoint decisions are in the ledger; the last integration batch has a clean review. |
+| I | Green, documented baseline | CI is green; handoff docs are in the repo and match the code; checkpoint decisions are in the ledger; every commit that was never reviewed or never re-reviewed has a clean review. |
 | J | The app runs end to end | A real service, real worker and the built UI pass end-to-end scenarios 1–8 in Chromium and WebKit, in CI. |
 | K | Task 34 | Capture, transcript, verification and pairing screens work against the real service; scenarios 9–11 pass; the first-use tools dialogue works. |
-| L | Governance gaps closed | Backups and refused moves are decided by policy and audited; every exception to "every decision is audited" is either removed or written down. |
-| M | macOS desktop app | Signed, notarised downloads for Apple Silicon and Intel are built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
+| L | Governance and durability gaps closed | Backups and refused actions are decided by policy and audited; no audit failure is silent; job records survive loss of the index (R31). |
+| M | macOS desktop app | The test suites pass on a Mac. Signed, notarised downloads for Apple Silicon and Intel are built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
 | N | Phase 1 finished | Owner reviews done and applied; final whole-branch review clean; merged to `main`. |
 
-Order: I, then J. K and L can run alongside J once Task 43 is in. M starts after J (37a, 37b, 37d and 37e can start earlier). N is last.
+Order: I, then J. K and L can run alongside J once Task 43 is in. M starts after J (37a, 37b, 37d, 37e and 59 can start earlier; 59 should start early because it is the first time anything runs on a Mac). N is last.
 
 ## 5. Tasks
 
@@ -72,40 +73,50 @@ Format: **Depends** (tasks that must be merged first) · **Parallel** (may run a
 - Model: Sonnet.
 
 **Task 39 — Bring in the handoff docs and correct them**
-- Depends: the `handoff/2026-11-11` branch being on GitHub. Parallel: 38.
+- Depends: none (`handoff/2026-11-11` is on GitHub at `0832c77`). Parallel: 38.
 - Files: `CLAUDE.md`, `docs/handoff/*.md`, `README.md`, `packages/core/src/index.ts` (stale header comment only).
-- Accept: handoff commits merged into the working branch unchanged, then one follow-up commit that fixes what disagrees with the code: branch names (section 3), commit trailers (this session's, not the old one's), "jobs persist in files" (they live only in the search index, `packages/library/src/index/rebuild.ts:42`), the diagnosis of the second CLI failure, the scale-test timing, and the two ADR numbers the old plan cites wrongly. `INDEX.md` lists `docs/PLAN.md`. `README.md` no longer says the media worker comes later and lists every package and script.
+- Accept: handoff commits merged into the working branch unchanged, then one follow-up commit that fixes what disagrees with the code: branch names (section 3), commit trailers (this session's, not the old one's), the diagnosis of the second CLI failure, the scale-test timing, and the two ADR numbers the old plan cites wrongly. Where DECISIONS.md and ARCHITECTURE.md say job records persist in files, they now say that R31 requires it, that only review items and import batches do so today, and that Task 51 closes the gap. `INDEX.md` lists `docs/PLAN.md` and `LEDGER-INDEX.md`. `README.md` no longer says the media worker comes later and lists every package and script.
 - Verify: `grep -rn "eager-sagan" CLAUDE.md docs/handoff` shows only historical mentions; every path named in `INDEX.md` exists.
 - Model: Sonnet.
 
 **Task 40 — Record the checkpoint decisions**
 - Depends: 39.
 - Files: `docs/handoff/LEDGER.md`, `docs/handoff/DECISIONS.md`, `docs/adr/0012-citations.md`, `packages/core/csl/NOTICE.md`.
-- Accept: section 2 entered as rulings R120 onward, each with its cost if wrong. The CPAL-1.0 choice is recorded with the licence's own wording for what it requires of us (attribution notice, where it must be shown, what happens to our modifications), quoted from the licence text shipped with citeproc-js, and a follow-up task is added here if the app must display anything.
+- Accept: section 2 entered as rulings R120 onward, each with its cost if wrong, including the two that replace earlier ones: the ledger is kept in git (replaces R2), and optional tools are downloaded on first use (replaces the bundling in the old Task 37). The CPAL-1.0 choice closes R87; the ledger records no obligations for either licence, so they are taken from the licence's own wording (attribution notice, where it must be shown, what happens to our modifications), quoted from the licence text shipped with citeproc-js, and a follow-up task is added here if the app must display anything.
 - Verify: controller reads the diff and the quoted licence text.
 - Model: Sonnet.
 
-**Task 41 — Review the last integration batch [ledger]**
-- Depends: 38.
-- Files: read-only review of `0432261..0ad6506`; fixes wherever findings land.
-- Accept: an adversarial reviewer has probed the batch, with particular attention to resolving a half-finished write after a crash (`packages/library/src/repo/txn.ts`, R26 and R27: a half-written change must never be kept) and to the single router in `packages/ui/src/App.tsx`. Every Critical and Important finding is fixed and re-reviewed; Minors are fixed or listed as deferred in the ledger.
+**Task 41a — Review the unreviewed library and service commits [ledger: R26, R27, R96, R116, R118]**
+- Depends: 38. Parallel: 41b.
+- Files: read-only review; fixes wherever findings land.
+- Scope: commits no reviewer has seen: the R118 commits `085a8fb`, `c2f6478`, `0ae7f9d`, `4cad0e3`, `41f5308`; the carry-overs `f9340e5`, `3579f11`, `0ad6506` (service and library parts); and `4e10e85`, the fix for R116 that was never re-reviewed.
+- Accept: an adversarial reviewer has probed them, with particular attention to resolving a half-finished write after a crash (`packages/library/src/repo/txn.ts`): "keep" may be offered only when the change is fully committed, "roll back" only when it is not, the choice is audited, and a half-written change is never kept (R26, R27, R118 g). Every Critical and Important finding is fixed and re-reviewed; Minors are fixed or listed as deferred in the ledger.
 - Verify: reviewer's report; `pnpm test`; controller re-runs the reviewer's failing inputs.
+- Model: Opus (reviewer and implementer).
+
+**Task 41b — Review the unreviewed interface commits [ledger: R113, R114, R115, R117, R119]**
+- Depends: 38. Parallel: 41a.
+- Files: read-only review; fixes wherever findings land.
+- Scope: final fix rounds that were checked only by the controller or never re-reviewed: `72112cb` (Task 33), `8028957` (Task 35), `77915a3` (Task 36), `5f99eb9` (Task 32); the merges `0432261`, `1f6f443`, `e80ca54`; and the interface parts of `f9340e5`, `3579f11`, `0ad6506`.
+- Accept: as 41a, with particular attention to the single router in `packages/ui/src/App.tsx` and to anything two merged branches both defined.
+- Verify: as 41a, plus `lint:css` and `lint:colours`.
 - Model: Opus (reviewer and implementer).
 
 **Task 42 — CI covers what we rely on**
 - Depends: 38. Parallel: 39–41.
 - Files: `.github/workflows/ci.yml`.
-- Accept: CI also runs the UI build, `lint:css`, `lint:colours`, the font check and the extension end-to-end suite. The Python matrix no longer cancels the other job on a failure.
-- Verify: a green CI run showing the new steps.
+- Accept: CI also runs the UI build, `lint:css`, `lint:colours`, the font check and the extension end-to-end suite. To save build minutes on a private repository, a push to a working branch runs one job; the full Python matrix runs on `main` and on request, and one job failing no longer cancels the other. CI prints how long the scale test took; it ran in 79–101 s before (ledger line 246) and 117.8 s at the checkpoint, so if it exceeds 105 s on GitHub's machines a profiling task is added here.
+- Verify: a green CI run showing the new steps and the scale-test time.
 - Model: Sonnet.
 
 ### Milestone J — The app runs end to end
 
-**Task 43 — End-to-end harness [ledger]**
-- Depends: 38. Controller ruling first: how a test browser may reach the service without weakening R96 and R98.
-- Files: `e2e/{playwright.config.ts,fixtures.ts,smoke.spec.ts}`, `scripts/{run-e2e.mjs,e2e-args.mjs,e2e-args.test.mjs}`, `apps/library-service/src/{auth.ts,main.ts,server.ts,server.test.ts}`, `packages/ui/index.html` only if the content-security policy blocks the connection, `.github/workflows/ci.yml`.
-- Accept: a fixture starts the real service (temporary config folder and library) and the real media worker with the fake download tools on `PATH`, serves the built UI on `127.0.0.1`, and hands the page its connection through `window.__AO_SERVICE__`, the same hook the desktop shell will use. The service accepts that page's origin only when started with an explicit test-only setting that names the exact origin; the setting is off by default, announced at start-up, and tests prove the default still refuses. A lookup-fixtures setting replays recorded Crossref answers. One smoke scenario (create library, create project, see it listed) passes in Chromium and in WebKit. `pnpm e2e -- --app-only` runs it.
-- Verify: `pnpm e2e -- --app-only --trace off`; `pnpm --filter @ao/library-service exec vitest run`; adversarial review of the origin setting.
+**Task 43 — End-to-end harness [ledger: R47, R96, R98, R105]**
+- Depends: 38.
+- Files: `e2e/{playwright.config.ts,fixtures.ts,smoke.spec.ts}`, `scripts/{run-e2e.mjs,e2e-args.mjs,e2e-args.test.mjs,test-report.mjs,test-report.test.mjs}`, `packages/library/src/lookup/http.ts` (fixtures switch), `.github/workflows/ci.yml`. Service files only if the fallback below is needed.
+- Approach: R96 makes the service refuse any browser origin except the desktop shell's (`tauri://localhost`, `http://tauri.localhost`) and a paired extension. **First choice, which leaves the service untouched:** the test browser loads the built UI under the shell's own origin, `http://tauri.localhost`, with the test framework answering requests for that address from `packages/ui/dist`. **Fallback, only if that fails in either browser:** an exact-origin test switch honoured only in test mode (R47), with matching cross-origin and preflight handling; that amends R96 and needs a new ruling and an adversarial review before it is merged.
+- Accept: a fixture starts the real service (temporary config folder and library) and the real media worker with the fake download tools on `PATH`, and hands the page its connection through `window.__AO_SERVICE__`, the same hook the desktop shell will use. A lookup-fixtures switch, honoured only in test mode (R47), replays recorded Crossref answers; it does not exist today. One smoke scenario (create library, create project, see it listed) passes in Chromium and in WebKit. `pnpm e2e -- --app-only` runs it. `pnpm report` includes the results, and a spec file with no tests no longer counts as a pass (ledger line 38).
+- Verify: `pnpm e2e -- --app-only --trace off`; `pnpm test:scripts`; if the fallback was used, `pnpm --filter @ao/library-service exec vitest run` showing the default still refuses.
 - Model: Opus.
 
 **Task 44 — Scenarios 1, 2, 5, 7**
@@ -132,25 +143,26 @@ Format: **Depends** (tasks that must be merged first) · **Parallel** (may run a
 **Task 47 — One definition for data crossing the service boundary**
 - Depends: 46. Parallel: Milestone L.
 - Files: `packages/shared/src/api/*.ts` (new), `apps/library-service/src/routes/*.ts`, `packages/ui/src/api/*.ts`.
-- Accept: request and response types for the routes Task 34 uses, plus any that 44–46 found drifting, are declared once in `@ao/shared` and imported by both sides. `packages/ui` no longer imports `@ao/core/src/...` by deep path. Retrofitting the remaining routes is listed as optional follow-up, not done here.
+- Accept: request and response types for the routes Task 34 uses, plus any that 44–46 found drifting, are declared once in `@ao/shared` and imported by both sides. `@ao/core` declares the sub-paths the UI needs as package exports (ledger lines 260, 267), and `packages/ui` no longer imports `@ao/core/src/...` by deep path. Retrofitting the remaining routes is listed as optional follow-up, not done here.
 - Verify: `pnpm -r typecheck`; changing a field name in the shared type breaks both the service and the UI build.
 - Model: Opus.
 
 ### Milestone K — Task 34 (capture, transcripts, verification)
 
-Specification: Task 34 in the old plan. UI rules from the ledger apply (R101 `SnapshotFrame`, R103 `CodeSwatch`, R109 content-security policy, R113 UI rules).
+Specification: Task 34 in the old plan, which was written before several rulings. These apply and every brief quotes them: R41 (a capture needs a legal basis; `LEGAL_BASIS_REQUIRED`), R43 (a maximum-items limit turns off removed-item detection), R84 (failed proxy jobs are shown), R99 (project-wide recheck runs as a job with progress), R101 and R105 (archived HTML only by fetch, then blob, then `SnapshotFrame`; never by address), R103 (`CodeSwatch`), R109 (content-security policy), R113 (UI rules).
 
-**Task 34a — Service additions the screens need [ledger]**
-- Depends: 41. Parallel: 43. Controller ruling first: how a media player receives file bytes when a bearer token may never appear in a URL (R98). Recommended: a short-lived ticket for one asset, issued by an authenticated call, carried in the URL path, usable only for range reads of that asset. Alternatives to weigh: fetching the whole file into memory, a service-worker that adds the header.
-- Files: `apps/library-service/src/routes/{sources.ts,capture.ts}`, `apps/library-service/src/server.test.ts`, `packages/library/src/` (asset read stream, transcript segments), `packages/shared/src/api/`.
-- Accept: (a) media, screenshots and proxies can be played or shown through the service, with range requests, decrypting encrypted projects as they stream, without loading the file into memory; a ticket for one asset cannot read another, expires, cannot be obtained with the extension token, and is refused for a locked project. (b) A transcript is returned as segments with start, end, language, text and flags, for machine and human-edited versions. (c) Source records sent to the UI carry field evidence and verification status. (d) Tests for the capture-related routes that have none today: capture-profile, transcribe, acknowledge, tools update.
-- Verify: `pnpm --filter @ao/library-service exec vitest run`; a 50 MB range-read test with a memory ceiling; adversarial review.
+**Task 34a — Service additions the screens need [ledger: R96, R98, R101, R105, R107, R109]**
+- Depends: 41a. Parallel: 43.
+- Controller ruling first, because two existing rulings stand in the way of playing audio and video. (1) R96: an access token never appears in an address, and a media player cannot send one any other way. (2) R105/R109: the page's content-security policy has no rule for media, so it falls back to "same origin only" and blocks anything served from the service's address. Recommended ruling: pictures (screenshots, proxies, thumbnails) are fetched with the token and shown as blobs, which the policy already allows and which matches how snapshots work; audio and video use a short-lived ticket for one asset, carried in the address path, good only for range reads of that asset, and the policy gains a media rule for the local service. Alternative to weigh: the desktop shell forwards media requests and adds the token itself, which keeps credentials out of addresses but does not work in the browser tests.
+- Files: `apps/library-service/src/routes/{sources.ts,capture.ts}`, `apps/library-service/src/server.test.ts`, `packages/library/src/` (asset read stream, transcript segments), `packages/shared/src/api/`, `packages/ui/index.html` (content-security policy), `packages/ui/src/api/client.ts` (its refusal of addresses carrying credentials, R105).
+- Accept: (a) audio and video play through the service with range requests, decrypting encrypted projects as they stream, without loading the file into memory; a ticket for one asset cannot read another, expires, never appears in logs, cannot be obtained with the extension token, and is refused for a locked project. (b) Pictures load by authenticated fetch. (c) A transcript is returned as segments with start, end, language, text and flags, for machine and human-edited versions. (d) Source records sent to the UI carry field evidence and verification status. (e) Tests for the capture-related routes that have none today: capture-profile, transcribe, acknowledge, tools update.
+- Verify: `pnpm --filter @ao/library-service exec vitest run`; a 50 MB range-read test with a memory ceiling; adversarial review of the ticket and the policy change.
 - Model: Opus.
 
 **Task 34b — Capture screen**
 - Depends: 34a, 47. Parallel: 34c, 34d, 34e (separate worktrees; route registration in `App.tsx` and `navigation.tsx` is merged by the controller).
 - Files: `packages/ui/src/api/capture.ts`, `packages/ui/src/screens/Capture.tsx`, `packages/ui/src/components/CaptureQueue.tsx`, tests beside them.
-- Accept: as the old plan's Task 34 "Capture screen" and its tests: paste URLs with a per-line preview, options, the Capture profile form, the one-time browser-session acknowledgement, the queue with plain-language failure reasons, Update capture tools.
+- Accept: as the old plan's Task 34 "Capture screen" and its tests: paste URLs with a per-line preview, options, the Capture profile form, the one-time browser-session acknowledgement, the queue with plain-language failure reasons, Update capture tools. In addition: the screen asks for a legal basis where the project requires one and explains a `LEGAL_BASIS_REQUIRED` refusal (R41); the profile form says that setting a maximum number of items turns off removed-item detection (R43).
 - Verify: `pnpm --filter @ao/ui exec vitest run src/screens/Capture.test.tsx src/components/CaptureQueue.test.tsx`; `lint:css`, `lint:colours`.
 - Model: Opus.
 
@@ -164,76 +176,98 @@ Specification: Task 34 in the old plan. UI rules from the ledger apply (R101 `Sn
 **Task 34d — Verification badges and recheck**
 - Depends: 34a, 47. Parallel: 34b, 34c, 34e.
 - Files: `packages/ui/src/components/{VerificationBadge.tsx,FieldEvidencePopover.tsx}`, `packages/ui/src/screens/SourceDetail.tsx`, tests.
-- Accept: a badge per field (verified, single source, unverified, conflict, confirmed by you); the popover lists each evidence source and quote; Confirm and choose-a-value post a user confirmation; Recheck on a source and Recheck project.
+- Accept: a badge per field (verified, single source, unverified, conflict, confirmed by you); the popover lists each evidence source and quote; Confirm and choose-a-value post a user confirmation; Recheck on a source; Recheck project runs as a job with visible progress (R99). The source screen shows a failed or pending proxy with its reason and a retry (R84).
 - Verify: `pnpm --filter @ao/ui exec vitest run src/components/VerificationBadge.test.tsx src/screens/SourceDetail.test.tsx`.
 - Model: Opus.
 
 **Task 34e — Extension pairing screen**
 - Depends: 47. Parallel: 34b–34d.
 - Files: `packages/ui/src/screens/ExtensionPairing.tsx` and test.
-- Accept: shows the six-digit code and its expiry; lists paired browsers; a pairing can be revoked.
+- Accept: shows the six-digit code and its expiry; a new code can be issued when one expires or is used up (R98); lists paired browsers; a pairing can be revoked.
 - Verify: `pnpm --filter @ao/ui exec vitest run src/screens/ExtensionPairing.test.tsx`.
 - Model: Sonnet.
 
-**Task 48 — First-use tools dialogue [ledger]**
+**Task 48 — First-use tools dialogue [ledger: R7, R83, R90; ADR 0009]**
 - Depends: 34b. Split into two sessions: worker and service first, then UI.
-- Files: `services/media-worker/ao_worker/` (tool catalogue, install), `packages/library/src/worker-client.ts`, `apps/library-service/src/routes/capture.ts`, `packages/ui/src/screens/ToolsSetup.tsx`, tests.
-- Accept: the worker reports each optional tool (speech models by size, video downloader, ffmpeg, OCR) with purpose, download size, and whether it is installed. Installs run as jobs with progress, are pinned by address and checksum where the version is fixed, and go to the app's data folder, never the library. On first use the UI asks what the researcher will do and offers the matching tools; the choice can be reopened from settings; a feature whose tool is missing says so and links to the dialogue. Nothing about a project is sent when downloading.
+- Files: `services/media-worker/ao_worker/` (tool catalogue, install), `packages/library/src/worker-client.ts`, `apps/library-service/src/routes/capture.ts`, `packages/ui/src/screens/ToolsSetup.tsx`, `docs/adr/0009-capture-tools.md`, tests.
+- Accept: the worker reports each optional tool (speech models by size, video downloader, ffmpeg, OCR) with purpose, download size, and whether it is installed. ADR 0009 stays in force: the video downloader is the latest release, checked against its published checksums, kept in the tools folder and updated in place; the image downloader is pinned inside the worker and exiftool is bundled and required, so neither is optional. Other installs are pinned by address and checksum, run as jobs with progress, and go to the app's data folder, never the library. On first use the UI asks what the researcher will do and offers the matching tools; the choice can be reopened from settings; a feature whose tool is missing says so and links to the dialogue. The dialogue says what going without ffmpeg means: media that carries a location stays "proxy pending" and is left out of exports (R83, R90 c). Nothing about a project is sent when downloading.
 - Verify: worker tests with a local file server standing in for the download hosts; UI tests; one end-to-end run.
 - Model: Opus.
 
 **Task 34f — Scenarios 9, 10, 11**
 - Depends: 34b, 34c, 34d, 43.
 - Files: `e2e/capture.spec.ts`.
-- Accept: (9) paste a YouTube and an Instagram address with the fake tools, both sources created, transcript opens with one flagged segment, edit it, human-edit version listed; (10) capture a profile twice, the item missing the second time is flagged as removed; (11) a planted DOI and title conflict appears in the review queue, choosing a value shows "confirmed by you".
+- Accept: (9) paste a YouTube and an Instagram address with the fake tools, both sources created, transcript opens with one flagged segment, edit it, human-edit version listed; (10) capture a profile twice with no maximum-items limit (R43), the item missing the second time is flagged as removed; (11) a planted DOI and title conflict appears in the review queue, choosing a value shows "confirmed by you".
 - Verify: `pnpm e2e -- --app-only e2e/capture.spec.ts --trace off`.
 - Model: Opus.
 
-### Milestone L — Governance gaps
-
-**Task 49 — Backups are governed and audited [ledger]**
-- Depends: 41. Parallel: Milestones J and K.
-- Files: `packages/core/src/governance/engine.ts`, `packages/library/src/export/backup.ts`, `apps/library-service/src/routes/projects.ts`, `packages/ui/src/screens/` (backup settings), `docs/governance/README.md`, tests.
-- Accept: creating a backup is evaluated by the policy engine first; a refusal gives the reason and is audited. Deleting old backups is audited by file name and uses secure deletion where the project requires it. A researcher can choose a separate backup folder per device (stored in the app's settings, not the library); that folder is checked against the project's location rules in the same way a library move is. Default behaviour without a chosen folder is unchanged. Restore is unchanged.
-- Verify: `pnpm --filter @ao/library exec vitest run src/export`; each profile × backup-to-cloud-folder case in the engine tests; adversarial review.
+**Task 57 — Routes the import wizard still lacks [ledger: R78, R100; ledger lines 260, 267]**
+- Depends: 34a. Parallel: 34b–34e.
+- Files: `apps/library-service/src/routes/{import.ts,review.ts,appearance.ts}`, `packages/ui/src/screens/import/`, `packages/ui/src/screens/AppearanceSettings.tsx`, tests.
+- Accept: first confirm each gap against the code, since the ledger stops before the last integration. Then: the Zotero Web key can be stored in the system password store from the wizard and is never sent back (R78); the wizard finds the Zotero data folder; the review queue previews the file under review; a typeface chosen from the researcher's own file loads through the service (R100).
+- Verify: `pnpm --filter @ao/library-service exec vitest run`; `pnpm --filter @ao/ui exec vitest run src/screens/import`.
 - Model: Opus.
 
-**Task 50 — Refused moves are audited; remaining exceptions written down [ledger]**
-- Depends: 41. Parallel: 49.
-- Files: `packages/library/src/{move.ts,reconnect.ts}`, `docs/adr/0005-governance-checkpoint.md`, tests.
-- Accept: a refused library move leaves an audit entry in each affected project. For the places where reconnect, relink and move only warn when an audit entry cannot be written, either the ledger shows this was ruled deliberate and ADR 0005 now lists it as a stated exception, or it is changed so the failure is visible on the audit screen.
-- Verify: `pnpm --filter @ao/library exec vitest run src/move.test.ts src/reconnect.test.ts`.
+### Milestone L — Governance and durability gaps
+
+**Task 49 — Backups are governed and audited [ledger: R90, R91, R92, R94]**
+- Depends: 41a. Parallel: Milestones J and K.
+- Files: `packages/core/src/governance/engine.ts`, `packages/library/src/export/backup.ts`, `apps/library-service/src/routes/projects.ts`, `docs/governance/README.md`, tests.
+- Accept: creating a backup, by hand or by the daily schedule, is evaluated by the policy engine first; a refusal gives the reason, is audited, and raises the existing `backup-failed` warning, because an automatic backup must never fail silently (R91, R92). Removing old backups is audited by file name; it stays a plain delete, as R91 accepted. Backups stay in `<Library>/Backups/` under the manifest. Restore is unchanged.
+- Not in this task: letting a researcher keep backups in a second folder. R90 d, R92 and R94 rely on every backup being under the manifest so that destroying raw data can find and remove the copies and say so on the certificate; a folder elsewhere would put copies beyond that. It needs the owner's decision and a ruling first (section 9).
+- Verify: `pnpm --filter @ao/library exec vitest run src/export`; each profile × backup case in the engine tests; adversarial review.
 - Model: Opus.
 
-**Task 51 — Job records survive loss of the index (optional)**
-- Depends: 41.
-- Files: `packages/library/src/{worker-client.ts,index/rebuild.ts,index/migrations/}`, `docs/adr/0007-index.md`.
-- Accept: job records are written to files in the project and the `jobs` table is rebuilt from them; the unused `import_batches` table is removed or filled from the batch folders; deleting `library.sqlite` loses nothing.
-- Verify: index tests; scenario 7.
+**Task 50 — No refusal or audit failure is silent [ledger: R28, R82; ledger lines 96, 115]**
+- Depends: 41a. Parallel: 49.
+- Files: `packages/library/src/{move.ts,reconnect.ts}`, `packages/library/src/repo/`, `docs/adr/0005-governance-checkpoint.md`, tests.
+- Accept: a refused library move and a refused project creation each leave an audit entry. Where move, reconnect and relink today only return a warning when an audit entry cannot be written, they follow the precedent the ledger set elsewhere: the action is not undone, but the project is marked as needing attention and the audit screen shows it (R28, R82: never silent). The same for the permission-change failure noted at ledger line 115. No ruling made the present behaviour deliberate.
+- Verify: `pnpm --filter @ao/library exec vitest run src/move.test.ts src/reconnect.test.ts src/repo`.
+- Model: Opus.
+
+**Task 51 — Job records survive loss of the index [ledger: R31, R83, R93]**
+- Depends: 41a. Parallel: 49, 50.
+- Files: `packages/library/src/{worker-client.ts,index/rebuild.ts,index/migrations/}`, `docs/adr/0007-index.md`, `docs/handoff/DECISIONS.md`.
+- Accept: R31 requires job records to live in files, sealed in encrypted projects, with the database table as a cache; that was never built for general jobs. Job records are written to a journal in the project and the `jobs` table is rebuilt from it; the `import_batches` table is filled from the batch folders or removed; deleting `library.sqlite` loses nothing; the "carried tables" mechanism is gone.
+- Verify: index tests; scenario 7 extended to a library with a pending job.
+- Model: Opus.
+
+**Task 58 — Ledger loose ends in the library [ledger: R74, R93]**
+- Depends: 41a. Parallel: 49–51.
+- Files: `packages/library/src/index/`, `packages/library/src/import/zotero-local.ts`, `packages/core/src/model/project.ts`, tests.
+- Accept: first confirm each is still open in the code. Then: text of imported Zotero annotations is searchable (R74 assigned this to a task that later became something else); a project has a time-zone setting where R93 calls for one.
+- Verify: `pnpm --filter @ao/library exec vitest run src/index src/import`.
 - Model: Opus.
 
 ### Milestone M — macOS desktop app (Task 37, split)
 
 Specification: Task 37 in the old plan, with the handoff's carry-overs. This container is Linux: the shell is built and tested on Linux here, and macOS builds run on GitHub's Mac machines. Nobody can open the Mac app except the owner.
 
-**Task 37a — The service runs outside the repository**
+**Task 59 — The test suites pass on a Mac [ledger lines 50, 111]**
+- Depends: 42. Parallel: anything. Start early.
+- Files: `.github/workflows/mac-tests.yml`; fixes wherever failures land.
+- Accept: a workflow run by hand runs the TypeScript and Python suites on an Apple Silicon machine. Nothing has run on a Mac before, and Mac disks treat `Report.pdf` and `report.pdf`, and differently composed accented letters, as the same name: two deferred items (collision checks that ignore case and composition, ledger line 50; ß and SS, line 111) become real there. Each failure is fixed with a test or listed in section 7 with a reason. Budget: two sessions.
+- Verify: a green run of that workflow.
+- Model: Opus.
+
+**Task 37a — The service runs outside the repository [ledger: R64, R86, R96, R100]**
 - Depends: 46. Parallel: 37b, 37d, 37e.
 - Files: `apps/library-service/{package.json,scripts/build.mjs}`, `packages/library/src/resources.ts` (new) and its callers (`citation/sandbox.ts`, `citation/custom-styles.ts`, `capture/` worker script, `index/db.ts`, `worker-client.ts`), `docs/adr/0013-desktop-shell.md`.
-- Accept: a build produces a folder containing the bundled service, its worker-thread scripts, the SQL migrations, the citation style bundle and the native modules. Copied to an empty folder outside the repository and started with plain `node`, it creates a library, attaches a PDF, renders a citation, cleans an HTML snapshot and searches. Every file the service used to find by relative path goes through one resolver that works both ways. ADR 0013 records the choice between a single-executable build and shipping the Node program beside the bundle.
+- Accept: a build produces a folder containing the bundled service, its worker-thread scripts, the SQL migrations, the citation style bundle and the native modules, together with the licence texts that must travel with them: the citation styles' licence and notice (R86) and the typefaces' licences (R100). Copied to an empty folder outside the repository and started with plain `node`, it creates a library, attaches a PDF, renders a citation, cleans an HTML snapshot and searches. Every file the service used to find by relative path goes through one resolver that works both ways. The documented way to start it sets the 512 MB memory ceiling (R64, R96), which cannot be set from inside the program. ADR 0013 records the choice between a single-executable build and shipping the Node program beside the bundle.
 - Verify: a CI step that builds, copies and runs that smoke sequence.
 - Model: Opus.
 
-**Task 37b — Service start-up hardening [ledger]**
+**Task 37b — The service reads its token from standard input [ledger: R96, R98]**
 - Depends: none. Parallel: 37a.
 - Files: `apps/library-service/src/main.ts`, tests.
-- Accept: the access token is read from standard input, never from the environment or arguments (R98); memory ceiling of 512 MB set as ruled (R64, R96); the test-only origin setting from Task 43 still works.
-- Verify: `pnpm --filter @ao/library-service exec vitest run`.
+- Accept: the access token is read from standard input, never from the environment or arguments (R98). The existing tests and the end-to-end harness start it the same way.
+- Verify: `pnpm --filter @ao/library-service exec vitest run`; `pnpm e2e -- --app-only`.
 - Model: Opus.
 
-**Task 37c — Desktop shell**
+**Task 37c — Desktop shell [ledger: R64, R96, R98, R103, R113, R117]**
 - Depends: 37a, 37b, 43.
 - Files: `apps/desktop/{package.json,src-tauri/**}`, `packages/ui/src/{serviceConnection.ts,components/DropZone.tsx,components/FileDrop.tsx,screens/LibraryChooser.tsx}`.
-- Accept: on launch the shell makes two random tokens, starts the service and the worker on free ports, waits for each to report ready, and gives the UI its connection; native folder and file pickers and dropped file paths reach the UI; closing the app stops both helpers and leaves no stray process; a second launch brings the first to the front. No library logic in the shell. Built and started on Linux under a virtual display.
+- Accept: on launch the shell makes two random tokens, starts the service (with the memory ceiling) and the worker on free ports, passes each its token on standard input, waits for each to report ready, and gives the UI its connection; native folder and file pickers and dropped file paths reach the UI; closing the app stops both helpers and leaves no stray process; a second launch brings the first to the front. No library logic in the shell. Built and started on Linux under a virtual display.
 - Verify: Linux build; a scripted launch that checks both helpers answer and are gone after exit.
 - Model: Opus.
 
@@ -252,7 +286,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Model: Opus.
 
 **Task 37f — Mac builds in CI**
-- Depends: 37c, 37d, 37e, 48.
+- Depends: 37c, 37d, 37e, 48, 59.
 - Files: `.github/workflows/desktop-macos.yml`, `apps/desktop/src-tauri/tauri.conf.json`.
 - Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered.
 - Verify: a green workflow run with two downloadable artefacts.
@@ -291,10 +325,10 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Accept: `packages/core/src/citation/__snapshots__/*.txt` no longer say "PENDING HUMAN REVIEW".
 - Model: Opus.
 
-**Task 54 — Final whole-branch review [ledger]**
+**Task 54 — Final whole-branch review [ledger: all]**
 - Depends: every task above except 55 and 56.
-- Accept: a review of the whole branch against the ledger's rulings and its "deferred" entries, by the most capable model available; Critical and Important findings fixed and re-reviewed.
-- Model: Opus.
+- Accept: a review of the whole branch against the ledger's rulings, by the most capable model available; Critical and Important findings fixed and re-reviewed. The reviewer's checklist includes: the roughly 200 "minor (deferred)" entries, starting with the fifteen named in section 7; the items the ledger flagged for this review (lines 111, 134, 212, 272); whether governance-load warnings reach the screen (R58) and participant codes are wired through citations (R88); and whether batch records, linked paths, Zotero keys and citation keys in reports respect pseudonymisation (R64, R69, R75, R77).
+- Model: Opus. Likely more than one session: split by package.
 
 **Task 55 — Owner's hands-on tests**
 - Depends: 37g, 37i.
@@ -313,15 +347,29 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 4. **Signing the helper programs.** Apple's rules for programs inside an app are strict; expect more than one attempt at 37g.
 5. **Mac build minutes** on GitHub cost more than Linux ones on a private repository. The Mac workflow runs only by hand or on a tag.
 6. **First real integration.** Tasks 44 and 45 are the first time the screens meet the real service. Task 46 has a fixed budget; a large overrun changes the order of everything after it.
-7. **Media delivery touches a binding ruling (R98).** The approach is ruled by the controller before 34a and probed by a reviewer.
-8. **The scale test has two seconds of headroom** on this machine. It has passed on GitHub's; it is watched, not loosened.
-9. **The ledger is not yet in the repository.** Until it is, tasks marked [ledger] cannot be dispatched.
+7. **Playing media needs two rulings changed** (R96 on credentials in addresses, R105/R109 on the content-security policy). The controller rules before 34a and a reviewer probes the result.
+8. **The scale test may have slowed.** It took 79–101 s in the earlier container and 117.8 s here, against a 120 s limit. Different machines may explain it; Task 42 measures it on GitHub's and adds a profiling task if it is real. The limit is not loosened.
+9. **Mac disks ignore case.** Name-collision checks were written and tested on a case-sensitive disk. Task 59 finds out early what that breaks.
+10. **Scope has grown.** The ledger check added five tasks and enlarged several. Milestones K and M are the largest; if time presses, Tasks 57 and 58 are the ones that can wait for Phase 2 with least harm.
 
 ## 7. Open items carried forward
 
 Known, not yet scheduled above, or accepted as limits:
 
-- Deferred minors recorded per task in the ledger (for Task 54).
+- About 200 "minor (deferred)" entries recorded per task in the ledger, for Task 54. The most consequential, by ledger line:
+  - 50: the collision-suffix check ignores case and composition (Task 59).
+  - 111: finishing a move does not re-hash the source, so edits made meanwhile can be stranded in the old copy; ß and SS collisions are not detected.
+  - 82: the same-computer lock check goes by host name only; clock skew of two minutes or more.
+  - 96: collection, tag and consent names are in plain text in an encrypted project's `project.json`; a failed trim-event append leaves no durable record.
+  - 104: clearing keys without locking leaves decrypted rows in memory tables.
+  - 139: the browser name is in plain text in the jobs row.
+  - 115: a crash window in the exclusive-copy fallback.
+  - 134: creators are matched to evidence by family name only (co-authors can be swapped).
+  - 169: unconfirmed lookups pre-fill review with the cited work's metadata.
+  - 155: DOI query and fragment trimming.
+  - 121: a lost final status request reports a finished job as failed.
+  - 212: a proxy whose rule changed re-runs only on resume.
+- Left for later phases by the ledger: signed audit checkpoints (R12); the destruction certificate inside the verification report (R92); validating timestamps on synced changes (ledger line 60); streaming Zotero RDF (R71); Zotero leftovers (R73, R75).
 - Library of Congress lookup address never checked from a real network (R51).
 - WorldCat lookup not built; needs an institutional key (ADR 0011).
 - Romanised file-name fallbacks not built (ADR 0003).
@@ -339,9 +387,10 @@ Update after every task; commit and push.
 | Task | Status | Commit | Notes |
 |---|---|---|---|
 | 38 Fix the red build | not started | | |
-| 39 Handoff docs in and corrected | blocked | | waits for `handoff/2026-11-11` on GitHub |
+| 39 Handoff docs in and corrected | not started | | |
 | 40 Record decisions | not started | | |
-| 41 Review last batch | not started | | |
+| 41a Review: library and service | not started | | |
+| 41b Review: interface | not started | | |
 | 42 CI coverage | not started | | |
 | 43 End-to-end harness | not started | | |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
@@ -355,11 +404,14 @@ Update after every task; commit and push.
 | 34e Pairing screen | not started | | |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
+| 57 Import wizard routes | not started | | |
 | 49 Backups governed | not started | | |
-| 50 Refused moves audited | not started | | |
-| 51 Job records in files | optional | | |
+| 50 No silent refusals | not started | | |
+| 51 Job records in files | not started | | |
+| 58 Ledger loose ends | not started | | |
+| 59 Tests pass on a Mac | not started | | |
 | 37a Service bundle | not started | | |
-| 37b Start-up hardening | not started | | |
+| 37b Token on standard input | not started | | |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | not started | | |
 | 37e Mac tools research | not started | | |
@@ -375,8 +427,8 @@ Update after every task; commit and push.
 
 ## 9. What needs the owner
 
-1. **Now:** say "push" in the earlier Amanuensis session so the handoff branch, with the ledger, reaches GitHub.
-2. Approve this plan, or amend it.
+1. Approve this plan, or amend it.
+2. Decide whether backups may also be kept in a second folder outside the library. For: a backup beside the data does not survive losing the drive. Against: when raw data is destroyed under a retention rule, the app can only find, remove and certify the copies it keeps under the library's own record. Until decided, backups stay inside the library and Task 49 only adds the policy check and the audit entries.
 3. Approve merges to `main` at milestone boundaries.
 4. Create the Apple Developer account; later, add its signing credentials as GitHub secrets (Task 37g gives the steps).
 5. Confirm the minimum macOS version when Task 37e reports.
@@ -399,3 +451,20 @@ Each phase gets its own plan when it starts.
 ## 11. Progress log
 
 - 2026-11-11: plan drafted at `0ad6506`. `main` created at `0ad6506`. Handoff branch requested from the earlier session; it is waiting for the owner's direct confirmation.
+- 2026-11-11: owner confirmed; `handoff/2026-11-11` pushed at `0832c77` (not yet merged into the working branch: that is Task 39). Plan checked against the ledger and amended (section 12). `docs/handoff/LEDGER-INDEX.md` added.
+
+## 12. What the ledger check changed
+
+For the record of why the plan differs from its first draft (`5893b35`):
+
+1. **Task 41 split and widened.** The final fix rounds of Tasks 32, 33, 35 and 36, the R116 fix and three merges were also never re-reviewed, not only the last integration commits.
+2. **Task 43 no longer needs to touch the service.** The test browser can load the UI under the desktop shell's own address, which R96 already allows. The test-only switch is a fallback, bound by R47.
+3. **Task 34a needs a ruling on two points, not one.** The content-security policy (R105, R109) blocks media from the service whatever the service allows.
+4. **Tasks 34b, 34d, 34e, 34f** gained requirements from rulings made after the old Task 34 was written (R41, R43, R84, R98, R99).
+5. **Task 48** is bound by ADR 0009: some tools are not optional, and the video downloader is deliberately not pinned to a version.
+6. **Task 49 narrowed.** A second backup folder conflicts with how destruction under retention finds copies (R90, R92, R94). Removing old backups stays a plain delete (R91). A refused automatic backup must warn (R91, R92).
+7. **Task 50** has no "it was deliberate" branch: no ruling covers it, and R28 and R82 point the other way. Two more unaudited refusals added.
+8. **Task 51 is required, not optional.** R31 rules that job records live in files. Task 39 must not "correct" the docs to say otherwise.
+9. **Task 37b** lost the memory ceiling, which cannot be set from inside the program; it moved to 37a and 37c. 37a also ships the licence texts (R86, R100).
+10. **New tasks:** 57 (routes the import wizard lacks), 58 (R74 and R93 fell through when task numbers were reused), 59 (run the suites on a Mac early).
+11. **Section 3** repeats the ledger's standing rules, and the ledger-in-git change is recorded as replacing R2.
