@@ -3,11 +3,14 @@
  * text size, line spacing, density and motion. Every change is applied at once and saved through
  * PUT /settings/appearance (by AppearanceProvider).
  *
- * Fonts from a user's file (`source: "user-file"`) are shown here when set, but picking a file is
- * done through the desktop shell (Tasks 33, 37): the UI never reads files itself.
+ * Fonts from the researcher's own files (`source: "user-file"`, R100): added by path in "Your own
+ * font files", checked and kept by the service, offered in every typeface picker, and loaded from the
+ * service's bytes by AppearanceProvider. The UI never reads a file itself.
  */
-import { useEffect, useId, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import type { FontsApi, UserFont } from "../api/fonts";
 import { UserText } from "../components/UserText";
+import { isAbsolutePath, PATH_HINT } from "./import/shared";
 import { ACCENT_TOO_LOW, FONT_SLOTS, LINE_SPACINGS, TEXT_SCALES, checkAccent, type AppearancePatch, type AppearanceSettings, type FontSlot } from "../theme/appearance";
 import { useAppearance } from "../theme/AppearanceProvider";
 import { FONT_PRESETS, genericOf, isUsableFamily, type FontChoice } from "../theme/fonts";
@@ -35,22 +38,32 @@ const CUSTOM = "__custom";
 /** The accent picker saves this long after the last change (a drag fires many changes; R105 I1). */
 export const ACCENT_DEBOUNCE_MS = 300;
 
-function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontChoice; onChoose: (c: FontChoice) => void }) {
+const FILE_PREFIX = "file:";
+
+function FontPicker({ slot, choice, userFonts, onChoose }: { slot: FontSlot; choice: FontChoice; userFonts: UserFont[]; onChoose: (c: FontChoice) => void }) {
   const id = useId();
   const [typed, setTyped] = useState("");
   const [rejected, setRejected] = useState<string | null>(null);
   const label = SLOT_LABELS[slot];
   const preset = FONT_PRESETS.find((p) => p.family === choice.family && p.source === choice.source);
-  const customLabel = choice.source === "user-file" ? `From file: ${choice.family}${choice.file ? ` (${choice.file.split(/[\\/]/).pop()})` : ""}` : `Installed: ${choice.family}`;
+  const ownFile = choice.source === "user-file" ? userFonts.find((f) => f.id === choice.file && f.name === choice.family) : undefined;
+  const customLabel = choice.source === "user-file" ? `From file: ${choice.family}` : `Installed: ${choice.family}`;
 
   return (
     <div className="ao-font-row">
       <label htmlFor={`${id}-select`}>{label} typeface</label>
       <select
         id={`${id}-select`}
-        value={preset ? preset.family : CUSTOM}
+        value={preset ? preset.family : ownFile ? `${FILE_PREFIX}${ownFile.id}` : CUSTOM}
         onChange={(e: ChangeEvent<HTMLSelectElement>) => {
-          const p = FONT_PRESETS.find((x) => x.family === e.target.value);
+          const v = e.target.value;
+          if (v.startsWith(FILE_PREFIX)) {
+            const f = userFonts.find((x) => `${FILE_PREFIX}${x.id}` === v);
+            // A face from a file has no known kind: monospace in the monospace slot, else serif.
+            if (f) onChoose({ family: f.name, source: "user-file", file: f.id, generic: slot === "mono" ? "monospace" : "serif" });
+            return;
+          }
+          const p = FONT_PRESETS.find((x) => x.family === v);
           if (p) onChoose({ family: p.family, source: p.source, generic: p.generic });
         }}
       >
@@ -59,7 +72,12 @@ function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontCh
             {p.label}
           </option>
         ))}
-        {!preset && <option value={CUSTOM}>{customLabel}</option>}
+        {userFonts.map((f) => (
+          <option key={f.id} value={`${FILE_PREFIX}${f.id}`}>
+            {`From file: ${f.name}`}
+          </option>
+        ))}
+        {!preset && !ownFile && <option value={CUSTOM}>{customLabel}</option>}
       </select>
       <form
         className="ao-font-typed"
@@ -94,6 +112,109 @@ function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontCh
   );
 }
 
+/**
+ * The researcher's own font files (R100): added by their path (the desktop shell's file picker
+ * gives a path, as for imports), checked and kept by the service, then offered in every typeface
+ * picker above. One request at a time; answers after the screen closes are dropped.
+ */
+function UserFontFiles({ fonts, list, onList }: { fonts: FontsApi; list: UserFont[]; onList: (l: UserFont[]) => void }) {
+  const id = useId();
+  const [path, setPath] = useState("");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const live = useRef(true);
+  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState("");
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
+
+  const run = async (what: () => Promise<void>) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError(null);
+    setStatus("");
+    try {
+      await what();
+    } catch (e) {
+      if (live.current) setError(e instanceof Error && e.message ? e.message : "Something went wrong.");
+    } finally {
+      busyRef.current = false;
+      if (live.current) setBusy(false);
+    }
+  };
+
+  const add = (e: FormEvent) => {
+    e.preventDefault();
+    const p = path.trim();
+    if (!isAbsolutePath(p)) {
+      setError(PATH_HINT);
+      return;
+    }
+    void run(async () => {
+      const f = await fonts.add(p, name.trim() || undefined);
+      if (!live.current) return;
+      onList([...list.filter((x) => x.id !== f.id), f]);
+      setPath("");
+      setName("");
+      setStatus(`Added “${f.name}”. Choose it for a typeface above.`);
+    });
+  };
+
+  const remove = (f: UserFont) =>
+    void run(async () => {
+      await fonts.remove(f.id);
+      if (!live.current) return;
+      onList(list.filter((x) => x.id !== f.id));
+      setStatus(`Removed “${f.name}”.`);
+    });
+
+  return (
+    <section aria-labelledby={`${id}-own`}>
+      <h2 id={`${id}-own`}>Your own font files</h2>
+      <p className="ao-hint">TrueType, OpenType, WOFF or WOFF2, up to 32 MB. The app keeps its own copy on this computer; the file is not changed.</p>
+      {list.length > 0 && (
+        <ul className="ao-font-files">
+          {list.map((f) => (
+            <li key={f.id}>
+              <UserText>{f.name}</UserText> <span className="ao-hint">({f.format.toUpperCase()})</span>{" "}
+              <button type="button" aria-label={`Remove ${f.name}`} disabled={busy} onClick={() => remove(f)}>
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <form className="ao-font-file-form" onSubmit={add}>
+        <div className="ao-field">
+          <label htmlFor={`${id}-path`}>Font file path</label>
+          <input id={`${id}-path`} type="text" spellCheck={false} placeholder="/Users/me/Fonts/Junicode.woff2" value={path} onChange={(e) => setPath(e.target.value)} />
+        </div>
+        <div className="ao-field">
+          <label htmlFor={`${id}-name`}>Name to use (optional)</label>
+          <input id={`${id}-name`} type="text" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <button type="submit" disabled={busy}>
+          Add font file
+        </button>
+      </form>
+      <p role="status" className="ao-hint">
+        {status && <UserText>{status}</UserText>}
+      </p>
+      {error && (
+        <p role="alert" className="ao-warning">
+          <UserText>{error}</UserText>
+        </p>
+      )}
+    </section>
+  );
+}
+
 function RadioGroup<T extends string>({ legend, name, value, options, onChange }: { legend: string; name: string; value: T; options: [T, string][]; onChange: (v: T) => void }) {
   const id = useId();
   return (
@@ -110,8 +231,20 @@ function RadioGroup<T extends string>({ legend, name, value, options, onChange }
 }
 
 export function AppearanceSettingsScreen() {
-  const { settings, theme, accentApplied, update, retrySave, saveError } = useAppearance();
+  const { settings, theme, accentApplied, update, retrySave, saveError, fonts, fontError } = useAppearance();
   const id = useId();
+  const [userFonts, setUserFonts] = useState<UserFont[]>([]);
+  useEffect(() => {
+    if (!fonts) return;
+    let live = true;
+    fonts.list().then(
+      (l) => live && setUserFonts(l),
+      () => undefined, // the section below says so when it is used; the pickers simply offer no files
+    );
+    return () => {
+      live = false;
+    };
+  }, [fonts]);
   const [rejectedAccent, setRejectedAccent] = useState<string | null>(null);
   // The colour shown in the picker while the user is still choosing (saved ACCENT_DEBOUNCE_MS after).
   const [draftAccent, setDraftAccent] = useState<string | null>(null);
@@ -202,10 +335,17 @@ export function AppearanceSettingsScreen() {
         <p className="ao-hint">
           Goudy Old Style is used when it is installed on this computer; otherwise the bundled Sorts Mill Goudy. Text in other scripts falls back to Noto and system fonts.
         </p>
+        {fontError && (
+          <p role="alert" className="ao-warning">
+            <UserText>{fontError}</UserText>
+          </p>
+        )}
         {FONT_SLOTS.map((slot) => (
-          <FontPicker key={slot} slot={slot} choice={settings.fonts[slot]} onChoose={(c) => set({ fonts: { [slot]: c } })} />
+          <FontPicker key={slot} slot={slot} choice={settings.fonts[slot]} userFonts={userFonts} onChoose={(c) => set({ fonts: { [slot]: c } })} />
         ))}
       </section>
+
+      {fonts && <UserFontFiles fonts={fonts} list={userFonts} onList={setUserFonts} />}
 
       <section aria-labelledby={`${id}-size`}>
         <h2 id={`${id}-size`}>Size and spacing</h2>
