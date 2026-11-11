@@ -1,6 +1,6 @@
 -- Index schema v1. Everything here is a cache derived from the library's files and can be rebuilt
--- (review_items from review/pending.jsonl, jobs from jobs/journal.jsonl; import_batches was never
--- written and is dropped by 0002 - see docs/adr/0007-index.md).
+-- (review_items, import_batches and jobs will be caches of files written by later tasks; until then
+-- a rebuild carries their rows over - see docs/adr/0007-index.md).
 --
 -- Encrypted projects (R30): only manifest-level fields (id, type, issued_year, folder, project id,
 -- locked flag) are stored here. Titles, creators, extracted text, dedupe keys, collection/tag names and
