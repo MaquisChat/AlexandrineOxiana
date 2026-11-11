@@ -36,11 +36,72 @@ function liveEvents() {
 
 const progress = (done: number, total: number, more: Record<string, unknown> = {}) => ({ kind: "recheck", jobId: "job-1", projectId: "p1", done, total, finished: false, ...more });
 
+/** Every distinct text each live region (status, alert, aria-live) of the page shows, in order, while watched. */
+function watchAnnouncements() {
+  const seen = new Map<Element, string[]>();
+  const regions = () => [...document.querySelectorAll("[role=status], [role=alert], [aria-live]")].filter((el) => el.getAttribute("aria-live") !== "off");
+  const snap = () => {
+    for (const r of regions()) {
+      const list = seen.get(r) ?? [];
+      const text = (r.textContent ?? "").trim();
+      if (list.at(-1) !== text) list.push(text);
+      seen.set(r, list);
+    }
+  };
+  snap();
+  const mo = new MutationObserver(snap);
+  mo.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
+  return {
+    stop: () => {
+      snap();
+      mo.disconnect();
+    },
+    /** The non-empty texts each region showed that mention the recheck. */
+    about: (re: RegExp) => [...seen.values()].flatMap((list) => list.filter((t) => t !== "" && re.test(t))),
+  };
+}
+
+describe("Recheck project: announcements (R113, review F1)", () => {
+  it("many rapid progress events announce only the start and the end; the visible counter and bar still move", async () => {
+    const ev = liveEvents();
+    server.use(ev.handler, http.post(url("/projects/:id/recheck"), () => HttpResponse.json({ jobId: "job-1", total: 60 })), ...libraryHandlers());
+    ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} />);
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await within(nav).findByRole("button", { name: /Dissertation/ });
+    await screen.findByRole("table", { name: "Sources" });
+    const watch = watchAnnouncements();
+    await user.click(screen.getByRole("button", { name: "Recheck project" }));
+    await screen.findByText("Rechecking the project's sources.");
+    for (let i = 1; i <= 59; i++) ev.send("job.progress", progress(i, 60));
+    await waitFor(() => expect(screen.getByText("59 of 60")).toBeTruthy());
+    const bar = screen.getByRole("progressbar", { name: "Project recheck progress" });
+    expect(bar.getAttribute("value")).toBe("59");
+    expect(bar.closest("[role=status], [aria-live]")).toBeNull();
+    ev.send("job.progress", progress(60, 60, { finished: true, changed: 3, failed: 0 }));
+    await screen.findByText(/Recheck finished: 3 sources changed/);
+    watch.stop();
+    const said = watch.about(/recheck/i);
+    expect(said).toEqual(["Rechecking the project's sources.", "Recheck finished: 3 sources changed."]);
+    // The background-jobs indicator does not repeat the recheck's progress.
+    expect(screen.getByRole("status", { name: "Background jobs" }).textContent).toBe("");
+  });
+});
+
 describe("Recheck project (R99)", () => {
-  it("starts the job, shows its progress from the job events, refuses a second start while it runs, and reads the badges again when it finishes", async () => {
+  /** The library on screen with its projects and sources loaded, each part awaited in turn. */
+  async function libraryShown() {
+    render(<Library api={testApi()} current={CURRENT_RW as never} />);
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await within(nav).findByRole("button", { name: /Dissertation/ });
+    await screen.findByRole("button", { name: "Recheck project" });
+    return screen.findByRole("table", { name: "Sources" });
+  }
+
+  it("starts the job, shows its progress from the job events, ignores other jobs, and refuses a second start while it runs", async () => {
     const ev = liveEvents();
     let starts = 0;
-    let sourceReads = 0;
     server.use(
       ev.handler,
       http.post(url("/projects/:id/recheck"), ({ params }) => {
@@ -48,6 +109,42 @@ describe("Recheck project (R99)", () => {
         expect(params.id).toBe("p1");
         return HttpResponse.json({ jobId: "job-1", total: 2 });
       }),
+      ...libraryHandlers(),
+    );
+    ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+    const user = userEvent.setup();
+    await libraryShown();
+    const button = screen.getByRole("button", { name: "Recheck project" });
+    await user.click(button);
+    await waitFor(() => expect(starts).toBe(1));
+    const status = screen.getByRole("status", { name: "Project recheck" });
+    await waitFor(() => expect(status.textContent).toBe("Rechecking the project's sources."));
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    await user.click(button);
+    expect(starts).toBe(1);
+
+    ev.send("job.progress", progress(1, 2));
+    await screen.findByText("1 of 2");
+    const bar = screen.getByRole("progressbar", { name: "Project recheck progress" });
+    expect(bar.getAttribute("value")).toBe("1");
+    expect(bar.getAttribute("max")).toBe("2");
+    // Another job's events (another project, or another recheck) do not move it.
+    ev.send("job.progress", { ...progress(2, 2), jobId: "job-other", finished: true });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(screen.getByText("1 of 2")).toBeTruthy();
+    expect(status.textContent).toBe("Rechecking the project's sources.");
+
+    ev.send("job.progress", progress(2, 2, { finished: true, changed: 1, failed: 0 }));
+    await waitFor(() => expect(status.textContent).toBe("Recheck finished: 1 source changed."));
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("when the job finishes, the open source's badges are read again", async () => {
+    const ev = liveEvents();
+    let sourceReads = 0;
+    server.use(
+      ev.handler,
+      http.post(url("/projects/:id/recheck"), () => HttpResponse.json({ jobId: "job-1", total: 2 })),
       http.get(url("/projects/:id/sources/:sid"), () => {
         sourceReads++;
         return HttpResponse.json(sourceReads === 1 ? VERIFIED_SOURCE : withFields([{ ...FIELD_TITLE_VERIFIED, status: "conflict" }]));
@@ -56,38 +153,13 @@ describe("Recheck project (R99)", () => {
     );
     ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
     const user = userEvent.setup();
-    render(<Library api={testApi()} current={CURRENT_RW as never} />);
-    // Step by step (the projects, then the sources, then the open source): each waits for what the one before it loaded.
-    const nav = await screen.findByRole("navigation", { name: "Projects" });
-    await within(nav).findByRole("button", { name: /Dissertation/ });
-    await screen.findByRole("button", { name: "Recheck project" });
-    const table = await screen.findByRole("table", { name: "Sources" });
+    const table = await libraryShown();
     await user.click(await within(table).findByRole("button", { name: "Ethnography at Work" }));
     await screen.findByRole("button", { name: "Title: Verified" });
-
-    const button = screen.getByRole("button", { name: "Recheck project" });
-    await user.click(button);
-    await waitFor(() => expect(starts).toBe(1));
-    const status = screen.getByRole("status", { name: "Project recheck" });
-    await waitFor(() => expect(status.textContent).toContain("Rechecking the project's sources"));
-    expect((button as HTMLButtonElement).disabled).toBe(true);
-    await user.click(button);
-    expect(starts).toBe(1);
-
-    ev.send("job.progress", progress(1, 2));
-    await waitFor(() => expect(status.textContent).toContain("1 of 2"));
-    const bar = within(status).getByRole("progressbar");
-    expect(bar.getAttribute("value")).toBe("1");
-    expect(bar.getAttribute("max")).toBe("2");
-    // Another job's events (another project, or another recheck) do not move it.
-    ev.send("job.progress", { ...progress(2, 2), jobId: "job-other", finished: true });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(status.textContent).toContain("1 of 2");
-
+    await user.click(screen.getByRole("button", { name: "Recheck project" }));
+    await screen.findByText("Rechecking the project's sources.");
     ev.send("job.progress", progress(2, 2, { finished: true, changed: 1, failed: 0 }));
-    await waitFor(() => expect(status.textContent).toContain("Recheck finished: 1 source changed"));
-    expect((button as HTMLButtonElement).disabled).toBe(false);
-    // The open source's badges were read again.
+    await screen.findByText("Recheck finished: 1 source changed.");
     expect(await screen.findByRole("button", { name: "Title: Conflict" })).toBeTruthy();
   });
 

@@ -82,7 +82,11 @@ export type ProjectRecheckControl = ReturnType<typeof useProjectRecheck>;
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-/** The button and its progress for one project (in the library's project menu). */
+/**
+ * The button and its progress for one project (in the library's project menu). Only the start and
+ * the end are announced (the live region's text changes twice, R113); the counter and the bar move
+ * outside it, where a screen reader finds them when asked.
+ */
 export function RecheckProjectButton({ control, projectId, readOnly }: { control: ProjectRecheckControl; projectId: string; readOnly: boolean }) {
   const job = control.jobs[projectId];
   const busy = job?.state === "starting" || job?.state === "running";
@@ -91,14 +95,16 @@ export function RecheckProjectButton({ control, projectId, readOnly }: { control
       <button type="button" disabled={readOnly || busy} aria-describedby={`recheck-${projectId}`} onClick={() => void control.start(projectId)}>
         Recheck project
       </button>
+      {job?.state === "running" && (
+        <span className="ao-muted">
+          <span>
+            {job.done} of {job.total}
+          </span>{" "}
+          <progress max={Math.max(job.total, 1)} value={Math.min(job.done, job.total)} aria-label="Project recheck progress" />
+        </span>
+      )}
       <span id={`recheck-${projectId}`} role="status" aria-label="Project recheck" className="ao-muted">
-        {job?.state === "starting" && "Rechecking the project's sources…"}
-        {job?.state === "running" && (
-          <>
-            Rechecking the project's sources: {job.done} of {job.total}{" "}
-            <progress max={Math.max(job.total, 1)} value={Math.min(job.done, job.total)} aria-label="Project recheck progress" />
-          </>
-        )}
+        {busy && "Rechecking the project's sources."}
         {job?.state === "finished" &&
           `Recheck finished: ${plural(job.changed ?? 0, "source changed", "sources changed")}${job.failed ? `, ${plural(job.failed, "source", "sources")} could not be checked` : ""}.`}
       </span>

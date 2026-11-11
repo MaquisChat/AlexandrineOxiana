@@ -200,8 +200,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
             if (typeof d.done !== "number" || typeof d.total !== "number") continue;
+            // A project recheck shows its own progress by its button (announced at start and end only, R113).
             if (d.kind === "recheck") recheckEvent.current(e.data);
-            if (d.kind === "index") setIndex({ done: d.done, total: d.total });
+            else if (d.kind === "index") setIndex({ done: d.done, total: d.total });
             else {
               const key = `${d.kind ?? "job"}:${d.jobId ?? ""}`;
               const finished = d.finished === true || d.done >= d.total;
