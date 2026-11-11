@@ -37,6 +37,8 @@ export interface SourceDetailProps {
   onLocked?: () => void;
   /** Changing it reads the source again (a project-wide recheck finished, R99). */
   refreshKey?: number;
+  /** How long to wait between reads of the record after "Try again" (tests shorten it). */
+  retryPollMs?: number;
 }
 
 const IDENTIFIER_LABELS: Record<string, string> = { doi: "DOI", isbn: "ISBN", issn: "ISSN", pmid: "PubMed ID", pmcid: "PubMed Central ID", arxiv: "arXiv", url: "Web address" };
@@ -98,7 +100,11 @@ const jobReason = (code: string) => JOB_REASONS[code] ?? "the media helper could
 
 type Picture = { url: string } | { error: string };
 
-export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked, refreshKey = 0 }: SourceDetailProps) {
+type RetryState = { state: "idle"; error?: string } | { state: "running" } | { state: "started"; before: Record<string, string>; reads: number };
+/** Reads of the record after "Try again" before the screen stops following the work. */
+const RETRY_READS = 60;
+
+export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked, refreshKey = 0, retryPollMs = 2000 }: SourceDetailProps) {
   const [file, setFile] = useState<VerifiedSource | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [editing, setEditing] = useState(false);
@@ -107,7 +113,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   const [rechecking, setRechecking] = useState(false);
   const [recheckNote, setRecheckNote] = useState<string | undefined>();
   const [pictures, setPictures] = useState<Record<string, Picture>>({});
-  const [retry, setRetry] = useState<{ state: "idle" | "running" | "started"; error?: string }>({ state: "idle" });
+  const [retry, setRetry] = useState<RetryState>({ state: "idle" });
   const id = useId();
 
   // Read again only when the source changes (not when the parent re-renders with a new api object).
@@ -244,39 +250,53 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     ];
   }, [file]);
   const anyFailed = jobs.some((j) => j.job.failed);
-  const anyWaiting = jobs.some((j) => !j.job.failed);
 
+  /**
+   * "Try again": the service answers before it has cleared the failures (`/jobs/retry` runs in the
+   * background), so the record is read again until every retried job has settled — gone (done),
+   * or failed anew (a different failure time) — or the reads run out. Answers for another source
+   * are dropped (gen).
+   */
   const retryJobs = async () => {
     const g = gen.current;
+    const before: Record<string, string> = {};
+    for (const { job } of jobs) if (job.failed) before[job.id] = job.failed.at;
     setRetry({ state: "running" });
     try {
       await api.verification.retryJobs(projectId, sourceId);
       if (g !== gen.current) return;
-      setRetry({ state: "started" });
-      const f = await api.sources.get(projectId, sourceId);
-      if (g === gen.current) setFile(f as VerifiedSource);
+      setRetry({ state: "started", before, reads: 0 });
     } catch (err) {
       if (g !== gen.current) return;
       setRetry({ state: "idle", error: failed(err, "The work could not be started again.") });
     }
   };
 
-  // After a retry, the record is read again every few seconds while work is still waiting.
+  const unsettled = retry.state === "started" && jobs.some(({ job }) => job.id in retry.before && (!job.failed || job.failed.at === retry.before[job.id]));
   useEffect(() => {
-    if (retry.state !== "started" || !anyWaiting) return;
+    if (retry.state !== "started") return;
+    if (!unsettled || retry.reads >= RETRY_READS) {
+      setRetry({ state: "idle" });
+      return;
+    }
     const g = gen.current;
-    let n = 0;
-    const t = setInterval(() => {
-      if (++n > 30 || g !== gen.current) return clearInterval(t);
-      apiRef.current.sources
-        .get(projectId, sourceId)
-        .then((f) => {
-          if (g === gen.current) setFile(f as VerifiedSource);
-        })
-        .catch(() => {});
-    }, 3000);
-    return () => clearInterval(t);
-  }, [retry.state, anyWaiting, projectId, sourceId]);
+    const t = setTimeout(
+      () => {
+        apiRef.current.sources
+          .get(projectId, sourceId)
+          .then((f) => {
+            if (g !== gen.current) return;
+            setFile(f as VerifiedSource);
+            setRetry((r) => (r.state === "started" ? { ...r, reads: r.reads + 1 } : r));
+          })
+          .catch(() => {
+            if (g === gen.current) setRetry((r) => (r.state === "started" ? { ...r, reads: r.reads + 1 } : r));
+          });
+      },
+      retry.reads === 0 ? 0 : retryPollMs,
+    );
+    return () => clearTimeout(t);
+  }, [retry, unsettled, projectId, sourceId, retryPollMs]);
 
   // ---- editing ----
   const startEdit = () => {
@@ -493,7 +513,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
                   Try again
                 </button>
               )}
-              {retry.error && (
+              {retry.state === "idle" && retry.error && (
                 <p role="alert" className="ao-error">
                   {retry.error}
                 </p>

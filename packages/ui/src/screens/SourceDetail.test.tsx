@@ -394,6 +394,62 @@ describe("SourceDetail: background work for the source (R84)", () => {
     expect(within(work).getByRole("status").textContent).toContain("Trying again");
   });
 
+  it("review F4: the service clears a failure after it answers the retry; the screen keeps reading until the retried work settles", async () => {
+    // Every job had failed (no waiting job), and the first reads after the retry still show the old failure.
+    const onlyFailed = { ...PROXY_FAILED_SOURCE, pendingProxies: [PROXY_FAILED_SOURCE.pendingProxies[0]!] };
+    const cleared = { ...onlyFailed, pendingProxies: [{ ...PROXY_FAILED_SOURCE.pendingProxies[0]!, failed: undefined }] };
+    const done = { ...onlyFailed, pendingProxies: [] };
+    let reads = 0;
+    let retried = false;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        reads++;
+        if (!retried || reads <= 3) return HttpResponse.json(onlyFailed);
+        return HttpResponse.json(reads === 4 ? cleared : done);
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), () => {
+        retried = true;
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} retryPollMs={20} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    // Not stuck on the old failure: it goes on reading until the job is done and the section goes away.
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Viewing copies and text recognition" })).toBeNull(), { timeout: 3000 });
+    expect(reads).toBeGreaterThanOrEqual(5);
+    const settled = reads;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(reads).toBe(settled);
+  });
+
+  it("review F4: answers to the follow-up reads are dropped once another source is shown", async () => {
+    let retried = false;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), ({ params }) => {
+        if (params.sid === "s2") return HttpResponse.json(second());
+        return HttpResponse.json(retried ? { ...PROXY_FAILED_SOURCE, pendingProxies: [] } : PROXY_FAILED_SOURCE);
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), async () => {
+        await new Promise((r) => setTimeout(r, 40));
+        retried = true;
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const user = userEvent.setup();
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} retryPollMs={20} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} retryPollMs={20} />);
+    await screen.findByRole("heading", { name: "Second source" });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.getByRole("heading", { name: "Second source" })).toBeTruthy();
+    expect(screen.queryByText(/Trying again/)).toBeNull();
+  });
+
   it("a retry the service refuses is explained, and the failure stays listed", async () => {
     server.use(...sourceHandlers(PROXY_FAILED_SOURCE), http.post(url("/jobs/retry"), () => serviceError(409, "READ_ONLY", "read only")));
     const user = userEvent.setup();
