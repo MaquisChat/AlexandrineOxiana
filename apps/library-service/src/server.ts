@@ -22,7 +22,7 @@ import { registerGovernance } from "./routes/governance.js";
 import { registerImport } from "./routes/import.js";
 import { registerJobs } from "./routes/jobs.js";
 import { registerLibraries } from "./routes/libraries.js";
-import { mediaRequestRefusal, registerMedia } from "./media.js";
+import { isMediaRoute, mediaRequestRefusal, registerMedia } from "./media.js";
 import { registerProjects } from "./routes/projects.js";
 import { registerReview } from "./routes/review.js";
 import { registerSources } from "./routes/sources.js";
@@ -56,6 +56,8 @@ export interface ServiceOptions {
   watchStabilityMs?: number;
   /** Largest picture the content route serves (default PICTURE_MAX_BYTES; test seam). */
   pictureMaxBytes?: number;
+  /** Test seam: runs on the media route after the first slice is read, right before the response starts. */
+  mediaBeforeSend?: () => Promise<void>;
 }
 
 export interface LibraryService {
@@ -147,7 +149,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
 
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
     if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
-    const isMedia = isMediaPath(req.url);
+    // The media route itself, by its own configuration (R140 3): no path test decides who skips the token.
+    const isMedia = isMediaRoute(req);
     // Event streams and media streams may stay open for hours: shutdown does not wait for them
     // (media streams end when their tickets are revoked, at the start of shutdown).
     if ((req.url.split("?")[0] ?? "") !== "/events" && !isMedia) {
@@ -222,12 +225,20 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
 
   app.setErrorHandler((err: unknown, req, reply) => {
     const e = toApiError(err);
+    // A file response that failed before its first byte: its content headers (already copied to the
+    // raw response when a stream was handed over) must not describe the error body (R140 5).
+    if (!reply.raw.headersSent) {
+      for (const h of ["content-type", "content-length", "content-range", "content-disposition", "content-security-policy", "accept-ranges"]) {
+        reply.removeHeader(h);
+        reply.raw.removeHeader(h);
+      }
+    }
     if (e.status >= 500) req.log.error({ err: state.describe(err) }, "request failed");
     void fail(reply, e);
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}) };
+  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -273,7 +284,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void> };
 
 /** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
 function decodedPath(path: string): string {
@@ -305,5 +316,8 @@ export function isMediaPath(url: string): boolean {
 export function logUrl(url: string): string {
   const path = url.split("?")[0] ?? "";
   if (isMediaPath(path)) return "/media/[redacted]";
-  return decodedPath(path).replace(/[A-Za-z0-9_-]{40,}/g, "[redacted]");
+  // An encoded separator could split a ticket into halves shorter than 40: then every run of 16 or
+  // more ticket characters is replaced (review M4).
+  const run = /%2f|%5c/i.test(path) ? /[A-Za-z0-9_-]{16,}/g : /[A-Za-z0-9_-]{40,}/g;
+  return decodedPath(path).replace(run, "[redacted]");
 }

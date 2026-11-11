@@ -36,8 +36,9 @@
  * or in an error message (every message here is fixed text).
  */
 import { createHash, randomBytes } from "node:crypto";
+import { Transform } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { isMediaMime, isPictureMime, openAssetContent, type AssetContent } from "@ao/library";
+import { DecryptionError, EncryptionFormatError, KeyNotAvailableError, ProjectLockedError, isMediaMime, isPictureMime, openAssetContent, type AssetContent } from "@ao/library";
 import {
   MEDIA_TICKETS_MAX,
   MEDIA_TICKET_IDLE_MS,
@@ -48,7 +49,7 @@ import {
   type MediaTicketRevokeResponse,
 } from "@ao/shared";
 import { SHELL_ORIGINS } from "./auth.js";
-import { ApiError, badRequest, notFound } from "./errors.js";
+import { ApiError, badRequest, notFound, toApiError } from "./errors.js";
 import { bodyOf, paramsOf, projectParam, str, type Ctx } from "./routes/util.js";
 
 export { PICTURE_MAX_BYTES };
@@ -64,7 +65,7 @@ interface Ticket {
   sourceId: string;
   assetId: string;
   issuedAt: number;
-  /** When the last request started or ended. */
+  /** When bytes were last sent for it (or it was issued): R140, idle means no bytes sent. */
   lastUsed: number;
   /** Responses streaming now. */
   streams: Set<Stream>;
@@ -94,6 +95,24 @@ export class MediaTickets {
 
   /** Streams whose ticket ended while they ran, until they have closed. */
   private readonly orphans = new Set<Stream>();
+  private sent = 0;
+
+  /** Bytes handed to responses so far, over all tickets (diagnostics, tests). */
+  bytesSent(): number {
+    return this.sent;
+  }
+
+  /** Bytes were sent for `t`: the idle clock starts again (R140). */
+  sentBytes(t: Ticket, n: number): void {
+    this.sent += n;
+    t.lastUsed = this.now();
+  }
+
+  /** Whether `ticket` is still live (no use recorded). */
+  isLive(ticket: string): boolean {
+    this.sweep();
+    return this.tickets.has(digest(ticket));
+  }
 
   issue(entry: Omit<Ticket, "issuedAt" | "lastUsed" | "streams">): { ticket: string; issuedAt: number } {
     this.sweep();
@@ -107,12 +126,10 @@ export class MediaTickets {
     return { ticket, issuedAt: at };
   }
 
-  /** The live ticket, its use recorded; undefined when unknown or ended. */
+  /** The live ticket; undefined when unknown or ended. A request alone does not refresh it: bytes do. */
   use(ticket: string): Ticket | undefined {
     this.sweep();
-    const t = this.tickets.get(digest(ticket));
-    if (t) t.lastUsed = this.now();
-    return t;
+    return this.tickets.get(digest(ticket));
   }
 
   /** Tracks a response of `t` until `done` is called. */
@@ -121,7 +138,6 @@ export class MediaTickets {
     return () => {
       t.streams.delete(s);
       this.orphans.delete(s);
-      t.lastUsed = this.now();
     };
   }
 
@@ -142,11 +158,14 @@ export class MediaTickets {
     this.stopTimer();
   }
 
-  /** Ends tickets past their idle time (none in progress) or their lifetime. */
+  /**
+   * Ends tickets past their lifetime, or with no bytes sent for 10 minutes (R140: a response open
+   * but making no progress does not keep its ticket; ending it closes that connection).
+   */
   sweep(): void {
     const now = this.now();
     for (const [k, t] of this.tickets) {
-      const idle = t.streams.size === 0 && now - t.lastUsed >= MEDIA_TICKET_IDLE_MS;
+      const idle = now - t.lastUsed >= MEDIA_TICKET_IDLE_MS;
       if (idle || now - t.issuedAt >= MEDIA_TICKET_LIFETIME_MS) this.end(k, t);
     }
     if (this.tickets.size === 0) this.stopTimer();
@@ -161,7 +180,7 @@ export class MediaTickets {
     this.tickets.delete(key);
     for (const s of t.streams) {
       this.orphans.add(s);
-      s.destroy(new Error("the media address has ended"));
+      s.destroy(ticketEnded());
     }
     t.streams.clear();
   }
@@ -196,13 +215,25 @@ function originOf(url: string): string | undefined {
   }
 }
 
+/** Marks the media route: server.ts exempts it from the token check by this, never by a path test (R140 3). */
+export const MEDIA_ROUTE_CONFIG = { mediaTicket: true } as const;
+
+/** Whether the request was routed to the media route itself (its own configuration says so). */
+export function isMediaRoute(req: FastifyRequest): boolean {
+  return (req.routeOptions.config as { mediaTicket?: unknown } | undefined)?.mediaTicket === true;
+}
+
+/** The answer for a media address that has ended (or never existed, or is spelled otherwise). */
+export const ticketEnded = (): ApiError => new ApiError(404, "NOT_FOUND", "This media address has ended. Open the recording again.");
+
 /**
- * Whether a `/media/…` request may be answered at all (before the ticket is looked up), and the
- * refusal if not. Host is checked by the caller.
+ * Whether a request to the media route may be answered at all (before the ticket is looked up),
+ * and the refusal if not. Host is checked by the caller. Only the exact address form is served:
+ * `/media/` and the ticket's own 43 characters, nothing percent-encoded, nothing after it (R140 4).
  */
 export function mediaRequestRefusal(req: FastifyRequest): ApiError | undefined {
-  if (req.method !== "GET" && req.method !== "HEAD") return new ApiError(404, "NOT_FOUND", "There is no such route.");
   if (req.url.includes("?")) return badRequest("A media address carries nothing after its path.");
+  if (!isMediaTicketPath(req.url)) return ticketEnded();
   const forbidden = (why: string) => new ApiError(403, "FORBIDDEN", why);
   const origin = header(req, "origin");
   if (origin !== undefined && !SHELL_ORIGINS.has(origin)) return forbidden("Requests from this origin are not allowed.");
@@ -259,7 +290,7 @@ function contentHeaders(reply: FastifyReply, mime: string, length: number): void
     .header("Content-Security-Policy", "default-src 'none'; sandbox");
 }
 
-export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes?: number }): void {
+export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void> }): void {
   const { state } = ctx;
   const tickets = state.media;
   const pictureMax = ctx.pictureMaxBytes ?? PICTURE_MAX_BYTES;
@@ -281,7 +312,7 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
       await c.close();
       throw new ApiError(413, "PAYLOAD_TOO_LARGE", "This picture is too large to show.");
     }
-    return sendContent(reply, c, c.size === 0 ? undefined : { start: 0, end: c.size - 1 }, 200, () => () => {});
+    return sendContent(req, reply, c, c.size === 0 ? undefined : { start: 0, end: c.size - 1 }, 200, {});
   });
 
   // ---- media tickets ----
@@ -306,7 +337,7 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
   });
 
   // ---- the media route (no token: the ticket is the credential; checks in server.ts) ----
-  const ended = () => new ApiError(404, "NOT_FOUND", "This media address has ended. Open the recording again.");
+  const ended = ticketEnded;
   const serve = async (req: FastifyRequest, reply: FastifyReply) => {
     const ticket = paramsOf(req).ticket ?? "";
     if (!isMediaTicketPath(`/media/${ticket}`)) throw ended();
@@ -337,6 +368,7 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     reply.header("Accept-Ranges", "bytes");
     if (r === "unsatisfiable") {
       await c.close();
+      tickets.sentBytes(t, 0);
       return reply.status(416).header("Content-Range", `bytes */${c.size}`).header("Cache-Control", "no-store").header("X-Content-Type-Options", "nosniff").send();
     }
     const range = r ?? (c.size === 0 ? undefined : { start: 0, end: c.size - 1 });
@@ -344,38 +376,118 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
     if (req.method === "HEAD") {
       contentHeaders(reply, c.mime, range ? range.end - range.start + 1 : 0);
       await c.close();
+      tickets.sentBytes(t, 0);
       return reply.status(r ? 206 : 200).send();
     }
-    return sendContent(reply, c, range, r ? 206 : 200, (stream) => tickets.track(t, stream));
+    return sendContent(req, reply, c, range, r ? 206 : 200, {
+      track: (stream) => tickets.track(t, stream),
+      sent: (n) => tickets.sentBytes(t, n),
+      // Between the first read and the first byte: the ticket must still be live and its project unlocked.
+      check: () => {
+        if (!tickets.isLive(ticket) || state.session !== s) throw ended();
+        if (!s.repo.isUnlocked(t.projectId)) {
+          tickets.revoke(ticket);
+          throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+        }
+      },
+      ...(ctx.mediaBeforeSend ? { beforeSend: ctx.mediaBeforeSend } : {}),
+    });
   };
-  app.route({ method: "GET", url: "/media/:ticket", exposeHeadRoute: false, handler: serve });
-  app.route({ method: "HEAD", url: "/media/:ticket", handler: serve });
+  app.route({ method: "GET", url: "/media/:ticket", exposeHeadRoute: false, config: MEDIA_ROUTE_CONFIG, handler: serve });
+  app.route({ method: "HEAD", url: "/media/:ticket", config: MEDIA_ROUTE_CONFIG, handler: serve });
+}
+
+/** How much is read before any header is sent: an unreadable file is refused with a proper error. */
+const FIRST_SLICE = 64 * 1024;
+
+/**
+ * A stored file that could not be read for display, as the service's own error (R140 5): locked
+ * → 423, damaged or unreadable → 409 with a fixed message. Logged by the caller without a stack.
+ */
+function readFailure(err: unknown): ApiError {
+  if (err instanceof ApiError) return err;
+  if (err instanceof ProjectLockedError || err instanceof KeyNotAvailableError) return toApiError(err);
+  if (err instanceof DecryptionError || err instanceof EncryptionFormatError) return toApiError(err);
+  return new ApiError(409, "CONFLICT", "This file could not be read. The library's integrity check can tell more.");
+}
+
+const logFailure = (req: FastifyRequest, e: ApiError, when: "before the first byte" | "while sending") => {
+  if (e.code === "NOT_FOUND" || e.code === "PROJECT_LOCKED") req.log.info({ code: e.code, when }, "a media address ended");
+  else req.log.warn({ code: e.code, when }, "a stored file could not be read for display");
+};
+
+interface SendHooks {
+  track?: (s: Stream) => () => void;
+  sent?: (bytes: number) => void;
+  check?: () => void;
+  beforeSend?: () => Promise<void>;
 }
 
 /**
- * Streams `range` of `c` (nothing for an empty file); the file is released when the response ends,
- * however it ends (finished, aborted by the client, or destroyed by a revocation).
+ * Streams `range` of `c` (nothing for an empty file). The first slice is read before any header
+ * is set, so a damaged file or a lock answers with the service's error shape (R140 5). The file is
+ * released when the response ends, however it ends (finished, aborted by the client, or ended by
+ * a revocation, after which nothing more is sent).
  */
-function sendContent(reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, track: (s: Stream) => () => void): FastifyReply {
-  const length = range ? range.end - range.start + 1 : 0;
+async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
+  if (!range) {
+    contentHeaders(reply, c.mime, 0);
+    await c.close();
+    return reply.status(status).send(Buffer.alloc(0));
+  }
+  const length = range.end - range.start + 1;
+  let first: Buffer;
+  try {
+    first = await c.read(range.start, Math.min(FIRST_SLICE, length));
+    hooks.check?.();
+  } catch (err) {
+    await c.close();
+    const e = readFailure(err);
+    logFailure(req, e, "before the first byte");
+    throw e;
+  }
   contentHeaders(reply, c.mime, length);
   reply.status(status);
-  if (!range) {
-    void c.close();
-    return reply.send(Buffer.alloc(0));
-  }
-  const body = c.range(range.start, range.end);
-  // Errors reading (a revoked ticket, a damaged file) end the response; their text names no path or ticket.
-  const done = track(body);
+
+  // Every byte goes through `out`, which counts it (the ticket's idle clock, R140) and can be cut off.
+  const out = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      hooks.sent?.(chunk.length);
+      cb(null, chunk);
+    },
+  });
+  const rest = first.length < length ? c.range(range.start + first.length, range.end) : undefined;
+  let stopped = false;
+  /** Ends the response: before the first byte with the service's error, after it by cutting the connection. */
+  const stop = (err: ApiError) => {
+    if (stopped) return;
+    stopped = true;
+    rest?.unpipe(out);
+    rest?.destroy();
+    if (reply.raw.headersSent) out.destroy();
+    else out.destroy(err);
+  };
+  const done = hooks.track?.({ destroy: (err?: Error) => stop(err instanceof ApiError ? err : ticketEnded()) }) ?? (() => {});
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
     done();
-    if (!body.destroyed) body.destroy();
+    rest?.destroy();
+    if (!out.destroyed) out.destroy();
     void c.close();
   };
   reply.raw.once("close", release);
-  body.once("error", release);
-  return reply.send(body);
+  rest?.once("error", (err) => {
+    if (stopped) return;
+    const e = readFailure(err);
+    logFailure(req, e, reply.raw.headersSent ? "while sending" : "before the first byte");
+    stop(e);
+  });
+  out.write(first);
+  if (rest) rest.pipe(out);
+  else out.end();
+  if (hooks.beforeSend) await hooks.beforeSend();
+  return reply.send(out);
 }
+

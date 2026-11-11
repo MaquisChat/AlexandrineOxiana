@@ -8,7 +8,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -249,8 +249,10 @@ describe("the media route (R135 2, 3)", () => {
     expect(head.raw.length).toBe(0);
 
     // Other methods: no such route; the ticket still works afterwards.
-    expect((await svc.app.inject({ method: "POST", url: path })).statusCode).toBe(404);
-    expect((await svc.app.inject({ method: "DELETE", url: path })).statusCode).toBe(404);
+    // Other methods are not the media route: the normal token check applies (401 without it).
+    expect((await svc.app.inject({ method: "POST", url: path })).statusCode).toBe(401);
+    expect((await svc.app.inject({ method: "DELETE", url: path })).statusCode).toBe(401);
+    expect((await call({ method: "POST", url: path })).status).toBe(404);
   });
 
   it("an encrypted project is decrypted as it streams, across the format's chunk boundaries", async () => {
@@ -451,6 +453,9 @@ describe("the media route: real listener", () => {
     expect((await get(port, path, {})).status).toBe(200);
     // Path only: even an empty query string is refused (inject would drop it; a socket keeps it).
     expect((await get(port, `${path}?`, {})).status).toBe(400);
+    // A dot segment survives on a real socket (inject normalises it away): refused too (R140 4).
+    expect([401, 404]).toContain((await get(port, `/media/./${path.slice(7)}`, {})).status);
+    expect((await get(port, `/media/${path.slice(7)}/.`, {})).status).not.toBe(200);
     expect((await get(port, path, { host: `evil.example:${port}` })).status).toBe(403);
     expect((await get(port, path, { host: `127.0.0.1:${port + 1}` })).status).toBe(403);
   });
@@ -626,20 +631,46 @@ describe("the ticket never reaches a log line or an error (R135 3)", () => {
       await media(`${t.path}?x=1`),
       await media(`${t.path}/x`),
       await media(`${t.path}%zz`),
-      // The same address spelled differently still never reaches a log line.
-      await media(`/%6Dedia/${secret}`),
-      await media(`//media/${secret}`),
-      await media(`/MEDIA/${secret}`),
       await media(t.path, {}, "HEAD"),
       await call({ method: "POST", url: t.path }),
       await call({ method: "POST", url: "/media-tickets/revoke", body: { path: t.path } }),
       await media(t.path),
     ]) bodies.push(r.body);
+    // The same address spelled any other way is refused before any ticket lookup (R140 4), and
+    // still never reaches a log line or an error body.
+    const t2 = await ticket(pid, sid, aid);
+    const s2 = t2.path.slice("/media/".length);
+    const hex = (c: string) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`;
+    for (const spelling of [
+      `/%6Dedia/${s2}`,
+      `/media/${hex(s2[0]!)}${s2.slice(1)}`,
+      `/media/${hex(s2[0]!).toLowerCase()}${s2.slice(1)}`,
+      `/media/${s2.slice(0, 42)}${hex(s2[42]!)}`,
+      `//media/${s2}`,
+      `/MEDIA/${s2}`,
+      `/media/${s2}/`,
+      `/media/${s2}.`,
+      `/media/${s2}%2F`,
+    ]) {
+      const r = await media(spelling);
+      expect([400, 401, 404], spelling).toContain(r.status);
+      bodies.push(r.body);
+    }
+    expect((await media(t2.path)).status).toBe(200); // the exact form still works
+    // Sent to another route split by an encoded slash (review M4): neither half is logged.
+    bodies.push((await call({ url: `/projects/${s2.slice(0, 20)}%2F${s2.slice(20)}` })).body);
     expect(logs.length).toBeGreaterThan(0);
     expect(logs).toContain("/media/[redacted]");
     expect(logs).not.toContain(secret);
     expect(logs).not.toContain(secret.slice(0, 16));
-    for (const b of bodies) expect(b).not.toContain(secret);
+    expect(logs).not.toContain(s2);
+    expect(logs).not.toContain(s2.slice(1, 17));
+    expect(logs).not.toContain(s2.slice(0, 20));
+    expect(logs).not.toContain(s2.slice(20));
+    for (const b of bodies) {
+      expect(b).not.toContain(secret);
+      expect(b).not.toContain(s2.slice(1));
+    }
   });
 });
 
@@ -684,5 +715,220 @@ describe("pictures (R135 1)", () => {
     const r = await call({ url: contentUrl(pid, sid, aid) });
     expect(r.status).toBe(413);
     expect(r.json.error.code).toBe("PAYLOAD_TOO_LARGE");
+  });
+});
+
+describe("fix round 1 (R140): the token exemption belongs to the media route only", () => {
+  it("an unknown path under /media/, and another method on a ticket address, get the normal token check", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject();
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
+    const { path } = await ticket(pid, sid, aid);
+    for (const [method, url] of [
+      ["GET", "/media/abc/def"],
+      ["GET", `${path}/extra`],
+      ["POST", path],
+      ["PUT", path],
+      ["DELETE", path],
+      ["PATCH", path],
+    ] as const) {
+      const r = await svc.app.inject({ method, url });
+      expect(r.statusCode, `${method} ${url}`).toBe(401);
+      expect(r.json().error.code).toBe("UNAUTHORIZED");
+      // With the token they are simply not routes.
+      expect((await svc.app.inject({ method, url, headers: auth })).statusCode, `${method} ${url}`).toBe(404);
+    }
+    expect((await media(path)).status).toBe(200);
+  });
+});
+
+/** A streaming GET over a real socket that the test can pause, resume and watch. */
+function streamingGet(port: number, path: string) {
+  let received = 0;
+  let ended: (how: string) => void = () => {};
+  const done = new Promise<string>((r) => (ended = r));
+  let firstChunk: () => void = () => {};
+  const first = new Promise<void>((r) => (firstChunk = r));
+  let res: import("node:http").IncomingMessage | undefined;
+  let status = 0;
+  const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}` } }, (r) => {
+    res = r;
+    status = r.statusCode ?? 0;
+    r.on("data", (d: Buffer) => {
+      received += d.length;
+      if (received === d.length) {
+        r.pause();
+        firstChunk();
+      }
+    });
+    r.on("end", () => ended("end"));
+    r.on("aborted", () => ended("aborted"));
+    r.on("error", () => ended("aborted"));
+    r.on("close", () => ended(r.complete ? "end" : "aborted"));
+  });
+  req.on("error", () => ended("aborted"));
+  req.end();
+  return {
+    first,
+    done,
+    get received() {
+      return received;
+    },
+    get status() {
+      return status;
+    },
+    resume: () => res?.resume(),
+    pause: () => res?.pause(),
+  };
+}
+
+const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+
+describe("fix round 1 (R140): idle means no bytes sent; in-flight streams end promptly", () => {
+  async function bigEncrypted(mb = 24): Promise<{ pid: string; sid: string; aid: string; path: string; port: number }> {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("big.mp4", randomBytes(mb * CHUNK)), "video");
+    const { path } = await ticket(pid, sid, aid);
+    const port = await svc.listen(0);
+    hostHeader = { host: `127.0.0.1:${port}` };
+    return { pid, sid, aid, path, port };
+  }
+
+  it("a reader that stalls for 10 minutes loses its connection and its ticket (bytes, not an open request, keep it alive)", async () => {
+    const { path, port } = await bigEncrypted();
+    const s = streamingGet(port, path);
+    await s.first;
+    await settle(200); // the socket buffers fill; nothing more is sent
+    clock.ms += 10 * 60_000 - 1000;
+    expect(svc.state.media.live()).toBe(1); // not yet
+    clock.ms += 1001;
+    expect(svc.state.media.live()).toBe(0);
+    s.resume();
+    expect(await s.done).toBe("aborted");
+    expect(s.received).toBeLessThan(24 * CHUNK);
+    expect((await media(path)).status).toBe(404);
+    for (let i = 0; i < 100 && svc.state.media.activeStreams() > 0; i++) await settle(20);
+    expect(svc.state.media.activeStreams()).toBe(0);
+  });
+
+  it("the 8-hour limit ends a stream in flight", async () => {
+    const { path, port } = await bigEncrypted();
+    const issued = clock.ms;
+    const s = streamingGet(port, path);
+    await s.first;
+    // Kept from going idle by bytes sent on other requests every 5 minutes.
+    while (clock.ms - issued < 8 * 3600_000 - 5 * 60_000) {
+      clock.ms += 5 * 60_000;
+      expect((await media(path, { range: "bytes=0-0" })).status).toBe(206);
+    }
+    expect(svc.state.media.live()).toBe(1);
+    clock.ms = issued + 8 * 3600_000;
+    expect(svc.state.media.live()).toBe(0);
+    s.resume();
+    expect(await s.done).toBe("aborted");
+  });
+
+  for (const event of ["lock", "close", "stop"] as const) {
+    it(`${event === "lock" ? "a project lock" : event === "close" ? "closing the library" : "stopping the service"} ends a stream in flight: no bytes sent after it`, async () => {
+      const { pid, path, port } = await bigEncrypted();
+      const s = streamingGet(port, path);
+      await s.first;
+      await settle(100);
+      const before = svc.state.media.bytesSent();
+      if (event === "lock") expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+      else if (event === "close") expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+      else await svc.close();
+      const atEvent = svc.state.media.bytesSent();
+      s.resume();
+      expect(await s.done).toBe("aborted");
+      await settle(100);
+      // Nothing more was handed to the socket after the event, and the client got no more than that.
+      expect(svc.state.media.bytesSent()).toBe(atEvent);
+      expect(atEvent).toBeLessThan(before + 128 * 1024); // at most a slice in progress
+      expect(s.received).toBeLessThanOrEqual(atEvent);
+      expect(s.received).toBeLessThan(24 * CHUNK);
+      expect(svc.state.media.activeStreams()).toBe(0);
+    });
+  }
+});
+
+describe("fix round 1 (R140): an error before the first byte", () => {
+  /** Damages the stored file's first encrypted chunk (after its 38-byte header). */
+  async function tamper(pid: string, sid: string, aid: string): Promise<void> {
+    const sf = await svc.state.session!.repo.getSource(pid, sid);
+    const abs = join(tmp, "Lib", ...sf.assets.find((a) => a.id === aid)!.path.split("/"));
+    const raw = await readFile(abs);
+    raw[38 + 10] = raw[38 + 10]! ^ 0xff;
+    await writeFile(abs, raw);
+  }
+
+  const quietLogs = () => {
+    for (const line of logs.split("\n").filter(Boolean)) {
+      const o = JSON.parse(line) as { level: number; err?: { stack?: string } };
+      expect(o.level, line).toBeLessThan(50);
+      expect(line).not.toContain('"stack"');
+      expect(line).not.toContain(tmp);
+    }
+  };
+
+  it("a damaged recording: the service's error shape, 409, logged without a stack below error level; no path or ticket", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(3 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    await tamper(pid, sid, aid);
+    for (const range of [undefined, "bytes=10-20", "bytes=-5"]) {
+      const r = await media(t.path, range ? { range } : {});
+      const expectedStatus = range === "bytes=-5" ? 206 : 409; // the last chunk is intact
+      expect(r.status, String(range)).toBe(expectedStatus);
+      if (expectedStatus === 409) {
+        expect(r.headers["content-type"]).toMatch(/^application\/json/);
+        expect(r.json).toEqual({ error: { code: "CONFLICT", message: expect.any(String) } });
+        expect(r.body).not.toContain(t.path.slice(7));
+        expect(r.body).not.toContain(tmp);
+      }
+    }
+    expect(logs).toContain("could not be read");
+    expect(logs).not.toContain(t.path.slice(7));
+    quietLogs();
+  });
+
+  it("a damaged picture: the same", async () => {
+    await start();
+    await openLibrary();
+    const pid = await newProject(true);
+    const png = Buffer.concat([tinyPng(), randomBytes(5000)]);
+    const { sid, aid } = await sourceWith(pid, await scratch("shot.png", png), "image");
+    await tamper(pid, sid, aid);
+    const r = await call({ url: `/projects/${pid}/sources/${sid}/assets/${aid}/content` });
+    expect(r.status).toBe(409);
+    expect(r.headers["content-type"]).toMatch(/^application\/json/);
+    expect(r.json.error.code).toBe("CONFLICT");
+    quietLogs();
+  });
+
+  it("a lock racing the start of a request: the service's error shape, no bytes", async () => {
+    let pid = "";
+    await start({
+      mediaBeforeSend: async () => {
+        svc.state.session!.repo.lockProject(pid);
+        svc.state.media.revokeProject(pid);
+      },
+    });
+    await openLibrary();
+    pid = await newProject(true);
+    const { sid, aid } = await sourceWith(pid, await scratch("a.mp4", randomBytes(2 * CHUNK)), "video");
+    const t = await ticket(pid, sid, aid);
+    const r = await media(t.path, { range: "bytes=0-99" });
+    expect([404, 423]).toContain(r.status);
+    expect(r.headers["content-type"]).toMatch(/^application\/json/);
+    expect(Object.keys(r.json)).toEqual(["error"]);
+    expect(r.headers["content-range"]).toBeUndefined();
+    expect(r.body).not.toContain(t.path.slice(7));
+    quietLogs();
   });
 });
