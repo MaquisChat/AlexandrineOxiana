@@ -67,6 +67,19 @@ function hasCredentials(u: string): boolean {
   }
 }
 
+/**
+ * A failed request in plain words for a researcher (review M2/N3). The service's `reason` is shown
+ * only where it is meant for people (a project rule's own reason, POLICY_DENIED); elsewhere it is
+ * internal (a read-only reason word, the media helper's start-up text, which can name shell commands
+ * or paths) and is left out. A media helper that is not running gets one sentence of what to do.
+ */
+function plainError(err: unknown, fallback: string): string {
+  if (!(err instanceof ApiClientError)) return fallback;
+  if (err.code === "WORKER_UNAVAILABLE") return `${fallback} The capture tools are not available on this computer right now, so nothing was queued. Restart the app and try again.`;
+  if (err.code === "POLICY_DENIED") return errorText(err, fallback);
+  return errorText(new ApiClientError(err.status, { code: err.code, message: err.message }), fallback);
+}
+
 /** The profile field's hint: the preview's guess, never a verdict. */
 function profileHint(url: string): string {
   const p = previewLink(url);
@@ -334,7 +347,7 @@ export function Capture({ client, projectId }: CaptureProps) {
         setProject(p);
         setAcknowledged(!!p?.acknowledgements?.includes("cookies"));
       },
-      (err: unknown) => live.current && setLoadError(errorText(err, "The project could not be read.")),
+      (err: unknown) => live.current && setLoadError(plainError(err, "The project could not be read.")),
     );
     api.policy(projectId).then(
       (p) => live.current && setPolicy(p),
@@ -342,7 +355,7 @@ export function Capture({ client, projectId }: CaptureProps) {
         if (!live.current) return;
         // Unreadable rules are read strictly (the service then refuses everything anyway).
         setPolicy({ legalBasisRequired: true, defaultLegalBasis: undefined, downloaderAllowed: false, readable: false });
-        setLoadError(errorText(err, "This project's rules could not be read."));
+        setLoadError(plainError(err, "This project's rules could not be read."));
       },
     );
   }, [api, projectId]);
@@ -448,7 +461,7 @@ export function Capture({ client, projectId }: CaptureProps) {
       setAck({ from: "service" });
       return;
     }
-    setFormError(errorText(err, fallbackText));
+    setFormError(plainError(err, fallbackText));
   };
 
   const start = async (run: () => Promise<void>) => {
@@ -546,7 +559,7 @@ export function Capture({ client, projectId }: CaptureProps) {
       else setNotice("Your acknowledgement is recorded. Capture again to start.");
       setAck(null);
     } catch (err) {
-      if (live.current) setAckError(errorText(err, "The acknowledgement could not be recorded."));
+      if (live.current) setAckError(plainError(err, "The acknowledgement could not be recorded."));
     } finally {
       ackRunning.current = false;
       if (live.current) setAckBusy(false);
@@ -885,7 +898,7 @@ export function CaptureRoute({ client, loc }: { client: ApiClient; loc: AppLocat
       (err: unknown) => {
         if (!live) return;
         setProjects([]);
-        setError(errorText(err, "The projects could not be read."));
+        setError(plainError(err, "The projects could not be read."));
       },
     );
     return () => {

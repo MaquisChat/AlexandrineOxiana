@@ -455,19 +455,25 @@ export function profileQueue(queueId: string, url: string): CaptureQueueState {
   return { queueId, kind: "profile", url, items: [], done: 0, total: undefined, finished: false };
 }
 
-/** The queue, marked as having missed progress (an unfinished queue only). */
-export function markGap(q: CaptureQueueState): CaptureQueueState {
-  return q.finished || q.gap ? q : { ...q, gap: true };
-}
-
 const PENDING = (s: ItemState) => s === "waiting" || s === "capturing";
+
+/**
+ * The queue after the event stream was lost (an unfinished queue only): progress may be missed from
+ * now on, possibly the last event too, so nothing still pending is claimed to be waiting or being
+ * captured any more — it is not known (R146, review N1). A later event still resolves what it reports.
+ */
+export function markGap(q: CaptureQueueState): CaptureQueueState {
+  if (q.finished) return q;
+  if (q.gap && !q.items.some((i) => PENDING(i.state))) return q;
+  return { ...q, gap: true, items: q.items.map((i) => (PENDING(i.state) ? { ...i, state: "unknown" } : i)) };
+}
 
 /** What the screen saw of a queue: done (an outcome other than failed) + failed + unknown + not tried + pending = total. */
 export function queueCounts(q: CaptureQueueState): { total: number; done: number; failed: number; unknown: number; notTried: number; pending: number } {
   const c = { total: 0, done: 0, failed: 0, unknown: 0, notTried: 0, pending: 0 };
   const total = Math.max(q.total ?? 0, q.items.length);
   for (let i = 0; i < total; i++) {
-    const s = q.items[i]?.state ?? (q.finished ? (q.gap ? "unknown" : "not-captured") : "waiting");
+    const s = q.items[i]?.state ?? (q.gap ? "unknown" : q.finished ? "not-captured" : "waiting");
     if (PENDING(s)) c.pending++;
     else if (s === "unknown") c.unknown++;
     else if (s === "not-captured") c.notTried++;
@@ -486,8 +492,16 @@ function reportText(r: ProfileReport): { error?: string; stopReason?: string } {
   if (r.status === "paused-rate-limited") return { error: OUTCOME_TEXT.RATE_LIMITED_PAUSED! };
   if (code === "POLICY_CHANGED") return { error: OUTCOME_TEXT.POLICY_CHANGED_RUN! };
   if (code === "RATE_LIMITED") return { error: OUTCOME_TEXT.RATE_LIMITED_PAUSED! };
-  return { error: outcomeText(code) };
+  // Sentences that are true of a whole run as well as of one link.
+  if (code !== undefined && RUN_SAFE_CODES.has(code)) return { error: outcomeText(code) };
+  return { error: STOPPED_RUN_TEXT };
 }
+
+/** Codes whose sentence also fits a whole profile run. */
+const RUN_SAFE_CODES: ReadonlySet<string> = new Set(["LEGAL_BASIS_REQUIRED", "INVALID_OPTIONS", "POLICY_DENIED", "PROJECT_LOCKED", "WORKER_UNAVAILABLE", "PROFILE_CAPTURE_UNAVAILABLE"]);
+
+/** A stopped run with no sentence of its own (review N2). */
+const STOPPED_RUN_TEXT = "The profile capture stopped before it finished, for a reason the app could not name. Posts shown here as saved are kept. Run it again later.";
 
 /** The queue after one event; the same object when the event is another queue's. */
 export function applyProgress(q: CaptureQueueState, e: CaptureProgress): CaptureQueueState {

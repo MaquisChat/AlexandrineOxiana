@@ -72,7 +72,8 @@ function statusLine(q: CaptureQueueState): string {
     if (q.report?.status === "paused-rate-limited") return "The profile capture is paused.";
     return "The profile capture stopped.";
   }
-  return q.total !== undefined ? countsLine(q, "post") : "Listing the profile…";
+  if (q.total !== undefined) return countsLine(q, "post");
+  return q.gap ? "How far this profile capture has got is not known: the connection was lost." : "Listing the profile…";
 }
 
 function QueueView({ q }: { q: CaptureQueueState }) {
