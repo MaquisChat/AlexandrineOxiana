@@ -402,6 +402,8 @@ Known, not yet scheduled above, or accepted as limits:
   - D5: after a relaunch the app shows "Choose a library" instead of "Library not found".
   - D6: in WebKit one typeface stays in error, so fonts never finish loading (to be checked in the real Mac web view).
   - D7: right-to-left title headings are laid out left to right.
+- Found by Task 34c: the transcribe route waits for the whole run and sends no progress events, so "Re-transcribe" can only show an indeterminate bar (for Task 46).
+- A UI test, ReviewQueue "loads titles six at a time", takes about 40 s under heavy machine load and passes alone; find out why without loosening its limit (for Task 46 or Task 54).
 - Defects found by Task 44 are added here when it runs.
 
 ## 8. Status
@@ -424,7 +426,7 @@ Update after every task; commit and push.
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | in progress | | implementer dispatched |
-| 34c Transcript viewer | in progress | | implementer dispatched |
+| 34c Transcript viewer | in review | 4b9a723 (worktree branch) | adversarial review dispatched; re-transcribe progress needs a service change |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
 | 34e Pairing screen | in progress | | implementer dispatched |
 | 48 Tools dialogue | not started | | |
