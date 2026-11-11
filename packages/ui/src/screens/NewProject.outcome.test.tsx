@@ -307,3 +307,138 @@ describe("New project dialog: the recovery code cannot be left unsaved (R134 I2)
     expect(onClosed).toHaveBeenCalled();
   });
 });
+
+// ---- Fix round 2: the "cannot tell" state can no longer be left silently ----
+
+/** Lost answer, then a list that cannot be read: the dialog says it cannot tell. */
+async function toCannotTell(user: User, fill: (d: HTMLElement, u: User) => Promise<void>) {
+  const dialog = await openDialog(user);
+  await fill(dialog, user);
+  await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+  await within(dialog).findByRole("button", { name: "Check again" });
+  return dialog;
+}
+
+const notice = () => screen.getByRole("region", { name: "A project that may have been created" });
+
+describe("New project dialog: an unknown outcome is never left behind (fix round 2)", () => {
+  it("closing while it cannot tell, then reopening and submitting again, does not post without the same-name warning", async () => {
+    const svc = serveLost(NEW_OPEN);
+    svc.listFails = true;
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillOpen);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    svc.listFails = false;
+    const again = await openDialog(user);
+    await fillOpen(again, user);
+    await user.click(within(again).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(within(again).getByRole("alert").textContent).toMatch(/A project named “Tide-line interviews” already exists\. Create another with the same name\?/));
+    expect(svc.posted).toHaveLength(1);
+  });
+
+  it("the library re-reads its project list whenever the dialog closes", async () => {
+    let lists = 0;
+    let created = false;
+    server.use(
+      http.get(url("/projects"), () => {
+        lists++;
+        return HttpResponse.json({ projects: [...PROJECTS.projects, ...(created ? [NEW_OPEN] : [])] });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    const dialog = await openDialog(user);
+    const before = lists;
+    // Made elsewhere meanwhile (or by an answer that was lost): shown once the dialog closes.
+    created = true;
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(lists).toBe(before + 1));
+    const nav = screen.getByRole("navigation", { name: "Projects" });
+    expect(await within(nav).findByRole("button", { name: /Tide-line interviews/ })).toBeTruthy();
+  });
+
+  it("a name already in use asks first: confirming creates another, declining sends nothing", async () => {
+    const posted: Posted[] = [];
+    server.use(
+      http.post(url("/projects"), async ({ request }) => {
+        posted.push((await request.json()) as Posted);
+        return HttpResponse.json({ project: { ...NEW_OPEN, id: "p7", name: "Dissertation" } });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    const dialog = await openDialog(user);
+    await user.type(within(dialog).getByRole("textbox", { name: "Project name" }), "Dissertation");
+    await user.click(within(dialog).getByRole("checkbox", { name: /holds identifiable information/ }));
+    await user.click(within(dialog).getByRole("checkbox", { name: "Encrypt this project" }));
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toMatch(/A project named “Dissertation” already exists\. Create another with the same name\?/));
+    expect(posted).toHaveLength(0);
+
+    await user.click(within(dialog).getByRole("button", { name: "Change the name" }));
+    expect(posted).toHaveLength(0);
+    expect(document.activeElement).toBe(within(dialog).getByRole("textbox", { name: "Project name" }));
+
+    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await user.click(await within(dialog).findByRole("button", { name: "Create another" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]!.name).toBe("Dissertation");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("an encrypted project: closing leaves a notice that stays until a check succeeds and reports the outcome", async () => {
+    const svc = serveLost(NEW_ENC);
+    svc.listFails = true;
+    const selected = vi.fn();
+    const user = userEvent.setup();
+    render(<Routed onSelected={selected} />);
+    await toCannotTell(user, fillEncrypted);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    expect(notice().textContent).toMatch(/“Clinic follow-up” may have been created/);
+    expect(notice().textContent).toMatch(/recovery code was not shown and cannot be shown again/i);
+    // Focus is back on New project; the next stop is the notice's Check again.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "New project" }));
+    await user.tab();
+    expect(document.activeElement).toBe(within(notice()).getByRole("button", { name: "Check again" }));
+
+    // Still unreadable: the notice stays.
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/still cannot tell/i));
+
+    svc.listFails = false;
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/“Clinic follow-up” was created/));
+    expect(notice().textContent).toMatch(/opens with the passphrase you chose/i);
+    await user.click(within(notice()).getByRole("button", { name: "Open the project" }));
+    await waitFor(() => expect(selected).toHaveBeenLastCalledWith("p4"));
+    expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
+    expect(svc.posted).toHaveLength(1);
+  });
+
+  it("an unencrypted project: the notice says nothing of a recovery code, and reports one that was not created", async () => {
+    const svc = serveLost(null);
+    svc.listFails = true;
+    const user = userEvent.setup();
+    render(<Routed onSelected={() => {}} />);
+    await toCannotTell(user, fillOpen);
+    const dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(notice().textContent).toMatch(/“Tide-line interviews” may have been created/);
+    expect(notice().textContent).not.toMatch(/recovery code/i);
+
+    svc.listFails = false;
+    await user.click(within(notice()).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(notice().textContent).toMatch(/“Tide-line interviews” was not created/));
+    await user.click(within(notice()).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "A project that may have been created" })).toBeNull();
+    expect(svc.posted).toHaveLength(1);
+  });
+});

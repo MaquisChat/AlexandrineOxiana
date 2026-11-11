@@ -19,7 +19,10 @@
  * outcome unknown (R134 I1). The project list read just before sending is compared with a fresh one:
  * a new project with the name sent was created (said plainly, and opened; its recovery code cannot
  * be shown again); none means nothing was made and creating again is allowed; an unreadable list
- * means the app cannot tell, so nothing is resent until "Check again" settles it.
+ * means the app cannot tell, so nothing is resent until "Check again" settles it. Closed in that
+ * state, the dialog hands the unresolved create to the library screen, which keeps a notice with
+ * "Check again" until a read of the list reports the outcome. A name already in the list is asked
+ * about before any create ("Create another with the same name?").
  *
  * Keyboard: focus starts in the name; Tab stays inside; Escape cancels (not while creating, and not
  * at the recovery code). The page behind is inert. Focus returns to `returnFocusTo` (the button that
@@ -115,7 +118,11 @@ export interface NewProjectProps {
   api: Pick<LibraryApi, "projects">;
   /** The project was created and the dialog is finished (after the recovery code was confirmed). */
   onCreated: (project: ProjectSummary) => void;
-  onCancel: () => void;
+  /**
+   * Closed without a project. With `unresolved`: a create's answer was lost and the check could not
+   * be made, so the library screen keeps a notice until a check succeeds (fix round 2).
+   */
+  onCancel: (unresolved?: UnresolvedCreate) => void;
   /** Where focus goes when the dialog closes (the button that opened it), worked out at closing time. */
   returnFocusTo?: () => HTMLElement | null | undefined;
   /**
@@ -128,6 +135,16 @@ export interface NewProjectProps {
 }
 
 type Field = "name" | "pass" | "again";
+
+/** A create whose answer was lost: the name sent, whether encrypted, and the project ids listed just before. */
+export interface UnresolvedCreate {
+  name: string;
+  encrypted: boolean;
+  before: Set<string>;
+}
+
+/** New projects with that name since `before`: what a lost create may have made. */
+export const madeSince = (projects: ProjectSummary[], u: UnresolvedCreate): ProjectSummary[] => projects.filter((x) => !u.before.has(x.id) && x.name === u.name);
 
 /** The service's limit on a passphrase (routes/projects.ts, UTF-16 units like maxLength). */
 const PASSPHRASE_MAX = 1024;
@@ -166,7 +183,12 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
   /** A project found after a lost answer: created, but its recovery code was never shown. */
   const [found, setFound] = useState<ProjectSummary | null>(null);
   /** What a lost answer is checked against: the name sent and the projects listed before sending. */
-  const pendingCheck = useRef<{ name: string; before: Set<string> } | null>(null);
+  const pendingCheck = useRef<UnresolvedCreate | null>(null);
+  /** A name already in use, waiting for "Create another" or "Change the name". */
+  const [sameName, setSameName] = useState<string | null>(null);
+  const sameNameRef = useRef<HTMLParagraphElement>(null);
+  /** The create request itself has gone out (until then, cancelling is still possible in principle). */
+  const [sent, setSent] = useState(false);
   /** A request (create or check) is in flight: no second one (state is too late for two events in one tick). */
   const inFlight = useRef(false);
 
@@ -287,7 +309,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     setError(null);
     try {
       const { projects: now } = await api.projects.list();
-      const fresh = now.filter((x) => !p.before.has(x.id) && x.name === p.name);
+      const fresh = madeSince(now, p);
       pendingCheck.current = null;
       setUncertain(null);
       if (fresh.length) setFound(fresh[fresh.length - 1]!);
@@ -302,8 +324,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     }
   };
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
+  /** `sameNameConfirmed`: the researcher chose to create another project with a name already in use. */
+  const send = async (sameNameConfirmed = false) => {
     if (inFlight.current || pendingCheck.current) return;
     const trimmed = name.trim();
     if (!trimmed) return show("Give the project a name.", "name");
@@ -312,15 +334,26 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
     if (encrypt && pass !== again) return show("The two passphrases do not match. Enter the same passphrase in both fields.", "again");
     inFlight.current = true;
     setError(null);
+    setSameName(null);
     setBusy(true);
-    const secret = pass;
-    // The passphrase is sent once and not kept (as when unlocking).
-    setPass("");
-    setAgain("");
+    setSent(false);
     let lost = false;
     try {
       // What exists before sending: a lost answer is checked against it.
-      const before = new Set((await api.projects.list()).projects.map((x) => x.id));
+      const listed = (await api.projects.list()).projects;
+      // A name already in use is asked about first: it may be this project, made by an answer that was lost.
+      const fold = (s: string) => s.trim().toLocaleLowerCase();
+      if (!sameNameConfirmed && listed.some((x) => fold(x.name) === fold(trimmed))) {
+        setSameName(trimmed);
+        setTimeout(() => sameNameRef.current?.focus());
+        return;
+      }
+      const before = new Set(listed.map((x) => x.id));
+      const secret = pass;
+      // The passphrase is sent once and not kept (as when unlocking).
+      setPass("");
+      setAgain("");
+      setSent(true);
       try {
         const r = await api.projects.create({
           name: trimmed,
@@ -331,7 +364,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
         else onCreated(r.project);
       } catch (err) {
         if (outcomeUnknown(err)) {
-          pendingCheck.current = { name: trimmed, before };
+          pendingCheck.current = { name: trimmed, encrypted: encrypt, before };
           lost = true;
         } else if (needsEncryption(err)) {
           setServiceNeedsEncryption(true);
@@ -349,6 +382,18 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
       setBusy(false);
     }
     if (lost) await check();
+  };
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void send();
+  };
+
+  /** Closing: an outcome still unknown goes to the library screen's notice (fix round 2). */
+  const cancel = () => {
+    if (busy || made || found) return;
+    const p = pendingCheck.current;
+    onCancel(uncertain === "cannot-tell" && p ? p : undefined);
   };
 
   const copy = async () => {
@@ -375,7 +420,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
       e.preventDefault();
       e.stopPropagation();
       // Never at the recovery code: it is shown once and must be saved first.
-      if (!busy && !made && !found) onCancel();
+      cancel();
       return;
     }
     if (e.key !== "Tab" || !box.current) return;
@@ -478,7 +523,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
         ) : (
           <>
             <h2 id={titleId}>New project</h2>
-            <form onSubmit={(e) => void submit(e)} noValidate>
+            <form onSubmit={submit} noValidate>
               <div className="ao-newproject__field">
                 <label htmlFor={`${id}-name`}>Project name</label>
                 <input
@@ -491,6 +536,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
                   value={name}
                   onChange={(e) => {
                     edited("name");
+                    setSameName(null);
                     setName(e.target.value);
                   }}
                   {...fieldError("name")}
@@ -576,6 +622,27 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
                   <UserText>{error.text}</UserText>
                 </p>
               )}
+              {sameName !== null && (
+                <div className="ao-newproject__confirm">
+                  <p ref={sameNameRef} role="alert" tabIndex={-1}>
+                    A project named “<UserText>{sameName}</UserText>” already exists. Create another with the same name?
+                  </p>
+                  <div className="ao-row">
+                    <button type="button" disabled={busy} onClick={() => void send(true)}>
+                      Create another
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSameName(null);
+                        nameRef.current?.focus();
+                      }}
+                    >
+                      Change the name
+                    </button>
+                  </div>
+                </div>
+              )}
               {uncertain === "cannot-tell" && !busy && (
                 <div className="ao-row">
                   <button type="button" ref={checkButton} onClick={() => void check()}>
@@ -585,14 +652,14 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
               )}
               {busy && (
                 <p role="status" className="ao-muted">
-                  {uncertain === "checking" ? "Checking whether the project was created…" : "Creating the project… This cannot be cancelled once sent."}
+                  {uncertain === "checking" ? "Checking whether the project was created…" : sent ? "Creating the project… This cannot be cancelled once sent." : "Reading the library's projects…"}
                 </p>
               )}
               <div className="ao-row ao-newproject__actions">
                 <button type="submit" disabled={locked}>
                   Create project
                 </button>
-                <button type="button" disabled={busy} onClick={() => !busy && onCancel()}>
+                <button type="button" disabled={busy} onClick={cancel}>
                   Cancel
                 </button>
               </div>

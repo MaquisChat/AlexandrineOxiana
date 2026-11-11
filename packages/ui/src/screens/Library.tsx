@@ -23,7 +23,7 @@ import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { PATHS } from "../navigation";
-import { NewProject } from "./NewProject";
+import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 
@@ -101,6 +101,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const holdClose = useRef(false);
   /** The library closed while that code was on screen. */
   const [closedUnder, setClosedUnder] = useState(false);
+  /** A create whose answer was lost and could not be checked when the dialog closed (fix round 2). */
+  const [unresolved, setUnresolved] = useState<{ create: UnresolvedCreate; state: "unknown" | "still-unknown" | "checking" | "not-created" | { found: ProjectSummary } } | null>(null);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
 
@@ -207,21 +209,58 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   }, [api]);
 
   // ---- projects and their profile badges ----
+  const showProjects = useCallback((list: ProjectSummary[]) => {
+    setProjects(list);
+    // The badges are the profiles the service reads from each project's rules (R118).
+    setProfiles(Object.fromEntries(list.map((p) => [p.id, knownProfiles(p.profiles)])));
+  }, []);
   useEffect(() => {
     let live = true;
     api.projects
       .list()
-      .then(({ projects: list }) => {
-        if (!live) return;
-        setProjects(list);
-        // The badges are the profiles the service reads from each project's rules (R118).
-        setProfiles(Object.fromEntries(list.map((p) => [p.id, knownProfiles(p.profiles)])));
-      })
+      .then(({ projects: list }) => live && showProjects(list))
       .catch((err: unknown) => live && setError(message(err, "The projects could not be read.")));
     return () => {
       live = false;
     };
-  }, [api]);
+  }, [api, showProjects]);
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
+  /** Reads the project list again (after the new-project dialog closes, whatever the reason). */
+  const reloadProjects = useCallback(async (keep?: ProjectSummary) => {
+    const { projects: read } = await api.projects.list();
+    // The project just created stays listed even if a read made before it was answered says otherwise.
+    const list = keep && !read.some((p) => p.id === keep.id) ? [...read, keep] : read;
+    if (mounted.current) showProjects(list);
+    return list;
+  }, [api, showProjects]);
+
+  /**
+   * Settles a create whose answer was lost (fix round 2): a successful read of the list says whether
+   * the project was made; until then the notice stays. `auto`: the read made as the dialog closed.
+   */
+  const checkUnresolved = useCallback(
+    async (create: UnresolvedCreate, auto = false) => {
+      setUnresolved({ create, state: "checking" });
+      try {
+        const fresh = madeSince(await reloadProjects(), create);
+        if (mounted.current) setUnresolved({ create, state: fresh.length ? { found: fresh[fresh.length - 1]! } : "not-created" });
+      } catch {
+        if (mounted.current) setUnresolved({ create, state: auto ? "unknown" : "still-unknown" });
+      }
+    },
+    [reloadProjects],
+  );
+  const dialogClosed = (unresolvedCreate?: UnresolvedCreate, made?: ProjectSummary) => {
+    setCreating(false);
+    if (unresolvedCreate) void checkUnresolved(unresolvedCreate, true);
+    else void reloadProjects(made).catch(() => {});
+  };
 
   // ---- the selected project's collections and tags ----
   useEffect(() => {
@@ -449,20 +488,65 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               holdClose.current = pending;
             }}
             libraryClosed={closedUnder}
-            onCancel={() => setCreating(false)}
+            onCancel={dialogClosed}
             onCreated={(made) => {
-              setCreating(false);
               if (closedUnder) {
                 // The library went away while the recovery code was on screen: now leave it.
+                setCreating(false);
                 closedRef.current?.();
                 return;
               }
+              dialogClosed(undefined, made);
               setProjects((list) => [...(list ?? []).filter((p) => p.id !== made.id), made]);
               setProfiles((all) => ({ ...all, [made.id]: knownProfiles(made.profiles) }));
               // Selected like any other project: the address names it (41b2 I1).
               selectProject(made.id);
             }}
           />
+        )}
+        {unresolved && (
+          <section aria-label="A project that may have been created" className="ao-newproject-notice">
+            {typeof unresolved.state === "object" ? (
+              <p role="status">
+                “<UserText>{unresolved.create.name}</UserText>” was created.
+                {unresolved.create.encrypted &&
+                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Asking for a new recovery code from the project's settings is planned, but not available yet."}
+              </p>
+            ) : unresolved.state === "not-created" ? (
+              <p role="status">
+                “<UserText>{unresolved.create.name}</UserText>” was not created. Nothing was changed; you can create it again.
+              </p>
+            ) : (
+              <p role="alert">
+                “<UserText>{unresolved.create.name}</UserText>” may have been created: the library service did not answer, so the app cannot tell yet.
+                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose."}
+                {" "}Do not create it again until this is settled.
+                {unresolved.state === "still-unknown" && " The app still cannot tell: the service did not answer. Try again in a moment."}
+              </p>
+            )}
+            <div className="ao-row">
+              {typeof unresolved.state === "object" ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const p = (unresolved.state as { found: ProjectSummary }).found;
+                    setUnresolved(null);
+                    selectProject(p.id);
+                  }}
+                >
+                  Open the project
+                </button>
+              ) : unresolved.state === "not-created" ? (
+                <button type="button" onClick={() => setUnresolved(null)}>
+                  Dismiss
+                </button>
+              ) : (
+                <button type="button" disabled={unresolved.state === "checking"} onClick={() => void checkUnresolved(unresolved.create)}>
+                  Check again
+                </button>
+              )}
+            </div>
+          </section>
         )}
         {project && !locked && (
           <>
