@@ -112,7 +112,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
       message: needsException
         ? `${PROFILE_LABEL[profile!]} requires ${describe(requiredBy(cfg, control).find((r) => r.profile === profile)?.req.value ?? "a value")} for ${control}. Setting it to ${describe(value)} is recorded as an exception with your reason.`
         : `Setting ${control} to ${describe(value)} loosens the project's rules, so it needs a reason.`,
-      apply: (reason, by) => {
+      apply: (reason: string, by: string) => {
         let next = setIn(text, control, value);
         if (needsException) next = addException(next, { control, value, reason, by, at: nowUtc() });
         return next;

@@ -3,6 +3,7 @@
  */
 import { useMemo } from "react";
 import { createClient, type ApiClient } from "./api/client";
+import { GovernanceRoutes } from "./routes/governance";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
@@ -14,6 +15,7 @@ export function App({ service }: { service?: ServiceConnection }) {
   return (
     <AppearanceProvider {...(client ? { client } : {})}>
       <AppearanceSettingsScreen />
+      {client ? <GovernanceRoutes client={client} /> : null}
     </AppearanceProvider>
   );
 }
