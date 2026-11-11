@@ -422,7 +422,8 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
-- Defects found by Task 44 are added here when it runs.
+- Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
+- Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
 
@@ -438,28 +439,30 @@ Update after every task; commit and push.
 | 42 CI coverage | done | ae3f762, b207182 | green run on GitHub at 27d7c6c; temporary network check removed |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
-| 44 Scenarios 1, 2, 5, 7 | in progress | | implementer dispatched |
+| 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46 Fix scenario findings | not started | | |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
+| 46c Two small service additions | not started | | a pairing code's status; confirming an identifier field; waits for the 34d and 34e reviews |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | fix round 1 | db52fdb (worktree branch) | spec met; 3 Important (R146); completed by new Task 63 |
-| 34c Transcript viewer | fix round 1 | 4b9a723 (worktree branch) | spec met; 4 Important (R143); two of them completed by new Task 62 |
+| 34c Transcript viewer | re-review of fix round 1 | f9fb892 (worktree branch) | four Important findings and seven minors reported fixed; two service items are Task 62 |
 | 34d Verification badges | in review | 140a402 (worktree branch) | built; closes defect D3; two concerns carried to review (identifier fields cannot be confirmed; blob pictures in WebKit) |
 | 34e Pairing screen | re-review of fix round 1 | 9d69ab0 (worktree branch) | both Important findings and five minors fixed; shared dialog shell now has its own tests |
 | 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | not started | | |
+| 57 Import wizard routes | in progress | | implementer dispatched |
 | 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
 | 50 No silent refusals | not started | | |
-| 51 Job records in files | fix round 1 | 20993f0 (worktree branch) | spec met; 2 Important (R142) |
+| 51 Job records in files | re-review of fix round 1 | b802afd (worktree branch) | both Important findings reported fixed (R142) |
 | 61 New recovery code | fix round 2 | ef05812 (worktree branch) | round 1 confirmed; one new Important (a stale staged file could be activated), settled by R148 |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |
-| 37b Token on standard input | not started | | |
+| 37b Token on standard input | in progress | | implementer dispatched |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | fix round 1 | 72cb7cc (worktree branch) | approved with fixes: stronger smoke test, accurate licence manifest, offline model load (R144) |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
