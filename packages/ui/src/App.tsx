@@ -13,6 +13,7 @@ import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
+import { CaptureRoute } from "./screens/Capture";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
@@ -32,6 +33,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isLibraryPath, render: (loc, client) => <LibraryRoutes client={client} loc={loc} />, back: false },
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
   { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
+  { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
     render: (_loc, client) => (
