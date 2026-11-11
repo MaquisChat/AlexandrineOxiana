@@ -26,7 +26,7 @@ import {
   type WrappedKey,
 } from "../crypto/keys.js";
 import { AuditStore } from "./audit-store.js";
-import { appendLibraryAudit } from "./library-audit.js";
+import { appendLibraryRefusal } from "./library-audit.js";
 import { appendChanges } from "./changelog-store.js";
 import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
@@ -53,11 +53,12 @@ const KEY_FILE_MODE = 0o600;
 /**
  * Records a refused project creation in the library's audit log (Task 50): who, what (the name
  * asked for, whether encrypted) and the rule's reason; never the passphrase. If it cannot be
- * written the refusal still stands, and the library warns (`audit-unrecorded`, library-wide).
+ * written the refusal still stands, and the library warns (`refusal-unrecorded`, library-wide).
+ * Repeats of the latest entry on the same day are counted, not appended (R154 a).
  */
 async function recordCreateRefusal(core: RepoCore, at: string, name: string, encrypted: boolean, reason: string): Promise<void> {
   try {
-    await appendLibraryAudit(core, {
+    await appendLibraryRefusal(core, {
       at,
       actor: core.actor,
       device: core.device,

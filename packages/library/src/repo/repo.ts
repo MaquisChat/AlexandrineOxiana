@@ -90,7 +90,7 @@ import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from ".
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 import { attentionWarnings, newAttentionId, reasonOf, removeAttention, settleAttention, writeAttention, type AttentionRecord } from "./attention.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
-import { readLibraryAudit } from "./library-audit.js";
+import { LIBRARY_AUDIT_DIR, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -123,7 +123,7 @@ export class Repo {
   }
 
   /** The library's own audit log (refused project creations, Task 50) and whether its chain verifies. */
-  libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult }> {
+  libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult; repeats?: { seq: number; count: number; lastAt: string } }> {
     return readLibraryAudit(this.core.root);
   }
 
@@ -510,16 +510,15 @@ export async function openRepoInternal(
   // Incomplete last lines (R28). Recovery ran first, so what a transaction appended is already
   // truncated; what is left was cut off outside a transaction and is not a committed record.
   // The workspace change log has no transactions and no audit chain: it is trimmed and reported.
-  reportIncompleteLines(core, "*", await scanIncompleteLines(core.root, "", writable), writable);
-  // The library's own audit log (refusals with no project, Task 50): reported when it does not verify.
-  const libAudit = await readLibraryAudit(core.root).catch(() => null);
-  if (libAudit && !libAudit.verify.ok) {
-    core.integrityWarnings.push({
-      projectId: "*",
-      kind: "chain-broken",
-      detail: `the library's audit log breaks at event ${libAudit.verify.brokenAt + 1} (${libAudit.verify.reason}); it changed outside the app`,
-    });
-  }
+  const rootLines = await scanIncompleteLines(core.root, "", writable);
+  reportIncompleteLines(core, "*", rootLines, writable);
+  // The library's own audit log (Task 50, R154 a): compared with its anchor like a project's log.
+  await checkLibraryAudit(
+    core,
+    anchors[libraryAnchorKey(core)],
+    writable,
+    rootLines.filter((l) => l.trimmed && l.file.startsWith(`${LIBRARY_AUDIT_DIR}/`)),
+  );
   const incomplete = new Map<string, IncompleteLine[]>();
   const loaded = await loadProjects(core, async (p) => {
     const lines = await scanIncompleteLines(core.root, p.rel, writable && !unattributed && !isPending(p));

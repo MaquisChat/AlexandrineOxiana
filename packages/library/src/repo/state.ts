@@ -127,6 +127,9 @@ export class RepoCore {
   readonly device: string;
   readonly scryptN: number | undefined;
   readonly auditSegmentSize: number | undefined;
+  /** The library's own audit log (Task 50, R154 a), loaded at open; its latest event. */
+  libraryAudit?: AuditStore;
+  libraryAuditLast?: AuditEvent | null;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
