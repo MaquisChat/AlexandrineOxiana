@@ -560,7 +560,7 @@ describe("import, export, secrets and maintenance", () => {
 
     const dry = await run(["--json", "import", join(bibDir, "a.bib"), "--project", "RefsA", "--dry-run"]);
     expect(dry.code, dry.stderr).toBe(0);
-    expect(json(dry).outsideFiles).toEqual([{ item: expect.any(String), folder: await realpath(elsewhere) }]);
+    expect(json(dry).outsideFiles).toEqual([{ item: expect.any(String), folder: await realpath(elsewhere), file: await realpath(join(elsewhere, "linked.pdf")) }]);
     const dryText = await run(["import", join(bibDir, "a.bib"), "--project", "RefsA", "--dry-run"]);
     expect(dryText.stdout).toContain("--approve-folder");
 
