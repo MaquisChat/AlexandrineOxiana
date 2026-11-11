@@ -1902,3 +1902,40 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${"019a7000-0000-7000-8000-0000000000ff"}/resolve`, body: { choice: "keep" } })).status).toBe(404);
   });
 });
+
+describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {
+  beforeEach(() => start());
+
+  it("is true while the source's review item is pending and false once it is decided, whatever the fields' verification", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = join(tmp, "in");
+    await fixturePdf("a.pdf", "First Paper on Rivers");
+    await fixturePdf("b.pdf", "Second Paper on Lakes");
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir }, options: {} } })).json;
+    await svc.state.idle();
+    const pending = (await call({ url: `/imports/${batchId}/review` })).json.items as Array<{ id: string; sourceId: string }>;
+    expect(pending.length, "the fixture's items wait for review (no lookups)").toBeGreaterThan(1);
+    const rows = async () => (await call({ url: `/projects/${pid}/sources?limit=100` })).json.items as Array<{ id: string; needsReview: boolean }>;
+    const waiting = new Set(pending.map((p) => p.sourceId));
+    for (const r of await rows()) expect(r.needsReview, r.id).toBe(waiting.has(r.id));
+
+    const [first, ...rest] = pending;
+    const statuses = async (sid: string) => ((await call({ url: `/projects/${pid}/sources/${sid}` })).json as { fields: Array<{ field: string; status: string }> }).fields.map((f) => `${f.field}:${f.status}`);
+    const before = await statuses(first!.sourceId);
+    const decided = await call({ method: "POST", url: `/review/${first!.id}/decide`, body: { projectId: pid, decision: { action: "accept" } } });
+    expect(decided.status, decided.body).toBe(200);
+    const after = await rows();
+    expect(after.find((r) => r.id === first!.sourceId)?.needsReview).toBe(false);
+    for (const p of rest) expect(after.find((r) => r.id === p.sourceId)?.needsReview).toBe(true);
+    // Accepting does not confirm the fields (R137): the source's verification is unchanged.
+    expect(await statuses(first!.sourceId)).toEqual(before);
+
+    // Every other decision clears it too (keep-both here), and a text search reports the same.
+    for (const p of rest) expect((await call({ method: "POST", url: `/review/${p.id}/decide`, body: { projectId: pid, decision: { action: "keep-both" } } })).status).toBe(200);
+    expect((await rows()).every((r) => !r.needsReview)).toBe(true);
+    const found = (await call({ url: `/projects/${pid}/sources?text=Rivers` })).json.items as Array<{ needsReview: boolean }>;
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.every((r) => !r.needsReview)).toBe(true);
+  });
+});

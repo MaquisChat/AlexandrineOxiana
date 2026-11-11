@@ -71,6 +71,20 @@ export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFil
   };
 }
 
+/**
+ * Of `ids`, the sources with an item waiting in the import review queue (R137: that, and nothing
+ * else, is what a library row's "Needs review" means; field verification is shown on the source
+ * screen). Read from the index's `review_items`, the cache of `review/pending.jsonl` that every
+ * queued item and every decision updates; it holds only ids, kinds and statuses for encrypted projects.
+ */
+function waitingForReview(db: { prepare(sql: string): { all(...p: unknown[]): unknown[] } }, projectId: string, ids: string[]): Set<string> {
+  if (!ids.length) return new Set();
+  const rows = db
+    .prepare(`SELECT DISTINCT source_id FROM review_items WHERE project_id = ? AND kind = 'import' AND status = 'pending' AND source_id IN (${ids.map(() => "?").join(",")})`)
+    .all(projectId, ...ids) as Array<{ source_id: string }>;
+  return new Set(rows.map((r) => r.source_id));
+}
+
 async function sourceOf(ctx: Ctx, projectId: string, sid: string): Promise<SourceFile> {
   const s = ctx.state.requireSession();
   if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
@@ -88,7 +102,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const offset = intParam(q.offset, "offset", 0, 10_000_000, 0);
     if (q.type !== undefined && !SourceType.safeParse(q.type).success) throw badRequest(`"${q.type}" is not a source type.`);
     if (s.index) {
-      return search(s.index.db, {
+      const found = search(s.index.db, {
         projectId,
         ...(q.text ? { text: q.text.slice(0, 500) } : {}),
         ...(q.type ? { types: [q.type as SourceType] } : {}),
@@ -97,6 +111,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
         limit,
         offset,
       });
+      const waiting = waitingForReview(s.index.db, projectId, found.items.map((i) => i.id));
+      return { ...found, items: found.items.map((i) => ({ ...i, needsReview: waiting.has(i.id) })) };
     }
     // A read-only library has no index we may write: list from the files (titles only when unlocked).
     const items = [];

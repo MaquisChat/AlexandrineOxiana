@@ -139,6 +139,7 @@ export interface SourceRow {
   creatorsText: string;
   issuedYear?: string;
   folder: string;
+  /** R137: an item of this source waits in the import review queue (and nothing else; not field verification). */
   needsReview: boolean;
   locked: boolean;
 }
