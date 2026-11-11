@@ -142,7 +142,8 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
     setBusy(true);
     setError(null);
     const approveOutside = approveOutsideOf(approvals);
-    const o = { ...opts, ...(approveOutside ? { approveOutside } : {}) };
+    // Zotero's linked files are copied with "Copy into the library" unless kept as links by choice (R136).
+    const o = { ...opts, ...(scanned.summary.linkedFiles ? { linkedFiles: opts.linkedFiles ?? "copy" } : {}), ...(approveOutside ? { approveOutside } : {}) };
     const c = scanned.choice;
     try {
       const r =
@@ -219,7 +220,7 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
       )}
       {step === "options" && (
         <>
-          <StepOptions options={opts} onOptions={setOptions} policy={effectivePolicy} />
+          <StepOptions options={opts} onOptions={setOptions} policy={effectivePolicy} linkedAttachments={scanned?.summary.linkedFiles ?? 0} />
           <ErrorNote error={error} />
           <div className="ao-import__actions">
             <button type="button" onClick={() => setStep("review")} disabled={busy}>

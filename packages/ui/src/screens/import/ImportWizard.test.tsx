@@ -494,4 +494,54 @@ describe("Bulk Import wizard", () => {
       expect(within(screen.getByRole("alertdialog")).getByText("Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?")).toBeTruthy();
     });
   });
+
+  describe("Zotero's linked files with “Copy into the library” (R136, D4)", () => {
+    const linked: ServiceSetup = { summary: { ...SUMMARY, linkedFiles: 2 } };
+
+    it("copies them by default: the choice to keep them as links is separate, shown only when the scan found some", async () => {
+      const { m, user } = setup(linked);
+      await scanFolder(user);
+      await toOptions(user);
+      const keep = screen.getByRole("checkbox", { name: "Keep the 2 files Zotero links to where they are, as links" }) as HTMLInputElement;
+      expect(keep.checked).toBe(false);
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual({ ...DEFAULT_OPTIONS, linkedFiles: "copy" });
+    });
+
+    it("keeping them as links is an explicit choice, with the warning", async () => {
+      const { m, user } = setup(linked);
+      await scanFolder(user);
+      await toOptions(user);
+      await user.click(screen.getByRole("checkbox", { name: "Keep the 2 files Zotero links to where they are, as links" }));
+      expect(screen.getByText(/outside encryption and retention control/)).toBeTruthy();
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: { linkedFiles: string } }).options.linkedFiles).toBe("link");
+    });
+
+    it("is never offered where the project's rules require encryption", async () => {
+      const { m, user } = setup({ ...linked, governance: "encryption:\n  atRest: required\n" });
+      await scanFolder(user);
+      await toOptions(user);
+      expect(screen.queryByRole("checkbox", { name: /where they are, as links/ })).toBeNull();
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: { linkedFiles: string } }).options.linkedFiles).toBe("copy");
+    });
+
+    it("is not shown when the scan found no linked files", async () => {
+      const { user } = setup();
+      await scanFolder(user);
+      await toOptions(user);
+      expect(screen.queryByRole("checkbox", { name: /where they are, as links/ })).toBeNull();
+    });
+
+    it("the report gives the number of files copied and the number left as links", async () => {
+      const { m, user } = setup({ ...linked, report: { ...REPORT, files: { copied: 1290, linked: 0 } } });
+      await scanFolder(user);
+      await toOptions(user);
+      await runToReport(m, user);
+      const table = await screen.findByRole("table", { name: "Items by outcome" });
+      expect(within(table).getByRole("row", { name: "Files copied into the library 1,290" })).toBeTruthy();
+      expect(within(table).getByRole("row", { name: "Files left as links 0" })).toBeTruthy();
+    });
+  });
 });

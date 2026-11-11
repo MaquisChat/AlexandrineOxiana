@@ -33,6 +33,12 @@ export interface ApproveOutside {
 /** ImportOptionsInput (@ao/core import-batch.ts): what the wizard sets. */
 export interface ImportOptions {
   fileHandling: "copy" | "link";
+  /**
+   * Files the source itself links in place (Zotero linked attachments): copied like any other file
+   * ("copy"), or kept as links only by the researcher's explicit choice (R136). The engine's own
+   * default, for callers that say nothing, is "link"; the wizard always says.
+   */
+  linkedFiles?: "copy" | "link";
   structure: "collections" | "tags" | "none";
   duplicates: "merge" | "skip" | "keep-both";
   ocr: boolean;
@@ -56,6 +62,8 @@ export interface ScanSummary {
    */
   /** `file` is the file's real path: what approving that one file names (R118). */
   outsideFiles: Array<{ item: string; folder: string; file: string }>;
+  /** Files the source links in place (Zotero linked attachments), approved or not (R136); absent from an older service. */
+  linkedFiles?: number;
 }
 
 export type BatchState = "running" | "paused" | "cancelled" | "finished" | "failed" | "undone" | "interrupted";
@@ -88,6 +96,8 @@ export interface ImportReport {
   startedAt: string;
   finishedAt?: string;
   counts: BatchCounts;
+  /** Files stored: copied into the library, and left as links (R136); absent from an older service. */
+  files?: { copied: number; linked: number };
   failures: Array<{ item: string; reason: string }>;
   fileNotes: Array<{ item: string; note: string }>;
   pendingReview: Array<{ reviewId: string; sourceId?: string; reasons: string[] }>;
