@@ -230,6 +230,7 @@ async function main() {
     writeFileSync(guard, guardSource(REPO));
     const flags = ["--max-old-space-size=512"]; // the documented start (START.txt, ADR 0013)
     step(`starting: node ${flags.join(" ")} service.mjs (with the guard: the repository unreachable)`);
+    const started = Date.now();
     child = spawn(process.execPath, [...(argv.has("--no-guard") ? [] : ["--import", pathToFileURL(guard).href]), ...flags, "service.mjs"], { cwd: app, env, stdio: ["pipe", "pipe", "pipe"] });
     if (stdin !== null) child.stdin.write(stdin);
     let logs = "";
@@ -260,7 +261,7 @@ async function main() {
         rejectP(new Error(`the service exited before it was ready (${code ?? signal})\n${logs.slice(-4000)}`));
       });
     });
-    step(`ready on port ${port}`);
+    step(`ready on port ${port} after ${Date.now() - started} ms`);
 
     const call = async (method, path, body) => {
       const res = await fetch(`http://127.0.0.1:${port}${path}`, {
