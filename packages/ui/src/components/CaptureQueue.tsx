@@ -3,9 +3,14 @@
  * (never by colour alone), the reason a link failed in plain language, and the queue's progress. A
  * profile run lists its posts as they arrive and ends with a summary of the run's report. Links are
  * user text: shown with UserText (dir="auto"), never as live links.
+ *
+ * Only what the screen saw is claimed (R146): an item whose outcome was missed is "Not known", the
+ * counts add up to the total (done + failed + not known + not tried + still to come), a queue whose
+ * progress may have been missed says so, and the library's own sentence for a stopped or paused run
+ * is shown as it is, with the counts of what was saved.
  */
 import { useId } from "react";
-import { outcomeText, type CaptureQueueState, type ItemState, type ProfileReport, type QueueItem } from "../api/capture";
+import { itemExplanation, queueCounts, type CaptureQueueState, type ItemState, type ProfileReport } from "../api/capture";
 import { UserText } from "./UserText";
 import "./CaptureQueue.css";
 
@@ -13,6 +18,7 @@ const STATE_LABEL: Record<string, string> = {
   waiting: "Waiting",
   capturing: "Capturing now",
   "not-captured": "Not captured",
+  unknown: "Not known",
   created: "Saved",
   duplicate: "Already in the project",
   refreshed: "Saved again with a new dated snapshot",
@@ -24,20 +30,11 @@ const STATE_LABEL: Record<string, string> = {
 /** The status in words; one this version does not know is "Finished" (the service's word is not shown). */
 export const stateLabel = (s: ItemState): string => (Object.hasOwn(STATE_LABEL, s) ? STATE_LABEL[s]! : "Finished");
 
-const TONE: Record<string, string> = { created: "ok", refreshed: "ok", duplicate: "info", "needs-review": "warn", incomplete: "warn", failed: "bad", "not-captured": "bad" };
+const TONE: Record<string, string> = { created: "ok", refreshed: "ok", duplicate: "info", "needs-review": "warn", incomplete: "warn", unknown: "warn", failed: "bad", "not-captured": "bad" };
 
 const NUMBER = new Intl.NumberFormat("en");
 const n = (x: number) => NUMBER.format(x);
 const plural = (x: number, one: string, many = `${one}s`) => `${n(x)} ${x === 1 ? one : many}`;
-
-/** The sentence under a link: why it failed or was saved only in part. */
-function itemReason(it: QueueItem): string | undefined {
-  if (it.state === "failed" || it.state === "incomplete") return outcomeText(it.errorCode, it.reason);
-  if (it.state === "not-captured") return "This link was not tried. Capture it again.";
-  if (it.state === "duplicate") return "This post is already in the project; nothing new was saved. Choose “Refresh existing” to save a new dated snapshot.";
-  if (it.state === "needs-review") return "Some details could not be confirmed, so the source is in the review queue.";
-  return undefined;
-}
 
 function reportSummary(r: ProfileReport): string {
   const parts = [
@@ -53,23 +50,35 @@ function reportSummary(r: ProfileReport): string {
   return `${lead} ${parts.join(", ")}.`;
 }
 
+const hasCounts = (r: ProfileReport) => r.created + r.duplicates + r.incomplete + r.failed + r.newlyUnavailable + r.reappeared + r.edited > 0;
+
+/** "Of 3 links: 1 done, 1 failed, 1 not known." — only what was seen. */
+function countsLine(q: CaptureQueueState, unit: string): string {
+  const c = queueCounts(q);
+  const parts = [
+    c.done && `${n(c.done)} done`,
+    c.failed && `${n(c.failed)} failed`,
+    c.unknown && `${n(c.unknown)} not known`,
+    c.notTried && `${n(c.notTried)} not tried`,
+    c.pending && `${n(c.pending)} still to come`,
+  ].filter(Boolean);
+  return `${q.finished ? "Finished. " : ""}Of ${plural(c.total, unit)}: ${parts.join(", ")}.`;
+}
+
+function statusLine(q: CaptureQueueState): string {
+  if (q.kind === "links") return countsLine(q, "link");
+  if (q.finished) {
+    if (q.report?.status === "completed") return "The profile capture finished.";
+    if (q.report?.status === "paused-rate-limited") return "The profile capture is paused.";
+    return "The profile capture stopped.";
+  }
+  return q.total !== undefined ? countsLine(q, "post") : "Listing the profile…";
+}
+
 function QueueView({ q }: { q: CaptureQueueState }) {
   const id = useId();
-  const unit = q.kind === "profile" ? "post" : "link";
-  const failed = q.items.filter((i) => i.state === "failed").length;
-  const status = q.finished
-    ? q.kind === "profile"
-      ? q.report?.status === "paused-rate-limited"
-        ? "Paused: the platform is limiting requests. Run the capture again later; it continues where it stopped."
-        : q.error
-          ? "The profile capture stopped."
-          : "The profile capture finished."
-      : `Finished: ${n(q.done)} of ${plural(q.total ?? q.items.length, unit)} done${failed ? `, ${n(failed)} failed` : ""}.`
-    : q.total !== undefined
-      ? `${n(q.done)} of ${plural(q.total, unit)} done${failed ? `, ${n(failed)} failed` : ""}.`
-      : q.kind === "profile"
-        ? "Listing the profile…"
-        : "Starting…";
+  const status = statusLine(q);
+  const r = q.report;
   return (
     <section className="ao-capture-queue__queue" aria-labelledby={`${id}-h`}>
       <h3 id={`${id}-h`}>
@@ -85,16 +94,24 @@ function QueueView({ q }: { q: CaptureQueueState }) {
         <span>{q.kind === "profile" ? "Posts captured" : "Links captured"}</span>
         <progress value={q.done} {...(q.total !== undefined ? { max: Math.max(q.total, 1) } : {})} />
       </label>
-      <p role="status">{status}</p>
-      {q.error && (
-        <p className="ao-capture-queue__error" role="alert">
-          {q.error}
+      {/* Announced when the queue ends, not on every link (a long list would announce hundreds of times). */}
+      {q.finished ? <p role="status">{status}</p> : <p>{status}</p>}
+      {(q.stopReason || q.error) && (
+        <div className="ao-capture-queue__error" role="alert">
+          {q.stopReason && <UserText as="p">{q.stopReason}</UserText>}
+          {q.error && <p>{q.error}</p>}
+        </div>
+      )}
+      {q.gap && (
+        <p className="ao-capture-queue__note">
+          Progress was missed while the connection to the library service was down. Items marked “Not known” may have been captured: look in the library for the captured sources. This screen cannot
+          re-read a running capture yet.
         </p>
       )}
-      {q.report && q.report.status !== "failed" && (
+      {r && (r.status !== "failed" || hasCounts(r) || q.items.length > 0) && (
         <>
-          <p>{reportSummary(q.report)}</p>
-          {!q.report.listComplete && (
+          <p>{reportSummary(r)}</p>
+          {!r.listComplete && (
             <p className="ao-capture-queue__note">
               Removed posts were not looked for in this run: the list was limited (by dates or a maximum number of items) or did not come back whole.
             </p>
@@ -104,12 +121,17 @@ function QueueView({ q }: { q: CaptureQueueState }) {
       {q.items.length > 0 && (
         <ol className="ao-capture-queue__items">
           {q.items.map((it, i) => {
-            const why = itemReason(it);
+            const why = itemExplanation(it);
             return (
               <li key={i} className={`ao-capture-queue__item ao-capture-queue__item--${TONE[it.state] ?? "plain"}`}>
-                <UserText className="ao-capture-queue__url">{it.url}</UserText>
+                {it.url ? <UserText className="ao-capture-queue__url">{it.url}</UserText> : <span>A post whose link was not received</span>}
                 <span className="ao-capture-queue__state">{stateLabel(it.state)}</span>
-                {why && <p className="ao-capture-queue__why">{why}</p>}
+                {why.ui && <p className="ao-capture-queue__why">{why.ui}</p>}
+                {why.service && (
+                  <UserText as="p" className="ao-capture-queue__why">
+                    {why.service}
+                  </UserText>
+                )}
               </li>
             );
           })}

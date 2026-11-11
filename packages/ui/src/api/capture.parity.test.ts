@@ -7,9 +7,8 @@
  * 2. The acknowledgement text: identical character for character.
  * 3. The reason codes: every code in the library's own table (read from its source) has a UI sentence.
  */
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import errorsSource from "../../../library/src/capture/errors.ts?raw";
 import { COOKIES_ACKNOWLEDGEMENT as LIBRARY_ACK } from "../../../library/src/capture/errors";
 import { classifyUrl } from "../../../library/src/capture/platforms";
 import { COOKIES_ACKNOWLEDGEMENT, KNOWN_OUTCOME_CODES, previewLink } from "./capture";
@@ -136,8 +135,7 @@ describe("capture parity with the library", () => {
   });
 
   it("has a sentence for every reason code in the library's own table", () => {
-    const src = readFileSync(fileURLToPath(new URL("../../../library/src/capture/errors.ts", import.meta.url)), "utf8");
-    const table = /const REASONS[^{]*\{([\s\S]*?)\n\};/.exec(src)?.[1] ?? "";
+    const table = /const REASONS[^{]*\{([\s\S]*?)\n\};/.exec(errorsSource)?.[1] ?? "";
     const codes = [...table.matchAll(/^\s*([A-Z][A-Z0-9_]+):/gm)].map((m) => m[1]!);
     expect(codes.length).toBeGreaterThan(10);
     for (const code of codes) expect(KNOWN_OUTCOME_CODES, code).toContain(code);

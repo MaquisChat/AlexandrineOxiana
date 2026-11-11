@@ -16,8 +16,9 @@
  * error }` (the error's name and message, which are never shown).
  *
  * Two things here mirror the library rather than import it (the UI never bundles @ao/library):
- * the browser-session acknowledgement's exact wording and the link classifier used for the preview.
- * capture.test.ts compares both with the library's own, so they cannot drift.
+ * the browser-session acknowledgement's exact wording and the link classifier used for the preview
+ * (a hint only; the service decides). capture.parity.test.ts compares both with the library's own
+ * until Task 63 gives them one shared definition (R146).
  */
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
 import { effectivePolicy } from "@ao/core/src/governance/merge";
@@ -215,7 +216,11 @@ const KIND_NAMES: Record<LinkKind, string> = {
   unknown: "kind found when it is downloaded",
 };
 
-// The classifier: the same rules as packages/library/src/capture/platforms.ts (platform and kind only).
+// ---- A PREVIEW HINT ONLY -------------------------------------------------------------------------
+// A copy of packages/library/src/capture/platforms.ts `classifyUrl` (platform and kind only), so the
+// UI can preview a pasted line without a round trip. The library service decides what an address is;
+// the UI never refuses an address because of this copy (R146). capture.parity.test.ts runs one table
+// of addresses through both. Task 63 replaces this copy with one shared definition both sides import.
 const IG_RESERVED = new Set(["p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct", "about", "developer", "legal", "web", "api"]);
 const YT_ID = /^[\w-]{6,}$/;
 
@@ -260,12 +265,17 @@ function classify(raw: string): { platform: Platform; kind: LinkKind } {
   return { platform: "other", kind: "unknown" };
 }
 
-/** The per-line preview: platform and kind in words (the service decides; this only previews). */
+/**
+ * The per-line preview: platform and kind in words. A hint only (R146): the service decides, and
+ * nothing is refused on the strength of this guess — only an address that is not a web address at
+ * all, which the service refuses for the whole list.
+ */
 export function previewLink(url: string): LinkPreview {
   const { platform, kind } = classify(url);
   const collection = kind === "profile" || kind === "playlist";
   if (!isWebAddress(url.trim())) return { platform, kind, collection, problem: "not-a-web-address", label: "This is not a web address (it must start with https:// or http://)." };
-  if (platform === "other") return { platform, kind, collection, problem: "unsupported", label: "This is not a YouTube, Instagram or TikTok link, so the downloader cannot capture it." };
+  if (platform === "other") return { platform, kind, collection, problem: "unsupported", label: "Not recognised here as a YouTube, Instagram or TikTok link — the app will check it." };
+  if (kind === "unknown") return { platform, kind, collection, label: `${PLATFORM_NAMES[platform]} — kind not recognised here; the app will check it` };
   return { platform, kind, collection, label: `${PLATFORM_NAMES[platform]} — ${KIND_NAMES[kind]}` };
 }
 
@@ -293,6 +303,9 @@ const OUTCOME_TEXT: Record<string, string> = {
     "This project's rules need a legal basis for social-media data that can identify people, and none was given. Enter the legal basis for this capture, or ask whoever manages the project's rules to set a default for social media, then capture again.",
   INTERRUPTED: "The capture was interrupted before it finished. Capture the link again.",
   POLICY_CHANGED: "This project's rules changed during the download, so nothing was saved.",
+  // A profile run's own meanings (a run keeps what it saved before it stopped).
+  POLICY_CHANGED_RUN: "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved.",
+  RATE_LIMITED_PAUSED: "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.",
   INVALID_OPTIONS: "Some profile capture options are not valid. Check the dates (YYYY-MM-DD) and the maximum number of items.",
   POLICY_DENIED: "This project's rules do not allow this capture.",
   PROJECT_LOCKED: "The project is locked. Unlock it, then try again.",
@@ -335,13 +348,48 @@ export function outcomeText(code: string | undefined, reason?: string): string {
  * A queue that stopped as a whole: the service sends the error's name and message (state.describe),
  * which are never shown. Only the kind of error chooses the sentence.
  */
-export function queueErrorText(error: string): string {
+export function queueErrorText(error: string, kind: "links" | "profile" = "links"): string {
   const name = /^(\w+)/.exec(error)?.[1] ?? "";
-  if (name === "WorkerUnavailableError") return OUTCOME_TEXT.WORKER_UNAVAILABLE!;
+  if (name === "WorkerUnavailableError") return "The media helper is not running, so the capture stopped. Restart the app and try again.";
   if (name === "ProjectLockedError" || name === "KeyNotAvailableError") return OUTCOME_TEXT.PROJECT_LOCKED!;
   if (name === "PolicyDeniedError") return OUTCOME_TEXT.POLICY_DENIED!;
   if (name === "AcknowledgementRequiredError") return "Using your browser session has not been acknowledged for this project, so nothing was downloaded. Acknowledge it, then capture again.";
-  return "The capture stopped before every link was tried. Links not marked as done were not captured; capture them again.";
+  if (kind === "profile") return "The profile capture stopped before it finished. Posts shown here as saved are kept. Run it again later.";
+  return "The capture stopped before it finished.";
+}
+
+/**
+ * What to say under one queue item: the UI's sentence (`ui`) and/or the service's own sentence
+ * (`service`, shown as user text). The library's sentence for a partial save or a note on a saved
+ * item is shown, never replaced (R146); for a failed link the UI's sentence for a known code is used
+ * (the same meaning in the UI's words), except where the code means something else for a whole run.
+ */
+export function itemExplanation(it: QueueItem): { ui?: string; service?: string } {
+  const reason = it.reason?.trim() || undefined;
+  switch (it.state) {
+    case "failed": {
+      const code = it.errorCode;
+      if (code === "POLICY_DENIED") return { ui: OUTCOME_TEXT.POLICY_DENIED!, ...(reason ? { service: reason } : {}) };
+      // A whole list sent as a link (or a code the UI does not know): the library's own sentence.
+      if (reason && (code === undefined || code === "POLICY_CHANGED" || code === "RATE_LIMITED" || !Object.hasOwn(OUTCOME_TEXT, code))) return { service: reason };
+      return { ui: outcomeText(code) };
+    }
+    case "incomplete":
+      return reason ? { service: reason } : { ui: `Only part of this post was saved. ${outcomeText(it.errorCode)}` };
+    case "created":
+    case "refreshed":
+      return reason ? { service: reason } : {};
+    case "needs-review":
+      return reason ? { service: reason } : { ui: "Some details could not be confirmed, so the source is in the review queue." };
+    case "duplicate":
+      return { ui: "This post is already in the project; nothing new was saved. Choose “Refresh existing” to save a new dated snapshot." };
+    case "unknown":
+      return { ui: "Not known: progress was missed while the connection to the library service was down. It may have been captured; look for its sources in the library." };
+    case "not-captured":
+      return { ui: "This link was not tried. Capture it again." };
+    default:
+      return reason ? { service: reason } : {};
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -366,7 +414,11 @@ export function captureProgress(e: ServiceEvent, projectId: string): CaptureProg
   return d as unknown as CaptureProgress;
 }
 
-export type ItemState = "waiting" | "capturing" | "not-captured" | CaptureStatus | (string & {});
+/**
+ * "unknown": the item was (or may have been) tried but the screen did not see its outcome (R146).
+ * "not-captured": the queue stopped before reaching it, and no progress was missed.
+ */
+export type ItemState = "waiting" | "capturing" | "not-captured" | "unknown" | CaptureStatus | (string & {});
 
 export interface QueueItem {
   url: string;
@@ -385,10 +437,14 @@ export interface CaptureQueueState {
   done: number;
   total: number | undefined;
   finished: boolean;
-  /** Why the queue (or the profile run) stopped, in plain words. */
+  /** Why the queue (or the profile run) stopped, in the UI's plain words (added to `stopReason`). */
   error?: string;
+  /** The library's own sentence for a stopped or paused run, shown as it is (R146). */
+  stopReason?: string;
   errorCode?: string;
   report?: ProfileReport;
+  /** Progress may have been missed: the event stream was down while this queue ran (R146). */
+  gap?: boolean;
 }
 
 export function linkQueue(queueId: string, urls: string[]): CaptureQueueState {
@@ -397,6 +453,40 @@ export function linkQueue(queueId: string, urls: string[]): CaptureQueueState {
 
 export function profileQueue(queueId: string, url: string): CaptureQueueState {
   return { queueId, kind: "profile", url, items: [], done: 0, total: undefined, finished: false };
+}
+
+/** The queue, marked as having missed progress (an unfinished queue only). */
+export function markGap(q: CaptureQueueState): CaptureQueueState {
+  return q.finished || q.gap ? q : { ...q, gap: true };
+}
+
+const PENDING = (s: ItemState) => s === "waiting" || s === "capturing";
+
+/** What the screen saw of a queue: done (an outcome other than failed) + failed + unknown + not tried + pending = total. */
+export function queueCounts(q: CaptureQueueState): { total: number; done: number; failed: number; unknown: number; notTried: number; pending: number } {
+  const c = { total: 0, done: 0, failed: 0, unknown: 0, notTried: 0, pending: 0 };
+  const total = Math.max(q.total ?? 0, q.items.length);
+  for (let i = 0; i < total; i++) {
+    const s = q.items[i]?.state ?? (q.finished ? (q.gap ? "unknown" : "not-captured") : "waiting");
+    if (PENDING(s)) c.pending++;
+    else if (s === "unknown") c.unknown++;
+    else if (s === "not-captured") c.notTried++;
+    else if (s === "failed") c.failed++;
+    else c.done++;
+  }
+  c.total = total;
+  return c;
+}
+
+/** What the UI adds to a run's own sentence (never contradicting it), or uses when there is none. */
+function reportText(r: ProfileReport): { error?: string; stopReason?: string } {
+  const reason = typeof r.reason === "string" && r.reason.trim() ? r.reason.trim() : undefined;
+  const code = r.errorCode;
+  if (reason) return { stopReason: reason, ...(code === "LEGAL_BASIS_REQUIRED" ? { error: OUTCOME_TEXT.LEGAL_BASIS_REQUIRED! } : {}) };
+  if (r.status === "paused-rate-limited") return { error: OUTCOME_TEXT.RATE_LIMITED_PAUSED! };
+  if (code === "POLICY_CHANGED") return { error: OUTCOME_TEXT.POLICY_CHANGED_RUN! };
+  if (code === "RATE_LIMITED") return { error: OUTCOME_TEXT.RATE_LIMITED_PAUSED! };
+  return { error: outcomeText(code) };
 }
 
 /** The queue after one event; the same object when the event is another queue's. */
@@ -408,20 +498,25 @@ export function applyProgress(q: CaptureQueueState, e: CaptureProgress): Capture
     const i = e.done - 1;
     const { url, status, errorCode, reason, sourceId } = e.outcome;
     const item: QueueItem = { url: q.kind === "links" && items[i] ? items[i].url : url, state: status, ...(errorCode ? { errorCode } : {}), ...(reason ? { reason } : {}), ...(sourceId ? { sourceId } : {}) };
-    while (items.length < i) items.push({ url: "", state: "waiting" });
+    while (items.length < i) items.push({ url: "", state: "unknown" });
     items[i] = item;
     done = Math.max(done, e.done);
-    if (q.kind === "links" && !e.finished && items[done]?.state === "waiting") items[done] = { ...items[done]!, state: "capturing" };
-  }
+  } else if (typeof e.done === "number") done = Math.max(done, e.done);
+  // Before `done`, every item was tried: one whose outcome was not seen is not known, never pending.
+  for (let i = 0; i < Math.min(done, items.length); i++) if (PENDING(items[i]!.state)) items[i] = { ...items[i]!, state: "unknown" };
+  if (q.kind === "links" && !e.finished && items[done] && PENDING(items[done]!.state)) items[done] = { ...items[done]!, state: "capturing" };
   const next: CaptureQueueState = { ...q, items, done, total: e.total ?? q.total };
   if (e.finished) {
     next.finished = true;
-    for (const [i, it] of items.entries()) if (it.state === "waiting" || it.state === "capturing") items[i] = { ...it, state: "not-captured" };
-    if (e.error !== undefined) next.error = queueErrorText(e.error);
+    // Not reached when the queue stopped: not tried, unless progress may have been missed.
+    for (const [i, it] of items.entries()) if (PENDING(it.state)) items[i] = { ...it, state: q.gap ? "unknown" : "not-captured" };
+    if (e.error !== undefined) next.error = queueErrorText(e.error, q.kind);
     if (e.report) {
       next.report = e.report;
-      if (e.report.status === "failed") {
-        next.error = outcomeText(e.report.errorCode, e.report.reason);
+      if (e.report.status !== "completed") {
+        const t = reportText(e.report);
+        if (t.stopReason) next.stopReason = t.stopReason;
+        if (t.error) next.error = t.error;
         if (e.report.errorCode) next.errorCode = e.report.errorCode;
       }
     }
