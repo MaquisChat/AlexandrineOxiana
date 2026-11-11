@@ -15,6 +15,8 @@
  *  - Redirects are followed (at most 3) only within the same origin.
  *  - User-Agent `AlexandrineOxiana/<version> (+https://github.com/maquiscatta-sys/AlexandrineOxiana)`;
  *    `; mailto:<email>` is added inside the parentheses only when the user set a contact email.
+ *  - Under NODE_ENV=test only, AO_LOOKUP_FIXTURES replays recorded answers and fetches nothing
+ *    (recorded.ts, R47/R130).
  */
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -22,6 +24,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { request, type Dispatcher } from "undici";
 import { writeFileAtomic } from "../fs/atomic.js";
+import { recordedLookupsFromEnv, type RecordedLookups } from "./recorded.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
 const PROJECT_URL = "https://github.com/maquiscatta-sys/AlexandrineOxiana";
@@ -79,6 +82,8 @@ export interface HttpClientOptions {
   timeoutMs?: number;
   /** Overall deadline of one attempt, redirects and body included (default 60 s). */
   attemptTimeoutMs?: number;
+  /** Where the recorded-answers switch is read (default process.env; honoured only under NODE_ENV=test). */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface GetOptions {
@@ -112,6 +117,8 @@ export class HttpClient {
   private readonly backoffMs: number;
   private readonly timeoutMs: number;
   private readonly attemptTimeoutMs: number;
+  /** Test mode only: recorded answers replace every request (and a lookup without one fails). */
+  private readonly recorded: RecordedLookups | undefined;
   private readonly memory = new Map<string, MemoryEntry>();
   private readonly nextSlot = new Map<string, number>();
   private readonly hostQueue = new Map<string, Promise<unknown>>();
@@ -129,6 +136,7 @@ export class HttpClient {
     this.backoffMs = opts.backoffMs ?? 500;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.attemptTimeoutMs = opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
+    this.recorded = recordedLookupsFromEnv(opts.env ?? process.env);
   }
 
   /** Parsed JSON, or null when the resource does not exist (404). A 200 that is not JSON is never cached. */
@@ -262,6 +270,7 @@ export class HttpClient {
   }
 
   private async fetchWithRetries(url: string): Promise<{ status: 200 | 404; body: string | null }> {
+    if (this.recorded) return this.recorded.answer(url);
     let lastError: LookupHttpError | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let res: Awaited<ReturnType<HttpClient["fetchFollowingRedirects"]>> | undefined;
