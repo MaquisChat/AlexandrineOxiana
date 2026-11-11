@@ -95,6 +95,11 @@ export interface ApiClient {
    * element only — never show, log, store it or put it in the page address. Fetches nothing.
    */
   mediaUrl(ticketPath: string): string;
+  /**
+   * A binary answer (a picture, R135 1) read with the token in the Authorization header, as a Blob.
+   * Same URL and error rules as request(); the caller turns it into a blob: URL and revokes it.
+   */
+  blob(path: string, opts?: { signal?: AbortSignal }): Promise<Blob>;
 }
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
@@ -408,6 +413,26 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
   }
 
+  async function blob(path: string, o: { signal?: AbortSignal } = {}): Promise<Blob> {
+    const url = urlFor(path);
+    const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "*/*" } };
+    if (o.signal) init.signal = o.signal;
+    let res: Response;
+    try {
+      res = await doFetch(url, init);
+    } catch (err) {
+      if (o.signal?.aborted) throw err;
+      throw unreachable();
+    }
+    if (!res.ok) throw await errorFrom(res);
+    try {
+      return await res.blob();
+    } catch (err) {
+      if (o.signal?.aborted) throw err;
+      throw unreachable();
+    }
+  }
+
   /** R135: a ticket address is `/media/` and 43 base64url characters; the token is never in it. */
   function mediaUrl(ticketPath: string): string {
     if (typeof ticketPath !== "string" || !isMediaTicketPath(ticketPath)) throw new Error("Not a media address: expected /media/<ticket> and nothing else."); // not echoed
@@ -424,5 +449,6 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     ndjson,
     events,
     mediaUrl,
+    blob,
   };
 }

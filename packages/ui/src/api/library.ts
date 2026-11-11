@@ -8,6 +8,7 @@
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
+import { verificationApi } from "./verification";
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -303,6 +304,8 @@ export function libraryApi(client: ApiClient) {
       attach: async (pid: string, paths: string[], toSourceId?: string) =>
         (await r<{ items: AttachOutcome[] }>("POST", `${proj(pid)}/attach`, { body: { paths, ...(toSourceId ? { toSourceId } : {}) } })).items,
     },
+    /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
+    verification: verificationApi(client),
     citations: {
       styles: async (q?: string, opts: { signal?: AbortSignal } = {}) =>
         (await r<{ styles: StyleEntry[] }>("GET", "/styles", { query: { q: q || undefined }, ...(opts.signal ? { signal: opts.signal } : {}) })).styles,
