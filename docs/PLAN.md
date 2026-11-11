@@ -452,11 +452,12 @@ Update after every task; commit and push.
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | in progress | | implementer dispatched |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48 Tools dialogue | not started | | |
+| 48a Tools: worker and service | in progress | | implementer dispatched; gallery-dl becomes a first-use download (R152) |
+| 48b Tools: the dialogue | not started | | after 48a |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | in progress | | implementer dispatched |
 | 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
-| 50 No silent refusals | not started | | |
+| 50 No silent refusals | in progress | | implementer dispatched; the restore item waits for Task 49 |
 | 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
