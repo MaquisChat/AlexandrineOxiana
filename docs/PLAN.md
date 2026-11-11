@@ -457,7 +457,7 @@ Update after every task; commit and push.
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | in progress | | implementer dispatched |
 | 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
-| 50 No silent refusals | in review | 31553d4 (worktree branch) | built except the restore item, which waits for Task 49 |
+| 50 No silent refusals | fix round 1 | 31553d4 (worktree branch) | 5 Important (R154): the new library-level record must be protected and shown; a repair must not obey a file on disk; marks can be set aside with a reason; nothing written under another device's lock. Larger than planned. The restore item waits for Task 49 |
 | 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
