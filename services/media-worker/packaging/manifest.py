@@ -69,7 +69,7 @@ def main() -> int:
         dist = metadata.distribution(name)
         lic = licence_of(dist.metadata)
         info_dir = f"{dist.metadata['Name'].replace('-', '_')}-{dist.version}.dist-info"
-        candidates = [d for d in internal.glob("*.dist-info") if canonical(d.name.rsplit("-", 1)[0]) == name]
+        candidates = [d for d in internal.glob("*.dist-info") if canonical(d.name.removesuffix(".dist-info").rsplit("-", 1)[0]) == name]
         files = sorted(str(p.relative_to(args.bundle)) for d in candidates for p in d.rglob("*")
                        if p.is_file() and re.search(r"(licen[cs]e|copying|notice|authors)", p.name, re.I) and p.suffix != ".pyc")
         packages.append({
@@ -90,6 +90,12 @@ def main() -> int:
         "pyinstaller": metadata.version("pyinstaller"),
         "notBundled": ["ffmpeg", "ffprobe", "tesseract", "ghostscript", "yt-dlp", "speech models"],
         "packages": packages,
+        # Native libraries the wheels vendor (auditwheel/delocate folders). Their licences are not in
+        # any package metadata (e.g. libx264 and libx265 are GPL); listed here for the licence review.
+        "vendoredLibraries": {
+            str(d.relative_to(internal)): sorted(p.name for p in d.iterdir() if p.is_file())
+            for d in sorted([*internal.glob("*.libs"), *internal.glob("*/.dylibs")]) if d.is_dir()
+        },
     }
     args.out.write_text(json.dumps(manifest, indent=1) + "\n")
     flagged = [f"{p['name']} {p['version']}: {p['licence']} ({p['copyleft']})" for p in packages if p["copyleft"] != "no"]
