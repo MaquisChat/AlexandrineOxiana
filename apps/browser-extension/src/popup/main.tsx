@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import browser from "webextension-polyfill";
 import { createApi } from "../api.js";
-import type { PendingLinks } from "../types.js";
+import { parsePending } from "../pending.js";
 import { Popup, type PopupBridge } from "./Popup.js";
 import "./popup.css";
 
@@ -14,7 +14,7 @@ const bridge: PopupBridge = {
   },
   send: (msg) => browser.runtime.sendMessage(msg) as never,
   async pendingLinks() {
-    return (await browser.storage.session.get("pendingLinks")).pendingLinks as PendingLinks | undefined;
+    return parsePending((await browser.storage.session.get("pendingLinks")).pendingLinks);
   },
   copy: (text) => navigator.clipboard.writeText(text),
 };

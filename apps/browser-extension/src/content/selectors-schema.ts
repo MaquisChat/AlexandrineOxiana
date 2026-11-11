@@ -73,7 +73,64 @@ function checkCss(css: string, path: string): void {
   }
 }
 
+/**
+ * Why `src` could backtrack catastrophically, or undefined: a backreference, or a repeated group that
+ * itself contains a repetition ("(a+)+", "(?:x*)*", "(a{1,5})+"). Repetition = *, + or {…}.
+ */
+export function unsafePatternReason(src: string): string | undefined {
+  const groups: Array<{ repeats: boolean }> = [{ repeats: false }];
+  const quantifierAt = (i: number): { len: number; repeats: boolean } | undefined => {
+    const c = src[i];
+    if (c === "*" || c === "+") return { len: src[i + 1] === "?" ? 2 : 1, repeats: true };
+    if (c === "?") return { len: src[i + 1] === "?" ? 2 : 1, repeats: false };
+    const m = c === "{" ? /^\{(\d+)(,(\d*))?\}\??/.exec(src.slice(i)) : null;
+    if (m) return { len: m[0].length, repeats: m[2] !== undefined || Number(m[1]) > 1 };
+    return undefined;
+  };
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i]!;
+    let atomRepeats = false; // the atom just read contains a repetition (groups only)
+    if (c === "\\") {
+      const n = src[i + 1] ?? "";
+      if (/[1-9]/.test(n) || (n === "k" && src[i + 2] === "<")) return "backreferences are not allowed";
+      i += 2;
+    } else if (c === "[") {
+      i++;
+      if (src[i] === "^") i++;
+      if (src[i] === "]") i++;
+      while (i < src.length && src[i] !== "]") i += src[i] === "\\" ? 2 : 1;
+      i++;
+    } else if (c === "(") {
+      groups.push({ repeats: false });
+      i++;
+      const head = /^\?(:|=|!|<=|<!|<[A-Za-z_][A-Za-z0-9_]*>)/.exec(src.slice(i));
+      if (head) i += head[0].length;
+      continue;
+    } else if (c === ")") {
+      const g = groups.pop();
+      if (!g || groups.length === 0) return "unbalanced parentheses";
+      atomRepeats = g.repeats;
+      i++;
+    } else {
+      i++;
+      if (c === "|" || c === "^" || c === "$") continue;
+    }
+    const q = quantifierAt(i);
+    const top = groups[groups.length - 1]!;
+    if (atomRepeats) top.repeats = true;
+    if (q) {
+      if (q.repeats && atomRepeats) return "nested quantifiers are not allowed";
+      if (q.repeats) top.repeats = true;
+      i += q.len;
+    }
+  }
+  return undefined;
+}
+
 function checkPattern(pattern: string, path: string): void {
+  const unsafe = unsafePatternReason(pattern);
+  if (unsafe) throw new SelectorsError(`${path}.pattern`, unsafe);
   let re: RegExp;
   try {
     re = new RegExp(pattern);

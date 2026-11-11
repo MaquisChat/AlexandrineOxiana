@@ -44,8 +44,8 @@ export type BackgroundRequest =
   | { type: "profile-status"; tabId: number }
   | { type: "profile-finish"; tabId: number }
   | { type: "profile-cancel"; tabId: number }
-  | { type: "pending-retry" }
-  | { type: "pending-discard" }
+  | { type: "pending-retry"; projectId: string }
+  | { type: "pending-discard"; projectId: string }
   /** From the in-page overlay (sender.tab is checked). */
   | { type: "overlay-finish"; urls: string[] }
   | { type: "overlay-cancel" };
@@ -59,12 +59,7 @@ export interface CaptureReply {
 export interface ProfileStatus {
   active: boolean;
   count: number;
+  left?: boolean;
   projectId?: string;
 }
 
-/** Profile links the service did not take, kept (in session storage only) until sent or discarded. */
-export interface PendingLinks {
-  projectId: string;
-  urls: string[];
-  reason: string;
-}

@@ -14,7 +14,7 @@ runs as a background script, and the code uses `webextension-polyfill`).
 ```sh
 pnpm --filter @ao/browser-extension build      # → apps/browser-extension/dist (unpacked)
 pnpm --filter @ao/browser-extension exec vitest run
-pnpm e2e -- e2e/extension.spec.ts --trace off  # builds, then Playwright (headless Chromium)
+pnpm e2e -- --extension-only e2e/extension.spec.ts --trace off  # builds, then Playwright (headless Chromium)
 ```
 
 To load the build:
@@ -72,7 +72,7 @@ publication time.
 `content/screenshot.ts` takes the screenshot in these steps:
 
 1. Scroll one viewport at a time and take `tabs.captureVisibleTab` at most twice a second (the browser's
-   limit).
+   limit, through one limiter shared by every capture the extension runs).
 2. Hide fixed and sticky bars after the first frame, so they appear once.
 3. Stitch the frames on an `OffscreenCanvas`.
 
@@ -88,10 +88,31 @@ the front during the capture, the capture stops.
 
 ## Profile as I scroll
 
-The extension only listens to scroll events. It never clicks, follows a link, scrolls or loads anything.
-A small counter in the page has **Finish** and **Cancel**, and the popup shows the same counter. On
-Finish, the links (at most 500, the service's limit per request) go to `POST /projects/:id/capture`.
+Profile capture is available only in projects whose rules allow both browser capture and the downloader,
+because the links are queued for the downloader. The extension only listens to scroll events. It never
+clicks, follows a link, scrolls or loads anything.
 
-**Current limitation:** the service accepts the extension token only for `POST /capture/browser` and
-`GET /projects` (R96), so Finish gets 403. The list is then kept in session storage, and the popup offers
-**Try again**, **Copy list** and **Discard** until the service accepts it.
+A small counter in the page has **Finish** and **Cancel**, and the popup shows the same counter. If the
+page moves to another address that is not one of the profile's own tabs, which single-page sites do
+without reloading, listening stops and the counter says so. The links noted so far are kept for Finish.
+
+On Finish, the links (at most 500 per run) go to `POST /capture/browser/links` with
+`{ projectId, urls }`. This extension-scoped route arrives in the service with R111.
+
+If the service does not take a list, the reply names the reason:
+
+- `FORBIDDEN`: the desktop app needs updating.
+- `POLICY_DENIED`: the project's rule says why.
+
+The list not taken is kept per project in session storage. A later list for the same project is merged
+in, never written over. The popup offers **Try again**, **Copy list** and **Discard** for each project.
+
+## Size limits
+
+- **Request body:** a capture is measured in UTF-8 bytes against the service's 32 MB limit. If it is too
+  big, the HTML snapshot is dropped first, then the extracted media links. If it is still too big, the
+  extension refuses it with a message instead of sending it.
+- **Media links:** at most 50, each at most 2,048 characters, and reading stops at 50.
+- **Snapshot fetches:** the HTML snapshot is built in an inert document, so making it fetches nothing.
+- **Selector patterns:** a pattern may not use backreferences or nested quantifiers, and it sees at most
+  the first 20,000 characters of a value.

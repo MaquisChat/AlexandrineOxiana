@@ -135,14 +135,40 @@ describe("pairing", () => {
     expect(await api.getPairing()).toBeUndefined();
   });
 
-  it("queues profile links with POST /projects/:id/capture and the Authorization header", async () => {
+  it("queues profile links with POST /capture/browser/links {projectId, urls} and the Authorization header (R111)", async () => {
     const storage = memoryStorage();
-    const { fn, calls } = fakeFetch((url) => (url.endsWith("/capture") ? { status: 200, body: { queueId: "q1" } } : service(url)));
+    const { fn, calls } = fakeFetch((url) => (url.endsWith("/capture/browser/links") ? { status: 200, body: { queueId: "q1" } } : service(url)));
     const api = createApi({ fetch: fn, storage });
     await api.pair("48123", "123456");
     expect(await api.queueLinks("p 1/x", ["https://www.instagram.com/p/A/"])).toEqual({ queueId: "q1" });
-    expect(calls[1]!.url).toBe("http://127.0.0.1:48123/projects/p%201%2Fx/capture");
-    expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ urls: ["https://www.instagram.com/p/A/"] });
+    expect(calls[1]!.url).toBe("http://127.0.0.1:48123/capture/browser/links");
+    expect(calls[1]!.init.method).toBe("POST");
+    expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ projectId: "p 1/x", urls: ["https://www.instagram.com/p/A/"] });
     expect(headerOf(calls[1]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("keeps the service's error code and reason (POLICY_DENIED carries the rule's reason)", async () => {
+    const storage = memoryStorage();
+    const { fn } = fakeFetch((url) =>
+      url.endsWith("/links") ? { status: 403, body: { error: { code: "POLICY_DENIED", message: "This capture is not allowed.", reason: "Platform tiktok is outside the protocol." } } } : service(url),
+    );
+    const api = createApi({ fetch: fn, storage });
+    await api.pair("48123", "123456");
+    await expect(api.queueLinks("p1", ["https://www.tiktok.com/@a/video/12345"])).rejects.toMatchObject({ code: "POLICY_DENIED", status: 403, reason: "Platform tiktok is outside the protocol." });
+    expect(storage.data.pairing).toBeDefined(); // a 403 is not a reason to forget the pairing
+  });
+
+  it("accepts only a token of at least 32 base64url characters", async () => {
+    for (const token of ["short", "a".repeat(31), `${"a".repeat(40)}+/`, `${"a".repeat(40)}=`, `${"a".repeat(40)} `]) {
+      const storage = memoryStorage();
+      const api = createApi({ fetch: fakeFetch(() => ({ status: 200, body: { token } })).fn, storage });
+      await expect(api.pair("48123", "123456"), token).rejects.toMatchObject({ code: "BAD_REPLY" });
+      expect(storage.data).toEqual({});
+    }
+    const storage = memoryStorage();
+    storage.data.pairing = { port: 48123, token: "a".repeat(31) };
+    expect(await createApi({ fetch: fakeFetch(service).fn, storage }).getPairing()).toBeUndefined();
+    storage.data.pairing = { port: 48123, token: "a".repeat(43) };
+    expect(await createApi({ fetch: fakeFetch(service).fn, storage }).getPairing()).toMatchObject({ token: "a".repeat(43) });
   });
 });

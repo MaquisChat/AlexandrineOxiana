@@ -27,6 +27,8 @@ export class ApiError extends Error {
     readonly code: string,
     message: string,
     readonly status?: number,
+    /** The service's reason (POLICY_DENIED: the project rule that refused it). */
+    readonly reason?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -34,7 +36,8 @@ export class ApiError extends Error {
 }
 
 const KEY = "pairing";
-const TOKEN = /^[A-Za-z0-9._~+/=-]{8,512}$/;
+/** The extension token: at least 32 base64url characters (the service issues 43). */
+const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
 
 export function parsePort(v: string | number): number | undefined {
   const s = String(v).trim();
@@ -87,10 +90,10 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
       data = undefined;
     }
     if (!res.ok) {
-      const err = (data as { error?: { code?: unknown; message?: unknown } } | undefined)?.error;
+      const err = (data as { error?: { code?: unknown; message?: unknown; reason?: unknown } } | undefined)?.error;
       const code = typeof err?.code === "string" ? err.code : `HTTP_${res.status}`;
       const message = typeof err?.message === "string" ? err.message : `The desktop app answered ${res.status}.`;
-      throw new ApiError(code, message, res.status);
+      throw new ApiError(code, message, res.status, typeof err?.reason === "string" ? err.reason : undefined);
     }
     return data as T;
   }
@@ -140,7 +143,8 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
 
     /** Profile as I scroll: the noted links, queued for the downloader. */
     queueLinks(projectId: string, urls: string[]): Promise<{ queueId: string }> {
-      return authed<{ queueId: string }>(`/projects/${encodeURIComponent(projectId)}/capture`, "POST", { urls });
+      // R111: the extension-scoped route (the extension token cannot use POST /projects/:id/capture).
+      return authed<{ queueId: string }>("/capture/browser/links", "POST", { projectId, urls });
     },
   };
 }

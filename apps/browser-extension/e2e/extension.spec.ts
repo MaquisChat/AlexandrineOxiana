@@ -1,26 +1,29 @@
 /**
  * End to end: the unpacked build in headless Chromium (new headless), paired with a stub service,
- * captures the synthetic instagram-post.html page.
+ * captures the synthetic instagram-post.html page, sends a profile's links, and makes its HTML
+ * snapshot without fetching anything.
  *
  * Opening the popup from the toolbar is what grants `activeTab` for the page; there is no toolbar
  * to click in headless mode, so the test asks Chromium to do exactly that through the DevTools
  * protocol (Extensions.triggerAction, which needs --enable-unsafe-extension-debugging) and then
- * clicks the popup's button through the protocol as well.
+ * clicks the popup's buttons through the protocol as well.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium, expect, test, type BrowserContext, type CDPSession, type Worker } from "@playwright/test";
+import { chromium, expect, test, type BrowserContext, type CDPSession, type Page, type Worker } from "@playwright/test";
 import { startFixtureServer, type FixtureServer } from "./fixture-server.js";
 import { startStubService, type StubService } from "./stub-service.js";
+
+test.describe.configure({ mode: "serial" });
 
 const DIST = fileURLToPath(new URL("../dist", import.meta.url));
 const HOST = "www.instagram.com";
 const POST_URL = `https://${HOST}/p/C0FAKEPOST1/`;
+const PROFILE_URL = `https://${HOST}/fieldnotes.example/`;
+const PROBE_URL = `https://${HOST}/probe/media/`;
 const CAPTION = "Morning light over the estuary. Notes on tide levels to follow. #fieldwork #tides";
-
-test.describe.configure({ mode: "serial" });
 
 let stub: StubService;
 let fixtures: FixtureServer;
@@ -28,6 +31,7 @@ let ctx: BrowserContext;
 let profileDir: string;
 let worker: Worker;
 let extensionId: string;
+let browserSession: CDPSession;
 
 test.beforeAll(async () => {
   stub = await startStubService();
@@ -49,6 +53,7 @@ test.beforeAll(async () => {
   });
   worker = ctx.serviceWorkers()[0] ?? (await ctx.waitForEvent("serviceworker"));
   extensionId = new URL(worker.url()).host;
+  browserSession = await ctx.browser()!.newBrowserCDPSession();
 });
 
 test.afterAll(async () => {
@@ -58,8 +63,11 @@ test.afterAll(async () => {
   if (profileDir) rmSync(profileDir, { recursive: true, force: true });
 });
 
+type TargetInfo = { targetId: string; type: string; url: string };
+const targets = async () => ((await browserSession.send("Target.getTargets", { filter: [{}] })) as { targetInfos: TargetInfo[] }).targetInfos;
+
 /** Evaluates `expression` in a target the test is not attached to (the toolbar popup). */
-async function evaluateIn(browserSession: CDPSession, targetId: string, expression: string): Promise<unknown> {
+async function evaluateIn(targetId: string, expression: string): Promise<unknown> {
   const { sessionId } = (await browserSession.send("Target.attachToTarget", { targetId, flatten: false })) as { sessionId: string };
   try {
     return await new Promise((resolve, reject) => {
@@ -83,6 +91,27 @@ async function evaluateIn(browserSession: CDPSession, targetId: string, expressi
   }
 }
 
+/** "Clicks the toolbar button" on the tab showing `url`: grants activeTab there and opens the popup. */
+async function openPopupOn(url: string): Promise<(expr: string) => Promise<unknown>> {
+  const before = new Set((await targets()).map((t) => t.targetId));
+  const tab = (await targets()).find((t) => t.type === "tab" && t.url === url);
+  expect(tab, `a tab showing ${url}`).toBeDefined();
+  await browserSession.send("Extensions.triggerAction", { id: extensionId, targetId: tab!.targetId });
+  let popup: TargetInfo | undefined;
+  await expect.poll(async () => (popup = (await targets()).find((t) => !before.has(t.targetId) && t.type === "page" && t.url === `chrome-extension://${extensionId}/popup.html`))).toBeDefined();
+  return (expr) => evaluateIn(popup!.targetId, expr);
+}
+
+const button = (label: string) => `[...document.querySelectorAll("button")].find((b) => b.textContent === ${JSON.stringify(label)})`;
+const enabled = (label: string) => `(() => { const b = ${button(label)}; return !!b && !b.disabled; })()`;
+
+async function view(url: string): Promise<Page> {
+  const page = await ctx.newPage();
+  await page.goto(url);
+  await page.bringToFront();
+  return page;
+}
+
 test("pair, then Capture this page sends the screenshot, the stripped HTML and the caption", async () => {
   // 1. Pairing: the user types the port shown by the desktop app and the 6-digit code.
   const popupTab = await ctx.newPage();
@@ -102,32 +131,20 @@ test("pair, then Capture this page sends the screenshot, the stripped HTML and t
   await popupTab.close();
 
   // 2. The researcher views the post, scrolled part-way down.
-  const page = await ctx.newPage();
-  await page.goto(POST_URL);
-  await page.bringToFront();
+  const page = await view(POST_URL);
   await page.evaluate(() => window.scrollTo(0, 300));
   const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
   expect(pageHeight).toBeGreaterThan(2 * 720); // several viewports: the screenshot must be stitched
 
   // 3. Clicking the toolbar button opens the popup (and grants activeTab for this tab only).
-  const browserSession = await ctx.browser()!.newBrowserCDPSession();
-  type TargetInfo = { targetId: string; type: string; url: string };
-  const targets = async () => ((await browserSession.send("Target.getTargets", { filter: [{}] })) as { targetInfos: TargetInfo[] }).targetInfos;
-  const tab = (await targets()).find((t) => t.type === "tab" && t.url === POST_URL);
-  expect(tab).toBeDefined();
-  await browserSession.send("Extensions.triggerAction", { id: extensionId, targetId: tab!.targetId });
-  let popup: TargetInfo | undefined;
-  const inPopup = (expr: string) => evaluateIn(browserSession, popup!.targetId, expr);
-  await expect.poll(async () => (popup = (await targets()).find((t) => t.type === "page" && t.url === `chrome-extension://${extensionId}/popup.html`))).toBeDefined();
+  const inPopup = await openPopupOn(POST_URL);
 
   // 4. The popup lists only projects that allow browser capture; click "Capture this page".
-
-  await expect
-    .poll(() => inPopup(`(() => { const b = [...document.querySelectorAll("button")].find((b) => b.textContent === "Capture this page"); return !!b && !b.disabled; })()`), { timeout: 15_000 })
-    .toBe(true);
-  expect(await inPopup(`[...document.querySelectorAll("select option")].map((o) => o.textContent)`)).toEqual(["Estuary study"]);
+  await expect.poll(() => inPopup(enabled("Capture this page")), { timeout: 15_000 }).toBe(true);
+  expect(await inPopup(`[...document.querySelectorAll("select option")].map((o) => o.textContent)`)).toEqual(["Estuary study", "Profiles study"]);
   expect(await inPopup(`document.querySelector("input[type=checkbox]").disabled`)).toBe(true); // no downloader in this project
-  await inPopup(`[...document.querySelectorAll("button")].find((b) => b.textContent === "Capture this page").click()`);
+  expect(await inPopup(enabled("Capture profile as I scroll"))).toBe(false); // profile capture needs the downloader too
+  await inPopup(`${button("Capture this page")}.click()`);
 
   // 5. The stub receives one capture with everything in it.
   await expect.poll(() => stub.captures.length, { timeout: 60_000 }).toBe(1);
@@ -146,10 +163,8 @@ test("pair, then Capture this page sends the screenshot, the stripped HTML and t
 
   const png = Buffer.from(body.screenshotPng, "base64");
   expect(png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(true);
-  const width = png.readUInt32BE(16);
-  const height = png.readUInt32BE(20);
-  expect(width).toBe(1280);
-  expect(height).toBeGreaterThanOrEqual(pageHeight);
+  expect(png.readUInt32BE(16)).toBe(1280);
+  expect(png.readUInt32BE(20)).toBeGreaterThanOrEqual(pageHeight);
 
   // 6. The page is left as it was: scroll position restored, nothing hidden.
   expect(await page.evaluate(() => window.scrollY)).toBe(300);
@@ -159,9 +174,80 @@ test("pair, then Capture this page sends the screenshot, the stripped HTML and t
   await expect.poll(() => inPopup(`document.querySelector('[role="status"]')?.textContent ?? ""`)).toContain("Captured");
   for (const r of stub.requests) expect(r.url).not.toContain(stub.token()!);
   for (const r of stub.requests.filter((x) => x.method === "POST")) expect(r.headers.origin).toBe(`chrome-extension://${extensionId}`);
-  // Chrome sends no Origin on these GETs (host permission): see stub-service.ts and the report.
-  expect(stub.noOriginGets.every((p) => p === "/projects")).toBe(true);
+  expect(stub.noOriginGets.every((p) => p === "/projects")).toBe(true); // R111: only there
   expect(stub.refusals).toEqual([]);
+  await page.close();
+});
+
+test("profile as I scroll: the noted links go to POST /capture/browser/links on Finish", async () => {
+  const page = await view(PROFILE_URL);
+  const inPopup = await openPopupOn(PROFILE_URL);
+  await expect.poll(() => inPopup(enabled("Capture this page")), { timeout: 15_000 }).toBe(true);
+  // Choose the project that allows the downloader (React reads the select's change event).
+  await inPopup(`(() => { const s = document.querySelector("select"); s.value = "p-profiles"; s.dispatchEvent(new Event("change", { bubbles: true })); })()`);
+  await expect.poll(() => inPopup(enabled("Capture profile as I scroll"))).toBe(true);
+  await inPopup(`${button("Capture profile as I scroll")}.click()`);
+  await expect.poll(() => inPopup(`document.body.textContent`)).toContain("6 posts noted");
+
+  // The researcher scrolls; the page shows more posts.
+  await page.evaluate(() => {
+    document.querySelector("main")!.insertAdjacentHTML("beforeend", `<div style="height:2000px"></div><a href="/p/C0FAKEPOST7/">7</a>`);
+    window.scrollTo(0, 1500);
+  });
+  await expect.poll(() => inPopup(`document.body.textContent`), { timeout: 10_000 }).toContain("7 posts noted");
+  await inPopup(`${button("Finish")}.click()`);
+
+  await expect.poll(() => stub.linkLists.length, { timeout: 15_000 }).toBe(1);
+  const req = stub.linkLists[0]!;
+  expect(req.headers.origin).toBe(`chrome-extension://${extensionId}`);
+  expect(req.headers.authorization).toBe(`Bearer ${stub.token()}`);
+  expect(req.body).toEqual({
+    projectId: "p-profiles",
+    urls: [
+      "https://www.instagram.com/p/C0FAKEPOST1/",
+      "https://www.instagram.com/p/C0FAKEPOST2/",
+      "https://www.instagram.com/reel/C0FAKEREEL3/",
+      "https://www.instagram.com/p/C0FAKEPOST4/",
+      "https://www.instagram.com/p/C0FAKEPOST5/",
+      "https://www.instagram.com/p/C0FAKEPOST6/",
+      "https://www.instagram.com/p/C0FAKEPOST7/",
+    ],
+  });
+  await expect.poll(() => inPopup(`document.querySelector('[role="status"]')?.textContent ?? ""`)).toContain("Sent 7 links");
+  // Nothing was clicked or opened for the user: the page is still the profile.
+  expect(page.url()).toBe(PROFILE_URL);
+  expect(stub.refusals).toEqual([]);
+  await page.close();
+});
+
+test("the HTML snapshot fetches nothing (built in an inert document)", async () => {
+  const page = await view(PROBE_URL);
+  await page.waitForLoadState("networkidle");
+  await page.waitForTimeout(1500); // let preload=auto media settle
+  await openPopupOn(PROBE_URL); // grants activeTab
+  const seen = fixtures.requests.length;
+
+  const tabId = (await worker.evaluate(async () => {
+    const c = (globalThis as unknown as { chrome: { tabs: { query(q: object): Promise<Array<{ id: number }>> } } }).chrome;
+    return (await c.tabs.query({ active: true, lastFocusedWindow: true }))[0]!.id;
+  })) as number;
+  const html = (await worker.evaluate(async (id: number) => {
+    const c = (globalThis as unknown as { chrome: { runtime: { getURL(p: string): string }; scripting: { executeScript(o: object): Promise<Array<{ result: unknown }>> } } }).chrome;
+    const sel = await (await fetch(c.runtime.getURL("selectors.json"))).json();
+    await c.scripting.executeScript({ target: { tabId: id }, files: ["content.js"] });
+    const [r] = await c.scripting.executeScript({
+      target: { tabId: id },
+      func: (s: unknown) => (globalThis as unknown as { __aoCapture: { collect(x: unknown): { html?: string } } }).__aoCapture.collect(s).html,
+      args: [sel],
+    });
+    return r!.result;
+  }, tabId)) as string;
+  await page.waitForTimeout(2000);
+
+  expect(html).toContain('src="/probe/video.mp4"');
+  expect(html).toContain('src="/probe/lazy.png"');
+  expect(fixtures.requests.slice(seen)).toEqual([]);
+  await page.close();
 });
 
 test("unpair clears the stored token", async () => {

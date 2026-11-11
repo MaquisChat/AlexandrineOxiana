@@ -9,7 +9,7 @@ import { validateSelectors, type SelectorsConfig } from "../selectors-schema.js"
 import { absoluteUrl, canonicalOn, readAll, readCommon } from "./engine.js";
 import { extractGeneric } from "./generic.js";
 import { instagram } from "./instagram.js";
-import type { PlatformExtractor } from "./platform.js";
+import type { PageIdentity, PlatformExtractor } from "./platform.js";
 import { tiktok } from "./tiktok.js";
 import { youtube } from "./youtube.js";
 
@@ -26,6 +26,14 @@ export function platformFor(url: string): PlatformExtractor | undefined {
   return u ? PLATFORM_EXTRACTORS.find((p) => p.hosts.includes(u.hostname)) : undefined;
 }
 
+/** `canonical` when it names the same page as the address (same kind, post id and account); else undefined. */
+function sameItem(platform: PlatformExtractor, canonical: string | undefined, id: PageIdentity): string | undefined {
+  const c = canonical ? platform.identify(new URL(canonical)) : undefined;
+  if (!c || c.kind !== id.kind || c.postId !== id.postId) return undefined;
+  if (id.postId === undefined && c.handle?.toLowerCase() !== id.handle?.toLowerCase()) return undefined;
+  return canonical;
+}
+
 export function extractPage(doc: Document, url: string, selectors: SelectorsConfig = bundledSelectors()): ExtractedPage {
   const u = absoluteUrl(url, url);
   const platform = platformFor(url);
@@ -39,7 +47,7 @@ export function extractPage(doc: Document, url: string, selectors: SelectorsConf
   return {
     platform: platform.name,
     kind: id.kind,
-    canonicalUrl: canonicalOn(doc, url, page, platform.hosts) ?? id.canonical,
+    canonicalUrl: sameItem(platform, canonicalOn(doc, url, page, platform.hosts), id) ?? id.canonical,
     ...(id.postId ? { postId: id.postId } : {}),
     ...(handle ? { handle } : {}),
     ...(common.displayName ? { displayName: common.displayName } : {}),

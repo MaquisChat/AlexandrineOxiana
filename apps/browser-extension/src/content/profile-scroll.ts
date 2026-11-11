@@ -7,12 +7,19 @@
 import { collectPostLinks, MAX_POST_LINKS } from "./extractors/index.js";
 import type { SelectorsConfig } from "./selectors-schema.js";
 
+/** A path with one trailing slash, for "is this still the same profile" comparisons. */
+const withSlash = (p: string) => (p.endsWith("/") ? p : `${p}/`);
+
 export class ProfileCollector {
   private readonly seen = new Set<string>();
   private readonly urls: string[] = [];
   private running = false;
+  private hasLeft = false;
+  private startPath = "/";
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private watch: ReturnType<typeof setInterval> | undefined;
   private readonly throttleMs: number;
+  private readonly onLeave: (count: number) => void;
   private readonly onScroll = () => {
     if (!this.running) return;
     if (this.throttleMs === 0) return this.observe();
@@ -28,9 +35,10 @@ export class ProfileCollector {
     private readonly url: string,
     private readonly selectors: SelectorsConfig,
     private readonly onChange: (count: number) => void,
-    opts: { throttleMs?: number } = {},
+    opts: { throttleMs?: number; onLeave?: (count: number) => void } = {},
   ) {
     this.throttleMs = opts.throttleMs ?? 250;
+    this.onLeave = opts.onLeave ?? (() => {});
   }
 
   get count(): number {
@@ -41,11 +49,19 @@ export class ProfileCollector {
     return this.urls.length >= MAX_POST_LINKS;
   }
 
+  /** The page moved away from the profile it started on (single-page navigation); listening ended. */
+  get left(): boolean {
+    return this.hasLeft;
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.startPath = withSlash(this.win.location.pathname);
     // Passive listeners: noting links never delays or changes the user's scrolling.
     this.win.addEventListener("scroll", this.onScroll, { passive: true, capture: true });
+    // Sites change their address without reloading; notice that even when nobody scrolls.
+    this.watch = setInterval(() => this.checkStillOnProfile(), 1000);
     this.observe();
   }
 
@@ -54,11 +70,24 @@ export class ProfileCollector {
     this.running = false;
     this.win.removeEventListener("scroll", this.onScroll, { capture: true });
     if (this.timer !== undefined) clearTimeout(this.timer);
+    if (this.watch !== undefined) clearInterval(this.watch);
     this.timer = undefined;
+    this.watch = undefined;
     return [...this.urls];
   }
 
+  /** The profile's own tabs (/name/reels/) still count; anything else ends listening. */
+  private checkStillOnProfile(): boolean {
+    if (!this.running) return false;
+    if (withSlash(this.win.location.pathname).startsWith(this.startPath)) return true;
+    this.stop();
+    this.hasLeft = true;
+    this.onLeave(this.urls.length);
+    return false;
+  }
+
   private observe(): void {
+    if (!this.checkStillOnProfile()) return;
     const added = collectPostLinks(this.doc, this.url, this.selectors, this.seen);
     if (!added.length) return;
     this.urls.push(...added);
@@ -114,6 +143,11 @@ export class ProfileOverlay {
   setCount(n: number, full: boolean): void {
     this.counter.textContent = `${n} post${n === 1 ? "" : "s"} noted`;
     this.note.textContent = full ? "That is the most one list can hold. Finish to send it." : "Scroll the profile yourself; nothing is clicked or opened for you.";
+  }
+
+  /** Listening stopped on its own (the page left the profile): Finish and Cancel stay. */
+  warn(text: string): void {
+    this.note.textContent = text;
   }
 
   /** Listening has ended: hide the buttons and show `text`. */

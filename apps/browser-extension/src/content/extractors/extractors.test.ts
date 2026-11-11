@@ -135,3 +135,47 @@ describe("collectPostLinks", () => {
     expect(collectPostLinks(page(`<a href="/p/X1/">x</a>`), "https://news.example/", selectors)).toEqual([]);
   });
 });
+
+describe("limits (R112)", () => {
+  it("drops media links longer than 2,048 characters (50 og:image tags of 1 MB each → none)", () => {
+    const huge = `https://news.example/${"a".repeat(1024 * 1024)}`;
+    const doc = page("<p>x</p>");
+    for (let i = 0; i < 50; i++) {
+      // Built with the DOM API: parsing 50 MB of markup in jsdom takes longer than the test itself.
+      const m = doc.createElement("meta");
+      m.setAttribute("property", "og:image");
+      m.setAttribute("content", `${huge}${i}`);
+      doc.head.append(m);
+    }
+    const r = extractPage(doc, "https://news.example/story", selectors);
+    expect(r.mediaUrls).toEqual([]);
+  });
+
+  it("keeps at most 50 media links", () => {
+    const head = Array.from({ length: 80 }, (_, i) => `<meta property="og:image" content="https://news.example/img/${i}.jpg">`).join("");
+    const r = extractPage(page("<p>x</p>", head), "https://news.example/story", selectors);
+    expect(r.mediaUrls).toHaveLength(50);
+    expect(r.mediaUrls[49]).toBe("https://news.example/img/49.jpg");
+  });
+
+  it("ignores a canonical link to another post on the same platform", () => {
+    const doc = page(`<main></main>`, `<link rel="canonical" href="https://www.instagram.com/p/C0OTHERPOST/">`);
+    const r = extractPage(doc, "https://www.instagram.com/p/C0FAKEPOST1/", selectors);
+    expect(r.canonicalUrl).toBe("https://www.instagram.com/p/C0FAKEPOST1/");
+    const yt = page(`<main></main>`, `<link rel="canonical" href="https://www.youtube.com/watch?v=OTHERvid001">`);
+    expect(extractPage(yt, "https://www.youtube.com/watch?v=FAKEvid0001", selectors).canonicalUrl).toBe("https://www.youtube.com/watch?v=FAKEvid0001");
+    const profile = page(`<main></main>`, `<link rel="canonical" href="https://www.instagram.com/someone.else/">`);
+    expect(extractPage(profile, "https://www.instagram.com/fieldnotes.example/", selectors).canonicalUrl).toBe("https://www.instagram.com/fieldnotes.example/");
+  });
+
+  it("matches selector patterns against at most the first 20,000 characters", () => {
+    const custom = validateSelectors({
+      ...rawSelectors,
+      platforms: { ...rawSelectors.platforms, generic: { pages: { page: { fields: { caption: [{ css: "p#v", pattern: "(x)$" }] } } } } },
+    });
+    const short = page(`<p id="v">${"a".repeat(100)}x</p>`);
+    expect(extractPage(short, "https://news.example/", custom).caption).toBe("x");
+    const long = page(`<p id="v">${"a".repeat(30_000)}x</p>`);
+    expect(extractPage(long, "https://news.example/", custom).caption).toBeUndefined();
+  });
+});

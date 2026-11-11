@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CAPTURE_INTERVAL_MS, MAX_SCREENSHOT_HEIGHT, bytesToBase64, memoryBudgetPixels, planCapture, waitForSlot } from "./screenshot.js";
+import { CAPTURE_INTERVAL_MS, MAX_SCREENSHOT_HEIGHT, bytesToBase64, createCaptureLimiter, memoryBudgetPixels, planCapture, waitForSlot } from "./screenshot.js";
 
 describe("planCapture", () => {
   it("covers the whole page in viewport steps, the last one flush with the bottom", () => {
@@ -68,6 +68,33 @@ describe("waitForSlot (captureVisibleTab allows two calls a second)", () => {
     const next = await waitForSlot(last, clock, sleep);
     expect(slept).toEqual([CAPTURE_INTERVAL_MS - 100]);
     expect(next - last).toBeGreaterThanOrEqual(CAPTURE_INTERVAL_MS);
+  });
+});
+
+describe("createCaptureLimiter (one limiter for every capture the background runs)", () => {
+  it("spaces concurrent callers CAPTURE_INTERVAL_MS apart, in order", async () => {
+    let now = 0;
+    const sleep = async (ms: number) => {
+      now += ms;
+    };
+    const slot = createCaptureLimiter(() => now, sleep);
+    const times: number[] = [];
+    await Promise.all([1, 2, 3, 4].map(() => slot().then(() => times.push(now))));
+    expect(times).toEqual([0, CAPTURE_INTERVAL_MS, 2 * CAPTURE_INTERVAL_MS, 3 * CAPTURE_INTERVAL_MS]);
+  });
+
+  it("does not wait when the last capture was long enough ago", async () => {
+    let now = 0;
+    const slot = createCaptureLimiter(
+      () => now,
+      async (ms) => {
+        now += ms;
+      },
+    );
+    await slot();
+    now += 2000;
+    await slot();
+    expect(now).toBe(2000);
   });
 });
 

@@ -18,9 +18,14 @@ export const MAX_HTML_CHARS = 5 * 1024 * 1024;
 
 const URL_ATTRS = ["href", "src", "action", "formaction", "xlink:href", "poster", "data", "background"];
 
-/** document.documentElement.outerHTML of a copy without scripts, event handlers or javascript: URLs. */
+/**
+ * document.documentElement.outerHTML of a copy without scripts, event handlers or javascript: URLs.
+ * The copy lives in an inert document (no browsing context): a copy made inside the live page would
+ * start fetching its images, video and audio again (R112).
+ */
 export function snapshotHtml(doc: Document): string {
-  const root = doc.documentElement.cloneNode(true) as HTMLElement;
+  const inert = doc.implementation.createHTMLDocument("");
+  const root = inert.importNode(doc.documentElement, true) as HTMLElement;
   for (const el of Array.from(root.querySelectorAll("script, noscript"))) el.remove();
   for (const el of [root, ...Array.from(root.querySelectorAll("*"))]) {
     for (const a of Array.from(el.attributes)) {
@@ -42,6 +47,8 @@ export interface Collected {
 export interface ProfileState {
   active: boolean;
   count: number;
+  /** The page left the profile it started on: nothing more is noted (Finish or Cancel). */
+  left?: boolean;
 }
 
 export interface ContentApi {
@@ -121,14 +128,16 @@ export function createContentApi(win: Window, messenger: PageMessenger): Content
             messenger.cancel();
           },
         });
-        const collector = new ProfileCollector(win.document, win, win.location.href, s, (n) => overlay.setCount(n, collector.full));
+        const collector = new ProfileCollector(win.document, win, win.location.href, s, (n) => overlay.setCount(n, collector.full), {
+          onLeave: (n) => overlay.warn(`This page is no longer the profile you started on, so nothing more is noted. ${n} link${n === 1 ? "" : "s"} noted: Finish sends them, Cancel drops them.`),
+        });
         profile = { collector, overlay };
         collector.start();
       }
       return { active: true, count: profile.collector.count };
     },
     profileStatus() {
-      return { active: !!profile, count: profile?.collector.count ?? 0 };
+      return { active: !!profile, count: profile?.collector.count ?? 0, ...(profile?.collector.left ? { left: true } : {}) };
     },
     profileStop: endProfile,
   };

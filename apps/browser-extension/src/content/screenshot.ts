@@ -73,6 +73,22 @@ export async function waitForSlot(lastAt: number | undefined, clock: () => numbe
   return clock();
 }
 
+/**
+ * One limiter shared by every capture the background runs (R112): callers queue in order, and each
+ * call to `slot()` returns when the next captureVisibleTab call is allowed.
+ */
+export function createCaptureLimiter(clock: () => number = Date.now, sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): () => Promise<void> {
+  let last: number | undefined;
+  let queue: Promise<void> = Promise.resolve();
+  return () => {
+    const turn = queue.then(async () => {
+      last = await waitForSlot(last, clock, sleep);
+    });
+    queue = turn.catch(() => {});
+    return turn;
+  };
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let s = "";
   for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -160,6 +176,8 @@ export interface ScreenshotDeps {
   };
   /** tabs.captureVisibleTab as a PNG data: URL. */
   captureVisible(): Promise<string>;
+  /** Waits for the shared captureVisibleTab rate limit (createCaptureLimiter). */
+  slot(): Promise<void>;
   deviceMemoryGb?: number;
 }
 
@@ -183,11 +201,10 @@ export async function captureFullPage(deps: ScreenshotDeps): Promise<Screenshot>
     const g = canvas.getContext("2d");
     if (!g) throw new Error("This browser cannot draw the screenshot.");
     const pxPerCss = plan.outWidth / m.viewportWidth;
-    let last: number | undefined;
     for (const [i, y] of plan.positions.entries()) {
       const at = await deps.page.scrollTo(y);
       if (i === 1) await deps.page.hideFixed();
-      last = await waitForSlot(last);
+      await deps.slot();
       const dataUrl = await deps.captureVisible();
       const bmp = await createImageBitmap(new Blob([base64ToBytes(dataUrl.slice(dataUrl.indexOf(",") + 1)) as BlobPart], { type: "image/png" }));
       try {

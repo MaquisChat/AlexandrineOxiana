@@ -7,7 +7,10 @@
 import type { Alternative, FieldName, PageSelectors } from "../selectors-schema.js";
 
 const MAX_TEXT = 20_000;
-const MAX_MEDIA = 50;
+/** Patterns see at most this much of a value (R112). */
+export const MAX_PATTERN_INPUT = 20_000;
+export const MAX_MEDIA = 50;
+export const MAX_URL_CHARS = 2048;
 
 /** Visible-ish text of an element: <br> becomes a line break, runs of spaces collapse. */
 export function textOf(el: Element): string {
@@ -41,17 +44,23 @@ function rawValue(el: Element, read: string | undefined): string | undefined {
 
 function applyPattern(v: string, pattern: string | undefined): string | undefined {
   if (!pattern) return v;
-  const m = new RegExp(pattern).exec(v);
+  const m = new RegExp(pattern).exec(v.slice(0, MAX_PATTERN_INPUT));
   return m?.[1] || undefined;
 }
 
-/** All values of one alternative (several elements allowed: lists such as media or post links). */
-export function readAll(doc: ParentNode, alt: Alternative): string[] {
+/**
+ * Values of one alternative (several elements allowed: lists such as media or post links). With
+ * `limit`, reading stops once that many values were accepted by `accept`.
+ */
+export function readAll(doc: ParentNode, alt: Alternative, opts: { limit?: number; accept?: (v: string) => string | undefined } = {}): string[] {
   const out: string[] = [];
-  for (const el of Array.from(doc.querySelectorAll(alt.css))) {
+  const limit = opts.limit ?? Number.POSITIVE_INFINITY;
+  for (const el of doc.querySelectorAll(alt.css)) {
+    if (out.length >= limit) break;
     const raw = rawValue(el, alt.read);
     const v = raw === undefined ? undefined : applyPattern(raw, alt.pattern);
-    if (v) out.push(v);
+    const accepted = v && (opts.accept ? opts.accept(v) : v);
+    if (accepted) out.push(accepted);
   }
   return out;
 }
@@ -126,15 +135,24 @@ export function readCommon(doc: Document, url: string, page: PageSelectors | und
     if (n !== undefined) counts[k] = n;
   }
   if (Object.keys(counts).length) out.counts = counts;
-  const media = new Set<string>();
   for (const alt of f.mediaUrls ?? []) {
-    for (const v of readAll(doc, alt)) {
-      const u = absoluteUrl(v, url);
-      if (u && media.size < MAX_MEDIA) media.add(u.href);
+    const media = new Set<string>();
+    // At most 50 links of at most 2,048 characters; reading stops at 50 (R112).
+    readAll(doc, alt, {
+      limit: MAX_MEDIA,
+      accept: (v) => {
+        if (v.length > MAX_URL_CHARS) return undefined;
+        const href = absoluteUrl(v, url)?.href;
+        if (!href || href.length > MAX_URL_CHARS || media.has(href)) return undefined;
+        media.add(href);
+        return href;
+      },
+    });
+    if (media.size) {
+      out.mediaUrls = [...media]; // the first alternative that finds media is the answer
+      break;
     }
-    if (media.size) break; // the first alternative that finds media is the answer
   }
-  out.mediaUrls = [...media];
   return out;
 }
 

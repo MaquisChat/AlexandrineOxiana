@@ -27,6 +27,20 @@ describe("snapshotHtml (pre-strip in the page; the service strips again)", () =>
     expect(doc.querySelectorAll("script")).toHaveLength(2);
     expect(doc.body.getAttribute("onload")).toBe("void 0");
   });
+
+  it("builds the copy in an inert document, never by cloning inside the live page (which would fetch media again)", () => {
+    const doc = new DOMParser().parseFromString(`<!DOCTYPE html><html><body><video src="/v.mp4" preload="auto"></video><img src="/a.png"></body></html>`, "text/html");
+    const clone = vi.spyOn(doc.documentElement, "cloneNode");
+    const importNode = vi.spyOn(doc, "importNode");
+    const create = vi.spyOn(doc.implementation, "createHTMLDocument");
+    const html = snapshotHtml(doc);
+    expect(clone).not.toHaveBeenCalled();
+    expect(importNode).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
+    const inert = create.mock.results[0]!.value as Document;
+    expect(inert).not.toBe(doc);
+    expect(html).toContain('<video src="/v.mp4" preload="auto"></video>');
+  });
 });
 
 describe("ProfileCollector (profile as I scroll)", () => {
@@ -67,6 +81,33 @@ describe("ProfileCollector (profile as I scroll)", () => {
     expect(click).not.toHaveBeenCalled();
     expect(intoView).not.toHaveBeenCalled();
     expect(window.location.href).not.toContain("/p/");
+  });
+
+  it("stops and warns when the page navigates away from the profile it started on (single-page apps)", () => {
+    document.open();
+    document.write(fixtureHtml("instagram-profile.html"));
+    document.close();
+    history.pushState(null, "", "/fieldnotes.example/");
+    const left: number[] = [];
+    const c = new ProfileCollector(document, window, "https://www.instagram.com/fieldnotes.example/", selectors, () => {}, { throttleMs: 0, onLeave: (n) => left.push(n) });
+    c.start();
+    expect(c.count).toBe(6);
+    // Staying on the profile's own tabs is fine.
+    history.pushState(null, "", "/fieldnotes.example/reels/");
+    document.querySelector("main")!.insertAdjacentHTML("beforeend", `<a href="/reel/C0FAKEREEL9/"></a>`);
+    window.dispatchEvent(new Event("scroll"));
+    expect(c.count).toBe(7);
+    // The page moves to another account: listening ends, the links noted so far are kept.
+    history.pushState(null, "", "/someone.else/");
+    document.querySelector("main")!.insertAdjacentHTML("beforeend", `<a href="/p/OTHERPOST1/"></a>`);
+    window.dispatchEvent(new Event("scroll"));
+    expect(c.count).toBe(7);
+    expect(c.left).toBe(true);
+    expect(left).toEqual([7]);
+    window.dispatchEvent(new Event("scroll"));
+    expect(left).toEqual([7]);
+    expect(c.stop()).toHaveLength(7);
+    history.pushState(null, "", "/");
   });
 
   it("stops at 500 links (the service's per-request limit)", () => {

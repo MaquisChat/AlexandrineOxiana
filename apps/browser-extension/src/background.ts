@@ -9,15 +9,18 @@
  */
 import browser, { type Runtime } from "webextension-polyfill";
 import { ApiError, createApi } from "./api.js";
+import { fitCaptureBody } from "./body-size.js";
 import type { ContentApi } from "./content/index.js";
-import { bytesToBase64, captureFullPage } from "./content/screenshot.js";
+import { bytesToBase64, captureFullPage, createCaptureLimiter } from "./content/screenshot.js";
 import { validateSelectors, type SelectorsConfig } from "./content/selectors-schema.js";
-import type { BackgroundRequest, BrowserCaptureBody, CaptureReply, PendingLinks, ProfileStatus } from "./types.js";
+import { addPending, chunks, parsePending, removePending } from "./pending.js";
+import type { BackgroundRequest, CaptureReply, ProfileStatus } from "./types.js";
 
 const api = createApi({ fetch: (input, init) => fetch(input, init), storage: browser.storage.local });
 
-/** The service's limit for one POST /capture/browser (32 MB) less room for the rest of the body. */
-const MAX_BODY_CHARS = 31 * 1024 * 1024;
+/** captureVisibleTab allows two calls a second for the whole extension: one limiter for all captures. */
+const captureSlot = createCaptureLimiter();
+/** The service takes at most 500 links per request. */
 const MAX_LINKS = 500;
 
 // ---- selectors.json: loaded from the package and checked against its schema ----
@@ -99,22 +102,22 @@ async function capturePage(tabId: number, projectId: string, alsoDownload: boole
         if (!now.active || now.windowId !== tab.windowId) throw new Error("The capture stopped because another tab was brought to the front. Try again and stay on the page until it finishes.");
         return browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
       },
+      slot: captureSlot,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
     });
     const notes: string[] = [];
-    const body: BrowserCaptureBody = {
+    if (collected.htmlNote) notes.push(collected.htmlNote);
+    // Within the service's 32 MB, in bytes: HTML, then media links are dropped, else refused here.
+    const fitted = fitCaptureBody({
       projectId,
       url: collected.url,
       extracted: collected.extracted,
       screenshotPng: bytesToBase64(shot.png),
       ...(collected.html ? { html: collected.html } : {}),
       alsoDownload,
-    };
-    if (collected.htmlNote) notes.push(collected.htmlNote);
-    if (JSON.stringify(body).length > MAX_BODY_CHARS) {
-      delete body.html;
-      notes.push("The page's HTML was left out to keep the capture within the desktop app's size limit.");
-    }
+    });
+    const body = fitted.body;
+    notes.push(...fitted.notes);
     if (shot.truncated) notes.push("The page is very long: the screenshot stops after 30,000 pixels.");
     else if (shot.scaled) notes.push("The screenshot was made smaller to fit in memory.");
     const r = await api.captureBrowser(body);
@@ -153,22 +156,60 @@ function cleanLinks(v: unknown): string[] {
   return [...out];
 }
 
+// Links not sent, per project, in storage.session; every change goes through one queue so two
+// finishing runs cannot overwrite each other's lists.
+let pendingQueue: Promise<unknown> = Promise.resolve();
+function updatePending(change: (p: ReturnType<typeof parsePending>) => ReturnType<typeof parsePending>): Promise<void> {
+  const run = pendingQueue.then(async () => {
+    const next = change(parsePending((await browser.storage.session.get(PENDING))[PENDING]));
+    if (Object.keys(next).length) await browser.storage.session.set({ [PENDING]: next });
+    else await browser.storage.session.remove(PENDING);
+  });
+  pendingQueue = run.catch(() => {});
+  return run;
+}
+
+/** Why the service did not take a list, in words for the user (R112: by error code). */
+function refusalReason(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.code === "FORBIDDEN") return "the desktop app needs updating (this version does not take link lists from the extension)";
+    if (e.code === "POLICY_DENIED") return `the project's rules do not allow it: ${e.reason ?? e.message}`;
+  }
+  return errorText(e);
+}
+
+const links = (n: number) => `${n} link${n === 1 ? "" : "s"}`;
+
+/** Sends `urls` (in pieces of 500) to POST /capture/browser/links; what is not taken is kept for the project. */
 async function sendLinks(projectId: string, urls: string[]): Promise<CaptureReply> {
   if (!urls.length) return { ok: false, message: "No post links were noted. Scroll the profile, then press Finish." };
+  let sent = 0;
   try {
-    await api.queueLinks(projectId, urls);
-    await browser.storage.session.remove(PENDING);
-    return { ok: true, message: `Sent ${urls.length} link${urls.length === 1 ? "" : "s"} to the desktop app's capture queue.` };
+    for (const part of chunks(urls, MAX_LINKS)) {
+      await api.queueLinks(projectId, part);
+      sent += part.length;
+    }
   } catch (e) {
-    // The current service lets the extension token reach only /capture/browser and GET /projects (R96).
-    const reason = e instanceof ApiError && e.status === 403 ? "this version of the desktop app does not take link lists from the extension" : errorText(e);
-    const pending: PendingLinks = { projectId, urls, reason };
-    await browser.storage.session.set({ [PENDING]: pending });
-    return { ok: false, message: `The ${urls.length} links were not sent: ${reason}. They are kept until the browser closes; open the extension to try again or copy them.` };
+    const reason = refusalReason(e);
+    const rest = urls.slice(sent);
+    await updatePending((p) => addPending(p, projectId, rest, reason));
+    return { ok: false, message: `${sent ? `Sent ${links(sent)}; ` : ""}${links(rest.length)} not sent: ${reason}. They are kept until the browser closes; open the extension to try again or copy them.` };
   }
+  // Whatever of these was waiting for this project has now been taken.
+  const done = new Set(urls);
+  await updatePending((p) => {
+    const left = (p[projectId]?.urls ?? []).filter((u) => !done.has(u));
+    return left.length ? { ...p, [projectId]: { ...p[projectId]!, urls: left } } : removePending(p, projectId);
+  });
+  return { ok: true, message: `Sent ${links(sent)} to the desktop app's capture queue.` };
 }
 
 async function profileStart(tabId: number, projectId: string): Promise<ProfileStatus> {
+  // Profile capture queues the links for the downloader: the project must allow both (R112).
+  const project = (await api.listProjects()).find((p) => p.id === projectId);
+  if (!project?.captureMethods.includes("browser_capture") || !project.captureMethods.includes("downloader")) {
+    throw new Error("Profile capture needs a project whose rules allow both browser capture and the downloader.");
+  }
   const sel = await loadSelectors();
   await injectContent(tabId);
   const s = await inTab(tabId, "profileStart", sel);
@@ -233,11 +274,13 @@ async function handle(msg: BackgroundRequest, sender: Runtime.MessageSender): Pr
     case "profile-cancel":
       return validTab(msg.tabId) ? profileCancel(msg.tabId, true) : undefined;
     case "pending-retry": {
-      const p = (await browser.storage.session.get(PENDING))[PENDING] as PendingLinks | undefined;
-      return p ? sendLinks(p.projectId, cleanLinks(p.urls)) : { ok: false, message: "Nothing is waiting to be sent." };
+      if (!validId(msg.projectId)) return undefined;
+      const entry = parsePending((await browser.storage.session.get(PENDING))[PENDING])[msg.projectId];
+      return entry ? sendLinks(msg.projectId, entry.urls) : { ok: false, message: "Nothing is waiting to be sent." };
     }
     case "pending-discard":
-      await browser.storage.session.remove(PENDING);
+      if (!validId(msg.projectId)) return undefined;
+      await updatePending((p) => removePending(p, msg.projectId));
       return { ok: true, message: "Discarded." };
     default:
       return undefined;

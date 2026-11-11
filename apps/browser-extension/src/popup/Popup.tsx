@@ -6,14 +6,15 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import type { Api, Pairing } from "../api.js";
-import type { BackgroundRequest, CaptureReply, PendingLinks, ProfileStatus, ProjectChoice } from "../types.js";
+import type { PendingByProject } from "../pending.js";
+import type { BackgroundRequest, CaptureReply, ProfileStatus, ProjectChoice } from "../types.js";
 
 export interface PopupBridge {
   api: Api;
   /** The tab the popup was opened on. */
   activeTabId(): Promise<number | undefined>;
   send<T>(msg: BackgroundRequest): Promise<T>;
-  pendingLinks(): Promise<PendingLinks | undefined>;
+  pendingLinks(): Promise<PendingByProject>;
   copy(text: string): Promise<void>;
 }
 
@@ -34,7 +35,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [profile, setProfile] = useState<ProfileStatus>({ active: false, count: 0 });
-  const [pending, setPending] = useState<PendingLinks | undefined>();
+  const [pending, setPending] = useState<PendingByProject>({});
 
   const refresh = useCallback(async () => {
     const pairing = await bridge.api.getPairing();
@@ -166,14 +167,14 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
             <input type="checkbox" checked={alsoDownload && downloaderAllowed} disabled={!downloaderAllowed || busy} onChange={(e) => setAlsoDownload(e.target.checked)} />
             Also download media with the downloader
           </label>
-          {!downloaderAllowed && <p className="hint">This project's rules do not allow the downloader.</p>}
+          {!downloaderAllowed && <p className="hint">This project's rules do not allow the downloader, so media downloads and profile capture are off.</p>}
 
           <div className="actions">
             <button type="button" disabled={!canCapture || profile.active} onClick={() => void run<CaptureReply>({ type: "capture-page", tabId: tabId!, projectId, alsoDownload: alsoDownload && downloaderAllowed }, "Capturing… keep this tab in front until it finishes.", showReply)}>
               Capture this page
             </button>
             {!profile.active ? (
-              <button type="button" disabled={!canCapture} onClick={() => void run<ProfileStatus & { error?: string }>({ type: "profile-start", tabId: tabId!, projectId }, "Starting…", (r) => {
+              <button type="button" disabled={!canCapture || !downloaderAllowed} onClick={() => void run<ProfileStatus & { error?: string }>({ type: "profile-start", tabId: tabId!, projectId }, "Starting…", (r) => {
                 setProfile(statusOf(r));
                 setStatus(r?.error ?? "Scroll the profile yourself. Posts you scroll past are noted; nothing is clicked or opened for you.");
               })}>
@@ -184,6 +185,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
                 <p>
                   {profile.count} post{profile.count === 1 ? "" : "s"} noted
                 </p>
+                {profile.left && <p className="hint">This tab is no longer on the profile you started on, so nothing more is noted. Finish sends what was noted.</p>}
                 <button type="button" disabled={busy} onClick={() => void run<CaptureReply>({ type: "profile-finish", tabId: tabId! }, "Sending…", (r) => {
                   setProfile({ active: false, count: 0 });
                   showReply(r);
@@ -203,31 +205,31 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
         </>
       )}
 
-      {pending && (
-        <section className="pending">
+      {Object.entries(pending).map(([pid, entry]) => (
+        <section className="pending" key={pid}>
           <p>
-            {pending.urls.length} link{pending.urls.length === 1 ? "" : "s"} not sent: {pending.reason}.
+            {entry.urls.length} link{entry.urls.length === 1 ? "" : "s"} for “{projects?.find((p) => p.id === pid)?.name ?? "another project"}” not sent: {entry.reason}.
           </p>
-          <textarea readOnly value={pending.urls.join("\n")} rows={4} aria-label="Links not sent" />
+          <textarea readOnly value={entry.urls.join("\n")} rows={4} aria-label="Links not sent" />
           <div className="actions">
-            <button type="button" disabled={busy} onClick={() => void run<CaptureReply>({ type: "pending-retry" }, "Sending…", (r) => {
+            <button type="button" disabled={busy} onClick={() => void run<CaptureReply>({ type: "pending-retry", projectId: pid }, "Sending…", (r) => {
               showReply(r);
               void bridge.pendingLinks().then(setPending);
             })}>
               Try again
             </button>
-            <button type="button" onClick={() => void bridge.copy(pending.urls.join("\n")).then(() => setStatus("Copied."), (e: unknown) => setStatus(message(e)))}>
+            <button type="button" onClick={() => void bridge.copy(entry.urls.join("\n")).then(() => setStatus("Copied."), (e: unknown) => setStatus(message(e)))}>
               Copy list
             </button>
-            <button type="button" onClick={() => void run({ type: "pending-discard" }, "", () => {
-              setPending(undefined);
+            <button type="button" onClick={() => void run({ type: "pending-discard", projectId: pid }, "", () => {
+              void bridge.pendingLinks().then(setPending);
               setStatus("Discarded.");
             })}>
               Discard
             </button>
           </div>
         </section>
-      )}
+      ))}
 
       <p role="status" className="status">
         {status}

@@ -48,6 +48,20 @@ describe("selectors.json schema", () => {
     expect(() => validateSelectors(t)).toThrow(/capture group/);
   });
 
+  it("refuses patterns that can backtrack badly: nested quantifiers and backreferences", () => {
+    for (const pattern of ["^((a+)+)$", "^(a*)*b$", "^((?:ab|a)+)+$", "^(a{1,5})+$", "^(?:([a-z]+)*)$", "^(a)\\1$", "^(?<x>a)\\k<x>$"]) {
+      const s = clone();
+      s.platforms.instagram.pages.post.fields.handle[0].pattern = pattern;
+      expect(() => validateSelectors(s), pattern).toThrow(/pattern/);
+    }
+    // Ordinary patterns stay allowed, including a quantified group with no quantifier inside.
+    for (const pattern of ["^/([A-Za-z0-9._]{1,30})/?$", "^(?:ab)+([0-9]+)$", "^([0-9][0-9,.]*) people$", "^\\(([a-z]+)\\)+$", "^([+*]+)$"]) {
+      const s = clone();
+      s.platforms.instagram.pages.post.fields.handle[0].pattern = pattern;
+      expect(() => validateSelectors(s), pattern).not.toThrow();
+    }
+  });
+
   it("refuses a field with no alternatives or a non-array", () => {
     const s = clone();
     s.platforms.instagram.pages.post.fields.caption = [];
