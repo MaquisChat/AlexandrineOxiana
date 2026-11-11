@@ -40,7 +40,7 @@ AO_WORKER_TOKEN=<random, ≥16 chars> AO_WORKER_PORT=0 .venv/bin/python -m ao_wo
 | --- | --- |
 | `AO_WORKER_TOKEN` | required; every request needs `Authorization: Bearer <token>` |
 | `AO_WORKER_PORT` | port on 127.0.0.1 (`0` = any free port; the chosen one is printed) |
-| `AO_MODELS_DIR` | faster-whisper model cache (downloaded on first use) |
+| `AO_MODELS_DIR` | faster-whisper model cache (Hugging Face cache layout). A model already there is loaded with no network contact; an absent one is downloaded on first use, and if that fails the job fails with `MODEL_UNAVAILABLE` ("not installed and could not be downloaded") |
 | `AO_TOOLS_DIR` | managed standalone yt-dlp binary (ADR 0009) |
 | `AO_YTDLP_BIN` / `AO_GALLERYDL_BIN` | use this executable instead |
 | `AO_WORKER_EXIT_ON_STDIN_EOF=1` | exit when stdin closes (set by `startWorker`, so the worker dies with the app) |

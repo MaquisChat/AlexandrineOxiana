@@ -45,6 +45,28 @@ def models_dir() -> Path:
     return base / "ao-worker" / "models"
 
 
+def model_path(name: str) -> str:
+    """The model's folder in `models_dir()`. A model already on disk is used with no network contact
+    at all; only an absent one is downloaded (from Hugging Face, into `models_dir()`)."""
+    from faster_whisper.utils import download_model
+
+    cache = str(models_dir())
+    try:
+        path = download_model(name, cache_dir=cache, local_files_only=True)
+        if (Path(path) / "model.bin").is_file():
+            return path
+    except Exception:  # noqa: BLE001 - huggingface_hub's "not in the local cache" errors vary by version
+        pass
+    log.info("the %s speech model is not on disk; downloading it", name)
+    try:
+        path = download_model(name, cache_dir=cache)
+    except Exception as e:  # noqa: BLE001 - httpx errors (proxy refusal, reset) are not OSError
+        log.warning("downloading the %s speech model failed with %s", name, type(e).__name__)
+        raise JobError("MODEL_UNAVAILABLE", f"the {name} model is not installed and could not be downloaded", type(e).__name__) from e
+    log.info("downloaded the %s speech model", name)
+    return path
+
+
 def _load_model(name: str, compute_type: str):
     """One model kept in memory (the last one used); large models are too big to keep several."""
     from faster_whisper import WhisperModel
@@ -53,15 +75,14 @@ def _load_model(name: str, compute_type: str):
     with _model_lock:
         if key not in _model_cache:
             _model_cache.clear()
+            path = model_path(name)
             try:
-                _model_cache[key] = WhisperModel(
-                    name, device="auto", compute_type=compute_type, cpu_threads=os.cpu_count() or 4,
-                    download_root=str(models_dir()),
-                )
+                # A folder path: faster-whisper loads it as is and never calls the hub.
+                _model_cache[key] = WhisperModel(path, device="auto", compute_type=compute_type, cpu_threads=os.cpu_count() or 4)
             except ValueError as e:  # e.g. float16 on a CPU without support
                 raise JobError("INVALID_PARAMS", f"compute type {compute_type} is not supported on this device") from e
-            except OSError as e:
-                raise JobError("MODEL_UNAVAILABLE", f"the {name} model could not be loaded or downloaded", type(e).__name__) from e
+            except (OSError, RuntimeError) as e:  # damaged or incomplete model files
+                raise JobError("MODEL_UNAVAILABLE", f"the {name} model on disk could not be loaded", type(e).__name__) from e
         return _model_cache[key]
 
 
