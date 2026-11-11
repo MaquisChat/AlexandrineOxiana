@@ -31,6 +31,7 @@
 }
 
 .ao-tx__segments {
+  position: relative;
   list-style: none;
   padding: 0;
   margin: var(--space-3) 0;
@@ -85,6 +86,7 @@
 .ao-tx__wholetext {
   margin: var(--space-1) 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .ao-tx__editor textarea,

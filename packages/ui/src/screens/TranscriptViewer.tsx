@@ -250,13 +250,35 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
     };
   }, [dirty]);
 
-  // The segment playing is brought into view (never focused: focus stays where the person put it).
-  useEffect(() => {
-    if (current < 0 || editing !== null) return;
-    const el = items.current.get(current);
+  // "Follow playback" (R143): the segment playing is brought into view inside the segment list's own
+  // scroll area — never the window, never focused. Following pauses while the researcher edits a
+  // segment, has focus inside the list, or has scrolled the list themselves; "Back to the playing
+  // segment" resumes it.
+  const listRef = useRef<HTMLOListElement | null>(null);
+  const [follow, setFollow] = useState(true);
+  const [userScrolled, setUserScrolled] = useState(false);
+  const [focusInside, setFocusInside] = useState(false);
+  const following = follow && !userScrolled && !focusInside && editing === null;
+  const scrollToSegment = useCallback((i: number) => {
+    const list = listRef.current;
+    const item = items.current.get(i);
+    if (!list || !item) return;
+    const top = item.offsetTop;
+    const bottom = top + item.offsetHeight;
+    const now = list.scrollTop;
+    const target = top < now ? top : bottom > now + list.clientHeight ? Math.min(top, bottom - list.clientHeight) : null;
+    if (target === null) return;
     const reduce = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    el?.scrollIntoView?.({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
-  }, [current, editing]);
+    if (!reduce && typeof list.scrollTo === "function") list.scrollTo({ top: target, behavior: "smooth" });
+    else list.scrollTop = target;
+  }, []);
+  useEffect(() => {
+    if (following && current >= 0) scrollToSegment(current);
+  }, [current, following, scrollToSegment]);
+  const backToPlaying = () => {
+    setUserScrolled(false);
+    if (current >= 0) scrollToSegment(current);
+  };
 
   const segmentsRef = useRef(segments);
   segmentsRef.current = segments;
@@ -493,8 +515,35 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
         </section>
       )}
 
+      {!locked && transcript?.timed && media && (
+        <div className="ao-tx__follow ao-row">
+          <label>
+            <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow playback
+          </label>
+          {follow && !following && current >= 0 && (
+            <button type="button" onClick={backToPlaying}>
+              Back to the playing segment
+            </button>
+          )}
+        </div>
+      )}
+
       {!locked && transcript?.timed && (
-        <ol aria-label="Transcript segments" className="ao-tx__segments">
+        <ol
+          aria-label="Transcript segments"
+          className="ao-tx__segments"
+          ref={listRef}
+          onWheel={() => setUserScrolled(true)}
+          onTouchMove={() => setUserScrolled(true)}
+          onPointerDown={(e) => {
+            // The list's own scroll bar (a press on the list itself, not on a segment).
+            if (e.target === e.currentTarget) setUserScrolled(true);
+          }}
+          onFocus={() => setFocusInside(true)}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusInside(false);
+          }}
+        >
           {segments.map((s, i) => {
             const flags = s.flags ? flagLabels(s.flags) : [];
             const draft = drafts.get(i);
