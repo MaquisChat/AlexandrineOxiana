@@ -325,7 +325,12 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     };
     let buf = "";
     // A read the body never answers still ends promptly on abort.
-    const aborted = new Promise<"aborted">((resolve) => o.signal?.addEventListener("abort", () => resolve("aborted"), { once: true }));
+    // The listener is removed when the generator ends, so a long-lived signal does not collect one per call (41b1 M13).
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<"aborted">((resolve) => {
+      onAbort = () => resolve("aborted");
+      o.signal?.addEventListener("abort", onAbort, { once: true });
+    });
     try {
       for (;;) {
         let chunk: ReadableStreamReadResult<Uint8Array> | "aborted";
@@ -354,6 +359,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         throw new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
       }
     } finally {
+      if (onAbort) o.signal?.removeEventListener("abort", onAbort);
       reader.cancel().catch(() => {});
     }
   }
