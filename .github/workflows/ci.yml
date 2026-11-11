@@ -33,16 +33,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Network check (diagnostic while the package mirror is unreachable; never fails the run)
-        continue-on-error: true
-        timeout-minutes: 3
-        run: |
-          for h in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com mirrors.edge.kernel.org registry.npmjs.org pypi.org files.pythonhosted.org codeload.github.com download.pytorch.org raw.pixls.us cdn.playwright.dev; do
-            ip=$(getent hosts "$h" | awk '{print $1}' | head -1)
-            code=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "https://$h/" 2>/dev/null || true)
-            echo "net-check $h dns=${ip:-FAIL} https=${code:-ERR}"
-          done
-          sed 's/^/net-check resolv: /' /etc/resolv.conf || true
       - name: System tools for the media worker (proxies, OCR)
         # When the runner cannot reach the package mirror, apt retries each file for 20 s; fail fast instead.
         timeout-minutes: 4

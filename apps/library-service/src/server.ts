@@ -22,6 +22,7 @@ import { registerGovernance } from "./routes/governance.js";
 import { registerImport } from "./routes/import.js";
 import { registerJobs } from "./routes/jobs.js";
 import { registerLibraries } from "./routes/libraries.js";
+import { isMediaRoute, mediaRequestRefusal, registerMedia } from "./media.js";
 import { registerProjects } from "./routes/projects.js";
 import { registerReview } from "./routes/review.js";
 import { registerSources } from "./routes/sources.js";
@@ -53,6 +54,10 @@ export interface ServiceOptions {
   beforeExecuteMove?: () => Promise<void>;
   /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
   watchStabilityMs?: number;
+  /** Largest picture the content route serves (default PICTURE_MAX_BYTES; test seam). */
+  pictureMaxBytes?: number;
+  /** Test seam: runs on the media route after the first slice is read, right before the response starts. */
+  mediaBeforeSend?: () => Promise<void>;
 }
 
 export interface LibraryService {
@@ -97,12 +102,18 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
       ...(opts.logStream ? { stream: opts.logStream } : {}),
       redact: { paths: REDACT, censor: "[redacted]" },
       serializers: {
-        req: (req: { method?: string; url?: string }) => ({ method: req.method, url: (req.url ?? "").split("?")[0] }),
+        // A media ticket is a credential carried in the path (R135): never logged.
+        req: (req: { method?: string; url?: string }) => ({ method: req.method, url: logUrl(req.url ?? "") }),
         res: (res: { statusCode?: number }) => ({ statusCode: res.statusCode }),
       },
     },
     // A proxy is never in front of this service: the socket address is the client.
     trustProxy: false,
+    // An address Fastify cannot route (bad percent-encoding, an overlong part): our error shape, and
+    // never the address itself echoed back (it may carry a media ticket, R135).
+    frameworkErrors: (_err, _req, reply) => {
+      void (reply as FastifyReply).status(400).send(errorBody(new ApiError(400, "VALIDATION", "That address is not valid."), []));
+    },
     // Open event streams must not keep a shutdown waiting.
     forceCloseConnections: true,
   });
@@ -138,12 +149,25 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
 
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
     if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
-    if ((req.url.split("?")[0] ?? "") !== "/events") {
+    // The media route itself, by its own configuration (R140 3): no path test decides who skips the token.
+    const isMedia = isMediaRoute(req);
+    // Event streams and media streams may stay open for hours: shutdown does not wait for them
+    // (media streams end when their tickets are revoked, at the start of shutdown).
+    if ((req.url.split("?")[0] ?? "") !== "/events" && !isMedia) {
       inFlight++;
       reply.raw.once("close", requestEnded);
     }
     // 1. DNS rebinding: only our own host names, on our port.
     if (!hostAllowed(req.headers.host, port)) return fail(reply, new ApiError(403, "FORBIDDEN", "This host name is not allowed."));
+    // Media addresses (R135): the ticket in the path is the credential; their own Origin and
+    // fetch-metadata rules (media.ts); no token is looked at.
+    if (isMedia) {
+      const refused = mediaRequestRefusal(req);
+      if (refused) return fail(reply, refused);
+      const o = req.headers.origin;
+      if (o !== undefined) reply.header("Access-Control-Allow-Origin", o).header("Vary", "Origin");
+      return;
+    }
     // 2. Origin: the desktop shell, or a paired extension (an unpaired one only to confirm pairing).
     const origin = req.headers.origin;
     const route = `${req.method} ${req.routeOptions.url ?? ""}`;
@@ -201,12 +225,20 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
 
   app.setErrorHandler((err: unknown, req, reply) => {
     const e = toApiError(err);
+    // A file response that failed before its first byte: its content headers (already copied to the
+    // raw response when a stream was handed over) must not describe the error body (R140 5).
+    if (!reply.raw.headersSent) {
+      for (const h of ["content-type", "content-length", "content-range", "content-disposition", "content-security-policy", "accept-ranges"]) {
+        reply.removeHeader(h);
+        reply.raw.removeHeader(h);
+      }
+    }
     if (e.status >= 500) req.log.error({ err: state.describe(err) }, "request failed");
     void fail(reply, e);
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}) };
+  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -219,6 +251,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerCitations(app, ctx);
   registerAppearance(app, ctx);
   registerJobs(app, ctx);
+  registerMedia(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {
@@ -234,6 +267,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     close() {
       closingNow = true;
       state.shuttingDown = true;
+      // Every media ticket ends as the service stops (R135 2), and with them their streams.
+      state.media.revokeAll();
       closing ??= (async () => {
         // Requests are refused from here on; those already in progress finish (a library being
         // opened is then refused and released); then running work is paused and the library closed.
@@ -249,4 +284,40 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void> };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void> };
+
+/** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
+function decodedPath(path: string): string {
+  let cur = path;
+  for (let i = 0; i < 4; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(cur);
+    } catch {
+      return cur;
+    }
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
+/** Whether a request path is (any spelling of) a media address: `/media/…`, decoded, any case, repeated slashes. */
+export function isMediaPath(url: string): boolean {
+  const path = url.split("?")[0] ?? "";
+  return path.startsWith("/media/") || /^\/+media\//i.test(decodedPath(path));
+}
+
+/**
+ * The path of a request as logged (R135): no query string; any spelling of a media address
+ * becomes `/media/[redacted]`; and anywhere else, a run of 40 or more ticket characters (no id of
+ * ours is that long) is replaced too, so a ticket sent to another route is not logged either.
+ */
+export function logUrl(url: string): string {
+  const path = url.split("?")[0] ?? "";
+  if (isMediaPath(path)) return "/media/[redacted]";
+  // An encoded separator could split a ticket into halves shorter than 40: then every run of 16 or
+  // more ticket characters is replaced (review M4).
+  const run = /%2f|%5c/i.test(path) ? /[A-Za-z0-9_-]{16,}/g : /[A-Za-z0-9_-]{40,}/g;
+  return decodedPath(path).replace(run, "[redacted]");
+}
