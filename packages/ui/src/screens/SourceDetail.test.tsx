@@ -19,7 +19,8 @@ import {
   VERIFIED_SOURCE,
   withFields,
 } from "../test/verification";
-import { SourceDetail } from "./SourceDetail";
+import { FIELD_LABELS as CORE_FIELD_LABELS } from "@ao/core/src/verify/checks";
+import { FIELD_LABELS, SourceDetail } from "./SourceDetail";
 
 useMockService();
 
@@ -319,6 +320,28 @@ describe("SourceDetail: pictures (R135: read with the token, shown as blobs)", (
     expect(blobs.live()).toEqual([]);
   });
 
+  it("review F6: on a source change, the old source's pictures are never asked for under the new source's address; a locked project is reported once", async () => {
+    const asked: string[] = [];
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), ({ request }) => {
+        asked.push(new URL(request.url).pathname);
+        return serviceError(423, "PROJECT_LOCKED", "This project is locked.");
+      }),
+      http.get(url("/projects/:id/sources/:sid"), ({ params }) => HttpResponse.json(params.sid === "s2" ? second() : PICTURE_SOURCE)),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+    );
+    const onLocked = vi.fn();
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await waitFor(() => expect(asked).toHaveLength(2));
+    await waitFor(() => expect(onLocked).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 30));
+    expect(onLocked).toHaveBeenCalledTimes(1);
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s2" readOnly={false} onClose={vi.fn()} onLocked={onLocked} />);
+    await screen.findByRole("heading", { name: "Second source" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(asked.filter((p) => p.includes("/sources/s2/"))).toEqual([]);
+  });
+
   it("a picture that arrives after the screen closed is never turned into a blob URL", async () => {
     let release: (() => void) | undefined;
     server.use(
@@ -458,6 +481,26 @@ describe("SourceDetail: background work for the source (R84)", () => {
     await user.click(within(work).getByRole("button", { name: "Try again" }));
     expect((await within(work).findByRole("alert")).textContent).toContain("This library is read-only");
     expect(within(work).getByText(/could not be made/)).toBeTruthy();
+  });
+
+  it("review F11: the field names copied for the badges are the verification report's own", () => {
+    expect(FIELD_LABELS).toEqual(CORE_FIELD_LABELS);
+  });
+
+  it("review F9/F10: a file with no text says so; waiting work does not claim the media helper is missing", async () => {
+    const src = {
+      ...SOURCE_FILE,
+      fields: [],
+      pendingOcr: [{ id: "o1", assetId: "a1", queuedAt: "2026-11-01T10:00:00Z", failed: { code: "NO_TEXT", at: "2026-11-01T10:01:00Z" } }],
+      pendingProxies: [{ id: "j9", type: "image.proxy", assetId: "a1", location: "coarsen", queuedAt: "2026-11-01T10:00:00Z" }],
+    };
+    server.use(...sourceHandlers(src));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    const [proxy, ocr] = within(work).getAllByRole("listitem");
+    expect(ocr!.textContent).toContain("no text that could be recognised");
+    expect(proxy!.textContent).toContain("has not been made yet");
+    expect(proxy!.textContent).toContain("waits until it is running");
   });
 
   it("text recognition that did not finish is listed too, with the same retry", async () => {

@@ -13,7 +13,6 @@
  * (R137). Every answer is dropped when the source changed, the screen closed or the project locked
  * in the meantime.
  */
-import { FIELD_LABELS } from "@ao/core/src/verify/checks";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { errorText, isProjectLocked, type Asset, type Creator, type LibraryApi, type SourcePatch } from "../api/library";
 import { isShowablePicture, type FieldReview, type PendingJob, type VerifiedSource } from "../api/verification";
@@ -50,6 +49,29 @@ export function creatorName(c: Creator): string {
 
 const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).at(-1) ?? p;
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
+/** The field names the verification report uses (packages/core/src/verify/checks.ts FIELD_LABELS), copied so no checking code reaches the bundle. */
+export const FIELD_LABELS: Record<string, string> = {
+  "/title": "Title",
+  "/creators": "Creators",
+  "/issued": "Publication date",
+  "/container": "Container (journal or site name)",
+  "/publisher": "Publisher",
+  "/volume": "Volume",
+  "/issue": "Issue",
+  "/page": "Pages",
+  "/edition": "Edition",
+  "/numberOfPages": "Number of pages",
+  "/publisherPlace": "Place of publication",
+  "/collectionTitle": "Series",
+  "/collectionNumber": "Number in series",
+  "/genre": "Genre",
+  "/medium": "Medium",
+  "/number": "Number",
+  "/identifiers/platformPostId": "Post ID",
+  "/identifiers/url": "Link",
+  "/identifiers/doi": "DOI",
+  "/identifiers/isbn": "ISBN",
+};
 const fieldLabel = (pointer: string) => FIELD_LABELS[pointer] ?? pointer.replace(/^\//, "").replace(/\//g, " ");
 
 function formatBytes(n: number | undefined): string {
@@ -95,6 +117,9 @@ const JOB_REASONS: Record<string, string> = {
   FFMPEG_FAILED: "the video tool could not convert the file",
   INPUT_NOT_FOUND: "the media helper could not find the stored file",
   CANCELLED: "it was cancelled",
+  NO_TEXT: "the file has no text that could be recognised",
+  FAILED: "the media helper could not finish it",
+  RULE_CHANGED: "the project's location rule changed, so it is made again under the new rule",
 };
 const jobReason = (code: string) => JOB_REASONS[code] ?? "the media helper could not finish it";
 
@@ -127,6 +152,12 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   /** Moves on whenever the source shown changes or the screen closes: older answers are dropped. */
   const gen = useRef(0);
   const shown = useRef("");
+  /** The project and source the record in `file` was read for. */
+  const fileFor = useRef("");
+  const showFile = (f: VerifiedSource) => {
+    fileFor.current = shown.current;
+    setFile(f);
+  };
   useEffect(
     () => () => {
       gen.current++;
@@ -158,7 +189,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     api.sources
       .get(projectId, sourceId)
       .then((f) => {
-        if (live && g === gen.current) setFile(f as VerifiedSource);
+        if (live && g === gen.current) showFile(f as VerifiedSource);
       })
       .catch((err: unknown) => {
         if (!live || g !== gen.current) return;
@@ -176,13 +207,18 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   // ---- pictures: fetched with the token, shown as blob URLs, revoked when no longer shown (R135 1) ----
   const pics = useMemo(() => (file ? picturesOf(file.assets) : []), [file]);
   const picKey = pics.map((a) => a.id).join("\n");
+  // The source the record on screen belongs to: just after a source change the old record is still
+  // shown for a moment, and its pictures must not be asked for under the new source (review F6).
+  const loadedFor = file ? fileFor.current : "";
+  const current = `${projectId}\n${sourceId}`;
   useEffect(() => {
     setPictures({});
-    if (!picKey) return;
+    if (!picKey || loadedFor !== current) return;
     const api = apiRef.current;
     const ac = new AbortController();
     const urls: string[] = [];
     let live = true;
+    let lockedSaid = false;
     for (const aid of picKey.split("\n")) {
       api.verification
         .picture(projectId, sourceId, aid, { signal: ac.signal })
@@ -194,7 +230,12 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
         })
         .catch((err: unknown) => {
           if (!live) return;
-          const text = failed(err, "The library service did not send it.");
+          // A locked project is reported once, not once per picture (review F8).
+          if (isProjectLocked(err) && !lockedSaid) {
+            lockedSaid = true;
+            lockedRef.current?.();
+          }
+          const text = message(err, "The library service did not send it.");
           setPictures((p) => ({ ...p, [aid]: { error: text } }));
         });
     }
@@ -203,7 +244,9 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       ac.abort();
       for (const u of urls) URL.revokeObjectURL(u);
     };
-  }, [projectId, sourceId, picKey, failed]);
+    // projectId and sourceId are in `current`, which must equal `loadedFor` for anything to be read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadedFor, current, picKey]);
 
   // ---- verification ----
   const confirm = async (field: string, value: unknown) => {
@@ -211,7 +254,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     try {
       const f = await api.verification.confirmField(projectId, sourceId, field, value);
       if (g !== gen.current) return;
-      setFile(f);
+      showFile(f as VerifiedSource);
       onChanged?.();
     } catch (err) {
       throw new Error(failed(err, "The library service did not answer."));
@@ -227,7 +270,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     try {
       const f = await api.verification.recheckSource(projectId, sourceId);
       if (g !== gen.current) return;
-      setFile(f);
+      showFile(f as VerifiedSource);
       setRecheckNote("Rechecked. The badges show the result.");
       onChanged?.();
     } catch (err) {
@@ -286,7 +329,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
           .get(projectId, sourceId)
           .then((f) => {
             if (g !== gen.current) return;
-            setFile(f as VerifiedSource);
+            showFile(f as VerifiedSource);
             setRetry((r) => (r.state === "started" ? { ...r, reads: r.reads + 1 } : r));
           })
           .catch(() => {
@@ -322,7 +365,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     try {
       const f = await api.sources.update(projectId, sourceId, patch);
       if (g !== gen.current) return;
-      setFile(f as VerifiedSource);
+      showFile(f as VerifiedSource);
       setEditing(false);
       onChanged?.();
     } catch (err) {
@@ -555,7 +598,7 @@ function JobRow({ job, what, name }: { job: PendingJob; what: "viewing copy" | "
           </>
         ) : (
           <>
-            Text recognition of <UserText>{name}</UserText> has not run yet. It runs in the background once the media helper is available.
+            Text recognition of <UserText>{name}</UserText> has not run yet. It runs in the background; if the media helper is not running, it waits until it is running.
           </>
         )}
       </li>
@@ -569,7 +612,7 @@ function JobRow({ job, what, name }: { job: PendingJob; what: "viewing copy" | "
         </>
       ) : (
         <>
-          The viewing copy of <UserText>{name}</UserText> has not been made yet. It is made in the background once the media helper is available.
+          The viewing copy of <UserText>{name}</UserText> has not been made yet. It is made in the background; if the media helper is not running, it waits until it is running.
         </>
       )}
     </li>
