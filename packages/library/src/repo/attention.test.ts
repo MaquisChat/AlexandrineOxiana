@@ -7,6 +7,7 @@ import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import { newAttentionId, readOutbox, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./attention.js";
+import { NotFoundError, PolicyDeniedError } from "./errors.js";
 import { projectWarnings, recordOrMark, type Repo } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 
@@ -248,5 +249,82 @@ describe("R154 e: the device-local outbox", () => {
     await writeOutbox(join(tmp, "config"), lib.id, pid, { ...unrecorded(), action: "key.unlock" });
     await reopen();
     expect((await events()).some((e) => e.action === "key.unlock" && e.device === "dev-B")).toBe(false);
+  });
+});
+
+describe("R154 d: a mark that cannot be repaired can be set aside", () => {
+  const unreadableMark = async () => {
+    await mkdir(join(lib.root, folder, "attention"), { recursive: true });
+    const name = `${newAttentionId()}.json`;
+    await writeFile(join(lib.root, folder, "attention", name), "{ damaged");
+    return name;
+  };
+
+  it("lists marks without paths or messages", async () => {
+    const rec = unrecorded({ state: "intent" });
+    await writeAttention(lib.root, folder, rec);
+    const name = await unreadableMark();
+    const marks = await repo.attentionMarks(pid);
+    expect(marks).toEqual(
+      expect.arrayContaining([
+        { id: rec.id, kind: "audit-unrecorded", action: "library.reconnect", occurredAt: rec.occurredAt, actor: "someone", reason: "EIO", interrupted: true, canSetAside: true },
+        { id: name, kind: "unreadable", canSetAside: true },
+      ]),
+    );
+    expect(JSON.stringify(marks)).not.toContain(tmp);
+  });
+
+  it("with an intact project log: decided, audited there with the reason, who and the mark; then removed", async () => {
+    const name = await unreadableMark();
+    expect(await projectWarnings(repo, pid)).toEqual(["attention-unreadable"]);
+    await expect(repo.setAsideMark(pid, name, "  ")).rejects.toThrow(/reason/);
+    await expect(repo.setAsideMark(pid, "nope.json", "x")).rejects.toBeInstanceOf(NotFoundError);
+    expect(await repo.setAsideMark(pid, name, "The disk damaged it; nothing else is missing")).toEqual({ recordedIn: "project" });
+    const ev = (await events()).at(-1)!;
+    expect(ev).toMatchObject({
+      action: "delete",
+      actor: "tester",
+      decision: { result: "allow" },
+      details: { op: "attention.set-aside", reason: "The disk damaged it; nothing else is missing", mark: { kind: "unreadable", file: `attention/${name}`, bytes: 9 } },
+    });
+    expect(await records()).toEqual([]);
+    expect(await projectWarnings(repo, pid)).toEqual([]);
+  });
+
+  it("with a project log that does not verify: recorded in the library's log instead", async () => {
+    const rec = unrecorded();
+    await writeAttention(lib.root, folder, rec);
+    const seg = join(lib.root, folder, "audit", "0001.jsonl");
+    const lines = (await readFile(seg, "utf8")).split("\n");
+    lines[0] = lines[0]!.replace('"actor":"tester"', '"actor":"forged"');
+    await writeFile(seg, lines.join("\n"));
+    const r = await reopen();
+    expect(await projectWarnings(r, pid)).toEqual(["audit-unrecorded-blocked"]);
+    expect(await r.setAsideMark(pid, rec.id, "Recorded on paper; the log is being investigated")).toEqual({ recordedIn: "library" });
+    const lev = (await r.libraryAudit()).events.at(-1)!;
+    expect(lev).toMatchObject({
+      action: "delete",
+      projectId: pid,
+      actor: "tester",
+      decision: { result: "allow" },
+      details: { op: "attention.set-aside", reason: "Recorded on paper; the log is being investigated", mark: { kind: "audit-unrecorded", record: { id: rec.id, action: "library.reconnect" } } },
+    });
+    expect(await records()).toEqual([]);
+    expect(await projectWarnings(r, pid)).toEqual([]);
+  });
+
+  it("a refusal by the policy engine is audited and nothing is removed", async () => {
+    const name = await unreadableMark();
+    await writeFile(join(lib.root, folder, "governance.yaml"), "::: not yaml [");
+    await expect(repo.setAsideMark(pid, name, "why")).rejects.toBeInstanceOf(PolicyDeniedError);
+    expect((await events()).at(-1)).toMatchObject({ action: "delete", decision: { result: "deny" }, details: { op: "attention.set-aside" } });
+    expect(await records()).toEqual([name]);
+  });
+
+  it("a mark waiting on this device for the library's lock is not set aside here", async () => {
+    const rec = unrecorded();
+    await writeOutbox(join(tmp, "config"), lib.id, pid, rec);
+    expect((await repo.attentionMarks(pid)).find((m) => m.id === rec.id)).toMatchObject({ kind: "waiting", canSetAside: false });
+    await expect(repo.setAsideMark(pid, rec.id, "x")).rejects.toBeInstanceOf(NotFoundError);
   });
 });

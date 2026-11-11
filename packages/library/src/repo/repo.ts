@@ -81,7 +81,7 @@ import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
-import { RecoveryPendingError } from "./errors.js";
+import { InvalidInputError, NotFoundError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
@@ -105,7 +105,7 @@ import {
   type AttentionRecord,
 } from "./attention.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
-import { LIBRARY_AUDIT_DIR, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
+import { LIBRARY_AUDIT_DIR, appendLibraryAudit, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -138,6 +138,20 @@ export class Repo {
   }
 
   /** The library's own audit log (refused project creations, Task 50) and whether its chain verifies. */
+  /** What the project needs attention for (Task 50): marks, as the audit screen lists them. */
+  attentionMarks(projectId: string): Promise<AttentionMark[]> {
+    return listMarks(this.core, this.core.state(projectId));
+  }
+
+  /**
+   * Sets a mark aside with a reason (R154 d): decided by the policy engine (`delete`, op
+   * `attention.set-aside`) and audited with the reason, who, when and the mark itself, in the
+   * project's log when it is intact, else in the library's log; only then is the mark removed.
+   */
+  setAsideMark(projectId: string, markId: string, reason: string): Promise<{ recordedIn: "project" | "library" }> {
+    return setAsideMarkIn(this.core, projectId, markId, reason);
+  }
+
   libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult; repeats?: { seq: number; count: number; lastAt: string } }> {
     return readLibraryAudit(this.core.root);
   }
@@ -1267,4 +1281,52 @@ export function setConsentDocumentAsset(repo: Repo, projectId: string, consentId
 export function noteIntegrityWarning(repo: Repo, w: IntegrityWarning): void {
   const list = cores.get(repo)!.integrityWarnings;
   if (!list.some((x) => x.projectId === w.projectId && x.kind === w.kind && x.detail === w.detail)) list.push(w);
+}
+
+const SET_ASIDE_OP = "attention.set-aside";
+
+async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string, reason: string): Promise<{ recordedIn: "project" | "library" }> {
+  core.assertWritable();
+  const why = typeof reason === "string" ? reason.trim() : "";
+  if (why === "" || why.length > 1000) throw new InvalidInputError("Give a reason (up to 1000 characters) for setting this aside");
+  const st = core.state(projectId);
+  if (typeof markId !== "string") throw new NotFoundError("Mark", String(markId));
+  const intact = st.recoveryPending !== true && st.auditUnverified !== true;
+  if (intact) {
+    const m = await markForSetAside(core, st, markId);
+    if (!m) throw new NotFoundError("Mark", markId);
+    // Decided and audited in the project's log (a deny is audited there and thrown).
+    await authorizeOnly(core, projectId, { action: "delete" }, { op: SET_ASIDE_OP, entity: { type: "project", id: projectId }, auditAllow: { details: { reason: why, mark: m.summary } } });
+    await core.serial(() => m.remove());
+    return { recordedIn: "project" };
+  }
+  // The project's log cannot take it: decided against the project's governance, recorded in the library's log.
+  return core.serial(async () => {
+    core.assertWritable();
+    const m = await markForSetAside(core, st, markId);
+    if (!m) throw new NotFoundError("Mark", markId);
+    const at = core.clock().toISOString();
+    let decision: { result: "allow" } | { result: "deny"; reason: string };
+    try {
+      const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+      if (!raw) throw new Error("governance.yaml is missing");
+      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "delete", projectId, actor: core.actor, now: at, tz: core.tz });
+      decision = d.result === "deny" ? { result: "deny", reason: d.reason } : { result: "allow" };
+    } catch (e) {
+      decision = { result: "deny", reason: `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    await appendLibraryAudit(core, {
+      at,
+      actor: core.actor,
+      device: core.device,
+      projectId,
+      action: "delete",
+      entity: { type: "project", id: projectId },
+      decision,
+      details: { op: SET_ASIDE_OP, reason: why, mark: m.summary, projectLogNotIntact: true },
+    });
+    if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "delete");
+    await m.remove();
+    return { recordedIn: "library" as const };
+  });
 }
