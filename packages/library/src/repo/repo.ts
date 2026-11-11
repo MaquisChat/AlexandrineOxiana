@@ -15,11 +15,20 @@ import {
   createConsent,
   createParticipant,
   createSession,
+  deleteParticipant,
+  deleteSession,
   getFieldwork,
   linkSourceToFieldwork,
+  updateConsent,
+  updateParticipant,
+  updateSession,
+  withdrawConsent,
   type ConsentInput,
+  type ConsentPatch,
   type ParticipantInput,
+  type ParticipantPatch,
   type SessionInput,
+  type SessionPatch,
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
@@ -234,6 +243,27 @@ export class Repo {
   }
   linkSourceToFieldwork(projectId: string, sourceId: string, link: { participantIds?: string[]; sessionId?: string }): Promise<SourceFile> {
     return linkSourceToFieldwork(this.core, projectId, sourceId, link);
+  }
+  updateParticipant(projectId: string, id: string, patch: ParticipantPatch): Promise<Participant> {
+    return updateParticipant(this.core, projectId, id, patch);
+  }
+  updateSession(projectId: string, id: string, patch: SessionPatch): Promise<Session> {
+    return updateSession(this.core, projectId, id, patch);
+  }
+  updateConsent(projectId: string, id: string, patch: ConsentPatch): Promise<ConsentRecord> {
+    return updateConsent(this.core, projectId, id, patch);
+  }
+  /** Marks the consent withdrawn and queues every source linked to its participant for review; deletes nothing. */
+  withdrawConsent(projectId: string, id: string, opts?: { reason?: string }): Promise<{ consent: ConsentRecord; flaggedSourceIds: string[] }> {
+    return withdrawConsent(this.core, projectId, id, opts);
+  }
+  /** Only when no consent record, session or source links to it (FieldworkInUseError otherwise). */
+  deleteParticipant(projectId: string, id: string): Promise<void> {
+    return deleteParticipant(this.core, projectId, id);
+  }
+  /** Only when no source links to it (FieldworkInUseError otherwise). */
+  deleteSession(projectId: string, id: string): Promise<void> {
+    return deleteSession(this.core, projectId, id);
   }
   getFieldwork(projectId: string): ReturnType<typeof getFieldwork> {
     return getFieldwork(this.core, projectId);

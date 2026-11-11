@@ -118,3 +118,14 @@ export class DestroyedParentError extends Error {
 export class InvalidInputError extends Error {
   override name = "InvalidInputError";
 }
+
+/** A participant or session is still linked to (consent records, sessions, sources): nothing was deleted (R97). */
+export class FieldworkInUseError extends Error {
+  override name = "FieldworkInUseError";
+  constructor(
+    what: string,
+    readonly links: string[],
+  ) {
+    super(`${what} cannot be deleted: ${links.join(", ")} still link to it. Remove those links first`);
+  }
+}
