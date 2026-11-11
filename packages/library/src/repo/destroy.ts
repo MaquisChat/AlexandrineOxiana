@@ -14,7 +14,11 @@
 import type { Asset, SourceFile } from "@ao/core";
 import { withCollisionSuffix } from "@ao/core";
 import { shredPath } from "../fs/shred.js";
-import { NotFoundError } from "./errors.js";
+import { effectivePolicy, parseGovernance } from "@ao/core";
+import { isDue } from "../retention-date.js";
+import { InvalidInputError, NotFoundError } from "./errors.js";
+import { readGovernance } from "./governance-edit.js";
+import type { ProjectState } from "./state.js";
 import { foldName, namesIn } from "./io.js";
 import { runMutation } from "./mutate.js";
 import { readSourceFile, writeSourceFile } from "./sources.js";
@@ -34,6 +38,12 @@ export interface DestroyInput {
   certificateStem: (at: Date) => string;
   /** The certificate's content, given the destroyed assets as recorded (before marking). */
   certificate: (destroyed: Array<{ asset: Asset; sourceId: string }>, at: string) => Record<string, unknown>;
+  /**
+   * Destroy only what is due (R117): checked inside the change against the rules as they are then
+   * — the retention date has passed in `tz` at `now`, and each of `originals` is an original of an
+   * identifiable source. Otherwise nothing is destroyed (InvalidInputError).
+   */
+  onlyDue?: { now: Date; tz: string; originals: Set<string> };
 }
 
 export async function destroyAssets(
@@ -49,6 +59,7 @@ export async function destroyAssets(
     projectId,
     { action: "delete" },
     async (tx) => {
+      if (input.onlyDue) await assertDue(core, projectId, st, input.onlyDue, input.plan);
       const destroyed: Array<{ asset: Asset; sourceId: string }> = [];
       for (const item of input.plan) {
         const cur: SourceFile = await readSourceFile(core, st, item.sourceId);
@@ -87,4 +98,26 @@ export async function destroyAssets(
     },
     { op: "retention.destroy", entity: { type: "project", id: projectId } },
   );
+}
+
+const NOT_DUE = "These files are not due for destruction under the project's retention rule now; nothing was destroyed";
+
+async function assertDue(core: RepoCore, projectId: string, st: ProjectState, due: NonNullable<DestroyInput["onlyDue"]>, plan: DestroyPlanItem[]): Promise<void> {
+  let date: string | null = null;
+  try {
+    date = effectivePolicy(parseGovernance((await readGovernance(core, projectId)).yaml)).policy.retention.rawDataDestroyAfter;
+  } catch {
+    date = null; // unreadable rules: nothing is due
+  }
+  if (!date || !isDue(date, due.now, due.tz)) throw new InvalidInputError(NOT_DUE);
+  const seen = new Set<string>();
+  for (const item of plan) {
+    const sf = await readSourceFile(core, st, item.sourceId);
+    for (const a of sf.assets) {
+      if (!due.originals.has(a.id)) continue;
+      if (a.role !== "original" || !sf.source.provenance.identifiable) throw new InvalidInputError(NOT_DUE);
+      seen.add(a.id);
+    }
+  }
+  for (const id of due.originals) if (!seen.has(id)) throw new InvalidInputError(NOT_DUE);
 }

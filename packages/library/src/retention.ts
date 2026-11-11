@@ -72,6 +72,8 @@ export async function retentionDue(repo: Repo, projectId: string, now: Date): Pr
 export interface DestroyOptions {
   /** Also destroy text derivatives (transcripts, OCR, translations) of the files. */
   includeDerived?: boolean;
+  /** Destroy only if the files are due at this time — re-checked inside the change (R117). */
+  onlyDue?: Date;
 }
 
 interface CertificateBackups {
@@ -175,6 +177,7 @@ export async function destroyRaw(
     plan: [...plan.entries()].map(([sourceId, ids]) => ({ sourceId, assetIds: [...ids] })),
     strayCopies: strays,
     certificateStem: (at) => certificateStem(at, tz),
+    ...(opts.onlyDue ? { onlyDue: { now: opts.onlyDue, tz: projectTimeZone(repo, projectId), originals: wanted } } : {}),
     certificate: (destroyed, at) => ({
       formatVersion: 1,
       kind: "destruction-certificate",

@@ -223,28 +223,35 @@ describe("fieldwork deletion only when nothing links to it", () => {
   });
 });
 
-describe("protocol approval documents (spec 6.3(9))", () => {
-  it("stores dropped documents under <Project>/protocol/, audited without names", async () => {
+describe("protocol approval documents (spec 6.3(9), R117 I6)", () => {
+  const added = (r: Awaited<ReturnType<typeof addProtocolDocuments>>) => r.filter((x) => x.outcome === "added").map((x) => x.document!.name);
+
+  it("stores dropped documents under <Project>/protocol/, audited without names; a name in use gets a new one", async () => {
     const r = await addProtocolDocuments(repo, pid, [pdf]);
-    expect(r).toEqual([{ name: "input.pdf", bytes: expect.any(Number), encrypted: false }]);
+    expect(r).toEqual([{ file: "input.pdf", outcome: "added", document: { name: "input.pdf", bytes: expect.any(Number), encrypted: false } }]);
     expect(await readFile(join(lib.root, folder(), "protocol", "input.pdf"), "utf8")).toContain("consent form");
-    // The same name again gets a new name; nothing is overwritten.
-    const again = await addProtocolDocuments(repo, pid, [pdf]);
-    expect(again[0]!.name).toBe("input (2).pdf");
+    expect(added(await addProtocolDocuments(repo, pid, [pdf]))).toEqual(["input (2).pdf"]);
     expect((await listProtocolDocuments(repo, pid)).map((d) => d.name)).toEqual(["input (2).pdf", "input.pdf"]);
     const ev = (await auditEvents(folder())).filter((e) => e.details?.op === "protocol.document");
     expect(ev).toHaveLength(2);
     expect(JSON.stringify(ev)).not.toContain("input");
   });
 
-  it("encrypts them in an encrypted project", async () => {
+  it("two drops of the same name at the same time both succeed, under different names", async () => {
+    const [a, b] = await Promise.all([addProtocolDocuments(repo, pid, [pdf]), addProtocolDocuments(repo, pid, [pdf])]);
+    expect([...added(a), ...added(b)].sort()).toEqual(["input (2).pdf", "input.pdf"]);
+  });
+
+  it("encrypted projects: stored under generated names, the real name only in the sealed manifest", async () => {
     const enc = (await repo.createProject({ name: "Sealed", governanceYaml: "", encryption: { enabled: true, passphrase: PASS } })).project;
-    const [doc] = await addProtocolDocuments(repo, enc.id, [pdf]);
-    expect(doc).toMatchObject({ encrypted: true });
+    const r = await addProtocolDocuments(repo, enc.id, [pdf]);
+    expect(r[0]).toMatchObject({ outcome: "added", document: { name: "input.pdf", encrypted: true } });
     const dir = join(lib.root, enc.folder, "protocol");
     const names = await readdir(dir);
     expect(names.every((n) => n.endsWith(".enc"))).toBe(true);
-    const raw = await readFile(join(dir, names[0]!));
+    expect(names.join(" ")).not.toContain("input");
+    const doc = names.find((n) => n !== "manifest.json.enc")!;
+    const raw = await readFile(join(dir, doc));
     expect(raw.toString("latin1")).not.toContain("consent form");
     const d = decryptStream((id) => ring.get(id));
     const parts: Buffer[] = [];
@@ -254,12 +261,35 @@ describe("protocol approval documents (spec 6.3(9))", () => {
       d.end(raw);
     });
     expect(Buffer.concat(parts).toString()).toContain("consent form");
+    expect((await listProtocolDocuments(repo, enc.id)).map((x) => x.name)).toEqual(["input.pdf"]);
+    expect(added(await addProtocolDocuments(repo, enc.id, [pdf]))).toEqual(["input (2).pdf"]);
   });
 
-  it("refuses folders, symbolic links and missing files", async () => {
-    await expect(addProtocolDocuments(repo, pid, [tmp])).rejects.toBeInstanceOf(InvalidInputError);
-    await expect(addProtocolDocuments(repo, pid, [join(tmp, "nope.pdf")])).rejects.toBeInstanceOf(InvalidInputError);
-    expect(await listProtocolDocuments(repo, pid)).toEqual([]);
+  it("accepts PDF, Word (DOCX), OpenDocument text, plain text and images only, each at most 100 MB; one result per file", async () => {
+    const txt = join(tmp, "approval.txt");
+    await writeFile(txt, "Approved on 3 March 2026.\n");
+    const png = join(tmp, "stamp.png");
+    await writeFile(png, tinyPng());
+    const exe = join(tmp, "tool.exe");
+    await writeFile(exe, Buffer.from([0x4d, 0x5a, 0x90, 0x00, 0x03, 0, 0, 0, 0x04, 0, 0, 0, 0xff, 0xff, 0, 0]));
+    const fakeTxt = join(tmp, "binary.txt");
+    await writeFile(fakeTxt, Buffer.from([0, 1, 2, 3, 0, 0, 255]));
+    const big = join(tmp, "huge.pdf");
+    await writeFile(big, "%PDF-1.7\n");
+    await truncate(big, 100 * 1024 * 1024 + 1);
+    const r = await addProtocolDocuments(repo, pid, [txt, png, exe, fakeTxt, big, tmp, join(tmp, "nope.pdf")]);
+    expect(r.map((x) => [x.file, x.outcome])).toEqual([
+      ["approval.txt", "added"],
+      ["stamp.png", "added"],
+      ["tool.exe", "failed"],
+      ["binary.txt", "failed"],
+      ["huge.pdf", "failed"],
+      [expect.any(String), "failed"],
+      ["nope.pdf", "failed"],
+    ]);
+    expect(r[2]!.reason).toMatch(/PDF, Word, OpenDocument, plain text or an image/);
+    expect(r[4]!.reason).toMatch(/100 MB/);
+    expect((await listProtocolDocuments(repo, pid)).map((d) => d.name)).toEqual(["approval.txt", "stamp.png"]);
   });
 });
 

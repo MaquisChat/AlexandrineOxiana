@@ -1,41 +1,72 @@
 /**
- * Protocol approval documents (spec 6.3(9), Task 36): files the researcher drops onto the protocol
- * record are copied into `<Project>/protocol/`, sealed with the project key (`<name>.enc`) when the
- * project is encrypted. Each copy is one governed change, audited as `protocol.document` without
- * the file's name. Nothing is ever overwritten: a name already used gets " (2)", " (3)", ….
+ * Protocol approval documents (spec 6.3(9), Task 36, R117 I6): files the researcher drops onto the
+ * protocol record are copied into `<Project>/protocol/`.
+ *
+ * - Only PDF, Word (DOCX), OpenDocument text, plain text and images (by content, not by name), each
+ *   at most 100 MB, regular files only (no folder or symbolic link).
+ * - Unencrypted projects keep the document's name; a name in use gets " (2)", " (3)", ….
+ * - Encrypted projects store each document sealed under a generated name (`doc-<id>.enc`); the
+ *   real name is kept only in the sealed `manifest.json.enc` beside them.
+ * - Each document is one governed change, audited as `protocol.document` without its name; the
+ *   name is chosen inside that change (so two drops at once never collide), and every file dropped
+ *   gets its own result.
  */
 import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
-import { InvalidInputError } from "./repo/errors.js";
-import { projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
+import { fileTypeFromFile } from "file-type";
+import { newId } from "@ao/core";
+import { decryptBytes, readMaybe } from "./repo/io.js";
+import type { Tx } from "./repo/mutate.js";
+import { projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
 
 export interface ProtocolDocument {
-  /** The document's name (without the `.enc` of an encrypted copy). */
+  /** The document's name as dropped (made unique). */
   name: string;
   /** Size of the file as dropped (plaintext bytes) on add; size on disk when listed. */
   bytes: number;
   encrypted: boolean;
 }
 
+export interface ProtocolDocumentResult {
+  /** The dropped file's name. */
+  file: string;
+  outcome: "added" | "failed";
+  document?: ProtocolDocument;
+  /** Why it was not added (plain language). */
+  reason?: string;
+}
+
+export const PROTOCOL_DOCUMENT_MAX_BYTES = 100 * 1024 * 1024;
+const MANIFEST = "manifest.json.enc";
 const MAX_NAME = 200;
 // eslint-disable-next-line no-control-regex
 const BAD_NAME = /[\u0000-\u001f\u007f/\\:*?"<>|]/u;
+const ALLOWED_EXT = new Set(["pdf", "docx", "odt"]);
+const KIND_REASON = "Only a PDF, Word, OpenDocument, plain text or an image can be added as a protocol document.";
+
+interface Manifest {
+  formatVersion: 1;
+  documents: Record<string, { name: string; bytes: number; addedAt: string }>;
+}
 
 function folderOf(repo: Repo, projectId: string): { rel: string; abs: string } {
   const rel = `${repo.getProject(projectId).folder}/protocol`;
   return { rel, abs: join(repoLibrary(repo).root, ...rel.split("/")) };
 }
 
-async function existingNames(abs: string): Promise<Array<{ file: string; name: string; encrypted: boolean }>> {
-  let names: string[];
+async function readManifest(abs: string, key: { key: Uint8Array; keyId: string }): Promise<Manifest> {
+  const raw = await readMaybe(join(abs, MANIFEST));
+  if (!raw) return { formatVersion: 1, documents: {} };
+  const plain = await decryptBytes((id) => (id === key.keyId ? key.key : undefined), raw);
+  return JSON.parse(plain.toString("utf8")) as Manifest;
+}
+
+async function plainNames(abs: string): Promise<string[]> {
   try {
-    names = await fsp.readdir(abs);
+    return (await fsp.readdir(abs)).filter((n) => !n.startsWith("."));
   } catch {
     return [];
   }
-  return names
-    .filter((n) => !n.startsWith("."))
-    .map((file) => (file.endsWith(".enc") ? { file, name: file.slice(0, -4), encrypted: true } : { file, name: file, encrypted: false }));
 }
 
 function uniqueName(wanted: string, taken: Set<string>): string {
@@ -48,50 +79,99 @@ function uniqueName(wanted: string, taken: Set<string>): string {
   }
 }
 
-/** The project's protocol documents, by name. */
+/** Plain text: UTF-8 without NUL or other binary control bytes. */
+async function isPlainText(path: string): Promise<boolean> {
+  const buf = await fsp.readFile(path);
+  if (buf.includes(0)) return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    return false;
+  }
+  // eslint-disable-next-line no-control-regex
+  return !/[\u0001-\u0008\u000e-\u001f\u007f]/u.test(buf.toString("utf8"));
+}
+
+/** Why the file cannot be a protocol document, or undefined when it can. */
+async function refusal(path: string): Promise<string | undefined> {
+  const name = basename(path);
+  const st = await fsp.lstat(path).catch(() => null);
+  if (!st) return `${name} could not be found.`;
+  if (st.isSymbolicLink()) return `${name} is a shortcut (symbolic link); drop the document itself.`;
+  if (!st.isFile()) return `${name} is not a file; drop documents, not folders.`;
+  if (st.size > PROTOCOL_DOCUMENT_MAX_BYTES) return `${name} is larger than 100 MB.`;
+  if (!name || name.length > MAX_NAME || BAD_NAME.test(name) || name.startsWith(".")) return "This document's name is not usable; rename the file and drop it again.";
+  const type = await fileTypeFromFile(path).catch(() => undefined);
+  if (type) {
+    const mime = type.mime.toLowerCase();
+    if (ALLOWED_EXT.has(type.ext) || (mime.startsWith("image/") && mime !== "image/svg+xml")) return undefined;
+    return KIND_REASON;
+  }
+  if (extname(name).toLowerCase() === ".txt" && (await isPlainText(path))) return undefined;
+  return KIND_REASON;
+}
+
+/** The project's protocol documents, by name. An encrypted project must be unlocked (the names are sealed). */
 export async function listProtocolDocuments(repo: Repo, projectId: string): Promise<ProtocolDocument[]> {
   const { abs } = folderOf(repo, projectId);
   const out: ProtocolDocument[] = [];
-  for (const e of await existingNames(abs)) {
-    const st = await fsp.lstat(join(abs, e.file)).catch(() => null);
-    if (st?.isFile()) out.push({ name: e.name, bytes: st.size, encrypted: e.encrypted });
+  if (projectEncrypted(repo, projectId)) {
+    const key = projectDataKey(repo, projectId); // throws ProjectLockedError when locked
+    if (!key) return [];
+    const m = await readManifest(abs, key);
+    for (const [file, d] of Object.entries(m.documents)) {
+      const st = await fsp.lstat(join(abs, file)).catch(() => null);
+      if (st?.isFile()) out.push({ name: d.name, bytes: d.bytes, encrypted: true });
+    }
+  } else {
+    for (const file of await plainNames(abs)) {
+      const st = await fsp.lstat(join(abs, file)).catch(() => null);
+      if (st?.isFile()) out.push({ name: file, bytes: st.size, encrypted: false });
+    }
   }
   return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
-/**
- * Copies `paths` (absolute paths of regular files) into the project's protocol folder. Every path
- * is checked before anything is copied: a folder, a symbolic link or a missing file refuses the
- * whole drop (InvalidInputError).
- */
-export async function addProtocolDocuments(repo: Repo, projectId: string, paths: string[]): Promise<ProtocolDocument[]> {
-  if (!paths.length) throw new InvalidInputError("Drop at least one document");
-  for (const p of paths) {
-    const st = await fsp.lstat(p).catch(() => null);
-    if (!st) throw new InvalidInputError(`${basename(p)} could not be found`);
-    if (st.isSymbolicLink()) throw new InvalidInputError(`${basename(p)} is a shortcut (symbolic link); drop the document itself`);
-    if (!st.isFile()) throw new InvalidInputError(`${basename(p)} is not a file; drop documents, not folders`);
-    const name = basename(p);
-    if (!name || name.length > MAX_NAME || BAD_NAME.test(name) || name.startsWith(".")) {
-      throw new InvalidInputError("A document name is not usable; rename the file and drop it again");
-    }
-  }
+async function addOne(repo: Repo, projectId: string, path: string): Promise<ProtocolDocument> {
   const { rel, abs } = folderOf(repo, projectId);
-  const encrypted = projectEncrypted(repo, projectId);
-  const out: ProtocolDocument[] = [];
-  for (const p of paths) {
-    const taken = new Set((await existingNames(abs)).map((e) => e.name.toLowerCase()));
-    const name = uniqueName(basename(p), taken);
-    const r = await repo.mutate(
-      projectId,
-      { action: "store", store: { identifiable: false, hasLocation: false } },
-      async (tx) => {
-        if (!(await tx.exists(rel))) await tx.mkdir(rel);
-        return tx.copyFile(p, `${rel}/${name}${tx.encrypted ? ".enc" : ""}`, { encrypt: tx.encrypted, noFollow: true });
-      },
-      { op: "protocol.document", entity: { type: "project", id: projectId } },
-    );
-    out.push({ name, bytes: r.bytes, encrypted });
+  const wanted = basename(path);
+  return repo.mutate(
+    projectId,
+    { action: "store", store: { identifiable: false, hasLocation: false } },
+    async (tx: Tx) => {
+      if (!(await tx.exists(rel))) await tx.mkdir(rel);
+      if (tx.encrypted) {
+        const key = tx.key();
+        const m = await readManifest(abs, key);
+        const name = uniqueName(wanted, new Set(Object.values(m.documents).map((d) => d.name.toLowerCase())));
+        const file = `doc-${newId()}.enc`;
+        const r = await tx.copyFile(path, `${rel}/${file}`, { encrypt: true, noFollow: true });
+        m.documents[file] = { name, bytes: r.bytes, addedAt: tx.at };
+        await tx.writeFile(`${rel}/${MANIFEST}`, JSON.stringify(m), { encrypt: true, mode: 0o600 });
+        return { name, bytes: r.bytes, encrypted: true };
+      }
+      const name = uniqueName(wanted, new Set((await plainNames(abs)).map((n) => n.toLowerCase())));
+      const r = await tx.copyFile(path, `${rel}/${name}`, { noFollow: true });
+      return { name, bytes: r.bytes, encrypted: false };
+    },
+    { op: "protocol.document", entity: { type: "project", id: projectId } },
+  );
+}
+
+/**
+ * Copies `paths` (absolute paths) into the project's protocol folder, one governed change per
+ * document; returns one result per path, in order. A policy refusal or a locked project is thrown.
+ */
+export async function addProtocolDocuments(repo: Repo, projectId: string, paths: string[]): Promise<ProtocolDocumentResult[]> {
+  const out: ProtocolDocumentResult[] = [];
+  for (const path of paths) {
+    const file = basename(path);
+    const why = await refusal(path);
+    if (why) {
+      out.push({ file, outcome: "failed", reason: why });
+      continue;
+    }
+    out.push({ file, outcome: "added", document: await addOne(repo, projectId, path) });
   }
   return out;
 }

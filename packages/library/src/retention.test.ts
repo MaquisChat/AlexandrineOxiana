@@ -152,6 +152,17 @@ describe("destroyRaw", () => {
     expect((await kit.repo.getSource(p.id, sf.source.id)).assets.find((a) => a.id === ocr.id)?.status).toBe("destroyed");
   });
 
+  it("onlyDue (R117): re-checks inside the change that the files are due; nothing is destroyed otherwise", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const sf = await rawSource(p);
+    const pub = await addSource(kit, p, { title: "Published", files: [{ path: await scratchFile(kit, "p.pdf", "%PDF"), role: "original", handling: "copy" }] });
+    await expect(destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "x", { onlyDue: new Date("2026-11-30T12:00:00Z") })).rejects.toThrow(/not due/u);
+    await expect(destroyRaw(kit.repo, p.id, [pub.assets[0]!.id], "x", { onlyDue: new Date("2026-12-02T12:00:00Z") })).rejects.toThrow(/not due/u);
+    expect((await kit.repo.getSource(p.id, sf.source.id)).assets[0]!.status).not.toBe("destroyed");
+    await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "x", { onlyDue: new Date("2026-12-02T12:00:00Z") });
+    expect((await kit.repo.getSource(p.id, sf.source.id)).assets[0]!.status).toBe("destroyed");
+  });
+
   it("refuses an asset that is not an original of this project", async () => {
     const p = await makeProject(kit, GOV(false));
     const sf = await rawSource(p);
