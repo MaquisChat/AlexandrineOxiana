@@ -206,6 +206,35 @@ describe("retention (spec 6.3(5))", () => {
     expect(JSON.stringify(r.json)).not.toContain(tmp);
     expect((await call({ url: `/projects/${pid}/retention` })).json.due).toEqual([]);
   });
+
+  it("R147: the certificate is shown as written, with its amendments and the resulting status, at the destruction and afterwards", async () => {
+    const { assetId } = await newSource();
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    const held = `Backups/${b.json.backup.file as string}`;
+    const r = await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true } });
+    expect(r.status, r.body).toBe(200);
+    // As written at the destruction (and never rewritten): the backup that held the file, still to be removed.
+    expect(r.json.original.backups).toEqual({ status: "pending", containing: [held], deleted: [] });
+    // What happened then is an amendment beside it; the certificate is presented with the result.
+    expect(r.json.status).toBe("deleted");
+    expect(r.json.certificate.backups).toMatchObject({ status: "deleted", containing: [held], deleted: [held] });
+    expect(r.json.amendments).toEqual([
+      {
+        file: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.amendment-1\.json$/),
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        verified: true,
+        content: expect.objectContaining({ kind: "destruction-certificate-amendment", number: 1 }),
+      },
+    ]);
+    expect(JSON.parse(await readFile(join(tmp, "Lib", r.json.certificateFile), "utf8"))).toEqual(r.json.original);
+    const list = await call({ url: `/projects/${pid}/retention/certificates` });
+    expect(list.status, list.body).toBe(200);
+    expect(list.json.certificates).toEqual([
+      { certificateFile: r.json.certificateFile, certificateSha256: expect.stringMatching(/^[0-9a-f]{64}$/), verified: true, original: r.json.original, certificate: r.json.certificate, amendments: r.json.amendments, status: "deleted", outstanding: [] },
+    ]);
+    expect(list.body).not.toContain(tmp);
+  });
 });
 
 describe("researcher name (device setting, R84/R117 carry-over)", () => {

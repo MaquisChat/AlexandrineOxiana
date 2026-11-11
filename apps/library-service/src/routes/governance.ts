@@ -8,13 +8,16 @@
  * Also the two governance controls that keep files (Task 36): protocol approval documents dropped
  * onto the protocol record (stored under `<Project>/protocol/`, sealed in encrypted projects), and
  * retention — the raw originals due under `retention.rawDataDestroyAfter`, and their destruction
- * (only those due, only with `confirm: true`), answered with the destruction certificate.
+ * (only those due, only with `confirm: true`), answered with the destruction certificate. A
+ * certificate is always shown as written at the destruction together with its amendments and the
+ * resulting status of its backups step (R147): in the answer to a destruction, and in the list of
+ * the project's certificates.
  */
 import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
 import { effectivePolicy, parseGovernance } from "@ao/core";
-import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, researcherName, retentionDue, scrubPaths } from "@ao/library";
+import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listDestructions, listProtocolDocuments, researcherName, retentionDue, scrubPaths } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
 
@@ -147,6 +150,18 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     state.publishState();
     const root = s.lib.root.replace(/[\\/]+$/, "");
     const rel = r.certificatePath.startsWith(root) ? r.certificatePath.slice(root.length + 1).split(/[\\/]/).join("/") : "";
-    return { certificate: r.certificate, certificateFile: rel };
+    // `certificate`: as presented (its backups as they stand now). `original`: the file as written,
+    // never rewritten. `amendments`: what was recorded beside it since (library-relative files).
+    return { certificate: r.certificate, certificateFile: rel, original: r.original, amendments: r.amendments, status: r.status };
+  });
+
+  // The project's destruction certificates, oldest first: each as written, with its amendments, the
+  // resulting status, the backups still to be removed, and why the app does not remove them by
+  // itself when its files and the audit log disagree (R147). Library-relative paths only.
+  app.get("/projects/:id/retention/certificates", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    const certificates = (await listDestructions(s.repo, projectId)).map((d) => (d.problem ? { ...d, problem: scrubPaths(d.problem, state.roots) } : d));
+    return { certificates };
   });
 }

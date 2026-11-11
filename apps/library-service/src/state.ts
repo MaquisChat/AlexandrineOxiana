@@ -12,6 +12,7 @@ import {
   WorkerUnavailableError,
   backupFailure,
   backupIfDue,
+  backupsAwaitingRemoval,
   resumeDestruction,
   createBulkImport,
   createIndexSink,
@@ -25,6 +26,7 @@ import {
   startMediaWorker,
   startWatchedFolders,
   type BackupFailure,
+  type PendingRemoval,
   type BatchHandle,
   type BulkImport,
   type Deps,
@@ -696,11 +698,15 @@ export class ServiceState {
       projectWarnings: this.cachedProjectWarnings,
       // Why a project shows `backup-failed` (R125: a refusal gives the engine's reason), path-scrubbed.
       backupFailures: this.cachedBackupFailures,
+      // What stands behind `destruction-backups-pending` (R147): which backups still wait to be
+      // removed after a destruction, and why the app does not remove them by itself when it does not.
+      destructionBackupsPending: this.cachedPendingRemovals,
     };
   }
 
   private cachedProjectWarnings: Record<string, string[]> = {};
   private cachedBackupFailures: Record<string, BackupFailure> = {};
+  private cachedPendingRemovals: Record<string, PendingRemoval[]> = {};
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
     return s.repo.integrityWarnings.map((w) => ({
@@ -715,13 +721,17 @@ export class ServiceState {
   async projectWarnings(s: Session): Promise<Record<string, string[]>> {
     const out: Record<string, string[]> = {};
     const failures: Record<string, BackupFailure> = {};
+    const waiting: Record<string, PendingRemoval[]> = {};
     for (const p of s.repo.listProjects()) {
       out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
       const f = out[p.id]!.includes("backup-failed") ? await backupFailure(s.repo, p.id).catch(() => undefined) : undefined;
       if (f) failures[p.id] = { ...f, reason: scrubPaths(f.reason, this.roots) };
+      const w = out[p.id]!.includes("destruction-backups-pending") ? await backupsAwaitingRemoval(s.repo, p.id).catch(() => []) : [];
+      if (w.length) waiting[p.id] = w.map((x) => (x.reason ? { ...x, reason: scrubPaths(x.reason, this.roots) } : x));
     }
     this.cachedProjectWarnings = out;
     this.cachedBackupFailures = failures;
+    this.cachedPendingRemovals = waiting;
     return out;
   }
 
@@ -731,6 +741,7 @@ export class ServiceState {
     if (!s) {
       this.cachedProjectWarnings = {};
       this.cachedBackupFailures = {};
+      this.cachedPendingRemovals = {};
       this.events.publish("library.state", this.libraryState());
       return;
     }
@@ -749,12 +760,18 @@ export class ServiceState {
     const s = this.session;
     if (!s || s.lib.mode !== "read-write" || this.moving || this.shuttingDown) return [];
     const out: BackupRun[] = [];
+    let retried = false;
     for (const p of s.repo.listProjects()) {
       if (onlyProjectId && p.id !== onlyProjectId) continue;
       // A destruction whose backups could not all be removed is retried on every pass (R138 e, N1):
-      // at open, at unlock and hourly, until its certificate says every holding backup is gone.
+      // at open, at unlock and hourly, until the audit log records every listed backup as gone
+      // (R147). Never for a locked project: nothing of it can be read or recorded.
       if (s.repo.isUnlocked(p.id)) {
-        await resumeDestruction(s.repo, p.id).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "resuming a destruction failed"));
+        const worked = await resumeDestruction(s.repo, p.id).catch((err: unknown) => {
+          this.opts.log.warn({ err: this.describe(err) }, "resuming a destruction failed");
+          return ["failed"];
+        });
+        if (worked.length) retried = true;
       }
       if (p.backups?.automatic === false) continue;
       try {
@@ -767,7 +784,7 @@ export class ServiceState {
         this.events.publish("job.progress", { kind: "backup", projectId: p.id, ok: false, error: this.describe(err) });
       }
     }
-    if (out.length) this.publishState();
+    if (out.length || retried) this.publishState();
     return out;
   }
 

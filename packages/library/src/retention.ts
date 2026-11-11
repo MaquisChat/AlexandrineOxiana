@@ -1013,6 +1013,28 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
   return out;
 }
 
+/** A destruction whose listed backups are not all gone yet, as the last retry pass noted it. */
+export interface PendingRemoval {
+  /** Library-relative path of the destruction certificate. */
+  certificateFile: string;
+  /** Backups (library-relative) still to be removed. */
+  backups: string[];
+  /** Why the app does not remove them by itself (plain words), when it does not. */
+  reason?: string;
+}
+
+/**
+ * What stands behind the project's `destruction-backups-pending` warning: which backups wait, for
+ * which destruction, and why the app does not remove them by itself when it does not. Read from the
+ * note the last retry pass wrote from the audit log (cheap; `listDestructions` reads the log itself).
+ */
+export async function backupsAwaitingRemoval(repo: Repo, projectId: string): Promise<PendingRemoval[]> {
+  const notes = await destructionNotes(repo, projectId);
+  return Object.keys(notes)
+    .sort()
+    .map((rel) => ({ certificateFile: rel, backups: notes[rel]!.files, ...(notes[rel]!.problem ? { reason: notes[rel]!.problem } : {}) }));
+}
+
 /** `destruction-<YYYY-MM-DD HHmm>` for a time in `tz`. */
 export function certificateStem(at: Date, tz?: string): string {
   return `destruction-${formatModified(at, tz)}`;

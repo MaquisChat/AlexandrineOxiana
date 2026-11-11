@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   KeyRing,
   OcrQueue,
@@ -22,6 +22,8 @@ import {
   openLibrary,
   projectWarnings,
   openRepo,
+  readDestruction,
+  resumeDestruction,
   type Deps,
   type JobResult,
   type WorkerClient,
@@ -35,6 +37,13 @@ import * as authModule from "./auth.js";
 import { readServiceToken } from "./auth.js";
 import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
+
+// The library as it is, with the destruction retry observable: a test can tell whether the service
+// started it for a project at all (R3-M3), not only what it changed.
+vi.mock("@ao/library", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@ao/library")>();
+  return { ...actual, resumeDestruction: vi.fn(actual.resumeDestruction) };
+});
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
 const PASS = "correct horse battery staple";
@@ -1043,7 +1052,9 @@ processing:
       shredSeams.failFor = undefined;
     }
   }
-  const statusOf = async (path: string) => (JSON.parse(await readFile(path, "utf8")) as { backups: { status: string } }).backups.status;
+  // R147: the certificate file is never rewritten; the status is read with its amendments, from the audit log.
+  const statusOf = async (pid: string, path: string) => (await readDestruction(svc.state.session!.repo, pid, path)).status;
+  type Waiting = Record<string, Array<{ certificateFile: string; backups: string[]; reason?: string }>>;
 
   beforeEach(async () => {
     clock.now = new Date("2026-12-02T10:00:00.000Z");
@@ -1056,12 +1067,14 @@ processing:
   it("runs when the library is opened", async () => {
     const path = await openNewLibrary();
     const { pid, certificatePath, backup } = await stuckDestruction();
-    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
+    const written = await readFile(certificatePath);
     await call({ method: "POST", url: "/libraries/close" });
     later(HOUR);
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     await svc.state.idle();
-    expect(await statusOf(certificatePath)).toBe("deleted");
+    expect(await statusOf(pid, certificatePath)).toBe("deleted");
+    expect((await readFile(certificatePath)).equals(written)).toBe(true);
     expect(existsSync(backup)).toBe(false);
     expect(await projectWarnings(svc.state.session!.repo, pid)).not.toContain("destruction-backups-pending");
   });
@@ -1069,42 +1082,55 @@ processing:
   it("runs when a project is unlocked, and never while it is locked", async () => {
     await openNewLibrary();
     const { pid, certificatePath, backup } = await stuckDestruction(true);
-    svc.state.session!.repo.lockProject(pid);
+    const repo = svc.state.session!.repo;
+    repo.lockProject(pid);
     later(HOUR);
+    const retry = vi.mocked(resumeDestruction);
+    retry.mockClear();
     await svc.state.runScheduledBackups();
-    // Locked: not retried (the certificate is sealed; the backup is the evidence).
+    // Locked: the retry is not even started for the project (R3-M3: without the service's own
+    // check it would be started, and only the library would decline).
+    expect(retry).not.toHaveBeenCalled();
     expect(certificatePath.endsWith(".json.enc")).toBe(true);
     expect(existsSync(backup)).toBe(true);
     expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
     await svc.state.idle();
+    expect(retry).toHaveBeenCalledWith(repo, pid);
     expect(existsSync(backup)).toBe(false);
+    expect(await statusOf(pid, certificatePath)).toBe("deleted");
     expect(await projectWarnings(svc.state.session!.repo, pid)).not.toContain("destruction-backups-pending");
   });
 
   it("runs on the hourly pass, at most hourly", async () => {
     await openNewLibrary();
-    const { certificatePath, backup } = await stuckDestruction();
+    const { pid, certificatePath, backup } = await stuckDestruction();
     later(30 * 60_000);
     // The first retry after the destruction is due at once; it still fails here.
     shredSeams.failFor = (p) => p.endsWith(backup.slice(backup.lastIndexOf("/") + 1));
     await svc.state.runScheduledBackups();
     shredSeams.failFor = undefined;
-    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
     // Half an hour later: not due yet.
     later(30 * 60_000);
     await svc.state.runScheduledBackups();
-    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
     expect(existsSync(backup)).toBe(true);
+    // The library state names the backup that waits (no reason: nothing disagrees, the removal failed).
+    await svc.state.projectWarnings(svc.state.session!);
+    const waiting = (svc.state.libraryState() as { destructionBackupsPending: Waiting }).destructionBackupsPending;
+    expect(waiting[pid]).toEqual([{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), backups: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`] }]);
     // An hour after the last attempt: retried, and done.
     later(30 * 60_000);
     await svc.state.runScheduledBackups();
-    expect(await statusOf(certificatePath)).toBe("deleted");
+    expect(await statusOf(pid, certificatePath)).toBe("deleted");
     expect(existsSync(backup)).toBe(false);
+    await svc.state.projectWarnings(svc.state.session!);
+    expect((svc.state.libraryState() as { destructionBackupsPending: Waiting }).destructionBackupsPending[pid]).toBeUndefined();
   });
 
   it("does not run while the library is being moved, nor in a read-only library", async () => {
     await openNewLibrary();
-    const { certificatePath, backup } = await stuckDestruction();
+    const { pid, certificatePath, backup } = await stuckDestruction();
     later(HOUR);
     const st = svc.state as unknown as { moving: unknown };
     const before = st.moving;
@@ -1114,7 +1140,7 @@ processing:
     } finally {
       st.moving = before;
     }
-    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
     // As if the library had been opened read-only (an instance property shadows the getter).
     const lib = svc.state.session!.lib;
     const own = Object.getOwnPropertyDescriptor(lib, "mode");
@@ -1126,8 +1152,32 @@ processing:
       else delete (lib as unknown as { mode?: unknown }).mode;
     }
     expect(svc.state.session!.lib.mode).toBe("read-write");
-    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(await statusOf(pid, certificatePath)).toBe("pending");
     expect(existsSync(backup)).toBe(true);
+  });
+
+  it("R147: a certificate changed on disk: the retry removes nothing, the warning stands, and the library state says which backup waits and why, in plain words", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    const cert = JSON.parse(await readFile(certificatePath, "utf8")) as { assets: unknown[] };
+    cert.assets = [];
+    await writeFile(certificatePath, JSON.stringify(cert));
+    later(HOUR);
+    await svc.state.runScheduledBackups();
+    expect(existsSync(backup)).toBe(true);
+    await svc.state.projectWarnings(svc.state.session!);
+    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; destructionBackupsPending: Waiting };
+    expect(state.projectWarnings[pid]).toContain("destruction-backups-pending");
+    expect(state.destructionBackupsPending[pid]).toEqual([
+      { certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), backups: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`], reason: expect.stringMatching(/audit log/u) },
+    ]);
+    expect(JSON.stringify(state)).not.toContain(tmp);
+    // The route that shows certificates says the same of it.
+    const shown = await call({ url: `/projects/${pid}/retention/certificates` });
+    expect(shown.status, shown.body).toBe(200);
+    expect(shown.json.certificates).toHaveLength(1);
+    expect(shown.json.certificates[0]).toMatchObject({ verified: false, status: "pending", outstanding: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`], problem: expect.stringMatching(/audit log/u) });
+    expect(shown.body).not.toContain(tmp);
   });
 });
 
