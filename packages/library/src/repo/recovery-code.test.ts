@@ -282,5 +282,10 @@ describe("issueRecoveryCode and backups (R91, R92)", () => {
     await expect(restoreBackup(repo, b.path, { passphrase: recoveryCode })).rejects.toThrow(/does not open/i);
     const restored = await restoreBackup(repo, b.path, { passphrase: code });
     expect(restored.projectId).not.toBe(pid);
+    // The restored project carries the key file of its time: the old code opens it, the new one does not.
+    expect(await opens(restored.projectId, recoveryCode)).toBe(false);
+    expect(await opens(restored.projectId, code)).toBe(true);
+    // The live project is unaffected: the new code opens it.
+    expect(await opens(pid, recoveryCode)).toBe(true);
   });
 });
