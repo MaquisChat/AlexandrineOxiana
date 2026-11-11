@@ -858,8 +858,10 @@ export const BACKUP_FAILED_WARNING = "backup-failed";
 export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
 
 /**
- * Persisted in `Backups/backups-state.json` (`undestroyed`) while a backup holding raw data destroyed
- * under the retention rule could not be removed (R138 e, N1); cleared once a retry removes it.
+ * Noted in `Backups/backups-state.json` (`undestroyed`) while a backup listed at a destruction under
+ * the retention rule is not yet verifiably gone (R138 e, N1, R147). The note is rewritten from the
+ * audit log at every retry pass, and cleared once every listed backup is recorded as removed or as
+ * no longer present.
  */
 export const DESTRUCTION_BACKUPS_PENDING_WARNING = "destruction-backups-pending";
 
