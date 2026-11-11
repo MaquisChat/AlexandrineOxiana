@@ -52,6 +52,41 @@ describe("import routes", () => {
     expect(m.calls.filter((c) => c.path.includes(".."))).toHaveLength(0);
   });
 
+  it("/import naming a project and an import opens that import's report (D1)", async () => {
+    const m = mockService({ batches: [{ batchId: B1, number: 4, kind: "folder", state: "finished", startedAt: "2026-11-11T10:00:00.000Z", counts: { created: 3, merged: 0, skipped: 0, failed: 0, needsReview: 1 } }] });
+    render(<>{importRoute({ pathname: "/import", search: `?project=${P1}&batch=${B1}` }, m.client)}</>);
+    expect(await screen.findByRole("heading", { name: "Report and undo" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Undo import" })).toBeTruthy();
+  });
+
+  it("/import ignores an import id that is not valid, without calling the service with it", async () => {
+    const m = mockService();
+    render(<>{importRoute({ pathname: "/import", search: `?project=${P1}&batch=..` }, m.client)}</>);
+    expect(await screen.findByRole("option", { name: "Thesis" })).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("heading", { name: "Report and undo" })).toBeNull();
+    expect(m.calls.filter((c) => c.path.includes(".."))).toHaveLength(0);
+  });
+
+  it("/import/review links back to the report of the import being reviewed (D1)", async () => {
+    const m = mockService();
+    render(<>{importRoute({ pathname: "/import/review", search: `?project=${P1}&batch=${B1}` }, m.client)}</>);
+    const link = await screen.findByRole("link", { name: "Back to the import's report and undo" });
+    expect(link.getAttribute("href")).toBe(`/import?project=${P1}&batch=${B1}`);
+  });
+
+  it("/import/review's picker links to the chosen import's report (D1)", async () => {
+    const m = mockService({ batches: [{ batchId: B7, number: 7, kind: "folder", state: "finished", startedAt: "2026-11-10T09:00:00.000Z", counts: { created: 3, merged: 0, skipped: 0, failed: 0, needsReview: 0 } }] });
+    render(<>{importRoute({ pathname: "/import/review", search: "" }, m.client)}</>);
+    await screen.findByRole("option", { name: /Import 7/ });
+    // Nothing waits in import 7, so it is not chosen for review; once chosen, its report is linked.
+    const pick = screen.getByRole("combobox", { name: "Import" }) as HTMLSelectElement;
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.change(pick, { target: { value: B7 } });
+    const link = await screen.findByRole("link", { name: "Back to the import's report and undo" });
+    expect(link.getAttribute("href")).toBe(`/import?project=${P1}&batch=${B7}`);
+  });
+
   it("other paths are not import routes", () => {
     const m = mockService();
     expect(importRoute({ pathname: "/library", search: "" }, m.client)).toBeNull();

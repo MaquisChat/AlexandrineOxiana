@@ -6,12 +6,19 @@
  * governance sets the defaults (R24: no link in place when files must be encrypted; R64: folder
  * structure ignored by default where names are pseudonymised). Files outside the source's folders
  * are approved on the Scan step and the approvals go with the start request (R67).
+ *
+ * An import's report stays reachable (D1): once an import starts, the wizard's address names it
+ * (`/import?project=<id>&batch=<id>`, replacing the current history entry), and the wizard opened
+ * on such an address shows that import (its run while it runs, else its report and undo), read
+ * from the service (GET /projects/:id/imports, /imports/:id/report), never from memory. The Source
+ * step lists the project's recent imports, each linking to its report.
  */
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../../api/client";
-import { importApi, isValidId, type BatchState, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
+import { importApi, isValidId, type BatchState, type BatchSummary, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
 import { UserText } from "../../components/UserText";
-import { ErrorNote, errorText } from "./shared";
+import { inAppLink, navigate } from "../../navigation";
+import { batchStateText, ErrorNote, errorText, fmt, reportHref, Section } from "./shared";
 import { StepOptions, defaultOptions, type WizardOptions } from "./StepOptions";
 import { StepReport } from "./StepReport";
 import { StepReview } from "./StepReview";
@@ -51,7 +58,15 @@ export interface ImportWizardProps {
   client: ApiClient;
   /** The project to preselect. */
   projectId?: string;
+  /** An import of `projectId` to open (from the address): its run, or its report and undo (D1). */
+  batchId?: string;
 }
+
+/** Batch states the run screen follows; any other state is shown as the report. */
+const LIVE: ReadonlySet<BatchState> = new Set(["running", "paused", "interrupted"]);
+
+/** How many of the project's imports the Source step lists. */
+export const RECENT_IMPORTS = 5;
 
 /** What was scanned: the start request uses exactly this (R115 I2). */
 interface Scanned {
@@ -60,8 +75,10 @@ interface Scanned {
   summary: ScanSummary;
 }
 
-export function ImportWizard({ client, projectId: initialProject }: ImportWizardProps) {
+export function ImportWizard({ client, projectId: initialProject, batchId: initialBatch }: ImportWizardProps) {
   const api = useMemo(() => importApi(client), [client]);
+  /** The import named by the address, when both ids are valid: it is read before anything is shown. */
+  const [opening, setOpening] = useState(() => isValidId(initialProject) && isValidId(initialBatch));
   const [step, setStep] = useState<Step>("source");
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [projectId, setProjectIdState] = useState(isValidId(initialProject) ? initialProject : "");
@@ -71,6 +88,9 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
   const [approvals, setApprovals] = useState<OutsideApprovals>(NO_APPROVALS);
   const [options, setOptions] = useState<WizardOptions | null>(null);
   const [batchId, setBatchId] = useState<string | null>(null);
+  /** The project of the import being run or reported (the scanned one, or the one in the address). */
+  const [runProject, setRunProject] = useState<string>("");
+  const [recent, setRecent] = useState<BatchSummary[] | null>(null);
   const [runError, setRunError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -103,6 +123,44 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
       live = false;
     };
   }, [api]);
+
+  // The import named in the address (D1): its run while it runs, else its report.
+  useEffect(() => {
+    if (!opening || !isValidId(initialProject) || !isValidId(initialBatch)) return;
+    let live = true;
+    api
+      .batches(initialProject)
+      .then((list) => {
+        if (!live) return;
+        const b = list.find((x) => x.batchId === initialBatch);
+        if (!b) {
+          setError("This import was not found in this project; it may have been removed. You can start a new import here.");
+        } else {
+          setRunProject(initialProject);
+          setBatchId(b.batchId);
+          setStep(LIVE.has(b.state) ? "run" : "report");
+        }
+      })
+      .catch((e: unknown) => live && setError(`The import could not be read. ${errorText(e)}`))
+      .finally(() => live && setOpening(false));
+    return () => {
+      live = false;
+    };
+  }, [api, opening, initialProject, initialBatch]);
+
+  // The project's recent imports, listed on the Source step, each linking to its report (D1).
+  useEffect(() => {
+    setRecent(null);
+    if (step !== "source" || opening || !isValidId(projectId)) return;
+    let live = true;
+    api
+      .batches(projectId)
+      .then((list) => live && setRecent([...list].sort((a, b) => b.number - a.number).slice(0, RECENT_IMPORTS)))
+      .catch(() => live && setRecent([])); // a read-only or locked library: nothing is listed
+    return () => {
+      live = false;
+    };
+  }, [api, step, opening, projectId]);
 
   useEffect(() => {
     if (!isValidId(projectId)) return;
@@ -154,8 +212,11 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
               options: { ...o, ...(c.researcherName.trim() ? { researcherName: c.researcherName.trim() } : {}) },
             })
           : await api.start(scanned.projectId, adapterOf(c), o);
+      setRunProject(scanned.projectId);
       setBatchId(r.batchId);
       setStep("run");
+      // The address names the import, so Back from the review queue (or anywhere) returns to it (D1).
+      if (isValidId(scanned.projectId) && isValidId(r.batchId)) navigate(reportHref(scanned.projectId, r.batchId), { replace: true });
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -169,7 +230,7 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
   };
 
   const current = STEPS.findIndex((s) => s.step === step);
-  const project = projects.find((p) => p.id === projectId);
+  const project = projects.find((p) => p.id === (runProject || projectId));
 
   return (
     <main className="ao-import" aria-labelledby="ao-import-title">
@@ -191,7 +252,8 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
         ))}
       </ol>
 
-      {step === "source" && (
+      {opening && <p role="status">Opening the import…</p>}
+      {!opening && step === "source" && (
         <StepSource
           api={api}
           projects={projects}
@@ -205,6 +267,7 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
           {...(scanned ? { onNext: () => setStep("scan") } : {})}
         />
       )}
+      {!opening && step === "source" && recent && recent.length > 0 && isValidId(projectId) && <RecentImports projectId={projectId} batches={recent} />}
       {step === "scan" && scanned && (
         <>
           <StepScan summary={scanned.summary} sourceName={describeChoice(scanned.choice)} approvals={approvals} onApprovals={setApprovals} device={scanned.choice.kind === "device"} />
@@ -231,9 +294,29 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
           </div>
         </>
       )}
-      {step === "run" && batchId && scanned && <StepRun client={client} api={api} projectId={scanned.projectId} batchId={batchId} onEnded={ended} />}
-      {step === "report" && batchId && scanned && <StepReport api={api} projectId={scanned.projectId} batchId={batchId} {...(runError ? { error: runError } : {})} />}
+      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} />}
+      {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} {...(runError ? { error: runError } : {})} />}
     </main>
+  );
+}
+
+const DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
+
+/** The project's latest imports, newest first, each a link to its report and undo (D1). */
+function RecentImports({ projectId, batches }: { projectId: string; batches: BatchSummary[] }) {
+  return (
+    <Section title="Recent imports">
+      <ul>
+        {batches.filter((b) => isValidId(b.batchId)).map((b) => (
+          <li key={b.batchId}>
+            <a href={reportHref(projectId, b.batchId)} onClick={inAppLink}>
+              Import {fmt(b.number)} — <UserText>{b.kind}</UserText>
+              {Number.isNaN(Date.parse(b.startedAt)) ? "" : `, ${DATE.format(new Date(b.startedAt))}`} ({batchStateText(b.state)})
+            </a>
+          </li>
+        ))}
+      </ul>
+    </Section>
   );
 }
 

@@ -33,7 +33,8 @@ import {
 } from "../../api/import";
 import { CodeSwatch } from "../../components/CodeSwatch";
 import { UserText } from "../../components/UserText";
-import { count, ErrorNote, errorText, fmt, Section, SOURCE_TYPES, typeLabel } from "./shared";
+import { inAppLink } from "../../navigation";
+import { count, ErrorNote, errorText, fmt, reportHref, Section, SOURCE_TYPES, typeLabel } from "./shared";
 import "./import.css";
 
 /** Batch kinds whose collections are made from folder names. */
@@ -267,6 +268,11 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
       <h1 id="ao-review-title" ref={title} tabIndex={-1}>
         Review queue
       </h1>
+      <p>
+        <a href={reportHref(projectId, batchId)} onClick={inAppLink}>
+          Back to the import's report and undo
+        </a>
+      </p>
       <ErrorNote error={error} />
       <p className="ao-visually-hidden" role="status">
         {status}
