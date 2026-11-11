@@ -431,10 +431,29 @@ describe("Review queue: the file under review (Task 57, R135)", () => {
   });
 
   it("an answer that arrives after another item was chosen is dropped, and nothing outlives the screen", async () => {
-    const { user } = setup(withPictures({ pictureDelayMs: 150 }));
+    // The first picture answers only once the test lets it, after another item was chosen.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    let first = true;
+    const { user } = setup(
+      withPictures({
+        extra: [
+          http.get(`${SERVICE}/projects/:id/sources/:sid/assets/:aid/content`, async () => {
+            if (first) {
+              first = false;
+              await gate;
+            }
+            return new HttpResponse(PNG, { headers: { "Content-Type": "image/png" } });
+          }),
+        ],
+      }),
+    );
     await screen.findByRole("region", { name: "File preview" });
+    await waitFor(() => expect(first).toBe(false));
     await user.click(screen.getByRole("button", { name: "Show Second paper" }));
-    await new Promise((r) => setTimeout(r, 250));
+    await within(screen.getByRole("region", { name: "File preview" })).findByText(/No preview of this file can be shown here/);
+    release();
+    await new Promise((r) => setTimeout(r, 50));
     expect(screen.queryByRole("img", { name: /Preview of/ })).toBeNull();
     expect(made).toEqual([]); // the late answer never became an address
     await user.click(screen.getByRole("button", { name: "Show Market photo" }));
