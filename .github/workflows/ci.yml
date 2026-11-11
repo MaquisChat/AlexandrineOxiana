@@ -37,7 +37,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         run: |
-          for h in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com registry.npmjs.org pypi.org files.pythonhosted.org codeload.github.com download.pytorch.org raw.pixls.us cdn.playwright.dev; do
+          for h in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com mirrors.edge.kernel.org registry.npmjs.org pypi.org files.pythonhosted.org codeload.github.com download.pytorch.org raw.pixls.us cdn.playwright.dev; do
             ip=$(getent hosts "$h" | awk '{print $1}' | head -1)
             code=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "https://$h/" 2>/dev/null || true)
             echo "net-check $h dns=${ip:-FAIL} https=${code:-ERR}"
@@ -47,6 +47,15 @@ jobs:
         # When the runner cannot reach the package mirror, apt retries each file for 20 s; fail fast instead.
         timeout-minutes: 4
         run: |
+          # If Ubuntu's own mirrors do not resolve (seen on 2026-11-11: every *.ubuntu.com name failed on the
+          # runner while other hosts worked), use a full mirror under another name for this run. Packages are
+          # still verified against Ubuntu's signing keys, so the mirror cannot substitute anything.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            echo "::warning::Ubuntu's package mirrors do not resolve on this runner; using mirrors.edge.kernel.org for this run."
+            for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              [ -f "$f" ] && sudo sed -i -E 's#https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?#https://mirrors.edge.kernel.org/ubuntu/#g' "$f"
+            done
+          fi
           sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
           sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 tesseract-ocr ghostscript ffmpeg
       - run: pnpm install --frozen-lockfile
