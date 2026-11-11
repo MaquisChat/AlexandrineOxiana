@@ -12,6 +12,7 @@ import { BackToLibrary, normalisePath, PATHS, projectInQuery, useDropGuard, useL
 import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
+import { isTranscriptPath, TranscriptRoute } from "./routes/transcript";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
@@ -33,6 +34,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isLibraryPath, render: (loc, client) => <LibraryRoutes client={client} loc={loc} />, back: false },
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
   { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
+  { matches: isTranscriptPath, render: (loc, client) => <TranscriptRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
