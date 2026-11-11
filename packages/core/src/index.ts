@@ -1,4 +1,4 @@
-// Placeholder so the package builds and typechecks; real code arrives in later tasks.
+// Public entry point of @ao/core: re-exports the platform-neutral domain model and helpers.
 export const packageName = "@ao/core";
 
 export { isId, newId, shortId } from "./ids.js";

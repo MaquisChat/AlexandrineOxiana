@@ -23,7 +23,7 @@ The full numbered log of 119 binding rulings is in `docs/handoff/LEDGER.md`. Eac
 - Chunked AES-256-GCM encryption with scrypt-wrapped keys and a recovery code (ADR 0006).
 - A write-ahead transaction marker plus an audit commit gives crash safety; rollback happens on open (R26).
 - A hash-chained audit log with a device anchor. Tampering is detected; a missing anchor on a device that wrote to the log counts as a failure (R81, R82).
-- The search index is a disposable cache. Encrypted-project content is kept only in in-memory TEMP tables (R30). Review items, jobs and batches persist in files (R31).
+- The search index is a disposable cache. Encrypted-project content is kept only in in-memory TEMP tables (R30). R31 requires review items, jobs and batches to persist in files. Today review items (`review/pending.jsonl`) and import batches (batch folders) do, and proxy jobs are recorded with their source, but general job records live only in the search index and are carried across rebuilds (`packages/library/src/index/rebuild.ts`, `CARRIED_TABLES`). PLAN Task 51 closes the gap.
 
 ### Import
 - Parsers are written in-house, linear-time and size-capped. citation-js was rejected because of stack overflow, whole-file abort and a network dependency (R65–R70).

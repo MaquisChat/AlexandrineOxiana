@@ -23,7 +23,7 @@ UI and extension → HTTP (bearer token) → `library-service` → `@ao/library`
 4. appends audit and change-log entries;
 5. updates the index cache.
 
-Media work (downloads, transcription, proxies, OCR) goes through `worker-client.ts` to the Python worker, with jobs persisted in source files.
+Media work (downloads, transcription, proxies, OCR) goes through `worker-client.ts` to the Python worker, with proxy jobs recorded with their source. General job records live only in the search index for now (carried across rebuilds); R31 requires files, and PLAN Task 51 closes the gap.
 
 Progress reaches the UI through SSE `/events` (`library.state`, `job.progress`, `import.progress`, `capture.progress`).
 
@@ -36,7 +36,13 @@ One portable library folder, which can be moved and reconnected. Layout per spec
 
 Device-specific settings live in the app config dir and never in the library: approved import folders, watched folders, extension pairings, appearance, researcher name, audit anchors.
 
-## External dependencies (pinned)
+## Known gaps (2026-11-11)
+- The UI and the service cannot yet be started together: the service accepts only the future desktop shell's origin and a paired extension, and nothing gives the UI its connection (PLAN Milestone J).
+- Making a backup is not checked by the policy engine, and a refused library move is not audited (PLAN Tasks 49, 50).
+- The UI's data types are written by hand and nothing ties them to the service's responses (PLAN Task 47).
+- No media-delivery route exists for a player (PLAN Task 34a).
+
+## External dependencies (the rule is exact pins; the root dev tools use `^` ranges)
 - **Node:** fastify, better-sqlite3, parse5 8.0.1, yauzl/yazl, fflate, pdfjs-dist, exiftool-vendored, undici, citeproc-js, turndown, @xmldom/xmldom, @napi-rs/keyring, chokidar, React 19, Vite 7, msw, playwright, yaml.
 - **Python:** faster-whisper, yt-dlp (managed binary), gallery-dl, pillow-heif, rawpy, ocrmypdf.
 - **Data:** CSL styles and locales (CC BY-SA 3.0, built by `pnpm fetch-csl`), plus OFL fonts.
