@@ -137,7 +137,11 @@ function makePdf(text) {
   return Buffer.from(pdf, "latin1");
 }
 
-const CUSTOM_STYLE = `<?xml version="1.0" encoding="utf-8"?>
+/** A 1×1 JPEG (JFIF), no metadata. */
+const TINY_JPEG =
+  "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
+
+const CUSTOM_STYLE =`<?xml version="1.0" encoding="utf-8"?>
 <style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
   <info>
     <title>Smoke Test Style</title>
@@ -291,6 +295,16 @@ async function main() {
     const sourceId = attached.items?.[0]?.sourceId;
     check(sourceId, `the PDF was not attached: ${JSON.stringify(attached).slice(0, 500)}`);
     step("PDF attached");
+
+    // A photo: its metadata is read by ExifTool, run with Perl from the folder's exiftool-vendored.pl.
+    const jpgPath = join(tmp, "in", "photo.jpg");
+    writeFileSync(jpgPath, Buffer.from(TINY_JPEG, "base64"));
+    const photo = await call("POST", `/projects/${project.id}/attach`, { paths: [jpgPath] });
+    check(photo.items?.[0]?.sourceId, `the photo was not attached: ${JSON.stringify(photo).slice(0, 500)}`);
+    if (process.platform === "linux") {
+      check(processesNaming(join(app, "node_modules", "exiftool-vendored.pl")).length > 0, "ExifTool is not running from the built folder");
+    }
+    step("photo attached (ExifTool from the folder)");
 
     const apa = await call("POST", "/cite", { projectId: project.id, refs: [{ sourceId }], style: "apa", format: "text" });
     check(/Quillfeather/.test(apa.text ?? ""), `the APA citation does not name the author: ${JSON.stringify(apa)}`);

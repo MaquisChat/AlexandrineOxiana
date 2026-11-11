@@ -169,7 +169,7 @@ function copyPackage(name, fromDir, out, copied) {
   record(dir, "copied");
   const skip = new Set(INSTALL_ONLY[name] ?? []);
   for (const dep of Object.keys(pkg.dependencies ?? {})) {
-    if (skip.has(dep)) continue;
+    if (skip.has(dep) || dep.startsWith("@types/")) continue; // type declarations never run
     if (!copyPackage(dep, dir, out, copied)) fail(`${name} needs ${dep}, which is not installed.`);
   }
   // Optional dependencies: those installed and made for this machine (platform-specific binaries).
