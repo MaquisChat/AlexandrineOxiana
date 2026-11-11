@@ -19,10 +19,13 @@
  *   - the assets are marked `destroyed` in source.json (path and sha256 stay as the record);
  *   - the certificate `Projects/<p>/retention/destruction-<YYYY-MM-DD HHmm>.json` (0600) records
  *     the asset ids, library-relative paths, sha256s, the time and the actor (`by`).
- * Then the app's backups that hold any of the destroyed files: a fresh backup is made first, and
- * only once it succeeded are those backups overwritten and removed; the certificate is updated
- * with them (or says they were kept because the fresh backup failed). A crash in between leaves the
- * certificate's backups "pending": `resumeDestruction` (Task 30, at start) finishes it.
+ * Then the app's backups that hold any of the destroyed files: a fresh backup is tried first, and
+ * those backups are overwritten and removed whether or not it could be made (R138 e). The
+ * certificate records each one removed (and when), each one that could NOT be removed with its
+ * reason (`notRemoved`; the project shows `destruction-backups-pending` until a retry removes it),
+ * and, if no fresh backup could be made, why (`freshBackupFailed`, `note`). A crash or a failed
+ * removal leaves the certificate's backups "pending": `resumeDestruction` (Task 30, at start) retries.
+ * Destruction holds the project's maintenance lock (R138 a).
  * Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed` (counts and
  * the certificate's sha256; no paths) and `retention.backups` when backups are settled.
  */
@@ -30,7 +33,19 @@ import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { basename, join } from "node:path";
 import { formatModified, type Asset } from "@ao/core";
-import { backupFailureReason, backupProject, destroyBackups, listBackups, pruneBackups, unresolvedBackupsOf, withProjectMaintenance, DEFAULT_KEEP } from "./export/backup.js";
+import {
+  backupFailureReason,
+  backupProjectHeld,
+  destroyBackups,
+  listBackups,
+  plainErrorText,
+  pruneBackupsHeld,
+  setHoldingNotRemoved,
+  unresolvedBackupsOf,
+  withProjectMaintenance,
+  DEFAULT_KEEP,
+  type MaintenanceHold,
+} from "./export/backup.js";
 import { decryptBytes } from "./repo/io.js";
 import { NotFoundError } from "./repo/errors.js";
 import {
@@ -38,6 +53,7 @@ import {
   destroyProjectAssets,
   lookupPolicyInfo,
   projectDataKey,
+  repoClock,
   repoLibrary,
   type Repo,
 } from "./repo/repo.js";
@@ -88,8 +104,12 @@ interface CertificateBackups {
   freshBackup?: string;
   /** Why no fresh backup could be made after the destruction (R138 e: the holding backups are removed regardless). */
   freshBackupFailed?: string;
-  /** Plain words for a reader of the certificate when the project was left with no backup. */
+  /** Plain words for a reader of the certificate when no fresh backup could be made: composed from what actually happened. */
   note?: string;
+  /** When each backup in `deleted` was actually removed (a retry shows its later time). */
+  removedAt?: Record<string, string>;
+  /** Holding backups the last attempt could NOT remove, each with the plain reason (N1); retried. */
+  notRemoved?: Array<{ file: string; reason: string }>;
   /** Why the last attempt stopped (plain; retried). */
   lastError?: string;
 }
@@ -137,11 +157,24 @@ export function destroyRaw(
 ): Promise<{ certificatePath: string; certificate: Record<string, unknown> }> {
   // Never at the same time as a backup, prune or restore of the project (R138 a): a backup in
   // progress is finished first, and then found among the backups that hold the data.
-  return withProjectMaintenance(repo, projectId, () => destroyRawLocked(repo, projectId, assetIds, by, opts));
+  return withProjectMaintenance(repo, projectId, (hold) => destroyRawLocked(repo, hold, projectId, assetIds, by, opts));
+}
+
+/** Package-internal (tests of the commit-point check): destroyRaw under a hold the caller already has on the project. */
+export function destroyRawHeld(
+  repo: Repo,
+  hold: MaintenanceHold,
+  projectId: string,
+  assetIds: string[],
+  by: string,
+  opts: DestroyOptions = {},
+): Promise<{ certificatePath: string; certificate: Record<string, unknown> }> {
+  return withProjectMaintenance(repo, projectId, (h) => destroyRawLocked(repo, h, projectId, assetIds, by, opts), hold);
 }
 
 async function destroyRawLocked(
   repo: Repo,
+  hold: MaintenanceHold,
   projectId: string,
   assetIds: string[],
   by: string,
@@ -229,7 +262,7 @@ async function destroyRawLocked(
     certificateSha256: createHash("sha256").update(certificateText(res.certificate)).digest("hex"),
   });
   let certificate = res.certificate;
-  if (containing.length) certificate = await settleBackups(repo, projectId, res.certificateRel);
+  if (containing.length) certificate = await settleBackups(repo, hold, projectId, res.certificateRel);
   return { certificatePath, certificate };
 }
 
@@ -266,7 +299,7 @@ const plainError = (repo: Repo, err: unknown) => `${backupFailureReason(repo, er
  * was removed. Unreadable project-named backups (a rebuilt manifest) are never deleted blindly:
  * the step stays `unknown-pending`. The certificate is updated in a governed, audited change.
  */
-async function settleBackups(repo: Repo, projectId: string, certificateRel: string): Promise<Record<string, unknown>> {
+async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: string, certificateRel: string): Promise<Record<string, unknown>> {
   const cert = await readCertificate(repo, projectId, certificateRel);
   const b = cert.backups;
   if (b.status !== "pending" && b.status !== "unknown-pending") return cert;
@@ -278,34 +311,51 @@ async function settleBackups(repo: Repo, projectId: string, certificateRel: stri
     deleted: [...b.deleted],
   };
   const unresolvedLeft = held.unresolved.length > 0;
+  const at = repoClock(repo)().toISOString();
   // A fresh backup first, when it can be made (R90 d); the holding backups are removed whether or
   // not it could (R138 e): destruction never depends on a new backup succeeding.
   if (held.files.length && !next.freshBackup) {
     try {
-      const fresh = await backupProject(repo, projectId, { prune: false });
+      const fresh = await backupProjectHeld(repo, hold, projectId, { prune: false });
       next.freshBackup = `Backups/${basename(fresh.path)}`;
       delete next.freshBackupFailed;
-      delete next.note;
     } catch (err) {
       // backupProject has recorded `backup-failed` with the same reason.
-      const reason = backupFailureReason(repo, err);
-      next.freshBackupFailed = reason;
-      next.note = `The earlier backups that held the destroyed files were removed. No new backup could be made afterwards: ${reason}${/[.!?]$/u.test(reason) ? "" : "."} This project has no backup until one succeeds.`;
+      next.freshBackupFailed = backupFailureReason(repo, err);
     }
   }
+  // Each holding backup: removed (with when), or named as NOT removed with the plain reason (N1).
+  let removedNow: string[] = [];
+  let notRemoved: Array<{ file: string; reason: string }> = [];
   try {
     const r = await destroyBackups(repo, projectId, held.files);
-    next.deleted = union(next.deleted, r.deleted.map((f) => `Backups/${f}`));
-    if (r.error) throw r.error;
+    removedNow = r.deleted.map((f) => `Backups/${f}`);
+    notRemoved = r.failed.map(({ file, error }) => ({ file: `Backups/${file}`, reason: `It could not be overwritten and removed (${plainErrorText(repo, error)}).` }));
+    if (r.failed.length) throw new Error(`A backup holding the destroyed files could not be removed (${plainErrorText(repo, r.failed[0]!.error)}); the step will be tried again`);
     delete next.lastError;
     next.status = unresolvedLeft ? "unknown-pending" : "deleted";
   } catch (err) {
     next.status = unresolvedLeft ? "unknown-pending" : "pending";
-    next.lastError = plainError(repo, err);
+    next.lastError = notRemoved.length && err instanceof Error ? err.message : plainError(repo, err);
   }
+  next.deleted = union(next.deleted, removedNow);
+  next.removedAt = { ...(b.removedAt ?? {}), ...Object.fromEntries(removedNow.map((f) => [f, at])) };
+  if (notRemoved.length) next.notRemoved = notRemoved;
+  else delete next.notRemoved;
+  // The note says only what happened (N1): composed from the outcome above.
+  delete next.note;
+  if (next.freshBackupFailed && !next.freshBackup) {
+    const reason = next.freshBackupFailed;
+    const stop = /[.!?]$/u.test(reason) ? "" : ".";
+    const one = notRemoved.length === 1;
+    next.note = notRemoved.length
+      ? `No new backup could be made after the destruction: ${reason}${stop} ${one ? "A backup that holds the destroyed files could not be removed yet" : "Some backups that hold the destroyed files could not be removed yet"} (see notRemoved); removing ${one ? "it" : "them"} is tried again.`
+      : `The earlier backups that held the destroyed files were removed. No new backup could be made afterwards: ${reason}${stop} This project has no backup until one succeeds.`;
+  }
+  await setHoldingNotRemoved(repo, projectId, notRemoved.map((x) => x.file)).catch(() => {});
   if (next.status === "deleted") {
     // Pruning keeps its own record when it cannot be audited (backup-audit-pending): not this step's failure.
-    await pruneBackups(repo, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP).catch(() => {});
+    await pruneBackupsHeld(repo, hold, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP).catch(() => {});
   }
   const updated = { ...cert, backups: next };
   await repo.mutate(
@@ -316,19 +366,27 @@ async function settleBackups(repo: Repo, projectId: string, certificateRel: stri
     },
     { op: "retention.backups", entity: { type: "project", id: projectId } },
   );
-  await appendLibraryEvent(repo, projectId, "retention.backups", { status: next.status, deleted: next.deleted.length });
+  // The same facts as the certificate: what was removed now, and what could not be.
+  await appendLibraryEvent(repo, projectId, "retention.backups", {
+    status: next.status,
+    deleted: next.deleted.length,
+    removed: removedNow,
+    notRemoved: notRemoved.map((x) => x.file),
+    ...(next.freshBackupFailed && !next.freshBackup ? { freshBackupFailed: next.freshBackupFailed } : {}),
+  });
   return updated;
 }
+
 
 /**
  * Finishes (or retries) destructions whose backups step is not done (a crash, a quit or a failure
  * after the destruction): returns the certificates (absolute paths) worked on. For Task 30, at start.
  */
 export function resumeDestruction(repo: Repo, projectId: string): Promise<string[]> {
-  return withProjectMaintenance(repo, projectId, () => resumeLocked(repo, projectId));
+  return withProjectMaintenance(repo, projectId, (hold) => resumeLocked(repo, hold, projectId));
 }
 
-async function resumeLocked(repo: Repo, projectId: string): Promise<string[]> {
+async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string): Promise<string[]> {
   const root = repoLibrary(repo).root;
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
   let names: string[];
@@ -347,7 +405,7 @@ async function resumeLocked(repo: Repo, projectId: string): Promise<string[]> {
       continue;
     }
     if (status !== "pending" && status !== "unknown-pending") continue;
-    await settleBackups(repo, projectId, rel);
+    await settleBackups(repo, hold, projectId, rel);
     out.push(join(root, ...rel.split("/")));
   }
   return out;

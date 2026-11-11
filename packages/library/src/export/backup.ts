@@ -68,7 +68,6 @@
  * (`project.backups.automatic`, default on), the project is unlocked, and the last backup is a day
  * old (or there is none).
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -140,7 +139,7 @@ export const backupSeams: {
   /** Runs after old backups are removed, before their `backup.prune` event is written. */
   beforePruneAudit?: () => Promise<void>;
   /** Runs once the archive is complete and recorded, before it is named and committed (R138 probes). */
-  beforeCommit?: () => Promise<void>;
+  beforeCommit?: (hold: MaintenanceHold) => Promise<void>;
 } = {};
 
 function crashPoint(point: BackupCrashPoint): void {
@@ -304,6 +303,8 @@ interface BackupState {
   failures: Record<string, BackupFailure>;
   /** Backups and prunes not yet settled, by backup id / prune id. */
   pending: Record<string, PendingOp>;
+  /** Per project: backups holding destroyed raw data that could not be removed yet (N1, `destruction-backups-pending`). */
+  undestroyed: Record<string, string[]>;
 }
 
 /** Why the project's last backup failed (plain text; never a path), and when. */
@@ -344,9 +345,10 @@ async function readState(dir: string): Promise<BackupState> {
       owners: s.owners && typeof s.owners === "object" ? s.owners : {},
       failures: s.failures && typeof s.failures === "object" ? s.failures : {},
       pending: pendingOf(s.pending),
+      undestroyed: s.undestroyed && typeof s.undestroyed === "object" && !Array.isArray(s.undestroyed) ? s.undestroyed : {},
     };
   } catch {
-    return { formatVersion: 1, owners: {}, failures: {}, pending: {} };
+    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {} };
   }
 }
 
@@ -648,20 +650,39 @@ const activeOps = new Set<string>();
 
 // ------------------------------------------------------------------------------------------
 // The maintenance lock (R138 a): backup, prune, restore and destruction of raw data run one at a
-// time per project. It is not the repository's write queue: ordinary changes go on meanwhile. It is
-// re-entrant within one operation (destruction makes a fresh backup and prunes while holding it).
+// time per project. It is not the repository's write queue: ordinary changes go on meanwhile.
+// Holding it is explicit (N3): the section receives a hold, valid only while it runs, and passes it
+// to the steps it makes itself (destruction's fresh backup and prune). Nothing inherits it: work
+// scheduled from inside (a timer, a callback) that asks for the lock waits like anyone else.
 // In-process only: the library lock keeps other processes out of a writable library.
 
-const heldMaintenance = new AsyncLocalStorage<ReadonlySet<string>>();
+/** Package-internal: a hold on a project's maintenance lock, valid only while its section runs. */
+export interface MaintenanceHold {
+  readonly key: string;
+  active: boolean;
+}
+
 const maintenanceTails = new Map<string, Promise<unknown>>();
 
-/** Package-internal: runs `fn` holding the project's maintenance lock (waits for the one before). */
-export function withProjectMaintenance<T>(repo: Repo, projectId: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Package-internal: runs `fn` holding the project's maintenance lock (waits for the one before).
+ * With `held` (a hold the caller's own section was given), runs at once under that hold instead.
+ */
+export function withProjectMaintenance<T>(repo: Repo, projectId: string, fn: (hold: MaintenanceHold) => Promise<T>, held?: MaintenanceHold): Promise<T> {
   const key = `${repoLibrary(repo).root}\u0000${projectId}`;
-  const mine = heldMaintenance.getStore();
-  if (mine?.has(key)) return fn();
+  if (held) {
+    if (held.key !== key || !held.active) return Promise.reject(new Error("The project's maintenance lock is not held by this operation"));
+    return fn(held);
+  }
   const prev = maintenanceTails.get(key) ?? Promise.resolve();
-  const run = prev.then(() => heldMaintenance.run(new Set([...(mine ?? []), key]), fn));
+  const run = prev.then(async () => {
+    const hold: MaintenanceHold = { key, active: true };
+    try {
+      return await fn(hold);
+    } finally {
+      hold.active = false;
+    }
+  });
   // A thrown error (or a simulated crash) releases it like a success.
   const tail = run.then(
     () => undefined,
@@ -926,10 +947,10 @@ class CommitAppendError extends Error {}
  * project's warning `backup-failed` (and thrown).
  */
 export function backupProject(repo: Repo, projectId: string, opts: BackupOptions = {}): Promise<BackupResult> {
-  return withProjectMaintenance(repo, projectId, () => backupLocked(repo, projectId, opts));
+  return withProjectMaintenance(repo, projectId, (hold) => backupLocked(repo, projectId, opts, hold));
 }
 
-async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions): Promise<BackupResult> {
+async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, hold: MaintenanceHold): Promise<BackupResult> {
   const dir = backupsDir(repo);
   await fsp.mkdir(dir, { recursive: true });
   await settlePending(repo);
@@ -960,7 +981,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions):
     crashPoint("after-decision");
 
     // 2. The zip, complete and fsynced under its temp name; the backup name reserved.
-    let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string } | undefined;
+    let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string; wanted: string } | undefined;
     for (let attempt = 0; attempt < 2 && !result; attempt++) {
       const snap = await snapshot(repo, projectId);
       try {
@@ -984,7 +1005,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions):
             }
             warnings.push("Some files changed while the backup was made, twice; this backup may not be one consistent state.");
           }
-          result = { snap, tmp, name, ...r };
+          result = { snap, tmp, name, wanted, ...r };
         } catch (err) {
           if (err instanceof SimulatedCrash) throw err;
           await shredPath(tmp).catch(() => {});
@@ -1016,13 +1037,13 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions):
       const p = s.pending[backupId];
       if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry: entryOf(result.name) });
     });
-    await backupSeams.beforeCommit?.();
+    await backupSeams.beforeCommit?.(hold);
 
     // 3. Its name, never over an existing file (a taken name gets the next counter), then the
     // bytes under that name checked against what was recorded (R138 b).
     let name = result.name;
     while (!(await placeExclusive(repo, result.tmp, join(dir, name)))) {
-      name = await reserveName(repo, backupId, result.name);
+      name = await reserveName(repo, backupId, result.wanted);
       await withState(repo, (s) => {
         const p = s.pending[backupId];
         if (p?.kind === "create") Object.assign(p, { file: name, entry: entryOf(name) });
@@ -1030,16 +1051,29 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions):
     }
     const entry = entryOf(name);
     const final = join(dir, name);
-    if ((await sha256Of(final)) !== result.sha256) throw new BackupDiscardedError(CHANGED_ON_DISK);
+    /** The attempt, so a refusal or a discard can be matched to its allow decision (N4). */
+    const attempt = { op: "backup.create", backupId, file: name, at: "commit" };
+    if ((await sha256Of(final)) !== result.sha256) {
+      await withProjectQueue(repo, projectId, (ctx) => ctx.record("backup.discarded", { result: "deny", reason: CHANGED_ON_DISK }, attempt)).catch(() => {});
+      throw new BackupDiscardedError(CHANGED_ON_DISK);
+    }
     crashPoint("before-commit");
 
     // 4. The commit point, in one write-queue turn (R138 c, d): the decision again, against the
-    // governance in force now (a deny is audited and thrown); no raw data destroyed since the
-    // snapshot; then the `backup.create` event.
+    // governance in force now (a deny is audited, with this attempt's id and name, and thrown); no
+    // raw data destroyed since the snapshot (else audited as discarded); then the `backup.create` event.
     await withProjectQueue(repo, projectId, async (ctx) => {
-      await ctx.decide(request, { op: "backup.create", entity });
+      try {
+        await ctx.decide(request, { op: "backup.create", entity, unaudited: true });
+      } catch (err) {
+        if (err instanceof PolicyDeniedError) await ctx.record("backup", { result: "deny", reason: err.reason }, attempt);
+        throw err;
+      }
       const destroyed = await destroyedAssetIds(repo, projectId);
-      if (snap.assets.some((id) => destroyed.has(id))) throw new BackupDiscardedError(DESTROYED_MEANWHILE);
+      if (snap.assets.some((id) => destroyed.has(id))) {
+        await ctx.record("backup.discarded", { result: "deny", reason: DESTROYED_MEANWHILE }, attempt);
+        throw new BackupDiscardedError(DESTROYED_MEANWHILE);
+      }
       try {
         await ctx.audit("backup.create", { backupId, file: name, sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
       } catch (err) {
@@ -1122,6 +1156,17 @@ export function pruneBackups(repo: Repo, projectId: string, keep: number): Promi
   return withProjectMaintenance(repo, projectId, () => pruneLocked(repo, projectId, keep));
 }
 
+/** Package-internal (retention): a backup made under the hold the caller's own section has on the project. */
+export function backupProjectHeld(repo: Repo, hold: MaintenanceHold, projectId: string, opts: BackupOptions = {}): Promise<BackupResult> {
+  return withProjectMaintenance(repo, projectId, (h) => backupLocked(repo, projectId, opts, h), hold);
+}
+
+/** Package-internal (retention): pruning under the hold the caller's own section has on the project. */
+export function pruneBackupsHeld(repo: Repo, hold: MaintenanceHold, projectId: string, keep: number): Promise<string[]> {
+  if (!Number.isInteger(keep) || keep < 1) return Promise.reject(new TypeError("keep must be a whole number of at least 1"));
+  return withProjectMaintenance(repo, projectId, () => pruneLocked(repo, projectId, keep), hold);
+}
+
 async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise<string[]> {
   const dir = backupsDir(repo);
   await settlePending(repo);
@@ -1175,10 +1220,14 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
  * project one by one (manifest-listed ones), the manifest updated after each; a failure does not
  * stop the others. Returns the names removed, and the first error, if any.
  */
-export async function destroyBackups(repo: Repo, projectId: string, files: string[]): Promise<{ deleted: string[]; error?: unknown }> {
+export async function destroyBackups(
+  repo: Repo,
+  projectId: string,
+  files: string[],
+): Promise<{ deleted: string[]; failed: Array<{ file: string; error: unknown }>; error?: unknown }> {
   const dir = backupsDir(repo);
   const deleted: string[] = [];
-  let first: unknown;
+  const failed: Array<{ file: string; error: unknown }> = [];
   for (const f of files) {
     if (f !== basename(f)) continue;
     try {
@@ -1189,11 +1238,28 @@ export async function destroyBackups(repo: Repo, projectId: string, files: strin
         deleted.push(f);
       });
     } catch (error) {
-      // The others are still tried; the first failure is reported.
-      first ??= error;
+      // The others are still tried; each failure is reported with its file (N1).
+      failed.push({ file: f, error });
     }
   }
-  return first === undefined ? { deleted } : { deleted, error: first };
+  return failed.length ? { deleted, failed, error: failed[0]!.error } : { deleted, failed };
+}
+
+/**
+ * Package-internal (retention, N1): the backups of the project that hold destroyed raw data and
+ * could not be removed yet: the project's warning `destruction-backups-pending` until they are.
+ */
+export function setHoldingNotRemoved(repo: Repo, projectId: string, files: string[]): Promise<void> {
+  return withState(repo, (s) => {
+    if (files.length) s.undestroyed[projectId] = files;
+    else delete s.undestroyed[projectId];
+  });
+}
+
+/** Package-internal: an error's message in plain words, paths in the library scrubbed (its class name when it has none). */
+export function plainErrorText(repo: Repo, err: unknown): string {
+  const msg = err instanceof Error ? scrubPaths(err.message, [repoLibrary(repo).root]).trim() : "";
+  return msg || (err instanceof Error ? err.name : "unknown error");
 }
 
 /** Sets the project's backup settings (governed, audited): `automatic` daily backups, how many to `keep`. */
@@ -1211,10 +1277,10 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
 export function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
   // Whether one is due is decided while holding the project (R138 a): a manual backup running at
   // the same time makes this one not due, instead of a second backup.
-  return withProjectMaintenance(repo, projectId, () => backupIfDueLocked(repo, projectId, now, opts));
+  return withProjectMaintenance(repo, projectId, (hold) => backupIfDueLocked(repo, projectId, now, opts, hold));
 }
 
-async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv">): Promise<BackupResult | null> {
+async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv">, hold: MaintenanceHold): Promise<BackupResult | null> {
   const p = repo.getProject(projectId);
   if (p.backups?.automatic === false) return null;
   if (!repo.isUnlocked(projectId)) return null;
@@ -1223,7 +1289,7 @@ async function backupIfDueLocked(repo: Repo, projectId: string, now: Date, opts:
   const failed = await backupFailure(repo, projectId);
   if (failed?.refused && now.getTime() - Date.parse(failed.at) < DAY_MS) return null;
   try {
-    return await backupProject(repo, projectId, opts);
+    return await backupLocked(repo, projectId, opts, hold);
   } catch (err) {
     if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return null;
     throw err;

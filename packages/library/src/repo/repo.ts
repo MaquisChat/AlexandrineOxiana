@@ -858,6 +858,12 @@ export const BACKUP_FAILED_WARNING = "backup-failed";
 export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
 
 /**
+ * Persisted in `Backups/backups-state.json` (`undestroyed`) while a backup holding raw data destroyed
+ * under the retention rule could not be removed (R138 e, N1); cleared once a retry removes it.
+ */
+export const DESTRUCTION_BACKUPS_PENDING_WARNING = "destruction-backups-pending";
+
+/**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
  * 'backup-failed', R92; 'backup-audit-pending', R125).
  */
@@ -866,8 +872,10 @@ export async function projectWarnings(repo: Repo, projectId: string): Promise<st
   const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
-    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown> }) : undefined;
+    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown>; undestroyed?: Record<string, unknown> }) : undefined;
     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
+    const stuck = m?.undestroyed && typeof m.undestroyed === "object" && Object.hasOwn(m.undestroyed, projectId) ? m.undestroyed[projectId] : undefined;
+    if (Array.isArray(stuck) && stuck.length) out.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
     const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
     if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
       out.push(BACKUP_AUDIT_PENDING_WARNING);
@@ -1014,7 +1022,9 @@ export interface ProjectQueueContext {
    * Evaluates a request in this turn, against the governance in force now (a backup's commit
    * point, R138 c): a deny is audited and thrown as PolicyDeniedError, as in any governed write.
    */
-  decide(req: MutateRequest, opts: { op: string; entity?: { type: EntityType; id: string } }): Promise<PolicyDecision>;
+  decide(req: MutateRequest, opts: { op: string; entity?: { type: EntityType; id: string }; unaudited?: boolean }): Promise<PolicyDecision>;
+  /** Appends one audit event about the project with the given decision (e.g. a deny with what it refused), anchored. */
+  record(action: string, decision: { result: "allow" } | { result: "deny"; reason: string }, details: Record<string, unknown>): Promise<void>;
 }
 
 /**
@@ -1042,8 +1052,12 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
         await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision: { result: "allow" }, details });
       },
       decide: async (req, o) => {
-        const [first] = await decide(core, st, req, core.clock().toISOString(), o.op, o.entity);
+        const [first] = await decide(core, st, req, core.clock().toISOString(), o.op, o.entity, undefined, o.unaudited === true);
         return first!.d;
+      },
+      record: async (action, decision, details) => {
+        const at = core.clock().toISOString();
+        await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision, details });
       },
     });
   });

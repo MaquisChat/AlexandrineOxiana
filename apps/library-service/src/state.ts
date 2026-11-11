@@ -12,6 +12,7 @@ import {
   WorkerUnavailableError,
   backupFailure,
   backupIfDue,
+  resumeDestruction,
   createBulkImport,
   createIndexSink,
   disposeOcrQueue,
@@ -743,6 +744,11 @@ export class ServiceState {
     const out: BackupRun[] = [];
     for (const p of s.repo.listProjects()) {
       if (onlyProjectId && p.id !== onlyProjectId) continue;
+      // A destruction whose backups could not all be removed is retried on every pass (R138 e, N1):
+      // at open, at unlock and hourly, until its certificate says every holding backup is gone.
+      if (s.repo.isUnlocked(p.id)) {
+        await resumeDestruction(s.repo, p.id).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "resuming a destruction failed"));
+      }
       if (p.backups?.automatic === false) continue;
       try {
         const r = await backupIfDue(s.repo, p.id, this.opts.now());
