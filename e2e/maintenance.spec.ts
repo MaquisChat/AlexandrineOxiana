@@ -25,7 +25,6 @@ interface Libraries {
 }
 
 const D5: Defect = { id: "D5", title: "on relaunch the app shows “Library not found” for the library that was open (spec 4.5)" };
-const D6: Defect = { id: "D6", title: "the app's fonts finish loading in WebKit (no face left in error, document.fonts settles)" };
 
 /** Every file under `dir`, relative to it ("/"-separated). */
 function filesUnder(dir: string): string[] {
@@ -242,17 +241,6 @@ async function fontsSettle(page: Page, timeout = 10_000): Promise<void> {
   expect(await page.evaluate(() => [...document.fonts].filter((f) => f.status === "error").map((f) => `${f.family} ${f.style} ${f.unicodeRange}`))).toEqual([]);
 }
 
-/**
- * Before a screenshot in WebKit: D6 leaves a font face of the app in "error" and document.fonts
- * "loading" for good, and a screenshot waits for the fonts. Loading the failed faces again settles
- * them (the files themselves load), so a human still gets WebKit screenshots. The defect itself is
- * the blocked step "the app's fonts finish loading".
- */
-async function settleFontsForScreenshot(page: Page): Promise<void> {
-  await page.evaluate(() => Promise.all([...document.fonts].filter((f) => f.status === "error").map((f) => f.load().catch(() => undefined))));
-  await expect.poll(() => page.evaluate(() => document.fonts.status)).toBe("loaded");
-}
-
 test.describe("scenario 8", () => {
   // Screenshots for a human to look at: at device scale 2, so the scripts can be read closely.
   test.use({ deviceScaleFactor: 2 });
@@ -274,12 +262,11 @@ test.describe("scenario 8", () => {
       expect(await table.evaluate((e) => getComputedStyle(e).direction)).toBe("ltr");
     });
 
-    if (browserName === "webkit") await blockedBy(D6);
-    else await test.step("the app's fonts finish loading", () => fontsSettle(page));
+    // D6 (fixed in Task 46b): in WebKit too, no face is left in error and document.fonts settles.
+    await test.step("the app's fonts finish loading", () => fontsSettle(page));
 
     await test.step("screenshot of the list", async () => {
       mkdirSync(SCREENS, { recursive: true });
-      await settleFontsForScreenshot(page);
       await page.screenshot({ path: join(SCREENS, `scenario-8-library-list-${browserName}.png`), fullPage: true });
     });
 
@@ -308,10 +295,15 @@ test.describe("scenario 8", () => {
       await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: arabic.title, exact: true }).click();
       const detail = page.getByRole("region", { name: "Source details" });
       await expect(detail.getByRole("heading", { level: 2, name: arabic.title, exact: true })).toBeVisible();
-      await settleFontsForScreenshot(page);
       await detail.screenshot({ path: join(SCREENS, `scenario-8-rtl-source-arabic-${browserName}.png`) });
     });
   });
+});
+
+// D6 (fixed in Task 46b): on the first page too, in both browsers.
+test("the app's fonts finish loading on the library chooser (no face left in error, document.fonts settles)", async ({ page }) => {
+  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
+  await fontsSettle(page);
 });
 
 // ---------- the steps scenarios 6 and 8 cannot do yet, each on its own (expected to fail while the defect reproduces) ----------
@@ -323,11 +315,4 @@ test(`${D5.id}: ${D5.title}`, async ({ page, app }) => {
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   expectDefect(D5);
   await expect(page.getByRole("heading", { level: 1, name: `Library not found: ${LIBRARY}` })).toBeVisible({ timeout: DEFECT_TIMEOUT });
-});
-
-test(`${D6.id}: ${D6.title}`, async ({ page, browserName }) => {
-  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
-  // Chromium loads every face: there this is an ordinary passing test.
-  if (browserName === "webkit") expectDefect(D6);
-  await fontsSettle(page, DEFECT_TIMEOUT);
 });
