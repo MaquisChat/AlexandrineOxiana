@@ -24,6 +24,7 @@ import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
+import { isPlayableRecording } from "../components/TranscriptLink";
 import { UserText } from "../components/UserText";
 import { blockNavigation } from "../navigation";
 import { setTranscriptionRun, subscribeTranscriptionRuns, transcriptionRun } from "./transcriptionRuns";
@@ -48,16 +49,24 @@ const MODEL_LABELS: Record<TranscriptionModel, string> = {
 const LOCKED = "This project is locked, so its transcript and recording are not shown. Unlock it in the library, then choose Try again.";
 const UNSAVED = "You have edits that are not saved. Save them as a new version or discard them first.";
 
-/** A language code in words ("en" → "English"); "und" → "Language not known". */
+let displayNames: Intl.DisplayNames | null | undefined;
+const languageNames = new Map<string, string>();
+
+/** A language code in words ("en" → "English"); "und" → "Language not known". Cached per code. */
 function languageName(code: string): string {
   if (!code || code === "und") return "Language not known";
+  const known = languageNames.get(code);
+  if (known !== undefined) return known;
+  let name = code;
   try {
-    const name = new Intl.DisplayNames(["en"], { type: "language" }).of(code);
-    if (name && name !== code) return name;
+    if (displayNames === undefined) displayNames = typeof Intl.DisplayNames === "function" ? new Intl.DisplayNames(["en"], { type: "language" }) : null;
+    const n = displayNames?.of(code);
+    if (n && n !== code) name = n;
   } catch {
     /* not a code Intl knows */
   }
-  return code;
+  if (languageNames.size < 500) languageNames.set(code, name);
+  return name;
 }
 
 function dateText(iso: string | undefined): string {
@@ -370,12 +379,15 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
     });
   };
 
+  const versionPicker = useRef<HTMLSelectElement | null>(null);
   const discard = () => {
     setDrafts(new Map());
     setWholeDraft(undefined);
     setEditing(null);
     setSaveError(undefined);
     setRefused(false);
+    // The button pressed goes away: focus moves to the version picker, not to the page.
+    versionPicker.current?.focus();
   };
 
   const save = async () => {
@@ -396,6 +408,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       setEditing(null);
       dirtyRef.current = false;
       setNotice("Saved as a new version. The version it was edited from is kept.");
+      versionPicker.current?.focus();
       await loadVersions({ id: r.id });
     } catch (err) {
       if (!mounted.current || k !== keyRef.current || mine !== actionSeq.current) return;
@@ -461,7 +474,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
   };
 
   const busy = run?.state === "running" || run?.state === "unknown";
-  const media = useMemo(() => source?.assets.find((a) => a.role === "original" && a.status !== "destroyed" && typeof a.mime === "string" && /^(audio|video)\//i.test(a.mime)), [source]);
+  const media = useMemo(() => source?.assets.find(isPlayableRecording), [source]);
   const title = source?.source.title.variants[0];
   const human = transcript?.origin === "human-edit";
 
@@ -512,7 +525,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
               api={api}
               projectId={projectId}
               sourceId={sourceId}
-              asset={{ id: media.id, mime: media.mime ?? "" }}
+              asset={{ id: media.id, mime: media.mime ?? "", kind: media.kind }}
               label="Recording"
               onTime={onTime}
               onLocked={() => {
@@ -530,7 +543,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       {!locked && (
         <div className="ao-tx__toolbar">
           <label htmlFor={`${id}-version`}>Version</label>
-          <select id={`${id}-version`} value={selected ?? ""} disabled={!versions?.length} onChange={(e) => chooseVersion(e.target.value)} aria-describedby={dirty ? `${id}-dirty` : undefined}>
+          <select id={`${id}-version`} ref={versionPicker} value={selected ?? ""} disabled={!versions?.length} onChange={(e) => chooseVersion(e.target.value)} aria-describedby={dirty ? `${id}-dirty` : undefined}>
             {!versions?.length && <option value="">{versions ? "No transcript yet" : "Loading…"}</option>}
             {versions?.map((v) => (
               <option key={v.id} value={v.id}>

@@ -18,12 +18,16 @@ export interface LinkAsset {
 
 const live = (a: LinkAsset) => a.status !== "destroyed";
 const isTranscript = (a: LinkAsset) => a.role === "derived" && a.kind === "transcript" && live(a);
-const isRecording = (a: LinkAsset) =>
+/**
+ * A recording the viewer plays and the service transcribes: an original audio or video asset (by
+ * kind, or by recorded type) that has not been destroyed. The link and the viewer both use this.
+ */
+export const isPlayableRecording = (a: LinkAsset): boolean =>
   a.role === "original" && live(a) && (a.kind === "audio" || a.kind === "video" || (typeof a.mime === "string" && /^(audio|video)\//i.test(a.mime)));
 
 export function TranscriptLink({ projectId, sourceId, assets }: { projectId: string; sourceId: string; assets: readonly LinkAsset[] }) {
   const transcript = assets.some(isTranscript);
-  if (!transcript && !assets.some(isRecording)) return null;
+  if (!transcript && !assets.some(isPlayableRecording)) return null;
   return (
     <p>
       <a href={transcriptHref(projectId, sourceId)} onClick={inAppLink}>

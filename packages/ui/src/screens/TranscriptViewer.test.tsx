@@ -6,7 +6,7 @@ import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
 import { BASE, server, testClient, url, useMockService } from "../test/service";
-import { humanTranscript, humanVersion, machineTranscript, machineVersion, MACHINE_VERSIONS, SEGMENTS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
+import { humanTranscript, humanVersion, machineTranscript, sourceFile, machineVersion, MACHINE_VERSIONS, SEGMENTS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
 import { resetTranscriptionRuns } from "./transcriptionRuns";
 import { TranscriptViewer } from "./TranscriptViewer";
 
@@ -319,6 +319,30 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(segmentItems()).toHaveLength(3);
   });
 
+  it("a recording known only by its kind (no recorded type) still plays; a destroyed one is not offered (review M8)", async () => {
+    const svc = transcriptService();
+    let destroyed = false;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        const f = sourceFile("s1");
+        const rec = f.assets[0]! as Record<string, unknown>;
+        delete rec.mime;
+        if (destroyed) rec.status = "destroyed";
+        return HttpResponse.json(f);
+      }),
+      ...svc.handlers,
+    );
+    const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    await waitFor(() => expect(media()?.tagName).toBe("VIDEO"));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(1));
+    view.unmount();
+    destroyed = true;
+    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    expect(await screen.findByText(/no recording to play/i)).toBeTruthy();
+    expect(media()).toBeNull();
+  });
+
   it("an audio recording plays in an audio element", async () => {
     await open({ media: "audio" });
     await waitFor(() => expect(media()?.tagName).toBe("AUDIO"));
@@ -441,6 +465,7 @@ describe("TranscriptViewer — editing and versions", () => {
     );
     expect(await screen.findByText(/Saved as a new version/)).toBeTruthy();
     const picker = screen.getByLabelText("Version") as HTMLSelectElement;
+    await waitFor(() => expect(document.activeElement).toBe(picker));
     await waitFor(() => expect(picker.options).toHaveLength(2));
     expect(picker.options[0]!.textContent).toMatch(/Speech recognition \(faster-whisper, model small\)/);
     expect(picker.options[1]!.textContent).toMatch(/Edited by a person/);
@@ -562,6 +587,8 @@ describe("TranscriptViewer — editing and versions", () => {
     expect(picker.value).toBe("h0");
     await user.click(screen.getByRole("button", { name: "Discard edits" }));
     expect(screen.queryByLabelText("Text of the segment at 0:00")).toBeNull();
+    // Focus does not fall to the page when the button goes (review M5).
+    expect(document.activeElement).toBe(screen.getByLabelText("Version"));
     act(() => navigate("/?project=p1"));
     expect(window.location.pathname).toBe("/");
   });
