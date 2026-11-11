@@ -34,7 +34,7 @@ import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
 import { ReadOnlyLibraryError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { newAttentionId, projectFolders, reasonOf, writeAttention, type UnrecordedAudit } from "./repo/attention.js";
+import { newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import {
   appendLibraryEvent,
   openRepo,
@@ -644,11 +644,15 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
         const w = await recordOrMark(repo, pr.id, "library.reconnect", details);
         if (w) warnings.push(w);
       }
-    } else if (writable) {
-      // The projects could not be opened: each one readable is marked, so a later open records the reconnect.
+    } else {
+      // No repo: the projects could not be opened, or the library is read-only here. Each readable
+      // project gets a mark: in its folder when this device holds the lock, else (or when the folder
+      // cannot take it) kept on this device until its next writable open (R154 e).
       const at = deps.clock().toISOString();
+      const i = result.integrity;
       let marked = 0;
-      for (const [, rel] of await projectFolders(root)) {
+      let kept = 0;
+      for (const [projectId, rel] of await projectFolders(root)) {
         const rec: UnrecordedAudit = {
           formatVersion: 1,
           id: newAttentionId(),
@@ -657,18 +661,35 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
           actor: opts.actor ?? "local-user",
           device: deps.deviceId,
           action: "library.reconnect",
-          details: { hint: `${deps.hostname}:${basename(resolve(root))}`, sample, rebuilt: false, projectsNotOpened: true },
+          details: {
+            hint: `${deps.hostname}:${basename(resolve(root))}`,
+            sample,
+            rebuilt: false,
+            ...(writable ? { projectsNotOpened: true } : { readOnly: library.readOnlyReason ?? "unknown" }),
+            integrity: { checked: i.checked, missing: i.missing.length, mismatched: i.mismatched.length },
+          },
           state: "ready",
-          reason: reasonOf(repoError),
+          reason: writable ? reasonOf(repoError) : "ReadOnlyLibrary",
         };
-        await writeAttention(root, rel, rec).then(
-          () => marked++,
-          (err: unknown) => warnings.push(`A project could not be marked as needing attention (${msg(err)})`),
-        );
+        try {
+          if (!writable) throw new Error("not held");
+          await writeAttention(root, rel, rec);
+          marked++;
+        } catch {
+          try {
+            await writeOutbox(deps.appConfigDir, library.id, projectId, rec);
+            kept++;
+          } catch (err) {
+            warnings.push(`The library.reconnect audit event for a project could not be kept for later (${msg(err)})`);
+          }
+        }
       }
       if (marked > 0) warnings.push(`${marked} project(s) are marked as needing attention; the reconnect is recorded in their audit logs when they can be opened`);
-    } else {
-      warnings.push(`The library.reconnect audit event was not recorded: the library is read-only (${library.readOnlyReason ?? "unknown"})`);
+      if (kept > 0) {
+        warnings.push(
+          `The library.reconnect audit event was not recorded${writable ? "" : `: the library is read-only (${library.readOnlyReason ?? "unknown"})`}; it is kept on this computer for ${kept} project(s) and recorded when the library is next opened here with write access`,
+        );
+      }
     }
     return result;
   } catch (err) {

@@ -1060,6 +1060,43 @@ describe("Task 50: no refusal or audit failure is silent", () => {
     expect(await projectWarnings(r, a.id)).toEqual([]);
   });
 
+  it("P2 / R154 e: nothing is written under another device's lock; the mark waits on this device and is delivered once", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    const depsB: Deps = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1 };
+    await acquireLock(dest, depsB);
+    const out = await deleteOldCopy(lib.root, res.confirmToken);
+    expect(out.rootRemoved).toBe(true);
+    expect(out.warnings.join(" ")).toMatch(/kept on this computer/);
+    // Nothing appeared in the library B holds.
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+    expect(await attentionOf(dest, b.folder)).toEqual([]);
+    const outbox = await readdir(join(tmp, "config", "attention-outbox")).catch(() => [] as string[]);
+    expect(outbox).toHaveLength(1);
+    // Shown on this device while B holds the lock.
+    const ro = await openLibrary(dest, mkDeps());
+    expect(ro.readOnlyReason).toBe("locked-by-other-device");
+    const roRepo = await openTestRepo(ro, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    expect(await projectWarnings(roRepo, a.id)).toEqual(["audit-waiting"]);
+    await ro.close();
+    // Delivered on this device's next writable open, once.
+    await releaseLock(dest, depsB);
+    for (let i = 0; i < 2; i++) {
+      const d = await openLibrary(dest, mkDeps());
+      const r = await openTestRepo(d, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+      for (const f of [a.folder, b.folder]) {
+        const ev = (await auditOf(dest, f)).filter((e) => e.action === "library.old-copy-deleted");
+        expect(ev).toHaveLength(1);
+        expect(ev[0]!.details).toMatchObject({ recordedLate: { by: "dev-A" } });
+      }
+      expect(await projectWarnings(r, a.id)).toEqual([]);
+      await d.close();
+    }
+    const left = await readdir(join(tmp, "config", "attention-outbox", (await readdir(join(tmp, "config", "attention-outbox")))[0]!));
+    expect(left).toEqual([]);
+  });
+
   it("a library.old-copy-deleted event that cannot be written marks the project in the new copy", async () => {
     const { lib, a, b } = await fixture();
     const dest = join(tmp, "Dest");

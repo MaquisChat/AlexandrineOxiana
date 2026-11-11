@@ -11,7 +11,7 @@ import type { Deps } from "./deps.js";
 import { IndexHandle } from "./index/db.js";
 import { rebuildIndex } from "./index/rebuild.js";
 import { LibraryMovedError, WrongLibraryError, createLibrary, openLibrary, type Library } from "./library.js";
-import { acquireLock, readLock } from "./lock.js";
+import { acquireLock, readLock, releaseLock } from "./lock.js";
 import { MOVED_MARKER, MOVE_JOURNAL } from "./move.js";
 import { addPendingOldCopy } from "./old-copies.js";
 import {
@@ -890,6 +890,25 @@ describe("Task 50: reconnect and relink are never silent when an audit entry can
     expect(ev[0]!.details).toMatchObject({ hint: "host-A:Research", recordedLate: { occurredAt: NOW } });
     expect(again.repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: pid, kind: "audit-recorded-late" }));
     expect(await attentionOf(lib.root, folder)).toEqual([]);
+  });
+
+  it("R154 e: a reconnect to a library another device holds keeps its event on this device and delivers it later", async () => {
+    const { lib, pid, folder } = await fixture();
+    await lib.close();
+    await acquireLock(lib.root, depsB());
+    const r = await reconnect(lib.root, lib.id, mkDeps(), { keyRing: ring });
+    expect(r.library.readOnlyReason).toBe("locked-by-other-device");
+    expect(r.warnings.join(" ")).toMatch(/kept on this computer/);
+    expect(await attentionOf(lib.root, folder)).toEqual([]);
+    await r.library.close();
+    await releaseLock(lib.root, depsB());
+    const again = await openLibrary(lib.root, mkDeps());
+    open.push(again);
+    const repo = await openTestRepo(again, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    const ev = (await auditOf(lib.root, folder)).filter((e) => e.action === "library.reconnect");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.details).toMatchObject({ hint: "host-A:Research", recordedLate: { by: "dev-A" } });
+    expect(await projectWarnings(repo, pid)).toEqual([]);
   });
 
   it("relink: a library.relink event that cannot be written leaves the file restored, marks the project, and is recorded on the next open", async () => {

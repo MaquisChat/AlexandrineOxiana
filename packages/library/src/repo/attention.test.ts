@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
-import { newAttentionId, reasonOf, writeAttention, type UnrecordedAudit } from "./attention.js";
+import { newAttentionId, readOutbox, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./attention.js";
 import { projectWarnings, recordOrMark, type Repo } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
 
@@ -216,5 +216,37 @@ describe("R154 c: a repair takes no instruction from a record on disk", () => {
     expect((await events()).some((e) => e.action === "key.recovery-activated" || e.details?.txn === "deadbeef" || e.action === "library.reconnect")).toBe(false);
     expect(await projectWarnings(r, pid)).toEqual(["attention-unreadable"]);
     expect(await records()).toHaveLength(3);
+  });
+});
+
+describe("R154 e: the device-local outbox", () => {
+  it("a crash after delivering (event appended, outbox file not yet removed) never records it twice", async () => {
+    const rec = unrecorded();
+    await writeOutbox(join(tmp, "config"), lib.id, pid, rec);
+    expect(await projectWarnings(repo, pid)).toEqual(["audit-waiting"]);
+    // The event is already in the log with this id: as if the process died right after the append.
+    expect(await recordOrMark(repo, pid, "library.reconnect", { ...rec.details, attentionId: rec.id })).toBeUndefined();
+    const r = await reopen();
+    expect((await events()).filter((e) => e.action === "library.reconnect")).toHaveLength(1);
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
+    expect(await projectWarnings(r, pid)).toEqual([]);
+  });
+
+  it("an entry for a project that cannot take its event now moves into the project, never lost", async () => {
+    await writeOutbox(join(tmp, "config"), lib.id, pid, unrecorded());
+    const seg = join(lib.root, folder, "audit", "0001.jsonl");
+    const lines = (await readFile(seg, "utf8")).split("\n");
+    lines[0] = lines[0]!.replace('"actor":"tester"', '"actor":"forged"');
+    await writeFile(seg, lines.join("\n"));
+    const r = await reopen();
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
+    expect(await records()).toHaveLength(1);
+    expect(await projectWarnings(r, pid)).toEqual(["audit-unrecorded-blocked"]);
+  });
+
+  it("an entry whose record is not valid is never delivered", async () => {
+    await writeOutbox(join(tmp, "config"), lib.id, pid, { ...unrecorded(), action: "key.unlock" });
+    await reopen();
+    expect((await events()).some((e) => e.action === "key.unlock" && e.device === "dev-B")).toBe(false);
   });
 });

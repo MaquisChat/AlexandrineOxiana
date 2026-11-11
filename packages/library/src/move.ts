@@ -24,7 +24,7 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { copyFileAtomic, writeFileAtomic } from "./fs/atomic.js";
 import { checkpointTruncate, INDEX_FILE, type IndexHandle } from "./index/db.js";
-import { MOVED_MARKER, MOVE_JOURNAL, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
+import { MOVED_MARKER, MOVE_JOURNAL, isClosed, openLibraryInternal, projectMovedAway, type Library, type LibraryJson } from "./library.js";
 import { classifyLocation, type Location, type LocationEnv } from "./location.js";
 import { acquireLock, peekLock, readLock, releaseLock } from "./lock.js";
 import {
@@ -41,7 +41,7 @@ import {
 import { addKnownPath, registerLibrary } from "./registry.js";
 import { PathEscapeError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { newAttentionId, projectFolderOf, reasonOf, writeAttention } from "./repo/attention.js";
+import { newAttentionId, projectFolderOf, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import { openRepo, recordOrMark, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
 import { parseProjectJson } from "./repo/state.js";
 
@@ -539,8 +539,8 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
     let unrecorded = false;
     for (const p of denied) {
       const reason = p.decision.result === "deny" ? p.decision.reason : "";
-      const w = await auditOrMark(lib.root, p.projectId, p.folder, opts.sourceRepo, lib, "move", details, { actor: opts.actor, deps }, { reason });
-      if (w?.includes("could not be marked")) unrecorded = true;
+      const w = await auditOrMark(lib.root, p.projectId, p.folder, opts.sourceRepo, lib, "move", details, { actor: opts.actor, deps }, { libraryId: lib.id, held: lib.mode === "read-write" }, { reason });
+      if (w?.includes("either")) unrecorded = true;
     }
     const why = denied.map((p) => `${p.name}: ${p.decision.result === "deny" ? p.decision.reason : ""}`).join("; ");
     throw new MoveNotAllowedError(
@@ -826,6 +826,7 @@ async function auditOrMark(
   action: string,
   details: Record<string, unknown>,
   who: { actor?: string; deps: Deps },
+  where: { libraryId: string; held: boolean },
   refusal?: { reason: string },
   cause?: unknown,
 ): Promise<string | undefined> {
@@ -835,26 +836,37 @@ async function auditOrMark(
     if (sameLib && repo.listProjects().some((p) => p.id === projectId)) return recordOrMark(repo, projectId, action, details, refusal);
   }
   const what = `The ${action} audit event could not be recorded for project ${projectId}${cause !== undefined ? ` (${msg(cause)})` : ""}`;
-  try {
-    const rel = folder ?? (await projectFolderOf(root, projectId));
-    if (!rel) throw new Error("the project folder was not found");
-    await writeAttention(root, rel, {
-      formatVersion: 1,
-      id: newAttentionId(),
-      kind: "audit-unrecorded",
-      occurredAt: who.deps.clock().toISOString(),
-      actor: who.actor ?? "local-user",
-      device: who.deps.deviceId,
-      action,
-      ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
-      details,
-      state: "ready",
-      reason: cause !== undefined ? reasonOf(cause) : "RepoNotOpen",
-    });
-  } catch (e) {
-    return `${what}; the project could not be marked as needing attention either (${msg(e)})`;
+  const rec: UnrecordedAudit = {
+    formatVersion: 1,
+    id: newAttentionId(),
+    kind: "audit-unrecorded",
+    occurredAt: who.deps.clock().toISOString(),
+    actor: who.actor ?? "local-user",
+    device: who.deps.deviceId,
+    action,
+    ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+    details,
+    state: "ready",
+    reason: cause !== undefined ? reasonOf(cause) : "RepoNotOpen",
+  };
+  // Only into a library this device holds the lock for (R154 e); otherwise, or when the project
+  // folder cannot take it, the mark waits on this device and is delivered at its next writable open.
+  if (where.held) {
+    try {
+      const rel = folder ?? (await projectFolderOf(root, projectId));
+      if (!rel) throw new Error("the project folder was not found");
+      await writeAttention(root, rel, rec);
+      return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
+    } catch {
+      // falls through to the outbox
+    }
   }
-  return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
+  try {
+    await writeOutbox(who.deps.appConfigDir, where.libraryId, projectId, rec);
+  } catch (e) {
+    return `${what}; it could not be kept for later either (${msg(e)})`;
+  }
+  return `${what}; it is kept on this computer and recorded when the library is next opened here with write access`;
 }
 
 /**
@@ -895,15 +907,10 @@ async function auditIn(
     cause = err;
   }
   try {
-    if (!repo) {
-      const meta = await fsp.readFile(join(root, "library.json"), "utf8").then((t) => JSON.parse(t) as Partial<LibraryJson>, () => null);
-      if (meta?.libraryId !== check.expectId) {
-        warnings.push(`The ${action} audit events could not be recorded (${msg(cause)})`);
-        return;
-      }
-    }
+    // This device may write into the folder only while it holds that library's lock (R154 e).
+    const held = lib !== undefined && lib.mode === "read-write" && lib.id === check.expectId && !isClosed(lib);
     for (const id of projectIds) {
-      const w = await auditOrMark(root, id, null, repo, undefined, action, details, { actor: ctx.actor, deps }, undefined, cause);
+      const w = await auditOrMark(root, id, null, repo, undefined, action, details, { actor: ctx.actor, deps }, { libraryId: check.expectId, held }, undefined, cause);
       if (w) warnings.push(w);
     }
   } finally {
