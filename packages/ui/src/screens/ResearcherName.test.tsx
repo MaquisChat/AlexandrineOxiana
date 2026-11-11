@@ -35,6 +35,22 @@ describe("researcher name setting (R84/R117)", () => {
     await waitFor(() => expect(puts).toEqual([{ name: "A. Souza" }, { name: null }]));
   });
 
+  it("a failed read shows an error and keeps the form off, so the stored name is never cleared by accident (41b2 M9)", async () => {
+    const puts: unknown[] = [];
+    server.use(
+      http.get(url("/settings/researcher"), () => HttpResponse.json({ error: { code: "INTERNAL", message: "The settings could not be read." } }, { status: 500 })),
+      http.put(url("/settings/researcher"), async ({ request }) => {
+        puts.push(await request.json());
+        return HttpResponse.json({ name: null });
+      }),
+    );
+    render(<ResearcherNameSetting client={testClient()} />);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/could not be read/);
+    expect((screen.getByRole("textbox", { name: "Your name as researcher" }) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Save name" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(puts).toEqual([]);
+  });
+
   it("shows the service's refusal", async () => {
     server.use(
       http.get(url("/settings/researcher"), () => HttpResponse.json({ name: null })),
