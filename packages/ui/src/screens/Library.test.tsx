@@ -29,6 +29,13 @@ describe("Library screen", () => {
     expect(clinic.textContent).toMatch(/Locked/);
   });
 
+  it("the library's name heading takes its direction from the text itself (D7)", async () => {
+    server.use(...libraryHandlers());
+    renderLibrary({ ...CURRENT_RW, name: "مكتبة الأطروحة" });
+    const heading = await screen.findByRole("heading", { level: 1, name: "مكتبة الأطروحة" });
+    expect(heading.getAttribute("dir")).toBe("auto");
+  });
+
   it("shows nested collections, tags and the project's sources", async () => {
     server.use(...libraryHandlers());
     renderLibrary();

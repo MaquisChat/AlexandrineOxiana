@@ -124,9 +124,9 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       {!src && !error && <p aria-live="polite">Loading…</p>}
       {src && (
         <>
-          <h2>
-            <UserText lang={variants[0]?.lang}>{title || "Untitled"}</UserText>
-          </h2>
+          <UserText as="h2" lang={variants[0]?.lang}>
+            {title || "Untitled"}
+          </UserText>
           {variants.slice(1).map((v, i) => (
             <p key={i} className="ao-muted">
               <UserText lang={v.lang}>{v.value}</UserText>
