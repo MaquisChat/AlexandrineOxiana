@@ -6,7 +6,7 @@
  * Collection names are user text (dir=auto). New collections go inside the selected one; the
  * selected collection can be renamed or deleted (off while the library is read-only).
  */
-import { useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { Collection } from "../api/library";
 import { UserText } from "./UserText";
 import "./library.css";
@@ -115,6 +115,11 @@ export function CollectionTree({ collections, selectedId, onSelect, readOnly = f
       f();
     }
   };
+
+  // Rename and delete belong to the collection they were opened for: another selection closes them (41b1 M2).
+  useEffect(() => {
+    setMode((m) => (m === "rename" || m === "delete" ? "none" : m));
+  }, [selectedId]);
 
   const start = (m: "create" | "rename" | "delete") => {
     setName(m === "rename" ? (selected?.name ?? "") : "");

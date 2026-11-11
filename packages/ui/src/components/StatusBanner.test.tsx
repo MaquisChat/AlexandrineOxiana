@@ -63,7 +63,7 @@ describe("StatusBanner", () => {
       "chain-broken", "head-mismatch", "truncated", "empty", "anchor-missing", "anchors-unreadable", "rolled-back-incomplete-write",
       "invalid-txn-marker", "incomplete-write-pending", "txn-recovery-skipped-audit-unverifiable", "trimmed-incomplete-audit-line",
       "incomplete-audit-line-pending", "audit-append-failed-at-open", "deleted-records-unreadable", "annotations-unreadable",
-      "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due",
+      "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due", "protocol-manifest-unreadable",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();

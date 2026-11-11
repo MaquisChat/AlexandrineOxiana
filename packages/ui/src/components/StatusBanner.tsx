@@ -50,6 +50,7 @@ const WARNINGS: Record<string, (p: string) => string> = {
   "annotations-hash-mismatch": (p) => `Some annotations in ${p} were changed outside the app. They are shown as they are now.`,
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
+  "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,
   "retention-due": (p) => `${p} has reached its retention date. Review which raw data must now be destroyed or kept.`,
 };
 

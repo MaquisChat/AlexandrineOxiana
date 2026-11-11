@@ -262,13 +262,15 @@ describe("Library screen", () => {
     await user.click(resolve);
     const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
     const first = await within(dialog).findByRole("group", { name: "Interrupted change in Dissertation" });
-    expect((within(first).getByRole("button", { name: "Keep it" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(first).queryByRole("button", { name: "Keep it" })).toBeNull();
     const second = within(dialog).getByRole("group", { name: "Interrupted change in library" });
     expect(within(second).queryByRole("button", { name: "Roll it back" })).toBeNull();
-    expect(second.textContent).toMatch(/cannot be undone or kept here/);
+    expect(second.textContent).toMatch(/restore the project from a backup/);
     await user.click(within(first).getByRole("button", { name: "Roll it back" }));
     // A confirmation first.
     expect(resolved).toEqual([]);
+    // An unverifiable change: the roll-back needs an explicit acknowledgement (41b2 I3).
+    await user.click(within(first).getByRole("checkbox", { name: /I understand/ }));
     await user.click(within(first).getByRole("button", { name: "Yes, roll it back" }));
     await waitFor(() => expect(resolved).toEqual([{ txn: T1, choice: "roll-back" }]));
     await waitFor(() => expect(within(dialog).queryByRole("group", { name: "Interrupted change in Dissertation" })).toBeNull());
@@ -356,6 +358,65 @@ describe("Library screen", () => {
     expect(screen.getByText("Source 1")).toBeTruthy();
     expect(offsets.at(-1)).toBe("2");
     expect(screen.queryByRole("button", { name: "Load more sources" })).toBeNull();
+  });
+
+  describe("a slow Load more answer is dropped when it is stale (41b1 I1)", () => {
+    const row = (i: number, title = `Source ${i}`) => ({ ...SOURCES.items[0]!, id: `s${i}`, title });
+    let slowFirstPage = false;
+    function slowPages() {
+      slowFirstPage = false;
+      server.use(
+        http.get(url("/projects/:id/sources"), async ({ request }) => {
+          const q = new URL(request.url).searchParams;
+          if (q.get("offset") === "2") {
+            await new Promise((r) => setTimeout(r, 600));
+            return HttpResponse.json({ total: 3, items: [row(3, "Old page three")] });
+          }
+          if (q.get("text") === "zebra") return HttpResponse.json({ total: 1, items: [row(9, "Zebra one")] });
+          if (slowFirstPage) await new Promise((r) => setTimeout(r, 400));
+          return HttpResponse.json({ total: 3, items: [row(1), row(2)] });
+        }),
+        http.post(url("/projects/:id/unlock"), () => HttpResponse.json({ unlocked: true })),
+        http.post(url("/projects/:id/lock"), () => HttpResponse.json({ unlocked: false })),
+        ...libraryHandlers(),
+      );
+    }
+
+    it("after the search changed", async () => {
+      slowPages();
+      const user = userEvent.setup();
+      renderLibrary();
+      await screen.findByText("Source 2");
+      await user.click(screen.getByRole("button", { name: "Load more sources" }));
+      await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "zebra");
+      expect(await screen.findByText("Zebra one")).toBeTruthy();
+      await new Promise((r) => setTimeout(r, 700));
+      expect(screen.queryByText("Old page three")).toBeNull();
+      expect(screen.getByText("Zebra one")).toBeTruthy();
+    });
+
+    it("after the project was locked: no decrypted rows come back", async () => {
+      slowPages();
+      const user = userEvent.setup();
+      renderLibrary();
+      await user.click(await screen.findByRole("button", { name: /Clinic interviews/ }));
+      await user.type(await screen.findByLabelText("Passphrase or recovery code"), "pw");
+      await user.click(screen.getByRole("button", { name: "Unlock" }));
+      await screen.findByText("Source 2");
+      await user.click(screen.getByRole("button", { name: "Load more sources" }));
+      await user.click(screen.getByRole("button", { name: "Lock project" }));
+      expect(await screen.findByLabelText("Passphrase or recovery code")).toBeTruthy();
+      await new Promise((r) => setTimeout(r, 700));
+      expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+      // Unlock again: until the fresh answer arrives, nothing left over from before the lock shows.
+      slowFirstPage = true;
+      await user.type(screen.getByLabelText("Passphrase or recovery code"), "pw");
+      await user.click(screen.getByRole("button", { name: "Unlock" }));
+      expect(await screen.findByText("Loading sources…")).toBeTruthy();
+      expect(screen.queryByText("Old page three")).toBeNull();
+      expect(screen.queryByText("Source 1")).toBeNull();
+      expect(await screen.findByText("Source 1")).toBeTruthy();
+    });
   });
 
   it("library.state open:false tells the shell the library closed", async () => {

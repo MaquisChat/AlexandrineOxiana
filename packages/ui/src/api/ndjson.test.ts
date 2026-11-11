@@ -31,6 +31,27 @@ describe("client.ndjson()", () => {
     await expect(collect(testClient().ndjson("POST", "/s"))).resolves.toEqual([{ a: 1 }, { b: 2 }]);
   });
 
+  it("removes its abort listener when it ends, so a long-lived signal does not collect them (41b1 M13)", async () => {
+    server.use(http.post(url("/s"), () => chunks(['{"a":1}\n'])));
+    const ac = new AbortController();
+    let added = 0;
+    let removed = 0;
+    const add = ac.signal.addEventListener.bind(ac.signal);
+    const remove = ac.signal.removeEventListener.bind(ac.signal);
+    ac.signal.addEventListener = ((...a: Parameters<AbortSignal["addEventListener"]>) => {
+      if (a[0] === "abort") added++;
+      add(...a);
+    }) as AbortSignal["addEventListener"];
+    ac.signal.removeEventListener = ((...a: Parameters<AbortSignal["removeEventListener"]>) => {
+      if (a[0] === "abort") removed++;
+      remove(...a);
+    }) as AbortSignal["removeEventListener"];
+    for (let i = 0; i < 3; i++) await collect(testClient().ndjson("POST", "/s", { signal: ac.signal }));
+    expect(added).toBeGreaterThan(0);
+    // One listener of its own per call, each removed again (fetch adds and manages its own).
+    expect(removed).toBe(3);
+  });
+
   it("an abort returns quietly", async () => {
     server.use(http.post(url("/s"), () => chunks(['{"a":1}\n'], { hang: true })));
     const ac = new AbortController();

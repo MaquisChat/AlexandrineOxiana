@@ -39,6 +39,13 @@ export interface LibraryProps {
   navigate?: (path: string) => void;
   /** The service reports no library open any more (library.state open:false). */
   onClosed?: () => void;
+  /**
+   * The project named in the address (`?project=<id>`). It is selected whenever it changes; an id
+   * that is not one of the library's selects nothing and says so. Without one, the first project.
+   */
+  projectFromAddress?: string | undefined;
+  /** The selected project changed (the route keeps it in the address). */
+  onProjectSelected?: (id: string) => void;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -57,7 +64,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -82,11 +89,29 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [sourcesError, setSourcesError] = useState<string | undefined>();
   const [loadingMore, setLoadingMore] = useState(false);
   const [reload, setReload] = useState(0);
+  /** The address named a project this library does not have (41b2 I1). */
+  const [unknownProject, setUnknownProject] = useState(false);
+  /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
+  const [stateSeq, setStateSeq] = useState(0);
 
   const readOnly = state.mode !== "read-write";
   const project = projects?.find((p) => p.id === projectId);
   const locked = !!project && project.encrypted && !project.unlocked && !unlockedHere.has(project.id);
   const refresh = useCallback(() => setReload((n) => n + 1), []);
+
+  /**
+   * The current list of sources' generation: a new search, a reload, another project, a lock or
+   * unmounting moves it on, and a "Load more" answer for an older generation is dropped (41b1 I1).
+   */
+  const pageGen = useRef(0);
+  const morePage = useRef<AbortController | undefined>(undefined);
+  const staleMore = useCallback(() => {
+    pageGen.current++;
+    morePage.current?.abort();
+    morePage.current = undefined;
+    setLoadingMore(false);
+  }, []);
+  useEffect(() => staleMore, [staleMore]);
 
   const closedRef = useRef(onClosed);
   closedRef.current = onClosed;
@@ -96,12 +121,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * sources, open source and attach outcomes; UnlockProject shows in their place.
    */
   const forgetDecrypted = useCallback(() => {
+    staleMore();
     setCollections([]);
     setTags({ tags: [], workspaceTags: [] });
     setSources(undefined);
     setOpenSource(undefined);
     setOutcomes(undefined);
-  }, []);
+  }, [staleMore]);
   const markLocked = useCallback(
     (id: string) => {
       setUnlockedHere((s) => new Set([...s].filter((x) => x !== id)));
@@ -141,6 +167,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             }
             // Each event is the whole state: a reason or lock holder it no longer names is gone.
             setState(({ readOnlyReason: _r, lockedBy: _l, ...s }) => ({ ...s, ...d }));
+            setStateSeq((n) => n + 1);
           }
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
@@ -174,7 +201,6 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .then(({ projects: list }) => {
         if (!live) return;
         setProjects(list);
-        setProjectId((id) => id ?? list[0]?.id);
         // The badges are the profiles the service reads from each project's rules (R118).
         setProfiles(Object.fromEntries(list.map((p) => [p.id, knownProfiles(p.profiles)])));
       })
@@ -202,6 +228,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
 
   // ---- the sources for the current search and filters ----
   useEffect(() => {
+    staleMore();
     if (!projectId || locked) return;
     const ac = new AbortController();
     api.sources
@@ -223,28 +250,74 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const loadMore = async () => {
     if (!projectId || !sources) return;
     const pid = projectId;
+    const gen = pageGen.current;
+    const ac = new AbortController();
+    morePage.current?.abort();
+    morePage.current = ac;
+    const stale = () => gen !== pageGen.current || ac.signal.aborted || projectIdRef.current !== pid;
     setLoadingMore(true);
     try {
-      const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length });
-      if (projectIdRef.current !== pid) return;
-      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : r));
+      const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length }, { signal: ac.signal });
+      if (stale()) return;
+      // A late page is only ever added to the list it continues, never used as a whole list.
+      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
     } catch (err) {
-      fail(err, "More sources could not be read.", setSourcesError);
+      if (!stale()) fail(err, "More sources could not be read.", setSourcesError);
     } finally {
-      setLoadingMore(false);
+      if (!stale()) setLoadingMore(false);
+      if (morePage.current === ac) morePage.current = undefined;
     }
   };
 
-  const selectProject = (id: string) => {
-    if (id === projectId) return;
-    setProjectId(id);
-    setCollections([]);
-    setTags({ tags: [], workspaceTags: [] });
-    setSources(undefined);
-    setOpenSource(undefined);
-    setOutcomes(undefined);
-    setFilter((f) => ({ text: f.text }));
-  };
+  const selectedRef = useRef(onProjectSelected);
+  selectedRef.current = onProjectSelected;
+  /**
+   * The project this screen last wrote into the address, until the address shows it: a render with
+   * an older address (a selection made just before) must not undo the selection.
+   */
+  const written = useRef<string | undefined>(undefined);
+  const selectProject = useCallback(
+    (id: string | undefined) => {
+      setUnknownProject(false);
+      if (id && selectedRef.current) {
+        written.current = id;
+        selectedRef.current(id);
+      }
+      if (id === projectIdRef.current) return;
+      projectIdRef.current = id;
+      staleMore();
+      setProjectId(id);
+      setCollections([]);
+      setTags({ tags: [], workspaceTags: [] });
+      setSources(undefined);
+      setOpenSource(undefined);
+      setOutcomes(undefined);
+      setFilter((f) => ({ text: f.text }));
+    },
+    [staleMore],
+  );
+
+  // ---- the project named in the address (41b2 I1): honoured on every way into the library ----
+  useEffect(() => {
+    if (!projects) return;
+    if (written.current !== undefined) {
+      if (projectFromAddress !== written.current) return; // the address has not caught up yet
+      written.current = undefined;
+    }
+    if (!projectFromAddress) {
+      // No project named: keep the one selected, else the first; either way the address names it.
+      selectProject(projectIdRef.current ?? projects[0]?.id);
+      return;
+    }
+    if (projects.some((p) => p.id === projectFromAddress)) {
+      selectProject(projectFromAddress);
+      return;
+    }
+    // Not one of this library's projects: select none, so nothing is dropped into the wrong one.
+    selectProject(undefined);
+    setUnknownProject(true);
+  }, [projects, projectFromAddress, selectProject]);
+
 
   // Edits: each goes through the service; a failure is shown, success reloads.
   const edit = (what: string, run: () => Promise<unknown>) => {
@@ -324,10 +397,12 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         <PendingWritesDialog
           api={api}
           readOnly={readOnly}
+          changed={stateSeq}
           onClose={() => {
             const from = resolving.from;
             setResolving(null);
-            from?.focus();
+            // After the dialog is gone and the page is no longer inert.
+            setTimeout(() => from?.focus());
           }}
           onResolved={refresh}
         />
@@ -390,6 +465,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         {error && (
           <p role="alert" className="ao-error">
             {error}
+          </p>
+        )}
+        {unknownProject && (
+          <p role="alert" className="ao-error">
+            The project named in the address is not in this library. Choose a project from the list.
           </p>
         )}
         {project && locked && (

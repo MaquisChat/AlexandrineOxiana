@@ -54,6 +54,8 @@ export interface StepReportProps {
 export function StepReport({ api, projectId, batchId, error: runError }: StepReportProps) {
   const [report, setReport] = useState<ImportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** A failed undo: shown inside the dialog while it is open (the page behind it is inert), on the page after. */
+  const [undoError, setUndoError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [undoing, setUndoing] = useState(false);
   const [undone, setUndone] = useState<UndoResult | null>(null);
@@ -78,13 +80,13 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
 
   const undo = async () => {
     setUndoing(true);
-    setError(null);
+    setUndoError(null);
     try {
       setUndone(await api.undo(batchId));
       setConfirming(false);
       setRefocus((n) => n + 1);
     } catch (e) {
-      setError(errorText(e));
+      setUndoError(errorText(e));
     } finally {
       setUndoing(false);
     }
@@ -99,6 +101,7 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
     <Section title="Report and undo" headingRef={heading}>
       {runError && <p className="ao-import__error">{runError}</p>}
       <ErrorNote error={error} />
+      {!confirming && <ErrorNote error={undoError} />}
       {!report && !error && <p role="status">Loading the report…</p>}
       {report && (
         <>
@@ -185,12 +188,12 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
           {undone ? (
             <div role="status">
               <p>
-                Removed {count(undone.removedSources, "source")} and restored {count(undone.revertedMerges, "merged source")}.
+                Removed {count(undone.removedSources, "source")} and restored {count(undone.revertedMerges, "source")} that had been merged or updated.
               </p>
               {undone.kept.length > 0 && (
                 <ul>
                   {undone.kept.map((k) => (
-                    <li key={`${k.kind}-${k.id}`}>Kept: {k.reason}</li>
+                    <li key={`${k.kind}-${k.sourceId ?? ""}-${k.id}`}>Kept: {k.reason}</li>
                   ))}
                 </ul>
               )}
@@ -198,13 +201,21 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
           ) : (
             report.state !== "undone" && (
               <div className="ao-import__actions">
-                <button type="button" ref={undoButton} onClick={() => setConfirming(true)} disabled={confirming}>
+                <button
+                  type="button"
+                  ref={undoButton}
+                  onClick={() => {
+                    setUndoError(null);
+                    setConfirming(true);
+                  }}
+                  disabled={confirming}
+                >
                   Undo import
                 </button>
               </div>
             )
           )}
-          {confirming && report && <ConfirmUndo question={undoQuestion(report)} busy={undoing} onCancel={close} onConfirm={() => void undo()} />}
+          {confirming && report && <ConfirmUndo question={undoQuestion(report)} busy={undoing} error={undoError} onCancel={close} onConfirm={() => void undo()} />}
         </>
       )}
     </Section>
@@ -213,11 +224,21 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
 
 /**
  * A modal confirmation: rendered on top of the page (a portal in <body>), everything else inert
- * while it is open, Tab and Shift+Tab kept inside it, Escape cancels.
+ * while it is open, Tab and Shift+Tab kept inside it, Escape cancels (except while the undo runs).
+ * While it runs, focus is on a status line in the dialog; a failure is announced in the dialog and
+ * focused there (41b1 I2), since the page behind it is inert.
  */
-function ConfirmUndo({ question, busy, onCancel, onConfirm }: { question: string; busy: boolean; onCancel(): void; onConfirm(): void }) {
+function ConfirmUndo({ question, busy, error, onCancel, onConfirm }: { question: string; busy: boolean; error: string | null; onCancel(): void; onConfirm(): void }) {
   const box = useRef<HTMLDivElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
+  const status = useRef<HTMLParagraphElement>(null);
+  const failure = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (busy) status.current?.focus();
+  }, [busy]);
+  useEffect(() => {
+    if (error) failure.current?.focus();
+  }, [error]);
   const [host] = useState(() => document.createElement("div"));
 
   useEffect(() => {
@@ -238,11 +259,15 @@ function ConfirmUndo({ question, busy, onCancel, onConfirm }: { question: string
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
       e.preventDefault();
-      onCancel();
+      if (!busy) onCancel();
       return;
     }
     if (e.key !== "Tab") return;
     const items = Array.from(box.current?.querySelectorAll<HTMLElement>("button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? []);
+    if (!items.length) {
+      e.preventDefault(); // nothing to move to while the undo runs: focus stays on the status line
+      return;
+    }
     if (!items.length) return;
     const first = items[0]!;
     const last = items[items.length - 1]!;
@@ -254,13 +279,23 @@ function ConfirmUndo({ question, busy, onCancel, onConfirm }: { question: string
 
   return createPortal(
     <div className="ao-import__backdrop">
-      <div ref={box} className="ao-import__dialog" role="alertdialog" aria-modal="true" aria-labelledby="ao-undo-q" aria-describedby="ao-undo-d" onKeyDown={onKeyDown}>
+      <div ref={box} className="ao-import__dialog" role="alertdialog" aria-modal="true" aria-labelledby="ao-undo-q" aria-describedby={error ? "ao-undo-d ao-undo-e" : "ao-undo-d"} onKeyDown={onKeyDown}>
         <p id="ao-undo-q" className="ao-import__dialog-question">
           {question}
         </p>
         <p id="ao-undo-d" className="ao-import__hint">
           Collections and tags this import created are removed too, unless something else uses them. Your later edits to merged sources are kept.
         </p>
+        {busy && (
+          <p ref={status} role="status" tabIndex={-1} className="ao-import__hint">
+            Undoing the import…
+          </p>
+        )}
+        {error && !busy && (
+          <p ref={failure} id="ao-undo-e" role="alert" tabIndex={-1} className="ao-import__error">
+            The import was not undone. {error}
+          </p>
+        )}
         <div className="ao-import__actions">
           <button type="button" ref={cancel} onClick={onCancel} disabled={busy}>
             Cancel
