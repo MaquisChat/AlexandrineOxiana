@@ -88,6 +88,8 @@ import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./r
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
+import { attentionWarnings, newAttentionId, reasonOf, removeAttention, settleAttention, writeAttention, type AttentionRecord } from "./attention.js";
+import { SimulatedCrash, maybeCrash } from "./seams.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -554,6 +556,18 @@ export async function openRepoInternal(
         await completeRecoveryActivation(core, st, events, verify.ok, at);
         if (st.audit.head?.seq !== headBefore) appended = true;
       }
+      // Audit events an action could not write, and permissions a restore could not set (Task 50).
+      if (verify.ok) {
+        const settled = await settleAttention(core, st, events, at);
+        if (settled > 0) {
+          appended = true;
+          core.integrityWarnings.push({
+            projectId: st.project.id,
+            kind: "audit-recorded-late",
+            detail: `${settled} action(s) whose audit entry or file permissions could not be written at the time were recorded now`,
+          });
+        }
+      }
       if (!problem && !appended && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
         await core.updateAnchor(st, at);
       }
@@ -642,6 +656,91 @@ export async function appendLibraryEvent(
       details,
     });
   });
+}
+
+/**
+ * Package-internal (library move, Task 50): audits a refusal of a library-level action for one
+ * project (a deny event: who, what, the rule's reason), with the same guards as any append.
+ */
+export async function appendRefusalEvent(repo: Repo, projectId: string, action: string, reason: string, details: Record<string, unknown>): Promise<void> {
+  const core = cores.get(repo)!;
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    const st = core.state(projectId);
+    if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+    const at = core.clock().toISOString();
+    await core.auditNow(st, {
+      ...core.auditBase(st, at),
+      action,
+      entity: { type: "project", id: projectId },
+      decision: { result: "deny", reason },
+      details,
+    });
+  });
+}
+
+/** Package-internal: the project's library-relative folder, actor and device in this repo. */
+export function repoProjectInfo(repo: Repo, projectId: string): { rel: string; actor: string; device: string; at: string } {
+  const core = cores.get(repo)!;
+  return { rel: core.state(projectId).rel, actor: core.actor, device: core.device, at: core.clock().toISOString() };
+}
+
+/**
+ * Package-internal (Task 50, R28, R82): appends a library-level event; when that fails, the action is
+ * not undone but the project is marked (`<Project>/attention/`, warning `audit-unrecorded`) and the
+ * next writable open records the event late. Returns a plain warning when the event was not
+ * recorded now (and says whether the mark could be written), else undefined.
+ */
+export async function recordOrMark(
+  repo: Repo,
+  projectId: string,
+  action: string,
+  details: Record<string, unknown>,
+  refusal?: { reason: string },
+): Promise<string | undefined> {
+  try {
+    if (refusal) await appendRefusalEvent(repo, projectId, action, refusal.reason, details);
+    else await appendLibraryEvent(repo, projectId, action, details);
+    return undefined;
+  } catch (err) {
+    const core = cores.get(repo)!;
+    const st = core.projects.get(projectId);
+    const what = `The ${action} audit event could not be recorded for project ${projectId} (${err instanceof Error ? err.message : String(err)})`;
+    if (!st) return `${what}; the project could not be marked as needing attention`;
+    try {
+      maybeCrash("before-attention-mark");
+      await writeAttention(core.root, st.rel, {
+        formatVersion: 1,
+        id: newAttentionId(),
+        kind: "audit-unrecorded",
+        occurredAt: core.clock().toISOString(),
+        actor: core.actor,
+        device: core.device,
+        action,
+        ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+        details,
+        state: "ready",
+        reason: reasonOf(err),
+      });
+    } catch (e) {
+      if (e instanceof SimulatedCrash) throw e;
+      return `${what}; the project could not be marked as needing attention either (${e instanceof Error ? e.message : String(e)})`;
+    }
+    return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
+  }
+}
+
+/** Package-internal: the project's standing attention warnings, read through this repo. */
+export async function writeProjectAttention(repo: Repo, projectId: string, rec: AttentionRecord): Promise<void> {
+  const core = cores.get(repo)!;
+  await writeAttention(core.root, core.state(projectId).rel, rec);
+}
+
+/** Package-internal: removes a record written before an action, once its event is recorded. */
+export async function removeProjectAttention(repo: Repo, projectId: string, id: string): Promise<void> {
+  const core = cores.get(repo)!;
+  await removeAttention(core.root, core.state(projectId).rel, id);
 }
 
 /** Package-internal (reconnect): points a linked asset at its new library-relative path, governed and audited. */
@@ -878,13 +977,16 @@ export const BACKUP_FAILED_WARNING = "backup-failed";
 
 /**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
- * 'backup-failed', R92; 'recovery-code-unshown', R141 b).
+ * 'backup-failed', R92; 'recovery-code-unshown', R141 b; 'audit-unrecorded' and
+ * 'permissions-not-set', Task 50).
  */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   const out = (await deletedRecordsWarning(core, st)) ? [DELETED_RECORDS_WARNING] : [];
   if (await recoveryCodeUnshown(core, st)) out.push(RECOVERY_CODE_UNSHOWN_WARNING);
+  // Actions not undone whose audit event, or permissions, could not be written (Task 50).
+  out.push(...(await attentionWarnings(core.root, st.rel)));
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
     const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
