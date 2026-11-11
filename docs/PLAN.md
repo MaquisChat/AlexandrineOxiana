@@ -418,7 +418,7 @@ Update after every task; commit and push.
 | 42 CI coverage | done | ae3f762, b207182 | green run on GitHub at 27d7c6c; temporary network check removed |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
-| 44 Scenarios 1, 2, 5, 7 | not started | | unblocked; next to dispatch |
+| 44 Scenarios 1, 2, 5, 7 | in progress | | implementer dispatched |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
@@ -426,7 +426,7 @@ Update after every task; commit and push.
 | 34b Capture screen | in progress | | implementer dispatched |
 | 34c Transcript viewer | in progress | | implementer dispatched |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
-| 34e Pairing screen | not started | | |
+| 34e Pairing screen | in progress | | implementer dispatched |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
