@@ -257,6 +257,55 @@ describe("New recovery code dialog", () => {
     expect(onClosed).toHaveBeenCalled();
   });
 
+  it("a library closed while the request is in flight still shows the code that comes back, then leaves the library", async () => {
+    const enc = new TextEncoder();
+    let ctl: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const send = (type: string, data: unknown) => ctl?.enqueue(enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`));
+    let answer: (() => void) | undefined;
+    serve(() => HttpResponse.json({ recoveryCode: CODE }));
+    server.use(
+      http.post(url("/projects/:id/recovery-code"), async () => {
+        await new Promise<void>((r) => (answer = r));
+        return HttpResponse.json({ recoveryCode: CODE });
+      }),
+      http.get(url("/events"), () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(c) {
+            ctl = c;
+            send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
+          },
+        });
+        return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+      }),
+    );
+    const onClosed = vi.fn();
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+    const dialog = await openDialog(user);
+    await ask(dialog, user);
+    await waitFor(() => expect(answer).toBeDefined());
+    act(() => send("library.state", { open: false }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(onClosed).not.toHaveBeenCalled();
+    answer!();
+    const step = await screen.findByRole("dialog", { name: "Save the recovery code" });
+    expect(await within(step).findByText(/library was closed/i)).toBeTruthy();
+    expect(within(step).getByText(CODE)).toBeTruthy();
+    await confirmAndClose(step, user);
+    expect(onClosed).toHaveBeenCalled();
+  });
+
+  it("the 429 text is said once and says the right passphrase is refused too", async () => {
+    serve(() => serviceError(429, "RATE_LIMITED", "Too many wrong passphrases for this project. For a minute even the right passphrase is refused: wait a minute, then try again."));
+    const user = userEvent.setup();
+    render(<Library api={testApi()} current={CURRENT_RW as never} />);
+    const dialog = await openDialog(user);
+    await ask(dialog, user);
+    const text = (await within(dialog).findByRole("alert")).textContent ?? "";
+    expect(text).toMatch(/even the right passphrase is refused/);
+    expect(text.match(/Too many/g)).toHaveLength(1);
+  });
+
   it("is offered only for an unlocked encrypted project, and is off in a read-only library", async () => {
     serve(issued, [OPEN, ENC]);
     const user = userEvent.setup();

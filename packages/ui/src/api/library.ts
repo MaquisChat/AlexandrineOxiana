@@ -354,7 +354,8 @@ const CODE_LEAD: Partial<Record<string, string>> = {
 export function errorText(err: unknown, fallback: string): string {
   if (!(err instanceof ApiClientError)) return fallback;
   const parts: string[] = [];
-  const lead = CODE_LEAD[err.code];
+  // A rate limit the service explains itself is said once, in its words.
+  const lead = err.code === "RATE_LIMITED" && err.message ? undefined : CODE_LEAD[err.code];
   if (lead) parts.push(lead);
   if (err.message && !parts.includes(err.message) && !(err.code === "PROJECT_LOCKED" || err.code === "READ_ONLY")) parts.push(err.message);
   if (err.reason && !parts.some((p) => p.includes(err.reason!))) parts.push(err.reason);

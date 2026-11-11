@@ -34,6 +34,7 @@ describe("StatusBanner", () => {
     ["annotations-unreadable", /annotations in Dissertation could not be read/],
     ["destroy-incomplete", /destruction of raw data in Dissertation did not finish/],
     ["retention-due", /Dissertation has reached its retention date/],
+    ["recovery-code-unshown", /new recovery code for Dissertation was issued, but the app stopped before it could be shown.*New recovery code…/],
     ["anchor-missing", /audit log may have been changed outside the app/],
   ])("warning %s in plain language", (warning, text) => {
     render(<StatusBanner variant={{ kind: "warning", warning, project: "Dissertation" }} />);
@@ -64,6 +65,7 @@ describe("StatusBanner", () => {
       "invalid-txn-marker", "incomplete-write-pending", "txn-recovery-skipped-audit-unverifiable", "trimmed-incomplete-audit-line",
       "incomplete-audit-line-pending", "audit-append-failed-at-open", "deleted-records-unreadable", "annotations-unreadable",
       "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due", "protocol-manifest-unreadable",
+      "recovery-code-unshown",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();

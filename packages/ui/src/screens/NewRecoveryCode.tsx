@@ -12,6 +12,9 @@
  * so plainly, and that the old code then no longer works, and asks the researcher to ask again:
  * issuing another is safe, and only the newest code works. It never resends by itself.
  *
+ * A library closed while the request is in flight waits for its answer as it waits for a code on
+ * screen: a code that comes back is shown (with a notice), and the library is left afterwards.
+ *
  * Keyboard: focus starts in the passphrase; Tab stays inside; Enter sends; Escape cancels (not while
  * sending, and not at the code). The page behind is inert. Focus returns to `returnFocusTo` (the
  * button that opened the dialog) when it closes.
@@ -101,8 +104,12 @@ export function NewRecoveryCode({ api, project, onClose, onLocked, returnFocusTo
     setPass("");
     setError(null);
     setBusy(true);
+    // A code may come back: a library closed meanwhile must wait for it (R134), as once it is on screen.
+    onRecoveryPending?.(true);
+    let issued = false;
     try {
       const r = await api.projects.newRecoveryCode(project.id, { passphrase: secret });
+      issued = true;
       setCode(r.recoveryCode);
     } catch (err) {
       if (outcomeUnknown(err)) show(LOST_ANSWER, false);
@@ -115,6 +122,8 @@ export function NewRecoveryCode({ api, project, onClose, onLocked, returnFocusTo
     } finally {
       inFlight.current = false;
       setBusy(false);
+      // With a code, RecoveryCodeStep keeps the hold until it is confirmed.
+      if (!issued) onRecoveryPending?.(false);
     }
   };
 

@@ -542,7 +542,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               <p role="status">
                 “<UserText>{unresolved.create.name}</UserText>” was created.
                 {unresolved.create.encrypted &&
-                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Asking for a new recovery code from the project's settings is planned, but not available yet."}
+                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Once it is unlocked, choose “New recovery code…” to get a recovery code you can save."}
               </p>
             ) : unresolved.state === "not-created" ? (
               <p role="status">
@@ -551,7 +551,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             ) : (
               <p role="alert">
                 “<UserText>{unresolved.create.name}</UserText>” may have been created: the library service did not answer, so the app cannot tell yet.
-                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose."}
+                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose, and “New recovery code…” gives it a new one."}
                 {" "}Do not create it again until this is settled.
                 {unresolved.state === "still-unknown" && " The app still cannot tell: the service did not answer. Try again in a moment."}
               </p>

@@ -419,7 +419,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecovery
                   <UserText>{found.name}</UserText> was created, but the library service's answer was lost on the way, so its recovery code could not be shown, and it cannot be shown again.
                 </p>
                 <p className="ao-newproject__warning">
-                  The project opens with the passphrase you just chose. Keep that passphrase safe: for now it is the only way to open the project. Asking for a new recovery code from the project's settings is planned, but not available yet.
+                  The project opens with the passphrase you just chose. Keep that passphrase safe: for now it is the only way to open the project. Once the project is open, choose “New recovery code…” on the library screen to get a recovery code you can save.
                 </p>
               </>
             ) : (
