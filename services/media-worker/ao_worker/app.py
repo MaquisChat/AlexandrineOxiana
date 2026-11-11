@@ -7,7 +7,6 @@ import logging
 import os
 import platform
 import re
-import subprocess
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata

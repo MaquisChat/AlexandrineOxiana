@@ -148,12 +148,10 @@ def ffmpeg_component(files: Files, ffmpeg_zip: bytes | None = None, ffprobe_zip:
 
 
 def no_system(monkeypatch, *names: str) -> None:
-    """PATH without these programs (the fake tools and the interpreter's folder stay)."""
-    keep = [str(FAKE_BIN), os.path.dirname(sys.executable)]
-    stub = Path(os.environ.get("TMPDIR", "/tmp"))
-    monkeypatch.setenv("PATH", os.pathsep.join(keep))
+    """PATH holding only the fake capture tools and the interpreter's folder: none of `names`."""
+    monkeypatch.setenv("PATH", os.pathsep.join([str(FAKE_BIN), os.path.dirname(sys.executable)]))
     for n in names:
-        assert tools.shutil.which(n) is None or n == "yt-dlp", n
+        assert tools.shutil.which(n) is None, n
 
 
 def staging_left(root: Path) -> list[str]:

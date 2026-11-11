@@ -33,7 +33,7 @@ from typing import Callable
 
 from . import fetch, toolpins, unpack
 from .jobs import Job, JobCancelled, JobContext, JobError, child_env
-from .toolpins import Component, Download, Tool, Unavailable
+from .toolpins import Component, Download, Unavailable
 
 log = logging.getLogger("ao_worker.tools")
 
@@ -215,12 +215,12 @@ def component_status(c: Component, base: Path | None = None) -> Status:
     if c.kind == "model":
         return _model_status(c, base)
     if c.id == "yt-dlp":
-        from .download import resolve_ytdlp, tool_version
+        from .download import resolve_ytdlp
 
         r = resolve_ytdlp(download=False)
         if r is None:
             return Status()
-        line = tool_version([r[0]])
+        line = run_version([r[0], "--version"])
         source = "managed" if r[1] else ("override" if os.environ.get("AO_YTDLP_BIN") else "system")
         return Status(True, line is not None, source, line)
     if c.id == "deno":
