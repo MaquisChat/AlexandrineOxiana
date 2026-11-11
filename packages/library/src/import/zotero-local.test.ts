@@ -676,6 +676,44 @@ processing:
     expect(byZoteroKey(await sources(p), "AAAA1111").assets[0]!.linked).toBeUndefined();
   });
 
+  it("R136: the dry run counts the linked attachments the scan found (approved or not)", async () => {
+    const p = await project();
+    const dry = await bulkImport().dryRun(p.id, zoteroLocalAdapter(dataDir));
+    expect(dry.linkedFiles).toBe(1);
+  });
+
+  it("R136: the engine's default links an approved linked file; the report counts the files copied and left as links", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await h.done;
+    const all = (await sources(p)).flatMap((sf) => sf.assets.filter((a) => a.role === "original"));
+    const linked = all.filter((a) => a.linked).length;
+    expect(linked).toBe(1);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.files).toEqual({ copied: all.length - 1, linked: 1 });
+    const md = await readFile(join(lib.root, repo.getProject(p.id).folder, "imports", "batch-0001", "report.md"), "utf8");
+    expect(md).toContain(`- Files copied into the library: ${all.length - 1}`);
+    expect(md).toContain("- Files left as links: 1");
+  });
+
+  it("R136: with linkedFiles \"copy\" an approved linked file is copied in like any other file", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), { ...approve(), linkedFiles: "copy" });
+    const r = await h.done;
+    expect(r.counts.failed).toBe(0);
+    const b = byZoteroKey(await sources(p), "BBBB2222");
+    expect(b.assets).toHaveLength(1);
+    expect(b.assets[0]!.linked).toBeUndefined();
+    expect(await readFile(join(lib.root, b.assets[0]!.path))).toEqual(await readFile(fx.linkedPdf));
+    const all = (await sources(p)).flatMap((sf) => sf.assets.filter((a) => a.role === "original"));
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect(report.files).toEqual({ copied: all.length, linked: 0 });
+    // Copying was asked for: no note that it was copied because of the project's rules.
+    expect(report.fileNotes).toEqual([]);
+  });
+
   it("re-import: unchanged items are skipped; a version bump updates the changed title and creates nothing", async () => {
     const p = await project();
     const bulk = bulkImport();
@@ -1309,6 +1347,7 @@ processing:
     expect(b.assets[0]!.encrypted).toBe(true);
     const report = await bulk.batchReport(p.id, h.batchId);
     expect(report.fileNotes).toEqual([{ item: "zotero:BBBB2222", note: ENGINE_FILE_NOTES.linkedCopied }]);
+    expect(report.files.linked).toBe(0);
     // Nothing of the notes or annotations in plaintext anywhere in the project.
     const walk = async (d: string): Promise<string[]> => {
       const out: string[] = [];
