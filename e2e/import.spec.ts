@@ -98,7 +98,6 @@ const REVIEWED_AS = "Street Vendors in Accra, 2018–2020";
 
 const D1: Defect = { id: "D1", title: "back from the review queue to the import's report and its Undo" };
 const D2: Defect = { id: "D2", title: "after a decision in the review queue, the library row no longer carries “Needs review” (R137)" };
-const D4: Defect = { id: "D4", title: "with “Copy into the library”, an approved Zotero linked file is copied in, and the report gives the files copied and the files left as links (R136)" };
 
 /** A library and project, the Zotero fixture data folder, and readers of what the service holds. */
 async function zoteroSetUp(app: AppHarness, page: Page) {
@@ -187,7 +186,17 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect(await z.linkedPdfAsset()).toBeDefined();
   });
 
-  await blockedBy(D4);
+  await test.step("with “Copy into the library”, the approved Zotero linked file is copied in; the report gives the files copied and the files left as links (R136)", async () => {
+    const report = page.getByRole("region", { name: "Report and undo" });
+    await expect(reportRow(page, "Files copied into the library")).toHaveAccessibleName(/^Files copied into the library \d+$/);
+    await expect(reportRow(page, "Files left as links")).toHaveAccessibleName("Files left as links 0");
+    await expect(report).toBeVisible();
+    const pdf = (await z.linkedPdfAsset())!;
+    expect(pdf.linked, JSON.stringify(pdf)).toBeUndefined();
+    const stored = join(z.libraryPath, ...pdf.path.split("/"));
+    expect(resolve(stored).startsWith(resolve(z.libraryPath) + sep), `${pdf.path} is inside the library`).toBe(true);
+    expect(readFileSync(stored).equals(readFileSync(z.linkedPdfPath))).toBe(true);
+  });
 
   await test.step("collections are recreated: Urban, and Food inside it, each holding its items", async () => {
     const cs = await collections();
@@ -318,24 +327,6 @@ test(`${D2.id}: ${D2.title}`, async ({ page, app }) => {
   expectDefect(D2);
   // R137: the badge means "an item waits in the review queue"; nothing is asserted about field-level verification.
   await expect(row.getByText("Needs review")).toHaveCount(0, { timeout: DEFECT_TIMEOUT });
-});
-
-test(`${D4.id}: ${D4.title}`, async ({ page, app }) => {
-  const z = await zoteroSetUp(app, page);
-  // The wizard's defaults: "Copy into the library", and Zotero's linked files not kept where they are.
-  await importZotero(page, z.dataDir);
-  await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 4");
-  expectDefect(D4);
-  // R136: the report states how many files were copied and how many remain links.
-  const report = page.getByRole("region", { name: "Report and undo" });
-  await expect(report).toContainText(/\d[\d,]*\D{0,60}\bcopied\b|\bcopied\b\D{0,60}\d/i, { timeout: DEFECT_TIMEOUT });
-  await expect(report).toContainText(/\d[\d,]*\D{0,60}\blinks?\b|\blinks?\b\D{0,60}\d/i, { timeout: DEFECT_TIMEOUT });
-  // R136: the linked file's bytes are inside the library and the source has no linked file.
-  const pdf = (await z.linkedPdfAsset())!;
-  expect(pdf.linked, JSON.stringify(pdf)).toBeUndefined();
-  const stored = join(z.libraryPath, ...pdf.path.split("/"));
-  expect(resolve(stored).startsWith(resolve(z.libraryPath) + sep), `${pdf.path} is inside the library`).toBe(true);
-  expect(readFileSync(stored).equals(readFileSync(z.linkedPdfPath))).toBe(true);
 });
 
 // ---------- scenario 4 ----------
