@@ -109,6 +109,32 @@ describe("selectors.json schema", () => {
     expect(allowed).toBe(3);
   });
 
+  it("41a N3: character classes are read as JavaScript reads them; empty classes are refused and nothing hides behind a bracket", () => {
+    const refused = [
+      "^[^](a+)+]",
+      "^[^]((?:a|a)*)]",
+      "^[^](a*a*a*)]",
+      "^[](a+)+]",
+      "^[]a](a+)+",
+      "^[\\]](a+)+",
+      "^[^\\]](a*a*a*)",
+      "^[a\\]](b+)+",
+    ];
+    // Refusals first: these would not finish on the hostile strings.
+    for (const p of refused) expect(unsafePatternReason(p), p).toMatch(/not allowed/);
+    const allowed = ["^[^\\]]*(x)$", "^[\\]a-z]{1,30}([0-9]+)$", "^([^a])"];
+    const hostile = ["x" + "a".repeat(MAX_PATTERN_INPUT - 1), "]" + "a".repeat(MAX_PATTERN_INPUT - 1), "a".repeat(MAX_PATTERN_INPUT - 1) + "#"];
+    for (const p of allowed) {
+      expect(unsafePatternReason(p), p).toBeUndefined();
+      const re = new RegExp(p);
+      for (const s of hostile) {
+        const t0 = performance.now();
+        re.exec(s);
+        expect(performance.now() - t0, p).toBeLessThan(250);
+      }
+    }
+  });
+
   it("R116: the patterns shipped in selectors.json still pass", () => {
     const shipped: string[] = [];
     const walk = (v: unknown): void => {

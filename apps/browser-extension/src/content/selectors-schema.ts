@@ -145,8 +145,11 @@ export function unsafePatternReason(src: string): string | undefined {
     } else if (c === "[") {
       i++;
       if (src[i] === "^") i++;
-      if (src[i] === "]") i++;
+      // In JavaScript a "]" right after "[" or "[^" closes the class ("[]" matches nothing, "[^]"
+      // anything), unlike POSIX. Refused rather than guessed at (41a N3): a literal "]" is "\]".
+      if (src[i] === "]") return "an empty character class ([] or [^]) is not allowed; write a literal ] as \\]";
       while (i < src.length && src[i] !== "]") i += src[i] === "\\" ? 2 : 1;
+      if (i >= src.length) return "an unterminated character class is not allowed";
       i++;
     } else if (c === "(") {
       groups.push({ start: i, quantified: false, alternation: false, alternatives: 1 });
