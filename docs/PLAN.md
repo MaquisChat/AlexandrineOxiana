@@ -233,7 +233,7 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Model: Opus.
 
 **Task 58 — Ledger loose ends in the library [ledger: R74, R93]**
-- Depends: 41a. Parallel: 49–51.
+- Depends: 41a, 51 (both touch `packages/library/src/index/`). Parallel: 49, 50.
 - Files: `packages/library/src/index/`, `packages/library/src/import/zotero-local.ts`, `packages/core/src/model/project.ts`, tests.
 - Accept: first confirm each is still open in the code. Then: text of imported Zotero annotations is searchable (R74 assigned this to a task that later became something else); a project has a time-zone setting where R93 calls for one.
 - Verify: `pnpm --filter @ao/library exec vitest run src/index src/import`.
