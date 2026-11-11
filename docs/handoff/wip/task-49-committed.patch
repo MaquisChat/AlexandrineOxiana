@@ -1,0 +1,1500 @@
+diff --git a/apps/library-service/src/errors.ts b/apps/library-service/src/errors.ts
+index a379e74..759ca37 100644
+--- a/apps/library-service/src/errors.ts
++++ b/apps/library-service/src/errors.ts
+@@ -10,6 +10,7 @@ import {
+   PendingWriteIncompleteError,
+   AnchorsUnreadableError,
+   AuditChainInvalidError,
++  BackupNotRecordedError,
+   DecryptionError,
+   DestroyedParentError,
+   EncryptionFormatError,
+@@ -125,6 +126,7 @@ export function toApiError(err: unknown): ApiError {
+   if (err instanceof ParticipantCodeMissingError) return new ApiError(409, "CONFLICT", "A participant in these sources has no participant code yet, so they cannot be cited.");
+   if (err instanceof ExportDestinationError) return new ApiError(400, "VALIDATION", err.message);
+   if (err instanceof ExportFailedError) return new ApiError(500, "INTERNAL", "The export could not be finished; nothing was left half-written.");
++  if (err instanceof BackupNotRecordedError) return new ApiError(500, "INTERNAL", err.message);
+   if (err instanceof DestroyedParentError || err instanceof MissingParentError) return new ApiError(409, "CONFLICT", "The file this would be made from is no longer there.");
+   if (err instanceof KeyNotAvailableError) return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+   if (err instanceof DecryptionError || err instanceof EncryptionFormatError) return new ApiError(409, "CONFLICT", "An encrypted file could not be read (damaged, or made with another key).");
+diff --git a/apps/library-service/src/routes/projects.ts b/apps/library-service/src/routes/projects.ts
+index 0b39d20..7ac8f2d 100644
+--- a/apps/library-service/src/routes/projects.ts
++++ b/apps/library-service/src/routes/projects.ts
+@@ -1,11 +1,12 @@
+ /**
+  * Projects: list (also for the browser extension: names and whether browser capture is allowed),
+  * create, unlock (pending proxies / OCR resume and watched folders rescan), lock (sensitive lookups
+- * purged from the shared HttpClient, R96), backup settings and the one-time acknowledgements.
++ * purged from the shared HttpClient, R96), backup settings, a backup now (governed, R125) and the one-time acknowledgements.
+  */
+ import type { FastifyInstance } from "fastify";
+ import { effectivePolicy, parseGovernance, type Project } from "@ao/core";
+-import { setBackupSettings, type Repo } from "@ao/library";
++import { basename } from "node:path";
++import { backupProject, setBackupSettings, type Repo } from "@ao/library";
+ import { badRequest } from "../errors.js";
+ import { bodyOf, optBool, optObj, projectParam, str, strArray, type Ctx } from "./util.js";
+ 
+@@ -108,6 +109,19 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
+     return { backups: p.backups ?? {} };
+   });
+ 
++  // A backup now (R125): governed and audited by the library; a refusal is 403 POLICY_DENIED with
++  // the engine's reason. The answer names the file in the library's Backups folder, never a path.
++  app.post("/projects/:id/backups", async (req) => {
++    const s = state.requireWritable();
++    const id = projectParam(ctx, req);
++    try {
++      const r = await backupProject(s.repo, id);
++      return { backup: { file: basename(r.path), sha256: r.sha256, bytes: r.bytes, pruned: r.pruned, warnings: r.warnings } };
++    } finally {
++      state.publishState(); // `backup-failed` set or cleared
++    }
++  });
++
+   app.post("/projects/:id/acknowledge", async (req) => {
+     const s = state.requireWritable();
+     const id = projectParam(ctx, req);
+diff --git a/apps/library-service/src/server.test.ts b/apps/library-service/src/server.test.ts
+index ea6133a..beb064e 100644
+--- a/apps/library-service/src/server.test.ts
++++ b/apps/library-service/src/server.test.ts
+@@ -911,6 +911,63 @@ describe("review round 1: backups on open and unlock (R99 I7)", () => {
+   });
+ });
+ 
++describe("R125: backups are governed and audited", () => {
++  /** The library sits on this computer's disk, which these rules exclude. */
++  const REMOVABLE_ONLY = `${OPEN_GOV}residency:\n  allowed: [removable]\n`;
++  const NOT_ALLOWED = /this project's rules do not allow its data there/u;
++
++  it("POST /projects/:id/backups makes a backup now: file name, sha256 and size, never a path; audited", async () => {
++    await start();
++    const path = await openNewLibrary();
++    const pid = await newProject(OPEN_GOV, false, "Manual");
++    const r = await call({ method: "POST", url: `/projects/${pid}/backups` });
++    expect(r.status, r.body).toBe(200);
++    expect(r.json.backup).toEqual({ file: expect.stringMatching(/^Manual - backup - modified .+\.zip$/u), sha256: expect.stringMatching(/^[0-9a-f]{64}$/u), bytes: expect.any(Number), pruned: [], warnings: [] });
++    expect(r.body).not.toContain(path);
++    expect(r.body).not.toContain(tmp);
++    expect(await listBackups(svc.state.session!.repo, pid)).toHaveLength(1);
++    const { events } = await svc.state.session!.repo.readAudit(pid);
++    expect(events.map((e) => e.action)).toEqual(expect.arrayContaining(["backup", "backup.create"]));
++  });
++
++  it("a refused manual backup → 403 POLICY_DENIED with the engine's reason; nothing is made; the denial is audited", async () => {
++    await start();
++    const path = await openNewLibrary();
++    const pid = await newProject(REMOVABLE_ONLY, false, "Refused");
++    const r = await call({ method: "POST", url: `/projects/${pid}/backups` });
++    expect(r.status, r.body).toBe(403);
++    expect(r.json.error).toMatchObject({ code: "POLICY_DENIED", reason: expect.stringMatching(NOT_ALLOWED) });
++    expect(r.body).not.toContain(path);
++    expect(await listBackups(svc.state.session!.repo, pid)).toEqual([]);
++    const { events } = await svc.state.session!.repo.readAudit(pid);
++    expect(events.find((e) => e.action === "backup")?.decision).toMatchObject({ result: "deny", reason: expect.stringMatching(NOT_ALLOWED) });
++  });
++
++  it("a refused SCHEDULED backup raises `backup-failed` with the reason in the library state; a later backup clears it", async () => {
++    await start();
++    await openNewLibrary();
++    const pid = await newProject(REMOVABLE_ONLY, false, "Scheduled");
++    await svc.state.idle();
++    const runs = await svc.state.runScheduledBackups();
++    expect(runs).toEqual([expect.objectContaining({ projectId: pid, ok: false, backedUp: false, error: expect.stringMatching(NOT_ALLOWED) })]);
++    await svc.state.projectWarnings(svc.state.session!);
++    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, { reason: string; refused?: boolean }> };
++    expect(state.projectWarnings[pid]).toContain("backup-failed");
++    expect(state.backupFailures[pid]).toMatchObject({ refused: true, reason: expect.stringMatching(NOT_ALLOWED) });
++    expect(JSON.stringify(state)).not.toContain(tmp);
++    // The rules are changed (a loosening, with a reason); a backup made by hand clears the warning.
++    const g = await call({ url: `/projects/${pid}/governance` });
++    expect(g.status, g.body).toBe(200);
++    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "The library stays on this computer." } });
++    expect(put.status, put.body).toBe(200);
++    expect((await call({ method: "POST", url: `/projects/${pid}/backups` })).status).toBe(200);
++    await svc.state.projectWarnings(svc.state.session!);
++    const after = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, unknown> };
++    expect(after.projectWarnings[pid]).not.toContain("backup-failed");
++    expect(after.backupFailures[pid]).toBeUndefined();
++  });
++});
++
+ describe("review round 1: smaller route fixes (R99 minors)", () => {
+   beforeEach(() => start());
+ 
+diff --git a/apps/library-service/src/state.ts b/apps/library-service/src/state.ts
+index c03a4d1..be6832e 100644
+--- a/apps/library-service/src/state.ts
++++ b/apps/library-service/src/state.ts
+@@ -10,6 +10,7 @@ import {
+   IndexHandle,
+   KeyRing,
+   WorkerUnavailableError,
++  backupFailure,
+   backupIfDue,
+   createBulkImport,
+   createIndexSink,
+@@ -22,6 +23,7 @@ import {
+   scrubPaths,
+   startMediaWorker,
+   startWatchedFolders,
++  type BackupFailure,
+   type BatchHandle,
+   type BulkImport,
+   type Deps,
+@@ -684,10 +686,13 @@ export class ServiceState {
+       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
+       integrityWarnings: this.integrityWarnings(s, names),
+       projectWarnings: this.cachedProjectWarnings,
++      // Why a project shows `backup-failed` (R125: a refusal gives the engine's reason), path-scrubbed.
++      backupFailures: this.cachedBackupFailures,
+     };
+   }
+ 
+   private cachedProjectWarnings: Record<string, string[]> = {};
++  private cachedBackupFailures: Record<string, BackupFailure> = {};
+ 
+   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
+     return s.repo.integrityWarnings.map((w) => ({
+@@ -701,8 +706,14 @@ export class ServiceState {
+   /** The projects' standing warnings (backup failed, deletion records unreadable), by project id. */
+   async projectWarnings(s: Session): Promise<Record<string, string[]>> {
+     const out: Record<string, string[]> = {};
+-    for (const p of s.repo.listProjects()) out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
++    const failures: Record<string, BackupFailure> = {};
++    for (const p of s.repo.listProjects()) {
++      out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
++      const f = out[p.id]!.includes("backup-failed") ? await backupFailure(s.repo, p.id).catch(() => undefined) : undefined;
++      if (f) failures[p.id] = { ...f, reason: scrubPaths(f.reason, this.roots) };
++    }
+     this.cachedProjectWarnings = out;
++    this.cachedBackupFailures = failures;
+     return out;
+   }
+ 
+@@ -711,6 +722,7 @@ export class ServiceState {
+     const s = this.session;
+     if (!s) {
+       this.cachedProjectWarnings = {};
++      this.cachedBackupFailures = {};
+       this.events.publish("library.state", this.libraryState());
+       return;
+     }
+diff --git a/docs/adr/0005-governance-checkpoint.md b/docs/adr/0005-governance-checkpoint.md
+index 9c79b04..c6b5c3f 100644
+--- a/docs/adr/0005-governance-checkpoint.md
++++ b/docs/adr/0005-governance-checkpoint.md
+@@ -17,6 +17,7 @@ The library holds material governed by IRB, GDPR, HIPAA and funder rules. Every
+ - **Processing.** The provider must be in the op's list, including `local`: a project may forbid even on-device processing.
+ - **Dates.** Protocol dates are calendar dates, inclusive, evaluated in the researcher's time zone (`tz`, an IANA name, default UTC; an invalid zone denies). Capture is allowed from `approvedFrom` through `expires` inclusive; a date with a time uses its UTC date part. Within 30 calendar days of expiry the decision carries a warning ("expires today", "in 1 day", "in N days").
+ - **Request and policy validation.** Request payloads and the effective policy's scalar fields are type-checked before the rules run; anything malformed denies.
++- **Backup** (R125). A backup is a full copy of a project written to `<Library>/Backups/`, which is where the library itself lives. The request lists every kind of storage that folder may be on: its path and its real path, classified as for a move. When a kind cannot be determined, every plausible kind is listed (`uncertain`). Each one must pass the move's residency rule (the kind is in `residency.allowed`; a cloud folder is on the approved list where one is needed). `encryption.atRest: required` adds an `encrypt` condition. An unencrypted project cannot honour it, so the caller refuses the backup and no unsealed backup is ever made. No other control takes part, and a backup has no governance section of its own.
+ - **Sync** is denied in Phase 1; `view`, `share` and `delete` are allowed and will be refined later.
+ 
+ ## Consequences
+@@ -27,4 +28,5 @@ The library holds material governed by IRB, GDPR, HIPAA and funder rules. Every
+ - The project name in the move reason is the request's `projectId` until the request carries a name.
+ - The repository (`packages/library/src/repo/mutate.ts`) audits every allow and deny decision for an existing project. The one exception is `createProject`: its decision is made before the project, and so its audit log, exists. A deny there throws before anything is written and is not audited; an allow is recorded as the first event of the new log.
+ - Repository writes use a write-ahead marker (`<Library>/.tmp/txn-<id>.json`, see `repo/txn.ts`). Every allow event of a write carries `details.txn`. If a crash interrupts a write before all its allow events are appended, the next writable open rolls the write back and reports `rolled-back-incomplete-write`. Data never stays live without its audit record.
++- Backups are governed like every other action. Manual and scheduled backups alike are evaluated before anything is written, and a deny is audited (`backup`, with the reason) and creates nothing. Backups are not an exception to the write-ahead rule, but they cannot use the txn marker: the marker may only touch the project's own folder, and a backup is written to `<Library>/Backups/`. They follow the same rule with a record of their own instead, kept in `Backups/backups-state.json` (`pending`). The allow decision is audited first (`backup`, with its conditions and a `backupId`). The zip is then written in full under a temp name and fsynced. **The commit point is the `backup.create` audit event** carrying the same `backupId`. Only after that event is the file renamed to its backup name and listed in the manifest. On the next writable open, and before every backup operation, an interrupted backup is settled by what the audit log says. If the log holds `backup.create`, the backup is renamed and listed. If it does not, the temp file is overwritten and removed and the project shows `backup-failed`. A backup is never named or listed as one without its event. If the event cannot be written, the backup is not kept and `backup-failed` gives the reason (R28, R82). Removing old backups is a plain delete (R91). It is recorded in `pending` before the first file goes and audited afterwards, as one `backup.prune` event naming the files. If a crash or a failed append loses that event, it is written on the next settle (`recovered: true`), and the project shows `backup-audit-pending` until then.
+ - An audit event or change exists only once its whole line and newline are durably written (R28). A crash during an append outside a transaction (a deny event, an unlock, an integrity event written at open) can leave an incomplete last line and no marker. The next writable open removes such a line from a project's last audit segment and its change logs, reports `trimmed-incomplete-audit-line`, and records `audit.trimmed-incomplete-line` with the file, byte count and SHA-256 of the removed bytes. A read-only open, or a project with an unresolved marker, only reports it (`incomplete-audit-line-pending`). An audit append that fails while opening blocks that project only, never the whole library.
+diff --git a/docs/governance/README.md b/docs/governance/README.md
+index 6b6be60..e10c02a 100644
+--- a/docs/governance/README.md
++++ b/docs/governance/README.md
+@@ -77,6 +77,18 @@ Phones and many cameras record where a photo, video or voice memo was made (GPS)
+ - If the media helper is not running, the original is still stored as above, and the source shows that its viewing copy is pending ("proxy pending"). The copy is made, with the rule applied, as soon as the media helper is available.
+ - Voice memos and other recordings have no viewing copy; their location stays only in the original, stored under the same rule.
+ 
++### Backups
++
++A backup is a full copy of one project: every file, the audit log included. The app writes it to the `Backups` folder inside the library, so it is stored wherever the library is stored. Backups are made by hand or once a day automatically. A project's rules decide each backup in the same way as they decide storing the project's data in that place. Backups have no setting of their own.
++
++- **Where the library is.** The `Backups` folder must be on a kind of storage the project allows under "where data may live" (`residency.allowed`). The app checks this for the folder's path and also for the place it really points to. A cloud-synced folder must also be on the project's approved list when HIPAA applies, or whenever that list is not empty. If the app cannot tell what kind of storage the folder is on, it checks every kind it might be, and refuses the backup if any of them is not allowed.
++- **Encryption.** In an encrypted project the whole backup is sealed with the project's key, and no unencrypted copy reaches the disk. When a project's rules require encryption at rest (`encryption.atRest: required`, which HIPAA always sets), the project never gets an unencrypted backup. If such a project is not encrypted, its backups are refused.
++- **When it is refused.** Nothing is created, and the researcher sees the reason in plain words, for example: "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there." When the rules cannot be read, every backup is refused. If an automatic backup is refused or fails, the project shows a warning that the last backup failed, with the reason. After a refusal the app asks again a day later; after a failure, at its next hourly check. The warning stays until a backup succeeds.
++- **What is recorded.** Every backup decision goes into the project's audit log, refusals included, with the reason. When a backup is allowed, the log first records the decision and any condition on it (encryption). It then records the finished backup: its file name, size, SHA-256 fingerprint and number of files. A backup counts as made only once that second entry is written. If the app is interrupted before then, the unfinished file is overwritten and removed the next time the library opens, and the project shows that the backup failed. If the entry cannot be written, the backup is not kept. No path is recorded, only the file name.
++- **Removing old backups.** The app keeps the newest backups of each project (10 unless the project says otherwise) and deletes older ones with an ordinary delete. It deletes only files listed as this project's backups. Each removal goes into the audit log with the names of the deleted files. If that entry cannot be written straight away, the project shows a warning until it is.
++- **Restoring** a backup makes a new project and records the restore, with the backup's fingerprint, in the new project's audit log.
++- **Copies elsewhere.** Every backup the app makes stays in the library's `Backups` folder. This lets destroying raw data under the retention rule find every copy and list it on the destruction certificate. The app does not make backups in any other place. To keep a copy safe from the loss of the drive, copy the whole library folder yourself. That copy is outside the app's records: retention cannot destroy it, and you are responsible for it.
++
+ ## Enforcement status
+ 
+ At present the workbench computes the effective policy and the list of violations. Actually blocking actions (for example refusing a capture until a protocol is recorded) lands with the policy engine, the next task. Where the profile pages say the app "blocks" something, that describes the behavior the policy engine will enforce.
+diff --git a/packages/core/src/governance/engine.test.ts b/packages/core/src/governance/engine.test.ts
+index 43a5e95..dbc51b9 100644
+--- a/packages/core/src/governance/engine.test.ts
++++ b/packages/core/src/governance/engine.test.ts
+@@ -202,6 +202,61 @@ describe("move", () => {
+   });
+ });
+ 
++describe("backup (R125): a full copy of the project written to <Library>/Backups/", () => {
++  type Dest = NonNullable<PolicyRequest["backup"]>["destinations"][number];
++  const bk = (...destinations: Dest[]) => req({ action: "backup", backup: { destinations } });
++  const at = (destination: string, extra: Partial<Dest> = {}): Dest => ({ destination: destination as never, ...extra });
++  const ENCRYPT = [{ type: "encrypt" }];
++  const HIPAA_CLOUD = "profiles: [hipaa]\nsharing: { locationMetadata: strip }\nresidency: { allowed: [device, cloud_folder], approvedCloudFolders: [f1] }";
++  // [case, governance.yaml, where the library's folder is, expected result, conditions or deny reason]
++  const table: Array<[string, string, Dest[], "allow" | "allow_with_conditions" | "deny", unknown]> = [
++    ["no profile, defaults (encryption required), on this computer", "", [at("device")], "allow_with_conditions", ENCRYPT],
++    ["no profile, encryption optional", "encryption: { atRest: optional }", [at("device")], "allow", undefined],
++    ["no profile, encryption off", "encryption: { atRest: off }", [at("removable")], "allow", undefined],
++    ["no profile, on a network drive (not allowed by default)", "encryption: { atRest: optional }", [at("network")], "deny", "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there"],
++    ["IRB, encryption optional", "profiles: [irb]\nencryption: { atRest: optional }", [at("device")], "allow", undefined],
++    ["IRB, defaults", "profiles: [irb]", [at("device")], "allow_with_conditions", ENCRYPT],
++    ["IRB, in a cloud-synced folder the project does not allow", "profiles: [irb]", [at("cloud_folder", { cloudFolderId: "dropbox" })], "deny", "Backups are kept in the library's folder, which is in a cloud-synced folder; this project's rules do not allow its data there"],
++    ["GDPR, encryption optional", "profiles: [gdpr]\nencryption: { atRest: optional }", [at("device")], "allow", undefined],
++    ["GDPR, defaults, on a removable drive", "profiles: [gdpr]", [at("removable")], "allow_with_conditions", ENCRYPT],
++    ["GDPR, any cloud folder allowed (no approved list)", "profiles: [gdpr]\nencryption: { atRest: optional }\nresidency: { allowed: [device, cloud_folder] }", [at("cloud_folder", { cloudFolderId: "icloud" })], "allow", undefined],
++    ["HIPAA, encryption off in the file: required anyway", "profiles: [hipaa]\nencryption: { atRest: off }\nsharing: { locationMetadata: strip }", [at("device")], "allow_with_conditions", ENCRYPT],
++    ["HIPAA, approved cloud folder", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f1" })], "allow_with_conditions", ENCRYPT],
++    ["HIPAA, cloud folder not on the approved list", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f2" })], "deny", "Backups are kept in the library's folder, which is in cloud folder f2; it is not on this project's approved list"],
++    ["HIPAA, cloud folder with no approved folders", "profiles: [hipaa]\nresidency: { allowed: [device, cloud_folder] }", [at("cloud_folder", { cloudFolderId: "f1" })], "deny", "Backups are kept in the library's folder, which is in a cloud-synced folder; this project's rules do not allow its data there"],
++    ["HIPAA, public cloud never", "profiles: [hipaa]\nresidency: { allowed: [device, cloud] }", [at("cloud")], "deny", "Backups are kept in the library's folder, which is on a cloud service; this project's rules do not allow its data there"],
++    ["DMP, encryption optional", "profiles: [dmp]\nencryption: { atRest: optional }", [at("device")], "allow", undefined],
++    ["DMP, defaults, own server allowed", "profiles: [dmp]\nresidency: { allowed: [own_server] }", [at("own_server")], "allow_with_conditions", ENCRYPT],
++    ["all four profiles", "profiles: [irb, gdpr, hipaa, dmp]\nsharing: { locationMetadata: strip }", [at("device")], "allow_with_conditions", ENCRYPT],
++    ["typed path and real path: every one must be allowed", "encryption: { atRest: optional }", [at("device"), at("network")], "deny", "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there"],
++    ["a kind that could not be determined is refused when it may be one the rules exclude", "encryption: { atRest: optional }", [at("device", { uncertain: true }), at("removable", { uncertain: true }), at("network", { uncertain: true })], "deny", "Where the library's folder is stored could not be determined (it may be a network drive); this project's rules do not allow its data there"],
++  ];
++  it.each(table)("%s", (_case, yaml, dests, result, detail) => {
++    const d = evaluate(cfg(yaml), bk(...dests));
++    expect(d.result).toBe(result);
++    if (result === "deny") expect(denyReason(d)).toBe(detail);
++    if (result === "allow_with_conditions") expect(conditions(d)).toEqual(detail);
++  });
++  it("a profile that raised encryption to required says so in a warning", () => {
++    const d = evaluate(cfg("profiles: [hipaa]\nencryption: { atRest: optional }\nsharing: { locationMetadata: strip }"), bk(at("device")));
++    expect(d.warnings).toContain("Governance setting encryption.atRest is stricter than configured because hipaa requires it");
++  });
++  it("fails closed: no destinations, a malformed one, or no payload", () => {
++    expect(denyReason(evaluate(cfg(), bk()))).toMatch(/^Policy could not be evaluated/);
++    expect(denyReason(evaluate(cfg(), bk({ destination: 5 } as never)))).toMatch(/^Policy could not be evaluated/);
++    expect(denyReason(evaluate(cfg(), bk({ destination: "device", uncertain: "yes" } as never)))).toMatch(/^Policy could not be evaluated/);
++    expect(denyReason(evaluate(cfg(), bk(null as never)))).toMatch(/^Policy could not be evaluated/);
++    expect(denyReason(evaluate(cfg(), req({ action: "backup" })))).toMatch(/^Policy could not be evaluated/);
++    expect(denyReason(evaluate(cfg(), req({ action: "backup", backup: {} as never })))).toMatch(/^Policy could not be evaluated/);
++  });
++  it("an unknown kind is refused, never allowed", () => {
++    expect(evaluate(cfg("encryption: { atRest: optional }"), bk(at("moon"))).result).toBe("deny");
++  });
++  it("the move rules are unchanged by the shared residency check", () => {
++    expect(denyReason(evaluate(cfg(), req({ action: "move", move: { destination: "network" } })))).toBe("Destination network is not permitted for project proj-1");
++  });
++});
++
+ describe("other actions", () => {
+   it("denies sync in Phase 1", () => {
+     expect(denyReason(evaluate(cfg(), req({ action: "sync", sync: {} })))).toBe("Sync is not enabled in this version");
+diff --git a/packages/core/src/governance/engine.ts b/packages/core/src/governance/engine.ts
+index 596f7c9..c96c9f3 100644
+--- a/packages/core/src/governance/engine.ts
++++ b/packages/core/src/governance/engine.ts
+@@ -2,7 +2,7 @@ import type { Provenance } from "../model/source.js";
+ import { effectivePolicy } from "./merge.js";
+ import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
+ 
+-export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move";
++export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup";
+ 
+ export interface PolicyRequest {
+   action: PolicyAction;
+@@ -18,6 +18,13 @@ export interface PolicyRequest {
+   store?: { identifiable: boolean; hasLocation: boolean; legalBasis?: string };
+   move?: { destination: ResidencyKind; cloudFolderId?: string };
+   export?: { identifiable: boolean; hasLocation: boolean };
++  /**
++   * A full copy of the project written to `<Library>/Backups/`, i.e. where the library itself lives
++   * (R125). `destinations` lists every kind of storage that folder may be on: its path and its real
++   * path (symbolic links resolved), and, when a kind could not be determined (`uncertain`), every
++   * plausible kind. Each must be allowed.
++   */
++  backup?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }> };
+   sync?: Record<string, never>;
+ }
+ 
+@@ -209,22 +216,70 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
+   return withConditions(conditions, warnings);
+ }
+ 
++/**
++ * Whether the project's data may be kept on this kind of storage (residency): "kind" when the kind
++ * is not in the effective `residency.allowed`; "folder" when it is a cloud folder that must be, and
++ * is not, on the approved list (HIPAA, or whenever that list is non-empty); else null.
++ */
++function residencyProblem(p: GovernanceConfig, destination: string, cloudFolderId: string | undefined): "kind" | "folder" | null {
++  if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination as ResidencyKind)) return "kind";
++  if (destination === "cloud_folder") {
++    const approved = p.residency.approvedCloudFolders;
++    const needsList = p.profiles.includes("hipaa") || approved.length > 0;
++    if (needsList && (cloudFolderId === undefined || !approved.includes(cloudFolderId))) return "folder";
++  }
++  return null;
++}
++
+ function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
+   const { destination, cloudFolderId } = need(req.move, "move");
+   str(destination, "move.destination");
+   if (cloudFolderId !== undefined) str(cloudFolderId, "move.cloudFolderId");
+-  if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination)) {
+-    return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
++  const problem = residencyProblem(p, destination, cloudFolderId);
++  if (problem === "kind") return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
++  if (problem === "folder") return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
++  return allow(warnings);
++}
++
++/** Plain words for a kind of storage, in refusal reasons. */
++const STORAGE_WORDS: Record<ResidencyKind, string> = {
++  device: "this computer's disk",
++  removable: "a removable drive",
++  network: "a network drive",
++  cloud_folder: "a cloud-synced folder",
++  own_server: "your own server",
++  cloud: "a cloud service",
++};
++const storageWords = (kind: string): string => (Object.hasOwn(STORAGE_WORDS, kind) ? STORAGE_WORDS[kind as ResidencyKind] : `storage of kind "${kind}"`);
++const onOrIn = (kind: string): string => `${kind === "cloud_folder" ? "in" : "on"} ${storageWords(kind)}`;
++
++/**
++ * A backup (R125): the same questions as storing the project's data where the library lives. Every
++ * kind of storage the Backups folder may be on must be allowed by the project's residency rules (as
++ * for a move); when the rules require encryption at rest, the backup must be sealed (an `encrypt`
++ * condition, which an unencrypted project cannot honour, so the caller refuses it).
++ */
++function backup(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
++  const b = need(req.backup, "backup");
++  if (typeof b !== "object" || !Array.isArray(b.destinations) || b.destinations.length === 0) {
++    throw new Error("backup.destinations must be a non-empty list");
+   }
+-  if (destination === "cloud_folder") {
+-    const approved = p.residency.approvedCloudFolders;
+-    const hipaa = p.profiles.includes("hipaa");
+-    const needsList = hipaa || approved.length > 0;
+-    if (needsList && (cloudFolderId === undefined || !approved.includes(cloudFolderId))) {
+-      return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
++  for (const d of b.destinations) {
++    if (typeof d !== "object" || d === null) throw new Error("backup.destinations entries must be mappings");
++    const destination = str(d.destination, "backup.destinations.destination");
++    if (d.cloudFolderId !== undefined) str(d.cloudFolderId, "backup.destinations.cloudFolderId");
++    const uncertain = d.uncertain === undefined ? false : bool(d.uncertain, "backup.destinations.uncertain");
++    const problem = residencyProblem(p, destination, d.cloudFolderId);
++    if (problem === null) continue;
++    if (uncertain) {
++      return deny(`Where the library's folder is stored could not be determined (it may be ${storageWords(destination)}); this project's rules do not allow its data there`, warnings);
+     }
++    if (problem === "folder") {
++      return deny(`Backups are kept in the library's folder, which is in cloud folder ${d.cloudFolderId ?? "(unknown)"}; it is not on this project's approved list`, warnings);
++    }
++    return deny(`Backups are kept in the library's folder, which is ${onOrIn(destination)}; this project's rules do not allow its data there`, warnings);
+   }
+-  return allow(warnings);
++  return withConditions(p.encryption.atRest === "required" ? [{ type: "encrypt" }] : [], warnings);
+ }
+ 
+ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
+@@ -248,6 +303,8 @@ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
+       return exportData(policy, req, warnings);
+     case "move":
+       return move(policy, req, warnings);
++    case "backup":
++      return backup(policy, req, warnings);
+     case "sync":
+       return deny("Sync is not enabled in this version", warnings);
+     case "delete":
+diff --git a/packages/library/src/export/backup-governed.test.ts b/packages/library/src/export/backup-governed.test.ts
+new file mode 100644
+index 0000000..37a0bde
+--- /dev/null
++++ b/packages/library/src/export/backup-governed.test.ts
+@@ -0,0 +1,323 @@
++/**
++ * R125: a backup is evaluated by the policy engine and audited; its commit point; refusals and the
++ * `backup-failed` warning; pruning audited by file name.
++ */
++import { readdir, readFile, stat, writeFile } from "node:fs/promises";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import type { AuditEvent, Project } from "@ao/core";
++import type { LocationEnv } from "../location.js";
++import { PolicyDeniedError } from "../repo/errors.js";
++import { projectWarnings } from "../repo/repo.js";
++import { SimulatedCrash, seams } from "../repo/testing.js";
++import {
++  BACKUPS_MANIFEST,
++  BACKUPS_STATE,
++  BackupNotRecordedError,
++  PruneNotRecordedError,
++  backupFailure,
++  backupIfDue,
++  backupProject,
++  backupSeams,
++  listBackups,
++  pruneBackups,
++  restoreBackup,
++  type BackupCrashPoint,
++} from "./backup.js";
++import { OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, type Kit } from "./test-kit.js";
++
++let kit: Kit;
++beforeEach(async () => {
++  kit = await makeKit("ao-backup-gov-");
++});
++afterEach(async () => {
++  backupSeams.crashAt = undefined;
++  backupSeams.afterSnapshot = undefined;
++  backupSeams.beforePruneAudit = undefined;
++  seams.failAuditAppendFor = undefined;
++  await kit.close();
++});
++
++const backupsDir = () => join(kit.lib.root, "Backups");
++/** Backup files and their temp files in Backups/ (not the manifest, state or anything else). */
++const backupFiles = async () => (await readdir(backupsDir()).catch(() => [] as string[])).filter((n) => n.includes(" - backup - modified "));
++const events = async (p: Project, action?: string) => (await auditEvents(kit, p)).filter((e) => action === undefined || e.action === action);
++/** Where the library is, as the location classifier would see it. */
++const onNetwork = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [{ path: kit.lib.root, removable: false, network: true }] });
++const unknownPlace = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [], mountsKnown: false });
++
++async function tighten(p: Project, yaml: string): Promise<void> {
++  const g = await kit.repo.getGovernance(p.id);
++  await kit.repo.setGovernance(p.id, yaml, { baseSha256: g.sha256 });
++}
++
++describe("R125: every backup is evaluated first and audited", () => {
++  it("an allowed backup: the decision (with its conditions) is audited before the result, linked by a backup id; the result names the file, never a path", async () => {
++    const p = await makeProject(kit, PSEUDO_GOV, true, "Sealed Study");
++    await addSource(kit, p, { title: "x" });
++    const r = await backupProject(kit.repo, p.id);
++    const all = await events(p);
++    const decision = all.filter((e) => e.action === "backup");
++    const result = all.filter((e) => e.action === "backup.create");
++    expect(decision).toHaveLength(1);
++    expect(result).toHaveLength(1);
++    expect(decision[0]!.decision).toEqual({ result: "allow_with_conditions", conditions: [{ type: "encrypt" }] });
++    expect(decision[0]!.seq).toBeLessThan(result[0]!.seq);
++    const backupId = (decision[0]!.details as { backupId?: string }).backupId;
++    expect(backupId).toMatch(/^[0-9a-f-]{36}$/u);
++    expect(result[0]!.details).toMatchObject({ backupId, file: "Sealed Study - backup - modified 2026-11-10 0930.zip.enc", sha256: r.sha256, bytes: r.bytes, encrypted: true });
++    expect(JSON.stringify([decision[0], result[0]])).not.toContain(kit.lib.root);
++  });
++
++  it("an unencrypted project whose rules allow it: decision `allow`", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Open");
++    await backupProject(kit.repo, p.id);
++    expect((await events(p, "backup"))[0]!.decision).toEqual({ result: "allow" });
++  });
++});
++
++describe("R125: a refused backup", () => {
++  it("rules that require encryption on an unencrypted project (governance.yaml changed outside the app): nothing is created, the plain reason is given, the denial is audited", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Needs Seal");
++    await addSource(kit, p, { title: "x" });
++    // The app refuses this edit (GovernanceViolationError); a file edited by hand can still say it.
++    await writeFile(join(kit.lib.root, p.folder, "governance.yaml"), OPEN_GOV.replace("atRest: optional", "atRest: required"));
++    const err = await backupProject(kit.repo, p.id).catch((e: unknown) => e);
++    expect(err).toBeInstanceOf(PolicyDeniedError);
++    expect((err as PolicyDeniedError).reason).toBe("Governance requires encryption at rest, but this project is not encrypted");
++    expect(await backupFiles()).toEqual([]);
++    expect(await listBackups(kit.repo, p.id)).toEqual([]);
++    const denied = await events(p, "backup");
++    expect(denied).toHaveLength(1);
++    expect(denied[0]!.decision).toEqual({ result: "deny", reason: "Governance requires encryption at rest, but this project is not encrypted" });
++    expect(await events(p, "backup.create")).toEqual([]);
++  });
++
++  it("a library on storage the project's rules exclude (a network drive): refused with the engine's reason", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Net");
++    await expect(backupProject(kit.repo, p.id, { locationEnv: onNetwork() })).rejects.toMatchObject({
++      reason: "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there",
++    });
++    expect(await backupFiles()).toEqual([]);
++    expect((await events(p, "backup"))[0]!.decision).toMatchObject({ result: "deny" });
++  });
++
++  it("where the library is cannot be determined: refused when it may be storage the rules exclude (fail closed)", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Unknown");
++    await expect(backupProject(kit.repo, p.id, { locationEnv: unknownPlace() })).rejects.toMatchObject({
++      reason: "Where the library's folder is stored could not be determined (it may be a network drive); this project's rules do not allow its data there",
++    });
++    expect(await backupFiles()).toEqual([]);
++  });
++
++  it("the device's own disk excluded by the rules: refused", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Removable Only");
++    await tighten(p, `${OPEN_GOV}residency:\n  allowed: [removable]\n`);
++    const env: LocationEnv = { homeDir: kit.tmp, platform: "linux", mounts: [{ path: "/", removable: false, network: false }] };
++    await expect(backupProject(kit.repo, p.id, { locationEnv: env })).rejects.toMatchObject({
++      reason: "Backups are kept in the library's folder, which is on this computer's disk; this project's rules do not allow its data there",
++    });
++  });
++
++  it("a governance file that cannot be read: refused (fail closed)", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Broken Rules");
++    await writeFile(join(kit.lib.root, p.folder, "governance.yaml"), "encryption: [not, a, mapping");
++    await expect(backupProject(kit.repo, p.id)).rejects.toMatchObject({ reason: expect.stringMatching(/^Policy could not be evaluated/u) });
++    expect(await backupFiles()).toEqual([]);
++  });
++
++  it("a refused SCHEDULED backup raises `backup-failed` with the reason; it is not retried (nor re-audited) within the day; a later backup clears it", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Daily Refused");
++    await expect(backupIfDue(kit.repo, p.id, kit.clock.now, { locationEnv: onNetwork() })).rejects.toBeInstanceOf(PolicyDeniedError);
++    expect(await projectWarnings(kit.repo, p.id)).toContain("backup-failed");
++    expect(await backupFailure(kit.repo, p.id)).toMatchObject({
++      refused: true,
++      reason: "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there",
++    });
++    // The hourly scheduler does not ask again the same day: one denial in the log, the warning stays.
++    kit.clock.now = new Date("2026-11-10T15:00:00.000Z");
++    expect(await backupIfDue(kit.repo, p.id, kit.clock.now, { locationEnv: onNetwork() })).toBeNull();
++    expect(await events(p, "backup")).toHaveLength(1);
++    expect(await projectWarnings(kit.repo, p.id)).toContain("backup-failed");
++    // Survives a reopen.
++    const again = await kit.reopen();
++    expect(await projectWarnings(again, p.id)).toContain("backup-failed");
++    // A day later, with the library where the rules allow it: made, and the warning clears.
++    kit.clock.now = new Date("2026-11-11T09:31:00.000Z");
++    expect((await backupIfDue(again, p.id, kit.clock.now))?.path).toBeDefined();
++    expect(await projectWarnings(again, p.id)).not.toContain("backup-failed");
++    expect(await backupFailure(again, p.id)).toBeUndefined();
++  });
++
++  it("a refused MANUAL backup does not wait a day: the next one is evaluated again at once", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Manual Again");
++    await expect(backupProject(kit.repo, p.id, { locationEnv: onNetwork() })).rejects.toBeInstanceOf(PolicyDeniedError);
++    expect((await backupProject(kit.repo, p.id)).path).toBeDefined();
++    expect(await projectWarnings(kit.repo, p.id)).not.toContain("backup-failed");
++  });
++});
++
++describe("R125: the commit point is the `backup.create` audit event", () => {
++  const points: Array<[BackupCrashPoint, boolean]> = [
++    ["after-decision", false],
++    ["after-zip", false],
++    ["before-commit", false],
++    ["after-commit", true],
++    ["before-manifest", true],
++  ];
++  it.each(points)("a crash %s, then a reopen: committed=%s", async (point, committed) => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Crash");
++    await addSource(kit, p, { title: "x" });
++    backupSeams.crashAt = point;
++    await expect(backupProject(kit.repo, p.id)).rejects.toBeInstanceOf(SimulatedCrash);
++    // Before anything else looks: no backup is presented as made.
++    if (!committed) expect((await backupFiles()).filter((n) => !n.includes(".tmp-"))).toEqual([]);
++    const again = await kit.reopen();
++    const created = await events(p, "backup.create");
++    if (committed) {
++      expect(created).toHaveLength(1);
++      const list = await listBackups(again, p.id);
++      expect(list).toHaveLength(1);
++      expect(list[0]!.sha256).toBe((created[0]!.details as { sha256: string }).sha256);
++      expect(list[0]!.file).toBe((created[0]!.details as { file: string }).file);
++      expect(await backupFiles()).toEqual([list[0]!.file]);
++      const bytes = await readFile(join(backupsDir(), list[0]!.file));
++      expect(bytes.length).toBe((created[0]!.details as { bytes: number }).bytes);
++      expect(await projectWarnings(again, p.id)).not.toContain("backup-failed");
++      // A real backup: it restores.
++      const restored = await restoreBackup(again, join(backupsDir(), list[0]!.file));
++      expect(again.listSourceIds(restored.projectId)).toHaveLength(1);
++    } else {
++      expect(created).toEqual([]);
++      // The decision is in the log; the interrupted backup left nothing, and the project says so.
++      expect(await events(p, "backup")).toHaveLength(1);
++      expect(await backupFiles()).toEqual([]);
++      expect(await listBackups(again, p.id)).toEqual([]);
++      expect(await projectWarnings(again, p.id)).toContain("backup-failed");
++      expect((await backupFailure(again, p.id))?.reason).toBe("The backup was interrupted before it was finished; nothing of it was kept.");
++    }
++    // The state file keeps nothing pending.
++    const state = JSON.parse(await readFile(join(backupsDir(), BACKUPS_STATE), "utf8")) as { pending?: Record<string, unknown> };
++    expect(Object.keys(state.pending ?? {})).toEqual([]);
++    // The next backup works.
++    kit.clock.now = new Date("2026-11-10T10:30:00.000Z");
++    await backupProject(again, p.id);
++    expect(await listBackups(again, p.id)).toHaveLength(committed ? 2 : 1);
++  });
++
++  it("an interrupted backup is settled by the next backup operation too (no reopen)", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "No Reopen");
++    backupSeams.crashAt = "after-commit";
++    await expect(backupProject(kit.repo, p.id)).rejects.toBeInstanceOf(SimulatedCrash);
++    expect(await listBackups(kit.repo, p.id)).toHaveLength(1);
++  });
++
++  it("the commit event cannot be written: the backup is not kept, the error says so, and `backup-failed` is raised (R28, R82)", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "No Audit");
++    // The decision is recorded; then the audit log stops taking events.
++    backupSeams.afterSnapshot = async () => {
++      seams.failAuditAppendFor = p.id;
++    };
++    await expect(backupProject(kit.repo, p.id)).rejects.toBeInstanceOf(BackupNotRecordedError);
++    seams.failAuditAppendFor = undefined;
++    expect(await backupFiles()).toEqual([]);
++    expect(await listBackups(kit.repo, p.id)).toEqual([]);
++    expect(await events(p, "backup.create")).toEqual([]);
++    expect((await backupFailure(kit.repo, p.id))?.reason).toBe("The backup could not be recorded in the audit log, so it was not kept.");
++  });
++
++  it("the decision cannot be audited: nothing is made, and `backup-failed` is raised", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "No Decision");
++    seams.failAuditAppendFor = p.id;
++    await expect(backupProject(kit.repo, p.id)).rejects.toThrow();
++    seams.failAuditAppendFor = undefined;
++    expect(await backupFiles()).toEqual([]);
++    expect(await projectWarnings(kit.repo, p.id)).toContain("backup-failed");
++  });
++});
++
++describe("R125: pruning is audited by file name; a plain delete (R91)", () => {
++  async function three(p: Project): Promise<string[]> {
++    const names: string[] = [];
++    for (let i = 0; i < 3; i++) {
++      kit.clock.now = new Date(Date.UTC(2026, 10, 10, 9, 30 + i));
++      names.push((await backupProject(kit.repo, p.id, { prune: false })).path.slice(backupsDir().length + 1));
++    }
++    return names;
++  }
++
++  it("one `backup.prune` event per run, listing every file removed", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Prune Audit");
++    const names = await three(p);
++    expect(await pruneBackups(kit.repo, p.id, 1)).toEqual([names[1], names[0]]);
++    const ev = await events(p, "backup.prune");
++    expect(ev).toHaveLength(1);
++    expect(ev[0]!.details).toMatchObject({ files: [names[1], names[0]], keep: 1 });
++    expect(ev[0]!.decision).toEqual({ result: "allow" });
++    // Nothing to remove: no event.
++    expect(await pruneBackups(kit.repo, p.id, 1)).toEqual([]);
++    expect(await events(p, "backup.prune")).toHaveLength(1);
++    // The prune after a new backup is audited the same way.
++    kit.clock.now = new Date(Date.UTC(2026, 10, 10, 10, 0));
++    const r = await backupProject(kit.repo, p.id, { keep: 1 });
++    expect(r.pruned).toEqual([names[2]]);
++    expect((await events(p, "backup.prune")).at(-1)!.details).toMatchObject({ files: [names[2]], keep: 1 });
++  });
++
++  it("the prune event cannot be written: the files are gone (not undone), the error says so, `backup-audit-pending` stands until it is recorded", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Prune Fail");
++    const names = await three(p);
++    seams.failAuditAppendFor = p.id;
++    await expect(pruneBackups(kit.repo, p.id, 2)).rejects.toBeInstanceOf(PruneNotRecordedError);
++    seams.failAuditAppendFor = undefined;
++    expect(await backupFiles()).not.toContain(names[0]);
++    expect(await projectWarnings(kit.repo, p.id)).toContain("backup-audit-pending");
++    const again = await kit.reopen();
++    const ev = await events(p, "backup.prune");
++    expect(ev).toHaveLength(1);
++    expect(ev[0]!.details).toMatchObject({ files: [names[0]], recovered: true });
++    expect(await projectWarnings(again, p.id)).not.toContain("backup-audit-pending");
++  });
++
++  it("a backup whose own prune cannot be recorded is still a backup; its result says so", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Prune Warn");
++    await three(p);
++    kit.clock.now = new Date(Date.UTC(2026, 10, 10, 11, 0));
++    let n = 0;
++    // Let the decision and the commit through; refuse the prune event.
++    backupSeams.beforePruneAudit = async () => {
++      n++;
++      seams.failAuditAppendFor = p.id;
++    };
++    try {
++      const r = await backupProject(kit.repo, p.id, { keep: 2 });
++      expect(r.pruned).toHaveLength(2);
++      expect(r.warnings).toContain("Old backups were removed, but their removal could not be recorded in the audit log yet; it is recorded at the next backup.");
++    } finally {
++      backupSeams.beforePruneAudit = undefined;
++      seams.failAuditAppendFor = undefined;
++    }
++    expect(n).toBe(1);
++    expect(await events(p, "backup.create")).toHaveLength(4);
++  });
++
++  it("a crash before the prune event: the next open records it", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Prune Crash");
++    const names = await three(p);
++    backupSeams.crashAt = "before-prune-audit";
++    await expect(pruneBackups(kit.repo, p.id, 2)).rejects.toBeInstanceOf(SimulatedCrash);
++    await kit.reopen();
++    expect((await events(p, "backup.prune")).map((e: AuditEvent) => e.details)).toEqual([expect.objectContaining({ files: [names[0]], recovered: true })]);
++  });
++
++  it("still touches only manifest-listed files with a backup's name", async () => {
++    const p = await makeProject(kit, OPEN_GOV, false, "Only Mine");
++    await writeFile(join(backupsDir(), "Only Mine - backup - modified 2001-01-01 0000.zip"), "not ours");
++    await three(p);
++    await pruneBackups(kit.repo, p.id, 1);
++    expect(await readFile(join(backupsDir(), "Only Mine - backup - modified 2001-01-01 0000.zip"), "utf8")).toBe("not ours");
++    const files = ((await events(p, "backup.prune"))[0]!.details as { files: string[] }).files;
++    expect(files).not.toContain("Only Mine - backup - modified 2001-01-01 0000.zip");
++    expect((await stat(join(backupsDir(), BACKUPS_MANIFEST))).isFile()).toBe(true);
++  });
++});
+diff --git a/packages/library/src/export/backup.ts b/packages/library/src/export/backup.ts
+index 28d749c..d213576 100644
+--- a/packages/library/src/export/backup.ts
++++ b/packages/library/src/export/backup.ts
+@@ -20,7 +20,27 @@
+  * `Backups/backups-state.json` (`failures`, beside each backup's owning project id: a damaged
+  * manifest loses neither), which the project shows as the persisted warning `backup-failed` until
+  * a backup succeeds. Leftover temp files of interrupted backups are overwritten and removed.
+- * Audited as `backup.create` (sha256, size, file count; no path).
++ *
++ * Governed (R125): before anything is written, the policy engine decides (`action: 'backup'`): every
++ * kind of storage the Backups folder may be on (its path and real path, classified as for a library
++ * move; an uncertain kind counts as every plausible one) must be in the project's
++ * `residency.allowed`, and `encryption.atRest: required` gives an `encrypt` condition that an
++ * unencrypted project cannot honour (refused). A refusal is audited (decision deny, the engine's
++ * reason) and thrown as PolicyDeniedError; nothing is created. The allow decision is audited as the
++ * event `backup` (with its conditions and a `backupId`). The COMMIT POINT is the audit event
++ * `backup.create` (same `backupId`; file name, sha256, size, file count; no path): it is appended
++ * once the zip is complete and fsynced under its temp name, and only then is the file renamed to
++ * its backup name and listed in the manifest. The steps are recorded beforehand in
++ * `backups-state.json` (`pending`), so an interruption is settled the next time the library opens
++ * or a backup operation runs, by what the audit log says: committed → renamed and listed;
++ * not committed → the temp file is overwritten and removed and the project shows `backup-failed`.
++ * No backup is ever listed, or named as one, without its `backup.create` event. If that event
++ * cannot be written the backup is not kept (BackupNotRecordedError, `backup-failed`).
++ *
++ * Pruning stays a plain delete (R91) and is audited by file name: one `backup.prune` event per run
++ * listing the files removed, written after they are removed (the run is recorded in `pending`
++ * first, so a crash or a failed append is recorded later, `recovered: true`, never lost; until then
++ * the project shows `backup-audit-pending` and the caller gets PruneNotRecordedError).
+  *
+  * The sidecar manifest `Backups/backups-manifest.json` (0600) lists every backup the app made: file
+  * name, project id, time, sha256, size, the audit head, the asset ids it holds and, for an
+@@ -55,14 +75,18 @@ import { basename, dirname, join, resolve } from "node:path";
+ import { Writable, type Readable } from "node:stream";
+ import { pipeline } from "node:stream/promises";
+ import yazl from "yazl";
+-import { datedFileName, formatModified, newId, withCollisionSuffix, type Project } from "@ao/core";
++import { datedFileName, formatModified, newId, withCollisionSuffix, type PolicyRequest, type Project } from "@ao/core";
+ import { encryptStream, readKeyId } from "../crypto/format.js";
+ import { unwrapKey, unwrapWithRecovery, WrongPassphraseError } from "../crypto/keys.js";
+ import { openSealedZip } from "../crypto/random-access.js";
+ import { extractArchive, readArchiveEntry, type ZipSource } from "../extract/zip.js";
+ import { writeFileAtomic } from "../fs/atomic.js";
+ import { shredPath } from "../fs/shred.js";
+-import { ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
++import { defaultLocationEnv, type LocationEnv } from "../location.js";
++import { candidates, locate } from "../move.js";
++import { AuditStore } from "../repo/audit-store.js";
++import { PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
++import { SimulatedCrash } from "../repo/seams.js";
+ import { foldName, namesIn, readMaybe } from "../repo/io.js";
+ import type { ProjectKeyFile } from "../repo/projects.js";
+ import { AuditChainInvalidError, RestoreError } from "../repo/restore.js";
+@@ -70,7 +94,9 @@ import {
+   addKeyToRing,
+   adoptRestoredProject,
+   appendLibraryEvent,
++  authorizeProcessing,
+   keyFromRing,
++  onProjectOpened,
+   onProjectUnlocked,
+   lookupPolicyInfo,
+   repoClock,
+@@ -98,14 +124,51 @@ const BACKUP_TEMP = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))
+ /** A backup's file name (any project name, date and collision suffix). */
+ const BACKUP_NAME = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?$/u;
+ 
++/** Points in a backup or a prune where a test can simulate the process dying (R125). */
++export type BackupCrashPoint = "after-decision" | "after-zip" | "before-commit" | "after-commit" | "before-manifest" | "before-prune-audit";
++
+ /** Test seams. */
+ export const backupSeams: {
+   failBackup?: boolean;
+   /** Runs after each snapshot, outside the write queue, before the zip is written. */
+   afterSnapshot?: () => Promise<void>;
+   freeBytes?: (dir: string) => Promise<number>;
++  /** Throws SimulatedCrash once at this point: nothing is cleaned up, as if the process died. */
++  crashAt?: BackupCrashPoint;
++  /** Runs after old backups are removed, before their `backup.prune` event is written. */
++  beforePruneAudit?: () => Promise<void>;
+ } = {};
+ 
++function crashPoint(point: BackupCrashPoint): void {
++  if (backupSeams.crashAt === point) {
++    backupSeams.crashAt = undefined;
++    throw new SimulatedCrash(`simulated crash at ${point}`);
++  }
++}
++
++/** The `backup.create` event (the commit point) could not be written: the backup was not kept. */
++export class BackupNotRecordedError extends Error {
++  override name = "BackupNotRecordedError";
++  constructor(options?: { cause?: unknown }) {
++    super("The backup could not be recorded in the audit log, so it was not kept.", options);
++  }
++}
++
++/** Old backups were removed (a plain delete, not undone) but the `backup.prune` event could not be written yet. */
++export class PruneNotRecordedError extends Error {
++  override name = "PruneNotRecordedError";
++  constructor(
++    /** File names removed. */
++    readonly removed: string[],
++    options?: { cause?: unknown },
++  ) {
++    super("Old backups were removed, but their removal could not be recorded in the audit log yet; it is recorded at the next backup.", options);
++  }
++}
++
++/** The reason kept for a backup interrupted before its commit point. */
++export const BACKUP_INTERRUPTED = "The backup was interrupted before it was finished; nothing of it was kept.";
++
+ export interface BackupEntry {
+   file: string;
+   projectId: string;
+@@ -216,17 +279,58 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
+ // ------------------------------------------------------------------------------------------
+ // Backup state kept beside the manifest (R94): who each backup belongs to and failed backups, in a
+ // file of its own, so a damaged manifest loses neither (both are plaintext ids, nothing identifying).
++// Also the backups and prunes in progress (R125): file names and, once a zip is complete, its
++// manifest entry (the same content the manifest holds).
++
++/**
++ * A backup or a prune in progress (R125), recorded before its first step so an interruption is
++ * settled later by what the audit log says. `create`: the temp file and backup name once chosen,
++ * and the manifest entry once the zip is complete. `prune`: the files about to be removed;
++ * `auditFailed` once writing their `backup.prune` event failed (the warning `backup-audit-pending`).
++ */
++type PendingOp =
++  | { kind: "create"; projectId: string; at: string; tmp?: string; file?: string; entry?: BackupEntry }
++  | { kind: "prune"; projectId: string; at: string; files: string[]; keep: number; auditFailed?: boolean };
+ 
+ interface BackupState {
+   formatVersion: 1;
+   /** Backup file → project id (rename-safe: never inferred from the project's current name). */
+   owners: Record<string, string>;
+-  /** Projects whose last backup failed: the warning `backup-failed`. */
+-  failures: Record<string, { at: string; reason: string }>;
++  /** Projects whose last backup failed or was refused: the warning `backup-failed`. */
++  failures: Record<string, BackupFailure>;
++  /** Backups and prunes not yet settled, by backup id / prune id. */
++  pending: Record<string, PendingOp>;
++}
++
++/** Why the project's last backup failed (plain text; never a path), and when. */
++export interface BackupFailure {
++  at: string;
++  reason: string;
++  /** The policy engine refused it (R125). */
++  refused?: true;
+ }
+ 
+ export const BACKUPS_STATE = "backups-state.json";
+ 
++const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
++
++function pendingOf(v: unknown): Record<string, PendingOp> {
++  const out: Record<string, PendingOp> = {};
++  if (!isObject(v)) return out;
++  for (const [id, op] of Object.entries(v)) {
++    if (!isObject(op) || typeof op.projectId !== "string" || typeof op.at !== "string") continue;
++    // Names only, inside Backups/, of the backup naming pattern: a damaged or edited record never
++    // points the settling at any other file.
++    const nameOk = (v: unknown, re: RegExp) => v === undefined || (typeof v === "string" && v === basename(v) && re.test(v));
++    const entry = op.entry as Partial<BackupEntry> | undefined;
++    if (op.kind === "create" && nameOk(op.tmp, BACKUP_TEMP) && nameOk(op.file, BACKUP_NAME) && (entry === undefined || (isObject(entry) && entry.file === op.file && entry.projectId === op.projectId))) {
++      out[id] = op as PendingOp;
++    }
++    else if (op.kind === "prune" && Array.isArray(op.files) && op.files.every((f) => typeof f === "string")) out[id] = op as PendingOp;
++  }
++  return out;
++}
++
+ async function readState(dir: string): Promise<BackupState> {
+   try {
+     const raw = await readMaybe(join(dir, BACKUPS_STATE));
+@@ -235,22 +339,32 @@ async function readState(dir: string): Promise<BackupState> {
+       formatVersion: 1,
+       owners: s.owners && typeof s.owners === "object" ? s.owners : {},
+       failures: s.failures && typeof s.failures === "object" ? s.failures : {},
++      pending: pendingOf(s.pending),
+     };
+   } catch {
+-    return { formatVersion: 1, owners: {}, failures: {} };
++    return { formatVersion: 1, owners: {}, failures: {}, pending: {} };
+   }
+ }
+ 
++/** Reads, edits and writes the state; the caller holds the manifest's queue. */
++async function editStateNow(dir: string, fn: (s: BackupState) => void): Promise<void> {
++  const s = await readState(dir);
++  fn(s);
++  await fsp.mkdir(dir, { recursive: true });
++  await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
++}
++
++/** The recorded failure of the project's last backup (the warning `backup-failed`), if any. */
++export async function backupFailure(repo: Repo, projectId: string): Promise<BackupFailure | undefined> {
++  const f = (await readState(backupsDir(repo))).failures;
++  return Object.hasOwn(f, projectId) ? f[projectId] : undefined;
++}
++
+ /** Edits the state (in the manifest's queue, so writes never interleave). */
+ function withState(repo: Repo, fn: (s: BackupState) => void): Promise<void> {
+   const dir = backupsDir(repo);
+   const prev = manifestLocks.get(dir) ?? Promise.resolve();
+-  const run = prev.then(async () => {
+-    const s = await readState(dir);
+-    fn(s);
+-    await fsp.mkdir(dir, { recursive: true });
+-    await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
+-  });
++  const run = prev.then(() => editStateNow(dir, fn));
+   manifestLocks.set(
+     dir,
+     run.catch(() => {}),
+@@ -342,6 +456,9 @@ async function readEntry(repo: Repo, file: string): Promise<BackupEntry | undefi
+ /** The project's backups the app made and that still exist, newest first. */
+ export async function listBackups(repo: Repo, projectId: string): Promise<BackupEntry[]> {
+   const dir = backupsDir(repo);
++  // A backup interrupted after its commit point is finished first, so it is listed (and found by
++  // destruction under retention, R90 d); one interrupted before it is removed (R125).
++  await settlePending(repo);
+   const m = await withManifest(repo, async (x) => x);
+   const out: BackupEntry[] = [];
+   for (const b of m.backups) {
+@@ -356,6 +473,7 @@ export async function listBackups(repo: Repo, projectId: string): Promise<Backup
+  * rebuilt and whose name is the project's — they may hold its data.
+  */
+ export async function unresolvedBackupsOf(repo: Repo, projectId: string): Promise<string[]> {
++  await settlePending(repo);
+   const m = await withManifest(repo, async (x) => x);
+   const dir = backupsDir(repo);
+   const state = await readState(dir);
+@@ -521,7 +639,10 @@ async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unkn
+ /** In-progress temp files of this process (never swept while running). */
+ const activeTemps = new Set<string>();
+ 
+-/** Overwrites and removes temp files left by interrupted backups (they may be plaintext zips). */
++/** Backups and prunes running in this process (their pending records are not settled meanwhile). */
++const activeOps = new Set<string>();
++
++/** Overwrites and removes temp files left by interrupted backups (they may be plaintext zips), except those still pending. */
+ async function sweepTemps(dir: string): Promise<void> {
+   let names: string[] = [];
+   try {
+@@ -529,34 +650,179 @@ async function sweepTemps(dir: string): Promise<void> {
+   } catch {
+     return;
+   }
+-  for (const n of names) if (BACKUP_TEMP.test(n) && !activeTemps.has(join(dir, n))) await shredPath(join(dir, n)).catch(() => {});
++  const pending = new Set(Object.values((await readState(dir)).pending).flatMap((op) => (op.kind === "create" && op.tmp ? [op.tmp] : [])));
++  for (const n of names) if (BACKUP_TEMP.test(n) && !activeTemps.has(join(dir, n)) && !pending.has(n)) await shredPath(join(dir, n)).catch(() => {});
++}
++
++/** Plain text kept with `backup-failed`: the engine's reason for a refusal, else what failed (never a message that may hold a path). */
++function failureOf(err: unknown, at: string): BackupFailure {
++  if (err instanceof PolicyDeniedError) return { at, reason: err.reason, refused: true };
++  if (err instanceof BackupNotRecordedError) return { at, reason: err.message };
++  return { at, reason: err instanceof Error ? err.name : "Error" };
+ }
+ 
+ async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
+-  const at = repoClock(repo)().toISOString();
++  const f = failureOf(err, repoClock(repo)().toISOString());
+   await withState(repo, (s) => {
+-    s.failures[projectId] = { at, reason: err instanceof Error ? err.name : "Error" };
++    s.failures[projectId] = f;
+   }).catch(() => {});
+ }
+ 
++const exists = (p: string) => fsp.stat(p).then(() => true, () => false);
++
++/** Whether the project's audit log holds the event `action` whose `details[key]` is `id`. */
++async function hasEvent(repo: Repo, projectId: string, action: string, key: string, id: string): Promise<boolean> {
++  const p = repo.getProject(projectId);
++  const events = await AuditStore.read(join(repoLibrary(repo).root, ...p.folder.split("/"), "audit"));
++  return events.some((e) => e?.action === action && (e.details as Record<string, unknown> | undefined)?.[key] === id);
++}
++
++const projectExists = (repo: Repo, projectId: string) => repo.listProjects().some((p) => p.id === projectId);
++
++/**
++ * Settles backups and prunes that were interrupted (a crash, or a failure this process could not
++ * resolve), by what the audit log says (R125). Writable libraries only; each record is tried again
++ * next time if settling it fails. Runs when a project opens or is unlocked and before every backup
++ * operation.
++ */
++async function settlePending(repo: Repo): Promise<void> {
++  if (repoLibrary(repo).mode !== "read-write") return;
++  const state = await readState(backupsDir(repo));
++  for (const [id, op] of Object.entries(state.pending)) {
++    if (activeOps.has(id)) continue;
++    activeOps.add(id);
++    try {
++      if (op.kind === "create") await settleCreate(repo, id, op);
++      else await settlePrune(repo, id, op);
++    } catch {
++      // stays pending: tried again by the next backup operation or open
++    } finally {
++      activeOps.delete(id);
++    }
++  }
++}
++
++/**
++ * A backup whose `backup.create` event is in the audit log is finished: renamed to its backup name
++ * (if the crash came first) and listed in the manifest. One without it is not a backup: its temp
++ * file is overwritten and removed, and the project shows `backup-failed`.
++ */
++async function settleCreate(repo: Repo, id: string, op: Extract<PendingOp, { kind: "create" }>): Promise<"committed" | "dropped"> {
++  const dir = backupsDir(repo);
++  const known = projectExists(repo, op.projectId);
++  const committed = known && (await hasEvent(repo, op.projectId, "backup.create", "backupId", id));
++  if (committed && op.file && op.entry) {
++    const tmp = op.tmp ? join(dir, op.tmp) : undefined;
++    const final = join(dir, op.file);
++    if (tmp && !(await exists(final)) && (await exists(tmp))) await fsp.rename(tmp, final);
++    const entry = op.entry;
++    if (await exists(final)) {
++      await withManifest(repo, async (m) => {
++        if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
++      });
++    }
++    await withState(repo, (s) => {
++      s.owners[entry.file] = op.projectId;
++      delete s.failures[op.projectId]; // a backup succeeded
++      delete s.pending[id];
++    });
++    return "committed";
++  }
++  if (op.tmp) await shredPath(join(dir, op.tmp));
++  const at = repoClock(repo)().toISOString();
++  await withState(repo, (s) => {
++    if (known) s.failures[op.projectId] = { at, reason: BACKUP_INTERRUPTED };
++    delete s.pending[id];
++  });
++  return "dropped";
++}
++
++/** Removed files of an interrupted prune whose `backup.prune` event is missing are recorded now (`recovered`). */
++async function settlePrune(repo: Repo, id: string, op: Extract<PendingOp, { kind: "prune" }>): Promise<void> {
++  const dir = backupsDir(repo);
++  const gone: string[] = [];
++  for (const f of op.files) if (f === basename(f) && !(await exists(join(dir, f)))) gone.push(f);
++  if (gone.length && projectExists(repo, op.projectId) && !(await hasEvent(repo, op.projectId, "backup.prune", "pruneId", id))) {
++    try {
++      await appendLibraryEvent(repo, op.projectId, "backup.prune", { pruneId: id, files: gone, keep: op.keep, recovered: true });
++    } catch (err) {
++      await withState(repo, (s) => {
++        const p = s.pending[id];
++        if (p?.kind === "prune") p.auditFailed = true;
++      });
++      throw err;
++    }
++  }
++  await withState(repo, (s) => {
++    delete s.pending[id];
++  });
++}
++
++/** Every kind of storage the Backups folder may be on (R125): its path and real path; an uncertain kind as every plausible one. */
++async function backupDestinations(dir: string, env: LocationEnv): Promise<NonNullable<PolicyRequest["backup"]>["destinations"]> {
++  const { destinations } = await locate(dir, env);
++  return candidates(destinations).map(({ loc, guessed }) => ({
++    destination: loc.kind,
++    ...(loc.cloudFolderId ? { cloudFolderId: loc.cloudFolderId } : {}),
++    ...(guessed ? { uncertain: true } : {}),
++  }));
++}
++
++export interface BackupOptions {
++  /** How many of the project's backups to keep (default: the project's setting, else 10). */
++  keep?: number;
++  /** False: no pruning after the backup (retention). */
++  prune?: boolean;
++  /** Where things are on this machine, to classify the library's folder (default: probed). */
++  locationEnv?: LocationEnv;
++}
++
+ /**
+  * Backs up the project to Backups/ and prunes its older backups to the newest `keep`
+- * (default: the project's setting, else 10). A failure is recorded as the project's warning
+- * `backup-failed` (and thrown).
++ * (default: the project's setting, else 10). Governed and audited (R125, see the top of this file):
++ * a refusal throws PolicyDeniedError and creates nothing. A failure or refusal is recorded as the
++ * project's warning `backup-failed` (and thrown).
+  */
+-export async function backupProject(repo: Repo, projectId: string, opts: { keep?: number; prune?: boolean } = {}): Promise<BackupResult> {
++export async function backupProject(repo: Repo, projectId: string, opts: BackupOptions = {}): Promise<BackupResult> {
+   const dir = backupsDir(repo);
+   await fsp.mkdir(dir, { recursive: true });
++  await settlePending(repo);
+   await sweepTemps(dir);
+   const tz = repoTz(repo);
+   const warnings: string[] = [];
++  const backupId = newId();
+   let made: { entry: BackupEntry; project: Project };
++  /** The pending record exists. */
++  let recorded = false;
++  /** The commit could not be confirmed either way: the pending record stays for the audit log to decide. */
++  let undecided = false;
++  const temps: string[] = [];
+   try {
+     if (backupSeams.failBackup) throw new Error("simulated backup failure");
++    const destinations = await backupDestinations(dir, opts.locationEnv ?? (await defaultLocationEnv()));
++    // Recorded first, so an interruption from here on is settled (and shown) later.
++    activeOps.add(backupId);
++    await withState(repo, (s) => {
++      s.pending[backupId] = { kind: "create", projectId, at: repoClock(repo)().toISOString() };
++    });
++    recorded = true;
++    // 1. The decision, audited either way (a deny is audited and thrown by authorizeProcessing).
++    const decision = await authorizeProcessing(
++      repo,
++      projectId,
++      { action: "backup", backup: { destinations } },
++      { op: "backup.create", entity: { type: "project", id: projectId }, auditAllow: { details: { backupId } } },
++    );
++    const mustSeal = decision.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
++    crashPoint("after-decision");
++
++    // 2. The zip, complete and fsynced under its temp name.
+     let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string } | undefined;
+     for (let attempt = 0; attempt < 2 && !result; attempt++) {
+       const snap = await snapshot(repo, projectId);
+       try {
++        // Never an unsealed backup of a project whose rules require encryption (the engine's condition).
++        if (mustSeal && !snap.key) throw new PolicyDeniedError("Governance requires encryption at rest, but this project is not encrypted", "backup");
+         await backupSeams.afterSnapshot?.();
+         let name = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
+         if (snap.key) name = `${name}.enc`;
+@@ -564,18 +830,25 @@ export async function backupProject(repo: Repo, projectId: string, opts: { keep?
+         name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
+         const tmp = join(dir, `${name}.tmp-${randomBytes(6).toString("hex")}`);
+         activeTemps.add(tmp);
++        temps.push(tmp);
++        await withState(repo, (s) => {
++          const p = s.pending[backupId];
++          if (p?.kind === "create") p.tmp = basename(tmp);
++        });
+         try {
+           const header = { formatVersion: 1, projectId, projectName: snap.project.name, createdAt: snap.at, encrypted: !!snap.key, auditHead: snap.head, files: snap.files.length, assets: snap.assets };
+           const r = await writeZip(tmp, snap, header);
+           if (await changedSince(snap.files)) {
+             if (attempt === 0) {
+               await shredPath(tmp);
++              activeTemps.delete(tmp);
+               continue;
+             }
+             warnings.push("Some files changed while the backup was made, twice; this backup may not be one consistent state.");
+           }
+           result = { snap, tmp, name, ...r };
+         } catch (err) {
++          if (err instanceof SimulatedCrash) throw err;
+           await shredPath(tmp).catch(() => {});
+           activeTemps.delete(tmp);
+           // A file that changed size or went away while it was read: start again once.
+@@ -587,58 +860,136 @@ export async function backupProject(repo: Repo, projectId: string, opts: { keep?
+       }
+     }
+     if (!result) throw new Error("the project kept changing while it was backed up");
++    crashPoint("after-zip");
++    const { snap } = result;
++    const entry: BackupEntry = {
++      file: result.name,
++      projectId,
++      createdAt: snap.at,
++      sha256: result.sha256,
++      bytes: result.bytes,
++      encrypted: !!snap.key,
++      files: snap.files.length,
++      auditHead: snap.head,
++      assets: snap.assets,
++      ...(snap.keyFile ? { keyFile: snap.keyFile } : {}),
++    };
++    await withState(repo, (s) => {
++      const p = s.pending[backupId];
++      if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry });
++    });
++    crashPoint("before-commit");
++
++    // 3. The commit point: the `backup.create` event. If it cannot be written, the audit log decides
++    // (it may have been written after all); without it the backup is not kept.
+     try {
+-      await fsp.rename(result.tmp, join(dir, result.name));
++      await appendLibraryEvent(repo, projectId, "backup.create", { backupId, file: result.name, sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
++    } catch (err) {
++      activeTemps.delete(result.tmp);
++      const outcome = await settleCreate(repo, backupId, { kind: "create", projectId, at: snap.at, tmp: basename(result.tmp), file: result.name, entry }).catch(() => "unsettled" as const);
++      if (outcome === "unsettled") undecided = true;
++      if (outcome !== "committed") throw new BackupNotRecordedError({ cause: err });
++    }
++    crashPoint("after-commit");
++
++    // 4. Its name, then the manifest.
++    try {
++      if (await exists(result.tmp)) await fsp.rename(result.tmp, join(dir, result.name));
+     } finally {
+       activeTemps.delete(result.tmp);
+     }
+-    const { snap } = result;
+-    await appendLibraryEvent(repo, projectId, "backup.create", { sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
+-    made = {
+-      project: snap.project,
+-      entry: {
+-        file: result.name,
+-        projectId,
+-        createdAt: snap.at,
+-        sha256: result.sha256,
+-        bytes: result.bytes,
+-        encrypted: !!snap.key,
+-        files: snap.files.length,
+-        auditHead: snap.head,
+-        assets: snap.assets,
+-        ...(snap.keyFile ? { keyFile: snap.keyFile } : {}),
+-      },
+-    };
++    crashPoint("before-manifest");
++    await withManifest(repo, async (m) => {
++      if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
++    });
++    await withState(repo, (s) => {
++      s.owners[entry.file] = projectId;
++      delete s.failures[projectId];
++      delete s.pending[backupId];
++    });
++    made = { project: snap.project, entry };
+   } catch (err) {
++    if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
++    if (recorded && !undecided) {
++      // Nothing was committed (a committed backup does not get here): anything left of it goes.
++      const p = (await readState(dir)).pending[backupId];
++      if (p?.kind === "create" && p.tmp) await shredPath(join(dir, p.tmp)).catch(() => {});
++      await withState(repo, (s) => {
++        delete s.pending[backupId];
++      }).catch(() => {});
++    }
+     await recordFailure(repo, projectId, err);
+     throw err;
++  } finally {
++    activeOps.delete(backupId);
++    for (const t of temps) activeTemps.delete(t);
++  }
++  let pruned: string[] = [];
++  if (opts.prune !== false) {
++    try {
++      pruned = await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
++    } catch (err) {
++      // The backup itself is made and recorded; a removal that could not be recorded is said, not hidden.
++      if (!(err instanceof PruneNotRecordedError)) throw err;
++      pruned = err.removed;
++      warnings.push(err.message);
++    }
+   }
+-  await withState(repo, (s) => {
+-    s.owners[made.entry.file] = projectId;
+-    delete s.failures[projectId];
+-  });
+-  await withManifest(repo, async (m) => {
+-    m.backups.push(made.entry);
+-  });
+-  const pruned = opts.prune === false ? [] : await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
+   return { path: join(dir, made.entry.file), sha256: made.entry.sha256, bytes: made.entry.bytes, pruned, warnings };
+ }
+ 
+-/** Removes the project's backups beyond the newest `keep`: by the manifest's project id, backup-named files only. */
++/**
++ * Removes the project's backups beyond the newest `keep`: by the manifest's project id, backup-named
++ * files only; a plain delete (R91). Audited by file name: one `backup.prune` event per run that
++ * removed anything (R125). If that event cannot be written, the files stay removed and
++ * PruneNotRecordedError is thrown; the removal is recorded later.
++ */
+ export async function pruneBackups(repo: Repo, projectId: string, keep: number): Promise<string[]> {
+   if (!Number.isInteger(keep) || keep < 1) throw new TypeError("keep must be a whole number of at least 1");
+   const dir = backupsDir(repo);
+-  return withManifest(repo, async (m) => {
+-    const mine = m.backups.filter((b) => b.projectId === projectId && BACKUP_NAME.test(b.file) && b.file === basename(b.file));
+-    mine.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+-    const removed: string[] = [];
+-    for (const b of mine.slice(keep)) {
+-      await fsp.rm(join(dir, b.file), { force: true });
+-      removed.push(b.file);
++  await settlePending(repo);
++  const pruneId = newId();
++  activeOps.add(pruneId);
++  try {
++    const removed = await withManifest(repo, async (m) => {
++      const mine = m.backups.filter((b) => b.projectId === projectId && BACKUP_NAME.test(b.file) && b.file === basename(b.file));
++      mine.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
++      const doomed = mine.slice(keep).map((b) => b.file);
++      const out: string[] = [];
++      if (!doomed.length) return out;
++      // Recorded before the first removal, so a crash cannot lose the record of it.
++      await editStateNow(dir, (s) => {
++        s.pending[pruneId] = { kind: "prune", projectId, at: repoClock(repo)().toISOString(), files: doomed, keep };
++      });
++      try {
++        for (const f of doomed) {
++          await fsp.rm(join(dir, f), { force: true });
++          out.push(f);
++        }
++      } finally {
++        m.backups = m.backups.filter((b) => !(b.projectId === projectId && out.includes(b.file)));
++      }
++      return out;
++    });
++    if (!removed.length) return removed;
++    crashPoint("before-prune-audit");
++    await backupSeams.beforePruneAudit?.();
++    try {
++      await appendLibraryEvent(repo, projectId, "backup.prune", { pruneId, files: removed, keep });
++    } catch (err) {
++      await withState(repo, (s) => {
++        const p = s.pending[pruneId];
++        if (p?.kind === "prune") Object.assign(p, { files: removed, auditFailed: true });
++      }).catch(() => {});
++      throw new PruneNotRecordedError(removed, { cause: err });
+     }
+-    m.backups = m.backups.filter((b) => !(b.projectId === projectId && removed.includes(b.file)));
++    await withState(repo, (s) => {
++      delete s.pending[pruneId];
++    });
+     return removed;
+-  });
++  } finally {
++    activeOps.delete(pruneId);
++  }
+ }
+ 
+ /**
+@@ -675,17 +1026,20 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
+ /**
+  * For the daily scheduler (Task 30): backs the project up when automatic backups are on (default),
+  * the project is open for writing and unlocked, and its last backup is at least a day old. Null
+- * when nothing was due (or it could not run now). A failure is thrown and stays as the project's
+- * warning `backup-failed`.
++ * when nothing was due (or it could not run now). A failure or a refusal (R125) is thrown and stays
++ * as the project's warning `backup-failed`, with its reason. A refused one is asked again a day
++ * later, not at every pass of the scheduler (one denial in the audit log a day, not one an hour).
+  */
+-export async function backupIfDue(repo: Repo, projectId: string, now: Date): Promise<BackupResult | null> {
++export async function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
+   const p = repo.getProject(projectId);
+   if (p.backups?.automatic === false) return null;
+   if (!repo.isUnlocked(projectId)) return null;
+   const [last] = await listBackups(repo, projectId);
+   if (last && now.getTime() - Date.parse(last.createdAt) < DAY_MS) return null;
++  const failed = await backupFailure(repo, projectId);
++  if (failed?.refused && now.getTime() - Date.parse(failed.at) < DAY_MS) return null;
+   try {
+-    return await backupProject(repo, projectId);
++    return await backupProject(repo, projectId, opts);
+   } catch (err) {
+     if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return null;
+     throw err;
+@@ -801,3 +1155,8 @@ export async function restoreBackup(repo: Repo, path: string, opts: { passphrase
+ onProjectUnlocked(async (repo) => {
+   await withManifest(repo, async () => {});
+ });
++
++// Backups and prunes interrupted by a crash are settled when the library opens (R125).
++onProjectOpened(async (repo) => {
++  await settlePending(repo);
++});
+diff --git a/packages/library/src/index.ts b/packages/library/src/index.ts
+index e800bb1..3e54e79 100644
+--- a/packages/library/src/index.ts
++++ b/packages/library/src/index.ts
+@@ -183,9 +183,13 @@ export {
+   AuditChainInvalidError,
+   BACKUPS_MANIFEST,
+   BACKUPS_STATE,
++  BACKUP_INTERRUPTED,
+   BACKUP_LIMITS,
++  BackupNotRecordedError,
+   DEFAULT_KEEP,
+   RestoreError,
++  PruneNotRecordedError,
++  backupFailure,
+   backupIfDue,
+   backupProject,
+   listBackups,
+@@ -193,7 +197,7 @@ export {
+   restoreBackup,
+   setBackupSettings,
+ } from "./export/backup.js";
+-export type { BackupEntry, BackupResult, RestoreResult } from "./export/backup.js";
++export type { BackupEntry, BackupFailure, BackupOptions, BackupResult, RestoreResult } from "./export/backup.js";
+ export { ExportDestinationError, ExportFailedError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
+ export type { ProjectExportResult } from "./export/project-export.js";
+ export { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
+diff --git a/packages/library/src/move.ts b/packages/library/src/move.ts
+index df95b92..8ee56f3 100644
+--- a/packages/library/src/move.ts
++++ b/packages/library/src/move.ts
+@@ -427,8 +427,8 @@ function assertNoCollisions(w: Walked): void {
+   }
+ }
+ 
+-/** Classifications of the typed path and its real path; the first cloud folder, else the real path's. */
+-async function locate(destRoot: string, env: LocationEnv): Promise<{ destination: Location; destinations: Location[] }> {
++/** Package-internal (also backups, R125). Classifications of the typed path and its real path; the first cloud folder, else the real path's. */
++export async function locate(destRoot: string, env: LocationEnv): Promise<{ destination: Location; destinations: Location[] }> {
+   const typed = classifyLocation(resolve(destRoot), env);
+   const realPath = await realish(destRoot);
+   const destinations = realPath === resolve(destRoot) ? [typed] : [typed, classifyLocation(realPath, env)];
+@@ -436,8 +436,8 @@ async function locate(destRoot: string, env: LocationEnv): Promise<{ destination
+   return { destination, destinations };
+ }
+ 
+-/** Each destination candidate: a certain classification as is; an uncertain one as every plausible kind. */
+-function candidates(destinations: Location[]): Array<{ loc: Location; guessed: boolean }> {
++/** Package-internal (also backups, R125). Each destination candidate: a certain classification as is; an uncertain one as every plausible kind. */
++export function candidates(destinations: Location[]): Array<{ loc: Location; guessed: boolean }> {
+   const out: Array<{ loc: Location; guessed: boolean }> = [];
+   const add = (loc: Location, guessed: boolean) => {
+     if (!out.some((c) => c.loc.kind === loc.kind && c.loc.cloudFolderId === loc.cloudFolderId)) out.push({ loc, guessed });
+diff --git a/packages/library/src/repo/index.ts b/packages/library/src/repo/index.ts
+index 7122a50..36fcc15 100644
+--- a/packages/library/src/repo/index.ts
++++ b/packages/library/src/repo/index.ts
+@@ -1,4 +1,4 @@
+-export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
++export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING, BACKUP_AUDIT_PENDING_WARNING } from "./repo.js";
+ export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, UNREADABLE_GOVERNANCE } from "./governance-edit.js";
+ export type { GovernanceEditResult } from "./governance-edit.js";
+ export type { AuditCheck, RepoOptions } from "./repo.js";
+diff --git a/packages/library/src/repo/repo.ts b/packages/library/src/repo/repo.ts
+index f2d2dcd..c988cf9 100644
+--- a/packages/library/src/repo/repo.ts
++++ b/packages/library/src/repo/repo.ts
+@@ -851,17 +851,27 @@ export async function deletedRecordsTrouble(repo: Repo, projectId: string): Prom
+ /** Persisted in `Backups/backups-state.json` (`failures`) when a backup of the project failed (R92); cleared by the next success. */
+ export const BACKUP_FAILED_WARNING = "backup-failed";
+ 
++/**
++ * Persisted in `Backups/backups-state.json` (`pending`) when old backups were removed but their
++ * `backup.prune` audit event could not be written yet (R125, R82); cleared once it is recorded.
++ */
++export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
++
+ /**
+  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
+- * 'backup-failed', R92).
++ * 'backup-failed', R92; 'backup-audit-pending', R125).
+  */
+ export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
+   const core = cores.get(repo)!;
+   const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
+   try {
+     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
+-    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
++    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown> }) : undefined;
+     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
++    const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
++    if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
++      out.push(BACKUP_AUDIT_PENDING_WARNING);
++    }
+   } catch {
+     // an unreadable manifest is handled (and rebuilt) by the backups module
+   }

@@ -33,6 +33,22 @@ export interface AppLocation {
 /** "/library/" → "/library"; "/" stays "/". */
 export const normalisePath = (p: string): string => (p.length > 1 ? p.replace(/\/+$/, "") || "/" : p || "/");
 
+/** While set, navigate() moves nowhere and calls it instead (see blockNavigation). */
+let navigationBlock: (() => void) | null = null;
+
+/**
+ * Refuses in-app navigation (links and navigate()) until the returned function is called; each
+ * refused attempt calls `onRefused` (to say why). Used while something shown once must not be lost,
+ * such as a new project's recovery code (R134). The browser's Back and Forward are guarded by the
+ * caller (they do not go through navigate()).
+ */
+export function blockNavigation(onRefused: () => void): () => void {
+  navigationBlock = onRefused;
+  return () => {
+    if (navigationBlock === onRefused) navigationBlock = null;
+  };
+}
+
 /**
  * Moves to an in-app path ("/…", query allowed) without reloading; listeners of popstate re-render.
  * `replace` rewrites the current history entry instead of adding one (for example to keep the
@@ -40,6 +56,10 @@ export const normalisePath = (p: string): string => (p.length > 1 ? p.replace(/\
  */
 export function navigate(href: string, opts: { replace?: boolean } = {}): void {
   if (!href.startsWith("/") || href.startsWith("//")) throw new Error(`navigate() takes an in-app path starting with "/" (got "${href}").`);
+  if (navigationBlock) {
+    navigationBlock();
+    return;
+  }
   if (opts.replace) window.history.replaceState(null, "", href);
   else window.history.pushState(null, "", href);
   window.dispatchEvent(new PopStateEvent("popstate"));

@@ -90,6 +90,28 @@ export interface ProjectSummary {
   profiles?: string[];
 }
 
+/**
+ * The body of POST /projects (routes/projects.ts). `governanceYaml` is the rules file verbatim ("" is
+ * the default rules, which require encryption). An encrypted project needs a non-empty passphrase.
+ * `name` is at most 200 characters and must not be blank.
+ */
+export interface NewProjectRequest {
+  name: string;
+  governanceYaml: string;
+  encryption: { enabled: false } | { enabled: true; passphrase: string };
+  /** At most 20 language tags of at most 35 characters. */
+  targetLanguages?: string[];
+}
+
+/**
+ * The answer of POST /projects: the project as GET /projects lists it, and, for an encrypted project
+ * only, its recovery code. The service returns the code this once and never stores or logs it.
+ */
+export interface NewProjectResult {
+  project: ProjectSummary;
+  recoveryCode?: string;
+}
+
 export interface Collection {
   id: string;
   projectId: string;
@@ -247,6 +269,8 @@ export function libraryApi(client: ApiClient) {
     },
     projects: {
       list: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+      /** Creates a project; the recovery code in the answer is a secret shown once (never kept). */
+      create: (body: NewProjectRequest) => r<NewProjectResult>("POST", "/projects", { body }),
       unlock: (id: string, secret: string) => r<{ unlocked: true }>("POST", `${proj(id)}/unlock`, { body: { secret } }),
       lock: (id: string) => r<{ unlocked: false }>("POST", `${proj(id)}/lock`),
       governance: (id: string) => r<{ yaml: string; sha256: string; violations: unknown[] }>("GET", `${proj(id)}/governance`),

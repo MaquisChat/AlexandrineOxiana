@@ -1,0 +1,2889 @@
+diff --git a/apps/library-service/src/capture-routes.test.ts b/apps/library-service/src/capture-routes.test.ts
+new file mode 100644
+index 0000000..6cc9b78
+--- /dev/null
++++ b/apps/library-service/src/capture-routes.test.ts
+@@ -0,0 +1,297 @@
++/**
++ * Capture routes that had no tests (Task 34a e): capture-profile, transcribe, the one-time
++ * acknowledgement, and the capture tools' update, against a stand-in media worker.
++ */
++import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { Writable } from "node:stream";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { WorkerJobError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob } from "@ao/library";
++import type { TranscriptListResponse, TranscriptResponse } from "@ao/shared";
++import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
++
++const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
++const auth = { authorization: `Bearer ${TOKEN}` };
++const EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
++const GOV = `identifiability:
++  containsIdentifiable: false
++encryption:
++  atRest: optional
++consent:
++  requireLegalBasis: false
++processing:
++  metadata_lookup: []
++`;
++const CAPTURE_GOV = `${GOV}captureMethods: [manual_upload, downloader]\n`;
++
++let tmp: string;
++let deps: Deps;
++let svc: LibraryService;
++
++/** A stand-in worker: transcription writes a canned transcript (one of two segments flagged); downloads fail. */
++function stubWorker(): WorkerProvider & { calls: WorkerJob[]; updates: number } {
++  const calls: WorkerJob[] = [];
++  const p = {
++    calls,
++    updates: 0,
++    async start() {
++      const client = {
++        async submit(_pid: string, job: WorkerJob): Promise<JobResult> {
++          calls.push(job);
++          if (job.type === "audio.transcribe") {
++            await mkdir(job.output, { recursive: true });
++            const segments = [
++              { start: 0, end: 2, text: "Welcome to the market.", lang: "en", flags: [] },
++              { start: 2, end: 4, text: "Thanks for watching!", lang: "en", flags: ["outside-speech", "stock-phrase"] },
++            ];
++            await writeFile(join(job.output, "segments.json"), JSON.stringify(segments));
++            await writeFile(join(job.output, "transcript.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the market.\n\nNOTE flags: outside-speech, stock-phrase\n\n00:00:02.000 --> 00:00:04.000\nThanks for watching!\n");
++            return { id: "t1", type: job.type, output: job.output, files: [join(job.output, "transcript.vtt"), join(job.output, "segments.json")], meta: { model: (job.params?.model as string | undefined) ?? "small", detectedLanguages: ["en"], flaggedCount: 1 }, encrypted: false };
++          }
++          throw new WorkerJobError("TOOL_FAILED", "the tool failed");
++        },
++        async resumePending() {
++          return [];
++        },
++      } as unknown as WorkerClient;
++      return {
++        clientFor: () => client,
++        versions: async () => ({ "yt-dlp": "2026.10.01", "gallery-dl": "1.30.0" }),
++        updateTools: async () => {
++          p.updates++;
++          return { ytDlp: { old: "2026.10.01", new: "2026.11.01", managed: true }, galleryDl: { version: "1.30.0", pinned: true } };
++        },
++        stop: async () => {},
++      };
++    },
++  };
++  return p;
++}
++
++async function start(over: Partial<ServiceOptions> = {}): Promise<void> {
++  svc = await createService({ token: TOKEN, deps, worker: null, logStream: new Writable({ write: (_c, _e, cb) => cb() }), pairing: { confirmPerMinute: 100 }, ...over });
++}
++
++async function call(r: { method?: "GET" | "POST"; url: string; body?: unknown; headers?: Record<string, string>; noAuth?: boolean }) {
++  const res = await svc.app.inject({
++    method: r.method ?? "GET",
++    url: r.url,
++    headers: { ...(r.noAuth ? {} : auth), ...(r.body !== undefined ? { "content-type": "application/json" } : {}), ...r.headers },
++    ...(r.body !== undefined ? { payload: JSON.stringify(r.body) } : {}),
++  });
++  let json: any;
++  try {
++    json = res.json();
++  } catch {
++    json = undefined;
++  }
++  return { status: res.statusCode, json, body: res.body };
++}
++
++async function library(gov = CAPTURE_GOV): Promise<string> {
++  expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Lib"), name: "Lib" } })).status).toBe(200);
++  const r = await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: gov, encryption: { enabled: false } } });
++  expect(r.status, r.body).toBe(200);
++  return r.json.project.id;
++}
++
++async function extensionToken(): Promise<string> {
++  const code = await call({ method: "POST", url: "/extension/pair" });
++  const c = await svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ code: code.json.code }) });
++  return c.json().token as string;
++}
++
++beforeEach(async () => {
++  tmp = await mkdtemp(join(tmpdir(), "ao-capture-routes-"));
++  deps = { ...deviceDeps(join(tmp, "config")), settleMs: 0 };
++});
++afterEach(async () => {
++  await svc?.close();
++  await rm(tmp, { recursive: true, force: true });
++});
++
++describe("POST /projects/:id/acknowledge", () => {
++  it("records the one-time browser-session acknowledgement; only kind cookies; listed on the project", async () => {
++    await start();
++    const pid = await library();
++    expect((await call({ method: "POST", url: `/projects/${pid}/acknowledge`, body: { kind: "camera" } })).status).toBe(400);
++    expect((await call({ method: "POST", url: `/projects/${pid}/acknowledge`, body: {} })).status).toBe(400);
++    expect((await call({ method: "POST", url: "/projects/01ZZZZZZZZZZZZZZZZZZZZZZZZ/acknowledge", body: { kind: "cookies" } })).status).toBe(404);
++    const r = await call({ method: "POST", url: `/projects/${pid}/acknowledge`, body: { kind: "cookies" } });
++    expect(r.status, r.body).toBe(200);
++    expect(r.json).toEqual({ acknowledgements: ["cookies"] });
++    // Again: the same answer (idempotent).
++    expect((await call({ method: "POST", url: `/projects/${pid}/acknowledge`, body: { kind: "cookies" } })).json).toEqual({ acknowledgements: ["cookies"] });
++    const projects = await call({ url: "/projects" });
++    const listed = (projects.json.projects ?? projects.json).find((p: { id: string }) => p.id === pid);
++    expect(listed.acknowledgements).toEqual(["cookies"]);
++    // The extension cannot acknowledge for the researcher.
++    const ext = await extensionToken();
++    expect((await call({ method: "POST", url: `/projects/${pid}/acknowledge`, body: { kind: "cookies" }, noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT } })).status).toBe(403);
++  });
++});
++
++describe("POST /projects/:id/capture-profile", () => {
++  it("validates its options; asks for the acknowledgement before using the browser session; queues and reports progress", async () => {
++    const worker = stubWorker();
++    await start({ worker, autoStartWorker: false });
++    const pid = await library();
++    const url = `/projects/${pid}/capture-profile`;
++    const profile = "https://www.instagram.com/some.researcher/";
++    for (const body of [
++      {},
++      { url: "ftp://example.com/x" },
++      { url: profile, options: { since: "2026/01/01" } },
++      { url: profile, options: { until: "yesterday" } },
++      { url: profile, options: { maxItems: 0 } },
++      { url: profile, options: { maxItems: 2.5 } },
++      { url: profile, options: { contentTypes: ["stories"] } },
++      { url: profile, options: { cookiesFromBrowser: "netscape" } },
++      { url: profile, options: { transcribeModel: "huge" } },
++    ]) {
++      const r = await call({ method: "POST", url, body });
++      expect(r.status, JSON.stringify(body)).toBe(400);
++      expect(r.json.error.code).toBe("VALIDATION");
++    }
++    const needsAck = await call({ method: "POST", url, body: { url: profile, options: { cookiesFromBrowser: "firefox" } } });
++    expect(needsAck.status).toBe(409);
++    expect(needsAck.json.error).toMatchObject({ code: "ACKNOWLEDGEMENT_REQUIRED", reason: "cookies" });
++    expect(worker.calls).toHaveLength(0);
++
++    const events: Array<{ type: string; data: any }> = [];
++    svc.state.events.subscribe((e) => events.push(e));
++    const ok = await call({ method: "POST", url, body: { url: profile, options: { since: "2026-01-01", until: "2026-06-30", maxItems: 5, contentTypes: ["posts", "reels"], metadataOnly: true } } });
++    expect(ok.status, ok.body).toBe(200);
++    expect(ok.json.queueId).toEqual(expect.any(String));
++    await svc.state.idle();
++    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === ok.json.queueId);
++    expect(mine.at(-1)?.data).toMatchObject({ projectId: pid, finished: true });
++    expect(worker.calls.length).toBeGreaterThan(0);
++    expect(worker.calls[0]!.type).toBe("capture.download");
++
++    // After the acknowledgement, the browser session may be used.
++    await call({ method: "POST", url: `/projects/${pid}/acknowledge`, body: { kind: "cookies" } });
++    expect((await call({ method: "POST", url, body: { url: profile, options: { cookiesFromBrowser: "firefox" } } })).status).toBe(200);
++    await svc.state.idle();
++  });
++
++  it("a project whose rules do not allow the downloader: 403 POLICY_DENIED with the reason, nothing queued", async () => {
++    const worker = stubWorker();
++    await start({ worker, autoStartWorker: false });
++    const pid = await library(`${GOV}captureMethods: [manual_upload]\n`);
++    const r = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: "https://www.youtube.com/@channel" } });
++    expect(r.status).toBe(403);
++    expect(r.json.error.code).toBe("POLICY_DENIED");
++    expect(typeof r.json.error.reason).toBe("string");
++    expect(worker.calls).toHaveLength(0);
++  });
++
++  it("no media helper: 503 WORKER_UNAVAILABLE", async () => {
++    await start();
++    const pid = await library();
++    const r = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: "https://www.youtube.com/@channel" } });
++    expect(r.status).toBe(503);
++    expect(r.json.error.code).toBe("WORKER_UNAVAILABLE");
++  });
++});
++
++describe("POST /projects/:id/sources/:sid/transcribe", () => {
++  async function audioSource(pid: string): Promise<string> {
++    const dir = join(tmp, "in");
++    await mkdir(dir, { recursive: true });
++    await writeFile(join(dir, "talk.mp3"), Buffer.alloc(64, 1));
++    const sf = await svc.state.session!.repo.createSource(
++      pid,
++      { projectIds: [pid], type: "audio", title: { variants: [{ lang: "en", kind: "original", value: "Talk" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
++      [{ path: join(dir, "talk.mp3"), role: "original", handling: "copy" }],
++      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
++    );
++    return sf.source.id;
++  }
++
++  it("transcribes a source's recording; the versions read back as segments with their flags", async () => {
++    const worker = stubWorker();
++    await start({ worker, autoStartWorker: false });
++    const pid = await library();
++    const sid = await audioSource(pid);
++    for (const body of [{ model: "huge" }, { language: "English" }]) {
++      expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body })).status, JSON.stringify(body)).toBe(400);
++    }
++    expect((await call({ method: "POST", url: `/projects/${pid}/sources/01ZZZZZZZZZZZZZZZZZZZZZZZZ/transcribe`, body: {} })).status).toBe(404);
++    const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: { model: "small", language: "en" } });
++    expect(r.status, r.body).toBe(200);
++    const job = worker.calls.find((c) => c.type === "audio.transcribe")!;
++    expect(job.params).toMatchObject({ model: "small", language: "en" });
++    const list = (await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse;
++    expect(list.versions.map((v) => v.format).sort()).toEqual(["json", "vtt"]);
++    for (const v of list.versions) {
++      expect(v).toMatchObject({ origin: "machine", flaggedSegments: 1, tool: "faster-whisper" });
++      const t = (await call({ url: `/projects/${pid}/sources/${sid}/transcripts/${v.id}` })).json as TranscriptResponse;
++      expect(t.segments).toEqual([
++        { start: 0, end: 2, lang: "en", text: "Welcome to the market.", flags: [] },
++        { start: 2, end: 4, lang: "en", text: "Thanks for watching!", flags: ["outside-speech", "stock-phrase"] },
++      ]);
++    }
++  });
++
++  it("a source without a recording: 400; no media helper: 503", async () => {
++    await start({ worker: stubWorker(), autoStartWorker: false });
++    const pid = await library();
++    const sf = await svc.state.session!.repo.createSource(
++      pid,
++      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Paper" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
++      [],
++      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
++    );
++    const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: {} });
++    expect(r.status).toBe(400);
++    await svc.close();
++    await start();
++    await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
++    const sid = await audioSource(pid);
++    const none = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
++    expect(none.status).toBe(503);
++    expect(none.json.error.code).toBe("WORKER_UNAVAILABLE");
++  });
++});
++
++describe("POST /tools/update and GET /tools/versions", () => {
++  it("updates the capture tools through the media helper and reports old and new versions", async () => {
++    const worker = stubWorker();
++    await start({ worker, autoStartWorker: false });
++    expect((await call({ url: "/tools/versions" })).json).toEqual({ versions: { "yt-dlp": "2026.10.01", "gallery-dl": "1.30.0" } });
++    const r = await call({ method: "POST", url: "/tools/update" });
++    expect(r.status, r.body).toBe(200);
++    expect(r.json).toEqual({ ytDlp: { old: "2026.10.01", new: "2026.11.01", managed: true }, galleryDl: { version: "1.30.0", pinned: true } });
++    expect(worker.updates).toBe(1);
++    // Not for the extension, and not without the token.
++    const ext = await extensionToken();
++    expect((await call({ method: "POST", url: "/tools/update", noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT } })).status).toBe(403);
++    expect((await call({ method: "POST", url: "/tools/update", noAuth: true })).status).toBe(401);
++    expect(worker.updates).toBe(1);
++  });
++
++  it("no media helper: 503 WORKER_UNAVAILABLE", async () => {
++    await start();
++    const r = await call({ method: "POST", url: "/tools/update" });
++    expect(r.status).toBe(503);
++    expect(r.json.error.code).toBe("WORKER_UNAVAILABLE");
++  });
++
++  it("a failed update is reported, not thrown as an unknown error", async () => {
++    const worker = stubWorker();
++    worker.start = (async () => ({
++      clientFor: () => ({}) as WorkerClient,
++      versions: async () => ({}),
++      updateTools: async () => {
++        throw new WorkerJobError("UPDATE_FAILED", "pip failed");
++      },
++      stop: async () => {},
++    })) as typeof worker.start;
++    await start({ worker, autoStartWorker: false });
++    const r = await call({ method: "POST", url: "/tools/update" });
++    expect(r.status).toBe(502);
++    expect(r.json.error).toMatchObject({ code: "INTERNAL", reason: "UPDATE_FAILED" });
++  });
++});
+diff --git a/apps/library-service/src/media.test.ts b/apps/library-service/src/media.test.ts
+new file mode 100644
+index 0000000..e68baa3
+--- /dev/null
++++ b/apps/library-service/src/media.test.ts
+@@ -0,0 +1,688 @@
++/**
++ * Pictures and audio/video from the service (Task 34a, R135): the picture content route (UI token,
++ * raster types, no-store, size limit), media tickets (issued with the UI token for one audio/video
++ * asset of one unlocked project; 256 bits; memory only; path only; 10 idle minutes, 8 hours at
++ * most; revoked on lock, library close or move, and service stop; 16 at most) and the media route
++ * (GET/HEAD with ranges, decrypting as it streams, Host and Origin and Sec-Fetch checks, nosniff,
++ * no-store, inline, the ticket never in a log line or error).
++ */
++import { createHash, randomBytes } from "node:crypto";
++import { createWriteStream } from "node:fs";
++import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
++import { request as httpRequest } from "node:http";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { Writable } from "node:stream";
++import { setFlagsFromString } from "node:v8";
++import { runInNewContext } from "node:vm";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { deviceDeps, type Deps } from "@ao/library";
++import { MEDIA_TICKET_PATH, type MediaTicketResponse } from "@ao/shared";
++import { tinyPng } from "../../../tests/fixtures/generate.mjs";
++import { createService, type LibraryService, type ServiceOptions } from "./server.js";
++
++const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
++const PASS = "correct horse battery staple";
++const auth = { authorization: `Bearer ${TOKEN}` };
++const CHUNK = 1024 * 1024;
++const OPEN_GOV = `identifiability:
++  containsIdentifiable: false
++encryption:
++  atRest: optional
++consent:
++  requireLegalBasis: false
++processing:
++  metadata_lookup: []
++`;
++const EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
++
++let tmp: string;
++let deps: Deps;
++let logs: string;
++let svc: LibraryService;
++const clock = { ms: Date.parse("2026-11-11T10:00:00.000Z") };
++/** Set once a test listens on a real port: injected requests must then name it in Host. */
++let hostHeader: Record<string, string> = {};
++
++async function start(over: Partial<ServiceOptions> = {}): Promise<LibraryService> {
++  logs = "";
++  const logStream = new Writable({
++    write(chunk, _enc, cb) {
++      logs += chunk.toString();
++      cb();
++    },
++  });
++  svc = await createService({ token: TOKEN, deps, logStream, logLevel: "trace", worker: null, now: () => new Date(clock.ms), pairing: { confirmPerMinute: 100 }, ...over });
++  return svc;
++}
++
++type Inject = { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"; url: string; body?: unknown; headers?: Record<string, string>; noAuth?: boolean };
++async function call(r: Inject) {
++  const res = await svc.app.inject({
++    method: r.method ?? "GET",
++    url: r.url,
++    headers: { ...hostHeader, ...(r.noAuth ? {} : auth), ...(r.body !== undefined ? { "content-type": "application/json" } : {}), ...r.headers },
++    ...(r.body !== undefined ? { payload: JSON.stringify(r.body) } : {}),
++  });
++  let json: any;
++  try {
++    json = res.json();
++  } catch {
++    json = undefined;
++  }
++  return { status: res.statusCode, json, body: res.body, raw: res.rawPayload, headers: res.headers };
++}
++
++/** A media request: no token, as a media element sends it. */
++const media = (path: string, headers: Record<string, string> = {}, method: "GET" | "HEAD" = "GET") => call({ method, url: path, headers, noAuth: true });
++
++async function openLibrary(): Promise<void> {
++  const r = await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Lib"), name: "Lib" } });
++  expect(r.status, r.body).toBe(200);
++}
++
++async function newProject(encrypted = false, name = "Study"): Promise<string> {
++  const r = await call({ method: "POST", url: "/projects", body: { name, governanceYaml: OPEN_GOV, encryption: encrypted ? { enabled: true, passphrase: PASS } : { enabled: false } } });
++  expect(r.status, r.body).toBe(200);
++  return r.json.project.id as string;
++}
++
++/** A source with one original made from `file` (through the library, as an import would). */
++async function sourceWith(projectId: string, file: string, type = "audio"): Promise<{ sid: string; aid: string }> {
++  const repo = svc.state.session!.repo;
++  const sf = await repo.createSource(
++    projectId,
++    { projectIds: [projectId], type: type as never, title: { variants: [{ lang: "en", kind: "original", value: "Recording" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
++    [{ path: file, role: "original", handling: "copy" }],
++    { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
++  );
++  return { sid: sf.source.id, aid: sf.assets[0]!.id };
++}
++
++async function scratch(name: string, data: Buffer | string): Promise<string> {
++  const dir = join(tmp, "in", Math.random().toString(36).slice(2));
++  await mkdir(dir, { recursive: true });
++  const p = join(dir, name);
++  await writeFile(p, data);
++  return p;
++}
++
++const ticketUrl = (pid: string, sid: string, aid: string) => `/projects/${pid}/sources/${sid}/assets/${aid}/media-ticket`;
++async function ticket(pid: string, sid: string, aid: string): Promise<MediaTicketResponse> {
++  const r = await call({ method: "POST", url: ticketUrl(pid, sid, aid) });
++  expect(r.status, r.body).toBe(200);
++  return r.json as MediaTicketResponse;
++}
++
++beforeEach(async () => {
++  tmp = await mkdtemp(join(tmpdir(), "ao-media-"));
++  deps = { ...deviceDeps(join(tmp, "config")), settleMs: 0 };
++  clock.ms = Date.parse("2026-11-11T10:00:00.000Z");
++  hostHeader = {};
++});
++afterEach(async () => {
++  await svc?.close();
++  await rm(tmp, { recursive: true, force: true });
++});
++
++describe("media tickets: issuing (R135 2)", () => {
++  beforeEach(() => start());
++
++  it("UI token only; 256 random bits in the path; one asset; a non-media asset, a locked project and an unknown asset are refused", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const audio = randomBytes(5000);
++    const { sid, aid } = await sourceWith(pid, await scratch("talk.mp3", audio));
++    const t = await ticket(pid, sid, aid);
++    expect(t.path).toMatch(MEDIA_TICKET_PATH);
++    expect(Buffer.from(t.path.slice("/media/".length), "base64url")).toHaveLength(32);
++    expect(t).toMatchObject({ mime: "audio/mpeg", size: 5000 });
++    expect(Date.parse(t.idleExpiresAt) - clock.ms).toBe(10 * 60_000);
++    expect(Date.parse(t.expiresAt) - clock.ms).toBe(8 * 3600_000);
++    const t2 = await ticket(pid, sid, aid);
++    expect(t2.path).not.toBe(t.path);
++
++    // No token, and the extension's token: refused.
++    expect((await call({ method: "POST", url: ticketUrl(pid, sid, aid), noAuth: true })).status).toBe(401);
++    const code = await call({ method: "POST", url: "/extension/pair" });
++    const c = await svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ code: code.json.code }) });
++    const ext = c.json().token as string;
++    const byExt = await call({ method: "POST", url: ticketUrl(pid, sid, aid), noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT } });
++    expect(byExt.status).toBe(403);
++
++    // A picture is not media.
++    const pic = await sourceWith(pid, await scratch("shot.png", tinyPng()), "image");
++    const notMedia = await call({ method: "POST", url: ticketUrl(pid, pic.sid, pic.aid) });
++    expect(notMedia.status).toBe(400);
++    expect(notMedia.json.error.code).toBe("VALIDATION");
++    expect((await call({ method: "POST", url: ticketUrl(pid, sid, "01ZZZZZZZZZZZZZZZZZZZZZZZZ") })).status).toBe(404);
++    expect((await call({ method: "POST", url: ticketUrl(pid, "01ZZZZZZZZZZZZZZZZZZZZZZZZ", aid) })).status).toBe(404);
++
++    // A locked project: refused.
++    const enc = await newProject(true, "Sealed");
++    const e = await sourceWith(enc, await scratch("talk.mp3", randomBytes(100)));
++    expect((await call({ method: "POST", url: `/projects/${enc}/lock` })).status).toBe(200);
++    const locked = await call({ method: "POST", url: ticketUrl(enc, e.sid, e.aid) });
++    expect(locked.status).toBe(423);
++    expect(locked.json.error.code).toBe("PROJECT_LOCKED");
++  });
++
++  it("at most 16 live: the 17th is refused until one ends (revoked or expired)", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const { sid, aid } = await sourceWith(pid, await scratch("talk.mp3", randomBytes(100)));
++    const live: MediaTicketResponse[] = [];
++    for (let i = 0; i < 16; i++) live.push(await ticket(pid, sid, aid));
++    const r17 = await call({ method: "POST", url: ticketUrl(pid, sid, aid) });
++    expect(r17.status).toBe(429);
++    expect(r17.json.error.code).toBe("RATE_LIMITED");
++    const rv = await call({ method: "POST", url: "/media-tickets/revoke", body: { path: live[0]!.path } });
++    expect(rv.json).toEqual({ revoked: true });
++    expect((await call({ method: "POST", url: "/media-tickets/revoke", body: { path: live[0]!.path } })).json).toEqual({ revoked: false });
++    expect((await media(live[0]!.path)).status).toBe(404);
++    await ticket(pid, sid, aid);
++    expect((await call({ method: "POST", url: ticketUrl(pid, sid, aid) })).status).toBe(429);
++    clock.ms += 10 * 60_000 + 1;
++    await ticket(pid, sid, aid); // the idle ones have ended
++    expect((await call({ method: "POST", url: "/media-tickets/revoke", body: { path: "/media/nope" } })).status).toBe(400);
++  });
++});
++
++describe("the media route (R135 2, 3)", () => {
++  beforeEach(() => start());
++
++  it("serves the whole file and every kind of range, with the headers R135 asks for", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const data = randomBytes(10_000);
++    const { sid, aid } = await sourceWith(pid, await scratch("clip.mp4", data), "video");
++    const { path } = await ticket(pid, sid, aid);
++
++    const whole = await media(path);
++    expect(whole.status).toBe(200);
++    expect(whole.raw.equals(data)).toBe(true);
++    expect(whole.headers).toMatchObject({
++      "content-type": "video/mp4",
++      "content-length": "10000",
++      "accept-ranges": "bytes",
++      "x-content-type-options": "nosniff",
++      "cache-control": "no-store",
++      "content-disposition": "inline",
++    });
++    expect(whole.headers["access-control-allow-origin"]).toBeUndefined();
++
++    const range = async (h: string) => media(path, { range: h });
++    const first = await range("bytes=0-99");
++    expect(first.status).toBe(206);
++    expect(first.raw.equals(data.subarray(0, 100))).toBe(true);
++    expect(first.headers).toMatchObject({ "content-range": "bytes 0-99/10000", "content-length": "100", "x-content-type-options": "nosniff", "cache-control": "no-store" });
++    const middle = await range("bytes=4000-4999");
++    expect(middle.raw.equals(data.subarray(4000, 5000))).toBe(true);
++    const open = await range("bytes=9990-");
++    expect(open.headers["content-range"]).toBe("bytes 9990-9999/10000");
++    expect(open.raw.equals(data.subarray(9990))).toBe(true);
++    const last = await range("bytes=9999-9999");
++    expect(last.status).toBe(206);
++    expect(last.raw.equals(data.subarray(9999))).toBe(true);
++    const suffix = await range("bytes=-500");
++    expect(suffix.headers["content-range"]).toBe("bytes 9500-9999/10000");
++    expect(suffix.raw.equals(data.subarray(9500))).toBe(true);
++    const past = await range("bytes=200-99999");
++    expect(past.headers["content-range"]).toBe("bytes 200-9999/10000");
++
++    for (const bad of ["bytes=10000-", "bytes=10000-10001", "bytes=-0"]) {
++      const r = await range(bad);
++      expect(r.status, bad).toBe(416);
++      expect(r.headers["content-range"]).toBe("bytes */10000");
++    }
++    // Several ranges: the Range header is ignored (RFC 9110 14.2 allows it) and the whole file sent.
++    const multi = await range("bytes=0-9,20-29");
++    expect(multi.status).toBe(200);
++    expect(multi.raw.equals(data)).toBe(true);
++    // A Range that is not understood is ignored too; so is one under If-Range (we give no validators).
++    expect((await range("items=0-5")).status).toBe(200);
++    expect((await media(path, { range: "bytes=0-5", "if-range": '"x"' })).status).toBe(200);
++
++    const head = await media(path, { range: "bytes=0-99" }, "HEAD");
++    expect(head.status).toBe(206);
++    expect(head.headers["content-length"]).toBe("100");
++    expect(head.raw.length).toBe(0);
++
++    // Other methods: no such route; the ticket still works afterwards.
++    expect((await svc.app.inject({ method: "POST", url: path })).statusCode).toBe(404);
++    expect((await svc.app.inject({ method: "DELETE", url: path })).statusCode).toBe(404);
++  });
++
++  it("an encrypted project is decrypted as it streams, across the format's chunk boundaries", async () => {
++    await openLibrary();
++    const pid = await newProject(true);
++    const data = randomBytes(2 * CHUNK + 777);
++    const { sid, aid } = await sourceWith(pid, await scratch("talk.m4a", data));
++    const { path } = await ticket(pid, sid, aid);
++    expect((await media(path)).raw.equals(data)).toBe(true);
++    const a = CHUNK - 10;
++    const b = 2 * CHUNK + 10;
++    const r = await media(path, { range: `bytes=${a}-${b}` });
++    expect(r.status).toBe(206);
++    expect(r.raw.equals(data.subarray(a, b + 1))).toBe(true);
++    expect((await media(path, { range: "bytes=-1" })).raw.equals(data.subarray(data.length - 1))).toBe(true);
++  });
++
++  it("a ticket reads only its own asset; a query string, a wrong form and an unknown ticket are refused", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const A = randomBytes(1000);
++    const B = randomBytes(1000);
++    const a = await sourceWith(pid, await scratch("a.mp3", A));
++    const b = await sourceWith(pid, await scratch("b.mp3", B));
++    const ta = await ticket(pid, a.sid, a.aid);
++    const tb = await ticket(pid, b.sid, b.aid);
++    expect((await media(ta.path)).raw.equals(A)).toBe(true);
++    expect((await media(tb.path)).raw.equals(B)).toBe(true);
++    // Nothing in the address can name another asset: the ticket alone decides.
++    expect((await media(`${ta.path}/../${b.aid}`)).status).toBe(404);
++    expect((await media(`${ta.path}?asset=${b.aid}`)).status).toBe(400);
++    expect((await media(`/media/${"A".repeat(43)}`)).status).toBe(404);
++    expect((await media("/media/short")).status).toBe(404);
++    const unknown = await media(`/media/${"B".repeat(43)}`);
++    expect(Object.keys(unknown.json)).toEqual(["error"]);
++    // The UI token is no substitute for a ticket, and a ticket is no substitute for the token.
++    expect((await call({ url: `/media/${"C".repeat(43)}` })).status).toBe(404);
++    expect((await call({ url: "/projects", noAuth: true, headers: { authorization: `Bearer ${ta.path.slice(7)}` } })).status).toBe(401);
++  });
++
++  it("expires after 10 idle minutes, and after 8 hours however much it is used", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
++    const idle = await ticket(pid, sid, aid);
++    clock.ms += 10 * 60_000 - 1;
++    expect((await media(idle.path)).status).toBe(200); // used: the idle clock starts again
++    clock.ms += 10 * 60_000 - 1;
++    expect((await media(idle.path)).status).toBe(200);
++    clock.ms += 10 * 60_000 + 1;
++    expect((await media(idle.path)).status).toBe(404);
++
++    const busy = await ticket(pid, sid, aid);
++    const issued = clock.ms;
++    while (clock.ms - issued < 8 * 3600_000 - 5 * 60_000) {
++      clock.ms += 5 * 60_000;
++      expect((await media(busy.path, { range: "bytes=0-0" })).status).toBe(206);
++    }
++    clock.ms = issued + 8 * 3600_000 + 1;
++    expect((await media(busy.path)).status).toBe(404);
++  });
++
++  it("revoked when its project is locked, and refused while the project is locked", async () => {
++    await openLibrary();
++    const pid = await newProject(true);
++    const other = await newProject(false, "Open");
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
++    const o = await sourceWith(other, await scratch("b.mp3", randomBytes(100)));
++    const t = await ticket(pid, sid, aid);
++    const keep = await ticket(other, o.sid, o.aid);
++    expect((await media(t.path)).status).toBe(200);
++    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
++    expect((await media(t.path)).status).toBe(404);
++    expect((await media(keep.path)).status).toBe(200); // another project's ticket lives on
++    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
++    expect((await media(t.path)).status).toBe(404); // unlocking again does not bring it back
++    // Locked by any other way than the route: the media route checks too.
++    const t2 = await ticket(pid, sid, aid);
++    svc.state.session!.repo.lockProject(pid);
++    const r = await media(t2.path);
++    expect(r.status).toBe(423);
++    expect((await media(t2.path)).status).toBe(404); // and the ticket is gone
++  });
++
++  it("revoked when the library is closed or another is opened, and when the service stops", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
++    const t = await ticket(pid, sid, aid);
++    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
++    expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);
++    expect((await media(t.path)).status).toBe(404);
++    const t2 = await ticket(pid, sid, aid);
++    expect(svc.state.media.live()).toBe(1);
++    await svc.close();
++    expect(svc.state.media.live()).toBe(0);
++  });
++
++  it("revoked when a library move starts", async () => {
++    await openLibrary();
++    const pid = await newProject();
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
++    const t = await ticket(pid, sid, aid);
++    const s = svc.state.session!;
++    await svc.state.quiesce(s); // what a move does before copying
++    expect((await media(t.path)).status).toBe(404);
++  });
++});
++
++describe("the media route: who may load it", () => {
++  beforeEach(() => start());
++
++  async function oneTicket(): Promise<string> {
++    await openLibrary();
++    const pid = await newProject();
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
++    return (await ticket(pid, sid, aid)).path;
++  }
++
++  it("a media element of the shell page (no Origin, no-cors, cross-site, dest audio/video) is served", async () => {
++    const path = await oneTicket();
++    for (const dest of ["audio", "video"]) {
++      const r = await media(path, { "sec-fetch-site": "cross-site", "sec-fetch-mode": "no-cors", "sec-fetch-dest": dest, referer: "http://tauri.localhost/sources/1", range: "bytes=0-" });
++      expect(r.status, dest).toBe(206);
++    }
++    // WebKit's custom scheme as the referrer, and a CORS-mode media element (crossorigin) from the shell.
++    expect((await media(path, { "sec-fetch-mode": "no-cors", "sec-fetch-dest": "video", referer: "tauri://localhost/x" })).status).toBe(200);
++    const cors = await media(path, { origin: "http://tauri.localhost", "sec-fetch-mode": "cors", "sec-fetch-dest": "video" });
++    expect(cors.status).toBe(200);
++    expect(cors.headers["access-control-allow-origin"]).toBe("http://tauri.localhost");
++    // A client that sends no fetch metadata at all (older web views, the platform media stack).
++    expect((await media(path)).status).toBe(200);
++  });
++
++  it("any other web origin, a navigation, a document or frame load, and a foreign referrer are refused", async () => {
++    const path = await oneTicket();
++    const refused: Array<Record<string, string>> = [
++      { origin: "https://evil.example" },
++      { origin: EXT },
++      { origin: "null" },
++      { "sec-fetch-mode": "cors" }, // a CORS request always carries an Origin; without one it is not a browser's
++      { "sec-fetch-mode": "navigate", "sec-fetch-dest": "document", "sec-fetch-site": "none", "sec-fetch-user": "?1" },
++      { "sec-fetch-dest": "document" },
++      { "sec-fetch-dest": "iframe" },
++      { "sec-fetch-dest": "embed" },
++      { "sec-fetch-dest": "object" },
++      { "sec-fetch-dest": "script" },
++      { "sec-fetch-site": "none" },
++      { "sec-fetch-user": "?1" },
++      { referer: "https://evil.example/page" },
++    ];
++    for (const h of refused) {
++      const r = await media(path, h);
++      expect(r.status, JSON.stringify(h)).toBe(403);
++      expect(r.headers["access-control-allow-origin"]).toBeUndefined();
++    }
++    expect((await media(path)).status).toBe(200); // still usable by the shell
++  });
++});
++
++describe("the media route: real listener", () => {
++  /** A GET on the real socket; `onFirst` may abort after the first chunk. */
++  function get(port: number, path: string, headers: Record<string, string>, opts: { abortAfterFirst?: boolean; sink?: (chunk: Buffer) => void | Promise<void> } = {}): Promise<{ status: number; headers: Record<string, unknown>; bytes: number }> {
++    return new Promise((resolve, reject) => {
++      const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}`, ...headers } }, (res) => {
++        let bytes = 0;
++        res.on("data", (d: Buffer) => {
++          bytes += d.length;
++          const wait = opts.sink?.(d);
++          if (wait) {
++            // The response waits (paused) while the test measures.
++            res.pause();
++            void wait.then(() => res.resume());
++          }
++          if (opts.abortAfterFirst) {
++            req.destroy();
++            resolve({ status: res.statusCode ?? 0, headers: res.headers, bytes });
++          }
++        });
++        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, bytes }));
++        res.on("error", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, bytes }));
++      });
++      req.on("error", (e) => (opts.abortAfterFirst ? undefined : reject(e)));
++      req.end();
++    });
++  }
++
++  const openFds = async (): Promise<number> => (process.platform === "linux" ? (await readdir("/proc/self/fd")).length : 0);
++
++  it("the Host check is kept: a foreign Host is refused even with a valid ticket", async () => {
++    await start();
++    const port = await svc.listen(0);
++    hostHeader = { host: `127.0.0.1:${port}` };
++    await openLibrary();
++    const pid = await newProject();
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(100)));
++    const { path } = await ticket(pid, sid, aid);
++    expect((await get(port, path, {})).status).toBe(200);
++    // Path only: even an empty query string is refused (inject would drop it; a socket keeps it).
++    expect((await get(port, `${path}?`, {})).status).toBe(400);
++    expect((await get(port, path, { host: `evil.example:${port}` })).status).toBe(403);
++    expect((await get(port, path, { host: `127.0.0.1:${port + 1}` })).status).toBe(403);
++  });
++
++  it("an aborted request releases its file handle", async () => {
++    await start();
++    const port = await svc.listen(0);
++    hostHeader = { host: `127.0.0.1:${port}` };
++    await openLibrary();
++    const pid = await newProject(true);
++    const { sid, aid } = await sourceWith(pid, await scratch("big.mp4", randomBytes(8 * CHUNK)), "video");
++    const { path } = await ticket(pid, sid, aid);
++    const before = await openFds();
++    const r = await get(port, path, {}, { abortAfterFirst: true });
++    expect(r.status).toBe(200);
++    for (let i = 0; i < 100 && (svc.state.media.activeStreams() > 0 || (await openFds()) > before); i++) await new Promise((res) => setTimeout(res, 20));
++    expect(svc.state.media.activeStreams()).toBe(0);
++    if (process.platform === "linux") expect(await openFds()).toBeLessThanOrEqual(before);
++    // The ticket still works after an aborted read (a seek aborts the previous request).
++    expect((await get(port, path, { range: "bytes=0-9" })).bytes).toBe(10);
++  });
++
++  it("revoking a ticket ends a stream in progress (lock)", async () => {
++    await start();
++    const port = await svc.listen(0);
++    hostHeader = { host: `127.0.0.1:${port}` };
++    await openLibrary();
++    const pid = await newProject(true);
++    const { sid, aid } = await sourceWith(pid, await scratch("big.mp4", randomBytes(16 * CHUNK)), "video");
++    const { path } = await ticket(pid, sid, aid);
++    let got = 0;
++    let locked = false;
++    const done = new Promise<number>((resolve) => {
++      const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}` } }, (res) => {
++        res.on("data", (d: Buffer) => {
++          got += d.length;
++          if (!locked) {
++            locked = true;
++            res.pause();
++            void call({ method: "POST", url: `/projects/${pid}/lock` }).then(() => res.resume());
++          }
++        });
++        res.on("end", () => resolve(got));
++        res.on("error", () => resolve(got));
++        res.on("aborted", () => resolve(got));
++      });
++      req.on("error", () => resolve(got));
++      req.end();
++    });
++    const total = await done;
++    expect(total).toBeLessThan(16 * CHUNK);
++    for (let i = 0; i < 100 && svc.state.media.activeStreams() > 0; i++) await new Promise((res) => setTimeout(res, 20));
++    expect(svc.state.media.activeStreams()).toBe(0);
++  });
++
++  it("a 50 MB encrypted recording read by ranges and whole, with a ceiling on memory growth", async () => {
++    await start();
++    const port = await svc.listen(0);
++    hostHeader = { host: `127.0.0.1:${port}` };
++    await openLibrary();
++    const pid = await newProject(true);
++    // Written in pieces so the test itself never holds 50 MB.
++    const file = join(tmp, "in", "long.mp4");
++    await mkdir(join(tmp, "in"), { recursive: true });
++    const want = createHash("sha256");
++    await new Promise<void>((resolve, reject) => {
++      const w = createWriteStream(file);
++      w.on("error", reject);
++      let i = 0;
++      const more = () => {
++        while (i < 50) {
++          const piece = randomBytes(CHUNK);
++          want.update(piece);
++          i++;
++          if (!w.write(piece)) return void w.once("drain", more);
++        }
++        w.end(resolve);
++      };
++      more();
++    });
++    const expected = want.digest("hex");
++    const { sid, aid } = await sourceWith(pid, file, "video");
++    const { path, size } = await ticket(pid, sid, aid);
++    expect(size).toBe(50 * CHUNK);
++
++    // A collector we can run on demand, so "held in memory" is measured, not GC timing.
++    setFlagsFromString("--expose-gc");
++    const gc = runInNewContext("gc") as () => void;
++    const used = () => {
++      const m = process.memoryUsage();
++      return m.heapUsed + m.arrayBuffers;
++    };
++    /** Runs the collector until its deferred frees have happened too. */
++    const settle = async () => {
++      for (let i = 0; i < 3; i++) {
++        gc();
++        await new Promise((r) => setImmediate(r));
++      }
++    };
++    // Warm up first (code compiled, pools made), so the baseline is the steady state.
++    for (const r of ["bytes=0-1048575", "bytes=-1048576"]) await get(port, path, { range: r });
++    await settle();
++    const base = used();
++    const retained: number[] = [];
++    /** What is live now beyond the baseline. */
++    const measure = async () => {
++      await settle();
++      retained.push(used() - base);
++    };
++    // By ranges, as a player seeking through it would; halfway through each, what is still held
++    // after a collection.
++    const h = createHash("sha256");
++    const step = 7 * CHUNK + 12345; // not aligned to the format's chunks
++    for (let at = 0; at < size; at += step) {
++      const end = Math.min(size, at + step) - 1;
++      let seen = 0;
++      let measured = false;
++      const r = await get(port, path, { range: `bytes=${at}-${end}` }, {
++        sink: (c) => {
++          h.update(c);
++          seen += c.length;
++          if (!measured && seen >= (end - at + 1) / 2) {
++            measured = true;
++            return measure();
++          }
++          return undefined;
++        },
++      });
++      expect(r.status).toBe(206);
++      expect(r.bytes).toBe(end - at + 1);
++    }
++    expect(h.digest("hex")).toBe(expected);
++    // And whole, in one response, measured halfway too.
++    const h2 = createHash("sha256");
++    let seen = 0;
++    let measured = false;
++    const all = await get(port, path, {}, {
++      sink: (c) => {
++        h2.update(c);
++        seen += c.length;
++        if (!measured && seen >= 25 * CHUNK) {
++          measured = true;
++          return measure();
++        }
++        return undefined;
++      },
++    });
++    expect(all.bytes).toBe(size);
++    expect(h2.digest("hex")).toBe(expected);
++    // The file never sits in memory: in the middle of every response (paused there while measured),
++    // under 16 MB more is live than before (measured about 8: the decrypted-chunk cache of the open
++    // file, stream and socket buffers), against a 50 MB file read whole. Measured after collections:
++    // the peak of uncollected garbage depends on when the collector runs, not on what is held.
++    expect(retained).toHaveLength(9);
++    for (const r of retained) expect(r).toBeLessThan(16 * CHUNK);
++  });
++});
++
++describe("the ticket never reaches a log line or an error (R135 3)", () => {
++  it("issuing, using, ranges, refusals, unknown tickets and revocation, at trace level", async () => {
++    await start();
++    await openLibrary();
++    const pid = await newProject(true);
++    const { sid, aid } = await sourceWith(pid, await scratch("a.mp3", randomBytes(3000)));
++    const t = await ticket(pid, sid, aid);
++    const secret = t.path.slice("/media/".length);
++    const bodies: string[] = [];
++    for (const r of [
++      await media(t.path),
++      await media(t.path, { range: "bytes=0-9" }),
++      await media(t.path, { range: "bytes=99999-" }),
++      await media(t.path, { origin: "https://evil.example" }),
++      await media(`${t.path}?x=1`),
++      await media(`${t.path}/x`),
++      await media(`${t.path}%zz`),
++      // The same address spelled differently still never reaches a log line.
++      await media(`/%6Dedia/${secret}`),
++      await media(`//media/${secret}`),
++      await media(`/MEDIA/${secret}`),
++      await media(t.path, {}, "HEAD"),
++      await call({ method: "POST", url: t.path }),
++      await call({ method: "POST", url: "/media-tickets/revoke", body: { path: t.path } }),
++      await media(t.path),
++    ]) bodies.push(r.body);
++    expect(logs.length).toBeGreaterThan(0);
++    expect(logs).toContain("/media/[redacted]");
++    expect(logs).not.toContain(secret);
++    expect(logs).not.toContain(secret.slice(0, 16));
++    for (const b of bodies) expect(b).not.toContain(secret);
++  });
++});
++
++describe("pictures (R135 1)", () => {
++  const contentUrl = (pid: string, sid: string, aid: string) => `/projects/${pid}/sources/${sid}/assets/${aid}/content`;
++
++  it("UI token only; raster pictures only; nosniff, no-store; decrypted in encrypted projects", async () => {
++    await start();
++    await openLibrary();
++    for (const encrypted of [false, true]) {
++      const pid = await newProject(encrypted, encrypted ? "Sealed" : "Open");
++      const png = tinyPng();
++      const { sid, aid } = await sourceWith(pid, await scratch("shot.png", png), "image");
++      const r = await call({ url: contentUrl(pid, sid, aid) });
++      expect(r.status, r.body).toBe(200);
++      expect(r.raw.equals(png)).toBe(true);
++      expect(r.headers).toMatchObject({ "content-type": "image/png", "content-length": String(png.length), "x-content-type-options": "nosniff", "cache-control": "no-store" });
++      expect((await call({ url: contentUrl(pid, sid, aid), noAuth: true })).status).toBe(401);
++      const audio = await sourceWith(pid, await scratch("a.mp3", randomBytes(10)));
++      expect((await call({ url: contentUrl(pid, audio.sid, audio.aid) })).status).toBe(400);
++      const svg = await sourceWith(pid, await scratch("x.svg", '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'), "image");
++      expect((await call({ url: contentUrl(pid, svg.sid, svg.aid) })).status).toBe(400);
++      if (encrypted) {
++        await call({ method: "POST", url: `/projects/${pid}/lock` });
++        expect((await call({ url: contentUrl(pid, sid, aid) })).status).toBe(423);
++      }
++    }
++    // The extension's token: refused.
++    const code = await call({ method: "POST", url: "/extension/pair" });
++    const c = await svc.app.inject({ method: "POST", url: "/extension/pair/confirm", headers: { origin: EXT, "content-type": "application/json" }, payload: JSON.stringify({ code: code.json.code }) });
++    const pid = await newProject(false, "Third");
++    const { sid, aid } = await sourceWith(pid, await scratch("shot.png", tinyPng()), "image");
++    expect((await call({ url: contentUrl(pid, sid, aid), noAuth: true, headers: { authorization: `Bearer ${c.json().token}`, origin: EXT } })).status).toBe(403);
++  });
++
++  it("a picture over the size limit is refused before anything is read", async () => {
++    await start({ pictureMaxBytes: 1000 });
++    await openLibrary();
++    const pid = await newProject();
++    const big = Buffer.concat([tinyPng(), randomBytes(2000)]);
++    const { sid, aid } = await sourceWith(pid, await scratch("big.png", big), "image");
++    const r = await call({ url: contentUrl(pid, sid, aid) });
++    expect(r.status).toBe(413);
++    expect(r.json.error.code).toBe("PAYLOAD_TOO_LARGE");
++  });
++});
+diff --git a/apps/library-service/src/media.ts b/apps/library-service/src/media.ts
+new file mode 100644
+index 0000000..dae486d
+--- /dev/null
++++ b/apps/library-service/src/media.ts
+@@ -0,0 +1,381 @@
++/**
++ * Pictures and audio/video for the UI (Task 34a, R135).
++ *
++ * Pictures: `GET /projects/:id/sources/:sid/assets/:aid/content`, UI token, raster types only, at
++ * most PICTURE_MAX_BYTES (48 MiB: a full-page screenshot of a very long page, which browser capture
++ * accepts up to 32 MB of request, fits with room to spare); the UI shows it as a blob URL.
++ *
++ * Audio and video: a media element cannot send an Authorization header, so the UI asks
++ * (`POST …/assets/:aid/media-ticket`, UI token only) for a ticket: 256 random bits, kept only in
++ * this process's memory (by its SHA-256, so the map holds no usable ticket), naming exactly one
++ * asset of one project of the library open now. `GET`/`HEAD /media/<ticket>` serves that asset with
++ * range requests, decrypting as it streams (never holding the file in memory). A ticket ends after
++ * 10 minutes without a request in progress, 8 hours after it was issued whatever happens, when its
++ * project is locked, when the library is closed or moved, and when the service stops; at most 16
++ * are live (the 17th is refused, 429, until one ends: evicting one silently would stop a recording
++ * that is playing). Ending a ticket also ends its streams in progress.
++ *
++ * Who may load `/media/<ticket>` (decided here, checked in server.ts before any token logic):
++ *  - Host must be ours (as for every route).
++ *  - No query string at all (R135: path only).
++ *  - Origin, when sent, must be the desktop shell's (`tauri://localhost`, `http://tauri.localhost`);
++ *    a media element without `crossorigin` sends none (a no-cors GET), one with it sends the
++ *    shell's. A paired extension's origin is refused here (it has no business with recordings).
++ *  - Fetch metadata, when sent: a navigation (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-User`,
++ *    `Sec-Fetch-Site: none`) is refused, so a ticket address never opens as a page; so is any
++ *    destination but audio, video, track or empty (no document, frame, embed, object, script…).
++ *    `Sec-Fetch-Mode: cors` without an Origin is refused (no browser sends that).
++ *    `Sec-Fetch-Site` cannot tell the shell from another site (both are cross-site to 127.0.0.1),
++ *    so it is not used to allow anything.
++ *  - Referer, when sent, must be from the shell's origin: a page elsewhere that embeds a leaked
++ *    ticket is refused unless it also suppresses its referrer. This is defence in depth only; the
++ *    ticket is the credential (R135's stated cost).
++ *  - Clients that send no fetch metadata (non-browser programs, older web views, the platform's
++ *    media stack) are served on the ticket alone.
++ * The ticket never appears in a log line (server.ts redacts `/media/…` in the request serializer)
++ * or in an error message (every message here is fixed text).
++ */
++import { createHash, randomBytes } from "node:crypto";
++import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
++import { isMediaMime, isPictureMime, openAssetContent, type AssetContent } from "@ao/library";
++import {
++  MEDIA_TICKETS_MAX,
++  MEDIA_TICKET_IDLE_MS,
++  MEDIA_TICKET_LIFETIME_MS,
++  PICTURE_MAX_BYTES,
++  isMediaTicketPath,
++  type MediaTicketResponse,
++  type MediaTicketRevokeResponse,
++} from "@ao/shared";
++import { SHELL_ORIGINS } from "./auth.js";
++import { ApiError, badRequest, notFound } from "./errors.js";
++import { bodyOf, paramsOf, projectParam, str, type Ctx } from "./routes/util.js";
++
++export { PICTURE_MAX_BYTES };
++
++interface Stream {
++  destroy(err?: Error): void;
++}
++
++interface Ticket {
++  /** The library open when it was issued (a ticket never outlives it). */
++  lib: object;
++  projectId: string;
++  sourceId: string;
++  assetId: string;
++  issuedAt: number;
++  /** When the last request started or ended. */
++  lastUsed: number;
++  /** Responses streaming now. */
++  streams: Set<Stream>;
++}
++
++const digest = (ticket: string) => createHash("sha256").update(ticket, "utf8").digest("hex");
++
++/** The live media tickets (memory only). */
++export class MediaTickets {
++  private readonly tickets = new Map<string, Ticket>();
++  private timer: ReturnType<typeof setInterval> | undefined;
++
++  constructor(private readonly now: () => number) {}
++
++  /** Live tickets (after ending the expired ones). */
++  live(): number {
++    this.sweep();
++    return this.tickets.size;
++  }
++
++  /** Responses streaming now, over all tickets. */
++  activeStreams(): number {
++    let n = 0;
++    for (const t of this.tickets.values()) n += t.streams.size;
++    return n + this.orphans.size;
++  }
++
++  /** Streams whose ticket ended while they ran, until they have closed. */
++  private readonly orphans = new Set<Stream>();
++
++  issue(entry: Omit<Ticket, "issuedAt" | "lastUsed" | "streams">): { ticket: string; issuedAt: number } {
++    this.sweep();
++    if (this.tickets.size >= MEDIA_TICKETS_MAX) {
++      throw new ApiError(429, "RATE_LIMITED", "Too many recordings are open at once. Close one, then try again.");
++    }
++    const ticket = randomBytes(32).toString("base64url");
++    const at = this.now();
++    this.tickets.set(digest(ticket), { ...entry, issuedAt: at, lastUsed: at, streams: new Set() });
++    this.startTimer();
++    return { ticket, issuedAt: at };
++  }
++
++  /** The live ticket, its use recorded; undefined when unknown or ended. */
++  use(ticket: string): Ticket | undefined {
++    this.sweep();
++    const t = this.tickets.get(digest(ticket));
++    if (t) t.lastUsed = this.now();
++    return t;
++  }
++
++  /** Tracks a response of `t` until `done` is called. */
++  track(t: Ticket, s: Stream): () => void {
++    t.streams.add(s);
++    return () => {
++      t.streams.delete(s);
++      this.orphans.delete(s);
++      t.lastUsed = this.now();
++    };
++  }
++
++  revoke(ticket: string): boolean {
++    const key = digest(ticket);
++    const t = this.tickets.get(key);
++    if (!t) return false;
++    this.end(key, t);
++    return true;
++  }
++
++  revokeProject(projectId: string): void {
++    for (const [k, t] of this.tickets) if (t.projectId === projectId) this.end(k, t);
++  }
++
++  revokeAll(): void {
++    for (const [k, t] of this.tickets) this.end(k, t);
++    this.stopTimer();
++  }
++
++  /** Ends tickets past their idle time (none in progress) or their lifetime. */
++  sweep(): void {
++    const now = this.now();
++    for (const [k, t] of this.tickets) {
++      const idle = t.streams.size === 0 && now - t.lastUsed >= MEDIA_TICKET_IDLE_MS;
++      if (idle || now - t.issuedAt >= MEDIA_TICKET_LIFETIME_MS) this.end(k, t);
++    }
++    if (this.tickets.size === 0) this.stopTimer();
++  }
++
++  expiry(t: { issuedAt: number; lastUsed: number }): { idleExpiresAt: string; expiresAt: string } {
++    const end = t.issuedAt + MEDIA_TICKET_LIFETIME_MS;
++    return { idleExpiresAt: new Date(Math.min(end, t.lastUsed + MEDIA_TICKET_IDLE_MS)).toISOString(), expiresAt: new Date(end).toISOString() };
++  }
++
++  private end(key: string, t: Ticket): void {
++    this.tickets.delete(key);
++    for (const s of t.streams) {
++      this.orphans.add(s);
++      s.destroy(new Error("the media address has ended"));
++    }
++    t.streams.clear();
++  }
++
++  /** A sweep each minute, so a stream past the 8-hour limit is ended even if no request comes. */
++  private startTimer(): void {
++    if (this.timer) return;
++    this.timer = setInterval(() => this.sweep(), 60_000);
++    this.timer.unref?.();
++  }
++
++  private stopTimer(): void {
++    if (this.timer) clearInterval(this.timer);
++    this.timer = undefined;
++  }
++}
++
++/** Fetch-metadata destinations a media element (or a plain fetch of it) uses. */
++const MEDIA_DESTS = new Set(["audio", "video", "track", "empty"]);
++
++const header = (req: FastifyRequest, name: string): string | undefined => {
++  const v = req.headers[name];
++  return Array.isArray(v) ? v.join(",") : v;
++};
++
++function originOf(url: string): string | undefined {
++  try {
++    const u = new URL(url);
++    return u.protocol === "tauri:" ? `tauri://${u.host}` : u.origin;
++  } catch {
++    return undefined;
++  }
++}
++
++/**
++ * Whether a `/media/…` request may be answered at all (before the ticket is looked up), and the
++ * refusal if not. Host is checked by the caller.
++ */
++export function mediaRequestRefusal(req: FastifyRequest): ApiError | undefined {
++  if (req.method !== "GET" && req.method !== "HEAD") return new ApiError(404, "NOT_FOUND", "There is no such route.");
++  if (req.url.includes("?")) return badRequest("A media address carries nothing after its path.");
++  const forbidden = (why: string) => new ApiError(403, "FORBIDDEN", why);
++  const origin = header(req, "origin");
++  if (origin !== undefined && !SHELL_ORIGINS.has(origin)) return forbidden("Requests from this origin are not allowed.");
++  const mode = header(req, "sec-fetch-mode");
++  const dest = header(req, "sec-fetch-dest");
++  const site = header(req, "sec-fetch-site");
++  if (mode === "navigate" || mode === "nested-navigate" || header(req, "sec-fetch-user") !== undefined || site === "none") {
++    return forbidden("A media address is played by the app, not opened as a page.");
++  }
++  if (mode === "cors" && origin === undefined) return forbidden("Requests from this origin are not allowed.");
++  if (dest !== undefined && !MEDIA_DESTS.has(dest)) return forbidden("A media address is played by the app, not opened as a page.");
++  const referer = header(req, "referer");
++  if (referer !== undefined) {
++    const from = originOf(referer);
++    if (!from || !SHELL_ORIGINS.has(from)) return forbidden("Requests from this page are not allowed.");
++  }
++  return undefined;
++}
++
++/**
++ * The byte range to send for a `Range` header (RFC 9110 14): undefined → the whole file (200).
++ * One range of the `bytes` unit is honoured; several ranges, another unit, a malformed header or
++ * an If-Range (we give no validators, so it never matches) mean the header is ignored, which
++ * RFC 9110 allows, and the whole file is streamed. "unsatisfiable" → 416.
++ */
++export function parseRange(range: string | undefined, ifRange: string | undefined, size: number): { start: number; end: number } | "unsatisfiable" | undefined {
++  if (range === undefined || ifRange !== undefined) return undefined;
++  const m = /^bytes=\s*(\d*)\s*-\s*(\d*)\s*$/.exec(range.trim());
++  if (!m) return undefined; // several ranges (a comma), another unit, or not understood
++  const [, a = "", b = ""] = m;
++  if (a === "" && b === "") return undefined;
++  if (a === "") {
++    const n = Number(b);
++    if (!Number.isSafeInteger(n) || n === 0 || size === 0) return "unsatisfiable";
++    return { start: Math.max(0, size - n), end: size - 1 };
++  }
++  const start = Number(a);
++  if (!Number.isSafeInteger(start)) return "unsatisfiable";
++  if (b !== "" && Number(b) < start) return undefined; // invalid: ignored
++  if (start >= size) return "unsatisfiable";
++  const end = b === "" ? size - 1 : Math.min(size - 1, Number(b));
++  return { start, end };
++}
++
++/** Headers every response with a file's bytes carries (R135 3). */
++function contentHeaders(reply: FastifyReply, mime: string, length: number): void {
++  reply
++    .header("Content-Type", mime)
++    .header("Content-Length", String(length))
++    .header("X-Content-Type-Options", "nosniff")
++    .header("Cache-Control", "no-store")
++    .header("Content-Disposition", "inline")
++    // If it were ever opened as a document anyway: nothing in it may run or load.
++    .header("Content-Security-Policy", "default-src 'none'; sandbox");
++}
++
++export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes?: number }): void {
++  const { state } = ctx;
++  const tickets = state.media;
++  const pictureMax = ctx.pictureMaxBytes ?? PICTURE_MAX_BYTES;
++
++  const assetParams = (req: FastifyRequest) => {
++    const projectId = projectParam(ctx, req);
++    const { sid = "", aid = "" } = paramsOf(req);
++    return { projectId, sid, aid };
++  };
++
++  // ---- pictures ----
++  app.get("/projects/:id/sources/:sid/assets/:aid/content", async (req, reply) => {
++    if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
++    const s = state.requireSession();
++    const { projectId, sid, aid } = assetParams(req);
++    if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
++    const c = await openAssetContent(s.repo, projectId, sid, aid, (a) => isPictureMime(a.mime));
++    if (c.size > pictureMax) {
++      await c.close();
++      throw new ApiError(413, "PAYLOAD_TOO_LARGE", "This picture is too large to show.");
++    }
++    return sendContent(reply, c, c.size === 0 ? undefined : { start: 0, end: c.size - 1 }, 200, () => () => {});
++  });
++
++  // ---- media tickets ----
++  app.post("/projects/:id/sources/:sid/assets/:aid/media-ticket", async (req): Promise<MediaTicketResponse> => {
++    if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
++    const s = state.requireSession();
++    state.assertNotMoving();
++    const { projectId, sid, aid } = assetParams(req);
++    if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
++    // Opened once to check it (type, lock, file present) and to give its size; then released.
++    const c = await openAssetContent(s.repo, projectId, sid, aid, (a) => isMediaMime(a.mime));
++    await c.close();
++    const { ticket, issuedAt } = tickets.issue({ lib: s.lib, projectId, sourceId: sid, assetId: aid });
++    return { path: `/media/${ticket}`, mime: c.mime, size: c.size, ...tickets.expiry({ issuedAt, lastUsed: issuedAt }) };
++  });
++
++  app.post("/media-tickets/revoke", async (req): Promise<MediaTicketRevokeResponse> => {
++    if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
++    const path = str(bodyOf(req), "path", 128);
++    if (!isMediaTicketPath(path)) throw badRequest('"path" must be a media address (/media/…).');
++    return { revoked: tickets.revoke(path.slice("/media/".length)) };
++  });
++
++  // ---- the media route (no token: the ticket is the credential; checks in server.ts) ----
++  const ended = () => new ApiError(404, "NOT_FOUND", "This media address has ended. Open the recording again.");
++  const serve = async (req: FastifyRequest, reply: FastifyReply) => {
++    const ticket = paramsOf(req).ticket ?? "";
++    if (!isMediaTicketPath(`/media/${ticket}`)) throw ended();
++    const t = tickets.use(ticket);
++    if (!t) throw ended();
++    const s = state.session;
++    if (!s || s.lib !== t.lib || state.moving) {
++      tickets.revoke(ticket);
++      throw ended();
++    }
++    if (!s.repo.listProjects().some((p) => p.id === t.projectId)) {
++      tickets.revoke(ticket);
++      throw ended();
++    }
++    if (!s.repo.isUnlocked(t.projectId)) {
++      // Locked some other way than the lock route: refused, and the ticket ends.
++      tickets.revoke(ticket);
++      throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
++    }
++    let c: AssetContent;
++    try {
++      c = await openAssetContent(s.repo, t.projectId, t.sourceId, t.assetId, (a) => isMediaMime(a.mime));
++    } catch (err) {
++      tickets.revoke(ticket);
++      throw err;
++    }
++    const r = parseRange(header(req, "range"), header(req, "if-range"), c.size);
++    reply.header("Accept-Ranges", "bytes");
++    if (r === "unsatisfiable") {
++      await c.close();
++      return reply.status(416).header("Content-Range", `bytes */${c.size}`).header("Cache-Control", "no-store").header("X-Content-Type-Options", "nosniff").send();
++    }
++    const range = r ?? (c.size === 0 ? undefined : { start: 0, end: c.size - 1 });
++    if (r) reply.header("Content-Range", `bytes ${r.start}-${r.end}/${c.size}`);
++    if (req.method === "HEAD") {
++      contentHeaders(reply, c.mime, range ? range.end - range.start + 1 : 0);
++      await c.close();
++      return reply.status(r ? 206 : 200).send();
++    }
++    return sendContent(reply, c, range, r ? 206 : 200, (stream) => tickets.track(t, stream));
++  };
++  app.route({ method: "GET", url: "/media/:ticket", exposeHeadRoute: false, handler: serve });
++  app.route({ method: "HEAD", url: "/media/:ticket", handler: serve });
++}
++
++/**
++ * Streams `range` of `c` (nothing for an empty file); the file is released when the response ends,
++ * however it ends (finished, aborted by the client, or destroyed by a revocation).
++ */
++function sendContent(reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, track: (s: Stream) => () => void): FastifyReply {
++  const length = range ? range.end - range.start + 1 : 0;
++  contentHeaders(reply, c.mime, length);
++  reply.status(status);
++  if (!range) {
++    void c.close();
++    return reply.send(Buffer.alloc(0));
++  }
++  const body = c.range(range.start, range.end);
++  // Errors reading (a revoked ticket, a damaged file) end the response; their text names no path or ticket.
++  const done = track(body);
++  let released = false;
++  const release = () => {
++    if (released) return;
++    released = true;
++    done();
++    if (!body.destroyed) body.destroy();
++    void c.close();
++  };
++  reply.raw.once("close", release);
++  body.once("error", release);
++  return reply.send(body);
++}
+diff --git a/apps/library-service/src/records.test.ts b/apps/library-service/src/records.test.ts
+new file mode 100644
+index 0000000..ec56c4f
+--- /dev/null
++++ b/apps/library-service/src/records.test.ts
+@@ -0,0 +1,154 @@
++/**
++ * What the transcript and verification screens read (Task 34a c, d): transcript versions as
++ * segments (machine and human-edited), and source records carrying each field's evidence and
++ * verification in a shape the UI renders without knowing the library's internals, with no
++ * absolute path in them (R132).
++ */
++import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { Writable } from "node:stream";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { deviceDeps, type Deps } from "@ao/library";
++import type { FieldReview, SourceRecordExtras, TranscriptListResponse, TranscriptResponse } from "@ao/shared";
++import { buildPdf } from "../../../tests/fixtures/generate.mjs";
++import { createService, type LibraryService } from "./server.js";
++
++const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
++const auth = { authorization: `Bearer ${TOKEN}` };
++const OPEN_GOV = `identifiability:
++  containsIdentifiable: false
++encryption:
++  atRest: optional
++consent:
++  requireLegalBasis: false
++processing:
++  metadata_lookup: []
++`;
++
++let tmp: string;
++let deps: Deps;
++let svc: LibraryService;
++
++async function call(r: { method?: "GET" | "POST" | "PATCH"; url: string; body?: unknown }) {
++  const res = await svc.app.inject({
++    method: r.method ?? "GET",
++    url: r.url,
++    headers: { ...auth, ...(r.body !== undefined ? { "content-type": "application/json" } : {}) },
++    ...(r.body !== undefined ? { payload: JSON.stringify(r.body) } : {}),
++  });
++  return { status: res.statusCode, json: res.json() as any, body: res.body };
++}
++
++beforeEach(async () => {
++  tmp = await mkdtemp(join(tmpdir(), "ao-records-"));
++  deps = { ...deviceDeps(join(tmp, "config")), settleMs: 0 };
++  svc = await createService({ token: TOKEN, deps, worker: null, logStream: new Writable({ write: (_c, _e, cb) => cb() }) });
++  expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Lib"), name: "Lib" } })).status).toBe(200);
++});
++afterEach(async () => {
++  await svc.close();
++  await rm(tmp, { recursive: true, force: true });
++});
++
++async function project(): Promise<string> {
++  const r = await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: OPEN_GOV, encryption: { enabled: false } } });
++  return r.json.project.id;
++}
++
++async function file(name: string, data: Buffer | string): Promise<string> {
++  const dir = join(tmp, "in", Math.random().toString(36).slice(2));
++  await mkdir(dir, { recursive: true });
++  await writeFile(join(dir, name), data);
++  return join(dir, name);
++}
++
++describe("transcripts as segments (Task 34a c)", () => {
++  it("a human-edited version: segments with start, end, language, text and flags null; the existing fields kept", async () => {
++    const pid = await project();
++    const repo = svc.state.session!.repo;
++    const sf = await repo.createSource(
++      pid,
++      { projectIds: [pid], type: "audio", title: { variants: [{ lang: "en", kind: "original", value: "Talk" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
++      [{ path: await file("talk.mp3", Buffer.alloc(32, 1)), role: "original", handling: "copy" }],
++      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
++    );
++    const sid = sf.source.id;
++    const vtt = "WEBVTT\n\n00:00.000 --> 00:01.500\nOlá\n\n00:01.500 --> 00:03.000\nTudo bem?\n";
++    const saved = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcripts`, body: { text: vtt, format: "vtt", lang: "pt" } });
++    expect(saved.status, saved.body).toBe(200);
++    const list = (await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse;
++    expect(list.versions).toHaveLength(1);
++    expect(list.versions[0]).toMatchObject({ id: saved.json.id, origin: "human-edit", format: "vtt", tool: "researcher" });
++    expect(list.versions[0]!.path.startsWith("/")).toBe(false);
++    const t = (await call({ url: `/projects/${pid}/sources/${sid}/transcripts/${saved.json.id}` })).json as TranscriptResponse;
++    expect(t).toMatchObject({ id: saved.json.id, text: vtt, format: "vtt", origin: "human-edit", timed: true });
++    expect(t.segments).toEqual([
++      { start: 0, end: 1.5, lang: "pt", text: "Olá", flags: null },
++      { start: 1.5, end: 3, lang: "pt", text: "Tudo bem?", flags: null },
++    ]);
++    const txt = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcripts`, body: { text: "Olá. Tudo bem?", format: "txt" } });
++    expect((await call({ url: `/projects/${pid}/sources/${sid}/transcripts/${txt.json.id}` })).json).toMatchObject({ timed: false, segments: [], text: "Olá. Tudo bem?" });
++    expect((await call({ url: `/projects/${pid}/sources/${sid}/transcripts/01ZZZZZZZZZZZZZZZZZZZZZZZZ` })).status).toBe(404);
++  });
++});
++
++describe("evidence and verification on source records (Task 34a d)", () => {
++  it("every field's status, checks and evidence in plain words; a user confirmation shows as the researcher's", async () => {
++    const pid = await project();
++    const pdf = await file("paper.pdf", await buildPdf({ title: "Coastal Fisheries and Kinship", author: "Ana Souza", lines: ["Coastal fisheries and kinship in the delta."] }));
++    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
++    const sid = att.json.items[0].sourceId as string;
++    const got = await call({ url: `/projects/${pid}/sources/${sid}` });
++    expect(got.status).toBe(200);
++    // The stored record's own keys are still there for the screens that use them.
++    expect(got.json.source.id).toBe(sid);
++    expect(Array.isArray(got.json.fieldEvidence)).toBe(true);
++    const rec = got.json as SourceRecordExtras;
++    const title = rec.fields.find((f: FieldReview) => f.field === "/title");
++    expect(title).toBeDefined();
++    expect(["verified", "single-source", "unverified", "conflict", "user-confirmed", "none"]).toContain(title!.status);
++    expect(Array.isArray(title!.checks)).toBe(true);
++    expect(title!.evidence.length).toBeGreaterThan(0);
++    for (const e of title!.evidence) {
++      expect(typeof e.from.label).toBe("string");
++      expect(e.from.label.length).toBeGreaterThan(0);
++      expect(typeof e.at).toBe("string");
++      expect(Object.keys(e.from)).not.toContain("ref");
++    }
++    expect(rec.fields.map((f) => f.field)).toEqual([...rec.fields.map((f) => f.field)].sort());
++
++    const confirmed = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/issued", value: "2001" } });
++    expect(confirmed.status, confirmed.body).toBe(200);
++    const issued = (confirmed.json as SourceRecordExtras).fields.find((f) => f.field === "/issued")!;
++    expect(issued.status).toBe("user-confirmed");
++    expect(issued.evidence).toContainEqual(expect.objectContaining({ value: "2001", from: { kind: "user", label: "the researcher" } }));
++    // PATCH of the source and recheck answer the same shape.
++    const patched = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}`, body: { publisher: "Delta Press" } });
++    expect(Array.isArray(patched.json.fields)).toBe(true);
++    const rechecked = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/recheck` });
++    expect(Array.isArray(rechecked.json.fields)).toBe(true);
++  });
++
++  it("a linked file's absolute path never leaves the service (R132)", async () => {
++    const pid = await project();
++    const linked = await file("linked.pdf", await buildPdf({ title: "Linked Paper", author: "A B", lines: ["x"] }));
++    const repo = svc.state.session!.repo;
++    const sf = await repo.createSource(
++      pid,
++      { projectIds: [pid], type: "report", title: { variants: [{ lang: "en", kind: "original", value: "Linked" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
++      [{ path: linked, role: "original", handling: "link" }],
++      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
++    );
++    expect(sf.assets[0]!.linked?.absolutePath).toBe(linked);
++    for (const r of [
++      await call({ url: `/projects/${pid}/sources/${sf.source.id}` }),
++      await call({ method: "PATCH", url: `/projects/${pid}/sources/${sf.source.id}`, body: { publisher: "P" } }),
++      await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/recheck` }),
++    ]) {
++      expect(r.status, r.body).toBe(200);
++      expect(r.body).not.toContain(tmp);
++      expect(r.json.assets[0].linked).toEqual({ libraryRelativePath: sf.assets[0]!.linked!.libraryRelativePath });
++    }
++  });
++});
+diff --git a/apps/library-service/src/routes/projects.ts b/apps/library-service/src/routes/projects.ts
+index 0b39d20..0f14e42 100644
+--- a/apps/library-service/src/routes/projects.ts
++++ b/apps/library-service/src/routes/projects.ts
+@@ -91,6 +91,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
+     const s = state.requireSession();
+     const id = projectParam(ctx, req);
+     s.repo.lockProject(id);
++    // Its recordings stop playing: media tickets end with the key (R135 2).
++    state.media.revokeProject(id);
+     // Nothing looked up for an encrypted project stays in memory once it is locked (R30, R50).
+     s.http.purgeSensitive();
+     state.publishState();
+diff --git a/apps/library-service/src/routes/sources.ts b/apps/library-service/src/routes/sources.ts
+index 8322286..1642a9c 100644
+--- a/apps/library-service/src/routes/sources.ts
++++ b/apps/library-service/src/routes/sources.ts
+@@ -5,7 +5,7 @@
+  */
+ import { randomUUID } from "node:crypto";
+ import type { FastifyInstance } from "fastify";
+-import { BIBLIO_FIELDS, SourceType, type SourceFile } from "@ao/core";
++import { BIBLIO_FIELDS, SourceType, evidenceSourceName, type FieldEvidence, type SourceFile } from "@ao/core";
+ import {
+   ASSET_TEXT_MAX_BYTES,
+   addTranscriptVersion,
+@@ -14,11 +14,13 @@ import {
+   ocrQueueFor,
+   ProjectLockedError,
+   proxyQueueFor,
+-  readAssetText,
++  readTranscript,
++  scrubPaths,
+   search,
+   transcriptVersions,
+   type SourcePatch,
+ } from "@ao/library";
++import type { EvidenceOrigin, FieldReview, SourceRecordExtras, TranscriptListResponse, TranscriptResponse } from "@ao/shared";
+ import { ApiError, badRequest, notFound } from "../errors.js";
+ import { bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
+ 
+@@ -27,6 +29,48 @@ const EDITABLE = new Set<string>(["type", "title", "creators", "container", "pub
+ 
+ export const TRANSCRIPT_BODY_LIMIT = ASSET_TEXT_MAX_BYTES + 2 * 1024 * 1024;
+ 
++const originOf = (src: FieldEvidence["source"]): EvidenceOrigin => ({
++  kind: src.kind,
++  label: evidenceSourceName({ source: src }),
++  ...(src.provider ? { provider: src.provider } : {}),
++});
++
++/**
++ * Each field's verification and evidence (Task 34a d), sorted by field: what the badges and the
++ * evidence popover show, in plain words. `ref` (an internal pointer) is left out; a reason is
++ * scrubbed of absolute paths like every message of the service.
++ */
++export function fieldReviews(sf: SourceFile, roots: Iterable<string>): FieldReview[] {
++  const rs = [...roots];
++  const fields = new Set([...Object.keys(sf.verification ?? {}), ...(sf.fieldEvidence ?? []).map((e) => e.field)]);
++  return [...fields].sort().map((field) => {
++    const v = sf.verification?.[field];
++    return {
++      field,
++      status: v?.status ?? "none",
++      checks: v?.checks ?? [],
++      ...(v?.reason ? { reason: scrubPaths(v.reason, rs) } : {}),
++      ...(v && v.current !== undefined ? { current: v.current } : {}),
++      ...(v?.values ? { values: v.values.map((x) => ({ value: x.value, from: originOf(x.source) })) } : {}),
++      evidence: (sf.fieldEvidence ?? [])
++        .filter((e) => e.field === field)
++        .map((e) => ({ value: e.value, from: originOf(e.source), ...(e.quote !== undefined ? { quote: e.quote } : {}), at: e.at })),
++    };
++  });
++}
++
++/**
++ * A source record as sent to the UI: the stored record, a linked file's absolute path left out
++ * (R132: only its library-relative path), and `fields` (fieldReviews).
++ */
++export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFile & SourceRecordExtras {
++  return {
++    ...sf,
++    assets: sf.assets.map((a) => (a.linked ? ({ ...a, linked: { libraryRelativePath: a.linked.libraryRelativePath } } as typeof a) : a)),
++    fields: fieldReviews(sf, roots),
++  };
++}
++
+ async function sourceOf(ctx: Ctx, projectId: string, sid: string): Promise<SourceFile> {
+   const s = ctx.state.requireSession();
+   if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
+@@ -70,9 +114,11 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
+     return { total: items.length, items: items.slice(offset, offset + limit) };
+   });
+ 
++  const record = (sf: SourceFile) => sourceRecord(sf, state.roots);
++
+   app.get("/projects/:id/sources/:sid", async (req) => {
+     const projectId = projectParam(ctx, req);
+-    return sourceOf(ctx, projectId, paramsOf(req).sid ?? "");
++    return record(await sourceOf(ctx, projectId, paramsOf(req).sid ?? ""));
+   });
+ 
+   app.patch("/projects/:id/sources/:sid", async (req) => {
+@@ -89,7 +135,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
+     if (b.collectionIds !== undefined) patch.collectionIds = [...new Set(strArray(b, "collectionIds", { max: 1000, itemMax: 64, optional: true }))];
+     if (b.tagIds !== undefined) patch.tagIds = [...new Set(strArray(b, "tagIds", { max: 1000, itemMax: 64, optional: true }))];
+     // One governed change: fields and membership together (ids checked inside it, R99).
+-    return Object.keys(patch).length ? s.repo.updateSource(projectId, sid, patch as SourcePatch) : s.repo.getSource(projectId, sid);
++    return record(Object.keys(patch).length ? await s.repo.updateSource(projectId, sid, patch as SourcePatch) : await s.repo.getSource(projectId, sid));
+   });
+ 
+   app.delete("/projects/:id/sources/:sid", async (req) => {
+@@ -109,7 +155,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
+     await sourceOf(ctx, projectId, sid);
+     const b = bodyOf(req);
+     if (!("value" in b)) throw badRequest('"value" is required.');
+-    return confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value);
++    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value));
+   });
+ 
+   app.post("/projects/:id/sources/:sid/recheck", async (req) => {
+@@ -117,7 +163,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
+     const projectId = projectParam(ctx, req);
+     const sid = paramsOf(req).sid ?? "";
+     await sourceOf(ctx, projectId, sid);
+-    return s.repo.recheckSource(projectId, sid);
++    return record(await s.repo.recheckSource(projectId, sid));
+   });
+ 
+   // Every source of the project, as a background job with progress (`job.progress`, kind "recheck").
+@@ -259,20 +305,33 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
+   });
+ 
+   // ---- transcript versions ----
+-  app.get("/projects/:id/sources/:sid/transcripts", async (req) => {
++  // Every stored version; a machine run has two (its WebVTT and its segments.json), both readable as segments.
++  app.get("/projects/:id/sources/:sid/transcripts", async (req): Promise<TranscriptListResponse> => {
+     const projectId = projectParam(ctx, req);
+     const sf = await sourceOf(ctx, projectId, paramsOf(req).sid ?? "");
+     return {
+-      versions: transcriptVersions(sf).map((a) => ({ id: a.id, path: a.path, mime: a.mime, bytes: a.bytes, tool: a.derivation?.provider, derivation: a.derivation })),
++      versions: transcriptVersions(sf).map((a) => ({
++        id: a.id,
++        path: a.path,
++        mime: a.mime,
++        bytes: a.bytes,
++        ...(a.derivation?.provider !== undefined ? { tool: a.derivation.provider } : {}),
++        derivation: a.derivation,
++        origin: a.derivation?.operation === "human-edit" ? "human-edit" : "machine",
++        format: a.mime === "application/json" ? "json" : /\.vtt(\.enc)?$/i.test(a.path) ? "vtt" : "txt",
++        ...(a.metadata?.flaggedSegments !== undefined ? { flaggedSegments: a.metadata.flaggedSegments } : {}),
++      })),
+     };
+   });
+-  app.get("/projects/:id/sources/:sid/transcripts/:aid", async (req) => {
++  // One version: its stored text (as before) and its segments (start, end, language, text, flags;
++  // flags null for a human edit, which no check has run on).
++  app.get("/projects/:id/sources/:sid/transcripts/:aid", async (req): Promise<TranscriptResponse> => {
+     const s = state.requireSession();
+     const projectId = projectParam(ctx, req);
+     const { sid = "", aid = "" } = paramsOf(req);
+     const sf = await sourceOf(ctx, projectId, sid);
+     if (!transcriptVersions(sf).some((a) => a.id === aid)) throw notFound("That transcript");
+-    return { id: aid, text: await readAssetText(s.repo, projectId, sid, aid) };
++    return readTranscript(s.repo, projectId, sid, aid);
+   });
+   app.post("/projects/:id/sources/:sid/transcripts", { bodyLimit: TRANSCRIPT_BODY_LIMIT }, async (req) => {
+     const s = state.requireWritable();
+diff --git a/apps/library-service/src/server.ts b/apps/library-service/src/server.ts
+index c802eae..5165b5f 100644
+--- a/apps/library-service/src/server.ts
++++ b/apps/library-service/src/server.ts
+@@ -22,6 +22,7 @@ import { registerGovernance } from "./routes/governance.js";
+ import { registerImport } from "./routes/import.js";
+ import { registerJobs } from "./routes/jobs.js";
+ import { registerLibraries } from "./routes/libraries.js";
++import { mediaRequestRefusal, registerMedia } from "./media.js";
+ import { registerProjects } from "./routes/projects.js";
+ import { registerReview } from "./routes/review.js";
+ import { registerSources } from "./routes/sources.js";
+@@ -53,6 +54,8 @@ export interface ServiceOptions {
+   beforeExecuteMove?: () => Promise<void>;
+   /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
+   watchStabilityMs?: number;
++  /** Largest picture the content route serves (default PICTURE_MAX_BYTES; test seam). */
++  pictureMaxBytes?: number;
+ }
+ 
+ export interface LibraryService {
+@@ -97,12 +100,18 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
+       ...(opts.logStream ? { stream: opts.logStream } : {}),
+       redact: { paths: REDACT, censor: "[redacted]" },
+       serializers: {
+-        req: (req: { method?: string; url?: string }) => ({ method: req.method, url: (req.url ?? "").split("?")[0] }),
++        // A media ticket is a credential carried in the path (R135): never logged.
++        req: (req: { method?: string; url?: string }) => ({ method: req.method, url: logUrl(req.url ?? "") }),
+         res: (res: { statusCode?: number }) => ({ statusCode: res.statusCode }),
+       },
+     },
+     // A proxy is never in front of this service: the socket address is the client.
+     trustProxy: false,
++    // An address Fastify cannot route (bad percent-encoding, an overlong part): our error shape, and
++    // never the address itself echoed back (it may carry a media ticket, R135).
++    frameworkErrors: (_err, _req, reply) => {
++      void (reply as FastifyReply).status(400).send(errorBody(new ApiError(400, "VALIDATION", "That address is not valid."), []));
++    },
+     // Open event streams must not keep a shutdown waiting.
+     forceCloseConnections: true,
+   });
+@@ -138,12 +147,24 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
+ 
+   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
+     if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
+-    if ((req.url.split("?")[0] ?? "") !== "/events") {
++    const isMedia = isMediaPath(req.url);
++    // Event streams and media streams may stay open for hours: shutdown does not wait for them
++    // (media streams end when their tickets are revoked, at the start of shutdown).
++    if ((req.url.split("?")[0] ?? "") !== "/events" && !isMedia) {
+       inFlight++;
+       reply.raw.once("close", requestEnded);
+     }
+     // 1. DNS rebinding: only our own host names, on our port.
+     if (!hostAllowed(req.headers.host, port)) return fail(reply, new ApiError(403, "FORBIDDEN", "This host name is not allowed."));
++    // Media addresses (R135): the ticket in the path is the credential; their own Origin and
++    // fetch-metadata rules (media.ts); no token is looked at.
++    if (isMedia) {
++      const refused = mediaRequestRefusal(req);
++      if (refused) return fail(reply, refused);
++      const o = req.headers.origin;
++      if (o !== undefined) reply.header("Access-Control-Allow-Origin", o).header("Vary", "Origin");
++      return;
++    }
+     // 2. Origin: the desktop shell, or a paired extension (an unpaired one only to confirm pairing).
+     const origin = req.headers.origin;
+     const route = `${req.method} ${req.routeOptions.url ?? ""}`;
+@@ -206,7 +227,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
+   });
+   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
+ 
+-  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}) };
++  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}) };
+   registerLibraries(app, ctx);
+   registerProjects(app, ctx);
+   registerSources(app, ctx);
+@@ -219,6 +240,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
+   registerCitations(app, ctx);
+   registerAppearance(app, ctx);
+   registerJobs(app, ctx);
++  registerMedia(app, ctx);
+ 
+   let closing: Promise<void> | undefined;
+   return {
+@@ -234,6 +256,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
+     close() {
+       closingNow = true;
+       state.shuttingDown = true;
++      // Every media ticket ends as the service stops (R135 2), and with them their streams.
++      state.media.revokeAll();
+       closing ??= (async () => {
+         // Requests are refused from here on; those already in progress finish (a library being
+         // opened is then refused and released); then running work is paused and the library closed.
+@@ -249,4 +273,37 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
+   };
+ }
+ 
+-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void> };
++export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number };
++
++/** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
++function decodedPath(path: string): string {
++  let cur = path;
++  for (let i = 0; i < 4; i++) {
++    let next: string;
++    try {
++      next = decodeURIComponent(cur);
++    } catch {
++      return cur;
++    }
++    if (next === cur) return cur;
++    cur = next;
++  }
++  return cur;
++}
++
++/** Whether a request path is (any spelling of) a media address: `/media/…`, decoded, any case, repeated slashes. */
++export function isMediaPath(url: string): boolean {
++  const path = url.split("?")[0] ?? "";
++  return path.startsWith("/media/") || /^\/+media\//i.test(decodedPath(path));
++}
++
++/**
++ * The path of a request as logged (R135): no query string; any spelling of a media address
++ * becomes `/media/[redacted]`; and anywhere else, a run of 40 or more ticket characters (no id of
++ * ours is that long) is replaced too, so a ticket sent to another route is not logged either.
++ */
++export function logUrl(url: string): string {
++  const path = url.split("?")[0] ?? "";
++  if (isMediaPath(path)) return "/media/[redacted]";
++  return decodedPath(path).replace(/[A-Za-z0-9_-]{40,}/g, "[redacted]");
++}
+diff --git a/apps/library-service/src/state.ts b/apps/library-service/src/state.ts
+index c03a4d1..cc98c5a 100644
+--- a/apps/library-service/src/state.ts
++++ b/apps/library-service/src/state.ts
+@@ -38,6 +38,7 @@ import {
+ } from "@ao/library";
+ import { ApiError } from "./errors.js";
+ import { EventBus } from "./events.js";
++import { MediaTickets } from "./media.js";
+ 
+ /** A running media worker, shared by every library the service opens. */
+ export interface ServiceWorker {
+@@ -133,6 +134,8 @@ const actor = (): string => {
+ export class ServiceState {
+   session: Session | undefined;
+   readonly events = new EventBus();
++  /** Media tickets (R135): memory only; all end when the library closes or moves, or the service stops. */
++  readonly media = new MediaTickets(() => this.opts.now().getTime());
+   private worker: ServiceWorker | undefined;
+   private workerStarting: Promise<ServiceWorker> | undefined;
+   private readonly tasks = new Set<Promise<unknown>>();
+@@ -513,6 +516,8 @@ export class ServiceState {
+    * writes to the library while it is copied. Returns the batches to resume afterwards.
+    */
+   async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
++    // A ticket never outlives the library where it was issued (R135 2): ended as the move starts.
++    this.media.revokeAll();
+     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
+     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
+     if (!(await this.drainWork(ms))) {
+@@ -587,6 +592,8 @@ export class ServiceState {
+ 
+   /** Closes the open library: running batches cancelled, watches stopped, queues disposed of, lock released. */
+   async closeLibrary(): Promise<void> {
++    // Media tickets end with the library (R135 2), and so do their streams.
++    this.media.revokeAll();
+     const s = this.session;
+     if (!s) return;
+     this.session = undefined;
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index ab7609a..07c63d8 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -56,6 +56,7 @@ export type { Condition, PolicyAction, PolicyDecision, PolicyRequest } from "./g
+ export { DOC_TEXT_LIMIT, groundedIn, normalizeTitle, titleSimilarity } from "./verify/evidence.js";
+ export type { LookupEvidence } from "./verify/evidence.js";
+ export { REQUIRED_FIELDS, applyVerification, recheckSourceFile, verifyDraft } from "./verify/recheck.js";
++export { sourceName as evidenceSourceName } from "./verify/checks.js";
+ export type { VerificationReport, VerifyContext } from "./verify/recheck.js";
+ 
+ export * from "./import/index.js";
+diff --git a/packages/library/src/asset-content.test.ts b/packages/library/src/asset-content.test.ts
+new file mode 100644
+index 0000000..aeecf95
+--- /dev/null
++++ b/packages/library/src/asset-content.test.ts
+@@ -0,0 +1,121 @@
++/**
++ * Reading one stored file of a source as a stream of byte ranges (Task 34a, R135): plain and
++ * encrypted (decrypted as it streams, across the format's 1 MiB chunk boundaries), nothing
++ * written anywhere, a locked project refused, a destroyed or unknown asset refused, a file swapped
++ * for a symbolic link refused.
++ */
++import { randomBytes } from "node:crypto";
++import { rm, symlink } from "node:fs/promises";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import type { Project, SourceFile } from "@ao/core";
++import { openAssetContent, isMediaMime, isPictureMime } from "./asset-content.js";
++import { CHUNK_SIZE } from "./crypto/format.js";
++import { OPEN_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
++import { NotFoundError, PathEscapeError, ProjectLockedError } from "./repo/errors.js";
++import { InvalidInputError } from "./repo/errors.js";
++
++let kit: Kit;
++beforeEach(async () => {
++  kit = await makeKit("ao-asset-content-");
++});
++afterEach(async () => {
++  await kit.close();
++});
++
++async function collect(s: NodeJS.ReadableStream): Promise<Buffer> {
++  const parts: Buffer[] = [];
++  for await (const c of s) parts.push(c as Buffer);
++  return Buffer.concat(parts);
++}
++
++async function mediaSource(p: Project, data: Buffer, name = "talk.mp3"): Promise<SourceFile> {
++  const file = await scratchFile(kit, name, data);
++  return addSource(kit, p, { type: "audio", title: "A talk", files: [{ path: file, role: "original", handling: "copy" }] });
++}
++
++describe("openAssetContent", () => {
++  for (const encrypted of [false, true]) {
++    it(`${encrypted ? "an encrypted" : "a plain"} project: whole file and ranges across chunk boundaries`, async () => {
++      const p = await makeProject(kit, OPEN_GOV, encrypted);
++      const data = randomBytes(2 * CHUNK_SIZE + 12345);
++      const sf = await mediaSource(p, data);
++      const asset = sf.assets[0]!;
++      expect(asset.encrypted).toBe(encrypted);
++      const c = await openAssetContent(kit.repo, p.id, sf.source.id, asset.id, (a) => isMediaMime(a.mime));
++      try {
++        expect(c.size).toBe(data.length);
++        expect(c.mime).toBe("audio/mpeg");
++        expect((await collect(c.range(0, data.length - 1))).equals(data)).toBe(true);
++        // Spanning both boundaries, starting and ending mid-chunk.
++        const a = CHUNK_SIZE - 7;
++        const b = 2 * CHUNK_SIZE + 9;
++        expect((await collect(c.range(a, b))).equals(data.subarray(a, b + 1))).toBe(true);
++        expect((await collect(c.range(data.length - 1, data.length - 1))).equals(data.subarray(data.length - 1))).toBe(true);
++        expect((await collect(c.range(CHUNK_SIZE, CHUNK_SIZE))).equals(data.subarray(CHUNK_SIZE, CHUNK_SIZE + 1))).toBe(true);
++        expect(() => c.range(0, data.length)).toThrow(RangeError);
++      } finally {
++        await c.close();
++      }
++    });
++  }
++
++  it("a locked encrypted project is refused", async () => {
++    const p = await makeProject(kit, OPEN_GOV, true);
++    const sf = await mediaSource(p, randomBytes(1000));
++    kit.repo.lockProject(p.id);
++    await expect(openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true)).rejects.toBeInstanceOf(ProjectLockedError);
++  });
++
++  it("an unknown asset, or one the caller does not accept, is refused", async () => {
++    const p = await makeProject(kit);
++    const sf = await mediaSource(p, randomBytes(100));
++    await expect(openAssetContent(kit.repo, p.id, sf.source.id, "01ZZZZZZZZZZZZZZZZZZZZZZZZ", () => true)).rejects.toBeInstanceOf(NotFoundError);
++    await expect(openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, (a) => isPictureMime(a.mime))).rejects.toBeInstanceOf(InvalidInputError);
++  });
++
++  it("a stored file replaced by a symbolic link is refused", async () => {
++    const p = await makeProject(kit);
++    const sf = await mediaSource(p, randomBytes(100));
++    const abs = join(kit.lib.root, ...sf.assets[0]!.path.split("/"));
++    const elsewhere = await scratchFile(kit, "secret.mp3", "outside the library");
++    await rm(abs);
++    await symlink(elsewhere, abs);
++    await expect(openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true)).rejects.toBeInstanceOf(PathEscapeError);
++  });
++
++  it("a missing file is NotFoundError without its path", async () => {
++    const p = await makeProject(kit);
++    const sf = await mediaSource(p, randomBytes(100));
++    await rm(join(kit.lib.root, ...sf.assets[0]!.path.split("/")));
++    const err = (await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true).catch((e: unknown) => e)) as Error;
++    expect(err).toBeInstanceOf(NotFoundError);
++    expect(err.message).not.toContain(kit.tmp);
++  });
++
++  it("closing while a range is being read ends it and releases the file", async () => {
++    const p = await makeProject(kit, OPEN_GOV, true);
++    const data = randomBytes(3 * CHUNK_SIZE);
++    const sf = await mediaSource(p, data);
++    const c = await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true);
++    const s = c.range(0, data.length - 1);
++    const it = s[Symbol.asyncIterator]();
++    await it.next();
++    await c.close();
++    await c.close(); // idempotent
++    await expect(collect(s)).rejects.toThrow();
++  });
++
++  it("mime rules: audio and video only for media; raster pictures only (no SVG) for pictures", () => {
++    expect(isMediaMime("audio/mpeg")).toBe(true);
++    expect(isMediaMime("video/mp4")).toBe(true);
++    expect(isMediaMime("image/png")).toBe(false);
++    expect(isMediaMime("text/html")).toBe(false);
++    expect(isMediaMime("video/mp4; charset=x")).toBe(false);
++    expect(isPictureMime("image/png")).toBe(true);
++    expect(isPictureMime("image/jpeg")).toBe(true);
++    expect(isPictureMime("image/webp")).toBe(true);
++    expect(isPictureMime("image/svg+xml")).toBe(false);
++    expect(isPictureMime("text/html")).toBe(false);
++  });
++});
+diff --git a/packages/library/src/asset-content.ts b/packages/library/src/asset-content.ts
+new file mode 100644
+index 0000000..d19df87
+--- /dev/null
++++ b/packages/library/src/asset-content.ts
+@@ -0,0 +1,131 @@
++/**
++ * Reading one stored file of a source for display (Task 34a, R135): pictures fetched by the UI with
++ * its token, audio and video played through a media ticket. The file is read in byte ranges as a
++ * stream, so nothing is ever held whole in memory; in an encrypted project each range is decrypted
++ * as it is read (crypto/random-access.ts: only the 1 MiB chunks it covers, each authenticated), and
++ * no plaintext is written anywhere.
++ *
++ * Reading is not a policy decision (the policy engine has no "read" action) and changes nothing:
++ * no audit, no transaction. A locked project is refused (ProjectLockedError), as are destroyed and
++ * unknown assets (NotFoundError), an asset the caller does not accept (InvalidInputError), and a
++ * stored file that is a symbolic link or resolves outside the library (PathEscapeError). Errors
++ * never carry the file's absolute path.
++ */
++import { constants as fsc } from "node:fs";
++import * as fsp from "node:fs/promises";
++import { Readable } from "node:stream";
++import type { Asset } from "@ao/core";
++import { openDecryptedHandle, type DecryptedFile } from "./crypto/random-access.js";
++import { absPath, assertContained } from "./repo/io.js";
++import { InvalidInputError, NotFoundError } from "./repo/errors.js";
++import { projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
++
++/** Recorded types the media route serves (R135 3): audio and video only. */
++const MEDIA_MIME = /^(audio|video)\/[a-z0-9][a-z0-9.+-]{0,126}$/;
++/**
++ * Pictures the UI may load as a blob (R135 1): raster formats only. SVG is excluded on purpose: it
++ * is a document that can carry script, and a blob URL of it opened directly would run in the
++ * app's own origin.
++ */
++const PICTURE_MIMES: ReadonlySet<string> = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/apng", "image/heic", "image/heif"]);
++
++export const isMediaMime = (mime: string): boolean => MEDIA_MIME.test(mime);
++export const isPictureMime = (mime: string): boolean => PICTURE_MIMES.has(mime);
++
++/** How much is read (and decrypted) per step of a stream. */
++const SLICE = 64 * 1024;
++
++export interface AssetContent {
++  asset: Asset;
++  /** The recorded type. */
++  mime: string;
++  /** Plaintext size in bytes. */
++  size: number;
++  /** Bytes `start` to `end` inclusive, as a stream (RangeError when outside the file). */
++  range(start: number, end: number): Readable;
++  /** Releases the file (and wipes the decryption key copy); any stream still reading then fails. Idempotent. */
++  close(): Promise<void>;
++}
++
++/**
++ * Opens asset `assetId` of source `sourceId` for reading, when `accept` agrees to its record.
++ * The caller must close() it (also when the request is aborted).
++ */
++export async function openAssetContent(repo: Repo, projectId: string, sourceId: string, assetId: string, accept: (a: Asset) => boolean): Promise<AssetContent> {
++  const sf = await repo.getSource(projectId, sourceId);
++  const asset = sf.assets.find((a) => a.id === assetId);
++  if (!asset || asset.status === "destroyed") throw new NotFoundError("Asset", assetId);
++  if (!accept(asset)) throw new InvalidInputError("this file cannot be shown here");
++  // An encrypted file needs the project's key: a locked project is refused before anything is opened.
++  const key = asset.encrypted ? projectDataKey(repo, projectId) : null;
++  if (asset.encrypted && !key) throw new InvalidInputError("this file is encrypted but the project is not");
++  let abs: string;
++  if (asset.linked) {
++    abs = asset.linked.absolutePath;
++  } else {
++    const root = repoLibrary(repo).root;
++    abs = absPath(root, asset.path);
++    await assertContained(root, abs);
++  }
++  let fh: fsp.FileHandle;
++  try {
++    // Never through a symbolic link put in the file's place after the check above.
++    fh = await fsp.open(abs, fsc.O_RDONLY | (fsc.O_NOFOLLOW ?? 0));
++  } catch (err) {
++    const code = (err as NodeJS.ErrnoException).code;
++    if (code === "ELOOP") throw new InvalidInputError("this file could not be opened safely");
++    throw new NotFoundError("Asset", assetId);
++  }
++  let dec: DecryptedFile | undefined;
++  let size: number;
++  try {
++    const st = await fh.stat();
++    if (!st.isFile()) throw new NotFoundError("Asset", assetId);
++    if (key) {
++      dec = await openDecryptedHandle(fh, (id) => (id === key.keyId ? key.key : undefined));
++      size = dec.size;
++    } else {
++      size = st.size;
++    }
++  } catch (err) {
++    if (!dec) await fh.close().catch(() => {});
++    throw err;
++  }
++
++  let closed = false;
++  const read = async (position: number, length: number): Promise<Buffer> => {
++    if (closed) throw new Error("the file was closed");
++    if (dec) return dec.read(position, length);
++    const buf = Buffer.allocUnsafe(length);
++    let got = 0;
++    while (got < length) {
++      const r = await fh.read(buf, got, length - got, position + got);
++      if (r.bytesRead === 0) throw new Error("the file is shorter than recorded");
++      got += r.bytesRead;
++    }
++    return buf;
++  };
++
++  return {
++    asset,
++    mime: asset.mime,
++    size,
++    range(start, end) {
++      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= size) throw new RangeError("range outside the file");
++      async function* gen(): AsyncGenerator<Buffer> {
++        for (let at = start; at <= end; ) {
++          const n = Math.min(SLICE, end - at + 1);
++          yield await read(at, n);
++          at += n;
++        }
++      }
++      return Readable.from(gen(), { objectMode: false, highWaterMark: SLICE });
++    },
++    async close() {
++      if (closed) return;
++      closed = true;
++      if (dec) await dec.close().catch(() => {});
++      else await fh.close().catch(() => {});
++    },
++  };
++}
+diff --git a/packages/library/src/crypto/random-access.ts b/packages/library/src/crypto/random-access.ts
+index a73dc7b..9dc5a30 100644
+--- a/packages/library/src/crypto/random-access.ts
++++ b/packages/library/src/crypto/random-access.ts
+@@ -38,7 +38,14 @@ export interface DecryptedFile {
+ 
+ /** Opens `path` for random-access decryption; throws KeyNotAvailableError when `getKey` has no key. */
+ export async function openDecrypted(path: string, getKey: (keyId: string) => Uint8Array | undefined): Promise<DecryptedFile> {
+-  const fh = await fsp.open(path, "r");
++  return openDecryptedHandle(await fsp.open(path, "r"), getKey);
++}
++
++/**
++ * The same over a file already open (e.g. opened without following symbolic links). The returned
++ * file owns `fh`: its close() closes it, and so does a failure here.
++ */
++export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: string) => Uint8Array | undefined): Promise<DecryptedFile> {
+   try {
+     const { size: fileSize } = await fh.stat();
+     const header = Buffer.alloc(HEADER_LEN);
+diff --git a/packages/library/src/index.ts b/packages/library/src/index.ts
+index e800bb1..3ef55c7 100644
+--- a/packages/library/src/index.ts
++++ b/packages/library/src/index.ts
+@@ -253,6 +253,10 @@ export {
+   readAssetText,
+   transcriptVersions,
+ } from "./source-actions.js";
++export { isMediaMime, isPictureMime, openAssetContent } from "./asset-content.js";
++export type { AssetContent } from "./asset-content.js";
++export { parseVtt, readTranscript } from "./transcript-segments.js";
++export type { TranscriptRead, TranscriptSegment, VttCue } from "./transcript-segments.js";
+ export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
+ export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";
+ export { BROWSER_CAPTURE_LIMITS, HtmlSnapshotRefusedError, captureBrowserPage, htmlStripStats } from "./capture/browser-capture.js";
+diff --git a/packages/library/src/source-actions.ts b/packages/library/src/source-actions.ts
+index c49ce88..4757f83 100644
+--- a/packages/library/src/source-actions.ts
++++ b/packages/library/src/source-actions.ts
+@@ -144,7 +144,9 @@ export async function addTranscriptVersion(
+         operation: "human-edit",
+         provider: "researcher",
+         ranAt: "local",
+-        params: input.basedOn ? { basedOn: input.basedOn } : {},
++        // The language is recorded here too (the file name alone carries it otherwise), so a
++        // reader of the version's segments knows it (transcript-segments.ts).
++        params: { ...(input.basedOn ? { basedOn: input.basedOn } : {}), ...(input.lang ? { lang: input.lang } : {}) },
+         at: new Date().toISOString(),
+         triggeredBy: "user",
+       },
+diff --git a/packages/library/src/transcript-segments.test.ts b/packages/library/src/transcript-segments.test.ts
+new file mode 100644
+index 0000000..8922be0
+--- /dev/null
++++ b/packages/library/src/transcript-segments.test.ts
+@@ -0,0 +1,125 @@
++/**
++ * Transcripts as segments (Task 34a c): machine versions from the worker's segments.json (start,
++ * end, text, language and flags), or from its WebVTT with the `NOTE flags:` lines when there is no
++ * segments file; human-edited versions from their WebVTT, with flags `null` (no checks were run on
++ * a person's text) and the language they were saved with, else the language of the version they
++ * were edited from; plain-text edits are untimed.
++ */
++import { mkdir, writeFile } from "node:fs/promises";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import type { Project, SourceFile } from "@ao/core";
++import { OPEN_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
++import { addTranscriptVersion, transcriptVersions } from "./source-actions.js";
++import { parseVtt, readTranscript } from "./transcript-segments.js";
++
++let kit: Kit;
++beforeEach(async () => {
++  kit = await makeKit("ao-transcript-");
++});
++afterEach(async () => {
++  await kit.close();
++});
++
++const SEGMENTS = [
++  { start: 0, end: 2, text: "Welcome to the market.", lang: "en", avgLogprob: -0.2, noSpeechProb: 0.01, compressionRatio: 1.2, flags: [] },
++  { start: 2, end: 4.5, text: "Obrigado.", lang: "pt", avgLogprob: -1.4, noSpeechProb: 0.9, compressionRatio: 1.1, flags: ["outside-speech", "stock-phrase"] },
++];
++const VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the market.\n\nNOTE flags: outside-speech, stock-phrase\n\n00:00:02.000 --> 00:00:04.500\nObrigado.\n";
++
++/** A source with an audio original and a machine transcript (.vtt, and segments.json unless `vttOnly`). */
++async function machineTranscribed(p: Project, opts: { vttOnly?: boolean } = {}): Promise<SourceFile> {
++  const audio = await scratchFile(kit, "talk.mp3", Buffer.alloc(64, 1));
++  const sf = await addSource(kit, p, { type: "audio", title: "Talk", files: [{ path: audio, role: "original", handling: "copy" }] });
++  const media = sf.assets[0]!;
++  const dir = join(kit.tmp, "out", Math.random().toString(36).slice(2));
++  await mkdir(dir, { recursive: true });
++  await writeFile(join(dir, "transcript.vtt"), VTT);
++  await writeFile(join(dir, "segments.json"), JSON.stringify(SEGMENTS));
++  const derivation = { parents: [media.id], operation: "transcribe", provider: "faster-whisper", model: "small", ranAt: "local", params: { model: "small", detectedLanguages: ["en", "pt"] }, at: "2026-11-10T09:30:00.000Z", triggeredBy: "user" };
++  for (const ext of opts.vttOnly ? ["vtt"] : ["vtt", "json"]) {
++    await kit.repo.addDerivedAsset(p.id, sf.source.id, { fromPath: join(dir, ext === "vtt" ? "transcript.vtt" : "segments.json"), kind: "transcript", lang: "mul", tool: "whisper-small", ext, metadata: { flaggedSegments: 1 }, derivation });
++  }
++  return kit.repo.getSource(p.id, sf.source.id);
++}
++
++describe("parseVtt", () => {
++  it("reads cues (hours optional, cue ids and settings), NOTE flags for the next cue, tags and entities", () => {
++    const cues = parseVtt("﻿WEBVTT - title\n\nNOTE a comment\n\n1\n00:01.000 --> 00:02.500 align:start\n<v Ana>Hi &amp; <b>bye</b>\nsecond line\n\nNOTE flags: repeated\n\n01:00:00.000 --> 01:00:01.000\nLast\n");
++    expect(cues).toEqual([
++      { start: 1, end: 2.5, text: "Hi & bye\nsecond line", flags: [] },
++      { start: 3600, end: 3601, text: "Last", flags: ["repeated"] },
++    ]);
++  });
++
++  it("CRLF line ends; a malformed timing line is skipped", () => {
++    expect(parseVtt("WEBVTT\r\n\r\n00:00.000 --> 00:01.000\r\nA\r\n\r\nnot a time --> x\r\nB\r\n")).toEqual([{ start: 0, end: 1, text: "A", flags: [] }]);
++  });
++});
++
++describe("readTranscript", () => {
++  it("a machine version (vtt or segments.json) gives the worker's segments with language and flags", async () => {
++    const p = await makeProject(kit);
++    const sf = await machineTranscribed(p);
++    const [vtt, json] = transcriptVersions(sf);
++    for (const a of [vtt!, json!]) {
++      const t = await readTranscript(kit.repo, p.id, sf.source.id, a.id);
++      expect(t.origin).toBe("machine");
++      expect(t.timed).toBe(true);
++      expect(t.segments).toEqual([
++        { start: 0, end: 2, lang: "en", text: "Welcome to the market.", flags: [] },
++        { start: 2, end: 4.5, lang: "pt", text: "Obrigado.", flags: ["outside-speech", "stock-phrase"] },
++      ]);
++    }
++    expect((await readTranscript(kit.repo, p.id, sf.source.id, vtt!.id)).text).toBe(VTT);
++  });
++
++  it("a machine vtt without segments.json: flags from its NOTE lines; language from the run when it found one", async () => {
++    const p = await makeProject(kit);
++    const sf = await machineTranscribed(p, { vttOnly: true });
++    const t = await readTranscript(kit.repo, p.id, sf.source.id, transcriptVersions(sf)[0]!.id);
++    expect(t.segments.map((s) => s.flags)).toEqual([[], ["outside-speech", "stock-phrase"]]);
++    // Two languages were detected and the vtt does not say which segment is which.
++    expect(t.segments.map((s) => s.lang)).toEqual(["und", "und"]);
++  });
++
++  it("a human-edited vtt: flags null; language as saved, else from the version it was edited from", async () => {
++    const p = await makeProject(kit);
++    const sf = await machineTranscribed(p);
++    const base = transcriptVersions(sf)[0]!;
++    const edited = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the fish market.\n\n00:00:02.000 --> 00:00:04.500\nObrigada.\n";
++    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id });
++    const t = await readTranscript(kit.repo, p.id, sf.source.id, a.id);
++    expect(t).toMatchObject({ origin: "human-edit", basedOn: base.id, timed: true, text: edited });
++    expect(t.segments).toEqual([
++      { start: 0, end: 2, lang: "en", text: "Welcome to the fish market.", flags: null },
++      { start: 2, end: 4.5, lang: "pt", text: "Obrigada.", flags: null },
++    ]);
++    const b = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id, lang: "pt-BR" });
++    expect((await readTranscript(kit.repo, p.id, sf.source.id, b.id)).segments.map((s) => s.lang)).toEqual(["pt-BR", "pt-BR"]);
++  });
++
++  it("a plain-text edit is untimed: no segments, the text as is", async () => {
++    const p = await makeProject(kit);
++    const sf = await machineTranscribed(p);
++    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "Just words.", format: "txt" });
++    expect(await readTranscript(kit.repo, p.id, sf.source.id, a.id)).toMatchObject({ origin: "human-edit", timed: false, segments: [], text: "Just words." });
++  });
++
++  it("an encrypted project reads the same", async () => {
++    const p = await makeProject(kit, OPEN_GOV, true);
++    const sf = await machineTranscribed(p);
++    const t = await readTranscript(kit.repo, p.id, sf.source.id, transcriptVersions(sf)[0]!.id);
++    expect(t.segments).toHaveLength(2);
++  });
++
++  it("a damaged segments.json falls back to the vtt", async () => {
++    const p = await makeProject(kit);
++    const sf = await machineTranscribed(p);
++    const json = transcriptVersions(sf).find((a) => a.mime === "application/json")!;
++    await writeFile(join(kit.lib.root, ...json.path.split("/")), "[{\"start\": \"no\"}]");
++    const vtt = transcriptVersions(sf).find((a) => a.mime !== "application/json")!;
++    const t = await readTranscript(kit.repo, p.id, sf.source.id, vtt.id);
++    expect(t.segments.map((s) => s.text)).toEqual(["Welcome to the market.", "Obrigado."]);
++  });
++});
+diff --git a/packages/library/src/transcript-segments.ts b/packages/library/src/transcript-segments.ts
+new file mode 100644
+index 0000000..53285bd
+--- /dev/null
++++ b/packages/library/src/transcript-segments.ts
+@@ -0,0 +1,198 @@
++/**
++ * A transcript version as segments (Task 34a c), for the transcript viewer.
++ *
++ * How versions are stored: a machine run (link-capture.ts `runTranscription`) stores two derived
++ * assets of kind `transcript` with the same derivation (operation `transcribe`): the WebVTT and the
++ * worker's `segments.json` (start, end, text, lang, flags and the scores behind the flags; a
++ * flagged cue is preceded in the WebVTT by `NOTE flags: a, b`). A human edit (source-actions.ts
++ * `addTranscriptVersion`, operation `human-edit`) is one WebVTT or plain-text asset.
++ *
++ * What a version reads as:
++ *  - machine: the segments of its segments.json (either asset of the run gives the same); without
++ *    a usable segments.json, the WebVTT's cues with flags from its NOTE lines. Flags are always a
++ *    list (empty: checked, nothing found).
++ *  - human edit: the WebVTT's cues with `flags: null` — the hallucination checks ran on the
++ *    machine's text, not on what a person wrote, so "no flags" would claim a check that never
++ *    happened. Language: the one it was saved with, else that of the overlapping segment of the
++ *    version it was edited from, else "und". A plain-text edit has no timings: `timed: false` and
++ *    no segments (its text is still given whole).
++ */
++import type { Asset } from "@ao/core";
++import type { Repo } from "./repo/repo.js";
++import { NotFoundError } from "./repo/errors.js";
++import { readAssetText, transcriptVersions } from "./source-actions.js";
++
++export interface TranscriptSegment {
++  /** Seconds from the start of the recording. */
++  start: number;
++  end: number;
++  /** BCP 47 language of the segment ("und" when not known). */
++  lang: string;
++  text: string;
++  /** Hallucination-check flags; null for a human edit (not checked). */
++  flags: string[] | null;
++}
++
++export interface TranscriptRead {
++  id: string;
++  /** The stored text of this version (the WebVTT, plain text, or segments.json as stored). */
++  text: string;
++  format: "vtt" | "txt" | "json";
++  origin: "machine" | "human-edit";
++  /** For a human edit: the version it was edited from. */
++  basedOn?: string;
++  /** False for a plain-text edit (no timings, so no segments). */
++  timed: boolean;
++  segments: TranscriptSegment[];
++}
++
++export interface VttCue {
++  start: number;
++  end: number;
++  text: string;
++  flags: string[];
++}
++
++const TIME = String.raw`(?:(\d{1,3}):)?(\d{2}):(\d{2})\.(\d{3})`;
++const TIMING = new RegExp(`^${TIME}\\s+-->\\s+${TIME}(?:\\s+.*)?$`);
++const MAX_SEGMENTS = 100_000;
++const MAX_FLAGS = 16;
++
++const secondsOf = (h: string | undefined, m: string, s: string, ms: string): number => Number(h ?? 0) * 3600 + Number(m) * 60 + Number(s) + Number(ms) / 1000;
++
++/** Cue text for display: tags removed, the common character references decoded. */
++function cueText(lines: string[]): string {
++  return lines
++    .join("\n")
++    .replace(/<[^>]*>/g, "")
++    .replace(/&lt;/g, "<")
++    .replace(/&gt;/g, ">")
++    .replace(/&nbsp;/g, " ")
++    .replace(/&amp;/g, "&");
++}
++
++/** The cues of a WebVTT text; `NOTE flags: a, b` gives the flags of the cue after it. Malformed blocks are skipped. */
++export function parseVtt(text: string): VttCue[] {
++  const blocks = text.replace(/^﻿/, "").split(/\r\n|\r|\n/);
++  const out: VttCue[] = [];
++  let pending: string[] = [];
++  let block: string[] = [];
++  const flush = () => {
++    const b = block;
++    block = [];
++    if (!b.length) return;
++    const head = b[0]!;
++    if (/^WEBVTT\b/.test(head) || head === "STYLE" || head === "REGION") return;
++    if (/^NOTE\b/.test(head)) {
++      const m = /^NOTE flags:\s*(.*)$/.exec(head);
++      if (m) pending = m[1]!.split(",").map((f) => f.trim()).filter(Boolean).slice(0, MAX_FLAGS);
++      return;
++    }
++    const at = TIMING.test(head) ? 0 : b[1] !== undefined && TIMING.test(b[1]) ? 1 : -1;
++    if (at < 0) return;
++    const m = TIMING.exec(b[at]!)!;
++    const start = secondsOf(m[1], m[2]!, m[3]!, m[4]!);
++    const end = secondsOf(m[5], m[6]!, m[7]!, m[8]!);
++    if (out.length < MAX_SEGMENTS) out.push({ start, end, text: cueText(b.slice(at + 1)), flags: pending });
++    pending = [];
++  };
++  for (const line of blocks) {
++    if (line.trim() === "") flush();
++    else block.push(line);
++  }
++  flush();
++  return out;
++}
++
++/** The worker's segments.json, or undefined when it is not a list of well-formed segments. */
++function parseSegmentsJson(raw: string, fallbackLang: string): TranscriptSegment[] | undefined {
++  let v: unknown;
++  try {
++    v = JSON.parse(raw);
++  } catch {
++    return undefined;
++  }
++  if (!Array.isArray(v) || v.length > MAX_SEGMENTS) return undefined;
++  const out: TranscriptSegment[] = [];
++  for (const s of v) {
++    if (typeof s !== "object" || s === null) return undefined;
++    const o = s as Record<string, unknown>;
++    if (typeof o.start !== "number" || typeof o.end !== "number" || !Number.isFinite(o.start) || !Number.isFinite(o.end) || typeof o.text !== "string") return undefined;
++    const flags = Array.isArray(o.flags) ? o.flags.filter((f): f is string => typeof f === "string").slice(0, MAX_FLAGS) : [];
++    out.push({ start: o.start, end: o.end, lang: typeof o.lang === "string" && o.lang ? o.lang : fallbackLang, text: o.text, flags });
++  }
++  return out;
++}
++
++const isJson = (a: Asset) => a.mime === "application/json";
++const formatOf = (a: Asset): TranscriptRead["format"] => (isJson(a) ? "json" : /\.vtt(\.enc)?$/i.test(a.path) ? "vtt" : "txt");
++
++/** The run's one language, when it found exactly one. */
++function runLang(a: Asset): string {
++  const langs = a.derivation?.params.detectedLanguages;
++  return Array.isArray(langs) && langs.length === 1 && typeof langs[0] === "string" ? langs[0] : "und";
++}
++
++/** The other asset of the same machine run (the segments.json of a .vtt, or the reverse). */
++function sibling(all: Asset[], a: Asset, wantJson: boolean): Asset | undefined {
++  const d = a.derivation;
++  return all.find(
++    (b) =>
++      b.id !== a.id &&
++      isJson(b) === wantJson &&
++      b.derivation?.operation === d?.operation &&
++      b.derivation?.at === d?.at &&
++      JSON.stringify(b.derivation?.parents ?? []) === JSON.stringify(d?.parents ?? []),
++  );
++}
++
++/** Reads transcript version `assetId` of a source as segments (decrypted in encrypted projects). */
++export async function readTranscript(repo: Repo, projectId: string, sourceId: string, assetId: string, depth = 0): Promise<TranscriptRead> {
++  const sf = await repo.getSource(projectId, sourceId);
++  const all = transcriptVersions(sf);
++  const asset = all.find((a) => a.id === assetId);
++  if (!asset) throw new NotFoundError("Transcript", assetId);
++  const text = await readAssetText(repo, projectId, sourceId, assetId);
++  const format = formatOf(asset);
++  const human = asset.derivation?.operation === "human-edit";
++
++  if (!human) {
++    const json = isJson(asset) ? asset : sibling(all, asset, true);
++    if (json) {
++      const raw = json === asset ? text : await readAssetText(repo, projectId, sourceId, json.id).catch(() => undefined);
++      const segs = raw === undefined ? undefined : parseSegmentsJson(raw, runLang(asset));
++      if (segs) return { id: assetId, text, format, origin: "machine", timed: true, segments: segs };
++    }
++    const vtt = format === "vtt" ? text : await (async () => {
++      const v = sibling(all, asset, false);
++      return v ? readAssetText(repo, projectId, sourceId, v.id).catch(() => "") : "";
++    })();
++    const lang = runLang(asset);
++    return { id: assetId, text, format, origin: "machine", timed: true, segments: parseVtt(vtt).map((c) => ({ ...c, lang })) };
++  }
++
++  const basedOn = typeof asset.derivation?.params.basedOn === "string" ? asset.derivation.params.basedOn : undefined;
++  const base = { id: assetId, text, format, origin: "human-edit" as const, ...(basedOn ? { basedOn } : {}) };
++  if (format !== "vtt") return { ...base, timed: false, segments: [] };
++  const saved = asset.derivation?.params.lang;
++  let langAt: (start: number, end: number) => string = () => "und";
++  if (typeof saved === "string" && saved) {
++    langAt = () => saved;
++  } else if (basedOn && depth < 8 && all.some((a) => a.id === basedOn)) {
++    const from = await readTranscript(repo, projectId, sourceId, basedOn, depth + 1).catch(() => undefined);
++    const segs = from?.segments ?? [];
++    langAt = (start, end) => {
++      let best: TranscriptSegment | undefined;
++      let most = 0;
++      for (const s of segs) {
++        const overlap = Math.min(end, s.end) - Math.max(start, s.start);
++        if (overlap > most) {
++          most = overlap;
++          best = s;
++        }
++      }
++      return best?.lang ?? "und";
++    };
++  }
++  return { ...base, timed: true, segments: parseVtt(text).map((c) => ({ start: c.start, end: c.end, lang: langAt(c.start, c.end), text: c.text, flags: null })) };
++}
+diff --git a/packages/shared/src/api/index.ts b/packages/shared/src/api/index.ts
+new file mode 100644
+index 0000000..1d44910
+--- /dev/null
++++ b/packages/shared/src/api/index.ts
+@@ -0,0 +1,7 @@
++/**
++ * Request and response shapes of the service's routes, declared once for the service and the UI
++ * (Task 34a starts this; Task 47 moves the remaining routes here).
++ */
++export * from "./media.js";
++export * from "./sources.js";
++export * from "./transcripts.js";
+diff --git a/packages/shared/src/api/media.ts b/packages/shared/src/api/media.ts
+new file mode 100644
+index 0000000..0a04d99
+--- /dev/null
++++ b/packages/shared/src/api/media.ts
+@@ -0,0 +1,51 @@
++/**
++ * Pictures and audio/video from the service (Task 34a, R135).
++ *
++ * Pictures: `GET /projects/:id/sources/:sid/assets/:aid/content` with the UI token; the body is the
++ * picture itself (raster types only, at most PICTURE_MAX_BYTES), shown by the UI as a blob URL.
++ *
++ * Audio and video: `POST /projects/:id/sources/:sid/assets/:aid/media-ticket` with the UI token
++ * gives a ticket address `/media/<ticket>` (no query string, ever) that a media element loads with
++ * GET/HEAD range requests. The ticket is a secret (R135 5): never shown, logged, stored or put in
++ * the page address; `POST /media-tickets/revoke` ends it when the player closes.
++ */
++
++/** The address form of a ticket: `/media/` and 43 base64url characters (256 random bits). */
++export const MEDIA_TICKET_PATH = /^\/media\/[A-Za-z0-9_-]{43}$/;
++
++export function isMediaTicketPath(path: string): boolean {
++  return MEDIA_TICKET_PATH.test(path);
++}
++
++/** Largest picture the content route serves (a full-page screenshot of a very long page fits). */
++export const PICTURE_MAX_BYTES = 48 * 1024 * 1024;
++
++/** Tickets live at once (R135 2); one more is refused (429 RATE_LIMITED) until one ends. */
++export const MEDIA_TICKETS_MAX = 16;
++/** A ticket not used for this long ends (R135 2). */
++export const MEDIA_TICKET_IDLE_MS = 10 * 60_000;
++/** A ticket ends this long after it was issued, used or not (R135 2). */
++export const MEDIA_TICKET_LIFETIME_MS = 8 * 60 * 60_000;
++
++/** `POST /projects/:id/sources/:sid/assets/:aid/media-ticket` (no body). */
++export interface MediaTicketResponse {
++  /** `/media/<ticket>`: resolve against the service's base URL, nothing else added. */
++  path: string;
++  /** The asset's recorded type (audio/* or video/*). */
++  mime: string;
++  /** Plaintext size in bytes. */
++  size: number;
++  /** When the ticket ends if it is not used before then (moves on with every use). */
++  idleExpiresAt: string;
++  /** When the ticket ends whatever happens. */
++  expiresAt: string;
++}
++
++/** `POST /media-tickets/revoke`. */
++export interface MediaTicketRevokeRequest {
++  path: string;
++}
++export interface MediaTicketRevokeResponse {
++  /** False when it had already ended (or never existed). */
++  revoked: boolean;
++}
+diff --git a/packages/shared/src/api/sources.ts b/packages/shared/src/api/sources.ts
+new file mode 100644
+index 0000000..241d133
+--- /dev/null
++++ b/packages/shared/src/api/sources.ts
+@@ -0,0 +1,48 @@
++/** Source records as the service sends them to the UI (Task 34a d). */
++
++export type VerificationStatus = "verified" | "single-source" | "unverified" | "conflict" | "user-confirmed";
++
++/** Where a piece of evidence came from, in words the UI can show as is. */
++export interface EvidenceOrigin {
++  /** embedded, lookup, platform-json, page-dom, filename, ai, zotero, refman, ocr, user. */
++  kind: string;
++  /** Plain words, e.g. "an online lookup (crossref)", "the web page", "the researcher". */
++  label: string;
++  provider?: string;
++}
++
++export interface FieldEvidenceEntry {
++  value: unknown;
++  from: EvidenceOrigin;
++  /** The passage the value was read from, when one was recorded (AI evidence). */
++  quote?: string;
++  /** When it was recorded (ISO time). */
++  at: string;
++}
++
++/** One field's verification and the evidence behind it. */
++export interface FieldReview {
++  /** JSON pointer into the source, e.g. "/title", "/issued". */
++  field: string;
++  /** "none": evidence exists but the field has not been checked. */
++  status: VerificationStatus | "none";
++  /** Names of the checks that ran. */
++  checks: string[];
++  /** Why it has this status, in plain words. */
++  reason?: string;
++  /** The record's value when it was checked. */
++  current?: unknown;
++  /** The differing values, for a conflict. */
++  values?: Array<{ value: unknown; from: EvidenceOrigin }>;
++  evidence: FieldEvidenceEntry[];
++}
++
++/**
++ * Added to every source record the service sends (`GET`/`PATCH /projects/:id/sources/:sid`,
++ * `PATCH …/fields`, `POST …/recheck`), next to the stored record's own keys. In those records a
++ * linked file's absolute path is left out (R132): `assets[].linked` keeps only `libraryRelativePath`.
++ */
++export interface SourceRecordExtras {
++  /** Every field that has a verification or evidence, sorted by field. */
++  fields: FieldReview[];
++}
+diff --git a/packages/shared/src/api/transcripts.ts b/packages/shared/src/api/transcripts.ts
+new file mode 100644
+index 0000000..01517d9
+--- /dev/null
++++ b/packages/shared/src/api/transcripts.ts
+@@ -0,0 +1,58 @@
++/** Transcript versions (Task 34a c). */
++
++export interface TranscriptSegment {
++  /** Seconds from the start of the recording. */
++  start: number;
++  end: number;
++  /** BCP 47 language of the segment ("und" when not known; "mul" never appears per segment). */
++  lang: string;
++  text: string;
++  /**
++   * Hallucination-check flags (e.g. "outside-speech", "stock-phrase"); `[]` when checked and
++   * nothing was found. `null` for a human-edited version: the checks ran on the machine's text,
++   * not on what a person wrote, so no result exists for it.
++   */
++  flags: string[] | null;
++}
++
++/** One stored version in `GET /projects/:id/sources/:sid/transcripts`. */
++export interface TranscriptVersionSummary {
++  id: string;
++  /** Library-relative path (never absolute). */
++  path: string;
++  mime: string;
++  bytes: number;
++  /** The provider that made it ("faster-whisper", "researcher"). */
++  tool?: string;
++  derivation?: unknown;
++  origin: "machine" | "human-edit";
++  format: "vtt" | "txt" | "json";
++  /** For a machine version: how many segments the checks flagged. */
++  flaggedSegments?: number;
++}
++
++export interface TranscriptListResponse {
++  versions: TranscriptVersionSummary[];
++}
++
++/** `GET /projects/:id/sources/:sid/transcripts/:aid`. */
++export interface TranscriptResponse {
++  id: string;
++  /** The stored text of the version (WebVTT, plain text, or the segments file as stored). */
++  text: string;
++  format: "vtt" | "txt" | "json";
++  origin: "machine" | "human-edit";
++  /** For a human edit: the version it was edited from. */
++  basedOn?: string;
++  /** False for a plain-text edit: it has no timings, so `segments` is empty. */
++  timed: boolean;
++  segments: TranscriptSegment[];
++}
++
++/** `POST /projects/:id/sources/:sid/transcripts` (unchanged; declared here for the UI). */
++export interface TranscriptSaveRequest {
++  text: string;
++  format: "vtt" | "txt";
++  basedOn?: string;
++  lang?: string;
++}
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index e640a9b..d3f942e 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -3,4 +3,5 @@
+  * here: both a Node service and a browser bundle import this package.
+  */
+ export { CREDENTIAL_QUERY_KEYS, isCredentialQueryKey } from "./credentials.js";
++export * from "./api/index.js";
+ export { GENERIC_FAMILIES, inferGenericFamily, isGenericFamily, isUsableFontFamily, splitFontFamilies, type GenericFamily } from "./fonts.js";
+diff --git a/packages/shared/src/shared.test.ts b/packages/shared/src/shared.test.ts
+index ca9fd65..254d2d5 100644
+--- a/packages/shared/src/shared.test.ts
++++ b/packages/shared/src/shared.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies } from "./index.js";
++import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies } from "./index.js";
+ 
+ describe("@ao/shared", () => {
+   it("credential query keys (R96/R98), any case", () => {
+@@ -32,4 +32,13 @@ describe("@ao/shared", () => {
+     expect(inferGenericFamily("Some Unknown Face")).toBeUndefined();
+     expect(splitFontFamilies("'A, B', \"C\", D")).toEqual(["'A, B'", '"C"', "D"]);
+   });
++
++  it("media ticket addresses (R135): /media/ and 43 base64url characters, nothing else", () => {
++    const t = "A".repeat(42) + "_";
++    expect(isMediaTicketPath(`/media/${t}`)).toBe(true);
++    expect(MEDIA_TICKET_PATH.test(`/media/${t}`)).toBe(true);
++    for (const bad of [`/media/${t}?x=1`, `/media/${t}#f`, `/media/${t}/`, `/media/${t}A`, `/media/${"A".repeat(42)}`, `/media/${"A".repeat(42)}=`, `//media/${t}`, `http://127.0.0.1:1/media/${t}`, `/media/../${t}`]) {
++      expect(isMediaTicketPath(bad), bad).toBe(false);
++    }
++  });
+ });
+diff --git a/packages/ui/index.html b/packages/ui/index.html
+index 1785279..b54814a 100644
+--- a/packages/ui/index.html
++++ b/packages/ui/index.html
+@@ -10,8 +10,11 @@
+          without it a snapshot's own <style> and style="" would not render. The tradeoff is small:
+          inline CSS cannot run code, scripts stay 'self' only, and React escapes all text, so there is
+          no path to inject markup or script; the app's own CSS has no colours outside tokens (lint).
+-         In `vite` dev mode this tag is dropped (vite.config.ts): the dev server injects inline scripts. -->
+-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
++         In `vite` dev mode this tag is dropped (vite.config.ts): the dev server injects inline scripts.
++         R135: audio and video play from the service through media tickets (/media/<ticket>), so
++         media-src has the same loopback reach as connect-src, plus blob:; pictures need no change
++         (fetched with the token, shown as blob: URLs, which img-src allows). -->
++    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src http://127.0.0.1:* http://localhost:* blob:; font-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
+     <title>Alexandrine Oxiana</title>
+   </head>
+   <body>
+diff --git a/packages/ui/src/api/client.test.ts b/packages/ui/src/api/client.test.ts
+index 9700271..d6edbe1 100644
+--- a/packages/ui/src/api/client.test.ts
++++ b/packages/ui/src/api/client.test.ts
+@@ -162,6 +162,51 @@ describe("createClient", () => {
+   });
+ });
+ 
++describe("mediaUrl() — the address a media element loads (R135)", () => {
++  const TICKET = "Ab3_-".repeat(8) + "xyz"; // 43 base64url characters
++  const B64_TOKEN = "Q".repeat(40); // a token that could sit inside a ticket-shaped path
++
++  it("gives the base URL plus the ticket path, nothing else, and fetches nothing", () => {
++    const f = fakeFetch(() => json({}));
++    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
++    expect(api.mediaUrl(`/media/${TICKET}`)).toBe(`${BASE}/media/${TICKET}`);
++    expect(f.calls).toHaveLength(0);
++  });
++
++  it("refuses anything but /media/<43 base64url characters>: a query, a fragment, other routes, other hosts", () => {
++    const api = createClient(BASE, TOKEN, { fetch: fakeFetch(() => json({})).fetch });
++    for (const path of [
++      `/media/${TICKET}?x=1`,
++      `/media/${TICKET}?`,
++      `/media/${TICKET}#t=10`,
++      `/media/${TICKET}%3Fx=1`,
++      `/media/${TICKET}%23t`,
++      `/media/${TICKET}/x`,
++      `/media/${TICKET.slice(1)}`,
++      "/projects",
++      `//evil.example/media/${TICKET}`,
++      `http://127.0.0.1:4317/media/${TICKET}`,
++      `/media/../media/${TICKET}`,
++    ]) {
++      expect(() => api.mediaUrl(path), path).toThrow(/media address/);
++    }
++  });
++
++  it("refuses an address carrying the service token, however it is written", () => {
++    const api = createClient(BASE, B64_TOKEN, { fetch: fakeFetch(() => json({})).fetch });
++    expect(() => api.mediaUrl(`/media/${B64_TOKEN}abc`)).toThrow(/token/);
++    expect(() => api.mediaUrl(`/media/abc${B64_TOKEN}`)).toThrow(/token/);
++    expect(() => api.mediaUrl(`/media/${TICKET}`)).not.toThrow();
++  });
++
++  it("the ordinary request paths still refuse ?, # and the token (unchanged by the media address)", () => {
++    const api = createClient(BASE, B64_TOKEN, { fetch: fakeFetch(() => json({})).fetch });
++    for (const path of [`/media/${TICKET}?a=1`, `/media/${TICKET}#f`, `/media/${B64_TOKEN}abc`]) {
++      expect(() => api.request("GET", path), path).toThrow(/path|token/);
++    }
++  });
++});
++
+ describe("events() — SSE over fetch streaming (not EventSource)", () => {
+   function streamOf(chunks: string[]) {
+     const enc = new TextEncoder();
+diff --git a/packages/ui/src/api/client.ts b/packages/ui/src/api/client.ts
+index 0132ebe..4787693 100644
+--- a/packages/ui/src/api/client.ts
++++ b/packages/ui/src/api/client.ts
+@@ -16,7 +16,7 @@
+  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
+  * `request()` (Tasks 33+).
+  */
+-import { isCredentialQueryKey } from "@ao/shared";
++import { isCredentialQueryKey, isMediaTicketPath } from "@ao/shared";
+ import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
+ 
+ export type ErrorCode =
+@@ -88,6 +88,13 @@ export interface ApiClient {
+    * called once the service has accepted the stream (events published from then on arrive).
+    */
+   events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
++  /**
++   * The address a media element loads for a media ticket (R135): the base URL plus the ticket path
++   * the service gave (`/media/<ticket>`), nothing added. Only that exact form is accepted: no query,
++   * no fragment, never the service token. The result is a secret (R135 5): give it to the media
++   * element only — never show, log, store it or put it in the page address. Fetches nothing.
++   */
++  mediaUrl(ticketPath: string): string;
+ }
+ 
+ /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
+@@ -401,6 +408,13 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
+     }
+   }
+ 
++  /** R135: a ticket address is `/media/` and 43 base64url characters; the token is never in it. */
++  function mediaUrl(ticketPath: string): string {
++    if (typeof ticketPath !== "string" || !isMediaTicketPath(ticketPath)) throw new Error("Not a media address: expected /media/<ticket> and nothing else."); // not echoed
++    if (tokenForms.some((t) => ticketPath.includes(t))) throw new Error("Refusing a media address that contains the service token.");
++    return `${base}${ticketPath}`;
++  }
++
+   return {
+     request,
+     appearance: {
+@@ -409,5 +423,6 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
+     },
+     ndjson,
+     events,
++    mediaUrl,
+   };
+ }
