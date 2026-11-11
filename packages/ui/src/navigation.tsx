@@ -33,12 +33,23 @@ export interface AppLocation {
 /** "/library/" → "/library"; "/" stays "/". */
 export const normalisePath = (p: string): string => (p.length > 1 ? p.replace(/\/+$/, "") || "/" : p || "/");
 
-/** Moves to an in-app path ("/…", query allowed) without reloading; listeners of popstate re-render. */
-export function navigate(href: string): void {
+/**
+ * Moves to an in-app path ("/…", query allowed) without reloading; listeners of popstate re-render.
+ * `replace` rewrites the current history entry instead of adding one (for example to keep the
+ * selected project in the library's address).
+ */
+export function navigate(href: string, opts: { replace?: boolean } = {}): void {
   if (!href.startsWith("/") || href.startsWith("//")) throw new Error(`navigate() takes an in-app path starting with "/" (got "${href}").`);
-  window.history.pushState(null, "", href);
+  if (opts.replace) window.history.replaceState(null, "", href);
+  else window.history.pushState(null, "", href);
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
+
+/** The project named in an address's query (`?project=<id>`), or undefined. */
+export const projectInQuery = (search: string): string | undefined => new URLSearchParams(search).get("project") || undefined;
+
+/** The library's address, naming a project when there is one (41b2 I1). */
+export const libraryHref = (projectId?: string): string => (projectId ? `${PATHS.library}?project=${encodeURIComponent(projectId)}` : PATHS.library);
 
 type LinkClick = Pick<MouseEvent<HTMLElement>, "button" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey" | "preventDefault"> & {
   currentTarget: { getAttribute(n: string): string | null };
@@ -68,11 +79,11 @@ export function useLocation(): AppLocation {
 
 export const usePathname = (): string => useLocation().pathname;
 
-/** The link every screen other than the library shows at its top. */
-export function BackToLibrary() {
+/** The link every screen other than the library shows at its top; it keeps the screen's project. */
+export function BackToLibrary({ projectId }: { projectId?: string | undefined } = {}) {
   return (
     <nav aria-label="Library" className="ao-back">
-      <a href={PATHS.library} onClick={inAppLink}>
+      <a href={libraryHref(projectId)} onClick={inAppLink}>
         Back to library
       </a>
     </nav>

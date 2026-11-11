@@ -8,7 +8,7 @@
  */
 import { useMemo, type ReactElement } from "react";
 import { createClient, type ApiClient } from "./api/client";
-import { BackToLibrary, normalisePath, PATHS, useDropGuard, useLocation, type AppLocation } from "./navigation";
+import { BackToLibrary, normalisePath, PATHS, projectInQuery, useDropGuard, useLocation, type AppLocation } from "./navigation";
 import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
@@ -29,7 +29,7 @@ export interface AppRoute {
 
 /** The route table: first match wins. */
 export const ROUTES: readonly AppRoute[] = [
-  { matches: isLibraryPath, render: (_loc, client) => <LibraryRoutes client={client} />, back: false },
+  { matches: isLibraryPath, render: (loc, client) => <LibraryRoutes client={client} loc={loc} />, back: false },
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
   { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
   {
@@ -58,7 +58,7 @@ export function routeFor(loc: AppLocation, client: ApiClient): ReactElement {
   const screen = route?.render(loc, client) ?? <NotFound />;
   return (
     <>
-      {route?.back !== false && <BackToLibrary />}
+      {route?.back !== false && <BackToLibrary projectId={projectInQuery(loc.search)} />}
       {screen}
     </>
   );

@@ -39,6 +39,13 @@ export interface LibraryProps {
   navigate?: (path: string) => void;
   /** The service reports no library open any more (library.state open:false). */
   onClosed?: () => void;
+  /**
+   * The project named in the address (`?project=<id>`). It is selected whenever it changes; an id
+   * that is not one of the library's selects nothing and says so. Without one, the first project.
+   */
+  projectFromAddress?: string | undefined;
+  /** The selected project changed (the route keeps it in the address). */
+  onProjectSelected?: (id: string) => void;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -57,7 +64,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -82,6 +89,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [sourcesError, setSourcesError] = useState<string | undefined>();
   const [loadingMore, setLoadingMore] = useState(false);
   const [reload, setReload] = useState(0);
+  /** The address named a project this library does not have (41b2 I1). */
+  const [unknownProject, setUnknownProject] = useState(false);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
 
@@ -192,7 +201,6 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       .then(({ projects: list }) => {
         if (!live) return;
         setProjects(list);
-        setProjectId((id) => id ?? list[0]?.id);
         // The badges are the profiles the service reads from each project's rules (R118).
         setProfiles(Object.fromEntries(list.map((p) => [p.id, knownProfiles(p.profiles)])));
       })
@@ -261,17 +269,43 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     }
   };
 
-  const selectProject = (id: string) => {
-    if (id === projectId) return;
-    staleMore();
-    setProjectId(id);
-    setCollections([]);
-    setTags({ tags: [], workspaceTags: [] });
-    setSources(undefined);
-    setOpenSource(undefined);
-    setOutcomes(undefined);
-    setFilter((f) => ({ text: f.text }));
-  };
+  const selectedRef = useRef(onProjectSelected);
+  selectedRef.current = onProjectSelected;
+  const selectProject = useCallback(
+    (id: string | undefined) => {
+      setUnknownProject(false);
+      if (id) selectedRef.current?.(id);
+      if (id === projectIdRef.current) return;
+      projectIdRef.current = id;
+      staleMore();
+      setProjectId(id);
+      setCollections([]);
+      setTags({ tags: [], workspaceTags: [] });
+      setSources(undefined);
+      setOpenSource(undefined);
+      setOutcomes(undefined);
+      setFilter((f) => ({ text: f.text }));
+    },
+    [staleMore],
+  );
+
+  // ---- the project named in the address (41b2 I1): honoured on every way into the library ----
+  useEffect(() => {
+    if (!projects) return;
+    if (!projectFromAddress) {
+      // No project named: keep the one selected, else the first; either way the address names it.
+      selectProject(projectIdRef.current ?? projects[0]?.id);
+      return;
+    }
+    if (projects.some((p) => p.id === projectFromAddress)) {
+      selectProject(projectFromAddress);
+      return;
+    }
+    // Not one of this library's projects: select none, so nothing is dropped into the wrong one.
+    selectProject(undefined);
+    setUnknownProject(true);
+  }, [projects, projectFromAddress, selectProject]);
+
 
   // Edits: each goes through the service; a failure is shown, success reloads.
   const edit = (what: string, run: () => Promise<unknown>) => {
@@ -419,6 +453,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         {error && (
           <p role="alert" className="ao-error">
             {error}
+          </p>
+        )}
+        {unknownProject && (
+          <p role="alert" className="ao-error">
+            The project named in the address is not in this library. Choose a project from the list.
           </p>
         )}
         {project && locked && (
