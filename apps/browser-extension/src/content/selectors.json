@@ -1,0 +1,89 @@
+{
+  "$comment": "The only place the extension's CSS selectors live (R110). Checked against src/content/selectors-schema.ts on every load. When a platform changes its markup, edit this file; a field none of whose alternatives matches exactly one element is left out, never guessed.",
+  "version": 1,
+  "platforms": {
+    "instagram": {
+      "pages": {
+        "post": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }],
+            "handle": [{ "css": "article header a[role='link'][href]", "read": "attr:href", "pattern": "^/([A-Za-z0-9._]{1,30})/?$" }],
+            "displayName": [{ "css": "article header span.x1lliihq" }],
+            "caption": [{ "css": "article ul._a9z6 h1._ap3a" }],
+            "postedAt": [{ "css": "article a[href*='/p/'] time[datetime]", "read": "attr:datetime" }],
+            "likes": [{ "css": "article section a[href$='/liked_by/'] span.html-span" }],
+            "mediaUrls": [{ "css": "article div._aagv img[src]", "read": "attr:src" }]
+          }
+        },
+        "profile": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }],
+            "handle": [{ "css": "main header h2 span.x1lliihq" }],
+            "displayName": [{ "css": "main header span.x1plvlek" }]
+          },
+          "postLinks": [{ "css": "main a[href]", "read": "attr:href" }]
+        }
+      }
+    },
+    "tiktok": {
+      "pages": {
+        "video": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }],
+            "handle": [{ "css": "[data-e2e='browse-username']" }],
+            "displayName": [{ "css": "[data-e2e='browser-nickname'] > span:first-child" }],
+            "caption": [{ "css": "h1[data-e2e='browse-video-desc']" }],
+            "likes": [{ "css": "[data-e2e='like-count']" }],
+            "comments": [{ "css": "[data-e2e='comment-count']" }],
+            "shares": [{ "css": "[data-e2e='share-count']" }],
+            "mediaUrls": [{ "css": "video[poster]", "read": "attr:poster" }]
+          }
+        },
+        "profile": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }],
+            "handle": [{ "css": "[data-e2e='user-title']" }],
+            "displayName": [{ "css": "[data-e2e='user-subtitle']" }]
+          },
+          "postLinks": [{ "css": "[data-e2e='user-post-item'] a[href]", "read": "attr:href" }]
+        }
+      }
+    },
+    "youtube": {
+      "pages": {
+        "video": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }],
+            "handle": [{ "css": "ytd-watch-metadata ytd-channel-name a[href]", "read": "attr:href", "pattern": "^/@([A-Za-z0-9._-]{3,30})$" }],
+            "displayName": [{ "css": "ytd-watch-metadata ytd-channel-name a" }],
+            "caption": [{ "css": "ytd-watch-metadata h1 yt-formatted-string" }],
+            "postedAt": [{ "css": "[itemtype$='VideoObject'] meta[itemprop='datePublished']", "read": "attr:content" }],
+            "views": [{ "css": "[itemtype$='VideoObject'] meta[itemprop='interactionCount']", "read": "attr:content" }],
+            "likes": [{ "css": "ytd-watch-metadata like-button-view-model button[aria-label]", "read": "attr:aria-label", "pattern": "^like this video along with ([0-9][0-9,.]*) other people$" }],
+            "comments": [{ "css": "ytd-comments #count .count-text span:first-child" }],
+            "mediaUrls": [{ "css": "[itemtype$='VideoObject'] link[itemprop='thumbnailUrl']", "read": "attr:href" }]
+          }
+        },
+        "channel": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }],
+            "displayName": [{ "css": "#page-header h1 .yt-core-attributed-string" }]
+          },
+          "postLinks": [{ "css": "ytd-rich-grid-media a#video-title-link[href], ytd-rich-grid-media a#thumbnail[href]", "read": "attr:href" }]
+        }
+      }
+    },
+    "generic": {
+      "pages": {
+        "page": {
+          "fields": {
+            "canonicalUrl": [{ "css": "link[rel='canonical']", "read": "attr:href" }, { "css": "meta[property='og:url']", "read": "attr:content" }],
+            "caption": [{ "css": "meta[property='og:title']", "read": "attr:content" }, { "css": "head > title" }],
+            "postedAt": [{ "css": "meta[property='article:published_time']", "read": "attr:content" }],
+            "mediaUrls": [{ "css": "meta[property='og:image']", "read": "attr:content" }]
+          }
+        }
+      }
+    }
+  }
+}

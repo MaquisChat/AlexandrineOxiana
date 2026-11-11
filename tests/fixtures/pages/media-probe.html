@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- Synthetic probe page for the browser extension's end-to-end test: media that a copy of the page made
+     inside the live document would fetch again. The HTML snapshot must cause no requests at all. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Media probe (synthetic)</title>
+</head>
+<body>
+<h1>Media probe</h1>
+<video src="/probe/video.mp4" preload="auto" width="320" height="180"></video>
+<audio src="/probe/audio.mp3" preload="auto"></audio>
+<img src="/probe/image.png" width="10" height="10" alt="">
+<div style="height: 12000px"></div>
+<img src="/probe/lazy.png" loading="lazy" width="10" height="10" alt="">
+</body>
+</html>
