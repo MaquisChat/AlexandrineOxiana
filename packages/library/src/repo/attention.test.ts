@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent } from "@ao/core";
@@ -109,7 +109,7 @@ describe("Task 50: attention records", () => {
       device: "dev-B",
       at: NOW,
       decision: { result: "allow" },
-      details: { hint: "host-B:Lib", attentionId: rec.id, recordedLate: { occurredAt: "2026-11-08T10:00:00.000Z", reason: "EIO" } },
+      details: { hint: "host-B:Lib", attentionId: rec.id, recordedLate: { occurredAt: "2026-11-08T10:00:00.000Z", reason: "EIO", by: "dev-A" } },
     });
     expect(await projectWarnings(r, pid)).toEqual([]);
     expect(await records()).toEqual([]);
@@ -128,7 +128,7 @@ describe("Task 50: attention records", () => {
     await mkdir(join(lib.root, folder, "attention"), { recursive: true });
     await writeFile(join(lib.root, folder, "attention", `${newAttentionId()}.json`), "{ not json");
     const r = await reopen();
-    expect(await projectWarnings(r, pid)).toEqual(["audit-unrecorded"]);
+    expect(await projectWarnings(r, pid)).toEqual(["attention-unreadable"]);
     expect(await records()).toHaveLength(1);
   });
 
@@ -137,7 +137,7 @@ describe("Task 50: attention records", () => {
     seams.failAuditAppendFor = pid;
     const r = await reopen();
     expect(r.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: pid, kind: "audit-append-failed-at-open" }));
-    expect(await projectWarnings(r, pid)).toEqual(["audit-unrecorded"]);
+    expect(await projectWarnings(r, pid)).toEqual(["audit-unrecorded-blocked"]);
     seams.failAuditAppendFor = undefined;
     const r2 = await reopen();
     expect(await projectWarnings(r2, pid)).toEqual([]);
@@ -151,5 +151,70 @@ describe("Task 50: attention records", () => {
     seams.crashAt = "before-attention-mark";
     await expect(recordOrMark(repo, pid, "library.relink", { files: 1 })).rejects.toBeInstanceOf(SimulatedCrash);
     expect(await records()).toHaveLength(1);
+  });
+});
+
+describe("R154 c: a repair takes no instruction from a record on disk", () => {
+  const planted = async (body: Record<string, unknown>) => {
+    const id = newAttentionId();
+    await mkdir(join(lib.root, folder, "attention"), { recursive: true });
+    await writeFile(join(lib.root, folder, "attention", `${id}.json`), JSON.stringify({ formatVersion: 1, id, occurredAt: NOW, actor: "x", device: "dev-B", ...body }));
+    return id;
+  };
+
+  it("L3: a planted permissions record naming project.json with mode 0o777 changes nothing and is never audited as restricted", async () => {
+    const pj = join(lib.root, folder, "project.json");
+    await chmod(pj, 0o644);
+    await planted({ kind: "permissions-not-set", files: [`${folder}/project.json`], mode: 0o777, action: "library.relink" });
+    const r = await reopen();
+    expect((await stat(pj)).mode & 0o777).toBe(0o644);
+    expect((await events()).some((e) => e.action === "library.permissions-restricted")).toBe(false);
+    // Not a valid record: kept, shown, and can only be set aside.
+    expect(await projectWarnings(r, pid)).toEqual(["attention-unreadable"]);
+  });
+
+  it("a permissions record names sources only; the repair applies the code's own mode, never widens, verifies and audits what it did", async () => {
+    await writeFile(join(tmp, "in.pdf"), "%PDF body");
+    const draft = {
+      projectIds: [],
+      type: "article-journal" as const,
+      title: { variants: [{ lang: "en", kind: "original" as const, value: "T" }] },
+      creators: [],
+      issued: "2025",
+      identifiers: {},
+      caseAttributes: {},
+      availability: { status: "available" as const },
+      collectionIds: [],
+      tagIds: [],
+      participantIds: [],
+    };
+    const prov = { captureMethod: "manual_upload" as const, capturedAt: NOW, tool: { name: "ao", version: "0" }, fileHashes: {}, legal: { status: "public" as const }, identifiable: false };
+    const src = await repo.createSource(pid, draft, [{ path: join(tmp, "in.pdf"), role: "original", handling: "copy" }], { provenance: prov });
+    const file = join(lib.root, src.assets[0]!.path);
+    await chmod(file, 0o644);
+    await planted({ kind: "permissions-not-set", sourceIds: [src.source.id], action: "library.relink" });
+    const r = await reopen();
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    const ev = (await events()).filter((e) => e.action === "library.permissions-restricted");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.details).toMatchObject({ sources: 1, mode: "600", after: "library.relink" });
+    expect((ev[0]!.details as { files: number }).files).toBeGreaterThanOrEqual(1);
+    expect(await projectWarnings(r, pid)).toEqual([]);
+  });
+
+  it("a permissions record that carries a mode or file list is not acted on", async () => {
+    await planted({ kind: "permissions-not-set", sourceIds: [], files: ["x"], mode: 0o600, action: "library.relink" });
+    const r = await reopen();
+    expect(await projectWarnings(r, pid)).toEqual(["attention-unreadable"]);
+  });
+
+  it("M3: an unrecorded-audit record may only name the actions this task records, and no transaction", async () => {
+    await planted({ kind: "audit-unrecorded", action: "key.recovery-activated", details: { op: "x" }, state: "ready" });
+    await planted({ kind: "audit-unrecorded", action: "library.reconnect", details: { txn: "deadbeef" }, state: "ready" });
+    await planted({ kind: "audit-unrecorded", action: "library.reconnect", decision: { result: "deny", reason: "r" }, details: {}, state: "ready" });
+    const r = await reopen();
+    expect((await events()).some((e) => e.action === "key.recovery-activated" || e.details?.txn === "deadbeef" || e.action === "library.reconnect")).toBe(false);
+    expect(await projectWarnings(r, pid)).toEqual(["attention-unreadable"]);
+    expect(await records()).toHaveLength(3);
   });
 });

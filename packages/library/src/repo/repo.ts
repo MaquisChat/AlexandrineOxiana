@@ -88,7 +88,22 @@ import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./r
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
-import { attentionWarnings, newAttentionId, reasonOf, removeAttention, settleAttention, writeAttention, type AttentionRecord } from "./attention.js";
+import {
+  AUDIT_WAITING_WARNING,
+  attentionWarnings,
+  listMarks,
+  markForSetAside,
+  moveOutboxIntoProject,
+  newAttentionId,
+  readOutbox,
+  reasonOf,
+  removeAttention,
+  settleAttention,
+  writeAttention,
+  writeOutbox,
+  type AttentionMark,
+  type AttentionRecord,
+} from "./attention.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
 import { LIBRARY_AUDIT_DIR, checkLibraryAudit, libraryAnchorKey, readLibraryAudit } from "./library-audit.js";
 
@@ -538,6 +553,9 @@ export async function openRepoInternal(
     const problem = checkAnchor(events, verify, anchor, core.device);
     const at = core.clock().toISOString();
     if (problem) core.integrityWarnings.push({ projectId: st.project.id, ...problem });
+    if (!verify.ok) st.auditUnverified = true;
+    // Marks this device kept for this library (R154 e): a project that cannot be settled now takes them into its folder.
+    if (writable && (blocked || !verify.ok)) await moveOutboxIntoProject(core, st).catch(() => {});
     if (!writable || blocked) continue;
     // A failed append here must never keep the whole library from opening: it blocks this project only.
     try {
@@ -739,7 +757,25 @@ export async function recordOrMark(
       });
     } catch (e) {
       if (e instanceof SimulatedCrash) throw e;
-      return `${what}; the project could not be marked as needing attention either (${e instanceof Error ? e.message : String(e)})`;
+      // The project folder cannot take it: kept on this device instead (R154 e, M1).
+      try {
+        await writeOutbox(core.library.appConfigDir, core.library.id, projectId, {
+          formatVersion: 1,
+          id: newAttentionId(),
+          kind: "audit-unrecorded",
+          occurredAt: core.clock().toISOString(),
+          actor: core.actor,
+          device: core.device,
+          action,
+          ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+          details,
+          state: "ready",
+          reason: reasonOf(err),
+        });
+      } catch (e2) {
+        return `${what}; it could not be kept for later either (${e2 instanceof Error ? e2.message : String(e2)})`;
+      }
+      return `${what}; it is kept on this computer and recorded when the library is next opened here with write access`;
     }
     return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
   }
@@ -1000,7 +1036,9 @@ export async function projectWarnings(repo: Repo, projectId: string): Promise<st
   const out = (await deletedRecordsWarning(core, st)) ? [DELETED_RECORDS_WARNING] : [];
   if (await recoveryCodeUnshown(core, st)) out.push(RECOVERY_CODE_UNSHOWN_WARNING);
   // Actions not undone whose audit event, or permissions, could not be written (Task 50).
-  out.push(...(await attentionWarnings(core.root, st.rel)));
+  out.push(...(await attentionWarnings(core.root, st.rel, st.recoveryPending === true || st.auditUnverified === true)));
+  // Marks waiting on this device for this library's lock (R154 e).
+  if ((await readOutbox(core.library.appConfigDir, core.library.id)).some((e) => e.projectId === projectId)) out.push(AUDIT_WAITING_WARNING);
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
     const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;

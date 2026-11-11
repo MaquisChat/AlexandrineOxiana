@@ -985,7 +985,7 @@ describe("Task 50: reconnect and relink are never silent when an audit entry can
     expect(await projectWarnings(again.repo, p.id)).toEqual([]);
     const fixed = (await auditOf(lib.root, p.folder)).filter((e) => e.action === "library.permissions-restricted");
     expect(fixed).toHaveLength(1);
-    expect(fixed[0]!.details).toMatchObject({ files: 1, mode: "600", after: "library.relink" });
+    expect(fixed[0]!.details).toMatchObject({ sources: 1, changed: 1, mode: "600", after: "library.relink" });
     expect(again.repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: p.id, kind: "audit-recorded-late" }));
   });
 });

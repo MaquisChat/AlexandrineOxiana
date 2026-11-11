@@ -953,8 +953,12 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
       }
       const verify = async (staged: string) => (await hashStream(staged, defaultOpenRead, key).catch(() => null)) === a.sha256;
       const mode = f.identifiable || a.encrypted || f.keyId ? 0o600 : undefined;
-      // Nothing is copied into a project that cannot first be marked (fail closed).
+      // Nothing is copied into a project that cannot first be marked (fail closed). The record
+      // names this file before it is copied (M8), so a crash right after the copy still counts it.
       const intent = await intentFor(f.projectId);
+      const planned = [...(copied.get(f.projectId) ?? []), a.id];
+      intent.details = { files: planned.length, assetIds: planned };
+      await writeProjectAttention(repo, f.projectId, intent);
       const placed = await copyBack(lib.root, src.abs, target, mode, verify);
       if (placed !== "ok" && placed !== "ok-mode-not-set") {
         result.skipped.push({ path: f.path, reason: placed });
@@ -977,8 +981,7 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
             occurredAt: info.at,
             actor: info.actor,
             device: info.device,
-            files: [f.path],
-            mode: mode!,
+            sourceIds: [f.sourceId!],
             action: "library.relink",
           });
           result.warnings.push(`${f.path}: the file was restored but its owner-only permissions could not be set; the project is marked as needing attention and they are set again when the library is next opened`);
@@ -986,8 +989,6 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
           result.warnings.push(`${f.path}: the file was restored but its owner-only permissions could not be set, and the project could not be marked as needing attention (${msg(err)})`);
         }
       }
-      intent.details = { files: ids.length, assetIds: ids };
-      await writeProjectAttention(repo, f.projectId, intent).catch(() => {}); // the earlier version still names the project
     } catch (err) {
       result.warnings.push(`${f.path}: ${msg(err)}`);
     }

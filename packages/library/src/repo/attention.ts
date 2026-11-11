@@ -1,26 +1,38 @@
 /**
  * What a project needs attention for after an action that was not undone (R28, R82: never silent;
- * Task 50). Two kinds, each a small file `<Project>/attention/<id>.json` (owner-only, no absolute
- * paths, no secrets):
+ * Task 50, R154). Two kinds, each a small file `<Project>/attention/<id>.json` (owner-only, no
+ * absolute paths, no secrets):
  *
  * - `audit-unrecorded`: an action happened (or may have happened) but its audit event could not be
  *   written: a library move, split, old-copy deletion, reconnect or relink, or a refusal of a move.
- *   Relink writes the record BEFORE it copies anything (`state: "intent"`), so a crash between the
- *   copy and its audit event leaves the record; the others write it when the append fails (their
- *   own journals cover a crash before that). The project shows the standing warning
- *   `audit-unrecorded` while a record exists.
- * - `permissions-not-set`: a file was restored to the library but its owner-only permissions could
- *   not be set. The file stays; the warning `permissions-not-set` stands until they are set.
+ *   Relink writes the record BEFORE it copies anything (`state: "intent"`, naming each file before
+ *   its copy), so a crash between a copy and its audit event leaves the record; the others write it
+ *   when the append fails (their own journals cover a crash before that).
+ * - `permissions-not-set`: a file was restored to a source but its owner-only permissions could not
+ *   be set. The record names the SOURCES only (ids): never a path or a mode (R154 c).
  *
- * Each writable open repairs what it can (`settleAttention`): an unrecorded event is appended to
- * the project's audit log with `details.recordedLate` (when it happened, why it was late, whether
- * the action was interrupted) and `details.attentionId`, which makes the repair idempotent (a crash
- * between the append and removing the record does not record it twice); permissions are set again
- * and recorded as `library.permissions-restricted`. A repair raises the open's warning
- * `audit-recorded-late`. What cannot be repaired keeps its record and its warning. A record that
- * cannot be read is never removed and counts as `audit-unrecorded`.
+ * Records are data from a folder anyone with access (or a sync tool) can write, so they never steer
+ * a privileged action (R154 c): an unrecorded event may only name the actions this module records,
+ * a refusal only for `move`, and no transaction, attention id or late-recording fields; a
+ * permissions repair applies the code's own mode (owner read/write at most, never adding a bit) to
+ * the files of the named sources as the project's own index places them, verifies the result and
+ * audits what it did. A record that does not pass is never acted on, never removed by a repair, and
+ * shown as `attention-unreadable`.
+ *
+ * Each writable open repairs what it can (`settleAttention`, only for a project whose audit log
+ * verifies and that accepts writes): an unrecorded event is appended with `details.recordedLate`
+ * (when it happened, why it was late, whether interrupted, and `by`: the device recording it now)
+ * and `details.attentionId`, which makes the repair idempotent. A repair raises the open's warning
+ * `audit-recorded-late`. What cannot be repaired keeps its record; the researcher can set it aside
+ * (R154 d, `setAsideMark` in repo.ts).
+ *
+ * Device-local outbox (R154 e): a mark that belongs in a library this device does not hold the lock
+ * for (or whose project folder cannot take it) is written to
+ * `<appConfigDir>/attention-outbox/<libraryId>/<id>.json`, shown on this device (`audit-waiting`), and
+ * delivered on this device's next writable open of that library: settled directly when the project
+ * can be settled, else moved into the project's folder; the outbox file goes only after that.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditEvent } from "@ao/core";
@@ -30,9 +42,20 @@ import { parseProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export const ATTENTION_DIR = "attention";
 export const AUDIT_UNRECORDED_WARNING = "audit-unrecorded";
+export const AUDIT_UNRECORDED_BLOCKED_WARNING = "audit-unrecorded-blocked";
+export const ATTENTION_UNREADABLE_WARNING = "attention-unreadable";
 export const PERMISSIONS_NOT_SET_WARNING = "permissions-not-set";
+export const AUDIT_WAITING_WARNING = "audit-waiting";
 const MODE = 0o600;
+/** The only permission bits a repair leaves: owner read and write (R154 c). */
+export const RESTRICTED_MODE = 0o600;
 const NAME = /^[0-9a-f]{16,64}\.json$/;
+const OUTBOX = "attention-outbox";
+const ID = /^[0-9A-Za-z_-]{1,64}$/;
+
+/** The actions an `audit-unrecorded` record may name (R154 c, M3). `move` only as a refusal. */
+export const RECORDABLE_ACTIONS = new Set(["library.move", "library.split", "library.old-copy-deleted", "library.reconnect", "library.relink", "move"]);
+const RESERVED_DETAILS = ["txn", "attentionId", "recordedLate"];
 
 export interface UnrecordedAudit {
   formatVersion: 1;
@@ -42,9 +65,9 @@ export interface UnrecordedAudit {
   occurredAt: string;
   actor: string;
   device: string;
-  /** The audit event's action, e.g. `library.move`, or the policy action of a refusal (`move`). */
+  /** The audit event's action, e.g. `library.move`, or `move` for a refusal. */
   action: string;
-  /** Present for a refusal. */
+  /** Present exactly for a refusal (`move`). */
   decision?: { result: "deny"; reason: string };
   details: Record<string, unknown>;
   /** `intent`: written before the action; it may not have finished. `ready`: the action finished. */
@@ -60,11 +83,10 @@ export interface PermissionsNotSet {
   occurredAt: string;
   actor: string;
   device: string;
-  /** Library-relative files whose permissions must be `mode`. */
-  files: string[];
-  mode: number;
-  /** The audit action of the restore that placed them, e.g. `library.relink`. */
-  action: string;
+  /** Sources a restored file belongs to; their files are restricted. No path, no mode. */
+  sourceIds: string[];
+  /** The restore that placed the files: `library.relink`. */
+  action: "library.relink";
 }
 
 export type AttentionRecord = UnrecordedAudit | PermissionsNotSet;
@@ -100,84 +122,140 @@ export async function removeAttention(root: string, projectRel: string, id: stri
   });
 }
 
-function parseRecord(v: unknown, id: string): AttentionRecord | null {
-  const o = v as Partial<AttentionRecord> | null;
-  if (!o || typeof o !== "object" || o.formatVersion !== 1 || o.id !== id) return null;
+const isPlain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+/** A record this code wrote, or null: anything else is never acted on (R154 c). */
+export function parseRecord(v: unknown, id: string): AttentionRecord | null {
+  if (!isPlain(v)) return null;
+  const o = v as Partial<AttentionRecord> & Record<string, unknown>;
+  if (o.formatVersion !== 1 || o.id !== id) return null;
   if (typeof o.occurredAt !== "string" || typeof o.actor !== "string" || typeof o.device !== "string" || typeof o.action !== "string") return null;
   if (o.kind === "audit-unrecorded") {
     const u = o as Partial<UnrecordedAudit>;
-    if (!u.details || typeof u.details !== "object" || Array.isArray(u.details) || (u.state !== "intent" && u.state !== "ready")) return null;
-    if (u.decision !== undefined && (u.decision?.result !== "deny" || typeof u.decision.reason !== "string")) return null;
-    return o as UnrecordedAudit;
+    if (!isPlain(u.details) || (u.state !== "intent" && u.state !== "ready")) return null;
+    if (!RECORDABLE_ACTIONS.has(u.action!)) return null;
+    if (RESERVED_DETAILS.some((k) => Object.hasOwn(u.details!, k))) return null;
+    // A refusal is exactly a `move` deny; nothing else carries a decision.
+    if ((u.action === "move") !== (u.decision !== undefined)) return null;
+    if (u.decision !== undefined && (u.decision.result !== "deny" || typeof u.decision.reason !== "string")) return null;
+    if (u.reason !== undefined && (typeof u.reason !== "string" || !/^[A-Za-z0-9_]{1,64}$/.test(u.reason))) return null;
+    return u as UnrecordedAudit;
   }
   if (o.kind === "permissions-not-set") {
+    if ("files" in o || "mode" in o || o.action !== "library.relink") return null;
     const p = o as Partial<PermissionsNotSet>;
-    if (!Array.isArray(p.files) || !p.files.every((f) => typeof f === "string") || !Number.isInteger(p.mode)) return null;
-    return o as PermissionsNotSet;
+    if (!Array.isArray(p.sourceIds) || p.sourceIds.length === 0 || !p.sourceIds.every((s) => typeof s === "string" && ID.test(s))) return null;
+    return p as PermissionsNotSet;
   }
   return null;
 }
 
-/** The project's records; `unreadable` counts files that are not valid records (kept, never removed). */
-export async function readAttention(root: string, projectRel: string): Promise<{ records: AttentionRecord[]; unreadable: number }> {
+/** A file in the attention folder that is not a valid record, or the folder itself when it is not a folder. */
+export interface UnreadableMark {
+  /** The file's name in the attention folder; "" when `attention` itself is not a folder. */
+  file: string;
+}
+
+/** The project's records, and what in its attention folder is not a valid record (kept, never acted on). */
+export async function readAttention(root: string, projectRel: string): Promise<{ records: AttentionRecord[]; unreadable: UnreadableMark[] }> {
   let names: string[];
   try {
     names = await fsp.readdir(dirOf(root, projectRel));
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { records: [], unreadable: 0 };
-    return { records: [], unreadable: 1 };
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { records: [], unreadable: [] };
+    return { records: [], unreadable: [{ file: "" }] };
   }
   const records: AttentionRecord[] = [];
-  let unreadable = 0;
+  const unreadable: UnreadableMark[] = [];
   for (const n of names.sort()) {
-    if (n.includes(".tmp-")) continue; // an interrupted atomic write: never a record
-    if (!NAME.test(n)) {
-      unreadable++;
-      continue;
-    }
+    if (/\.tmp-[0-9a-f]+$/.test(n)) continue; // an interrupted atomic write: never a record
     let rec: AttentionRecord | null = null;
-    try {
-      const raw = await readMaybe(join(dirOf(root, projectRel), n));
-      rec = raw ? parseRecord(JSON.parse(raw.toString("utf8")), n.slice(0, -5)) : null;
-    } catch {
-      rec = null;
+    if (NAME.test(n)) {
+      try {
+        const raw = await readMaybe(join(dirOf(root, projectRel), n));
+        rec = raw ? parseRecord(JSON.parse(raw.toString("utf8")), n.slice(0, -5)) : null;
+      } catch {
+        rec = null;
+      }
     }
     if (rec) records.push(rec);
-    else unreadable++;
+    else unreadable.push({ file: n });
   }
   return { records, unreadable };
 }
 
-/** The standing warnings the project's records raise. */
-export async function attentionWarnings(root: string, projectRel: string): Promise<string[]> {
+/**
+ * The standing warnings, worded by cause: a readable unrecorded event that the next writable open
+ * records (`audit-unrecorded`), one that cannot be recorded while the project's log does not verify
+ * or it refuses writes (`audit-unrecorded-blocked`), anything not a valid record
+ * (`attention-unreadable`), permissions not set (`permissions-not-set`).
+ */
+export async function attentionWarnings(root: string, projectRel: string, blocked: boolean): Promise<string[]> {
   const { records, unreadable } = await readAttention(root, projectRel);
   const out: string[] = [];
-  if (unreadable > 0 || records.some((r) => r.kind === "audit-unrecorded")) out.push(AUDIT_UNRECORDED_WARNING);
+  if (records.some((r) => r.kind === "audit-unrecorded")) out.push(blocked ? AUDIT_UNRECORDED_BLOCKED_WARNING : AUDIT_UNRECORDED_WARNING);
+  if (unreadable.length > 0) out.push(ATTENTION_UNREADABLE_WARNING);
   if (records.some((r) => r.kind === "permissions-not-set")) out.push(PERMISSIONS_NOT_SET_WARNING);
   return out;
 }
+
+// ---- device-local outbox (R154 e) ----------------------------------------------------------------
+
+export interface OutboxEntry {
+  libraryId: string;
+  projectId: string;
+  record: AttentionRecord;
+}
+
+const outboxDir = (appConfigDir: string, libraryId: string) => join(appConfigDir, OUTBOX, libraryId);
+
+/** Keeps a mark on this device for a library it does not hold (or whose project folder cannot take it). */
+export async function writeOutbox(appConfigDir: string, libraryId: string, projectId: string, record: AttentionRecord): Promise<void> {
+  if (!ID.test(libraryId)) throw new Error("not a library id");
+  const dir = outboxDir(appConfigDir, libraryId);
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  const body: OutboxEntry = { libraryId, projectId, record };
+  await writeFileAtomic(join(dir, `${record.id}.json`), JSON.stringify(body, null, 2), { mode: MODE });
+}
+
+/** This device's waiting marks for the library (unreadable entries are kept and skipped). */
+export async function readOutbox(appConfigDir: string, libraryId: string): Promise<OutboxEntry[]> {
+  if (!ID.test(libraryId)) return [];
+  let names: string[];
+  try {
+    names = await fsp.readdir(outboxDir(appConfigDir, libraryId));
+  } catch {
+    return [];
+  }
+  const out: OutboxEntry[] = [];
+  for (const n of names.sort()) {
+    if (!NAME.test(n)) continue;
+    try {
+      const raw = await readMaybe(join(outboxDir(appConfigDir, libraryId), n));
+      const e = raw ? (JSON.parse(raw.toString("utf8")) as Partial<OutboxEntry>) : null;
+      const rec = e && typeof e.projectId === "string" ? parseRecord(e.record, n.slice(0, -5)) : null;
+      if (rec && e!.libraryId === libraryId) out.push({ libraryId, projectId: e!.projectId!, record: rec });
+    } catch {
+      // unreadable: left in place
+    }
+  }
+  return out;
+}
+
+async function removeOutbox(appConfigDir: string, libraryId: string, id: string): Promise<void> {
+  await fsp.unlink(join(outboxDir(appConfigDir, libraryId), `${id}.json`)).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== "ENOENT") throw err;
+  });
+}
+
+// ---- library helpers ------------------------------------------------------------------------------
 
 /**
  * The library-relative folder of project `projectId` in the library at `root`, read from each
  * `Projects/<n>/project.json` (for a library whose repo could not be opened). Null when not found.
  */
 export async function projectFolderOf(root: string, projectId: string): Promise<string | null> {
-  let names: string[] = [];
-  try {
-    names = await fsp.readdir(join(root, "Projects"));
-  } catch {
-    return null;
-  }
-  for (const n of names.sort()) {
-    if (n.startsWith(".")) continue;
-    try {
-      const raw = await readMaybe(join(root, "Projects", n, "project.json"));
-      if (raw && parseProjectJson(JSON.parse(raw.toString("utf8"))).project.id === projectId) return `Projects/${n}`;
-    } catch {
-      // not a readable project
-    }
-  }
-  return null;
+  return (await projectFolders(root)).get(projectId) ?? null;
 }
 
 /** Library-relative project folders by project id, for every readable project in the library at `root`. */
@@ -201,71 +279,194 @@ export async function projectFolders(root: string): Promise<Map<string, string>>
   return out;
 }
 
-/** Sets `mode` on one library-relative file, never through a symbolic link or outside the project. */
-async function restrict(core: RepoCore, st: ProjectState, rel: string, mode: number): Promise<void> {
-  if (!rel.startsWith(`${st.rel}/`)) throw new Error("outside the project");
-  const p = core.abs(rel);
-  await assertContained(core.abs(st.rel), p);
-  const s = await fsp.lstat(p);
-  if (!s.isFile()) throw new Error("not a file");
-  if (process.platform !== "win32") await fsp.chmod(p, mode);
-}
-
 /** Test seam: makes setting permissions again on open fail (until cleared). */
 export const attentionSeams: { failRestrict?: boolean } = {};
 
 /**
- * On a writable open of a project that accepts writes: appends each unrecorded event (once) and
- * sets each file's permissions again; removes what is settled. Returns how many records were
- * settled. An append failure throws (the caller blocks the project, R28).
+ * Restricts every file of one source, as the project's own index places it, to owner read/write at
+ * most (never adding a bit), without following links, and checks the result. Returns counts.
  */
-export async function settleAttention(core: RepoCore, st: ProjectState, events: Array<AuditEvent | null>, at: string): Promise<number> {
-  const { records } = await readAttention(core.root, st.rel);
-  let settled = 0;
-  for (const rec of records) {
-    if (rec.kind === "audit-unrecorded") {
-      const moveId = rec.details.moveId;
-      // Recorded already: by an earlier repair, or (a move step run again) by the action itself.
-      const already = events.some(
-        (e) => e?.details?.attentionId === rec.id || (moveId !== undefined && e?.action === rec.action && e.details?.moveId === moveId),
-      );
-      if (!already) {
-        await core.auditNow(st, {
-          at,
-          actor: rec.actor,
-          device: rec.device,
-          projectId: st.project.id,
-          action: rec.action,
-          entity: { type: "project", id: st.project.id },
-          decision: rec.decision ?? { result: "allow" },
-          details: {
-            ...rec.details,
-            attentionId: rec.id,
-            recordedLate: { occurredAt: rec.occurredAt, ...(rec.reason ? { reason: rec.reason } : {}), ...(rec.state === "intent" ? { interrupted: true } : {}) },
-          },
-        });
-      }
-      await removeAttention(core.root, st.rel, rec.id);
-      settled++;
-      continue;
+async function restrictSource(core: RepoCore, st: ProjectState, sourceId: string): Promise<{ files: number; changed: number }> {
+  const folder = st.sources.get(sourceId);
+  if (!folder || !folder.startsWith(`${st.rel}/Sources/`)) return { files: 0, changed: 0 }; // gone: nothing to restrict
+  const projectDir = core.abs(st.rel);
+  let files = 0;
+  let changed = 0;
+  const visit = async (abs: string): Promise<void> => {
+    await assertContained(projectDir, abs);
+    const s = await fsp.lstat(abs);
+    if (s.isSymbolicLink()) return;
+    if (s.isDirectory()) {
+      for (const n of (await fsp.readdir(abs)).sort()) await visit(join(abs, n));
+      return;
     }
-    try {
-      if (attentionSeams.failRestrict) throw Object.assign(new Error("permission change refused (simulated)"), { code: "EPERM" });
-      for (const f of rec.files) await restrict(core, st, f, rec.mode);
-    } catch {
-      continue; // stays: the warning stands until it works
+    if (!s.isFile()) return;
+    files++;
+    if (process.platform === "win32") return;
+    const cur = s.mode & 0o777;
+    const next = cur & RESTRICTED_MODE;
+    if (attentionSeams.failRestrict) throw Object.assign(new Error("permission change refused (simulated)"), { code: "EPERM" });
+    if (next !== cur) {
+      await fsp.chmod(abs, next);
+      changed++;
     }
-    if (!events.some((e) => e?.details?.attentionId === rec.id)) {
+    if (((await fsp.lstat(abs)).mode & 0o777 & ~RESTRICTED_MODE) !== 0) throw Object.assign(new Error("permissions are still wider"), { code: "EPERM" });
+  };
+  await visit(core.abs(folder));
+  return { files, changed };
+}
+
+/** Appends one record's event (once) or repairs its permissions; true when settled. Throws on a failed append. */
+async function settleOne(core: RepoCore, st: ProjectState, rec: AttentionRecord, events: Array<AuditEvent | null>, at: string): Promise<boolean> {
+  if (rec.kind === "audit-unrecorded") {
+    const moveId = rec.details.moveId;
+    // Recorded already: by an earlier repair, or (a move step run again) by the action itself.
+    const already = events.some((e) => e?.details?.attentionId === rec.id || (moveId !== undefined && e?.action === rec.action && e.details?.moveId === moveId));
+    if (!already) {
       await core.auditNow(st, {
-        ...core.auditBase(st, at),
-        action: "library.permissions-restricted",
+        at,
+        actor: rec.actor,
+        device: rec.device,
+        projectId: st.project.id,
+        action: rec.action,
         entity: { type: "project", id: st.project.id },
-        decision: { result: "allow" },
-        details: { attentionId: rec.id, files: rec.files.length, mode: rec.mode.toString(8), after: rec.action, occurredAt: rec.occurredAt },
+        decision: rec.decision ?? { result: "allow" },
+        details: {
+          ...rec.details,
+          attentionId: rec.id,
+          recordedLate: {
+            occurredAt: rec.occurredAt,
+            ...(rec.reason ? { reason: rec.reason } : {}),
+            ...(rec.state === "intent" ? { interrupted: true } : {}),
+            by: core.device,
+          },
+        },
       });
     }
+    return true;
+  }
+  let files = 0;
+  let changed = 0;
+  try {
+    for (const id of rec.sourceIds) {
+      const r = await restrictSource(core, st, id);
+      files += r.files;
+      changed += r.changed;
+    }
+  } catch {
+    return false; // stays: the warning stands until it works, or the researcher sets it aside
+  }
+  if (!events.some((e) => e?.details?.attentionId === rec.id)) {
+    await core.auditNow(st, {
+      ...core.auditBase(st, at),
+      action: "library.permissions-restricted",
+      entity: { type: "project", id: st.project.id },
+      decision: { result: "allow" },
+      details: { attentionId: rec.id, sources: rec.sourceIds.length, files, changed, mode: RESTRICTED_MODE.toString(8), after: rec.action, occurredAt: rec.occurredAt },
+    });
+  }
+  return true;
+}
+
+/**
+ * On a writable open of a project whose log verifies and that accepts writes: settles each record
+ * of the project and each of this device's outbox entries for it. Returns how many were settled.
+ * An append failure throws (the caller blocks the project, R28).
+ */
+export async function settleAttention(core: RepoCore, st: ProjectState, events: Array<AuditEvent | null>, at: string): Promise<number> {
+  let settled = 0;
+  for (const e of await readOutbox(core.library.appConfigDir, core.library.id)) {
+    if (e.projectId !== st.project.id) continue;
+    if (await settleOne(core, st, e.record, events, at)) settled++;
+    else await writeAttention(core.root, st.rel, e.record); // kept with the project from now on
+    await removeOutbox(core.library.appConfigDir, core.library.id, e.record.id);
+  }
+  const { records } = await readAttention(core.root, st.rel);
+  for (const rec of records) {
+    if (!(await settleOne(core, st, rec, events, at))) continue;
     await removeAttention(core.root, st.rel, rec.id);
     settled++;
   }
   return settled;
+}
+
+/**
+ * On a writable open of a project that cannot be settled now (its log does not verify, or it refuses
+ * writes): this device's outbox entries for it move into the project's folder, where they are shown
+ * and can be set aside. Failures leave them in the outbox.
+ */
+export async function moveOutboxIntoProject(core: RepoCore, st: ProjectState): Promise<void> {
+  for (const e of await readOutbox(core.library.appConfigDir, core.library.id)) {
+    if (e.projectId !== st.project.id) continue;
+    try {
+      await writeAttention(core.root, st.rel, e.record);
+      await removeOutbox(core.library.appConfigDir, core.library.id, e.record.id);
+    } catch {
+      // stays in the outbox
+    }
+  }
+}
+
+/** One mark as the audit screen lists it (no paths, no messages). */
+export interface AttentionMark {
+  /** The record id, or for something that is not a valid record its file name ("" for the folder). */
+  id: string;
+  kind: "audit-unrecorded" | "permissions-not-set" | "unreadable" | "waiting";
+  action?: string;
+  occurredAt?: string;
+  actor?: string;
+  /** An error code or name. */
+  reason?: string;
+  interrupted?: boolean;
+  refusal?: boolean;
+  /** Can be set aside here (not for a mark waiting on this device for the library's lock). */
+  canSetAside: boolean;
+}
+
+export async function listMarks(core: RepoCore, st: ProjectState): Promise<AttentionMark[]> {
+  const { records, unreadable } = await readAttention(core.root, st.rel);
+  const view = (r: AttentionRecord, waiting: boolean): AttentionMark => ({
+    id: r.id,
+    kind: waiting ? "waiting" : r.kind,
+    action: r.action,
+    occurredAt: r.occurredAt,
+    actor: r.actor,
+    ...(r.kind === "audit-unrecorded" && r.reason ? { reason: r.reason } : {}),
+    ...(r.kind === "audit-unrecorded" && r.state === "intent" ? { interrupted: true } : {}),
+    ...(r.kind === "audit-unrecorded" && r.decision ? { refusal: true } : {}),
+    canSetAside: !waiting,
+  });
+  return [
+    ...records.map((r) => view(r, false)),
+    ...unreadable.map((u): AttentionMark => ({ id: u.file, kind: "unreadable", canSetAside: true })),
+    ...(await readOutbox(core.library.appConfigDir, core.library.id)).filter((e) => e.projectId === st.project.id).map((e) => view(e.record, true)),
+  ];
+}
+
+/** What a set-aside records about a mark, and how to remove it. */
+export async function markForSetAside(
+  core: RepoCore,
+  st: ProjectState,
+  id: string,
+): Promise<{ summary: Record<string, unknown>; remove: () => Promise<void> } | null> {
+  const projectDir = core.abs(st.rel);
+  const { records, unreadable } = await readAttention(core.root, st.rel);
+  const rec = records.find((r) => r.id === id);
+  if (rec) return { summary: { kind: rec.kind, record: rec }, remove: () => removeAttention(core.root, st.rel, rec.id) };
+  const u = unreadable.find((x) => x.file === id);
+  if (!u) return null;
+  const abs = u.file === "" ? dirOf(core.root, st.rel) : join(dirOf(core.root, st.rel), u.file);
+  await assertContained(projectDir, abs);
+  const s = await fsp.lstat(abs);
+  if (!s.isFile()) return null; // a folder or link in the attention folder is not set aside here
+  const raw = await fsp.readFile(abs);
+  return {
+    summary: { kind: "unreadable", file: u.file === "" ? ATTENTION_DIR : `${ATTENTION_DIR}/${u.file}`, bytes: raw.length, sha256: createHash("sha256").update(raw).digest("hex") },
+    remove: async () => {
+      await assertContained(projectDir, abs);
+      await fsp.unlink(abs).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    },
+  };
 }

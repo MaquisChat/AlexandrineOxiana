@@ -112,6 +112,8 @@ export interface ProjectState {
    * audit or change-log line could not be trimmed, or an audit append failed while opening.
    */
   recoveryPending?: boolean;
+  /** The project's audit log did not verify when opened: marks cannot be recorded in it (Task 50). */
+  auditUnverified?: boolean;
 }
 
 export class RepoCore {
