@@ -195,10 +195,10 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Verify: `pnpm --filter @ao/ui exec vitest run src/screens/ExtensionPairing.test.tsx`.
 - Model: Sonnet.
 
-**Task 48 — First-use tools dialogue [ledger: R7, R83, R90; ADR 0009]**
+**Task 48 — First-use tools dialogue [ledger: R7, R83, R90, R126, R133; ADR 0009, ADR 0014]**
 - Depends: 34b. Split into two sessions: worker and service first, then UI.
 - Files: `services/media-worker/ao_worker/` (tool catalogue, install), `packages/library/src/worker-client.ts`, `apps/library-service/src/routes/capture.ts`, `packages/ui/src/screens/ToolsSetup.tsx`, `docs/adr/0009-capture-tools.md`, tests.
-- Accept: the worker reports each optional tool (speech models by size, video downloader, ffmpeg, OCR) with purpose, download size, and whether it is installed. ADR 0009 stays in force: the video downloader is the latest release, checked against its published checksums, kept in the tools folder and updated in place; the image downloader is pinned inside the worker and exiftool is bundled and required, so neither is optional. Other installs are pinned by address and checksum, run as jobs with progress, and go to the app's data folder, never the library. On first use the UI asks what the researcher will do and offers the matching tools; the choice can be reopened from settings; a feature whose tool is missing says so and links to the dialogue. The dialogue says what going without ffmpeg means: media that carries a location stays "proxy pending" and is left out of exports (R83, R90 c). Nothing about a project is sent when downloading.
+- Accept: the worker reports each optional tool (speech models by size, video downloader, ffmpeg, OCR) with purpose, download size, and whether it is installed. Follow ADR 0014 and R133: the video downloader is offered together with the JavaScript runtime it now needs for YouTube, and the worker names that runtime to it explicitly; OCR means tesseract only (ghostscript is no longer needed); an opt-in live check runs the real downloader against one public address so drift like this is caught (never in CI). ADR 0009 stays in force: the video downloader is the latest release, checked against its published checksums, kept in the tools folder and updated in place; the image downloader is pinned inside the worker and exiftool is bundled and required, so neither is optional. Other installs are pinned by address and checksum, run as jobs with progress, and go to the app's data folder, never the library. On first use the UI asks what the researcher will do and offers the matching tools; the choice can be reopened from settings; a feature whose tool is missing says so and links to the dialogue. The dialogue says what going without ffmpeg means: media that carries a location stays "proxy pending" and is left out of exports (R83, R90 c). Nothing about a project is sent when downloading.
 - Verify: worker tests with a local file server standing in for the download hosts; UI tests; one end-to-end run.
 - Model: Opus.
 
@@ -240,6 +240,14 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Verify: index tests; scenario 7 extended to a library with a pending job.
 - Model: Opus.
 
+**Task 61 — Issue a new recovery code [ledger: R134, R91, R92; ADR 0006]**
+- Depends: 41a, 60. Parallel: 49, 50.
+- Files: `packages/library/src/crypto/keys.ts`, `packages/library/src/repo/projects.ts`, `apps/library-service/src/routes/projects.ts`, `packages/ui/src/screens/` (project settings), `docs/adr/0006-encryption.md`, tests.
+- Why: the recovery code is shown once, at creation. A crash, a lost response or a closed window at that moment loses it for good, and nothing can issue another (found by the Task 60 review).
+- Accept: for an unlocked, encrypted project the researcher can ask for a new recovery code after entering the passphrase again. The action is evaluated by the policy engine and audited; the old code stops working; the new one is shown once with the same "I have saved it" step as at creation; a crash at any point leaves either the old code or the new one valid, never neither. ADR 0006 records that backups made before the change still open with the old code (R91, R92).
+- Verify: `pnpm --filter @ao/library exec vitest run src/crypto src/repo`; service and UI tests; adversarial review (crash points, wrong passphrase, locked project, read-only library).
+- Model: Opus.
+
 **Task 58 — Ledger loose ends in the library [ledger: R74, R93]**
 - Depends: 41a, 51 (both touch `packages/library/src/index/`). Parallel: 49, 50.
 - Files: `packages/library/src/index/`, `packages/library/src/import/zotero-local.ts`, `packages/core/src/model/project.ts`, tests.
@@ -279,7 +287,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: Linux build; a scripted launch that checks both helpers answer and are gone after exit.
 - Model: Opus.
 
-**Task 37d — Package the media worker**
+**Task 37d — Package the media worker [ledger: R133; ADR 0014]**
 - Depends: none. Parallel: 37a–37c.
 - Files: `apps/desktop/scripts/build-sidecars.mjs`, `services/media-worker/` (packaging spec, entry point).
 - Accept: a self-contained worker folder that starts without a Python installation, answers its health check, converts a HEIC image, makes a video proxy with an ffmpeg supplied by the tools manager, and transcribes the test clip with a model supplied on disk.
@@ -293,14 +301,14 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: controller reads it and rules; owner confirms the minimum macOS version.
 - Model: Opus.
 
-**Task 37f — Mac builds in CI**
+**Task 37f — Mac builds in CI [ledger: R133; ADR 0014]**
 - Depends: 37c, 37d, 37e, 48, 59.
 - Files: `.github/workflows/desktop-macos.yml`, `apps/desktop/src-tauri/tauri.conf.json`.
 - Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered.
 - Verify: a green workflow run with two downloadable artefacts.
 - Model: Opus.
 
-**Task 37g — Signing and notarisation**
+**Task 37g — Signing and notarisation [ledger: R133; ADR 0014]**
 - Depends: 37f, and the owner's Apple Developer account and credentials stored as GitHub secrets (the controller gives the exact steps).
 - Files: `.github/workflows/desktop-macos.yml`, `apps/desktop/src-tauri/` (entitlements).
 - Accept: both downloads are signed, the helpers inside them are signed, Apple's notarisation accepts them, and they open on a Mac without a security warning.
@@ -350,8 +358,8 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 ## 6. Risks
 
 1. **The Mac app cannot be run here.** Everything Mac-specific is first seen working on GitHub's machines or the owner's Mac. Mitigation: WebKit in the browser scenarios (the Mac app's web view is WebKit), a smoke test on the Mac build machines, the owner's checklist.
-2. **Packaging the worker for Intel Macs.** The speech and image libraries may not publish Intel-Mac builds any more. Task 37e finds out before 37f depends on it.
-3. **Tools on a Mac without a package manager.** tesseract and ghostscript have no simple official downloads. OCR may have to be bundled, or offered later than the rest.
+2. **Packaging the worker for Intel Macs.** Confirmed by Task 37e: four libraries publish no Intel-Mac build at the current versions, so the Intel download runs on a second, older set (R133). More libraries may follow, and GitHub may retire its Intel machines.
+3. **Tools on a Mac without a package manager.** tesseract has no official Mac download and is built and signed in our own CI; ghostscript turned out not to be needed. Tools the app downloads may be blocked by the Mac's security check unless signed (the video downloader is not signed by its authors): unverified, to be tested on the owner's Mac.
 4. **Signing the helper programs.** Apple's rules for programs inside an app are strict; expect more than one attempt at 37g.
 5. **Mac build minutes** on GitHub cost more than Linux ones on a private repository. The Mac workflow runs only by hand or on a tag.
 6. **First real integration.** Tasks 44 and 45 are the first time the screens meet the real service. Task 46 has a fixed budget; a large overrun changes the order of everything after it.
@@ -397,11 +405,11 @@ Update after every task; commit and push.
 | 38 Fix the red build | done | 8500d33 | 47 CLI tests pass locally; CI run on GitHub pending |
 | 39 Handoff docs in and corrected | done | 1597ad7, 8747f80 | |
 | 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
-| 41a Review: library and service | fix round 1 | | 1 Critical, 4 Important (R131); implementer working |
+| 41a Review: library and service | fix round 2 | | Critical fixed and re-reviewed; 3 Important open |
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | not started | | found by Task 43 |
+| 60 New-project dialog | fix round 1 | | spec met; 2 Important (R134) |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | not started | | |
 | 46 Fix scenario findings | not started | | |
@@ -417,19 +425,20 @@ Update after every task; commit and push.
 | 49 Backups governed | not started | | |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | not started | | |
+| 61 New recovery code | not started | | found by the Task 60 review |
 | 58 Ledger loose ends | not started | | |
-| 59 Tests pass on a Mac | not started | | |
+| 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |
 | 37b Token on standard input | not started | | |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | not started | | |
-| 37e Mac tools research | not started | | |
+| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
 | 37h Desktop end-to-end | not started | | |
 | 37i Guide and checklist | not started | | |
-| 52 Review pages | not started | | |
-| 53 Apply review findings | blocked | | needs owner review |
+| 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
+| 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
 | 55 Owner hands-on tests | blocked | | needs signed Mac build |
 | 56 Close out | not started | | |
@@ -440,7 +449,7 @@ Update after every task; commit and push.
 2. Decided 2026-11-11: no second backup folder in Phase 1. Until sync is designed, a backup lives beside the data it protects, so it does not survive losing the drive; copying the library folder to another drive by hand is the safeguard meanwhile.
 3. Approve merges to `main` at milestone boundaries.
 4. Create the Apple Developer account; later, add its signing credentials as GitHub secrets (Task 37g gives the steps).
-5. Confirm the minimum macOS version when Task 37e reports.
+5. Confirm two things from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia, which leaves out Intel MacBook Airs from 2018–19 and most Macs older than 2018; and the Intel download is kept although it must use older versions of four libraries (older cameras' RAW files only, two months behind on OCR fixes, an older cryptography library) and depends on GitHub keeping its Intel machines.
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
 8. Choose the project's own licence before anything is published (Task 56).
@@ -464,6 +473,7 @@ Each phase gets its own plan when it starts.
 - 2026-11-11: owner decided against a second backup folder in Phase 1; to be settled with sync (Phase 5). Plan still awaits approval.
 - 2026-11-11: owner approved the plan. Milestone I started: handoff docs merged and corrected (39), rulings R120–R128 recorded (40), build fixed (38), CI extended (42), three reviewers dispatched for the never-reviewed commits (41a, 41b).
 - 2026-11-11: reviews of the never-reviewed commits found 1 Critical and 9 Important defects (ledger, R131); fixes dispatched. Task 43 built the harness: real UI, service and worker pass in Chromium and WebKit with the service unchanged. It found that the UI cannot create a project: Task 60 added.
+- 2026-11-11: Task 37e done (ADR 0014, R133). Task 52 done and sent to the owner. Task 60 built, in review. Task 41a in fix round 2. GitHub's runners cannot reach the Ubuntu mirror today; CI has time limits now but no completed run yet.
 
 ## 12. What the ledger check changed
 

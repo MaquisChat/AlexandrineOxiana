@@ -16,6 +16,8 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A healthy run takes about 15 minutes; a stuck one must not burn build minutes for hours.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +34,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: System tools for the media worker (proxies, OCR)
-        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr ghostscript ffmpeg
+        # When the runner cannot reach the package mirror, apt retries each file for 20 s; fail fast instead.
+        timeout-minutes: 8
+        run: |
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
+          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 tesseract-ocr ghostscript ffmpeg
       - run: pnpm install --frozen-lockfile
       - name: Media worker venv
         run: pnpm setup:py

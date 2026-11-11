@@ -5,6 +5,7 @@
   "packageManager": "pnpm@10.28.0",
   "engines": { "node": ">=22" },
   "scripts": {
+    "review-pages": "node scripts/build-review-pages.mjs",
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run --passWithNoTests --reporter=default --reporter=json --outputFile.json=reports/vitest.json",
     "test:scale": "vitest run --config packages/library/vitest.scale.config.ts",
