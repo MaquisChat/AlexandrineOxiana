@@ -68,6 +68,25 @@ test("a Playwright spec file containing no tests is not a pass", () => {
   assert.match(md, /✗ The app end to end: empty\.spec\.ts contains no tests/);
 });
 
+// What Playwright 1.63 actually writes for a run over smoke.spec.ts and a spec file with no tests in
+// it: the empty file does not appear in `suites` at all, so it is found from the files on disk.
+const pwConfig = (argv) => ({ rootDir: "/repo/e2e", projects: [{ name: "chromium", testDir: "/repo/e2e" }], argv: ["/usr/bin/node", "/repo/e2e/node_modules/@playwright/test/cli.js", "test", ...argv] });
+const onDisk = (dir) => (dir === "/repo/e2e" ? ["/repo/e2e/smoke.spec.ts", "/repo/e2e/empty.spec.ts"] : []);
+
+test("a spec file on disk that the run did not report contains no tests: not a pass", () => {
+  const run = pwRun([pwSpec("works", ["expected"])], { config: pwConfig(["--trace", "off", "--project", "chromium"]) });
+  const md = buildReport({ playwrightApp: run }, { listSpecFiles: onDisk });
+  assert.match(md, /1 of 2 checks passed/);
+  assert.match(md, /✗ The app end to end: empty\.spec\.ts contains no tests/);
+});
+
+test("a run narrowed to some spec files does not flag the files it was not asked to run", () => {
+  const run = pwRun([pwSpec("works", ["expected"])], { config: pwConfig(["smoke.spec.ts", "--trace", "off"]) });
+  assert.match(buildReport({ playwrightApp: run }, { listSpecFiles: onDisk }), /1 of 1 checks passed/);
+  const grep = pwRun([pwSpec("works", ["expected"])], { config: pwConfig(["--grep", "works"]) });
+  assert.match(buildReport({ playwrightApp: grep }, { listSpecFiles: onDisk }), /1 of 1 checks passed/);
+});
+
 test("a Playwright run that found no tests or failed to start is not a pass", () => {
   const md = buildReport({ playwrightApp: { suites: [], errors: [{ message: "Error: No tests found" }] } });
   assert.match(md, /0 of 1 checks passed/);
