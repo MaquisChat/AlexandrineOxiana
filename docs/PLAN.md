@@ -422,18 +422,18 @@ Update after every task; commit and push.
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
-| 34a Service additions | in review | 0dd43ae (worktree branch) | security review resumed |
-| 34b Capture screen | not started | | |
-| 34c Transcript viewer | not started | | |
-| 34d Verification badges | not started | | |
+| 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
+| 34b Capture screen | in progress | | implementer dispatched |
+| 34c Transcript viewer | in progress | | implementer dispatched |
+| 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
 | 34e Pairing screen | not started | | |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | fix round 1 | 23d4ee8 (worktree branch) | resumed; 1 Critical, 4 Important (R138) |
+| 49 Backups governed | fix round 2 | 91f78f4 (worktree branch) | round 1 confirmed; one new Important (certificate wording when a removal fails) |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | in progress | | resumed |
-| 61 New recovery code | in progress | | implementer dispatched |
+| 61 New recovery code | in review | 35be129 (worktree branch) | adversarial review dispatched |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |

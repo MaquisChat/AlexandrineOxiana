@@ -10,7 +10,6 @@ agent's unfinished edits on top of the commit named below.
 
 | File | Task | Base | Branch head | State when stopped |
 |---|---|---|---|---|
-| `task-34a-committed.patch` | 34a media and transcript routes (R135) | `ad61439` | `0dd43ae` | Implementation finished and reported; the adversarial security review had only just begun. Report: see the ledger. |
 | `task-49-committed.patch` | 49 governed backups (R125) | `ad61439` | `23d4ee8` | Implementation finished; reviewed: 1 Critical, 4 Important (ledger, R138). Fix round 1 had not produced a commit. Does not apply cleanly on the current working branch (it predates the Task 41a merge); apply on its base, then merge. |
 | `task-51-uncommitted.patch` | 51 job records in files (R31) | on `668a86c` | | Early: first tests and the start of the journal module (3 files). Nothing committed. |
 
