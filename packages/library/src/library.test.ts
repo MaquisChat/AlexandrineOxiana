@@ -454,5 +454,9 @@ describe("lock holder's device name (R118 c)", () => {
     const z = await createLibrary(join(root, "..", `long-${now}`), "Long", mkDeps({ hostname: "h".repeat(300) }));
     expect((await openLibrary(z.root, depsB())).lockedBy).toBeUndefined();
     await z.close();
+    // 41a M6: a lone surrogate is not a usable name either.
+    const s = await createLibrary(join(root, "..", `surrogate-${now}`), "Surrogate", mkDeps({ hostname: "host\ud800" }));
+    expect((await openLibrary(s.root, depsB())).lockedBy).toBeUndefined();
+    await s.close();
   });
 });

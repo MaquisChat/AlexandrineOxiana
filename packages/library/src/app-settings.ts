@@ -113,11 +113,11 @@ export function updateAppSetting<T>(dir: string, name: string, edit: (cur: T | u
 export const RESEARCHER_SETTING = "researcher.json";
 export const RESEARCHER_NAME_MAX = 200;
 
-/** A usable display name: 1–200 characters once trimmed, no control, format (bidi, zero-width) or line-separator characters. */
+/** A usable display name: 1–200 characters once trimmed, no control, format (bidi, zero-width), line-separator or lone surrogate characters. */
 export function researcherNameOk(v: unknown): v is string {
   if (typeof v !== "string") return false;
   const t = v.trim();
-  return t.length > 0 && t.length <= RESEARCHER_NAME_MAX && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(t);
+  return t.length > 0 && t.length <= RESEARCHER_NAME_MAX && !/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(t);
 }
 
 /** The researcher's display name on this device, or undefined when none is set (or the file is not usable). */
