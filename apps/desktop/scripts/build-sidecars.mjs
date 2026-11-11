@@ -269,6 +269,8 @@ function main() {
     for (const l of links) console.log(`  ${l.path} -> ${l.target}`);
   }
   if (opts.smoke) {
+    // The manifest must list exactly what the bundle holds (every package and native library).
+    run(py, ["-I", join(PACKAGING, "manifest.py"), "--bundle", bundle, "--out", join(bundle, "sidecar-manifest.json"), "--check"]);
     run(py, ["-I", join(PACKAGING, "smoke_test.py"), "--worker", exe, "--report", join(OUT, `ao-worker-${triple}.smoke.json`),
       ...(opts.noModelDownload ? ["--no-model-download"] : []),
       ...(opts.allowMissing.length ? ["--allow-missing", opts.allowMissing.join(",")] : [])]);

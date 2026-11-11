@@ -173,7 +173,12 @@ native library in the bundle with the package that carries it and its licence *a
 that wheel's files, by the library itself (FFmpeg) or "unknown". The same facts are in
 `sidecar-manifest.json` (`packages[].binaryWheelStatement`,
 `packages[].copyleftIncludingNativeLibraries`, `nativeLibraries`). Facts only, no legal
-assessment.
+assessment. The manifest must match the bundle exactly: every `*.dist-info` folder and every
+native library in `_internal/` must be listed, and everything listed must be there. Writing the
+manifest fails the build otherwise, and `--smoke` checks it again
+(`manifest.py --bundle <folder> --out <folder>/sidecar-manifest.json --check`). The package list
+follows the extras a requirement asks for (ocrmypdf needs `pikepdf[pdfa]`, which brings
+jsonschema and referencing). Unit tests: `services/media-worker/tests/test_packaging_manifest.py`.
 
 **Symbolic links (for the Mac build):** PyInstaller links every shared library that a wheel keeps
 in `<package>.libs/` (or `.dylibs/` on macOS) into the top of `_internal/` (64 links in the Linux

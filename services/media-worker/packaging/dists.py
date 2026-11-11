@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from importlib import metadata
 
-from packaging.markers import Marker
+from packaging.requirements import Requirement
 
 
 def canonical(name: str) -> str:
@@ -16,21 +16,25 @@ def canonical(name: str) -> str:
 
 
 def runtime_dists(root: str = "ao-worker") -> list[str]:
-    """`root` and every distribution it needs at run time (extras and non-matching markers skipped)."""
-    seen: dict[str, None] = {}
-    todo = [root]
+    """`root` and every distribution it needs at run time.
+
+    Follows the extras a requirement asks for (ocrmypdf requires `pikepdf[pdfa]`, which brings
+    jsonschema and referencing); skips the extras nobody asks for and non-matching markers."""
+    done: dict[str, set[str]] = {}
+    todo: list[tuple[str, frozenset[str]]] = [(root, frozenset())]
     while todo:
-        name = canonical(todo.pop())
-        if name in seen:
+        raw, extras = todo.pop()
+        name = canonical(raw)
+        if name in done and extras <= done[name]:
             continue
         try:
             dist = metadata.distribution(name)
         except metadata.PackageNotFoundError:
             continue
-        seen[name] = None
-        for req in dist.requires or []:
-            spec, _, marker = req.partition(";")
-            if marker.strip() and not Marker(marker).evaluate({"extra": ""}):
+        done.setdefault(name, set()).update(extras)
+        for req_text in dist.requires or []:
+            req = Requirement(req_text)
+            if req.marker is not None and not any(req.marker.evaluate({"extra": e}) for e in ("", *extras)):
                 continue
-            todo.append(re.split(r"[\s<>=!~\[(;]", spec.strip(), maxsplit=1)[0])
-    return sorted(seen)
+            todo.append((req.name, frozenset(canonical(e) for e in req.extras)))
+    return sorted(done)

@@ -94,6 +94,8 @@ def licence_of(meta) -> str:
 
 
 def copyleft(licence: str) -> str:
+    if re.search(r"dependenc(y|ies)['’]? licen[cs]es?", licence, re.I):
+        return "unknown"  # e.g. pypdfium2: "BSD-3-Clause, Apache-2.0, dependency licenses" (which ones is not stated)
     if re.search(r"exception", licence, re.I) and STRONG.search(licence):
         return "runtime-exception"
     without_weak = WEAK.sub("", licence)
@@ -176,7 +178,9 @@ def statement_for(lib: Path, carrier: Dist | None) -> dict:
                     "copyleft": "no", "statedBy": "build Python's LICENSE.txt"}
         return {"licence": "unknown", "copyleft": "unknown", "statedBy": "nothing in the bundle (collected from the build machine)"}
     if (carrier.name, stem) in OWN_LIBRARIES:
-        return {"licence": f"{carrier.licence} (the package's own library)", "copyleft": copyleft(carrier.licence),
+        cl = copyleft(carrier.licence)
+        note = "; the dependency licences it mentions are not named there" if cl == "unknown" else ""
+        return {"licence": f"{carrier.licence} (the package's own library{note})", "copyleft": cl,
                 "statedBy": f"{carrier.dist.metadata['Name']} metadata"}
     for name, s, lic, cl, rel, quote in STATED:
         if name == carrier.name and s == stem:
@@ -197,6 +201,51 @@ def statement_for(lib: Path, carrier: Dist | None) -> dict:
     return {"licence": "unknown", "copyleft": "unknown", "statedBy": f"nothing in the {carrier.dist.metadata['Name']} wheel"}
 
 
+def native_library_files(internal: Path) -> list[Path]:
+    """Every shared library in `_internal` that is a real file and not a Python extension module."""
+    return sorted(p for p in internal.rglob("*") if is_shared_library(p) and not is_extension_module(p))
+
+
+def bundled_dist_names(internal: Path) -> set[str]:
+    return {canonical(d.name.removesuffix(".dist-info").rsplit("-", 1)[0]) for d in internal.glob("*.dist-info")}
+
+
+RANK = {"no": 0, "runtime-exception": 1, "choice": 2, "weak": 3, "unclear": 4, "unknown": 4, "yes": 5}
+
+
+def roll_up(values: list[str]) -> str:
+    """The strictest of several copyleft values. "unknown" outranks every known value except "yes",
+    so a package with one unknown library is never reported as permissive."""
+    return max(values, key=RANK.get)
+
+
+def check_complete(bundle: Path, manifest: dict) -> list[str]:
+    """Differences between what the bundle contains and what the manifest lists (empty when none):
+    every Python distribution (a `*.dist-info` folder) and every native library."""
+    internal = bundle / "_internal"
+    problems = []
+    listed = {canonical(p["name"]) for p in manifest.get("packages", [])}
+    present = bundled_dist_names(internal)
+    problems += [f"package {n} is in the bundle but not in the manifest" for n in sorted(present - listed)]
+    problems += [f"package {n} is in the manifest but not in the bundle" for n in sorted(listed - present)]
+    listed_libs = {x["path"] for x in manifest.get("nativeLibraries", [])}
+    present_libs = {str(p.relative_to(bundle)) for p in native_library_files(internal)}
+    problems += [f"native library {p} is in the bundle but not in the manifest" for p in sorted(present_libs - listed_libs)]
+    problems += [f"native library {p} is in the manifest but not in the bundle" for p in sorted(listed_libs - present_libs)]
+    return problems
+
+
+def review_lines(manifest: dict) -> list[str]:
+    """What a licence review should look at: every package or native library that is not plainly
+    permissive, as stated."""
+    lines = [f"review: {p['name']} {p['version']}: {p['licence']} ({p['copyleft']})" for p in manifest["packages"] if p["copyleft"] != "no"]
+    lines += [f"review: {p['name']} with its native libraries: {p['copyleftIncludingNativeLibraries']}"
+              for p in manifest["packages"] if p.get("copyleftIncludingNativeLibraries", "no") not in ("no", p["copyleft"])]
+    lines += [f"native: {x['library']} ({x['carriedBy']}): {x['licence']} [{x['copyleft']}]"
+              for x in manifest["nativeLibraries"] if x["copyleft"] != "no"]
+    return lines
+
+
 def native_libraries(bundle: Path, dists: dict[str, Dist]) -> list[dict]:
     internal = bundle / "_internal"
     owner_of_dir = {}
@@ -205,7 +254,7 @@ def native_libraries(bundle: Path, dists: dict[str, Dist]) -> list[dict]:
             if canonical(n) in dists:
                 owner_of_dir[top] = canonical(n)
     out = []
-    for lib in sorted(p for p in internal.rglob("*") if is_shared_library(p) and not is_extension_module(p)):
+    for lib in native_library_files(internal):
         rel = lib.relative_to(internal)
         top = rel.parts[0]
         if len(rel.parts) == 1:
@@ -263,17 +312,21 @@ def binary_wheel_statement(d: Dist) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bundle", required=True, type=Path)
-    ap.add_argument("--target", required=True)
-    ap.add_argument("--pin-set", required=True)
+    ap.add_argument("--target")
+    ap.add_argument("--pin-set")
     ap.add_argument("--constraints", type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--check", action="store_true", help="only compare an existing manifest (--out) with the bundle")
     args = ap.parse_args()
 
+    if args.check:
+        return report_completeness(args.bundle, json.loads(args.out.read_text()))
+    if not args.target or not args.pin_set:
+        ap.error("--target and --pin-set are required unless --check is given")
     internal = args.bundle / "_internal"
     dists = {n: Dist(n, internal) for n in runtime_dists() if n != "ao-worker"}
     libs = native_libraries(args.bundle, dists)
     folder = write_licence_folder(args.bundle, dists, libs)
-    rank = {"no": 0, "runtime-exception": 1, "choice": 2, "weak": 3, "unclear": 4, "unknown": 4, "yes": 5}
     packages = []
     for d in dists.values():
         own = [x for x in libs if x["carriedBy"] == d.dist.metadata["Name"]]
@@ -287,8 +340,8 @@ def main() -> int:
         if own or wheel:
             if own:
                 entry["nativeLibraries"] = len(own)
-            entry["copyleftIncludingNativeLibraries"] = max(
-                [entry["copyleft"], *([copyleft(wheel)] if wheel else []), *(x["copyleft"] for x in own)], key=rank.get)
+            entry["copyleftIncludingNativeLibraries"] = roll_up(
+                [entry["copyleft"], *([copyleft(wheel)] if wheel else []), *(x["copyleft"] for x in own)])
         packages.append(entry)
     manifest = {
         "name": "ao-worker",
@@ -308,19 +361,24 @@ def main() -> int:
         "nativeLibraries": libs,
     }
     args.out.write_text(json.dumps(manifest, indent=1) + "\n")
-    flagged = [f"{p['name']} {p['version']}: {p['licence']} ({p['copyleft']})" for p in packages if p["copyleft"] != "no"]
-    print(f"manifest: {len(packages)} bundled packages, {len(libs)} native libraries; package licences to review: {len(flagged)}")
-    for line in flagged:
-        print(f"  review: {line}")
-    for p in packages:
-        if p.get("copyleftIncludingNativeLibraries", "no") not in ("no", p["copyleft"]):
-            print(f"  review: {p['name']} with its native libraries: {p['copyleftIncludingNativeLibraries']}")
-    for x in libs:
-        if x["copyleft"] not in ("no",):
-            print(f"  native: {x['library']} ({x['carriedBy']}): {x['licence']} [{x['copyleft']}]")
+    print(f"manifest: {len(packages)} bundled packages, {len(libs)} native libraries")
+    for line in review_lines(manifest):
+        print(f"  {line}")
     nolicence = [p["name"] for p in packages if not p["licenceFiles"]]
     if nolicence:
         print(f"  packages whose wheel ships no licence file: {', '.join(nolicence)}")
+    return report_completeness(args.bundle, manifest)
+
+
+def report_completeness(bundle: Path, manifest: dict) -> int:
+    problems = check_complete(bundle, manifest)
+    if problems:
+        print(f"manifest check FAILED: {len(problems)} difference(s) between the bundle and its manifest", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        return 1
+    print(f"manifest check: every package ({len(manifest['packages'])}) and native library "
+          f"({len(manifest['nativeLibraries'])}) in the bundle is in the manifest, and nothing else")
     return 0
 
 
