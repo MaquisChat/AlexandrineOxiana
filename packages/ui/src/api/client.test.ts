@@ -292,3 +292,26 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
     expect(p.push("\n\r\n")).toEqual([{ type: "a", data: 1 }]);
   });
 });
+
+describe("ndjson() — streamed NDJSON answers (Task 36: library move)", () => {
+  const stream = (parts: string[]) =>
+    new Response(new ReadableStream({ start(c) { for (const p of parts) c.enqueue(new TextEncoder().encode(p)); c.close(); } }), { status: 200, headers: { "content-type": "application/x-ndjson" } });
+
+  it("yields each line as JSON, joining lines split across chunks, with the token in the header only", async () => {
+    const f = fakeFetch(() => stream(['{"progress":{"phase":"co', 'py"}}\n{"done":true}', "\n"]));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const out: unknown[] = [];
+    for await (const line of api.ndjson("POST", "/libraries/move", { body: { dest: "/x" } })) out.push(line);
+    expect(out).toEqual([{ progress: { phase: "copy" } }, { done: true }]);
+    expect(f.calls[0]!.url).toBe(`${BASE}/libraries/move`);
+    expect(header(f.calls[0]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(f.calls[0]!.init.body).toBe(JSON.stringify({ dest: "/x" }));
+  });
+
+  it("throws the service's error when the stream never starts", async () => {
+    const f = fakeFetch(() => json({ error: { code: "CONFLICT", message: "A move of this library is already running." } }, 409));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const it = api.ndjson("POST", "/libraries/move", { body: {} });
+    await expect(it.next()).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
+  });
+});

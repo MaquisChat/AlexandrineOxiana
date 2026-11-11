@@ -14,7 +14,7 @@
  * list are refused; and no URL may contain the token in any form.
  *
  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
- * `request()` (Tasks 33+).
+ * `request()` and `ndjson()` (Tasks 33+, R113: one module per task under api/).
  */
 import { isCredentialQueryKey } from "@ao/shared";
 import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
@@ -80,6 +80,12 @@ export interface ApiClient {
   };
   /** Server-sent events from GET /events, until the stream ends or `signal` aborts. */
   events(opts?: { signal?: AbortSignal }): AsyncGenerator<ServiceEvent, void, undefined>;
+  /**
+   * A streamed NDJSON answer (e.g. POST /libraries/move): each line parsed as JSON, in order, until
+   * the stream ends. An error before the stream starts throws ApiClientError; a cut-off stream ends
+   * the generator (the caller decides what that means). Lines over MAX_SSE_EVENT_BYTES throw.
+   */
+  ndjson<T>(method: Method, path: string, opts?: RequestOptions): AsyncGenerator<T, void, undefined>;
 }
 
 export interface ClientOptions {
@@ -310,8 +316,64 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
   }
 
+  async function* ndjson<T>(method: Method, path: string, o: RequestOptions = {}): AsyncGenerator<T, void, undefined> {
+    const url = urlFor(path, o.query);
+    const headers: Record<string, string> = { ...auth, Accept: "application/x-ndjson" };
+    const init: RequestInit = { method, headers };
+    if (o.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(o.body);
+    }
+    if (o.signal) init.signal = o.signal;
+    let res: Response;
+    try {
+      res = await doFetch(url, init);
+    } catch (err) {
+      if (o.signal?.aborted) throw err;
+      throw unreachable();
+    }
+    if (!res.ok) throw await errorFrom(res);
+    if (!res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const parse = (line: string): T => {
+      try {
+        return JSON.parse(line) as T;
+      } catch {
+        throw unexpected(res.status);
+      }
+    };
+    try {
+      for (;;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch {
+          return; // cut off: the caller asks the service what happened
+        }
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        let nl = buf.indexOf("\n");
+        while (nl >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line) yield parse(line);
+          nl = buf.indexOf("\n");
+        }
+        if (buf.length > MAX_SSE_EVENT_BYTES) {
+          throw new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The library service sent a line larger than 1 MB; the stream was closed." });
+        }
+      }
+      if (buf.trim()) yield parse(buf.trim());
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+  }
+
   return {
     request,
+    ndjson,
     appearance: {
       get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),
