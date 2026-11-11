@@ -195,6 +195,14 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Verify: `pnpm --filter @ao/ui exec vitest run src/screens/ExtensionPairing.test.tsx`.
 - Model: Sonnet.
 
+**Task 62 — Transcription as a job; flags survive a human edit [ledger: R143, R99, R142; SPEC 5.2, 5.8]**
+- Depends: 34c, 51. Parallel: 48 (UI half).
+- Files: `apps/library-service/src/routes/sources.ts`, `packages/library/src/worker-client.ts` and the transcript store, `packages/shared/src/api/transcripts.ts`, `packages/ui/src/screens/TranscriptViewer.tsx`, tests.
+- Why: found by the Task 34c review. The transcribe route waits for the whole run and reports no progress, so a researcher who leaves the screen can start the same transcription twice; and a human-edit version comes back with no flags at all, so flagged text the person never touched looks clean.
+- Accept: starting a transcription returns at once with a job; progress arrives as job events and the job's state can be read again after a reload; at most one transcription runs per source, and a second request while one runs is refused in plain words; the run can be cancelled. A human-edit version stores flags per segment: carried over where timing and text are unchanged, none where the person changed the segment, which is marked as edited. The viewer uses the job and the stored flags, and its interim workarounds from Task 34c are removed.
+- Verify: service and library tests; `pnpm --filter @ao/ui exec vitest run src/screens/TranscriptViewer.test.tsx`; the capture scenario (Task 34f) re-transcribes once.
+- Model: Opus.
+
 **Task 48 — First-use tools dialogue [ledger: R7, R83, R90, R126, R133; ADR 0009, ADR 0014]**
 - Depends: 34b. Split into two sessions: worker and service first, then UI.
 - Files: `services/media-worker/ao_worker/` (tool catalogue, install), `packages/library/src/worker-client.ts`, `apps/library-service/src/routes/capture.ts`, `packages/ui/src/screens/ToolsSetup.tsx`, `docs/adr/0009-capture-tools.md`, tests.
@@ -402,7 +410,6 @@ Known, not yet scheduled above, or accepted as limits:
   - D5: after a relaunch the app shows "Choose a library" instead of "Library not found".
   - D6: in WebKit one typeface stays in error, so fonts never finish loading (to be checked in the real Mac web view).
   - D7: right-to-left title headings are laid out left to right.
-- Found by Task 34c: the transcribe route waits for the whole run and sends no progress events, so "Re-transcribe" can only show an indeterminate bar (for Task 46).
 - A UI test, ReviewQueue "loads titles six at a time", takes about 40 s under heavy machine load and passes alone; find out why without loosening its limit (for Task 46 or Task 54).
 - Found by Task 37d: transcription contacts the model hub on every model load, even when the model is already on disk, and fails if a proxy refuses (a project that must stay offline should never need the network to transcribe; for Task 48).
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
@@ -428,9 +435,10 @@ Update after every task; commit and push.
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | in review | db52fdb (worktree branch) | adversarial review dispatched |
-| 34c Transcript viewer | in review | 4b9a723 (worktree branch) | adversarial review dispatched; re-transcribe progress needs a service change |
+| 34c Transcript viewer | fix round 1 | 4b9a723 (worktree branch) | spec met; 4 Important (R143); two of them completed by new Task 62 |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
 | 34e Pairing screen | in review | f48170a (worktree branch) | review dispatched; also changes the shared dialog shell (claim to be verified) |
+| 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
