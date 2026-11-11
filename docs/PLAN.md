@@ -452,7 +452,7 @@ Update after every task; commit and push.
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | in progress | | implementer dispatched |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48a Tools: worker and service | in progress | | implementer dispatched; gallery-dl becomes a first-use download (R152) |
+| 48a Tools: worker and service | in review | afa7bd5 (worktree branch) | built; OCR unavailable until our CI builds tesseract (Task 37f); speech models no longer download by themselves |
 | 48b Tools: the dialogue | not started | | after 48a |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | in progress | | implementer dispatched |
