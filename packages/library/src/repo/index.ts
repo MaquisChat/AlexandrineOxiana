@@ -1,4 +1,5 @@
 export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
+export { RECOVERY_CODE_UNSHOWN_WARNING } from "./projects.js";
 export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, UNREADABLE_GOVERNANCE } from "./governance-edit.js";
 export type { GovernanceEditResult } from "./governance-edit.js";
 export type { AuditCheck, RepoOptions } from "./repo.js";
@@ -17,6 +18,7 @@ export type { ConsentInput, ConsentPatch, ParticipantInput, ParticipantPatch, Se
 export {
   GovernanceViolationError,
   InvalidInputError,
+  KeyFileChangedError,
   DestroyedParentError,
   FieldworkInUseError,
   MissingParentError,

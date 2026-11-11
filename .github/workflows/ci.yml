@@ -9,9 +9,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# One run at a time per branch. A run in progress is allowed to finish (a full run takes about half
+# an hour on GitHub's two-processor runners, and tasks are merged more often than that, so cancelling
+# meant no run ever completed); GitHub keeps only the newest waiting run, so at most one run waits.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -101,3 +104,57 @@ jobs:
         with:
           name: reports-py${{ matrix.python }}
           path: reports/
+
+  # The packaged media worker (Task 37d): a one-folder PyInstaller build for Linux, then its smoke
+  # test. Only on main and on manual runs: it costs build minutes and changes rarely.
+  worker-bundle:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    # A healthy run takes about 6 minutes (install, build, smoke test).
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Tools the smoke test hands to the worker (no ghostscript, as on a Mac)
+        timeout-minutes: 4
+        run: |
+          # Same fallback as the test job when Ubuntu's own mirrors do not resolve on the runner.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            echo "::warning::Ubuntu's package mirrors do not resolve on this runner; using mirrors.edge.kernel.org for this run."
+            for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              [ -f "$f" ] && sudo sed -i -E 's#https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?#https://mirrors.edge.kernel.org/ubuntu/#g' "$f"
+            done
+          fi
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
+          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 --no-install-recommends tesseract-ocr ffmpeg
+      - name: Pinned test fixtures
+        run: node scripts/fetch-fixtures.mjs
+      - name: The tiny speech model for the smoke test (outside the bundle)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ao-worker-smoke-models
+          key: ao-worker-smoke-models-tiny-v1
+      - name: Build the worker and run its smoke test
+        env:
+          PYTHON: python
+        run: node apps/desktop/scripts/build-sidecars.mjs --smoke
+      - name: Bundle size and manifest in the run summary
+        if: always()
+        run: |
+          b=apps/desktop/sidecars/ao-worker-x86_64-unknown-linux-gnu
+          [ -d "$b" ] || exit 0
+          echo "Packaged worker: $(du -sh "$b" | cut -f1) on disk" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: worker-bundle-report
+          # The manifest and the smoke-test results only; the bundle itself (~540 MB) is not uploaded.
+          path: |
+            apps/desktop/sidecars/*/sidecar-manifest.json
+            apps/desktop/sidecars/*.smoke.json
+          if-no-files-found: ignore

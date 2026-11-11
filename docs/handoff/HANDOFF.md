@@ -57,7 +57,7 @@ Kept for history only; use `docs/PLAN.md` for what to do next.
 3. **Task 37: desktop shell (Tauri 2), packaging and e2e.**
    - Carry-overs:
      - The service sidecar runs with `--max-old-space-size=512` (R64/R96).
-     - `AO_SERVICE_TOKEN` is passed on stdin, not in the environment (R98).
+     - Done in Task 37b: the service takes its token as one line on standard input and refuses to start if one is in the environment or the arguments (R98). The shell must start it that way; the worker's own token is still passed in its environment and moves to standard input with the shell (Task 37c).
      - Native file and folder pickers and drop paths (FileDrop notes, R113).
      - Worker sidecar via PyInstaller.
      - An e2e test through `scripts/run-e2e.mjs --desktop-only`.
@@ -106,7 +106,7 @@ Kept for history only; use `docs/PLAN.md` for what to do next.
 | Extension e2e | `pnpm e2e -- --extension-only e2e/extension.spec.ts --trace off` |
 | UI build | `pnpm --filter @ao/ui run build` |
 | UI colour/CSS rules | `pnpm --filter @ao/ui run lint:css && pnpm --filter @ao/ui run lint:colours` |
-| Run the service | `pnpm --filter @ao/library-service start` (prints `AO_SERVICE_READY port=<n>`; needs `AO_SERVICE_TOKEN`, ≥32 chars) |
+| Run the service | `pnpm --filter @ao/library-service start` (prints `AO_SERVICE_READY port=<n>`; the access token, at least 32 characters, is written as one line to its standard input, for example `printf '%s\n' "$TOKEN" \| pnpm --filter @ao/library-service start`; it refuses to start if a token is in the environment or the arguments, R98) |
 | CLI | `pnpm ao --help` (see `apps/cli/README.md`) |
 
 ## Start here (next agent)

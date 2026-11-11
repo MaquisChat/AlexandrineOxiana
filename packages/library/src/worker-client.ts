@@ -452,7 +452,9 @@ const WORKER_ENV_NAMES = new Set([
 ]);
 const WORKER_ENV_PREFIXES = ["LC_", "XDG_", "AO_"];
 // Secrets of the app that the worker (and the tools it runs) must never see.
-const WORKER_ENV_DENY = new Set(["AO_WORKER_TOKEN", "AO_PASSPHRASE"]);
+// AO_SERVICE_TOKEN: the library service refuses to start with it set (it takes its token on standard
+// input, R98), so it cannot be here; denied anyway, in case another host process ever sets it.
+const WORKER_ENV_DENY = new Set(["AO_WORKER_TOKEN", "AO_PASSPHRASE", "AO_SERVICE_TOKEN"]);
 
 /** The allowlisted subset of `env` passed to the worker (names compared case-insensitively). */
 export function workerEnv(env: NodeJS.ProcessEnv): Record<string, string> {

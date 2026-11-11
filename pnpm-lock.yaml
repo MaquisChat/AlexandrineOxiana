@@ -76,6 +76,8 @@ importers:
         specifier: ^15.1.0
         version: 15.1.0
 
+  apps/desktop: {}
+
   apps/library-service:
     dependencies:
       '@ao/core':
