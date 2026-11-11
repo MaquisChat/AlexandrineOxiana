@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -34,7 +34,10 @@ beforeEach(() => {
   };
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Close the viewer while the mocked service still answers: closing revokes the ticket.
+  cleanup();
+  await new Promise((r) => setTimeout(r, 20));
   vi.restoreAllMocks();
 });
 
@@ -77,7 +80,7 @@ describe("TranscriptViewer — segments and flags", () => {
   it("an unknown flag gets a safe generic label and its raw name is not shown", async () => {
     await open({ transcripts: { v1: machineTranscript("v1", [{ start: 0, end: 2, lang: "en", text: "Hello and welcome.", flags: ["<img src=x>"] }]) } });
     const item = segmentItems()[0]!;
-    expect(within(item).getByText(/Flagged for review/)).toBeTruthy();
+    expect(item.textContent).toMatch(/Flagged for review: Another check flagged this segment/);
     expect(item.textContent).not.toContain("<img");
     expect(item.querySelector("img")).toBeNull();
   });
@@ -277,7 +280,7 @@ describe("TranscriptViewer — editing and versions", () => {
     await user.type(screen.getByLabelText("Text of the segment at 0:00"), "!");
     await user.click(screen.getByRole("button", { name: "Save edits as a new version" }));
     view.rerender(<TranscriptViewer api={api()} projectId="p1" sourceId="s2" />);
-    await screen.findByRole("heading", { name: "Second interview" });
+    await screen.findByRole("heading", { name: /Second interview/ });
     release();
     await act(async () => {
       await new Promise((r) => setTimeout(r, 50));
@@ -302,7 +305,7 @@ describe("TranscriptViewer — editing and versions", () => {
       ...svc.handlers,
     );
     const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
-    await screen.findByRole("heading", { name: "Interview with a baker" });
+    await screen.findByRole("heading", { name: /Interview with a baker/ });
     view.rerender(<TranscriptViewer api={api()} projectId="p1" sourceId="s2" />);
     await screen.findByText("Hello and welcome.");
     release();
@@ -314,7 +317,10 @@ describe("TranscriptViewer — editing and versions", () => {
   });
 
   it("a transcript that arrives after another version was chosen is dropped", async () => {
-    const { svc } = await open({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0", [{ start: 0, end: 1, lang: "en", text: "Edited words.", flags: null }]) } });
+    const svc = transcriptService({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0", [{ start: 0, end: 1, lang: "en", text: "Edited words.", flags: null }]) } });
+    server.use(...svc.handlers);
+    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Edited words.");
     // Opened on the newest (h0); now v1 is slow and h0 is chosen again before it answers.
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));

@@ -19,7 +19,7 @@ const FLAG_LABELS: Record<string, string> = {
 
 /** A flag in words. A flag this screen does not know gets a generic label (its name is never shown raw). */
 export function flagLabel(flag: string): string {
-  return Object.prototype.hasOwnProperty.call(FLAG_LABELS, flag) ? FLAG_LABELS[flag]! : "Flagged for review";
+  return Object.prototype.hasOwnProperty.call(FLAG_LABELS, flag) ? FLAG_LABELS[flag]! : "Another check flagged this segment";
 }
 
 /** The labels of a segment's flags, each once, in order. */

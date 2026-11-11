@@ -22,7 +22,7 @@ describe("transcript model", () => {
     expect(flagLabel("outside-speech")).toBe("Outside detected speech");
     expect(flagLabel("known-phrase")).toMatch(/phrase speech recognition is known to invent/);
     expect(flagLabel("stock-phrase")).toBe(flagLabel("known-phrase"));
-    expect(flagLabel("<b>new-check</b>")).toBe("Flagged for review");
+    expect(flagLabel("<b>new-check</b>")).toBe("Another check flagged this segment");
   });
 
   it("lists one entry per machine run (its WebVTT and segments file are one version) and each human edit", () => {
