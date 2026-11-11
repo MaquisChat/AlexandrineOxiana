@@ -6,6 +6,7 @@ import { createClient, type ApiClient } from "./api/client";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
+import { LibraryRoutes } from "./routes/library";
 
 export type { ServiceConnection } from "./serviceConnection";
 
@@ -14,6 +15,7 @@ export function App({ service }: { service?: ServiceConnection }) {
   return (
     <AppearanceProvider {...(client ? { client } : {})}>
       <AppearanceSettingsScreen />
+      {client ? <LibraryRoutes client={client} /> : null}
     </AppearanceProvider>
   );
 }
