@@ -50,6 +50,8 @@ export interface CaptureMock {
   emit(type: string, data: unknown): void;
   /** Open /events streams. */
   streams(): number;
+  /** Ends every open /events stream (the client reconnects). */
+  closeStreams(): void;
   client: ApiClient;
 }
 
@@ -147,6 +149,16 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       }
     },
     streams: () => open.size,
+    closeStreams() {
+      for (const c of [...open]) {
+        open.delete(c);
+        try {
+          c.close();
+        } catch {
+          // already closed
+        }
+      }
+    },
     client: createClient(BASE, TOKEN),
   };
 }

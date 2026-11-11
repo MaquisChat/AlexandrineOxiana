@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { applyProgress, linkQueue, profileQueue, UNKNOWN_OUTCOME_TEXT, type CaptureQueueState } from "../api/capture";
+import { applyProgress, linkQueue, markGap, profileQueue, UNKNOWN_OUTCOME_TEXT, type CaptureQueueState } from "../api/capture";
 import { CaptureQueue } from "./CaptureQueue";
 
 const P = "019a6f00-0000-7000-8000-000000000001";
@@ -25,7 +25,7 @@ describe("CaptureQueue", () => {
     expect(within(rows[2]!).getByText("Capturing now")).toBeTruthy();
     expect(screen.getByRole("progressbar", { name: "Links captured" }).getAttribute("value")).toBe("2");
     expect(screen.getByRole("progressbar", { name: "Links captured" }).getAttribute("max")).toBe("3");
-    expect(screen.getByText(/2 of 3 links done/)).toBeTruthy();
+    expect(screen.getByText("Of 3 links: 1 done, 1 failed, 1 still to come.")).toBeTruthy();
   });
 
   it("a failed link shows the LOGIN_REQUIRED sentence", () => {
@@ -102,6 +102,74 @@ describe("CaptureQueue", () => {
     });
     render(<CaptureQueue queues={[q]} />);
     expect(screen.getByRole("alert").textContent).toMatch(/need a legal basis/);
+  });
+
+  it("the reviewer's gap: a link whose outcome was missed is 'Not known', and the summary claims only what was seen", () => {
+    let q = linkQueue("q1", [A, B, C]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 3, finished: false, outcome: { url: A, status: "created" } });
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 3, total: 3, finished: true, outcome: { url: C, status: "created" } });
+    const { container } = render(<CaptureQueue queues={[q]} />);
+    const row = screen.getAllByRole("listitem")[1]!;
+    expect(within(row).getByText("Not known")).toBeTruthy();
+    expect(within(row).getByText(/progress was missed/)).toBeTruthy();
+    expect(container.textContent).not.toMatch(/not tried|3 of 3/);
+    expect(screen.getByText("Finished. Of 3 links: 2 done, 1 not known.")).toBeTruthy();
+    expect(screen.getByText(/look for its sources in the library/)).toBeTruthy();
+  });
+
+  it("a queue with a gap in its progress says so and what to do", () => {
+    let q = linkQueue("q1", [A, B]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 2, finished: false, outcome: { url: A, status: "created" } });
+    q = markGap(q);
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText(/Progress was missed while the connection to the library service was down/)).toBeTruthy();
+    expect(screen.getByText(/cannot re-read a running capture yet/)).toBeTruthy();
+  });
+
+  it("the reviewer's profile scenario: posts saved, then stopped by a rules change — the library's sentence and the counts, together", () => {
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    q = applyProgress(q, { queueId: "q9", projectId: P, done: 1, total: 3, finished: false, outcome: { url: B, status: "created" } });
+    const sentence = "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved.";
+    q = applyProgress(q, {
+      queueId: "q9",
+      projectId: P,
+      finished: true,
+      report: { status: "failed", listComplete: false, created: 1, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [], errorCode: "POLICY_CHANGED", reason: sentence },
+    });
+    const { container } = render(<CaptureQueue queues={[q]} />);
+    const said = screen.getByText(sentence);
+    expect(said.getAttribute("dir")).toBe("auto");
+    expect(screen.getByText(/1 new post saved/)).toBeTruthy();
+    expect(within(screen.getAllByRole("listitem")[0]!).getByText("Saved")).toBeTruthy();
+    expect(container.textContent).not.toMatch(/during the download, so nothing was saved/);
+  });
+
+  it("a rate-limit pause shows the library's sentence and what was saved", () => {
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    const sentence = "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.";
+    q = applyProgress(q, {
+      queueId: "q9",
+      projectId: P,
+      finished: true,
+      report: { status: "paused-rate-limited", listComplete: false, created: 4, duplicates: 2, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [], reason: sentence },
+    });
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText(sentence)).toBeTruthy();
+    expect(screen.getByText(/4 new posts saved, 2 already in the project/)).toBeTruthy();
+  });
+
+  it("the library's note on a saved link is shown (review M1)", () => {
+    let q = linkQueue("q1", [A]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: A, status: "created", reason: "The source was saved, but the transcript could not be made." } });
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText("The source was saved, but the transcript could not be made.").getAttribute("dir")).toBe("auto");
+  });
+
+  it("a rule's reason is shown as user text (review M6)", () => {
+    let q = linkQueue("q1", [A]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: A, status: "failed", errorCode: "POLICY_DENIED", reason: "لا يسمح بالتنزيل" } });
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText("لا يسمح بالتنزيل").getAttribute("dir")).toBe("auto");
   });
 
   it("nothing queued: nothing shown", () => {

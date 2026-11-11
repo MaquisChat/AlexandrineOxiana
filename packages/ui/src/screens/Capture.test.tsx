@@ -64,6 +64,24 @@ describe("Capture screen — links", () => {
     expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(0);
   });
 
+  it("a link listed twice is sent once and said so; the count is shown against the limit (review M3, M11)", async () => {
+    const { m, user } = await setup();
+    await paste(user, [YT, IG, YT]);
+    expect(screen.getByText("3 lines, 2 different links (at most 500 at once)")).toBeTruthy();
+    expect(screen.getByText(/Listed twice: captured once/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(1));
+    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT, IG], options: {} });
+  });
+
+  it("a link carrying a user name or password is refused with a sentence (review M3)", async () => {
+    const { m, user } = await setup();
+    await paste(user, [YT, "https://user:secret@www.youtube.com/watch?v=dQw4w9WgXcQ"]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    expect(await screen.findByText(/Line 2 contains a user name or password/)).toBeTruthy();
+    expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(0);
+  });
+
   it("a double click starts one capture", async () => {
     const { m, user } = await setup({ captureDelayMs: 80 });
     await paste(user, [YT]);
@@ -185,7 +203,39 @@ describe("Capture screen — progress", () => {
       m.emit("capture.progress", { queueId: "q1", projectId: P1, done: 2, total: 2, finished: true, outcome: { url: IG, status: "failed", errorCode: "LOGIN_REQUIRED", reason: "x" } });
     });
     expect(await screen.findByText("This post needs a signed-in session. Try again with “Use my browser session”.")).toBeTruthy();
-    expect(screen.getByText(/Finished: 2 of 2 links done, 1 failed/)).toBeTruthy();
+    expect(screen.getByText("Finished. Of 2 links: 1 done, 1 failed.")).toBeTruthy();
+  });
+
+  it("says that captures started earlier or elsewhere are not shown here", async () => {
+    await setup();
+    expect(screen.getByText(/Captures started earlier, or from the browser extension, keep running in the library service but are not shown here/)).toBeTruthy();
+  });
+
+  it("reconnects after a gap; a link whose outcome was missed is not known, and the gap is explained", async () => {
+    const { m, user } = await setup();
+    await paste(user, [YT, IG, TT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    await screen.findByRole("region", { name: "Capture queue" });
+    await act(async () => m.emit("capture.progress", { queueId: "q1", projectId: P1, done: 1, total: 3, finished: false, outcome: { url: YT, status: "created" } }));
+    await act(async () => m.closeStreams());
+    // done=2 is published while the stream is down: missed.
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => m.emit("capture.progress", { queueId: "q1", projectId: P1, done: 3, total: 3, finished: true, outcome: { url: TT, status: "created" } }));
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(within(queue).getByText("Finished. Of 3 links: 2 done, 1 not known.")).toBeTruthy());
+    expect(within(within(queue).getAllByRole("listitem")[1]!).getByText("Not known")).toBeTruthy();
+    expect(within(queue).getByText(/Progress was missed while the connection to the library service was down/)).toBeTruthy();
+    expect(queue.textContent).not.toMatch(/not tried|3 of 3/);
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+  });
+
+  it("keeps reconnecting over the screen's life when each reconnection works (review M4)", async () => {
+    const { m } = await setup();
+    for (let i = 0; i < 4; i++) {
+      await act(async () => m.closeStreams());
+      await waitFor(() => expect(m.streams()).toBe(1));
+    }
+    expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
   });
 
   it("an unknown outcome code gets a safe sentence", async () => {
@@ -314,12 +364,32 @@ describe("Capture screen — profile", () => {
     expect(within(queue).getByText(PROFILE)).toBeTruthy();
   });
 
-  it("refuses a link that is not a profile, and dates in the wrong order", async () => {
+  it("never refuses an address on the preview's say-so: it is sent and the service decides (R146)", async () => {
     const { m, user } = await setup();
-    await user.type(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }), YT);
+    const box = screen.getByRole("textbox", { name: "Profile, channel or playlist link" });
+    await user.type(box, YT);
+    expect(screen.getByText(/looks like a single post.*the app will check it/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
-    expect(await screen.findByText(/not a profile, channel or playlist/)).toBeTruthy();
-    await user.clear(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }));
+    await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
+    await user.clear(box);
+    await user.type(box, "https://www.youtube.com/something-new/abc");
+    expect(screen.getByText(/Not recognised here.*the app will check it/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Capture profile" }));
+    await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(2));
+    // The service's refusal shows in the queue.
+    await act(async () =>
+      m.emit("capture.progress", {
+        queueId: "qp1",
+        projectId: P1,
+        finished: true,
+        report: { status: "failed", listComplete: false, created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [], errorCode: "UNSUPPORTED_URL", reason: "This link is not a YouTube, Instagram or TikTok post, so the downloader cannot capture it." },
+      }),
+    );
+    expect(await screen.findByText("This link is not a YouTube, Instagram or TikTok post, so the downloader cannot capture it.")).toBeTruthy();
+  });
+
+  it("refuses dates in the wrong order", async () => {
+    const { m, user } = await setup();
     await user.type(screen.getByRole("textbox", { name: "Profile, channel or playlist link" }), PROFILE);
     fireEvent.change(screen.getByLabelText("Posts from"), { target: { value: "2026-06-30" } });
     fireEvent.change(screen.getByLabelText("Posts until"), { target: { value: "2026-01-01" } });
@@ -392,15 +462,26 @@ describe("Capture screen — capture tools", () => {
     expect(within(tools).getByText(/Not installed on this computer/)).toBeTruthy();
   });
 
-  it("a failed update and a helper that is not running are said plainly", async () => {
+  it("a failed update as the service sends it today (500) and a helper that is not running are said plainly", async () => {
     const { user } = await setup({
-      versionsAnswer: () => errorResponse(503, "WORKER_UNAVAILABLE", "The media helper is not running.", "the media worker is not reachable"),
-      updateAnswer: () => errorResponse(502, "INTERNAL", "The media helper could not finish the job.", "TOOL_UPDATE_FAILED"),
+      versionsAnswer: () => errorResponse(503, "WORKER_UNAVAILABLE", "The media helper is not running.", "The media helper is not set up yet. Run `pnpm setup:py` once, then try again."),
+      // apps/library-service: media-worker.ts call() throws a plain Error → toApiError → 500 INTERNAL.
+      updateAnswer: () => errorResponse(500, "INTERNAL", "Something went wrong. Nothing was changed by this request unless it says otherwise."),
     });
     const tools = screen.getByRole("region", { name: "Capture tools" });
     expect(await within(tools).findByText(/media helper is not running/)).toBeTruthy();
+    expect(tools.textContent).not.toMatch(/setup:py/);
     await user.click(within(tools).getByRole("button", { name: "Update capture tools" }));
-    expect(await within(tools).findByText(/The downloader tool could not be updated/)).toBeTruthy();
-    expect(tools.textContent).not.toMatch(/TOOL_UPDATE_FAILED/);
+    const alert = await within(tools).findByRole("alert");
+    expect(alert.textContent).toMatch(/^The capture tools could not be updated\./);
+    expect(alert.textContent).toMatch(/Something went wrong\. Nothing was changed/);
+  });
+
+  it("a failed update with a tool code (once Task 63 sends one) is explained, the code never shown", async () => {
+    const { user } = await setup({ updateAnswer: () => errorResponse(502, "TOOLS_UPDATE_FAILED", "The capture tools could not be updated.", "TOOL_CHECKSUM_MISMATCH") });
+    const tools = screen.getByRole("region", { name: "Capture tools" });
+    await user.click(within(tools).getByRole("button", { name: "Update capture tools" }));
+    expect(await within(tools).findByText(/did not match its published checksum/)).toBeTruthy();
+    expect(tools.textContent).not.toMatch(/TOOL_CHECKSUM_MISMATCH/);
   });
 });

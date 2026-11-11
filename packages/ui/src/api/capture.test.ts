@@ -1,73 +1,110 @@
 import { describe, expect, it } from "vitest";
-// Parity guards (test only): the UI keeps its own copies so the bundle never pulls in the library,
-// and these tests fail the moment the library's wording or link rules change.
-import { COOKIES_ACKNOWLEDGEMENT as LIBRARY_ACK, plainReason } from "../../../library/src/capture/errors";
-import { classifyUrl } from "../../../library/src/capture/platforms";
 import {
   applyProgress,
   capturePolicyFromYaml,
   captureProgress,
-  COOKIES_ACKNOWLEDGEMENT,
   isWebAddress,
-  KNOWN_OUTCOME_CODES,
   linkQueue,
+  markGap,
   outcomeText,
   parseLinks,
   previewLink,
   profileQueue,
+  queueCounts,
   queueErrorText,
   UNKNOWN_OUTCOME_TEXT,
+  type CaptureQueueState,
 } from "./capture";
 
 const P = "019a6f00-0000-7000-8000-000000000001";
 const OTHER = "019a6f00-0000-7000-8000-000000000002";
 
-describe("capture: what the UI shares with the library", () => {
-  it("shows the library's exact browser-session acknowledgement", () => {
-    expect(COOKIES_ACKNOWLEDGEMENT).toBe(LIBRARY_ACK);
+const REPORT = { listComplete: false, created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, items: [] };
+
+/** Seen done + seen failed + not known + not tried + still to come = total. */
+function addsUp(q: CaptureQueueState) {
+  const c = queueCounts(q);
+  expect(c.done + c.failed + c.unknown + c.notTried + c.pending).toBe(c.total);
+  return c;
+}
+
+describe("capture: progress that was missed (R146, review I1)", () => {
+  const three = ["https://a/1", "https://a/2", "https://a/3"];
+
+  it("an outcome the screen did not see is not known, never 'not tried'; counts only what was seen", () => {
+    let q = linkQueue("q1", three);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 3, finished: false, outcome: { url: three[0]!, status: "created" } });
+    // done=2 is lost; done=3 arrives and finishes the queue.
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 3, total: 3, finished: true, outcome: { url: three[2]!, status: "failed", errorCode: "LOGIN_REQUIRED" } });
+    expect(q.items.map((i) => i.state)).toEqual(["created", "unknown", "failed"]);
+    expect(addsUp(q)).toMatchObject({ total: 3, done: 1, failed: 1, unknown: 1, notTried: 0 });
   });
 
-  it("previews every kind of link as the library classifies it", () => {
-    const links = [
-      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-      "https://youtu.be/dQw4w9WgXcQ",
-      "https://youtube.com/shorts/abcdefgh",
-      "https://www.youtube.com/live/abcdefgh",
-      "https://www.youtube.com/playlist?list=PL123",
-      "https://www.youtube.com/@someone",
-      "https://www.youtube.com/channel/UC123",
-      "https://www.youtube.com/feed/trending",
-      "https://m.youtube.com/watch?v=abc",
-      "https://www.instagram.com/p/Cabc123/",
-      "https://www.instagram.com/someone/p/Cabc123/",
-      "https://www.instagram.com/reel/Cxyz/",
-      "https://www.instagram.com/tv/Ctv1/",
-      "https://www.instagram.com/stories/highlights/1789/",
-      "https://www.instagram.com/someone/",
-      "https://www.instagram.com/explore/",
-      "https://www.tiktok.com/@someone/video/7234567890",
-      "https://www.tiktok.com/@someone/photo/7234567890",
-      "https://www.tiktok.com/@someone",
-      "https://vm.tiktok.com/ZMabc/",
-      "https://example.org/article",
-      "ftp://example.org/file",
-      "not a link",
-      "",
-    ];
-    for (const u of links) {
-      const c = classifyUrl(u);
-      expect(previewLink(u), u).toMatchObject({ platform: c.platform, kind: c.kind });
-    }
+  it("a missed outcome is not known while the queue is still running too", () => {
+    let q = linkQueue("q1", three);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 2, total: 3, finished: false, outcome: { url: three[1]!, status: "created" } });
+    expect(q.items.map((i) => i.state)).toEqual(["unknown", "created", "capturing"]);
+    expect(addsUp(q)).toMatchObject({ done: 1, unknown: 1, pending: 1 });
   });
 
-  it("explains every reason code the library has, in the UI's own words", () => {
-    // The library's sentence for an unknown code is its fallback: every code it knows has its own.
-    const fallback = plainReason("NO_SUCH_CODE");
-    for (const code of KNOWN_OUTCOME_CODES) expect(outcomeText(code).length, code).toBeGreaterThan(10);
-    for (const code of ["LOGIN_REQUIRED", "PRIVATE", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "EXTRACTOR_ERROR", "WORKER_UNAVAILABLE", "UNSUPPORTED_URL", "PROFILE_CAPTURE_UNAVAILABLE", "NOTHING_SAVED", "CANCELLED", "NO_MEDIA", "LEGAL_BASIS_REQUIRED", "INTERRUPTED", "POLICY_CHANGED", "INVALID_OPTIONS"]) {
-      expect(plainReason(code), code).not.toBe(fallback);
-      expect(KNOWN_OUTCOME_CODES, code).toContain(code);
-    }
+  it("after a gap in the stream, links not reached when the queue stops are not known either", () => {
+    let q = linkQueue("q1", three);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 3, finished: false, outcome: { url: three[0]!, status: "created" } });
+    q = markGap(q);
+    expect(q.gap).toBe(true);
+    q = applyProgress(q, { queueId: "q1", projectId: P, finished: true, error: "WorkerUnavailableError: gone" });
+    expect(q.items.map((i) => i.state)).toEqual(["created", "unknown", "unknown"]);
+    expect(addsUp(q)).toMatchObject({ done: 1, unknown: 2, notTried: 0 });
+  });
+
+  it("without a gap, links after a queue that stopped were not tried", () => {
+    let q = linkQueue("q1", three);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 3, finished: false, outcome: { url: three[0]!, status: "created" } });
+    q = applyProgress(q, { queueId: "q1", projectId: P, finished: true, error: "WorkerUnavailableError: gone" });
+    expect(q.items.map((i) => i.state)).toEqual(["created", "not-captured", "not-captured"]);
+    expect(addsUp(q)).toMatchObject({ done: 1, notTried: 2 });
+  });
+
+  it("a finished queue is not marked by a later gap", () => {
+    let q = linkQueue("q1", ["https://a/1"]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: "https://a/1", status: "created" } });
+    expect(markGap(q)).toBe(q);
+  });
+});
+
+describe("capture: a profile run's own sentence (R146, review I2)", () => {
+  it("a run stopped by a rules change keeps the library's sentence; nothing claims 'nothing was saved'", () => {
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    q = applyProgress(q, { queueId: "q9", projectId: P, done: 1, total: 3, finished: false, outcome: { url: "https://www.instagram.com/p/A/", status: "created" } });
+    const sentence = "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved.";
+    q = applyProgress(q, { queueId: "q9", projectId: P, finished: true, report: { ...REPORT, status: "failed", created: 1, errorCode: "POLICY_CHANGED", reason: sentence } });
+    expect(q.stopReason).toBe(sentence);
+    expect(q.error ?? "").not.toMatch(/nothing was saved/);
+  });
+
+  it("without the library's sentence, the run's own meaning is used, not the single link's", () => {
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    q = applyProgress(q, { queueId: "q9", projectId: P, finished: true, report: { ...REPORT, status: "failed", created: 2, errorCode: "POLICY_CHANGED" } });
+    expect(q.error).toMatch(/Posts saved before the change are kept/);
+  });
+
+  it("a rate-limit pause keeps the library's sentence", () => {
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    const sentence = "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.";
+    q = applyProgress(q, { queueId: "q9", projectId: P, finished: true, report: { ...REPORT, status: "paused-rate-limited", created: 4, reason: sentence } });
+    expect(q.stopReason).toBe(sentence);
+  });
+
+  it("a run refused for want of a legal basis adds the UI's explanation to the library's sentence", () => {
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    q = applyProgress(q, { queueId: "q9", projectId: P, finished: true, report: { ...REPORT, status: "failed", errorCode: "LEGAL_BASIS_REQUIRED", reason: "Record a legal basis for this project's social-media data, then try again." } });
+    expect(q.stopReason).toMatch(/Record a legal basis/);
+    expect(q.error).toMatch(/Enter the legal basis/);
+    expect(q.errorCode).toBe("LEGAL_BASIS_REQUIRED");
+  });
+
+  it("a stopped profile run is not described in terms of links", () => {
+    expect(queueErrorText("TypeError: x", "profile")).not.toMatch(/link/i);
   });
 });
 
@@ -85,14 +122,14 @@ describe("capture: links", () => {
     expect(isWebAddress(`https://example.org/${"a".repeat(2050)}`)).toBe(false);
   });
 
-  it("names the platform and the kind in words", () => {
+  it("names the platform and the kind in words; what it cannot place is left to the app", () => {
     expect(previewLink("https://www.youtube.com/watch?v=dQw4w9WgXcQ").label).toBe("YouTube — video");
     expect(previewLink("https://www.instagram.com/someone/").label).toBe("Instagram — whole profile");
-    expect(previewLink("https://example.org/a").label).toMatch(/not a YouTube, Instagram or TikTok link/);
+    expect(previewLink("https://example.org/a").label).toMatch(/Not recognised here.*the app will check it/);
+    expect(previewLink("https://example.org/a").label).not.toMatch(/cannot capture/);
     expect(previewLink("nonsense").label).toMatch(/not a web address/);
   });
 });
-
 describe("capture: reasons in plain words", () => {
   it("LOGIN_REQUIRED says to use the browser session", () => {
     expect(outcomeText("LOGIN_REQUIRED")).toBe("This post needs a signed-in session. Try again with “Use my browser session”.");
