@@ -13,9 +13,11 @@
  *
  * The list shows the titles the service sends with the items (R118); a record is fetched for the
  * item shown, and — as a fallback for items sent without a title — for those items, a pool of
- * SOURCE_POOL requests at a time, the shown item first (R115 I4).
+ * SOURCE_POOL requests at a time, the shown item first (R115 I4). The records loaded are kept in a
+ * small store outside React state that each row reads for itself, so an answer re-renders only the
+ * rows it changes, not the whole queue (a queue of thousands would otherwise be rebuilt per answer).
  */
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ApiClient } from "../../api/client";
 import {
   importApi,
@@ -55,6 +57,34 @@ export function titleFromFileName(item: ReviewItem, sf: SourceFile | undefined):
   return !!sf?.fieldEvidence.some((e) => e.field === "/title" && e.source.kind === "filename");
 }
 
+/** The source records loaded so far, by source id; a change tells only its readers (useRecord). */
+interface RecordStore {
+  get(sid: string | undefined): SourceFile | undefined;
+  set(entries: Iterable<[string, SourceFile]>): void;
+  subscribe(listener: () => void): () => void;
+}
+
+function recordStore(): RecordStore {
+  const map = new Map<string, SourceFile>();
+  const listeners = new Set<() => void>();
+  return {
+    get: (sid) => (sid ? map.get(sid) : undefined),
+    set(entries) {
+      for (const [k, v] of entries) map.set(k, v);
+      for (const l of listeners) l();
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => void listeners.delete(listener);
+    },
+  };
+}
+
+/** One source's record; the component re-renders when that record changes, and only then. */
+function useRecord(store: RecordStore, sid: string | undefined): SourceFile | undefined {
+  return useSyncExternalStore(store.subscribe, () => store.get(sid));
+}
+
 export interface ReviewQueueProps {
   client: ApiClient;
   projectId: string;
@@ -73,8 +103,11 @@ function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
 export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
   const [items, setItems] = useState<ReviewItem[] | null>(null);
-  const [sources, setSources] = useState<Record<string, SourceFile>>({});
+  const [store] = useState(recordStore);
   const [failed, setFailed] = useState<ReadonlySet<string>>(new Set());
+  /** Read by each answer: clearing a failure that is not there would re-render the whole queue. */
+  const failedRef = useRef(failed);
+  failedRef.current = failed;
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
   const [batch, setBatch] = useState<BatchSummary | undefined>(undefined);
   const [collections, setCollections] = useState<Collection[]>([]);
@@ -101,12 +134,8 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     if (!arrived.current.size) return;
     const got = arrived.current;
     arrived.current = new Map();
-    setSources((cur) => {
-      const next = { ...cur };
-      for (const [k, v] of got) next[k] = v;
-      return next;
-    });
-  }, []);
+    store.set(got);
+  }, [store]);
   const pump = useCallback(() => {
     const p = pool.current;
     while (p.live && p.active < SOURCE_POOL && p.queue.length) {
@@ -121,7 +150,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
             arrived.current.set(sid, sf);
             if (sid === shownSid.current) flush();
             else flushTimer.current ??= setTimeout(flush, 16);
-            setFailed((cur) => (cur.has(sid) ? new Set([...cur].filter((x) => x !== sid)) : cur));
+            if (failedRef.current.has(sid)) setFailed((cur) => new Set([...cur].filter((x) => x !== sid)));
           },
           () => {
             p.asked.delete(sid); // a retry may ask again
@@ -177,6 +206,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
   // The item shown is loaded (its full record, for the preview) before the rest of the queue.
   const currentItem = items?.find((i) => i.id === current);
   shownSid.current = currentItem?.sourceId;
+  const shownSource = useRecord(store, currentItem?.sourceId);
   useEffect(() => {
     const sid = currentItem?.sourceId;
     if (sid) loadFirst([sid]);
@@ -189,7 +219,8 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     (el ?? title.current)?.focus();
   }, [focusId]);
 
-  const titleFor = (i: ReviewItem, n: number) => (i.sourceId ? titleOf(sources[i.sourceId]) : "") || i.title || `item ${fmt(n)}`;
+  /** The title the list shows for an item (read now, for the status line after a decision). */
+  const titleFor = (i: ReviewItem, n: number) => titleOf(store.get(i.sourceId)) || i.title || `item ${fmt(n)}`;
 
   const retry = useCallback(
     (sid: string) => {
@@ -240,19 +271,17 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
       setStatus(`${done} ${count(r.edited, "item")}.`);
       // The service applied the patch; the loaded records are updated in place (no refetch).
       const sids = new Set(chosen.flatMap((i) => (i.sourceId ? [i.sourceId] : [])));
-      setSources((cur) => {
-        const next = { ...cur };
-        for (const sid of sids) {
-          const sf = next[sid];
-          if (!sf) continue;
-          const s = { ...sf.source };
-          if (patch.type) s.type = patch.type;
-          if (patch.tagIds) s.tagIds = [...new Set([...s.tagIds, ...patch.tagIds])];
-          if (patch.collectionId) s.collectionIds = [...new Set([...s.collectionIds, patch.collectionId])];
-          next[sid] = { ...sf, source: s };
-        }
-        return next;
-      });
+      const edited: Array<[string, SourceFile]> = [];
+      for (const sid of sids) {
+        const sf = store.get(sid);
+        if (!sf) continue;
+        const s = { ...sf.source };
+        if (patch.type) s.type = patch.type;
+        if (patch.tagIds) s.tagIds = [...new Set([...s.tagIds, ...patch.tagIds])];
+        if (patch.collectionId) s.collectionIds = [...new Set([...s.collectionIds, patch.collectionId])];
+        edited.push([sid, { ...sf, source: s }]);
+      }
+      store.set(edited);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -301,7 +330,8 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
                   id={i.id}
                   sourceId={i.sourceId}
                   n={at + 1}
-                  title={titleFor(i, at + 1)}
+                  store={store}
+                  fallbackTitle={i.title || `item ${fmt(at + 1)}`}
                   reason={i.reasons[0] ?? ""}
                   current={i.id === current}
                   selected={selectedSet.has(i.id)}
@@ -320,12 +350,12 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
               api={api}
               projectId={projectId}
               item={item}
-              source={item.sourceId ? sources[item.sourceId] : undefined}
+              source={shownSource}
               loadFailed={!!item.sourceId && failed.has(item.sourceId)}
               onRetry={() => item.sourceId && retry(item.sourceId)}
               collections={collections}
               tags={tags}
-              flagTitle={flagging && titleFromFileName(item, item.sourceId ? sources[item.sourceId] : undefined)}
+              flagTitle={flagging && titleFromFileName(item, shownSource)}
               flagFolderNames={flagging ? (id: string) => madeByBatch(id, batch) : () => false}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
@@ -341,7 +371,9 @@ interface RowProps {
   id: string;
   sourceId: string | undefined;
   n: number;
-  title: string;
+  store: RecordStore;
+  /** The title when the record has none (or is not loaded): the one sent with the item, else "item n". */
+  fallbackTitle: string;
   reason: string;
   current: boolean;
   selected: boolean;
@@ -352,8 +384,9 @@ interface RowProps {
   showRef(id: string, el: HTMLButtonElement | null): void;
 }
 
-/** One queue row; re-renders only when its own props change (queues can hold thousands). */
-const Row = memo(function Row({ id, sourceId, n, title: t, reason, current, selected, broken, onToggle, onShow, onRetry, showRef }: RowProps) {
+/** One queue row; re-renders only when its own props or its own record change (queues can hold thousands). */
+const Row = memo(function Row({ id, sourceId, n, store, fallbackTitle, reason, current, selected, broken, onToggle, onShow, onRetry, showRef }: RowProps) {
+  const t = titleOf(useRecord(store, sourceId)) || fallbackTitle;
   return (
     <li className={current ? "ao-review__row ao-review__row--current" : "ao-review__row"}>
       <input type="checkbox" aria-label={`Select ${t}`} checked={selected} onChange={(e) => onToggle(id, e.target.checked)} />

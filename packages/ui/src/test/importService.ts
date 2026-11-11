@@ -122,6 +122,21 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
   // component sends while a test is being torn down still finds a handler.
   server.resetHandlers(
     ...(o.extra ?? []),
+    // First: queue tests send it thousands of times, and MSW parses the request's address and
+    // cookies once for every handler it tries (in jsdom, most of a long test's time).
+    http.get(url("/projects/:id/sources/:sid"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}`);
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      try {
+        await wait(o.sourceDelayMs);
+      } finally {
+        inFlight--;
+      }
+      if (failOnce.delete(params.sid as string)) return HttpResponse.json({ error: { code: "INTERNAL", message: "The source could not be read." } }, { status: 500 });
+      const s = o.sources?.[params.sid as string];
+      return s ? HttpResponse.json(s) : HttpResponse.json({ error: { code: "NOT_FOUND", message: "That source was not found." } }, { status: 404 });
+    }),
     http.get(url("/projects"), async ({ request }) => {
       await rec(request, "/projects");
       return HttpResponse.json({ projects: [PROJECT, { id: P2, name: "Fieldwork", encrypted: true, unlocked: true }] });
@@ -163,19 +178,6 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     http.get(url("/projects/:id/tags"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/tags`);
       return HttpResponse.json({ tags: o.tags ?? [], workspaceTags: o.workspaceTags ?? [] });
-    }),
-    http.get(url("/projects/:id/sources/:sid"), async ({ request, params }) => {
-      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}`);
-      inFlight++;
-      peak = Math.max(peak, inFlight);
-      try {
-        await wait(o.sourceDelayMs);
-      } finally {
-        inFlight--;
-      }
-      if (failOnce.delete(params.sid as string)) return HttpResponse.json({ error: { code: "INTERNAL", message: "The source could not be read." } }, { status: 500 });
-      const s = o.sources?.[params.sid as string];
-      return s ? HttpResponse.json(s) : HttpResponse.json({ error: { code: "NOT_FOUND", message: "That source was not found." } }, { status: 404 });
     }),
     http.get(url("/projects/:id/sources"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/sources`);
