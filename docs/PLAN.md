@@ -443,11 +443,11 @@ Update after every task; commit and push.
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c A pairing code's status | in review | f889a93 (worktree branch) | route and screen built |
+| 46c A pairing code's status | fix round 1 | f889a93 (worktree branch) | spec met, access rules unchanged; one Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | re-review of fix round 2 | f001a92 (worktree branch) | focus tests added (R145), no real defect exposed; plain wording for a missing tool |
-| 34c Transcript viewer | re-review of fix round 2 | 75041d9 (worktree branch) | playback position kept across ticket renewals; a damaged point ends in a plain message |
+| 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
+| 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
 | 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
@@ -462,7 +462,7 @@ Update after every task; commit and push.
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | in progress | | implementer dispatched (ahead of Task 46: little overlap, and it heads the longest remaining chain) |
-| 37b Token on standard input | in review | 0175e11 (worktree branch) | built; every launcher changed |
+| 37b Token on standard input | fix round 1 (short) | 0175e11 (worktree branch) | code sound under probes; two small clean-ups; HANDOFF.md to be corrected at merge |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
