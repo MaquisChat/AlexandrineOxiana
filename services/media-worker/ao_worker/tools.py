@@ -299,12 +299,6 @@ def _model_status(c: Component, base: Path | None) -> Status:
     return Status(True, usable, "managed", rev[:7], rev != pinned_rev)
 
 
-def tool_status(t: Tool) -> dict:
-    comps = [toolpins.COMPONENTS[cid] for cid in t.components]
-    statuses = [component_status(c) for c in comps]
-    return {"components": comps, "statuses": statuses}
-
-
 # ---------- the catalogue ----------
 
 
@@ -326,7 +320,7 @@ def catalogue() -> dict:
     for t in toolpins.TOOLS.values():
         comps = [toolpins.COMPONENTS[cid] for cid in t.components]
         parts = []
-        size = 0
+        size = remaining = 0
         approx = False
         reasons = []
         for c in comps:
@@ -336,9 +330,10 @@ def catalogue() -> dict:
             available = not isinstance(d, Unavailable)
             if not available:
                 reasons.append(d.reason)  # type: ignore[union-attr]
+            size += s
+            approx = approx or a
             if not (st.installed and st.usable and not st.outdated):
-                size += s if available else 0
-                approx = approx or a
+                remaining += s
             parts.append({
                 "id": c.id, "name": c.name, "version": c.version, "licence": c.licence,
                 "installed": st.installed, "usable": st.usable, "source": st.source,
@@ -353,7 +348,8 @@ def catalogue() -> dict:
         out.append({
             "id": t.id, "group": t.group, "name": t.name, "purpose": t.purpose, "without": t.without,
             "version": " + ".join(c.version for c in comps) if len(comps) > 1 else comps[0].version,
-            "downloadSize": size, "sizeApproximate": approx,
+            # The whole download, and what is still to be downloaded (parts already in place excluded).
+            "downloadSize": size, "sizeApproximate": approx, "remainingSize": remaining,
             "installed": installed, "usable": usable,
             "managed": any(p["source"] == "managed" for p in parts),
             "updateAvailable": any(p["outdated"] for p in parts),
