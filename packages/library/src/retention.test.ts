@@ -10,7 +10,7 @@ import { SimulatedCrash, seams } from "./repo/testing.js";
 import { findSourceBy, indexSource, openIndex } from "./index/db.js";
 import { shredSeams } from "./fs/shred.js";
 import { backupSeams } from "./export/backup.js";
-import { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
+import { DESTRUCTION_NOTICE, destroyRaw, readDestruction, resumeDestruction, retentionDue } from "./retention.js";
 
 let kit: Kit;
 beforeEach(async () => {
@@ -132,7 +132,12 @@ describe("destroyRaw", () => {
     // Sealed in an encrypted project (readable when unlocked).
     expect(r.certificatePath.endsWith(".json.enc")).toBe(true);
     expect((await readFile(r.certificatePath)).includes(Buffer.from(original.sha256))).toBe(false);
-    const cert = JSON.parse((await plainOf(kit, p, r.certificatePath.slice(kit.lib.root.length + 1).split("\\").join("/"))).toString("utf8"));
+    // R147: the file is the certificate as written at the destruction, never replaced; what became
+    // of the backups is read with its amendments (this test compared the replaced file before).
+    const written = JSON.parse((await plainOf(kit, p, r.certificatePath.slice(kit.lib.root.length + 1).split("\\").join("/"))).toString("utf8"));
+    expect(written).toEqual(r.original);
+    expect(written.backups).toEqual({ status: "pending", containing: [`Backups/${old.path.slice(old.path.lastIndexOf("/") + 1)}`], deleted: [] });
+    const cert = (await readDestruction(kit.repo, p.id, r.certificatePath)).certificate as typeof written;
     expect(cert).toEqual(r.certificate);
     expect(cert.assets.map((a: { assetId: string }) => a.assetId).sort()).toEqual([original.id, proxy.id].sort());
     expect(cert.trashedCopies).toEqual([`.tmp/trash-00000000-0000-4000-8000-000000000000-abcd/${base}`]);
@@ -210,7 +215,9 @@ describe("destroyRaw", () => {
     const done = await resumeDestruction(again, p.id);
     expect(done).toHaveLength(1);
     expect(existsSync(old.path)).toBe(false);
-    const cert = JSON.parse(await readFile(done[0]!, "utf8"));
+    // R147: the status is read with the amendments; the certificate file still says what it said at the destruction.
+    expect(JSON.parse(await readFile(done[0]!, "utf8")).backups.status).toBe("pending");
+    const cert = (await readDestruction(again, p.id, done[0]!)).certificate as { backups: { status: string } };
     expect(cert.backups.status).toBe("deleted");
   });
 });
@@ -260,7 +267,8 @@ describe("R92", () => {
     expect((await listBackups(kit.repo, p.id)).map((x) => x.file)).not.toContain(nameOf(a));
     kit.clock.now = new Date("2026-12-02T10:20:00.000Z");
     const [path] = await resumeDestruction(kit.repo, p.id);
-    const cert = JSON.parse(await readFile(path!, "utf8"));
+    // R147: read with its amendments (the certificate file is not replaced any more).
+    const cert = (await readDestruction(kit.repo, p.id, path!)).certificate as { backups: { status: string; deleted: string[] } };
     expect(cert.backups.status).toBe("deleted");
     expect(cert.backups.deleted.sort()).toEqual([`Backups/${nameOf(a)}`, `Backups/${nameOf(b)}`].sort());
     expect(existsSync(b.path)).toBe(false);

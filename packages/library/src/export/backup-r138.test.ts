@@ -14,7 +14,7 @@ import type { LocationEnv } from "../location.js";
 import { PolicyDeniedError } from "../repo/errors.js";
 import { projectWarnings } from "../repo/repo.js";
 import { SimulatedCrash } from "../repo/testing.js";
-import { destroyRaw, destroyRawHeld, resumeDestruction } from "../retention.js";
+import { destroyRaw, destroyRawHeld, readDestruction, resumeDestruction } from "../retention.js";
 import { shredSeams } from "../fs/shred.js";
 import {
   BackupDiscardedError,
@@ -344,14 +344,20 @@ describe("fix round 2", () => {
 
     kit.clock.now = new Date("2026-12-03T08:00:00.000Z");
     const [path] = await resumeDestruction(kit.repo, p.id);
-    const cert = JSON.parse(await readFile(path!, "utf8")) as { backups: Bk };
+    // R147: the certificate file is as the destruction wrote it; what happened since is read with
+    // its amendments (this test read the replaced file before).
+    expect(JSON.parse(await readFile(path!, "utf8"))).toEqual(r.original);
+    const rec = await readDestruction(kit.repo, p.id, path!);
+    const cert = rec.certificate as { backups: Bk };
     expect(cert.backups.status).toBe("deleted");
     expect(cert.backups.deleted.sort()).toEqual([`Backups/${nameOf(a)}`, `Backups/${nameOf(b)}`].sort());
     expect(cert.backups.removedAt).toEqual({ [`Backups/${nameOf(a)}`]: "2026-12-02T10:15:00.000Z", [`Backups/${nameOf(b)}`]: "2026-12-03T08:00:00.000Z" });
-    // Point 3 (round 3): amended, not rewritten: the original "not removed" entry stays, and the
-    // later removal is appended with its time.
+    // Point 3 (round 3), as R147 changed it: amended, never rewritten: the original "not removed"
+    // entry stays, and the later removal is an amendment of its own (a file beside the certificate), with its time.
     expect(cert.backups.notRemoved).toEqual([notRemovedEntry]);
-    expect((cert.backups as Bk & { amendments?: unknown }).amendments).toEqual([{ at: "2026-12-03T08:00:00.000Z", removed: [`Backups/${nameOf(b)}`] }]);
+    expect(rec.amendments).toHaveLength(2);
+    expect(rec.amendments[0]!.content).toMatchObject({ at: "2026-12-02T10:15:00.000Z", backups: { removed: [{ file: `Backups/${nameOf(a)}`, at: "2026-12-02T10:15:00.000Z" }], notRemoved: [notRemovedEntry] } });
+    expect(rec.amendments[1]!.content).toMatchObject({ at: "2026-12-03T08:00:00.000Z", backups: { removed: [{ file: `Backups/${nameOf(b)}`, at: "2026-12-03T08:00:00.000Z" }], notRemoved: [], outstanding: [] } });
     expect((cert.backups as Bk & { outstanding?: unknown }).outstanding).toBeUndefined();
     expect(cert.backups.lastError).toBeUndefined();
     expect(existsSync(b.path)).toBe(false);
@@ -465,9 +471,12 @@ describe("fix round 3", () => {
     shredSeams.failFor = undefined;
     kit.clock.now = new Date(t0 + 71 * HOUR);
     const [path] = await resumeDestruction(kit.repo, p.id);
-    const cert = JSON.parse(await readFile(path!, "utf8")) as { backups: { status: string; amendments?: unknown } };
-    expect(cert.backups.status).toBe("deleted");
-    expect(cert.backups.amendments).toEqual([{ at: new Date(t0 + 71 * HOUR).toISOString(), removed: [`Backups/${nameOf(old)}`] }]);
+    // R147: read with its amendments (the certificate file itself is not replaced any more).
+    const rec = await readDestruction(kit.repo, p.id, path!);
+    expect(rec.status).toBe("deleted");
+    expect((rec.certificate!.backups as { status: string }).status).toBe("deleted");
+    const at71 = new Date(t0 + 71 * HOUR).toISOString();
+    expect(rec.amendments.at(-1)!.content).toMatchObject({ at: at71, backups: { removed: [{ file: `Backups/${nameOf(old)}`, at: at71 }] } });
     const last = (await auditEvents(kit, p)).filter((e) => e.action === "retention.backups").at(-1)!;
     expect(last.details).toMatchObject({ status: "deleted", removed: [`Backups/${nameOf(old)}`], notRemoved: [] });
     expect(existsSync(old.path)).toBe(false);
