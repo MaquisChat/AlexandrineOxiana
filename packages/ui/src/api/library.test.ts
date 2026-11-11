@@ -2,7 +2,6 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { ndjson, server, testApi, url, useMockService } from "../test/service";
 import { ApiClientError } from "./client";
-import { profilesFromGovernance } from "./library";
 
 useMockService();
 
@@ -72,6 +71,17 @@ describe("library API (R113: typed methods on request())", () => {
     expect(seen).toEqual([{ path: "/A" }]);
   });
 
+  it("a locate stream that ends without done is an error (the search was cut off)", async () => {
+    server.use(http.post(url("/libraries/locate"), () => ndjson([{ found: { path: "/A" } }])));
+    const seen: unknown[] = [];
+    await expect(
+      (async () => {
+        for await (const f of testApi().libraries.locate("lib-1")) seen.push(f);
+      })(),
+    ).rejects.toBeInstanceOf(ApiClientError);
+    expect(seen).toEqual([{ path: "/A" }]);
+  });
+
   it("cite posts project, refs, style and format and returns the service's string", async () => {
     let body: unknown;
     server.use(
@@ -87,14 +97,5 @@ describe("library API (R113: typed methods on request())", () => {
   it("unlock posts the secret; a wrong one is WRONG_PASSPHRASE", async () => {
     server.use(http.post(url("/projects/:id/unlock"), () => HttpResponse.json({ error: { code: "WRONG_PASSPHRASE", message: "That passphrase is not correct." } }, { status: 401 })));
     await expect(testApi().projects.unlock("p2", "nope")).rejects.toMatchObject({ code: "WRONG_PASSPHRASE" });
-  });
-});
-
-describe("profilesFromGovernance", () => {
-  it("reads flow and block lists and keeps only known profiles", () => {
-    expect(profilesFromGovernance("profiles: [irb, gdpr]\n")).toEqual(["irb", "gdpr"]);
-    expect(profilesFromGovernance("profiles:\n  - hipaa\n  - made-up\n")).toEqual(["hipaa"]);
-    expect(profilesFromGovernance("encryption: required\n")).toEqual([]);
-    expect(profilesFromGovernance(": : not yaml [")).toEqual([]);
   });
 });

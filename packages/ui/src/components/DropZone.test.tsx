@@ -41,4 +41,11 @@ describe("DropZone", () => {
     expect((screen.getByRole("button", { name: "Attach files…" }) as HTMLButtonElement).disabled).toBe(true);
     expect(zone.textContent).toContain("This library is read-only.");
   });
+
+  it("disabled: dragover and drop still prevent the browser's default (no navigation to the file)", () => {
+    render(<DropZone onPaths={vi.fn()} disabled />);
+    const zone = screen.getByRole("region", { name: /attach files/i });
+    expect(fireEvent.dragOver(zone, { dataTransfer: dataTransfer("file:///a.pdf") })).toBe(false);
+    expect(fireEvent.drop(zone, { dataTransfer: dataTransfer("file:///a.pdf") })).toBe(false);
+  });
 });

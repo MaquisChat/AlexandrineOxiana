@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it } from "vitest";
@@ -41,5 +41,31 @@ describe("library routes", () => {
     navigate("/import/review");
     window.removeEventListener("popstate", on);
     await waitFor(() => expect(seen).toBe("/import/review"));
+  });
+
+  it("when the service reports the library closed, goes back to the chooser", async () => {
+    server.use(
+      http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, current: { libraryId: "lib-1", name: "Thesis library", mode: "read-write" } })),
+      ...libraryHandlers({ events: [{ type: "library.state", data: { open: false } }] }),
+    );
+    render(<LibraryRoutes client={testClient()} />);
+    expect(await screen.findByRole("heading", { name: "Choose a library" })).toBeTruthy();
+  });
+
+  it("other screens (appearance, review queue) get a Back to library link", async () => {
+    window.history.replaceState(null, "", "/settings/appearance");
+    const user = userEvent.setup();
+    render(<LibraryRoutes client={testClient()} />);
+    const link = screen.getByRole("link", { name: "Back to library" });
+    expect(link.getAttribute("href")).toBe("/");
+    await user.click(link);
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("a file dropped anywhere outside a drop zone does not navigate the app away", () => {
+    server.use(...libraryHandlers());
+    render(<LibraryRoutes client={testClient()} />);
+    expect(fireEvent.dragOver(document.body)).toBe(false);
+    expect(fireEvent.drop(document.body)).toBe(false);
   });
 });

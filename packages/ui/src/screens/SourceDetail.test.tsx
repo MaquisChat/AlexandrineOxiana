@@ -48,4 +48,20 @@ describe("SourceDetail", () => {
     render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly onClose={vi.fn()} />);
     expect(((await screen.findByRole("button", { name: "Edit details" })) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("the library turning read-only mid-edit disables Save", async () => {
+    server.use(...handlers());
+    const user = userEvent.setup();
+    const { rerender } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "Edit details" }));
+    rerender(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly onClose={vi.fn()} />);
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("citation key and date are user text (dir=auto)", async () => {
+    server.use(...handlers());
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    expect((await screen.findByText("smith2019")).closest("[dir=auto]")).toBeTruthy();
+    expect(screen.getByText("2019").closest("[dir=auto]")).toBeTruthy();
+  });
 });

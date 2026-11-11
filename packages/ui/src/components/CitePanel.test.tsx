@@ -72,4 +72,20 @@ describe("CitePanel", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("withheld from citations");
     expect(writeText).not.toHaveBeenCalled();
   });
+
+  it("a policy refusal shows the service's reason with plain words for the code", async () => {
+    server.use(
+      http.post(url("/cite"), () =>
+        HttpResponse.json({ error: { code: "POLICY_DENIED", message: "Citing this source is not allowed.", reason: "Two interviewees have no participant code yet." } }, { status: 403 }),
+      ),
+    );
+    const user = userEvent.setup();
+    stubClipboard();
+    render(<CitePanel api={testApi()} projectId="p1" sourceIds={["s1"]} />);
+    await user.click(screen.getByRole("button", { name: "Copy citation" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("project's rules");
+    expect(alert.textContent).toContain("Citing this source is not allowed.");
+    expect(alert.textContent).toContain("Two interviewees have no participant code yet.");
+  });
 });

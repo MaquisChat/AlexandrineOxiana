@@ -72,12 +72,12 @@ describe("LibraryNotFound", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("That folder holds a different library.");
   });
 
-  it("Wait retries the last known place until the drive returns", async () => {
-    let calls = 0;
+  it("Wait reconnects at the last known place (checking the library id) until the drive returns", async () => {
+    const bodies: unknown[] = [];
     server.use(
-      http.post(url("/libraries/open"), () => {
-        calls++;
-        return calls < 3 ? serviceError(404, "NOT_FOUND", "That folder is not a library.") : HttpResponse.json({ libraryId: "lib-1", name: "Thesis library", mode: "read-write" });
+      http.post(url("/libraries/reconnect"), async ({ request }) => {
+        bodies.push(await request.json());
+        return bodies.length < 3 ? serviceError(404, "NOT_FOUND", "That folder is not a library.") : HttpResponse.json({ libraryId: "lib-1", name: "Thesis library", mode: "read-write", integrity: {}, rebuilt: false, warnings: [] });
       }),
     );
     const onOpened = vi.fn();
@@ -85,8 +85,85 @@ describe("LibraryNotFound", () => {
     render(<LibraryNotFound api={testApi()} library={LIB} onOpened={onOpened} onOpenDifferent={vi.fn()} waitIntervalMs={30} />);
     await user.click(screen.getByRole("button", { name: "Wait for the drive" }));
     expect(screen.getByText(/Waiting for Fieldwork SSD/)).toBeTruthy();
-    await waitFor(() => expect(onOpened).toHaveBeenCalledWith({ libraryId: "lib-1", name: "Thesis library", mode: "read-write" }));
-    expect(calls).toBe(3);
+    await waitFor(() => expect(onOpened).toHaveBeenCalledTimes(1));
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0]).toEqual({ path: "/Volumes/Fieldwork SSD/Thesis library", libraryId: "lib-1" });
+  });
+
+  it("Stop pressed while a try is in flight: no further requests and no late open", async () => {
+    let calls = 0;
+    server.use(
+      http.post(url("/libraries/reconnect"), async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 200));
+        return HttpResponse.json({ libraryId: "lib-1", name: "Thesis library", mode: "read-write", integrity: {}, rebuilt: false, warnings: [] });
+      }),
+    );
+    const onOpened = vi.fn();
+    const user = userEvent.setup();
+    render(<LibraryNotFound api={testApi()} library={LIB} onOpened={onOpened} onOpenDifferent={vi.fn()} waitIntervalMs={50} />);
+    await user.click(screen.getByRole("button", { name: "Wait for the drive" }));
+    await waitFor(() => expect(calls).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Stop waiting" }));
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls).toBe(1);
+    expect(onOpened).not.toHaveBeenCalled();
+  });
+
+  it("unmounting stops the wait", async () => {
+    let calls = 0;
+    server.use(
+      http.post(url("/libraries/reconnect"), () => {
+        calls++;
+        return serviceError(404, "NOT_FOUND", "That folder is not a library.");
+      }),
+    );
+    const user = userEvent.setup();
+    const { unmount } = render(<LibraryNotFound api={testApi()} library={LIB} onOpened={vi.fn()} onOpenDifferent={vi.fn()} waitIntervalMs={30} />);
+    await user.click(screen.getByRole("button", { name: "Wait for the drive" }));
+    await waitFor(() => expect(calls).toBeGreaterThan(0));
+    unmount();
+    const at = calls;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(calls).toBeLessThanOrEqual(at + 1);
+    const later = calls;
+    await new Promise((r) => setTimeout(r, 150));
+    expect(calls).toBe(later);
+  });
+
+  it("choosing something else stops the wait", async () => {
+    let calls = 0;
+    server.use(
+      http.post(url("/libraries/reconnect"), () => {
+        calls++;
+        return serviceError(404, "NOT_FOUND", "That folder is not a library.");
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryNotFound api={testApi()} library={LIB} onOpened={vi.fn()} onOpenDifferent={vi.fn()} waitIntervalMs={30} />);
+    await user.click(screen.getByRole("button", { name: "Wait for the drive" }));
+    await waitFor(() => expect(calls).toBeGreaterThan(0));
+    await user.click(screen.getByRole("button", { name: "Locate library…" }));
+    await new Promise((r) => setTimeout(r, 60));
+    const at = calls;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(calls).toBe(at);
+  });
+
+  it("an error other than 'not there yet' is shown and the wait stops", async () => {
+    let calls = 0;
+    server.use(
+      http.post(url("/libraries/reconnect"), () => {
+        calls++;
+        return serviceError(400, "VALIDATION", "That folder holds a different library.");
+      }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryNotFound api={testApi()} library={LIB} onOpened={vi.fn()} onOpenDifferent={vi.fn()} waitIntervalMs={30} />);
+    await user.click(screen.getByRole("button", { name: "Wait for the drive" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("That folder holds a different library.");
+    await new Promise((r) => setTimeout(r, 150));
+    expect(calls).toBe(1);
   });
 
   it("Open different goes back to the chooser", async () => {

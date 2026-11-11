@@ -37,7 +37,69 @@ describe("CollectionTree", () => {
   });
 });
 
+describe("CollectionTree expand, collapse, rename, delete", () => {
+  it("parents carry aria-expanded; Left collapses (hiding children) and Right expands", async () => {
+    const user = userEvent.setup();
+    render(<CollectionTree collections={COLLECTIONS.collections} selectedId={undefined} onSelect={vi.fn()} />);
+    const ch1 = screen.getByRole("treeitem", { name: "Chapter 1" });
+    expect(ch1.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("treeitem", { name: "Chapter 2" }).hasAttribute("aria-expanded")).toBe(false);
+    ch1.focus();
+    await user.keyboard("{ArrowLeft}");
+    expect(ch1.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("treeitem", { name: "Interviews" })).toBeNull();
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(screen.getByRole("treeitem", { name: "Chapter 2" }));
+    await user.keyboard("{ArrowUp}{ArrowRight}");
+    expect(ch1.getAttribute("aria-expanded")).toBe("true");
+    await user.keyboard("{ArrowRight}");
+    expect(document.activeElement).toBe(screen.getByRole("treeitem", { name: "Interviews" }));
+    // Interviews has a child: the first Left collapses it, the second moves to its parent
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByRole("treeitem", { name: "Interviews" }).getAttribute("aria-expanded")).toBe("false");
+    await user.keyboard("{ArrowLeft}");
+    expect(document.activeElement).toBe(ch1);
+  });
+
+  it("the selected collection can be renamed and deleted (with a confirmation); read-only turns both off", async () => {
+    const onRename = vi.fn();
+    const onDelete = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(<CollectionTree collections={COLLECTIONS.collections} selectedId="c4" onSelect={vi.fn()} onRename={onRename} onDelete={onDelete} />);
+    await user.click(screen.getByRole("button", { name: "Rename collection Chapter 2" }));
+    const field = screen.getByLabelText("New name for Chapter 2");
+    await user.clear(field);
+    await user.type(field, "Chapter Two{Enter}");
+    expect(onRename).toHaveBeenCalledWith("c4", "Chapter Two");
+    await user.click(screen.getByRole("button", { name: "Delete collection Chapter 2" }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    expect(onDelete).toHaveBeenCalledWith("c4");
+    rerender(<CollectionTree collections={COLLECTIONS.collections} selectedId="c4" onSelect={vi.fn()} onRename={onRename} onDelete={onDelete} readOnly />);
+    expect((screen.getByRole("button", { name: "Rename collection Chapter 2" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Delete collection Chapter 2" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
 describe("TagList", () => {
+  it("a tag's own colour is shown as a swatch only when it is a valid #rrggbb", () => {
+    render(
+      <TagList
+        tags={[
+          { id: "a", scope: "p1", name: "red tag", color: "#aa0000" },
+          { id: "b", scope: "p1", name: "bad colour", color: "red; background: url(x)" },
+        ]}
+        workspaceTags={[]}
+        onSelect={vi.fn()}
+        onRename={vi.fn()}
+        onDelete={vi.fn()}
+        onCreate={vi.fn()}
+      />,
+    );
+    const swatches = screen.getAllByTestId("code-swatch");
+    expect(swatches).toHaveLength(1);
+    expect(swatches[0]!.textContent).toContain("red tag");
+  });
+
   it("project tags can be renamed and deleted; workspace tags say where they are managed", async () => {
     const onRename = vi.fn();
     const onDelete = vi.fn();

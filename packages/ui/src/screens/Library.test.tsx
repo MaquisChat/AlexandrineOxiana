@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
-import { CURRENT_RW, libraryHandlers, server, SOURCES, testApi, url, useMockService } from "../test/service";
+import { describe, expect, it, vi } from "vitest";
+import { CURRENT_RW, libraryHandlers, PROJECTS, server, SOURCES, serviceError, testApi, url, useMockService } from "../test/service";
 import { Library } from "./Library";
 
 useMockService();
@@ -150,6 +150,8 @@ describe("Library screen", () => {
     await waitFor(() => expect(screen.queryByLabelText("Passphrase or recovery code")).toBeNull());
     expect(tries).toBe(2);
     expect(await screen.findByRole("table", { name: "Sources" })).toBeTruthy();
+    const clinic = within(screen.getByRole("navigation", { name: "Projects" })).getByRole("button", { name: /Clinic interviews/ });
+    expect(clinic.textContent).not.toMatch(/Locked/);
   });
 
   it("opening a source shows its details", async () => {
@@ -160,5 +162,110 @@ describe("Library screen", () => {
     const detail = await screen.findByRole("region", { name: "Source details" });
     expect(await within(detail).findByText("University Press")).toBeTruthy();
     expect(within(detail).getByRole("button", { name: "Copy citation" })).toBeTruthy();
+  });
+
+  it("uses the profiles GET /projects sends, without reading governance.yaml", async () => {
+    let governanceReads = 0;
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map((p) => ({ ...p, profiles: p.id === "p1" ? ["dmp"] : [] })) })),
+      http.get(url("/projects/:id/governance"), () => {
+        governanceReads++;
+        return HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] });
+      }),
+      ...libraryHandlers(),
+    );
+    renderLibrary();
+    const diss = await screen.findByRole("button", { name: /Dissertation/ });
+    await waitFor(() => expect(diss.textContent).toMatch(/DMP/));
+    expect(diss.textContent).not.toMatch(/IRB/);
+    expect(governanceReads).toBe(0);
+  });
+
+  it("PROJECT_LOCKED during an edit returns to UnlockProject and clears what was decrypted", async () => {
+    server.use(http.patch(url("/projects/:id/tags/:tid"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")), ...libraryHandlers());
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await user.click(screen.getByRole("button", { name: "Rename tag to read" }));
+    const field = screen.getByLabelText("New name for to read");
+    await user.clear(field);
+    await user.type(field, "reading{Enter}");
+    expect(await screen.findByLabelText("Passphrase or recovery code")).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+    expect(screen.queryByText("Ethnography at Work")).toBeNull();
+  });
+
+  it("Lock project clears the decrypted sources and details and shows UnlockProject", async () => {
+    let locked = 0;
+    server.use(
+      http.post(url("/projects/:id/unlock"), () => HttpResponse.json({ unlocked: true })),
+      http.post(url("/projects/:id/lock"), () => {
+        locked++;
+        return HttpResponse.json({ unlocked: false });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await user.click(await screen.findByRole("button", { name: /Clinic interviews/ }));
+    await user.type(await screen.findByLabelText("Passphrase or recovery code"), "pw");
+    await user.click(screen.getByRole("button", { name: "Unlock" }));
+    await user.click(await screen.findByRole("button", { name: "Ethnography at Work" }));
+    await screen.findByRole("region", { name: "Source details" });
+    await user.click(screen.getByRole("button", { name: "Lock project" }));
+    expect(await screen.findByLabelText("Passphrase or recovery code")).toBeTruthy();
+    expect(locked).toBe(1);
+    expect(screen.queryByRole("region", { name: "Source details" })).toBeNull();
+    expect(screen.queryByText("Ethnography at Work")).toBeNull();
+    expect(screen.queryByRole("tree", { name: "Collections" })).toBeNull();
+    const clinic = within(screen.getByRole("navigation", { name: "Projects" })).getByRole("button", { name: /Clinic interviews/ });
+    expect(clinic.textContent).toMatch(/Locked/);
+  });
+
+  it("a service refusal shows its reason; a later successful search does not hide it", async () => {
+    server.use(
+      http.patch(url("/projects/:id/tags/:tid"), () => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "Renaming tags is not allowed.", reason: "The project's rules are being reviewed." } }, { status: 403 })),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await user.click(screen.getByRole("button", { name: "Rename tag to read" }));
+    const field = screen.getByLabelText("New name for to read");
+    await user.clear(field);
+    await user.type(field, "reading{Enter}");
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("The project's rules are being reviewed.");
+    await user.type(screen.getByRole("searchbox", { name: "Search sources" }), "eth");
+    await new Promise((r) => setTimeout(r, 400));
+    expect(screen.getByRole("alert").textContent).toContain("The project's rules are being reviewed.");
+  });
+
+  it("Load more fetches the next page by offset and appends it", async () => {
+    const offsets: Array<string | null> = [];
+    const row = (i: number) => ({ ...SOURCES.items[0]!, id: `s${i}`, title: `Source ${i}` });
+    server.use(
+      http.get(url("/projects/:id/sources"), ({ request }) => {
+        const off = new URL(request.url).searchParams.get("offset");
+        offsets.push(off);
+        return HttpResponse.json(off === "2" ? { total: 3, items: [row(3)] } : { total: 3, items: [row(1), row(2)] });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Source 2");
+    await user.click(screen.getByRole("button", { name: "Load more sources" }));
+    expect(await screen.findByText("Source 3")).toBeTruthy();
+    expect(screen.getByText("Source 1")).toBeTruthy();
+    expect(offsets.at(-1)).toBe("2");
+    expect(screen.queryByRole("button", { name: "Load more sources" })).toBeNull();
+  });
+
+  it("library.state open:false tells the shell the library closed", async () => {
+    server.use(...libraryHandlers({ events: [{ type: "library.state", data: { open: false } }] }));
+    const onClosed = vi.fn();
+    render(<Library api={testApi()} current={CURRENT_RW as never} onClosed={onClosed} />);
+    await waitFor(() => expect(onClosed).toHaveBeenCalled());
   });
 });

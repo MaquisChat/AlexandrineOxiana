@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { StatusBanner, bannersFor, volumeOf } from "./StatusBanner";
+import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
 
 describe("StatusBanner", () => {
   it("read-only, locked by another computer", () => {
@@ -42,9 +42,37 @@ describe("StatusBanner", () => {
     expect(screen.getByRole("status").textContent).not.toContain(warning);
   });
 
-  it("an unknown warning shows the service's own detail", () => {
-    render(<StatusBanner variant={{ kind: "warning", warning: "txn-recovery-skipped", project: "library", detail: "a change was kept for review" }} />);
-    expect(screen.getByRole("status").textContent).toContain("a change was kept for review");
+  const SECRET_DETAIL = "txn 7f3a in /Users/rana/Library/Thesis library/Projects/p1-secret/journal failed for p1-secret";
+  it.each([
+    ["rolled-back-incomplete-write", /interrupted change .* was undone/],
+    ["head-mismatch", /audit log .* does not match/],
+    ["audit-append-failed-at-open", /could not be recorded in the audit log/],
+    ["made-up-kind", /Something in Dissertation needs attention/],
+  ])("warning %s: a plain sentence, never the detail, ids or paths", (warning, text) => {
+    render(<StatusBanner variant={{ kind: "warning", warning, project: "Dissertation", detail: SECRET_DETAIL }} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(text);
+    expect(t).not.toContain(warning);
+    expect(t).not.toContain("p1-secret");
+    expect(t).not.toContain("/Users");
+    expect(t).not.toContain("7f3a");
+  });
+
+  it("every warning kind the service emits has its own sentence", () => {
+    const kinds = [
+      "chain-broken", "head-mismatch", "truncated", "empty", "anchor-missing", "anchors-unreadable", "rolled-back-incomplete-write",
+      "invalid-txn-marker", "incomplete-write-pending", "txn-recovery-skipped-audit-unverifiable", "trimmed-incomplete-audit-line",
+      "incomplete-audit-line-pending", "audit-append-failed-at-open", "deleted-records-unreadable", "annotations-unreadable",
+      "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due",
+    ];
+    const generic = warningText("made-up-kind", "P");
+    const seen = new Set<string>();
+    for (const k of kinds) {
+      const t = warningText(k, "P");
+      expect(t, k).not.toBe(generic);
+      seen.add(t);
+    }
+    expect(seen.size).toBe(kinds.length);
   });
 });
 
