@@ -428,12 +428,18 @@ async function relaunchWithoutIndex(app: AppHarness, libraryPath: string): Promi
   return before;
 }
 
-/** After a relaunch: opens the library from the chooser (D5: the app does not reopen it by itself). */
+/**
+ * After a relaunch: the library open again. Today the relaunched app shows the chooser (the service
+ * does not reopen the last library; the same cause as D5), so it is opened from there; once the app
+ * reopens it by itself, this goes straight on.
+ */
 async function openFromChooser(page: Page, name: string): Promise<void> {
   await page.goto(`${APP_ORIGIN}/`);
-  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
-  await page.getByRole("button", { name: `Open ${name}` }).click();
-  await expect(page.getByRole("heading", { level: 1, name })).toBeVisible();
+  const chooser = page.getByRole("heading", { level: 1, name: "Choose a library" });
+  const library = page.getByRole("heading", { level: 1, name });
+  await expect(chooser.or(library)).toBeVisible();
+  if (await chooser.isVisible()) await page.getByRole("button", { name: `Open ${name}` }).click();
+  await expect(library).toBeVisible();
 }
 
 const D8: Defect = { id: "D8", title: "opening a library whose library.sqlite was deleted rebuilds the index from the files, so its sources are listed and found by search (spec 4.3, 9)" };
