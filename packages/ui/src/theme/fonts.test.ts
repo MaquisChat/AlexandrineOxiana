@@ -91,8 +91,15 @@ describe("bundled fonts", () => {
     for (const fam of ["Sorts Mill Goudy", "Atkinson Hyperlegible", "OpenDyslexic"]) expect(fontsCss).toContain(`font-family: "${fam}"`);
     expect(fontsCss).toMatch(/font-family: "Sorts Mill Goudy";[^}]*font-style: italic/);
     expect(fontsCss).not.toMatch(/font-family: "Goudy Old Style"/);
-    // An installed copy of each bundled font is preferred over the bundled file.
-    expect(fontsCss).toContain('local("Sorts Mill Goudy")');
+  });
+
+  it("no bundled face names a local() source (D6): in WebKit a face with local() sources that the page matches but does not need is left in error, and document.fonts never finishes loading", () => {
+    const faces = [...fontsCss.matchAll(/@font-face\s*\{([^}]*)\}/g)].map((m) => m[1]!);
+    expect(faces.length).toBeGreaterThan(0);
+    for (const f of faces) {
+      expect(f).not.toMatch(/local\(/);
+      expect(f).toMatch(/src:\s*url\("\/fonts\/[^"]+\.woff2"\) format\("woff2"\);/);
+    }
   });
 
   it("every font file fonts.css loads is pinned in scripts/fonts.lock.json", () => {
