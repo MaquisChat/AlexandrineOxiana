@@ -39,4 +39,20 @@ describe("governance routes (R113, R118)", () => {
     expect(screen.getByRole("link", { name: "Audit log" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Audit log" }).getAttribute("href")).toBe("/audit?project=p2");
   });
+
+  it("an unknown project in the address selects none and says so, instead of showing another project's screen (41b2 M1)", async () => {
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Coastal kinship" }] })));
+    window.history.replaceState(null, "", "/fieldwork?project=nope");
+    render(<Host />);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/not in this library/);
+    expect(screen.getByText("Choose a project first.")).toBeTruthy();
+    expect((screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement).value).toBe("");
+  });
+
+  it("a failed project list is shown (41b2 M2)", async () => {
+    server.use(http.get(url("/projects"), () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "The service is not answering." } }, { status: 503 })));
+    window.history.replaceState(null, "", "/governance");
+    render(<Host />);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/projects could not be read|could not be reached/);
+  });
 });

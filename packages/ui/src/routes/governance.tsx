@@ -6,6 +6,7 @@
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import type { ApiClient } from "../api/client";
 import { governanceApi, type GovernanceApi, type ProjectSummary } from "../api/governance";
+import { errorText } from "../api/library";
 import { inAppLink, navigate, normalisePath, PATHS, type AppLocation } from "../navigation";
 import { AuditLog } from "../screens/AuditLog";
 import { Fieldwork } from "../screens/Fieldwork";
@@ -39,15 +40,27 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
   const path = normalisePath(loc.pathname);
   const asked = new URLSearchParams(loc.search).get("project") ?? "";
   const id = useId();
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
+  const [listError, setListError] = useState<string | undefined>();
   useEffect(() => {
+    let live = true;
     api.projects().then(
-      (r) => setProjects(r.projects),
-      () => setProjects([]),
+      (r) => live && setProjects(r.projects),
+      (err: unknown) => {
+        if (!live) return;
+        setProjects([]);
+        setListError(errorText(err, "The projects could not be read."));
+      },
     );
+    return () => {
+      live = false;
+    };
   }, [api]);
-  // The project named in the address, if it is one of the library's; else the first.
-  const projectId = projects.some((p) => p.id === asked) ? asked : (projects[0]?.id ?? "");
+  const list = projects ?? [];
+  // The project named in the address when it is one of the library's. A name that is not selects
+  // none (never another project's screen, 41b2 M1); no name selects the first.
+  const unknown = !!asked && !!projects && !list.some((p) => p.id === asked);
+  const projectId = asked ? (unknown ? "" : asked) : (list[0]?.id ?? "");
   const route = governanceRoutes.find((r) => r.path === path);
   return (
     <div>
@@ -61,14 +74,25 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           );
         })}
         <label htmlFor={`${id}-project`}>Project</label>
-        <select id={`${id}-project`} value={projectId} onChange={(e) => navigate(governanceHref(path, e.target.value))}>
-          {projects.map((p) => (
+        <select id={`${id}-project`} value={projectId} onChange={(e) => e.target.value && navigate(governanceHref(path, e.target.value))}>
+          {!projectId && <option value="">Choose a project</option>}
+          {list.map((p) => (
             <option key={p.id} value={p.id}>
               {p.name}
             </option>
           ))}
         </select>
       </nav>
+      {listError && (
+        <p role="alert" className="ao-screen ao-error">
+          {listError}
+        </p>
+      )}
+      {unknown && (
+        <p role="alert" className="ao-screen ao-error">
+          The project named in the address is not in this library. Choose a project from the list.
+        </p>
+      )}
       {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId) : null}
     </div>
   );
