@@ -16,7 +16,7 @@
  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
  * `request()` (Tasks 33+).
  */
-import { isCredentialQueryKey } from "@ao/shared";
+import { isCredentialQueryKey, isMediaTicketPath } from "@ao/shared";
 import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
 
 export type ErrorCode =
@@ -88,6 +88,13 @@ export interface ApiClient {
    * called once the service has accepted the stream (events published from then on arrive).
    */
   events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
+  /**
+   * The address a media element loads for a media ticket (R135): the base URL plus the ticket path
+   * the service gave (`/media/<ticket>`), nothing added. Only that exact form is accepted: no query,
+   * no fragment, never the service token. The result is a secret (R135 5): give it to the media
+   * element only — never show, log, store it or put it in the page address. Fetches nothing.
+   */
+  mediaUrl(ticketPath: string): string;
 }
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
@@ -401,6 +408,13 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
   }
 
+  /** R135: a ticket address is `/media/` and 43 base64url characters; the token is never in it. */
+  function mediaUrl(ticketPath: string): string {
+    if (typeof ticketPath !== "string" || !isMediaTicketPath(ticketPath)) throw new Error("Not a media address: expected /media/<ticket> and nothing else."); // not echoed
+    if (tokenForms.some((t) => ticketPath.includes(t))) throw new Error("Refusing a media address that contains the service token.");
+    return `${base}${ticketPath}`;
+  }
+
   return {
     request,
     appearance: {
@@ -409,5 +423,6 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     },
     ndjson,
     events,
+    mediaUrl,
   };
 }

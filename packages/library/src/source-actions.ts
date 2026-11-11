@@ -144,7 +144,9 @@ export async function addTranscriptVersion(
         operation: "human-edit",
         provider: "researcher",
         ranAt: "local",
-        params: input.basedOn ? { basedOn: input.basedOn } : {},
+        // The language is recorded here too (the file name alone carries it otherwise), so a
+        // reader of the version's segments knows it (transcript-segments.ts).
+        params: { ...(input.basedOn ? { basedOn: input.basedOn } : {}), ...(input.lang ? { lang: input.lang } : {}) },
         at: new Date().toISOString(),
         triggeredBy: "user",
       },
