@@ -203,6 +203,21 @@ export function tightened(control: string, current: unknown, req: Requirement): 
   return isLooser(control, req.value, current) ? req.value : current;
 }
 
+/**
+ * The edits that turn `profile` on (R119: one edit): the profile listed, and each control it
+ * requires raised to the requirement where the rules ask for less. The governance screen and the
+ * new-project dialog both write a profile this way.
+ */
+export function profileOnEntries(cfg: Config, profile: Profile): Array<[string, unknown]> {
+  const entries: Array<[string, unknown]> = [["profiles", [...new Set([...cfg.profiles, profile])]]];
+  for (const req of PROFILE_REQUIREMENTS[profile]) {
+    const before = getPath(cfg, req.control);
+    const after = tightened(req.control, before, req);
+    if (JSON.stringify(after) !== JSON.stringify(before)) entries.push([req.control, after]);
+  }
+  return entries;
+}
+
 /** An exception already approving exactly this value. */
 export function hasException(cfg: Config, control: string, value: unknown): boolean {
   return cfg.exceptions.some((e) => e.control === control && JSON.stringify(e.value) === JSON.stringify(value));

@@ -20,8 +20,14 @@
  *   (its own tail, possibly torn by the crash, is not checked: the rollback
  *   truncates it), or the external anchor says
  *   events at or after this transaction's start were committed, which an
- *   uncommitted transaction cannot explain): nothing is touched, the marker is
+ *   uncommitted transaction cannot explain, or the recorded append offsets no
+ *   longer mark where it began: an offset off a line boundary, or a different
+ *   number of audit events before it than recorded, or later events not its
+ *   own, R131 b): nothing is touched, the marker is
  *   kept, reported 'txn-recovery-skipped-audit-unverifiable';
+ * - a choice the researcher recorded (R131 c): left to openRepo, which completes
+ *   and audits it first (pending-writes.ts); if that failed, nothing is touched,
+ *   reported 'incomplete-write-pending';
  * - otherwise every step is undone in reverse (including partially appended
  *   change log and audit lines), reported 'rolled-back-incomplete-write'. If an
  *   undo step fails the marker is kept for the next open.
@@ -33,7 +39,7 @@ import * as fsp from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { LibraryRelativePath, isId, newId, verifyChain, type AuditEvent } from "@ao/core";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
-import { AuditStore, type Head } from "./audit-store.js";
+import { AuditStore, auditSegments, type Head } from "./audit-store.js";
 import { PathEscapeError } from "./errors.js";
 import { shredPath } from "../fs/shred.js";
 import { assertContained, exists, undoAppend, type AppendUndo } from "./io.js";
@@ -47,6 +53,17 @@ export type MarkerEntry =
   | { kind: "trashed"; from: string; to: string; shred?: boolean }
   | { kind: "append"; path: string; prevSize: number; created: boolean };
 
+/**
+ * The researcher's choice for an interrupted change (R27, R131 c), written into the marker before
+ * anything is done, so that a crash or a failed audit append leaves it to be completed (and audited)
+ * on the next open rather than done silently. `status` is what the marker showed when the choice was made.
+ */
+export interface ResolveRecord {
+  choice: "keep" | "roll-back";
+  status: "committed" | "uncommitted";
+  at: string;
+}
+
 export interface TxnMarker {
   formatVersion: 1;
   txn: string;
@@ -58,6 +75,8 @@ export interface TxnMarker {
   /** Audit head seq when the transaction started (0 for an empty log). */
   auditSeqBefore: number;
   entries: MarkerEntry[];
+  /** Present once the researcher chose how to resolve it (R131 c). */
+  resolve?: ResolveRecord;
 }
 
 const MARKER = /^txn-([0-9a-f-]+)\.json$/;
@@ -179,7 +198,7 @@ export class TxnLog {
 }
 
 /** Best effort: keeps going past failures, and reports whether every step succeeded. */
-async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
+export async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolean> {
   let ok = true;
   for (const e of [...entries].reverse()) {
     try {
@@ -205,7 +224,7 @@ async function undoEntries(root: string, entries: MarkerEntry[]): Promise<boolea
   return ok;
 }
 
-async function removeMarker(root: string, m: TxnMarker): Promise<void> {
+export async function removeMarker(root: string, m: TxnMarker): Promise<void> {
   for (const e of m.entries) {
     if (e.kind === "replaced") await fsp.rm(fromRel(root, e.backup), { force: true }).catch(() => {});
   }
@@ -236,6 +255,12 @@ export function markerProblem(m: unknown, fileTxn: string): string | null {
   if (!isRel(pf) || !/^Projects\/[^/]+$/.test(pf) || pf.slice("Projects/".length).startsWith(".")) return "projectFolder is not Projects/<folder>";
   if (!count(x.auditEvents) || (x.auditEvents as number) < 1 || !count(x.auditSeqBefore)) return "bad audit counters";
   if (!Array.isArray(x.entries)) return "entries missing";
+  if (x.resolve !== undefined) {
+    const r = x.resolve as Partial<ResolveRecord> | null;
+    if (!r || typeof r !== "object" || (r.choice !== "keep" && r.choice !== "roll-back") || (r.status !== "committed" && r.status !== "uncommitted") || typeof r.at !== "string") {
+      return "bad resolve record";
+    }
+  }
   for (const e of x.entries as unknown[]) {
     const en = e as Partial<Record<string, unknown>> | null;
     if (!en || typeof en !== "object") return "bad entry";
@@ -305,7 +330,9 @@ export type RecoveryOutcome =
   | "rolled-back"
   | "rollback-incomplete"
   | "invalid"
-  | "skipped-audit-unverifiable";
+  | "skipped-audit-unverifiable"
+  /** A choice the researcher recorded could not be completed yet (R131 c): the marker is kept, never acted on here. */
+  | "resolve-incomplete";
 
 export interface RecoveryResult {
   /** The marker's project id, or "*" when the marker cannot be read. */
@@ -351,6 +378,8 @@ export interface MarkerInspection {
   detail?: string;
   /** The parsed marker, for every status but `invalid`. */
   marker?: TxnMarker;
+  /** A choice is recorded in the marker and its `txn.resolve` audit event is already written: only the marker is left. */
+  resolveAudited?: boolean;
 }
 
 /** Inspects one marker (`.tmp/txn-<fileTxn>.json`). Reads only. */
@@ -376,7 +405,10 @@ export async function inspectMarker(root: string, fileTxn: string, anchorOf: (pr
   const m = raw as TxnMarker;
   const base = { txn: m.txn, projectId: m.projectId, projectFolder: m.projectFolder, marker: m };
   const events = await AuditStore.read(fromRel(root, `${m.projectFolder}/audit`));
-  const mine = events.filter((e) => e !== null && e.decision?.result !== "deny" && (e.details as { txn?: unknown } | undefined)?.txn === m.txn).length;
+  const ofThis = (e: AuditEvent | null): boolean => e !== null && (e.details as { txn?: unknown } | undefined)?.txn === m.txn;
+  // A recorded choice whose audit event is written: carried out and recorded, only the marker is left (R131 c).
+  if (m.resolve && events.some((e) => ofThis(e) && e!.action === "txn.resolve")) return { ...base, status: m.resolve.status, resolveAudited: true };
+  const mine = events.filter((e) => ofThis(e) && e!.action !== "txn.resolve" && e!.decision?.result !== "deny").length;
   if (mine >= m.auditEvents) return { ...base, status: "committed" };
   // Rolling back is only safe when the audit log can be trusted to say "not committed".
   // Only the part of the log written before this transaction is checked: its own tail (possibly a
@@ -389,10 +421,67 @@ export async function inspectMarker(root: string, fileTxn: string, anchorOf: (pr
     return {
       ...base,
       status: "unverifiable",
-      detail: !prefixOk ? "the audit chain before this change does not verify" : `the audit anchor (event ${anchor!.seq}) is past this transaction's start (event ${m.auditSeqBefore})`,
+      detail: !prefixOk
+        ? "the audit record before this change does not verify, so it cannot show whether the change was finished"
+        : `this computer recorded audit events up to event ${anchor!.seq}, later than this change's start (event ${m.auditSeqBefore}), so the change may have been finished`,
     };
   }
+  // Undoing truncates appended files back to the recorded sizes: only safe while those sizes still
+  // mark where the change began (R131 b).
+  const offsets = await offsetProblem(root, m, events, ofThis);
+  if (offsets) return { ...base, status: "unverifiable", detail: offsets };
   return { ...base, status: "uncommitted" };
+}
+
+/** Number of complete, non-empty lines in `buf` (a whole file, or a prefix of one ending at a line boundary). */
+function countLines(buf: Buffer): number {
+  const parts = buf.toString("utf8").split("\n");
+  return parts.filter((l, i) => i < parts.length - 1 && l.trim() !== "").length;
+}
+
+/**
+ * Why the marker's recorded append offsets cannot be trusted, or null (R131 b): every offset must
+ * lie within its file and on a line boundary, the audit log must hold exactly `auditSeqBefore`
+ * events before the transaction's first audit offset, and every event after that must be the
+ * transaction's own. Reads only; the reason names no path.
+ */
+async function offsetProblem(root: string, m: TxnMarker, events: Array<AuditEvent | null>, ofThis: (e: AuditEvent | null) => boolean): Promise<string | null> {
+  const auditPrefix = `${m.projectFolder}/audit/`;
+  let auditStart: { segment: number; prevSize: number; created: boolean } | undefined;
+  for (const e of m.entries) {
+    if (e.kind !== "append") continue;
+    if (e.path.startsWith(auditPrefix)) {
+      const segment = Number.parseInt(e.path.slice(auditPrefix.length), 10);
+      if (!auditStart || segment < auditStart.segment) auditStart = { segment, prevSize: e.prevSize, created: e.created };
+    }
+    if (e.created || e.prevSize === 0) continue; // the whole file is the transaction's
+    const fh = await fsp.open(fromRel(root, e.path), "r").catch(() => null);
+    if (!fh) continue; // nothing there to truncate
+    try {
+      if ((await fh.stat()).size < e.prevSize) return "a log file this change added to is now shorter than when the change began";
+      const b = Buffer.alloc(1);
+      await fh.read(b, 0, 1, e.prevSize - 1);
+      if (b[0] !== 0x0a) return "a log file this change added to does not end a line where the change recorded it began";
+    } finally {
+      await fh.close();
+    }
+  }
+  let before = events.length;
+  if (auditStart) {
+    before = 0;
+    const dir = fromRel(root, `${m.projectFolder}/audit`);
+    for (const name of await auditSegments(dir)) {
+      const no = Number.parseInt(name, 10);
+      if (no > auditStart.segment) break;
+      const buf = await fsp.readFile(join(dir, name)).catch(() => null);
+      if (!buf) continue;
+      if (no < auditStart.segment) before += countLines(buf);
+      else if (!auditStart.created) before += countLines(buf.subarray(0, auditStart.prevSize));
+    }
+  }
+  if (before !== m.auditSeqBefore) return `the audit record holds ${before} event(s) where this change began, but the change recorded ${m.auditSeqBefore}`;
+  if (events.slice(m.auditSeqBefore).some((e) => !ofThis(e))) return "the audit record holds events written after this change began";
+  return null;
 }
 
 /** Every marker present, inspected (reads only). */
@@ -408,6 +497,13 @@ export async function inspectMarkers(root: string, anchorOf: (projectId: string)
  * when a destroyed file could not be overwritten yet.
  */
 export async function finishCommitted(root: string, m: TxnMarker): Promise<boolean> {
+  if (!(await finishCommittedSteps(root, m))) return false;
+  await removeMarker(root, m);
+  return true;
+}
+
+/** finishCommitted without removing the marker; repeatable (a destroyed file already gone is skipped). */
+export async function finishCommittedSteps(root: string, m: TxnMarker): Promise<boolean> {
   let shredded = true;
   for (const e of m.entries) {
     if (e.kind !== "trashed" || !e.shred) continue;
@@ -421,8 +517,14 @@ export async function finishCommitted(root: string, m: TxnMarker): Promise<boole
   for (const e of m.entries) {
     if (e.kind === "trashed") await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
   }
-  await removeMarker(root, m);
   return true;
+}
+
+/** Records the researcher's choice in the marker (atomically) before it is carried out (R131 c). */
+export async function recordResolve(root: string, m: TxnMarker, rec: ResolveRecord): Promise<void> {
+  const next: TxnMarker = { ...m, resolve: rec };
+  await writeSmallFileAtomic(join(root, ".tmp", `txn-${m.txn}.json`), JSON.stringify(next));
+  m.resolve = rec;
 }
 
 /**
@@ -452,6 +554,11 @@ export async function recoverTransactions(
       continue;
     }
     const m = i.marker!;
+    if (m.resolve) {
+      // The researcher's recorded choice is completed, and audited, by openRepo (R131 c); never silently here.
+      out.push({ ...where, outcome: "resolve-incomplete", detail: `the choice to ${m.resolve.choice === "keep" ? "keep" : "roll back"} it is recorded but could not be completed yet` });
+      continue;
+    }
     if (i.status === "committed") {
       // Destroyed files are overwritten before they go (R90 d): a crash after the commit finishes it
       // here. If that fails, the marker and the trash stay, and the next open tries again (R92).

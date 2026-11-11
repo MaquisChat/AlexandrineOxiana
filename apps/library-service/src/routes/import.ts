@@ -11,6 +11,7 @@ import {
   listWatchedFolders,
   removeWatchedFolder,
   researcherName,
+  researcherNameOk,
   startZoteroWebImport,
   watchFolder,
   zoteroWebAdapter,
@@ -154,6 +155,8 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput & { researcherName?: string };
     // The photographer: the name given for this import, else this device's researcher name (R84/R117).
     const given = typeof options.researcherName === "string" ? options.researcherName.trim() : "";
+    // Checked like the device setting before it becomes the photographer in provenance (41a M6).
+    if (given !== "" && !researcherNameOk(given)) throw badRequest('"researcherName" must be 1 to 200 characters, with no control, format or line-separator characters.');
     const researcher = given || (await researcherName(state.deps.appConfigDir));
     const { researcherName: _given, ...rest } = options;
     const h = await s.bulk.importDeviceFolder(projectId, dir, {

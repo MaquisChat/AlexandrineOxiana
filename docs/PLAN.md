@@ -229,7 +229,7 @@ Specification: Task 34 in the old plan, which was written before several rulings
 **Task 50 — No refusal or audit failure is silent [ledger: R28, R82; ledger lines 96, 115]**
 - Depends: 41a. Parallel: 49.
 - Files: `packages/library/src/{move.ts,reconnect.ts}`, `packages/library/src/repo/`, `docs/adr/0005-governance-checkpoint.md`, tests.
-- Accept: a refused library move and a refused project creation each leave an audit entry. Where move, reconnect and relink today only return a warning when an audit entry cannot be written, they follow the precedent the ledger set elsewhere: the action is not undone, but the project is marked as needing attention and the audit screen shows it (R28, R82: never silent). The same for the permission-change failure noted at ledger line 115. No ruling made the present behaviour deliberate.
+- Accept: a refused library move and a refused project creation each leave an audit entry. Restoring a backup asks the policy engine before it writes (found by Task 49: today it is audited but not decided). Where move, reconnect and relink today only return a warning when an audit entry cannot be written, they follow the precedent the ledger set elsewhere: the action is not undone, but the project is marked as needing attention and the audit screen shows it (R28, R82: never silent). The same for the permission-change failure noted at ledger line 115. No ruling made the present behaviour deliberate.
 - Verify: `pnpm --filter @ao/library exec vitest run src/move.test.ts src/reconnect.test.ts src/repo`.
 - Model: Opus.
 
@@ -394,7 +394,15 @@ Known, not yet scheduled above, or accepted as limits:
 - Content-security policy allows inline styles (accepted).
 - Five files exceed 1,000 lines (`import/bulk/run.ts`, `import/refman.ts`, `repo/repo.ts`, `reconnect.ts`, `move.ts`). Not to be split as a task of its own; split only when one must change anyway.
 - No general linting. Candidate for after Phase 1: a small rule set for unhandled promises and package boundaries.
-- Defects found by Tasks 44 and 45 are listed here as they are found.
+- Defects found by Task 45 (for Task 46; details in the ledger and in the task's report):
+  - D1: after the review queue there is no way back to the import's report and Undo.
+  - D2: a source accepted in review stays "Needs review" in the library (needs a ruling on what that badge means).
+  - D3: the source screen shows no proxy picture (built by Tasks 34a and 34d).
+  - D4: "Copy into the library" leaves Zotero's linked files as links, and the report does not say so.
+  - D5: after a relaunch the app shows "Choose a library" instead of "Library not found".
+  - D6: in WebKit one typeface stays in error, so fonts never finish loading (to be checked in the real Mac web view).
+  - D7: right-to-left title headings are laid out left to right.
+- Defects found by Task 44 are added here when it runs.
 
 ## 8. Status
 
@@ -405,16 +413,16 @@ Update after every task; commit and push.
 | 38 Fix the red build | done | 8500d33 | 47 CLI tests pass locally; CI run on GitHub pending |
 | 39 Handoff docs in and corrected | done | 1597ad7, 8747f80 | |
 | 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
-| 41a Review: library and service | fix round 2 | | Critical fixed and re-reviewed; 3 Important open |
+| 41a Review: library and service | done | f5d47a3 | 1 Critical and 5 Important fixed over two rounds and re-reviewed (R131, R132) |
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
-| 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
+| 42 CI coverage | awaiting CI | ae3f762, b207182 | GitHub's runners cannot resolve ubuntu.com; mirror fallback added; done when a run is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | fix round 1 | | spec met; 2 Important (R134) |
-| 44 Scenarios 1, 2, 5, 7 | not started | | |
-| 45 Scenarios 3, 4, 6, 8 | not started | | |
+| 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
+| 44 Scenarios 1, 2, 5, 7 | not started | | unblocked (43, 60 done); starts when Task 45 has merged, since both may extend `e2e/fixtures.ts` |
+| 45 Scenarios 3, 4, 6, 8 | in review | 7089d9f (worktree branch) | 28 steps pass, 6 fixmes; defects D1–D7 for Task 46 |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
-| 34a Service additions | not started | | |
+| 34a Service additions | in progress | | R135 ruled; implementer dispatched |
 | 34b Capture screen | not started | | |
 | 34c Transcript viewer | not started | | |
 | 34d Verification badges | not started | | |
@@ -422,9 +430,9 @@ Update after every task; commit and push.
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | not started | | |
+| 49 Backups governed | in review | 23d4ee8 (worktree branch) | adversarial review dispatched |
 | 50 No silent refusals | not started | | |
-| 51 Job records in files | not started | | |
+| 51 Job records in files | in progress | | implementer dispatched |
 | 61 New recovery code | not started | | found by the Task 60 review |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |

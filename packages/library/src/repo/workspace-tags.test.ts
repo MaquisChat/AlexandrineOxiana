@@ -134,6 +134,18 @@ describe("workspace tags: rename (R118 b)", () => {
     expect((await workspaceFile()).tags.find((t) => t.id === tag.id)?.name).toBe("to-read");
   });
 
+  it("M7: two renames to the same name at once: the one that loses is refused before anything is audited", async () => {
+    const repo = await repoFor();
+    const { a, b, tag, other } = await twoProjectsWithTag(repo);
+    const r = await Promise.allSettled([repo.renameWorkspaceTag(tag.id, "same"), repo.renameWorkspaceTag(other.id, "Same"), repo.createTag("workspace", "SAME")]);
+    expect(r.filter((x) => x.status === "fulfilled")).toHaveLength(1);
+    for (const x of r) if (x.status === "rejected") expect(String(x.reason)).toMatch(/already exists/);
+    expect((await repo.listWorkspaceTags()).filter((t) => t.name.toLowerCase() === "same")).toHaveLength(1);
+    for (const pid of [a, b]) {
+      expect((await auditEvents(repo, pid)).filter((e) => (e.details as { op?: string })?.op === "workspace-tag.rename").length).toBeLessThanOrEqual(1);
+    }
+  });
+
   it("is refused before anything is written while an encrypted project is locked", async () => {
     const repo = await repoFor();
     const { a, tag } = await twoProjectsWithTag(repo);
@@ -190,6 +202,50 @@ describe("workspace tags: delete (R118 b)", () => {
     expect((await repo.getSource(a, sa)).source.tagIds).not.toContain(tag.id);
     expect((await repo.getSource(b, sb)).source.tagIds).not.toContain(tag.id);
     expect((await workspaceFile()).tags.some((t) => t.id === tag.id)).toBe(false);
+  });
+
+  it("I2: membership changes running alongside the delete, at every step, never leave a source tagged with the deleted tag", async () => {
+    const repo = await repoFor();
+    const { a, b, sa, sb } = await twoProjectsWithTag(repo);
+    for (let round = 0; round < 3; round++) {
+      const tag = await repo.createTag("workspace", `round ${round}`);
+      await repo.setMembership(a, sa, { tagIds: [tag.id] });
+      await repo.setMembership(b, sb, { tagIds: [tag.id] });
+      let done = false;
+      const del = repo.deleteWorkspaceTag(tag.id).finally(() => {
+        done = true;
+      });
+      // Keep putting the tag back on a source in each project, one change after another, until the delete ends.
+      const outcomes: string[] = [];
+      let i = 0;
+      while (!done) {
+        const [pid, sid] = i++ % 2 === 0 ? [a, sa] : [b, sb];
+        outcomes.push(await repo.setMembership(pid, sid, { tagIds: [tag.id] }).then(
+          () => "ok",
+          (e: unknown) => (e instanceof NotFoundError ? "not-found" : String(e)),
+        ));
+      }
+      await del;
+      expect(outcomes.every((o) => o === "ok" || o === "not-found"), outcomes.join()).toBe(true);
+      expect((await workspaceFile()).tags.some((t) => t.id === tag.id)).toBe(false);
+      expect((await repo.getSource(a, sa)).source.tagIds).not.toContain(tag.id);
+      expect((await repo.getSource(b, sb)).source.tagIds).not.toContain(tag.id);
+    }
+  });
+
+  it("I2: while a delete is unfinished the tag cannot be put on a source, it stays listed, and deleting again finishes it", async () => {
+    const repo = await repoFor();
+    const { a, b, tag, sa, sb } = await twoProjectsWithTag(repo);
+    seams.failAuditAppendFor = b;
+    await expect(repo.deleteWorkspaceTag(tag.id)).rejects.toThrow();
+    seams.failAuditAppendFor = undefined;
+    await expect(repo.setMembership(a, sa, { tagIds: [tag.id] })).rejects.toBeInstanceOf(NotFoundError);
+    await expect(repo.updateSource(a, sa, { tagIds: [tag.id] })).rejects.toBeInstanceOf(NotFoundError);
+    expect((await repo.listWorkspaceTags()).map((t) => t.id)).toContain(tag.id);
+    await expect(repo.renameWorkspaceTag(tag.id, "something else")).rejects.toThrow(/being deleted/);
+    await repo.deleteWorkspaceTag(tag.id);
+    expect((await workspaceFile()).tags.some((t) => t.id === tag.id)).toBe(false);
+    expect((await repo.getSource(b, sb)).source.tagIds).not.toContain(tag.id);
   });
 
   it("is refused before anything is written while a project has an unresolved interrupted change", async () => {

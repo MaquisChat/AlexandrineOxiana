@@ -15,7 +15,7 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import { newId } from "@ao/core";
-import { InvalidInputError, PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
+import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError } from "./repo/errors.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import type { Tx } from "./repo/mutate.js";
 import { noteIntegrityWarning, projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
@@ -212,7 +212,11 @@ export async function addProtocolDocuments(repo: Repo, projectId: string, paths:
               ? "The project is locked. Unlock it, then try again."
               : err instanceof InvalidInputError
                 ? err.message
-                : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
+                : err instanceof RecoveryPendingError
+                  ? "The project refuses changes until an interrupted change is resolved; nothing of this file was kept."
+                  : err instanceof ReadOnlyLibraryError
+                    ? "The library is open read-only, so nothing can be added."
+                    : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
       out.push({ file, outcome: "failed", reason });
     }
   }

@@ -436,6 +436,49 @@ describe("pause, cancel and resume", () => {
   });
 });
 
+describe("review queue: workspace tags being deleted (41a N2)", () => {
+  it("a bulk review edit cannot put a workspace tag being deleted on a source, whether it is marked already or the delete races it", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const items = await bulk.listReview(p.id, h.batchId);
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    // Already marked: the delete stopped part-way (another project could not take it).
+    const marked = await repo.createTag("workspace", "marked");
+    const tagsFile = join(lib.root, "tags.json");
+    const tj = JSON.parse(await readFile(tagsFile, "utf8")) as Record<string, unknown>;
+    await writeFile(tagsFile, JSON.stringify({ ...tj, deleting: [marked.id] }));
+    await expect(bulk.bulkEditReview(p.id, [items[0]!.id], { tagIds: [marked.id] })).rejects.toThrow(/not found/i);
+    expect((await repo.getSource(p.id, items[0]!.sourceId!)).source.tagIds).not.toContain(marked.id);
+    // Racing: the edit checks its tags, the whole delete runs, then the edit writes.
+    for (let round = 0; round < 3; round++) {
+      const tag = await repo.createTag("workspace", `racing ${round}`);
+      let done = false;
+      const del = repo.deleteWorkspaceTag(tag.id).finally(() => {
+        done = true;
+      });
+      while (!done) await bulk.bulkEditReview(p.id, [items[1]!.id], { tagIds: [tag.id] }).catch(() => {});
+      await del;
+      expect((await repo.listWorkspaceTags()).some((t) => t.id === tag.id)).toBe(false);
+      expect((await repo.getSource(p.id, items[1]!.sourceId!)).source.tagIds).not.toContain(tag.id);
+    }
+  });
+
+  it("createSource refuses a workspace tag whose deletion has started", async () => {
+    const p = await project();
+    const tag = await repo.createTag("workspace", "going");
+    const tagsFile = join(lib.root, "tags.json");
+    const tj = JSON.parse(await readFile(tagsFile, "utf8")) as Record<string, unknown>;
+    await writeFile(tagsFile, JSON.stringify({ ...tj, deleting: [tag.id] }));
+    const before = repo.listSourceIds(p.id).length;
+    await expect(
+      repo.createSource(p.id, { projectIds: [], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "T" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [tag.id], participantIds: [] }, [], {
+        provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "ao", version: "0" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+      }),
+    ).rejects.toThrow(/not found/i);
+    expect(repo.listSourceIds(p.id).length).toBe(before);
+  });
+});
+
 describe("review queue", () => {
   it("decideReview and bulkEditReview are governed, audited changes", async () => {
     const p = await project();

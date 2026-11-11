@@ -1,7 +1,7 @@
 /**
  * Smoke: the real UI meets the real service and worker for the first time. The app opens on the
  * library chooser; a library is created at a typed folder (native pickers arrive with the desktop
- * shell); a project is created; the library screen lists it. Elements are found by role and
+ * shell); a project is created through the New project dialog; the library screen lists and selects it. Elements are found by role and
  * accessible name, as a keyboard or screen-reader user finds them.
  */
 import { existsSync, readFileSync } from "node:fs";
@@ -11,7 +11,7 @@ import { expect, test } from "./fixtures.js";
 const LIBRARY_NAME = "Estuary fieldwork";
 const PROJECT_NAME = "Tide-line interviews";
 
-test("creates a library at a typed folder; a project made through the service is listed on the library screen", async ({ page, app }) => {
+test("creates a library at a typed folder, then a project through the New project dialog, which is listed and selected", async ({ page, app }) => {
   // The chooser: nothing registered yet on this device.
   await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
   await expect(page.getByText("No libraries yet.")).toBeVisible();
@@ -38,22 +38,40 @@ test("creates a library at a typed folder; a project made through the service is
   // Opening the library started the real media worker.
   await expect.poll(() => app.childProcesses().some((c) => c.includes("ao_worker")), { message: "the media worker is running", timeout: 30_000 }).toBe(true);
 
-  // A project. The UI has no way to create one yet (see the fixme test below), so it is created
-  // through the service as test set-up; the library screen reads projects when it opens.
-  // Rules of a project without identifiable data (the default rules require encryption).
-  const governanceYaml = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\n";
-  const created = await app.api<{ project: { id: string; name: string } }>("POST", "/projects", { name: PROJECT_NAME, governanceYaml, encryption: { enabled: false } });
-  expect(created.status, JSON.stringify(created.body)).toBe(200);
-  await page.reload(); // the shell hands the connection over again on every load, as here
+  // A project, through the New project dialog: rules without identifiable data, where encryption is a
+  // choice (the default rules require it), left unencrypted.
+  await page.getByRole("button", { name: "New project" }).click();
+  const dialog = page.getByRole("dialog", { name: "New project" });
+  await expect(dialog.getByRole("textbox", { name: "Project name" })).toBeFocused();
+  await dialog.getByRole("textbox", { name: "Project name" }).fill(PROJECT_NAME);
+  const encrypt = dialog.getByRole("checkbox", { name: "Encrypt this project" });
+  await expect(encrypt).toBeChecked();
+  await expect(encrypt).toBeDisabled(); // identifiable data needs encryption
+  await dialog.getByRole("checkbox", { name: "This project holds identifiable information about people" }).uncheck();
+  await expect(encrypt).toBeEnabled();
+  await encrypt.uncheck();
+  await expect(dialog.getByLabel("Passphrase", { exact: true })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Create project" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "New project" })).toBeFocused();
 
-  await expect(page.getByRole("heading", { level: 1, name: LIBRARY_NAME })).toBeVisible();
+  // What the service persisted: the project, unencrypted, with the rules the dialog wrote.
+  const listedProjects = await app.api<{ projects: Array<{ id: string; name: string; encrypted: boolean }> }>("GET", "/projects");
+  expect(listedProjects.body.projects.map((p) => p.name)).toEqual([PROJECT_NAME]);
+  const made = listedProjects.body.projects[0]!;
+  expect(made.encrypted).toBe(false);
+  const rules = await app.api<{ yaml: string }>("GET", `/projects/${made.id}/governance`);
+  expect(rules.body.yaml).toMatch(/containsIdentifiable: false/);
+  expect(rules.body.yaml).toMatch(/atRest: optional/);
+
+  // The new project is listed and selected, and the address names it.
   await expect(projects.getByRole("button", { name: PROJECT_NAME })).toBeVisible();
   await expect(projects.getByRole("button", { name: PROJECT_NAME })).toHaveAttribute("aria-current", "true");
-});
+  await expect(page).toHaveURL(new RegExp(`[?&]project=${made.id}$`));
+  await expect(page.getByRole("alert")).toHaveCount(0);
 
-// Product gap found by this scenario: the UI has no control that creates a project (the service has
-// POST /projects; packages/ui calls it nowhere). Recorded in the Task 43 report; un-fixme this when a
-// "New project" screen exists, replacing the API call above.
-test.fixme("creates a project through the UI", async ({ page }) => {
-  await page.getByRole("button", { name: "New project" }).click();
+  // A reload (the shell hands the connection over again on every load) returns to it.
+  await page.reload();
+  await expect(page.getByRole("heading", { level: 1, name: LIBRARY_NAME })).toBeVisible();
+  await expect(projects.getByRole("button", { name: PROJECT_NAME })).toHaveAttribute("aria-current", "true");
 });

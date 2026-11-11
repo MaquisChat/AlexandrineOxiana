@@ -382,7 +382,7 @@ function holderName(holder: LockInfo | null | undefined): { lockedBy?: string } 
   const h = holder?.hostname;
   if (typeof h !== "string") return {};
   const name = h.trim();
-  if (name.length === 0 || name.length > 253 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(name)) return {};
+  if (name.length === 0 || name.length > 253 || /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(name)) return {};
   return { lockedBy: name };
 }
 
