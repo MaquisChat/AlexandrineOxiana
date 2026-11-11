@@ -397,10 +397,10 @@ Update after every task; commit and push.
 | 38 Fix the red build | done | 8500d33 | 47 CLI tests pass locally; CI run on GitHub pending |
 | 39 Handoff docs in and corrected | done | 1597ad7, 8747f80 | |
 | 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
-| 41a Review: library and service | in review | | reviewer dispatched |
-| 41b Review: interface | in review | | two reviewers (fix rounds; integration) |
+| 41a Review: library and service | fix round 1 | | 1 Critical, 4 Important (R131); implementer working |
+| 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
-| 43 End-to-end harness | in review | 604c185 (worktree branch) | Chromium and WebKit pass; service untouched |
+| 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
 | 60 New-project dialog | not started | | found by Task 43 |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | not started | | |
