@@ -15,6 +15,7 @@ import {
   type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource } from "./load.js";
+import { JOBS_FILE, markLegacyJobs, readJobJournal, upgradeLegacyJobs, upsertJobRow, type JobRecord } from "../job-journal.js";
 import { indexUnlockedProject } from "./sink.js";
 
 export interface RebuildResult {
@@ -34,12 +35,13 @@ export interface RebuildOptions {
 }
 
 /**
- * Tables that later tasks fill from files of their own (review items, import batches, jobs). Until
- * those files exist the index is their only home, so a rebuild copies their rows over (ADR 0007).
- * Review items now also live in `review/pending.jsonl` (R31): rows read from those files replace
- * carried ones; rows of locked encrypted projects are carried as they were.
+ * Review items live in `review/pending.jsonl` (R31): rows read from those files replace the old
+ * database's rows, which are copied over so that rows of locked encrypted projects (whose files
+ * cannot be read) stay as they were. Jobs are never copied: they are read from each project's job
+ * journal (`jobs/journal.jsonl`). The one exception is the upgrade of a database written before
+ * the journal existed: its job rows of locked encrypted projects, not yet written into their
+ * journals (`upgradeLegacyJobs`), are kept until the project is unlocked.
  */
-const CARRIED_TABLES = ["review_items", "import_batches", "jobs"] as const;
 
 const REBUILD_PREFIX = `${INDEX_FILE}.rebuild-`;
 
@@ -72,9 +74,23 @@ export async function rebuildIndex(
   const tmp = join(root, `${REBUILD_PREFIX}${newId()}`);
   let nextDb: IndexDb | undefined;
   try {
-    const carried = readCarried(handle.isOpen ? handle.db : undefined);
+    const old = handle.isOpen ? handle.db : undefined;
+    // Job rows from before the journal are written into the journals first (R31 upgrade).
+    const legacy = old ? await upgradeLegacyJobs(old, root, keyRing) : undefined;
+    const carried = readCarried(old);
     nextDb = openIndexAt(tmp);
     const result = await populate(nextDb, root, keyRing, carried, onProgress);
+    if (legacy) {
+      result.errors.push(...legacy.errors);
+      if (legacy.waiting.length) {
+        for (const r of legacy.waiting) {
+          nextDb.prepare("INSERT OR REPLACE INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+            r.id, r.project_id, r.kind, r.status, r.payload_json, r.created_at,
+          );
+        }
+        markLegacyJobs(nextDb);
+      }
+    }
     checkpointTruncate(nextDb);
     nextDb.pragma("journal_mode = DELETE"); // one self-contained file
     nextDb.close();
@@ -142,15 +158,11 @@ async function reloadUnlocked(
 }
 
 function readCarried(old: IndexDb | undefined): Record<string, Array<Record<string, unknown>>> {
-  const out: Record<string, Array<Record<string, unknown>>> = {};
-  for (const t of CARRIED_TABLES) {
-    try {
-      out[t] = old ? (old.prepare(`SELECT * FROM ${t}`).all() as Array<Record<string, unknown>>) : [];
-    } catch {
-      out[t] = []; // unreadable old database: nothing to carry
-    }
+  try {
+    return { review_items: old ? (old.prepare("SELECT * FROM review_items").all() as Array<Record<string, unknown>>) : [] };
+  } catch {
+    return { review_items: [] }; // unreadable old database: nothing to carry
   }
-  return out;
 }
 
 async function populate(
@@ -166,6 +178,7 @@ async function populate(
 
   const jobs: Array<() => Promise<void>> = [];
   const reviewRows: ReviewItemRow[] = [];
+  const jobRecords: JobRecord[] = [];
   for (const e of await listProjectEntries(root)) {
     if (!e.data) {
       result.errors.push({ folder: e.rel, message: e.error ?? "unreadable project" });
@@ -204,6 +217,14 @@ async function populate(
       }
     } catch (err) {
       result.errors.push({ folder: `${e.rel}/${REVIEW_FILE}`, message: err instanceof Error ? err.message : String(err) });
+    }
+    // So is its job journal (R31): the jobs table is filled from it alone.
+    try {
+      const journal = await readJobJournal(root, e.rel, project.id, k);
+      jobRecords.push(...journal.records.values());
+      if (journal.unreadable.length) result.errors.push({ folder: `${e.rel}/${JOBS_FILE}`, message: `${journal.unreadable.length} unreadable line(s) skipped` });
+    } catch (err) {
+      result.errors.push({ folder: `${e.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
     }
     // Plain projects are indexed fully here. An unlocked encrypted project gets manifest-level rows
     // only; its content is loaded into memory after the new file is in place (R30).
@@ -247,6 +268,7 @@ async function populate(
   }
   // The files win over carried rows: they are the record (rows of locked projects stay as carried).
   for (const r of reviewRows) upsertReviewItem(db, r);
+  for (const r of jobRecords) upsertJobRow(db, r);
   setMeta(db, "projectStamps", JSON.stringify(stamps));
   setMeta(db, "lastChangeId", newestChangeId(stamps) ?? "");
   return result;

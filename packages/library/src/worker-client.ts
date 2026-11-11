@@ -8,11 +8,13 @@
  *      ocr), evaluated by the repo with the system tz and `now`; a deny is audited through the repo
  *      and thrown as PolicyDeniedError before the worker is contacted. `capture.download` is not
  *      evaluated here: the caller has already passed a `capture` decision.
- *   2. a `jobs` row (status queued → running → done | failed | cancelled) so that a job the app
- *      did not see finish is resubmitted on the next launch (`resumePending`). `capture.download`
- *      is never resumed (its capture decision and caller are gone): it is marked failed
- *      `INTERRUPTED`, and leftover `.tmp/capture-*` / `worker-*` / `batch-*` folders are swept. For an encrypted
- *      project the row's payload is sealed with the project key.
+ *   2. a record in the project's job journal (`<Project>/jobs/journal.jsonl`, sealed in encrypted
+ *      projects, R31; see job-journal.ts), written before the `jobs` row of the index, which is
+ *      only a cache of it (status queued → running → done | failed | cancelled), so that a job
+ *      the app did not see finish is resubmitted on the next launch (`resumePending`, which reads
+ *      the journals). `capture.download` is never resumed (its capture decision and caller are
+ *      gone): it is marked failed `INTERRUPTED`, and leftover `.tmp/capture-*` / `worker-*` /
+ *      `batch-*` folders are swept. A read-only library records nothing (and resumes nothing).
  *   3. a private temp folder `<Library>/.tmp/worker-<id>/` (0700): an encrypted input is decrypted
  *      into it (0600), and the worker writes its outputs there.
  *   4. polling every 500 ms, progress forwarded; an aborted signal cancels the worker job.
@@ -30,11 +32,15 @@ import type { EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
 import type { IndexDb } from "./index/db.js";
+import {
+  UNFINISHED, appendJobRecords, assertNoSecrets, compactJobJournal, errorCode, readJobJournal, syncJobRows, upgradeLegacyJobs, upsertJobRow,
+  type JobRecord, type JobStatus, type StoredJob, type WorkerJobType,
+} from "./job-journal.js";
+import { ProjectLockedError } from "./repo/errors.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
-import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 
-export type WorkerJobType = "audio.transcribe" | "capture.download" | "image.proxy" | "video.proxy" | "pdf.ocr";
+export type { WorkerJobType } from "./job-journal.js";
 
 /** The processing op each job type is evaluated as (null: the caller passed a `capture` decision). */
 export const JOB_OPS: Record<WorkerJobType, ProcessingOp | null> = {
@@ -103,19 +109,13 @@ export interface WorkerEndpoint {
 export interface WorkerClientOptions {
   repo: Repo;
   worker: WorkerEndpoint;
-  /** The library index; its `jobs` table records jobs so pending ones survive a restart. */
-  index?: { db: IndexDb };
+  /**
+   * The library index (an IndexHandle, or anything whose `db` is the live connection): its `jobs`
+   * table is kept as a cache of the job journals. Optional: the journals are the record.
+   */
+  index?: { readonly db: IndexDb };
   /** Poll interval (default 500 ms). */
   pollMs?: number;
-}
-
-interface StoredJob {
-  type: WorkerJobType;
-  input: string;
-  inputEncrypted?: boolean;
-  output: string;
-  params: Record<string, unknown>;
-  entity?: { type: EntityType; id: string };
 }
 
 interface WorkerJobState {
@@ -133,46 +133,81 @@ const POLL_RETRIES = 3;
 export class WorkerClient {
   private readonly repo: Repo;
   private readonly worker: WorkerEndpoint;
-  private readonly db?: IndexDb;
+  private readonly index?: { readonly db: IndexDb };
+  /** The newest record of each job this client is running (the base of its next line). */
+  private readonly records = new Map<string, JobRecord>();
   private readonly pollMs: number;
   private readonly active = new Set<string>();
 
   constructor(opts: WorkerClientOptions) {
     this.repo = opts.repo;
     this.worker = opts.worker;
-    this.db = opts.index?.db;
+    this.index = opts.index;
     this.pollMs = opts.pollMs ?? 500;
   }
 
   submit(projectId: string, job: WorkerJob): Promise<JobResult> {
-    return this.run(randomUUID(), projectId, job, true);
+    return this.run(randomUUID(), projectId, job);
   }
 
   /**
-   * Resubmits jobs recorded as queued or running (the app quit or the worker died before they
-   * finished). Call once at launch, before new submissions; stale worker temp folders are removed.
-   * Jobs of locked projects are reported with ProjectLockedError and stay pending.
+   * Resubmits jobs whose newest journal record is queued or running (the app quit or the worker
+   * died before they finished). Call once at launch, before new submissions; stale worker temp
+   * folders are removed. Works from the journals alone: rows written before the journal existed
+   * are first written into them (`upgradeLegacyJobs`), each readable journal is compacted when
+   * mostly superseded, and the index rows are made to match it. Journals of locked encrypted
+   * projects cannot be read: their jobs stay pending (rows the index knows are reported with
+   * ProjectLockedError). A read-only library is not written to: nothing is resumed.
    */
   async resumePending(): Promise<Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }>> {
-    if (!this.db) return [];
+    const library = repoLibrary(this.repo);
+    if (library.mode !== "read-write") return [];
     await this.removeStaleTemp();
-    const rows = this.db
-      .prepare("SELECT id, project_id, kind, payload_json FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at, id")
-      .all() as Array<{ id: string; project_id: string; kind: string; payload_json: string }>;
+    const db = this.db();
+    if (db) await upgradeLegacyJobs(db, library.root, { get: (keyId: string) => this.keyById(keyId) }).catch(() => undefined);
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
-    for (const row of rows) {
-      if (row.kind === "capture.download") {
-        // Never resumed: its caller (and the capture decision it made) is gone, and its output
-        // folder has been swept. The researcher captures the link again.
-        this.setStatus(row.id, "failed", true);
-        out.push({ id: row.id, projectId: row.project_id, error: new WorkerJobError("INTERRUPTED", "the capture was interrupted; capture the link again") });
+    const todo: JobRecord[] = [];
+    for (const p of this.repo.listProjects()) {
+      let key: { key: Uint8Array; keyId: string } | null;
+      try {
+        key = projectDataKey(this.repo, p.id);
+      } catch (error) {
+        if (!(error instanceof ProjectLockedError)) throw error;
+        const rows = (db ? db.prepare("SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued', 'running') ORDER BY created_at, id").all(p.id) : []) as Array<{ id: string }>;
+        for (const r of rows) out.push({ id: r.id, projectId: p.id, error });
         continue;
       }
       try {
-        const stored = await this.unseal(row.project_id, row.payload_json);
-        out.push({ id: row.id, projectId: row.project_id, result: await this.run(row.id, row.project_id, stored, false) });
+        await compactJobJournal(library.root, p.folder, p.id, key);
+        const journal = await readJobJournal(library.root, p.folder, p.id, key);
+        const live = this.db();
+        if (live) syncJobRows(live, p.id, journal.records.values());
+        for (const r of journal.records.values()) if (UNFINISHED.has(r.status) && !this.records.has(r.id)) todo.push(r);
       } catch (error) {
-        out.push({ id: row.id, projectId: row.project_id, error });
+        out.push({ id: "", projectId: p.id, error });
+      }
+    }
+    todo.sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt)));
+    for (const rec of todo) {
+      if (rec.kind === "capture.download" || !rec.job) {
+        // Never resumed: a capture's caller (and the capture decision it made) is gone, and its
+        // output folder has been swept; the researcher captures the link again. A record without
+        // its job (from before the journal, unreadable) cannot run again either.
+        const code = rec.kind === "capture.download" ? "INTERRUPTED" : "UNRECOVERABLE";
+        this.records.set(rec.id, rec);
+        await this.transition(rec.id, "failed", code).catch(() => {});
+        this.records.delete(rec.id);
+        out.push({
+          id: rec.id,
+          projectId: rec.projectId,
+          error: new WorkerJobError(code, code === "INTERRUPTED" ? "the capture was interrupted; capture the link again" : "the job's record cannot be read; start it again"),
+        });
+        continue;
+      }
+      try {
+        out.push({ id: rec.id, projectId: rec.projectId, result: await this.run(rec.id, rec.projectId, rec.job, rec) });
+      } catch (error) {
+        out.push({ id: rec.id, projectId: rec.projectId, error });
       }
     }
     return out;
@@ -180,9 +215,10 @@ export class WorkerClient {
 
   // ---- internals ----
 
-  private async run(id: string, projectId: string, job: WorkerJob, fresh: boolean): Promise<JobResult> {
+  private async run(id: string, projectId: string, job: WorkerJob, resumed?: JobRecord): Promise<JobResult> {
     const op = JOB_OPS[job.type];
     if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
+    assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
     let decision: PolicyDecision | undefined;
     if (op !== null) {
       decision = await authorizeProcessing(
@@ -203,8 +239,14 @@ export class WorkerClient {
       params: job.params ?? {},
       ...(job.entity ? { entity: job.entity } : {}),
     };
-    if (fresh) await this.insertRow(id, projectId, stored, dataKey);
-    else this.setStatus(id, "queued");
+    const now = new Date().toISOString();
+    this.records.set(id, resumed ?? { v: 1, id, projectId, kind: stored.type, status: "queued", createdAt: now, updatedAt: now, job: stored });
+    try {
+      await this.transition(id, "queued");
+    } catch (err) {
+      this.records.delete(id);
+      throw err;
+    }
 
     const root = repoLibrary(this.repo).root;
     const tmp = join(root, ".tmp", `worker-${id}`);
@@ -235,7 +277,7 @@ export class WorkerClient {
         output: workerOutput,
         params: job.params ?? {},
       });
-      this.setStatus(id, "running");
+      await this.transition(id, "running");
       const state = await this.poll(workerId, job);
 
       if (state.status === "cancelled") throw new WorkerJobError("CANCELLED", "the job was cancelled");
@@ -245,14 +287,17 @@ export class WorkerClient {
       }
       const files = await publish(outDir, finalBase, dataKey);
       const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
-      this.setStatus(id, "done", true);
+      await this.transition(id, "done");
       return { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
     } catch (err) {
       if (!(err instanceof WorkerUnavailableError)) {
-        this.setStatus(id, err instanceof WorkerJobError && err.code === "CANCELLED" ? "cancelled" : "failed", true);
+        const cancelled = err instanceof WorkerJobError && err.code === "CANCELLED";
+        // A failure to record the outcome leaves the job pending (resubmitted later): the job's own error is the useful one.
+        await this.transition(id, cancelled ? "cancelled" : "failed", errorCode(err instanceof WorkerJobError ? err.code : undefined)).catch(() => {});
       }
       throw err;
     } finally {
+      this.records.delete(id);
       this.active.delete(id);
       await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
       activeTemp.delete(`worker-${id}`);
@@ -322,29 +367,48 @@ export class WorkerClient {
     return json as T;
   }
 
-  private async insertRow(id: string, projectId: string, stored: StoredJob, dataKey: { key: Uint8Array; keyId: string } | null): Promise<void> {
-    if (!this.db) return;
-    const json = JSON.stringify(stored);
-    // R30: an encrypted project's paths, URLs and params never reach the persistent index in the clear.
-    const payload = dataKey ? JSON.stringify({ sealed: (await encryptBytes(dataKey.key, dataKey.keyId, json)).toString("base64") }) : json;
-    this.db
-      .prepare("INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES (?, ?, ?, 'queued', ?, ?)")
-      .run(id, projectId, stored.type, payload, new Date().toISOString());
+  private db(): IndexDb | undefined {
+    const db = this.index?.db;
+    return db?.open ? db : undefined;
   }
 
-  private setStatus(id: string, status: WorkerJobState["status"], clearPayload = false): void {
-    if (!this.db?.open) return;
-    if (clearPayload) this.db.prepare("UPDATE jobs SET status = ?, payload_json = '{}' WHERE id = ?").run(status, id);
-    else this.db.prepare("UPDATE jobs SET status = ? WHERE id = ?").run(status, id);
+  /** The key of an unlocked encrypted project, by key id (opens sealed rows of the legacy upgrade). */
+  private keyById(keyId: string): Uint8Array | undefined {
+    for (const p of this.repo.listProjects()) {
+      try {
+        const k = projectDataKey(this.repo, p.id);
+        if (k && k.keyId === keyId) return k.key;
+      } catch {
+        // locked
+      }
+    }
+    return undefined;
   }
 
-  private async unseal(projectId: string, payloadJson: string): Promise<StoredJob> {
-    const parsed = JSON.parse(payloadJson) as StoredJob | { sealed: string };
-    if (!("sealed" in parsed)) return parsed;
-    const k = projectDataKey(this.repo, projectId); // ProjectLockedError while locked
-    if (!k) throw new Error("job payload is sealed but the project is not encrypted");
-    const plain = await decryptBytes((keyId) => (keyId === k.keyId ? k.key : undefined), Buffer.from(parsed.sealed, "base64"));
-    return JSON.parse(plain.toString("utf8")) as StoredJob;
+  /**
+   * The one writer of job records: appends the job's new state to its project's journal (sealed
+   * in encrypted projects), then updates the cache row. Finished jobs keep no paths or parameters.
+   * Nothing is written in a read-only library. Throws (writing nothing more) when the journal
+   * cannot be appended, e.g. the project was locked meanwhile.
+   */
+  private async transition(id: string, status: JobStatus, error?: string): Promise<void> {
+    const prev = this.records.get(id);
+    if (!prev) return;
+    const library = repoLibrary(this.repo);
+    if (library.mode !== "read-write") return;
+    const { job, error: _previous, ...base } = prev;
+    const rec: JobRecord = {
+      ...base,
+      status,
+      updatedAt: new Date().toISOString(),
+      ...(UNFINISHED.has(status) && job ? { job } : {}),
+      ...(error && !UNFINISHED.has(status) ? { error } : {}),
+    };
+    const key = projectDataKey(this.repo, prev.projectId); // ProjectLockedError while locked
+    await appendJobRecords(library.root, this.repo.getProject(prev.projectId).folder, key, [rec]);
+    this.records.set(id, rec);
+    const db = this.db();
+    if (db) upsertJobRow(db, rec);
   }
 
   private async removeStaleTemp(): Promise<void> {

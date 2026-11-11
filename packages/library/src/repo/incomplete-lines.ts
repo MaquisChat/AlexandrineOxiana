@@ -8,7 +8,7 @@
  * and no write-ahead marker. Such a line is not a committed record.
  *
  * `scanIncompleteLines` finds them in a project's last audit segment and in
- * each of its change-log files and its review queue file (or in the workspace change log), and with
+ * each of its change-log files, its review queue file and its job journal (or in the workspace change log), and with
  * `trim` cuts each file back to just after its last newline. The caller
  * decides whether trimming is allowed (writable library, no unresolved marker
  * for the project) and reports and audits the result.
@@ -51,6 +51,9 @@ export async function scanIncompleteLines(root: string, folder: string, trim: bo
   for (const n of logs.filter((x) => CHANGE_LOG.test(x)).sort()) files.push({ abs: join(base, "changes", n), file: rel("changes", n) });
   if (folder && (await fsp.stat(join(base, "review", "pending.jsonl")).catch(() => null))?.isFile()) {
     files.push({ abs: join(base, "review", "pending.jsonl"), file: rel("review", "pending.jsonl") });
+  }
+  if (folder && (await fsp.stat(join(base, "jobs", "journal.jsonl")).catch(() => null))?.isFile()) {
+    files.push({ abs: join(base, "jobs", "journal.jsonl"), file: rel("jobs", "journal.jsonl") });
   }
 
   const out: IncompleteLine[] = [];

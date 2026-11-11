@@ -76,7 +76,7 @@ const jobRows = () =>
 async function dropIndex(): Promise<void> {
   handle.close();
   for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
-  handle = new IndexHandle(lib.root);
+  handle.reopen(); // the same handle: the repo's index sink keeps writing to it
 }
 
 async function indexBytes(): Promise<Buffer> {
@@ -94,7 +94,7 @@ async function finishedAndPending(projectId: string): Promise<{ done: string; pe
   await expect(client(await downWorker()).submit(projectId, { type: "image.proxy", input, output, params: { label: MARKER } })).rejects.toBeInstanceOf(
     WorkerUnavailableError,
   );
-  const pending = jobRows().find((x) => x.status === "queued")!.id;
+  const pending = jobRows().find((x) => x.status === "queued")!.id!;
   return { done: r.id, pending, input, output };
 }
 

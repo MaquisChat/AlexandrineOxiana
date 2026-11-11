@@ -300,10 +300,10 @@ async function legacyJob(row: LegacyRow, key: ProjectKey): Promise<StoredJob | u
  * Idempotent: a row whose id is already in its journal is not written again, so a crash part-way
  * only leaves the rest for the next call. Rows of locked encrypted projects wait (their payload is
  * sealed); rows of projects that no longer exist are removed. When nothing waits, the database's
- * legacy mark is cleared and later calls return at once. `onlyProject` limits the work to one
- * project (an unlock). Writes files: call only for a read-write library.
+ * legacy mark is cleared and later calls return at once. Runs at a rebuild, at an unlock and when
+ * jobs are resumed at launch. Writes files: call only for a read-write library.
  */
-export async function upgradeLegacyJobs(db: IndexDb, root: string, keyRing: KeyRing, onlyProject?: string): Promise<LegacyUpgrade> {
+export async function upgradeLegacyJobs(db: IndexDb, root: string, keyRing: Pick<KeyRing, "get">): Promise<LegacyUpgrade> {
   const out: LegacyUpgrade = { migrated: 0, waiting: [], dropped: 0, errors: [] };
   if (getMeta(db, LEGACY_JOBS_META) === undefined) return out;
   const rows = db.prepare("SELECT id, project_id, kind, status, payload_json, created_at FROM jobs ORDER BY created_at, id").all() as LegacyRow[];
@@ -314,10 +314,6 @@ export async function upgradeLegacyJobs(db: IndexDb, root: string, keyRing: KeyR
   }
   const entries = await listProjectEntries(root);
   for (const [projectId, list] of byProject) {
-    if (onlyProject !== undefined && projectId !== onlyProject) {
-      out.waiting.push(...list);
-      continue;
-    }
     const entry = entries.find((e) => e.data?.project.id === projectId);
     if (!entry?.data) {
       if (entries.some((e) => !e.data)) {
@@ -330,7 +326,7 @@ export async function upgradeLegacyJobs(db: IndexDb, root: string, keyRing: KeyR
       out.dropped += list.length;
       continue;
     }
-    const k = projectKey(entry.data, keyRing);
+    const k = projectKey(entry.data, keyRing as KeyRing); // reads only keyRing.get
     if (k === undefined) {
       out.waiting.push(...list);
       continue;
