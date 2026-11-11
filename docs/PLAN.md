@@ -462,7 +462,7 @@ Update after every task; commit and push.
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
-| 37a Service bundle | in review | ea7f78a (worktree branch) | built: one resolver, a 93 MB self-contained folder, smoke run outside the repository, ADR 0013 |
+| 37a Service bundle | fix round 1 | ea7f78a (worktree branch) | spec met; one Important: the built folder could load a module from outside itself (R153) |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
