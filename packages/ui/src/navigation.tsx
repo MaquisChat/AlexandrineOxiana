@@ -90,10 +90,26 @@ export function BackToLibrary({ projectId }: { projectId?: string | undefined } 
   );
 }
 
-/** Files dropped anywhere but a drop zone must not make the webview open them (and leave the app). */
+const editable = (t: EventTarget | null): boolean =>
+  t instanceof HTMLElement && (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t.isContentEditable);
+
+/** Whether a drag may carry files or links the webview would open (unknown counts as yes). */
+const carriesFiles = (e: DragEvent): boolean => {
+  const types = e.dataTransfer?.types;
+  if (!types) return true;
+  return Array.from(types).some((t) => t === "Files" || t === "text/uri-list");
+};
+
+/**
+ * Files dropped anywhere but a drop zone must not make the webview open them (and leave the app).
+ * Text dragged into a field is left alone, so it still drops there (41b1 M9).
+ */
 export function useDropGuard(): void {
   useEffect(() => {
-    const stop = (e: DragEvent) => e.preventDefault();
+    const stop = (e: DragEvent) => {
+      if (editable(e.target) && !carriesFiles(e)) return;
+      e.preventDefault();
+    };
     window.addEventListener("dragover", stop);
     window.addEventListener("drop", stop);
     return () => {

@@ -190,4 +190,17 @@ describe("the app's one router (R118)", () => {
     expect(fireEvent.dragOver(document.body)).toBe(false);
     expect(fireEvent.drop(document.body)).toBe(false);
   });
+
+  it("text dragged into a field still drops there; files dropped on a field are still stopped (41b1 M9)", () => {
+    server.use(...appearance(), ...libraryHandlers());
+    render(<App service={service} />);
+    const field = document.createElement("textarea");
+    document.body.appendChild(field);
+    const text = { dataTransfer: { types: ["text/plain"], getData: () => "words" } };
+    expect(fireEvent.dragOver(field, text)).toBe(true);
+    expect(fireEvent.drop(field, text)).toBe(true);
+    expect(fireEvent.drop(field, { dataTransfer: { types: ["Files"], files: [] } })).toBe(false);
+    expect(fireEvent.drop(document.body, text)).toBe(false);
+    field.remove();
+  });
 });
