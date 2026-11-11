@@ -1,24 +1,18 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { App, type ServiceConnection } from "./App";
+import { App } from "./App";
+import { takeServiceConnection } from "./serviceConnection";
 import "./theme/tokens.css";
 import "./theme/fonts.css";
 import "./theme/base.css";
 
-declare global {
-  interface Window {
-    /**
-     * Set by the desktop shell (Task 37) before the app loads: the local service's URL and the UI
-     * token, which is only ever sent in the Authorization header.
-     */
-    __AO_SERVICE__?: ServiceConnection;
-  }
-}
+// Read the service URL and token handed over by the desktop shell, and remove them from window.
+const service = takeServiceConnection(window);
 
 const el = document.getElementById("root");
 if (!el) throw new Error("index.html has no #root element");
 createRoot(el).render(
   <StrictMode>
-    <App {...(window.__AO_SERVICE__ ? { service: window.__AO_SERVICE__ } : {})} />
+    <App {...(service ? { service } : {})} />
   </StrictMode>,
 );

@@ -12,9 +12,12 @@
     "test": "vitest run",
     "lint:css": "stylelint \"src/**/*.css\"",
     "fetch-fonts": "node scripts/fetch-fonts.mjs",
-    "gen:tokens": "tsx scripts/gen-tokens.ts"
+    "gen:tokens": "tsx scripts/gen-tokens.ts",
+    "lint:colours": "node scripts/colour-scan.mjs",
+    "fit:palette": "tsx scripts/fit-palette.ts"
   },
   "dependencies": {
+    "@ao/shared": "workspace:*",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },

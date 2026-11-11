@@ -43,7 +43,7 @@ export const TEXT_PAIRS: readonly { fg: string; on: readonly string[] }[] = [
 ];
 
 /** Borders that must stay visible in the high-contrast themes (WCAG 1.4.11, 3:1). */
-const HC_BORDERS = ["line", "line-strong"] as const;
+const HC_BORDERS = ["line", "line-strong", "line-control"] as const;
 
 export const GENERATED_BEGIN = "/* BEGIN GENERATED: high-contrast themes, derived from light and dark by `pnpm --filter @ao/ui gen:tokens`. Do not edit by hand. */";
 export const GENERATED_END = "/* END GENERATED */";

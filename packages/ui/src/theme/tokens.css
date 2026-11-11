@@ -3,11 +3,15 @@
  * uses var(--token), enforced by stylelint (color-no-hex, color-named, no colour functions).
  *
  * light and dark: the approved mockup's .ao-light / .ao-dark values, unchanged.
- * --code-1 ... --code-12: the qualitative code palette (R103). --code-n keeps the same hue family in
- *   every theme: red, orange, gold, olive, green, teal, cyan, blue, indigo, purple, magenta, brown
- *   (ranges in src/theme/codePalette.ts). Every pair differs by CIEDE2000 >= 15 with normal vision
- *   and >= 12 under simulated deuteranopia, protanopia and tritanopia (Machado et al. 2009); every
- *   colour has a minimum chroma, is not near-black and reaches 3:1 against --bg and --surface.
+ * --line-control: borders of form controls, >= 3:1 on --bg, --surface, --surface-2 and --chip (R105).
+ * --code-1 ... --code-12: the qualitative code palette (R103, R105). --code-n keeps the same hue family
+ *   in every theme: red, orange, gold, olive, green, teal, cyan, blue, indigo, purple, magenta, brown,
+ *   inside per-theme CIELAB lightness, chroma and hue bands (src/theme/codePalette.ts). Every pair differs by
+ *   CIEDE2000 >= 15 with normal vision and >= 12 under simulated deuteranopia, protanopia and
+ *   tritanopia (Machado et al. 2009); every colour reaches 3:1 on --bg and --surface, and on --chip in
+ *   dark (light: >= 2.8 on --chip, relaxed per R105). Fitted by scripts/fit-palette.ts:
+ *     pnpm --filter @ao/ui fit:palette --theme light --seeds 3 --restarts 6 --iterations 100000 --write
+ *     pnpm --filter @ao/ui fit:palette --theme dark --seeds 4 --restarts 8 --iterations 120000 --write
  *   Codes are never shown by colour alone (CodeSwatch adds a shape and the name).
  *   Checked by src/theme/palette.test.ts.
  * light-hc and dark-hc: generated from light and dark (src/theme/tokenFile.ts) so that every text
@@ -26,6 +30,7 @@
   --line: #E2DFD7;
   --line-soft: #EEEBE4;
   --line-strong: #CFCBC1;
+  --line-control: #858177;
   --chip: #F1EFE9;
   --accent: #1F5E63;
   --accent-ink: #163F43;
@@ -49,18 +54,18 @@
   --amber-ink: #8A5A00;
   --deny: #9A2B1F;
   --backdrop: #E9E7E1;
-  --code-1: #D07176;
-  --code-2: #7C2E00;
-  --code-3: #955B00;
-  --code-4: #94900A;
-  --code-5: #00844D;
-  --code-6: #005855;
-  --code-7: #009BAF;
-  --code-8: #0064CE;
-  --code-9: #847DFB;
-  --code-10: #78007C;
-  --code-11: #D12384;
-  --code-12: #50352C;
+  --code-1: #911304;
+  --code-2: #AB521D;
+  --code-3: #C07D00;
+  --code-4: #7D9563;
+  --code-5: #057B57;
+  --code-6: #005553;
+  --code-7: #019CA9;
+  --code-8: #036DD9;
+  --code-9: #152DDA;
+  --code-10: #5A2E7B;
+  --code-11: #F43091;
+  --code-12: #5A322C;
 }
 
 [data-theme="dark"] {
@@ -75,6 +80,7 @@
   --line: #35332E;
   --line-soft: #2B2A26;
   --line-strong: #4C4942;
+  --line-control: #827E75;
   --chip: #2B2A26;
   --accent: #6FB7B3;
   --accent-ink: #A7D8D5;
@@ -98,18 +104,18 @@
   --amber-ink: #E9C46A;
   --deny: #F08A7E;
   --backdrop: #0B0B0A;
-  --code-1: #D60700;
-  --code-2: #E17700;
-  --code-3: #FFB600;
-  --code-4: #637749;
-  --code-5: #00F294;
-  --code-6: #93C7B1;
-  --code-7: #009FA8;
-  --code-8: #0071B1;
-  --code-9: #A282F4;
-  --code-10: #FFC0FC;
-  --code-11: #CE0078;
-  --code-12: #A58D79;
+  --code-1: #E62F15;
+  --code-2: #F68201;
+  --code-3: #FFD03D;
+  --code-4: #A2A970;
+  --code-5: #B5E29A;
+  --code-6: #259EA2;
+  --code-7: #83D8DF;
+  --code-8: #98ADEF;
+  --code-9: #736BB0;
+  --code-10: #AB6BFF;
+  --code-11: #CB497C;
+  --code-12: #9B7352;
 }
 
 /* BEGIN GENERATED: high-contrast themes, derived from light and dark by `pnpm --filter @ao/ui gen:tokens`. Do not edit by hand. */
@@ -125,6 +131,7 @@
   --line: #8E8C87;
   --line-soft: #EEEBE4;
   --line-strong: #8F8C85;
+  --line-control: #858177;
   --chip: #F1EFE9;
   --accent: #1F5E63;
   --accent-ink: #163F43;
@@ -148,18 +155,18 @@
   --amber-ink: #6C4600;
   --deny: #8F281D;
   --backdrop: #E9E7E1;
-  --code-1: #D07176;
-  --code-2: #7C2E00;
-  --code-3: #955B00;
-  --code-4: #94900A;
-  --code-5: #00844D;
-  --code-6: #005855;
-  --code-7: #009BAF;
-  --code-8: #0064CE;
-  --code-9: #847DFB;
-  --code-10: #78007C;
-  --code-11: #D12384;
-  --code-12: #50352C;
+  --code-1: #911304;
+  --code-2: #AB521D;
+  --code-3: #C07D00;
+  --code-4: #7D9563;
+  --code-5: #057B57;
+  --code-6: #005553;
+  --code-7: #019CA9;
+  --code-8: #036DD9;
+  --code-9: #152DDA;
+  --code-10: #5A2E7B;
+  --code-11: #F43091;
+  --code-12: #5A322C;
 }
 
 [data-theme="dark-hc"] {
@@ -174,6 +181,7 @@
   --line: #6C6A66;
   --line-soft: #2B2A26;
   --line-strong: #6C6A64;
+  --line-control: #827E75;
   --chip: #2B2A26;
   --accent: #6FB7B3;
   --accent-ink: #A7D8D5;
@@ -197,17 +205,17 @@
   --amber-ink: #E9C46A;
   --deny: #F3A097;
   --backdrop: #0B0B0A;
-  --code-1: #D60700;
-  --code-2: #E17700;
-  --code-3: #FFB600;
-  --code-4: #637749;
-  --code-5: #00F294;
-  --code-6: #93C7B1;
-  --code-7: #009FA8;
-  --code-8: #0071B1;
-  --code-9: #A282F4;
-  --code-10: #FFC0FC;
-  --code-11: #CE0078;
-  --code-12: #A58D79;
+  --code-1: #E62F15;
+  --code-2: #F68201;
+  --code-3: #FFD03D;
+  --code-4: #A2A970;
+  --code-5: #B5E29A;
+  --code-6: #259EA2;
+  --code-7: #83D8DF;
+  --code-8: #98ADEF;
+  --code-9: #736BB0;
+  --code-10: #AB6BFF;
+  --code-11: #CB497C;
+  --code-12: #9B7352;
 }
 /* END GENERATED */

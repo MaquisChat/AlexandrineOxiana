@@ -6,11 +6,11 @@
  * Fonts from a user's file (`source: "user-file"`) are shown here when set, but picking a file is
  * done through the desktop shell (Tasks 33, 37): the UI never reads files itself.
  */
-import { useId, useState, type ChangeEvent } from "react";
+import { useEffect, useId, useRef, useState, type ChangeEvent } from "react";
 import { UserText } from "../components/UserText";
 import { ACCENT_TOO_LOW, FONT_SLOTS, LINE_SPACINGS, TEXT_SCALES, checkAccent, type AppearancePatch, type AppearanceSettings, type FontSlot } from "../theme/appearance";
 import { useAppearance } from "../theme/AppearanceProvider";
-import { FONT_PRESETS, type FontChoice } from "../theme/fonts";
+import { FONT_PRESETS, genericOf, isUsableFamily, type FontChoice } from "../theme/fonts";
 import { THEMES } from "../theme/themes";
 import "./AppearanceSettings.css";
 
@@ -32,9 +32,13 @@ const SAMPLE: Record<FontSlot, string> = {
 
 const CUSTOM = "__custom";
 
+/** The accent picker saves this long after the last change (a drag fires many changes; R105 I1). */
+export const ACCENT_DEBOUNCE_MS = 300;
+
 function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontChoice; onChoose: (c: FontChoice) => void }) {
   const id = useId();
   const [typed, setTyped] = useState("");
+  const [rejected, setRejected] = useState<string | null>(null);
   const label = SLOT_LABELS[slot];
   const preset = FONT_PRESETS.find((p) => p.family === choice.family && p.source === choice.source);
   const customLabel = choice.source === "user-file" ? `From file: ${choice.family}${choice.file ? ` (${choice.file.split(/[\\/]/).pop()})` : ""}` : `Installed: ${choice.family}`;
@@ -47,7 +51,7 @@ function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontCh
         value={preset ? preset.family : CUSTOM}
         onChange={(e: ChangeEvent<HTMLSelectElement>) => {
           const p = FONT_PRESETS.find((x) => x.family === e.target.value);
-          if (p) onChoose({ family: p.family, source: p.source });
+          if (p) onChoose({ family: p.family, source: p.source, generic: p.generic });
         }}
       >
         {FONT_PRESETS.map((p) => (
@@ -62,10 +66,15 @@ function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontCh
         onSubmit={(e) => {
           e.preventDefault();
           const family = typed.trim();
-          if (family && !/[;{}<>\\]/.test(family)) {
-            onChoose({ family, source: "system" });
-            setTyped("");
+          if (!family) return;
+          if (!isUsableFamily(family)) {
+            setRejected(family);
+            return;
           }
+          setRejected(null);
+          const generic = slot === "mono" ? "monospace" : genericOf({ family, source: "system" });
+          onChoose({ family, source: "system", generic });
+          setTyped("");
         }}
       >
         <input type="text" aria-label={`Installed font for ${label}`} placeholder="Another installed font" value={typed} onChange={(e) => setTyped(e.target.value)} />
@@ -73,6 +82,11 @@ function FontPicker({ slot, choice, onChoose }: { slot: FontSlot; choice: FontCh
           Use
         </button>
       </form>
+      {rejected !== null && (
+        <p role="alert" className="ao-warning ao-font-typed-warning">
+          “<UserText>{rejected}</UserText>” can't be used as a font name (it contains characters such as ; {"{"} {"}"} &lt; &gt; \ or a line break).
+        </p>
+      )}
       <UserText as="p" className={`ao-font-sample ao-font-sample--${slot}`} data-testid="font-sample">
         {SAMPLE[slot]}
       </UserText>
@@ -99,6 +113,10 @@ export function AppearanceSettingsScreen() {
   const { settings, theme, accentApplied, update, saveError } = useAppearance();
   const id = useId();
   const [rejectedAccent, setRejectedAccent] = useState<string | null>(null);
+  // The colour shown in the picker while the user is still choosing (saved ACCENT_DEBOUNCE_MS after).
+  const [draftAccent, setDraftAccent] = useState<string | null>(null);
+  const accentTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(accentTimer.current), []);
   const showAccentWarning = rejectedAccent !== null || (!!settings.accent && !accentApplied);
 
   const set = (patch: AppearancePatch) => void update(patch);
@@ -106,12 +124,17 @@ export function AppearanceSettingsScreen() {
   const onAccent = (e: ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value.toUpperCase();
     if (!/^#[0-9A-F]{6}$/.test(value)) return;
+    clearTimeout(accentTimer.current);
+    setDraftAccent(value);
     if (!checkAccent(value, THEMES[theme], settings.highContrast).ok) {
       setRejectedAccent(value);
       return;
     }
     setRejectedAccent(null);
-    void update({ accent: value });
+    accentTimer.current = setTimeout(() => {
+      setDraftAccent(null);
+      void update({ accent: value });
+    }, ACCENT_DEBOUNCE_MS);
   };
 
   return (
@@ -138,10 +161,12 @@ export function AppearanceSettingsScreen() {
 
         <div className="ao-accent">
           <label htmlFor={`${id}-accent`}>Accent color</label>
-          <input type="color" id={`${id}-accent`} value={(rejectedAccent ?? settings.accent ?? THEMES[theme].accent!).toLowerCase()} onChange={onAccent} aria-describedby={showAccentWarning ? `${id}-accent-warning` : undefined} />
+          <input type="color" id={`${id}-accent`} value={(draftAccent ?? settings.accent ?? THEMES[theme].accent!).toLowerCase()} onChange={onAccent} aria-describedby={showAccentWarning ? `${id}-accent-warning` : undefined} />
           <button
             type="button"
             onClick={() => {
+              clearTimeout(accentTimer.current);
+              setDraftAccent(null);
               setRejectedAccent(null);
               void update({ accent: null });
             }}

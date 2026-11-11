@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CVD_KINDS, MACHADO_2009, deltaE2000, hexToLab, minPairwiseDeltaE, simulate } from "./colorVision";
 import { contrastRatio } from "./contrast";
-import { CODE_FAMILIES, CODE_MIN_CHROMA, CODE_MIN_LIGHTNESS, inHueRange, lch } from "./codePalette";
+import { CODE_BACKGROUNDS, CODE_FAMILIES, LIGHT_CHIP_MIN, bandProblem, lch } from "./codePalette";
 import { CODE_PALETTE_SIZE, THEMES, codeColors } from "./themes";
 import { THEME_NAMES } from "./tokenFile";
 
@@ -19,6 +19,18 @@ describe("ΔE2000 (CIEDE2000)", () => {
     [[50, 2.5, 0], [58, 24, 15], 19.4535],
     [[60.2574, -34.0099, 36.2677], [60.4626, -34.1751, 39.4387], 1.2644],
     [[2.0776, 0.0795, -1.135], [0.9033, -0.0636, -0.5514], 0.9082],
+    // Hue wrap-around and the mean-hue edge cases (Table 1, pairs 4–6 and 9–16).
+    [[50, -1.3802, -84.2814], [50, 0, -82.7485], 1.0],
+    [[50, -1.1848, -84.8006], [50, 0, -82.7485], 1.0],
+    [[50, -0.9009, -85.5211], [50, 0, -82.7485], 1.0],
+    [[50, 2.49, -0.001], [50, -2.49, 0.0009], 7.1792],
+    [[50, 2.49, -0.001], [50, -2.49, 0.001], 7.1792],
+    [[50, 2.49, -0.001], [50, -2.49, 0.0011], 7.2195],
+    [[50, 2.49, -0.001], [50, -2.49, 0.0012], 7.2195],
+    [[50, -0.001, 2.49], [50, 0.0009, -2.49], 4.8045],
+    [[50, -0.001, 2.49], [50, 0.001, -2.49], 4.8045],
+    [[50, -0.001, 2.49], [50, 0.0011, -2.49], 4.7461],
+    [[50, 2.5, 0], [50, 0, -2.5], 4.3065],
   ];
   it("reproduces the Sharma et al. reference values", () => {
     for (const [a, b, want] of SHARMA) {
@@ -73,19 +85,17 @@ describe("qualitative code palette (R103)", () => {
         expect(new Set(colors).size).toBe(12);
       });
 
-      it("--code-n stays in its hue family, reads as a colour (minimum chroma) and is not near-black", () => {
-        const bad: string[] = [];
-        colors.forEach((c, i) => {
-          const f = CODE_FAMILIES[i]!;
-          const { L, C, h } = lch(c);
-          if (!inHueRange(h, f.hue)) bad.push(`--code-${i + 1} ${c} (${f.name}): hue ${h.toFixed(0)} outside ${f.hue.join("–")}`);
-          if (C < f.minChroma) bad.push(`--code-${i + 1} ${c} (${f.name}): chroma ${C.toFixed(0)} < ${f.minChroma}`);
-          if (f.maxChroma !== undefined && C > f.maxChroma) bad.push(`--code-${i + 1} ${c} (${f.name}): chroma ${C.toFixed(0)} > ${f.maxChroma}`);
-          if (f.maxLightness !== undefined && L > f.maxLightness) bad.push(`--code-${i + 1} ${c} (${f.name}): L* ${L.toFixed(0)} > ${f.maxLightness}`);
-          if (L < CODE_MIN_LIGHTNESS) bad.push(`--code-${i + 1} ${c} (${f.name}): L* ${L.toFixed(0)} is near-black`);
-          if (C < CODE_MIN_CHROMA) bad.push(`--code-${i + 1} ${c}: chroma below the palette minimum`);
-        });
-        expect(bad).toEqual([]);
+      it("--code-n stays in its family's band (hue, lightness and chroma) for this theme", () => {
+        const base = theme.startsWith("dark") ? "dark" : "light";
+        const bad = colors.map((c, i) => [c, CODE_FAMILIES[i]!, bandProblem(c, CODE_FAMILIES[i]![base])] as const).filter(([, , p]) => p);
+        expect(bad.map(([c, f, p]) => `--code-${CODE_FAMILIES.indexOf(f) + 1} ${c} (${f.name}): ${p}`)).toEqual([]);
+      });
+
+      it("light orange and gold read as orange and gold, and brown is darker and greyer than both", () => {
+        const [orange, gold, brown] = [colors[1]!, colors[2]!, colors[11]!].map(lch);
+        expect(orange!.C).toBeGreaterThanOrEqual(55);
+        expect(gold!.C).toBeGreaterThanOrEqual(45);
+        expect(brown!.C).toBeLessThan(Math.min(orange!.C, gold!.C) - 15);
       });
 
       it("every pair differs by ΔE2000 ≥ 15 with normal vision and ≥ 12 under deuteranopia, protanopia and tritanopia", () => {
@@ -93,8 +103,11 @@ describe("qualitative code palette (R103)", () => {
         for (const kind of CVD_KINDS) expect(minPairwiseDeltaE(colors, kind), kind).toBeGreaterThanOrEqual(12);
       });
 
-      it("every colour stands out from --bg and --surface (≥ 3:1, WCAG non-text contrast)", () => {
-        for (const c of colors) for (const bg of ["bg", "surface"]) expect(contrastRatio(c, THEMES[theme][bg]!), `${c} on --${bg}`).toBeGreaterThanOrEqual(3);
+      it("every colour stands out from its backgrounds (≥ 3:1, WCAG non-text contrast; --chip too in dark)", () => {
+        const base = theme.startsWith("dark") ? "dark" : "light";
+        expect(CODE_BACKGROUNDS.dark).toEqual(["bg", "surface", "chip"]);
+        for (const c of colors) for (const bg of CODE_BACKGROUNDS[base]) expect(contrastRatio(c, THEMES[theme][bg]!), `${c} on --${bg}`).toBeGreaterThanOrEqual(3);
+        if (base === "light") for (const c of colors) expect(contrastRatio(c, THEMES[theme].chip!), `${c} on --chip`).toBeGreaterThanOrEqual(LIGHT_CHIP_MIN);
       });
     });
   }

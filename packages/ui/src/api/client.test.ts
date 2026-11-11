@@ -1,6 +1,10 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
-import { ApiClientError, createClient, parseSse } from "./client";
+import { ApiClientError, SseParser, createClient } from "./client";
 
 const TOKEN = "t".repeat(40) + "SECRET";
 const BASE = "http://127.0.0.1:4317";
@@ -63,13 +67,65 @@ describe("createClient", () => {
     expect(f.calls[3]!.url).toBe(`${BASE}/projects/p1/sources?text=x`);
   });
 
-  it("refuses a base URL that carries credentials or a query string, and a query parameter named token", () => {
-    expect(() => createClient(`http://u:p@127.0.0.1:1`, TOKEN)).toThrow(/base URL/);
-    expect(() => createClient(`${BASE}/?token=${TOKEN}`, TOKEN)).toThrow(/base URL/);
-    expect(() => createClient("file:///etc", TOKEN)).toThrow(/base URL/);
+  it("refuses a base URL that is not loopback http on a port (reviewer bypasses)", () => {
+    for (const bad of [
+      "http://u:p@127.0.0.1:1",
+      `${BASE}/?token=${TOKEN}`,
+      `${BASE}/#x`,
+      "file:///etc",
+      "https://127.0.0.1:4317",
+      "http://127.0.0.1",
+      "http://127.0.0.1:0",
+      "http://localhost",
+      "http://evil.example:4317",
+      "http://127.0.0.1.evil.example:4317",
+      "http://localhost.evil.example:4317",
+      "http://[::1]:4317",
+      "http://127.0.0.2:4317",
+      "http://0x7f000001:4317",
+      "http://127.0.0.1:4317/api",
+      "  http://127.0.0.1:4317",
+    ]) {
+      expect(() => createClient(bad, TOKEN), bad).toThrow(/base URL/);
+    }
+    expect(() => createClient("http://localhost:4317", TOKEN)).not.toThrow();
+    expect(() => createClient("http://127.0.0.1:65535/", TOKEN)).not.toThrow();
+  });
+
+  it("refuses a token that is short or contains CR/LF", () => {
+    expect(() => createClient(BASE, "short")).toThrow(/token/);
+    expect(() => createClient(BASE, "x".repeat(31))).toThrow(/token/);
+    expect(() => createClient(BASE, `${"x".repeat(40)}\r\nX-Evil: 1`)).toThrow(/token/);
+    expect(() => createClient(BASE, `${"x".repeat(40)}\n`)).toThrow(/token/);
+    expect(() => createClient(BASE, "x".repeat(32))).not.toThrow();
+  });
+
+  it("refuses paths with ? or #, credential query keys (the service's list, any case) and any URL containing the token (reviewer bypasses)", () => {
     const api = createClient(BASE, TOKEN, { fetch: fakeFetch(() => json({})).fetch });
-    expect(() => api.request("GET", "/x", { query: { token: "abc" } })).toThrow(/token/);
-    expect(() => api.request("GET", "x")).toThrow(/path/);
+    for (const path of ["x", "//evil.example/x", `/x?token=${TOKEN}`, "/x?a=1", "/x#frag", "/x%3Ftoken=1", `/projects/${TOKEN}`, `/projects/${encodeURIComponent(TOKEN)}`]) {
+      expect(() => api.request("GET", path), path).toThrow(/path|token/);
+    }
+    for (const key of CREDENTIAL_QUERY_KEYS) {
+      expect(() => api.request("GET", "/x", { query: { [key]: "v" } }), key).toThrow(/token|credential/);
+      expect(() => api.request("GET", "/x", { query: { [key.toUpperCase()]: "v" } }), key).toThrow(/token|credential/);
+    }
+    expect(() => api.request("GET", "/x", { query: { text: TOKEN } })).toThrow(/token/);
+    expect(() => api.request("GET", "/x", { query: { text: TOKEN.slice(0, 20) } })).not.toThrow();
+  });
+
+  it("uses the same credential query keys as the service", () => {
+    const auth = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../../../apps/library-service/src/auth.ts"), "utf8");
+    const m = /CREDENTIAL_QUERY_KEYS[^=\n]*=\s*new Set\(\[([^\]]*)\]\)/.exec(auth);
+    const imported = /import\s*\{[^}]*CREDENTIAL_QUERY_KEYS[^}]*\}\s*from\s*"@ao\/(?:core|shared)/.test(auth);
+    expect(m !== null || imported, "auth.ts declares or imports CREDENTIAL_QUERY_KEYS").toBe(true);
+    if (m?.[1]) expect(new Set(m[1].split(",").map((k) => k.trim().replace(/"/g, "")))).toEqual(new Set(CREDENTIAL_QUERY_KEYS));
+  });
+
+  it("a 2xx answer that is not JSON is an ApiClientError, not a crash", async () => {
+    const api = createClient(BASE, TOKEN, { fetch: fakeFetch(() => new Response("<html>proxy</html>", { status: 200 })).fetch });
+    const e = await api.appearance.get().catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ApiClientError);
+    expect((e as ApiClientError).code).toBe("INTERNAL");
   });
 
   it("errors carry the service's { error: { code, message, reason } }", async () => {
@@ -170,8 +226,45 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
     expect(got).toHaveLength(1);
   });
 
-  it("parseSse handles CRLF line endings and multi-line data", () => {
-    expect(parseSse("event: a\r\ndata: 1\r\n\r\n")).toEqual({ events: [{ type: "a", data: 1 }], rest: "" });
-    expect(parseSse("data: {\"x\":\ndata: 1}\n\nevent: b")).toEqual({ events: [{ type: "message", data: { x: 1 } }], rest: "event: b" });
+  it("a CRLF split across chunks is one line break, not a blank line (no event is cut short)", async () => {
+    const f = fakeFetch(() => new Response(streamOf(["event: job.progress\r", "\ndata: {\"a\":1,\r", "\n", "data: \"b\":2}\r\n\r\n"])));
+    const got = [];
+    for await (const ev of createClient(BASE, TOKEN, { fetch: f.fetch }).events()) got.push(ev);
+    expect(got).toEqual([{ type: "job.progress", data: { a: 1, b: 2 } }]);
+  });
+
+  it("an incomplete final event (stream ended without a blank line) is discarded", async () => {
+    const f = fakeFetch(() => new Response(streamOf(["event: a\ndata: 1\n\n", "event: b\ndata: 2"])));
+    const got = [];
+    for await (const ev of createClient(BASE, TOKEN, { fetch: f.fetch }).events()) got.push(ev);
+    expect(got).toEqual([{ type: "a", data: 1 }]);
+  });
+
+  it("an event larger than 1 MB is an error, not unbounded buffering", async () => {
+    const big = "x".repeat(256 * 1024);
+    const chunks = ["data: \""];
+    for (let i = 0; i < 5; i++) chunks.push(big);
+    const f = fakeFetch(() => new Response(streamOf(chunks)));
+    const it = createClient(BASE, TOKEN, { fetch: f.fetch }).events();
+    await expect(it.next()).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
+
+  it("many small chunks of one large event are parsed in linear time", async () => {
+    const chunks = ["data: \""];
+    for (let i = 0; i < 20000; i++) chunks.push("y".repeat(40));
+    chunks.push("\"\n\n");
+    const f = fakeFetch(() => new Response(streamOf(chunks)));
+    const t0 = performance.now();
+    const got = [];
+    for await (const ev of createClient(BASE, TOKEN, { fetch: f.fetch }).events()) got.push(ev);
+    expect((got[0]!.data as string).length).toBe(800000);
+    expect(performance.now() - t0).toBeLessThan(3000);
+  });
+
+  it("SseParser handles CR, LF and CRLF line endings, multi-line data and comments", () => {
+    const p = new SseParser();
+    expect(p.push("event: a\r\ndata: 1\r\n\r\n")).toEqual([{ type: "a", data: 1 }]);
+    expect(p.push("data: {\"x\":\ndata: 1}\n\nevent: b")).toEqual([{ type: "message", data: { x: 1 } }]);
+    expect(p.push("\rdata: 2\r\r: keep-alive\n\n")).toEqual([{ type: "b", data: 2 }]);
   });
 });

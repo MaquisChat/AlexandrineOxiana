@@ -1,10 +1,16 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { ApiClient } from "../api/client";
 import { DEFAULT_APPEARANCE, type AppearanceSettings } from "../theme/appearance";
 import { AppearanceProvider } from "../theme/AppearanceProvider";
-import { AppearanceSettingsScreen } from "./AppearanceSettings";
+import { ACCENT_DEBOUNCE_MS, AppearanceSettingsScreen } from "./AppearanceSettings";
+
+/** Lets real time pass (debounce, pending saves) inside act. */
+const settle = (ms: number) => act(() => new Promise<void>((r) => setTimeout(r, ms)));
 
 const root = () => document.documentElement;
 const prop = (name: string) => root().style.getPropertyValue(name);
@@ -52,9 +58,10 @@ describe("Appearance settings screen", () => {
     const { put } = setup();
     const before = prop("--font-reading");
     await userEvent.setup().selectOptions(screen.getByRole("combobox", { name: "Interface typeface" }), "Inter");
-    expect(prop("--font-interface").startsWith("Inter, 'Noto Serif'")).toBe(true);
+    expect(prop("--font-interface").startsWith("Inter, 'Noto Sans'")).toBe(true);
+    expect(prop("--font-interface").endsWith(", sans-serif")).toBe(true);
     expect(prop("--font-reading")).toBe(before);
-    expect(put).toHaveBeenCalledWith({ fonts: { interface: { family: "Inter", source: "system" } } });
+    expect(put).toHaveBeenCalledWith({ fonts: { interface: { family: "Inter", source: "system", generic: "sans-serif" } } });
   });
 
   it("offers the Atkinson Hyperlegible and OpenDyslexic presets for every area", () => {
@@ -73,6 +80,18 @@ describe("Appearance settings screen", () => {
     await user.type(screen.getByRole("textbox", { name: "Installed font for Reading view" }), "Charter");
     await user.click(screen.getByRole("button", { name: "Use installed font for Reading view" }));
     expect(prop("--font-reading").startsWith("Charter, 'Noto Serif'")).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a typed font name that cannot be used shows a message and changes nothing", async () => {
+    const { put } = setup();
+    const user = userEvent.setup();
+    const before = prop("--font-notes");
+    await user.type(screen.getByRole("textbox", { name: "Installed font for Notes and memos" }), "Evil; color: red");
+    await user.click(screen.getByRole("button", { name: "Use installed font for Notes and memos" }));
+    expect(screen.getByRole("alert").textContent).toMatch(/can't be used as a font name/);
+    expect(prop("--font-notes")).toBe(before);
+    expect(put).not.toHaveBeenCalled();
   });
 
   it("a custom accent that fails contrast shows the warning and is not applied", async () => {
@@ -87,11 +106,31 @@ describe("Appearance settings screen", () => {
     const { put } = setup({ ...DEFAULT_APPEARANCE, theme: "light" });
     fireEvent.change(screen.getByLabelText("Accent color"), { target: { value: "#7a1f5c" } });
     expect(screen.queryByRole("alert")).toBeNull();
+    await settle(ACCENT_DEBOUNCE_MS + 50);
     expect(prop("--accent")).toBe("#7A1F5C");
     expect(put).toHaveBeenCalledWith({ accent: "#7A1F5C" });
     await userEvent.setup().click(screen.getByRole("button", { name: "Use the theme's accent" }));
     expect(prop("--accent")).toBe("");
     expect(put).toHaveBeenLastCalledWith({ accent: null });
+  });
+
+  it("the accent picker is debounced: a drag through many colours saves only the last, 300 ms after it stops", async () => {
+    expect(ACCENT_DEBOUNCE_MS).toBe(300);
+    const { put } = setup({ ...DEFAULT_APPEARANCE, theme: "light" });
+    const input = screen.getByLabelText("Accent color");
+    for (const v of ["#7a1f5c", "#6a1f5c", "#5a1f5c", "#4a1f5c"]) fireEvent.change(input, { target: { value: v } });
+    await settle(150);
+    expect(put).not.toHaveBeenCalled();
+    expect(prop("--accent")).toBe("");
+    await settle(ACCENT_DEBOUNCE_MS);
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledWith({ accent: "#4A1F5C" });
+    expect(prop("--accent")).toBe("#4A1F5C");
+  });
+
+  it("headings are sized in rem only (the root font size already carries the text scale)", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "AppearanceSettings.css"), "utf8");
+    expect(css).not.toMatch(/--text-scale/);
   });
 
   it("text size, line spacing, density and reduced motion are applied to <html>", async () => {

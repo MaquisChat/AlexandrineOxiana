@@ -9,9 +9,14 @@
  * Errors: the service always answers errors as `{ error: { code, message, reason? } }`; they are
  * thrown as ApiClientError carrying exactly that.
  *
+ * Hardening (R105): the base URL must be loopback http on a port; the token at least 32 characters
+ * with no line breaks; paths carry no query or fragment; query keys on the service's credential
+ * list are refused; and no URL may contain the token in any form.
+ *
  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
  * `request()` (Tasks 33+).
  */
+import { isCredentialQueryKey } from "@ao/shared";
 import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
 
 export type ErrorCode =
@@ -81,20 +86,27 @@ export interface ClientOptions {
   fetch?: typeof fetch;
 }
 
+
+/** The service listens on loopback only (R96): http://127.0.0.1:<port> or http://localhost:<port>. */
 function checkBase(baseUrl: string): string {
-  let u: URL;
-  try {
-    u = new URL(baseUrl);
-  } catch {
-    throw new Error("The service base URL is not a URL.");
+  const m = /^http:\/\/(127\.0\.0\.1|localhost):([0-9]{1,5})\/?$/.exec(baseUrl);
+  const port = m ? Number(m[2]) : 0;
+  if (!m || port < 1 || port > 65535) {
+    throw new Error("The service base URL must be http://127.0.0.1:<port> or http://localhost:<port>, with nothing else.");
   }
-  if ((u.protocol !== "http:" && u.protocol !== "https:") || u.username || u.password || u.search || u.hash) {
-    throw new Error("The service base URL must be http(s)://host:port with no credentials, query or fragment.");
+  return `http://${m[1]}:${port}`;
+}
+
+function checkToken(token: string): void {
+  // eslint-disable-next-line no-control-regex
+  if (typeof token !== "string" || token.length < 32 || /[\u0000-\u001f\u007f]/.test(token)) {
+    throw new Error("The service token must be at least 32 characters, with no line breaks or control characters.");
   }
-  return u.href.replace(/\/+$/, "");
 }
 
 const unreachable = (): ApiClientError => new ApiClientError(0, { code: "UNAVAILABLE", message: "The library service could not be reached." });
+const unexpected = (status: number): ApiClientError =>
+  new ApiClientError(status, { code: "INTERNAL", message: `The library service answered with something unexpected (HTTP ${status}).` });
 
 async function errorFrom(res: Response): Promise<ApiClientError> {
   let body: unknown;
@@ -110,53 +122,101 @@ async function errorFrom(res: Response): Promise<ApiClientError> {
   return new ApiClientError(res.status, { code: "INTERNAL", message: `The library service answered with an unexpected error (HTTP ${res.status}).` });
 }
 
+/** Largest single event the client accepts (R105); a bigger one is an error, not unbounded memory. */
+export const MAX_SSE_EVENT_BYTES = 1024 * 1024;
+
 /**
- * Splits complete SSE frames off `buf`: the events in them, and the incomplete rest. Comment lines
- * (":" keep-alives) are skipped; several `data:` lines join with "\n" and are parsed as JSON.
+ * Incremental parser for a text/event-stream (WHATWG HTML §9.2): lines end with CRLF, LF or CR (a
+ * CRLF split across chunks counts once); a blank line dispatches the event; `:` lines are comments;
+ * several `data:` lines join with "\n" and are parsed as JSON when they are JSON. Only new text is
+ * scanned on each push, and an event over MAX_SSE_EVENT_BYTES throws. An event the stream ends in the
+ * middle of is never dispatched.
  */
-export function parseSse(buf: string): { events: ServiceEvent[]; rest: string } {
-  const text = buf.replace(/\r\n?/g, "\n");
-  const frames = text.split("\n\n");
-  const rest = frames.pop() ?? "";
-  const events: ServiceEvent[] = [];
-  for (const frame of frames) {
-    let type = "message";
-    const data: string[] = [];
-    for (const line of frame.split("\n")) {
-      if (!line || line.startsWith(":")) continue;
-      const i = line.indexOf(":");
-      const field = i < 0 ? line : line.slice(0, i);
-      const value = i < 0 ? "" : line.slice(i + 1).replace(/^ /, "");
-      if (field === "event") type = value;
-      else if (field === "data") data.push(value);
+export class SseParser {
+  private parts: string[] = [];
+  private lineLength = 0;
+  private afterCR = false;
+  private type = "";
+  private data: string[] = [];
+  private eventLength = 0;
+
+  push(text: string): ServiceEvent[] {
+    const out: ServiceEvent[] = [];
+    let i = 0;
+    if (this.afterCR && text.startsWith("\n")) i = 1;
+    this.afterCR = false;
+    const eol = /\r\n|\r|\n/g;
+    eol.lastIndex = i;
+    for (let m = eol.exec(text); m; m = eol.exec(text)) {
+      this.add(text.slice(i, m.index));
+      i = m.index + m[0].length;
+      if (m[0] === "\r" && i === text.length) this.afterCR = true;
+      this.line(this.parts.join(""), out);
+      this.parts = [];
+      this.lineLength = 0;
     }
-    if (!data.length) continue;
-    const raw = data.join("\n");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      parsed = raw;
-    }
-    events.push({ type, data: parsed });
+    this.add(text.slice(i));
+    return out;
   }
-  return { events, rest };
+
+  private add(s: string): void {
+    if (!s) return;
+    this.parts.push(s);
+    this.lineLength += s.length;
+    if (this.lineLength + this.eventLength > MAX_SSE_EVENT_BYTES) {
+      throw new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The library service sent an event larger than 1 MB; the event stream was closed." });
+    }
+  }
+
+  private line(line: string, out: ServiceEvent[]): void {
+    if (line === "") {
+      if (this.data.length) {
+        const raw = this.data.join("\n");
+        let data: unknown;
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          data = raw;
+        }
+        out.push({ type: this.type || "message", data });
+      }
+      this.type = "";
+      this.data = [];
+      this.eventLength = 0;
+      return;
+    }
+    if (line.startsWith(":")) return;
+    const c = line.indexOf(":");
+    const field = c < 0 ? line : line.slice(0, c);
+    const value = c < 0 ? "" : line.slice(c + 1).replace(/^ /, "");
+    if (field === "event") this.type = value;
+    else if (field === "data") {
+      this.data.push(value);
+      this.eventLength += value.length + 1;
+    }
+  }
 }
 
 export function createClient(baseUrl: string, token: string, opts: ClientOptions = {}): ApiClient {
   const base = checkBase(baseUrl);
+  checkToken(token);
   const doFetch = opts.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const auth = { Authorization: `Bearer ${token}` };
+  const tokenForms = [token, encodeURIComponent(token)];
 
   function urlFor(path: string, query?: RequestOptions["query"]): string {
-    if (!path.startsWith("/") || path.startsWith("//")) throw new Error(`A service path must start with "/" (got "${path}").`);
+    if (!path.startsWith("/") || path.startsWith("//") || /[?#]|%3f|%23/i.test(path)) {
+      throw new Error(`A service path must start with "/" and have no query or fragment (got "${path}"); pass query values in opts.query.`);
+    }
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(query ?? {})) {
-      if (/token/i.test(k)) throw new Error("A token is sent in the Authorization header, never in a URL.");
+      if (isCredentialQueryKey(k) || /token/i.test(k)) throw new Error(`"${k}" is a credential key: a token is sent in the Authorization header, never in a URL.`);
       if (v !== undefined) qs.set(k, String(v));
     }
     const s = qs.toString();
-    return `${base}${path}${s ? `?${s}` : ""}`;
+    const url = `${base}${path}${s ? `?${s}` : ""}`;
+    if (tokenForms.some((t) => url.includes(t))) throw new Error("Refusing a URL that contains the service token: it is sent in the Authorization header only.");
+    return url;
   }
 
   async function send<T>(method: Method, url: string, o: RequestOptions): Promise<T> {
@@ -176,11 +236,15 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
     if (!res.ok) throw await errorFrom(res);
     if (res.status === 204) return undefined as T;
-    return (await res.json()) as T;
+    try {
+      return (await res.json()) as T;
+    } catch {
+      throw unexpected(res.status);
+    }
   }
 
   function request<T>(method: Method, path: string, o: RequestOptions = {}): Promise<T> {
-    const url = urlFor(path, o.query); // throws synchronously on a bad path or a token in the query
+    const url = urlFor(path, o.query); // throws synchronously on a bad path or a credential in the URL
     return send<T>(method, url, o);
   }
 
@@ -190,7 +254,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     let res: Response;
     try {
       res = await doFetch(urlFor("/events"), init);
-    } catch (err) {
+    } catch {
       if (o.signal?.aborted) return;
       throw unreachable();
     }
@@ -198,7 +262,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     if (!res.body) return;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const parser = new SseParser();
     try {
       for (;;) {
         let chunk: ReadableStreamReadResult<Uint8Array>;
@@ -209,16 +273,12 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
           throw err;
         }
         if (chunk.done) break;
-        buf += decoder.decode(chunk.value, { stream: true });
-        const { events: evs, rest } = parseSse(buf);
-        buf = rest;
-        for (const e of evs) {
+        for (const e of parser.push(decoder.decode(chunk.value, { stream: true }))) {
           yield e;
           if (o.signal?.aborted) return;
         }
       }
-      buf += decoder.decode();
-      yield* parseSse(`${buf}\n\n`).events;
+      // Whatever is left is an event the stream ended in the middle of: discarded.
     } finally {
       reader.cancel().catch(() => {});
     }

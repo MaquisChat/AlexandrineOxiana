@@ -9,8 +9,19 @@
   width: 1em;
   height: 1em;
   /* A thin outline keeps light code colours visible on light chips and dark ones on dark chips. */
-  stroke: var(--line-strong);
+  stroke: var(--line-control);
   stroke-width: 0.6;
+}
+
+/* From code 13 on, colours and shapes repeat; the number tells the codes apart. */
+.ao-code-swatch__badge {
+  font-size: 0.7em;
+  line-height: 1.2;
+  color: var(--ink-2);
+  background: var(--chip);
+  border: 1px solid var(--line-control);
+  border-radius: 0.6em;
+  padding: 0 0.35em;
 }
 
 .ao-visually-hidden {

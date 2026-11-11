@@ -65,12 +65,11 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
   const systemReduce = useMedia("(prefers-reduced-motion: reduce)");
   // Set once the user changes something, so a slow initial load never overwrites that change.
   const changed = useRef(false);
-  // Only the answer to the latest save is applied (an earlier, slower answer would undo a later change).
-  const saveSeq = useRef(0);
+  // Saving (R105 I1): at most one PUT in flight. Changes made meanwhile are merged into one pending
+  // patch, sent when the PUT in flight answers; each update() resolves when its change was sent.
+  const saving = useRef<{ busy: boolean; pending: AppearancePatch | null; waiting: (() => void)[] }>({ busy: false, pending: null, waiting: [] });
 
-  useEffect(() => {
-    if (initial) setSettings(initial);
-  }, [initial]);
+  // `initial` is applied once, when the provider mounts (a later value does not reset the user's choices).
 
   useEffect(() => {
     if (!client) return;
@@ -111,23 +110,38 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
   }, [theme, reducedMotion, settings, accent?.ok, accent?.onAccent]);
 
   const update = useCallback(
-    async (patch: AppearancePatch) => {
+    (patch: AppearancePatch): Promise<void> => {
       changed.current = true;
       setSettings((cur) => applyPatch(cur, patch));
-      if (!client) return;
-      const seq = ++saveSeq.current;
-      try {
-        const saved = await client.appearance.put(patch);
-        if (seq === saveSeq.current) {
-          setSettings(saved);
-          setSaveError(undefined);
-        }
-      } catch (err) {
-        if (seq === saveSeq.current) setSaveError(`Couldn't save your appearance settings: ${messageOf(err)}`);
-      }
+      if (!client) return Promise.resolve();
+      const q = saving.current;
+      q.pending = mergePatch(q.pending, patch);
+      const done = new Promise<void>((resolve) => q.waiting.push(resolve));
+      if (!q.busy) void drain(client, q);
+      return done;
     },
     [client],
   );
+
+  async function drain(c: Pick<ApiClient, "appearance">, q: typeof saving.current) {
+    q.busy = true;
+    while (q.pending) {
+      const patchNow = q.pending;
+      const waiting = q.waiting;
+      q.pending = null;
+      q.waiting = [];
+      try {
+        const saved = await c.appearance.put(patchNow);
+        // Changes made while this PUT was in flight stay on screen until their own PUT answers.
+        setSettings(q.pending ? applyPatch(saved, q.pending) : saved);
+        setSaveError(undefined);
+      } catch (err) {
+        setSaveError(`Couldn't save your appearance settings: ${messageOf(err)}`);
+      }
+      for (const w of waiting) w();
+    }
+    q.busy = false;
+  }
 
   const value = useMemo<AppearanceContextValue>(
     () => ({ settings, theme, reducedMotion, accentApplied, update, ...(saveError ? { saveError } : {}) }),
@@ -143,6 +157,14 @@ function safeStack(choice: FontChoice, slot: FontSlot): string {
   } catch {
     return fontStack(DEFAULT_APPEARANCE.fonts[slot]);
   }
+}
+
+/** Two patches as one: later values win; font slots merge. */
+function mergePatch(a: AppearancePatch | null, b: AppearancePatch): AppearancePatch {
+  if (!a) return { ...b, ...(b.fonts ? { fonts: { ...b.fonts } } : {}) };
+  const out: AppearancePatch = { ...a, ...b };
+  if (a.fonts || b.fonts) out.fonts = { ...a.fonts, ...b.fonts };
+  return out;
 }
 
 function messageOf(err: unknown): string {

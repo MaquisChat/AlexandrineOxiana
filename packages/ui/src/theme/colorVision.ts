@@ -41,6 +41,25 @@ function linearToLab([r, g, b]: [number, number, number]): Lab {
   return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
+/** CIELAB → linear sRGB (unclamped: channels outside 0–1 are out of gamut). */
+export function labToLinear([L, a, b]: Lab): [number, number, number] {
+  const fy = (L + 16) / 116;
+  const fx = fy + a / 500;
+  const fz = fy - b / 200;
+  const inv = (t: number) => (t ** 3 > 216 / 24389 ? t ** 3 : (116 * t - 16) / (24389 / 27));
+  const x = inv(fx) * 0.95047;
+  const y = inv(fy);
+  const z = inv(fz) * 1.08883;
+  return [3.2404542 * x - 1.5371385 * y - 0.4985314 * z, -0.969266 * x + 1.8760108 * y + 0.041556 * z, 0.0556434 * x - 0.2040259 * y + 1.0572252 * z];
+}
+
+/** CIELAB → `#RRGGBB` (clamped), and how far outside the sRGB gamut it was (0 when inside). */
+export function labToHex(lab: Lab): { hex: string; outOfGamut: number } {
+  const lin = labToLinear(lab);
+  const outOfGamut = lin.reduce((s, v) => s + Math.max(0, v - 1, -v), 0);
+  return { hex: toHex(lin.map((c) => toGamma(clamp01(c)) * 255)), outOfGamut };
+}
+
 export function hexToLab(hex: string): Lab {
   return linearToLab(linearRgb(hex));
 }

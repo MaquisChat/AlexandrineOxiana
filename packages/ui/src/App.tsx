@@ -4,12 +4,10 @@
 import { useMemo } from "react";
 import { createClient, type ApiClient } from "./api/client";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
+import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
 
-export interface ServiceConnection {
-  baseUrl: string;
-  token: string;
-}
+export type { ServiceConnection } from "./serviceConnection";
 
 export function App({ service }: { service?: ServiceConnection }) {
   const client: ApiClient | undefined = useMemo(() => (service ? createClient(service.baseUrl, service.token) : undefined), [service]);

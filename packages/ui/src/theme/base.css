@@ -47,7 +47,7 @@ textarea {
   font: inherit;
   color: var(--ink);
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line-control);
   border-radius: 4px;
   padding: var(--space-1) var(--space-2);
 }

@@ -73,6 +73,15 @@ describe("theme tokens", () => {
     }
   });
 
+  it("form-control borders (--line-control) reach 3:1 on --bg, --surface, --surface-2 and --chip in every theme", () => {
+    for (const name of THEME_NAMES) {
+      const t = THEMES[name];
+      for (const bg of ["bg", "surface", "surface-2", "chip"]) expect(contrastRatio(t["line-control"]!, t[bg]!), `${name} --line-control on --${bg}`).toBeGreaterThanOrEqual(3);
+    }
+    const base = readFileSync(new URL("./base.css", import.meta.url), "utf8");
+    expect(base).toMatch(/input,\s*select,\s*button,\s*textarea\s*\{[^}]*border: 1px solid var\(--line-control\)/);
+  });
+
   it("high-contrast themes keep borders visible (--line, --line-strong ≥ 3:1 on --bg and --surface)", () => {
     for (const name of ["light-hc", "dark-hc"] as const) {
       const t = THEMES[name];

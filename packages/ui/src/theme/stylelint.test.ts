@@ -25,7 +25,40 @@ describe("no hard-coded colours outside tokens.css (stylelint)", () => {
     expect(await lintCode(".x { color: oklch(50% 0.1 200); }", "src/screens/x.css")).toContain("function-disallowed-list");
   });
 
+  it("flags every colour bypass the review found (R105 I2)", async () => {
+    const bypasses = [
+      ".x { color: RGB(0 0 0); }",
+      ".x { color: Rgba(0, 0, 0, 0.5); }",
+      ".x { color: HSL(0 0% 0%); }",
+      ".x { color: hwb(0 0% 0%); }",
+      ".x { color: LAB(50% 40 59); }",
+      ".x { color: lch(50% 40 59); }",
+      ".x { color: OKLab(0.6 0.1 0.1); }",
+      ".x { color: OKLCH(60% 0.1 200); }",
+      ".x { color: color(display-p3 1 0 0); }",
+      ".x { color: Color(srgb 1 0 0); }",
+      ".x { color: device-cmyk(0 1 1 0); }",
+      ".x { color: color-mix(in srgb, var(--ink) 50%, white); }",
+      ".x { color: Canvas; }",
+      ".x { background: ButtonFace; }",
+      ".x { color: canvastext; }",
+      ".x { border-color: AccentColor; }",
+      ".x { color: Highlight; }",
+      ".x { color: GrayText; }",
+      ".x { color: WindowText; }",
+      ".x { outline: 1px solid -webkit-focus-ring-color; }",
+      ".x { background: url(\"data:image/svg+xml,%3Csvg fill='%23ff0000'/%3E\"); }",
+      ".x { background: url(data:image/svg+xml;utf8,<svg%20fill=%23f00/>); }",
+      ".x { background-image: URL('data:image/svg+xml,%23abc'); }",
+      ".x { color: #FFF; }",
+      ".x { --mine: #123456; }",
+    ];
+    for (const code of bypasses) expect((await lintCode(code, "src/screens/x.css")).length, code).toBeGreaterThan(0);
+  });
+
   it("allows tokens everywhere and literal colours only in src/theme/tokens.css", async () => {
+    expect(await lintCode(".x { color: currentColor; background: transparent; border-color: inherit; }", "src/screens/x.css")).toEqual([]);
+    expect(await lintCode(".x { background: url(\"/fonts/x.woff2\"); }", "src/screens/x.css")).toEqual([]);
     expect(await lintCode(".x { color: var(--ink); background: var(--surface); }", "src/screens/x.css")).toEqual([]);
     expect(await lintCode(":root { --ink: #1C1B19; }", "src/theme/tokens.css")).toEqual([]);
     expect(await lintCode(":root { --ink: #1C1B19; }", "src/theme/fonts.css")).toContain("color-no-hex");

@@ -3,6 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- R105: only this app's own scripts run; the service is reached on loopback only; captured
+         snapshots are shown in sandboxed blob: frames (components/SnapshotFrame.tsx). In `vite` dev
+         mode this tag is dropped (vite.config.ts), because the dev server injects inline scripts. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
     <title>Alexandrine Oxiana</title>
   </head>
   <body>
