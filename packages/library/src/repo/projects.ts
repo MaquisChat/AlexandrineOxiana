@@ -24,9 +24,10 @@ import {
 } from "../crypto/keys.js";
 import { AuditStore } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
-import { GovernanceViolationError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
+import { GovernanceViolationError, InvalidInputError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
-import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
+import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
+import { seams } from "./seams.js";
 import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
@@ -214,6 +215,60 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
   } catch (error) {
     core.indexErrors.push({ op: "project.unlock", error });
   }
+}
+
+/**
+ * Issues a new recovery code for an unlocked encrypted project (Task 61, R134 c). The researcher
+ * gives the passphrase again; it is proved by unwrapping the stored passphrase wrapping (not only by
+ * the key being in the key ring). The project key does not change: only the recovery wrapping in
+ * keys/project-key.json is replaced, so the old code stops working and the passphrase keeps working.
+ *
+ * Written through the governed write path (`runMutation`): policy `store` of the project (as for
+ * other project settings: governance, backup settings), the key file replaced atomically with its old
+ * bytes kept aside by the write-ahead marker, then the allow audit event (the commit point, R26). A
+ * crash before that event rolls back to the old file (old code valid); after it, the new file is kept
+ * (new code valid, possibly never shown: issuing again is safe). The code is returned only after the
+ * commit and is never stored, audited or logged.
+ */
+export async function issueRecoveryCode(core: RepoCore, projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  if (!core.encrypted(st)) throw new InvalidInputError("This project is not encrypted, so it has no recovery code");
+  if (st.recoveryPending) throw new RecoveryPendingError(projectId);
+  core.assertUnlocked(st);
+  if (typeof passphrase !== "string" || passphrase === "") throw new InvalidInputError("Enter the project's passphrase");
+
+  // The slow key derivations run outside the library's write queue; the file is checked unchanged inside it.
+  const rel = `${st.rel}/keys/project-key.json`;
+  const raw = await readMaybe(core.abs(rel));
+  if (!raw) throw new Error("this project's key file is missing");
+  const file = JSON.parse(raw.toString("utf8")) as ProjectKeyFile;
+  const key = await unwrapKey(file.passphrase, passphrase); // WrongPassphraseError: nothing written
+  let next: { recoveryCode: string; file: WrappedKey };
+  try {
+    const { key: ringKey, keyId } = core.key(st);
+    if (file.keyId !== keyId || file.passphrase.keyId !== keyId || !Buffer.from(key).equals(Buffer.from(ringKey))) {
+      throw new Error("this project's key file does not hold the key the project is unlocked with");
+    }
+    next = await createRecoveryFile(key, keyId, core.scryptN ? { N: core.scryptN } : {});
+  } finally {
+    key.fill(0);
+  }
+  seams.onRecoveryCode?.(next.recoveryCode);
+  const keyFile: ProjectKeyFile = { keyId: file.keyId, passphrase: file.passphrase, recovery: next.file };
+
+  await runMutation(
+    core,
+    projectId,
+    { action: "store", store: { identifiable: false, hasLocation: false } },
+    async (tx) => {
+      const now = await readMaybe(core.abs(rel));
+      if (!now || !now.equals(raw)) throw new Error("the project's key file changed meanwhile; ask for a new recovery code again");
+      await tx.writeFile(rel, JSON.stringify(keyFile, null, 2), { mode: KEY_FILE_MODE });
+    },
+    { op: "project.recovery-code", entity: { type: "project", id: projectId } },
+  );
+  return { recoveryCode: next.recoveryCode };
 }
 
 export function lockProject(core: RepoCore, projectId: string): void {

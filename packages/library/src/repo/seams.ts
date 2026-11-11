@@ -14,6 +14,8 @@ export const seams: {
   beforeMkdir?: (abs: string) => Promise<void>;
   /** Makes every audit append for this project id fail (until cleared). */
   failAuditAppendFor?: string;
+  /** Receives a newly issued recovery code before the change is written (crash tests, Task 61). */
+  onRecoveryCode?: (code: string) => void;
 } = {};
 
 /** Thrown at a crash point; the mutation does NOT roll back (as if the process died). */

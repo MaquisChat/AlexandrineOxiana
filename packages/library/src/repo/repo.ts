@@ -47,7 +47,7 @@ import {
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
 import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
-import { createProject, isUnlocked, lockProject, readFullData, unlockProject, type CreateProjectInput } from "./projects.js";
+import { createProject, isUnlocked, issueRecoveryCode, lockProject, readFullData, unlockProject, type CreateProjectInput } from "./projects.js";
 import {
   createSource,
   createSources,
@@ -121,6 +121,14 @@ export class Repo {
     await unlockProject(this.core, projectId, passphraseOrRecovery);
     // Work that waited for the key (e.g. sealed backups the backups manifest could not read, R94).
     for (const h of unlockHooks) await h(this, projectId).catch(() => {});
+  }
+  /**
+   * Issues a new recovery code for an unlocked encrypted project, given its passphrase again
+   * (governed and audited; the project key is unchanged and the old code stops working). The code is
+   * returned once and never stored.
+   */
+  issueRecoveryCode(projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
+    return issueRecoveryCode(this.core, projectId, passphrase);
   }
   lockProject(projectId: string): void {
     lockProject(this.core, projectId);
