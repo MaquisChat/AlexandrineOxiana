@@ -26,7 +26,6 @@ interface Libraries {
 
 const D5: Defect = { id: "D5", title: "on relaunch the app shows “Library not found” for the library that was open (spec 4.5)" };
 const D6: Defect = { id: "D6", title: "the app's fonts finish loading in WebKit (no face left in error, document.fonts settles)" };
-const D7: Defect = { id: "D7", title: "a right-to-left title's heading on the source screen is itself right to left (aligned to the right), not only its inline text" };
 
 /** Every file under `dir`, relative to it ("/"-separated). */
 function filesUnder(dir: string): string[] {
@@ -294,7 +293,15 @@ test.describe("scenario 8", () => {
       }
     });
 
-    await blockedBy(D7);
+    await test.step("each source screen's heading block is itself laid out in its title's direction, not only its inline text (D7)", async () => {
+      const table = page.getByRole("table", { name: "Sources" });
+      for (const t of TITLES) {
+        await table.getByRole("button", { name: t.title, exact: true }).click();
+        const heading = page.getByRole("region", { name: "Source details" }).getByRole("heading", { level: 2, name: t.title, exact: true });
+        await expect(heading, t.script).toBeVisible();
+        expect(await heading.evaluate((e) => getComputedStyle(e).direction), `${t.script} heading block`).toBe(t.rtl ? "rtl" : "ltr");
+      }
+    });
 
     await test.step("screenshot of a right-to-left source", async () => {
       const arabic = TITLES[0]!;
@@ -323,18 +330,4 @@ test(`${D6.id}: ${D6.title}`, async ({ page, browserName }) => {
   // Chromium loads every face: there this is an ordinary passing test.
   if (browserName === "webkit") expectDefect(D6);
   await fontsSettle(page, DEFECT_TIMEOUT);
-});
-
-test(`${D7.id}: ${D7.title}`, async ({ page, app }) => {
-  const rtl = TITLES.filter((t) => t.rtl);
-  await importTitles(app, page, rtl);
-  const headings = [];
-  for (const t of rtl) {
-    await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: t.title, exact: true }).click();
-    const heading = page.getByRole("region", { name: "Source details" }).getByRole("heading", { level: 2, name: t.title, exact: true });
-    await expect(heading, t.script).toBeVisible();
-    headings.push(`${t.script}: ${await heading.evaluate((e) => getComputedStyle(e).direction)}`);
-  }
-  expectDefect(D7);
-  expect(headings).toEqual(rtl.map((t) => `${t.script}: rtl`));
 });
