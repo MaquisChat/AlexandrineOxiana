@@ -27,7 +27,6 @@ import {
 } from "@ao/library";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
 import * as authModule from "./auth.js";
-import { readServiceToken } from "./auth.js";
 import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
@@ -131,14 +130,6 @@ describe("authentication (R96)", () => {
     expect(both.status).toBe(401);
     expect(both.json).toEqual({ error: { code: "UNAUTHORIZED", message: expect.any(String) } });
     expect((await call({ url: "/libraries" })).status).toBe(200);
-  });
-
-  it("reads AO_SERVICE_TOKEN once and removes it from the environment", () => {
-    const env: NodeJS.ProcessEnv = { AO_SERVICE_TOKEN: "x".repeat(40) };
-    expect(readServiceToken(env)).toBe("x".repeat(40));
-    expect(env.AO_SERVICE_TOKEN).toBeUndefined();
-    expect(() => readServiceToken({})).toThrow();
-    expect(() => readServiceToken({ AO_SERVICE_TOKEN: "short" })).toThrow();
   });
 
   it("errors have exactly {error:{code,message,reason?}} and a body over 1 MB is 413", async () => {
@@ -676,9 +667,12 @@ describe("entry point", () => {
     const entry = fileURLToPath(new URL("./main.ts", import.meta.url));
     const child = spawn(process.execPath, ["--import", "tsx", entry], {
       cwd: fileURLToPath(new URL("../", import.meta.url)),
-      env: { ...process.env, AO_SERVICE_TOKEN: TOKEN, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_LIBRARY: path, AO_NO_WORKER: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      // The token goes on standard input (R98), never in the environment.
+      env: { ...process.env, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_LIBRARY: path, AO_NO_WORKER: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    child.stdin!.on("error", () => {});
+    child.stdin!.write(`${TOKEN}\n`);
     let out = "";
     let err = "";
     child.stderr!.on("data", (d: Buffer) => (err += d.toString()));
