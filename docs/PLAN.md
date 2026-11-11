@@ -267,7 +267,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 **Task 37c — Desktop shell [ledger: R64, R96, R98, R103, R113, R117]**
 - Depends: 37a, 37b, 43.
 - Files: `apps/desktop/{package.json,src-tauri/**}`, `packages/ui/src/{serviceConnection.ts,components/DropZone.tsx,components/FileDrop.tsx,screens/LibraryChooser.tsx}`.
-- Accept: on launch the shell makes two random tokens, starts the service (with the memory ceiling) and the worker on free ports, passes each its token on standard input, waits for each to report ready, and gives the UI its connection; native folder and file pickers and dropped file paths reach the UI; closing the app stops both helpers and leaves no stray process; a second launch brings the first to the front. No library logic in the shell. Built and started on Linux under a virtual display.
+- Accept: on launch the shell makes two random tokens, starts the service (with the memory ceiling) and the worker on free ports, passes each its token on standard input, waits for each to report ready, and gives the UI its connection; native folder and file pickers and dropped file paths reach the UI; closing the app stops both helpers and leaves no stray process; a second launch brings the first to the front. An About screen lists the third-party notices, including the citeproc-js notice that CPAL-1.0 section 3.6 calls for (source available, repository address, pinned version, no modifications) with the text from `packages/core/csl/NOTICE.md` (ADR 0012, R124). No library logic in the shell. Built and started on Linux under a virtual display.
 - Verify: Linux build; a scripted launch that checks both helpers answer and are gone after exit.
 - Model: Opus.
 
@@ -386,12 +386,12 @@ Update after every task; commit and push.
 
 | Task | Status | Commit | Notes |
 |---|---|---|---|
-| 38 Fix the red build | not started | | |
-| 39 Handoff docs in and corrected | not started | | |
-| 40 Record decisions | not started | | |
-| 41a Review: library and service | not started | | |
-| 41b Review: interface | not started | | |
-| 42 CI coverage | not started | | |
+| 38 Fix the red build | done | 8500d33 | 47 CLI tests pass locally; CI run on GitHub pending |
+| 39 Handoff docs in and corrected | done | 1597ad7, 8747f80 | |
+| 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
+| 41a Review: library and service | in review | | reviewer dispatched |
+| 41b Review: interface | in review | | two reviewers (fix rounds; integration) |
+| 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
 | 43 End-to-end harness | not started | | |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | not started | | |
@@ -453,6 +453,7 @@ Each phase gets its own plan when it starts.
 - 2026-11-11: plan drafted at `0ad6506`. `main` created at `0ad6506`. Handoff branch requested from the earlier session; it is waiting for the owner's direct confirmation.
 - 2026-11-11: owner confirmed; `handoff/2026-11-11` pushed at `0832c77` (not yet merged into the working branch: that is Task 39). Plan checked against the ledger and amended (section 12). `docs/handoff/LEDGER-INDEX.md` added.
 - 2026-11-11: owner decided against a second backup folder in Phase 1; to be settled with sync (Phase 5). Plan still awaits approval.
+- 2026-11-11: owner approved the plan. Milestone I started: handoff docs merged and corrected (39), rulings R120–R128 recorded (40), build fixed (38), CI extended (42), three reviewers dispatched for the never-reviewed commits (41a, 41b).
 
 ## 12. What the ledger check changed
 
