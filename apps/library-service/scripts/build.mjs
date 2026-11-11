@@ -10,7 +10,9 @@
 //   node --max-old-space-size=512 service.mjs
 //
 // The folder:
-//   service.mjs                    the service, bundled by esbuild (our code and every pure-JS dependency)
+//   service.mjs                    the entry point (scripts/launcher.mjs): refuses a redirecting
+//                                  environment or a mismatched Node/platform, then loads main.mjs
+//   main.mjs                       the service, bundled by esbuild (our code and every pure-JS dependency)
 //   workers/                       worker-thread scripts: the citation style sandbox, the web page cleaner
 //   migrations/                    the index's SQL migrations
 //   csl/                           the citation styles and locales, with their CC BY-SA 3.0 licence and
@@ -27,7 +29,7 @@
 // the bundle sees as the "bundle" layout (the `__AO_BUNDLE__` define): inside this folder only.
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -162,6 +164,8 @@ function copyPackage(name, fromDir, out, copied) {
     if (parts.length === 1 && LICENCE_FILE.test(base)) return true;
     // Source maps, type declarations and TypeScript sources, and documentation: not needed to run.
     if (/\.(map|ts|mts|cts|md|markdown)$/i.test(base)) return false;
+    // Test folders are never loaded at run time.
+    if (parts.some((p) => /^(test|tests|__tests__)$/.test(p))) return false;
     if (!keep) return true;
     return keep.some((k) => rel === k || rel.startsWith(`${k}/`) || k.startsWith(`${rel}/`));
   };
@@ -213,7 +217,7 @@ async function main() {
     await esbuild.build({
       ...common,
       entryPoints: [join(SERVICE, "src", "main.ts")],
-      outfile: join(out, "service.mjs"),
+      outfile: join(out, "main.mjs"),
       define: { __AO_BUNDLE__: JSON.stringify({ libraryVersion }) },
     }),
     await esbuild.build({ ...common, entryPoints: [join(LIBRARY, "src", "citation", "sandbox-worker.mjs")], outfile: join(out, LAYOUT.sandboxWorker) }),
@@ -254,6 +258,10 @@ async function main() {
   for (const name of EXTERNAL) {
     if (!copyPackage(name, KEPT_FROM[name], out, copied)) fail(`${name} is not installed for this platform (${process.platform}-${process.arch}).`);
   }
+  const { stubs } = closeTheFolder(out, copied, results);
+  // The entry point: checks the environment and the build, then loads main.mjs (R153, M4).
+  cpSync(join(HERE, "launcher.mjs"), join(out, "service.mjs"));
+
   // Load each native module from the folder once, so a build that would not start fails here.
   for (const name of NATIVE) {
     try {
@@ -287,6 +295,13 @@ async function main() {
         libraryVersion,
         nativeModules: nativeFiles.sort(),
         packages: [...copied].map(([n, v]) => `${n}@${v}`).sort(),
+        // R153: the only packages left outside the bundle (with their dependencies, in packages).
+        external: EXTERNAL,
+        // Names some shipped file may load that are not part of this build: each is a stub in
+        // node_modules/ that fails like a missing module, so Node never looks outside the folder.
+        stubs: stubs.sort(),
+        // Names that appear in the bundle only inside generated-code text, never loaded (BUNDLE_TEXT_ONLY).
+        neverLoaded: Object.keys(BUNDLE_TEXT_ONLY).sort(),
       },
       null,
       2,
@@ -304,6 +319,139 @@ async function main() {
   };
   size(out);
   process.stdout.write(`build: ${relative(process.cwd(), out) || "."} (${(bytes / 1048576).toFixed(1)} MB; ${packages.size} npm packages; native: ${nativeFiles.join(", ")})\n`);
+}
+
+// ------------------------------------------------------------------------------------------
+// R153: the folder loads code only from itself. A require() or import of a package name that is
+// not in <folder>/node_modules would make Node go on looking in parent folders, the global
+// folders and NODE_PATH. So every package name any shipped file can load must be in the folder:
+// a copied package, a builtin, or an explicit stub (STUBS) that fails the way a missing module
+// does. Loading by a computed name is allowed only where COMPUTED says why.
+
+/**
+ * Package names a shipped file may load that this build does not contain, and why that is fine:
+ * each gets a stub package in node_modules/ that throws MODULE_NOT_FOUND (what a missing module
+ * does), so the caller behaves as it would without it and Node never searches outside the folder.
+ */
+const STUBS = [
+  { test: (n) => /^@napi-rs\/(canvas|keyring)-/.test(n), why: "the native binary of another platform or architecture (the napi-rs loader names every one)" },
+  { test: (n) => n === "supports-color", why: "optional colour support of `debug` (it carries on without it)" },
+];
+/**
+ * Names that appear in the bundle only inside the text of code that Ajv and fast-json-stringify
+ * generate for their "standalone" mode, which Fastify does not use: never loaded. The smoke run
+ * plants modules under these names outside the folder to prove it.
+ */
+const BUNDLE_TEXT_ONLY = {
+  ajv: "Ajv's standalone code text (require(\"ajv/dist/runtime/…\"))",
+  "ajv-formats": "Ajv's standalone code text",
+  "fast-json-stringify": "fast-json-stringify's standalone code text",
+};
+/** Files that load a module by a computed name, and why each stays inside the folder. */
+const COMPUTED = {
+  "@napi-rs/canvas/js-binding.js": "require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH) only when that variable is set; service.mjs refuses to start if it is",
+  "@napi-rs/keyring/index.js": "the same NAPI_RS_NATIVE_LIBRARY_PATH override; refused by service.mjs",
+  "bindings/bindings.js": "requireFunc(n) of better_sqlite3.node under the calling package's own folder (build/Release)",
+  "better-sqlite3/lib/database.js": "requireFunc(nativeBinding) only when a caller passes the nativeBinding option, which the library never does",
+  "exiftool-vendored/dist/ExiftoolPath.js": 'import("exiftool-vendored.pl") (".exe" on Windows), which is in the folder',
+  "file-type/source/index.js": 'importAtRuntime("strtok3"), which is in the folder',
+  "pdfjs-dist/legacy/build/pdf.mjs": "import(workerSrc): pdf.worker.mjs next to it in the folder",
+  "pdfjs-dist/legacy/build/pdf.min.mjs": "the minified copy of pdf.mjs (not loaded)",
+  "pdfjs-dist/legacy/build/pdf.worker.mjs": "the OpenJPEG wasm decoder, off (useWasm: false in extract/pdf.ts)",
+  "pdfjs-dist/legacy/build/pdf.worker.min.mjs": "the minified copy of pdf.worker.mjs (not loaded)",
+  "pdfjs-dist/legacy/build/pdf.sandbox.mjs": "the PDF scripting sandbox, never loaded (no scripting, extract/pdf.ts)",
+  "pdfjs-dist/legacy/build/pdf.sandbox.min.mjs": "the minified scripting sandbox, never loaded",
+};
+
+const SPECIFIER_PATTERNS = [
+  /\brequire\s*\(\s*(['"])([^'"\n]+)\1\s*\)/g,
+  /\brequire\.resolve\s*\(\s*(['"])([^'"\n]+)\1/g,
+  /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)*(['"])([^'"\n]+)\1\s*\)/g,
+  /^\s*import\s+(['"])([^'"\n]+)\1/gm,
+  /^\s*(?:import|export)\b[^'"\n;]*?\bfrom\s*(['"])([^'"\n]+)\1/gm,
+];
+// require/import and the aliases of require seen in the copied packages (bindings' requireFunc).
+// A static scan cannot see every alias: the smoke run's planted modules and its guard are the
+// run-time proof.
+const COMPUTED_PATTERN = /[^.\w$](?:import|require|__require|requireFunc)\(\s*(?:\/\*[\s\S]*?\*\/\s*)*([^"'`\s)][^)]{0,80})/g;
+
+/** The package name of a bare specifier (undefined for relative, absolute, builtin and template ones). */
+function packageNameOf(spec) {
+  if (spec.includes("${") || /\s/.test(spec)) return undefined;
+  if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("node:") || isBuiltin(spec) || /^[a-z]+:/i.test(spec)) return undefined;
+  const parts = spec.split("/");
+  return spec.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
+
+function specifiersIn(code) {
+  const found = new Set();
+  for (const re of SPECIFIER_PATTERNS) for (const m of code.matchAll(re)) found.add(m[2]);
+  return found;
+}
+
+function jsFilesUnder(dir) {
+  const files = [];
+  const walk = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(c|m)?js$/.test(e.name)) files.push(p);
+    }
+  };
+  walk(dir);
+  return files;
+}
+
+/**
+ * Makes sure no require() or import of a shipped file can miss in the folder (R153): every bare
+ * name loaded by a copied package is a copied package, a builtin or a stub (written here); every
+ * bare name in the bundles is a builtin, a kept package or text only; every computed load is
+ * accounted for in COMPUTED. Anything else fails the build. Returns the stub names.
+ */
+function closeTheFolder(out, copied, results) {
+  const nm = join(out, "node_modules");
+  const misses = new Map(); // name -> files that load it
+  const problems = [];
+  for (const file of jsFilesUnder(nm)) {
+    const code = readFileSync(file, "utf8");
+    const rel = relative(nm, file).split(sep).join("/");
+    const own = rel.startsWith("@") ? rel.split("/").slice(0, 2).join("/") : rel.split("/")[0];
+    for (const spec of specifiersIn(code)) {
+      const name = packageNameOf(spec);
+      if (!name || name === own || copied.has(name)) continue;
+      if (!misses.has(name)) misses.set(name, new Set());
+      misses.get(name).add(rel);
+    }
+    const computed = [...code.matchAll(COMPUTED_PATTERN)].map((m) => m[1].trim().slice(0, 60));
+    if (computed.length && !COMPUTED[rel]) problems.push(`${rel} loads a module by a computed name (${computed.slice(0, 3).join("; ")})`);
+  }
+  for (const r of results) {
+    for (const file of Object.keys(r.metafile.outputs)) {
+      const rel = relative(out, resolve(REPO, file));
+      for (const spec of specifiersIn(readFileSync(resolve(REPO, file), "utf8"))) {
+        const name = packageNameOf(spec);
+        if (name && !EXTERNAL.includes(name) && !BUNDLE_TEXT_ONLY[name]) problems.push(`${rel} loads ${name}, which is neither bundled nor in the folder`);
+      }
+    }
+  }
+  const stubs = [];
+  for (const [name, files] of misses) {
+    const rule = STUBS.find((s) => s.test(name));
+    if (!rule) {
+      problems.push(`${[...files].slice(0, 3).join(", ")} load${files.size === 1 ? "s" : ""} ${name}, which is not in the folder (copy it, or add a stub with a reason)`);
+      continue;
+    }
+    const dir = join(nm, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), `${JSON.stringify({ name, version: "0.0.0-not-included", private: true, main: "index.js", description: `Not part of this build: ${rule.why}.` }, null, 2)}\n`);
+    writeFileSync(
+      join(dir, "index.js"),
+      `// Not part of the Alexandrine Oxiana library service build: ${rule.why}.\n// Fails the way a missing module does, without Node searching outside the folder (R153).\nconst e = new Error(${JSON.stringify(`Cannot find module '${name}' (not part of this build)`)});\ne.code = "MODULE_NOT_FOUND";\nthrow e;\n`,
+    );
+    stubs.push(name);
+  }
+  if (problems.length) fail(`the folder would load code from outside itself (R153):\n  ${problems.join("\n  ")}`);
+  return { stubs };
 }
 
 function writeLicences(out) {
@@ -333,22 +481,61 @@ function writeLicences(out) {
     "| Package | Version | Licence | How | Licence files |",
     "| --- | --- | --- | --- | --- |",
   ];
-  const missing = [];
+  const problems = [];
   for (const { dir: pdir, pkg, how } of rows) {
     const id = `${pkg.name}@${pkg.version}`;
     const dest = join(dir, "npm", id);
     const files = readdirSync(pdir).filter((f) => LICENCE_FILE.test(f) && statSync(join(pdir, f)).isFile());
+    let note = files.join(", ");
+    mkdirSync(dest, { recursive: true });
     if (files.length) {
-      mkdirSync(dest, { recursive: true });
       for (const f of files) cpSync(join(pdir, f), join(dest, f));
-    } else missing.push(id);
-    const licence = typeof pkg.license === "string" ? pkg.license : (pkg.license?.type ?? (Array.isArray(pkg.licenses) ? pkg.licenses.map((l) => l.type).join(" OR ") : "UNKNOWN"));
-    lines.push(`| ${pkg.name} | ${pkg.version} | ${licence} | ${how} | ${files.length ? files.join(", ") : "none in the package"} |`);
+    } else {
+      // A package whose npm tarball has no licence file: its text from LICENCE_TEXT_FROM, or the build fails.
+      const text = LICENCE_TEXT_FROM.find((x) => x.test(pkg.name))?.text(pkg, rows);
+      if (!text) problems.push(`${id} has no licence file (add its text to LICENCE_TEXT_FROM)`);
+      else {
+        writeFileSync(join(dest, "LICENSE"), text.body);
+        note = `LICENSE (${text.source})`;
+      }
+    }
+    const licence = typeof pkg.license === "string" ? pkg.license : (pkg.license?.type ?? (Array.isArray(pkg.licenses) ? pkg.licenses.map((l) => l.type).join(" OR ") : undefined));
+    if (!licence || /^(UNKNOWN|UNLICENSED|SEE LICENSE)/i.test(licence)) problems.push(`${id} declares no usable licence (${licence ?? "none"})`);
+    const used = USED_UNDER[pkg.name] ? ` (used under ${USED_UNDER[pkg.name]})` : "";
+    lines.push(`| ${pkg.name} | ${pkg.version} | ${licence}${used} | ${how} | ${note} |`);
   }
+  if (problems.length) fail(`licences:\n  ${problems.join("\n  ")}`);
   lines.push("");
   writeFileSync(join(dir, "THIRD-PARTY-NOTICES.md"), lines.join("\n"));
-  if (missing.length) process.stdout.write(`build: no licence file in: ${missing.join(", ")} (listed with their package.json licence)\n`);
 }
+
+/** Where a dual-licensed package's licence is chosen. */
+const USED_UNDER = { citeproc: "CPAL-1.0, R124; see licences/csl/NOTICE.md" };
+
+/**
+ * Licence texts for packages whose npm tarball has none (review M1). Each names its source; a
+ * package without a licence file and missing from here fails the build.
+ */
+const LICENCE_TEXT_FROM = [
+  {
+    // The platform binaries of @napi-rs/canvas and @napi-rs/keyring are built from the same
+    // repository as the package itself, under the same licence: that package's LICENSE file.
+    test: (n) => /^@napi-rs\/(canvas|keyring)-/.test(n),
+    text: (pkg, rows) => {
+      const parentName = pkg.name.replace(/^(@napi-rs\/(?:canvas|keyring))-.*$/, "$1");
+      const parent = rows.find((r) => r.pkg.name === parentName);
+      const f = parent && readdirSync(parent.dir).find((x) => /^licen[cs]e/i.test(x));
+      return f ? { body: readFileSync(join(parent.dir, f), "utf8"), source: `from ${parentName}, the same repository` } : undefined;
+    },
+  },
+  ...[
+    ["@tokenizer/token", "tokenizer-token.txt"],
+    ["abstract-logging", "abstract-logging.txt"],
+  ].map(([name, file]) => ({
+    test: (n) => n === name,
+    text: () => ({ body: readFileSync(join(HERE, "licence-texts", file), "utf8"), source: `from scripts/licence-texts/${file}` }),
+  })),
+];
 
 const START = `Alexandrine Oxiana library service (built folder)
 
@@ -359,14 +546,24 @@ Start it with the Node.js 22 that matches build-info.json (same platform, archit
 --max-old-space-size=512 is required: it caps the JavaScript heap at 512 MB (R64, R96), which the
 program cannot set for itself once started.
 
-Environment:
-  AO_SERVICE_TOKEN  the access token (at least 32 random characters). The desktop shell passes it the
-                    way the service reads it (standard input, R98, once Task 37b lands).
+The access token: one line on standard input (R98), for example
+  printf '%s\\n' "$TOKEN" | node --max-old-space-size=512 service.mjs
+It is never read from the environment or the command line: the service refuses to start if
+AO_SERVICE_TOKEN is set or if it is given any argument.
+
+Give it an allow-listed environment (R153), never the launcher's own. It uses only:
+  PATH, HOME, TMPDIR (TEMP/TMP on Windows), LANG and LC_*, TZ
   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any free port)
   AO_CONFIG_DIR     the app settings folder
   AO_LIBRARY        a library folder to open at start (optional)
   AO_WORKER_BIN     the packaged media worker (required for capture, transcription, proxies and OCR;
                     this folder does not contain it), or AO_NO_WORKER=1 to run without it
+  and, passed on to the media worker it starts: AO_MODELS_DIR, AO_TOOLS_DIR, TESSDATA_PREFIX,
+  XDG_*, HTTP_PROXY/HTTPS_PROXY/NO_PROXY, SSL_CERT_FILE/SSL_CERT_DIR, when they are needed.
+Must NOT be set: NODE_OPTIONS, NODE_PATH, NAPI_RS_NATIVE_LIBRARY_PATH (each can make Node load code
+from outside this folder; NODE_OPTIONS even acts before the service can check), and
+AO_SERVICE_TOKEN. service.mjs refuses to start if any of them is set, and if this folder was built
+for another platform, architecture or Node ABI (build-info.json).
 
 It prints "AO_SERVICE_READY port=<n>" when it is listening, and stops cleanly on SIGTERM.
 Licences: licences/THIRD-PARTY-NOTICES.md.

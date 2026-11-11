@@ -6,18 +6,25 @@
 // 1. builds the folder (scripts/build.mjs), unless --no-build;
 // 2. copies it to an empty folder under os.tmpdir(), outside the repository, and checks no file
 //    in the copy names the repository's path;
-// 3. starts it with plain `node` and the documented flags (--max-old-space-size=512), plus a guard
-//    preloaded with --import (in the service and every worker thread; written outside the
-//    repository) that makes the repository unreachable: any module resolved or loaded from it and
-//    any fs call on a path inside it is refused and reported (`AO_GUARD_DENIED`), which fails the
-//    run even if the service swallowed the error. (Node's permission model would be stricter but
-//    disables fchmod, which the library's atomic writes use.) The child's environment names no
-//    path in the repository (PATH entries inside it are dropped);
-// 4. over HTTP: creates a library and a project, attaches a PDF, renders a citation with a bundled
+// 3. plants modules (each writes a marker file if loaded) under every package name the build
+//    reports and some generic optional ones, in the home folder's .node_modules and
+//    .node_libraries, in a node_modules of the folder's parent and in a NODE_PATH folder (R153);
+// 4. starts it with plain `node` and the documented flags (--max-old-space-size=512), the token on
+//    standard input (R98), plus a guard preloaded with --import (in the service and every worker
+//    thread; written outside the repository): any fs call on a path in the repository, and any
+//    module resolved from outside the copied folder (builtins aside), is refused and reported
+//    (`AO_GUARD_DENIED`), which fails the run even if the service swallowed the error. (Node's
+//    permission model would be stricter but disables fchmod, which the library's atomic writes
+//    use.) The child's environment names no path in the repository (PATH entries inside it are
+//    dropped);
+// 5. over HTTP: creates a library and a project, attaches a PDF, renders a citation with a bundled
 //    style and with an imported one (the sandbox worker and citeproc from the folder), cleans an
 //    HTML snapshot (the cleaner's worker), and searches for a word of the PDF's text;
-// 5. checks (Linux) that every native module mapped into the process is in the copied folder;
-// 6. stops it with SIGTERM and checks it exited cleanly and left no process behind.
+// 5b. checks (Linux) that every native module mapped into the process is in the copied folder;
+// 6. stops it with SIGTERM and checks it exited cleanly and left no process behind, and that no
+//    planted module was loaded;
+// 7. starts it again with NODE_PATH set to the planted folder: it must refuse to start, in plain
+//    words, and load nothing planted.
 import { execFileSync, spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -31,28 +38,41 @@ const REPO = realpathSync(resolve(SERVICE, "../.."));
 const DIST = join(SERVICE, "dist", "library-service");
 const argv = new Set(process.argv.slice(2));
 
-/** The guard preloaded into the service (see 3. above); `repo` is the path made unreachable. */
-function guardSource(repo) {
-  return `// Test-only guard of the Task 37a smoke run: the repository is unreachable.
+/**
+ * The guard preloaded into the service (see 3. above). `repo` is made unreachable for fs calls;
+ * `app` (the copied folder) is the only place modules may be resolved from (builtins aside, R153).
+ * Paths are compared after path.resolve and, where they exist, realpath (review M3).
+ */
+function guardSource(repo, app) {
+  return `// Test-only guard of the Task 37a smoke run.
 import fs from "node:fs";
+import path from "node:path";
 import Module, { register } from "node:module";
 import { fileURLToPath } from "node:url";
 import { isMainThread } from "node:worker_threads";
 
 const REPO = ${JSON.stringify(repo)};
-const SEP = ${JSON.stringify(sep)};
-const inRepo = (p) => {
+const APP = ${JSON.stringify(app)};
+const SEP = path.sep;
+const realpath = fs.realpathSync.native;
+const canonical = (p) => {
   let s;
   try {
-    s = typeof p === "string" ? p : p instanceof URL ? fileURLToPath(p) : Buffer.isBuffer(p) ? p.toString() : undefined;
+    s = typeof p === "string" ? p : p instanceof URL ? fileURLToPath(p) : undefined;
   } catch {
-    return false;
+    return undefined;
   }
-  return !!s && (s === REPO || s.startsWith(REPO + SEP));
+  if (!s) return undefined;
+  s = path.resolve(s);
+  try {
+    s = realpath(s);
+  } catch {}
+  return s;
 };
+const under = (dir, p) => p !== undefined && (p === dir || p.startsWith(dir + SEP));
 const deny = (what, p) => {
   process.stderr.write("AO_GUARD_DENIED " + what + " " + String(p) + "\\n");
-  const e = new Error("the repository is unreachable in this smoke run");
+  const e = new Error("outside what this smoke run allows");
   e.code = "EACCES";
   return e;
 };
@@ -60,7 +80,7 @@ for (const name of Object.keys(fs)) {
   const f = fs[name];
   if (typeof f !== "function" || /^[A-Z]/.test(name) || name === "watch" || name === "unwatchFile") continue;
   fs[name] = Object.assign(function (...args) {
-    for (const a of args.slice(0, 2)) if (inRepo(a)) {
+    for (const a of args.slice(0, 2)) if ((typeof a === "string" || a instanceof URL) && under(REPO, canonical(a))) {
       const e = deny("fs." + name, a);
       if (name === "existsSync") return false;
       throw e;
@@ -72,7 +92,7 @@ for (const name of Object.keys(fs.promises)) {
   const f = fs.promises[name];
   if (typeof f !== "function") continue;
   fs.promises[name] = async function (...args) {
-    for (const a of args.slice(0, 2)) if (inRepo(a)) throw deny("fs.promises." + name, a);
+    for (const a of args.slice(0, 2)) if ((typeof a === "string" || a instanceof URL) && under(REPO, canonical(a))) throw deny("fs.promises." + name, a);
     return f.apply(this, args);
   };
 }
@@ -80,20 +100,46 @@ Module.syncBuiltinESMExports();
 const resolveFilename = Module._resolveFilename;
 Module._resolveFilename = function (...args) {
   const r = resolveFilename.apply(this, args);
-  if (inRepo(r)) throw deny("require", r);
+  if (path.isAbsolute(r) && !under(APP, canonical(r))) throw deny("require", r);
   return r;
 };
 register("data:text/javascript," + encodeURIComponent(\`
-const REPO = \${JSON.stringify(REPO)};
-const inRepo = (u) => u.startsWith("file://") && decodeURIComponent(new URL(u).pathname).startsWith(REPO + ${JSON.stringify(sep)});
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+const APP = \${JSON.stringify(APP)};
+const SEP = \${JSON.stringify(SEP)};
 export async function resolve(s, c, next) {
   const r = await next(s, c);
-  if (inRepo(r.url)) { process.stderr.write("AO_GUARD_DENIED import " + r.url + "\\\\n"); throw new Error("the repository is unreachable in this smoke run"); }
+  if (r.url.startsWith("file:")) {
+    let p = fileURLToPath(r.url);
+    try { p = realpathSync(p); } catch {}
+    if (!(p === APP || p.startsWith(APP + SEP))) { process.stderr.write("AO_GUARD_DENIED import " + r.url + "\\\\n"); throw new Error("outside what this smoke run allows"); }
+  }
   return r;
 }
 \`));
 if (isMainThread) process.stderr.write("AO_GUARD_ACTIVE\\n");
 `;
+}
+
+/**
+ * Generic names planted besides those the build reports (R153): modules that a dependency might
+ * try to load optionally.
+ */
+const GENERIC_PLANTS = ["supports-color", "debug", "fsevents", "bufferutil", "utf-8-validate", "encoding", "pino-pretty", "canvas", "sharp", "node-gyp-build", "keytar"];
+
+/**
+ * Plants, for every name, a module in `dir/<name>` that writes a marker into `markers` if loaded.
+ * `where` labels the planting site in the marker's name.
+ */
+function plant(dir, names, markers, where) {
+  for (const name of names) {
+    const d = join(dir, name);
+    mkdirSync(d, { recursive: true });
+    const marker = join(markers, `${where}__${name.replace(/[@/]/g, "_")}`);
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name, version: "9.9.9", main: "index.js" }));
+    writeFileSync(join(d, "index.js"), `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "loaded");\nmodule.exports = {};\n`);
+  }
 }
 
 const WORD = "quillwortsmoke"; // in the PDF's title, read by the extractor (pdfjs) and found by the search
@@ -106,12 +152,9 @@ function check(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
-/**
- * How the token reaches the service: today AO_SERVICE_TOKEN in its environment. When the service
- * reads it from standard input (Task 37b, R98), change this one helper.
- */
+/** How the token reaches the service: one line on standard input, never the environment (R98). */
 function passToken(env, token) {
-  return { env: { ...env, AO_SERVICE_TOKEN: token }, stdin: null };
+  return { env, stdin: `${token}\n` };
 }
 
 /** A one-page PDF whose Info title and author are set and whose page text contains `text`. */
@@ -204,7 +247,18 @@ async function main() {
     check(naming.length === 0, `files in the built folder name the repository's path: ${naming.slice(0, 10).join(", ")}`);
     step(`copied to ${app}`);
 
-    for (const d of ["home", "config", "tmp", "in"]) mkdirSync(join(tmp, d));
+    for (const d of ["home", "config", "tmp", "in", "markers"]) mkdirSync(join(tmp, d));
+    // R153: modules planted where Node would look after a miss in the folder: the home folder's
+    // global folders and a node_modules in the folder's parent. Every package name the build knows
+    // (copied, kept outside the bundle, stubbed, text-only) plus generic optional ones.
+    const info = JSON.parse(readFileSync(join(app, "build-info.json"), "utf8"));
+    const plantNames = [...new Set([...info.packages.map((p) => p.replace(/@[^@]+$/, "")), ...info.external, ...info.stubs, ...info.neverLoaded, ...GENERIC_PLANTS])];
+    const markers = join(tmp, "markers");
+    plant(join(tmp, "home", ".node_modules"), plantNames, markers, "home-node_modules");
+    plant(join(tmp, "home", ".node_libraries"), plantNames, markers, "home-node_libraries");
+    plant(join(tmp, "node_modules"), plantNames, markers, "parent-node_modules");
+    plant(join(tmp, "nodepath"), plantNames, markers, "NODE_PATH");
+    step(`planted ${plantNames.length} module names in the home folder, a parent folder and a NODE_PATH folder`);
     const pdfPath = join(tmp, "in", "smoke.pdf");
     writeFileSync(pdfPath, makePdf("A page of the smoke test PDF"));
 
@@ -227,9 +281,9 @@ async function main() {
     const { env, stdin } = passToken(baseEnv, token);
     const guard = join(tmp, "guard", "guard.mjs");
     mkdirSync(dirname(guard));
-    writeFileSync(guard, guardSource(REPO));
+    writeFileSync(guard, guardSource(REPO, app));
     const flags = ["--max-old-space-size=512"]; // the documented start (START.txt, ADR 0013)
-    step(`starting: node ${flags.join(" ")} service.mjs (with the guard: the repository unreachable)`);
+    step(`starting: node ${flags.join(" ")} service.mjs (token on standard input; with the guard)`);
     const started = Date.now();
     child = spawn(process.execPath, [...(argv.has("--no-guard") ? [] : ["--import", pathToFileURL(guard).href]), ...flags, "service.mjs"], { cwd: app, env, stdio: ["pipe", "pipe", "pipe"] });
     if (stdin !== null) child.stdin.write(stdin);
@@ -341,7 +395,7 @@ async function main() {
     check(found, `searching for a word of the PDF's title did not find it`);
     step(`search found the PDF ("${found.title}")`);
 
-    check(guardActive, "the guard did not start in the service");
+    check(guardActive || argv.has("--no-guard"), "the guard did not start in the service");
     if (process.platform === "linux") {
       const mapped = [...new Set(readFileSync(`/proc/${child.pid}/maps`, "utf8").split("\n").map((l) => l.split(/\s+/).slice(5).join(" ")).filter((f) => f.endsWith(".node")))];
       check(mapped.length > 0, "no native module is loaded (better-sqlite3 should be)");
@@ -363,8 +417,25 @@ async function main() {
     }
     check(left.length === 0, `processes left running from the built folder: ${left.join(", ")}`);
     step("stopped cleanly; no process left");
-    check(denied.length === 0, `the service reached into the repository:\n${denied.slice(0, 20).join("\n")}`);
-    step("nothing was looked up in the repository");
+    check(denied.length === 0, `the service reached outside its folder (into the repository, or for a module):\n${denied.slice(0, 20).join("\n")}`);
+    step("nothing was looked up in the repository; every module came from the folder");
+    const loaded = () => readdirSync(markers);
+    check(loaded().length === 0, `planted modules outside the folder were loaded: ${loaded().join(", ")}`);
+    step("no planted module (home folder, parent folder) was loaded");
+
+    // NODE_PATH (like NODE_OPTIONS and NAPI_RS_NATIVE_LIBRARY_PATH) set: the service refuses to
+    // start, before it loads anything (R153).
+    const withPath = spawn(process.execPath, [...flags, "service.mjs"], { cwd: app, env: { ...env, NODE_PATH: join(tmp, "nodepath") }, stdio: ["pipe", "pipe", "pipe"] });
+    if (stdin !== null) withPath.stdin.write(stdin);
+    let refusal = "";
+    withPath.stderr.on("data", (d) => (refusal += d));
+    withPath.stdout.on("data", (d) => (refusal += d));
+    const refused = await Promise.race([new Promise((r) => withPath.once("exit", (code) => r({ code }))), new Promise((r) => setTimeout(() => r({ timeout: true }), 30_000))]);
+    if (refused.timeout) withPath.kill("SIGKILL");
+    check(refused.code === 1 && /The library service will not start: NODE_PATH is set/.test(refusal), `with NODE_PATH set the service did not refuse to start (${refused.code ?? "timeout"}): ${refusal.slice(-1000)}`);
+    check(!/AO_SERVICE_READY/.test(refusal), "with NODE_PATH set the service started");
+    check(loaded().length === 0, `planted modules were loaded with NODE_PATH set: ${loaded().join(", ")}`);
+    step("with NODE_PATH set it refused to start, and loaded nothing planted");
     ok = true;
   } finally {
     if (child) child.kill("SIGKILL");
