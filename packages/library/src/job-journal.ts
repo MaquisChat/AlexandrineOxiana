@@ -39,6 +39,8 @@ export type WorkerJobType = "audio.transcribe" | "capture.download" | "image.pro
 export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 const STATUSES: ReadonlySet<string> = new Set(["queued", "running", "done", "failed", "cancelled"]);
 export const UNFINISHED: ReadonlySet<JobStatus> = new Set(["queued", "running"]);
+/** The error of a job cancelled because its project was locked before it started (R142): it runs again at the next unlock. */
+export const LOCKED_CODE = "PROJECT_LOCKED";
 
 /** What is needed to submit the job again. */
 export interface StoredJob {
@@ -59,7 +61,7 @@ export interface JobRecord {
   status: JobStatus;
   createdAt: string;
   updatedAt: string;
-  /** Present while the job is unfinished (queued, running): what resubmitting it needs. */
+  /** Present while the job is pending (queued, running, or cancelled by a lock: `isPending`): what resubmitting it needs. */
   job?: StoredJob;
   /** Failed or cancelled jobs: a fixed error code (never a message, which may quote paths). */
   error?: string;
@@ -200,14 +202,43 @@ export async function appendJobRecords(root: string, projectRel: string, key: Pr
   });
 }
 
-/** Lines beyond which a journal is compacted, when most of them are superseded. */
+/** Lines beyond which a journal is compacted. */
 const COMPACT_MIN_LINES = 64;
+/** R142: succeeded (done) jobs are dropped at compaction once older than this many days ... */
+export const SUCCEEDED_MAX_AGE_DAYS = 30;
+/** ... or beyond this many most recent ones per project. */
+export const MAX_SUCCEEDED_KEPT = 500;
+/** R142: failed and cancelled jobs stay until retried or superseded, but at most this many most recent per project. */
+export const MAX_FAILED_KEPT = 500;
+
+/** A record that will run again: unfinished, or cancelled because its project was locked before it started (R142). */
+export function isPending(r: JobRecord): boolean {
+  return UNFINISHED.has(r.status) || (r.status === "cancelled" && r.error === LOCKED_CODE && r.job !== undefined);
+}
+
+/** The ids compaction drops (R142): see the constants above. Pending records are never dropped. */
+function prunable(records: Map<string, JobRecord>, now: number): Set<string> {
+  const drop = new Set<string>();
+  const newestFirst = (a: JobRecord, b: JobRecord) => (a.updatedAt === b.updatedAt ? 0 : a.updatedAt < b.updatedAt ? 1 : -1);
+  const done = [...records.values()].filter((r) => r.status === "done").sort(newestFirst);
+  const oldest = new Date(now - SUCCEEDED_MAX_AGE_DAYS * 86_400_000).toISOString();
+  done.forEach((r, i) => {
+    if (i >= MAX_SUCCEEDED_KEPT || r.updatedAt < oldest) drop.add(r.id);
+  });
+  const failed = [...records.values()].filter((r) => (r.status === "failed" || r.status === "cancelled") && !isPending(r)).sort(newestFirst);
+  failed.slice(MAX_FAILED_KEPT).forEach((r) => drop.add(r.id));
+  return drop;
+}
 
 /**
- * Rewrites the journal (atomically: temp file, fsync, rename) with only the newest line per job
- * plus any unreadable lines, when at least half its lines are superseded and it has more than
- * `minLines` lines. Returns true when it was rewritten. Bound: after compaction one line per job
- * ever recorded; between compactions at most three more lines per job (queued, running, final).
+ * Rewrites the journal (atomically: temp file, fsync, rename) with the newest line per job, minus
+ * the finished jobs R142 lets go (succeeded ones older than SUCCEEDED_MAX_AGE_DAYS or beyond the
+ * MAX_SUCCEEDED_KEPT most recent; failed and cancelled ones beyond the MAX_FAILED_KEPT most
+ * recent), plus any unreadable lines (kept verbatim). Runs when the journal has more than
+ * `minLines` lines and either half of them are superseded or some record can be dropped. Returns
+ * true when it was rewritten. Bound: MAX_SUCCEEDED_KEPT + MAX_FAILED_KEPT lines plus the pending
+ * jobs after compaction; between compactions at most three more lines per job (queued, running,
+ * final). A job's result lives in its source's files: a dropped record loses only history.
  */
 export async function compactJobJournal(
   root: string,
@@ -215,18 +246,40 @@ export async function compactJobJournal(
   projectId: string,
   key: ProjectKey,
   minLines = COMPACT_MIN_LINES,
+  now = Date.now(),
 ): Promise<boolean> {
   const path = journalPath(root, projectRel);
   return serialize(path, async () => {
     const raw = await readMaybe(path);
     if (!raw) return false;
     const parsed = parseJobJournal(raw.toString("utf8"), projectId, key ? key.key : null);
-    const kept = parsed.latestLines.size + parsed.unreadable.length;
-    if (parsed.lines <= minLines || kept * 2 > parsed.lines) return false;
+    const drop = prunable(parsed.records, now);
+    const kept = parsed.latestLines.size - drop.size + parsed.unreadable.length;
+    if (parsed.lines <= minLines || (drop.size === 0 && kept * 2 > parsed.lines)) return false;
     await prepare(root, projectRel);
-    const text = [...parsed.unreadable, ...parsed.latestLines.values()].map((l) => `${l}\n`).join("");
-    await writeFileAtomic(path, text, { mode: FILE_MODE });
+    const lines = [...parsed.unreadable, ...[...parsed.latestLines].filter(([id]) => !drop.has(id)).map(([, l]) => l)];
+    await writeFileAtomic(path, lines.map((l) => `${l}\n`).join(""), { mode: FILE_MODE });
     return true;
+  });
+}
+
+/**
+ * Reads the journal and makes the project's rows match it, as one step with respect to this
+ * process's appends (no line appended meanwhile is missed, so no newer row is overwritten or
+ * removed by an older read). Returns what was read.
+ */
+export async function refreshJobRows(
+  db: () => IndexDb | undefined,
+  root: string,
+  projectRel: string,
+  projectId: string,
+  key: ProjectKey,
+): Promise<ParsedJournal> {
+  return serialize(journalPath(root, projectRel), async () => {
+    const journal = await readJobJournal(root, projectRel, projectId, key);
+    const live = db();
+    if (live?.open) syncJobRows(live, projectId, journal.records.values());
+    return journal;
   });
 }
 

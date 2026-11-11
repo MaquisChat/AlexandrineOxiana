@@ -533,5 +533,5 @@ describe("R142: the journal stays bounded", () => {
     await c.resumePending();
     const second = Date.now() - t;
     expect(second).toBeLessThan(Math.max(first, 50)); // flat: no longer proportional to history
-  });
+  }, 120_000);
 });

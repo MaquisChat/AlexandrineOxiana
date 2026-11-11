@@ -33,12 +33,12 @@ import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
 import type { IndexDb } from "./index/db.js";
 import {
-  UNFINISHED, appendJobRecords, assertNoSecrets, compactJobJournal, errorCode, readJobJournal, syncJobRows, upgradeLegacyJobs, upsertJobRow,
-  type JobRecord, type JobStatus, type StoredJob, type WorkerJobType,
+  LOCKED_CODE, UNFINISHED, appendJobRecords, assertNoSecrets, compactJobJournal, errorCode, isPending, refreshJobRows, upgradeLegacyJobs,
+  upsertJobRow, type JobRecord, type JobStatus, type ProjectKey, type StoredJob, type WorkerJobType,
 } from "./job-journal.js";
 import { ProjectLockedError } from "./repo/errors.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
-import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
+import { authorizeProcessing, onProjectUnlocked, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 
 export type { WorkerJobType } from "./job-journal.js";
 
@@ -130,6 +130,14 @@ const TERMINAL = new Set(["done", "failed", "cancelled"]);
 /** Failed polls retried (with backoff) before the worker is treated as gone. */
 const POLL_RETRIES = 3;
 
+/** Job ids being run by any client of this process: one run per job. */
+const claimed = new Set<string>();
+/** The newest client of each repository: the one that resubmits a project's jobs when it is unlocked (R142). */
+const latestClient = new WeakMap<Repo, WorkerClient>();
+onProjectUnlocked(async (repo, projectId) => {
+  latestClient.get(repo)?.resumeAfterUnlock(projectId);
+});
+
 export class WorkerClient {
   private readonly repo: Repo;
   private readonly worker: WorkerEndpoint;
@@ -138,12 +146,34 @@ export class WorkerClient {
   private readonly records = new Map<string, JobRecord>();
   private readonly pollMs: number;
   private readonly active = new Set<string>();
+  /** R142: the project key each running job captured at its start (a copy, zeroed when the job ends). */
+  private readonly keys = new Map<string, NonNullable<ProjectKey>>();
+  /** Background work this client started on its own (resubmission after an unlock). */
+  private readonly background = new Set<Promise<unknown>>();
 
   constructor(opts: WorkerClientOptions) {
     this.repo = opts.repo;
     this.worker = opts.worker;
     this.index = opts.index;
     this.pollMs = opts.pollMs ?? 500;
+    latestClient.set(this.repo, this);
+  }
+
+  /** Test seam: how many captured project keys running jobs hold (0 once every job has ended). */
+  get heldKeys(): number {
+    return this.keys.size;
+  }
+
+  /** Resolves once the work this client started on its own (resubmission at an unlock) has settled. */
+  async idle(): Promise<void> {
+    while (this.background.size) await Promise.allSettled([...this.background]);
+  }
+
+  /** R142: an unlocked project's pending jobs (including those cancelled by its lock) are offered again. */
+  resumeAfterUnlock(projectId: string): void {
+    const p = this.resumePending(projectId).catch(() => []);
+    this.background.add(p);
+    void p.finally(() => this.background.delete(p));
   }
 
   submit(projectId: string, job: WorkerJob): Promise<JobResult> {
@@ -157,9 +187,11 @@ export class WorkerClient {
    * are first written into them (`upgradeLegacyJobs`), each readable journal is compacted when
    * mostly superseded, and the index rows are made to match it. Journals of locked encrypted
    * projects cannot be read: their jobs stay pending (rows the index knows are reported with
-   * ProjectLockedError). A read-only library is not written to: nothing is resumed.
+   * ProjectLockedError). A read-only library is not written to: nothing is resumed. Jobs cancelled
+   * because their project was locked before they started are resubmitted too (R142); this runs
+   * by itself for one project when it is unlocked (`projectId`).
    */
-  async resumePending(): Promise<Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }>> {
+  async resumePending(projectId?: string): Promise<Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }>> {
     const library = repoLibrary(this.repo);
     if (library.mode !== "read-write") return [];
     await this.removeStaleTemp();
@@ -168,6 +200,7 @@ export class WorkerClient {
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
     const todo: JobRecord[] = [];
     for (const p of this.repo.listProjects()) {
+      if (projectId !== undefined && p.id !== projectId) continue;
       let key: { key: Uint8Array; keyId: string } | null;
       try {
         key = projectDataKey(this.repo, p.id);
@@ -179,24 +212,26 @@ export class WorkerClient {
       }
       try {
         await compactJobJournal(library.root, p.folder, p.id, key);
-        const journal = await readJobJournal(library.root, p.folder, p.id, key);
-        const live = this.db();
-        if (live) syncJobRows(live, p.id, journal.records.values());
-        for (const r of journal.records.values()) if (UNFINISHED.has(r.status) && !this.records.has(r.id)) todo.push(r);
+        const journal = await refreshJobRows(() => this.db(), library.root, p.folder, p.id, key);
+        for (const r of journal.records.values()) if (isPending(r)) todo.push(r);
       } catch (error) {
         out.push({ id: "", projectId: p.id, error });
       }
     }
     todo.sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt)));
     for (const rec of todo) {
+      // One run per job across this process's clients (a launch and an unlock may overlap).
+      if (claimed.has(rec.id)) continue;
       if (rec.kind === "capture.download" || !rec.job) {
         // Never resumed: a capture's caller (and the capture decision it made) is gone, and its
         // output folder has been swept; the researcher captures the link again. A record without
         // its job (from before the journal, unreadable) cannot run again either.
         const code = rec.kind === "capture.download" ? "INTERRUPTED" : "UNRECOVERABLE";
+        claimed.add(rec.id);
         this.records.set(rec.id, rec);
         await this.transition(rec.id, "failed", code).catch(() => {});
         this.records.delete(rec.id);
+        claimed.delete(rec.id);
         out.push({
           id: rec.id,
           projectId: rec.projectId,
@@ -216,6 +251,16 @@ export class WorkerClient {
   // ---- internals ----
 
   private async run(id: string, projectId: string, job: WorkerJob, resumed?: JobRecord): Promise<JobResult> {
+    if (claimed.has(id)) throw new WorkerJobError("ALREADY_RUNNING", "the job is already running");
+    claimed.add(id);
+    try {
+      return await this.runClaimed(id, projectId, job, resumed);
+    } finally {
+      claimed.delete(id);
+    }
+  }
+
+  private async runClaimed(id: string, projectId: string, job: WorkerJob, resumed?: JobRecord): Promise<JobResult> {
     const op = JOB_OPS[job.type];
     if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
     assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
@@ -228,7 +273,12 @@ export class WorkerClient {
         { op: `worker.${job.type}`, entity: job.entity },
       );
     }
-    const dataKey = projectDataKey(this.repo, projectId); // throws ProjectLockedError when locked
+    const live = projectDataKey(this.repo, projectId); // throws ProjectLockedError when locked
+    // R142: the job keeps its own copy of the key from here to its end (a lock zeroes the ring's),
+    // for its input, its sealed output and its journal lines; the copy is zeroed when it ends.
+    const dataKey = live ? { key: Uint8Array.from(live.key), keyId: live.keyId } : null;
+    if (dataKey) this.keys.set(id, dataKey);
+    const lockedNow = () => dataKey !== null && !this.repo.isUnlocked(projectId);
     const mustEncrypt = decision?.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
     if (mustEncrypt && !dataKey) throw new WorkerJobError("ENCRYPTION_REQUIRED", "the decision requires encryption but the project is not encrypted");
     const stored: StoredJob = {
@@ -245,6 +295,7 @@ export class WorkerClient {
       await this.transition(id, "queued");
     } catch (err) {
       this.records.delete(id);
+      this.dropKey(id);
       throw err;
     }
 
@@ -271,13 +322,25 @@ export class WorkerClient {
       const finalBase = isDir ? job.output : dirname(job.output);
 
       if (job.signal?.aborted) throw new WorkerJobError("CANCELLED", "the job was cancelled");
+      // R142: a job whose project is locked before it starts does not start; it runs again at the next unlock.
+      if (lockedNow()) await this.cancelForLock(id, projectId);
       const { id: workerId } = await this.request<{ id: string }>("POST", "/jobs", {
         type: job.type,
         input,
         output: workerOutput,
         params: job.params ?? {},
       });
-      await this.transition(id, "running");
+      if (lockedNow()) {
+        await this.request("POST", `/jobs/${encodeURIComponent(workerId)}/cancel`).catch(() => {});
+        await this.cancelForLock(id, projectId);
+      }
+      try {
+        await this.transition(id, "running");
+      } catch (err) {
+        // Not recorded as running: the worker must not go on with a job the library is not tracking.
+        await this.request("POST", `/jobs/${encodeURIComponent(workerId)}/cancel`).catch(() => {});
+        throw err;
+      }
       const state = await this.poll(workerId, job);
 
       if (state.status === "cancelled") throw new WorkerJobError("CANCELLED", "the job was cancelled");
@@ -290,7 +353,8 @@ export class WorkerClient {
       await this.transition(id, "done");
       return { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
     } catch (err) {
-      if (!(err instanceof WorkerUnavailableError)) {
+      const recorded = this.records.get(id)?.status;
+      if (!(err instanceof WorkerUnavailableError) && recorded !== undefined && UNFINISHED.has(recorded)) {
         const cancelled = err instanceof WorkerJobError && err.code === "CANCELLED";
         // A failure to record the outcome leaves the job pending (resubmitted later): the job's own error is the useful one.
         await this.transition(id, cancelled ? "cancelled" : "failed", errorCode(err instanceof WorkerJobError ? err.code : undefined)).catch(() => {});
@@ -298,6 +362,7 @@ export class WorkerClient {
       throw err;
     } finally {
       this.records.delete(id);
+      this.dropKey(id);
       this.active.delete(id);
       await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
       activeTemp.delete(`worker-${id}`);
@@ -367,6 +432,17 @@ export class WorkerClient {
     return json as T;
   }
 
+  /** Records the job as cancelled by its project's lock (it keeps its job, to run at the next unlock) and stops it. */
+  private async cancelForLock(id: string, projectId: string): Promise<never> {
+    await this.transition(id, "cancelled", LOCKED_CODE, true);
+    throw new ProjectLockedError(projectId);
+  }
+
+  private dropKey(id: string): void {
+    this.keys.get(id)?.key.fill(0);
+    this.keys.delete(id);
+  }
+
   private db(): IndexDb | undefined {
     const db = this.index?.db;
     return db?.open ? db : undefined;
@@ -391,7 +467,7 @@ export class WorkerClient {
    * Nothing is written in a read-only library. Throws (writing nothing more) when the journal
    * cannot be appended, e.g. the project was locked meanwhile.
    */
-  private async transition(id: string, status: JobStatus, error?: string): Promise<void> {
+  private async transition(id: string, status: JobStatus, error?: string, keepJob = false): Promise<void> {
     const prev = this.records.get(id);
     if (!prev) return;
     const library = repoLibrary(this.repo);
@@ -401,10 +477,11 @@ export class WorkerClient {
       ...base,
       status,
       updatedAt: new Date().toISOString(),
-      ...(UNFINISHED.has(status) && job ? { job } : {}),
+      ...((UNFINISHED.has(status) || keepJob) && job ? { job } : {}),
       ...(error && !UNFINISHED.has(status) ? { error } : {}),
     };
-    const key = projectDataKey(this.repo, prev.projectId); // ProjectLockedError while locked
+    // The job's captured key (R142), else the project's (ProjectLockedError while locked).
+    const key = this.keys.get(id) ?? projectDataKey(this.repo, prev.projectId);
     await appendJobRecords(library.root, this.repo.getProject(prev.projectId).folder, key, [rec]);
     this.records.set(id, rec);
     const db = this.db();

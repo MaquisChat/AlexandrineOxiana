@@ -8,7 +8,7 @@ import {
   getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource } from "./load.js";
-import { JOBS_FILE, readJobJournal, syncJobRows, upgradeLegacyJobs } from "../job-journal.js";
+import { JOBS_FILE, refreshJobRows, upgradeLegacyJobs } from "../job-journal.js";
 
 /**
  * (Re)loads an unlocked encrypted project's content into the in-memory TEMP schema: every source
@@ -62,8 +62,7 @@ export async function indexUnlockedProject(
   // here, and the rows are made to match the journal (rows hold no payload: persistent is fine, R30).
   try {
     out.errors.push(...(await upgradeLegacyJobs(db, root, keyRing)).errors);
-    const journal = await readJobJournal(root, entry.rel, projectId, k);
-    syncJobRows(db, projectId, journal.records.values());
+    await refreshJobRows(() => db, root, entry.rel, projectId, k);
   } catch (err) {
     out.errors.push({ folder: `${entry.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
   }
