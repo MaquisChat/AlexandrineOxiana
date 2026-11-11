@@ -404,6 +404,8 @@ Known, not yet scheduled above, or accepted as limits:
   - D7: right-to-left title headings are laid out left to right.
 - Found by Task 34c: the transcribe route waits for the whole run and sends no progress events, so "Re-transcribe" can only show an indeterminate bar (for Task 46).
 - A UI test, ReviewQueue "loads titles six at a time", takes about 40 s under heavy machine load and passes alone; find out why without loosening its limit (for Task 46 or Task 54).
+- Found by Task 37d: transcription contacts the model hub on every model load, even when the model is already on disk, and fails if a proxy refuses (a project that must stay offline should never need the network to transcribe; for Task 48).
+- Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Defects found by Task 44 are added here when it runs.
 
 ## 8. Status
@@ -441,7 +443,7 @@ Update after every task; commit and push.
 | 37a Service bundle | not started | | |
 | 37b Token on standard input | not started | | |
 | 37c Desktop shell | not started | | |
-| 37d Worker packaging | in progress | | implementer dispatched |
+| 37d Worker packaging | in review | 72cb7cc (worktree branch) | 540 MB bundle; smoke test passes on Linux; licence facts for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
@@ -462,7 +464,7 @@ Update after every task; commit and push.
 5. Confirm two things from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia, which leaves out Intel MacBook Airs from 2018–19 and most Macs older than 2018; and the Intel download is kept although it must use older versions of four libraries (older cameras' RAW files only, two months behind on OCR fixes, an older cryptography library) and depends on GitHub keeping its Intel machines.
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
-8. Choose the project's own licence before anything is published (Task 56).
+8. Choose the project's own licence before anything is published (Task 56). Facts that bear on it, found by Task 37d: the packaged worker contains a GPL-2.0-only program (gallery-dl) and GPL video-codec libraries inside two of its Python packages, besides LGPL and MPL parts. What may be shipped together, and under which licence, is a question for the owner and, ideally, a lawyer; the plan's default until then is to move gallery-dl out of the bundle into the first-use downloads, like the video downloader.
 9. Optional: on GitHub, make `main` the default branch (Settings, then Branches).
 
 ## 10. After Phase 1 (outline only)
