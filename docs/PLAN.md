@@ -29,7 +29,7 @@ Task 40 enters these in the ledger as rulings R120 onward.
 3. **Branches.** `main` exists (created at `0ad6506`) and is the approved state. Work happens on a working branch and reaches `main` only with the owner's approval.
 4. **Citation engine licence.** citeproc-js is used under **CPAL-1.0**. The project's own licence is not chosen yet; AGPL-3.0 is the likely later choice and must stay possible. No project `LICENSE` file is added until the owner decides. (Closes the open half of R87.)
 5. **Citation review.** The owner will review the five citation styles from a prepared page.
-6. **Backups.** Making a backup becomes a governed, audited action like every other. Whether a backup may also be kept outside the library folder is a separate question that is still open (Task 49, section 9).
+6. **Backups.** Making a backup becomes a governed, audited action like every other. Backups stay inside the library folder for Phase 1; whether one may also be kept elsewhere is decided when sync is designed (Phase 5).
 7. **Optional tools.** On first use the app asks which tools the researcher needs (speech model, video downloader, OCR) and downloads only those. This replaces the old Task 37 instruction to bundle ffmpeg, tesseract and ghostscript inside the app.
 8. **Review depth.** As in `docs/handoff/PROCESS.md`: up to three fix rounds per implementer, then a fresh one.
 
@@ -214,7 +214,7 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Depends: 41a. Parallel: Milestones J and K.
 - Files: `packages/core/src/governance/engine.ts`, `packages/library/src/export/backup.ts`, `apps/library-service/src/routes/projects.ts`, `docs/governance/README.md`, tests.
 - Accept: creating a backup, by hand or by the daily schedule, is evaluated by the policy engine first; a refusal gives the reason, is audited, and raises the existing `backup-failed` warning, because an automatic backup must never fail silently (R91, R92). Removing old backups is audited by file name; it stays a plain delete, as R91 accepted. Backups stay in `<Library>/Backups/` under the manifest. Restore is unchanged.
-- Not in this task: letting a researcher keep backups in a second folder. R90 d, R92 and R94 rely on every backup being under the manifest so that destroying raw data can find and remove the copies and say so on the certificate; a folder elsewhere would put copies beyond that. It needs the owner's decision and a ruling first (section 9).
+- Not in this task: letting a researcher keep backups in a second folder. R90 d, R92 and R94 rely on every backup being under the manifest so that destroying raw data can find and remove the copies and say so on the certificate; a folder elsewhere would put copies beyond that. The owner decided on 2026-11-11 to leave it out of Phase 1 and settle it when sync is designed, since sync faces the same question.
 - Verify: `pnpm --filter @ao/library exec vitest run src/export`; each profile × backup case in the engine tests; adversarial review.
 - Model: Opus.
 
@@ -428,7 +428,7 @@ Update after every task; commit and push.
 ## 9. What needs the owner
 
 1. Approve this plan, or amend it.
-2. Decide whether backups may also be kept in a second folder outside the library. For: a backup beside the data does not survive losing the drive. Against: when raw data is destroyed under a retention rule, the app can only find, remove and certify the copies it keeps under the library's own record. Until decided, backups stay inside the library and Task 49 only adds the policy check and the audit entries.
+2. Decided 2026-11-11: no second backup folder in Phase 1. Until sync is designed, a backup lives beside the data it protects, so it does not survive losing the drive; copying the library folder to another drive by hand is the safeguard meanwhile.
 3. Approve merges to `main` at milestone boundaries.
 4. Create the Apple Developer account; later, add its signing credentials as GitHub secrets (Task 37g gives the steps).
 5. Confirm the minimum macOS version when Task 37e reports.
@@ -443,7 +443,7 @@ Update after every task; commit and push.
 - **Phase 2, capture and media.** Web page snapshots and whole-site archive; optional official platform interfaces; scheduled profile monitoring; translation; speaker separation; multilingual transcript editor; cross-language search; research watches, the Research Inbox and desktop research agents.
 - **Phase 3, annotation and coding.** Highlights on PDF, EPUB, web, video and images; codebook, coding, memos, retrieval; REFI-QDA exchange. The `Anchor` and `Annotation` models already exist.
 - **Phase 4, writing integrations.** Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clips.
-- **Phase 5, hybrid and agents.** Sync server, web app and installable mobile app; always-on watches and agents; a server for external AI assistants; verification reports; the legitimate access chain. The governed-write logic lives in `packages/library` today and would need to move toward `packages/core` for a server to reuse it.
+- **Phase 5, hybrid and agents.** Sync server, web app and installable mobile app; always-on watches and agents; a server for external AI assistants; verification reports; the legitimate access chain. The governed-write logic lives in `packages/library` today and would need to move toward `packages/core` for a server to reuse it. Decide here whether backups may be kept outside the library folder, and how destruction under a retention rule then finds and certifies every copy (R90, R92, R94).
 - **Phase 6, later.** Custom themes, collaborators and roles, the analysis suite, native mobile, AI features.
 
 Each phase gets its own plan when it starts.
@@ -452,6 +452,7 @@ Each phase gets its own plan when it starts.
 
 - 2026-11-11: plan drafted at `0ad6506`. `main` created at `0ad6506`. Handoff branch requested from the earlier session; it is waiting for the owner's direct confirmation.
 - 2026-11-11: owner confirmed; `handoff/2026-11-11` pushed at `0832c77` (not yet merged into the working branch: that is Task 39). Plan checked against the ledger and amended (section 12). `docs/handoff/LEDGER-INDEX.md` added.
+- 2026-11-11: owner decided against a second backup folder in Phase 1; to be settled with sync (Phase 5). Plan still awaits approval.
 
 ## 12. What the ledger check changed
 
