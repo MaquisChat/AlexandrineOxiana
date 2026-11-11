@@ -48,15 +48,30 @@ def models_dir() -> Path:
 def model_path(name: str) -> str:
     """The model's folder in `models_dir()`. A model already on disk is used with no network contact
     at all; only an absent one is downloaded (from Hugging Face, into `models_dir()`)."""
-    from faster_whisper.utils import download_model
+    from faster_whisper.utils import _MODELS, download_model
 
-    cache = str(models_dir())
-    try:
-        path = download_model(name, cache_dir=cache, local_files_only=True)
-        if (Path(path) / "model.bin").is_file():
-            return path
-    except Exception:  # noqa: BLE001 - huggingface_hub's "not in the local cache" errors vary by version
-        pass
+    folder = models_dir()
+    cache = str(folder)
+    # Hugging Face cache layout: <models dir>/models--<owner>--<repo>/snapshots/<revision>/
+    repo = folder / ("models--" + _MODELS[name].replace("/", "--"))
+    absent = (not folder.exists() or folder.is_dir()) and not os.path.lexists(repo)
+    if not absent:
+        try:
+            path = download_model(name, cache_dir=cache, local_files_only=True)
+        except Exception as e:  # noqa: BLE001 - reported, never answered with a download
+            damaged = type(e).__name__ == "IncompleteSnapshotError"
+            log.warning("the %s speech model on disk is unusable (%s); not downloading", name, type(e).__name__)
+            raise JobError(
+                "MODEL_UNAVAILABLE",
+                f"the {name} model on disk is incomplete or damaged; remove it from the models folder to install it again"
+                if damaged else f"the {name} model on disk could not be read",
+                type(e).__name__,
+            ) from e
+        if not (Path(path) / "model.bin").is_file():
+            log.warning("the %s speech model on disk has no model.bin; not downloading", name)
+            raise JobError("MODEL_UNAVAILABLE",
+                           f"the {name} model on disk is incomplete or damaged; remove it from the models folder to install it again")
+        return path
     log.info("the %s speech model is not on disk; downloading it", name)
     try:
         path = download_model(name, cache_dir=cache)
