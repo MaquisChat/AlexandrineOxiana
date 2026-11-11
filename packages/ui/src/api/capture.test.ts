@@ -103,6 +103,30 @@ describe("capture: a profile run's own sentence (R146, review I2)", () => {
     expect(q.errorCode).toBe("LEGAL_BASIS_REQUIRED");
   });
 
+  it("a stopped run with no sentence from the library and a code the UI does not know gets a run-worded fallback (review N2)", () => {
+    for (const status of ["failed", "something-new"]) {
+      let q = profileQueue("q9", "https://www.instagram.com/someone/");
+      q = applyProgress(q, { queueId: "q9", projectId: P, finished: true, report: { ...REPORT, status, created: 2, errorCode: "BRAND_NEW" } });
+      expect(q.error, status).toMatch(/profile capture stopped/);
+      expect(q.error, status).toMatch(/saved are kept/);
+      expect(q.error, status).not.toMatch(/link|Nothing was saved/i);
+    }
+    let q = profileQueue("q9", "https://www.instagram.com/someone/");
+    q = applyProgress(q, { queueId: "q9", projectId: P, finished: true, report: { ...REPORT, status: "failed", created: 2, errorCode: "CAPTURE_FAILED" } });
+    expect(q.error).not.toMatch(/this link|Nothing was saved/i);
+  });
+
+  it("losing the stream ends what the screen can claim: unfinished links are not known (review N1)", () => {
+    let q = linkQueue("q1", ["https://a/1", "https://a/2", "https://a/3"]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 3, finished: false, outcome: { url: "https://a/1", status: "created" } });
+    q = markGap(q);
+    expect(q.items.map((i) => i.state)).toEqual(["created", "unknown", "unknown"]);
+    expect(addsUp(q)).toMatchObject({ done: 1, unknown: 2, pending: 0 });
+    // A late event still resolves a link it reports.
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 3, total: 3, finished: true, outcome: { url: "https://a/3", status: "created" } });
+    expect(q.items.map((i) => i.state)).toEqual(["created", "unknown", "created"]);
+  });
+
   it("a stopped profile run is not described in terms of links", () => {
     expect(queueErrorText("TypeError: x", "profile")).not.toMatch(/link/i);
   });

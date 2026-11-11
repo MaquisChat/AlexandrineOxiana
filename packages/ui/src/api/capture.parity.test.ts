@@ -44,6 +44,12 @@ const PLATFORM_FORMS = [
   "https://www.instagram.com/stories/someone/123/",
   "https://www.instagram.com/someone/",
   "https://www.instagram.com/some.one_2",
+  // Handle characters (review N4): a hyphen, a dot, an underscore.
+  "https://www.instagram.com/some-one/",
+  "https://www.instagram.com/some.one/",
+  "https://www.instagram.com/some_one/",
+  "https://www.tiktok.com/@some-one",
+  "https://www.tiktok.com/@some.one/video/7234567890",
   "https://www.instagram.com/explore/",
   "https://www.instagram.com/accounts/login/",
   // TikTok

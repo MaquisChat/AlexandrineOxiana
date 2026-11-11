@@ -172,6 +172,23 @@ describe("CaptureQueue", () => {
     expect(screen.getByText("لا يسمح بالتنزيل").getAttribute("dir")).toBe("auto");
   });
 
+  it("announces a queue when it ends, not on every link (review M5)", () => {
+    const running = three();
+    const { rerender } = render(<CaptureQueue queues={[running]} />);
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("Of 3 links: 1 done, 1 failed, 1 still to come.").getAttribute("role")).toBeNull();
+    const ended = applyProgress(running, { queueId: "q1", projectId: P, done: 3, total: 3, finished: true, outcome: { url: C, status: "created" } });
+    rerender(<CaptureQueue queues={[ended]} />);
+    expect(screen.getByRole("status").textContent).toBe("Finished. Of 3 links: 2 done, 1 failed.");
+  });
+
+  it("after the stream is lost, unfinished links are not known and nothing claims a capture is running (review N1)", () => {
+    const q = markGap(three());
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.queryByText(/Capturing now|Waiting/)).toBeNull();
+    expect(screen.getByText("Of 3 links: 1 done, 1 failed, 1 not known.")).toBeTruthy();
+  });
+
   it("nothing queued: nothing shown", () => {
     const { container } = render(<CaptureQueue queues={[]} />);
     expect(container.textContent).toBe("");

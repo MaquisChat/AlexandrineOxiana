@@ -128,6 +128,29 @@ describe("Capture screen — links", () => {
     expect(alert.textContent).not.toMatch(/\{|POLICY_DENIED/);
   });
 
+  it("a media helper that is not running is said in plain words, never with the helper's own start-up text (review M2/N3)", async () => {
+    const { user } = await setup({
+      captureAnswer: () => errorResponse(503, "WORKER_UNAVAILABLE", "The media helper is not running.", "The media helper is not set up yet. Run `pnpm setup:py` once, then try again."),
+    });
+    await paste(user, [YT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/capture tools are not available on this computer right now/);
+    expect(alert.textContent).toMatch(/Restart the app/);
+    expect(document.body.textContent).not.toMatch(/setup:py|pnpm|`/);
+    // Said once, not three times.
+    expect(alert.textContent!.match(/not running|not available/g)?.length ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it("a read-only library's internal reason word is not shown", async () => {
+    const { user } = await setup({ captureAnswer: () => errorResponse(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.", "locked-by-other-device") });
+    await paste(user, [YT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/read-only/);
+    expect(alert.textContent).not.toMatch(/locked-by-other-device/);
+  });
+
   it("says when the project's rules do not allow the downloader", async () => {
     await setup({ governance: { [P1]: "consent:\n  requireLegalBasis: false\n" } });
     expect(screen.getByText(/rules do not allow capture with the downloader/)).toBeTruthy();
@@ -168,6 +191,87 @@ describe("Capture screen — the browser-session acknowledgement", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect((box as HTMLInputElement).checked).toBe(false);
     expect(m.bodies(`POST /projects/${P1}/acknowledge`)).toHaveLength(0);
+  });
+
+  describe("focus (R145)", () => {
+    const CONFIRM = "I understand, use my browser session";
+
+    /** Open from the checkbox; focus is on the first control of the dialog, and Tab and Shift+Tab stay inside at both ends. */
+    async function openAndWalk(user: ReturnType<typeof userEvent.setup>) {
+      const box = screen.getByRole("checkbox", { name: "Use my browser session" });
+      await user.click(box);
+      const dialog = await screen.findByRole("dialog", { name: "Use your browser session?" });
+      const confirm = within(dialog).getByRole("button", { name: CONFIRM });
+      const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+      expect(document.activeElement).toBe(confirm); // on open
+      await user.tab();
+      expect(document.activeElement).toBe(cancel);
+      await user.tab(); // past the last: back to the first
+      expect(document.activeElement).toBe(confirm);
+      await user.tab({ shift: true }); // before the first: to the last
+      expect(document.activeElement).toBe(cancel);
+      await user.tab({ shift: true });
+      expect(document.activeElement).toBe(confirm);
+      return { box, dialog, confirm, cancel };
+    }
+
+    it("on open, through Tab and Shift+Tab, and after Escape", async () => {
+      const { user } = await setup();
+      const { box } = await openAndWalk(user);
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(box);
+    });
+
+    it("after Cancel", async () => {
+      const { user } = await setup();
+      const { box, cancel } = await openAndWalk(user);
+      await user.click(cancel);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(box);
+    });
+
+    it("after the confirming action", async () => {
+      const { user } = await setup();
+      const { box, confirm } = await openAndWalk(user);
+      await user.click(confirm);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(document.activeElement).toBe(box);
+    });
+
+    it("opened by the service's refusal: focus enters, stays inside, and returns to “Capture links”", async () => {
+      const { user } = await setup({ acknowledged: [P1], captureAnswer: () => errorResponse(409, "ACKNOWLEDGEMENT_REQUIRED", COOKIES_ACKNOWLEDGEMENT, "cookies") });
+      await paste(user, [YT]);
+      await user.click(screen.getByRole("checkbox", { name: "Use my browser session" }));
+      const start = screen.getByRole("button", { name: "Capture links" });
+      await user.click(start);
+      const dialog = await screen.findByRole("dialog", { name: "Use your browser session?" });
+      const confirm = within(dialog).getByRole("button", { name: CONFIRM });
+      const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+      expect(document.activeElement).toBe(confirm);
+      await user.tab({ shift: true });
+      expect(document.activeElement).toBe(cancel);
+      await user.tab();
+      expect(document.activeElement).toBe(confirm);
+      await user.click(confirm);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      await waitFor(() => expect(document.activeElement).toBe(start));
+    });
+
+    it("returns focus to the opener even when making the page inert moves focus away first, as browsers do (review M9)", async () => {
+      const { user } = await setup();
+      // A browser moves focus out of an element that becomes inert; jsdom does not. Emulate it.
+      const set = Element.prototype.setAttribute;
+      vi.spyOn(Element.prototype, "setAttribute").mockImplementation(function (this: Element, name: string, value: string) {
+        set.call(this, name, value);
+        if (name === "inert" && document.activeElement && this.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
+      });
+      const box = screen.getByRole("checkbox", { name: "Use my browser session" });
+      await user.click(box);
+      const dialog = await screen.findByRole("dialog");
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(document.activeElement).toBe(box);
+    });
   });
 
   it("another project asks again", async () => {
@@ -227,6 +331,30 @@ describe("Capture screen — progress", () => {
     expect(within(queue).getByText(/Progress was missed while the connection to the library service was down/)).toBeTruthy();
     expect(queue.textContent).not.toMatch(/not tried|3 of 3/);
     expect(screen.queryByText(/Progress updates are not available right now/)).toBeNull();
+  });
+
+  it("a run whose last event is missed does not say “Capturing now” for ever (review N1)", async () => {
+    const { m, user } = await setup();
+    await paste(user, [YT, IG, TT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await act(async () => m.emit("capture.progress", { queueId: "q1", projectId: P1, done: 1, total: 3, finished: false, outcome: { url: YT, status: "created" } }));
+    await waitFor(() => expect(within(queue).getByText("Saved")).toBeTruthy());
+    await act(async () => m.closeStreams());
+    await waitFor(() => expect(within(queue).getByText("Of 3 links: 1 done, 2 not known.")).toBeTruthy());
+    expect(within(queue).queryByText(/Capturing now|Waiting/)).toBeNull();
+    expect(queue.textContent).not.toMatch(/still to come/);
+    expect(within(queue).getAllByText("Not known")).toHaveLength(2);
+    expect(within(queue).getByText(/Progress was missed while the connection to the library service was down/)).toBeTruthy();
+  });
+
+  it("a legal-basis refusal of a queue this screen did not start does not open the field (review M7)", async () => {
+    const { m } = await setup({ governance: { [P1]: ANON_RULES } });
+    await act(async () => {
+      m.emit("capture.progress", { queueId: "from-the-extension", projectId: P1, done: 1, total: 1, finished: true, outcome: { url: YT, status: "failed", errorCode: "LEGAL_BASIS_REQUIRED" } });
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(screen.queryByRole("textbox", { name: "Legal basis" })).toBeNull();
   });
 
   it("keeps reconnecting over the screen's life when each reconnection works (review M4)", async () => {
