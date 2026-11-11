@@ -2,7 +2,7 @@ import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
 import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
-export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move";
+export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup";
 
 export interface PolicyRequest {
   action: PolicyAction;
@@ -18,6 +18,13 @@ export interface PolicyRequest {
   store?: { identifiable: boolean; hasLocation: boolean; legalBasis?: string };
   move?: { destination: ResidencyKind; cloudFolderId?: string };
   export?: { identifiable: boolean; hasLocation: boolean };
+  /**
+   * A full copy of the project written to `<Library>/Backups/`, i.e. where the library itself lives
+   * (R125). `destinations` lists every kind of storage that folder may be on: its path and its real
+   * path (symbolic links resolved), and, when a kind could not be determined (`uncertain`), every
+   * plausible kind. Each must be allowed.
+   */
+  backup?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }> };
   sync?: Record<string, never>;
 }
 
@@ -209,22 +216,70 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
   return withConditions(conditions, warnings);
 }
 
+/**
+ * Whether the project's data may be kept on this kind of storage (residency): "kind" when the kind
+ * is not in the effective `residency.allowed`; "folder" when it is a cloud folder that must be, and
+ * is not, on the approved list (HIPAA, or whenever that list is non-empty); else null.
+ */
+function residencyProblem(p: GovernanceConfig, destination: string, cloudFolderId: string | undefined): "kind" | "folder" | null {
+  if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination as ResidencyKind)) return "kind";
+  if (destination === "cloud_folder") {
+    const approved = p.residency.approvedCloudFolders;
+    const needsList = p.profiles.includes("hipaa") || approved.length > 0;
+    if (needsList && (cloudFolderId === undefined || !approved.includes(cloudFolderId))) return "folder";
+  }
+  return null;
+}
+
 function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const { destination, cloudFolderId } = need(req.move, "move");
   str(destination, "move.destination");
   if (cloudFolderId !== undefined) str(cloudFolderId, "move.cloudFolderId");
-  if (!(RESIDENCY_KINDS as readonly string[]).includes(destination) || !p.residency.allowed.includes(destination)) {
-    return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
-  }
-  if (destination === "cloud_folder") {
-    const approved = p.residency.approvedCloudFolders;
-    const hipaa = p.profiles.includes("hipaa");
-    const needsList = hipaa || approved.length > 0;
-    if (needsList && (cloudFolderId === undefined || !approved.includes(cloudFolderId))) {
-      return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
-    }
-  }
+  const problem = residencyProblem(p, destination, cloudFolderId);
+  if (problem === "kind") return deny(`Destination ${destination} is not permitted for project ${req.projectId}`, warnings);
+  if (problem === "folder") return deny(`Cloud folder ${cloudFolderId ?? "(unspecified)"} is not on this project's approved list`, warnings);
   return allow(warnings);
+}
+
+/** Plain words for a kind of storage, in refusal reasons. */
+const STORAGE_WORDS: Record<ResidencyKind, string> = {
+  device: "this computer's disk",
+  removable: "a removable drive",
+  network: "a network drive",
+  cloud_folder: "a cloud-synced folder",
+  own_server: "your own server",
+  cloud: "a cloud service",
+};
+const storageWords = (kind: string): string => (Object.hasOwn(STORAGE_WORDS, kind) ? STORAGE_WORDS[kind as ResidencyKind] : `storage of kind "${kind}"`);
+const onOrIn = (kind: string): string => `${kind === "cloud_folder" ? "in" : "on"} ${storageWords(kind)}`;
+
+/**
+ * A backup (R125): the same questions as storing the project's data where the library lives. Every
+ * kind of storage the Backups folder may be on must be allowed by the project's residency rules (as
+ * for a move); when the rules require encryption at rest, the backup must be sealed (an `encrypt`
+ * condition, which an unencrypted project cannot honour, so the caller refuses it).
+ */
+function backup(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const b = need(req.backup, "backup");
+  if (typeof b !== "object" || !Array.isArray(b.destinations) || b.destinations.length === 0) {
+    throw new Error("backup.destinations must be a non-empty list");
+  }
+  for (const d of b.destinations) {
+    if (typeof d !== "object" || d === null) throw new Error("backup.destinations entries must be mappings");
+    const destination = str(d.destination, "backup.destinations.destination");
+    if (d.cloudFolderId !== undefined) str(d.cloudFolderId, "backup.destinations.cloudFolderId");
+    const uncertain = d.uncertain === undefined ? false : bool(d.uncertain, "backup.destinations.uncertain");
+    const problem = residencyProblem(p, destination, d.cloudFolderId);
+    if (problem === null) continue;
+    if (uncertain) {
+      return deny(`Where the library's folder is stored could not be determined (it may be ${storageWords(destination)}); this project's rules do not allow its data there`, warnings);
+    }
+    if (problem === "folder") {
+      return deny(`Backups are kept in the library's folder, which is in cloud folder ${d.cloudFolderId ?? "(unknown)"}; it is not on this project's approved list`, warnings);
+    }
+    return deny(`Backups are kept in the library's folder, which is ${onOrIn(destination)}; this project's rules do not allow its data there`, warnings);
+  }
+  return withConditions(p.encryption.atRest === "required" ? [{ type: "encrypt" }] : [], warnings);
 }
 
 function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
@@ -248,6 +303,8 @@ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
       return exportData(policy, req, warnings);
     case "move":
       return move(policy, req, warnings);
+    case "backup":
+      return backup(policy, req, warnings);
     case "sync":
       return deny("Sync is not enabled in this version", warnings);
     case "delete":
