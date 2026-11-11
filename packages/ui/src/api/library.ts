@@ -112,6 +112,22 @@ export interface NewProjectResult {
   recoveryCode?: string;
 }
 
+/**
+ * The body of POST /projects/:id/recovery-code (routes/projects.ts, Task 61): the project's
+ * passphrase again (at most 1024 characters). UI token only; never logged.
+ */
+export interface NewRecoveryCodeRequest {
+  passphrase: string;
+}
+
+/**
+ * Its answer: the project's new recovery code, returned this once and never stored or logged. The old
+ * code stopped working; backups made before still open with the old code (ADR 0006).
+ */
+export interface NewRecoveryCodeResult {
+  recoveryCode: string;
+}
+
 export interface Collection {
   id: string;
   projectId: string;
@@ -273,6 +289,8 @@ export function libraryApi(client: ApiClient) {
       create: (body: NewProjectRequest) => r<NewProjectResult>("POST", "/projects", { body }),
       unlock: (id: string, secret: string) => r<{ unlocked: true }>("POST", `${proj(id)}/unlock`, { body: { secret } }),
       lock: (id: string) => r<{ unlocked: false }>("POST", `${proj(id)}/lock`),
+      /** Issues a new recovery code (the old one stops working); the code in the answer is a secret shown once. */
+      newRecoveryCode: (id: string, body: NewRecoveryCodeRequest) => r<NewRecoveryCodeResult>("POST", `${proj(id)}/recovery-code`, { body }),
       governance: (id: string) => r<{ yaml: string; sha256: string; violations: unknown[] }>("GET", `${proj(id)}/governance`),
     },
     collections: {
