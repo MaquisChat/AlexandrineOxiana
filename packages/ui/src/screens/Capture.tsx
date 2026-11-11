@@ -24,6 +24,7 @@ import {
   isWebAddress,
   KNOWN_OUTCOME_CODES,
   linkQueue,
+  markGap,
   MAX_LINKS,
   MODELS,
   outcomeText,
@@ -53,6 +54,27 @@ const RECONNECTS = 2;
 const RECONNECT_DELAY_MS = 300;
 /** Events kept for queues whose id is not known yet (their start's answer is still on its way). */
 const EARLY_EVENTS = 500;
+/** Lines previewed one by one. */
+const PREVIEW_LINES = 100;
+
+/** A link carrying a user name or password (it would be shown, queued and sent as it is). */
+function hasCredentials(u: string): boolean {
+  try {
+    const p = new URL(u.trim());
+    return p.username !== "" || p.password !== "";
+  } catch {
+    return false;
+  }
+}
+
+/** The profile field's hint: the preview's guess, never a verdict. */
+function profileHint(url: string): string {
+  const p = previewLink(url);
+  if (p.problem === "not-a-web-address") return p.label;
+  if (p.collection) return p.label;
+  if (p.kind !== "unknown" && p.platform !== "other") return `${p.label}: this looks like a single post, not a profile, channel or playlist — the app will check it.`;
+  return "Not recognised here as a profile, channel or playlist — the app will check it.";
+}
 
 type Transcribe = "project" | "yes" | "no";
 
@@ -325,24 +347,38 @@ export function Capture({ client, projectId }: CaptureProps) {
     );
   }, [api, projectId]);
 
-  const onProgress = useCallback((e: CaptureProgress) => {
+  /** A LEGAL_BASIS_REQUIRED refusal of a queue this screen started opens the legal-basis field (review M7). */
+  const noteRefusal = (e: CaptureProgress) => {
     if (e.outcome?.errorCode === "LEGAL_BASIS_REQUIRED" || e.report?.errorCode === "LEGAL_BASIS_REQUIRED") setLegalRefused(true);
+  };
+
+  const onProgress = useCallback((e: CaptureProgress) => {
     if (!known.current.has(e.queueId)) {
       early.current.push(e);
       if (early.current.length > EARLY_EVENTS) early.current.splice(0, early.current.length - EARLY_EVENTS);
       return;
     }
+    noteRefusal(e);
     setQueues((qs) => qs.map((q) => applyProgress(q, e)));
   }, []);
+
+  /** False while the event stream is down: events published then are missed (R146). */
+  const connected = useRef(false);
 
   // capture.progress events of this project, for as long as the screen is shown.
   useEffect(() => {
     const ctl = new AbortController();
     let stop = false;
     (async () => {
-      for (let tries = 0; !stop; tries++) {
+      let tries = 0;
+      while (!stop) {
         try {
-          for await (const ev of client.events({ signal: ctl.signal, onOpen: () => live.current && setLost(false) })) {
+          const onOpen = () => {
+            connected.current = true;
+            tries = 0; // a working connection starts the count again (review M4)
+            if (live.current) setLost(false);
+          };
+          for await (const ev of client.events({ signal: ctl.signal, onOpen })) {
             if (stop) return;
             const e = captureProgress(ev, projectId);
             if (e) onProgress(e);
@@ -351,15 +387,20 @@ export function Capture({ client, projectId }: CaptureProps) {
           // ended or failed: try again below
         }
         if (stop || ctl.signal.aborted) return;
+        // The stream ended: whatever is published until it is back is missed by every running queue.
+        connected.current = false;
+        if (live.current) setQueues((qs) => qs.map(markGap));
         if (tries >= RECONNECTS) {
           if (live.current) setLost(true);
           return;
         }
+        tries++;
         await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
       }
     })();
     return () => {
       stop = true;
+      connected.current = false;
       ctl.abort();
     };
   }, [client, projectId, onProgress, attempt]);
@@ -369,7 +410,10 @@ export function Capture({ client, projectId }: CaptureProps) {
     known.current.add(q.queueId);
     const mine = early.current.filter((e) => e.queueId === q.queueId);
     early.current = early.current.filter((e) => e.queueId !== q.queueId);
-    setQueues((qs) => [...qs, mine.reduce(applyProgress, q)]);
+    for (const e of mine) noteRefusal(e);
+    // Started while the stream was down: its first events may already be lost.
+    const start = connected.current ? q : markGap(q);
+    setQueues((qs) => [...qs, mine.reduce(applyProgress, start)]);
   };
 
   // ---- the legal basis (R41) ----
@@ -422,15 +466,21 @@ export function Capture({ client, projectId }: CaptureProps) {
   };
 
   const linkLines = parseLinks(text);
-  const previews = linkLines.map((u) => ({ url: u, p: previewLink(u) }));
+  const distinct = [...new Set(linkLines)];
+  // Only the first lines are previewed: thousands of rows on every keystroke help nobody (review M11).
+  const previews = linkLines.slice(0, PREVIEW_LINES).map((u, i) => ({ url: u, p: previewLink(u), repeat: linkLines.indexOf(u) < i }));
 
   const captureLinks = () =>
     start(async () => {
-      const urls = parseLinks(text);
-      if (!urls.length) return setLinkError("Paste at least one link, one per line.");
-      if (urls.length > MAX_LINKS) return setLinkError(`At most ${MAX_LINKS} links can be queued at once; this list has ${urls.length}.`);
-      const bad = urls.findIndex((u) => !isWebAddress(u));
+      const lines = parseLinks(text);
+      if (!lines.length) return setLinkError("Paste at least one link, one per line.");
+      const bad = lines.findIndex((u) => !isWebAddress(u));
       if (bad >= 0) return setLinkError(`Line ${bad + 1} is not a web address. Each line must be one link starting with https:// or http://.`);
+      const secret = lines.findIndex(hasCredentials);
+      if (secret >= 0) return setLinkError(`Line ${secret + 1} contains a user name or password. Remove it from the link (the part before @), then capture.`);
+      // A link listed twice is captured once (review M3).
+      const urls = [...new Set(lines)];
+      if (urls.length > MAX_LINKS) return setLinkError(`At most ${MAX_LINKS} links can be queued at once; this list has ${urls.length}.`);
       setLinkError(null);
       if (!checkLegal(false)) return;
       try {
@@ -443,7 +493,6 @@ export function Capture({ client, projectId }: CaptureProps) {
       }
     });
 
-  const profilePreview = profileUrl.trim() ? previewLink(profileUrl.trim()) : undefined;
   const maxNumber = maxItems.trim() === "" ? undefined : Number(maxItems);
 
   const captureProfile = () =>
@@ -451,7 +500,8 @@ export function Capture({ client, projectId }: CaptureProps) {
       const url = profileUrl.trim();
       if (!url) return setProfileError("Paste the link of a profile, channel or playlist.");
       if (!isWebAddress(url)) return setProfileError("This is not a web address. It must start with https:// or http://.");
-      if (!previewLink(url).collection) return setProfileError("This link is not a profile, channel or playlist. Capture single posts with “Capture links” above.");
+      if (hasCredentials(url)) return setProfileError("This link contains a user name or password. Remove it from the link (the part before @), then capture.");
+      // What kind of address it is, the service decides: the preview never refuses one (R146).
       if (since && until && since > until) return setProfileError("“Posts from” must be on or before “Posts until”.");
       if (maxNumber !== undefined && (!Number.isInteger(maxNumber) || maxNumber < 1)) return setProfileError("The maximum number of items must be a whole number of 1 or more.");
       setProfileError(null);
@@ -597,16 +647,22 @@ export function Capture({ client, projectId }: CaptureProps) {
         <FieldError id={ids.linksError} error={linkError} />
         {previews.length > 0 && (
           <>
-            <p>{previews.length === 1 ? "1 link" : `${previews.length} links`}</p>
+            <p className={distinct.length > MAX_LINKS ? "ao-capture__field-error" : undefined}>
+              {linkLines.length === distinct.length
+                ? `${linkLines.length === 1 ? "1 link" : `${linkLines.length} links`} (at most ${MAX_LINKS} at once)`
+                : `${linkLines.length} lines, ${distinct.length === 1 ? "1 different link" : `${distinct.length} different links`} (at most ${MAX_LINKS} at once)`}
+            </p>
+            <p className="ao-capture__hint">The preview is a hint: the library service decides what each link is when it captures it.</p>
             <ol className="ao-capture__preview" aria-label="Link preview">
-              {previews.map(({ url, p }, i) => (
+              {previews.map(({ url, p, repeat }, i) => (
                 <li key={i} className={p.problem ? "ao-capture__preview--problem" : undefined}>
                   <UserText className="ao-capture__url">{url}</UserText>
-                  <span>{p.label}</span>
-                  {p.collection && !p.problem && <span className="ao-capture__hint">The whole list is captured with default options; use “Capture profile” below to choose them.</span>}
+                  <span>{repeat ? "Listed twice: captured once." : p.label}</span>
+                  {p.collection && !p.problem && !repeat && <span className="ao-capture__hint">The whole list is captured with default options; use “Capture profile” below to choose them.</span>}
                 </li>
               ))}
             </ol>
+            {linkLines.length > previews.length && <p className="ao-capture__hint">{`The first ${PREVIEW_LINES} lines are previewed; all ${linkLines.length} are sent.`}</p>}
           </>
         )}
         <div className="ao-capture__actions">
@@ -728,7 +784,7 @@ export function Capture({ client, projectId }: CaptureProps) {
             setProfileError(null);
           }}
         />
-        <Hint id={ids.profileHint}>{profilePreview ? profilePreview.label : "For example https://www.instagram.com/name/ or a YouTube channel."}</Hint>
+        <Hint id={ids.profileHint}>{profileUrl.trim() ? profileHint(profileUrl.trim()) : "For example https://www.instagram.com/name/ or a YouTube channel."}</Hint>
         <div className="ao-capture__row">
           <label className="ao-capture__field" htmlFor={`${id}-since`}>
             <span>Posts from</span>
@@ -782,12 +838,17 @@ export function Capture({ client, projectId }: CaptureProps) {
       </form>
 
       {formError && (
-        <p className="ao-capture__error" role="alert">
-          {formError}
-        </p>
+        <div className="ao-capture__error" role="alert">
+          {/* It carries the service's message and a rule's own reason (review M6). */}
+          <UserText as="p">{formError}</UserText>
+        </div>
       )}
       {notice && <p role="status">{notice}</p>}
 
+      <p className="ao-capture__hint">
+        Captures started earlier, or from the browser extension, keep running in the library service but are not shown here: this screen shows only the captures it starts, and cannot re-read a
+        running capture yet. Look for their sources in the library.
+      </p>
       <CaptureQueue queues={queues} />
 
       <CaptureTools api={api} />
@@ -842,7 +903,7 @@ export function CaptureRoute({ client, loc }: { client: ApiClient; loc: AppLocat
         <select id={`${id}-project`} value={projectId} onChange={(e) => e.target.value && navigate(`${path}?project=${encodeURIComponent(e.target.value)}`)}>
           {!projectId && <option value="">Choose a project</option>}
           {list.map((p) => (
-            <option key={p.id} value={p.id}>
+            <option key={p.id} value={p.id} dir="auto">
               {p.name}
             </option>
           ))}
