@@ -15,10 +15,10 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join, relative } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { buildZoteroFixture } from "../packages/library/tests/fixtures/zotero/build-fixture.mjs";
-import { APP_ORIGIN, blockedBy, decryptStoredFile, expect, libraryWithProject, test, type Page } from "./fixtures.js";
+import { APP_ORIGIN, blockedBy, decryptStoredFile, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test, type AppHarness, type Defect, type Page } from "./fixtures.js";
 import { LIBRARY_DIR, REPO_ROOT } from "./paths.js";
 
 // ---------- shared ----------
@@ -96,28 +96,67 @@ const ZOTERO_TITLES = ["Feeding the City: Informal Markets in Lagos", "Markets a
 const REVIEWED = "Street Vendors in Accra";
 const REVIEWED_AS = "Street Vendors in Accra, 2018–2020";
 
-test("scenario 3: bulk import of a Zotero data folder — collections, review, report, undo, import again", async ({ page, app }) => {
+const D1: Defect = { id: "D1", title: "back from the review queue to the import's report and its Undo" };
+const D2: Defect = { id: "D2", title: "after a decision in the review queue, the library row no longer carries “Needs review” (R137)" };
+const D4: Defect = { id: "D4", title: "with “Copy into the library”, an approved Zotero linked file is copied in, and the report gives the files copied and the files left as links (R136)" };
+
+/** A library and project, the Zotero fixture data folder, and readers of what the service holds. */
+async function zoteroSetUp(app: AppHarness, page: Page) {
   const dataDir = join(app.root, "sources", "Zotero");
   const linkedDir = join(app.root, "sources", "linked");
-  let projectId = "";
-  let libraryPath = "";
-  let projectFolder = "";
-  const sourcesOnDisk = () => readdirSync(join(libraryPath, projectFolder, "Sources")).filter((n) => !n.startsWith("."));
-  const listed = async () => (await app.api<SourceList>("GET", `/projects/${projectId}/sources?limit=500`)).body;
-  const collections = async () => (await app.api<{ collections: Array<{ id: string; name: string; parentId?: string }> }>("GET", `/projects/${projectId}/collections`)).body.collections;
-  const batches = async () => (await app.api<{ batches: Batch[] }>("GET", `/projects/${projectId}/imports`)).body.batches;
-  /** The PDF of "Markets and Memory": in Zotero a linked file outside the data folder. */
-  const linkedPdfAsset = async () => {
-    const book = (await listed()).items.find((i) => i.title === "Markets and Memory")!;
-    const stored = (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${book.id}`)).body;
-    return stored.assets.find((a) => a.role === "original" && a.mime === "application/pdf");
+  // Five items in the user library (two in collections Urban > Food), one linked PDF outside the data folder.
+  const fx = buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "okafor zotero" }), linkedPdf: await buildPdf({ extra: "adebayo linked" }), linkedDir });
+  const { projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Urban food library", project: "Market studies" });
+  const listed = async (query = "") => (await app.api<SourceList>("GET", `/projects/${projectId}/sources?limit=500${query}`)).body;
+  return {
+    dataDir,
+    linkedDir,
+    linkedPdfPath: fx.linkedPdf,
+    projectId,
+    libraryPath,
+    projectFolder,
+    listed,
+    sourcesOnDisk: () => readdirSync(join(libraryPath, projectFolder, "Sources")).filter((n) => !n.startsWith(".")),
+    collections: async () => (await app.api<{ collections: Array<{ id: string; name: string; parentId?: string }> }>("GET", `/projects/${projectId}/collections`)).body.collections,
+    batches: async () => (await app.api<{ batches: Batch[] }>("GET", `/projects/${projectId}/imports`)).body.batches,
+    /** The PDF of "Markets and Memory": in Zotero a linked file outside the data folder. */
+    linkedPdfAsset: async () => {
+      const book = (await listed()).items.find((i) => i.title === "Markets and Memory")!;
+      const stored = (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${book.id}`)).body;
+      return stored.assets.find((a) => a.role === "original" && a.mime === "application/pdf");
+    },
   };
+}
+
+/** The wizard's Zotero import with its defaults ("Copy into the library"), the outside folder approved. */
+async function importZotero(page: Page, dataDir: string): Promise<void> {
+  await openWizard(page, "Zotero library", "Zotero data folder", dataDir);
+  await scanAndRun(page, () => page.getByRole("checkbox", { name: "Approve this folder and its subfolders" }).check());
+}
+
+/** From the report: the review queue, and a plain Accept of its one item. */
+async function acceptTheReviewItem(page: Page): Promise<void> {
+  await page.getByRole("link", { name: "Open the review queue (1 item)" }).click();
+  await expect(page.getByRole("list", { name: "Items waiting for review (1)" })).toBeVisible();
+  await page.getByRole("group", { name: "Decide this item" }).getByRole("button", { name: "Accept" }).click();
+  await expect(page.getByText("Nothing is waiting for review in this import.")).toBeVisible();
+}
+
+test("scenario 3: bulk import of a Zotero data folder — collections, review, report, undo, import again", async ({ page, app }) => {
+  // Three imports and two undos against the real service: three times the usual time on a slow machine.
+  test.slow();
+  let z!: Awaited<ReturnType<typeof zoteroSetUp>>;
+  let projectId = "";
+  const listed = (query = "") => z.listed(query);
+  const collections = () => z.collections();
+  const batches = () => z.batches();
+  const sourcesOnDisk = () => z.sourcesOnDisk();
 
   await test.step("set-up: the Zotero fixture data folder, a library and a project (through the service)", async () => {
-    // Five items in the user library (two in collections Urban > Food), one linked PDF outside the data folder.
-    buildZoteroFixture(dataDir, { pdf: await buildPdf({ extra: "okafor zotero" }), linkedPdf: await buildPdf({ extra: "adebayo linked" }), linkedDir });
-    ({ projectId, libraryPath, projectFolder } = await libraryWithProject(app, page, { library: "Urban food library", project: "Market studies" }));
+    z = await zoteroSetUp(app, page);
+    projectId = z.projectId;
   });
+  const { dataDir, linkedDir } = z;
 
   await test.step("the wizard scans the Zotero data folder and asks about the file outside it", async () => {
     await openWizard(page, "Zotero library", "Zotero data folder", dataDir);
@@ -144,22 +183,22 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect(list.items.map((i) => i.title).sort()).toEqual(ZOTERO_TITLES);
     // On disk: one folder per source in the project's Sources folder.
     expect(sourcesOnDisk()).toHaveLength(5);
-    // The approved linked PDF is part of its source (D4: kept as a link, see below).
-    expect(await linkedPdfAsset()).toBeDefined();
+    // The approved linked PDF is part of its source (how it is stored: D4).
+    expect(await z.linkedPdfAsset()).toBeDefined();
   });
 
-  await blockedBy("D4", "with “Copy into the library” chosen, the file Zotero links to is copied in (or the report says it stays linked)", async () => {
-    const pdf = (await linkedPdfAsset())!;
-    expect(pdf.linked, JSON.stringify(pdf)).toBeUndefined();
-    expect(existsSync(join(libraryPath, ...pdf.path.split("/")))).toBe(true);
-  });
+  await blockedBy(D4);
 
-  await test.step("collections are recreated: Urban, and Food inside it", async () => {
+  await test.step("collections are recreated: Urban, and Food inside it, each holding its items", async () => {
     const cs = await collections();
     const urban = cs.find((c) => c.name === "Urban");
+    const food = cs.find((c) => c.name === "Food");
     expect(urban, JSON.stringify(cs)).toBeDefined();
-    expect(cs.find((c) => c.name === "Food")).toMatchObject({ parentId: urban!.id });
+    expect(food).toMatchObject({ parentId: urban!.id });
     expect(cs).toHaveLength(2);
+    // Membership as in Zotero: "Markets and Memory" in Urban, "Feeding the City" in Food.
+    expect((await listed(`&collection=${urban!.id}`)).items.map((i) => i.title)).toContain("Markets and Memory");
+    expect((await listed(`&collection=${food!.id}`)).items.map((i) => i.title)).toEqual(["Feeding the City: Informal Markets in Lagos"]);
   });
 
   await test.step("review one item: edit its title and accept it", async () => {
@@ -180,11 +219,7 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect((await listed()).items.map((i) => i.title)).toContain(REVIEWED_AS);
   });
 
-  await blockedBy("D1", "back from the review queue to the import's report and its Undo", async () => {
-    await page.goBack();
-    await expect(page.getByRole("heading", { level: 2, name: "Report and undo" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Undo import" })).toBeVisible();
-  });
+  await blockedBy(D1);
 
   await test.step("the library shows the imported sources and the recreated collections", async () => {
     await page.goto(`${APP_ORIGIN}/?project=${projectId}`); // D1: the way back is to the library
@@ -202,11 +237,7 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     await expect(page.getByText("5 sources", { exact: true })).toBeVisible();
   });
 
-  await blockedBy("D2", "a source accepted in the review queue is no longer marked “Needs review” in the library", async () => {
-    const row = page.getByRole("table", { name: "Sources" }).getByRole("row").filter({ has: page.getByRole("button", { name: REVIEWED_AS }) });
-    await expect(row.getByText("Needs review")).toHaveCount(0);
-    expect((await listed()).items.find((i) => i.title === REVIEWED_AS)?.needsReview).toBe(false);
-  });
+  await blockedBy(D2);
 
   await test.step("undo the first import (through the service: D1 leaves no way to its Undo in the UI)", async () => {
     const [b] = await batches();
@@ -260,6 +291,51 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect(sourcesOnDisk()).toHaveLength(5);
     expect((await collections()).map((c) => c.name).sort()).toEqual(["Food", "Urban"]);
   });
+});
+
+// ---------- the steps scenario 3 cannot do yet, each on its own (expected to fail while the defect reproduces) ----------
+
+test(`${D1.id}: ${D1.title}`, async ({ page, app }) => {
+  const z = await zoteroSetUp(app, page);
+  await importZotero(page, z.dataDir);
+  await acceptTheReviewItem(page);
+  expectDefect(D1);
+  // Fixed means a way back from the queue: a link to the import's report, or the browser's Back.
+  const toReport = page.getByRole("link", { name: /report/i });
+  if (await toReport.count()) await toReport.first().click();
+  else await page.goBack();
+  await expect(page.getByRole("heading", { level: 2, name: "Report and undo" })).toBeVisible({ timeout: DEFECT_TIMEOUT });
+  await expect(page.getByRole("button", { name: "Undo import" })).toBeVisible({ timeout: DEFECT_TIMEOUT });
+});
+
+test(`${D2.id}: ${D2.title}`, async ({ page, app }) => {
+  const z = await zoteroSetUp(app, page);
+  await importZotero(page, z.dataDir);
+  await acceptTheReviewItem(page);
+  await page.goto(`${APP_ORIGIN}/?project=${z.projectId}`);
+  const row = page.getByRole("table", { name: "Sources" }).getByRole("row").filter({ has: page.getByRole("button", { name: REVIEWED, exact: true }) });
+  await expect(row).toHaveCount(1);
+  expectDefect(D2);
+  // R137: the badge means "an item waits in the review queue"; nothing is asserted about field-level verification.
+  await expect(row.getByText("Needs review")).toHaveCount(0, { timeout: DEFECT_TIMEOUT });
+});
+
+test(`${D4.id}: ${D4.title}`, async ({ page, app }) => {
+  const z = await zoteroSetUp(app, page);
+  // The wizard's defaults: "Copy into the library", and Zotero's linked files not kept where they are.
+  await importZotero(page, z.dataDir);
+  await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 4");
+  expectDefect(D4);
+  // R136: the report states how many files were copied and how many remain links.
+  const report = page.getByRole("region", { name: "Report and undo" });
+  await expect(report).toContainText(/\d[\d,]*\D{0,60}\bcopied\b|\bcopied\b\D{0,60}\d/i, { timeout: DEFECT_TIMEOUT });
+  await expect(report).toContainText(/\d[\d,]*\D{0,60}\blinks?\b|\blinks?\b\D{0,60}\d/i, { timeout: DEFECT_TIMEOUT });
+  // R136: the linked file's bytes are inside the library and the source has no linked file.
+  const pdf = (await z.linkedPdfAsset())!;
+  expect(pdf.linked, JSON.stringify(pdf)).toBeUndefined();
+  const stored = join(z.libraryPath, ...pdf.path.split("/"));
+  expect(resolve(stored).startsWith(resolve(z.libraryPath) + sep), `${pdf.path} is inside the library`).toBe(true);
+  expect(readFileSync(stored).equals(readFileSync(z.linkedPdfPath))).toBe(true);
 });
 
 // ---------- scenario 4 ----------
@@ -324,6 +400,31 @@ async function locationTags(et: ExifToolLike, path: string): Promise<Record<stri
 
 const decimals = (n: number) => (String(n).split(".")[1] ?? "").length;
 
+/** Every property name anywhere in a JSON value. */
+function keysOf(v: unknown): string[] {
+  if (Array.isArray(v)) return v.flatMap(keysOf);
+  if (v && typeof v === "object") return Object.entries(v).flatMap(([k, x]) => [k, ...keysOf(x)]);
+  return [];
+}
+
+const D3: Defect = { id: "D3", title: "the source screen displays the proxy (the picture, not only its file name)" };
+
+/** A Live Photo imported through the wizard into an encrypted project that coarsens locations; resolves once both proxies exist. */
+async function importLivePhoto(app: AppHarness, page: Page): Promise<{ projectId: string }> {
+  const phone = join(app.root, "sources", "PHONE");
+  await buildLivePhoto(phone);
+  const { projectId } = await libraryWithProject(app, page, { library: "Field library", project: "Harbour walk", governanceYaml: COARSEN_RULES, passphrase: PASSPHRASE });
+  await openWizard(page, "Camera or phone folder", "Camera or phone folder", phone);
+  await scanAndRun(page);
+  await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 1");
+  const list = (await app.api<SourceList>("GET", `/projects/${projectId}/sources`)).body;
+  const sid = list.items[0]!.id;
+  await expect
+    .poll(async () => (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${sid}`)).body.assets.filter((a) => a.role === "derived").length, { timeout: 60_000 })
+    .toBe(2);
+  return { projectId };
+}
+
 test("scenario 4: device import of a Live Photo — one source, its proxy, the location coarsened", async ({ page, app }) => {
   const phone = join(app.root, "sources", "PHONE");
   const plain = join(app.root, "plain");
@@ -386,14 +487,16 @@ test("scenario 4: device import of a Live Photo — one source, its proxy, the l
     await expect(files.getByRole("listitem").filter({ hasText: /proxy · .* · encrypted/ })).toHaveCount(2);
   });
 
-  await blockedBy("D3", "the source screen displays the proxy (the picture, not only its file name)", async () => {
-    const detail = page.getByRole("region", { name: "Source details" });
-    await expect(detail.getByRole("img")).toHaveCount(1);
-  });
+  await blockedBy(D3);
 
   await test.step("what the service stored carries no exact location: the record has none, and every stored file is encrypted", async () => {
     const record = JSON.stringify(stored);
     for (const exact of [String(LAT), String(LON), "40.7128", "74.006"]) expect(record).not.toContain(exact);
+    // The record holds no location field at all (so the check above is not vacuous by accident of
+    // naming): the coarsened location lives only in the proxies' own metadata, checked next.
+    // (A proxy's derivation.params.location names the mode, "coarsen", not a place: derivations are left out.)
+    const placeFree = { ...stored!, assets: stored!.assets.map(({ derivation: _mode, ...a }) => a) };
+    expect(keysOf(placeFree).filter((k) => /gps|locat|latitude|longitude|^lat$|^lon$|coordinates/iu.test(k))).toEqual([]);
     const folder = join(libraryPath, ...stored!.source.folder.split("/"));
     const files = filesUnder(folder);
     expect(files.length).toBeGreaterThanOrEqual(5); // source record, two originals, two proxies
@@ -428,4 +531,16 @@ test("scenario 4: device import of a Live Photo — one source, its proxy, the l
     }
     expect(readFileSync(join(libraryPath, ...stored!.assets.find((a) => a.role === "original" && a.kind === "image")!.path.split("/"))).subarray(0, 5).toString("latin1")).toBe("AOENC");
   });
+});
+
+// ---------- the step scenario 4 cannot do yet, on its own (expected to fail while the defect reproduces) ----------
+
+test(`${D3.id}: ${D3.title}`, async ({ page, app }) => {
+  await importLivePhoto(app, page);
+  await page.getByRole("link", { name: "Back to library" }).click();
+  await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: "2026-03-14 iPhone 15 Pro - IMG_0001" }).click();
+  const detail = page.getByRole("region", { name: "Source details" });
+  await expect(detail.getByRole("listitem").filter({ hasText: /proxy · .* · encrypted/ })).toHaveCount(2);
+  expectDefect(D3);
+  await expect(detail.getByRole("img")).toHaveCount(1, { timeout: DEFECT_TIMEOUT });
 });
