@@ -4,7 +4,9 @@
  * the open source's details. The service's `library.state` and `job.progress` events drive the
  * status banners (read-only, offline, index rebuilding, integrity and project warnings) and the
  * jobs indicator. While the library is read-only the drop zone and every edit button are off. A
- * locked encrypted project shows UnlockProject in place of its sources.
+ * locked encrypted project shows UnlockProject in place of its sources. "New project" opens the
+ * new-project dialog (Task 60); the project it creates is selected through the address, like any
+ * other selection.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
@@ -21,6 +23,7 @@ import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { PATHS } from "../navigation";
+import { NewProject } from "./NewProject";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 
@@ -91,6 +94,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [reload, setReload] = useState(0);
   /** The address named a project this library does not have (41b2 I1). */
   const [unknownProject, setUnknownProject] = useState(false);
+  /** The new-project dialog is open. */
+  const [creating, setCreating] = useState(false);
+  const newProjectButton = useRef<HTMLButtonElement>(null);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
 
@@ -419,6 +425,23 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <p aria-live="polite">Loading projects…</p>
         ) : (
           <ProjectNav projects={projects} profiles={profiles} selectedId={projectId} onSelect={selectProject} />
+        )}
+        <button type="button" ref={newProjectButton} className="ao-new-project" disabled={readOnly || projects === undefined} onClick={() => setCreating(true)}>
+          New project
+        </button>
+        {creating && (
+          <NewProject
+            api={api}
+            returnFocusTo={newProjectButton.current}
+            onCancel={() => setCreating(false)}
+            onCreated={(made) => {
+              setProjects((list) => [...(list ?? []).filter((p) => p.id !== made.id), made]);
+              setProfiles((all) => ({ ...all, [made.id]: knownProfiles(made.profiles) }));
+              setCreating(false);
+              // Selected like any other project: the address names it (41b2 I1).
+              selectProject(made.id);
+            }}
+          />
         )}
         {project && !locked && (
           <>
