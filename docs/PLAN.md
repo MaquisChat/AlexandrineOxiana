@@ -446,7 +446,7 @@ Update after every task; commit and push.
 | 46c A pairing code's status | in progress | | implementer dispatched; the identifier half moved into Task 34d (R149) |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | re-review of fix round 1 | b91e2c0 (worktree branch) | three Important findings and ten minors reported fixed (R146) |
+| 34b Capture screen | fix round 2 | b91e2c0 (worktree branch) | behaviour confirmed right; remaining: focus tests (R145) and one developer-facing message |
 | 34c Transcript viewer | fix round 2 | f9fb892 (worktree branch) | round 1 confirmed except one Important: the playback position is lost when a ticket is renewed |
 | 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
@@ -464,7 +464,7 @@ Update after every task; commit and push.
 | 37a Service bundle | in progress | | implementer dispatched (ahead of Task 46: little overlap, and it heads the longest remaining chain) |
 | 37b Token on standard input | in progress | | implementer dispatched |
 | 37c Desktop shell | not started | | |
-| 37d Worker packaging | re-review of fix round 1 | ca0e230 (worktree branch) | stronger smoke test, restated licence manifest, offline model load (R144) reported done |
+| 37d Worker packaging | fix round 2 | ca0e230 (worktree branch) | round 1 confirmed; one Important left: nothing fails when a bundled package is missing from the licence list |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
