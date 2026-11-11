@@ -67,6 +67,15 @@ function layOut(): HTMLElement {
   return list;
 }
 
+/**
+ * What a browser does when an element's source changes or it is emptied (the media element load
+ * algorithm): the position goes back to 0 and `timeupdate` fires, before any seek. jsdom does not.
+ */
+function browserReset(el: HTMLMediaElement) {
+  el.currentTime = 0;
+  fireEvent(el, new Event("timeupdate"));
+}
+
 /** Moves the player to `t` seconds as a browser would report it. */
 function playTo(el: HTMLMediaElement, t: number) {
   el.currentTime = t;
@@ -285,6 +294,90 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(screen.queryByText(/The recording could not be played/)).toBeNull();
   });
 
+  it("a recording damaged at the resume point: the browser's reset to 0 is ignored, every resume is at the kept position, and it ends in the plain message (review I1b, M13)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    const list = layOut();
+    fireEvent(el, new Event("play"));
+    playTo(el, 6);
+    await waitFor(() => expect(list.scrollTop).toBe(150));
+    const renewed = async (n: number) => {
+      await waitFor(() => expect(svc.log.tickets).toHaveLength(n));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[n - 1]!.path}`));
+    };
+    // The first failure at 6 s: a new ticket; the browser reports 0 as the new source loads.
+    fireEvent(el, new Event("error"));
+    await renewed(2);
+    browserReset(el);
+    // That 0 is not taken as the position: segment 1 is not marked and the list does not jump (M13).
+    expect(segmentItems()[0]!.getAttribute("aria-current")).toBeNull();
+    expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true");
+    expect(list.scrollTop).toBe(150);
+    // Damaged right at the resume point: it fails again before the resume seek.
+    fireEvent(el, new Event("error"));
+    await renewed(3);
+    browserReset(el);
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(6);
+    fireEvent(el, new Event("seeked"));
+    // Playback runs on a little, reaches the damage again: the third failure there ends it.
+    playTo(el, 6.4);
+    fireEvent(el, new Event("error"));
+    expect(screen.getByText(/The recording could not be played/)).toBeTruthy();
+    expect(svc.log.tickets).toHaveLength(3);
+    // The first segment was never marked as playing and the list never jumped to the top.
+    expect(segmentItems()[0]!.getAttribute("aria-current")).toBeNull();
+    expect(list.scrollTop).toBe(150);
+  });
+
+  it("a failure at the same place counts against the limit however much was played elsewhere in between (review I1b)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    for (let cycle = 0; cycle < 5 && !screen.queryByText(/The recording could not be played/); cycle++) {
+      playTo(el, 40);
+      const before = svc.log.tickets.length;
+      fireEvent(el, new Event("error"));
+      if (screen.queryByText(/The recording could not be played/)) break;
+      await waitFor(() => expect(svc.log.tickets.length).toBe(before + 1));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets.at(-1)!.path}`));
+      browserReset(el);
+      fireEvent(el, new Event("loadedmetadata"));
+      fireEvent(el, new Event("seeked"));
+      // A long stretch played well past the damage, then the researcher goes back to it.
+      playTo(el, 41);
+      playTo(el, 90);
+    }
+    expect(screen.getByText(/The recording could not be played/)).toBeTruthy();
+    expect(svc.log.tickets).toHaveLength(3);
+  });
+
+  it("Try the recording again resumes at the kept position, not at the 0 the browser reports after giving up (review I1b)", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    playTo(el, 40);
+    for (let i = 0; i < 3; i++) {
+      const before = svc.log.tickets.length;
+      fireEvent(el, new Event("error"));
+      if (i < 2) {
+        await waitFor(() => expect(svc.log.tickets.length).toBe(before + 1));
+        await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets.at(-1)!.path}`));
+        browserReset(el);
+      }
+    }
+    expect(await screen.findByText(/The recording could not be played/)).toBeTruthy();
+    // Giving up empties the element: the browser reports 0 again.
+    browserReset(el);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Try the recording again" }));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(4));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[3]!.path}`));
+    browserReset(el);
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(40);
+  });
+
   it("a recording that plays on after a renewal still gets renewals later", async () => {
     const { svc } = await open();
     await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
@@ -295,7 +388,10 @@ describe("TranscriptViewer — the player and its media ticket", () => {
       fireEvent(el, new Event("error"));
       await waitFor(() => expect(svc.log.tickets).toHaveLength(cycle + 2));
       await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[cycle + 1]!.path}`));
+      browserReset(el);
       fireEvent(el, new Event("loadedmetadata"));
+      expect(el.currentTime).toBe(at);
+      fireEvent(el, new Event("seeked"));
       // Real progress: the position moves well past where it failed.
       playTo(el, at + 30);
     }
@@ -432,6 +528,8 @@ describe("TranscriptViewer — player and segments in step", () => {
     playTo(media()!, 3);
     await waitFor(() => expect(segmentItems()[1]!.getAttribute("aria-current")).toBe("true"));
     expect(list.scrollTop).toBe(0);
+    // Not offered while the editor is open: it would scroll the list away from it (review M11).
+    expect(screen.queryByRole("button", { name: "Back to the playing segment" })).toBeNull();
   });
 
   it("activating a segment from the keyboard seeks the player", async () => {

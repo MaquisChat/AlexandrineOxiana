@@ -7,11 +7,14 @@
  * element then fails its next read, and the player asks for a new ticket and resumes where it was,
  * playing or paused. If that is refused (locked project, closed library) it says so in plain words.
  *
- * Renewal is not a loop (R143): a recording that fails again at the same place (a damaged or cut
- * file, for example) is renewed at most twice without real progress — the position moving
- * RENEWAL_PROGRESS_S beyond where it failed; loading alone does not count. Then the player stops,
- * says so, and offers "Try the recording again". Every ticket is revoked once it is replaced or
- * given up.
+ * Renewal is not a loop (R143): a recording is renewed at most twice without real progress — the
+ * position moving RENEWAL_PROGRESS_S beyond where it failed; loading alone does not count — and a
+ * place that fails a third time (within SAME_PLACE_S) ends it however much was played in between.
+ * Then the player stops, says so, and offers "Try the recording again". Every ticket is revoked
+ * once it is replaced or given up.
+ *
+ * The position is kept by the player, not read back from the element while a new `src` loads: a
+ * browser reports 0 then, and a resume seeks to the kept position before any report counts.
  *
  * The ticket address is a secret (R135 5): it goes to the element only — never shown as text,
  * logged, stored, or put in the page address. No `crossorigin` attribute: the service expects the
@@ -46,6 +49,13 @@ export interface MediaTicketPlayerProps {
 export const MAX_RENEWALS_WITHOUT_PROGRESS = 2;
 /** How far (seconds) playback must move beyond the failure for it to count as progress. */
 export const RENEWAL_PROGRESS_S = 3;
+/**
+ * Failures this close (seconds) count as the same place: a place that fails this many times
+ * (MAX_RENEWALS_WITHOUT_PROGRESS) ends in the plain message, however much was played elsewhere.
+ */
+export const SAME_PLACE_S = 2;
+/** A reported time this close to a resume target means the resume seek has landed. */
+const SEEK_TOLERANCE_S = 1;
 
 type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { kind: "failed"; message: string; retry: boolean };
 
@@ -81,13 +91,26 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     let live = true;
     /** The ticket address in use (a secret: kept here only, to revoke it). */
     let ticket: string | null = null;
-    /** Where to resume once a renewed ticket's recording has loaded. */
-    let resume: { at: number; play: boolean } | null = null;
+    /**
+     * The position the researcher is at, kept apart from what the element reports: when a new
+     * `src` is set (or the element is emptied) a browser resets its position to 0 and fires
+     * `timeupdate` before any seek. That 0 is never taken as the position (R143, review I1b).
+     */
+    let position = 0;
     let wantPlay = false;
-    let lastTime = 0;
+    /**
+     * A resume in progress after a new `src`: where to seek and whether to play. Until the seek has
+     * completed (`seeked`, or a reported time at the target), the element's reported time is ignored.
+     */
+    let pending: { at: number; play: boolean; seekIssued: boolean } | null = null;
+    /** Given up (or refused): the element's reports are ignored until Try again. */
+    let halted = false;
+    let stopped = { at: 0, play: false };
     /** Renewals since playback last made real progress, and where the last failure happened. */
     let renewals = 0;
     let failedAt = 0;
+    /** Every failure position since the player opened (or Try again): a damaged place is bounded. */
+    let failures: number[] = [];
 
     const revoke = (path: string) => {
       void api.revokeTicket(path).catch(() => {});
@@ -105,6 +128,14 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       }
     };
 
+    const halt = (phase: Phase) => {
+      stopped = pending ? { at: pending.at, play: pending.play } : { at: position, play: wantPlay };
+      pending = null;
+      halted = true;
+      release();
+      setPhase(phase);
+    };
+
     const attach = async (renewing: boolean) => {
       let path: string;
       try {
@@ -112,11 +143,10 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       } catch (err) {
         if (!live) return;
         if (isProjectLocked(err)) lockedRef.current?.();
-        release();
-        setPhase({ kind: "failed", message: refusal(err, renewing), retry: !isProjectLocked(err) });
+        halt({ kind: "failed", message: refusal(err, renewing), retry: !isProjectLocked(err) });
         return;
       }
-      if (!live) {
+      if (!live || halted) {
         revoke(path);
         return;
       }
@@ -125,8 +155,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         address = api.mediaUrl(path);
       } catch {
         revoke(path);
-        release();
-        setPhase({ kind: "failed", message: "The library service gave an address the player cannot use.", retry: true });
+        halt({ kind: "failed", message: "The library service gave an address the player cannot use.", retry: true });
         return;
       }
       const old = ticket;
@@ -137,35 +166,47 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     };
 
     const onError = () => {
-      if (!ticket || !live) return;
-      resume = { at: lastTime, play: wantPlay };
-      if (renewals >= MAX_RENEWALS_WITHOUT_PROGRESS) {
-        release();
-        setPhase({ kind: "failed", message: `The recording could not be played: it stopped at the same place again. Its file may be damaged or in a format this app cannot play. You can choose ${RETRY}.`, retry: true });
+      if (!ticket || !live || halted) return;
+      const at = pending ? pending.at : position;
+      const play = pending ? pending.play : wantPlay;
+      const samePlace = failures.filter((f) => Math.abs(f - at) <= SAME_PLACE_S).length;
+      failures.push(at);
+      if (renewals >= MAX_RENEWALS_WITHOUT_PROGRESS || samePlace >= MAX_RENEWALS_WITHOUT_PROGRESS) {
+        pending = { at, play, seekIssued: false };
+        halt({ kind: "failed", message: `The recording could not be played: it stopped at the same place again. Its file may be damaged or in a format this app cannot play. You can choose ${RETRY}.`, retry: true });
         return;
       }
       renewals++;
-      failedAt = lastTime;
+      failedAt = at;
+      position = at;
+      pending = { at, play, seekIssued: false };
       setPhase({ kind: "renewing" });
       void attach(true);
     };
-    const onTimeUpdate = () => {
-      lastTime = el.currentTime;
-      if (renewals > 0 && lastTime >= failedAt + RENEWAL_PROGRESS_S) renewals = 0;
-      timeRef.current?.(el.currentTime);
+    const onTimeUpdate = (e: Event) => {
+      if (halted) return;
+      if (pending) {
+        const done = pending.seekIssued && (e.type === "seeked" || Math.abs(el.currentTime - pending.at) < SEEK_TOLERANCE_S);
+        if (!done) return;
+        pending = null;
+      }
+      position = el.currentTime;
+      if (renewals > 0 && position >= failedAt + RENEWAL_PROGRESS_S) renewals = 0;
+      timeRef.current?.(position);
     };
     const onPlay = () => {
-      wantPlay = true;
+      if (!pending && !halted) wantPlay = true;
     };
     const onPause = () => {
-      wantPlay = false;
+      // A browser pauses an element whose source changes: that is not the researcher pausing.
+      if (!pending && !halted) wantPlay = false;
     };
     const onMetadata = () => {
-      if (!resume || !ticket) return;
-      const r = resume;
-      resume = null;
-      el.currentTime = r.at;
-      if (r.play) {
+      if (!pending || pending.seekIssued || !ticket || halted) return;
+      pending.seekIssued = true;
+      el.currentTime = pending.at;
+      if (pending.play) {
+        wantPlay = true;
         const p = el.play() as Promise<void> | undefined;
         if (p && typeof p.catch === "function") p.catch(() => {});
       }
@@ -181,18 +222,25 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
 
     retryRef.current = () => {
       if (!live) return;
+      halted = false;
       renewals = 0;
-      resume = { at: lastTime, play: resume?.play ?? false };
+      failures = [];
+      position = stopped.at;
+      pending = { at: stopped.at, play: stopped.play, seekIssued: false };
       setPhase({ kind: "loading" });
       void attach(false);
     };
 
     if (control) {
       control.current = {
-        seek: (s) => {
-          el.currentTime = s;
-          lastTime = s;
-          timeRef.current?.(s);
+        seek: (sec) => {
+          position = sec;
+          if (halted) stopped = { ...stopped, at: sec };
+          else if (pending) {
+            pending.at = sec;
+            if (pending.seekIssued) el.currentTime = sec;
+          } else el.currentTime = sec;
+          timeRef.current?.(sec);
         },
       };
     }

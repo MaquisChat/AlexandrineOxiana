@@ -626,7 +626,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
           <label>
             <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow playback
           </label>
-          {follow && !following && current >= 0 && (
+          {follow && !following && editing === null && current >= 0 && (
             <button type="button" onClick={backToPlaying}>
               Back to the playing segment
             </button>
