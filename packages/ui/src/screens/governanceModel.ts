@@ -208,13 +208,23 @@ export function hasException(cfg: Config, control: string, value: unknown): bool
   return cfg.exceptions.some((e) => e.control === control && JSON.stringify(e.value) === JSON.stringify(value));
 }
 
+/**
+ * Sets each path to its value in the YAML text with one parse (R119), keeping comments and layout
+ * elsewhere. The size limit is checked before parsing; the alias limit when the document is read.
+ */
+export function setManyIn(text: string, entries: Array<[string, unknown]>): string {
+  if (new TextEncoder().encode(text).length > GOVERNANCE_MAX_BYTES) throw new Error("governance.yaml is larger than 64 KB");
+  const doc = parseDocument(text, { uniqueKeys: true }) as Document;
+  if (doc.errors.length) throw new Error(doc.errors[0]!.message.split("\n")[0]);
+  doc.toJS({ maxAliasCount: MAX_ALIASES }); // throws on alias expansion beyond the limit
+  if (!isMap(doc.contents)) doc.contents = doc.createNode({}) as never;
+  for (const [path, value] of entries) doc.setIn(path.split("."), doc.createNode(value));
+  return String(doc);
+}
+
 /** Sets `path` to `value` in the YAML text, keeping comments and layout elsewhere. */
 export function setIn(text: string, path: string, value: unknown): string {
-  readConfig(text); // size and alias limits before editing
-  const doc = parseDocument(text, { uniqueKeys: true }) as Document;
-  if (!isMap(doc.contents)) doc.contents = doc.createNode({}) as never;
-  doc.setIn(path.split("."), doc.createNode(value));
-  return String(doc);
+  return setManyIn(text, [[path, value]]);
 }
 
 /** Appends an exception (spec 6.2: a recorded justification for loosening a profile requirement). */

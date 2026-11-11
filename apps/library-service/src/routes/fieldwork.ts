@@ -8,7 +8,7 @@
 import type { FastifyInstance } from "fastify";
 import { attachConsentDocument, proxyQueueFor, type ConsentInput, type ConsentPatch, type ParticipantInput, type ParticipantPatch, type SessionInput, type SessionPatch } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
-import { bodyOf, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
+import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
 
 /** A text value that may be `null` (to clear it); undefined when absent. */
 function nullableStr(o: Obj, key: string, max: number): string | null | undefined {
@@ -104,7 +104,9 @@ export function registerFieldwork(app: FastifyInstance, ctx: Ctx): void {
     const path = str(b, "path", 4096);
     if (!isAbsolute(path) || path.includes("\0")) throw badRequest('"path" must be an absolute path.');
     const legalBasis = optStr(b, "legalBasis", 2000);
-    return attachConsentDocument(s.repo, projectId, paramsOf(req).fid ?? "", path, { proxies: proxyQueueFor(s.repo), ...(legalBasis ? { legalBasis } : {}) });
+    // `reattach: true` links a form that was detached from this record before (explicit, audited; R119).
+    const reattach = optBool(b, "reattach") === true;
+    return attachConsentDocument(s.repo, projectId, paramsOf(req).fid ?? "", path, { proxies: proxyQueueFor(s.repo), ...(legalBasis ? { legalBasis } : {}), ...(reattach ? { reattach } : {}) });
   });
 
   app.delete("/projects/:id/participants/:fid", async (req) => {

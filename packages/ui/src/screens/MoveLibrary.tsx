@@ -11,7 +11,7 @@
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../api/client";
-import { isStreamCutOff, type GovernanceApi, type MovePlan, type MoveProgress } from "../api/governance";
+import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type MoveProgress } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
@@ -25,7 +25,7 @@ const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
 const isMoveInProgress = (err: unknown) =>
   err instanceof ApiClientError && (err.code === "MOVE_IN_PROGRESS" || (err.status === 409 && /already running/i.test(err.message)));
 
-const sameRoot = (a: string, b: string) => a.replace(/[\\/]+$/, "") === b.replace(/[\\/]+$/, "");
+const sameRoot = (a: string, b: string) => normaliseRoot(a) === normaliseRoot(b);
 
 export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: GovernanceApi; pollMs?: number; maxPolls?: number }) {
   const ids = useId();
@@ -102,8 +102,10 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
     const target = dest.trim();
     const ac = new AbortController();
     stream.current = ac;
+    let started = false;
     try {
       for await (const line of api.move(target, exclude, ac.signal)) {
+        started = true;
         if ("progress" in line) setProgress(line.progress);
         else if ("error" in line) {
           setError(`${line.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
@@ -122,11 +124,11 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
     } catch (err) {
       if (!alive.current) return;
       if (isMoveInProgress(err)) return inProgress();
-      if (isStreamCutOff(err)) {
+      if (isStreamCutOff(err, started)) {
         await pickUp(target, "The move finished and was verified (the connection to it was interrupted).");
         return;
       }
-      setError(err instanceof Error ? err.message : "The move could not be started.");
+      setError(`The move could not be started: ${err instanceof Error ? err.message : "the library service did not answer"} Nothing was copied or changed.`);
       setStage(plan ? "plan" : "pick");
     }
   };

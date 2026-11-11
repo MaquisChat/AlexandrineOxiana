@@ -1032,6 +1032,12 @@ export interface AuditCheck {
 }
 
 /** Package-internal (consent forms, R117 I3): records the signed form's asset on the consent. */
-export function setConsentDocumentAsset(repo: Repo, projectId: string, consentId: string, assetId: string): Promise<ConsentRecord> {
-  return setConsentDocument(cores.get(repo)!, projectId, consentId, assetId);
+export function setConsentDocumentAsset(repo: Repo, projectId: string, consentId: string, assetId: string, opts: { reattach?: boolean } = {}): Promise<ConsentRecord> {
+  return setConsentDocument(cores.get(repo)!, projectId, consentId, assetId, opts);
+}
+
+/** Package-internal: records an integrity warning once (same project, kind and detail). */
+export function noteIntegrityWarning(repo: Repo, w: IntegrityWarning): void {
+  const list = cores.get(repo)!.integrityWarnings;
+  if (!list.some((x) => x.projectId === w.projectId && x.kind === w.kind && x.detail === w.detail)) list.push(w);
 }

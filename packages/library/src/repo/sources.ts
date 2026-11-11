@@ -614,6 +614,12 @@ export async function updateSource(
         const ws = patch.tagIds?.length ? await workspaceTags(core) : [];
         for (const t of patch.tagIds ?? []) if (!data.tags.some((x) => x.id === t) && !ws.some((x) => x.id === t)) throw new NotFoundError("Tag", t);
       }
+      // Fieldwork links set by the patch must exist (R119).
+      const linksChange = "participantIds" in patch || "sessionId" in patch;
+      if (linksChange) {
+        for (const p of patch.participantIds ?? []) if (!tx.state.data.participants.some((x) => x.id === p)) throw new NotFoundError("Participant", p);
+        if (patch.sessionId !== undefined && !tx.state.data.sessions.some((x) => x.id === patch.sessionId)) throw new NotFoundError("Session", patch.sessionId);
+      }
       const source = Source.parse({
         ...cur.source,
         ...patch,
@@ -626,6 +632,8 @@ export async function updateSource(
       if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
+      // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
+      if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
       tx.index((sink) => sink.indexSource(sf));
       return sf;
     },

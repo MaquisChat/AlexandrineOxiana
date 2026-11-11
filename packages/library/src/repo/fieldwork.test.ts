@@ -16,7 +16,8 @@ import { attachConsentDocument, reconcileConsentDocuments } from "../consent-doc
 import { buildCameraTiff, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { mkdir, truncate } from "node:fs/promises";
 import { openRepo } from "./repo.js";
-import { addProtocolDocuments, listProtocolDocuments } from "../protocol-docs.js";
+import { addProtocolDocuments, listProtocolDocuments, protocolSeams } from "../protocol-docs.js";
+import { seams } from "./seams.js";
 import { FieldworkInUseError, InvalidInputError, NotFoundError, type Repo } from "./index.js";
 import { projectReviewEntries } from "./repo.js";
 import { openTestRepo } from "./testing.js";
@@ -481,5 +482,91 @@ describe("a consent form stays linked to its consent (R117 I5)", () => {
     });
     const again = await openRepo(lib, ring, { clock: () => new Date(NOW), tz: "UTC", actor: "tester" });
     expect((await again.getFieldwork(pid)).consents[0]!.documentAssetId).toBe(orphan.assets[0]!.id);
+  });
+});
+
+describe("a detached form stays detached (R119 I-a, I-b)", () => {
+  it("attach, detach with a reason, reconcile: nothing is re-linked", async () => {
+    const p = await repo.createParticipant(pid, {});
+    const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
+    const r = await attachConsentDocument(repo, pid, c.id, pdf);
+    const d = await repo.updateConsent(pid, c.id, { documentAssetId: null, detachReason: "the wrong participant's form" });
+    expect(d.detachedAssetIds).toEqual([r.assetId]);
+    expect(await reconcileConsentDocuments(repo, pid)).toBe(0);
+    expect((await repo.getFieldwork(pid)).consents[0]!.documentAssetId).toBeUndefined();
+    // Reopening runs the reconciler too.
+    const again = await openRepo(lib, ring, { clock: () => new Date(NOW), tz: "UTC", actor: "tester" });
+    expect((await again.getFieldwork(pid)).consents[0]!.documentAssetId).toBeUndefined();
+  });
+
+  it("attaching the detached file again needs an explicit re-attach, which is audited", async () => {
+    const p = await repo.createParticipant(pid, {});
+    const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
+    const r = await attachConsentDocument(repo, pid, c.id, pdf);
+    await repo.updateConsent(pid, c.id, { documentAssetId: null, detachReason: "scanned upside down" });
+    await expect(attachConsentDocument(repo, pid, c.id, pdf)).rejects.toThrow(/detached.*re-attach/i);
+    const back = await attachConsentDocument(repo, pid, c.id, pdf, { reattach: true });
+    expect(back.assetId).toBe(r.assetId);
+    expect(back.consent.documentAssetId).toBe(r.assetId);
+    expect(back.consent.detachedAssetIds ?? []).toEqual([]);
+    expect((await auditEvents(folder())).some((e) => e.details?.op === "consent.document-reattach")).toBe(true);
+  });
+
+  it("attaching a different form while one is attached is refused", async () => {
+    const p = await repo.createParticipant(pid, {});
+    const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
+    await attachConsentDocument(repo, pid, c.id, pdf);
+    const other = join(tmp, "other.png");
+    await writeFile(other, tinyPng());
+    await expect(attachConsentDocument(repo, pid, c.id, other)).rejects.toThrow(/Detach the current form first, and give a reason/);
+    expect(repo.listSourceIds(pid)).toHaveLength(1);
+  });
+});
+
+describe("updateSource and fieldwork links (R119)", () => {
+  it("checks the participants and session exist, and flags links to a withdrawn participant", async () => {
+    const p = await repo.createParticipant(pid, {});
+    const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
+    await repo.withdrawConsent(pid, c.id);
+    const src = await repo.createSource(pid, draft(), [{ path: pdf, role: "original", handling: "copy" }], { provenance: provenance() });
+    await expect(repo.updateSource(pid, src.source.id, { participantIds: ["0190f0f0-0000-7000-8000-000000000000"] })).rejects.toBeInstanceOf(NotFoundError);
+    await expect(repo.updateSource(pid, src.source.id, { sessionId: "0190f0f0-0000-7000-8000-000000000000" })).rejects.toBeInstanceOf(NotFoundError);
+    await repo.updateSource(pid, src.source.id, { participantIds: [p.id] });
+    expect(await pendingReviewFor(pid, src.source.id)).toHaveLength(1);
+  });
+});
+
+describe("protocol documents: limits and failures (R119)", () => {
+  afterEach(() => {
+    protocolSeams.copyMaxBytes = undefined;
+    seams.failAuditAppendFor = undefined;
+  });
+
+  it("enforces the byte cap on what was actually copied (a file that grew after the check); nothing is kept", async () => {
+    protocolSeams.copyMaxBytes = 8; // as if the file had grown past the cap after it was checked
+    const r = await addProtocolDocuments(repo, pid, [pdf]);
+    expect(r).toEqual([{ file: "input.pdf", outcome: "failed", reason: expect.stringMatching(/larger than 100 MB/) }]);
+    expect(await listProtocolDocuments(repo, pid)).toEqual([]);
+  });
+
+  it("a damaged names list gives a plain error and an integrity warning, and is never overwritten", async () => {
+    const enc = (await repo.createProject({ name: "Sealed", governanceYaml: "", encryption: { enabled: true, passphrase: PASS } })).project;
+    await addProtocolDocuments(repo, enc.id, [pdf]);
+    const manifest = join(lib.root, enc.folder, "protocol", "manifest.json.enc");
+    await writeFile(manifest, "garbage");
+    await expect(listProtocolDocuments(repo, enc.id)).rejects.toThrow(/names of the protocol documents cannot be read/);
+    expect(repo.integrityWarnings.some((w) => w.projectId === enc.id && w.kind === "protocol-manifest-unreadable")).toBe(true);
+    const r = await addProtocolDocuments(repo, enc.id, [pdf]);
+    expect(r[0]).toMatchObject({ outcome: "failed", reason: expect.stringMatching(/names of the protocol documents cannot be read/) });
+    expect(await readFile(manifest, "utf8")).toBe("garbage");
+  });
+
+  it("an error while copying one file still gives a result for every file", async () => {
+    const txt = join(tmp, "approval.txt");
+    await writeFile(txt, "Approved.\n");
+    seams.failAuditAppendFor = pid;
+    const r = await addProtocolDocuments(repo, pid, [pdf, join(tmp, "missing.pdf"), txt]);
+    expect(r.map((x) => [x.file, x.outcome])).toEqual([["input.pdf", "failed"], ["missing.pdf", "failed"], ["approval.txt", "failed"]]);
+    expect(r[0]!.reason).toMatch(/could not be copied/);
   });
 });

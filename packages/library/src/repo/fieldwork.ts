@@ -327,7 +327,10 @@ export async function updateConsent(core: RepoCore, projectId: string, id: strin
         if (patch.expires === null || patch.expires === "") delete c.expires;
         else c.expires = patch.expires;
       }
-      if (detaching) delete c.documentAssetId;
+      if (detaching && c.documentAssetId) {
+        c.detachedAssetIds = [...new Set([...(c.detachedAssetIds ?? []), c.documentAssetId])];
+        delete c.documentAssetId;
+      }
       const parsed = ConsentRecord.safeParse(c);
       if (!parsed.success) throw new InvalidInputError("The consent record is not valid (check the dates)");
       await writeProjectData(core, tx, data);
@@ -342,12 +345,19 @@ export async function updateConsent(core: RepoCore, projectId: string, id: strin
   );
 }
 
+/** The consent already holds a different form (R119 I-b). */
+export const DETACH_FIRST = "This consent record already has a signed form. Detach the current form first, and give a reason";
+/** The form was deliberately detached (R119 I-a). */
+export const DETACHED_FORM = "This form was detached from the consent record; re-attach it explicitly if it belongs there";
+
 /**
- * Package-internal (attachConsentDocument): records the signed form's asset on the consent. The
- * asset must belong to a source of this project that was made for this consent (I5).
+ * Package-internal (attachConsentDocument, the reconciler): records the signed form's asset on the
+ * consent. Refused when another form is attached (detach it first), or when this asset was detached
+ * and `reattach` is not set; a re-attach is audited as `consent.document-reattach` (R119).
  */
-export async function setConsentDocument(core: RepoCore, projectId: string, id: string, assetId: string): Promise<ConsentRecord> {
+export async function setConsentDocument(core: RepoCore, projectId: string, id: string, assetId: string, opts: { reattach?: boolean } = {}): Promise<ConsentRecord> {
   core.assertWritable();
+  let reattached = false;
   return runMutation(
     core,
     projectId,
@@ -358,14 +368,22 @@ export async function setConsentDocument(core: RepoCore, projectId: string, id: 
       if (!c) throw new NotFoundError("Consent record", id);
       if (c.withdrawn) throw new InvalidInputError("This consent was withdrawn; the record is kept as it was and cannot be changed");
       if (c.documentAssetId === assetId) return c;
+      if (c.documentAssetId) throw new InvalidInputError(DETACH_FIRST);
+      const detached = c.detachedAssetIds?.includes(assetId) ?? false;
+      if (detached && !opts.reattach) throw new InvalidInputError(DETACHED_FORM);
+      reattached = detached;
       const before = structuredClone(c);
       c.documentAssetId = assetId;
+      if (detached) {
+        c.detachedAssetIds = c.detachedAssetIds!.filter((x) => x !== assetId);
+        if (!c.detachedAssetIds.length) delete c.detachedAssetIds;
+      }
       ConsentRecord.parse(c);
       await writeProjectData(core, tx, data);
       tx.record("consent", id, before, c);
       return c;
     },
-    { op: "consent.document", entity: { type: "consent", id } },
+    { op: "consent.document", entity: { type: "consent", id }, auditDetails: () => (reattached ? { op: "consent.document-reattach" } : {}) },
   );
 }
 

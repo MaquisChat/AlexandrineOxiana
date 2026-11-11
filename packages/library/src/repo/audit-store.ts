@@ -23,6 +23,8 @@ export interface IntegrityWarning {
   projectId: string;
   kind:
     | "chain-broken"
+    /** The sealed list of protocol document names cannot be read (R119); the documents are kept. */
+    | "protocol-manifest-unreadable"
     | "head-mismatch"
     | "truncated"
     | "empty"

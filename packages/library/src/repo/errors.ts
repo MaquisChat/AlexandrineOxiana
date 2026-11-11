@@ -126,6 +126,6 @@ export class FieldworkInUseError extends Error {
     what: string,
     readonly links: string[],
   ) {
-    super(`${what} cannot be deleted: ${links.join(", ")} still link to it. Remove those links first`);
+    super(`${what} cannot be deleted because these still refer to it: ${links.join("; ")}. Remove those links first`);
   }
 }

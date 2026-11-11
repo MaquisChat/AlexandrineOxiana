@@ -25,6 +25,8 @@ export const ConsentRecord = z.object({
   projectId: Id,
   participantId: Id,
   documentAssetId: Id.optional(),
+  /** Forms deliberately detached from this record (R119): never linked again except by an explicit re-attach. */
+  detachedAssetIds: z.array(Id).optional(),
   scope: z.string(),
   date: z.string().min(1),
   expires: z.string().optional(),

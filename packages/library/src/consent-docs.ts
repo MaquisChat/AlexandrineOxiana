@@ -26,6 +26,7 @@ import { serialStore } from "./import/project-queue.js";
 import { pendingFor, proxyQueueFor, proxyTypeFor, type ProxyPlan, type ProxyQueue } from "./import/proxies.js";
 import { LOCATED_MEDIA, mayHaveLocation } from "./import/resolve.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
+import { DETACHED_FORM, DETACH_FIRST } from "./repo/fieldwork.js";
 import { createSourceRefusing, onProjectOpened, setConsentDocumentAsset, type Repo } from "./repo/repo.js";
 
 const VERSION: string = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
@@ -36,7 +37,7 @@ export const CONSENT_FORM_MAX_BYTES = 100 * 1024 * 1024;
 export const CONSENT_KEY = "consentId";
 
 /** The form's source and asset for this consent and file hash, if one was already stored. */
-async function existingForm(repo: Repo, projectId: string, consentId: string, sha256?: string): Promise<{ sourceId: string; assetId: string } | undefined> {
+async function existingForm(repo: Repo, projectId: string, consentId: string, sha256?: string, skip: ReadonlySet<string> = new Set()): Promise<{ sourceId: string; assetId: string } | undefined> {
   for (const id of repo.listSourceIds(projectId)) {
     let sf: SourceFile;
     try {
@@ -45,7 +46,7 @@ async function existingForm(repo: Repo, projectId: string, consentId: string, sh
       continue;
     }
     if (sf.source.provenance.externalKeys?.[CONSENT_KEY] !== consentId) continue;
-    const a = sf.assets.find((x) => x.role === "original" && x.status !== "destroyed" && (sha256 === undefined || x.sha256 === sha256));
+    const a = sf.assets.find((x) => x.role === "original" && x.status !== "destroyed" && !skip.has(x.id) && (sha256 === undefined || x.sha256 === sha256));
     if (a) return { sourceId: id, assetId: a.id };
   }
   return undefined;
@@ -56,13 +57,17 @@ export async function attachConsentDocument(
   projectId: string,
   consentId: string,
   path: string,
-  opts: { legalBasis?: string; proxies?: ProxyQueue } = {},
+  /** `reattach`: link a form that was detached from this record before (explicit, audited; R119). */
+  opts: { legalBasis?: string; proxies?: ProxyQueue; reattach?: boolean } = {},
 ): Promise<{ consent: ConsentRecord; sourceId: string; assetId: string; note?: string }> {
   const fw = await repo.getFieldwork(projectId);
   const c = fw.consents.find((x) => x.id === consentId);
   if (!c) throw new NotFoundError("Consent record", consentId);
   if (c.withdrawn) throw new InvalidInputError("This consent was withdrawn; the record is kept as it was and cannot be changed");
   const p = fw.participants.find((x) => x.id === c.participantId);
+
+  // One form per record: another attached form is detached first, with a reason (R119 I-b).
+  if (c.documentAssetId) throw new InvalidInputError(DETACH_FIRST);
 
   const name = basename(path);
   const st = await fsp.lstat(path).catch(() => null);
@@ -80,7 +85,9 @@ export async function attachConsentDocument(
   // A retry after an interruption: the form is already stored for this consent.
   const found = await existingForm(repo, projectId, consentId, sha256);
   if (found) {
-    const consent = await setConsentDocumentAsset(repo, projectId, consentId, found.assetId);
+    // A form detached on purpose comes back only by an explicit re-attach (R119 I-a).
+    if (c.detachedAssetIds?.includes(found.assetId) && !opts.reattach) throw new InvalidInputError(DETACHED_FORM);
+    const consent = await setConsentDocumentAsset(repo, projectId, consentId, found.assetId, opts.reattach ? { reattach: true } : {});
     return { consent, ...found };
   }
 
@@ -145,7 +152,8 @@ export async function reconcileConsentDocuments(repo: Repo, projectId: string): 
   let linked = 0;
   for (const c of fw.consents) {
     if (c.documentAssetId || c.withdrawn) continue;
-    const found = await existingForm(repo, projectId, c.id);
+    // Never a form that was detached on purpose (R119 I-a).
+    const found = await existingForm(repo, projectId, c.id, undefined, new Set(c.detachedAssetIds ?? []));
     if (!found) continue;
     await setConsentDocumentAsset(repo, projectId, c.id, found.assetId);
     linked++;

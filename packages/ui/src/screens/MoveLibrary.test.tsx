@@ -161,6 +161,36 @@ describe("Move library", () => {
     expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("a move the service could not be reached for is \"could not be started\", not a cut-off stream", async () => {
+    const user = userEvent.setup();
+    let polled = false;
+    server.use(
+      http.post(url("/libraries/move"), () => HttpResponse.error()),
+      http.get(url("/libraries/move/status"), () => {
+        polled = true;
+        return HttpResponse.json({ pending: null });
+      }),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/The move could not be started/);
+    expect(polled).toBe(false);
+  });
+
+  it("matches the finished move by its destination the way the service compares paths (Windows separators and case)", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })),
+      http.post(url("/libraries/move"), () => new HttpResponse("", { headers: { "content-type": "application/x-ndjson" } })),
+      http.get(url("/libraries/move/status"), () => HttpResponse.json({ pending: { oldRoot: "C:/old", newRoot: "d:/field ssd/library", confirmToken: "tok-win", expiresAt: "2026-11-11T10:15:00.000Z" } })),
+    );
+    render(<MoveLibrary api={makeApi()} pollMs={5} maxPolls={3} />);
+    await user.type(screen.getByRole("textbox", { name: "Destination folder" }), "D:\\Field SSD\\Archive\\..\\Library\\");
+    await user.click(screen.getByRole("button", { name: "Check destination" }));
+    await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+    expect(await screen.findByRole("status", { name: "Verification" })).toBeTruthy();
+  });
+
   it("stops reading the move's stream when the screen closes", async () => {
     const user = userEvent.setup();
     const s = controlledStream();

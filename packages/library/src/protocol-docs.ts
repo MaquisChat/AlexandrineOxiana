@@ -15,9 +15,16 @@ import * as fsp from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import { newId } from "@ao/core";
+import { InvalidInputError, PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import type { Tx } from "./repo/mutate.js";
-import { projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
+import { noteIntegrityWarning, projectDataKey, projectEncrypted, repoLibrary, type Repo } from "./repo/repo.js";
+
+/** Test seam (package-internal): a smaller cap for the check made on what was copied. */
+export const protocolSeams: { copyMaxBytes?: number } = {};
+
+const MANIFEST_UNREADABLE =
+  "The names of the protocol documents cannot be read (their sealed list is damaged). The documents themselves are kept; nothing is added until the list is repaired";
 
 export interface ProtocolDocument {
   /** The document's name as dropped (made unique). */
@@ -54,11 +61,19 @@ function folderOf(repo: Repo, projectId: string): { rel: string; abs: string } {
   return { rel, abs: join(repoLibrary(repo).root, ...rel.split("/")) };
 }
 
-async function readManifest(abs: string, key: { key: Uint8Array; keyId: string }): Promise<Manifest> {
+/** The sealed names list; a damaged one is a plain error and an integrity warning (R119), never replaced. */
+async function readManifest(repo: Repo, projectId: string, abs: string, key: { key: Uint8Array; keyId: string }): Promise<Manifest> {
   const raw = await readMaybe(join(abs, MANIFEST));
   if (!raw) return { formatVersion: 1, documents: {} };
-  const plain = await decryptBytes((id) => (id === key.keyId ? key.key : undefined), raw);
-  return JSON.parse(plain.toString("utf8")) as Manifest;
+  try {
+    const plain = await decryptBytes((id) => (id === key.keyId ? key.key : undefined), raw);
+    const m = JSON.parse(plain.toString("utf8")) as Manifest;
+    if (m?.formatVersion !== 1 || typeof m.documents !== "object" || m.documents === null) throw new Error("not a manifest");
+    return m;
+  } catch {
+    noteIntegrityWarning(repo, { projectId, kind: "protocol-manifest-unreadable", detail: "the sealed list of protocol document names cannot be read" });
+    throw new InvalidInputError(MANIFEST_UNREADABLE);
+  }
 }
 
 async function plainNames(abs: string): Promise<string[]> {
@@ -99,7 +114,7 @@ async function refusal(path: string): Promise<string | undefined> {
   if (!st) return `${name} could not be found.`;
   if (st.isSymbolicLink()) return `${name} is a shortcut (symbolic link); drop the document itself.`;
   if (!st.isFile()) return `${name} is not a file; drop documents, not folders.`;
-  if (st.size > PROTOCOL_DOCUMENT_MAX_BYTES) return `${name} is larger than 100 MB.`;
+  if (st.size > PROTOCOL_DOCUMENT_MAX_BYTES) return TOO_LARGE(name);
   if (!name || name.length > MAX_NAME || BAD_NAME.test(name) || name.startsWith(".")) return "This document's name is not usable; rename the file and drop it again.";
   const type = await fileTypeFromFile(path).catch(() => undefined);
   if (type) {
@@ -118,7 +133,7 @@ export async function listProtocolDocuments(repo: Repo, projectId: string): Prom
   if (projectEncrypted(repo, projectId)) {
     const key = projectDataKey(repo, projectId); // throws ProjectLockedError when locked
     if (!key) return [];
-    const m = await readManifest(abs, key);
+    const m = await readManifest(repo, projectId, abs, key);
     for (const [file, d] of Object.entries(m.documents)) {
       const st = await fsp.lstat(join(abs, file)).catch(() => null);
       if (st?.isFile()) out.push({ name: d.name, bytes: d.bytes, encrypted: true });
@@ -132,6 +147,17 @@ export async function listProtocolDocuments(repo: Repo, projectId: string): Prom
   return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
+const TOO_LARGE = (name: string) => `${name} is larger than 100 MB.`;
+class TooLargeError extends Error {}
+
+/**
+ * The cap applies to the bytes actually copied too (a file can grow after it was checked): over it,
+ * the change fails and rolls back, so nothing of the file is kept (R119).
+ */
+function assertCopiedSize(bytes: number): void {
+  if (bytes > (protocolSeams.copyMaxBytes ?? PROTOCOL_DOCUMENT_MAX_BYTES)) throw new TooLargeError();
+}
+
 async function addOne(repo: Repo, projectId: string, path: string): Promise<ProtocolDocument> {
   const { rel, abs } = folderOf(repo, projectId);
   const wanted = basename(path);
@@ -142,16 +168,18 @@ async function addOne(repo: Repo, projectId: string, path: string): Promise<Prot
       if (!(await tx.exists(rel))) await tx.mkdir(rel);
       if (tx.encrypted) {
         const key = tx.key();
-        const m = await readManifest(abs, key);
+        const m = await readManifest(repo, projectId, abs, key);
         const name = uniqueName(wanted, new Set(Object.values(m.documents).map((d) => d.name.toLowerCase())));
         const file = `doc-${newId()}.enc`;
         const r = await tx.copyFile(path, `${rel}/${file}`, { encrypt: true, noFollow: true });
+        assertCopiedSize(r.bytes);
         m.documents[file] = { name, bytes: r.bytes, addedAt: tx.at };
         await tx.writeFile(`${rel}/${MANIFEST}`, JSON.stringify(m), { encrypt: true, mode: 0o600 });
         return { name, bytes: r.bytes, encrypted: true };
       }
       const name = uniqueName(wanted, new Set((await plainNames(abs)).map((n) => n.toLowerCase())));
       const r = await tx.copyFile(path, `${rel}/${name}`, { noFollow: true });
+      assertCopiedSize(r.bytes);
       return { name, bytes: r.bytes, encrypted: false };
     },
     { op: "protocol.document", entity: { type: "project", id: projectId } },
@@ -160,7 +188,7 @@ async function addOne(repo: Repo, projectId: string, path: string): Promise<Prot
 
 /**
  * Copies `paths` (absolute paths) into the project's protocol folder, one governed change per
- * document; returns one result per path, in order. A policy refusal or a locked project is thrown.
+ * document; returns one result per path, in order, whatever fails (refusals, policy, IO errors).
  */
 export async function addProtocolDocuments(repo: Repo, projectId: string, paths: string[]): Promise<ProtocolDocumentResult[]> {
   const out: ProtocolDocumentResult[] = [];
@@ -171,7 +199,22 @@ export async function addProtocolDocuments(repo: Repo, projectId: string, paths:
       out.push({ file, outcome: "failed", reason: why });
       continue;
     }
-    out.push({ file, outcome: "added", document: await addOne(repo, projectId, path) });
+    try {
+      out.push({ file, outcome: "added", document: await addOne(repo, projectId, path) });
+    } catch (err) {
+      // Every file keeps its own result, whatever happens to one of them (R119).
+      const reason =
+        err instanceof TooLargeError
+          ? TOO_LARGE(file)
+          : err instanceof PolicyDeniedError
+            ? err.reason
+            : err instanceof ProjectLockedError
+              ? "The project is locked. Unlock it, then try again."
+              : err instanceof InvalidInputError
+                ? err.message
+                : `${file} could not be copied (a file or disk error); nothing of it was kept.`;
+      out.push({ file, outcome: "failed", reason });
+    }
   }
   return out;
 }

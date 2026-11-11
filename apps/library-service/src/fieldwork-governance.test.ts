@@ -163,6 +163,11 @@ describe("fieldwork PATCH / DELETE (R97)", () => {
     const off = await call({ method: "PATCH", url: `/projects/${pid}/consents/${c.id}`, body: { documentAssetId: null, detachReason: "wrong form" } });
     expect(off.status, off.body).toBe(200);
     expect(off.json.documentAssetId).toBeUndefined();
+    // A detached form comes back only by an explicit re-attach (R119).
+    expect((await call({ method: "POST", url: `/projects/${pid}/consents/${c.id}/document`, body: { path: pdf } })).status).toBe(400);
+    const back = await call({ method: "POST", url: `/projects/${pid}/consents/${c.id}/document`, body: { path: pdf, reattach: true } });
+    expect(back.status, back.body).toBe(200);
+    expect(back.json.consent.documentAssetId).toBe(r.json.assetId);
   });
 });
 

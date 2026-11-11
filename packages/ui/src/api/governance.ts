@@ -10,10 +10,33 @@ import { ApiClientError, type ApiClient } from "./client";
 
 /**
  * The client's error for a stream that ended unexpectedly: cut off in the middle of a line, or the
- * connection lost while reading (status 0). The work may still be running on the service.
+ * connection lost while reading (status 0). The work may still be running on the service. Before
+ * the stream `started` (no line read yet), an unreachable service means the work never started
+ * (R119), so that is not a cut-off.
  */
-export function isStreamCutOff(err: unknown): boolean {
-  return err instanceof ApiClientError && err.status === 0 && (err.code === "UNAVAILABLE" || err.code === "INTERNAL");
+export function isStreamCutOff(err: unknown, started: boolean): boolean {
+  if (!(err instanceof ApiClientError) || err.status !== 0) return false;
+  if (err.code === "INTERNAL") return true;
+  return err.code === "UNAVAILABLE" && started;
+}
+
+/**
+ * A folder path compared the way the service resolves it (path.resolve semantics): separators
+ * unified, "." and ".." resolved, trailing separators dropped; Windows paths (drive letter, UNC or
+ * backslashes) compared without regard to case.
+ */
+export function normaliseRoot(p: string): string {
+  const windows = /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\") || p.includes("\\");
+  const s = p.trim().replace(/\\/g, "/");
+  const prefix = /^[A-Za-z]:\//.test(s) ? s.slice(0, 3) : s.startsWith("//") ? "//" : s.startsWith("/") ? "/" : "";
+  const parts: string[] = [];
+  for (const seg of s.slice(prefix.length).split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  const out = prefix + parts.join("/");
+  return windows ? out.toLowerCase() : out;
 }
 
 export type Profile = "irb" | "gdpr" | "hipaa" | "dmp";
@@ -108,6 +131,7 @@ export interface ConsentRecord {
   id: string;
   participantId: string;
   documentAssetId?: string;
+  detachedAssetIds?: string[];
   scope: string;
   date: string;
   expires?: string;
@@ -228,8 +252,9 @@ export function governanceApi(client: ApiClient) {
       r<ConsentRecord>("PATCH", `${p(projectId)}/consents/${encodeURIComponent(id)}`, { body }),
     withdrawConsent: (projectId: string, id: string, reason?: string) =>
       r<{ consent: ConsentRecord; flaggedSourceIds: string[] }>("POST", `${p(projectId)}/consents/${encodeURIComponent(id)}/withdraw`, { body: reason ? { reason } : {} }),
-    attachConsentDocument: (projectId: string, id: string, path: string) =>
-      r<{ consent: ConsentRecord; sourceId: string; assetId: string; note?: string }>("POST", `${p(projectId)}/consents/${encodeURIComponent(id)}/document`, { body: { path } }),
+    /** `reattach`: link a form that was detached from this record before (explicit, audited; R119). */
+    attachConsentDocument: (projectId: string, id: string, path: string, reattach?: boolean) =>
+      r<{ consent: ConsentRecord; sourceId: string; assetId: string; note?: string }>("POST", `${p(projectId)}/consents/${encodeURIComponent(id)}/document`, { body: { path, ...(reattach ? { reattach: true } : {}) } }),
 
     movePlan: (dest: string) => r<MovePlan>("POST", "/libraries/move/plan", { body: { dest } }),
     /** Streams the move's progress; ends with `done` (verified and switched) or `error`. */
