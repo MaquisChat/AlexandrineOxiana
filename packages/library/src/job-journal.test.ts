@@ -10,7 +10,8 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { INDEX_FILE, IndexHandle, createIndexSink, getMeta, rebuildIndex, setMeta } from "./index/index.js";
 import {
-  JOBS_FILE, appendJobRecords, assertNoSecrets, compactJobJournal, journalPath, readJobJournal, upgradeLegacyJobs, type JobRecord,
+  JOBS_FILE, MAX_FAILED_KEPT, MAX_SUCCEEDED_KEPT, SUCCEEDED_MAX_AGE_DAYS, appendJobRecords, assertNoSecrets, compactJobJournal, journalPath,
+  readJobJournal, upgradeLegacyJobs, type JobRecord,
 } from "./job-journal.js";
 import { createLibrary, openLibrary, type Library } from "./library.js";
 import type { Repo } from "./repo/index.js";
@@ -180,15 +181,19 @@ describe("job journal", () => {
     await rebuildIndex(handle, ring, lib);
     expect(jobRows()).toEqual([]); // sealed: neither ids nor statuses can be read
     const w = await okWorker();
-    expect(await client(w).resumePending()).toEqual([]); // nothing runs while locked
+    const c = client(w);
+    expect(await c.resumePending()).toEqual([]); // nothing runs while locked
     expect(w.jobs.size).toBe(0);
+    // the unlock loads the rows from the journal and resubmits the project's pending job (R142)
     await repo.unlockProject(project.id, "pw");
+    await c.idle();
     expect(jobRows().map((r) => [r.id, r.status])).toEqual([
       [done, "done"],
-      [pending, "queued"],
+      [pending, "done"],
     ]);
-    const resumed = await client(w).resumePending();
-    expect(resumed.map((r) => [r.id, r.error])).toEqual([[pending, undefined]]);
+    expect(w.jobs.size).toBe(1);
+    expect(await client(w).resumePending()).toEqual([]);
+    expect(w.jobs.size).toBe(1);
   });
 
   it("an incomplete last line is ignored, trimmed at open, and the next append is whole", async () => {
@@ -369,5 +374,164 @@ describe("upgrade of a library made before the journal", () => {
       ["e-running", undefined],
       ["p-queued", undefined],
     ]);
+  });
+});
+
+describe("R142: a lock while a job runs", () => {
+  /** An encrypted project, an encrypted input, and the key (copied) to read outputs with. */
+  async function encryptedJob() {
+    const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const k = projectDataKey(repo, project.id)!;
+    const key = { key: Uint8Array.from(k.key), keyId: k.keyId };
+    const input = join(tmp, "a.png.enc");
+    await writeFile(input, await encryptBytes(key.key, key.keyId, "png"));
+    return { project, key, input };
+  }
+  const journalOf = async (project: { id: string; folder: string }) =>
+    readJobJournal(lib.root, project.folder, project.id, projectDataKey(repo, project.id));
+
+  it("a lock while the job runs: it finishes with the key it captured, is recorded done once, and never runs again", async () => {
+    const { project, key, input } = await encryptedJob();
+    const w = await stubWorker(
+      async (job) => {
+        await mkdir(dirname(job.body.output), { recursive: true });
+        await writeFile(job.body.output, "jpeg");
+        return { status: "done", result: { output: job.body.output, meta: {} } };
+      },
+      { pollsUntilDone: 3 },
+    );
+    const c = client(w);
+    let heldWhileRunning = -1;
+    const output = join(tmp, "out", "p.jpg");
+    const r = await c.submit(project.id, {
+      type: "image.proxy", input, inputEncrypted: true, output, params: {},
+      onProgress: () => {
+        if (heldWhileRunning === -1) heldWhileRunning = c.heldKeys;
+        if (repo.isUnlocked(project.id)) repo.lockProject(project.id);
+      },
+    });
+    expect(repo.isUnlocked(project.id)).toBe(false);
+    expect(heldWhileRunning).toBe(1);
+    expect(c.heldKeys).toBe(0); // dropped when the job ended
+    // the real result, published once, readable with the project key
+    expect(r.encrypted).toBe(true);
+    const { decryptBytes } = await import("./repo/io.js");
+    expect((await decryptBytes((id) => (id === key.keyId ? key.key : undefined), await readFile(output))).toString("utf8")).toBe("jpeg");
+    expect(jobRows().map((x) => x.status)).toEqual(["done"]);
+    // no second run, neither at the next launch nor after unlock
+    const later = client(await okWorker());
+    expect(await later.resumePending()).toEqual([]);
+    await repo.unlockProject(project.id, "pw");
+    await later.idle();
+    expect(await later.resumePending()).toEqual([]);
+    expect(w.jobs.size).toBe(1);
+    const j = await journalOf(project);
+    expect([...j.records.values()].map((x) => x.status)).toEqual(["done"]);
+  });
+
+  it("a lock before the job runs: the worker job is cancelled, recorded cancelled-locked, and resubmitted once at unlock", async () => {
+    const { project, input } = await encryptedJob();
+    let first = true;
+    const w = await stubWorker(async (job) => {
+      if (first) {
+        first = false;
+        repo.lockProject(project.id); // the lock lands while the worker accepts the job
+      }
+      await mkdir(dirname(job.body.output), { recursive: true });
+      await writeFile(job.body.output, "jpeg");
+      return { status: "done", result: { output: job.body.output, meta: {} } };
+    }, { pollsUntilDone: 3 });
+    const c = client(w);
+    const err = await c.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "o.jpg"), params: {} }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    expect(w.requests).toContain("POST /jobs/j1/cancel");
+    expect(c.heldKeys).toBe(0);
+    expect(jobRows().map((x) => [x.status, x.payload_json])).toEqual([["cancelled", '{"error":"PROJECT_LOCKED"}']]);
+    // still locked: nothing runs at a launch
+    expect(await client(w).resumePending()).toEqual([]);
+    const latest = client(w);
+    await repo.unlockProject(project.id, "pw");
+    await latest.idle();
+    expect([...w.jobs.keys()]).toEqual(["j1", "j2"]); // resubmitted exactly once
+    expect(jobRows().map((x) => x.status)).toEqual(["done"]);
+    expect(await client(w).resumePending()).toEqual([]);
+    expect(w.jobs.size).toBe(2);
+    expect([...(await journalOf(project)).records.values()].map((x) => x.status)).toEqual(["done"]);
+  });
+
+  it("the captured key is dropped after a failure and after a cancellation", async () => {
+    const { project, input } = await encryptedJob();
+    const failing = client(await stubWorker(() => ({ status: "failed", error: { code: "UNSUPPORTED_INPUT", message: "no" } })));
+    await expect(failing.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "f.jpg"), params: {} })).rejects.toThrow();
+    expect(failing.heldKeys).toBe(0);
+    const slow = client(await stubWorker(() => ({ status: "done", result: { output: "", meta: {} } }), { pollsUntilDone: 1000 }));
+    const ac = new AbortController();
+    await expect(
+      slow.submit(project.id, { type: "image.proxy", input, inputEncrypted: true, output: join(tmp, "c.jpg"), params: {}, signal: ac.signal, onProgress: () => ac.abort() }),
+    ).rejects.toThrow();
+    expect(slow.heldKeys).toBe(0);
+  });
+});
+
+describe("R142: the journal stays bounded", () => {
+  const DAY = 86_400_000;
+  const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
+  const rec = (projectId: string, id: string, status: JobRecord["status"], msAgo: number, extra: Partial<JobRecord> = {}): JobRecord => ({
+    v: 1, id, projectId, kind: "pdf.ocr", status, createdAt: iso(msAgo), updatedAt: iso(msAgo), ...(status === "failed" || status === "cancelled" ? { error: "X" } : {}), ...extra,
+  });
+
+  it("keeps succeeded jobs of the last 30 days up to 500, failed and cancelled up to 500, and every unfinished job", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const recs: JobRecord[] = [];
+    for (let i = 0; i < 700; i++) recs.push(rec(project.id, `done-${i}`, "done", (i + 1) * 60_000)); // newest first
+    for (let i = 0; i < 20; i++) recs.push(rec(project.id, `old-done-${i}`, "done", 40 * DAY));
+    for (let i = 0; i < 499; i++) recs.push(rec(project.id, `failed-${i}`, i % 2 ? "failed" : "cancelled", (i + 1) * 60_000));
+    recs.push(rec(project.id, "old-failed", "failed", 100 * DAY));
+    recs.push(rec(project.id, "old-queued", "queued", 400 * DAY, { job: { type: "pdf.ocr", input: "/x", output: "/y", params: {} } }));
+    recs.push(rec(project.id, "old-locked", "cancelled", 400 * DAY, { error: "PROJECT_LOCKED", job: { type: "pdf.ocr", input: "/x", output: "/y", params: {} } }));
+    await appendJobRecords(lib.root, project.folder, null, recs);
+    expect(await compactJobJournal(lib.root, project.folder, project.id, null)).toBe(true);
+    const ids = [...(await readJobJournal(lib.root, project.folder, project.id, null)).records.keys()];
+    const done = ids.filter((i) => i.startsWith("done-"));
+    expect(done).toHaveLength(MAX_SUCCEEDED_KEPT);
+    expect(new Set(done)).toEqual(new Set(Array.from({ length: 500 }, (_, i) => `done-${i}`))); // the most recent
+    expect(ids.filter((i) => i.startsWith("old-done-"))).toEqual([]); // older than 30 days
+    expect(ids.filter((i) => i.startsWith("failed-"))).toHaveLength(499);
+    expect(ids).toContain("old-failed"); // failed: kept however old until retried, within the cap
+    expect(ids).toContain("old-queued"); // unfinished: never dropped
+    expect(ids).toContain("old-locked"); // waits for an unlock
+    expect(SUCCEEDED_MAX_AGE_DAYS).toBe(30);
+    // beyond the cap the oldest failed record goes
+    await appendJobRecords(lib.root, project.folder, null, [rec(project.id, "new-failed", "failed", 0)]);
+    await compactJobJournal(lib.root, project.folder, project.id, null, 0);
+    const ids2 = [...(await readJobJournal(lib.root, project.folder, project.id, null)).records.keys()];
+    expect(ids2.filter((i) => i.includes("failed"))).toHaveLength(MAX_FAILED_KEPT);
+    expect(ids2).not.toContain("old-failed");
+    expect(ids2).toContain("old-queued");
+    // a retry supersedes the failed record; the record then follows the succeeded rules
+    await appendJobRecords(lib.root, project.folder, null, [rec(project.id, "old-failed", "done", 0)]);
+    await compactJobJournal(lib.root, project.folder, project.id, null, 0);
+    expect((await readJobJournal(lib.root, project.folder, project.id, null)).records.get("old-failed")!.status).toBe("done");
+  });
+
+  it("20,000 finished jobs: the first launch compacts to the cap (rows too) and the next launch reads only that", async () => {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const key = projectDataKey(repo, project.id);
+    const recs: JobRecord[] = [];
+    for (let i = 0; i < 20_000; i++) recs.push(rec(project.id, `j${i}`, "done", i * 1000));
+    await appendJobRecords(lib.root, project.folder, key, recs);
+    await rebuildIndex(handle, ring, lib);
+    expect(jobRows()).toHaveLength(20_000);
+    const c = client(await okWorker());
+    let t = Date.now();
+    await c.resumePending();
+    const first = Date.now() - t;
+    const after = await readJobJournal(lib.root, project.folder, project.id, key);
+    expect(after.lines).toBe(MAX_SUCCEEDED_KEPT);
+    expect(jobRows()).toHaveLength(MAX_SUCCEEDED_KEPT);
+    t = Date.now();
+    await c.resumePending();
+    const second = Date.now() - t;
+    expect(second).toBeLessThan(Math.max(first, 50)); // flat: no longer proportional to history
   });
 });
