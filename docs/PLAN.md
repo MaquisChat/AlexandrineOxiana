@@ -401,7 +401,7 @@ Update after every task; commit and push.
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | not started | | found by Task 43 |
+| 60 New-project dialog | in progress | | implementer dispatched |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | not started | | |
 | 46 Fix scenario findings | not started | | |
@@ -418,17 +418,17 @@ Update after every task; commit and push.
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | not started | | |
 | 58 Ledger loose ends | not started | | |
-| 59 Tests pass on a Mac | not started | | |
+| 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |
 | 37b Token on standard input | not started | | |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | not started | | |
-| 37e Mac tools research | not started | | |
+| 37e Mac tools research | in progress | | researcher dispatched |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
 | 37h Desktop end-to-end | not started | | |
 | 37i Guide and checklist | not started | | |
-| 52 Review pages | not started | | |
+| 52 Review pages | in progress | | dispatched |
 | 53 Apply review findings | blocked | | needs owner review |
 | 54 Final review | not started | | |
 | 55 Owner hands-on tests | blocked | | needs signed Mac build |
