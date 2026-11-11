@@ -13,15 +13,33 @@
  * Elements are found by role and accessible name. Steps the product cannot do yet are
  * `blockedBy(<defect>)` (fixtures.ts), described in the Task 45 report.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, blockedBy, expect, libraryWithProject, test, type Page } from "./fixtures.js";
+import { APP_ORIGIN, blockedBy, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test, type AppHarness, type Defect, type Page } from "./fixtures.js";
 import { REPO_ROOT } from "./paths.js";
 
 interface Libraries {
   libraries: Array<{ libraryId: string; name: string; lastKnownPaths: string[] }>;
   current?: { libraryId: string; name: string; mode: string };
+}
+
+const D5: Defect = { id: "D5", title: "on relaunch the app shows “Library not found” for the library that was open (spec 4.5)" };
+const D6: Defect = { id: "D6", title: "the app's fonts finish loading in WebKit (no face left in error, document.fonts settles)" };
+const D7: Defect = { id: "D7", title: "a right-to-left title's heading on the source screen is itself right to left (aligned to the right), not only its inline text" };
+
+/** Every file under `dir`, relative to it ("/"-separated). */
+function filesUnder(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string) => {
+    for (const name of readdirSync(d)) {
+      const p = join(d, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else out.push(relative(dir, p).split("\\").join("/"));
+    }
+  };
+  walk(dir);
+  return out.sort();
 }
 
 // ---------- scenario 6 ----------
@@ -76,7 +94,8 @@ test("scenario 6: move the library, verify, delete the old copy; rename it outsi
     await page.route(
       isMove,
       async (route) => {
-        const response = await route.fetch({ timeout: 120_000 });
+        // As long as the verification wait below: a hung move fails here, not two minutes later.
+        const response = await route.fetch({ timeout: 60_000 });
         streamed = await response.text();
         await route.fulfill({ response, body: streamed });
       },
@@ -103,6 +122,21 @@ test("scenario 6: move the library, verify, delete the old copy; rename it outsi
     expect(existsSync(join(libraryPath, "library.json")), "the old copy stays until its deletion is confirmed").toBe(true);
   });
 
+  await test.step("checked independently before deleting anything: every file of the old copy is at the new place, byte for byte", async () => {
+    // Two differences are by design: the old copy alone carries MOVED.json (the marker "this library
+    // was moved from here" that Search reports), and an audit log (append-only .jsonl) at the new
+    // place may already have lines added since the move, so the old one must be its exact beginning.
+    const old = filesUnder(libraryPath).filter((f) => f !== "MOVED.json");
+    expect(old.length).toBeGreaterThan(0);
+    expect(existsSync(join(dest, "MOVED.json")), "the moved-from marker is only in the old copy").toBe(false);
+    const different = old.filter((f) => {
+      if (!existsSync(join(dest, f))) return true;
+      const [was, now] = [readFileSync(join(libraryPath, f)), readFileSync(join(dest, f))];
+      return /\/audit\/[^/]+\.jsonl$/u.test(f) ? !now.subarray(0, was.length).equals(was) : !now.equals(was);
+    });
+    expect(different, "files of the old copy missing or different at the new place").toEqual([]);
+  });
+
   await test.step("delete the old copy, after a typed confirmation", async () => {
     await page.getByRole("button", { name: "Delete old copy" }).click();
     const dialog = page.getByRole("dialog", { name: "Delete old copy" });
@@ -125,9 +159,7 @@ test("scenario 6: move the library, verify, delete the old copy; rename it outsi
     await page.goto(`${APP_ORIGIN}/`);
   });
 
-  await blockedBy("D5", "on relaunch the app shows “Library not found” for the library that was open (spec 4.5)", async () => {
-    await expect(page.getByRole("heading", { level: 1, name: `Library not found: ${LIBRARY}` })).toBeVisible();
-  });
+  await blockedBy(D5);
 
   await test.step("the chooser lists the library at its last place; opening it shows “Library not found”", async () => {
     await page.goto(`${APP_ORIGIN}/`); // D5: start again from the screen the app shows on launch
@@ -177,8 +209,39 @@ const TITLES: Array<{ script: string; title: string; rtl: boolean }> = [
 
 const SCREENS = join(REPO_ROOT, "reports", "screens");
 
-/** The computed direction of the text element (UserText, dir=auto) inside `el`. */
-const directionOf = (el: ReturnType<Page["getByRole"]>) => el.evaluate((e) => getComputedStyle(e.querySelector("[dir]") ?? e).direction);
+/**
+ * The computed direction of the source text (UserText, dir=auto): `el` itself when it carries `dir`,
+ * else the element inside it that does. There must be one: without it the answer would be the
+ * page's own direction, which says nothing about the text.
+ */
+const directionOf = (el: ReturnType<Page["getByRole"]>) =>
+  el.evaluate((e) => {
+    const text = e.matches("[dir]") ? e : e.querySelector("[dir]");
+    if (!text) throw new Error(`No element with dir in ${e.outerHTML.slice(0, 200)}`);
+    return getComputedStyle(text).direction;
+  });
+
+/** Sources with these titles, imported through the service from a CSL-JSON file; the page reloaded. */
+async function importTitles(app: AppHarness, page: Page, titles: typeof TITLES): Promise<void> {
+  const { projectId } = await libraryWithProject(app, page, { library: "Scripts library", project: "Markets in eight scripts" });
+  const file = join(app.root, "sources", "titles.json");
+  mkdirSync(join(app.root, "sources"), { recursive: true });
+  writeFileSync(file, JSON.stringify(titles.map((t, i) => ({ id: `t${i}`, type: "book", title: t.title, issued: { "date-parts": [[2020 + i]] } }))));
+  const started = await app.api<{ batchId: string }>("POST", `/projects/${projectId}/import`, { adapter: { kind: "csl-json", path: file }, options: {} });
+  expect(started.status, JSON.stringify(started.body)).toBe(200);
+  await expect
+    .poll(async () => (await app.api<{ batches: Array<{ batchId: string; state: string }> }>("GET", `/projects/${projectId}/imports`)).body.batches.find((b) => b.batchId === started.body.batchId)?.state, { timeout: 60_000 })
+    .toBe("finished");
+  const listed = (await app.api<{ items: Array<{ title: string }> }>("GET", `/projects/${projectId}/sources?limit=50`)).body.items.map((i) => i.title);
+  expect(listed.sort()).toEqual(titles.map((t) => t.title).sort());
+  await page.reload();
+}
+
+/** The app's fonts have all loaded, none in error. */
+async function fontsSettle(page: Page, timeout = 10_000): Promise<void> {
+  await expect.poll(() => page.evaluate(() => document.fonts.status), { timeout }).toBe("loaded");
+  expect(await page.evaluate(() => [...document.fonts].filter((f) => f.status === "error").map((f) => `${f.family} ${f.style} ${f.unicodeRange}`))).toEqual([]);
+}
 
 /**
  * Before a screenshot in WebKit: D6 leaves a font face of the app in "error" and document.fonts
@@ -196,21 +259,8 @@ test.describe("scenario 8", () => {
   test.use({ deviceScaleFactor: 2 });
 
   test("titles in eight scripts render in the library list and on the source screen, right to left for Arabic and Hebrew", async ({ page, app, browserName }) => {
-    let projectId = "";
-
     await test.step("set-up: eight sources imported from a CSL-JSON file (through the service)", async () => {
-      ({ projectId } = await libraryWithProject(app, page, { library: "Scripts library", project: "Markets in eight scripts" }));
-      const file = join(app.root, "sources", "titles.json");
-      mkdirSync(join(app.root, "sources"), { recursive: true });
-      writeFileSync(file, JSON.stringify(TITLES.map((t, i) => ({ id: `t${i}`, type: "book", title: t.title, issued: { "date-parts": [[2020 + i]] } }))));
-      const started = await app.api<{ batchId: string }>("POST", `/projects/${projectId}/import`, { adapter: { kind: "csl-json", path: file }, options: {} });
-      expect(started.status, JSON.stringify(started.body)).toBe(200);
-      await expect
-        .poll(async () => (await app.api<{ batches: Array<{ batchId: string; state: string }> }>("GET", `/projects/${projectId}/imports`)).body.batches.find((b) => b.batchId === started.body.batchId)?.state, { timeout: 60_000 })
-        .toBe("finished");
-      const listed = (await app.api<{ items: Array<{ title: string }> }>("GET", `/projects/${projectId}/sources?limit=50`)).body.items.map((i) => i.title);
-      expect(listed.sort()).toEqual(TITLES.map((t) => t.title).sort());
-      await page.reload();
+      await importTitles(app, page, TITLES);
     });
 
     await test.step("every title is in the library list, with its computed direction", async () => {
@@ -225,12 +275,8 @@ test.describe("scenario 8", () => {
       expect(await table.evaluate((e) => getComputedStyle(e).direction)).toBe("ltr");
     });
 
-    const fontsSettle = async () => {
-      await expect.poll(() => page.evaluate(() => document.fonts.status), { timeout: 10_000 }).toBe("loaded");
-      expect(await page.evaluate(() => [...document.fonts].filter((f) => f.status === "error").map((f) => `${f.family} ${f.style} ${f.unicodeRange}`))).toEqual([]);
-    };
-    if (browserName === "webkit") await blockedBy("D6", "the app's fonts finish loading in WebKit (no face left in error, document.fonts settles)", fontsSettle);
-    else await test.step("the app's fonts finish loading", fontsSettle);
+    if (browserName === "webkit") await blockedBy(D6);
+    else await test.step("the app's fonts finish loading", () => fontsSettle(page));
 
     await test.step("screenshot of the list", async () => {
       mkdirSync(SCREENS, { recursive: true });
@@ -248,13 +294,7 @@ test.describe("scenario 8", () => {
       }
     });
 
-    await blockedBy("D7", "a right-to-left title's heading on the source screen is itself right to left (aligned to the right), not only its inline text", async () => {
-      for (const t of TITLES.filter((x) => x.rtl)) {
-        await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: t.title, exact: true }).click();
-        const heading = page.getByRole("region", { name: "Source details" }).getByRole("heading", { level: 2, name: t.title, exact: true });
-        expect(await heading.evaluate((e) => getComputedStyle(e).direction), t.script).toBe("rtl");
-      }
-    });
+    await blockedBy(D7);
 
     await test.step("screenshot of a right-to-left source", async () => {
       const arabic = TITLES[0]!;
@@ -265,4 +305,36 @@ test.describe("scenario 8", () => {
       await detail.screenshot({ path: join(SCREENS, `scenario-8-rtl-source-arabic-${browserName}.png`) });
     });
   });
+});
+
+// ---------- the steps scenarios 6 and 8 cannot do yet, each on its own (expected to fail while the defect reproduces) ----------
+
+test(`${D5.id}: ${D5.title}`, async ({ page, app }) => {
+  const { libraryPath } = await libraryWithProject(app, page, { library: LIBRARY, project: PROJECT });
+  await app.restart(async () => renameSync(libraryPath, `${libraryPath} (renamed)`));
+  await page.goto(`${APP_ORIGIN}/`);
+  await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+  expectDefect(D5);
+  await expect(page.getByRole("heading", { level: 1, name: `Library not found: ${LIBRARY}` })).toBeVisible({ timeout: DEFECT_TIMEOUT });
+});
+
+test(`${D6.id}: ${D6.title}`, async ({ page, browserName }) => {
+  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
+  // Chromium loads every face: there this is an ordinary passing test.
+  if (browserName === "webkit") expectDefect(D6);
+  await fontsSettle(page, DEFECT_TIMEOUT);
+});
+
+test(`${D7.id}: ${D7.title}`, async ({ page, app }) => {
+  const rtl = TITLES.filter((t) => t.rtl);
+  await importTitles(app, page, rtl);
+  const headings = [];
+  for (const t of rtl) {
+    await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: t.title, exact: true }).click();
+    const heading = page.getByRole("region", { name: "Source details" }).getByRole("heading", { level: 2, name: t.title, exact: true });
+    await expect(heading, t.script).toBeVisible();
+    headings.push(`${t.script}: ${await heading.evaluate((e) => getComputedStyle(e).direction)}`);
+  }
+  expectDefect(D7);
+  expect(headings).toEqual(rtl.map((t) => `${t.script}: rtl`));
 });
