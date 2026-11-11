@@ -445,17 +445,17 @@ Update after every task; commit and push.
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | fix round 1 | db52fdb (worktree branch) | spec met; 3 Important (R146); completed by new Task 63 |
 | 34c Transcript viewer | fix round 1 | 4b9a723 (worktree branch) | spec met; 4 Important (R143); two of them completed by new Task 62 |
-| 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
-| 34e Pairing screen | fix round 1 | f48170a (worktree branch) | 2 Important; its fix to the shared dialog shell is confirmed real and kept |
+| 34d Verification badges | in review | 140a402 (worktree branch) | built; closes defect D3; two concerns carried to review (identifier fields cannot be confirmed; blob pictures in WebKit) |
+| 34e Pairing screen | re-review of fix round 1 | 9d69ab0 (worktree branch) | both Important findings and five minors fixed; shared dialog shell now has its own tests |
 | 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | fix round 3 | fdb61e9 (worktree branch) | rounds 1 and 2 confirmed; two Important in the automatic retry of pending removals |
+| 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | fix round 1 | 20993f0 (worktree branch) | spec met; 2 Important (R142) |
-| 61 New recovery code | fix round 1 | 35be129 (worktree branch) | spec met; 3 Important (R141) |
+| 61 New recovery code | fix round 2 | ef05812 (worktree branch) | round 1 confirmed; one new Important (a stale staged file could be activated), settled by R148 |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |
