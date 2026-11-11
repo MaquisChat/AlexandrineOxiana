@@ -3,9 +3,10 @@
  * sentences: they never carry cookies, tokens, URLs or file paths from the tools' output.
  */
 
-/** The one-time explanation shown before the downloader may use the researcher's browser session (spec 5.1). */
-export const COOKIES_ACKNOWLEDGEMENT =
-  "Using your browser's signed-in session lets the downloader see what you can see. Platforms may restrict or suspend accounts they detect using automated tools. This choice is recorded in the project's audit log.";
+import { COOKIES_ACKNOWLEDGEMENT } from "@ao/core";
+
+/** The one-time explanation (spec 5.1): defined once in @ao/core for the library and the interface (R146). */
+export { COOKIES_ACKNOWLEDGEMENT };
 
 /**
  * Capturing with the browser session needs the researcher's one-time acknowledgement, recorded in

@@ -10,14 +10,12 @@
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
+// The address classifier and the acknowledgement: one definition, shared with the interface (R146).
+import { COOKIES_ACKNOWLEDGEMENT, MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "@ao/core";
 import {
-  COOKIES_ACKNOWLEDGEMENT,
   captureBrowserPage,
   checkCaptureAllowed,
-  classifyUrl,
   createLinkCapture,
-  isCollectionLink,
-  isPostLink,
   type BrowserName,
   type CaptureOptions,
   type ProfileCaptureOptions,
@@ -65,19 +63,9 @@ export const MAX_QUEUED_LINKS = 500;
 
 /** A list of web addresses (http or https only, at most 2048 characters each). */
 function urlList(b: Obj, key: string, max: number): string[] {
-  const urls = strArray(b, key, { max, itemMax: 2048 });
+  const urls = strArray(b, key, { max, itemMax: MAX_ADDRESS_LENGTH });
   for (const u of urls) if (!isWebAddress(u)) throw badRequest(`"${key}" must be web addresses.`);
   return urls;
-}
-
-function isWebAddress(u: string): boolean {
-  if (!/^https?:\/\//i.test(u)) return false;
-  try {
-    const p = new URL(u);
-    return (p.protocol === "http:" || p.protocol === "https:") && p.hostname.length > 0;
-  } catch {
-    return false;
-  }
 }
 
 /**
