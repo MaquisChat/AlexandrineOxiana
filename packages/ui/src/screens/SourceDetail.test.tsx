@@ -534,6 +534,13 @@ describe("SourceDetail: the transcript entry point", () => {
     window.history.replaceState(null, "", before);
   });
 
+  it("a recording without a transcript links to the viewer to play and transcribe it (Task 34c's link)", async () => {
+    server.use(...sourceHandlers({ ...TRANSCRIPT_SOURCE, assets: TRANSCRIPT_SOURCE.assets.filter((a) => a.kind !== "transcript") }));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const link = await screen.findByRole("link", { name: "Play the recording and transcribe it" });
+    expect(link.getAttribute("href")).toBe("/transcript?project=p1&source=s1");
+  });
+
   it("no transcript, no link", async () => {
     server.use(...sourceHandlers(VERIFIED_SOURCE));
     render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);

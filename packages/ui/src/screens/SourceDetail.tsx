@@ -8,7 +8,7 @@
  * R37–R40), **Recheck** for the source, the source's pictures (screenshots, image viewing copies)
  * read with the token and shown as blob URLs that are revoked when no longer shown (R135 1), its
  * viewing copies and text recognition that failed or are still waiting, with their plain reasons
- * and a retry (R84), and a link to the transcript viewer when it has a transcript. Badges come only
+ * and a retry (R84), and Task 34c's link to the transcript viewer (a transcript or a recording). Badges come only
  * from the record's field checks: a cleared review item does not make them say "confirmed by you"
  * (R137). Every answer is dropped when the source changed, the screen closed or the project locked
  * in the meantime.
@@ -385,7 +385,6 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     placed.add(pointer);
     return <FieldCheck key={`check-${pointer}`} review={review} label={label} value={valueAt(src, pointer)} readOnly={readOnly} onConfirm={confirm} />;
   };
-  const hasTranscript = !!file?.assets.some((a) => a.kind === "transcript" && a.status !== "destroyed");
 
   return (
     <section aria-label="Source details" className="ao-detail">
@@ -399,7 +398,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
         <button type="button" disabled={readOnly || !src || rechecking} onClick={() => void recheck()}>
           {rechecking ? "Rechecking…" : "Recheck"}
         </button>
-        {src && hasTranscript && <TranscriptLink projectId={projectId} sourceId={sourceId} />}
+        {file && src && <TranscriptLink projectId={projectId} assets={file.assets} sourceId={sourceId} />}
       </div>
       {error && (
         <p role="alert" className="ao-error">
