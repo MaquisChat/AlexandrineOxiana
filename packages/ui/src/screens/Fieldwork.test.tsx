@@ -225,4 +225,56 @@ describe("Fieldwork", () => {
     await waitFor(() => expect(within(c).getByText((_, el) => el?.tagName === "STRONG" && /Withdrawn on 2026-11-11/.test(el.textContent ?? ""))).toBeTruthy());
     expect(within(c).queryByRole("button", { name: "Withdraw consent of P-001" })).toBeNull();
   });
+
+  it("a form that was detached before is offered for re-attaching, only after a confirmation (R119 carry-over)", async () => {
+    const pid0 = id();
+    db.participants.push({ id: pid0, code: "P-001", consentIds: [] });
+    db.consents.push({ id: id(), participantId: pid0, scope: "Audio", date: "2026-03-14", detachedAssetIds: ["0190f0f0-0000-7000-8000-0000000000aa"] });
+    server.use(
+      http.post(P("/consents/:fid/document"), async ({ request, params }) => {
+        const body = (await request.json()) as { path: string; reattach?: boolean };
+        db.calls.push({ method: "POST", path: `/consents/${String(params.fid)}/document`, body });
+        if (!body.reattach) {
+          return HttpResponse.json(
+            { error: { code: "VALIDATION", message: "This form was detached from the consent record; re-attach it explicitly if it belongs there", reason: "detached-form" } },
+            { status: 400 },
+          );
+        }
+        const c = db.consents.find((x) => x.id === params.fid);
+        c.documentAssetId = "0190f0f0-0000-7000-8000-0000000000aa";
+        return HttpResponse.json({ consent: c, sourceId: "s9", assetId: c.documentAssetId });
+      }),
+    );
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    const c = await screen.findByRole("region", { name: "Consent records" });
+    const file = Object.assign(new File(["%PDF"], "consent P-001.pdf"), { path: "/Users/ana/consent P-001.pdf" });
+    fireEvent.drop(await within(c).findByText(/Drop the signed consent form here/), { dataTransfer: { files: [file], types: ["Files"] } });
+    const offer = await within(c).findByRole("group", { name: "Re-attach the signed form of P-001?" });
+    expect(offer.textContent).toMatch(/detached from this consent record before/);
+    expect(db.calls.filter((x) => x.body?.reattach)).toHaveLength(0);
+    const user = userEvent.setup();
+    await user.click(within(offer).getByRole("button", { name: "Re-attach the form" }));
+    await waitFor(() => expect(db.calls.at(-1)).toMatchObject({ method: "POST", body: { path: "/Users/ana/consent P-001.pdf", reattach: true } }));
+    expect(await within(c).findByText(/Signed form attached/)).toBeTruthy();
+  });
+
+  it("the re-attach offer can be declined: nothing is sent", async () => {
+    const pid0 = id();
+    db.participants.push({ id: pid0, code: "P-001", consentIds: [] });
+    db.consents.push({ id: id(), participantId: pid0, scope: "Audio", date: "2026-03-14" });
+    server.use(
+      http.post(P("/consents/:fid/document"), async ({ request }) => {
+        db.calls.push({ method: "POST", path: "/document", body: await request.json() });
+        return HttpResponse.json({ error: { code: "VALIDATION", message: "detached", reason: "detached-form" } }, { status: 400 });
+      }),
+    );
+    render(<Fieldwork api={makeApi()} projectId={PID} />);
+    const c = await screen.findByRole("region", { name: "Consent records" });
+    const file = Object.assign(new File(["%PDF"], "f.pdf"), { path: "/Users/ana/f.pdf" });
+    fireEvent.drop(await within(c).findByText(/Drop the signed consent form here/), { dataTransfer: { files: [file], types: ["Files"] } });
+    const offer = await within(c).findByRole("group", { name: "Re-attach the signed form of P-001?" });
+    await userEvent.setup().click(within(offer).getByRole("button", { name: "Cancel" }));
+    expect(within(c).queryByRole("group", { name: "Re-attach the signed form of P-001?" })).toBeNull();
+    expect(db.calls).toHaveLength(1);
+  });
 });

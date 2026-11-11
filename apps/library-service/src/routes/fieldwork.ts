@@ -6,7 +6,7 @@
  * form is stored as an identifiable source linked to the participant.
  */
 import type { FastifyInstance } from "fastify";
-import { attachConsentDocument, proxyQueueFor, type ConsentInput, type ConsentPatch, type ParticipantInput, type ParticipantPatch, type SessionInput, type SessionPatch } from "@ao/library";
+import { DETACHED_FORM, InvalidInputError, attachConsentDocument, proxyQueueFor, type ConsentInput, type ConsentPatch, type ParticipantInput, type ParticipantPatch, type SessionInput, type SessionPatch } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
 
@@ -106,7 +106,13 @@ export function registerFieldwork(app: FastifyInstance, ctx: Ctx): void {
     const legalBasis = optStr(b, "legalBasis", 2000);
     // `reattach: true` links a form that was detached from this record before (explicit, audited; R119).
     const reattach = optBool(b, "reattach") === true;
-    return attachConsentDocument(s.repo, projectId, paramsOf(req).fid ?? "", path, { proxies: proxyQueueFor(s.repo), ...(legalBasis ? { legalBasis } : {}), ...(reattach ? { reattach } : {}) });
+    try {
+      return await attachConsentDocument(s.repo, projectId, paramsOf(req).fid ?? "", path, { proxies: proxyQueueFor(s.repo), ...(legalBasis ? { legalBasis } : {}), ...(reattach ? { reattach } : {}) });
+    } catch (err) {
+      // A form detached from this record before: the UI offers an explicit re-attach on this reason.
+      if (err instanceof InvalidInputError && err.message === DETACHED_FORM) throw new ApiError(400, "VALIDATION", DETACHED_FORM, "detached-form");
+      throw err;
+    }
   });
 
   app.delete("/projects/:id/participants/:fid", async (req) => {

@@ -8,6 +8,7 @@
  */
 import { useCallback, useEffect, useId, useState, type ReactNode } from "react";
 import type { ConsentRecord, GovernanceApi, Participant, Session } from "../api/governance";
+import { ApiClientError } from "../api/client";
 import { FileDrop } from "../components/FileDrop";
 import { ChoiceDialog, ReasonOptionalDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
@@ -90,6 +91,8 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
   const [deleting, setDeleting] = useState<Participant | null>(null);
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ConsentRecord | null>(null);
+  /** A dropped form the service refused because it was detached from this record before (R119): offered for an explicit re-attach. */
+  const [reattach, setReattach] = useState<{ consentId: string; path: string } | null>(null);
   const [session, setSession] = useState({ date: "", place: "", notes: "", participantIds: [] as string[] });
   const [consent, setConsent] = useState({ participantId: "", scope: "", date: "", expires: "" });
   const ids = useId();
@@ -304,12 +307,45 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
                   single={{ message: "Drop one signed form at a time: each consent record holds one form. Nothing was added." }}
                   onPaths={(paths) =>
                     void run(async () => {
-                      const r = await api.attachConsentDocument(projectId, c.id, paths[0]!);
-                      return r.note ? `Signed form attached. ${r.note}` : undefined;
+                      setReattach(null);
+                      try {
+                        const r = await api.attachConsentDocument(projectId, c.id, paths[0]!);
+                        return r.note ? `Signed form attached. ${r.note}` : undefined;
+                      } catch (err) {
+                        if (err instanceof ApiClientError && err.reason === "detached-form") {
+                          setReattach({ consentId: c.id, path: paths[0]! });
+                          return;
+                        }
+                        throw err;
+                      }
                     })
                   }
                 />
               ) : null}
+              {reattach?.consentId === c.id && !c.documentAssetId && (
+                <div role="group" aria-label={`Re-attach the signed form of ${codeOf(c.participantId)}?`} className="ao-field">
+                  <span>
+                    This form was detached from this consent record before. Re-attach it? Re-attaching is recorded in the project&apos;s audit log.
+                  </span>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      const { path } = reattach;
+                      void run(async () => {
+                        const r = await api.attachConsentDocument(projectId, c.id, path, true);
+                        setReattach(null);
+                        return r.note ? `Signed form attached. ${r.note}` : undefined;
+                      });
+                    }}
+                  >
+                    Re-attach the form
+                  </button>
+                  <button type="button" disabled={busy} onClick={() => setReattach(null)}>
+                    Cancel
+                  </button>
+                </div>
+              )}
             </li>
           ))}
         </ul>
