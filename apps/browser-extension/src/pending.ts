@@ -39,3 +39,28 @@ export function chunks<T>(items: T[], size: number): T[][] {
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
 }
+
+/** Sends `urls` in pieces of `size`, stopping at the first refusal: what was taken, what was not, and why. */
+export async function sendInChunks(urls: string[], size: number, send: (part: string[]) => Promise<void>): Promise<{ sent: string[]; rest: string[]; error?: unknown }> {
+  const sent: string[] = [];
+  for (const part of chunks(urls, size)) {
+    try {
+      await send(part);
+    } catch (error) {
+      return { sent, rest: urls.slice(sent.length), error };
+    }
+    sent.push(...part);
+  }
+  return { sent, rest: [] };
+}
+
+/**
+ * The project's pending list after a send (R116): the links the service took leave it, so a retry never
+ * sends them again; those it did not take are merged in with `reason`.
+ */
+export function afterSend(p: PendingByProject, projectId: string, sent: string[], rest: string[], reason: string): PendingByProject {
+  const taken = new Set(sent);
+  const left = (p[projectId]?.urls ?? []).filter((u) => !taken.has(u));
+  const base = left.length ? { ...p, [projectId]: { urls: left, reason: p[projectId]!.reason } } : removePending(p, projectId);
+  return rest.length ? addPending(base, projectId, rest, reason) : base;
+}

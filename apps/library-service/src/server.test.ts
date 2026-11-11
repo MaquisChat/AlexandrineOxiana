@@ -1550,9 +1550,10 @@ describe("integration: the extension's routes (R111)", () => {
     await openNewLibrary();
     const pid = await newProject(LINKS_GOV);
     const token = await pair();
-    const many = Array.from({ length: 501 }, (_, i) => `https://example.org/p/${i}`);
+    const many = Array.from({ length: 501 }, (_, i) => `https://www.youtube.com/watch?v=ao${String(i).padStart(9, "0")}`);
     expect((await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: many })).status).toBe(400);
     expect((await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: many.slice(0, 500) })).status).toBe(200);
+    await svc.state.idle(); // that queue has finished: the caller limit (R116) is free again
     for (const bad of ["file:///etc/passwd", "javascript:alert(1)", "ftp://example.org/x", "data:text/html,x", "//example.org/x", `https://example.org/${"a".repeat(2048)}`]) {
       const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: ["https://example.org/ok", bad] });
       expect(r.status, bad.slice(0, 30)).toBe(400);
@@ -1572,5 +1573,113 @@ describe("integration: the extension's routes (R111)", () => {
     const ui = await call({ method: "POST", url: "/capture/browser/links", body: { projectId: pid, urls: ["https://example.org/x"] } });
     expect(ui.status).toBe(403);
     expect(ui.json.error.code).toBe("FORBIDDEN");
+  });
+
+  /** A media worker whose downloads take `ms`, recording how many run at once per platform. */
+  function slowProvider(ms: number): WorkerProvider & { downloads: string[]; overlaps: string[] } {
+    const inFlight = new Map<string, number>();
+    const p = {
+      downloads: [] as string[],
+      overlaps: [] as string[],
+      async start() {
+        const client = {
+          async submit(_pid: string, job: WorkerJob): Promise<JobResult> {
+            const platform = new URL(job.input).hostname;
+            const n = (inFlight.get(platform) ?? 0) + 1;
+            inFlight.set(platform, n);
+            if (n > 1) p.overlaps.push(platform);
+            p.downloads.push(job.input);
+            await new Promise((r) => setTimeout(r, ms));
+            inFlight.set(platform, (inFlight.get(platform) ?? 1) - 1);
+            throw new WorkerJobError("TOOL_FAILED", "the tool failed");
+          },
+          async resumePending() {
+            return [];
+          },
+        } as unknown as WorkerClient;
+        return { clientFor: () => client, versions: async () => ({}), updateTools: async () => ({}) as never, stop: async () => {} };
+      },
+    };
+    return p;
+  }
+  const yt = (k: string, i: number) => `https://www.youtube.com/watch?v=${(k + String(i).padStart(11, "0")).slice(-11)}`;
+
+  it("R116: the project must allow browser capture as well as the downloader (403 POLICY_DENIED with the reason)", async () => {
+    await start({ worker: fakeProvider({ fail: 99 }), pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(`${OPEN_GOV}captureMethods: [manual_upload, downloader]\n`);
+    const token = await pair();
+    const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("a", 1)] });
+    expect(r.status, r.body).toBe(403);
+    expect(r.json.error.code).toBe("POLICY_DENIED");
+    expect(r.json.error.reason).toMatch(/browser/i);
+  });
+
+  it("R116: the same link many times is queued once", async () => {
+    const provider = slowProvider(1);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: Array.from({ length: 500 }, () => yt("a", 1)) });
+    expect(r.status, r.body).toBe(200);
+    expect(svc.state.captureQueue(r.json.queueId)).toMatchObject({ total: 1 });
+    await svc.state.idle();
+    expect(provider.downloads).toHaveLength(1);
+  });
+
+  it("R116: one extension token has at most one active links queue and one waiting; more is 429 RATE_LIMITED", async () => {
+    const provider = slowProvider(40);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const results = await Promise.all(Array.from({ length: 50 }, (_, i) => ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("b", i)] })));
+    const ok = results.filter((r) => r.status === 200);
+    const limited = results.filter((r) => r.status === 429);
+    expect(ok).toHaveLength(2);
+    expect(limited).toHaveLength(48);
+    for (const r of limited) expect(r.json.error.code).toBe("RATE_LIMITED");
+    // Another paired extension has its own allowance.
+    const other = await pair(OTHER);
+    expect((await ext(other, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("c", 1)] }, OTHER)).status).toBe(200);
+    // Once the queues have finished, the token may queue again.
+    await svc.state.idle();
+    expect((await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("d", 1)] })).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("R116: queues from different callers share one per-platform lane (no two downloads from one platform at once)", async () => {
+    const provider = slowProvider(10);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const a = await pair();
+    const b = await pair(OTHER);
+    const ra = await ext(a, "POST", "/capture/browser/links", { projectId: pid, urls: [0, 1, 2].map((i) => yt("e", i)) });
+    const rb = await ext(b, "POST", "/capture/browser/links", { projectId: pid, urls: [0, 1, 2].map((i) => yt("f", i)) }, OTHER);
+    const ui = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [0, 1, 2].map((i) => yt("g", i)), options: {} } });
+    expect([ra.status, rb.status, ui.status]).toEqual([200, 200, 200]);
+    await svc.state.idle();
+    expect(provider.downloads).toHaveLength(9);
+    expect(provider.overlaps).toEqual([]);
+  });
+
+  it("R116: only post and video links; a profile or channel is refused with 400 and a plain message", async () => {
+    await start({ worker: fakeProvider({ fail: 99 }), pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    for (const url of ["https://www.instagram.com/someone/", "https://www.youtube.com/@channel"]) {
+      const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("h", 1), url] });
+      expect(r.status, url).toBe(400);
+      expect(r.json.error.code).toBe("VALIDATION");
+      expect(r.json.error.message).toMatch(/profile|channel/i);
+      expect(r.json.error.message).not.toMatch(/someone|channel"|@/);
+    }
+    // Posts, reels and videos are taken.
+    const r = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: ["https://www.instagram.com/p/CfAkEcArO01/", "https://www.instagram.com/reel/CfAkEcArO02/", "https://www.tiktok.com/@a.b/video/7000000000000000001", yt("h", 2)] });
+    expect(r.status, r.body).toBe(200);
+    await svc.state.idle();
   });
 });

@@ -124,7 +124,7 @@ export type {
   WorkerJobType,
 } from "./worker-client.js";
 
-export { classifyUrl } from "./capture/platforms.js";
+export { classifyUrl, isCollectionLink, isPostLink } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
 export { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, incompleteReason, plainReason } from "./capture/errors.js";
 export { stripSnapshot } from "./capture/snapshot.js";

@@ -28,7 +28,8 @@
  * the per-platform queue and the per-item path (`captureItem`).
  *
  * Reasons in outcomes are fixed plain-language sentences (errors.ts): never cookies, tokens, URLs
- * or file paths. Captures against one platform never run in parallel.
+ * or file paths. Captures against one platform never run in parallel, across every queue of the
+ * library (the lanes are shared per library, R116).
  */
 import { randomUUID } from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -43,7 +44,7 @@ import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import type { SourceInputFile } from "../repo/sources.js";
 import { WorkerJobError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
 import { AcknowledgementRequiredError, incompleteReason, plainReason } from "./errors.js";
-import { classifyUrl, type ClassifiedUrl, type Platform } from "./platforms.js";
+import { classifyUrl, isCollectionLink, type ClassifiedUrl, type Platform } from "./platforms.js";
 import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport } from "./profile-capture.js";
 import { buildDraft, stripSnapshot, verificationSnapshot, type CaptureTool } from "./snapshot.js";
 
@@ -183,11 +184,19 @@ function failed(url: string, code: string, reason = plainReason(code)): CaptureO
   return { url, status: "failed", errorCode: code, reason };
 }
 
+/** One set of per-platform lanes per open library (repo), whichever queue or capture uses it (R116). */
+const libraryLanes = new WeakMap<Repo, Map<Platform, Promise<unknown>>>();
+function lanesFor(repo: Repo): Map<Platform, Promise<unknown>> {
+  let lanes = libraryLanes.get(repo);
+  if (!lanes) libraryLanes.set(repo, (lanes = new Map()));
+  return lanes;
+}
+
 export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
   const { repo, worker } = deps;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  /** Per-platform queue: captures against one platform never overlap. */
-  const lanes = new Map<Platform, Promise<unknown>>();
+  /** Per-platform queue, shared by every capture of this library: captures against one platform never overlap (R116). */
+  const lanes = lanesFor(repo);
   const inLane = <T>(p: Platform, fn: () => Promise<T>): Promise<T> => {
     const prev = lanes.get(p) ?? Promise.resolve();
     const next = prev.catch(() => {}).then(fn);
@@ -644,7 +653,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     // The browser session needs the one-time acknowledgement, whatever the link is.
     if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(url);
-    if (c.kind === "profile" || c.kind === "playlist") {
+    if (isCollectionLink(c)) {
       if (deps.captureProfile) return deps.captureProfile(projectId, url, opts);
       return profiles.outcomeOf(url, await profiles.captureProfile(projectId, url, opts));
     }

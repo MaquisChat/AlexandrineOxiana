@@ -15,6 +15,19 @@ export interface ClassifiedUrl {
   handle?: string;
 }
 
+/** The kinds that name one post or video (R116: all a list of links may hold). */
+const POST_KINDS: ReadonlySet<LinkKind> = new Set<LinkKind>(["video", "short", "post", "reel", "carousel"]);
+
+/** A whole profile, channel or playlist: captured as a profile run (`captureProfile`), never as one link. */
+export function isCollectionLink(c: ClassifiedUrl): boolean {
+  return c.kind === "profile" || c.kind === "playlist";
+}
+
+/** One post or video on a known platform. */
+export function isPostLink(c: ClassifiedUrl): boolean {
+  return c.platform !== "other" && POST_KINDS.has(c.kind);
+}
+
 /** Query parameters that only track how a link was shared. */
 const TRACKING = /^(utm_.*|igsh|igshid|si|feature|fbclid|gclid|mc_cid|mc_eid|is_from_webapp|sender_device|sender_web_id|_r|_t)$/i;
 

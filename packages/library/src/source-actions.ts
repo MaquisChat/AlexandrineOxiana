@@ -13,21 +13,26 @@
 import { randomUUID } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { recheckSourceFile, type Asset, type Source, type SourceFile } from "@ao/core";
+import { recheckSourceFile, type Asset, type Provenance, type Source, type SourceFile } from "@ao/core";
 import { classifyUrl } from "./capture/platforms.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, updateSourceRechecked, type Repo } from "./repo/repo.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
 import { activeTemp } from "./tmp-registry.js";
 
-/** Evaluates (and on deny, audits and throws) the `capture` decision for each platform the links are on. */
-export async function checkCaptureAllowed(repo: Repo, projectId: string, urls: string[]): Promise<void> {
+/**
+ * Evaluates (and on deny, audits and throws) the `capture` decision for each platform the links are on,
+ * for each of `methods` (default the downloader; the extension's link lists need browser capture too, R116).
+ */
+export async function checkCaptureAllowed(repo: Repo, projectId: string, urls: string[], methods: ReadonlyArray<Provenance["captureMethod"]> = ["downloader"]): Promise<void> {
   const platforms = new Set<string>();
   for (const u of urls) {
     platforms.add(classifyUrl(u).platform);
   }
-  for (const platform of platforms) {
-    await authorizeProcessing(repo, projectId, { action: "capture", capture: { method: "downloader", platform } }, { op: "capture.preflight" });
+  for (const method of methods) {
+    for (const platform of platforms) {
+      await authorizeProcessing(repo, projectId, { action: "capture", capture: { method, platform } }, { op: "capture.preflight" });
+    }
   }
 }
 

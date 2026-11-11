@@ -1,7 +1,9 @@
 /**
  * Capture (spec 5.1, 5.5): links queued for the downloader (per-item outcomes as `capture.progress`
  * events), whole profiles, transcription of a source, the capture tools' versions and update, and
- * browser capture from the paired extension (its pairing too, and its link lists: R111).
+ * browser capture from the paired extension (its pairing too, and its link lists: R111; R116: both
+ * capture methods authorised, links deduplicated, single posts and videos only, one running and one
+ * waiting list per extension).
  *
  * The `capture` decision is evaluated before anything is queued, so a capture the project's rules
  * deny answers 403 POLICY_DENIED with the reason at once (the deny is audited).
@@ -12,7 +14,10 @@ import {
   COOKIES_ACKNOWLEDGEMENT,
   captureBrowserPage,
   checkCaptureAllowed,
+  classifyUrl,
   createLinkCapture,
+  isCollectionLink,
+  isPostLink,
   type BrowserName,
   type CaptureOptions,
   type ProfileCaptureOptions,
@@ -75,19 +80,53 @@ function isWebAddress(u: string): boolean {
   }
 }
 
+/**
+ * The extension's link lists hold single posts and videos only (R116): a whole profile or channel is
+ * captured deliberately from the desktop app. 400 with a plain message otherwise.
+ */
+function postLinksOnly(urls: string[]): void {
+  for (const u of urls) {
+    const c = classifyUrl(u);
+    if (isCollectionLink(c)) throw badRequest("A link list can hold single posts and videos only. Whole profiles, channels and playlists are captured from the desktop app (Capture profile).");
+    if (!isPostLink(c)) throw badRequest("A link list can hold single posts and videos from YouTube, Instagram or TikTok only.");
+  }
+}
+
+/** Links queues one extension may have at once (R116): one running and one waiting. */
+export const LINK_QUEUES_PER_EXTENSION = 2;
+
 export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   const { state, pairing } = ctx;
 
   /** Queues `urls` for the downloader after the project's capture decision (403 POLICY_DENIED with the reason). */
-  async function queueLinks(s: Session, projectId: string, urls: string[], opts: CaptureOptions): Promise<{ queueId: string }> {
-    await checkCaptureAllowed(s.repo, projectId, urls); // 403 with the reason when denied
+  async function queueLinks(
+    s: Session,
+    projectId: string,
+    urls: string[],
+    opts: CaptureOptions,
+    extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void } = {},
+  ): Promise<{ queueId: string }> {
+    await checkCaptureAllowed(s.repo, projectId, urls, extra.methods); // 403 with the reason when denied
     requireAcknowledged(s, projectId, opts);
     await state.workerClient(); // 503 when the media helper cannot run
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
     // The legal basis is checked per link as it is stored, as for every capture.
-    state.startCaptureQueue(queueId, projectId, urls, opts);
+    const done = state.startCaptureQueue(queueId, projectId, urls, opts, extra.after ? { after: extra.after } : {});
+    extra.onQueued?.(queueId, done);
     return { queueId };
+  }
+
+  /**
+   * Each paired extension's links queues (R116): a slot is taken synchronously before anything async,
+   * so parallel requests cannot all pass the limit; it stays taken while its queue is unfinished.
+   */
+  type Slot = { root: string; queueId?: string; done?: Promise<void> };
+  const linkSlots = new Map<string, Slot[]>();
+  function activeSlots(callerId: string, root: string): Slot[] {
+    const live = (linkSlots.get(callerId) ?? []).filter((x) => x.root === root && (x.queueId === undefined || state.captureQueue(x.queueId)?.finished === false));
+    linkSlots.set(callerId, live);
+    return live;
   }
 
   app.post("/projects/:id/capture", async (req) => {
@@ -194,10 +233,34 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const b = bodyOf(req);
     const projectId = str(b, "projectId", 64);
     if (!s.repo.listProjects().some((p) => p.id === projectId)) throw notFound("That project");
-    const urls = urlList(b, "urls", MAX_QUEUED_LINKS);
+    // The same link listed again is queued once (R116).
+    const urls = [...new Set(urlList(b, "urls", MAX_QUEUED_LINKS))];
     if (!urls.length) throw badRequest('"urls" must list at least one web address.');
+    postLinksOnly(urls);
     const legalBasis = optStr(b, "legalBasis", 2000);
-    return queueLinks(s, projectId, urls, { transcribe: "project-default", ...(legalBasis ? { legalBasis } : {}) });
+    // One running and one waiting links queue per paired extension; more is 429 (R116).
+    const callerId = req.extensionId ?? "";
+    const root = s.lib.root;
+    const live = activeSlots(callerId, root);
+    if (live.length >= LINK_QUEUES_PER_EXTENSION) throw new ApiError(429, "RATE_LIMITED", "Links from this browser are already being captured. Wait until they have finished, then send more.");
+    const slot: Slot = { root };
+    live.push(slot);
+    // A second list waits for the first; downloads from any queue share one lane per platform.
+    const after = live.find((x) => x !== slot)?.done;
+    try {
+      return await queueLinks(s, projectId, urls, { transcribe: "project-default", ...(legalBasis ? { legalBasis } : {}) }, {
+        // A link list is both browser capture and the downloader: the project must allow both (R116).
+        methods: ["browser_capture", "downloader"],
+        ...(after ? { after } : {}),
+        onQueued: (queueId, done) => {
+          slot.queueId = queueId;
+          slot.done = done;
+        },
+      });
+    } catch (err) {
+      linkSlots.set(callerId, (linkSlots.get(callerId) ?? []).filter((x) => x !== slot));
+      throw err;
+    }
   });
 
   app.post("/capture/browser", { bodyLimit: BROWSER_CAPTURE_BODY_LIMIT }, async (req) => {

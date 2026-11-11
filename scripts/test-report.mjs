@@ -18,6 +18,7 @@ export const AREA_NAMES = {
   "custom-styles.test.ts": "Custom citation styles",
   "library.test.ts": "Library folder",
   "test-report.test.mjs": "Test report",
+  "e2e-args.test.mjs": "End-to-end test arguments",
 };
 
 export function areaName(file) {

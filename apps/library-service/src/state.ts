@@ -170,7 +170,8 @@ export class ServiceState {
    * stops early it returns how to continue (given the library open then), which runs after the
    * move. Work that cannot stop part-way simply finishes (it is drained).
    */
-  startWork(kind: string, fn: (ctl: WorkControl) => Promise<((s: Session) => void) | void>): void {
+  /** Runs `fn` in the work registry; the promise settles (never rejects) when it has ended. */
+  startWork(kind: string, fn: (ctl: WorkControl) => Promise<((s: Session) => void) | void>): Promise<void> {
     const id = ++this.workSeq;
     const ctl: WorkControl = { stopping: false };
     const root = this.session?.lib.root;
@@ -184,6 +185,7 @@ export class ServiceState {
       .finally(() => this.work.delete(id));
     this.work.set(id, { kind, ctl, done });
     this.track(done, kind);
+    return done;
   }
 
   /** Background work running now, by kind (diagnostics, tests). */
@@ -236,12 +238,17 @@ export class ServiceState {
 
   /**
    * Captures `urls` one at a time in the registry: progress as `capture.progress`; a move stops it
-   * between links and it continues with the rest on the moved library (R106 C1).
+   * between links and it continues with the rest on the moved library (R106 C1). With `after`, the
+   * queue waits for that (another queue) to end before its first link (R116). The promise settles
+   * when this run of the queue has ended.
    */
-  startCaptureQueue(queueId: string, projectId: string, urls: string[], opts: CaptureOptions, offset = 0, total = urls.length): void {
+  startCaptureQueue(queueId: string, projectId: string, urls: string[], opts: CaptureOptions, at: { offset?: number; total?: number; after?: Promise<unknown> } = {}): Promise<void> {
+    const offset = at.offset ?? 0;
+    const total = at.total ?? urls.length;
     const info = this.captures.get(queueId) ?? { projectId, done: offset, total, finished: false };
     this.captures.set(queueId, info);
-    this.startWork("capture", async (ctl) => {
+    return this.startWork("capture", async (ctl) => {
+      await at.after?.catch(() => {});
       const s = this.requireSession();
       const worker = await this.workerClient();
       const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
@@ -265,8 +272,8 @@ export class ServiceState {
       }
       if (outcomes.length < urls.length) {
         const rest = urls.slice(outcomes.length);
-        const at = offset + outcomes.length;
-        return () => this.startCaptureQueue(queueId, projectId, rest, opts, at, total);
+        const next = offset + outcomes.length;
+        return () => void this.startCaptureQueue(queueId, projectId, rest, opts, { offset: next, total });
       }
       info.finished = true;
       return;

@@ -5,18 +5,24 @@
 //   pnpm e2e -- --extension-only <args…>       only the extension suite, <args…> passed to its Playwright
 //   pnpm e2e -- --desktop-only <args…>         only the desktop suite, <args…> passed to its Playwright
 //
+// The flag may stand anywhere among the arguments (e2e-args.mjs).
+//
 // Extra arguments without a flag go to the extension suite while the desktop suite does not exist;
 // once it does, a flag is needed so one suite's spec path never reaches the other.
 import { existsSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { parseE2eArgs } from "./e2e-args.mjs";
 
 mkdirSync("reports", { recursive: true });
-let args = process.argv.slice(2).filter((a) => a !== "--");
-let only;
-if (args[0] === "--extension-only" || args[0] === "--desktop-only") {
-  only = args[0] === "--extension-only" ? "extension" : "desktop";
-  args = args.slice(1);
+let parsed;
+try {
+  parsed = parseE2eArgs(process.argv.slice(2));
+} catch (e) {
+  console.error(e.message);
+  process.exit(2);
 }
+const { args } = parsed;
+let { only } = parsed;
 const hasExtension = existsSync("apps/browser-extension");
 const hasDesktop = existsSync("apps/desktop");
 if (!only && args.length) {

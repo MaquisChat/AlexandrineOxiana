@@ -73,24 +73,54 @@ function checkCss(css: string, path: string): void {
   }
 }
 
+/** Characters tried when asking whether two single-character atoms can match the same thing. */
+const SAMPLE_CHARS: string[] = (() => {
+  const out: string[] = [];
+  for (let c = 0; c < 256; c++) out.push(String.fromCharCode(c));
+  for (const c of ["\u0660", "\u2003", "\u2028", "\u3000", "\ufeff", "\u3042", "\u20ac", "\u0430", "\u4e00"]) out.push(c);
+  return out;
+})();
+
+/** Whether two atoms can match a common character; a group (several characters) is assumed to. */
+function atomsOverlap(a: { src: string; group: boolean }, b: { src: string; group: boolean }): boolean {
+  if (a.group || b.group) return true;
+  let ra: RegExp, rb: RegExp;
+  try {
+    ra = new RegExp(`^(?:${a.src})$`);
+    rb = new RegExp(`^(?:${b.src})$`);
+  } catch {
+    return true;
+  }
+  return SAMPLE_CHARS.some((c) => ra.test(c) && rb.test(c));
+}
+
 /**
- * Why `src` could backtrack catastrophically, or undefined: a backreference, or a repeated group that
- * itself contains a repetition ("(a+)+", "(?:x*)*", "(a{1,5})+"). Repetition = *, + or {…}.
+ * Why `src` could backtrack catastrophically, or undefined:
+ *  - a backreference;
+ *  - a repeated group that contains a quantifier ("(a+)+", "(?:x*)*", "(a{1,5})+", "(a?){25}");
+ *  - a repeated group that contains alternation ("(a|aa)+", "(?:\w|\d)+", "(.|\s)*") (R116);
+ *  - two adjacent unbounded quantifiers whose atoms can match the same character ("\s*\s*") (R116).
+ * Repeated = *, +, {n,}, {n,m} with m > 1, or {n} with n > 1; unbounded = *, + or {n,}.
  */
 export function unsafePatternReason(src: string): string | undefined {
-  const groups: Array<{ repeats: boolean }> = [{ repeats: false }];
-  const quantifierAt = (i: number): { len: number; repeats: boolean } | undefined => {
+  type Frame = { start: number; quantified: boolean; alternation: boolean; prev?: { src: string; group: boolean } };
+  const groups: Frame[] = [{ start: -1, quantified: false, alternation: false }];
+  const quantifierAt = (i: number): { len: number; repeats: boolean; unbounded: boolean } | undefined => {
     const c = src[i];
-    if (c === "*" || c === "+") return { len: src[i + 1] === "?" ? 2 : 1, repeats: true };
-    if (c === "?") return { len: src[i + 1] === "?" ? 2 : 1, repeats: false };
+    if (c === "*" || c === "+") return { len: src[i + 1] === "?" ? 2 : 1, repeats: true, unbounded: true };
+    if (c === "?") return { len: src[i + 1] === "?" ? 2 : 1, repeats: false, unbounded: false };
     const m = c === "{" ? /^\{(\d+)(,(\d*))?\}\??/.exec(src.slice(i)) : null;
-    if (m) return { len: m[0].length, repeats: m[2] !== undefined || Number(m[1]) > 1 };
+    if (m) {
+      const unbounded = m[2] !== undefined && m[3] === "";
+      return { len: m[0].length, repeats: unbounded || Number(m[3] || m[1]) > 1, unbounded };
+    }
     return undefined;
   };
   let i = 0;
   while (i < src.length) {
     const c = src[i]!;
-    let atomRepeats = false; // the atom just read contains a repetition (groups only)
+    const start = i;
+    let inner: Frame | undefined; // the group just closed
     if (c === "\\") {
       const n = src[i + 1] ?? "";
       if (/[1-9]/.test(n) || (n === "k" && src[i + 2] === "<")) return "backreferences are not allowed";
@@ -102,27 +132,42 @@ export function unsafePatternReason(src: string): string | undefined {
       while (i < src.length && src[i] !== "]") i += src[i] === "\\" ? 2 : 1;
       i++;
     } else if (c === "(") {
-      groups.push({ repeats: false });
+      groups.push({ start: i, quantified: false, alternation: false });
       i++;
       const head = /^\?(:|=|!|<=|<!|<[A-Za-z_][A-Za-z0-9_]*>)/.exec(src.slice(i));
       if (head) i += head[0].length;
       continue;
     } else if (c === ")") {
-      const g = groups.pop();
-      if (!g || groups.length === 0) return "unbalanced parentheses";
-      atomRepeats = g.repeats;
+      inner = groups.pop();
+      if (!inner || groups.length === 0) return "unbalanced parentheses";
       i++;
     } else {
       i++;
-      if (c === "|" || c === "^" || c === "$") continue;
+      if (c === "|" || c === "^" || c === "$") {
+        const top = groups[groups.length - 1]!;
+        if (c === "|") top.alternation = true;
+        top.prev = undefined; // nothing is adjacent across these
+        continue;
+      }
+    }
+    const top = groups[groups.length - 1]!;
+    const atomStart = inner ? inner.start : start;
+    const atom = { src: src.slice(atomStart, i), group: inner !== undefined };
+    if (inner) {
+      // What the closed group contains is contained by the enclosing one too.
+      if (inner.quantified) top.quantified = true;
+      if (inner.alternation) top.alternation = true;
     }
     const q = quantifierAt(i);
-    const top = groups[groups.length - 1]!;
-    if (atomRepeats) top.repeats = true;
     if (q) {
-      if (q.repeats && atomRepeats) return "nested quantifiers are not allowed";
-      if (q.repeats) top.repeats = true;
+      if (q.repeats && inner?.quantified) return "nested quantifiers are not allowed";
+      if (q.repeats && inner?.alternation) return "a repeated group with alternatives (|) is not allowed";
+      top.quantified = true;
       i += q.len;
+      if (q.unbounded && top.prev && atomsOverlap(top.prev, atom)) return "adjacent unbounded quantifiers over overlapping characters are not allowed";
+      top.prev = q.unbounded ? atom : undefined;
+    } else {
+      top.prev = undefined;
     }
   }
   return undefined;

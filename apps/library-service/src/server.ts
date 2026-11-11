@@ -69,6 +69,8 @@ declare module "fastify" {
   interface FastifyRequest {
     /** Who is calling: the desktop UI, or a paired browser extension. */
     caller?: "ui" | "extension";
+    /** The paired extension calling (its pairing id), for its per-caller limits (R116). */
+    extensionId?: string;
   }
 }
 
@@ -181,6 +183,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     const originOk = origin === ext.origin || (origin === undefined && EXTENSION_NO_ORIGIN_ROUTES.has(route));
     if (!originOk) return fail(reply, new ApiError(403, "FORBIDDEN", origin === undefined ? "Requests from the browser extension must carry its origin." : "This token belongs to another extension."));
     req.caller = "extension";
+    req.extensionId = ext.id;
   });
 
   // During a library move nothing may change anything (R102 N2): every non-read request waits it out.

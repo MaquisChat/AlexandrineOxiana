@@ -13,7 +13,7 @@ import { fitCaptureBody } from "./body-size.js";
 import type { ContentApi } from "./content/index.js";
 import { bytesToBase64, captureFullPage, createCaptureLimiter } from "./content/screenshot.js";
 import { validateSelectors, type SelectorsConfig } from "./content/selectors-schema.js";
-import { addPending, chunks, parsePending, removePending } from "./pending.js";
+import { afterSend, parsePending, removePending, sendInChunks } from "./pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus } from "./types.js";
 
 const api = createApi({ fetch: (input, init) => fetch(input, init), storage: browser.storage.local });
@@ -173,6 +173,7 @@ function updatePending(change: (p: ReturnType<typeof parsePending>) => ReturnTyp
 function refusalReason(e: unknown): string {
   if (e instanceof ApiError) {
     if (e.code === "FORBIDDEN") return "the desktop app needs updating (this version does not take link lists from the extension)";
+    if (e.code === "RATE_LIMITED") return "the desktop app is still capturing the links sent before; try again when it has finished";
     if (e.code === "POLICY_DENIED") return `the project's rules do not allow it: ${e.reason ?? e.message}`;
   }
   return errorText(e);
@@ -183,24 +184,16 @@ const links = (n: number) => `${n} link${n === 1 ? "" : "s"}`;
 /** Sends `urls` (in pieces of 500) to POST /capture/browser/links; what is not taken is kept for the project. */
 async function sendLinks(projectId: string, urls: string[]): Promise<CaptureReply> {
   if (!urls.length) return { ok: false, message: "No post links were noted. Scroll the profile, then press Finish." };
-  let sent = 0;
-  try {
-    for (const part of chunks(urls, MAX_LINKS)) {
-      await api.queueLinks(projectId, part);
-      sent += part.length;
-    }
-  } catch (e) {
-    const reason = refusalReason(e);
-    const rest = urls.slice(sent);
-    await updatePending((p) => addPending(p, projectId, rest, reason));
-    return { ok: false, message: `${sent ? `Sent ${links(sent)}; ` : ""}${links(rest.length)} not sent: ${reason}. They are kept until the browser closes; open the extension to try again or copy them.` };
-  }
-  // Whatever of these was waiting for this project has now been taken.
-  const done = new Set(urls);
-  await updatePending((p) => {
-    const left = (p[projectId]?.urls ?? []).filter((u) => !done.has(u));
-    return left.length ? { ...p, [projectId]: { ...p[projectId]!, urls: left } } : removePending(p, projectId);
+  const r = await sendInChunks(urls, MAX_LINKS, async (part) => {
+    await api.queueLinks(projectId, part);
   });
+  const sent = r.sent.length;
+  // What was taken leaves the pending list even when a later piece failed, so a retry does not send it again (R116).
+  const reason = r.error === undefined ? "" : refusalReason(r.error);
+  await updatePending((p) => afterSend(p, projectId, r.sent, r.rest, reason));
+  if (r.error !== undefined) {
+    return { ok: false, message: `${sent ? `Sent ${links(sent)}; ` : ""}${links(r.rest.length)} not sent: ${reason}. They are kept until the browser closes; open the extension to try again or copy them.` };
+  }
   return { ok: true, message: `Sent ${links(sent)} to the desktop app's capture queue.` };
 }
 

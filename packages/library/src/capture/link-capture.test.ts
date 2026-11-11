@@ -732,3 +732,31 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
     expect((await repo.getSource(p.id, first.sourceId!)).assets.length).toBe(before);
   });
 });
+
+describe("R116: one per-platform lane per library", () => {
+  it("two link captures (two queues) on the same library never download from one platform at the same time", async () => {
+    const p = await project();
+    const inFlight = new Map<string, number>();
+    const overlaps: string[] = [];
+    let downloads = 0;
+    const fake = {
+      async submit(_pid: string, job: { type: string; input: string }) {
+        const platform = classifyUrl(job.input).platform;
+        const n = (inFlight.get(platform) ?? 0) + 1;
+        inFlight.set(platform, n);
+        if (n > 1) overlaps.push(platform);
+        downloads++;
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight.set(platform, n - 1);
+        const { WorkerJobError } = await import("../worker-client.js");
+        throw new WorkerJobError("TOOL_FAILED", "the tool failed");
+      },
+    } as unknown as WorkerClient;
+    const a = createLinkCapture({ repo, worker: fake, index: handle });
+    const b = createLinkCapture({ repo, worker: fake, index: handle });
+    const urls = (k: string) => Array.from({ length: 4 }, (_, i) => `https://www.youtube.com/watch?v=aoLane${k}000${i}`);
+    await Promise.all([a.captureUrls(p.id, urls("A"), { transcribe: false }), b.captureUrls(p.id, urls("B"), { transcribe: false })]);
+    expect(downloads).toBe(8);
+    expect(overlaps).toEqual([]);
+  });
+});

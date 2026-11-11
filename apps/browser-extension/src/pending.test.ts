@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addPending, chunks, parsePending, removePending } from "./pending.js";
+import { addPending, afterSend, chunks, parsePending, removePending, sendInChunks } from "./pending.js";
 
 describe("pending profile links (kept per project, merged, never overwritten)", () => {
   it("keeps lists of different projects apart", () => {
@@ -27,5 +27,24 @@ describe("pending profile links (kept per project, merged, never overwritten)", 
   it("sends long lists in pieces of at most 500", () => {
     const urls = Array.from({ length: 1201 }, (_, i) => `https://a.example/${i}`);
     expect(chunks(urls, 500).map((c) => c.length)).toEqual([500, 500, 201]);
+  });
+
+  it("R116: when a later piece fails, the links already sent leave the pending list (a retry does not send them again)", async () => {
+    const urls = Array.from({ length: 700 }, (_, i) => `https://a.example/${i}`);
+    let p = addPending({}, "p1", urls, "offline");
+    const sentParts: string[][] = [];
+    const r = await sendInChunks(p.p1!.urls, 500, async (part) => {
+      if (sentParts.length === 1) throw new Error("the service went away");
+      sentParts.push(part);
+    });
+    expect(sentParts.map((x) => x.length)).toEqual([500]);
+    expect(r.error).toBeInstanceOf(Error);
+    p = afterSend(p, "p1", r.sent, r.rest, "the service went away");
+    expect(p.p1!.urls).toEqual(urls.slice(500));
+    expect(p.p1!.reason).toBe("the service went away");
+    // All taken: the project's list is gone.
+    const ok = await sendInChunks(p.p1!.urls, 500, async () => {});
+    expect(ok.error).toBeUndefined();
+    expect(afterSend(p, "p1", ok.sent, ok.rest, "")).toEqual({});
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import rawSelectors from "./selectors.json";
-import { SelectorsError, validateSelectors } from "./selectors-schema.js";
+import { SelectorsError, unsafePatternReason, validateSelectors } from "./selectors-schema.js";
 
 const clone = (): any => JSON.parse(JSON.stringify(rawSelectors));
 
@@ -60,6 +60,27 @@ describe("selectors.json schema", () => {
       s.platforms.instagram.pages.post.fields.handle[0].pattern = pattern;
       expect(() => validateSelectors(s), pattern).not.toThrow();
     }
+  });
+
+  it("R116: refuses quantified groups with alternation and adjacent unbounded quantifiers over overlapping classes", () => {
+    for (const pattern of ["(?:a|aa)+$", "(a|aa)+$", "(\\w|\\d)+$", "(.|\\s)*$", "(a|a?)+$", "^(a?){25}a{25}$", "\\s*\\s*\\s*$", "\\s*\\s*"]) {
+      expect(unsafePatternReason(pattern), pattern).toBeDefined();
+      const s = clone();
+      s.platforms.instagram.pages.post.fields.handle[0].pattern = pattern.includes("(") && !pattern.startsWith("(?:") ? pattern : `(${pattern})`;
+      expect(() => validateSelectors(s), pattern).toThrow(/pattern.*not allowed/);
+    }
+  });
+
+  it("R116: the patterns shipped in selectors.json still pass", () => {
+    const shipped: string[] = [];
+    const walk = (v: unknown): void => {
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) (k === "pattern" && typeof x === "string" ? shipped.push(x) : walk(x));
+    };
+    walk(clone());
+    expect(shipped).toHaveLength(3);
+    for (const pattern of shipped) expect(unsafePatternReason(pattern), pattern).toBeUndefined();
+    expect(() => validateSelectors(clone())).not.toThrow();
   });
 
   it("refuses a field with no alternatives or a non-array", () => {
