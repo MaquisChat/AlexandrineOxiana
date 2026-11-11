@@ -64,7 +64,12 @@ const COMMENTS_LEGAL_MISSING = "Enter the legal basis for this capture. Comments
 
 function AckDialog({ busy, error, onConfirm, onCancel }: { busy: boolean; error: string | null; onConfirm: () => void; onCancel: () => void }) {
   const id = useId();
+  // What had focus before the dialog, read while rendering: before the background is made inert,
+  // which in a browser can move focus to <body> before useTrap's passive effect reads it (review M9).
+  const [before] = useState(() => document.activeElement as HTMLElement | null);
   const { ref, onKeyDown } = useTrap(onCancel, busy);
+  // Declared after useTrap: its cleanup runs after useTrap's, so this restore is the one that stays.
+  useEffect(() => () => before?.focus?.(), [before]);
   const [host] = useState(() => document.createElement("div"));
   // Attached before useTrap's effect moves focus into the dialog (layout effects run first).
   useLayoutEffect(() => {
@@ -111,12 +116,17 @@ const TOOL_LABELS: Array<{ keys: string[]; label: string; missing: string }> = [
   { keys: ["faster_whisper", "faster-whisper"], label: "faster-whisper (transcription)", missing: "Not installed on this computer." },
 ];
 
-/** Plain words for a failed tools call: a helper code is explained, never shown. */
-function toolsErrorText(err: unknown, fallback: string): string {
-  if (err instanceof ApiClientError && err.reason && /^[A-Z][A-Z0-9_]+$/.test(err.reason)) {
-    return KNOWN_OUTCOME_CODES.includes(err.reason) ? outcomeText(err.reason) : fallback;
-  }
-  return errorText(err, fallback);
+/**
+ * Plain words for a failed tools call. Today a failed update reaches the UI as 500 INTERNAL with the
+ * service's generic message (media-worker.ts throws a plain Error): `lead` plus that message. A tool
+ * code in `reason` (Task 63 is to send one) is explained, never shown. The reason of a 503 (the
+ * helper's start-up message, which can name commands or paths) is never shown.
+ */
+function toolsErrorText(err: unknown, lead: string): string {
+  if (!(err instanceof ApiClientError)) return lead;
+  if (err.reason && /^[A-Z][A-Z0-9_]+$/.test(err.reason)) return KNOWN_OUTCOME_CODES.includes(err.reason) ? outcomeText(err.reason) : lead;
+  if (err.code === "WORKER_UNAVAILABLE") return `${lead} The media helper is not running. Restart the app and try again.`;
+  return err.message && err.message !== lead ? `${lead} ${err.message}` : lead;
 }
 
 function updateLines(u: ToolsUpdate): string[] {
@@ -175,7 +185,11 @@ function CaptureTools({ api }: { api: ReturnType<typeof captureApi> }) {
     <section className="ao-capture__section" aria-labelledby={id}>
       <h2 id={id}>Capture tools</h2>
       <p>The downloaders change often as platforms change. Updating them can fix links that stopped working.</p>
-      {versionsError && <p className="ao-capture__note">{versionsError}</p>}
+      {versionsError && (
+        <UserText as="p" className="ao-capture__note">
+          {versionsError}
+        </UserText>
+      )}
       {rows.length > 0 && (
         <dl className="ao-capture__tools">
           {rows.map(({ t, key }) => {
@@ -203,9 +217,9 @@ function CaptureTools({ api }: { api: ReturnType<typeof captureApi> }) {
         </div>
       )}
       {error && (
-        <p className="ao-capture__error" role="alert">
-          {error}
-        </p>
+        <div className="ao-capture__error" role="alert">
+          <UserText as="p">{error}</UserText>
+        </div>
       )}
     </section>
   );
