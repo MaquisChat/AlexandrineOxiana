@@ -15,6 +15,7 @@ import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
 import { ProjectNav } from "../components/ProjectNav";
+import { RecheckProjectButton, useProjectRecheck } from "../components/RecheckProject";
 import { SearchBox } from "../components/SearchBox";
 import { SourceTable } from "../components/SourceTable";
 import { PendingWritesDialog } from "../components/PendingWritesDialog";
@@ -164,6 +165,18 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
 
+  /** "Recheck project" (Task 34d, R99): its job's events come from the stream below; when it finishes, the open source's badges are read again. */
+  const [badgesVersion, setBadgesVersion] = useState(0);
+  const recheck = useProjectRecheck(api, {
+    onFinished: () => {
+      setBadgesVersion((n) => n + 1);
+      refresh();
+    },
+    onLocked: markLocked,
+  });
+  const recheckEvent = useRef(recheck.onEvent);
+  recheckEvent.current = recheck.onEvent;
+
   // ---- service events: library state, index progress, background jobs ----
   useEffect(() => {
     const ac = new AbortController();
@@ -187,6 +200,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
             if (typeof d.done !== "number" || typeof d.total !== "number") continue;
+            if (d.kind === "recheck") recheckEvent.current(e.data);
             if (d.kind === "index") setIndex({ done: d.done, total: d.total });
             else {
               const key = `${d.kind ?? "job"}:${d.jobId ?? ""}`;
@@ -425,6 +439,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               Lock project
             </button>
           )}
+          {project && !locked && <RecheckProjectButton control={recheck} projectId={project.id} readOnly={readOnly} />}
           {!locked && !readOnly && project && (
             <a href={importHref(project.id)} onClick={(e) => follow(e, importHref(project.id))}>
               Import
@@ -664,7 +679,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             )}
             {openSource && (
               <div className="ao-library__detail">
-                <SourceDetail api={api} projectId={project.id} sourceId={openSource} readOnly={readOnly} onClose={() => setOpenSource(undefined)} onChanged={refresh} onLocked={() => markLocked(project.id)} />
+                <SourceDetail api={api} projectId={project.id} sourceId={openSource} readOnly={readOnly} onClose={() => setOpenSource(undefined)} onChanged={refresh} onLocked={() => markLocked(project.id)} refreshKey={badgesVersion} />
               </div>
             )}
           </>
