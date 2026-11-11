@@ -368,7 +368,7 @@ export class ServiceState {
     let repo: Repo;
     try {
       index = lib.mode === "read-write" ? new IndexHandle(lib.root) : undefined;
-      repo = await openRepo(lib, ring, { actor: actor(), tz: this.tz, ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }) } : {}) });
+      repo = await openRepo(lib, ring, { actor: actor(), tz: this.tz, clock: this.opts.now, ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }) } : {}) });
     } catch (err) {
       index?.close();
       await lib.close().catch(() => {});

@@ -17,15 +17,20 @@ import {
   WorkerJobError,
   createLibrary,
   deviceDeps,
+  destroyRaw,
   listBackups,
   openLibrary,
+  projectWarnings,
   openRepo,
   type Deps,
   type JobResult,
   type WorkerClient,
   type WorkerJob,
 } from "@ao/library";
+import { existsSync } from "node:fs";
 import { buildPdf, tinyPng } from "../../../tests/fixtures/generate.mjs";
+// Test seam of the library (same module instance as @ao/library's): makes overwriting a file fail.
+import { shredSeams } from "../../../packages/library/src/fs/shred.js";
 import * as authModule from "./auth.js";
 import { readServiceToken } from "./auth.js";
 import { CREDENTIAL_QUERY_KEYS } from "@ao/shared";
@@ -989,6 +994,140 @@ describe("R125: backups are governed and audited", () => {
     const after = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, unknown> };
     expect(after.projectWarnings[pid]).not.toContain("backup-failed");
     expect(after.backupFailures[pid]).toBeUndefined();
+  });
+});
+
+describe("Task 49 round 3: the destruction retry (when it runs, where it does not)", () => {
+  const RETAIN = `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+  deidentifiedExportsOnly: true
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: false
+retention:
+  rawDataDestroyAfter: 2026-12-01
+captureMethods: [manual_upload]
+processing:
+  metadata_lookup: []
+`;
+  const clock = { now: new Date("2026-12-02T10:00:00.000Z") };
+  const later = (ms: number) => {
+    clock.now = new Date(clock.now.getTime() + ms);
+  };
+  const HOUR = 3_600_000;
+
+  /** A project whose destruction left its one backup NOT removed: returns the project id, the certificate and the backup's path. */
+  async function stuckDestruction(encrypted = false): Promise<{ pid: string; certificatePath: string; backup: string }> {
+    const pid = await newProject(encrypted ? RETAIN.replace("atRest: optional", "atRest: required") : RETAIN, encrypted, "Retain");
+    const repo = svc.state.session!.repo;
+    const file = join(tmp, "in", "interview.mp3");
+    await import("node:fs/promises").then((f) => f.mkdir(dirname(file), { recursive: true }));
+    await writeFile(file, "RAW interview audio bytes");
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "interview", title: { variants: [{ lang: "en", kind: "original", value: "Interview" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: file, role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: clock.now.toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "consented", basis: "test" }, identifiable: true } },
+    );
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    const backup = join(svc.state.session!.lib.root, "Backups", b.json.backup.file as string);
+    later(60_000);
+    shredSeams.failFor = (p) => p.endsWith(b.json.backup.file as string);
+    try {
+      const r = await destroyRaw(repo, pid, [sf.assets[0]!.id], "tester");
+      return { pid, certificatePath: r.certificatePath, backup };
+    } finally {
+      shredSeams.failFor = undefined;
+    }
+  }
+  const statusOf = async (path: string) => (JSON.parse(await readFile(path, "utf8")) as { backups: { status: string } }).backups.status;
+
+  beforeEach(async () => {
+    clock.now = new Date("2026-12-02T10:00:00.000Z");
+    await start({ now: () => clock.now });
+  });
+  afterEach(() => {
+    shredSeams.failFor = undefined;
+  });
+
+  it("runs when the library is opened", async () => {
+    const path = await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    expect(await statusOf(certificatePath)).toBe("pending");
+    await call({ method: "POST", url: "/libraries/close" });
+    later(HOUR);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc.state.idle();
+    expect(await statusOf(certificatePath)).toBe("deleted");
+    expect(existsSync(backup)).toBe(false);
+    expect(await projectWarnings(svc.state.session!.repo, pid)).not.toContain("destruction-backups-pending");
+  });
+
+  it("runs when a project is unlocked, and never while it is locked", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction(true);
+    svc.state.session!.repo.lockProject(pid);
+    later(HOUR);
+    await svc.state.runScheduledBackups();
+    // Locked: not retried (the certificate is sealed; the backup is the evidence).
+    expect(certificatePath.endsWith(".json.enc")).toBe(true);
+    expect(existsSync(backup)).toBe(true);
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    await svc.state.idle();
+    expect(existsSync(backup)).toBe(false);
+    expect(await projectWarnings(svc.state.session!.repo, pid)).not.toContain("destruction-backups-pending");
+  });
+
+  it("runs on the hourly pass, at most hourly", async () => {
+    await openNewLibrary();
+    const { certificatePath, backup } = await stuckDestruction();
+    later(30 * 60_000);
+    // The first retry after the destruction is due at once; it still fails here.
+    shredSeams.failFor = (p) => p.endsWith(backup.slice(backup.lastIndexOf("/") + 1));
+    await svc.state.runScheduledBackups();
+    shredSeams.failFor = undefined;
+    expect(await statusOf(certificatePath)).toBe("pending");
+    // Half an hour later: not due yet.
+    later(30 * 60_000);
+    await svc.state.runScheduledBackups();
+    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(existsSync(backup)).toBe(true);
+    // An hour after the last attempt: retried, and done.
+    later(30 * 60_000);
+    await svc.state.runScheduledBackups();
+    expect(await statusOf(certificatePath)).toBe("deleted");
+    expect(existsSync(backup)).toBe(false);
+  });
+
+  it("does not run while the library is being moved, nor in a read-only library", async () => {
+    await openNewLibrary();
+    const { certificatePath, backup } = await stuckDestruction();
+    later(HOUR);
+    const st = svc.state as unknown as { moving: unknown };
+    const before = st.moving;
+    st.moving = true;
+    try {
+      expect(await svc.state.runScheduledBackups()).toEqual([]);
+    } finally {
+      st.moving = before;
+    }
+    expect(await statusOf(certificatePath)).toBe("pending");
+    // As if the library had been opened read-only (an instance property shadows the getter).
+    const lib = svc.state.session!.lib;
+    const own = Object.getOwnPropertyDescriptor(lib, "mode");
+    Object.defineProperty(lib, "mode", { value: "read-only", configurable: true });
+    try {
+      expect(await svc.state.runScheduledBackups()).toEqual([]);
+    } finally {
+      if (own) Object.defineProperty(lib, "mode", own);
+      else delete (lib as unknown as { mode?: unknown }).mode;
+    }
+    expect(svc.state.session!.lib.mode).toBe("read-write");
+    expect(await statusOf(certificatePath)).toBe("pending");
+    expect(existsSync(backup)).toBe(true);
   });
 });
 
