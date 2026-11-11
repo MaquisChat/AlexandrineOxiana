@@ -15,6 +15,7 @@ import { JobsIndicator, type Job } from "../components/JobsIndicator";
 import { ProjectNav } from "../components/ProjectNav";
 import { SearchBox } from "../components/SearchBox";
 import { SourceTable } from "../components/SourceTable";
+import { PendingWritesDialog } from "../components/PendingWritesDialog";
 import { StatusBanner, bannersFor, volumeOf } from "../components/StatusBanner";
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
@@ -73,6 +74,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [sources, setSources] = useState<{ total: number; items: SourceRow[] } | undefined>();
   const [openSource, setOpenSource] = useState<string | undefined>();
   const [outcomes, setOutcomes] = useState<AttachOutcome[] | undefined>();
+  /** "Resolve…" (R27) is open; focus goes back to the button that opened it. */
+  const [resolving, setResolving] = useState<{ from: HTMLElement | null } | null>(null);
   const [attaching, setAttaching] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const [sourcesError, setSourcesError] = useState<string | undefined>();
@@ -311,10 +314,22 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           )}
         </div>
       </header>
+      {resolving && (
+        <PendingWritesDialog
+          api={api}
+          readOnly={readOnly}
+          onClose={() => {
+            const from = resolving.from;
+            setResolving(null);
+            from?.focus();
+          }}
+          onResolved={refresh}
+        />
+      )}
       {banners.length > 0 && (
         <div className="ao-library__banners">
           {banners.map((b, i) => (
-            <StatusBanner key={`${b.kind}-${i}`} variant={b} />
+            <StatusBanner key={`${b.kind}-${i}`} variant={b} onResolve={() => setResolving({ from: document.activeElement instanceof HTMLElement ? document.activeElement : null })} />
           ))}
         </div>
       )}

@@ -6,6 +6,7 @@
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
 import {
   AcknowledgementRequiredError,
+  PendingWriteChoiceError,
   AnchorsUnreadableError,
   AuditChainInvalidError,
   DecryptionError,
@@ -96,6 +97,7 @@ export interface ErrorBody {
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
   if (err instanceof PolicyDeniedError) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
+  if (err instanceof PendingWriteChoiceError) return new ApiError(409, "CONFLICT", err.message, err.allowed.length ? `allowed: ${err.allowed.join(", ")}` : "allowed: none");
   if (err instanceof BatchRefusedError) {
     if (err.denied) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
     // Running (being paused or undone) or already finished: a state conflict (R102, by kind — R106).

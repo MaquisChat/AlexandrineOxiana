@@ -238,6 +238,45 @@ describe("Library screen", () => {
     await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}', "DELETE w1"]));
   });
 
+  it("Resolve… on an interrupted-change banner lists the changes and resolves one by the researcher's choice (R27)", async () => {
+    const T1 = "019a7000-0000-7000-8000-0000000000c1";
+    const T2 = "019a7000-0000-7000-8000-00000000bad1";
+    let pending = [
+      { txn: T1, projectId: "p1", project: "Dissertation", status: "unverifiable", canKeep: false, canRollBack: true, steps: 3 },
+      { txn: T2, projectId: "*", project: "library", status: "invalid", canKeep: false, canRollBack: false, steps: 0 },
+    ];
+    const resolved: unknown[] = [];
+    const warn = { projectId: "p1", project: "Dissertation", kind: "txn-recovery-skipped-audit-unverifiable", detail: "x" };
+    server.use(
+      http.get(url("/libraries/pending-writes"), () => HttpResponse.json({ pendingWrites: pending })),
+      http.post(url("/libraries/pending-writes/:txn/resolve"), async ({ params, request }) => {
+        resolved.push({ txn: params.txn, ...((await request.json()) as object) });
+        pending = pending.filter((p) => p.txn !== params.txn);
+        return HttpResponse.json({ txn: params.txn, choice: "roll-back", projectId: "p1" });
+      }),
+      ...libraryHandlers({ state: { open: true, ...CURRENT_RW, integrityWarnings: [warn], projectWarnings: {} } }),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    const resolve = await screen.findByRole("button", { name: "Resolve the interrupted change in Dissertation…" });
+    await user.click(resolve);
+    const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
+    const first = await within(dialog).findByRole("group", { name: "Interrupted change in Dissertation" });
+    expect((within(first).getByRole("button", { name: "Keep it" }) as HTMLButtonElement).disabled).toBe(true);
+    const second = within(dialog).getByRole("group", { name: "Interrupted change in library" });
+    expect(within(second).queryByRole("button", { name: "Roll it back" })).toBeNull();
+    expect(second.textContent).toMatch(/cannot be undone or kept here/);
+    await user.click(within(first).getByRole("button", { name: "Roll it back" }));
+    // A confirmation first.
+    expect(resolved).toEqual([]);
+    await user.click(within(first).getByRole("button", { name: "Yes, roll it back" }));
+    await waitFor(() => expect(resolved).toEqual([{ txn: T1, choice: "roll-back" }]));
+    await waitFor(() => expect(within(dialog).queryByRole("group", { name: "Interrupted change in Dissertation" })).toBeNull());
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(resolve);
+  });
+
   it("PROJECT_LOCKED during an edit returns to UnlockProject and clears what was decrypted", async () => {
     server.use(http.patch(url("/projects/:id/tags/:tid"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")), ...libraryHandlers());
     const user = userEvent.setup();

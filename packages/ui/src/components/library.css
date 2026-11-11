@@ -413,3 +413,36 @@ button:disabled,
   width: 1em;
   margin-inline-end: var(--space-1);
 }
+
+/* ---- interrupted changes (R27) ---- */
+.ao-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--backdrop) 80%, var(--bg) 20%);
+}
+
+.ao-dialog {
+  max-width: 40rem;
+  max-height: calc(100vh - 2 * var(--space-3));
+  overflow: auto;
+  border: 2px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: var(--space-3);
+}
+
+.ao-pending {
+  border-top: 1px solid var(--line);
+  padding: var(--space-2) 0;
+}
+
+.ao-pending__title {
+  font-weight: 600;
+  margin: 0 0 var(--space-1);
+}

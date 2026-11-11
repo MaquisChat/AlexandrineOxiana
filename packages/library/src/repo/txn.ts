@@ -331,6 +331,111 @@ export async function pendingMarkers(root: string): Promise<number> {
 }
 
 /**
+ * What a marker says, decided without touching anything (R26 rules, shared by recovery on open and
+ * by the researcher's manual resolution, R27):
+ * - `invalid`: unreadable, or unsafe to act on (see markerProblem / unsafeOnDisk);
+ * - `committed`: every allow audit event of the transaction is in the project's audit log;
+ * - `unverifiable`: not committed by the log, but the log cannot be trusted to say so (its chain
+ *   before the transaction does not verify, or the external anchor is past the transaction's start);
+ * - `uncommitted`: not committed, and the log can be trusted to say so.
+ */
+export type MarkerStatus = "invalid" | "committed" | "unverifiable" | "uncommitted";
+
+export interface MarkerInspection {
+  txn: string;
+  status: MarkerStatus;
+  /** The marker's project id ("*" when it cannot be read or names none). */
+  projectId: string;
+  /** The marker's `projectFolder` as written, when it has one (it may be a different project's folder). */
+  projectFolder?: string;
+  detail?: string;
+  /** The parsed marker, for every status but `invalid`. */
+  marker?: TxnMarker;
+}
+
+/** Inspects one marker (`.tmp/txn-<fileTxn>.json`). Reads only. */
+export async function inspectMarker(root: string, fileTxn: string, anchorOf: (projectId: string) => Head | undefined): Promise<MarkerInspection> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await fsp.readFile(join(root, ".tmp", `txn-${fileTxn}.json`), "utf8"));
+  } catch {
+    return { txn: fileTxn, status: "invalid", projectId: "*", detail: "unreadable" };
+  }
+  const problem = markerProblem(raw, fileTxn) ?? (await unsafeOnDisk(root, raw as TxnMarker));
+  if (problem) {
+    // An invalid marker may name one project and point into another: report both, so both are blocked.
+    const { projectId: pid, projectFolder: pf } = (raw ?? {}) as { projectId?: unknown; projectFolder?: unknown };
+    return {
+      txn: fileTxn,
+      status: "invalid",
+      projectId: typeof pid === "string" && isId(pid) ? pid : "*",
+      ...(typeof pf === "string" ? { projectFolder: pf } : {}),
+      detail: problem,
+    };
+  }
+  const m = raw as TxnMarker;
+  const base = { txn: m.txn, projectId: m.projectId, projectFolder: m.projectFolder, marker: m };
+  const events = await AuditStore.read(fromRel(root, `${m.projectFolder}/audit`));
+  const mine = events.filter((e) => e !== null && e.decision?.result !== "deny" && (e.details as { txn?: unknown } | undefined)?.txn === m.txn).length;
+  if (mine >= m.auditEvents) return { ...base, status: "committed" };
+  // Rolling back is only safe when the audit log can be trusted to say "not committed".
+  // Only the part of the log written before this transaction is checked: its own tail (possibly a
+  // line torn by the crash) is exactly what the rollback truncates.
+  const prefix = events.slice(0, m.auditSeqBefore);
+  const verify = verifyChain(prefix as AuditEvent[]);
+  const prefixOk = verify.ok && prefix.length === m.auditSeqBefore && (verify.head?.seq ?? 0) === m.auditSeqBefore;
+  const anchor = anchorOf(m.projectId);
+  if (!prefixOk || (anchor && anchor.seq > m.auditSeqBefore)) {
+    return {
+      ...base,
+      status: "unverifiable",
+      detail: !prefixOk ? "the audit chain before this change does not verify" : `the audit anchor (event ${anchor!.seq}) is past this transaction's start (event ${m.auditSeqBefore})`,
+    };
+  }
+  return { ...base, status: "uncommitted" };
+}
+
+/** Every marker present, inspected (reads only). */
+export async function inspectMarkers(root: string, anchorOf: (projectId: string) => Head | undefined): Promise<MarkerInspection[]> {
+  const out: MarkerInspection[] = [];
+  for (const name of await listMarkers(root)) out.push(await inspectMarker(root, MARKER.exec(name)![1]!, anchorOf));
+  return out;
+}
+
+/**
+ * Finishes a committed transaction: files it destroyed are overwritten (R90 d), its trash and
+ * backups removed, then the marker. Returns false (marker and trash kept, retried later, R92/R94)
+ * when a destroyed file could not be overwritten yet.
+ */
+export async function finishCommitted(root: string, m: TxnMarker): Promise<boolean> {
+  let shredded = true;
+  for (const e of m.entries) {
+    if (e.kind !== "trashed" || !e.shred) continue;
+    try {
+      await shredPath(fromRel(root, e.to));
+    } catch {
+      shredded = false;
+    }
+  }
+  if (!shredded) return false;
+  for (const e of m.entries) {
+    if (e.kind === "trashed") await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
+  }
+  await removeMarker(root, m);
+  return true;
+}
+
+/**
+ * Undoes every step of an uncommitted transaction in reverse (partially appended change-log and
+ * audit lines included), then removes the marker. Returns false, keeping the marker, when a step failed.
+ */
+export async function rollBackMarker(root: string, m: TxnMarker): Promise<boolean> {
+  if (!(await undoEntries(root, m.entries))) return false;
+  await removeMarker(root, m);
+  return true;
+}
+
+/**
  * Finishes or rolls back every transaction marker left by a crash. Writable
  * libraries only. `anchorOf` returns the external audit anchor of a project.
  */
@@ -340,78 +445,25 @@ export async function recoverTransactions(
 ): Promise<RecoveryResult[]> {
   const out: RecoveryResult[] = [];
   for (const name of await listMarkers(root)) {
-    const fileTxn = MARKER.exec(name)![1]!;
-    let raw: unknown;
-    try {
-      raw = JSON.parse(await fsp.readFile(join(root, ".tmp", name), "utf8"));
-    } catch {
-      out.push({ projectId: "*", txn: fileTxn, outcome: "invalid", detail: "unreadable" });
+    const i = await inspectMarker(root, MARKER.exec(name)![1]!, anchorOf);
+    const where = { projectId: i.projectId, ...(i.projectFolder !== undefined ? { projectFolder: i.projectFolder } : {}), txn: i.txn };
+    if (i.status === "invalid") {
+      out.push({ ...where, outcome: "invalid", ...(i.detail ? { detail: i.detail } : {}) });
       continue;
     }
-    const problem = markerProblem(raw, fileTxn) ?? (await unsafeOnDisk(root, raw as TxnMarker));
-    if (problem) {
-      // An invalid marker may name one project and point into another: report both, so both are blocked.
-      const { projectId: pid, projectFolder: pf } = (raw ?? {}) as { projectId?: unknown; projectFolder?: unknown };
-      out.push({
-        projectId: typeof pid === "string" && isId(pid) ? pid : "*",
-        ...(typeof pf === "string" ? { projectFolder: pf } : {}),
-        txn: fileTxn,
-        outcome: "invalid",
-        detail: problem,
-      });
-      continue;
-    }
-    const m = raw as TxnMarker;
-    const events = await AuditStore.read(fromRel(root, `${m.projectFolder}/audit`));
-    const mine = events.filter(
-      (e) => e !== null && e.decision?.result !== "deny" && (e.details as { txn?: unknown } | undefined)?.txn === m.txn,
-    ).length;
-    if (mine >= m.auditEvents) {
+    const m = i.marker!;
+    if (i.status === "committed") {
       // Destroyed files are overwritten before they go (R90 d): a crash after the commit finishes it
       // here. If that fails, the marker and the trash stay, and the next open tries again (R92).
-      let shredded = true;
-      for (const e of m.entries) {
-        if (e.kind !== "trashed" || !e.shred) continue;
-        try {
-          await shredPath(fromRel(root, e.to));
-        } catch {
-          shredded = false;
-        }
-      }
-      if (!shredded) {
-        out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed-destroy-pending" });
-        continue;
-      }
-      for (const e of m.entries) {
-        if (e.kind === "trashed") await fsp.rm(fromRel(root, e.to), { recursive: true, force: true }).catch(() => {});
-      }
-      await removeMarker(root, m);
-      out.push({ projectId: m.projectId, txn: m.txn, outcome: "committed" });
+      out.push({ projectId: m.projectId, txn: m.txn, outcome: (await finishCommitted(root, m)) ? "committed" : "committed-destroy-pending" });
       continue;
     }
-    // Rolling back is only safe when the audit log can be trusted to say "not committed".
-    // Only the part of the log written before this transaction is checked: its own tail (possibly a
-    // line torn by the crash) is exactly what the rollback truncates.
-    const prefix = events.slice(0, m.auditSeqBefore);
-    const verify = verifyChain(prefix as AuditEvent[]);
-    const prefixOk = verify.ok && prefix.length === m.auditSeqBefore && (verify.head?.seq ?? 0) === m.auditSeqBefore;
-    const anchor = anchorOf(m.projectId);
-    if (!prefixOk || (anchor && anchor.seq > m.auditSeqBefore)) {
-      out.push({
-        projectId: m.projectId,
-        projectFolder: m.projectFolder,
-        txn: m.txn,
-        outcome: "skipped-audit-unverifiable",
-        detail: !prefixOk ? "the audit chain before this change does not verify" : `the audit anchor (event ${anchor!.seq}) is past this transaction's start (event ${m.auditSeqBefore})`,
-      });
+    if (i.status === "unverifiable") {
+      out.push({ ...where, outcome: "skipped-audit-unverifiable", ...(i.detail ? { detail: i.detail } : {}) });
       continue;
     }
-    if (await undoEntries(root, m.entries)) {
-      await removeMarker(root, m);
-      out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
-    } else {
-      out.push({ projectId: m.projectId, projectFolder: m.projectFolder, txn: m.txn, outcome: "rollback-incomplete" });
-    }
+    if (await rollBackMarker(root, m)) out.push({ projectId: m.projectId, txn: m.txn, outcome: "rolled-back" });
+    else out.push({ ...where, outcome: "rollback-incomplete" });
   }
   return out;
 }

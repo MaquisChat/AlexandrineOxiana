@@ -269,6 +269,39 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     };
   });
 
+  // ---- interrupted changes recovery could not settle (R27): listed, and resolved by the researcher's choice ----
+  app.get("/libraries/pending-writes", async () => {
+    const s = state.requireSession();
+    const names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]));
+    const list = await s.repo.pendingWrites();
+    return {
+      pendingWrites: list.map((p) => ({
+        txn: p.txn,
+        projectId: p.projectId,
+        project: p.projectId === "*" ? "library" : (names.get(p.projectId) ?? "a project"),
+        status: p.status,
+        canKeep: p.canKeep,
+        canRollBack: p.canRollBack,
+        steps: p.steps,
+        ...(p.detail ? { detail: scrubPaths(p.detail, state.roots) } : {}),
+      })),
+    };
+  });
+
+  app.post("/libraries/pending-writes/:txn/resolve", async (req) => {
+    const s = state.requireWritable();
+    const txn = (req.params as { txn?: string }).txn ?? "";
+    const choice = str(bodyOf(req), "choice", 16);
+    if (choice !== "roll-back" && choice !== "keep") throw badRequest('"choice" must be "roll-back" or "keep".');
+    const r = await s.repo.resolvePendingWrite(txn, choice);
+    // The index was built with the change half there (or, kept, without it): rebuild it in the background.
+    void state.startWork("index", async () => {
+      await rebuildIndex(s.index, s.ring, s.lib, (done, total) => state.events.publish("job.progress", { kind: "index", done, total }));
+    });
+    state.publishState();
+    return r;
+  });
+
   app.post("/libraries/relink", async (req) => {
     const s = state.requireWritable();
     const searchDir = absPath(bodyOf(req), "searchDir");

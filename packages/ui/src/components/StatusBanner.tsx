@@ -85,11 +85,23 @@ const TONE: Record<BannerVariant["kind"], string> = {
   warning: "warn",
 };
 
-export function StatusBanner({ variant }: { variant: BannerVariant }) {
+/** Warnings about an interrupted change the researcher can resolve by hand (R27). */
+export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable"]);
+
+export function StatusBanner({ variant, onResolve }: { variant: BannerVariant; onResolve?: () => void }) {
+  const resolvable = !!onResolve && variant.kind === "warning" && RESOLVABLE_WARNINGS.has(variant.warning);
   // Project names and service details are user text: shown with dir=auto inside the sentence.
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
       <UserText>{text(variant)}</UserText>
+      {resolvable && (
+        <>
+          {" "}
+          <button type="button" className="ao-small" aria-label={`Resolve the interrupted change in ${variant.project}…`} onClick={onResolve}>
+            Resolve…
+          </button>
+        </>
+      )}
     </div>
   );
 }

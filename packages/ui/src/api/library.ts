@@ -44,6 +44,21 @@ export interface FoundLibrary {
   [k: string]: unknown;
 }
 
+/** An interrupted change recovery could not settle (R27; GET /libraries/pending-writes). */
+export interface PendingWrite {
+  txn: string;
+  projectId: string;
+  /** The project's name, or "library" when the record names none. */
+  project: string;
+  status: "invalid" | "committed" | "unverifiable" | "uncommitted";
+  canKeep: boolean;
+  canRollBack: boolean;
+  steps: number;
+  detail?: string;
+}
+
+export type PendingWriteChoice = "roll-back" | "keep";
+
 export interface IntegrityWarning {
   projectId: string;
   project: string;
@@ -204,6 +219,11 @@ export function libraryApi(client: ApiClient) {
   const r = client.request;
   return {
     events: (opts: { signal?: AbortSignal } = {}): AsyncGenerator<ServiceEvent, void, undefined> => client.events(opts),
+    /** Interrupted changes recovery could not settle, resolved by the researcher's choice (R27). */
+    pendingWrites: {
+      list: async () => (await r<{ pendingWrites: PendingWrite[] }>("GET", "/libraries/pending-writes")).pendingWrites,
+      resolve: (txn: string, choice: PendingWriteChoice) => r<{ txn: string; choice: PendingWriteChoice; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/resolve`, { body: { choice } }),
+    },
     libraries: {
       list: () => r<{ libraries: LibraryEntry[]; current?: CurrentLibrary }>("GET", "/libraries"),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),

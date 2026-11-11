@@ -55,6 +55,22 @@ export class RecoveryPendingError extends Error {
   }
 }
 
+/**
+ * An interrupted change cannot be resolved the way asked (R27): it is kept only when its marker
+ * shows it committed, rolled back only when it is uncommitted and its marker is valid; an invalid
+ * marker cannot be acted on at all. `allowed` lists the choices that are possible.
+ */
+export class PendingWriteChoiceError extends Error {
+  override name = "PendingWriteChoiceError";
+  constructor(
+    readonly txn: string,
+    readonly allowed: Array<"roll-back" | "keep">,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 /** A path resolves (through a symbolic link) outside the folder it must stay in. */
 export class PathEscapeError extends Error {
   override name = "PathEscapeError";

@@ -61,6 +61,7 @@ import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { RecoveryPendingError } from "./errors.js";
+import { pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
 import { destroyAssets, type DestroyInput } from "./destroy.js";
@@ -228,6 +229,20 @@ export class Repo {
   /** `scope` is "workspace" or a project id. */
   createTag(scope: string, name: string, color?: string): Promise<Tag> {
     return createTag(this.core, scope, name, color);
+  }
+  /**
+   * Interrupted changes recovery could not settle (R27), with the choices each allows. Reads only;
+   * works on a read-only library too.
+   */
+  pendingWrites(): Promise<PendingWrite[]> {
+    return pendingWrites(this.core);
+  }
+  /**
+   * Resolves one by the researcher's choice (R27): "keep" only when it committed, "roll-back" only
+   * when it did not and its record is valid; audited as `txn.resolve`. Writable libraries only.
+   */
+  resolvePendingWrite(txn: string, choice: PendingWriteChoice): Promise<{ txn: string; choice: PendingWriteChoice; projectId: string }> {
+    return resolvePendingWrite(this.core, txn, choice);
   }
   listWorkspaceTags(): Promise<Tag[]> {
     return workspaceTags(this.core);

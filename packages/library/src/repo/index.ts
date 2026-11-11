@@ -26,6 +26,8 @@ export {
   ProjectLockedError,
   ReadOnlyLibraryError,
   PathEscapeError,
+  PendingWriteChoiceError,
   RecoveryPendingError,
   TornFileError,
 } from "./errors.js";
+export type { PendingWrite, PendingWriteChoice } from "./pending-writes.js";

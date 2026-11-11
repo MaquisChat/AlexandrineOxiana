@@ -1800,3 +1800,47 @@ describe("screens integration (R118): import routes", () => {
     }
   });
 });
+
+describe("screens integration (R118): resolve a pending write (R27)", () => {
+  beforeEach(() => start());
+
+  it("(g) lists unresolved interrupted changes and resolves one by the researcher's choice; refused choices are 409", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    expect((await call({ url: "/libraries/pending-writes" })).json).toEqual({ pendingWrites: [] });
+    // An unreadable marker (invalid) and a valid-looking one for a change that never happened.
+    await mkdir(join(path, ".tmp"), { recursive: true });
+    const bad = "019a7000-0000-7000-8000-00000000bad1";
+    await writeFile(join(path, ".tmp", `txn-${bad}.json`), "{ torn");
+    const folder = (await call({ url: "/projects" })).json.projects[0].folder as string;
+    const good = "019a7000-0000-7000-8000-0000000000c1";
+    const auditLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await writeFile(
+      join(path, ".tmp", `txn-${good}.json`),
+      JSON.stringify({ formatVersion: 1, txn: good, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: auditLines + 5, entries: [{ kind: "created", path: `${folder}/half-written.txt` }] }),
+    );
+    await writeFile(join(path, folder, "half-written.txt"), "half");
+    // Reopen: recovery leaves both (the second's audit counters do not match the log).
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string; status: string; canKeep: boolean; canRollBack: boolean; project: string }>;
+    expect(list.find((p) => p.txn === bad)).toMatchObject({ status: "invalid", canKeep: false, canRollBack: false, project: "library" });
+    const g = list.find((p) => p.txn === good)!;
+    expect(g).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: true, project: "Study" });
+    expect(JSON.stringify(list)).not.toContain(path);
+
+    const keep = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "keep" } });
+    expect(keep.status).toBe(409);
+    expect(keep.json.error.code).toBe("CONFLICT");
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${bad}/resolve`, body: { choice: "roll-back" } })).status).toBe(409);
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "maybe" } })).status).toBe(400);
+    const r = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "roll-back" } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ txn: good, choice: "roll-back" });
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites.map((p: { txn: string }) => p.txn)).toEqual([bad]);
+    const audit = JSON.stringify((await call({ url: `/projects/${pid}/audit` })).json);
+    expect(audit).toContain("txn.resolve");
+    expect((await call({ method: "POST", url: `/libraries/pending-writes/${"019a7000-0000-7000-8000-0000000000ff"}/resolve`, body: { choice: "keep" } })).status).toBe(404);
+  });
+});

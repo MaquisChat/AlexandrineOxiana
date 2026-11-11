@@ -1,5 +1,5 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
 
 describe("StatusBanner", () => {
@@ -102,5 +102,23 @@ describe("volumeOf", () => {
     expect(volumeOf("E:\\Research\\Lib")).toBe("E:");
     expect(volumeOf("\\\\nas\\share\\Lib")).toBe("\\\\nas\\share");
     expect(volumeOf("/home/r/Lib")).toBe("the drive holding Lib");
+  });
+
+  it.each(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable"])("%s offers Resolve… (R27)", async (warning) => {
+    const onResolve = vi.fn();
+    render(<StatusBanner variant={{ kind: "warning", warning, project: "Dissertation" }} onResolve={onResolve} />);
+    const b = screen.getByRole("button", { name: "Resolve the interrupted change in Dissertation…" });
+    b.click();
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("other warnings, and banners without a handler, offer no Resolve…", () => {
+    render(
+      <>
+        <StatusBanner variant={{ kind: "warning", warning: "backup-failed", project: "Dissertation" }} onResolve={vi.fn()} />
+        <StatusBanner variant={{ kind: "warning", warning: "invalid-txn-marker", project: "Dissertation" }} />
+      </>,
+    );
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });
