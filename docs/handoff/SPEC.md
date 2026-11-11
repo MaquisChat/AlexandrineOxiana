@@ -693,11 +693,17 @@ future collaboration; web and desktop first, some mobile; video scraping, transc
 5. **Public metadata services (Crossref, OpenAlex, Open Library, LoC) are exempt from vendor/BAA rules** — they receive only bibliographic identifiers/titles (R14).
 6. **Option 2 for files outside expected places (R67):** files referenced by an import that live outside the import's own folder (or approved folders) are listed in the preview and attached only with the researcher's approval (per folder or file; "remember this folder"). Approving a folder covers its subfolders (R115).
 7. **Build the remaining work in parallel where independent** (R95).
+8. **macOS first (Apple Silicon and Intel), Windows after Phase 1** (R122).
+9. **`main` is the approved state and changes only with the owner's approval** (R123).
+10. **citeproc-js is used under CPAL-1.0; the project's own licence is left open** (R124).
+11. **Backups are governed and audited and kept inside the library folder; a second backup location is decided when sync is designed** (R125).
+12. **Optional tools are chosen and downloaded on first use rather than bundled** (R126).
 
 ## B.4 Binding implementation rulings
-125 numbered rulings (R1–R119) refine the spec during implementation — crash safety, encryption, privacy, parser safety, location handling, participant codes, etc. They are binding for future work. Full text with cost-if-wrong: `docs/handoff/LEDGER.md`. Highlights: `docs/handoff/DECISIONS.md`.
+119 numbered rulings (R1–R119, as counted in `docs/handoff/LEDGER-INDEX.md`; R120 onward were added at the 2026-11-11 checkpoint) refine the spec during implementation — crash safety, encryption, privacy, parser safety, location handling, participant codes, etc. They are binding for future work. Full text with cost-if-wrong: `docs/handoff/LEDGER.md`. Highlights: `docs/handoff/DECISIONS.md`.
 
 ## B.5 Open decisions still owed by the user
-- citeproc-js licence choice (CPAL-1.0 vs AGPL-3.0) before distribution (R87).
+- The project's own licence, before any publication (R124).
+- Whether backups may be kept outside the library folder; decided when sync is designed (R125).
 - Human review of 5 citation snapshots against the style guides (R86).
 - Visual check of the 12-colour qualitative-code palette (R103–R109).

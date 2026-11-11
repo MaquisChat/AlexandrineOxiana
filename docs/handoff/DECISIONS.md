@@ -1,6 +1,6 @@
 # DECISIONS — key choices
 
-The full numbered log of 119 binding rulings is in `docs/handoff/LEDGER.md`. Each entry there records its cost if wrong. Architecture decision records are in `docs/adr/0001–0012`. This page summarises the most important choices.
+The full numbered log of binding rulings (R1–R119 from the first build; R120 onward added at the 2026-11-11 checkpoint) is in `docs/handoff/LEDGER.md`. Each entry there records its cost if wrong. Architecture decision records are in `docs/adr/0001–0012`. This page summarises the most important choices.
 
 ## User decisions
 
@@ -42,4 +42,14 @@ The full numbered log of 119 binding rulings is in `docs/handoff/LEDGER.md`. Eac
 
 ### Interface and external code
 - Theme colours come from tokens only, enforced by lint. Goudy Old Style is used when installed, with Sorts Mill Goudy (OFL) as fallback. High-contrast themes are ≥7:1. The 12 code colours keep the same hue across themes and are always shown with a shape and a name (R100, R103, R105, R109).
-- The citeproc-js licence choice is still open for the user (R87).
+- citeproc-js is used under CPAL-1.0 (R124, 2026-11-11). The project's own licence is not chosen yet, and AGPL-3.0 stays possible. What CPAL requires is in ADR 0012.
+
+## Checkpoint decisions, 2026-11-11
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| macOS first, Apple Silicon and Intel as two downloads unless Task 37e shows one combined app is practical; Windows after Phase 1 (R122) | Windows in Phase 1; Apple Silicon only | Scope is Phase 1 in detail. Cost if wrong: Intel packaging may prove impractical for the worker's speech and image libraries; 37e finds out before 37f depends on it |
+| `main` is the approved state (created at 0ad6506) and changes only with the owner's approval; work happens on the working branch (R123) | Working directly on `main` | Recorded in R123 without further reasons; cost if wrong is none to the product |
+| citeproc-js is used under CPAL-1.0; the project's own licence is left open, AGPL-3.0 likely later; no LICENSE file and nothing published until the owner decides (R124) | AGPL-3.0 now; choose the project licence now | citeproc-js is dual-licensed and the owner holds the rights in the project's own code, so AGPL-3.0 stays possible. Cost if wrong: a missing attribution display or notice at first release; re-checked at Task 56 |
+| Backups are governed and audited, kept in `<Library>/Backups/` under the manifest; a second backup location is decided when sync is designed (R125) | A second location built in Phase 1 | Under the manifest, destruction under retention can find and certify them. Cost if wrong: until then a backup does not survive losing the drive that holds the library; the owner was told to copy the library folder elsewhere by hand |
+| Optional tools are chosen and downloaded on first use, not bundled (R126); exiftool stays bundled and required | Bundling ffmpeg, tesseract and ghostscript (the original Task 37) | Replaces the original bundling. Cost if wrong: first use needs a network connection |
