@@ -34,11 +34,14 @@ export function creatorKey(c: Creator): string | undefined {
   return k ? k.normalize("NFC") : undefined;
 }
 
-/** Next free `P-NNN` code (one past the highest numeric code in use). */
-export function nextParticipantCode(participants: Participant[]): string {
+/**
+ * Next free `P-NNN` code: one past the highest numeric code ever given — of the participants, the
+ * retired codes of deleted ones and the pseudonym map's codes (`taken`), so none is reissued (R117 C1).
+ */
+export function nextParticipantCode(participants: Participant[], taken: Iterable<string> = []): string {
   let max = 0;
-  for (const p of participants) {
-    const m = /^P-(\d+)$/.exec(p.code);
+  for (const code of [...participants.map((p) => p.code), ...taken]) {
+    const m = /^P-(\d+)$/i.exec(code);
     if (m) max = Math.max(max, Number(m[1]));
   }
   return `P-${String(max + 1).padStart(3, "0")}`;
@@ -68,7 +71,7 @@ export function assignCodes(
     }
     let code = lookup(key);
     if (!code) {
-      code = nextParticipantCode(data.participants);
+      code = nextParticipantCode(data.participants, [...map.values(), ...(data.retiredParticipantCodes ?? [])]);
       const p: Participant = { id: newId(), projectId: tx.projectId, code, consentIds: [] };
       data.participants.push(p);
       tx.record("participant", p.id, null, p);

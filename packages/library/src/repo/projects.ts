@@ -239,6 +239,8 @@ interface FieldworkSecrets {
   formatVersion: 1;
   participants: Record<string, Record<string, string>>;
   sessions: Record<string, { place?: string; notes?: string }>;
+  /** Withdrawal reasons of consent records (R117). */
+  consents?: Record<string, { withdrawnReason?: string }>;
 }
 
 async function readSecrets(core: RepoCore, st: ProjectState): Promise<FieldworkSecrets> {
@@ -264,6 +266,10 @@ export async function readFullData(core: RepoCore, st: ProjectState, allowLocked
     if (d) p.details = d;
   }
   for (const s of data.sessions) Object.assign(s, secrets.sessions[s.id] ?? {});
+  for (const c of data.consents) {
+    const r = secrets.consents?.[c.id]?.withdrawnReason;
+    if (r && c.withdrawn) c.withdrawn.reason = r;
+  }
   return data;
 }
 
@@ -276,7 +282,11 @@ export async function writeProjectData(core: RepoCore, tx: Tx, full: ProjectJson
   const st = tx.state;
   const plain = structuredClone(full);
   if (core.encrypted(st)) {
-    const secrets: FieldworkSecrets = { formatVersion: 1, participants: {}, sessions: {} };
+    const secrets: FieldworkSecrets = { formatVersion: 1, participants: {}, sessions: {}, consents: {} };
+    for (const c of plain.consents) {
+      if (c.withdrawn?.reason) secrets.consents![c.id] = { withdrawnReason: c.withdrawn.reason };
+      if (c.withdrawn) delete c.withdrawn.reason;
+    }
     for (const p of plain.participants) {
       if (p.details) secrets.participants[p.id] = p.details;
       delete p.details;
@@ -289,7 +299,7 @@ export async function writeProjectData(core: RepoCore, tx: Tx, full: ProjectJson
       delete s.place;
       delete s.notes;
     }
-    const hasSecrets = Object.keys(secrets.participants).length + Object.keys(secrets.sessions).length > 0;
+    const hasSecrets = Object.keys(secrets.participants).length + Object.keys(secrets.sessions).length + Object.keys(secrets.consents!).length > 0;
     if (hasSecrets || (await tx.exists(`${st.rel}/fieldwork.json.enc`))) {
       await tx.writeFile(`${st.rel}/fieldwork.json.enc`, JSON.stringify(secrets), { encrypt: true });
     }
@@ -297,7 +307,8 @@ export async function writeProjectData(core: RepoCore, tx: Tx, full: ProjectJson
   const identifying =
     !core.encrypted(st) &&
     (plain.participants.some((p) => p.details && Object.keys(p.details).length > 0) ||
-      plain.sessions.some((s) => !!s.place?.trim() || !!s.notes?.trim()));
+      plain.sessions.some((s) => !!s.place?.trim() || !!s.notes?.trim()) ||
+      plain.consents.some((c) => !!c.withdrawn?.reason));
   await tx.writeFile(`${st.rel}/project.json`, JSON.stringify(plain, null, 2), identifying ? { mode: 0o600 } : {});
   tx.onCommit(() => {
     st.data = plain;

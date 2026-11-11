@@ -28,11 +28,21 @@ import {
   createConsent,
   createParticipant,
   createSession,
+  deleteParticipant,
+  deleteSession,
   getFieldwork,
   linkSourceToFieldwork,
+  updateConsent,
+  updateParticipant,
+  updateSession,
+  withdrawConsent,
   type ConsentInput,
+  type ConsentPatch,
   type ParticipantInput,
+  type ParticipantPatch,
   type SessionInput,
+  type SessionPatch,
+  setConsentDocument,
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
@@ -71,6 +81,13 @@ import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditRe
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
 export function onProjectUnlocked(fn: (repo: Repo, projectId: string) => Promise<void>): void {
+  unlockHooks.push(fn);
+}
+
+/** Package-internal: run for each readable project when a repo opens read-write, and after an unlock (best effort). */
+const openHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
+export function onProjectOpened(fn: (repo: Repo, projectId: string) => Promise<void>): void {
+  openHooks.push(fn);
   unlockHooks.push(fn);
 }
 
@@ -273,6 +290,27 @@ export class Repo {
   }
   linkSourceToFieldwork(projectId: string, sourceId: string, link: { participantIds?: string[]; sessionId?: string }): Promise<SourceFile> {
     return linkSourceToFieldwork(this.core, projectId, sourceId, link);
+  }
+  updateParticipant(projectId: string, id: string, patch: ParticipantPatch): Promise<Participant> {
+    return updateParticipant(this.core, projectId, id, patch);
+  }
+  updateSession(projectId: string, id: string, patch: SessionPatch): Promise<Session> {
+    return updateSession(this.core, projectId, id, patch);
+  }
+  updateConsent(projectId: string, id: string, patch: ConsentPatch): Promise<ConsentRecord> {
+    return updateConsent(this.core, projectId, id, patch);
+  }
+  /** Marks the consent withdrawn and queues every source linked to its participant for review; deletes nothing. */
+  withdrawConsent(projectId: string, id: string, opts?: { reason?: string }): Promise<{ consent: ConsentRecord; flaggedSourceIds: string[] }> {
+    return withdrawConsent(this.core, projectId, id, opts);
+  }
+  /** Only when no consent record, session or source links to it (FieldworkInUseError otherwise). */
+  deleteParticipant(projectId: string, id: string): Promise<void> {
+    return deleteParticipant(this.core, projectId, id);
+  }
+  /** Only when no source links to it (FieldworkInUseError otherwise). */
+  deleteSession(projectId: string, id: string): Promise<void> {
+    return deleteSession(this.core, projectId, id);
   }
   getFieldwork(projectId: string): ReturnType<typeof getFieldwork> {
     return getFieldwork(this.core, projectId);
@@ -496,7 +534,15 @@ export async function openRepoInternal(
       });
     }
   }
-  return new Repo(core);
+  const repo = new Repo(core);
+  // Package-internal reconcilers (e.g. consent forms whose link to the consent was interrupted, R117 I5).
+  if (writable) {
+    for (const st of core.projects.values()) {
+      if (st.recoveryPending || (core.encrypted(st) && !isUnlocked(core, st.project.id))) continue;
+      for (const h of openHooks) await h(repo, st.project.id).catch(() => {});
+    }
+  }
+  return repo;
 }
 
 /**
@@ -1022,4 +1068,15 @@ export interface AuditCheck {
   /** When earlier opens of the library found the log altered (its `audit.anchor-mismatch` events). */
   alteredAt: string[];
   problem?: { kind: AnchorProblemKind | "anchors-unreadable"; detail: string };
+}
+
+/** Package-internal (consent forms, R117 I3): records the signed form's asset on the consent. */
+export function setConsentDocumentAsset(repo: Repo, projectId: string, consentId: string, assetId: string, opts: { reattach?: boolean } = {}): Promise<ConsentRecord> {
+  return setConsentDocument(cores.get(repo)!, projectId, consentId, assetId, opts);
+}
+
+/** Package-internal: records an integrity warning once (same project, kind and detail). */
+export function noteIntegrityWarning(repo: Repo, w: IntegrityWarning): void {
+  const list = cores.get(repo)!.integrityWarnings;
+  if (!list.some((x) => x.projectId === w.projectId && x.kind === w.kind && x.detail === w.detail)) list.push(w);
 }

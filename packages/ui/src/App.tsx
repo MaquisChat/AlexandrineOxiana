@@ -1,13 +1,15 @@
 /**
  * The app shell and its one router (R118). Navigation is pushState-based (navigation.tsx; never
  * hash routing) and this file owns the single route table: the library screens (Task 33), the bulk
- * import wizard and its review queue (Task 35) and the appearance settings. Every screen other than
+ * import wizard and its review queue (Task 35), governance, audit log, fieldwork, move library and
+ * missing files (Task 36) and the appearance settings. Every screen other than
  * the library shows a "Back to library" link. Without a service connection only the appearance
  * settings can be shown.
  */
 import { useMemo, type ReactElement } from "react";
 import { createClient, type ApiClient } from "./api/client";
 import { BackToLibrary, normalisePath, PATHS, useDropGuard, useLocation, type AppLocation } from "./navigation";
+import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
@@ -28,6 +30,7 @@ export interface AppRoute {
 export const ROUTES: readonly AppRoute[] = [
   { matches: isLibraryPath, render: (_loc, client) => <LibraryRoutes client={client} />, back: false },
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
+  { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.appearance, render: () => <AppearanceSettingsScreen />, back: true },
 ];
 

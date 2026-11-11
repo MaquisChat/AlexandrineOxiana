@@ -25,9 +25,12 @@ export const ConsentRecord = z.object({
   projectId: Id,
   participantId: Id,
   documentAssetId: Id.optional(),
+  /** Forms deliberately detached from this record (R119): never linked again except by an explicit re-attach. */
+  detachedAssetIds: z.array(Id).optional(),
   scope: z.string(),
   date: z.string().min(1),
   expires: z.string().optional(),
-  withdrawn: z.object({ at: Timestamp }).optional(),
+  /** `reason` is sealed in encrypted projects (kept in fieldwork.json.enc, R117). */
+  withdrawn: z.object({ at: Timestamp, reason: z.string().optional() }).optional(),
 });
 export type ConsentRecord = z.infer<typeof ConsentRecord>;

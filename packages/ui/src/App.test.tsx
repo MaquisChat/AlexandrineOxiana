@@ -20,7 +20,7 @@ function at(path: string) {
 describe("the app's one router (R118)", () => {
   it("has one route table covering the library, import, review queue and appearance paths", () => {
     const owners = (p: string) => ROUTES.filter((r) => r.matches(p)).length;
-    for (const p of ["/", "/library", "/import", "/import/review", "/settings/appearance"]) expect(owners(p)).toBe(1);
+    for (const p of ["/", "/library", "/import", "/import/review", "/settings/appearance", "/governance", "/audit", "/fieldwork", "/move-library", "/missing-files"]) expect(owners(p)).toBe(1);
     expect(owners("/nowhere")).toBe(0);
   });
 
@@ -77,6 +77,19 @@ describe("the app's one router (R118)", () => {
     expect(window.location.pathname).toBe(PATHS.importWizard);
     expect(new URLSearchParams(window.location.search).get("project")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Back to library" })).toBeTruthy();
+  });
+
+  it("Governance and records opens the Task 36 screens for the library's project, with Back to library", async () => {
+    server.use(appearance(), ...libraryHandlers(), http.get(url("/projects/:id/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })));
+    const user = userEvent.setup();
+    render(<App service={service} />);
+    const header = (await screen.findByRole("heading", { level: 1 })).closest("header")!;
+    await user.click(await within(header).findByRole("link", { name: "Governance and records" }));
+    expect(window.location.pathname).toBe(PATHS.governance);
+    expect(new URLSearchParams(window.location.search).get("project")).toBe("p1");
+    expect(await screen.findByRole("navigation", { name: "Governance and library" })).toBeTruthy();
+    await user.click(screen.getByRole("link", { name: "Back to library" }));
+    expect(await screen.findByRole("navigation", { name: "Projects" })).toBeTruthy();
   });
 
   it("an unknown path says so and offers Back to library", async () => {

@@ -198,6 +198,9 @@ export { ExportDestinationError, ExportFailedError, escapeMarkdown, exportProjec
 export type { ProjectExportResult } from "./export/project-export.js";
 export { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
 export type { DestroyOptions, DueItem } from "./retention.js";
+export { addProtocolDocuments, listProtocolDocuments } from "./protocol-docs.js";
+export type { ProtocolDocument, ProtocolDocumentResult } from "./protocol-docs.js";
+export { attachConsentDocument, reconcileConsentDocuments, CONSENT_FORM_MAX_BYTES } from "./consent-docs.js";
 export {
   CSL_NS,
   CUSTOM_STYLE_MAX_BYTES,

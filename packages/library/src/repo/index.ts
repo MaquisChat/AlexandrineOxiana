@@ -13,11 +13,12 @@ export type { DerivedAssetInput, OriginalAssetInput } from "./assets.js";
 export type { AcknowledgementKind } from "./acknowledge.js";
 export type { ReviewEntry, ReviewInput, ReviewItemRow } from "./review.js";
 export { REVIEW_FILE } from "./review.js";
-export type { ConsentInput, ParticipantInput, SessionInput } from "./fieldwork.js";
+export type { ConsentInput, ConsentPatch, ParticipantInput, ParticipantPatch, SessionInput, SessionPatch } from "./fieldwork.js";
 export {
   GovernanceViolationError,
   InvalidInputError,
   DestroyedParentError,
+  FieldworkInUseError,
   MissingParentError,
   ProxyRecordRefusedError,
   ImmutableProvenanceError,

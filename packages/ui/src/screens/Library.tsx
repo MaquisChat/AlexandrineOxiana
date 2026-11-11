@@ -26,6 +26,7 @@ import { UnlockProject } from "./UnlockProject";
 
 /** Where "needs review" outcomes send the researcher (the import review queue, Task 35). */
 export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
+const governanceHref = (projectId: string) => `${PATHS.governance}?project=${encodeURIComponent(projectId)}`;
 const importHref = (projectId: string) => `${PATHS.importWizard}?project=${encodeURIComponent(projectId)}`;
 
 export interface LibraryProps {
@@ -302,6 +303,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           {!locked && !readOnly && project && (
             <a href={importHref(project.id)} onClick={(e) => follow(e, importHref(project.id))}>
               Import
+            </a>
+          )}
+          {project && (
+            <a href={governanceHref(project.id)} onClick={(e) => follow(e, governanceHref(project.id))}>
+              Governance and records
             </a>
           )}
           <a href={PATHS.appearance} onClick={(e) => follow(e, PATHS.appearance)}>

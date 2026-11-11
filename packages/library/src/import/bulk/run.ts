@@ -1708,6 +1708,17 @@ export async function resumeBatch(deps: BulkImportDeps, projectId: string, batch
     if (!source) throw new BatchRefusedError("The source of this import is needed to resume it.");
     const governance = await preflight(deps.repo, projectId, rec.source.kind, rec.options);
     await preflightDeleted(deps.repo, projectId, source, rec.options);
+    if (rec.fieldwork) {
+      // The session and participants new sources are linked to must still exist (R117 I2).
+      const fw = await deps.repo.getFieldwork(projectId);
+      const sid = rec.fieldwork.sessionId;
+      if (sid && !fw.sessions.some((x) => x.id === sid)) {
+        throw new BatchRefusedError("The fieldwork session this import links its sources to no longer exists, so it cannot be resumed. Start a new import and choose the session again.");
+      }
+      if ((rec.fieldwork.participantIds ?? []).some((id) => !fw.participants.some((x) => x.id === id))) {
+        throw new BatchRefusedError("A participant this import links its sources to no longer exists, so it cannot be resumed. Start a new import and choose the participants again.");
+      }
+    }
     rec.governance = [...rec.governance.filter((g) => g.items !== undefined), ...governance];
     rec.state = "running";
     delete rec.finishedAt;

@@ -31,6 +31,7 @@ import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mut
 import { readFullData, writeProjectData } from "./projects.js";
 import { workspaceTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
+import { flagIfWithdrawn } from "./withdrawn.js";
 import { appendReviewEntry, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
@@ -560,6 +561,8 @@ async function writeNewSource(
   for (const a of assets) tx.record("asset", a.id, null, a);
   for (const a of sf.annotations) tx.record("annotation", a.id, null, a);
   if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
+  // Linked to a participant whose consent was withdrawn: queued for review (R117 I1).
+  await flagIfWithdrawn(core, tx, st.data, id, source);
   if (inTx) await inTx(tx, sf);
   tx.onCommit(() => st.sources.set(id, folder));
   tx.index((sink) => sink.indexSource(sf));
@@ -611,6 +614,12 @@ export async function updateSource(
         const ws = patch.tagIds?.length ? await workspaceTags(core) : [];
         for (const t of patch.tagIds ?? []) if (!data.tags.some((x) => x.id === t) && !ws.some((x) => x.id === t)) throw new NotFoundError("Tag", t);
       }
+      // Fieldwork links set by the patch must exist (R119).
+      const linksChange = "participantIds" in patch || "sessionId" in patch;
+      if (linksChange) {
+        for (const p of patch.participantIds ?? []) if (!tx.state.data.participants.some((x) => x.id === p)) throw new NotFoundError("Participant", p);
+        if (patch.sessionId !== undefined && !tx.state.data.sessions.some((x) => x.id === patch.sessionId)) throw new NotFoundError("Session", patch.sessionId);
+      }
       const source = Source.parse({
         ...cur.source,
         ...patch,
@@ -623,6 +632,8 @@ export async function updateSource(
       if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
+      // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
+      if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
       tx.index((sink) => sink.indexSource(sf));
       return sf;
     },

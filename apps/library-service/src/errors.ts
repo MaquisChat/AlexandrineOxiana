@@ -14,6 +14,7 @@ import {
   EncryptionFormatError,
   ExportDestinationError,
   ExportFailedError,
+  FieldworkInUseError,
   GovernanceConflictError,
   InvalidInputError,
   KeyNotAvailableError,
@@ -114,6 +115,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof GovernanceLooseningError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof GovernanceConflictError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof InvalidInputError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");

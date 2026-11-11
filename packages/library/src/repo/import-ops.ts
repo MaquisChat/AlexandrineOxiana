@@ -10,6 +10,7 @@ import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mut
 import { readFullData, writeProjectData } from "./projects.js";
 import { appendReviewEntry, appendReviewUpdate, readReviewEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
+import { flagIfWithdrawn } from "./withdrawn.js";
 import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
 import type { RepoCore } from "./state.js";
 
@@ -63,6 +64,8 @@ export function runImportChange<T>(
           const parsed = SourceFile.parse(sf);
           await writeSourceFile(core, tx, parsed);
           tx.record("source", parsed.source.id, before?.source ?? null, parsed.source);
+          // New links to a participant whose consent was withdrawn: queued for review (R117 I1).
+          await flagIfWithdrawn(core, tx, st.data, parsed.source.id, parsed.source, before?.source);
           const old = new Map((before?.assets ?? []).map((a) => [a.id, a]));
           for (const a of parsed.assets) if (!old.has(a.id)) tx.record("asset", a.id, null, a);
           const now = new Set(parsed.assets.map((a) => a.id));
