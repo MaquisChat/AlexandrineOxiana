@@ -13,7 +13,7 @@ import { KeyRing, WrongPassphraseError, normalizeRecoveryCode } from "../crypto/
 import type { Deps } from "../deps.js";
 import { backupProject, restoreBackup } from "../export/backup.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
-import { InvalidInputError, PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError, RecoveryPendingError, type Repo } from "./index.js";
+import { InvalidInputError, KeyFileChangedError, PolicyDeniedError, ProjectLockedError, RECOVERY_CODE_UNSHOWN_WARNING, ReadOnlyLibraryError, RecoveryPendingError, projectWarnings, type Repo } from "./index.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "./testing.js";
 
 const GOV = `identifiability:
@@ -86,11 +86,11 @@ async function audit(pid: string): Promise<AuditEvent[]> {
 const issued = async (pid: string) => (await audit(pid)).filter((e) => (e.details as { op?: string } | undefined)?.op === "project.recovery-code");
 
 /** True when `secret` unlocks the project (locks it first, and leaves it locked). */
-async function opens(pid: string, secret: string): Promise<boolean> {
-  repo.lockProject(pid);
+async function opens(pid: string, secret: string, r: Repo = repo): Promise<boolean> {
+  r.lockProject(pid);
   try {
-    await repo.unlockProject(pid, secret);
-    repo.lockProject(pid);
+    await r.unlockProject(pid, secret);
+    r.lockProject(pid);
     return true;
   } catch (err) {
     if (err instanceof WrongPassphraseError) return false;
@@ -182,14 +182,17 @@ describe("issueRecoveryCode", () => {
 
   it("refuses a project with an unresolved interrupted change", async () => {
     const { pid, code } = await encrypted();
+    const before = await keyFileBytes(pid);
     seams.crashAt = "before-audit";
-    seams.failUndo = "replaced";
+    seams.failUndo = "created";
     await expect(repo.issueRecoveryCode(pid, PASS)).rejects.toBeInstanceOf(SimulatedCrash);
     // The next open cannot roll it back (undo fails): the project waits for the researcher (R27).
     repo = await reopen();
     seams.failUndo = undefined;
     await repo.unlockProject(pid, PASS).catch(() => {});
     await expect(repo.issueRecoveryCode(pid, PASS)).rejects.toBeInstanceOf(RecoveryPendingError);
+    // The active key file was never replaced (R141).
+    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
     // The old wrapping is kept aside by the marker; resolving the interrupted change by rolling it
     // back puts it back, and the old code opens the project again.
     const [pw] = await repo.pendingWrites();
@@ -221,53 +224,110 @@ describe("issueRecoveryCode", () => {
   });
 });
 
-describe("issueRecoveryCode: a crash at each seam, then reopen (R26)", () => {
-  // Before the audit event (the commit point) the change rolls back: the old code works.
-  // After it, the change is kept: the new code works (and was possibly never shown: ask again).
-  const cases: Array<[CrashPoint, "old" | "new"]> = [
-    ["before-changes", "old"],
-    ["before-audit", "old"],
-    ["torn-audit", "old"],
-    ["before-marker-delete", "new"],
+const stagingPath = (pid: string) => join(lib.root, repo.getProject(pid).folder, "keys", "project-key.next.json");
+const exists = (p: string) => stat(p).then(() => true, () => false);
+
+/** A second device opening the same library while the first (crashed) one still holds it: read-only. */
+async function readOnlyRepo(): Promise<{ ro: Repo; close: () => Promise<void>; ring: KeyRing }> {
+  const roRing = new KeyRing();
+  const roLib = await openLibrary(lib.root, mkDeps({ deviceId: "dev-B", hostname: "host-B", pid: 99 }));
+  const ro = await openTestRepo(roLib, roRing, { clock: () => new Date(NOW), tz: "UTC", scryptN: 2 ** 10 });
+  return { ro, ring: roRing, close: async () => { await roLib.close(); roRing.clear(); } };
+}
+
+describe("issueRecoveryCode: staged, then activated after the commit point (R26, R141)", () => {
+  // Before the audit event the active key file is untouched: every open, read-only included, takes
+  // the old code. After the commit the staged wrapping is activated; if a crash stops that, the next
+  // writable open completes it and warns that a code may not have been shown.
+  type Case = { point: CrashPoint; ro: "old" | "new"; rw: "old" | "new"; warn: boolean };
+  const cases: Case[] = [
+    { point: "recovery-before-stage", ro: "old", rw: "old", warn: false },
+    { point: "before-changes", ro: "old", rw: "old", warn: false },
+    { point: "before-audit", ro: "old", rw: "old", warn: false },
+    { point: "torn-audit", ro: "old", rw: "old", warn: false },
+    { point: "before-marker-delete", ro: "old", rw: "new", warn: true },
+    { point: "recovery-before-activate", ro: "old", rw: "new", warn: true },
+    { point: "recovery-mid-activate", ro: "new", rw: "new", warn: true },
+    { point: "recovery-after-activate", ro: "new", rw: "new", warn: false },
   ];
-  for (const [point, valid] of cases) {
-    it(`${point}: exactly the ${valid} code works after reopening, and the audit log agrees`, async () => {
+  for (const c of cases) {
+    it(`${c.point}: a read-only open takes the ${c.ro} code, a writable open the ${c.rw} code${c.warn ? ", with a warning" : ""}`, async () => {
       const { pid, code } = await encrypted();
       const before = await keyFileBytes(pid);
-      seams.crashAt = point;
-      // The code is returned only after the commit, so a crash means the caller never sees it; the
+      // The code is returned only after activation, so a crash means the caller never sees it; the
       // test seam hands over the code that would have been shown.
       let shown: string | undefined;
-      seams.onRecoveryCode = (c) => (shown = c);
+      seams.onRecoveryCode = (x) => (shown = x);
+      seams.crashAt = c.point;
       await expect(repo.issueRecoveryCode(pid, PASS)).rejects.toBeInstanceOf(SimulatedCrash);
       seams.onRecoveryCode = undefined;
       expect(shown).toBeDefined();
+      if (c.ro === "old") expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+
+      // Staging (if any) holds only wrapped keys: never the code or the passphrase.
+      if (await exists(stagingPath(pid))) {
+        const text = await readFile(stagingPath(pid), "utf8");
+        for (const secret of [shown!, normalizeRecoveryCode(shown!), code, normalizeRecoveryCode(code), PASS]) expect(text).not.toContain(secret);
+        expect(Object.keys(JSON.parse(text)).sort()).toEqual(["formatVersion", "issueId", "keyFile"]);
+        expect(Object.keys(JSON.parse(text).keyFile).sort()).toEqual(["keyId", "passphrase", "recovery"]);
+      }
+
+      // 1. Another device opens the library read-only (no recovery, no activation).
+      const r = await readOnlyRepo();
+      expect(await opens(pid, code, r.ro)).toBe(c.ro === "old");
+      expect(await opens(pid, shown!, r.ro)).toBe(c.ro === "new");
+      expect(await opens(pid, PASS, r.ro)).toBe(true);
+      expect(await projectWarnings(r.ro, pid)).not.toContain(RECOVERY_CODE_UNSHOWN_WARNING);
+      await r.close();
+
+      // 2. A writable open.
       repo = await reopen();
-      const kinds = repo.integrityWarnings.map((w) => w.kind);
-      if (valid === "old") expect(kinds).toContain("rolled-back-incomplete-write");
-      else expect(kinds).not.toContain("rolled-back-incomplete-write");
-      expect(await readdir(join(lib.root, ".tmp")).catch(() => [])).not.toContainEqual(expect.stringMatching(/^txn-.*\.json$/));
-      const oldWorks = await opens(pid, code);
-      const newWorks = await opens(pid, shown!);
-      expect([oldWorks, newWorks]).toEqual(valid === "old" ? [true, false] : [false, true]);
+      expect(await opens(pid, code)).toBe(c.rw === "old");
+      expect(await opens(pid, shown!)).toBe(c.rw === "new");
       expect(await opens(pid, PASS)).toBe(true);
-      expect(await issued(pid)).toHaveLength(valid === "old" ? 0 : 1);
-      if (valid === "old") expect((await keyFileBytes(pid)).equals(before)).toBe(true);
-      const v = await repo.verifyAudit(pid);
-      expect(v.ok).toBe(true);
+      expect(await exists(stagingPath(pid))).toBe(false);
+      expect(await readdir(join(lib.root, ".tmp")).catch(() => [])).not.toContainEqual(expect.stringMatching(/^txn-.*\.json$/));
+      expect((await projectWarnings(repo, pid)).includes(RECOVERY_CODE_UNSHOWN_WARNING)).toBe(c.warn);
+      expect(await issued(pid)).toHaveLength(c.rw === "old" ? 0 : 1);
+      if (c.rw === "old") expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+      expect((await audit(pid)).some((e) => e.action === "key.recovery-activated")).toBe(c.warn);
+      expect((await repo.verifyAudit(pid)).ok).toBe(true);
+
+      // 3. Opening again changes nothing more; issuing another code clears the warning.
+      repo = await reopen();
+      expect(await opens(pid, c.rw === "old" ? code : shown!)).toBe(true);
+      await repo.unlockProject(pid, PASS);
+      const again = (await repo.issueRecoveryCode(pid, PASS)).recoveryCode;
+      expect(await projectWarnings(repo, pid)).not.toContain(RECOVERY_CODE_UNSHOWN_WARNING);
+      expect(await opens(pid, again)).toBe(true);
+      expect(await opens(pid, shown!)).toBe(false);
     });
   }
 
-  it("a crash after the old key file was copied aside but before the new one was renamed in: the old code works", async () => {
+  it("the reviewer's probe: a crash before the audit event, then a read-only open: the old code works, the unseen one does not", async () => {
     const { pid, code } = await encrypted();
-    const before = await keyFileBytes(pid);
-    seams.crashAt = "before-changes";
+    let shown: string | undefined;
+    seams.onRecoveryCode = (x) => (shown = x);
+    seams.crashAt = "before-audit";
     await expect(repo.issueRecoveryCode(pid, PASS)).rejects.toBeInstanceOf(SimulatedCrash);
-    // As if the atomic rename had not happened yet: the old file is still in place.
-    await writeFile(keyFilePath(pid), before);
-    repo = await reopen();
-    expect(await opens(pid, code)).toBe(true);
-    expect((await keyFileBytes(pid)).equals(before)).toBe(true);
+    const r = await readOnlyRepo();
+    expect(r.ro.integrityWarnings.map((w) => w.kind)).toContain("incomplete-write-pending");
+    await expect(r.ro.unlockProject(pid, shown!)).rejects.toBeInstanceOf(WrongPassphraseError);
+    await r.ro.unlockProject(pid, code);
+    expect(r.ro.isUnlocked(pid)).toBe(true);
+    await r.close();
+  });
+
+  it("two issues at once: one wins, the other is a KeyFileChangedError, and the winner's code works", async () => {
+    const { pid } = await encrypted();
+    const results = await Promise.allSettled([repo.issueRecoveryCode(pid, PASS), repo.issueRecoveryCode(pid, PASS)]);
+    const ok = results.filter((x): x is PromiseFulfilledResult<{ recoveryCode: string }> => x.status === "fulfilled");
+    const failed = results.filter((x): x is PromiseRejectedResult => x.status === "rejected");
+    expect(ok).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.reason).toBeInstanceOf(KeyFileChangedError);
+    expect(await opens(pid, ok[0]!.value.recoveryCode)).toBe(true);
+    expect(await issued(pid)).toHaveLength(1);
   });
 });
 

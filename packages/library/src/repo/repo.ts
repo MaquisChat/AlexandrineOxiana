@@ -47,7 +47,18 @@ import {
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
 import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
-import { createProject, isUnlocked, issueRecoveryCode, lockProject, readFullData, unlockProject, type CreateProjectInput } from "./projects.js";
+import {
+  RECOVERY_CODE_UNSHOWN_WARNING,
+  completeRecoveryActivation,
+  createProject,
+  isUnlocked,
+  issueRecoveryCode,
+  lockProject,
+  readFullData,
+  recoveryCodeUnshown,
+  unlockProject,
+  type CreateProjectInput,
+} from "./projects.js";
 import {
   createSource,
   createSources,
@@ -537,6 +548,12 @@ export async function openRepoInternal(
           appended = true;
         }
       }
+      // A new recovery code committed but not yet put in place when the app stopped (R141 b).
+      if (core.encrypted(st)) {
+        const headBefore = st.audit.head?.seq;
+        await completeRecoveryActivation(core, st, events, at);
+        if (st.audit.head?.seq !== headBefore) appended = true;
+      }
       if (!problem && !appended && st.audit.head && (anchor?.seq !== st.audit.head.seq || anchor.hash !== st.audit.head.hash)) {
         await core.updateAnchor(st, at);
       }
@@ -861,11 +878,13 @@ export const BACKUP_FAILED_WARNING = "backup-failed";
 
 /**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
- * 'backup-failed', R92).
+ * 'backup-failed', R92; 'recovery-code-unshown', R141 b).
  */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
   const core = cores.get(repo)!;
-  const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
+  const st = core.state(projectId);
+  const out = (await deletedRecordsWarning(core, st)) ? [DELETED_RECORDS_WARNING] : [];
+  if (await recoveryCodeUnshown(core, st)) out.push(RECOVERY_CODE_UNSHOWN_WARNING);
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
     const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;

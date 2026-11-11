@@ -1,7 +1,9 @@
 /** Projects: creation, project.json persistence, key files, lock/unlock. */
+import { timingSafeEqual } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import {
+  type AuditEvent,
   diffToChanges,
   effectivePolicy,
   evaluate,
@@ -24,10 +26,10 @@ import {
 } from "../crypto/keys.js";
 import { AuditStore } from "./audit-store.js";
 import { appendChanges } from "./changelog-store.js";
-import { GovernanceViolationError, InvalidInputError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
+import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
-import { seams } from "./seams.js";
+import { SimulatedCrash, maybeCrash, seams } from "./seams.js";
 import type { Manifest, ProjectJson, ProjectState, RepoCore } from "./state.js";
 
 export interface CreateProjectInput {
@@ -217,18 +219,36 @@ export async function unlockProject(core: RepoCore, projectId: string, secret: s
   }
 }
 
+/** The staged key file of a new recovery code (R141), beside the active one until it is activated. */
+const STAGED_KEY_FILE = "keys/project-key.next.json";
+/** Present while a new recovery code was activated on open and may never have been shown (R141 b). */
+const UNSHOWN_FILE = "keys/recovery-code-unshown.json";
+/** The project warning while UNSHOWN_FILE is present. */
+export const RECOVERY_CODE_UNSHOWN_WARNING = "recovery-code-unshown";
+const ISSUE_OP = "project.recovery-code";
+
+/** `keys/project-key.next.json`: the key file to activate once issue `issueId` is committed. Wrapped keys only. */
+interface StagedKeyFile {
+  formatVersion: 1;
+  issueId: string;
+  keyFile: ProjectKeyFile;
+}
+
 /**
- * Issues a new recovery code for an unlocked encrypted project (Task 61, R134 c). The researcher
+ * Issues a new recovery code for an unlocked encrypted project (Task 61, R134 c, R141). The researcher
  * gives the passphrase again; it is proved by unwrapping the stored passphrase wrapping (not only by
- * the key being in the key ring). The project key does not change: only the recovery wrapping in
- * keys/project-key.json is replaced, so the old code stops working and the passphrase keeps working.
+ * the key being in the key ring). The project key does not change: only the recovery wrapping is
+ * replaced, so the old code stops working and the passphrase keeps working.
  *
- * Written through the governed write path (`runMutation`): policy `store` of the project (as for
- * other project settings: governance, backup settings), the key file replaced atomically with its old
- * bytes kept aside by the write-ahead marker, then the allow audit event (the commit point, R26). A
- * crash before that event rolls back to the old file (old code valid); after it, the new file is kept
- * (new code valid, possibly never shown: issuing again is safe). The code is returned only after the
- * commit and is never stored, audited or logged.
+ * Through the governed write path (`runMutation`): policy `store` of the project (as for its other
+ * settings), then the new key file is STAGED as keys/project-key.next.json beside the active one, then
+ * the allow audit event carrying this issue's id (the commit point, R26). Only after that is the staged
+ * file made active (replacing keys/project-key.json atomically, then removing the staged file), still
+ * inside the library's write queue. The active key file is never replaced before the commit point, so
+ * an uncommitted change is invisible to every open, read-only included. A crash between the commit
+ * and the end of activation is completed by the next writable open (`completeRecoveryActivation`),
+ * which raises the project warning `recovery-code-unshown`. The code is returned only once it is
+ * active, and is never stored, audited or logged.
  */
 export async function issueRecoveryCode(core: RepoCore, projectId: string, passphrase: string): Promise<{ recoveryCode: string }> {
   core.assertWritable();
@@ -247,7 +267,9 @@ export async function issueRecoveryCode(core: RepoCore, projectId: string, passp
   let next: { recoveryCode: string; file: WrappedKey };
   try {
     const { key: ringKey, keyId } = core.key(st);
-    if (file.keyId !== keyId || file.passphrase.keyId !== keyId || !Buffer.from(key).equals(Buffer.from(ringKey))) {
+    // Compared in place (no copies of the key are made).
+    const same = key.length === ringKey.length && timingSafeEqual(key, ringKey);
+    if (file.keyId !== keyId || file.passphrase.keyId !== keyId || !same) {
       throw new Error("this project's key file does not hold the key the project is unlocked with");
     }
     next = await createRecoveryFile(key, keyId, core.scryptN ? { N: core.scryptN } : {});
@@ -255,20 +277,98 @@ export async function issueRecoveryCode(core: RepoCore, projectId: string, passp
     key.fill(0);
   }
   seams.onRecoveryCode?.(next.recoveryCode);
+  const issueId = newId();
   const keyFile: ProjectKeyFile = { keyId: file.keyId, passphrase: file.passphrase, recovery: next.file };
+  const staged: StagedKeyFile = { formatVersion: 1, issueId, keyFile };
+  const stagedRel = `${st.rel}/${STAGED_KEY_FILE}`;
+  const unshownRel = `${st.rel}/${UNSHOWN_FILE}`;
 
+  /** What stopped activation after the commit (a simulated crash in tests, or a real failure). */
+  let activation: unknown = null;
   await runMutation(
     core,
     projectId,
     { action: "store", store: { identifiable: false, hasLocation: false } },
     async (tx) => {
       const now = await readMaybe(core.abs(rel));
-      if (!now || !now.equals(raw)) throw new Error("the project's key file changed meanwhile; ask for a new recovery code again");
-      await tx.writeFile(rel, JSON.stringify(keyFile, null, 2), { mode: KEY_FILE_MODE });
+      if (!now || !now.equals(raw)) throw new KeyFileChangedError();
+      maybeCrash("recovery-before-stage");
+      // A staged file left by an earlier issue whose activation failed is superseded by this one.
+      await tx.writeFile(stagedRel, JSON.stringify(staged, null, 2), { mode: KEY_FILE_MODE });
+      // A new code supersedes one that was activated on open and may not have been shown.
+      if (await tx.exists(unshownRel)) await tx.trash(unshownRel);
+      // Activation runs after the commit, still inside the write queue. `tx.index` is the only
+      // asynchronous after-commit step mutate.ts offers; its failures never undo the commit.
+      tx.index(async () => {
+        try {
+          maybeCrash("recovery-before-activate");
+          await activateStaged(core, st, staged);
+        } catch (err) {
+          activation = err;
+        }
+      });
     },
-    { op: "project.recovery-code", entity: { type: "project", id: projectId } },
+    { op: ISSUE_OP, entity: { type: "project", id: projectId }, auditDetails: { issueId } },
   );
+  if (activation instanceof SimulatedCrash) throw activation; // tests: the process "died" here
+  if (activation !== null) {
+    // Committed but not active: the old code still works, and this code would not. The next writable
+    // open completes it (with a warning); asking again supersedes it now.
+    throw new Error("The new recovery code was recorded but could not be put in place, so it was not shown. The current recovery code still works. Ask for a new recovery code again");
+  }
+  maybeCrash("recovery-after-activate");
   return { recoveryCode: next.recoveryCode };
+}
+
+/** Makes a staged key file active: the active file replaced atomically (0600), then the staged one removed. Idempotent. */
+async function activateStaged(core: RepoCore, st: ProjectState, staged: StagedKeyFile): Promise<void> {
+  await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged.keyFile, null, 2), { mode: KEY_FILE_MODE });
+  maybeCrash("recovery-mid-activate");
+  await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+}
+
+/**
+ * Writable open, for a project with no unresolved interrupted change (R141 b): a staged key file whose
+ * issue is committed in the audit log (an allow event of this operation with its issue id) is made
+ * active, a persistent warning that the code may never have been shown is raised (UNSHOWN_FILE, until
+ * another code is issued), and the completion is audited. A staged file whose issue is not committed
+ * is left over from a change that was rolled back: it is removed. Throws when the audit append fails
+ * (the caller blocks the project, R28); the activation itself is then already done and the warning raised.
+ */
+export async function completeRecoveryActivation(core: RepoCore, st: ProjectState, events: ReadonlyArray<AuditEvent | null>, at: string): Promise<void> {
+  const raw = await readMaybe(core.abs(`${st.rel}/${STAGED_KEY_FILE}`));
+  if (!raw) return;
+  let staged: StagedKeyFile | undefined;
+  try {
+    const s = JSON.parse(raw.toString("utf8")) as StagedKeyFile;
+    if (s?.formatVersion === 1 && typeof s.issueId === "string" && s.keyFile?.keyId === st.project.encryption.keyId) staged = s;
+  } catch {
+    // unreadable: not activated, removed below
+  }
+  const committed =
+    staged !== undefined &&
+    events.some((e) => {
+      const d = e?.details as { op?: unknown; issueId?: unknown } | undefined;
+      return e?.decision?.result !== "deny" && d?.op === ISSUE_OP && d.issueId === staged!.issueId;
+    });
+  if (!committed) {
+    await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+    return;
+  }
+  await writeFileAtomic(core.abs(`${st.rel}/${UNSHOWN_FILE}`), JSON.stringify({ formatVersion: 1, issueId: staged!.issueId, activatedAt: at }), { mode: KEY_FILE_MODE });
+  await writeFileAtomic(core.abs(`${st.rel}/keys/project-key.json`), JSON.stringify(staged!.keyFile, null, 2), { mode: KEY_FILE_MODE });
+  await core.auditNow(st, {
+    ...core.auditBase(st, at),
+    action: "key.recovery-activated",
+    entity: { type: "project", id: st.project.id },
+    details: { issueId: staged!.issueId, reason: "a new recovery code was issued, but the app stopped before it could be shown; it was put in place when the library was next opened" },
+  });
+  await fsp.rm(core.abs(`${st.rel}/${STAGED_KEY_FILE}`), { force: true });
+}
+
+/** Whether the project carries the warning that a new recovery code may never have been shown (R141 b). */
+export async function recoveryCodeUnshown(core: RepoCore, st: ProjectState): Promise<boolean> {
+  return core.encrypted(st) && (await readMaybe(core.abs(`${st.rel}/${UNSHOWN_FILE}`))) !== null;
 }
 
 export function lockProject(core: RepoCore, projectId: string): void {

@@ -4,7 +4,20 @@
  */
 
 /** Points in a mutation where a simulated crash can be injected. */
-export type CrashPoint = "before-changes" | "before-audit" | "between-audit" | "before-marker-delete" | "torn-audit";
+export type CrashPoint =
+  | "before-changes"
+  | "before-audit"
+  | "between-audit"
+  | "before-marker-delete"
+  | "torn-audit"
+  /** Issuing a new recovery code (R141): before the staged key file is written. */
+  | "recovery-before-stage"
+  /** After the commit point, before the staged key file is made active. */
+  | "recovery-before-activate"
+  /** The active key file replaced, the staged one not yet removed. */
+  | "recovery-mid-activate"
+  /** Activation finished, before the code is returned. */
+  | "recovery-after-activate";
 
 export const seams: {
   crashAt?: CrashPoint;
