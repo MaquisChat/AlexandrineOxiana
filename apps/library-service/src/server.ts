@@ -147,7 +147,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
 
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
     if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
-    const isMedia = req.url.startsWith("/media/");
+    const isMedia = isMediaPath(req.url);
     // Event streams and media streams may stay open for hours: shutdown does not wait for them
     // (media streams end when their tickets are revoked, at the start of shutdown).
     if ((req.url.split("?")[0] ?? "") !== "/events" && !isMedia) {
@@ -275,8 +275,35 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
 
 export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number };
 
-/** The path of a request as logged: no query string, and a media ticket replaced (R135). */
+/** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
+function decodedPath(path: string): string {
+  let cur = path;
+  for (let i = 0; i < 4; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(cur);
+    } catch {
+      return cur;
+    }
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
+/** Whether a request path is (any spelling of) a media address: `/media/…`, decoded, any case, repeated slashes. */
+export function isMediaPath(url: string): boolean {
+  const path = url.split("?")[0] ?? "";
+  return path.startsWith("/media/") || /^\/+media\//i.test(decodedPath(path));
+}
+
+/**
+ * The path of a request as logged (R135): no query string; any spelling of a media address
+ * becomes `/media/[redacted]`; and anywhere else, a run of 40 or more ticket characters (no id of
+ * ours is that long) is replaced too, so a ticket sent to another route is not logged either.
+ */
 export function logUrl(url: string): string {
   const path = url.split("?")[0] ?? "";
-  return path.startsWith("/media/") ? "/media/[redacted]" : path;
+  if (isMediaPath(path)) return "/media/[redacted]";
+  return decodedPath(path).replace(/[A-Za-z0-9_-]{40,}/g, "[redacted]");
 }

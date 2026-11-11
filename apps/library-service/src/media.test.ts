@@ -626,6 +626,10 @@ describe("the ticket never reaches a log line or an error (R135 3)", () => {
       await media(`${t.path}?x=1`),
       await media(`${t.path}/x`),
       await media(`${t.path}%zz`),
+      // The same address spelled differently still never reaches a log line.
+      await media(`/%6Dedia/${secret}`),
+      await media(`//media/${secret}`),
+      await media(`/MEDIA/${secret}`),
       await media(t.path, {}, "HEAD"),
       await call({ method: "POST", url: t.path }),
       await call({ method: "POST", url: "/media-tickets/revoke", body: { path: t.path } }),

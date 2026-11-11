@@ -47,7 +47,7 @@ function stubWorker(): WorkerProvider & { calls: WorkerJob[]; updates: number } 
             ];
             await writeFile(join(job.output, "segments.json"), JSON.stringify(segments));
             await writeFile(join(job.output, "transcript.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the market.\n\nNOTE flags: outside-speech, stock-phrase\n\n00:00:02.000 --> 00:00:04.000\nThanks for watching!\n");
-            return { id: "t1", type: job.type, output: job.output, files: [join(job.output, "transcript.vtt"), join(job.output, "segments.json")], meta: { model: (job.params.model as string) ?? "small", detectedLanguages: ["en"], flaggedCount: 1 }, encrypted: false };
+            return { id: "t1", type: job.type, output: job.output, files: [join(job.output, "transcript.vtt"), join(job.output, "segments.json")], meta: { model: (job.params?.model as string | undefined) ?? "small", detectedLanguages: ["en"], flaggedCount: 1 }, encrypted: false };
           }
           throw new WorkerJobError("TOOL_FAILED", "the tool failed");
         },
