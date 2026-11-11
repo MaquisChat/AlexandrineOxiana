@@ -443,13 +443,13 @@ Update after every task; commit and push.
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c Two small service additions | not started | | a pairing code's status; confirming an identifier field; waits for the 34d and 34e reviews |
+| 46c A pairing code's status | not started | | small service addition and its use on the pairing screen; the identifier half moved into Task 34d (R149) |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | fix round 1 | db52fdb (worktree branch) | spec met; 3 Important (R146); completed by new Task 63 |
-| 34c Transcript viewer | re-review of fix round 1 | f9fb892 (worktree branch) | four Important findings and seven minors reported fixed; two service items are Task 62 |
-| 34d Verification badges | in review | 140a402 (worktree branch) | built; closes defect D3; two concerns carried to review (identifier fields cannot be confirmed; blob pictures in WebKit) |
-| 34e Pairing screen | re-review of fix round 1 | 9d69ab0 (worktree branch) | both Important findings and five minors fixed; shared dialog shell now has its own tests |
+| 34b Capture screen | re-review of fix round 1 | b91e2c0 (worktree branch) | three Important findings and ten minors reported fixed (R146) |
+| 34c Transcript viewer | fix round 2 | f9fb892 (worktree branch) | round 1 confirmed except one Important: the playback position is lost when a ticket is renewed |
+| 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
+| 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
@@ -457,7 +457,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | in progress | | implementer dispatched |
 | 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
 | 50 No silent refusals | not started | | |
-| 51 Job records in files | re-review of fix round 1 | b802afd (worktree branch) | both Important findings reported fixed (R142) |
+| 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
 | 61 New recovery code | fix round 2 | ef05812 (worktree branch) | round 1 confirmed; one new Important (a stale staged file could be activated), settled by R148 |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
