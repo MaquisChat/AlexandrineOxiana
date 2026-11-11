@@ -10,8 +10,11 @@
          without it a snapshot's own <style> and style="" would not render. The tradeoff is small:
          inline CSS cannot run code, scripts stay 'self' only, and React escapes all text, so there is
          no path to inject markup or script; the app's own CSS has no colours outside tokens (lint).
-         In `vite` dev mode this tag is dropped (vite.config.ts): the dev server injects inline scripts. -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
+         In `vite` dev mode this tag is dropped (vite.config.ts): the dev server injects inline scripts.
+         R135: audio and video play from the service through media tickets (/media/<ticket>), so
+         media-src has the same loopback reach as connect-src, plus blob:; pictures need no change
+         (fetched with the token, shown as blob: URLs, which img-src allows). -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src http://127.0.0.1:* http://localhost:* blob:; font-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
     <title>Alexandrine Oxiana</title>
   </head>
   <body>
