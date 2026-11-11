@@ -255,6 +255,91 @@ describe("the certificate and backups-state.json are conveniences; the audit log
     expect(rec!.problem).toMatch(/missing/u);
   });
 
+  it("an amendment removed, or a file put beside the certificate under an amendment's name: the same (nothing deleted, the warning stands, the reason given)", async () => {
+    for (const tamper of ["remove", "add"] as const) {
+      const { p, x, certificatePath } = await stuck(`Beside ${tamper}`);
+      const rec0 = await readDestruction(kit.repo, p.id, certificatePath);
+      const first = join(kit.lib.root, ...rec0.amendments[0]!.file.split("/"));
+      if (tamper === "remove") await rm(first);
+      else await writeFile(first.replace(".amendment-1.", ".amendment-2."), await readFile(first));
+      later(HOUR);
+      await resumeDestruction(kit.repo, p.id);
+      expect(existsSync(x.path)).toBe(true);
+      expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+      const rec = await readDestruction(kit.repo, p.id, certificatePath);
+      expect(rec).toMatchObject({ status: "pending", outstanding: [rel(x)] });
+      expect(rec.problem).toMatch(tamper === "remove" ? /amendment .* is missing.*audit log/u : /named like an amendment.*audit log does not record it/u);
+      // The file the app did not write is left alone, and no amendment is written over it.
+      if (tamper === "add") expect(await readFile(first.replace(".amendment-1.", ".amendment-2."))).toEqual(await readFile(first));
+    }
+  });
+
+  it("while a certificate disagrees with the audit log, a listed backup removed by hand is still recorded as gone, and the warning then clears", async () => {
+    const { p, x, certificatePath } = await stuck();
+    await editRetentionFiles(p, (json) => {
+      if (Array.isArray(json.assets)) json.assets = [];
+    });
+    later(HOUR);
+    await resumeDestruction(kit.repo, p.id);
+    expect(existsSync(x.path)).toBe(true);
+    expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+    await rm(x.path);
+    later(HOUR);
+    await resumeDestruction(kit.repo, p.id);
+    const rec = await readDestruction(kit.repo, p.id, certificatePath);
+    expect(rec).toMatchObject({ status: "no-longer-present", outstanding: [], verified: false });
+    expect(detailsOf((await amendmentEvents(p)).at(-1)!)).toMatchObject({ removed: [], noLongerPresent: [rel(x)] });
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+  });
+
+  it("a certificate the audit log does not record (an earlier version's, or not the app's) is never acted on: its backups stay, the warning says so while they are there", async () => {
+    const p = await makeProject(kit, RETAIN, false, "Unrecorded");
+    await rawSource(p);
+    const x = await backupProject(kit.repo, p.id);
+    const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "retention");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(dir, { recursive: true });
+    const name = "destruction-2026-11-30 0900.json";
+    await writeFile(join(dir, name), JSON.stringify({ formatVersion: 1, kind: "destruction-certificate", projectId: p.id, assets: [], backups: { status: "pending", containing: [rel(x)], deleted: [] } }));
+    kit.clock.now = new Date("2026-12-02T10:00:00.000Z");
+    const before = (await auditEvents(kit, p)).length;
+    expect(await resumeDestruction(kit.repo, p.id)).toEqual([]);
+    expect(existsSync(x.path)).toBe(true);
+    expect(await holdingNotRemoved(kit.repo, p.id)).toEqual([rel(x)]);
+    expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+    const [rec] = await listDestructions(kit.repo, p.id);
+    expect(rec).toMatchObject({ verified: false, status: "pending", outstanding: [rel(x)], amendments: [] });
+    expect(rec!.problem).toMatch(/audit log does not record/u);
+    expect((await auditEvents(kit, p)).length).toBe(before);
+    // Removed by hand: nothing is left to warn about.
+    await rm(x.path);
+    later(HOUR);
+    await resumeDestruction(kit.repo, p.id);
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+  });
+
+  it("an audit log whose chain no longer verifies: nothing is deleted on its word, the reason is given once, and the log is not read in full at every pass", async () => {
+    const { p, x, certificatePath } = await stuck();
+    // An early entry is changed on disk (the last entry, and so the head, is untouched).
+    const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
+    const segment = join(dir, (await readdir(dir)).sort()[0]!);
+    const lines = (await readFile(segment, "utf8")).split("\n");
+    const firstEvent = JSON.parse(lines[0]!) as { actor: string };
+    firstEvent.actor = "someone else";
+    lines[0] = JSON.stringify(firstEvent);
+    await writeFile(segment, lines.join("\n"));
+    for (let i = 0; i < 3; i++) {
+      later(HOUR / 2);
+      await resumeDestruction(kit.repo, p.id);
+      expect(existsSync(x.path)).toBe(true);
+      expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+    }
+    const said = (await reports(p)).filter((e) => typeof detailsOf(e).problem === "string");
+    expect(said).toHaveLength(1);
+    expect(detailsOf(said[0]!).problem).toMatch(/audit log .* does not hold together/u);
+    expect((await readDestruction(kit.repo, p.id, certificatePath)).outstanding).toEqual([rel(x)]);
+  });
+
   it("backups-state.json deleted: the retry still knows what is outstanding from the audit log, and writes nothing more to it for a retry that changes nothing", async () => {
     const { p, x, certificatePath } = await stuck();
     later(HOUR);
