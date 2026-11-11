@@ -5,7 +5,7 @@
  */
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
-function useTrap(onCancel: () => void) {
+export function useTrap(onCancel: () => void) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const before = document.activeElement as HTMLElement | null;
