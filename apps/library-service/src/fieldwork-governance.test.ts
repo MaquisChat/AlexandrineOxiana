@@ -211,7 +211,7 @@ describe("retention (spec 6.3(5))", () => {
 describe("researcher name (device setting, R84/R117 carry-over)", () => {
   it("GET/PUT /settings/researcher keeps a display name on this device; invalid names are refused", async () => {
     expect((await call({ url: "/settings/researcher" })).json).toEqual({ name: null });
-    for (const name of ["", "   ", "a".repeat(201), "Ana‮Souza", "Ana\nSouza", 7]) {
+    for (const name of ["", "   ", "a".repeat(201), "Ana‮Souza", "Ana\nSouza", 7, "\ud800", "Ana\udc00"]) {
       expect((await call({ method: "PUT", url: "/settings/researcher", body: { name } })).status, JSON.stringify(name)).toBe(400);
     }
     const put = await call({ method: "PUT", url: "/settings/researcher", body: { name: "  Ana Souza " } });
@@ -248,5 +248,18 @@ describe("researcher name (device setting, R84/R117 carry-over)", () => {
     const batches = (await readdir(join(tmp, "Lib", folder, "imports"))).sort();
     const rec = JSON.parse(await readFile(join(tmp, "Lib", folder, "imports", batches.at(-1)!, "batch.json"), "utf8"));
     expect(rec.adapterOptions).toEqual({ researcherName: "Ana Souza" });
+  });
+
+  it("41a M6: a researcher name given for one device import is checked like the setting (400, nothing imported)", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const dir = join(tmp, "DCIM2");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "note.txt"), "x");
+    const dev = await call({ method: "POST", url: "/projects", body: { name: "Device2", governanceYaml: FIELD_GOV.replace("captureMethods: [manual_upload]", "captureMethods: [manual_upload, device_import]"), encryption: { enabled: false } } });
+    const devPid = dev.json.project.id as string;
+    for (const researcherName of ["Ana‮Souza", "Ana\nSouza", "\ud800", "a".repeat(201)]) {
+      const r = await call({ method: "POST", url: `/projects/${devPid}/device-import`, body: { dir, options: { researcherName } } });
+      expect(r.status, JSON.stringify(researcherName)).toBe(400);
+    }
   });
 });
