@@ -443,7 +443,7 @@ Update after every task; commit and push.
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c A pairing code's status | not started | | small service addition and its use on the pairing screen; the identifier half moved into Task 34d (R149) |
+| 46c A pairing code's status | in progress | | implementer dispatched; the identifier half moved into Task 34d (R149) |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | re-review of fix round 1 | b91e2c0 (worktree branch) | three Important findings and ten minors reported fixed (R146) |
@@ -461,10 +461,10 @@ Update after every task; commit and push.
 | 61 New recovery code | fix round 2 | ef05812 (worktree branch) | round 1 confirmed; one new Important (a stale staged file could be activated), settled by R148 |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
-| 37a Service bundle | not started | | |
+| 37a Service bundle | in progress | | implementer dispatched (ahead of Task 46: little overlap, and it heads the longest remaining chain) |
 | 37b Token on standard input | in progress | | implementer dispatched |
 | 37c Desktop shell | not started | | |
-| 37d Worker packaging | fix round 1 | 72cb7cc (worktree branch) | approved with fixes: stronger smoke test, accurate licence manifest, offline model load (R144) |
+| 37d Worker packaging | re-review of fix round 1 | ca0e230 (worktree branch) | stronger smoke test, restated licence manifest, offline model load (R144) reported done |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
