@@ -272,7 +272,7 @@ function backup(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Po
     const problem = residencyProblem(p, destination, d.cloudFolderId);
     if (problem === null) continue;
     if (uncertain) {
-      return deny(`Where the library's folder is stored could not be determined (it may be ${storageWords(destination)}); this project's rules do not allow its data there`, warnings);
+      return deny(`Where the library's folder is stored could not be determined (it may be ${storageWords(destination)}), and this project's rules do not allow its data there. To make backups, move the library to storage the rules allow, or allow that kind of storage in the project's rules.`, warnings);
     }
     if (problem === "folder") {
       return deny(`Backups are kept in the library's folder, which is in cloud folder ${d.cloudFolderId ?? "(unknown)"}; it is not on this project's approved list`, warnings);

@@ -229,7 +229,7 @@ describe("backup (R125): a full copy of the project written to <Library>/Backups
     ["DMP, defaults, own server allowed", "profiles: [dmp]\nresidency: { allowed: [own_server] }", [at("own_server")], "allow_with_conditions", ENCRYPT],
     ["all four profiles", "profiles: [irb, gdpr, hipaa, dmp]\nsharing: { locationMetadata: strip }", [at("device")], "allow_with_conditions", ENCRYPT],
     ["typed path and real path: every one must be allowed", "encryption: { atRest: optional }", [at("device"), at("network")], "deny", "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there"],
-    ["a kind that could not be determined is refused when it may be one the rules exclude", "encryption: { atRest: optional }", [at("device", { uncertain: true }), at("removable", { uncertain: true }), at("network", { uncertain: true })], "deny", "Where the library's folder is stored could not be determined (it may be a network drive); this project's rules do not allow its data there"],
+    ["a kind that could not be determined is refused when it may be one the rules exclude", "encryption: { atRest: optional }", [at("device", { uncertain: true }), at("removable", { uncertain: true }), at("network", { uncertain: true })], "deny", "Where the library's folder is stored could not be determined (it may be a network drive), and this project's rules do not allow its data there. To make backups, move the library to storage the rules allow, or allow that kind of storage in the project's rules."],
   ];
   it.each(table)("%s", (_case, yaml, dests, result, detail) => {
     const d = evaluate(cfg(yaml), bk(...dests));

@@ -105,7 +105,7 @@ describe("R125: a refused backup", () => {
   it("where the library is cannot be determined: refused when it may be storage the rules exclude (fail closed)", async () => {
     const p = await makeProject(kit, OPEN_GOV, false, "Unknown");
     await expect(backupProject(kit.repo, p.id, { locationEnv: unknownPlace() })).rejects.toMatchObject({
-      reason: "Where the library's folder is stored could not be determined (it may be a network drive); this project's rules do not allow its data there",
+      reason: "Where the library's folder is stored could not be determined (it may be a network drive), and this project's rules do not allow its data there. To make backups, move the library to storage the rules allow, or allow that kind of storage in the project's rules.",
     });
     expect(await backupFiles()).toEqual([]);
   });
