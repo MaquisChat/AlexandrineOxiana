@@ -45,6 +45,11 @@ export interface Library {
    * move's switch did not finish; complete it with `completeMove(newRoot, …)`.
    */
   movedTo?: { newRoot: string; unfinished: boolean };
+  /**
+   * With `locked-by-other-device`: the name of the device holding the lock (its hostname from the
+   * lock file), when known and plausible. Only the device's name: the lock records no user name.
+   */
+  lockedBy?: string;
   /** App-level config folder (outside the library), from Deps; holds the registry and audit anchors. */
   appConfigDir: string;
   /** This device's id, from Deps; recorded in audit events and change log entries. */
@@ -242,8 +247,8 @@ export async function openLibraryInternal(
 ): Promise<Library> {
   const meta = await readMeta(root);
   const key = resolve(root);
-  const readOnly = (reason: NonNullable<Library["readOnlyReason"]>, movedTo?: Library["movedTo"]): Library =>
-    makeHandle(meta, root, deps, { mode: "read-only", reason }, movedTo);
+  const readOnly = (reason: NonNullable<Library["readOnlyReason"]>, movedTo?: Library["movedTo"], holder?: LockInfo | null): Library =>
+    makeHandle(meta, root, deps, { mode: "read-only", reason, ...holderName(holder) }, movedTo);
 
   // Read-only opens must not touch the library folder at all.
   if ((meta.formatVersion as number) > FORMAT_VERSION) {
@@ -261,11 +266,12 @@ export async function openLibraryInternal(
   const onDisk = await readLock(root);
   if (openRoots.has(key) && onDisk !== null && onDisk !== "corrupt" && onDisk.deviceId === deps.deviceId && onDisk.pid === deps.pid) {
     await note(root, meta, deps);
-    return readOnly("locked-by-other-device");
+    return readOnly("locked-by-other-device", undefined, onDisk);
   }
-  if (await peekLock(root, deps)) {
+  const peeked = await peekLock(root, deps);
+  if (peeked) {
     await note(root, meta, deps);
-    return readOnly("locked-by-other-device");
+    return readOnly("locked-by-other-device", undefined, peeked);
   }
   let got: Awaited<ReturnType<typeof acquireLock>>;
   try {
@@ -279,7 +285,7 @@ export async function openLibraryInternal(
   }
   if (!got.acquired) {
     await note(root, meta, deps);
-    return readOnly("locked-by-other-device");
+    return readOnly("locked-by-other-device", undefined, got.holder);
   }
 
   openRoots.add(key);
@@ -289,6 +295,7 @@ export async function openLibraryInternal(
   const lockLost = (holder: LockInfo | null) => {
     state.mode = "read-only";
     state.reason = "locked-by-other-device";
+    state.lockedBy = holderName(holder).lockedBy;
     state.held = false;
     openRoots.delete(key);
     opts.onLockLost?.(holder);
@@ -361,13 +368,29 @@ export async function openLibraryInternal(
     hb = startHeartbeat(root, deps, lockLost);
     state.mode = "read-write";
     state.reason = undefined;
+    state.lockedBy = undefined;
   };
   return lib;
+}
+
+/**
+ * The device name to show for a lock holder: its hostname, if it is a plausible device name (1 to
+ * 253 characters, no control, format or line-separator characters). The lock file is written by
+ * whatever device holds the library, so anything else is not passed on.
+ */
+function holderName(holder: LockInfo | null | undefined): { lockedBy?: string } {
+  const h = holder?.hostname;
+  if (typeof h !== "string") return {};
+  const name = h.trim();
+  if (name.length === 0 || name.length > 253 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(name)) return {};
+  return { lockedBy: name };
 }
 
 interface HandleState {
   mode: Library["mode"];
   reason?: Library["readOnlyReason"];
+  /** The lock holder's device name while `reason` is locked-by-other-device. */
+  lockedBy?: string | undefined;
   /** True while this handle holds the library lock. */
   held?: boolean;
 }
@@ -403,6 +426,9 @@ function makeHandle(
     },
     get readOnlyReason() {
       return state.reason;
+    },
+    get lockedBy() {
+      return state.reason === "locked-by-other-device" ? state.lockedBy : undefined;
     },
     ...(movedTo ? { movedTo } : {}),
     appConfigDir: deps.appConfigDir,

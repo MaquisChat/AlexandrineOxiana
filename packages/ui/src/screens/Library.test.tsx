@@ -101,12 +101,26 @@ describe("Library screen", () => {
     expect(items[2]!.textContent).toMatch(/c\.pdf.*The file could not be read\./);
   });
 
+  it("names the device holding the lock: read-only (locked by <hostname>), from the library and its state events", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "field-laptop" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    expect((await screen.findByText(/Read-only \(locked by field-laptop\)/)).closest("[role=status]")).toBeTruthy();
+  });
+
+  it("a lock taken while the library is open names the new holder from library.state", async () => {
+    const st = { open: true, ...CURRENT_RW, mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "lab-mac", integrityWarnings: [], projectWarnings: {} };
+    server.use(...libraryHandlers({ state: st }));
+    renderLibrary();
+    expect(await screen.findByText(/Read-only \(locked by lab-mac\)/)).toBeTruthy();
+  });
+
   it("a read-only library shows the banner and disables the drop zone and edit buttons", async () => {
     const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device" };
     server.use(...libraryHandlers({ current: ro }));
     renderLibrary(ro);
     await screen.findByText("Ethnography at Work");
-    expect((await screen.findByText(/Read-only — locked by another device/)).closest("[role=status]")).toBeTruthy();
+    expect((await screen.findByText(/Read-only \(locked by another device\)/)).closest("[role=status]")).toBeTruthy();
     expect(screen.getByRole("region", { name: /attach files/i }).getAttribute("aria-disabled")).toBe("true");
     expect((screen.getByRole("button", { name: "Attach files…" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "New collection" }) as HTMLButtonElement).disabled).toBe(true);

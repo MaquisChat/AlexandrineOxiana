@@ -1,5 +1,5 @@
 /**
- * The library's status, in plain language (spec 4.5; R113): read-only (locked by another device,
+ * The library's status, in plain language (spec 4.5; R113): read-only (locked by <hostname>,
  * newer format, other reasons), offline until the drive returns, the index rebuilding, and the
  * library's integrity warnings and projects' standing warnings. Warning codes are never shown as
  * such; an unknown one shows the service's own (path-scrubbed) detail.
@@ -62,7 +62,7 @@ export function warningText(kind: string, project: string): string {
 function text(v: BannerVariant): string {
   switch (v.kind) {
     case "read-only-locked":
-      return `Read-only — locked by ${v.hostname ?? "another device"}. Changes are off until it closes the library there.`;
+      return `Read-only (locked by ${v.hostname ?? "another device"}). Changes are off until the library is closed there.`;
     case "read-only-newer-format":
       return "Read-only — newer format. This library was saved by a newer version of the app; update the app to make changes.";
     case "read-only":

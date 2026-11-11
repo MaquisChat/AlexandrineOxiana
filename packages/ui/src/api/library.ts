@@ -26,6 +26,8 @@ export interface CurrentLibrary {
   name: string;
   mode: "read-write" | "read-only";
   readOnlyReason?: ReadOnlyReason | (string & {});
+  /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
+  lockedBy?: string;
 }
 
 export interface ReconnectResult extends CurrentLibrary {
@@ -56,6 +58,7 @@ export interface LibraryState {
   name?: string;
   mode?: CurrentLibrary["mode"];
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
+  lockedBy?: CurrentLibrary["lockedBy"];
   integrityWarnings?: IntegrityWarning[];
   projectWarnings?: Record<string, string[]>;
 }

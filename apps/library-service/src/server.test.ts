@@ -1703,3 +1703,31 @@ describe("screens integration (R118)", () => {
     expect(again.find((p) => p.id === open)?.profiles).toEqual([]);
   });
 });
+
+describe("screens integration (R118): lock holder", () => {
+  beforeEach(() => start());
+
+  it("(c) a library locked by another device names that device (only its name) in GET /libraries, open and library.state", async () => {
+    const path = await openNewLibrary();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const now = new Date().toISOString();
+    await writeFile(join(path, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    const opened = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect(opened.status, opened.body).toBe(200);
+    expect(opened.json).toMatchObject({ mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "field-laptop" });
+    expect((await call({ url: "/libraries" })).json.current.lockedBy).toBe("field-laptop");
+    const libState = svc.state.libraryState();
+    expect(libState.lockedBy).toBe("field-laptop");
+    for (const body of [opened.body, JSON.stringify(libState)]) {
+      expect(body).not.toContain("dev-other");
+      expect(body).not.toContain("4242");
+      expect(body).not.toContain("ana");
+    }
+  });
+
+  it("(c) a writable library sends no lockedBy", async () => {
+    await openNewLibrary();
+    expect((await call({ url: "/libraries" })).json.current.lockedBy).toBeUndefined();
+    expect(svc.state.libraryState().lockedBy).toBeUndefined();
+  });
+});

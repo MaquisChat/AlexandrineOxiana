@@ -5,12 +5,12 @@ import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner"
 describe("StatusBanner", () => {
   it("read-only, locked by another computer", () => {
     render(<StatusBanner variant={{ kind: "read-only-locked", hostname: "lab-mac" }} />);
-    expect(screen.getByRole("status").textContent).toContain("Read-only — locked by lab-mac");
+    expect(screen.getByRole("status").textContent).toContain("Read-only (locked by lab-mac)");
   });
 
   it("read-only, locked, holder unknown", () => {
     render(<StatusBanner variant={{ kind: "read-only-locked" }} />);
-    expect(screen.getByRole("status").textContent).toContain("Read-only — locked by another device");
+    expect(screen.getByRole("status").textContent).toContain("Read-only (locked by another device)");
   });
 
   it("read-only, newer format", () => {

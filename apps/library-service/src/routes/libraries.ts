@@ -31,7 +31,14 @@ import { bodyOf, queryOf, str, strArray, type Ctx } from "./util.js";
 function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
   const s = ctx.state.session;
   if (!s) return undefined;
-  return { libraryId: s.lib.id, name: s.lib.name, mode: s.lib.mode, ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}) };
+  return {
+    libraryId: s.lib.id,
+    name: s.lib.name,
+    mode: s.lib.mode,
+    ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
+    // Only the holding device's name (R118): never its id, process or a user name.
+    ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
+  };
 }
 
 /** Starts a streamed response (NDJSON or SSE) with the headers the hooks set (CORS). */

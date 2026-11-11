@@ -674,6 +674,7 @@ export class ServiceState {
       name: s.lib.name,
       mode: s.lib.mode,
       ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
+      ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
       projectWarnings: this.cachedProjectWarnings,
     };

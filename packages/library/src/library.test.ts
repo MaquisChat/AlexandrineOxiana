@@ -417,3 +417,42 @@ describe("fix round 1", () => {
     expect((await listLibraries(deps)).map((l) => l.libraryId)).toEqual(["L1", "L2"]);
   });
 });
+
+describe("lock holder's device name (R118 c)", () => {
+  it("a read-only handle names the device holding the lock; a writable one names none", async () => {
+    const a = await createLibrary(root, "Mine", mkDeps());
+    expect(a.lockedBy).toBeUndefined();
+    const b = await openLibrary(root, depsB());
+    expect(b.readOnlyReason).toBe("locked-by-other-device");
+    expect(b.lockedBy).toBe("host-A");
+    await b.close();
+    await a.close();
+  });
+
+  it("a handle demoted by another device taking the lock names that device; holder unknown → none", async () => {
+    const a = await createLibrary(root, "Mine", mkDeps());
+    now += 121_000;
+    await openLibrary(root, depsB());
+    now += 30_000;
+    await tick(0);
+    expect(a.lockedBy).toBe("host-B");
+    await a.close();
+    const c = await createLibrary(join(root, "..", `other-${now}`), "Other", mkDeps());
+    failWrites(".lock", "EIO");
+    for (let i = 0; i < 5; i++) {
+      now += 30_000;
+      for (let t = 0; t < timers.length; t++) if (!timers[t]!.cleared) await tick(t);
+    }
+    expect(c.readOnlyReason).toBe("locked-by-other-device");
+    expect(c.lockedBy).toBeUndefined();
+  });
+
+  it("a hostname with control characters or of absurd length is not passed on", async () => {
+    const a = await createLibrary(root, "Mine", mkDeps({ hostname: "evil\u0007host" }));
+    expect((await openLibrary(root, depsB())).lockedBy).toBeUndefined();
+    await a.close();
+    const z = await createLibrary(join(root, "..", `long-${now}`), "Long", mkDeps({ hostname: "h".repeat(300) }));
+    expect((await openLibrary(z.root, depsB())).lockedBy).toBeUndefined();
+    await z.close();
+  });
+});

@@ -56,7 +56,11 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
 export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed }: LibraryProps) {
-  const [state, setState] = useState<LibraryState>({ mode: current.mode, ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}) });
+  const [state, setState] = useState<LibraryState>({
+    mode: current.mode,
+    ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
+    ...(current.lockedBy ? { lockedBy: current.lockedBy } : {}),
+  });
   const [index, setIndex] = useState<{ done: number; total: number } | undefined>();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [projects, setProjects] = useState<ProjectSummary[] | undefined>();
@@ -131,7 +135,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               closedRef.current?.();
               continue;
             }
-            setState((s) => ({ ...s, ...d }));
+            // Each event is the whole state: a reason or lock holder it no longer names is gone.
+            setState(({ readOnlyReason: _r, lockedBy: _l, ...s }) => ({ ...s, ...d }));
           }
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
@@ -266,7 +271,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   };
 
   const projectNames = useMemo(() => Object.fromEntries((projects ?? []).map((p) => [p.id, p.name])), [projects]);
-  const banners = bannersFor(state, { projectNames, index, ...(libraryPath ? { volume: volumeOf(libraryPath) } : {}) });
+  const banners = bannersFor(state, { projectNames, index, ...(libraryPath ? { volume: volumeOf(libraryPath) } : {}), ...(state.lockedBy ? { hostname: state.lockedBy } : {}) });
   const readOnlyReason = state.readOnlyReason === "offline" ? "The library is offline; attaching waits until it is back." : "This library is read-only.";
 
   return (
