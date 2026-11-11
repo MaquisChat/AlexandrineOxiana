@@ -195,6 +195,22 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Verify: `pnpm --filter @ao/ui exec vitest run src/screens/ExtensionPairing.test.tsx`.
 - Model: Sonnet.
 
+**Task 63 — A capture's state can be read again; one classifier [ledger: R146, R41, R43, R96; ADR 0009]**
+- Depends: 34b. Parallel: 62.
+- Files: `apps/library-service/src/routes/capture.ts`, `packages/library/src/capture/`, `packages/core/src/` or `packages/shared/src/` (the classifier and the acknowledgement text), `packages/ui/src/api/capture.ts`, `packages/ui/src/screens/Capture.tsx`, tests.
+- Why: found by the Task 34b review. Progress reaches the screen only as events, so anything missed while the connection was down is gone, a capture started before the screen opened is invisible, and the screen keeps its own copy of the address classifier because the real one lives where the UI may not import it.
+- Accept: the service can list a project's running and recent capture queues and return one queue's items with their outcomes; the screen reads them on opening and after a reconnect, so a running capture is always visible and "unknown" outcomes disappear; a second identical capture while one runs is refused or joined, in plain words. A failed tools update returns a proper error with its reason. The address classifier and the acknowledgement text have one definition that the library and the UI both import; the UI's copy and its parity test are deleted.
+- Verify: service and library tests; `pnpm --filter @ao/ui exec vitest run src/screens/Capture.test.tsx`; the capture scenario (Task 34f) reloads the page mid-capture.
+- Model: Opus.
+
+**Task 62 — Transcription as a job; flags survive a human edit [ledger: R143, R99, R142; SPEC 5.2, 5.8]**
+- Depends: 34c, 51. Parallel: 48 (UI half).
+- Files: `apps/library-service/src/routes/sources.ts`, `packages/library/src/worker-client.ts` and the transcript store, `packages/shared/src/api/transcripts.ts`, `packages/ui/src/screens/TranscriptViewer.tsx`, tests.
+- Why: found by the Task 34c review. The transcribe route waits for the whole run and reports no progress, so a researcher who leaves the screen can start the same transcription twice; and a human-edit version comes back with no flags at all, so flagged text the person never touched looks clean.
+- Accept: starting a transcription returns at once with a job; progress arrives as job events and the job's state can be read again after a reload; at most one transcription runs per source, and a second request while one runs is refused in plain words; the run can be cancelled. A human-edit version stores flags per segment: carried over where timing and text are unchanged, none where the person changed the segment, which is marked as edited. The viewer uses the job and the stored flags, and its interim workarounds from Task 34c are removed.
+- Verify: service and library tests; `pnpm --filter @ao/ui exec vitest run src/screens/TranscriptViewer.test.tsx`; the capture scenario (Task 34f) re-transcribes once.
+- Model: Opus.
+
 **Task 48 — First-use tools dialogue [ledger: R7, R83, R90, R126, R133; ADR 0009, ADR 0014]**
 - Depends: 34b. Split into two sessions: worker and service first, then UI.
 - Files: `services/media-worker/ao_worker/` (tool catalogue, install), `packages/library/src/worker-client.ts`, `apps/library-service/src/routes/capture.ts`, `packages/ui/src/screens/ToolsSetup.tsx`, `docs/adr/0009-capture-tools.md`, tests.
@@ -402,6 +418,10 @@ Known, not yet scheduled above, or accepted as limits:
   - D5: after a relaunch the app shows "Choose a library" instead of "Library not found".
   - D6: in WebKit one typeface stays in error, so fonts never finish loading (to be checked in the real Mac web view).
   - D7: right-to-left title headings are laid out left to right.
+- A UI test, ReviewQueue "loads titles six at a time", takes about 40 s under heavy machine load and passes alone; find out why without loosening its limit (for Task 46 or Task 54).
+- Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
+- Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
+- Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
 - Defects found by Task 44 are added here when it runs.
 
 ## 8. Status
@@ -418,28 +438,30 @@ Update after every task; commit and push.
 | 42 CI coverage | done | ae3f762, b207182 | green run on GitHub at 27d7c6c; temporary network check removed |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
-| 44 Scenarios 1, 2, 5, 7 | not started | | unblocked; next to dispatch |
+| 44 Scenarios 1, 2, 5, 7 | in progress | | implementer dispatched |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
-| 34a Service additions | in review | 0dd43ae (worktree branch) | security review resumed |
-| 34b Capture screen | not started | | |
-| 34c Transcript viewer | not started | | |
-| 34d Verification badges | not started | | |
-| 34e Pairing screen | not started | | |
+| 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
+| 34b Capture screen | fix round 1 | db52fdb (worktree branch) | spec met; 3 Important (R146); completed by new Task 63 |
+| 34c Transcript viewer | fix round 1 | 4b9a723 (worktree branch) | spec met; 4 Important (R143); two of them completed by new Task 62 |
+| 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
+| 34e Pairing screen | fix round 1 | f48170a (worktree branch) | 2 Important; its fix to the shared dialog shell is confirmed real and kept |
+| 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
+| 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | fix round 1 | 23d4ee8 (worktree branch) | resumed; 1 Critical, 4 Important (R138) |
+| 49 Backups governed | fix round 3 | fdb61e9 (worktree branch) | rounds 1 and 2 confirmed; two Important in the automatic retry of pending removals |
 | 50 No silent refusals | not started | | |
-| 51 Job records in files | in progress | | resumed |
-| 61 New recovery code | in progress | | implementer dispatched |
+| 51 Job records in files | fix round 1 | 20993f0 (worktree branch) | spec met; 2 Important (R142) |
+| 61 New recovery code | fix round 1 | 35be129 (worktree branch) | spec met; 3 Important (R141) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |
 | 37b Token on standard input | not started | | |
 | 37c Desktop shell | not started | | |
-| 37d Worker packaging | in progress | | implementer dispatched |
+| 37d Worker packaging | fix round 1 | 72cb7cc (worktree branch) | approved with fixes: stronger smoke test, accurate licence manifest, offline model load (R144) |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
@@ -460,7 +482,7 @@ Update after every task; commit and push.
 5. Confirm two things from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia, which leaves out Intel MacBook Airs from 2018–19 and most Macs older than 2018; and the Intel download is kept although it must use older versions of four libraries (older cameras' RAW files only, two months behind on OCR fixes, an older cryptography library) and depends on GitHub keeping its Intel machines.
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
-8. Choose the project's own licence before anything is published (Task 56).
+8. Choose the project's own licence before anything is published (Task 56). Facts that bear on it, found by Task 37d: the packaged worker contains a GPL-2.0-only program (gallery-dl) and GPL video-codec libraries inside two of its Python packages, besides LGPL and MPL parts. What may be shipped together, and under which licence, is a question for the owner and, ideally, a lawyer; the plan's default until then is to move gallery-dl out of the bundle into the first-use downloads, like the video downloader.
 9. Optional: on GitHub, make `main` the default branch (Settings, then Branches).
 
 ## 10. After Phase 1 (outline only)
