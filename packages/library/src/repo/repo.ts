@@ -71,7 +71,7 @@ import { loadPseudonyms } from "./pseudonyms.js";
 import { stampFor, type Stamp } from "../index/changes.js";
 import { isStaleWorkDir } from "../tmp-registry.js";
 import { RecoveryPendingError } from "./errors.js";
-import { pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
+import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
 import { destroyAssets, type DestroyInput } from "./destroy.js";
@@ -380,6 +380,10 @@ const RECOVERY_WARNINGS: Partial<Record<RecoveryOutcome, { kind: IntegrityWarnin
     kind: "txn-recovery-skipped-audit-unverifiable",
     text: "an interrupted change was not rolled back because the audit log cannot be trusted to show it was uncommitted; the marker is kept",
   },
+  "resolve-incomplete": {
+    kind: "incomplete-write-pending",
+    text: "the choice made for an interrupted change could not be completed when the library opened; the marker keeps the choice, and it is completed by resolving it again or on the next open",
+  },
 };
 
 /** Reads the anchors; an unreadable file is reported, moved aside (when writable) and replaced. */
@@ -442,6 +446,9 @@ export async function openRepoInternal(
   /** A marker is unresolved and cannot be tied to a project: no file of any project is trimmed. */
   let unattributed = false;
   if (writable) {
+    // Choices the researcher recorded but a crash or failed audit append left unfinished are
+    // completed and audited first (R131 c); recovery never acts on a recorded choice itself.
+    await completeRecordedResolves(core, (pid) => anchors[core.anchorKey(pid)]);
     const recovered = await recoverTransactions(core.root, (pid) => anchors[core.anchorKey(pid)]);
     for (const r of recovered) {
       // A committed change whose destroyed files still wait to be overwritten does not block writes.

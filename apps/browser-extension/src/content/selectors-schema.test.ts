@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import rawSelectors from "./selectors.json";
 import { SelectorsError, unsafePatternReason, validateSelectors } from "./selectors-schema.js";
+import { MAX_PATTERN_INPUT } from "./extractors/engine.js";
 
 const clone = (): any => JSON.parse(JSON.stringify(rawSelectors));
 
@@ -55,7 +56,7 @@ describe("selectors.json schema", () => {
       expect(() => validateSelectors(s), pattern).toThrow(/pattern/);
     }
     // Ordinary patterns stay allowed, including a quantified group with no quantifier inside.
-    for (const pattern of ["^/([A-Za-z0-9._]{1,30})/?$", "^(?:ab)+([0-9]+)$", "^([0-9][0-9,.]*) people$", "^\\(([a-z]+)\\)+$", "^([+*]+)$"]) {
+    for (const pattern of ["^/([A-Za-z0-9._]{1,30})/?$", "^(?:ab){1,8}([0-9]+)$", "^([0-9][0-9,.]*) people$", "^\\(([a-z]+)\\){1,3}$", "^([+*]+)$"]) {
       const s = clone();
       s.platforms.instagram.pages.post.fields.handle[0].pattern = pattern;
       expect(() => validateSelectors(s), pattern).not.toThrow();
@@ -68,6 +69,69 @@ describe("selectors.json schema", () => {
       const s = clone();
       s.platforms.instagram.pages.post.fields.handle[0].pattern = pattern.includes("(") && !pattern.startsWith("(?:") ? pattern : `(${pattern})`;
       expect(() => validateSelectors(s), pattern).toThrow(/pattern.*not allowed/);
+    }
+  });
+
+  it("41a I4: polynomial backtracking shapes are refused, and every pattern the validator lets through runs within a small budget on a long hostile string", () => {
+    const hostile = ["a".repeat(MAX_PATTERN_INPUT - 1) + "#", "1".repeat(MAX_PATTERN_INPUT - 1) + "!", " ".repeat(MAX_PATTERN_INPUT - 1) + "x"];
+    const candidates = [
+      // The reviewer's three (O(n^4) on 121 characters, about 2 s each).
+      "a*b?a*b?a*b?a*$",
+      "a*(?:)a*(?:)a*(?:)a*$",
+      "[a-z]*[0-9]?[a-z]*[0-9]?[a-z]*[0-9]?[a-z]*!$",
+      // Cousins: nullable separators of other kinds, quantifiers hidden in groups or lookarounds,
+      // unanchored single quantifiers (O(n^2) over every start), many optional atoms (exponential).
+      "^(a*)(?:a*)(?:a*)!$",
+      "^a*(?:b|)a*!$",
+      "^(?=a*a*a*!)(a)",
+      "[a-z]*([a-z])!$",
+      "^(a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?)aaaaaaaaaaaaaaaaaaaa!$",
+      "^\\s*(\\d+)\\s*$",
+      "^(?:a|b)*(x)|(y)$",
+      // Allowed shapes: start-anchored, one unbounded quantifier, few bounded choices.
+      "^a{0,15}a{0,15}([a-z]*)!$",
+      "^([0-9][0-9,.]*) people$",
+      "^/([A-Za-z0-9._]{1,30})/?$",
+    ];
+    // Refusals first: the shapes above would not finish on the hostile strings.
+    for (const p of candidates.slice(0, 10)) expect(unsafePatternReason(p), p).toMatch(/not allowed/);
+    let allowed = 0;
+    for (const pattern of candidates) {
+      if (unsafePatternReason(pattern) !== undefined) continue;
+      allowed++;
+      const re = new RegExp(pattern);
+      for (const s of hostile) {
+        const t0 = performance.now();
+        re.exec(s.slice(0, MAX_PATTERN_INPUT));
+        expect(performance.now() - t0, `${pattern} on ${s.slice(0, 3)}…`).toBeLessThan(250);
+      }
+    }
+    expect(allowed).toBe(3);
+  });
+
+  it("41a N3: character classes are read as JavaScript reads them; empty classes are refused and nothing hides behind a bracket", () => {
+    const refused = [
+      "^[^](a+)+]",
+      "^[^]((?:a|a)*)]",
+      "^[^](a*a*a*)]",
+      "^[](a+)+]",
+      "^[]a](a+)+",
+      "^[\\]](a+)+",
+      "^[^\\]](a*a*a*)",
+      "^[a\\]](b+)+",
+    ];
+    // Refusals first: these would not finish on the hostile strings.
+    for (const p of refused) expect(unsafePatternReason(p), p).toMatch(/not allowed/);
+    const allowed = ["^[^\\]]*(x)$", "^[\\]a-z]{1,30}([0-9]+)$", "^([^a])"];
+    const hostile = ["x" + "a".repeat(MAX_PATTERN_INPUT - 1), "]" + "a".repeat(MAX_PATTERN_INPUT - 1), "a".repeat(MAX_PATTERN_INPUT - 1) + "#"];
+    for (const p of allowed) {
+      expect(unsafePatternReason(p), p).toBeUndefined();
+      const re = new RegExp(p);
+      for (const s of hostile) {
+        const t0 = performance.now();
+        re.exec(s);
+        expect(performance.now() - t0, p).toBeLessThan(250);
+      }
     }
   });
 

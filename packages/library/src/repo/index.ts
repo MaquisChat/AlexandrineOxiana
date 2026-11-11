@@ -28,6 +28,7 @@ export {
   ReadOnlyLibraryError,
   PathEscapeError,
   PendingWriteChoiceError,
+  PendingWriteIncompleteError,
   RecoveryPendingError,
   TornFileError,
 } from "./errors.js";

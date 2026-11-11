@@ -71,6 +71,21 @@ export class PendingWriteChoiceError extends Error {
   }
 }
 
+/**
+ * The researcher's choice for an interrupted change was recorded but a step of it could not be
+ * carried out yet (a file could not be overwritten or put back). The marker keeps the choice; it is
+ * tried again by resolving again or on the next open (R131 c). The message is plain language.
+ */
+export class PendingWriteIncompleteError extends Error {
+  override name = "PendingWriteIncompleteError";
+  constructor(
+    readonly txn: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 /** A path resolves (through a symbolic link) outside the folder it must stay in. */
 export class PathEscapeError extends Error {
   override name = "PathEscapeError";

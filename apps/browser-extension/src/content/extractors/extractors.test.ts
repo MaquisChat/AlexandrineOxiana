@@ -171,7 +171,7 @@ describe("limits (R112)", () => {
   it("matches selector patterns against at most the first 20,000 characters", () => {
     const custom = validateSelectors({
       ...rawSelectors,
-      platforms: { ...rawSelectors.platforms, generic: { pages: { page: { fields: { caption: [{ css: "p#v", pattern: "(x)$" }] } } } } },
+      platforms: { ...rawSelectors.platforms, generic: { pages: { page: { fields: { caption: [{ css: "p#v", pattern: "^[^x]*(x)$" }] } } } } },
     });
     const short = page(`<p id="v">${"a".repeat(100)}x</p>`);
     expect(extractPage(short, "https://news.example/", custom).caption).toBe("x");

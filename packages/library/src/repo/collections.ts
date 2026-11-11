@@ -12,7 +12,7 @@ import { readMaybe } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type MutateRequest } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { editSource, readSourceFile, storeRequest } from "./sources.js";
-import type { RepoCore } from "./state.js";
+import type { ProjectState, RepoCore } from "./state.js";
 
 /** Organizing metadata carries no identifiable data of its own. */
 const ORGANIZE: MutateRequest = { action: "store", store: { identifiable: false, hasLocation: false } };
@@ -207,14 +207,61 @@ export async function deleteCollection(core: RepoCore, projectId: string, id: st
 interface TagsJson {
   formatVersion: 1;
   tags: Tag[];
+  /**
+   * Workspace tags whose deletion has started but not finished (41a I2): still listed (so the delete
+   * can be repeated), but no source may be given them any more.
+   */
+  deleting?: string[];
 }
 
 const tagsPath = (core: RepoCore) => join(core.root, "tags.json");
 
-export async function workspaceTags(core: RepoCore): Promise<Tag[]> {
+async function readTagsFile(core: RepoCore): Promise<{ tags: Tag[]; deleting: string[] }> {
   const raw = await readMaybe(tagsPath(core));
-  if (!raw) return [];
-  return Tag.array().parse((JSON.parse(raw.toString("utf8")) as TagsJson).tags ?? []);
+  if (!raw) return { tags: [], deleting: [] };
+  const j = JSON.parse(raw.toString("utf8")) as Partial<TagsJson>;
+  const deleting = Array.isArray(j.deleting) ? j.deleting.filter((x): x is string => typeof x === "string") : [];
+  return { tags: Tag.array().parse(j.tags ?? []), deleting };
+}
+
+/** Every workspace tag (those being deleted included). */
+export async function workspaceTags(core: RepoCore): Promise<Tag[]> {
+  return (await readTagsFile(core)).tags;
+}
+
+/** The workspace tags a source may be given now: not those whose deletion has started (41a I2). */
+export async function assignableWorkspaceTags(core: RepoCore): Promise<Tag[]> {
+  const { tags, deleting } = await readTagsFile(core);
+  return tags.filter((t) => !deleting.includes(t.id));
+}
+
+/**
+ * Refuses (NotFoundError) a source write that adds a tag which is neither one of the project's tags
+ * nor a workspace tag a source may be given now (41a I2, N2), exactly as setMembership checks.
+ * Called inside the governed change, so it is ordered against a workspace-tag delete: a write
+ * before the delete's mark is swept by it; one after the mark, or after the delete finished, is
+ * refused here. Tags the source already carried are left alone.
+ */
+export async function refuseUnknownTags(core: RepoCore, st: ProjectState, before: readonly string[], after: readonly string[]): Promise<void> {
+  const added = [...new Set(after)].filter((t) => !before.includes(t));
+  if (!added.length) return;
+  const data = await readFullData(core, st);
+  const ws = await assignableWorkspaceTags(core);
+  const unknown = added.find((t) => !data.tags.some((x) => x.id === t) && !ws.some((x) => x.id === t));
+  if (unknown) throw new NotFoundError("Tag", unknown);
+}
+
+/**
+ * Workspace tag operations that span projects (create, rename, delete) run one at a time, so two of
+ * them never interleave their per-project changes (41a M7). Each step inside still takes the
+ * ordinary write queue (`core.serial`), so other writes run between projects.
+ */
+const workspaceTagQueues = new WeakMap<RepoCore, Promise<unknown>>();
+function workspaceTagSerial<T>(core: RepoCore, fn: () => Promise<T>): Promise<T> {
+  const prev = workspaceTagQueues.get(core) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  workspaceTagQueues.set(core, run.catch(() => {}));
+  return run;
 }
 
 /**
@@ -246,13 +293,15 @@ export async function createTag(core: RepoCore, scope: string, name: string, col
       { op: "tag.create" },
     );
   }
-  return core.serial(async () => {
-    core.assertWritable();
-    const tags = await workspaceTags(core);
-    clash(tags);
-    await writeWorkspaceTags(core, [...tags, tag], null, tag, tag.id);
-    return tag;
-  });
+  return workspaceTagSerial(core, () =>
+    core.serial(async () => {
+      core.assertWritable();
+      const tags = await workspaceTags(core);
+      clash(tags);
+      await writeWorkspaceTags(core, [...tags, tag], null, tag, tag.id);
+      return tag;
+    }),
+  );
 }
 
 /**
@@ -281,7 +330,9 @@ async function workspaceTag(core: RepoCore, id: string): Promise<{ tags: Tag[]; 
 async function writeWorkspaceTags(core: RepoCore, tags: Tag[], before: Tag | null, after: Tag | null, id: string): Promise<void> {
   const path = tagsPath(core);
   const old = await readMaybe(path);
-  const body: TagsJson = { formatVersion: 1, tags };
+  // Deletions in progress stay marked, for tags still there.
+  const deleting = (await readTagsFile(core)).deleting.filter((d) => tags.some((t) => t.id === d));
+  const body: TagsJson = { formatVersion: 1, tags, ...(deleting.length ? { deleting } : {}) };
   await writeFileAtomic(path, JSON.stringify(body, null, 2));
   try {
     const at = core.clock().toISOString();
@@ -308,33 +359,36 @@ export async function renameWorkspaceTag(core: RepoCore, id: string, name: strin
   const clash = (tags: Tag[]) => {
     if (tags.some((t) => t.id !== id && t.name.toLowerCase() === name.toLowerCase())) throw new InvalidInputError(`A tag named "${name}" already exists`);
   };
-  const first = await workspaceTag(core, id);
-  clash(first.tags);
-  const next = Tag.parse({ ...first.tag, name, ...(color !== undefined ? { color } : {}) });
-  for (const projectId of workspaceChangeTargets(core)) {
-    await runMutation(
-      core,
-      projectId,
-      ORGANIZE,
-      async (tx) => {
-        const data = await readFullData(core, tx.state);
-        const copy = data.tags.find((t) => t.id === id);
-        if (!copy) return;
-        const before = structuredClone(copy);
-        Object.assign(copy, Tag.parse({ ...copy, name, ...(color !== undefined ? { color } : {}) }));
-        await writeProjectData(core, tx, data);
-        tx.record("tag", id, before, copy);
-      },
-      { op: "workspace-tag.rename", entity: { type: "tag", id } },
-    );
-  }
-  return core.serial(async () => {
-    core.assertWritable();
-    const { tags, tag } = await workspaceTag(core, id);
-    clash(tags);
-    const renamed = Tag.parse({ ...tag, name: next.name, ...(next.color !== undefined ? { color: next.color } : {}) });
-    await writeWorkspaceTags(core, tags.map((t) => (t.id === id ? renamed : t)), tag, renamed, id);
-    return renamed;
+  return workspaceTagSerial(core, async () => {
+    const first = await workspaceTag(core, id);
+    clash(first.tags);
+    if ((await readTagsFile(core)).deleting.includes(id)) throw new InvalidInputError("This tag is being deleted; delete it again to finish");
+    const next = Tag.parse({ ...first.tag, name, ...(color !== undefined ? { color } : {}) });
+    for (const projectId of workspaceChangeTargets(core)) {
+      await runMutation(
+        core,
+        projectId,
+        ORGANIZE,
+        async (tx) => {
+          const data = await readFullData(core, tx.state);
+          const copy = data.tags.find((t) => t.id === id);
+          if (!copy) return;
+          const before = structuredClone(copy);
+          Object.assign(copy, Tag.parse({ ...copy, name, ...(color !== undefined ? { color } : {}) }));
+          await writeProjectData(core, tx, data);
+          tx.record("tag", id, before, copy);
+        },
+        { op: "workspace-tag.rename", entity: { type: "tag", id } },
+      );
+    }
+    return core.serial(async () => {
+      core.assertWritable();
+      const { tags, tag } = await workspaceTag(core, id);
+      clash(tags);
+      const renamed = Tag.parse({ ...tag, name: next.name, ...(next.color !== undefined ? { color: next.color } : {}) });
+      await writeWorkspaceTags(core, tags.map((t) => (t.id === id ? renamed : t)), tag, renamed, id);
+      return renamed;
+    });
   });
 }
 
@@ -344,11 +398,32 @@ export async function renameWorkspaceTag(core: RepoCore, id: string, name: strin
  * project without it still records the deletion); only then is it removed from tags.json and
  * change-logged. Each project's change is crash-safe on its own (R26); an interruption leaves the
  * tag in tags.json, and deleting again finishes the job.
+ * Before any project is changed the tag is marked as being deleted in tags.json (in the write
+ * queue), so from then on no source in any project can be given it (41a I2): a membership change
+ * ordered before the mark is swept by its project's change, one ordered after it is refused.
  */
 export async function deleteWorkspaceTag(core: RepoCore, id: string): Promise<void> {
   core.assertWritable();
+  return workspaceTagSerial(core, () => deleteWorkspaceTagNow(core, id));
+}
+
+async function deleteWorkspaceTagNow(core: RepoCore, id: string): Promise<void> {
   await workspaceTag(core, id);
-  for (const projectId of workspaceChangeTargets(core)) {
+  workspaceChangeTargets(core); // refused before anything is written
+  // The projects to sweep are taken in the same step as the mark (41a N5): a project created by
+  // work queued before the mark is swept too.
+  const targets = await core.serial(async () => {
+    core.assertWritable();
+    const projects = workspaceChangeTargets(core);
+    const { tags, deleting } = await readTagsFile(core);
+    if (!tags.some((t) => t.id === id)) throw new NotFoundError("Tag", id);
+    if (!deleting.includes(id)) {
+      const body: TagsJson = { formatVersion: 1, tags, deleting: [...deleting, id] };
+      await writeFileAtomic(tagsPath(core), JSON.stringify(body, null, 2));
+    }
+    return projects;
+  });
+  for (const projectId of targets) {
     await runMutation(
       core,
       projectId,
@@ -394,7 +469,7 @@ export async function setMembership(
     async (tx) => {
       const data = await readFullData(core, tx.state);
       for (const c of m.collectionIds ?? []) if (!data.collections.some((x) => x.id === c)) throw new NotFoundError("Collection", c);
-      const ws = await workspaceTags(core);
+      const ws = await assignableWorkspaceTags(core);
       for (const t of m.tagIds ?? []) if (!data.tags.some((x) => x.id === t) && !ws.some((x) => x.id === t)) throw new NotFoundError("Tag", t);
       await editSource(core, tx, sourceId, (s) => ({
         ...s,

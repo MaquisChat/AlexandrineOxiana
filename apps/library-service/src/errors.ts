@@ -7,6 +7,7 @@ import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, P
 import {
   AcknowledgementRequiredError,
   PendingWriteChoiceError,
+  PendingWriteIncompleteError,
   AnchorsUnreadableError,
   AuditChainInvalidError,
   DecryptionError,
@@ -99,6 +100,8 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
   if (err instanceof PolicyDeniedError) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
   if (err instanceof PendingWriteChoiceError) return new ApiError(409, "CONFLICT", err.message, err.allowed.length ? `allowed: ${err.allowed.join(", ")}` : "allowed: none");
+  // A recorded choice whose step could not be carried out yet: the plain reason is kept (R131 c).
+  if (err instanceof PendingWriteIncompleteError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof BatchRefusedError) {
     if (err.denied) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
     // Running (being paused or undone) or already finished: a state conflict (R102, by kind — R106).
