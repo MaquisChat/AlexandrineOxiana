@@ -32,6 +32,7 @@ import {
   type Repo,
   type ToolsUpdate,
   type WorkerClient,
+  type WorkerEndpoint,
   type CaptureOptions,
   createLinkCapture,
   openLibrary,
@@ -53,13 +54,21 @@ export interface WorkerProvider {
   start(): Promise<ServiceWorker>;
 }
 
+/**
+ * The worker client of an open library. It is given the index handle itself, not its current
+ * connection, so that job rows reach the live database after a rebuild swaps it.
+ */
+export function workerClientFor(Client: typeof WorkerClient, worker: WorkerEndpoint, repo: Repo, index?: IndexHandle): WorkerClient {
+  return new Client({ repo, worker, pollMs: 200, ...(index ? { index } : {}) });
+}
+
 /** The default worker: `AO_WORKER_BIN`, or the venv made by `pnpm setup:py`. */
 export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerProvider => ({
   async start() {
     const mw = await startMediaWorker(onLog ? { onLog } : {});
     const { WorkerClient } = await import("@ao/library");
     return {
-      clientFor: (repo, index) => new WorkerClient({ repo, worker: mw.handle, pollMs: 200, ...(index ? { index: { db: index.db } } : {}) }),
+      clientFor: (repo, index) => workerClientFor(WorkerClient, mw.handle, repo, index),
       versions: () => mw.versions(),
       updateTools: () => mw.updateTools(),
       stop: () => mw.stop(),

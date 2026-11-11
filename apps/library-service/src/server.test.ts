@@ -1902,3 +1902,56 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${"019a7000-0000-7000-8000-0000000000ff"}/resolve`, body: { choice: "keep" } })).status).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Task 51 fix round 1 (R142 item 3): the worker client follows the live index after a rebuild
+
+describe("worker client and the index (Task 51)", () => {
+  it("a job's status change after rebuild-index reaches the rebuilt database's row", async () => {
+    const { createServer } = await import("node:http");
+    const { mkdir } = await import("node:fs/promises");
+    const { WorkerClient } = await import("@ao/library");
+    const { workerClientFor } = await import("./state.js");
+    let n = 0;
+    const outputs = new Map<string, string>();
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.writeHead(req.method === "POST" ? 202 : 200, { "Content-Type": "application/json" });
+      if (req.method === "POST" && req.url === "/jobs") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { output: string };
+        await mkdir(dirname(body.output), { recursive: true });
+        await writeFile(body.output, "jpeg");
+        const id = `w${++n}`;
+        outputs.set(id, body.output);
+        return res.end(JSON.stringify({ id }));
+      }
+      const id = /^\/jobs\/([^/]+)$/.exec(req.url ?? "")?.[1] ?? "";
+      res.end(JSON.stringify({ id, status: "done", progress: 1, result: { output: outputs.get(id), meta: {} } }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const endpoint = { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "t" };
+    try {
+      const provider: WorkerProvider = {
+        start: async () => ({
+          clientFor: (repo, index) => workerClientFor(WorkerClient, endpoint, repo, index),
+          versions: async () => ({}),
+          updateTools: async () => ({ ytDlp: { old: null, new: null, managed: false }, galleryDl: { version: null, pinned: true } }),
+          stop: async () => {},
+        }),
+      };
+      await start({ worker: provider, autoStartWorker: true });
+      await openNewLibrary();
+      const pid = await newProject();
+      const client = await svc.state.workerClient();
+      const input = join(tmp, "a.png");
+      await writeFile(input, "png");
+      expect((await call({ method: "POST", url: "/libraries/rebuild-index" })).status).toBe(200);
+      const r = await client.submit(pid, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} });
+      const db = svc.state.session!.index!.db;
+      expect(db.prepare("SELECT status FROM jobs WHERE id = ?").get(r.id)).toEqual({ status: "done" });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
