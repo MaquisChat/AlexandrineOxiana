@@ -11,11 +11,10 @@ import { LibraryRelativePath, type Asset } from "@ao/core";
 import { CHUNK_SIZE, HEADER_LEN, TAG_LEN, decryptStream, readKeyId } from "./crypto/format.js";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
-import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
+import { copyFileAtomic } from "./fs/atomic.js";
 import { listProjectEntries, projectKey, type ProjectEntry } from "./index/changes.js";
-import { INDEX_FILE, IndexHandle } from "./index/db.js";
 import { readSource } from "./index/load.js";
-import { isIndexStale, rebuildIndex } from "./index/rebuild.js";
+import { openIndexChecked, rebuildIndexIfNeeded } from "./index/rebuild.js";
 import {
   LibraryMovedError,
   MOVED_MARKER,
@@ -644,28 +643,15 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
 
 /** Rebuilds library.sqlite when it is missing, unreadable or stale. True when rebuilt. */
 async function rebuildIfNeeded(library: Library, keyRing: KeyRing, warnings: string[]): Promise<boolean> {
-  const dbPath = join(library.root, INDEX_FILE);
-  let stale = !(await pathExists(dbPath));
-  let handle: IndexHandle;
+  const checked = await openIndexChecked(library.root);
+  warnings.push(...checked.warnings);
   try {
-    handle = new IndexHandle(library.root);
-  } catch {
-    // Unreadable database: keep it aside (it is only a cache) and start over.
-    const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-    await renameWithRetry(dbPath, `${dbPath}.corrupt-${stamp}`);
-    for (const s of ["-wal", "-shm"]) await fsp.rm(dbPath + s, { force: true });
-    warnings.push("library.sqlite could not be opened; it was kept as library.sqlite.corrupt-<time> and rebuilt");
-    handle = new IndexHandle(library.root);
-    stale = true;
-  }
-  try {
-    if (!stale) stale = await isIndexStale(library.root, handle.db, keyRing).catch(() => true);
-    if (!stale) return false;
-    const res = await rebuildIndex(handle, keyRing, library);
+    const res = await rebuildIndexIfNeeded(checked.handle, keyRing, library, { force: checked.needsRebuild !== undefined });
+    if (!res) return false;
     for (const e of res.errors) warnings.push(`Index rebuild: ${e.folder}: ${e.message}`);
     return true;
   } finally {
-    handle.close();
+    checked.handle.close();
   }
 }
 
