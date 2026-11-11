@@ -174,6 +174,12 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
       try {
         const s = await api.codeStatus(codeId, ac.signal);
         if (stopped || !alive.current) return;
+        // An ending answer stops this poll at once, before React commits the cleared code: a tick in
+        // between would otherwise ask again and act twice (a second list read).
+        if (s.state === "used" || s.state === "expired" || s.state === "invalidated" || s.state === "replaced" || s.state === "none") {
+          stopped = true;
+          clearInterval(t);
+        }
         switch (s.state) {
           case "used":
             clearCode({ kind: "used", origin: s.browser.origin });
