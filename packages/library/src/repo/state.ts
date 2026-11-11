@@ -60,6 +60,11 @@ export interface ProjectJson {
   participants: Participant[];
   sessions: Session[];
   consents: ConsentRecord[];
+  /**
+   * Codes of deleted participants (R117 C1): retired forever, never given to anyone else, so a
+   * pseudonym map entry or an old citation can never point at a different person.
+   */
+  retiredParticipantCodes?: string[];
 }
 
 export function parseProjectJson(v: unknown): ProjectJson {
@@ -73,6 +78,7 @@ export function parseProjectJson(v: unknown): ProjectJson {
     participants: Participant.array().parse(o.participants ?? []),
     sessions: Session.array().parse(o.sessions ?? []),
     consents: ConsentRecord.array().parse(o.consents ?? []),
+    ...(Array.isArray(o.retiredParticipantCodes) ? { retiredParticipantCodes: (o.retiredParticipantCodes as unknown[]).filter((c): c is string => typeof c === "string") } : {}),
   };
 }
 

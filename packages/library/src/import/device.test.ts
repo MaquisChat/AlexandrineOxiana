@@ -392,6 +392,23 @@ describe("device import without media tools (R85: these never need them)", () =>
     expect(repo.listSourceIds(p.id)).toEqual([]);
   });
 
+  it("R117 I2: resuming re-checks the session and participants it links to; missing ones refuse with a plain reason", async () => {
+    const { bulk } = await setup();
+    const p = await project(gov({ mode: "keep", atRest: "optional" }), false);
+    const session = await repo.createSession(p.id, { date: "2026-03-14" });
+    const h = await bulk.importDeviceFolder(p.id, folder, { researcherName: "R", sessionId: session.id });
+    h.cancel();
+    await h.done;
+    // The session vanished outside the app (it cannot be deleted while the import is unfinished).
+    const batchDir = join(lib.root, p.folder, "imports");
+    const [name] = (await readdir(batchDir)).filter((n) => n.startsWith("batch-"));
+    const file = join(batchDir, name!, "batch.json");
+    const rec = JSON.parse(await readFile(file, "utf8"));
+    rec.fieldwork.sessionId = "019a0000-0000-7000-8000-00000000dead";
+    await writeFile(file, JSON.stringify(rec));
+    await expect(bulk.resumeBatch(p.id, h.batchId)).rejects.toThrow(/session .*no longer exists/i);
+  });
+
   it("proxyQueueFor: one queue per library, shared by attach, Bulk Import and watched folders", () => {
     const q = proxyQueueFor(repo);
     expect(proxyQueueFor(repo)).toBe(q);

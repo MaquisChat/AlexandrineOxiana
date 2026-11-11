@@ -29,6 +29,7 @@ import {
   type ParticipantPatch,
   type SessionInput,
   type SessionPatch,
+  setConsentDocument,
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
@@ -66,6 +67,13 @@ import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditRe
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
 export function onProjectUnlocked(fn: (repo: Repo, projectId: string) => Promise<void>): void {
+  unlockHooks.push(fn);
+}
+
+/** Package-internal: run for each readable project when a repo opens read-write, and after an unlock (best effort). */
+const openHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
+export function onProjectOpened(fn: (repo: Repo, projectId: string) => Promise<void>): void {
+  openHooks.push(fn);
   unlockHooks.push(fn);
 }
 
@@ -487,7 +495,15 @@ export async function openRepoInternal(
       });
     }
   }
-  return new Repo(core);
+  const repo = new Repo(core);
+  // Package-internal reconcilers (e.g. consent forms whose link to the consent was interrupted, R117 I5).
+  if (writable) {
+    for (const st of core.projects.values()) {
+      if (st.recoveryPending || (core.encrypted(st) && !isUnlocked(core, st.project.id))) continue;
+      for (const h of openHooks) await h(repo, st.project.id).catch(() => {});
+    }
+  }
+  return repo;
 }
 
 /**
@@ -1013,4 +1029,9 @@ export interface AuditCheck {
   /** When earlier opens of the library found the log altered (its `audit.anchor-mismatch` events). */
   alteredAt: string[];
   problem?: { kind: AnchorProblemKind | "anchors-unreadable"; detail: string };
+}
+
+/** Package-internal (consent forms, R117 I3): records the signed form's asset on the consent. */
+export function setConsentDocumentAsset(repo: Repo, projectId: string, consentId: string, assetId: string): Promise<ConsentRecord> {
+  return setConsentDocument(cores.get(repo)!, projectId, consentId, assetId);
 }

@@ -28,6 +28,7 @@ export const ConsentRecord = z.object({
   scope: z.string(),
   date: z.string().min(1),
   expires: z.string().optional(),
-  withdrawn: z.object({ at: Timestamp }).optional(),
+  /** `reason` is sealed in encrypted projects (kept in fieldwork.json.enc, R117). */
+  withdrawn: z.object({ at: Timestamp, reason: z.string().optional() }).optional(),
 });
 export type ConsentRecord = z.infer<typeof ConsentRecord>;

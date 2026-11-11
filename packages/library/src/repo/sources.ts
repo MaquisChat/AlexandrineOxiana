@@ -31,6 +31,7 @@ import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mut
 import { readFullData, writeProjectData } from "./projects.js";
 import { workspaceTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
+import { flagIfWithdrawn } from "./withdrawn.js";
 import { appendReviewEntry, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
@@ -560,6 +561,8 @@ async function writeNewSource(
   for (const a of assets) tx.record("asset", a.id, null, a);
   for (const a of sf.annotations) tx.record("annotation", a.id, null, a);
   if (opts.reviewItem) await appendReviewEntry(core, tx, { sourceId: id, ...opts.reviewItem });
+  // Linked to a participant whose consent was withdrawn: queued for review (R117 I1).
+  await flagIfWithdrawn(core, tx, st.data, id, source);
   if (inTx) await inTx(tx, sf);
   tx.onCommit(() => st.sources.set(id, folder));
   tx.index((sink) => sink.indexSource(sf));
