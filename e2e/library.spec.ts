@@ -234,6 +234,12 @@ test("scenario 1: a library and an IRB + GDPR project with encryption; the recov
   await test.step("lock again", lock);
 
   await test.step("unlock with the recovery code captured from the page", () => unlockWith(recoveryCode));
+
+  await test.step("both unlocks are in the audit log, and the log still verifies", async () => {
+    const events = (await app.api<{ events: Array<{ action: string; entity?: { type: string; id: string } }> }>("GET", `/projects/${project!.id}/audit?limit=1000`)).body.events;
+    expect(events.filter((e) => e.action === "key.unlock" && e.entity?.id === project!.id), JSON.stringify(events.map((e) => e.action))).toHaveLength(2);
+    expect((await app.api<{ ok: boolean }>("GET", `/projects/${project!.id}/audit/verify`)).body).toMatchObject({ ok: true });
+  });
 });
 
 // ---------- scenario 2 ----------
@@ -248,15 +254,12 @@ test("scenario 2: attach a PDF with a DOI by typing its path; the title from the
   let projectId = "";
   let sourceId = "";
   const pdf = join(app.root, "sources", "doi-article.pdf");
-  /** Whether the browser lets the page read the clipboard back (see the clipboard step). */
-  let canReadClipboard = false;
 
   await test.step("set-up: a library and a project with the default metadata lookups (through the service); the PDF on disk", async () => {
-    if (browserName === "chromium") {
-      // Chromium: explicit permissions, for the app's origin only.
-      await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: APP_ORIGIN });
-      canReadClipboard = true;
-    }
+    // The page may read the clipboard back, for the app's origin only. Chromium needs both
+    // permissions; WebKit knows only "clipboard-read" (Playwright refuses "clipboard-write" there)
+    // and lets the click on "Copy citation" write without one.
+    await page.context().grantPermissions(browserName === "webkit" ? ["clipboard-read"] : ["clipboard-read", "clipboard-write"], { origin: APP_ORIGIN });
     ({ projectId } = await libraryWithProject(app, page, { library: S2_LIBRARY, project: S2_PROJECT, governanceYaml: LOOKUP_RULES }));
     mkdirSync(join(app.root, "sources"), { recursive: true });
     writeFileSync(pdf, await buildDoiPdf());
@@ -313,18 +316,10 @@ test("scenario 2: attach a PDF with a DOI by typing its path; the title from the
     expect(copiedText).toBe(direct.body.text);
     // The cite panel copies an in-text citation: APA's author-date form, from the Crossref authors and year.
     expect(copiedText).toBe("(Okafor & Lindqvist, 2021)");
+    // The page says it copied, and the clipboard, read back by the page, holds exactly that text.
     const cite = page.getByRole("region", { name: "Source details" }).getByRole("region", { name: "Cite" });
-    if (canReadClipboard) {
-      await expect(cite.getByText("Copied.", { exact: true })).toBeVisible();
-      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(direct.body.text);
-    } else {
-      // WebKit: Playwright grants no clipboard permissions there, so the page's own report and the
-      // request the UI sent stand in for reading the clipboard back. Either the copy succeeded, or the
-      // page says plainly that copying is not available and shows the citation to select.
-      const copied = cite.getByText("Copied.", { exact: true });
-      const refused = cite.getByRole("alert").filter({ hasText: "Copying is not available here." });
-      await expect(copied.or(refused)).toBeVisible();
-    }
+    await expect(cite.getByText("Copied.", { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(direct.body.text);
   });
 });
 
