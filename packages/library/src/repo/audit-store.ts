@@ -47,7 +47,11 @@ export interface IntegrityWarning {
     /** A source's annotations file does not match its recorded hash; read as it is (R77). */
     | "annotations-hash-mismatch"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
-    | "destroy-incomplete";
+    | "destroy-incomplete"
+    /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
+    | "recovery-staging-discarded"
+    /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */
+    | "recovery-staging-unverifiable";
   detail: string;
   /** Library-relative file, for the two incomplete-line kinds. */
   file?: string;

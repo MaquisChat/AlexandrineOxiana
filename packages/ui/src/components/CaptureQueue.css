@@ -1,0 +1,84 @@
+/*
+ * The capture queue (Task 34b). Tokens only (spec 8A.1, R105). A status is always written out in
+ * words; the line at the start of a row only repeats it.
+ */
+
+.ao-capture-queue__queue {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.ao-capture-queue__queue h3 {
+  margin-top: 0;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.ao-capture-queue__progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ao-capture-queue__error {
+  border-inline-start: 4px solid var(--deny);
+  padding-inline-start: var(--space-2);
+  color: var(--ink);
+}
+
+.ao-capture-queue__note {
+  border-inline-start: 4px solid var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  padding: var(--space-1) var(--space-2);
+}
+
+.ao-capture-queue__items {
+  list-style: none;
+  padding: 0;
+  margin: var(--space-2) 0 0;
+}
+
+.ao-capture-queue__item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--line-soft);
+  border-inline-start: 4px solid var(--line-strong);
+}
+
+.ao-capture-queue__item--ok {
+  border-inline-start-color: var(--ok);
+}
+
+.ao-capture-queue__item--info {
+  border-inline-start-color: var(--accent);
+}
+
+.ao-capture-queue__item--warn {
+  border-inline-start-color: var(--warn-line);
+}
+
+.ao-capture-queue__item--bad {
+  border-inline-start-color: var(--deny);
+}
+
+.ao-capture-queue__url {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+}
+
+.ao-capture-queue__state {
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.ao-capture-queue__why {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--ink-2);
+}

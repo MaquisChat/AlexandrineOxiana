@@ -22,6 +22,10 @@ tests/fixtures/downloaded/
 tests/fixtures/generated/
 packages/library/tests/fixtures/refman/generated/
 
+# Desktop helper builds (apps/desktop/scripts/build-sidecars.mjs): build venvs, PyInstaller work files, output
+apps/desktop/.build/
+apps/desktop/sidecars/
+
 # CSL bundle built by scripts/fetch-csl.mjs (pinned commits + sha256; ~20 MB); licence and NOTICE are committed
 packages/core/csl/styles.zip
 packages/core/csl/styles.zip.part

@@ -1,20 +1,38 @@
 /**
- * PLACEHOLDER (Task 34d) for the entry point to the transcript viewer, which Task 34c builds in
- * parallel. It links to `/transcript?project=<id>&source=<id>`; when 34c's screen and its path are
- * merged, the coordinator points this at that path (PATHS in navigation.tsx) or replaces this
- * component with 34c's own link. In-app navigation goes through navigate() (R118).
+ * The way into the transcript viewer from a source (Task 34c): a link shown when the source has a
+ * transcript or a recording. Meant to be placed in the source's details (SourceDetail) — one line
+ * there: `<TranscriptLink projectId={projectId} assets={file.assets} sourceId={sourceId} />`.
  */
-import { inAppLink } from "../navigation";
+import { inAppLink, PATHS } from "../navigation";
 
-/** Where Task 34c's transcript viewer is expected to live (not yet in the route table). */
-export const TRANSCRIPT_PATH = "/transcript";
+/** The viewer's address for a source (ids only; never a media address). */
+export const transcriptHref = (projectId: string, sourceId: string): string => `${PATHS.transcript}?${new URLSearchParams({ project: projectId, source: sourceId }).toString()}`;
 
-export const transcriptHref = (projectId: string, sourceId: string): string => `${TRANSCRIPT_PATH}?${new URLSearchParams({ project: projectId, source: sourceId }).toString()}`;
+/** What the link reads of a source's assets (the library's Asset has these fields). */
+export interface LinkAsset {
+  role: string;
+  kind: string;
+  mime?: string | undefined;
+  status?: unknown;
+}
 
-export function TranscriptLink({ projectId, sourceId }: { projectId: string; sourceId: string }) {
+const live = (a: LinkAsset) => a.status !== "destroyed";
+const isTranscript = (a: LinkAsset) => a.role === "derived" && a.kind === "transcript" && live(a);
+/**
+ * A recording the viewer plays and the service transcribes: an original audio or video asset (by
+ * kind, or by recorded type) that has not been destroyed. The link and the viewer both use this.
+ */
+export const isPlayableRecording = (a: LinkAsset): boolean =>
+  a.role === "original" && live(a) && (a.kind === "audio" || a.kind === "video" || (typeof a.mime === "string" && /^(audio|video)\//i.test(a.mime)));
+
+export function TranscriptLink({ projectId, sourceId, assets }: { projectId: string; sourceId: string; assets: readonly LinkAsset[] }) {
+  const transcript = assets.some(isTranscript);
+  if (!transcript && !assets.some(isPlayableRecording)) return null;
   return (
-    <a href={transcriptHref(projectId, sourceId)} onClick={inAppLink}>
-      Open the transcript
-    </a>
+    <p>
+      <a href={transcriptHref(projectId, sourceId)} onClick={inAppLink}>
+        {transcript ? "Open the transcript" : "Play the recording and transcribe it"}
+      </a>
+    </p>
   );
 }

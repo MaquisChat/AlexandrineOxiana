@@ -33,7 +33,7 @@ export type { ServiceWorker, WorkerProvider } from "./state.js";
 export const BODY_LIMIT = 1024 * 1024;
 
 export interface ServiceOptions {
-  /** The UI token (from AO_SERVICE_TOKEN, see readServiceToken). */
+  /** The UI token (main.ts reads it from standard input, R98; see startup-token.ts). */
   token: string;
   deps?: Deps;
   /** Where log lines go (JSON, one per line); default stderr. */

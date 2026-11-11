@@ -5,8 +5,9 @@
  *  - makes a temporary folder under os.tmpdir() holding the app settings folder (`config/`), a place
  *    for libraries (`libraries/`) and the worker's tools and models folders, and removes it afterwards;
  *  - starts the service as its `start` script does (`node --max-old-space-size=512 --import tsx
- *    src/main.ts`), with a fresh random token, port 0, NODE_ENV=test, AO_CONFIG_DIR in the temporary
- *    folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode) and the
+ *    src/main.ts`), with a fresh random token written on its standard input as one line (R98: never
+ *    in its environment or command line; standard input is left open), port 0, NODE_ENV=test,
+ *    AO_CONFIG_DIR in the temporary folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode) and the
  *    fake yt-dlp / gallery-dl named in AO_YTDLP_BIN / AO_GALLERYDL_BIN (the worker would otherwise
  *    run the real gallery-dl from its venv) and first on PATH; it waits for
  *    `AO_SERVICE_READY port=<n>`. The service starts the real media worker itself when a library
@@ -264,7 +265,6 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
   const token = randomBytes(32).toString("hex");
   const env = serviceEnv({
     NODE_ENV: "test",
-    AO_SERVICE_TOKEN: token,
     AO_SERVICE_PORT: "0",
     AO_CONFIG_DIR: join(root, "config"),
     AO_TOOLS_DIR: join(root, "tools"),
@@ -272,8 +272,12 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
     AO_LOOKUP_FIXTURES: LOOKUP_FIXTURES,
   });
   const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];
-  const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["pipe", "pipe", "pipe"] });
   opts.onSpawn?.(child);
+  // The token is handed over on standard input, as the desktop shell will (R98). The pipe stays open;
+  // a child that never reads it (or never started) must not turn the write into an unhandled error.
+  child.stdin!.on("error", () => {});
+  child.stdin!.write(`${token}\n`);
   const log: string[] = [];
   createInterface({ input: child.stderr! }).on("line", (l) => log.push(`[stderr] ${l}`));
   const readyMs = opts.readyTimeoutMs ?? 60_000;

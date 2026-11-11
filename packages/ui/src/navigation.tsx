@@ -21,6 +21,8 @@ export const PATHS = {
   fieldwork: "/fieldwork",
   moveLibrary: "/move-library",
   missingFiles: "/missing-files",
+  transcript: "/transcript",
+  capture: "/capture",
 } as const;
 
 /** Where the Bulk Import screens live (R113): the wizard and its review queue. */

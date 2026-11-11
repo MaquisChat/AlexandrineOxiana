@@ -7,12 +7,19 @@
  * `--max-old-space-size=512` keeps bulk imports from growing the heap without bound (R64, R96);
  * the 10,000-item import runs in about 320 MB.
  *
+ * The access token (the UI token) is written on standard input by whoever starts it, as one line
+ * (R98; see startup-token.ts), for example:
+ *
+ *   printf '%s\n' "$TOKEN" | node --max-old-space-size=512 --import tsx apps/library-service/src/main.ts
+ *
+ * It is never taken from the environment or the command line: the service refuses to start if
+ * AO_SERVICE_TOKEN is set, if it is given any argument, if standard input is a terminal (a typed
+ * token would be echoed: pipe it in), if the token does not arrive within
+ * TOKEN_STDIN_TIMEOUT_MS, or if it is not 32–512 characters from `A–Z a–z 0–9 . _ ~ + / = -`. After
+ * the one line, standard input is no longer read but stays open (closing it does not stop the
+ * service). The token is never printed: not in a log line, an error, or the ready line.
+ *
  * Environment:
- *   AO_SERVICE_TOKEN  the UI token (≥ 32 random characters); read once, then removed from the
- *                     environment so the media worker and other children never see it. Removing it
- *                     from process.env does NOT remove it from /proc/<pid>/environ (Linux keeps the
- *                     environment the process started with): Task 37 will pass the token on stdin
- *                     instead (R98), and this variable stays for development and tests.
  *   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any free port)
  *   AO_LIBRARY        a library folder to open at start (optional)
  *   AO_CONFIG_DIR     the app settings folder (default: the platform's usual place)
@@ -25,14 +32,18 @@
  * rest) it exits 1.
  */
 import { openLibrary } from "@ao/library";
-import { readServiceToken } from "./auth.js";
 import { createService } from "./server.js";
+import { readStartupToken, startupErrorMessage } from "./startup-token.js";
 
 /** Exceeds the worst-case graceful close (R99): SUSPEND_TIMEOUT_MS for imports plus closing the rest. */
 export const FORCE_EXIT_MS = 90_000;
 
+/** The token once read, so that no start-up error message can carry it (it is replaced, R96/R98). */
+let knownToken: string | undefined;
+
 async function main(): Promise<void> {
-  const token = readServiceToken(process.env);
+  const token = await readStartupToken({ input: process.stdin, env: process.env, argv: process.argv, execArgv: process.execArgv });
+  knownToken = token;
   const rawPort = process.env.AO_SERVICE_PORT ?? "0";
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("AO_SERVICE_PORT must be a port number");
@@ -63,6 +74,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(`The library service could not start: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.stderr.write(`The library service could not start: ${startupErrorMessage(err, knownToken)}\n`);
   process.exit(1);
 });
