@@ -119,12 +119,14 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
 
   /**
    * Each paired extension's links queues (R116): a slot is taken synchronously before anything async,
-   * so parallel requests cannot all pass the limit; it stays taken while its queue is unfinished.
+   * so parallel requests cannot all pass the limit; it stays taken while its queue is unfinished,
+   * and only while the library it was taken in stays open (41a I3: closing the library, or shutting
+   * the service down, releases it even when the queue never got to finish).
    */
-  type Slot = { root: string; queueId?: string; done?: Promise<void> };
+  type Slot = { lib: object; queueId?: string; done?: Promise<void> };
   const linkSlots = new Map<string, Slot[]>();
-  function activeSlots(callerId: string, root: string): Slot[] {
-    const live = (linkSlots.get(callerId) ?? []).filter((x) => x.root === root && (x.queueId === undefined || state.captureQueue(x.queueId)?.finished === false));
+  function activeSlots(callerId: string, lib: object): Slot[] {
+    const live = (linkSlots.get(callerId) ?? []).filter((x) => x.lib === lib && (x.queueId === undefined || state.captureQueue(x.queueId)?.finished === false));
     linkSlots.set(callerId, live);
     return live;
   }
@@ -240,10 +242,9 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const legalBasis = optStr(b, "legalBasis", 2000);
     // One running and one waiting links queue per paired extension; more is 429 (R116).
     const callerId = req.extensionId ?? "";
-    const root = s.lib.root;
-    const live = activeSlots(callerId, root);
+    const live = activeSlots(callerId, s.lib);
     if (live.length >= LINK_QUEUES_PER_EXTENSION) throw new ApiError(429, "RATE_LIMITED", "Links from this browser are already being captured. Wait until they have finished, then send more.");
-    const slot: Slot = { root };
+    const slot: Slot = { lib: s.lib };
     live.push(slot);
     // A second list waits for the first; downloads from any queue share one lane per platform.
     const after = live.find((x) => x !== slot)?.done;

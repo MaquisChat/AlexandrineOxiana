@@ -247,13 +247,19 @@ export class ServiceState {
     const total = at.total ?? urls.length;
     const info = this.captures.get(queueId) ?? { projectId, done: offset, total, finished: false };
     this.captures.set(queueId, info);
+    // Every way out but a continuation after a move marks the queue finished (41a I3): an unfinished
+    // queue keeps an extension's links slot taken.
+    const fail = (err: unknown) => {
+      info.finished = true;
+      this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) });
+    };
     return this.startWork("capture", async (ctl) => {
       await at.after?.catch(() => {});
-      const s = this.requireSession();
-      const worker = await this.workerClient();
-      const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
-      let outcomes: Awaited<ReturnType<typeof capture.captureUrls>>;
+      let outcomes: Awaited<ReturnType<ReturnType<typeof createLinkCapture>["captureUrls"]>>;
       try {
+        const s = this.requireSession();
+        const worker = await this.workerClient();
+        const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
         outcomes = await capture.captureUrls(
           projectId,
           urls,
@@ -266,8 +272,7 @@ export class ServiceState {
           { shouldStop: () => ctl.stopping },
         );
       } catch (err) {
-        info.finished = true;
-        this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) });
+        fail(err);
         return;
       }
       if (outcomes.length < urls.length) {

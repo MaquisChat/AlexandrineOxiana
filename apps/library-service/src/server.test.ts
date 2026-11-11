@@ -1651,6 +1651,26 @@ describe("integration: the extension's routes (R111)", () => {
     await svc.state.idle();
   });
 
+  it("41a I3: closing the library while a links queue runs and another waits releases both slots (no 429 after reopening)", async () => {
+    const provider = slowProvider(40);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    const path = await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const a = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [0, 1, 2].map((i) => yt("i", i)) });
+    const b = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("j", 1)] });
+    expect([a.status, b.status]).toEqual([200, 200]);
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc.state.idle();
+    // Both queues ended (one way or another) and say so.
+    expect(svc.state.captureQueue(b.json.queueId)?.finished).toBe(true);
+    const c = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("k", 1)] });
+    const d = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("l", 1)] });
+    expect([c.status, d.status], d.body).toEqual([200, 200]);
+    await svc.state.idle();
+  });
+
   it("R116: queues from different callers share one per-platform lane (no two downloads from one platform at once)", async () => {
     const provider = slowProvider(10);
     await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
