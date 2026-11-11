@@ -415,11 +415,11 @@ Update after every task; commit and push.
 | 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
 | 41a Review: library and service | done | f5d47a3 | 1 Critical and 5 Important fixed over two rounds and re-reviewed (R131, R132) |
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
-| 42 CI coverage | done | ae3f762, b207182 | green run on GitHub at 27d7c6c (about 25 minutes, with both end-to-end suites); remove the temporary network check with the next code push |
+| 42 CI coverage | done | ae3f762, b207182 | green run on GitHub at 27d7c6c; temporary network check removed |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
-| 44 Scenarios 1, 2, 5, 7 | not started | | unblocked (43, 60 done); starts when Task 45 has merged, since both may extend `e2e/fixtures.ts` |
-| 45 Scenarios 3, 4, 6, 8 | fix round 1 | cdc42d7 (worktree branch) | resumed; defects D1–D7 for Task 46 (R136, R137) |
+| 44 Scenarios 1, 2, 5, 7 | not started | | unblocked; next to dispatch |
+| 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
 | 34a Service additions | in review | 0dd43ae (worktree branch) | security review resumed |
