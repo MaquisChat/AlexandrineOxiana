@@ -363,7 +363,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Model: Opus. Likely more than one session: split by package.
 
 **Task 55 — Owner's hands-on tests**
-- Depends: 37g, 37i.
+- Depends: 37f, 37i (the unsigned build is enough for the owner's own Mac, R151; 37g is needed before release to others).
 - Accept: the Mac checklist; a real Zotero account download (storage hosts unverified, R79); the Mac password store; the extension in Firefox; a live capture of one real YouTube and one real Instagram address.
 - Who: the owner, with the controller fixing what turns up.
 
@@ -461,19 +461,19 @@ Update after every task; commit and push.
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
-| 37a Service bundle | in progress | | implementer dispatched (ahead of Task 46: little overlap, and it heads the longest remaining chain) |
-| 37b Token on standard input | fix round 1 (short) | 0175e11 (worktree branch) | code sound under probes; two small clean-ups; HANDOFF.md to be corrected at merge |
+| 37a Service bundle | in review | ea7f78a (worktree branch) | built: one resolver, a 93 MB self-contained folder, smoke run outside the repository, ADR 0013 |
+| 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
 | 37c Desktop shell | not started | | |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
-| 37g Signing | blocked | | needs Apple Developer credentials |
+| 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | not started | | |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | blocked | | needs signed Mac build |
+| 55 Owner hands-on tests | blocked | | needs the first Mac build (Task 37f); a signed build is not required for the owner's own tests (R151) |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
