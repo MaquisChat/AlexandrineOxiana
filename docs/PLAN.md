@@ -432,7 +432,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | not started | | |
 | 49 Backups governed | fix round 2 | 91f78f4 (worktree branch) | round 1 confirmed; one new Important (certificate wording when a removal fails) |
 | 50 No silent refusals | not started | | |
-| 51 Job records in files | in review | 20993f0 (worktree branch) | adversarial review dispatched |
+| 51 Job records in files | fix round 1 | 20993f0 (worktree branch) | spec met; 2 Important (R142) |
 | 61 New recovery code | fix round 1 | 35be129 (worktree branch) | spec met; 3 Important (R141) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
