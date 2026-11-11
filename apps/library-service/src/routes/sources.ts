@@ -5,7 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { BIBLIO_FIELDS, SourceType, type SourceFile } from "@ao/core";
+import { BIBLIO_FIELDS, SourceType, evidenceSourceName, type FieldEvidence, type SourceFile } from "@ao/core";
 import {
   ASSET_TEXT_MAX_BYTES,
   addTranscriptVersion,
@@ -14,11 +14,13 @@ import {
   ocrQueueFor,
   ProjectLockedError,
   proxyQueueFor,
-  readAssetText,
+  readTranscript,
+  scrubPaths,
   search,
   transcriptVersions,
   type SourcePatch,
 } from "@ao/library";
+import type { EvidenceOrigin, FieldReview, SourceRecordExtras, TranscriptListResponse, TranscriptResponse } from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
 
@@ -26,6 +28,48 @@ import { bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArra
 const EDITABLE = new Set<string>(["type", "title", "creators", "container", "publisher", "issued", "accessed", "identifiers", "caseAttributes", "availability", ...BIBLIO_FIELDS]);
 
 export const TRANSCRIPT_BODY_LIMIT = ASSET_TEXT_MAX_BYTES + 2 * 1024 * 1024;
+
+const originOf = (src: FieldEvidence["source"]): EvidenceOrigin => ({
+  kind: src.kind,
+  label: evidenceSourceName({ source: src }),
+  ...(src.provider ? { provider: src.provider } : {}),
+});
+
+/**
+ * Each field's verification and evidence (Task 34a d), sorted by field: what the badges and the
+ * evidence popover show, in plain words. `ref` (an internal pointer) is left out; a reason is
+ * scrubbed of absolute paths like every message of the service.
+ */
+export function fieldReviews(sf: SourceFile, roots: Iterable<string>): FieldReview[] {
+  const rs = [...roots];
+  const fields = new Set([...Object.keys(sf.verification ?? {}), ...(sf.fieldEvidence ?? []).map((e) => e.field)]);
+  return [...fields].sort().map((field) => {
+    const v = sf.verification?.[field];
+    return {
+      field,
+      status: v?.status ?? "none",
+      checks: v?.checks ?? [],
+      ...(v?.reason ? { reason: scrubPaths(v.reason, rs) } : {}),
+      ...(v && v.current !== undefined ? { current: v.current } : {}),
+      ...(v?.values ? { values: v.values.map((x) => ({ value: x.value, from: originOf(x.source) })) } : {}),
+      evidence: (sf.fieldEvidence ?? [])
+        .filter((e) => e.field === field)
+        .map((e) => ({ value: e.value, from: originOf(e.source), ...(e.quote !== undefined ? { quote: e.quote } : {}), at: e.at })),
+    };
+  });
+}
+
+/**
+ * A source record as sent to the UI: the stored record, a linked file's absolute path left out
+ * (R132: only its library-relative path), and `fields` (fieldReviews).
+ */
+export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFile & SourceRecordExtras {
+  return {
+    ...sf,
+    assets: sf.assets.map((a) => (a.linked ? ({ ...a, linked: { libraryRelativePath: a.linked.libraryRelativePath } } as typeof a) : a)),
+    fields: fieldReviews(sf, roots),
+  };
+}
 
 async function sourceOf(ctx: Ctx, projectId: string, sid: string): Promise<SourceFile> {
   const s = ctx.state.requireSession();
@@ -70,9 +114,11 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     return { total: items.length, items: items.slice(offset, offset + limit) };
   });
 
+  const record = (sf: SourceFile) => sourceRecord(sf, state.roots);
+
   app.get("/projects/:id/sources/:sid", async (req) => {
     const projectId = projectParam(ctx, req);
-    return sourceOf(ctx, projectId, paramsOf(req).sid ?? "");
+    return record(await sourceOf(ctx, projectId, paramsOf(req).sid ?? ""));
   });
 
   app.patch("/projects/:id/sources/:sid", async (req) => {
@@ -89,7 +135,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     if (b.collectionIds !== undefined) patch.collectionIds = [...new Set(strArray(b, "collectionIds", { max: 1000, itemMax: 64, optional: true }))];
     if (b.tagIds !== undefined) patch.tagIds = [...new Set(strArray(b, "tagIds", { max: 1000, itemMax: 64, optional: true }))];
     // One governed change: fields and membership together (ids checked inside it, R99).
-    return Object.keys(patch).length ? s.repo.updateSource(projectId, sid, patch as SourcePatch) : s.repo.getSource(projectId, sid);
+    return record(Object.keys(patch).length ? await s.repo.updateSource(projectId, sid, patch as SourcePatch) : await s.repo.getSource(projectId, sid));
   });
 
   app.delete("/projects/:id/sources/:sid", async (req) => {
@@ -109,7 +155,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     await sourceOf(ctx, projectId, sid);
     const b = bodyOf(req);
     if (!("value" in b)) throw badRequest('"value" is required.');
-    return confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value);
+    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value));
   });
 
   app.post("/projects/:id/sources/:sid/recheck", async (req) => {
@@ -117,7 +163,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
-    return s.repo.recheckSource(projectId, sid);
+    return record(await s.repo.recheckSource(projectId, sid));
   });
 
   // Every source of the project, as a background job with progress (`job.progress`, kind "recheck").
@@ -259,20 +305,33 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   });
 
   // ---- transcript versions ----
-  app.get("/projects/:id/sources/:sid/transcripts", async (req) => {
+  // Every stored version; a machine run has two (its WebVTT and its segments.json), both readable as segments.
+  app.get("/projects/:id/sources/:sid/transcripts", async (req): Promise<TranscriptListResponse> => {
     const projectId = projectParam(ctx, req);
     const sf = await sourceOf(ctx, projectId, paramsOf(req).sid ?? "");
     return {
-      versions: transcriptVersions(sf).map((a) => ({ id: a.id, path: a.path, mime: a.mime, bytes: a.bytes, tool: a.derivation?.provider, derivation: a.derivation })),
+      versions: transcriptVersions(sf).map((a) => ({
+        id: a.id,
+        path: a.path,
+        mime: a.mime,
+        bytes: a.bytes,
+        ...(a.derivation?.provider !== undefined ? { tool: a.derivation.provider } : {}),
+        derivation: a.derivation,
+        origin: a.derivation?.operation === "human-edit" ? "human-edit" : "machine",
+        format: a.mime === "application/json" ? "json" : /\.vtt(\.enc)?$/i.test(a.path) ? "vtt" : "txt",
+        ...(a.metadata?.flaggedSegments !== undefined ? { flaggedSegments: a.metadata.flaggedSegments } : {}),
+      })),
     };
   });
-  app.get("/projects/:id/sources/:sid/transcripts/:aid", async (req) => {
+  // One version: its stored text (as before) and its segments (start, end, language, text, flags;
+  // flags null for a human edit, which no check has run on).
+  app.get("/projects/:id/sources/:sid/transcripts/:aid", async (req): Promise<TranscriptResponse> => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
     const { sid = "", aid = "" } = paramsOf(req);
     const sf = await sourceOf(ctx, projectId, sid);
     if (!transcriptVersions(sf).some((a) => a.id === aid)) throw notFound("That transcript");
-    return { id: aid, text: await readAssetText(s.repo, projectId, sid, aid) };
+    return readTranscript(s.repo, projectId, sid, aid);
   });
   app.post("/projects/:id/sources/:sid/transcripts", { bodyLimit: TRANSCRIPT_BODY_LIMIT }, async (req) => {
     const s = state.requireWritable();
