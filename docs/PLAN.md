@@ -412,6 +412,8 @@ Known, not yet scheduled above, or accepted as limits:
   - D7: right-to-left title headings are laid out left to right.
 - A UI test, ReviewQueue "loads titles six at a time", takes about 40 s under heavy machine load and passes alone; find out why without loosening its limit (for Task 46 or Task 54).
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
+- Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
+- Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
 - Defects found by Task 44 are added here when it runs.
 
 ## 8. Status
@@ -436,7 +438,7 @@ Update after every task; commit and push.
 | 34b Capture screen | in review | db52fdb (worktree branch) | adversarial review dispatched |
 | 34c Transcript viewer | fix round 1 | 4b9a723 (worktree branch) | spec met; 4 Important (R143); two of them completed by new Task 62 |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
-| 34e Pairing screen | in review | f48170a (worktree branch) | review dispatched; also changes the shared dialog shell (claim to be verified) |
+| 34e Pairing screen | fix round 1 | f48170a (worktree branch) | 2 Important; its fix to the shared dialog shell is confirmed real and kept |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
