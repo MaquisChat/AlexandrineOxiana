@@ -852,16 +852,26 @@ export async function deletedRecordsTrouble(repo: Repo, projectId: string): Prom
 export const BACKUP_FAILED_WARNING = "backup-failed";
 
 /**
+ * Persisted in `Backups/backups-state.json` (`pending`) when old backups were removed but their
+ * `backup.prune` audit event could not be written yet (R125, R82); cleared once it is recorded.
+ */
+export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
+
+/**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
- * 'backup-failed', R92).
+ * 'backup-failed', R92; 'backup-audit-pending', R125).
  */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
   const core = cores.get(repo)!;
   const out = (await deletedRecordsWarning(core, core.state(projectId))) ? [DELETED_RECORDS_WARNING] : [];
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
-    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
+    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown> }) : undefined;
     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
+    const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
+    if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
+      out.push(BACKUP_AUDIT_PENDING_WARNING);
+    }
   } catch {
     // an unreadable manifest is handled (and rebuilt) by the backups module
   }

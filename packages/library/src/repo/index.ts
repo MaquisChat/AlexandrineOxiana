@@ -1,4 +1,4 @@
-export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
+export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING, BACKUP_AUDIT_PENDING_WARNING } from "./repo.js";
 export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, UNREADABLE_GOVERNANCE } from "./governance-edit.js";
 export type { GovernanceEditResult } from "./governance-edit.js";
 export type { AuditCheck, RepoOptions } from "./repo.js";

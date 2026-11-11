@@ -20,7 +20,27 @@
  * `Backups/backups-state.json` (`failures`, beside each backup's owning project id: a damaged
  * manifest loses neither), which the project shows as the persisted warning `backup-failed` until
  * a backup succeeds. Leftover temp files of interrupted backups are overwritten and removed.
- * Audited as `backup.create` (sha256, size, file count; no path).
+ *
+ * Governed (R125): before anything is written, the policy engine decides (`action: 'backup'`): every
+ * kind of storage the Backups folder may be on (its path and real path, classified as for a library
+ * move; an uncertain kind counts as every plausible one) must be in the project's
+ * `residency.allowed`, and `encryption.atRest: required` gives an `encrypt` condition that an
+ * unencrypted project cannot honour (refused). A refusal is audited (decision deny, the engine's
+ * reason) and thrown as PolicyDeniedError; nothing is created. The allow decision is audited as the
+ * event `backup` (with its conditions and a `backupId`). The COMMIT POINT is the audit event
+ * `backup.create` (same `backupId`; file name, sha256, size, file count; no path): it is appended
+ * once the zip is complete and fsynced under its temp name, and only then is the file renamed to
+ * its backup name and listed in the manifest. The steps are recorded beforehand in
+ * `backups-state.json` (`pending`), so an interruption is settled the next time the library opens
+ * or a backup operation runs, by what the audit log says: committed → renamed and listed;
+ * not committed → the temp file is overwritten and removed and the project shows `backup-failed`.
+ * No backup is ever listed, or named as one, without its `backup.create` event. If that event
+ * cannot be written the backup is not kept (BackupNotRecordedError, `backup-failed`).
+ *
+ * Pruning stays a plain delete (R91) and is audited by file name: one `backup.prune` event per run
+ * listing the files removed, written after they are removed (the run is recorded in `pending`
+ * first, so a crash or a failed append is recorded later, `recovered: true`, never lost; until then
+ * the project shows `backup-audit-pending` and the caller gets PruneNotRecordedError).
  *
  * The sidecar manifest `Backups/backups-manifest.json` (0600) lists every backup the app made: file
  * name, project id, time, sha256, size, the audit head, the asset ids it holds and, for an
@@ -55,14 +75,18 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Writable, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import yazl from "yazl";
-import { datedFileName, formatModified, newId, withCollisionSuffix, type Project } from "@ao/core";
+import { datedFileName, formatModified, newId, withCollisionSuffix, type PolicyRequest, type Project } from "@ao/core";
 import { encryptStream, readKeyId } from "../crypto/format.js";
 import { unwrapKey, unwrapWithRecovery, WrongPassphraseError } from "../crypto/keys.js";
 import { openSealedZip } from "../crypto/random-access.js";
 import { extractArchive, readArchiveEntry, type ZipSource } from "../extract/zip.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
-import { ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { defaultLocationEnv, type LocationEnv } from "../location.js";
+import { candidates, locate } from "../move.js";
+import { AuditStore } from "../repo/audit-store.js";
+import { PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../repo/errors.js";
+import { SimulatedCrash } from "../repo/seams.js";
 import { foldName, namesIn, readMaybe } from "../repo/io.js";
 import type { ProjectKeyFile } from "../repo/projects.js";
 import { AuditChainInvalidError, RestoreError } from "../repo/restore.js";
@@ -70,7 +94,9 @@ import {
   addKeyToRing,
   adoptRestoredProject,
   appendLibraryEvent,
+  authorizeProcessing,
   keyFromRing,
+  onProjectOpened,
   onProjectUnlocked,
   lookupPolicyInfo,
   repoClock,
@@ -98,13 +124,50 @@ const BACKUP_TEMP = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))
 /** A backup's file name (any project name, date and collision suffix). */
 const BACKUP_NAME = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?$/u;
 
+/** Points in a backup or a prune where a test can simulate the process dying (R125). */
+export type BackupCrashPoint = "after-decision" | "after-zip" | "before-commit" | "after-commit" | "before-manifest" | "before-prune-audit";
+
 /** Test seams. */
 export const backupSeams: {
   failBackup?: boolean;
   /** Runs after each snapshot, outside the write queue, before the zip is written. */
   afterSnapshot?: () => Promise<void>;
   freeBytes?: (dir: string) => Promise<number>;
+  /** Throws SimulatedCrash once at this point: nothing is cleaned up, as if the process died. */
+  crashAt?: BackupCrashPoint;
+  /** Runs after old backups are removed, before their `backup.prune` event is written. */
+  beforePruneAudit?: () => Promise<void>;
 } = {};
+
+function crashPoint(point: BackupCrashPoint): void {
+  if (backupSeams.crashAt === point) {
+    backupSeams.crashAt = undefined;
+    throw new SimulatedCrash(`simulated crash at ${point}`);
+  }
+}
+
+/** The `backup.create` event (the commit point) could not be written: the backup was not kept. */
+export class BackupNotRecordedError extends Error {
+  override name = "BackupNotRecordedError";
+  constructor(options?: { cause?: unknown }) {
+    super("The backup could not be recorded in the audit log, so it was not kept.", options);
+  }
+}
+
+/** Old backups were removed (a plain delete, not undone) but the `backup.prune` event could not be written yet. */
+export class PruneNotRecordedError extends Error {
+  override name = "PruneNotRecordedError";
+  constructor(
+    /** File names removed. */
+    readonly removed: string[],
+    options?: { cause?: unknown },
+  ) {
+    super("Old backups were removed, but their removal could not be recorded in the audit log yet; it is recorded at the next backup.", options);
+  }
+}
+
+/** The reason kept for a backup interrupted before its commit point. */
+export const BACKUP_INTERRUPTED = "The backup was interrupted before it was finished; nothing of it was kept.";
 
 export interface BackupEntry {
   file: string;
@@ -216,16 +279,57 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
 // ------------------------------------------------------------------------------------------
 // Backup state kept beside the manifest (R94): who each backup belongs to and failed backups, in a
 // file of its own, so a damaged manifest loses neither (both are plaintext ids, nothing identifying).
+// Also the backups and prunes in progress (R125): file names and, once a zip is complete, its
+// manifest entry (the same content the manifest holds).
+
+/**
+ * A backup or a prune in progress (R125), recorded before its first step so an interruption is
+ * settled later by what the audit log says. `create`: the temp file and backup name once chosen,
+ * and the manifest entry once the zip is complete. `prune`: the files about to be removed;
+ * `auditFailed` once writing their `backup.prune` event failed (the warning `backup-audit-pending`).
+ */
+type PendingOp =
+  | { kind: "create"; projectId: string; at: string; tmp?: string; file?: string; entry?: BackupEntry }
+  | { kind: "prune"; projectId: string; at: string; files: string[]; keep: number; auditFailed?: boolean };
 
 interface BackupState {
   formatVersion: 1;
   /** Backup file → project id (rename-safe: never inferred from the project's current name). */
   owners: Record<string, string>;
-  /** Projects whose last backup failed: the warning `backup-failed`. */
-  failures: Record<string, { at: string; reason: string }>;
+  /** Projects whose last backup failed or was refused: the warning `backup-failed`. */
+  failures: Record<string, BackupFailure>;
+  /** Backups and prunes not yet settled, by backup id / prune id. */
+  pending: Record<string, PendingOp>;
+}
+
+/** Why the project's last backup failed (plain text; never a path), and when. */
+export interface BackupFailure {
+  at: string;
+  reason: string;
+  /** The policy engine refused it (R125). */
+  refused?: true;
 }
 
 export const BACKUPS_STATE = "backups-state.json";
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+function pendingOf(v: unknown): Record<string, PendingOp> {
+  const out: Record<string, PendingOp> = {};
+  if (!isObject(v)) return out;
+  for (const [id, op] of Object.entries(v)) {
+    if (!isObject(op) || typeof op.projectId !== "string" || typeof op.at !== "string") continue;
+    // Names only, inside Backups/, of the backup naming pattern: a damaged or edited record never
+    // points the settling at any other file.
+    const nameOk = (v: unknown, re: RegExp) => v === undefined || (typeof v === "string" && v === basename(v) && re.test(v));
+    const entry = op.entry as Partial<BackupEntry> | undefined;
+    if (op.kind === "create" && nameOk(op.tmp, BACKUP_TEMP) && nameOk(op.file, BACKUP_NAME) && (entry === undefined || (isObject(entry) && entry.file === op.file && entry.projectId === op.projectId))) {
+      out[id] = op as PendingOp;
+    }
+    else if (op.kind === "prune" && Array.isArray(op.files) && op.files.every((f) => typeof f === "string")) out[id] = op as PendingOp;
+  }
+  return out;
+}
 
 async function readState(dir: string): Promise<BackupState> {
   try {
@@ -235,22 +339,32 @@ async function readState(dir: string): Promise<BackupState> {
       formatVersion: 1,
       owners: s.owners && typeof s.owners === "object" ? s.owners : {},
       failures: s.failures && typeof s.failures === "object" ? s.failures : {},
+      pending: pendingOf(s.pending),
     };
   } catch {
-    return { formatVersion: 1, owners: {}, failures: {} };
+    return { formatVersion: 1, owners: {}, failures: {}, pending: {} };
   }
+}
+
+/** Reads, edits and writes the state; the caller holds the manifest's queue. */
+async function editStateNow(dir: string, fn: (s: BackupState) => void): Promise<void> {
+  const s = await readState(dir);
+  fn(s);
+  await fsp.mkdir(dir, { recursive: true });
+  await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** The recorded failure of the project's last backup (the warning `backup-failed`), if any. */
+export async function backupFailure(repo: Repo, projectId: string): Promise<BackupFailure | undefined> {
+  const f = (await readState(backupsDir(repo))).failures;
+  return Object.hasOwn(f, projectId) ? f[projectId] : undefined;
 }
 
 /** Edits the state (in the manifest's queue, so writes never interleave). */
 function withState(repo: Repo, fn: (s: BackupState) => void): Promise<void> {
   const dir = backupsDir(repo);
   const prev = manifestLocks.get(dir) ?? Promise.resolve();
-  const run = prev.then(async () => {
-    const s = await readState(dir);
-    fn(s);
-    await fsp.mkdir(dir, { recursive: true });
-    await writeFileAtomic(join(dir, BACKUPS_STATE), `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
-  });
+  const run = prev.then(() => editStateNow(dir, fn));
   manifestLocks.set(
     dir,
     run.catch(() => {}),
@@ -342,6 +456,9 @@ async function readEntry(repo: Repo, file: string): Promise<BackupEntry | undefi
 /** The project's backups the app made and that still exist, newest first. */
 export async function listBackups(repo: Repo, projectId: string): Promise<BackupEntry[]> {
   const dir = backupsDir(repo);
+  // A backup interrupted after its commit point is finished first, so it is listed (and found by
+  // destruction under retention, R90 d); one interrupted before it is removed (R125).
+  await settlePending(repo);
   const m = await withManifest(repo, async (x) => x);
   const out: BackupEntry[] = [];
   for (const b of m.backups) {
@@ -356,6 +473,7 @@ export async function listBackups(repo: Repo, projectId: string): Promise<Backup
  * rebuilt and whose name is the project's — they may hold its data.
  */
 export async function unresolvedBackupsOf(repo: Repo, projectId: string): Promise<string[]> {
+  await settlePending(repo);
   const m = await withManifest(repo, async (x) => x);
   const dir = backupsDir(repo);
   const state = await readState(dir);
@@ -521,7 +639,10 @@ async function writeZip(tmp: string, snap: Snapshot, header: Record<string, unkn
 /** In-progress temp files of this process (never swept while running). */
 const activeTemps = new Set<string>();
 
-/** Overwrites and removes temp files left by interrupted backups (they may be plaintext zips). */
+/** Backups and prunes running in this process (their pending records are not settled meanwhile). */
+const activeOps = new Set<string>();
+
+/** Overwrites and removes temp files left by interrupted backups (they may be plaintext zips), except those still pending. */
 async function sweepTemps(dir: string): Promise<void> {
   let names: string[] = [];
   try {
@@ -529,34 +650,179 @@ async function sweepTemps(dir: string): Promise<void> {
   } catch {
     return;
   }
-  for (const n of names) if (BACKUP_TEMP.test(n) && !activeTemps.has(join(dir, n))) await shredPath(join(dir, n)).catch(() => {});
+  const pending = new Set(Object.values((await readState(dir)).pending).flatMap((op) => (op.kind === "create" && op.tmp ? [op.tmp] : [])));
+  for (const n of names) if (BACKUP_TEMP.test(n) && !activeTemps.has(join(dir, n)) && !pending.has(n)) await shredPath(join(dir, n)).catch(() => {});
+}
+
+/** Plain text kept with `backup-failed`: the engine's reason for a refusal, else what failed (never a message that may hold a path). */
+function failureOf(err: unknown, at: string): BackupFailure {
+  if (err instanceof PolicyDeniedError) return { at, reason: err.reason, refused: true };
+  if (err instanceof BackupNotRecordedError) return { at, reason: err.message };
+  return { at, reason: err instanceof Error ? err.name : "Error" };
 }
 
 async function recordFailure(repo: Repo, projectId: string, err: unknown): Promise<void> {
+  const f = failureOf(err, repoClock(repo)().toISOString());
+  await withState(repo, (s) => {
+    s.failures[projectId] = f;
+  }).catch(() => {});
+}
+
+const exists = (p: string) => fsp.stat(p).then(() => true, () => false);
+
+/** Whether the project's audit log holds the event `action` whose `details[key]` is `id`. */
+async function hasEvent(repo: Repo, projectId: string, action: string, key: string, id: string): Promise<boolean> {
+  const p = repo.getProject(projectId);
+  const events = await AuditStore.read(join(repoLibrary(repo).root, ...p.folder.split("/"), "audit"));
+  return events.some((e) => e?.action === action && (e.details as Record<string, unknown> | undefined)?.[key] === id);
+}
+
+const projectExists = (repo: Repo, projectId: string) => repo.listProjects().some((p) => p.id === projectId);
+
+/**
+ * Settles backups and prunes that were interrupted (a crash, or a failure this process could not
+ * resolve), by what the audit log says (R125). Writable libraries only; each record is tried again
+ * next time if settling it fails. Runs when a project opens or is unlocked and before every backup
+ * operation.
+ */
+async function settlePending(repo: Repo): Promise<void> {
+  if (repoLibrary(repo).mode !== "read-write") return;
+  const state = await readState(backupsDir(repo));
+  for (const [id, op] of Object.entries(state.pending)) {
+    if (activeOps.has(id)) continue;
+    activeOps.add(id);
+    try {
+      if (op.kind === "create") await settleCreate(repo, id, op);
+      else await settlePrune(repo, id, op);
+    } catch {
+      // stays pending: tried again by the next backup operation or open
+    } finally {
+      activeOps.delete(id);
+    }
+  }
+}
+
+/**
+ * A backup whose `backup.create` event is in the audit log is finished: renamed to its backup name
+ * (if the crash came first) and listed in the manifest. One without it is not a backup: its temp
+ * file is overwritten and removed, and the project shows `backup-failed`.
+ */
+async function settleCreate(repo: Repo, id: string, op: Extract<PendingOp, { kind: "create" }>): Promise<"committed" | "dropped"> {
+  const dir = backupsDir(repo);
+  const known = projectExists(repo, op.projectId);
+  const committed = known && (await hasEvent(repo, op.projectId, "backup.create", "backupId", id));
+  if (committed && op.file && op.entry) {
+    const tmp = op.tmp ? join(dir, op.tmp) : undefined;
+    const final = join(dir, op.file);
+    if (tmp && !(await exists(final)) && (await exists(tmp))) await fsp.rename(tmp, final);
+    const entry = op.entry;
+    if (await exists(final)) {
+      await withManifest(repo, async (m) => {
+        if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
+      });
+    }
+    await withState(repo, (s) => {
+      s.owners[entry.file] = op.projectId;
+      delete s.failures[op.projectId]; // a backup succeeded
+      delete s.pending[id];
+    });
+    return "committed";
+  }
+  if (op.tmp) await shredPath(join(dir, op.tmp));
   const at = repoClock(repo)().toISOString();
   await withState(repo, (s) => {
-    s.failures[projectId] = { at, reason: err instanceof Error ? err.name : "Error" };
-  }).catch(() => {});
+    if (known) s.failures[op.projectId] = { at, reason: BACKUP_INTERRUPTED };
+    delete s.pending[id];
+  });
+  return "dropped";
+}
+
+/** Removed files of an interrupted prune whose `backup.prune` event is missing are recorded now (`recovered`). */
+async function settlePrune(repo: Repo, id: string, op: Extract<PendingOp, { kind: "prune" }>): Promise<void> {
+  const dir = backupsDir(repo);
+  const gone: string[] = [];
+  for (const f of op.files) if (f === basename(f) && !(await exists(join(dir, f)))) gone.push(f);
+  if (gone.length && projectExists(repo, op.projectId) && !(await hasEvent(repo, op.projectId, "backup.prune", "pruneId", id))) {
+    try {
+      await appendLibraryEvent(repo, op.projectId, "backup.prune", { pruneId: id, files: gone, keep: op.keep, recovered: true });
+    } catch (err) {
+      await withState(repo, (s) => {
+        const p = s.pending[id];
+        if (p?.kind === "prune") p.auditFailed = true;
+      });
+      throw err;
+    }
+  }
+  await withState(repo, (s) => {
+    delete s.pending[id];
+  });
+}
+
+/** Every kind of storage the Backups folder may be on (R125): its path and real path; an uncertain kind as every plausible one. */
+async function backupDestinations(dir: string, env: LocationEnv): Promise<NonNullable<PolicyRequest["backup"]>["destinations"]> {
+  const { destinations } = await locate(dir, env);
+  return candidates(destinations).map(({ loc, guessed }) => ({
+    destination: loc.kind,
+    ...(loc.cloudFolderId ? { cloudFolderId: loc.cloudFolderId } : {}),
+    ...(guessed ? { uncertain: true } : {}),
+  }));
+}
+
+export interface BackupOptions {
+  /** How many of the project's backups to keep (default: the project's setting, else 10). */
+  keep?: number;
+  /** False: no pruning after the backup (retention). */
+  prune?: boolean;
+  /** Where things are on this machine, to classify the library's folder (default: probed). */
+  locationEnv?: LocationEnv;
 }
 
 /**
  * Backs up the project to Backups/ and prunes its older backups to the newest `keep`
- * (default: the project's setting, else 10). A failure is recorded as the project's warning
- * `backup-failed` (and thrown).
+ * (default: the project's setting, else 10). Governed and audited (R125, see the top of this file):
+ * a refusal throws PolicyDeniedError and creates nothing. A failure or refusal is recorded as the
+ * project's warning `backup-failed` (and thrown).
  */
-export async function backupProject(repo: Repo, projectId: string, opts: { keep?: number; prune?: boolean } = {}): Promise<BackupResult> {
+export async function backupProject(repo: Repo, projectId: string, opts: BackupOptions = {}): Promise<BackupResult> {
   const dir = backupsDir(repo);
   await fsp.mkdir(dir, { recursive: true });
+  await settlePending(repo);
   await sweepTemps(dir);
   const tz = repoTz(repo);
   const warnings: string[] = [];
+  const backupId = newId();
   let made: { entry: BackupEntry; project: Project };
+  /** The pending record exists. */
+  let recorded = false;
+  /** The commit could not be confirmed either way: the pending record stays for the audit log to decide. */
+  let undecided = false;
+  const temps: string[] = [];
   try {
     if (backupSeams.failBackup) throw new Error("simulated backup failure");
+    const destinations = await backupDestinations(dir, opts.locationEnv ?? (await defaultLocationEnv()));
+    // Recorded first, so an interruption from here on is settled (and shown) later.
+    activeOps.add(backupId);
+    await withState(repo, (s) => {
+      s.pending[backupId] = { kind: "create", projectId, at: repoClock(repo)().toISOString() };
+    });
+    recorded = true;
+    // 1. The decision, audited either way (a deny is audited and thrown by authorizeProcessing).
+    const decision = await authorizeProcessing(
+      repo,
+      projectId,
+      { action: "backup", backup: { destinations } },
+      { op: "backup.create", entity: { type: "project", id: projectId }, auditAllow: { details: { backupId } } },
+    );
+    const mustSeal = decision.result === "allow_with_conditions" && decision.conditions.some((c) => c.type === "encrypt");
+    crashPoint("after-decision");
+
+    // 2. The zip, complete and fsynced under its temp name.
     let result: { snap: Snapshot; tmp: string; sha256: string; bytes: number; name: string } | undefined;
     for (let attempt = 0; attempt < 2 && !result; attempt++) {
       const snap = await snapshot(repo, projectId);
       try {
+        // Never an unsealed backup of a project whose rules require encryption (the engine's condition).
+        if (mustSeal && !snap.key) throw new PolicyDeniedError("Governance requires encryption at rest, but this project is not encrypted", "backup");
         await backupSeams.afterSnapshot?.();
         let name = datedFileName(`${snap.project.name} - backup`, new Date(snap.at), "zip", tz);
         if (snap.key) name = `${name}.enc`;
@@ -564,18 +830,25 @@ export async function backupProject(repo: Repo, projectId: string, opts: { keep?
         name = withCollisionSuffix(name, (n) => taken.has(foldName(n)));
         const tmp = join(dir, `${name}.tmp-${randomBytes(6).toString("hex")}`);
         activeTemps.add(tmp);
+        temps.push(tmp);
+        await withState(repo, (s) => {
+          const p = s.pending[backupId];
+          if (p?.kind === "create") p.tmp = basename(tmp);
+        });
         try {
           const header = { formatVersion: 1, projectId, projectName: snap.project.name, createdAt: snap.at, encrypted: !!snap.key, auditHead: snap.head, files: snap.files.length, assets: snap.assets };
           const r = await writeZip(tmp, snap, header);
           if (await changedSince(snap.files)) {
             if (attempt === 0) {
               await shredPath(tmp);
+              activeTemps.delete(tmp);
               continue;
             }
             warnings.push("Some files changed while the backup was made, twice; this backup may not be one consistent state.");
           }
           result = { snap, tmp, name, ...r };
         } catch (err) {
+          if (err instanceof SimulatedCrash) throw err;
           await shredPath(tmp).catch(() => {});
           activeTemps.delete(tmp);
           // A file that changed size or went away while it was read: start again once.
@@ -587,58 +860,136 @@ export async function backupProject(repo: Repo, projectId: string, opts: { keep?
       }
     }
     if (!result) throw new Error("the project kept changing while it was backed up");
+    crashPoint("after-zip");
+    const { snap } = result;
+    const entry: BackupEntry = {
+      file: result.name,
+      projectId,
+      createdAt: snap.at,
+      sha256: result.sha256,
+      bytes: result.bytes,
+      encrypted: !!snap.key,
+      files: snap.files.length,
+      auditHead: snap.head,
+      assets: snap.assets,
+      ...(snap.keyFile ? { keyFile: snap.keyFile } : {}),
+    };
+    await withState(repo, (s) => {
+      const p = s.pending[backupId];
+      if (p?.kind === "create") Object.assign(p, { tmp: basename(result.tmp), file: result.name, entry });
+    });
+    crashPoint("before-commit");
+
+    // 3. The commit point: the `backup.create` event. If it cannot be written, the audit log decides
+    // (it may have been written after all); without it the backup is not kept.
     try {
-      await fsp.rename(result.tmp, join(dir, result.name));
+      await appendLibraryEvent(repo, projectId, "backup.create", { backupId, file: result.name, sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
+    } catch (err) {
+      activeTemps.delete(result.tmp);
+      const outcome = await settleCreate(repo, backupId, { kind: "create", projectId, at: snap.at, tmp: basename(result.tmp), file: result.name, entry }).catch(() => "unsettled" as const);
+      if (outcome === "unsettled") undecided = true;
+      if (outcome !== "committed") throw new BackupNotRecordedError({ cause: err });
+    }
+    crashPoint("after-commit");
+
+    // 4. Its name, then the manifest.
+    try {
+      if (await exists(result.tmp)) await fsp.rename(result.tmp, join(dir, result.name));
     } finally {
       activeTemps.delete(result.tmp);
     }
-    const { snap } = result;
-    await appendLibraryEvent(repo, projectId, "backup.create", { sha256: result.sha256, bytes: result.bytes, encrypted: !!snap.key, files: snap.files.length });
-    made = {
-      project: snap.project,
-      entry: {
-        file: result.name,
-        projectId,
-        createdAt: snap.at,
-        sha256: result.sha256,
-        bytes: result.bytes,
-        encrypted: !!snap.key,
-        files: snap.files.length,
-        auditHead: snap.head,
-        assets: snap.assets,
-        ...(snap.keyFile ? { keyFile: snap.keyFile } : {}),
-      },
-    };
+    crashPoint("before-manifest");
+    await withManifest(repo, async (m) => {
+      if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
+    });
+    await withState(repo, (s) => {
+      s.owners[entry.file] = projectId;
+      delete s.failures[projectId];
+      delete s.pending[backupId];
+    });
+    made = { project: snap.project, entry };
   } catch (err) {
+    if (err instanceof SimulatedCrash) throw err; // tests: the process "died" here
+    if (recorded && !undecided) {
+      // Nothing was committed (a committed backup does not get here): anything left of it goes.
+      const p = (await readState(dir)).pending[backupId];
+      if (p?.kind === "create" && p.tmp) await shredPath(join(dir, p.tmp)).catch(() => {});
+      await withState(repo, (s) => {
+        delete s.pending[backupId];
+      }).catch(() => {});
+    }
     await recordFailure(repo, projectId, err);
     throw err;
+  } finally {
+    activeOps.delete(backupId);
+    for (const t of temps) activeTemps.delete(t);
   }
-  await withState(repo, (s) => {
-    s.owners[made.entry.file] = projectId;
-    delete s.failures[projectId];
-  });
-  await withManifest(repo, async (m) => {
-    m.backups.push(made.entry);
-  });
-  const pruned = opts.prune === false ? [] : await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
+  let pruned: string[] = [];
+  if (opts.prune !== false) {
+    try {
+      pruned = await pruneBackups(repo, projectId, opts.keep ?? made.project.backups?.keep ?? DEFAULT_KEEP);
+    } catch (err) {
+      // The backup itself is made and recorded; a removal that could not be recorded is said, not hidden.
+      if (!(err instanceof PruneNotRecordedError)) throw err;
+      pruned = err.removed;
+      warnings.push(err.message);
+    }
+  }
   return { path: join(dir, made.entry.file), sha256: made.entry.sha256, bytes: made.entry.bytes, pruned, warnings };
 }
 
-/** Removes the project's backups beyond the newest `keep`: by the manifest's project id, backup-named files only. */
+/**
+ * Removes the project's backups beyond the newest `keep`: by the manifest's project id, backup-named
+ * files only; a plain delete (R91). Audited by file name: one `backup.prune` event per run that
+ * removed anything (R125). If that event cannot be written, the files stay removed and
+ * PruneNotRecordedError is thrown; the removal is recorded later.
+ */
 export async function pruneBackups(repo: Repo, projectId: string, keep: number): Promise<string[]> {
   if (!Number.isInteger(keep) || keep < 1) throw new TypeError("keep must be a whole number of at least 1");
   const dir = backupsDir(repo);
-  return withManifest(repo, async (m) => {
-    const mine = m.backups.filter((b) => b.projectId === projectId && BACKUP_NAME.test(b.file) && b.file === basename(b.file));
-    mine.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
-    const removed: string[] = [];
-    for (const b of mine.slice(keep)) {
-      await fsp.rm(join(dir, b.file), { force: true });
-      removed.push(b.file);
+  await settlePending(repo);
+  const pruneId = newId();
+  activeOps.add(pruneId);
+  try {
+    const removed = await withManifest(repo, async (m) => {
+      const mine = m.backups.filter((b) => b.projectId === projectId && BACKUP_NAME.test(b.file) && b.file === basename(b.file));
+      mine.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+      const doomed = mine.slice(keep).map((b) => b.file);
+      const out: string[] = [];
+      if (!doomed.length) return out;
+      // Recorded before the first removal, so a crash cannot lose the record of it.
+      await editStateNow(dir, (s) => {
+        s.pending[pruneId] = { kind: "prune", projectId, at: repoClock(repo)().toISOString(), files: doomed, keep };
+      });
+      try {
+        for (const f of doomed) {
+          await fsp.rm(join(dir, f), { force: true });
+          out.push(f);
+        }
+      } finally {
+        m.backups = m.backups.filter((b) => !(b.projectId === projectId && out.includes(b.file)));
+      }
+      return out;
+    });
+    if (!removed.length) return removed;
+    crashPoint("before-prune-audit");
+    await backupSeams.beforePruneAudit?.();
+    try {
+      await appendLibraryEvent(repo, projectId, "backup.prune", { pruneId, files: removed, keep });
+    } catch (err) {
+      await withState(repo, (s) => {
+        const p = s.pending[pruneId];
+        if (p?.kind === "prune") Object.assign(p, { files: removed, auditFailed: true });
+      }).catch(() => {});
+      throw new PruneNotRecordedError(removed, { cause: err });
     }
-    m.backups = m.backups.filter((b) => !(b.projectId === projectId && removed.includes(b.file)));
+    await withState(repo, (s) => {
+      delete s.pending[pruneId];
+    });
     return removed;
-  });
+  } finally {
+    activeOps.delete(pruneId);
+  }
 }
 
 /**
@@ -675,17 +1026,20 @@ export function setBackupSettings(repo: Repo, projectId: string, settings: { aut
 /**
  * For the daily scheduler (Task 30): backs the project up when automatic backups are on (default),
  * the project is open for writing and unlocked, and its last backup is at least a day old. Null
- * when nothing was due (or it could not run now). A failure is thrown and stays as the project's
- * warning `backup-failed`.
+ * when nothing was due (or it could not run now). A failure or a refusal (R125) is thrown and stays
+ * as the project's warning `backup-failed`, with its reason. A refused one is asked again a day
+ * later, not at every pass of the scheduler (one denial in the audit log a day, not one an hour).
  */
-export async function backupIfDue(repo: Repo, projectId: string, now: Date): Promise<BackupResult | null> {
+export async function backupIfDue(repo: Repo, projectId: string, now: Date, opts: Pick<BackupOptions, "locationEnv"> = {}): Promise<BackupResult | null> {
   const p = repo.getProject(projectId);
   if (p.backups?.automatic === false) return null;
   if (!repo.isUnlocked(projectId)) return null;
   const [last] = await listBackups(repo, projectId);
   if (last && now.getTime() - Date.parse(last.createdAt) < DAY_MS) return null;
+  const failed = await backupFailure(repo, projectId);
+  if (failed?.refused && now.getTime() - Date.parse(failed.at) < DAY_MS) return null;
   try {
-    return await backupProject(repo, projectId);
+    return await backupProject(repo, projectId, opts);
   } catch (err) {
     if (err instanceof ProjectLockedError || err instanceof ReadOnlyLibraryError) return null;
     throw err;
@@ -800,4 +1154,9 @@ export async function restoreBackup(repo: Repo, path: string, opts: { passphrase
 // Unresolved sealed backups are tried again as soon as a project is unlocked (R94).
 onProjectUnlocked(async (repo) => {
   await withManifest(repo, async () => {});
+});
+
+// Backups and prunes interrupted by a crash are settled when the library opens (R125).
+onProjectOpened(async (repo) => {
+  await settlePending(repo);
 });
