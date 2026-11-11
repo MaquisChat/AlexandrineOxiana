@@ -110,6 +110,8 @@ export {
   JOB_OPS,
   WorkerClient,
   WorkerJobError,
+  WorkerToolError,
+  WorkerToolsClient,
   WorkerUnavailableError,
   devWorkerPython,
   startWorker,
@@ -117,6 +119,7 @@ export {
 export type {
   JobResult,
   StartWorkerOptions,
+  ToolAction,
   WorkerClientOptions,
   WorkerEndpoint,
   WorkerHandle,
