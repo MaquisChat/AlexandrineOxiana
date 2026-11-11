@@ -58,7 +58,7 @@ async function call(r: Inject) {
   } catch {
     json = undefined;
   }
-  return { status: res.statusCode, json, body: res.body };
+  return { status: res.statusCode, json, body: res.body, headers: res.headers };
 }
 
 async function openNewLibrary(): Promise<string> {
@@ -71,6 +71,7 @@ async function openNewLibrary(): Promise<string> {
 async function newProject(encrypted = true): Promise<{ pid: string; code?: string }> {
   const r = await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: encrypted ? GOV : GOV.replace("required", "optional"), encryption: encrypted ? { enabled: true, passphrase: PASS } : { enabled: false } } });
   expect(r.status, r.body).toBe(200);
+  expect(r.headers["cache-control"]).toBe("no-store");
   return { pid: r.json.project.id as string, code: r.json.recoveryCode as string | undefined };
 }
 
@@ -106,6 +107,7 @@ describe("POST /projects/:id/recovery-code", () => {
     const r = await issue(pid, { passphrase: PASS });
     expect(r.status, r.body).toBe(200);
     expect(Object.keys(r.json)).toEqual(["recoveryCode"]);
+    expect(r.headers["cache-control"]).toBe("no-store");
     expect(r.json.recoveryCode).toMatch(/^[0-9A-Z]{4}(-[0-9A-Z]{4}){7}$/);
     expect(r.json.recoveryCode).not.toBe(code);
     await lock(pid);
@@ -200,6 +202,37 @@ describe("wrong passphrases are rate-limited per project, unlock and recovery co
     clock.now += 61_000;
     expect((await unlock(pid, PASS)).status).toBe(200);
     expect((await issue(pid, { passphrase: PASS })).status).toBe(200);
+  });
+
+  it("20 wrong passphrases at once: at most 5 are tried, the rest are refused with 429 (counted before verifying, one at a time)", async () => {
+    await openNewLibrary();
+    const { pid } = await newProject();
+    const statuses = await Promise.all(Array.from({ length: 20 }, () => issue(pid, { passphrase: WRONG }).then((r) => r.status)));
+    expect(statuses.filter((s) => s === 401)).toHaveLength(5);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(15);
+    const limited = await issue(pid, { passphrase: PASS });
+    expect(limited.status).toBe(429);
+    expect(limited.json.error.message).toMatch(/even the right passphrase/i);
+  });
+
+  it("concurrent wrong passphrases and wrong recovery codes on unlock are limited the same way", async () => {
+    await openNewLibrary();
+    const { pid } = await newProject();
+    await lock(pid);
+    const both = await Promise.all(
+      Array.from({ length: 12 }, (_, i) => (i % 2 ? unlock(pid, WRONG) : call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: "ABCD-EFGH-JKMN-PQRS-TVWX-YZ01-2345-6789" } })).then((r) => r.status)),
+    );
+    expect(both.filter((s) => s === 401)).toHaveLength(5);
+    expect(both.filter((s) => s === 429)).toHaveLength(7);
+    expect((await unlock(pid, PASS)).status).toBe(429);
+  });
+
+  it("a request refused for another reason (locked) is not counted as a guess", async () => {
+    await openNewLibrary();
+    const { pid } = await newProject();
+    await lock(pid);
+    for (let i = 0; i < 6; i++) expect((await issue(pid, { passphrase: WRONG })).status).toBe(423);
+    expect((await unlock(pid, PASS)).status).toBe(200);
   });
 
   it("a success clears the count", async () => {

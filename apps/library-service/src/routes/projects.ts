@@ -45,34 +45,59 @@ const MAX_WRONG_PASSPHRASES = 5;
 const WRONG_PASSPHRASE_WINDOW_MS = 60_000;
 
 /**
- * A modest limit on guessing a project's passphrase (or recovery code) through the service: after 5
- * wrong ones within a minute, unlock and the new-recovery-code request of that project answer 429
- * until the oldest of them is a minute old. A correct one clears the count. In memory only.
+ * A modest limit on guessing a project's passphrase (or recovery code) through the service (R141):
+ * every attempt is counted BEFORE it is verified, and a project's attempts are verified one at a time
+ * (across unlock and the new-recovery-code request), so parallel requests cannot get past it and
+ * cannot start a burst of key derivations. After 5 counted wrong attempts within a minute the project
+ * answers 429, even to the right passphrase, until the oldest is a minute old. A correct passphrase
+ * clears the count; a request refused for another reason (locked, read-only, …) is not counted. In
+ * memory only.
  */
 class WrongPassphraseLimit {
-  private readonly wrong = new Map<string, number[]>();
+  private readonly attempts = new Map<string, number[]>();
+  /** The last attempt queued per project: the next one waits for it. */
+  private readonly turns = new Map<string, Promise<void>>();
   constructor(private readonly now: () => number) {}
 
   private recent(projectId: string): number[] {
     const cutoff = this.now() - WRONG_PASSPHRASE_WINDOW_MS;
-    const list = (this.wrong.get(projectId) ?? []).filter((t) => t > cutoff);
-    if (list.length) this.wrong.set(projectId, list);
-    else this.wrong.delete(projectId);
+    const list = (this.attempts.get(projectId) ?? []).filter((t) => t > cutoff);
+    if (list.length) this.attempts.set(projectId, list);
+    else this.attempts.delete(projectId);
     return list;
   }
 
-  /** Runs `fn` unless the project is limited; counts a wrong passphrase, clears the count on success. */
+  /** Runs `fn` in the project's turn unless it is limited; the attempt is counted first and kept only if the passphrase was wrong. */
   async guard<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
-    if (this.recent(projectId).length >= MAX_WRONG_PASSPHRASES) {
-      throw new ApiError(429, "RATE_LIMITED", "Too many wrong passphrases for this project. Wait a minute, then try again.");
-    }
+    const prev = this.turns.get(projectId) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => mine);
+    this.turns.set(projectId, tail);
+    await prev;
     try {
-      const r = await fn();
-      this.wrong.delete(projectId);
-      return r;
-    } catch (err) {
-      if (err instanceof WrongPassphraseError || err instanceof InvalidRecoveryCodeError) this.wrong.set(projectId, [...this.recent(projectId), this.now()]);
-      throw err;
+      const list = this.recent(projectId);
+      if (list.length >= MAX_WRONG_PASSPHRASES) {
+        throw new ApiError(429, "RATE_LIMITED", "Too many wrong passphrases for this project. For a minute even the right passphrase is refused: wait a minute, then try again.");
+      }
+      const at = this.now();
+      this.attempts.set(projectId, [...list, at]);
+      try {
+        const r = await fn();
+        this.attempts.delete(projectId);
+        return r;
+      } catch (err) {
+        if (!(err instanceof WrongPassphraseError || err instanceof InvalidRecoveryCodeError)) {
+          // Not a guess: take this attempt back.
+          const cur = this.attempts.get(projectId);
+          const i = cur?.lastIndexOf(at) ?? -1;
+          if (cur && i >= 0) cur.splice(i, 1);
+        }
+        throw err;
+      }
+    } finally {
+      release();
+      if (this.turns.get(projectId) === tail) this.turns.delete(projectId);
     }
   }
 }
@@ -91,7 +116,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     return { projects: await Promise.all(projects.map((p) => projectView(s.repo, p))) };
   });
 
-  app.post("/projects", async (req) => {
+  app.post("/projects", async (req, reply) => {
     const s = state.requireWritable();
     const b = bodyOf(req);
     const name = str(b, "name", 200);
@@ -108,7 +133,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
       ...(targetLanguages.length ? { targetLanguages } : {}),
     });
     state.publishState();
-    // The recovery code is shown once, here; it is never logged or stored.
+    // The recovery code is shown once, here; it is never logged or stored (nor cached).
+    reply.header("Cache-Control", "no-store");
     return { project: await projectView(s.repo, project), ...(recoveryCode ? { recoveryCode } : {}) };
   });
 
@@ -140,11 +166,12 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
 
   // A new recovery code (Task 61, R134 c): the passphrase again, the new code once in the response.
   // Neither is logged (the logger redacts both names and never logs bodies) nor audited.
-  app.post("/projects/:id/recovery-code", async (req) => {
+  app.post("/projects/:id/recovery-code", async (req, reply) => {
     const s = state.requireWritable();
     const id = projectParam(ctx, req);
     const passphrase = str(bodyOf(req), "passphrase", 1024);
     const { recoveryCode } = await limit.guard(id, () => s.repo.issueRecoveryCode(id, passphrase));
+    reply.header("Cache-Control", "no-store");
     return { recoveryCode };
   });
 
