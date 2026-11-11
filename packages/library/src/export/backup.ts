@@ -126,7 +126,15 @@ const BACKUP_TEMP = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))
 const BACKUP_NAME = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?$/u;
 
 /** Points in a backup or a prune where a test can simulate the process dying (R125). */
-export type BackupCrashPoint = "after-decision" | "after-zip" | "before-commit" | "after-commit" | "before-manifest" | "before-prune-audit";
+export type BackupCrashPoint =
+  | "after-decision"
+  | "after-zip"
+  | "before-commit"
+  | "after-commit"
+  | "before-manifest"
+  | "before-prune-audit"
+  /** Destruction under retention: a holding backup has been removed and the removal is not yet recorded. */
+  | "before-removal-record";
 
 /** Test seams. */
 export const backupSeams: {

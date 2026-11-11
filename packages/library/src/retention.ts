@@ -506,6 +506,70 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
   return out;
 }
 
+/** How the backups step of a destruction stands. */
+export type BackupsStepStatus = "none" | "pending" | "unknown-pending" | "deleted" | "no-longer-present";
+
+/** An amendment to a destruction certificate: a file kept beside it. */
+export interface DestructionAmendment {
+  /** Library-relative path of the amendment file. */
+  file: string;
+  /** Its sha256 as the audit log records it (of the JSON text, also when the file is sealed). */
+  sha256: string;
+  /** Whether the file on disk is the one the audit log recorded. */
+  verified: boolean;
+  /** Its content; absent when the file is missing or cannot be read. */
+  content?: Record<string, unknown>;
+}
+
+/** A destruction as its certificate, the amendments beside it and the audit log record it. */
+export interface DestructionRecord {
+  /** Library-relative path of the certificate written at the destruction. */
+  certificateFile: string;
+  /** Its sha256 as the audit log records it; absent when the audit log does not record this certificate. */
+  certificateSha256?: string;
+  /** Whether the certificate on disk is byte for byte the one the audit log recorded. */
+  verified: boolean;
+  /** The certificate as it is on disk. */
+  original?: Record<string, unknown>;
+  /** Later facts, oldest first. */
+  amendments: DestructionAmendment[];
+  /** The original with its `backups` brought up to date: what a screen shows. */
+  certificate?: Record<string, unknown>;
+  /** The resulting status of the backups step. */
+  status: BackupsStepStatus;
+  /** Backups (library-relative) still to be removed. */
+  outstanding: string[];
+  /** Why the app does not act on this destruction by itself (plain words), if so. */
+  problem?: string;
+}
+
+/** Every destruction of the project, oldest first. */
+export async function listDestructions(repo: Repo, projectId: string): Promise<DestructionRecord[]> {
+  const root = repoLibrary(repo).root;
+  const dirRel = `${repo.getProject(projectId).folder}/retention`;
+  let names: string[];
+  try {
+    names = (await fsp.readdir(join(root, ...dirRel.split("/")))).filter((n) => /^destruction-.*\.json(\.enc)?$/u.test(n)).sort();
+  } catch {
+    return [];
+  }
+  const out: DestructionRecord[] = [];
+  for (const n of names) {
+    const rel = `${dirRel}/${n}`;
+    const cert = await readCertificate(repo, projectId, rel);
+    out.push({ certificateFile: rel, verified: false, original: cert, amendments: [], certificate: cert, status: cert.backups.status, outstanding: cert.backups.outstanding ?? [] });
+  }
+  return out;
+}
+
+/** One destruction, by its certificate (a file name, a library-relative path or an absolute path). */
+export async function readDestruction(repo: Repo, projectId: string, certificate: string): Promise<DestructionRecord> {
+  const name = basename(certificate.split("\\").join("/"));
+  const found = (await listDestructions(repo, projectId)).find((d) => basename(d.certificateFile) === name);
+  if (!found) throw new NotFoundError("Destruction certificate", name);
+  return found;
+}
+
 /** `destruction-<YYYY-MM-DD HHmm>` for a time in `tz`. */
 export function certificateStem(at: Date, tz?: string): string {
   return `destruction-${formatModified(at, tz)}`;
