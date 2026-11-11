@@ -443,11 +443,11 @@ Update after every task; commit and push.
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c A pairing code's status | not started | | small service addition and its use on the pairing screen; the identifier half moved into Task 34d (R149) |
+| 46c A pairing code's status | fix round 1 | f889a93 (worktree branch) | spec met, access rules unchanged; one Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | re-review of fix round 1 | b91e2c0 (worktree branch) | three Important findings and ten minors reported fixed (R146) |
-| 34c Transcript viewer | fix round 2 | f9fb892 (worktree branch) | round 1 confirmed except one Important: the playback position is lost when a ticket is renewed |
+| 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
+| 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
 | 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
@@ -458,13 +458,13 @@ Update after every task; commit and push.
 | 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
-| 61 New recovery code | fix round 2 | ef05812 (worktree branch) | round 1 confirmed; one new Important (a stale staged file could be activated), settled by R148 |
+| 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
-| 37a Service bundle | not started | | |
-| 37b Token on standard input | in progress | | implementer dispatched |
+| 37a Service bundle | in progress | | implementer dispatched (ahead of Task 46: little overlap, and it heads the longest remaining chain) |
+| 37b Token on standard input | fix round 1 (short) | 0175e11 (worktree branch) | code sound under probes; two small clean-ups; HANDOFF.md to be corrected at merge |
 | 37c Desktop shell | not started | | |
-| 37d Worker packaging | fix round 1 | 72cb7cc (worktree branch) | approved with fixes: stronger smoke test, accurate licence manifest, offline model load (R144) |
+| 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |

@@ -1,0 +1,11 @@
+{
+  "name": "@ao/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The desktop app (Tauri shell, not built yet) and the build of its helper programs.",
+  "scripts": {
+    "build:sidecars": "node scripts/build-sidecars.mjs",
+    "smoke:sidecars": "node scripts/build-sidecars.mjs --skip-build --smoke"
+  }
+}

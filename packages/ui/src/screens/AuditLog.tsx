@@ -41,6 +41,25 @@ function Verdict({ check }: { check: AuditCheck }) {
   );
 }
 
+/**
+ * Operations named in plain words where the raw name would not tell a researcher what happened
+ * (Task 61): what an allowed event did, and what a refused one asked for (M-d).
+ */
+const PLAIN_OPS: Record<string, { allowed: string; refused: string }> = {
+  "project.recovery-code": { allowed: "A new recovery code was issued", refused: "A new recovery code was asked for" },
+};
+const PLAIN_ACTIONS: Record<string, string> = {
+  "key.recovery-activated": "A new recovery code was put in place when the library opened (it may not have been shown)",
+};
+
+/** The "what" cell: a plain description where there is one, else the operation, else the entity type. */
+function whatOf(e: { action: string; details?: Record<string, unknown> | undefined; entity?: { type: string } | undefined; decision?: { result?: string } | undefined }): string {
+  const op = typeof e.details?.op === "string" ? e.details.op : undefined;
+  if (op && Object.hasOwn(PLAIN_OPS, op)) return e.decision?.result === "deny" ? PLAIN_OPS[op]!.refused : PLAIN_OPS[op]!.allowed;
+  if (Object.hasOwn(PLAIN_ACTIONS, e.action)) return PLAIN_ACTIONS[e.action]!;
+  return op ?? (e.entity ? e.entity.type : "");
+}
+
 export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceApi; projectId: string; pageSize?: number }) {
   const [cursors, setCursors] = useState<Array<number | undefined>>([undefined]);
   const [page, setPage] = useState<AuditPage | null>(null);
@@ -119,7 +138,7 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
                     <UserText>{e.actor}</UserText>
                   </td>
                   <td>{e.action}</td>
-                  <td>{typeof e.details?.op === "string" ? e.details.op : e.entity ? e.entity.type : ""}</td>
+                  <td>{whatOf(e)}</td>
                   <td className={e.decision?.result === "deny" ? "ao-deny" : undefined}>
                     {e.decision?.result === "deny" ? `Denied: ${e.decision.reason ?? ""}` : e.decision?.result === "allow_with_conditions" ? "Allowed with conditions" : e.decision ? "Allowed" : ""}
                   </td>

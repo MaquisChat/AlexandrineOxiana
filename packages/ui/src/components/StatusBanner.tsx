@@ -51,6 +51,12 @@ const WARNINGS: Record<string, (p: string) => string> = {
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "protocol-manifest-unreadable": (p) => `The sealed list of protocol document names in ${p} could not be read. The documents themselves are unchanged; check the verification report.`,
+  "recovery-code-unshown": (p) =>
+    `A new recovery code for ${p} was issued, but the app stopped before it could be shown, so no one has it. The earlier recovery code no longer works; the passphrase still does. Unlock ${p} and choose “New recovery code…” to get one you can save.`,
+  "recovery-staging-discarded": (p) =>
+    `A key file waiting to be put in place in ${p} was not the one recorded when its recovery code was issued, so it was removed and not used. ${p}'s recovery code and passphrase are unchanged.`,
+  "recovery-staging-unverifiable": (p) =>
+    `A new recovery code for ${p} is waiting to be put in place, but ${p}'s audit log does not verify, so the app cannot tell whether it was really issued. Nothing was changed: the current recovery code and the passphrase still work. Open the verification report for details.`,
   "retention-due": (p) => `${p} has reached its retention date. Review which raw data must now be destroyed or kept.`,
 };
 

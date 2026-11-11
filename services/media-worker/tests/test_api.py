@@ -146,6 +146,22 @@ def test_python_m_ao_worker_prints_ready_and_binds_localhost(worker_env):
         p.wait(10)
 
 
+def test_sigterm_exits_cleanly_while_watching_stdin(worker_env):
+    # As startWorker runs it: stdin is a pipe that stays open, and the app stops it with SIGTERM.
+    env = {**os.environ, "AO_WORKER_TOKEN": TOKEN, "AO_WORKER_PORT": "0", "AO_WORKER_EXIT_ON_STDIN_EOF": "1"}
+    p = subprocess.Popen([sys.executable, "-m", "ao_worker"], cwd=Path(__file__).parents[1], env=env,
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().startswith("AO_WORKER_READY port=")
+        time.sleep(0.3)  # the stdin watcher is blocked in its read
+        p.terminate()
+        assert p.wait(15) == 0, p.stderr.read()[-500:]
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(10)
+
+
 def test_refuses_to_start_without_token(worker_env):
     env = {k: v for k, v in os.environ.items() if k != "AO_WORKER_TOKEN"}
     p = subprocess.run([sys.executable, "-m", "ao_worker"], cwd=Path(__file__).parents[1], env=env, capture_output=True, text=True, timeout=30)

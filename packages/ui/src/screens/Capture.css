@@ -1,0 +1,178 @@
+/*
+ * The capture screen (Task 34b). Tokens only (spec 8A.1, R105); focus rings come from base.css
+ * (:focus-visible).
+ */
+
+.ao-capture {
+  max-width: 56rem;
+}
+
+.ao-capture__picker {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.ao-capture__section {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-3) 0;
+}
+
+.ao-capture__section h2 {
+  margin-top: 0;
+  font-size: 1.15rem;
+}
+
+.ao-capture__options legend {
+  font-weight: 600;
+}
+
+.ao-capture__group {
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  margin: var(--space-2) 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
+
+.ao-capture__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.ao-capture__field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.ao-capture textarea,
+.ao-capture input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font-mono);
+}
+
+.ao-capture__hint {
+  display: block;
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: var(--space-1) 0;
+}
+
+.ao-capture__field-error {
+  display: block;
+  color: var(--deny);
+  font-weight: 600;
+  margin: var(--space-1) 0;
+}
+
+.ao-capture__error {
+  border-inline-start: 4px solid var(--deny);
+  padding-inline-start: var(--space-2);
+  color: var(--ink);
+}
+
+.ao-capture__note {
+  border-inline-start: 4px solid var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  padding: var(--space-1) var(--space-2);
+}
+
+.ao-capture__preview {
+  padding-inline-start: var(--space-4);
+  margin: var(--space-1) 0;
+}
+
+.ao-capture__preview li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ao-capture__preview--problem {
+  color: var(--warn-ink);
+}
+
+.ao-capture__url {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.ao-capture__legal {
+  margin-top: var(--space-2);
+}
+
+.ao-capture__tools {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+}
+
+.ao-capture__tools div {
+  display: contents;
+}
+
+.ao-capture__tools dd {
+  margin: 0;
+}
+
+.ao-capture__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.ao-capture__primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+
+.ao-capture__primary:disabled {
+  background: var(--chip);
+  color: var(--muted);
+  border-color: var(--line-control);
+}
+
+.ao-capture-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+  background: var(--backdrop);
+}
+
+.ao-capture-dialog {
+  max-width: 36rem;
+  width: 100%;
+  border: 2px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: var(--space-3);
+}
+
+.ao-capture-dialog h2 {
+  margin-top: 0;
+  font-size: 1.2rem;
+}

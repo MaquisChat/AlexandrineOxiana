@@ -38,8 +38,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     if os.environ.get("AO_WORKER_EXIT_ON_STDIN_EOF") == "1":
         def watch_stdin() -> None:
+            # os.read on the descriptor, not sys.stdin.buffer: a daemon thread blocked inside the
+            # buffered reader holds its lock, and the interpreter aborts (SIGABRT) at shutdown.
             try:
-                while sys.stdin.buffer.read(4096):
+                while os.read(sys.stdin.fileno(), 4096):
                     pass
             except (OSError, ValueError):
                 pass
