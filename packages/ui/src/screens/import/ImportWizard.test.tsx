@@ -137,7 +137,7 @@ describe("Bulk Import wizard", () => {
     await user.click(screen.getByRole("button", { name: "Undo import" }));
     await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Undo import" }));
     await waitFor(() => expect(m.bodies(`POST /imports/${B1}/undo`)).toHaveLength(1));
-    expect(await screen.findByText(/Removed 1,284 sources and restored 3 merged sources\./)).toBeTruthy();
+    expect(await screen.findByText(/Removed 1,284 sources and restored 3 sources that had been merged or updated\./)).toBeTruthy();
   });
 
   it("links the report to the review queue for this batch", async () => {
@@ -445,6 +445,48 @@ describe("Bulk Import wizard", () => {
       await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Undo import" }));
       await screen.findByText(/Removed 1,284 sources/);
       expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Report and undo" }));
+    });
+
+    it("a failed undo is announced inside the dialog and focused there, not behind it in the inert page (41b1 I2)", async () => {
+      const { http, HttpResponse } = await import("msw");
+      const { user } = await openUndo({
+        extra: [http.post("http://127.0.0.1:4100/imports/:batchId/undo", () => HttpResponse.json({ error: { code: "CONFLICT", message: "The import is still running." } }, { status: 409 }))],
+      });
+      const dialog = screen.getByRole("alertdialog");
+      await user.click(within(dialog).getByRole("button", { name: "Undo import" }));
+      const alert = await within(dialog).findByRole("alert");
+      expect(alert.textContent).toMatch(/The import is still running\./);
+      expect(document.activeElement).toBe(alert);
+      expect(dialog.getAttribute("aria-describedby")).toContain(alert.id);
+      // Nothing about the failure sits in the inert page behind the dialog.
+      for (const el of Array.from(document.querySelectorAll("[inert] [role=alert]"))) expect(el.textContent).not.toMatch(/still running/);
+      // Cancel is reachable again; after closing, the message stays on the page.
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(screen.getByRole("alert").textContent).toMatch(/The import is still running\./);
+    });
+
+    it("Escape does not close the dialog while the undo is running, and focus stays in the dialog (41b1 M1)", async () => {
+      const { http, HttpResponse } = await import("msw");
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => (release = r));
+      const { user } = await openUndo({
+        extra: [
+          http.post("http://127.0.0.1:4100/imports/:batchId/undo", async () => {
+            await gate;
+            return HttpResponse.json({ removedSources: 1284, revertedMerges: 3, kept: [] });
+          }),
+        ],
+      });
+      const dialog = screen.getByRole("alertdialog");
+      await user.click(within(dialog).getByRole("button", { name: "Undo import" }));
+      const status = await within(dialog).findByRole("status");
+      expect(status.textContent).toMatch(/Undoing/);
+      expect(document.activeElement).toBe(status);
+      await user.keyboard("{Escape}");
+      expect(screen.getByRole("alertdialog")).toBeTruthy();
+      release();
+      await screen.findByText(/Removed 1,284 sources/);
     });
 
     it("names updated sources apart from merged ones", async () => {
