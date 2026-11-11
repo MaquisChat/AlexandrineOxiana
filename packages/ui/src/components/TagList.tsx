@@ -1,7 +1,7 @@
 /**
  * The project's tags and the workspace tags shared by every project. A tag filters the sources
- * (toggle). Project tags can be renamed and deleted (with a confirmation); the service has no
- * rename or delete for workspace tags yet (R97 deferral), so those are listed only.
+ * (toggle). Both can be renamed and deleted (with a confirmation); a workspace tag's change reaches
+ * every project (R118), and its buttons and confirmation say so.
  */
 import { useId, useState, type FormEvent } from "react";
 import type { Tag } from "../api/library";
@@ -17,12 +17,28 @@ export interface TagListProps {
   readOnly?: boolean;
   onRename: (id: string, name: string) => void;
   onDelete: (id: string) => void;
+  /** A workspace tag's new name (every project sees it). */
+  onRenameWorkspace: (id: string, name: string) => void;
+  /** Deletes a workspace tag from every project. */
+  onDeleteWorkspace: (id: string) => void;
   onCreate: (name: string, scope: "project" | "workspace") => void;
 }
 
 const HEX = /^#[0-9a-fA-F]{6}$/;
 
-function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelete }: { tag: Tag; position: number; selected: boolean; onSelect: () => void; readOnly: boolean; onRename?: (name: string) => void; onDelete?: () => void }) {
+interface TagRowProps {
+  tag: Tag;
+  position: number;
+  selected: boolean;
+  onSelect: () => void;
+  readOnly: boolean;
+  onRename?: (name: string) => void;
+  onDelete?: () => void;
+  workspace?: boolean;
+}
+
+function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelete, workspace = false }: TagRowProps) {
+  const what = workspace ? "workspace tag" : "tag";
   const [mode, setMode] = useState<"view" | "rename" | "delete">("view");
   const [name, setName] = useState(tag.name);
   const fieldId = useId();
@@ -42,7 +58,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
         <button
           type="button"
           className="ao-small"
-          aria-label={`Rename tag ${tag.name}`}
+          aria-label={`Rename ${what} ${tag.name}`}
           disabled={readOnly}
           onClick={() => {
             setName(tag.name);
@@ -53,7 +69,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
         </button>
       )}
       {onDelete && (
-        <button type="button" className="ao-small" aria-label={`Delete tag ${tag.name}`} disabled={readOnly} onClick={() => setMode("delete")}>
+        <button type="button" className="ao-small" aria-label={`Delete ${what} ${tag.name}`} disabled={readOnly} onClick={() => setMode("delete")}>
           Delete
         </button>
       )}
@@ -77,9 +93,17 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
         </form>
       )}
       {mode === "delete" && !readOnly && (
-        <div role="group" aria-label={`Delete tag ${tag.name}?`} className="ao-inline-form">
+        <div role="group" aria-label={`Delete ${what} ${tag.name}?`} className="ao-inline-form">
           <span>
-            Delete the tag <UserText>{tag.name}</UserText>? Sources keep everything else.
+            {workspace ? (
+              <>
+                Delete the workspace tag <UserText>{tag.name}</UserText> from every project? Sources keep everything else.
+              </>
+            ) : (
+              <>
+                Delete the tag <UserText>{tag.name}</UserText>? Sources keep everything else.
+              </>
+            )}
           </span>
           <button
             type="button"
@@ -99,7 +123,7 @@ function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelet
   );
 }
 
-export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = false, onRename, onDelete, onCreate }: TagListProps) {
+export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = false, onRename, onDelete, onRenameWorkspace, onDeleteWorkspace, onCreate }: TagListProps) {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [scope, setScope] = useState<"project" | "workspace">("project");
@@ -129,10 +153,20 @@ export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = 
           <h3 className="ao-pane-subtitle">Workspace tags</h3>
           <ul className="ao-plain-list">
             {workspaceTags.map((t, i) => (
-              <TagRow key={t.id} tag={t} position={tags.length + i + 1} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} />
+              <TagRow
+                key={t.id}
+                tag={t}
+                workspace
+                position={tags.length + i + 1}
+                selected={selectedId === t.id}
+                onSelect={() => toggle(t.id)}
+                readOnly={readOnly}
+                onRename={(n) => onRenameWorkspace(t.id, n)}
+                onDelete={() => onDeleteWorkspace(t.id)}
+              />
             ))}
           </ul>
-          <p className="ao-muted ao-small-text">Workspace tags are shared by every project. Renaming or deleting them is not available yet.</p>
+          <p className="ao-muted ao-small-text">Workspace tags are shared by every project: renaming or deleting one changes it everywhere.</p>
         </>
       )}
       <button type="button" disabled={readOnly} aria-expanded={creating} onClick={() => setCreating((c) => !c)}>

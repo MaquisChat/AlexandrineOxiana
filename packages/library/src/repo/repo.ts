@@ -10,7 +10,20 @@ import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
 import { addWatchedFolderRecord, recordZoteroWebVersion, removeWatchedFolderRecord } from "./import-settings.js";
 import { addDerivedAsset, addOriginalAsset, currentLocationMode, updatePendingOcr, updatePendingOcrMany, updatePendingProxies, type DerivedAssetInput, type OriginalAssetInput } from "./assets.js";
 import { AnchorsUnreadableError, AuditStore, checkAnchor, type AnchorProblemKind, type IntegrityWarning } from "./audit-store.js";
-import { createCollection, createTag, deleteCollection, deleteTag, moveCollection, renameCollection, renameTag, setMembership, updateCollection, workspaceTags } from "./collections.js";
+import {
+  createCollection,
+  createTag,
+  deleteCollection,
+  deleteTag,
+  deleteWorkspaceTag,
+  moveCollection,
+  renameCollection,
+  renameTag,
+  renameWorkspaceTag,
+  setMembership,
+  updateCollection,
+  workspaceTags,
+} from "./collections.js";
 import {
   createConsent,
   createParticipant,
@@ -218,6 +231,17 @@ export class Repo {
   }
   listWorkspaceTags(): Promise<Tag[]> {
     return workspaceTags(this.core);
+  }
+  /**
+   * Renames (and recolours) a workspace tag: governed and audited in every project, then tags.json.
+   * Refused before anything is written while any project is locked or has an unresolved interrupted change.
+   */
+  renameWorkspaceTag(id: string, name: string, color?: string): Promise<Tag> {
+    return renameWorkspaceTag(this.core, id, name, color);
+  }
+  /** Deletes a workspace tag: every project's sources lose it (governed, audited per project), then tags.json. */
+  deleteWorkspaceTag(id: string): Promise<void> {
+    return deleteWorkspaceTag(this.core, id);
   }
   setMembership(projectId: string, sourceId: string, m: { collectionIds?: string[]; tagIds?: string[] }): Promise<void> {
     return setMembership(this.core, projectId, sourceId, m);

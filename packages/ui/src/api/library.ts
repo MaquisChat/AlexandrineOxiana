@@ -240,9 +240,13 @@ export function libraryApi(client: ApiClient) {
     tags: {
       list: (pid: string) => r<{ tags: Tag[]; workspaceTags: Tag[] }>("GET", `${proj(pid)}/tags`),
       create: (pid: string, name: string, scope: "project" | "workspace" = "project") => r<Tag>("POST", `${proj(pid)}/tags`, { body: { name, scope } }),
-      /** Project tags only: the service has no rename or delete for workspace tags. */
+      /** Project tags; workspace tags use renameWorkspace / removeWorkspace. */
       rename: (pid: string, tid: string, name: string) => r<Tag>("PATCH", `${proj(pid)}/tags/${seg(tid)}`, { body: { name } }),
       remove: (pid: string, tid: string) => r<{ deleted: true }>("DELETE", `${proj(pid)}/tags/${seg(tid)}`),
+      /** A workspace tag's new name: governed and audited in every project (R118). */
+      renameWorkspace: (tid: string, name: string) => r<Tag>("PATCH", `/workspace-tags/${seg(tid)}`, { body: { name } }),
+      /** Deletes a workspace tag from every project's sources, then the workspace (R118). */
+      removeWorkspace: (tid: string) => r<{ deleted: true }>("DELETE", `/workspace-tags/${seg(tid)}`),
     },
     sources: {
       search: (pid: string, q: SourceQuery = {}, opts: { signal?: AbortSignal } = {}) =>

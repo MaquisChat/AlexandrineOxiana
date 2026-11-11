@@ -92,6 +92,8 @@ describe("TagList", () => {
         onSelect={vi.fn()}
         onRename={vi.fn()}
         onDelete={vi.fn()}
+        onRenameWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
         onCreate={vi.fn()}
       />,
     );
@@ -100,12 +102,11 @@ describe("TagList", () => {
     expect(swatches[0]!.textContent).toContain("red tag");
   });
 
-  it("project tags can be renamed and deleted; workspace tags say where they are managed", async () => {
+  it("project tags can be renamed and deleted", async () => {
     const onRename = vi.fn();
     const onDelete = vi.fn();
     const user = userEvent.setup();
-    render(<TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={onRename} onDelete={onDelete} onCreate={vi.fn()} />);
-    expect(screen.queryByRole("button", { name: "Rename tag methods" })).toBeNull();
+    render(<TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={onRename} onDelete={onDelete} onRenameWorkspace={vi.fn()} onDeleteWorkspace={vi.fn()} onCreate={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: "Rename tag to read" }));
     const field = screen.getByLabelText("New name for to read");
     await user.clear(field);
@@ -114,7 +115,32 @@ describe("TagList", () => {
     await user.click(screen.getByRole("button", { name: "Delete tag to read" }));
     await user.click(screen.getByRole("button", { name: "Delete" }));
     expect(onDelete).toHaveBeenCalledWith("t1");
-    expect(screen.getByText(/Workspace tags are shared by every project/)).toBeTruthy();
+  });
+
+  it("workspace tags can be renamed and deleted too (R118), with a confirmation that names every project", async () => {
+    const onRenameWorkspace = vi.fn();
+    const onDeleteWorkspace = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <TagList tags={TAGS.tags} workspaceTags={TAGS.workspaceTags} onSelect={vi.fn()} onRename={vi.fn()} onDelete={vi.fn()} onRenameWorkspace={onRenameWorkspace} onDeleteWorkspace={onDeleteWorkspace} onCreate={vi.fn()} />,
+    );
+    expect(screen.queryByText(/not available yet/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+    const field = screen.getByLabelText("New name for methods");
+    await user.clear(field);
+    await user.type(field, "method{Enter}");
+    expect(onRenameWorkspace).toHaveBeenCalledWith("w1", "method");
+    await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
+    const confirm = screen.getByRole("group", { name: "Delete workspace tag methods?" });
+    expect(confirm.textContent).toMatch(/every project/);
+    await user.click(within(confirm).getByRole("button", { name: "Delete" }));
+    expect(onDeleteWorkspace).toHaveBeenCalledWith("w1");
+  });
+
+  it("workspace tag buttons are off while read-only", () => {
+    render(<TagList tags={[]} workspaceTags={TAGS.workspaceTags} readOnly onSelect={vi.fn()} onRename={vi.fn()} onDelete={vi.fn()} onRenameWorkspace={vi.fn()} onDeleteWorkspace={vi.fn()} onCreate={vi.fn()} />);
+    expect((screen.getByRole("button", { name: "Rename workspace tag methods" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Delete workspace tag methods" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
 

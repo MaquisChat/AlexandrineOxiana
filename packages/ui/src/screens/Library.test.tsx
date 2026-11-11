@@ -212,6 +212,32 @@ describe("Library screen", () => {
     expect(governanceReads).toBe(0);
   });
 
+  it("renames and deletes a workspace tag through /workspace-tags (R118)", async () => {
+    const calls: string[] = [];
+    server.use(
+      http.patch(url("/workspace-tags/:tid"), async ({ params, request }) => {
+        calls.push(`PATCH ${String(params.tid)} ${JSON.stringify(await request.json())}`);
+        return HttpResponse.json({ id: params.tid, scope: "workspace", name: "method" });
+      }),
+      http.delete(url("/workspace-tags/:tid"), ({ params }) => {
+        calls.push(`DELETE ${String(params.tid)}`);
+        return HttpResponse.json({ deleted: true });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    await screen.findByText("Ethnography at Work");
+    await user.click(screen.getByRole("button", { name: "Rename workspace tag methods" }));
+    const field = screen.getByLabelText("New name for methods");
+    await user.clear(field);
+    await user.type(field, "method{Enter}");
+    await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}']));
+    await user.click(screen.getByRole("button", { name: "Delete workspace tag methods" }));
+    await user.click(within(screen.getByRole("group", { name: "Delete workspace tag methods?" })).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(calls).toEqual(['PATCH w1 {"name":"method"}', "DELETE w1"]));
+  });
+
   it("PROJECT_LOCKED during an edit returns to UnlockProject and clears what was decrypted", async () => {
     server.use(http.patch(url("/projects/:id/tags/:tid"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")), ...libraryHandlers());
     const user = userEvent.setup();

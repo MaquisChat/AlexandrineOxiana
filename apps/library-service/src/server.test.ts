@@ -1731,3 +1731,37 @@ describe("screens integration (R118): lock holder", () => {
     expect(svc.state.libraryState().lockedBy).toBeUndefined();
   });
 });
+
+describe("screens integration (R118): workspace tags", () => {
+  beforeEach(() => start());
+
+  it("(b) PATCH and DELETE /workspace-tags/:tid rename and delete a workspace tag, audited in each project", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const tag = (await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "to-read", scope: "workspace" } })).json;
+    const renamed = await call({ method: "PATCH", url: `/workspace-tags/${tag.id}`, body: { name: "reading list", color: "#336699" } });
+    expect(renamed.status, renamed.body).toBe(200);
+    expect(renamed.json).toMatchObject({ id: tag.id, name: "reading list", color: "#336699", scope: "workspace" });
+    expect((await call({ url: `/projects/${pid}/tags` })).json.workspaceTags.map((t: { name: string }) => t.name)).toEqual(["reading list"]);
+    const audit = await call({ url: `/projects/${pid}/audit` });
+    expect(audit.status, audit.body).toBe(200);
+    expect(JSON.stringify(audit.json)).toContain("workspace-tag.rename");
+    expect((await call({ method: "PATCH", url: `/workspace-tags/${tag.id}`, body: {} })).status).toBe(400);
+    expect((await call({ method: "DELETE", url: `/workspace-tags/${tag.id}` })).json).toEqual({ deleted: true });
+    expect((await call({ url: `/projects/${pid}/tags` })).json.workspaceTags).toEqual([]);
+    expect((await call({ method: "DELETE", url: `/workspace-tags/${tag.id}` })).status).toBe(404);
+  });
+
+  it("(b) a locked encrypted project blocks the change with a plain 409 (not PROJECT_LOCKED for the open project)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const enc = await newProject(HIPAA_GOV, true, "Clinic");
+    await call({ method: "POST", url: `/projects/${enc}/lock` });
+    const tag = (await call({ method: "POST", url: `/projects/${pid}/tags`, body: { name: "to-read", scope: "workspace" } })).json;
+    const r = await call({ method: "DELETE", url: `/workspace-tags/${tag.id}` });
+    expect(r.status).toBe(409);
+    expect(r.json.error.code).toBe("CONFLICT");
+    expect(r.json.error.message).toMatch(/Unlock/);
+    expect(r.json.error.message).toContain("Clinic");
+  });
+});

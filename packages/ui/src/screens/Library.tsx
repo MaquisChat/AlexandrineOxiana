@@ -348,6 +348,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               onSelect={(tag) => setFilter((f) => ({ ...f, tag }))}
               onCreate={(name, scope) => edit("Creating the tag", () => api.tags.create(project.id, name, scope))}
               onRename={(tid, name) => edit("Renaming the tag", () => api.tags.rename(project.id, tid, name))}
+              onRenameWorkspace={(tid, name) => edit("Renaming the workspace tag", () => api.tags.renameWorkspace(tid, name))}
+              onDeleteWorkspace={(tid) =>
+                edit("Deleting the workspace tag", async () => {
+                  await api.tags.removeWorkspace(tid);
+                  setFilter((f) => (f.tag === tid ? { ...f, tag: undefined } : f));
+                })
+              }
               onDelete={(tid) =>
                 edit("Deleting the tag", async () => {
                   await api.tags.remove(project.id, tid);

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { Tag, diffToChanges, newId, type Collection } from "@ao/core";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { appendChanges } from "./changelog-store.js";
-import { InvalidInputError, NotFoundError } from "./errors.js";
+import { InvalidInputError, NotFoundError, RecoveryPendingError } from "./errors.js";
 import { readMaybe } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type MutateRequest } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
@@ -250,20 +250,129 @@ export async function createTag(core: RepoCore, scope: string, name: string, col
     core.assertWritable();
     const tags = await workspaceTags(core);
     clash(tags);
-    const path = tagsPath(core);
-    const old = await readMaybe(path);
-    const body: TagsJson = { formatVersion: 1, tags: [...tags, tag] };
-    await writeFileAtomic(path, JSON.stringify(body, null, 2));
-    try {
-      const at = core.clock().toISOString();
-      const changes = diffToChanges(null, tag, { at, author: core.actor, device: core.device, projectId: "workspace", entity: { type: "tag", id: tag.id } });
-      await appendChanges(join(core.root, "changes"), changes, undefined, CHANGE_LOG_MODE);
-    } catch (err) {
-      if (old) await writeFileAtomic(path, old);
-      else await fsp.rm(path, { force: true });
-      throw err;
-    }
+    await writeWorkspaceTags(core, [...tags, tag], null, tag, tag.id);
     return tag;
+  });
+}
+
+/**
+ * A workspace tag can be on sources of every project, so renaming or deleting one is a change to
+ * every project: refused before anything is written unless each project can take a governed change
+ * now (no unresolved interrupted change, encrypted projects unlocked).
+ */
+function workspaceChangeTargets(core: RepoCore): string[] {
+  const ids: string[] = [];
+  for (const st of core.projects.values()) {
+    if (st.recoveryPending) throw new RecoveryPendingError(st.project.id);
+    core.assertUnlocked(st);
+    ids.push(st.project.id);
+  }
+  return ids.sort();
+}
+
+async function workspaceTag(core: RepoCore, id: string): Promise<{ tags: Tag[]; tag: Tag }> {
+  const tags = await workspaceTags(core);
+  const tag = tags.find((t) => t.id === id);
+  if (!tag) throw new NotFoundError("Tag", id);
+  return { tags, tag };
+}
+
+/** Writes tags.json and change-logs the change (projectId "workspace"); tags.json is put back if the log fails. */
+async function writeWorkspaceTags(core: RepoCore, tags: Tag[], before: Tag | null, after: Tag | null, id: string): Promise<void> {
+  const path = tagsPath(core);
+  const old = await readMaybe(path);
+  const body: TagsJson = { formatVersion: 1, tags };
+  await writeFileAtomic(path, JSON.stringify(body, null, 2));
+  try {
+    const at = core.clock().toISOString();
+    const changes = diffToChanges(before, after, { at, author: core.actor, device: core.device, projectId: "workspace", entity: { type: "tag", id } });
+    await appendChanges(join(core.root, "changes"), changes, undefined, CHANGE_LOG_MODE);
+  } catch (err) {
+    if (old) await writeFileAtomic(path, old);
+    else await fsp.rm(path, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * Renames (and optionally recolours) a workspace tag (R118). Governed and audited in every project
+ * (one governed change each, op "workspace-tag.rename", entity the tag; the names stay out of the
+ * audit log); then tags.json is rewritten atomically and change-logged. A copy of the tag listed in
+ * a project's own project.json is renamed in that project's change. Each project's change is
+ * crash-safe on its own (R26); a crash between them leaves tags.json as it was, and renaming again
+ * finishes the job.
+ */
+export async function renameWorkspaceTag(core: RepoCore, id: string, name: string, color?: string): Promise<Tag> {
+  core.assertWritable();
+  if (typeof name !== "string" || name.trim() === "" || name.length > 200) throw new InvalidInputError("a tag name of 1 to 200 characters is required");
+  const clash = (tags: Tag[]) => {
+    if (tags.some((t) => t.id !== id && t.name.toLowerCase() === name.toLowerCase())) throw new InvalidInputError(`A tag named "${name}" already exists`);
+  };
+  const first = await workspaceTag(core, id);
+  clash(first.tags);
+  const next = Tag.parse({ ...first.tag, name, ...(color !== undefined ? { color } : {}) });
+  for (const projectId of workspaceChangeTargets(core)) {
+    await runMutation(
+      core,
+      projectId,
+      ORGANIZE,
+      async (tx) => {
+        const data = await readFullData(core, tx.state);
+        const copy = data.tags.find((t) => t.id === id);
+        if (!copy) return;
+        const before = structuredClone(copy);
+        Object.assign(copy, Tag.parse({ ...copy, name, ...(color !== undefined ? { color } : {}) }));
+        await writeProjectData(core, tx, data);
+        tx.record("tag", id, before, copy);
+      },
+      { op: "workspace-tag.rename", entity: { type: "tag", id } },
+    );
+  }
+  return core.serial(async () => {
+    core.assertWritable();
+    const { tags, tag } = await workspaceTag(core, id);
+    clash(tags);
+    const renamed = Tag.parse({ ...tag, name: next.name, ...(next.color !== undefined ? { color: next.color } : {}) });
+    await writeWorkspaceTags(core, tags.map((t) => (t.id === id ? renamed : t)), tag, renamed, id);
+    return renamed;
+  });
+}
+
+/**
+ * Deletes a workspace tag (R118). Every project, in turn, loses it from its sources (and from its
+ * project.json, if listed there) in one governed, audited change (op "workspace-tag.delete"; a
+ * project without it still records the deletion); only then is it removed from tags.json and
+ * change-logged. Each project's change is crash-safe on its own (R26); an interruption leaves the
+ * tag in tags.json, and deleting again finishes the job.
+ */
+export async function deleteWorkspaceTag(core: RepoCore, id: string): Promise<void> {
+  core.assertWritable();
+  await workspaceTag(core, id);
+  for (const projectId of workspaceChangeTargets(core)) {
+    await runMutation(
+      core,
+      projectId,
+      ORGANIZE,
+      async (tx) => {
+        const data = await readFullData(core, tx.state);
+        const copy = data.tags.find((t) => t.id === id);
+        if (copy) {
+          data.tags = data.tags.filter((t) => t.id !== id);
+          await writeProjectData(core, tx, data);
+          tx.record("tag", id, copy, null);
+        }
+        for (const sid of tx.state.sources.keys()) {
+          const sf = await readSourceFile(core, tx.state, sid);
+          if (sf.source.tagIds.includes(id)) await editSource(core, tx, sid, (src) => ({ ...src, tagIds: src.tagIds.filter((x) => x !== id) }));
+        }
+      },
+      { op: "workspace-tag.delete", entity: { type: "tag", id } },
+    );
+  }
+  await core.serial(async () => {
+    core.assertWritable();
+    const { tags, tag } = await workspaceTag(core, id);
+    await writeWorkspaceTags(core, tags.filter((t) => t.id !== id), tag, null, id);
   });
 }
 

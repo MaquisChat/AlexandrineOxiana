@@ -12,13 +12,14 @@ import {
   confirmField,
   createAttach,
   ocrQueueFor,
+  ProjectLockedError,
   proxyQueueFor,
   readAssetText,
   search,
   transcriptVersions,
   type SourcePatch,
 } from "@ao/library";
-import { badRequest, notFound } from "../errors.js";
+import { ApiError, badRequest, notFound } from "../errors.js";
 import { bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
 
 /** Fields a PATCH may change (provenance, folder and ids never). */
@@ -228,6 +229,32 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     await s.repo.deleteTag(projectId, paramsOf(req).tid ?? "");
+    return { deleted: true };
+  });
+
+  // ---- workspace tags (R118): every project records the change, so each must be able to take it ----
+  const workspaceChange = async <T>(s: { repo: { listProjects(): Array<{ id: string; name: string }> } }, fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof ProjectLockedError) {
+        const name = s.repo.listProjects().find((p) => p.id === err.projectId)?.name ?? "an encrypted project";
+        throw new ApiError(409, "CONFLICT", `Unlock every encrypted project first (${name} is locked): a workspace tag can be on sources in any project, so each one records the change.`);
+      }
+      throw err;
+    }
+  };
+  app.patch("/workspace-tags/:tid", async (req) => {
+    const s = state.requireWritable();
+    const b = bodyOf(req);
+    if (b.name === undefined) throw badRequest('Give the tag\'s new "name".');
+    const tid = paramsOf(req).tid ?? "";
+    return workspaceChange(s, () => s.repo.renameWorkspaceTag(tid, str(b, "name", 200), optStr(b, "color", 32)));
+  });
+  app.delete("/workspace-tags/:tid", async (req) => {
+    const s = state.requireWritable();
+    const tid = paramsOf(req).tid ?? "";
+    await workspaceChange(s, () => s.repo.deleteWorkspaceTag(tid));
     return { deleted: true };
   });
 
