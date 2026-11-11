@@ -28,6 +28,7 @@ afterEach(async () => {
   backupSeams.crashAt = undefined;
   backupSeams.failBackup = false;
   seams.crashAt = undefined;
+  seams.failAuditAppendFor = undefined;
   await kit.close();
 });
 
@@ -593,6 +594,31 @@ describe("crash safety: a removal that was not recorded", () => {
       expect(verifyChain(await auditEvents(kit, p)).ok).toBe(true);
     });
   }
+
+  it("the record cannot be written (the audit log refuses the entry): the backup still counts as outstanding and the warning stands until a later pass records it", async () => {
+    const { p, x, certificatePath } = await stuck();
+    later(HOUR);
+    seams.failAuditAppendFor = p.id;
+    try {
+      await expect(resumeDestruction(kit.repo, p.id)).rejects.toThrow();
+    } finally {
+      seams.failAuditAppendFor = undefined;
+    }
+    // The file went, but nothing says so yet: not an amendment, not the audit log, not the warning.
+    expect(existsSync(x.path)).toBe(false);
+    let rec = await readDestruction(kit.repo, p.id, certificatePath);
+    expect(rec).toMatchObject({ status: "pending", outstanding: [rel(x)] });
+    expect(rec.amendments).toHaveLength(1);
+    expect(rec.problem).toBeUndefined();
+    expect(await holdingNotRemoved(kit.repo, p.id)).toEqual([rel(x)]);
+    expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+    later(HOUR);
+    await resumeDestruction(kit.repo, p.id);
+    rec = await readDestruction(kit.repo, p.id, certificatePath);
+    expect(rec).toMatchObject({ status: "no-longer-present", outstanding: [] });
+    expect(await recorded(p, rel(x))).toEqual({ removed: 0, gone: 1 });
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+  });
 
   it("a crash right after the destruction, before its backups were touched: the retry works from the audit log's list", async () => {
     const p = await makeProject(kit, RETAIN, false, "Early");

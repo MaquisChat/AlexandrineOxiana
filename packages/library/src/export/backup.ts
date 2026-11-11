@@ -125,6 +125,9 @@ const BACKUP_TEMP = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))
 /** A backup's file name (any project name, date and collision suffix). */
 const BACKUP_NAME = /^.+ - backup - modified \d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.zip(?:\.enc)?$/u;
 
+/** Package-internal: whether `name` is a plain file name of the backup naming pattern (the only files in Backups/ the app ever removes). */
+export const isBackupFileName = (name: string): boolean => name === basename(name) && BACKUP_NAME.test(name);
+
 /** Points in a backup or a prune where a test can simulate the process dying (R125). */
 export type BackupCrashPoint =
   | "after-decision"
@@ -1273,7 +1276,7 @@ export async function removeHoldingBackups(repo: Repo, files: string[]): Promise
   const gone: string[] = [];
   const failed: Array<{ file: string; error: unknown }> = [];
   for (const f of files) {
-    if (f !== basename(f) || !BACKUP_NAME.test(f)) {
+    if (!isBackupFileName(f)) {
       failed.push({ file: f, error: new Error("this is not the name of a backup") });
       continue;
     }
@@ -1296,7 +1299,7 @@ export async function removeHoldingBackups(repo: Repo, files: string[]): Promise
 /** Package-internal (retention, R147): clears the manifest entries of backups that are no longer in Backups/ (and only of those). */
 export async function forgetMissingBackups(repo: Repo, files: string[]): Promise<void> {
   const dir = backupsDir(repo);
-  const names = files.filter((f) => f === basename(f) && BACKUP_NAME.test(f));
+  const names = files.filter(isBackupFileName);
   if (!names.length) return;
   await withManifest(repo, async (m) => {
     for (const f of names) if (!(await isThere(join(dir, f)))) forget(m, f);
@@ -1333,11 +1336,11 @@ export async function backupFilesNow(repo: Repo, files: string[]): Promise<Map<s
   const m = await withManifest(repo, async (x) => x);
   const out = new Map<string, { present: boolean; entry?: BackupEntry }>();
   for (const f of files) {
-    const ok = f === basename(f) && BACKUP_NAME.test(f);
-    const present = ok && (await isThere(join(dir, f)));
-    let entry = present ? m.backups.find((b) => b.file === f) : undefined;
+    // Anything but a plain name is never looked for outside Backups/, and never counted as gone.
+    const present = f === basename(f) ? await isThere(join(dir, f)) : true;
+    let entry = present && isBackupFileName(f) ? m.backups.find((b) => b.file === f) : undefined;
     // One the manifest does not know at all (it was replaced, say) is read here; one it lists as unreadable was just tried.
-    if (present && !entry && !(m.unresolved ?? []).includes(f)) entry = await readEntry(repo, f);
+    if (present && !entry && isBackupFileName(f) && !(m.unresolved ?? []).includes(f)) entry = await readEntry(repo, f);
     out.set(f, { present, ...(entry ? { entry } : {}) });
   }
   return out;

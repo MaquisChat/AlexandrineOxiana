@@ -60,6 +60,7 @@ import {
   backupProjectHeld,
   destructionNotes,
   forgetMissingBackups,
+  isBackupFileName,
   listBackups,
   noteDestruction,
   plainErrorText,
@@ -358,7 +359,8 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
  */
 async function holdingBackups(repo: Repo, projectId: string, ids: ReadonlySet<string>): Promise<{ files: string[]; unresolved: string[] }> {
   const files = (await listBackups(repo, projectId)).filter((b) => !Array.isArray(b.assets) || b.assets.some((id) => ids.has(id))).map((b) => b.file);
-  return { files, unresolved: await unresolvedBackupsOf(repo, projectId) };
+  // Only files named as the app names its backups are ever listed (and so ever removed).
+  return { files: files.filter(isBackupFileName), unresolved: (await unresolvedBackupsOf(repo, projectId)).filter(isBackupFileName) };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -810,15 +812,16 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     return undefined;
   }
 
-  // What this pass found, applied to the list.
-  for (const f of removed) a.removed.set(f, at);
-  for (const f of gone) a.gone.set(f, at);
-  for (const f of notHolding) a.notHolding.set(f, at);
-  if (freshMade) a.freshBackup = freshMade;
-  if (freshBackupFailed) a.freshBackupFailed = freshBackupFailed;
-  else delete a.freshBackupFailed;
-  const outstanding = outstandingOf(a);
-  const status = statusOf(a);
+  // What this pass found, applied to a copy of the list: `a` itself changes only once it is recorded.
+  const next: Audited = { ...a, removed: new Map(a.removed), gone: new Map(a.gone), notHolding: new Map(a.notHolding) };
+  for (const f of removed) next.removed.set(f, at);
+  for (const f of gone) next.gone.set(f, at);
+  for (const f of notHolding) next.notHolding.set(f, at);
+  if (freshMade) next.freshBackup = freshMade;
+  if (freshBackupFailed) next.freshBackupFailed = freshBackupFailed;
+  else delete next.freshBackupFailed;
+  const outstanding = outstandingOf(next);
+  const status = statusOf(next);
   // The note says only what happened (N1): composed from the outcome above.
   let note: string | undefined;
   if (act && freshBackupFailed) {
@@ -826,7 +829,7 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     const one = failed.length === 1;
     note = failed.length
       ? `No new backup could be made after the destruction: ${freshBackupFailed}${stop} ${one ? "A backup that holds the destroyed files could not be removed yet" : "Some backups that hold the destroyed files could not be removed yet"} (see notRemoved); removing ${one ? "it" : "them"} is tried again.`
-      : `${a.gone.size ? "None of the earlier backups that held the destroyed files is in the Backups folder any more" : "The earlier backups that held the destroyed files were removed"}. No new backup could be made afterwards: ${freshBackupFailed}${stop} This project has no backup until one succeeds.`;
+      : `${next.gone.size ? "None of the earlier backups that held the destroyed files is in the Backups folder any more" : "The earlier backups that held the destroyed files were removed"}. No new backup could be made afterwards: ${freshBackupFailed}${stop} This project has no backup until one succeeds.`;
   }
   const number = a.amendments.length + 1;
   const content = {
@@ -862,6 +865,11 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     ...(freshBackupFailed ? { freshBackupFailed } : {}),
   };
   const w = await amendProjectDestruction(repo, projectId, { certificate: a.certificate, certificateSha256: a.certificateSha256, number, content, facts });
+  // Recorded: the list is now what the audit log says.
+  Object.assign(a, { removed: next.removed, gone: next.gone, notHolding: next.notHolding });
+  if (next.freshBackup) a.freshBackup = next.freshBackup;
+  if (next.freshBackupFailed) a.freshBackupFailed = next.freshBackupFailed;
+  else delete a.freshBackupFailed;
   a.amendments.push({ name: w.name, sha256: w.sha256, at });
   a.lastRecordedAt = at;
   delete a.reportedProblem;
