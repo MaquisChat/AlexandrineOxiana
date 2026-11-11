@@ -407,25 +407,7 @@ function keysOf(v: unknown): string[] {
   return [];
 }
 
-const D3: Defect = { id: "D3", title: "the source screen displays the proxy (the picture, not only its file name)" };
-
-/** A Live Photo imported through the wizard into an encrypted project that coarsens locations; resolves once both proxies exist. */
-async function importLivePhoto(app: AppHarness, page: Page): Promise<{ projectId: string }> {
-  const phone = join(app.root, "sources", "PHONE");
-  await buildLivePhoto(phone);
-  const { projectId } = await libraryWithProject(app, page, { library: "Field library", project: "Harbour walk", governanceYaml: COARSEN_RULES, passphrase: PASSPHRASE });
-  await openWizard(page, "Camera or phone folder", "Camera or phone folder", phone);
-  await scanAndRun(page);
-  await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 1");
-  const list = (await app.api<SourceList>("GET", `/projects/${projectId}/sources`)).body;
-  const sid = list.items[0]!.id;
-  await expect
-    .poll(async () => (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${sid}`)).body.assets.filter((a) => a.role === "derived").length, { timeout: 60_000 })
-    .toBe(2);
-  return { projectId };
-}
-
-test("scenario 4: device import of a Live Photo — one source, its proxy, the location coarsened", async ({ page, app }) => {
+test("scenario 4: device import of a Live Photo — one source, its proxy, the location coarsened", async ({ page, app, browserName }) => {
   const phone = join(app.root, "sources", "PHONE");
   const plain = join(app.root, "plain");
   let projectId = "";
@@ -487,7 +469,17 @@ test("scenario 4: device import of a Live Photo — one source, its proxy, the l
     await expect(files.getByRole("listitem").filter({ hasText: /proxy · .* · encrypted/ })).toHaveCount(2);
   });
 
-  await blockedBy(D3);
+  await test.step("the source screen shows the viewing copy as a picture (formerly defect D3), read by authenticated fetch as a blob", async () => {
+    const detail = page.getByRole("region", { name: "Source details" });
+    // The JPEG viewing copy only: the HEIC original is not a picture a browser shows, and the videos are not pictures.
+    await expect(detail.getByRole("img")).toHaveCount(1);
+    await expect(detail.getByRole("img")).toHaveAttribute("src", /^blob:/);
+    // Decoded, not a broken image: it has a size of its own. Not checked in WebKit: there, under this
+    // harness (the app's origin answered by Playwright's route), no blob: picture decodes at all, not
+    // even a known-good JPEG made in the page itself, while Chromium decodes the same bytes (Task 34d report).
+    if (browserName !== "webkit") await expect.poll(() => detail.getByRole("img").evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+    else test.info().annotations.push({ type: "note", description: "blob: pictures do not decode in WebKit under the route-served app origin; decoding checked in Chromium only" });
+  });
 
   await test.step("what the service stored carries no exact location: the record has none, and every stored file is encrypted", async () => {
     const record = JSON.stringify(stored);
@@ -531,16 +523,4 @@ test("scenario 4: device import of a Live Photo — one source, its proxy, the l
     }
     expect(readFileSync(join(libraryPath, ...stored!.assets.find((a) => a.role === "original" && a.kind === "image")!.path.split("/"))).subarray(0, 5).toString("latin1")).toBe("AOENC");
   });
-});
-
-// ---------- the step scenario 4 cannot do yet, on its own (expected to fail while the defect reproduces) ----------
-
-test(`${D3.id}: ${D3.title}`, async ({ page, app }) => {
-  await importLivePhoto(app, page);
-  await page.getByRole("link", { name: "Back to library" }).click();
-  await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: "2026-03-14 iPhone 15 Pro - IMG_0001" }).click();
-  const detail = page.getByRole("region", { name: "Source details" });
-  await expect(detail.getByRole("listitem").filter({ hasText: /proxy · .* · encrypted/ })).toHaveCount(2);
-  expectDefect(D3);
-  await expect(detail.getByRole("img")).toHaveCount(1, { timeout: DEFECT_TIMEOUT });
 });

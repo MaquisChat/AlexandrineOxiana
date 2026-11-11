@@ -58,6 +58,8 @@ describe("Recheck project (R99)", () => {
     const user = userEvent.setup();
     render(<Library api={testApi()} current={CURRENT_RW as never} />);
     // Step by step (the projects, then the sources, then the open source): each waits for what the one before it loaded.
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await within(nav).findByRole("button", { name: /Dissertation/ });
     await screen.findByRole("button", { name: "Recheck project" });
     const table = await screen.findByRole("table", { name: "Sources" });
     await user.click(await within(table).findByRole("button", { name: "Ethnography at Work" }));
