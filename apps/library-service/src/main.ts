@@ -14,7 +14,8 @@
  *                     environment the process started with): Task 37 will pass the token on stdin
  *                     instead (R98), and this variable stays for development and tests.
  *   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any free port)
- *   AO_LIBRARY        a library folder to open at start (optional)
+ *   AO_LIBRARY        a library folder to open at start (optional; without it the library open
+ *                     when the service last ran is reopened, or named as not found)
  *   AO_CONFIG_DIR     the app settings folder (default: the platform's usual place)
  *   AO_NO_WORKER=1    run without the media worker (capture, transcription, proxies and OCR wait)
  *
@@ -57,6 +58,9 @@ async function main(): Promise<void> {
     const lib = await openLibrary(process.env.AO_LIBRARY, svc.state.deps, { onLockLost: () => svc.state.publishState() });
     svc.state.roots.add(lib.root);
     await svc.state.adopt(lib);
+  } else {
+    // Not awaited: GET /libraries waits for it (D5).
+    void svc.state.reopenLast();
   }
   const listening = await svc.listen(port);
   process.stdout.write(`AO_SERVICE_READY port=${listening}\n`);

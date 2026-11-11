@@ -9,7 +9,7 @@
  * whole edited transcript).
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { appConfigDir, deviceDeps, type Deps, type openLibrary } from "@ao/library";
+import { appConfigDir, deviceDeps, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
@@ -50,6 +50,8 @@ export interface ServiceOptions {
   suspendTimeoutMs?: number;
   /** Opens a library (test seam). */
   openLibrary?: typeof openLibrary;
+  /** Rebuilds the index when needed (test seam). */
+  rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
   /** Runs right before a move starts copying (test seam). */
   beforeExecuteMove?: () => Promise<void>;
   /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
@@ -127,6 +129,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.watchStabilityMs !== undefined ? { watchStabilityMs: opts.watchStabilityMs } : {}),
     ...(opts.suspendTimeoutMs !== undefined ? { suspendTimeoutMs: opts.suspendTimeoutMs } : {}),
     ...(opts.openLibrary ? { openLibrary: opts.openLibrary } : {}),
+    ...(opts.rebuildIndexIfNeeded ? { rebuildIndexIfNeeded: opts.rebuildIndexIfNeeded } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
