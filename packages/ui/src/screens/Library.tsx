@@ -20,11 +20,13 @@ import { StatusBanner, bannersFor, volumeOf } from "../components/StatusBanner";
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
+import { PATHS } from "../navigation";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 
 /** Where "needs review" outcomes send the researcher (the import review queue, Task 35). */
-export const REVIEW_QUEUE_PATH = "/import/review";
+export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
+const importHref = (projectId: string) => `${PATHS.importWizard}?project=${encodeURIComponent(projectId)}`;
 
 export interface LibraryProps {
   api: LibraryApi;
@@ -290,7 +292,12 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               Lock project
             </button>
           )}
-          <a href="/settings/appearance" onClick={(e) => follow(e, "/settings/appearance")}>
+          {!locked && !readOnly && project && (
+            <a href={importHref(project.id)} onClick={(e) => follow(e, importHref(project.id))}>
+              Import
+            </a>
+          )}
+          <a href={PATHS.appearance} onClick={(e) => follow(e, PATHS.appearance)}>
             Appearance
           </a>
           {onSwitchLibrary && (

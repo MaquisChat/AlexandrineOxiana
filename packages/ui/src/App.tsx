@@ -1,21 +1,59 @@
 /**
- * The app shell. For now it shows the Appearance settings; the library screens arrive in Task 33.
+ * The app shell and its one router (R118). Navigation is pushState-based (navigation.tsx; never
+ * hash routing) and this file owns the single route table: the library screens (Task 33), the bulk
+ * import wizard and its review queue (Task 35) and the appearance settings. Every screen other than
+ * the library shows a "Back to library" link. Without a service connection only the appearance
+ * settings can be shown.
  */
-import { useMemo } from "react";
+import { useMemo, type ReactElement } from "react";
 import { createClient, type ApiClient } from "./api/client";
+import { BackToLibrary, normalisePath, PATHS, useDropGuard, useLocation, type AppLocation } from "./navigation";
+import { importRoute, isImportPath } from "./routes/import";
+import { isLibraryPath, LibraryRoutes } from "./routes/library";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
-import { LibraryRoutes } from "./routes/library";
 
 export type { ServiceConnection } from "./serviceConnection";
 
+export interface AppRoute {
+  /** Which paths (normalised, without query) this route shows. */
+  matches(path: string): boolean;
+  render(loc: AppLocation, client: ApiClient): ReactElement | null;
+  /** Shows the "Back to library" link above the screen. */
+  back: boolean;
+}
+
+/** The route table: first match wins. */
+export const ROUTES: readonly AppRoute[] = [
+  { matches: isLibraryPath, render: (_loc, client) => <LibraryRoutes client={client} />, back: false },
+  { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
+  { matches: (p) => p === PATHS.appearance, render: () => <AppearanceSettingsScreen />, back: true },
+];
+
+function NotFound() {
+  return (
+    <main className="ao-page" aria-labelledby="ao-not-found">
+      <h1 id="ao-not-found">Page not found</h1>
+      <p>There is no screen at this address.</p>
+    </main>
+  );
+}
+
+export function routeFor(loc: AppLocation, client: ApiClient): ReactElement {
+  const route = ROUTES.find((r) => r.matches(normalisePath(loc.pathname)));
+  const screen = route?.render(loc, client) ?? <NotFound />;
+  return (
+    <>
+      {route?.back !== false && <BackToLibrary />}
+      {screen}
+    </>
+  );
+}
+
 export function App({ service }: { service?: ServiceConnection }) {
   const client: ApiClient | undefined = useMemo(() => (service ? createClient(service.baseUrl, service.token) : undefined), [service]);
-  return (
-    <AppearanceProvider {...(client ? { client } : {})}>
-      <AppearanceSettingsScreen />
-      {client ? <LibraryRoutes client={client} /> : null}
-    </AppearanceProvider>
-  );
+  const loc = useLocation();
+  useDropGuard();
+  return <AppearanceProvider {...(client ? { client } : {})}>{client ? routeFor(loc, client) : <AppearanceSettingsScreen />}</AppearanceProvider>;
 }

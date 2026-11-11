@@ -17,6 +17,7 @@
     "fit:palette": "tsx scripts/fit-palette.ts"
   },
   "dependencies": {
+    "@ao/core": "workspace:*",
     "@ao/shared": "workspace:*",
     "react": "19.3.1",
     "react-dom": "19.3.1",
