@@ -10,6 +10,7 @@ import {
   IndexHandle,
   KeyRing,
   WorkerUnavailableError,
+  backupFailure,
   backupIfDue,
   createBulkImport,
   createIndexSink,
@@ -22,6 +23,7 @@ import {
   scrubPaths,
   startMediaWorker,
   startWatchedFolders,
+  type BackupFailure,
   type BatchHandle,
   type BulkImport,
   type Deps,
@@ -684,10 +686,13 @@ export class ServiceState {
       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
       projectWarnings: this.cachedProjectWarnings,
+      // Why a project shows `backup-failed` (R125: a refusal gives the engine's reason), path-scrubbed.
+      backupFailures: this.cachedBackupFailures,
     };
   }
 
   private cachedProjectWarnings: Record<string, string[]> = {};
+  private cachedBackupFailures: Record<string, BackupFailure> = {};
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
     return s.repo.integrityWarnings.map((w) => ({
@@ -701,8 +706,14 @@ export class ServiceState {
   /** The projects' standing warnings (backup failed, deletion records unreadable), by project id. */
   async projectWarnings(s: Session): Promise<Record<string, string[]>> {
     const out: Record<string, string[]> = {};
-    for (const p of s.repo.listProjects()) out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
+    const failures: Record<string, BackupFailure> = {};
+    for (const p of s.repo.listProjects()) {
+      out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
+      const f = out[p.id]!.includes("backup-failed") ? await backupFailure(s.repo, p.id).catch(() => undefined) : undefined;
+      if (f) failures[p.id] = { ...f, reason: scrubPaths(f.reason, this.roots) };
+    }
     this.cachedProjectWarnings = out;
+    this.cachedBackupFailures = failures;
     return out;
   }
 
@@ -711,6 +722,7 @@ export class ServiceState {
     const s = this.session;
     if (!s) {
       this.cachedProjectWarnings = {};
+      this.cachedBackupFailures = {};
       this.events.publish("library.state", this.libraryState());
       return;
     }

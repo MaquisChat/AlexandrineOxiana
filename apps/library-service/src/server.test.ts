@@ -911,6 +911,63 @@ describe("review round 1: backups on open and unlock (R99 I7)", () => {
   });
 });
 
+describe("R125: backups are governed and audited", () => {
+  /** The library sits on this computer's disk, which these rules exclude. */
+  const REMOVABLE_ONLY = `${OPEN_GOV}residency:\n  allowed: [removable]\n`;
+  const NOT_ALLOWED = /this project's rules do not allow its data there/u;
+
+  it("POST /projects/:id/backups makes a backup now: file name, sha256 and size, never a path; audited", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, false, "Manual");
+    const r = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.backup).toEqual({ file: expect.stringMatching(/^Manual - backup - modified .+\.zip$/u), sha256: expect.stringMatching(/^[0-9a-f]{64}$/u), bytes: expect.any(Number), pruned: [], warnings: [] });
+    expect(r.body).not.toContain(path);
+    expect(r.body).not.toContain(tmp);
+    expect(await listBackups(svc.state.session!.repo, pid)).toHaveLength(1);
+    const { events } = await svc.state.session!.repo.readAudit(pid);
+    expect(events.map((e) => e.action)).toEqual(expect.arrayContaining(["backup", "backup.create"]));
+  });
+
+  it("a refused manual backup → 403 POLICY_DENIED with the engine's reason; nothing is made; the denial is audited", async () => {
+    await start();
+    const path = await openNewLibrary();
+    const pid = await newProject(REMOVABLE_ONLY, false, "Refused");
+    const r = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(r.status, r.body).toBe(403);
+    expect(r.json.error).toMatchObject({ code: "POLICY_DENIED", reason: expect.stringMatching(NOT_ALLOWED) });
+    expect(r.body).not.toContain(path);
+    expect(await listBackups(svc.state.session!.repo, pid)).toEqual([]);
+    const { events } = await svc.state.session!.repo.readAudit(pid);
+    expect(events.find((e) => e.action === "backup")?.decision).toMatchObject({ result: "deny", reason: expect.stringMatching(NOT_ALLOWED) });
+  });
+
+  it("a refused SCHEDULED backup raises `backup-failed` with the reason in the library state; a later backup clears it", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(REMOVABLE_ONLY, false, "Scheduled");
+    await svc.state.idle();
+    const runs = await svc.state.runScheduledBackups();
+    expect(runs).toEqual([expect.objectContaining({ projectId: pid, ok: false, backedUp: false, error: expect.stringMatching(NOT_ALLOWED) })]);
+    await svc.state.projectWarnings(svc.state.session!);
+    const state = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, { reason: string; refused?: boolean }> };
+    expect(state.projectWarnings[pid]).toContain("backup-failed");
+    expect(state.backupFailures[pid]).toMatchObject({ refused: true, reason: expect.stringMatching(NOT_ALLOWED) });
+    expect(JSON.stringify(state)).not.toContain(tmp);
+    // The rules are changed (a loosening, with a reason); a backup made by hand clears the warning.
+    const g = await call({ url: `/projects/${pid}/governance` });
+    expect(g.status, g.body).toBe(200);
+    const put = await call({ method: "PUT", url: `/projects/${pid}/governance`, body: { yaml: OPEN_GOV, baseSha256: g.json.sha256, reason: "The library stays on this computer." } });
+    expect(put.status, put.body).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/backups` })).status).toBe(200);
+    await svc.state.projectWarnings(svc.state.session!);
+    const after = svc.state.libraryState() as { projectWarnings: Record<string, string[]>; backupFailures: Record<string, unknown> };
+    expect(after.projectWarnings[pid]).not.toContain("backup-failed");
+    expect(after.backupFailures[pid]).toBeUndefined();
+  });
+});
+
 describe("review round 1: smaller route fixes (R99 minors)", () => {
   beforeEach(() => start());
 
