@@ -12,6 +12,7 @@ import { decryptStream } from "../crypto/format.js";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
+import { attachConsentDocument } from "../consent-docs.js";
 import { addProtocolDocuments, listProtocolDocuments } from "../protocol-docs.js";
 import { FieldworkInUseError, InvalidInputError, NotFoundError, type Repo } from "./index.js";
 import { projectReviewEntries } from "./repo.js";
@@ -138,6 +139,22 @@ describe("fieldwork updates (R97)", () => {
     expect(u).toMatchObject({ scope: "audio and video", expires: "2027-03-14", documentAssetId: "0190f0f0-0000-7000-8000-0000000000aa" });
     await repo.withdrawConsent(pid, c.id);
     await expect(repo.updateConsent(pid, c.id, { scope: "anything" })).rejects.toBeInstanceOf(InvalidInputError);
+  });
+});
+
+describe("consent documents (dropped onto a consent record)", () => {
+  it("stores the document as an identifiable source linked to the participant and records its asset on the consent", async () => {
+    const p = await repo.createParticipant(pid, {});
+    const c = await repo.createConsent(pid, { participantId: p.id, scope: "audio", date: "2026-03-14" });
+    const r = await attachConsentDocument(repo, pid, c.id, pdf);
+    const sf = await repo.getSource(pid, r.sourceId);
+    expect(sf.source.participantIds).toEqual([p.id]);
+    expect(sf.source.provenance.identifiable).toBe(true);
+    expect(sf.assets.map((a) => a.id)).toContain(r.assetId);
+    expect(r.consent.documentAssetId).toBe(r.assetId);
+    expect((await repo.getFieldwork(pid)).consents[0]!.documentAssetId).toBe(r.assetId);
+    await repo.withdrawConsent(pid, c.id);
+    await expect(attachConsentDocument(repo, pid, c.id, pdf)).rejects.toBeInstanceOf(InvalidInputError);
   });
 });
 

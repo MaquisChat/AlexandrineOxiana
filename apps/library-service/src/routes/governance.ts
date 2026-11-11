@@ -4,13 +4,29 @@
  * returns the effective policy's violations; a change that loosens the rules needs a `reason`,
  * which is recorded on the audit event (Repo.setGovernance). An edit names the version it was made
  * from (If-Match / `baseSha256`, the sha256 GET returns); a file changed since → 409 CONFLICT.
+ *
+ * Also the two governance controls that keep files (Task 36): protocol approval documents dropped
+ * onto the protocol record (stored under `<Project>/protocol/`, sealed in encrypted projects), and
+ * retention — the raw originals due under `retention.rawDataDestroyAfter`, and their destruction
+ * (only those due, only with `confirm: true`), answered with the destruction certificate.
  */
+import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
 import { effectivePolicy, parseGovernance } from "@ao/core";
-import { GOVERNANCE_MAX_BYTES } from "@ao/library";
+import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, retentionDue } from "@ao/library";
 import { badRequest } from "../errors.js";
-import { bodyOf, optStr, projectParam, str, type Ctx } from "./util.js";
+import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
+
+const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+
+const whoAmI = (): string => {
+  try {
+    return userInfo().username;
+  } catch {
+    return "researcher";
+  }
+};
 
 /** Aliases allowed in a governance file (each one may expand a whole subtree). */
 const MAX_ALIASES = 20;
@@ -75,5 +91,58 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const r = await s.repo.setGovernance(projectId, yaml, { baseSha256, ...(reason ? { reason } : {}) });
     state.publishState();
     return { violations: r.violations, loosened: r.loosened, sha256: r.sha256 };
+  });
+
+  app.get("/projects/:id/protocol/documents", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    return { documents: await listProtocolDocuments(s.repo, projectId) };
+  });
+
+  // Approval documents dropped onto the protocol record (absolute paths the researcher chose).
+  app.post("/projects/:id/protocol/documents", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const paths = strArray(bodyOf(req), "paths", { max: 50 });
+    if (paths.some((p) => !isAbsolute(p) || p.includes("\0"))) throw badRequest('"paths" must be absolute paths.');
+    await addProtocolDocuments(s.repo, projectId, paths);
+    return { documents: await listProtocolDocuments(s.repo, projectId) };
+  });
+
+  app.get("/projects/:id/retention", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    const { yaml } = await s.repo.getGovernance(projectId);
+    let destroyAfter: string | null = null;
+    try {
+      destroyAfter = effectivePolicy(parseGovernance(yaml)).policy.retention.rawDataDestroyAfter;
+    } catch {
+      // unreadable rules: nothing is listed as due (retentionDue fails closed the same way)
+    }
+    const due = await retentionDue(s.repo, projectId, state.deps.clock());
+    const out = [];
+    for (const d of due) {
+      const sf = await s.repo.getSource(projectId, d.sourceId);
+      out.push({ sourceId: d.sourceId, title: sf.source.title.variants[0]?.value ?? "", assetIds: d.assetIds });
+    }
+    return { destroyAfter, due: out };
+  });
+
+  app.post("/projects/:id/retention/destroy", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    const assetIds = strArray(b, "assetIds", { max: 10_000, itemMax: 64 });
+    if (optBool(b, "confirm") !== true) throw badRequest("Destroying raw data cannot be undone: confirm it (confirm: true).");
+    const includeDerived = optBool(b, "includeDerived") ?? false;
+    const by = optStr(b, "by", 200) ?? whoAmI();
+    // Only originals that are due now can be destroyed through here.
+    const due = new Set((await retentionDue(s.repo, projectId, state.deps.clock())).flatMap((d) => d.assetIds));
+    if (!assetIds.length || assetIds.some((id) => !due.has(id))) throw badRequest("Only raw originals that are due for destruction can be destroyed.");
+    const r = await destroyRaw(s.repo, projectId, assetIds, by, { includeDerived });
+    state.publishState();
+    const root = s.lib.root.replace(/[\\/]+$/, "");
+    const rel = r.certificatePath.startsWith(root) ? r.certificatePath.slice(root.length + 1).split(/[\\/]/).join("/") : "";
+    return { certificate: r.certificate, certificateFile: rel };
   });
 }
