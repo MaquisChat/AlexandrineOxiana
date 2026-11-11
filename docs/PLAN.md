@@ -240,6 +240,14 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Verify: index tests; scenario 7 extended to a library with a pending job.
 - Model: Opus.
 
+**Task 61 — Issue a new recovery code [ledger: R134, R91, R92; ADR 0006]**
+- Depends: 41a, 60. Parallel: 49, 50.
+- Files: `packages/library/src/crypto/keys.ts`, `packages/library/src/repo/projects.ts`, `apps/library-service/src/routes/projects.ts`, `packages/ui/src/screens/` (project settings), `docs/adr/0006-encryption.md`, tests.
+- Why: the recovery code is shown once, at creation. A crash, a lost response or a closed window at that moment loses it for good, and nothing can issue another (found by the Task 60 review).
+- Accept: for an unlocked, encrypted project the researcher can ask for a new recovery code after entering the passphrase again. The action is evaluated by the policy engine and audited; the old code stops working; the new one is shown once with the same "I have saved it" step as at creation; a crash at any point leaves either the old code or the new one valid, never neither. ADR 0006 records that backups made before the change still open with the old code (R91, R92).
+- Verify: `pnpm --filter @ao/library exec vitest run src/crypto src/repo`; service and UI tests; adversarial review (crash points, wrong passphrase, locked project, read-only library).
+- Model: Opus.
+
 **Task 58 — Ledger loose ends in the library [ledger: R74, R93]**
 - Depends: 41a, 51 (both touch `packages/library/src/index/`). Parallel: 49, 50.
 - Files: `packages/library/src/index/`, `packages/library/src/import/zotero-local.ts`, `packages/core/src/model/project.ts`, tests.
@@ -397,11 +405,11 @@ Update after every task; commit and push.
 | 38 Fix the red build | done | 8500d33 | 47 CLI tests pass locally; CI run on GitHub pending |
 | 39 Handoff docs in and corrected | done | 1597ad7, 8747f80 | |
 | 40 Record decisions | done | 0526848 + licence commit | R120–R128; CPAL-1.0 needs no attribution display (section 14 c), notice on the About screen anyway |
-| 41a Review: library and service | fix round 1 | | 1 Critical, 4 Important (R131); implementer working |
+| 41a Review: library and service | fix round 2 | | Critical fixed and re-reviewed; 3 Important open |
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | in progress | | implementer dispatched |
+| 60 New-project dialog | fix round 1 | | spec met; 2 Important (R134) |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | not started | | |
 | 46 Fix scenario findings | not started | | |
@@ -417,6 +425,7 @@ Update after every task; commit and push.
 | 49 Backups governed | not started | | |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | not started | | |
+| 61 New recovery code | not started | | found by the Task 60 review |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | not started | | |
