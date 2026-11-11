@@ -98,5 +98,11 @@ All work is on branch `claude/eager-sagan-ndp8ku`, pushed to origin. `handoff/20
 3. Continue open task 1, then 2, 3 and 4, using the SDD process in PROCESS.md: brief → implementer → reviewer → fix rounds → append to `.superpowers/sdd/.../progress.md`. Re-copy that ledger into `docs/handoff/LEDGER.md` when you hand off.
 4. Never commit model identifiers. Commit trailers are in PROCESS.md.
 
-## Checkpoint results
-(filled in at handoff time; see below)
+## Checkpoint results (2026-11-11, at 0ad6506 plus these docs)
+- `pnpm -r typecheck`: **pass** (all 7 packages).
+- `pnpm --filter @ao/ui run build`: **pass**.
+- `pnpm test`: **2053 passed, 2 failed, 1 skipped** (103 files). Both failures are in `apps/cli/src/cli.test.ts`, and both look like test expectations that the latest integration commits made stale. They need confirming.
+  1. *"R67 in the CLI: --dry-run lists outside files…"*: the dry-run `outsideFiles` entries now carry an extra `file` field (R118 e, commit 4cad0e3). The test expects the exact old shape `{item, folder}`.
+  2. *"export writes the chosen file atomically…"*: the `--json` export result no longer matches `{format:'ris', exported:1, …}`. The likely cause is the R116/R118 merge. Check `apps/cli/src/commands/export.ts` against `packages/library/src/export/refman-export.ts`.
+  - **Next step:** fix these first, as part of open task 1. Run `pnpm --filter @ao/cli exec vitest run` and update the CLI output or the tests deliberately. Keep CLI JSON stable where it is documented in `apps/cli/README.md`.
+- Not re-run at handoff: `pnpm test:scale` (last run 83–101 s, passing), `pnpm test:py` (last run 79 passing), and the extension e2e (last run 4/4).
