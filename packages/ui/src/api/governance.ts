@@ -6,6 +6,7 @@
  * Governance edits always name the version they were made from (`baseSha256`, the sha256 GET
  * returned; R99): the service answers 409 CONFLICT when the file changed elsewhere meanwhile.
  */
+import type { AttentionMarksResponse, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 
 /**
@@ -98,6 +99,8 @@ export interface AuditEvent {
   decision?: { result: "allow" | "deny" | "allow_with_conditions"; reason?: string };
   details?: Record<string, unknown>;
 }
+
+export type { AttentionMarkView, AttentionMarksResponse, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 
 export interface AuditPage {
   events: AuditEvent[];
@@ -229,6 +232,15 @@ export function governanceApi(client: ApiClient) {
     audit: (projectId: string, opts: { limit?: number; before?: number } = {}) =>
       r<AuditPage>("GET", `${p(projectId)}/audit`, { query: { limit: opts.limit, before: opts.before } }),
     verifyAudit: (projectId: string) => r<AuditCheck>("GET", `${p(projectId)}/audit/verify`),
+
+    /** The project's attention marks (Task 50, R154 b). */
+    attention: (projectId: string) => r<AttentionMarksResponse>("GET", `${p(projectId)}/attention`),
+    /** Sets a mark aside with a reason (decided and audited, R154 d). */
+    setAsideMark: (projectId: string, markId: string, reason: string) =>
+      r<SetAsideResponse>("POST", `${p(projectId)}/attention/${encodeURIComponent(markId)}/set-aside`, { body: { reason } }),
+    /** The library's own audit log (refused project creations, set-asides; R154 a, b). */
+    libraryAudit: (opts: { limit?: number; before?: number } = {}) => r<LibraryAuditPage>("GET", "/libraries/audit", { query: { limit: opts.limit, before: opts.before } }),
+    verifyLibraryAudit: () => r<LibraryAuditCheck>("GET", "/libraries/audit/verify"),
 
     participants: (projectId: string) => r<{ participants: Participant[]; complete: boolean }>("GET", `${p(projectId)}/participants`),
     sessions: (projectId: string) => r<{ sessions: Session[]; complete: boolean }>("GET", `${p(projectId)}/sessions`),

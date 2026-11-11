@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
 import { AuditLog } from "./AuditLog";
 
@@ -36,6 +36,11 @@ function serveAudit(total: number, pageSize = 2) {
   );
   return queries;
 }
+
+// Every test: a project with no marks unless it says otherwise (Task 50).
+beforeEach(() => {
+  server.use(http.get(url(`/projects/${PID}/attention`), () => HttpResponse.json({ marks: [] })));
+});
 
 describe("Audit log", () => {
   it("names a new recovery code in plain words (Task 61)", async () => {
@@ -131,5 +136,147 @@ describe("Audit log", () => {
     render(<AuditLog api={makeApi()} projectId={PID} />);
     await userEvent.setup().click(await screen.findByRole("button", { name: "Verify integrity" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/found altered on 2026-10-01/);
+  });
+});
+
+describe("Task 50 (R154 b, d): late entries, attention marks, the library's audit log", () => {
+  const RTL = "\u202Eevil\u202C دراسة";
+
+  it("a late entry says when it happened, that it was recorded late, by which computer, and if interrupted", async () => {
+    server.use(
+      http.get(url(`/projects/${PID}/audit`), () =>
+        HttpResponse.json({
+          events: [{ ...ev(1), at: "2026-11-09T10:00:00.000Z", action: "library.relink", details: { files: 1, recordedLate: { occurredAt: "2026-11-02T08:00:00.000Z", interrupted: true, by: "dev-B", reason: "EIO" } } }],
+          total: 1,
+        }),
+      ),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    const cell = within(table).getAllByRole("row")[1]!;
+    expect(cell.textContent).toMatch(/Happened 2026-11-02T08:00:00.000Z/);
+    expect(cell.textContent).toMatch(/recorded late on 2026-11-09T10:00:00.000Z/);
+    expect(cell.textContent).toMatch(/by dev-B/);
+    expect(cell.textContent).toMatch(/may not have finished/);
+  });
+
+  it("text from the log goes through UserText (dir=auto)", async () => {
+    server.use(
+      http.get(url(`/projects/${PID}/audit`), () =>
+        HttpResponse.json({ events: [{ ...ev(1), actor: RTL, action: RTL, decision: { result: "deny", reason: RTL }, details: { op: RTL } }], total: 1 }),
+      ),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    const spans = within(table).getAllByText((_t, el) => el?.getAttribute("dir") === "auto" && (el.textContent ?? "").includes("evil"));
+    // actor, action, operation and the refusal's reason
+    expect(spans.length).toBeGreaterThanOrEqual(4);
+  });
+
+  const marks = [
+    { id: "m1", kind: "audit-unrecorded", action: "library.relink", occurredAt: "2026-11-02T08:00:00.000Z", actor: "ana", reason: "EIO", interrupted: true, canSetAside: true },
+    { id: "m2", kind: "permissions-not-set", action: "library.relink", occurredAt: "2026-11-03T08:00:00.000Z", actor: "ana", canSetAside: true },
+    { id: "bad.json", kind: "unreadable", canSetAside: true },
+    { id: "m4", kind: "waiting", action: "library.reconnect", occurredAt: "2026-11-04T08:00:00.000Z", actor: "ana", canSetAside: false },
+  ];
+
+  it("lists the project's attention marks in plain words; a mark waiting for this computer cannot be set aside here", async () => {
+    serveAudit(0);
+    server.use(http.get(url(`/projects/${PID}/attention`), () => HttpResponse.json({ marks })));
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const region = await screen.findByRole("region", { name: "Needs attention" });
+    const items = within(region).getAllByRole("listitem");
+    expect(items).toHaveLength(4);
+    expect(items[0]!.textContent).toMatch(/not recorded in the audit log/);
+    expect(items[0]!.textContent).toMatch(/library\.relink/);
+    expect(items[1]!.textContent).toMatch(/could not be made private/);
+    expect(items[2]!.textContent).toMatch(/could not be read/);
+    expect(items[3]!.textContent).toMatch(/kept on this computer/);
+    expect(within(items[3]!).queryByRole("button")).toBeNull();
+    expect(within(region).getAllByRole("button", { name: /Set aside/ })).toHaveLength(3);
+  });
+
+  it("Set aside: focus moves into the dialog and is trapped; Escape restores it; a reason is required; after it, focus is on the list's heading", async () => {
+    serveAudit(0);
+    let list = marks.slice(0, 1);
+    const posted: unknown[] = [];
+    server.use(
+      http.get(url(`/projects/${PID}/attention`), () => HttpResponse.json({ marks: list })),
+      http.post(url(`/projects/${PID}/attention/m1/set-aside`), async ({ request }) => {
+        posted.push(await request.json());
+        list = [];
+        return HttpResponse.json({ recordedIn: "project" });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const button = await screen.findByRole("button", { name: /Set aside/ });
+    await user.click(button);
+    const dialog = await screen.findByRole("dialog", { name: "Set this aside" });
+    const reason = within(dialog).getByRole("textbox", { name: /Reason/ });
+    expect(document.activeElement).toBe(reason);
+    const confirm = within(dialog).getByRole("button", { name: "Set aside" });
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+    await user.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.tab();
+    expect(document.activeElement).toBe(reason);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(button);
+
+    await user.click(button);
+    const d2 = await screen.findByRole("dialog", { name: "Set this aside" });
+    await user.type(within(d2).getByRole("textbox", { name: /Reason/ }), "Recorded on paper");
+    await user.click(within(d2).getByRole("button", { name: "Set aside" }));
+    await screen.findByText(/Nothing needs attention/);
+    expect(posted).toEqual([{ reason: "Recorded on paper" }]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Needs attention" }));
+  });
+
+  it("a refused set-aside is shown in plain words and keeps the mark", async () => {
+    serveAudit(0);
+    server.use(
+      http.get(url(`/projects/${PID}/attention`), () => HttpResponse.json({ marks: marks.slice(0, 1) })),
+      http.post(url(`/projects/${PID}/attention/m1/set-aside`), () => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "Policy could not be evaluated" } }, { status: 403 })),
+    );
+    const user = userEvent.setup();
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    await user.click(await screen.findByRole("button", { name: /Set aside/ }));
+    const d = await screen.findByRole("dialog", { name: "Set this aside" });
+    await user.type(within(d).getByRole("textbox", { name: /Reason/ }), "x");
+    await user.click(within(d).getByRole("button", { name: "Set aside" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/Policy could not be evaluated/);
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("shows the library's audit log: refused creations by name, repeats, and its integrity check", async () => {
+    serveAudit(0);
+    server.use(
+      http.get(url("/libraries/audit"), () =>
+        HttpResponse.json({
+          events: [
+            { seq: 2, at: "2026-11-09T10:00:00.000Z", actor: "ana", device: "dev-A", action: "store", decision: { result: "deny", reason: "Governance requires encryption at rest" }, details: { op: "project.create", name: RTL, encrypted: false } },
+            { seq: 1, at: "2026-11-08T10:00:00.000Z", actor: "ana", device: "dev-A", action: "delete", projectId: PID, decision: { result: "allow" }, details: { op: "attention.set-aside", reason: "Recorded on paper", mark: { kind: "unreadable" } } },
+          ],
+          total: 2,
+          repeats: { seq: 2, count: 3, lastAt: "2026-11-09T11:00:00.000Z" },
+        }),
+      ),
+      http.get(url("/libraries/audit/verify"), () => HttpResponse.json({ ok: true, events: 2, anchored: true, alteredAt: [] })),
+    );
+    const user = userEvent.setup();
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    await user.click(await screen.findByRole("button", { name: "Show the library's audit log" }));
+    const table = await screen.findByRole("table", { name: "Library audit events" });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows[0]!.textContent).toMatch(/A project named .*evil.* was asked for/);
+    expect(rows[0]!.textContent).toMatch(/Denied: Governance requires encryption at rest/);
+    expect(rows[0]!.textContent).toMatch(/asked 3 more times, last at 2026-11-09T11:00:00.000Z/);
+    expect(within(rows[0]!).getAllByText((_t, el) => el?.getAttribute("dir") === "auto" && (el.textContent ?? "").includes("evil")).length).toBeGreaterThanOrEqual(1);
+    expect(rows[1]!.textContent).toMatch(/A mark was set aside: Recorded on paper/);
+    await user.click(screen.getByRole("button", { name: "Verify the library's audit log" }));
+    expect((await screen.findByText(/2 events — hash chain intact/)).textContent).toBeTruthy();
   });
 });
