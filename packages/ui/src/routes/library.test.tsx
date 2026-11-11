@@ -36,6 +36,19 @@ describe("library routes", () => {
     expect(await screen.findByRole("heading", { name: "Choose a library" })).toBeTruthy();
   });
 
+  it("D5: on launch, a remembered library the service could not reopen shows “Library not found”, not the chooser", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, notFound: { libraryId: "lib-1", name: "Thesis library" } })));
+    render(<LibraryRoutes client={testClient()} />);
+    expect(await screen.findByRole("heading", { level: 1, name: "Library not found: Thesis library" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Choose a library" })).toBeNull();
+  });
+
+  it("D5: a not-found library the registry no longer knows falls back to the chooser", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, notFound: { libraryId: "lib-9", name: "Gone" } })));
+    render(<LibraryRoutes client={testClient()} />);
+    expect(await screen.findByRole("heading", { name: "Choose a library" })).toBeTruthy();
+  });
+
   it("navigate() changes the path and notifies listeners", async () => {
     let seen = "";
     const on = () => (seen = window.location.pathname);

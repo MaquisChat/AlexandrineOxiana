@@ -43,7 +43,15 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
       .then((r) => {
         if (!live) return;
         setKnown(r.libraries);
-        setView(r.current ? { kind: "library", current: r.current, path: r.libraries.find((l) => l.libraryId === r.current?.libraryId)?.lastKnownPaths[0] } : { kind: "chooser" });
+        // The library open when the app last ran: reopened by the service, or not found there (D5).
+        const missing = r.notFound ? r.libraries.find((l) => l.libraryId === r.notFound?.libraryId) : undefined;
+        setView(
+          r.current
+            ? { kind: "library", current: r.current, path: r.libraries.find((l) => l.libraryId === r.current?.libraryId)?.lastKnownPaths[0] }
+            : missing
+              ? { kind: "not-found", library: missing }
+              : { kind: "chooser" },
+        );
       })
       .catch(() => live && setView({ kind: "chooser" }));
     return () => {
