@@ -90,6 +90,20 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const locked = !!project && project.encrypted && !project.unlocked && !unlockedHere.has(project.id);
   const refresh = useCallback(() => setReload((n) => n + 1), []);
 
+  /**
+   * The current list of sources' generation: a new search, a reload, another project, a lock or
+   * unmounting moves it on, and a "Load more" answer for an older generation is dropped (41b1 I1).
+   */
+  const pageGen = useRef(0);
+  const morePage = useRef<AbortController | undefined>(undefined);
+  const staleMore = useCallback(() => {
+    pageGen.current++;
+    morePage.current?.abort();
+    morePage.current = undefined;
+    setLoadingMore(false);
+  }, []);
+  useEffect(() => staleMore, [staleMore]);
+
   const closedRef = useRef(onClosed);
   closedRef.current = onClosed;
 
@@ -98,12 +112,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
    * sources, open source and attach outcomes; UnlockProject shows in their place.
    */
   const forgetDecrypted = useCallback(() => {
+    staleMore();
     setCollections([]);
     setTags({ tags: [], workspaceTags: [] });
     setSources(undefined);
     setOpenSource(undefined);
     setOutcomes(undefined);
-  }, []);
+  }, [staleMore]);
   const markLocked = useCallback(
     (id: string) => {
       setUnlockedHere((s) => new Set([...s].filter((x) => x !== id)));
@@ -205,6 +220,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
 
   // ---- the sources for the current search and filters ----
   useEffect(() => {
+    staleMore();
     if (!projectId || locked) return;
     const ac = new AbortController();
     api.sources
@@ -226,20 +242,28 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const loadMore = async () => {
     if (!projectId || !sources) return;
     const pid = projectId;
+    const gen = pageGen.current;
+    const ac = new AbortController();
+    morePage.current?.abort();
+    morePage.current = ac;
+    const stale = () => gen !== pageGen.current || ac.signal.aborted || projectIdRef.current !== pid;
     setLoadingMore(true);
     try {
-      const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length });
-      if (projectIdRef.current !== pid) return;
-      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : r));
+      const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length }, { signal: ac.signal });
+      if (stale()) return;
+      // A late page is only ever added to the list it continues, never used as a whole list.
+      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
     } catch (err) {
-      fail(err, "More sources could not be read.", setSourcesError);
+      if (!stale()) fail(err, "More sources could not be read.", setSourcesError);
     } finally {
-      setLoadingMore(false);
+      if (!stale()) setLoadingMore(false);
+      if (morePage.current === ac) morePage.current = undefined;
     }
   };
 
   const selectProject = (id: string) => {
     if (id === projectId) return;
+    staleMore();
     setProjectId(id);
     setCollections([]);
     setTags({ tags: [], workspaceTags: [] });
