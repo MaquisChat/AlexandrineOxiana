@@ -38,6 +38,40 @@ function serveAudit(total: number, pageSize = 2) {
 }
 
 describe("Audit log", () => {
+  it("names a new recovery code in plain words (Task 61)", async () => {
+    server.use(
+      http.get(url(`/projects/${PID}/audit`), () =>
+        HttpResponse.json({
+          events: [
+            { ...ev(2), action: "key.recovery-activated", entity: { type: "project", id: PID }, details: { issueId: "i" } },
+            { ...ev(1), action: "store", entity: { type: "project", id: PID }, details: { op: "project.recovery-code", txn: "t", issueId: "i" } },
+          ],
+          total: 2,
+        }),
+      ),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} pageSize={2} />);
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(within(table).getByText("A new recovery code was issued")).toBeTruthy();
+    expect(within(table).getByText(/put in place when the library opened/)).toBeTruthy();
+  });
+
+  it("a refused new recovery code is not called issued (M-d)", async () => {
+    server.use(
+      http.get(url(`/projects/${PID}/audit`), () =>
+        HttpResponse.json({
+          events: [{ ...ev(1), action: "store", entity: { type: "project", id: PID }, decision: { result: "deny", reason: "Policy could not be evaluated" }, details: { op: "project.recovery-code" } }],
+          total: 1,
+        }),
+      ),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} pageSize={2} />);
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(within(table).queryByText("A new recovery code was issued")).toBeNull();
+    expect(within(table).getByText("A new recovery code was asked for")).toBeTruthy();
+    expect(within(table).getByText(/denied/i)).toBeTruthy();
+  });
+
   it("shows a paged table of events, newest first, with older pages on request", async () => {
     const queries = serveAudit(5);
     render(<AuditLog api={makeApi()} projectId={PID} pageSize={2} />);
