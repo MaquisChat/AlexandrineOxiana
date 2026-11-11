@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TranscriptVersionSummary } from "@ao/shared";
-import { buildVtt, flagLabel, formatTime, segmentAt, versionEntries } from "./transcriptModel";
+import { buildVtt, carriedFlags, flagLabel, formatTime, machineBaseOf, segmentAt, versionEntries } from "./transcriptModel";
 
 const machine = (id: string, at: string, format: "vtt" | "json", model = "small"): TranscriptVersionSummary => ({
   id,
@@ -45,6 +45,36 @@ describe("transcript model", () => {
 
   it("a run with only its segments file still appears", () => {
     expect(versionEntries([machine("j1", "2026-11-01T10:00:00.000Z", "json")]).map((x) => x.id)).toEqual(["j1"]);
+  });
+
+  it("finds a human edit's machine base through earlier edits, or the newest machine version before it", () => {
+    const edit = (id: string, at: string, basedOn?: string): TranscriptVersionSummary => ({
+      id,
+      path: `p/${id}`,
+      mime: "text/vtt",
+      bytes: 1,
+      derivation: { operation: "human-edit", at, params: basedOn ? { basedOn } : {} },
+      origin: "human-edit",
+      format: "vtt",
+    });
+    const list = [machine("v1", "2026-11-01T10:00:00.000Z", "vtt"), machine("j1", "2026-11-01T10:00:00.000Z", "json"), edit("h1", "2026-11-02T10:00:00.000Z", "j1"), edit("h2", "2026-11-03T10:00:00.000Z", "h1"), machine("v2", "2026-11-04T10:00:00.000Z", "vtt"), edit("h3", "2026-11-05T10:00:00.000Z"), edit("h4", "2026-11-05T11:00:00.000Z", "gone")];
+    expect(machineBaseOf("h2", list)).toEqual({ id: "j1", at: "2026-11-01T10:00:00.000Z", guessed: false });
+    expect(machineBaseOf("h3", list)).toEqual({ id: "v2", at: "2026-11-04T10:00:00.000Z", guessed: true });
+    expect(machineBaseOf("h4", list)).toBeUndefined();
+    expect(machineBaseOf("v1", list)?.id).toBe("v1");
+  });
+
+  it("carries machine flags only to segments identical in start, end and text", () => {
+    const m = [
+      { start: 0.0004, end: 2.3456, text: " Hello", flags: ["low-confidence"] },
+      { start: 3, end: 4, text: "Two", flags: [] },
+    ];
+    expect(carriedFlags([{ start: 0, end: 2.346, text: "Hello" }, { start: 3, end: 4, text: "Two!" }, { start: 3, end: 4.1, text: "Two" }, { start: 3, end: 4, text: "Two" }], m)).toEqual([
+      ["low-confidence"],
+      "edited",
+      "edited",
+      [],
+    ]);
   });
 
   it("formats times and finds the segment playing", () => {

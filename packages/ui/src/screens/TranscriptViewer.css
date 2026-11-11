@@ -108,3 +108,9 @@
 .ao-tx__again {
   margin-top: var(--space-4);
 }
+
+.ao-tx__unchecked {
+  margin: var(--space-1) 0 0;
+  font-weight: 600;
+  color: var(--violet-ink);
+}

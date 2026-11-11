@@ -19,14 +19,14 @@
  * after they changed (or after the screen closed) is dropped.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { TranscriptResponse, TranscriptSaveRequest } from "@ao/shared";
+import type { TranscriptResponse, TranscriptSaveRequest, TranscriptSegment, TranscriptVersionSummary } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
 import { UserText } from "../components/UserText";
 import { blockNavigation } from "../navigation";
-import { buildVtt, flagLabels, formatTime, segmentAt, versionEntries, type VersionEntry } from "./transcriptModel";
+import { buildVtt, carriedFlags, flagLabels, formatTime, machineBaseOf, segmentAt, versionEntries, type VersionEntry } from "./transcriptModel";
 import "../components/library.css";
 import "./TranscriptViewer.css";
 
@@ -92,6 +92,8 @@ function transcribeError(err: unknown, model: string): string {
 
 type Drafts = ReadonlyMap<number, string>;
 
+type BaseState = { kind: "ready"; forId: string; segments: TranscriptSegment[]; guessed: boolean; at?: string } | { kind: "unavailable"; forId: string };
+
 /**
  * A new project or source starts the viewer afresh (its player closes and revokes its ticket, and
  * nothing of the previous source is shown for even one render).
@@ -116,6 +118,9 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
   const [attempt, setAttempt] = useState(0);
   const [loadError, setLoadError] = useState<string | undefined>();
   const [versions, setVersions] = useState<VersionEntry[] | undefined>();
+  const [rawVersions, setRawVersions] = useState<TranscriptVersionSummary[]>([]);
+  /** A human edit's machine base and the flags carried from it (R143), for the transcript shown. */
+  const [base, setBase] = useState<BaseState | undefined>();
   const [selected, setSelected] = useState<string | undefined>();
   const [transcript, setTranscript] = useState<TranscriptResponse | undefined>();
   const [transcriptError, setTranscriptError] = useState<string | undefined>();
@@ -168,6 +173,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
         if (!mounted.current || k !== keyRef.current || mine !== listSeq.current) return;
         const entries = versionEntries(r.versions);
         setVersions(entries);
+        setRawVersions(r.versions);
         const byPath = choose?.paths ? r.versions.filter((v) => choose.paths!.includes(v.path)).map((v) => v.id) : [];
         const wanted = [choose?.id, ...byPath].find((x) => x && entries.some((e) => e.id === x));
         setSelected((prev) => {
@@ -216,6 +222,40 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       },
     );
   }, [selected, projectId, sourceId, sawLocked, attempt]);
+
+  // A person's edit carries `flags: null` (no check ran on it). Until the service stores flags per
+  // segment (Task 62), the machine version it came from is read and its flags are shown on every
+  // segment the person left exactly as it was; the others are marked as edited and not checked.
+  const baseSeq = useRef(0);
+  const baseOf = transcript?.origin === "human-edit" && transcript.timed ? machineBaseOf(transcript.id, rawVersions) : undefined;
+  const humanId = transcript?.origin === "human-edit" && transcript.timed ? transcript.id : undefined;
+  const baseId = baseOf?.id;
+  const baseGuessed = baseOf?.guessed ?? false;
+  const baseAt = baseOf?.at;
+  useEffect(() => {
+    const mine = ++baseSeq.current;
+    setBase(undefined);
+    if (!humanId) return;
+    if (!baseId) {
+      setBase({ kind: "unavailable", forId: humanId });
+      return;
+    }
+    const k = keyRef.current;
+    apiRef.current.read(projectId, sourceId, baseId).then(
+      (t) => {
+        if (!mounted.current || k !== keyRef.current || mine !== baseSeq.current) return;
+        setBase({ kind: "ready", forId: humanId, segments: t.segments, guessed: baseGuessed, ...(baseAt ? { at: baseAt } : {}) });
+      },
+      () => {
+        if (!mounted.current || k !== keyRef.current || mine !== baseSeq.current) return;
+        setBase({ kind: "unavailable", forId: humanId });
+      },
+    );
+  }, [humanId, baseId, baseGuessed, baseAt, projectId, sourceId]);
+  const carried = useMemo(
+    () => (transcript && base?.kind === "ready" && base.forId === transcript.id ? carriedFlags(transcript.segments, base.segments) : undefined),
+    [transcript, base],
+  );
 
   // Unsaved edits are not lost: the window asks before closing; in-app links and navigate() are
   // refused; Back and Forward land on a copy of this address and are refused too.
@@ -487,10 +527,17 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
         </p>
       )}
 
-      {!locked && human && (
+      {!locked && human && transcript?.timed && (
         <p className="ao-tx__note">
-          This version was edited by a person. The checks for invented or repeated text run only on what speech recognition wrote, so a person's edit was not checked.
+          {base?.kind === "ready"
+            ? `This version was edited by a person. The checks for invented or repeated text run only on what speech recognition wrote: segments left unchanged show the flags found in the speech recognition version of ${dateText(base.at)}; segments the person changed are marked as not checked.${base.guessed ? " This edit does not record which version it was edited from, so the newest speech recognition version made before it was used." : ""}`
+            : base?.kind === "unavailable"
+              ? "This version was edited by a person. Flags are not available for this version: the speech recognition version it was edited from could not be read, so no segment here shows the checks' results. Open a speech recognition version under Version to see its flags."
+              : "This version was edited by a person. Finding which segments the person changed…"}
         </p>
+      )}
+      {!locked && human && transcript && !transcript.timed && (
+        <p className="ao-tx__note">This version was edited by a person as plain text, without timings. The checks for invented or repeated text did not run on it.</p>
       )}
 
       {!locked && selected && !transcript && !transcriptError && <p aria-live="polite">Loading the transcript…</p>}
@@ -545,7 +592,9 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
           }}
         >
           {segments.map((s, i) => {
-            const flags = s.flags ? flagLabels(s.flags) : [];
+            const fromMachine = carried?.[i];
+            const flags = s.flags ? flagLabels(s.flags) : Array.isArray(fromMachine) ? flagLabels(fromMachine) : [];
+            const unchecked = fromMachine === "edited";
             const draft = drafts.get(i);
             const at = formatTime(s.start);
             const cls = ["ao-tx__seg", flags.length ? "ao-tx__seg--flagged" : "", i === current ? "ao-tx__seg--current" : ""].filter(Boolean).join(" ");
@@ -599,6 +648,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
                     </button>
                   </>
                 )}
+                {unchecked && <p className="ao-tx__unchecked">Edited by a person — not checked</p>}
                 {flags.length > 0 && (
                   <p className="ao-tx__flags">
                     <span className="ao-tx__flag-mark" aria-hidden="true">

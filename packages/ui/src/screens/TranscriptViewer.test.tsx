@@ -6,7 +6,7 @@ import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
 import { BASE, server, testClient, url, useMockService } from "../test/service";
-import { humanTranscript, humanVersion, machineTranscript, machineVersion, MACHINE_VERSIONS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
+import { humanTranscript, humanVersion, machineTranscript, machineVersion, MACHINE_VERSIONS, SEGMENTS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
 import { TranscriptViewer } from "./TranscriptViewer";
 
 useMockService();
@@ -71,11 +71,16 @@ function playTo(el: HTMLMediaElement, t: number) {
   fireEvent(el, new Event("timeupdate"));
 }
 
-async function open(opts: Parameters<typeof transcriptService>[0] = {}, props: { sourceId?: string; onLocked?: () => void } = {}) {
+async function open(opts: Parameters<typeof transcriptService>[0] = {}, props: { sourceId?: string; onLocked?: () => void; waitFor?: string; select?: string } = {}) {
   const svc = transcriptService(opts);
   server.use(...svc.handlers);
   const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId={props.sourceId ?? "s1"} {...(props.onLocked ? { onLocked: props.onLocked } : {})} />);
-  await screen.findByText("Hello and welcome.");
+  if (props.select) {
+    const picker = (await screen.findByLabelText("Version")) as HTMLSelectElement;
+    await waitFor(() => expect([...picker.options].some((o) => o.value === props.select)).toBe(true));
+    await userEvent.setup().selectOptions(picker, props.select);
+  }
+  await screen.findByText(props.waitFor ?? "Hello and welcome.");
   return { svc, view };
 }
 
@@ -109,11 +114,46 @@ describe("TranscriptViewer — segments and flags", () => {
     expect(item.querySelector("img")).toBeNull();
   });
 
-  it("a person's edit (flags: null) shows no flags and says it was not checked", async () => {
-    await open({ versions: [humanVersion("h0")], transcripts: { h0: humanTranscript("h0") } });
-    expect(screen.getByText(/a person's edit was not checked/i)).toBeTruthy();
-    expect(screen.queryByText(/Possibly invented text/)).toBeNull();
+  it("a person's edit keeps the machine flags on segments the person did not change, and marks changed or re-timed ones (review I3)", async () => {
+    const edited = [
+      { ...SEGMENTS[0]!, text: "Hello, and welcome." },
+      { ...SEGMENTS[1]! },
+      { ...SEGMENTS[2]!, end: 8.5 },
+    ];
+    await open({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0", edited) } }, { waitFor: "Hello, and welcome." });
+    await waitFor(() => expect(segmentItems()[1]!.textContent).toMatch(/Flagged for review: Possibly invented text over silence/));
+    expect(segmentItems()[0]!.textContent).toMatch(/Edited by a person — not checked/);
+    expect(segmentItems()[0]!.textContent).not.toMatch(/Flagged/);
+    expect(segmentItems()[2]!.textContent).toMatch(/Edited by a person — not checked/);
+    expect(segmentItems()[2]!.textContent).not.toMatch(/Repeated text/);
+    expect(segmentItems()[1]!.textContent).not.toMatch(/not checked/);
+    expect(screen.getByText(/edited by a person/i, { selector: "p.ao-tx__note" }).textContent).toMatch(/speech recognition version of/);
+  });
+
+  it("a person's edit whose machine version cannot be read says flags are not available, rather than showing none", async () => {
+    const svc = transcriptService({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0") } });
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/transcripts/:aid"), ({ params }) =>
+        params.aid === "h0" ? HttpResponse.json(svc.state.transcripts.h0) : serviceErrorBody(404, "NOT_FOUND", "That transcript was not found."),
+      ),
+      ...svc.handlers,
+    );
+    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    expect(await screen.findByText(/Flags are not available for this version/)).toBeTruthy();
     expect(screen.queryByText(/Flagged/)).toBeNull();
+  });
+
+  it("a person's edit that does not name its base uses the newest machine version made before it, and says so", async () => {
+    const h = humanVersion("h0", "2026-11-05T09:00:00.000Z");
+    (h.derivation as { params: Record<string, unknown> }).params = {};
+    const later = machineVersion("v9", "vtt", "2026-11-06T09:00:00.000Z", "large-v3");
+    await open({
+      versions: [...MACHINE_VERSIONS, h, later],
+      transcripts: { h0: { ...humanTranscript("h0"), basedOn: undefined } as never, v9: machineTranscript("v9", SEGMENTS.map((x) => ({ ...x, flags: [] }))) },
+    }, { waitFor: "Thanks for watching.", select: "h0" });
+    await waitFor(() => expect(segmentItems()[1]!.textContent).toMatch(/Possibly invented text over silence/));
+    expect(screen.getByText(/does not record which version it was edited from/)).toBeTruthy();
   });
 });
 
@@ -403,7 +443,8 @@ describe("TranscriptViewer — editing and versions", () => {
     expect(picker.options[0]!.textContent).toMatch(/Speech recognition \(faster-whisper, model small\)/);
     expect(picker.options[1]!.textContent).toMatch(/Edited by a person/);
     expect(picker.value).toBe("h1");
-    expect(await screen.findByText(/a person's edit was not checked/i)).toBeTruthy();
+    // Untouched machine-flagged text keeps its flag in the new version (review I3).
+    await waitFor(() => expect(segmentItems()[2]!.textContent).toMatch(/Repeated text/));
     // The machine version is still there to open.
     await user.selectOptions(picker, "v1");
     expect(await screen.findByText(/Possibly invented text over silence/)).toBeTruthy();
