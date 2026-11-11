@@ -34,7 +34,19 @@ import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
 import { ReadOnlyLibraryError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { appendLibraryEvent, openRepo, relinkLinkedAsset, repoLibrary, type Repo } from "./repo/repo.js";
+import { newAttentionId, projectFolders, reasonOf, writeAttention, type UnrecordedAudit } from "./repo/attention.js";
+import {
+  appendLibraryEvent,
+  openRepo,
+  recordOrMark,
+  relinkLinkedAsset,
+  removeProjectAttention,
+  repoLibrary,
+  repoProjectInfo,
+  writeProjectAttention,
+  type Repo,
+} from "./repo/repo.js";
+import { SimulatedCrash } from "./repo/seams.js";
 import { LinkedContentChangedError } from "./repo/sources.js";
 import { LockNotWritableError } from "./lock.js";
 import type { Manifest } from "./repo/state.js";
@@ -580,10 +592,12 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
     const writable = library.mode === "read-write";
     // The repo first: opening it finishes or rolls back writes interrupted by a crash.
     let repo: Repo | undefined;
+    let repoError: unknown;
     if (writable) {
       try {
         repo = await openRepo(library, keyRing, { clock: deps.clock, ...(opts.tz ? { tz: opts.tz } : {}), ...(opts.actor ? { actor: opts.actor } : {}) });
       } catch (err) {
+        repoError = err;
         warnings.push(`The library's projects could not be opened (${msg(err)}); the library.reconnect audit event was not recorded`);
       }
     }
@@ -625,14 +639,35 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
           errors: i.errors.length,
         },
       };
+      // A project whose event cannot be written is marked; the next open records it (Task 50).
       for (const pr of repo.listProjects()) {
-        try {
-          await appendLibraryEvent(repo, pr.id, "library.reconnect", details);
-        } catch (err) {
-          warnings.push(`The library.reconnect audit event could not be recorded for project ${pr.id} (${msg(err)})`);
-        }
+        const w = await recordOrMark(repo, pr.id, "library.reconnect", details);
+        if (w) warnings.push(w);
       }
-    } else if (!writable) {
+    } else if (writable) {
+      // The projects could not be opened: each one readable is marked, so a later open records the reconnect.
+      const at = deps.clock().toISOString();
+      let marked = 0;
+      for (const [, rel] of await projectFolders(root)) {
+        const rec: UnrecordedAudit = {
+          formatVersion: 1,
+          id: newAttentionId(),
+          kind: "audit-unrecorded",
+          occurredAt: at,
+          actor: opts.actor ?? "local-user",
+          device: deps.deviceId,
+          action: "library.reconnect",
+          details: { hint: `${deps.hostname}:${basename(resolve(root))}`, sample, rebuilt: false, projectsNotOpened: true },
+          state: "ready",
+          reason: reasonOf(repoError),
+        };
+        await writeAttention(root, rel, rec).then(
+          () => marked++,
+          (err: unknown) => warnings.push(`A project could not be marked as needing attention (${msg(err)})`),
+        );
+      }
+      if (marked > 0) warnings.push(`${marked} project(s) are marked as needing attention; the reconnect is recorded in their audit logs when they can be opened`);
+    } else {
       warnings.push(`The library.reconnect audit event was not recorded: the library is read-only (${library.readOnlyReason ?? "unknown"})`);
     }
     return result;
@@ -821,6 +856,33 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
   const realRoot = await fsp.realpath(lib.root);
   /** Per project: asset ids restored by copying, for the audit event. */
   const copied = new Map<string, string[]>();
+  /** Per project: asset ids restored whose owner-only permissions could not be set (ledger line 115). */
+  const modeNotSet = new Map<string, string[]>();
+  /**
+   * Per project: the record written BEFORE its first copy (Task 50), so a crash between a copy and
+   * the audit event leaves something the next open records; updated after each copy.
+   */
+  const intents = new Map<string, UnrecordedAudit>();
+  const intentFor = async (projectId: string): Promise<UnrecordedAudit> => {
+    let rec = intents.get(projectId);
+    if (!rec) {
+      const info = repoProjectInfo(repo, projectId);
+      rec = {
+        formatVersion: 1,
+        id: newAttentionId(),
+        kind: "audit-unrecorded",
+        occurredAt: info.at,
+        actor: info.actor,
+        device: info.device,
+        action: "library.relink",
+        details: { files: 0, assetIds: [] },
+        state: "intent",
+      };
+      await writeProjectAttention(repo, projectId, rec);
+      intents.set(projectId, rec);
+    }
+    return rec;
+  };
   const placeholderOfSize = (size: number) => found.placeholders.some((c) => c.size === size);
 
   for (const f of missing) {
@@ -891,27 +953,77 @@ export async function relinkMissing(lib: Library, searchDir: string, repo: Repo,
       }
       const verify = async (staged: string) => (await hashStream(staged, defaultOpenRead, key).catch(() => null)) === a.sha256;
       const mode = f.identifiable || a.encrypted || f.keyId ? 0o600 : undefined;
+      // Nothing is copied into a project that cannot first be marked (fail closed).
+      const intent = await intentFor(f.projectId);
       const placed = await copyBack(lib.root, src.abs, target, mode, verify);
-      if (placed !== "ok") {
+      if (placed !== "ok" && placed !== "ok-mode-not-set") {
         result.skipped.push({ path: f.path, reason: placed });
         continue;
       }
       used.add(src.abs);
       result.relinked++;
       result.relinkedPaths.push(f.path);
-      copied.set(f.projectId, [...(copied.get(f.projectId) ?? []), a.id]);
+      const ids = [...(copied.get(f.projectId) ?? []), a.id];
+      copied.set(f.projectId, ids);
+      if (placed === "ok-mode-not-set") {
+        // The file stays (verified); the project is marked until its permissions are set (R28 precedent).
+        modeNotSet.set(f.projectId, [...(modeNotSet.get(f.projectId) ?? []), a.id]);
+        const info = repoProjectInfo(repo, f.projectId);
+        try {
+          await writeProjectAttention(repo, f.projectId, {
+            formatVersion: 1,
+            id: newAttentionId(),
+            kind: "permissions-not-set",
+            occurredAt: info.at,
+            actor: info.actor,
+            device: info.device,
+            files: [f.path],
+            mode: mode!,
+            action: "library.relink",
+          });
+          result.warnings.push(`${f.path}: the file was restored but its owner-only permissions could not be set; the project is marked as needing attention and they are set again when the library is next opened`);
+        } catch (err) {
+          result.warnings.push(`${f.path}: the file was restored but its owner-only permissions could not be set, and the project could not be marked as needing attention (${msg(err)})`);
+        }
+      }
+      intent.details = { files: ids.length, assetIds: ids };
+      await writeProjectAttention(repo, f.projectId, intent).catch(() => {}); // the earlier version still names the project
     } catch (err) {
       result.warnings.push(`${f.path}: ${msg(err)}`);
     }
   }
   result.stillMissing = missing.length - result.relinked;
 
-  for (const [projectId, assetIds] of copied) {
-    try {
-      await appendLibraryEvent(repo, projectId, "library.relink", { files: assetIds.length, assetIds });
-    } catch (err) {
-      result.warnings.push(`The library.relink audit event could not be recorded for project ${projectId} (${msg(err)})`);
+  if (relinkSeams.crashBeforeAudit) {
+    relinkSeams.crashBeforeAudit = undefined;
+    throw new SimulatedCrash("simulated crash after the copies, before their audit events");
+  }
+  for (const [projectId, intent] of intents) {
+    const assetIds = copied.get(projectId) ?? [];
+    if (assetIds.length === 0) {
+      await removeProjectAttention(repo, projectId, intent.id).catch(() => {});
+      continue;
     }
+    const notSet = modeNotSet.get(projectId);
+    const details = { files: assetIds.length, assetIds, ...(notSet ? { permissionsNotSet: notSet } : {}), attentionId: intent.id };
+    try {
+      await appendLibraryEvent(repo, projectId, "library.relink", details);
+    } catch (err) {
+      // Not undone: the files are verified. The record stays, now complete, and the next open records it (Task 50).
+      try {
+        await writeProjectAttention(repo, projectId, { ...intent, details: { files: assetIds.length, assetIds, ...(notSet ? { permissionsNotSet: notSet } : {}) }, state: "ready", reason: reasonOf(err) });
+        result.warnings.push(
+          `The library.relink audit event could not be recorded for project ${projectId} (${msg(err)}); the project is marked as needing attention and the event is recorded when the library is next opened`,
+        );
+      } catch (e) {
+        result.warnings.push(
+          `The library.relink audit event could not be recorded for project ${projectId} (${msg(err)}); the project stays marked as needing attention (${msg(e)})`,
+        );
+      }
+      continue;
+    }
+    // Recorded: the record goes (if this fails, the next open finds the event by its id and removes it).
+    await removeProjectAttention(repo, projectId, intent.id).catch(() => {});
   }
   return result;
 }
@@ -924,6 +1036,10 @@ export const relinkSeams: {
   beforeLinkedUpdate?: (abs: string) => Promise<void>;
   /** Behave as on a file system without hard links (FAT/exFAT). */
   noHardLinks?: boolean;
+  /** Setting permissions after an exclusive copy fails (ledger line 115). */
+  failChmod?: boolean;
+  /** Simulated crash after the copies, before their audit events (Task 50). */
+  crashBeforeAudit?: boolean;
 } = {};
 
 async function fsyncDir(dir: string): Promise<void> {
@@ -950,7 +1066,7 @@ async function copyBack(
   target: string,
   mode: number | undefined,
   verify: (staged: string) => Promise<boolean>,
-): Promise<"ok" | "verify-failed" | "target-exists"> {
+): Promise<"ok" | "ok-mode-not-set" | "verify-failed" | "target-exists"> {
   if (await pathExists(target)) return "target-exists";
   await assertContained(root, target);
   await fsp.mkdir(dirname(target), { recursive: true });
@@ -971,7 +1087,16 @@ async function copyBack(
         if ((e as NodeJS.ErrnoException).code === "EEXIST") return "target-exists";
         throw e;
       }
-      if (mode !== undefined && process.platform !== "win32") await fsp.chmod(target, mode);
+      if (mode !== undefined && process.platform !== "win32") {
+        try {
+          if (relinkSeams.failChmod) throw Object.assign(new Error("permission change refused (simulated)"), { code: "EPERM" });
+          await fsp.chmod(target, mode);
+        } catch {
+          // The verified file stays; the caller counts, audits and marks it (never silent).
+          await fsyncDir(dirname(target));
+          return "ok-mode-not-set";
+        }
+      }
     }
     await fsyncDir(dirname(target));
     return "ok";

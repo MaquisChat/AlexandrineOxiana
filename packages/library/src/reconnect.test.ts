@@ -28,8 +28,9 @@ import {
   type FoundLibrary,
 } from "./reconnect.js";
 import { listLibraries } from "./registry.js";
-import { ReadOnlyLibraryError, type Repo } from "./repo/index.js";
-import { openTestRepo } from "./repo/testing.js";
+import { attentionSeams } from "./repo/attention.js";
+import { ReadOnlyLibraryError, projectWarnings, type Repo } from "./repo/index.js";
+import { SimulatedCrash, openTestRepo, seams } from "./repo/testing.js";
 
 vi.mock("./fs/atomic.js", async (orig) => {
   const actual = await orig<typeof import("./fs/atomic.js")>();
@@ -179,6 +180,10 @@ afterEach(async () => {
   relinkSeams.beforeCopy = undefined;
   relinkSeams.beforeLinkedUpdate = undefined;
   relinkSeams.noHardLinks = undefined;
+  relinkSeams.failChmod = undefined;
+  relinkSeams.crashBeforeAudit = undefined;
+  attentionSeams.failRestrict = undefined;
+  seams.failAuditAppendFor = undefined;
   for (const l of open) await l.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
@@ -857,5 +862,130 @@ describe("watchAvailability", () => {
     expect(vi.getTimerCount()).toBe(0);
     expect(onChange).not.toHaveBeenCalled();
     await rename(`${lib.root}-gone`, lib.root);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe("Task 50: reconnect and relink are never silent when an audit entry cannot be written", () => {
+  const attentionOf = async (root: string, folder: string) => readdir(join(root, folder, "attention")).catch(() => [] as string[]);
+  async function reopen(lib: Library): Promise<{ lib: Library; repo: Repo }> {
+    await lib.close();
+    const again = await openLibrary(lib.root, mkDeps());
+    open.push(again);
+    return { lib: again, repo: await openTestRepo(again, ring, { clock: () => now, tz: "UTC", scryptN: FAST }) };
+  }
+
+  it("reconnect: a library.reconnect event that cannot be written marks the project; the next open records it late", async () => {
+    const { lib, pid, folder } = await fixture();
+    await lib.close();
+    seams.failAuditAppendFor = pid;
+    const r = await reconnect(lib.root, lib.id, mkDeps(), { keyRing: ring });
+    open.push(r.library);
+    expect(r.warnings.join(" ")).toMatch(/needing attention/);
+    expect(await attentionOf(lib.root, folder)).toHaveLength(1);
+    seams.failAuditAppendFor = undefined;
+    const again = await reopen(r.library);
+    const ev = (await auditOf(lib.root, folder)).filter((e) => e.action === "library.reconnect");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.details).toMatchObject({ hint: "host-A:Research", recordedLate: { occurredAt: NOW } });
+    expect(again.repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: pid, kind: "audit-recorded-late" }));
+    expect(await attentionOf(lib.root, folder)).toEqual([]);
+  });
+
+  it("relink: a library.relink event that cannot be written leaves the file restored, marks the project, and is recorded on the next open", async () => {
+    const { lib, repo, pid, folder, assets } = await fixture();
+    const target = join(lib.root, assets[1]!.path);
+    const content = await readFile(target);
+    await unlink(target);
+    await mkdir(join(tmp, "Found"));
+    await writeFile(join(tmp, "Found", "copy.bin"), content);
+    seams.failAuditAppendFor = pid;
+    const r = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+    expect(r.relinked).toBe(1);
+    expect((await readFile(target)).equals(content)).toBe(true);
+    expect(r.warnings.join(" ")).toMatch(/needing attention/);
+    expect(await projectWarnings(repo, pid)).toContain("audit-unrecorded");
+    seams.failAuditAppendFor = undefined;
+    const again = await reopen(lib);
+    const ev = (await auditOf(lib.root, folder)).filter((e) => e.action === "library.relink");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.details).toMatchObject({ files: 1, assetIds: [assets[1]!.id], recordedLate: { occurredAt: NOW } });
+    expect((ev[0]!.details!.recordedLate as Record<string, unknown>).interrupted).toBeUndefined();
+    expect(await projectWarnings(again.repo, pid)).toEqual([]);
+  });
+
+  it("relink: a crash after the copy and before its audit event is recorded on the next open, as interrupted", async () => {
+    const { lib, repo, pid, folder, assets } = await fixture();
+    const target = join(lib.root, assets[0]!.path);
+    const content = await readFile(target);
+    await unlink(target);
+    await mkdir(join(tmp, "Found"));
+    await writeFile(join(tmp, "Found", "copy.bin"), content);
+    relinkSeams.crashBeforeAudit = true;
+    await expect(relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring })).rejects.toBeInstanceOf(SimulatedCrash);
+    expect((await readFile(target)).equals(content)).toBe(true);
+    expect((await auditOf(lib.root, folder)).filter((e) => e.action === "library.relink")).toEqual([]);
+    expect(await projectWarnings(repo, pid)).toContain("audit-unrecorded");
+    const again = await reopen(lib);
+    const ev = (await auditOf(lib.root, folder)).filter((e) => e.action === "library.relink");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.details).toMatchObject({ assetIds: [assets[0]!.id], recordedLate: { interrupted: true } });
+    expect(again.repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: pid, kind: "audit-recorded-late" }));
+    expect(await attentionOf(lib.root, folder)).toEqual([]);
+  });
+
+  it("relink: a normal run leaves no attention record", async () => {
+    const { lib, repo, folder, assets } = await fixture();
+    const target = join(lib.root, assets[2]!.path);
+    const content = await readFile(target);
+    await unlink(target);
+    await mkdir(join(tmp, "Found"));
+    await writeFile(join(tmp, "Found", "copy.bin"), content);
+    expect((await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring })).relinked).toBe(1);
+    expect(await attentionOf(lib.root, folder)).toEqual([]);
+    expect((await auditOf(lib.root, folder)).filter((e) => e.action === "library.relink")[0]!.details).toMatchObject({ files: 1, assetIds: [assets[2]!.id] });
+  });
+
+  it("relink: permissions that cannot be set after an exclusive copy are counted, audited and marked until set (ledger line 115)", async () => {
+    const { lib, repo } = await fixture();
+    const p = (await repo.createProject({ name: "I", governanceYaml: IDENT_PLAIN_GOV, encryption: { enabled: false } })).project;
+    const src = await input("ident.pdf", "identifiable body");
+    const sf = await repo.createSource(p.id, draft("Ident"), [{ path: src, role: "original", handling: "copy" }], {
+      provenance: provenance({ identifiable: true, legal: { status: "consented", basis: "consent" } }),
+    });
+    const target = join(lib.root, sf.assets[0]!.path);
+    await unlink(target);
+    await mkdir(join(tmp, "Found"));
+    await cp(src, join(tmp, "Found", "x.pdf"));
+    await chmod(join(tmp, "Found", "x.pdf"), 0o644);
+    relinkSeams.noHardLinks = true;
+    relinkSeams.failChmod = true;
+    const r = await relinkMissing(lib, join(tmp, "Found"), repo, { keyRing: ring });
+    expect(r.relinked).toBe(1);
+    expect(r.relinkedPaths).toEqual([sf.assets[0]!.path]);
+    expect(r.warnings.join(" ")).toMatch(/permissions/);
+    // The copy may carry the staged file's mode; where the change really failed the file is wider.
+    await chmod(target, 0o644);
+    const ev = (await auditOf(lib.root, p.folder)).filter((e) => e.action === "library.relink");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.details).toMatchObject({ files: 1, assetIds: [sf.assets[0]!.id], permissionsNotSet: [sf.assets[0]!.id] });
+    expect(await projectWarnings(repo, p.id)).toEqual(["permissions-not-set"]);
+    relinkSeams.failChmod = undefined;
+
+    // Still refused on the next open: the warning stands.
+    attentionSeams.failRestrict = true;
+    let again = await reopen(lib);
+    expect(await projectWarnings(again.repo, p.id)).toEqual(["permissions-not-set"]);
+    expect((await stat(target)).mode & 0o777).toBe(0o644);
+    attentionSeams.failRestrict = undefined;
+
+    // Set on the next open that can: recorded, and the warning goes.
+    again = await reopen(again.lib);
+    expect((await stat(target)).mode & 0o777).toBe(0o600);
+    expect(await projectWarnings(again.repo, p.id)).toEqual([]);
+    const fixed = (await auditOf(lib.root, p.folder)).filter((e) => e.action === "library.permissions-restricted");
+    expect(fixed).toHaveLength(1);
+    expect(fixed[0]!.details).toMatchObject({ files: 1, mode: "600", after: "library.relink" });
+    expect(again.repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: p.id, kind: "audit-recorded-late" }));
   });
 });
