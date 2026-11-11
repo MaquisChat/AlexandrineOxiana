@@ -157,6 +157,9 @@ function crashPoint(point: BackupCrashPoint): void {
   }
 }
 
+/** Package-internal (retention): the same test seam, for the steps of a destruction's backups. */
+export const backupCrashPoint = crashPoint;
+
 /** The `backup.create` event (the commit point) could not be written: the backup was not kept. */
 export class BackupNotRecordedError extends Error {
   override name = "BackupNotRecordedError";
@@ -311,9 +314,15 @@ interface BackupState {
   failures: Record<string, BackupFailure>;
   /** Backups and prunes not yet settled, by backup id / prune id. */
   pending: Record<string, PendingOp>;
-  /** Per project, per destruction certificate: backups holding destroyed raw data not removed yet (N1, R2-I2). */
+  /**
+   * Per project, per destruction certificate: backups holding destroyed raw data not removed yet
+   * (N1, R2-I2): what raises `destruction-backups-pending`. A note for the warning only (R147): what
+   * is outstanding is decided from the audit log, and this is rewritten from it at every retry pass.
+   */
   undestroyed: Record<string, Record<string, string[]>>;
-  /** Per destruction certificate (`<projectId>:<rel>`): the retry record of its backups step (R2-I1). */
+  /** Per project, per destruction certificate: why the app does not remove those backups by itself (plain words), if so. */
+  destructionProblems: Record<string, Record<string, string>>;
+  /** Per destruction certificate (`<projectId>:<rel>`): the retry record of its backups step (R2-I1). Bookkeeping, not authority. */
   retries: Record<string, RetentionRetry>;
 }
 
@@ -358,6 +367,18 @@ function undestroyedOf(v: unknown): Record<string, Record<string, string[]>> {
   return out;
 }
 
+/** Per project, per certificate: one plain sentence or more. */
+function problemsOf(v: unknown): Record<string, Record<string, string>> {
+  const out: Record<string, Record<string, string>> = {};
+  if (!isObject(v)) return out;
+  for (const [pid, per] of Object.entries(v)) {
+    if (!isObject(per)) continue;
+    const mine = Object.fromEntries(Object.entries(per).filter((e): e is [string, string] => typeof e[1] === "string"));
+    if (Object.keys(mine).length) out[pid] = mine;
+  }
+  return out;
+}
+
 async function readState(dir: string): Promise<BackupState> {
   try {
     const raw = await readMaybe(join(dir, BACKUPS_STATE));
@@ -368,10 +389,11 @@ async function readState(dir: string): Promise<BackupState> {
       failures: s.failures && typeof s.failures === "object" ? s.failures : {},
       pending: pendingOf(s.pending),
       undestroyed: undestroyedOf(s.undestroyed),
+      destructionProblems: problemsOf(s.destructionProblems),
       retries: isObject(s.retries) ? (s.retries as Record<string, RetentionRetry>) : {},
     };
   } catch {
-    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {}, retries: {} };
+    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {}, destructionProblems: {}, retries: {} };
   }
 }
 
@@ -1239,48 +1261,140 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
 
 
 /**
- * Package-internal (retention, R90 d, R92 I3): overwrites and removes the named backups of the
- * project one by one (manifest-listed ones), the manifest updated after each; a failure does not
- * stop the others. Returns the names removed, and the first error, if any.
+ * Package-internal (retention, R147): removes backups named on a destruction's list (decided at the
+ * destruction and recorded in the audit log), one by one, the manifest updated after each. A file
+ * that is there is overwritten and removed (`removed`). One that is not there is `gone`: the app did
+ * not remove it. Either way the manifest lists it no longer. A failure does not stop the others.
+ * Only plain names of the backup pattern, inside Backups/, are ever touched.
  */
-export async function destroyBackups(
-  repo: Repo,
-  projectId: string,
-  files: string[],
-): Promise<{ deleted: string[]; failed: Array<{ file: string; error: unknown }>; error?: unknown }> {
+export async function removeHoldingBackups(repo: Repo, files: string[]): Promise<{ removed: string[]; gone: string[]; failed: Array<{ file: string; error: unknown }> }> {
   const dir = backupsDir(repo);
-  const deleted: string[] = [];
+  const removed: string[] = [];
+  const gone: string[] = [];
   const failed: Array<{ file: string; error: unknown }> = [];
   for (const f of files) {
-    if (f !== basename(f)) continue;
+    if (f !== basename(f) || !BACKUP_NAME.test(f)) {
+      failed.push({ file: f, error: new Error("this is not the name of a backup") });
+      continue;
+    }
     try {
       await withManifest(repo, async (m) => {
-        if (!m.backups.some((b) => b.projectId === projectId && b.file === f)) return;
-        await shredPath(join(dir, f));
-        m.backups = m.backups.filter((b) => !(b.projectId === projectId && b.file === f));
-        deleted.push(f);
+        const abs = join(dir, f);
+        const present = await isThere(abs);
+        if (present) await shredPath(abs);
+        forget(m, f);
+        (present ? removed : gone).push(f);
       });
     } catch (error) {
       // The others are still tried; each failure is reported with its file (N1).
       failed.push({ file: f, error });
     }
   }
-  return failed.length ? { deleted, failed, error: failed[0]!.error } : { deleted, failed };
+  return { removed, gone, failed };
+}
+
+/** Package-internal (retention, R147): clears the manifest entries of backups that are no longer in Backups/ (and only of those). */
+export async function forgetMissingBackups(repo: Repo, files: string[]): Promise<void> {
+  const dir = backupsDir(repo);
+  const names = files.filter((f) => f === basename(f) && BACKUP_NAME.test(f));
+  if (!names.length) return;
+  await withManifest(repo, async (m) => {
+    for (const f of names) if (!(await isThere(join(dir, f)))) forget(m, f);
+  });
+}
+
+function forget(m: BackupManifest, file: string): void {
+  m.backups = m.backups.filter((b) => b.file !== file);
+  if (m.unresolved) {
+    m.unresolved = m.unresolved.filter((x) => x !== file);
+    if (!m.unresolved.length) delete m.unresolved;
+  }
+}
+
+/** Whether anything is at `path` (a link is not followed); an error other than "not there" is thrown. */
+async function isThere(path: string): Promise<boolean> {
+  try {
+    await fsp.lstat(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
 }
 
 /**
- * Package-internal (retention, N1, R2-I2): the backups that hold raw data destroyed by one
- * destruction (its certificate) and could not be removed yet. Kept per certificate, so one
- * destruction settling never clears another's: the project's warning `destruction-backups-pending`
- * stands while any certificate has one.
+ * Package-internal (retention, R147): how each named file in Backups/ stands now: whether it is
+ * there, and its manifest entry when it can be read (one the manifest could not read before is
+ * tried again). No entry: it cannot be read now.
  */
-export function setHoldingNotRemoved(repo: Repo, projectId: string, certificateRel: string, files: string[]): Promise<void> {
+export async function backupFilesNow(repo: Repo, files: string[]): Promise<Map<string, { present: boolean; entry?: BackupEntry }>> {
+  const dir = backupsDir(repo);
+  await settlePending(repo);
+  const m = await withManifest(repo, async (x) => x);
+  const out = new Map<string, { present: boolean; entry?: BackupEntry }>();
+  for (const f of files) {
+    const ok = f === basename(f) && BACKUP_NAME.test(f);
+    const present = ok && (await isThere(join(dir, f)));
+    let entry = present ? m.backups.find((b) => b.file === f) : undefined;
+    // One the manifest does not know at all (it was replaced, say) is read here; one it lists as unreadable was just tried.
+    if (present && !entry && !(m.unresolved ?? []).includes(f)) entry = await readEntry(repo, f);
+    out.set(f, { present, ...(entry ? { entry } : {}) });
+  }
+  return out;
+}
+
+/** Package-internal (retention): what the state file notes of one destruction's backups still to remove, and why the app does not remove them by itself, if so. */
+export interface DestructionNote {
+  files: string[];
+  problem?: string;
+}
+
+/**
+ * Package-internal (retention, N1, R2-I2, R147): notes, for the warning `destruction-backups-pending`,
+ * the backups one destruction (its certificate) still has to see removed. Kept per certificate, so
+ * one destruction settling never clears another's.
+ */
+export function noteDestruction(repo: Repo, projectId: string, certificateRel: string, note: DestructionNote): Promise<void> {
   return withState(repo, (s) => {
     const mine = { ...(s.undestroyed[projectId] ?? {}) };
-    if (files.length) mine[certificateRel] = files;
+    const why = { ...(s.destructionProblems[projectId] ?? {}) };
+    if (note.files.length) mine[certificateRel] = note.files;
     else delete mine[certificateRel];
-    if (Object.keys(mine).length) s.undestroyed[projectId] = mine;
-    else delete s.undestroyed[projectId];
+    if (note.files.length && note.problem) why[certificateRel] = note.problem;
+    else delete why[certificateRel];
+    setOrDrop(s.undestroyed, projectId, mine);
+    setOrDrop(s.destructionProblems, projectId, why);
+  });
+}
+
+function setOrDrop<T>(all: Record<string, Record<string, T>>, projectId: string, mine: Record<string, T>): void {
+  if (Object.keys(mine).length) all[projectId] = mine;
+  else delete all[projectId];
+}
+
+/** Package-internal (retention, R147): the project's notes, by certificate (library-relative). */
+export async function destructionNotes(repo: Repo, projectId: string): Promise<Record<string, DestructionNote>> {
+  const s = await readState(backupsDir(repo));
+  const files = Object.hasOwn(s.undestroyed, projectId) ? s.undestroyed[projectId]! : {};
+  const why = Object.hasOwn(s.destructionProblems, projectId) ? s.destructionProblems[projectId]! : {};
+  const out: Record<string, DestructionNote> = {};
+  for (const [rel, list] of Object.entries(files)) out[rel] = { files: [...list], ...(Object.hasOwn(why, rel) ? { problem: why[rel]! } : {}) };
+  return out;
+}
+
+/**
+ * Package-internal (retention, R147): replaces the project's notes with what the audit log says
+ * (every certificate at once: a stale or edited note does not survive a retry pass). Written only
+ * when something differs.
+ */
+export async function setDestructionNotes(repo: Repo, projectId: string, notes: Record<string, DestructionNote>): Promise<void> {
+  const wanted = Object.fromEntries(Object.entries(notes).filter(([, n]) => n.files.length));
+  const same = (a: Record<string, DestructionNote>, b: Record<string, DestructionNote>) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
+  const sorted = (x: Record<string, DestructionNote>) => Object.keys(x).sort().map((k) => [k, x[k]!.files, x[k]!.problem ?? null]);
+  if (same(await destructionNotes(repo, projectId), wanted)) return;
+  await withState(repo, (s) => {
+    setOrDrop(s.undestroyed, projectId, Object.fromEntries(Object.entries(wanted).map(([k, n]) => [k, n.files])));
+    setOrDrop(s.destructionProblems, projectId, Object.fromEntries(Object.entries(wanted).flatMap(([k, n]) => (n.problem ? [[k, n.problem]] : []))));
   });
 }
 
@@ -1290,13 +1404,16 @@ export async function holdingNotRemoved(repo: Repo, projectId: string): Promise<
   return Object.hasOwn(u, projectId) ? [...new Set(Object.values(u[projectId]!).flat())].sort() : [];
 }
 
-/** Package-internal (retention, R2-I1): the retry record of one destruction's backups step. */
+/**
+ * Package-internal (retention, R2-I1): the retry record of one destruction's backups step: when it
+ * was last tried, and how many tries since the audit log last heard of it. Bookkeeping for the
+ * back-off only; what is outstanding, and when it was last recorded, come from the audit log (R147).
+ */
 export interface RetentionRetry {
   firstFailedAt: string;
   lastAttemptAt?: string;
   lastRecordedAt: string;
   attemptsSinceRecord: number;
-  outstanding: string[];
   lastFreshAt?: string;
 }
 

@@ -98,6 +98,41 @@ export class AuditStore {
     return out;
   }
 
+  /**
+   * A cheap pass over a long log for a few kinds of event (R147): like `read`, but only the lines
+   * that contain one of `needles` are parsed (one that cannot be parsed is left out). `last` is the
+   * last complete line of the log, parsed (null: none, or it cannot be parsed): what the log ends
+   * at, to compare with a head the caller holds.
+   */
+  static async readMatching(dir: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; last: AuditEvent | null }> {
+    const names = await auditSegments(dir);
+    const events: AuditEvent[] = [];
+    let lastLine: string | undefined;
+    for (const [i, n] of names.entries()) {
+      const lines = (await fsp.readFile(join(dir, n), "utf8")).split("\n");
+      if (i === names.length - 1) lines.pop();
+      for (const line of lines) {
+        if (line.trim() === "") continue;
+        lastLine = line;
+        if (!needles.some((s) => line.includes(s))) continue;
+        try {
+          events.push(JSON.parse(line) as AuditEvent);
+        } catch {
+          // not an event: the full read (and the chain check) reports it
+        }
+      }
+    }
+    let last: AuditEvent | null = null;
+    if (lastLine !== undefined) {
+      try {
+        last = JSON.parse(lastLine) as AuditEvent;
+      } catch {
+        last = null;
+      }
+    }
+    return { events, last };
+  }
+
   /** Opens the log: returns the store (appending after the last readable event) and the chain check. */
   static async load(
     dir: string,

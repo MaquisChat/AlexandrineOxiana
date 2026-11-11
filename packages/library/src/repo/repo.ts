@@ -74,7 +74,7 @@ import { RecoveryPendingError } from "./errors.js";
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
-import { destroyAssets, type DestroyInput } from "./destroy.js";
+import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 
@@ -1084,6 +1084,45 @@ export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<t
 export function destroyProjectAssets(repo: Repo, projectId: string, input: DestroyInput): ReturnType<typeof destroyAssets> {
   return destroyAssets(cores.get(repo)!, projectId, input);
 }
+
+/** Package-internal (retention, R147): the governed change that writes an amendment beside a destruction certificate. */
+export function amendProjectDestruction(repo: Repo, projectId: string, input: AmendInput): ReturnType<typeof amendDestruction> {
+  return amendDestruction(cores.get(repo)!, projectId, input);
+}
+
+/**
+ * Package-internal (retention, R147): the project's audit events whose line contains one of
+ * `needles`, read in the write queue (nothing is appended meanwhile). `headMatches`: the log on disk
+ * ends at the head this process holds (the one checked against the anchor at open, moved on only by
+ * this process's own appends); false means the log changed outside the app since.
+ */
+export function auditEventsMentioning(repo: Repo, projectId: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; headMatches: boolean }> {
+  const core = cores.get(repo)!;
+  return core.serial(async () => {
+    const st = core.state(projectId);
+    const { events, last } = await AuditStore.readMatching(st.audit.dir, needles);
+    return { events, headMatches: endsAt(last, st.audit.head) };
+  });
+}
+
+/**
+ * Package-internal (retention, R147): every audit event of the project, only when its chain of
+ * hashes verifies and it ends at the head this process holds; otherwise `ok: false` (the log is not
+ * what the app wrote, so nothing may be removed on its word).
+ */
+export function verifiedAuditEvents(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+  const core = cores.get(repo)!;
+  return core.serial(async () => {
+    const st = core.state(projectId);
+    const events = await AuditStore.read(st.audit.dir);
+    const verify = verifyChain(events as AuditEvent[]);
+    if (!verify.ok || !endsAt(verify.head, st.audit.head)) return { ok: false as const };
+    return { ok: true as const, events: events as AuditEvent[] };
+  });
+}
+
+const endsAt = (last: { seq: number; hash: string } | null, head: { seq: number; hash: string } | null): boolean =>
+  (last?.seq ?? 0) === (head?.seq ?? 0) && (last?.hash ?? "") === (head?.hash ?? "");
 
 /** Sets a project's backup settings (daily automatic backup, how many to keep); governed and audited. */
 export function setProjectBackupSettings(repo: Repo, projectId: string, settings: BackupSettings): Promise<Project> {

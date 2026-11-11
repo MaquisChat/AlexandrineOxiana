@@ -27,6 +27,7 @@ import { newId, sanitizeSegment, verifyChain, withCollisionSuffix, type AuditEve
 import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { AuditStore } from "./audit-store.js";
+import { DESTRUCTION_CERTIFICATE } from "./destroy.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
 import { loadProjectFolder, parseProjectJson, type Manifest, type RepoCore } from "./state.js";
 import { listSourceIds, readSourceFile } from "./sources.js";
@@ -117,7 +118,8 @@ async function destroyedHashes(core: RepoCore): Promise<Map<string, string>> {
   for (const st of core.projects.values()) {
     let names: string[];
     try {
-      names = (await fsp.readdir(core.abs(`${st.rel}/retention`))).filter((n) => /^destruction-.*\.json(\.enc)?$/u.test(n));
+      // Certificates only: the amendments kept beside them name no destroyed file.
+      names = (await fsp.readdir(core.abs(`${st.rel}/retention`))).filter((n) => DESTRUCTION_CERTIFICATE.test(n));
     } catch {
       continue;
     }
