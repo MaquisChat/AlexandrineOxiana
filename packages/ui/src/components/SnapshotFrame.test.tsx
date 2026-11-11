@@ -29,6 +29,7 @@ describe("<SnapshotFrame> (captured web pages, for Tasks 33/34)", () => {
   it("the document carries a CSP with script-src 'none' before any snapshot content", async () => {
     expect(SNAPSHOT_CSP).toMatch(/script-src 'none'/);
     expect(SNAPSHOT_CSP).toMatch(/default-src 'none'/);
+    expect(SNAPSHOT_CSP).toMatch(/frame-src 'none'/);
     const doc = snapshotDocument('<html><head><meta http-equiv="Content-Security-Policy" content="script-src *"></head><body><script>alert(1)</script></body></html>');
     const csp = doc.indexOf(`content="${SNAPSHOT_CSP}"`);
     expect(csp).toBeGreaterThan(-1);

@@ -113,6 +113,21 @@ describe("createClient", () => {
     expect(() => api.request("GET", "/x", { query: { text: TOKEN.slice(0, 20) } })).not.toThrow();
   });
 
+  it("finds the token however a path encodes it, and in query values as URLSearchParams writes them (R109)", () => {
+    const odd = "abc def+ghi/jkl~mno!*'()%zz:@;=,$&".padEnd(40, "q");
+    const api = createClient(BASE, odd, { fetch: fakeFetch(() => json({})).fetch });
+    const once = encodeURIComponent(odd);
+    for (const path of [`/x/${once}`, `/x/${encodeURIComponent(once)}`, `/x/${encodeURIComponent(encodeURIComponent(once))}`, `/x/${once.replace(/c/g, "%63")}`]) {
+      expect(() => api.request("GET", path), path).toThrow(/token/);
+    }
+    expect(() => api.request("GET", "/x", { query: { text: odd } })).toThrow(/token/);
+    expect(() => api.request("GET", "/x", { query: { text: `prefix ${odd} suffix` } })).toThrow(/token/);
+    expect(() => api.request("GET", "/x", { query: { text: "abc def" } })).not.toThrow();
+    const plain = createClient(BASE, TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    expect(() => plain.request("GET", `/x/${TOKEN.replace(/t/g, "%74")}`)).toThrow(/token/);
+    expect(() => plain.request("GET", "/x/%E0%A4%A")).toThrow(/path/); // undecodable: refused, not guessed
+  });
+
   it("uses the same credential query keys as the service", () => {
     const auth = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../../../apps/library-service/src/auth.ts"), "utf8");
     const m = /CREDENTIAL_QUERY_KEYS[^=\n]*=\s*new Set\(\[([^\]]*)\]\)/.exec(auth);
@@ -266,5 +281,14 @@ describe("events() — SSE over fetch streaming (not EventSource)", () => {
     expect(p.push("event: a\r\ndata: 1\r\n\r\n")).toEqual([{ type: "a", data: 1 }]);
     expect(p.push("data: {\"x\":\ndata: 1}\n\nevent: b")).toEqual([{ type: "message", data: { x: 1 } }]);
     expect(p.push("\rdata: 2\r\r: keep-alive\n\n")).toEqual([{ type: "b", data: 2 }]);
+  });
+
+  it("an empty chunk between CR and LF does not split the CRLF (R109)", () => {
+    const p = new SseParser();
+    expect(p.push("event: a\r")).toEqual([]);
+    expect(p.push("")).toEqual([]);
+    expect(p.push("\ndata: 1\r")).toEqual([]);
+    expect(p.push("")).toEqual([]);
+    expect(p.push("\n\r\n")).toEqual([{ type: "a", data: 1 }]);
   });
 });

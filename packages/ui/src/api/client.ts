@@ -143,6 +143,7 @@ export class SseParser {
   push(text: string): ServiceEvent[] {
     const out: ServiceEvent[] = [];
     let i = 0;
+    if (text === "") return out; // an empty chunk changes nothing (a pending CR stays pending)
     if (this.afterCR && text.startsWith("\n")) i = 1;
     this.afterCR = false;
     const eol = /\r\n|\r|\n/g;
@@ -197,12 +198,37 @@ export class SseParser {
   }
 }
 
+/**
+ * A path with every layer of percent-encoding removed (decoded until it stops changing), so a token
+ * cannot hide behind double encoding. A path that does not decode at all is refused.
+ */
+function fullyDecoded(path: string): string {
+  let cur: string;
+  try {
+    cur = decodeURIComponent(path);
+  } catch {
+    throw new Error(`A service path must be valid percent-encoding (got "${path}").`);
+  }
+  for (let i = 0; i < 8; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(cur);
+    } catch {
+      return cur;
+    }
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
 export function createClient(baseUrl: string, token: string, opts: ClientOptions = {}): ApiClient {
   const base = checkBase(baseUrl);
   checkToken(token);
   const doFetch = opts.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const auth = { Authorization: `Bearer ${token}` };
-  const tokenForms = [token, encodeURIComponent(token)];
+  // The token as it could appear in a URL: raw, percent-encoded, and as URLSearchParams writes it.
+  const tokenForms = [token, encodeURIComponent(token), new URLSearchParams({ t: token }).toString().slice(2)];
 
   function urlFor(path: string, query?: RequestOptions["query"]): string {
     if (!path.startsWith("/") || path.startsWith("//") || /[?#]|%3f|%23/i.test(path)) {
@@ -215,7 +241,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     }
     const s = qs.toString();
     const url = `${base}${path}${s ? `?${s}` : ""}`;
-    if (tokenForms.some((t) => url.includes(t))) throw new Error("Refusing a URL that contains the service token: it is sent in the Authorization header only.");
+    if (tokenForms.some((t) => url.includes(t)) || fullyDecoded(path).includes(token)) throw new Error("Refusing a URL that contains the service token: it is sent in the Authorization header only.");
     return url;
   }
 

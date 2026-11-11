@@ -114,8 +114,8 @@ export function genericOf(choice: FontChoice): GenericFamily {
 }
 
 /**
- * The CSS font-family value for a choice: the chosen family (or list of families) first, then the
- * per-script fallbacks for its generic family, ending with that generic family.
+ * The CSS font-family value for a choice: the chosen family (or list of families) first, then its
+ * generic family, then the per-script fallbacks for that generic family (ending with it again).
  */
 export function fontStack(choice: FontChoice): string {
   if (!isUsableFamily(choice.family)) throw new Error(`"${choice.family}" is not a font name.`);
@@ -123,7 +123,9 @@ export function fontStack(choice: FontChoice): string {
   const isList = splitFamilies(choice.family).length > 1 || /^['"]/.test(choice.family.trim());
   const families = isList ? splitFamilies(choice.family).map(cssFamily) : [cssFamily(choice.family)];
   while (families.length > 1 && TRAILING_GENERICS.has(families[families.length - 1]!) && families[families.length - 1] !== "ui-monospace") families.pop();
-  return [...families, FALLBACKS_BY_GENERIC[generic]].join(", ");
+  // R109: the generic family right after the chosen faces (a face missing a glyph falls back to the
+  // same kind of face first), then the per-script fallbacks, which end with the generic family again.
+  return [...families, generic, FALLBACKS_BY_GENERIC[generic]].join(", ");
 }
 
 export interface FontPreset extends FontChoice {

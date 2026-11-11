@@ -9,6 +9,7 @@
   width: 1em;
   height: 1em;
   /* A thin outline keeps light code colours visible on light chips and dark ones on dark chips. */
+  fill: var(--ao-swatch-fill, var(--muted));
   stroke: var(--line-control);
   stroke-width: 0.6;
 }

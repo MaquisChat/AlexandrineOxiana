@@ -1,7 +1,7 @@
 export interface ColourFinding {
   file: string;
   line: number;
-  rule: "colour-literal" | "colour-style";
+  rule: "colour-literal" | "colour-style" | "colour-svg" | "colour-sheet" | "colour-canvas";
   text: string;
 }
 export function scanSource(src: string, file: string): ColourFinding[];

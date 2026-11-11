@@ -110,13 +110,25 @@ function RadioGroup<T extends string>({ legend, name, value, options, onChange }
 }
 
 export function AppearanceSettingsScreen() {
-  const { settings, theme, accentApplied, update, saveError } = useAppearance();
+  const { settings, theme, accentApplied, update, retrySave, saveError } = useAppearance();
   const id = useId();
   const [rejectedAccent, setRejectedAccent] = useState<string | null>(null);
   // The colour shown in the picker while the user is still choosing (saved ACCENT_DEBOUNCE_MS after).
   const [draftAccent, setDraftAccent] = useState<string | null>(null);
   const accentTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => () => clearTimeout(accentTimer.current), []);
+  // The accent waiting for the debounce; saved at once if the screen closes first (R109).
+  const pendingAccent = useRef<string | null>(null);
+  const updateRef = useRef(update);
+  updateRef.current = update;
+  useEffect(
+    () => () => {
+      clearTimeout(accentTimer.current);
+      const v = pendingAccent.current;
+      pendingAccent.current = null;
+      if (v) void updateRef.current({ accent: v });
+    },
+    [],
+  );
   const showAccentWarning = rejectedAccent !== null || (!!settings.accent && !accentApplied);
 
   const set = (patch: AppearancePatch) => void update(patch);
@@ -125,13 +137,16 @@ export function AppearanceSettingsScreen() {
     const value = e.target.value.toUpperCase();
     if (!/^#[0-9A-F]{6}$/.test(value)) return;
     clearTimeout(accentTimer.current);
+    pendingAccent.current = null;
     setDraftAccent(value);
     if (!checkAccent(value, THEMES[theme], settings.highContrast).ok) {
       setRejectedAccent(value);
       return;
     }
     setRejectedAccent(null);
+    pendingAccent.current = value;
     accentTimer.current = setTimeout(() => {
+      pendingAccent.current = null;
       setDraftAccent(null);
       void update({ accent: value });
     }, ACCENT_DEBOUNCE_MS);
@@ -166,6 +181,7 @@ export function AppearanceSettingsScreen() {
             type="button"
             onClick={() => {
               clearTimeout(accentTimer.current);
+              pendingAccent.current = null;
               setDraftAccent(null);
               setRejectedAccent(null);
               void update({ accent: null });
@@ -237,9 +253,12 @@ export function AppearanceSettingsScreen() {
       </section>
 
       {saveError && (
-        <p role="alert" className="ao-warning">
-          {saveError}
-        </p>
+        <div role="alert" className="ao-warning">
+          <p>{saveError}</p>
+          <button type="button" onClick={() => void retrySave()}>
+            Try saving again
+          </button>
+        </div>
       )}
     </main>
   );

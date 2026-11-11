@@ -34,6 +34,9 @@ describe("index.html", () => {
     expect(m).not.toBeNull();
     const csp = m![1]!;
     for (const d of ["default-src 'self'", "script-src 'self'", "connect-src http://127.0.0.1:* http://localhost:*", "frame-src blob:", "object-src 'none'", "base-uri 'none'"]) expect(csp).toContain(d);
-    expect(csp).not.toMatch(/unsafe-inline|unsafe-eval/);
+    expect(csp).not.toMatch(/unsafe-eval/);
+    // R109: scripts stay 'self' only; inline styles are allowed so snapshots (blob: frames inherit this policy) render.
+    expect(/script-src ([^;]*)/.exec(csp)![1]).toBe("'self'");
+    expect(/style-src ([^;]*)/.exec(csp)![1]).toBe("'self' 'unsafe-inline'");
   });
 });

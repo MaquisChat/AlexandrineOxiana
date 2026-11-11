@@ -63,9 +63,57 @@ describe("colour scan of .ts/.tsx", () => {
     }
   });
 
+  it("catches the round-2 gaps (R109): shorthands, SVG paint attributes, setProperty, computed keys, named colours, multi-line templates, constructable sheets, canvas", () => {
+    const cases: string[] = [
+      // shorthand keys in style objects
+      `<div style={{ border: x }} />`,
+      `<div style={{ borderTop: "1px solid var(--line)" }} />`,
+      `<div style={{ outline: x }} />`,
+      `<div style={{ "box-shadow": x }} />`,
+      `<div style={{ textShadow: x }} />`,
+      `<div style={{ fill: x, stroke: y }} />`,
+      // SVG fill/stroke attributes that are not none/currentColor/var(--…)
+      `<path fill="red" />`,
+      `<path stroke="tomato" />`,
+      `<path fill={colour} />`,
+      `<circle stroke={props.c} />`,
+      `<path fill={"rebeccapurple"} />`,
+      // style.setProperty on a real property, or with a name that cannot be checked
+      `el.style.setProperty("color", x);`,
+      `el.style.setProperty("background", "var(--ink)");`,
+      `el.style.setProperty(name, x);`,
+      // computed keys in style objects
+      `<div style={{ [key]: x }} />`,
+      `<div style={{ ["color"]: x }} />`,
+      // named colours as values
+      `<div style={{ margin: 0, borderTop: "1px solid red" }} />`,
+      `el.style.cssText = "border: 1px solid navy";`,
+      `const css = "a { color: gold }";`,
+      // multi-line template literals
+      "const css = `\n  .x {\n    color: #ff0000;\n  }\n`;",
+      "const css = `\n  .x { border: 1px solid\n    red; }\n`;",
+      // constructable stylesheets
+      `sheet.replaceSync(css);`,
+      `sheet.insertRule(rule);`,
+      // canvas
+      `ctx.fillStyle = c;`,
+      `ctx.strokeStyle = "var(--ink)";`,
+      `ctx.shadowColor = c;`,
+    ];
+    for (const code of cases) expect(rulesOf(code).length, code).toBeGreaterThan(0);
+  });
+
   it("allows tokens through CSS classes, SVG attributes with var(), hashes that are not colours, and the token tooling", () => {
     for (const code of [
       `<path fill={\`var(--code-\${n})\`} />`,
+      `<path fill="none" stroke="currentColor" />`,
+      `<path fill="var(--code-1)" />`,
+      `<svg style={{ "--ao-swatch-fill": fill }} />`,
+      `root.style.setProperty(\`--font-\${slot}\`, stack);`,
+      `ctx.fillStyle = readToken("code-3");`,
+      `const families = ["red", "orange", "gold"];`,
+      `{ name: "teal", light: x }`,
+      "const msg = `Code ${name} is gold-ish`;",
       `<a href="#section-1">x</a>`,
       `const id = "#root";`,
       `document.getElementById("root");`,

@@ -30,13 +30,16 @@ describe("font stacks", () => {
   it("fontStack keeps the chosen families first and appends the serif fallbacks for a serif choice", () => {
     const s = fontStack({ family: GOUDY_STACK, source: "bundled", generic: "serif" });
     expect(s.startsWith("'Goudy Old Style', 'Sorts Mill Goudy'")).toBe(true);
-    expect(s).toBe(`'Goudy Old Style', 'Sorts Mill Goudy', Garamond, Georgia, ${FALLBACKS}`);
-    expect(families(s).filter((f) => f === "serif")).toHaveLength(1); // the generic family comes last, once
+    expect(s).toBe(`'Goudy Old Style', 'Sorts Mill Goudy', Garamond, Georgia, serif, ${FALLBACKS}`);
+    // R109: the generic family comes directly after the chosen faces, the script fallbacks after it
+    // (and the chain still ends with the generic family).
+    expect(families(s)[4]).toBe("serif");
+    expect(s.endsWith(", serif")).toBe(true);
   });
 
   it("the mono stack never falls back to a serif font and ends with monospace", () => {
     const mono = fontStack(DEFAULT_APPEARANCE.fonts.mono);
-    expect(mono.startsWith("ui-monospace, SFMono-Regular, Menlo, Consolas, ")).toBe(true);
+    expect(mono.startsWith("ui-monospace, SFMono-Regular, Menlo, Consolas, monospace, 'Noto Sans Mono'")).toBe(true);
     expect(families(mono).filter((f) => SERIF_WORDS.test(f))).toEqual([]);
     expect(mono.endsWith(", monospace")).toBe(true);
     // Also when the stored choice lost its generic (the service keeps family/source/file only).
@@ -45,7 +48,7 @@ describe("font stacks", () => {
 
   it('"Inter" falls back to sans-serif fonts, also without an explicit generic', () => {
     const inter = fontStack({ family: "Inter", source: "system", generic: "sans-serif" });
-    expect(inter).toBe(`Inter, ${FALLBACKS_BY_GENERIC["sans-serif"]}`);
+    expect(inter).toBe(`Inter, sans-serif, ${FALLBACKS_BY_GENERIC["sans-serif"]}`);
     expect(families(inter).filter((f) => SERIF_WORDS.test(f))).toEqual([]);
     expect(fontStack({ family: "Inter", source: "system" })).toBe(inter);
     expect(genericOf({ family: "Atkinson Hyperlegible", source: "bundled" })).toBe("sans-serif");
@@ -55,12 +58,12 @@ describe("font stacks", () => {
   });
 
   it("quotes a single family name that needs it", () => {
-    expect(fontStack({ family: "Atkinson Hyperlegible", source: "bundled", generic: "sans-serif" })).toBe(`'Atkinson Hyperlegible', ${FALLBACKS_BY_GENERIC["sans-serif"]}`);
+    expect(fontStack({ family: "Atkinson Hyperlegible", source: "bundled", generic: "sans-serif" })).toBe(`'Atkinson Hyperlegible', sans-serif, ${FALLBACKS_BY_GENERIC["sans-serif"]}`);
     expect(fontStack({ family: "Bob's Font", source: "system" }).startsWith(`'Bob\\'s Font', `)).toBe(true);
   });
 
   it("a user-file font uses the family name it registers under (the file itself is loaded by the desktop shell)", () => {
-    expect(fontStack({ family: "My Thesis Font", source: "user-file", file: "fonts/thesis.otf", generic: "serif" })).toBe(`'My Thesis Font', ${FALLBACKS}`);
+    expect(fontStack({ family: "My Thesis Font", source: "user-file", file: "fonts/thesis.otf", generic: "serif" })).toBe(`'My Thesis Font', serif, ${FALLBACKS}`);
   });
 
   it("refuses family names that could escape the font-family value, including control characters", () => {

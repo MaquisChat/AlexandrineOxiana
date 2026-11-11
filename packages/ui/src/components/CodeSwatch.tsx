@@ -7,6 +7,7 @@
  * Never throws (R105): an index that is not a whole number from 1 shows a neutral swatch with the
  * name. Takes no style: colours come from tokens (or the user's own colour, validated).
  */
+import type { CSSProperties } from "react";
 import { CODE_PALETTE_SIZE } from "../theme/themes";
 import { CODE_GLYPHS } from "./codeGlyphs";
 import { UserText } from "./UserText";
@@ -31,8 +32,9 @@ export function CodeSwatch({ index, name, color }: CodeSwatchProps) {
   const fill = valid ? (custom ?? `var(--code-${slot})`) : "var(--muted)";
   return (
     <span className="ao-code-swatch" data-testid="code-swatch">
-      <svg className="ao-code-swatch__glyph" viewBox="0 0 16 16" width="1em" height="1em" aria-hidden="true" focusable="false">
-        <path d={glyph.d} fill={fill} fillRule="evenodd" />
+      {/* The colour reaches the glyph through a custom property (CodeSwatch.css), never a paint attribute. */}
+      <svg className="ao-code-swatch__glyph" viewBox="0 0 16 16" width="1em" height="1em" aria-hidden="true" focusable="false" style={{ "--ao-swatch-fill": fill } as CSSProperties}>
+        <path d={glyph.d} fillRule="evenodd" />
       </svg>
       {valid && index > CODE_PALETTE_SIZE && (
         <span className="ao-code-swatch__badge" data-testid="code-badge" aria-hidden="true">

@@ -21,6 +21,15 @@ export function codeColors(theme: ThemeName): string[] {
   });
 }
 
+/**
+ * The current value of a token (without the leading "--"), as the page resolves it now; for canvas
+ * drawing, where CSS cannot reach (`ctx.fillStyle = readToken("code-3")`; the colour scan allows
+ * only this for canvas paint).
+ */
+export function readToken(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(`--${name}`).trim();
+}
+
 /** The theme to show for the settings and what the system prefers. */
 export function resolveTheme(theme: "system" | "light" | "dark", highContrast: boolean, systemDark: boolean): ThemeName {
   const base = theme === "system" ? (systemDark ? "dark" : "light") : theme;

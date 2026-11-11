@@ -222,6 +222,35 @@ describe("<AppearanceProvider>", () => {
   });
 });
 
+describe("<AppearanceProvider> failed saves (R109)", () => {
+  it("a failed change stays on screen with its error; a later successful save neither undoes it nor hides the error; retry saves it", async () => {
+    const { client, put, get } = fakeClient();
+    put.mockRejectedValueOnce(Object.assign(new Error("The library service could not be reached."), { code: "UNAVAILABLE" }));
+    let api: ReturnType<typeof useAppearance> | undefined;
+    function Probe() {
+      api = useAppearance();
+      return <p>{api.saveError ?? "saved"}</p>;
+    }
+    render(
+      <AppearanceProvider client={client}>
+        <Probe />
+      </AppearanceProvider>,
+    );
+    await waitFor(() => expect(screen.getByText("saved")).toBeTruthy());
+    await act(() => api!.update({ density: "compact" }));
+    expect(screen.getByText(/could not be reached/)).toBeTruthy();
+    await act(() => api!.update({ theme: "dark" })); // succeeds; the server's answer has density comfortable
+    expect(put).toHaveBeenLastCalledWith({ theme: "dark" });
+    expect(root().dataset.theme).toBe("dark");
+    expect(root().dataset.density).toBe("compact"); // not undone
+    expect(screen.getByText(/could not be reached/)).toBeTruthy(); // still unsaved, still said
+    await act(() => api!.retrySave());
+    expect(put).toHaveBeenLastCalledWith({ density: "compact" });
+    expect(screen.getByText("saved")).toBeTruthy();
+    expect((await get()).density).toBe("compact");
+  });
+});
+
 describe("<UserText>", () => {
   it("renders user-entered and source text with dir=auto (right-to-left text lays out correctly)", () => {
     render(

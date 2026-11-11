@@ -5,6 +5,9 @@ import { CODE_GLYPHS } from "./codeGlyphs";
 import { CodeSwatch } from "./CodeSwatch";
 import { UserText } from "./UserText";
 
+/** The colour a swatch paints its glyph with (a custom property on the svg; CodeSwatch.css uses it). */
+const fillOf = (sw: Element) => (sw.querySelector("svg") as SVGElement).style.getPropertyValue("--ao-swatch-fill");
+
 type Pt = [number, number];
 
 /** Vertices of a path made only of straight segments (M/L/H/V/Z), or null if it has curves. */
@@ -77,7 +80,8 @@ describe("<CodeSwatch>", () => {
     expect(svg.getAttribute("aria-hidden")).toBe("true");
     const path = svg.querySelector("path")!;
     expect(path.getAttribute("d")).toBe(CODE_GLYPHS[2]!.d);
-    expect(path.getAttribute("fill")).toBe("var(--code-3)");
+    expect(fillOf(sw)).toBe("var(--code-3)");
+    expect(path.getAttribute("fill")).toBeNull(); // no paint attribute: the colour comes through CSS
     const name = screen.getByText("Distrust of institutions");
     expect(name.getAttribute("dir")).toBe("auto");
     expect(sw.textContent).toContain(CODE_GLYPHS[2]!.name);
@@ -93,17 +97,17 @@ describe("<CodeSwatch>", () => {
 
   it("uses a valid custom colour the user set, and ignores anything else", () => {
     const { unmount } = render(<CodeSwatch index={2} name="Custom" color="#7A1F5C" />);
-    expect(screen.getByTestId("code-swatch").querySelector("path")!.getAttribute("fill")).toBe("#7A1F5C");
+    expect(fillOf(screen.getByTestId("code-swatch"))).toBe("#7A1F5C");
     unmount();
     render(<CodeSwatch index={2} name="Bad" color="red; background: url(x)" />);
-    expect(screen.getByTestId("code-swatch").querySelector("path")!.getAttribute("fill")).toBe("var(--code-2)");
+    expect(fillOf(screen.getByTestId("code-swatch"))).toBe("var(--code-2)");
   });
 
   it("never throws: a bad index shows a neutral swatch with the name", () => {
     for (const index of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY]) {
       const { unmount } = render(<CodeSwatch index={index} name={`code ${index}`} />);
       const sw = screen.getByTestId("code-swatch");
-      expect(sw.querySelector("path")!.getAttribute("fill")).toBe("var(--muted)");
+      expect(fillOf(sw)).toBe("var(--muted)");
       expect(screen.getByText(`code ${index}`)).toBeTruthy();
       unmount();
     }

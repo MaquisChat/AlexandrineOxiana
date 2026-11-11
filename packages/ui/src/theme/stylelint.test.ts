@@ -56,6 +56,44 @@ describe("no hard-coded colours outside tokens.css (stylelint)", () => {
     for (const code of bypasses) expect((await lintCode(code, "src/screens/x.css")).length, code).toBeGreaterThan(0);
   });
 
+  it("flags the round-2 gaps (R109): system colours in any property, data: URIs with named colours or base64 images, color-mix with a non-token argument", async () => {
+    const bypasses = [
+      ".x { background-image: linear-gradient(Canvas, transparent); }",
+      ".x { background-image: linear-gradient(to right, ButtonText 0%, transparent); }",
+      ".x { filter: drop-shadow(0 0 2px CanvasText); }",
+      ".x { -webkit-text-fill-color: Canvas; }",
+      ".x { -webkit-text-stroke: 1px ButtonText; }",
+      ".x { -webkit-text-stroke-color: highlight; }",
+      ".x { mask-image: radial-gradient(Field, transparent); }",
+      ".x { border-image: linear-gradient(GrayText, transparent) 1; }",
+      ".x { list-style-image: linear-gradient(Mark, Mark); }",
+      ".x { box-shadow: 0 0 0 2px Highlight; }",
+      ".x { background: url(\"data:image/svg+xml,<svg fill='red'/>\"); }",
+      ".x { background: url(data:image/svg+xml;utf8,<svg%20stroke=navy/>); }",
+      ".x { background-image: url(\"data:image/png;base64,iVBORw0KGgo=\"); }",
+      ".x { list-style-image: url('data:image/gif;base64,R0lGOD'); }",
+      ".x { color: color-mix(in srgb, var(--ink) 50%, #fff); }",
+      ".x { color: color-mix(in srgb, var(--ink), red); }",
+      ".x { color: COLOR-MIX(in oklab, var(--ink) 40%, rgb(0 0 0)); }",
+      ".x { color: color-mix(in srgb, var(--ink, red), var(--accent)); }",
+      ".x { color: color-mix(in srgb, var(--ink) 50%, Canvas); }",
+    ];
+    for (const code of bypasses) expect((await lintCode(code, "src/screens/x.css")).length, code).toBeGreaterThan(0);
+  });
+
+  it("allows color-mix() when every colour is a token, and ordinary words that only look like system colours", async () => {
+    for (const code of [
+      ".x { color: color-mix(in srgb, var(--ink) 40%, var(--surface)); }",
+      ".x { background: color-mix(in oklab, var(--accent), var(--bg) 20%); }",
+      ".x { transition: background 0.2s, color 0.2s; }",
+      ".x { will-change: background; }",
+      ".x { background: url(\"/img/menu.svg\"); }",
+      ".x { grid-template-areas: \"menu main\"; }",
+    ]) {
+      expect(await lintCode(code, "src/screens/x.css"), code).toEqual([]);
+    }
+  });
+
   it("allows tokens everywhere and literal colours only in src/theme/tokens.css", async () => {
     expect(await lintCode(".x { color: currentColor; background: transparent; border-color: inherit; }", "src/screens/x.css")).toEqual([]);
     expect(await lintCode(".x { background: url(\"/fonts/x.woff2\"); }", "src/screens/x.css")).toEqual([]);

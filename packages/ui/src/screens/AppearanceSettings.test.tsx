@@ -15,14 +15,22 @@ const settle = (ms: number) => act(() => new Promise<void>((r) => setTimeout(r, 
 const root = () => document.documentElement;
 const prop = (name: string) => root().style.getPropertyValue(name);
 
-function setup(initial: AppearanceSettings = DEFAULT_APPEARANCE) {
+/** What today's service does: it keeps family/source/file of each font and drops `generic`. */
+function withoutGeneric(s: AppearanceSettings): AppearanceSettings {
+  const out = structuredClone(s);
+  for (const f of Object.values(out.fonts)) delete (f as { generic?: string }).generic;
+  return out;
+}
+
+function setup(initial: AppearanceSettings = DEFAULT_APPEARANCE, opts: { serviceDropsGeneric?: boolean } = {}) {
   let cur = structuredClone(initial);
+  const answer = (s: AppearanceSettings) => (opts.serviceDropsGeneric ? withoutGeneric(s) : structuredClone(s));
   const put = vi.fn(async (patch: Partial<AppearanceSettings>) => {
     cur = { ...cur, ...patch, fonts: { ...cur.fonts, ...(patch.fonts ?? {}) } } as AppearanceSettings;
     if (patch.accent === null) delete cur.accent;
-    return structuredClone(cur);
+    return answer(cur);
   });
-  const get = vi.fn(async () => structuredClone(cur));
+  const get = vi.fn(async () => answer(cur));
   const client = { appearance: { get, put } } as unknown as ApiClient;
   const utils = render(
     <AppearanceProvider client={client} initial={initial}>
@@ -58,7 +66,7 @@ describe("Appearance settings screen", () => {
     const { put } = setup();
     const before = prop("--font-reading");
     await userEvent.setup().selectOptions(screen.getByRole("combobox", { name: "Interface typeface" }), "Inter");
-    expect(prop("--font-interface").startsWith("Inter, 'Noto Sans'")).toBe(true);
+    expect(prop("--font-interface").startsWith("Inter, sans-serif, 'Noto Sans'")).toBe(true);
     expect(prop("--font-interface").endsWith(", sans-serif")).toBe(true);
     expect(prop("--font-reading")).toBe(before);
     expect(put).toHaveBeenCalledWith({ fonts: { interface: { family: "Inter", source: "system", generic: "sans-serif" } } });
@@ -79,8 +87,24 @@ describe("Appearance settings screen", () => {
     const user = userEvent.setup();
     await user.type(screen.getByRole("textbox", { name: "Installed font for Reading view" }), "Charter");
     await user.click(screen.getByRole("button", { name: "Use installed font for Reading view" }));
-    expect(prop("--font-reading").startsWith("Charter, 'Noto Serif'")).toBe(true);
+    expect(prop("--font-reading").startsWith("Charter, serif, 'Noto Serif'")).toBe(true);
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a typed monospace font keeps its generic family when the service's answer drops it (R109)", async () => {
+    const { put, get } = setup(DEFAULT_APPEARANCE, { serviceDropsGeneric: true });
+    await waitFor(() => expect(get).toHaveBeenCalled());
+    const user = userEvent.setup();
+    await user.type(screen.getByRole("textbox", { name: "Installed font for Monospace" }), "Fira Code");
+    await user.click(screen.getByRole("button", { name: "Use installed font for Monospace" }));
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    const answer = await put.mock.results[0]!.value;
+    expect(answer.fonts.mono.generic).toBeUndefined(); // the service really dropped it
+    await settle(10);
+    const stack = prop("--font-mono");
+    expect(stack.startsWith("'Fira Code', monospace, ")).toBe(true);
+    expect(stack.endsWith(", monospace")).toBe(true);
+    expect(stack).not.toMatch(/Serif|Mincho|Songti|, serif/);
   });
 
   it("a typed font name that cannot be used shows a message and changes nothing", async () => {
@@ -126,6 +150,16 @@ describe("Appearance settings screen", () => {
     expect(put).toHaveBeenCalledTimes(1);
     expect(put).toHaveBeenCalledWith({ accent: "#4A1F5C" });
     expect(prop("--accent")).toBe("#4A1F5C");
+  });
+
+  it("a pending accent is saved when the screen closes before the debounce ends (R109)", async () => {
+    const { put, unmount } = setup({ ...DEFAULT_APPEARANCE, theme: "light" });
+    fireEvent.change(screen.getByLabelText("Accent color"), { target: { value: "#7a1f5c" } });
+    expect(put).not.toHaveBeenCalled();
+    unmount();
+    expect(put).toHaveBeenCalledWith({ accent: "#7A1F5C" });
+    await settle(ACCENT_DEBOUNCE_MS + 50);
+    expect(put).toHaveBeenCalledTimes(1);
   });
 
   it("headings are sized in rem only (the root font size already carries the text scale)", () => {
