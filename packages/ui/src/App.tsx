@@ -14,6 +14,7 @@ import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
 import { isTranscriptPath, TranscriptRoute } from "./routes/transcript";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
+import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
@@ -23,7 +24,7 @@ export type { ServiceConnection } from "./serviceConnection";
 export interface AppRoute {
   /** Which paths (normalised, without query) this route shows. */
   matches(path: string): boolean;
-  render(loc: AppLocation, client: ApiClient): ReactElement | null;
+  render(loc: AppLocation, client: ApiClient, port?: number): ReactElement | null;
   /** Shows the "Back to library" link above the screen. */
   back: boolean;
 }
@@ -34,6 +35,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
   { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
   { matches: isTranscriptPath, render: (loc, client) => <TranscriptRoute client={client} loc={loc} />, back: true },
+  { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
     render: (_loc, client) => (
@@ -55,9 +57,9 @@ function NotFound() {
   );
 }
 
-export function routeFor(loc: AppLocation, client: ApiClient): ReactElement {
+export function routeFor(loc: AppLocation, client: ApiClient, port?: number): ReactElement {
   const route = ROUTES.find((r) => r.matches(normalisePath(loc.pathname)));
-  const screen = route?.render(loc, client) ?? <NotFound />;
+  const screen = route?.render(loc, client, port) ?? <NotFound />;
   return (
     <>
       {route?.back !== false && <BackToLibrary projectId={projectInQuery(loc.search)} />}
@@ -66,9 +68,15 @@ export function routeFor(loc: AppLocation, client: ApiClient): ReactElement {
   );
 }
 
+/** The service's port, for the one screen that shows it (the token and address stay in the client). */
+const servicePort = (s?: ServiceConnection): number | undefined => {
+  const n = s ? Number(new URL(s.baseUrl).port) : NaN;
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+};
+
 export function App({ service }: { service?: ServiceConnection }) {
   const client: ApiClient | undefined = useMemo(() => (service ? createClient(service.baseUrl, service.token) : undefined), [service]);
   const loc = useLocation();
   useDropGuard();
-  return <AppearanceProvider {...(client ? { client } : {})}>{client ? routeFor(loc, client) : <AppearanceSettingsScreen />}</AppearanceProvider>;
+  return <AppearanceProvider {...(client ? { client } : {})}>{client ? routeFor(loc, client, servicePort(service)) : <AppearanceSettingsScreen />}</AppearanceProvider>;
 }
