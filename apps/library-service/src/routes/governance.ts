@@ -14,7 +14,7 @@ import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
 import { effectivePolicy, parseGovernance } from "@ao/core";
-import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, retentionDue } from "@ao/library";
+import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, retentionDue, scrubPaths } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
 
@@ -105,8 +105,9 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const paths = strArray(bodyOf(req), "paths", { max: 50 });
     if (paths.some((p) => !isAbsolute(p) || p.includes("\0"))) throw badRequest('"paths" must be absolute paths.');
-    await addProtocolDocuments(s.repo, projectId, paths);
-    return { documents: await listProtocolDocuments(s.repo, projectId) };
+    // One result per file (R117 I6): a refused file does not stop the others.
+    const results = (await addProtocolDocuments(s.repo, projectId, paths)).map((r) => (r.reason ? { ...r, reason: scrubPaths(r.reason, state.roots) } : r));
+    return { results, documents: await listProtocolDocuments(s.repo, projectId) };
   });
 
   app.get("/projects/:id/retention", async (req) => {
@@ -135,11 +136,14 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const assetIds = strArray(b, "assetIds", { max: 10_000, itemMax: 64 });
     if (optBool(b, "confirm") !== true) throw badRequest("Destroying raw data cannot be undone: confirm it (confirm: true).");
     const includeDerived = optBool(b, "includeDerived") ?? false;
-    const by = optStr(b, "by", 200) ?? whoAmI();
-    // Only originals that are due now can be destroyed through here.
-    const due = new Set((await retentionDue(s.repo, projectId, state.deps.clock())).flatMap((d) => d.assetIds));
+    // Who destroys the data is the researcher this service runs as (the OS user; the app has no
+    // separate researcher-name setting yet), never text from the request (R117).
+    const by = whoAmI();
+    // Only originals that are due now can be destroyed through here; checked again inside the change.
+    const now = state.deps.clock();
+    const due = new Set((await retentionDue(s.repo, projectId, now)).flatMap((d) => d.assetIds));
     if (!assetIds.length || assetIds.some((id) => !due.has(id))) throw badRequest("Only raw originals that are due for destruction can be destroyed.");
-    const r = await destroyRaw(s.repo, projectId, assetIds, by, { includeDerived });
+    const r = await destroyRaw(s.repo, projectId, assetIds, by, { includeDerived, onlyDue: now });
     state.publishState();
     const root = s.lib.root.replace(/[\\/]+$/, "");
     const rel = r.certificatePath.startsWith(root) ? r.certificatePath.slice(root.length + 1).split(/[\\/]/).join("/") : "";

@@ -95,9 +95,12 @@ describe("fieldwork PATCH / DELETE (R97)", () => {
   it("updates a participant, a session and a consent record", async () => {
     const p = (await call({ method: "POST", url: `/projects/${pid}/participants`, body: {} })).json;
     expect(p.code).toBe("P-001");
-    const up = await call({ method: "PATCH", url: `/projects/${pid}/participants/${p.id}`, body: { code: "P-100", details: { name: "Rosa" } } });
+    const renamed = await call({ method: "PATCH", url: `/projects/${pid}/participants/${p.id}`, body: { code: "P-100" } });
+    expect(renamed.status).toBe(400);
+    expect(renamed.json.error.message).toMatch(/cannot be changed/);
+    const up = await call({ method: "PATCH", url: `/projects/${pid}/participants/${p.id}`, body: { details: { name: "Rosa" } } });
     expect(up.status, up.body).toBe(200);
-    expect(up.json).toMatchObject({ code: "P-100", details: { name: "Rosa" } });
+    expect(up.json).toMatchObject({ code: "P-001", details: { name: "Rosa" } });
     expect((await call({ method: "PATCH", url: `/projects/${pid}/participants/${p.id}`, body: { details: null } })).json.details).toBeUndefined();
 
     const s = (await call({ method: "POST", url: `/projects/${pid}/sessions`, body: { date: "2026-03-14", place: "Lima" } })).json;
@@ -111,7 +114,9 @@ describe("fieldwork PATCH / DELETE (R97)", () => {
     expect(cu.status, cu.body).toBe(200);
     expect(cu.json).toMatchObject({ scope: "audio and video", expires: "2027-03-14" });
     expect((await call({ method: "PATCH", url: `/projects/${pid}/consents/${c.id}`, body: { scope: 7 } })).status).toBe(400);
-    expect((await call({ method: "PATCH", url: `/projects/${pid}/participants/0190f0f0-0000-7000-8000-000000000000`, body: { code: "X" } })).status).toBe(404);
+    // The document is set only by attaching the signed form (R117 I3).
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/consents/${c.id}`, body: { documentAssetId: "0190f0f0-0000-7000-8000-0000000000aa" } })).status).toBe(400);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/participants/0190f0f0-0000-7000-8000-000000000000`, body: { details: null } })).status).toBe(404);
   });
 
   it("withdraws a consent: the record is kept, linked sources are flagged for review, nothing is deleted", async () => {
@@ -133,6 +138,10 @@ describe("fieldwork PATCH / DELETE (R97)", () => {
     await call({ method: "POST", url: `/projects/${pid}/consents`, body: { participantId: p.id, scope: "audio", date: "2026-03-14" } });
     const busy = await call({ method: "DELETE", url: `/projects/${pid}/participants/${p.id}` });
     expect(busy.status).toBe(409);
+    // Mapped in one place (R117): the service's error mapping knows FieldworkInUseError.
+    const { toApiError } = await import("./errors.js");
+    const { FieldworkInUseError } = await import("@ao/library");
+    expect(toApiError(new FieldworkInUseError("X", ["1 source"])).status).toBe(409);
     expect(busy.json.error.code).toBe("CONFLICT");
     expect(busy.json.error.message).toMatch(/consent record/);
     const free = (await call({ method: "POST", url: `/projects/${pid}/participants`, body: {} })).json;
@@ -150,19 +159,24 @@ describe("fieldwork PATCH / DELETE (R97)", () => {
     expect(r.status, r.body).toBe(200);
     expect(r.json.consent.documentAssetId).toBe(r.json.assetId);
     expect((await call({ method: "POST", url: `/projects/${pid}/consents/${c.id}/document`, body: { path: "relative.pdf" } })).status).toBe(400);
+    expect((await call({ method: "PATCH", url: `/projects/${pid}/consents/${c.id}`, body: { documentAssetId: null } })).status).toBe(400);
+    const off = await call({ method: "PATCH", url: `/projects/${pid}/consents/${c.id}`, body: { documentAssetId: null, detachReason: "wrong form" } });
+    expect(off.status, off.body).toBe(200);
+    expect(off.json.documentAssetId).toBeUndefined();
   });
 });
 
 describe("protocol documents (spec 6.3(9))", () => {
   it("adds dropped approval documents under <Project>/protocol/ and lists them", async () => {
     expect((await call({ url: `/projects/${pid}/protocol/documents` })).json.documents).toEqual([]);
-    const r = await call({ method: "POST", url: `/projects/${pid}/protocol/documents`, body: { paths: [pdf] } });
+    const r = await call({ method: "POST", url: `/projects/${pid}/protocol/documents`, body: { paths: [pdf, tmp] } });
     expect(r.status, r.body).toBe(200);
     expect(r.json.documents).toEqual([{ name: "form.pdf", bytes: expect.any(Number), encrypted: false }]);
+    expect(r.json.results.map((x: { outcome: string }) => x.outcome)).toEqual(["added", "failed"]);
+    expect(JSON.stringify(r.json.results)).not.toContain(tmp);
     const folder = svc.state.session!.repo.getProject(pid).folder;
     expect(await readFile(join(tmp, "Lib", folder, "protocol", "form.pdf"), "utf8")).toContain("signed consent");
     expect((await call({ url: `/projects/${pid}/protocol/documents` })).json.documents).toHaveLength(1);
-    expect((await call({ method: "POST", url: `/projects/${pid}/protocol/documents`, body: { paths: [tmp] } })).status).toBe(400);
     expect((await call({ method: "POST", url: `/projects/${pid}/protocol/documents`, body: { paths: ["form.pdf"] } })).status).toBe(400);
   });
 });
@@ -175,9 +189,11 @@ describe("retention (spec 6.3(5))", () => {
     expect(due.json).toMatchObject({ destroyAfter: "2020-01-01", due: [{ sourceId, assetIds: [assetId], title: "Interview with the harbour master" }] });
     expect((await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId] } })).status).toBe(400);
     expect((await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: ["0190f0f0-0000-7000-8000-000000000000"], confirm: true } })).status).toBe(400);
-    const r = await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true, by: "Ana" } });
+    const r = await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true, by: "Somebody Else" } });
     expect(r.status, r.body).toBe(200);
     expect(r.json.certificate).toMatchObject({ kind: "destruction-certificate" });
+    // Who destroyed it is the researcher this service runs as, never text the client sent (R117).
+    expect(r.json.certificate.actor).not.toBe("Somebody Else");
     expect(r.json.certificateFile).toMatch(/^Projects\/.+\/retention\/destruction-.+\.json$/);
     expect(JSON.stringify(r.json)).not.toContain(tmp);
     expect((await call({ url: `/projects/${pid}/retention` })).json.due).toEqual([]);

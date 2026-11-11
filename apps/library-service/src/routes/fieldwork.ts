@@ -1,12 +1,12 @@
 /**
  * Fieldwork (spec 3.6): participants, sessions and consent records — listed, created, changed and
  * (participants and sessions, only when nothing links to them) deleted through the governed
- * repository (R97). Consent records are never deleted: a consent is withdrawn instead, which is
+ * repository (R97, R117). Participant codes never change. Consent records are never deleted: a consent is withdrawn instead, which is
  * audited and queues the participant's sources for review (nothing is deleted). A dropped consent
  * form is stored as an identifiable source linked to the participant.
  */
 import type { FastifyInstance } from "fastify";
-import { attachConsentDocument, FieldworkInUseError, type ConsentInput, type ConsentPatch, type ParticipantInput, type ParticipantPatch, type SessionInput, type SessionPatch } from "@ao/library";
+import { attachConsentDocument, proxyQueueFor, type ConsentInput, type ConsentPatch, type ParticipantInput, type ParticipantPatch, type SessionInput, type SessionPatch } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { bodyOf, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
 
@@ -17,16 +17,6 @@ function nullableStr(o: Obj, key: string, max: number): string | null | undefine
 
 function detailsOf(details: Obj): Record<string, string> {
   return Object.fromEntries(Object.entries(details).map(([k, v]) => [k.slice(0, 200), String(v).slice(0, 4000)]));
-}
-
-/** Linked records are a conflict the person resolves first (409), never a silent cascade. */
-async function guarded<T>(fn: () => Promise<T>): Promise<T> {
-  try {
-    return await fn();
-  } catch (err) {
-    if (err instanceof FieldworkInUseError) throw new ApiError(409, "CONFLICT", err.message);
-    throw err;
-  }
 }
 
 const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
@@ -86,12 +76,15 @@ export function registerFieldwork(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const b = bodyOf(req);
     const expires = nullableStr(b, "expires", 40);
-    const documentAssetId = nullableStr(b, "documentAssetId", 64);
+    // The document is set only by attaching the signed form (POST …/document); it can only be detached here, with a reason (R117 I3).
+    if (b.documentAssetId !== undefined && b.documentAssetId !== null) throw badRequest("A consent record's document is set by attaching the signed form, not by editing the record.");
+    const detachReason = optStr(b, "detachReason", 2000);
     const patch: ConsentPatch = {
       ...(optStr(b, "scope", 2000) !== undefined ? { scope: optStr(b, "scope", 2000)! } : {}),
       ...(optStr(b, "date", 40) !== undefined ? { date: optStr(b, "date", 40)! } : {}),
       ...(expires !== undefined ? { expires } : {}),
-      ...(documentAssetId !== undefined ? { documentAssetId } : {}),
+      ...(b.documentAssetId === null ? { documentAssetId: null } : {}),
+      ...(detachReason ? { detachReason } : {}),
     };
     return s.repo.updateConsent(projectId, paramsOf(req).fid ?? "", patch);
   });
@@ -111,21 +104,20 @@ export function registerFieldwork(app: FastifyInstance, ctx: Ctx): void {
     const path = str(b, "path", 4096);
     if (!isAbsolute(path) || path.includes("\0")) throw badRequest('"path" must be an absolute path.');
     const legalBasis = optStr(b, "legalBasis", 2000);
-    const r = await attachConsentDocument(s.repo, projectId, paramsOf(req).fid ?? "", path, legalBasis ? { legalBasis } : {});
-    return r;
+    return attachConsentDocument(s.repo, projectId, paramsOf(req).fid ?? "", path, { proxies: proxyQueueFor(s.repo), ...(legalBasis ? { legalBasis } : {}) });
   });
 
   app.delete("/projects/:id/participants/:fid", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    await guarded(() => s.repo.deleteParticipant(projectId, paramsOf(req).fid ?? ""));
+    await s.repo.deleteParticipant(projectId, paramsOf(req).fid ?? "");
     return { deleted: true };
   });
 
   app.delete("/projects/:id/sessions/:fid", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    await guarded(() => s.repo.deleteSession(projectId, paramsOf(req).fid ?? ""));
+    await s.repo.deleteSession(projectId, paramsOf(req).fid ?? "");
     return { deleted: true };
   });
 
