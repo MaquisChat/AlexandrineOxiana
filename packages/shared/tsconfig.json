@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // No Node or DOM types: this package must work in both the service and the browser (R109).
+    "types": []
+  },
+  "include": ["src"]
+}

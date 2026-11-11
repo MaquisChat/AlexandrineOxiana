@@ -1,2 +1,15 @@
-// Placeholder so the package builds and typechecks; real code arrives in later tasks.
 export const packageName = "@ao/ui";
+export { App } from "./App";
+export { ApiClientError, createClient, type ApiClient, type ServiceError, type ServiceEvent } from "./api/client";
+export { UserText } from "./components/UserText";
+export { CodeSwatch } from "./components/CodeSwatch";
+export { SNAPSHOT_CSP, SnapshotFrame } from "./components/SnapshotFrame";
+export { takeServiceConnection, type ServiceConnection } from "./serviceConnection";
+export { CODE_GLYPHS, type CodeGlyph } from "./components/codeGlyphs";
+export { CODE_FAMILIES } from "./theme/codePalette";
+export { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
+export { DEFAULT_APPEARANCE, type AppearancePatch, type AppearanceSettings } from "./theme/appearance";
+export { AppearanceProvider, useAppearance } from "./theme/AppearanceProvider";
+export { contrastRatio } from "./theme/contrast";
+export { FONT_PRESETS, fontStack, type FontChoice } from "./theme/fonts";
+export { THEMES, codeColors } from "./theme/themes";

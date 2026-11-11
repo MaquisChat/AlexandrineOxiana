@@ -1,0 +1,87 @@
+.ao-appearance {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-3);
+}
+
+.ao-appearance h1 {
+  font-size: 1.6rem; /* rem already carries the text scale (root font size) */
+  margin: 0 0 var(--space-3);
+}
+
+.ao-appearance h2 {
+  font-size: 1.15rem;
+  margin: var(--space-4) 0 var(--space-2);
+  padding-bottom: var(--space-1);
+  border-bottom: 1px solid var(--line);
+}
+
+.ao-fieldset {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-2);
+}
+
+.ao-fieldset legend {
+  color: var(--ink-2);
+  padding: 0 var(--space-1);
+}
+
+.ao-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-right: var(--space-3);
+}
+
+.ao-field,
+.ao-accent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.ao-font-row {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) 2fr;
+  gap: var(--space-1) var(--space-3);
+  align-items: center;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ao-font-typed {
+  grid-column: 2;
+  display: flex;
+  gap: var(--space-1);
+}
+
+.ao-font-sample {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface-2);
+  border-radius: 4px;
+}
+
+.ao-font-sample--interface { font-family: var(--font-interface); }
+.ao-font-sample--reading { font-family: var(--font-reading); }
+.ao-font-sample--transcript { font-family: var(--font-transcript); }
+.ao-font-sample--notes { font-family: var(--font-notes); }
+.ao-font-sample--mono { font-family: var(--font-mono); }
+
+.ao-hint {
+  color: var(--muted);
+}
+
+.ao-warning {
+  color: var(--warn-ink);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-line);
+  border-radius: 4px;
+  padding: var(--space-1) var(--space-2);
+  flex-basis: 100%;
+}

@@ -1,0 +1,78 @@
+/*
+ * Document-wide styles driven by the appearance settings that AppearanceProvider puts on <html>:
+ * data-theme (tokens.css), --font-*, --text-scale, --line-spacing, data-density, data-motion.
+ * No literal colours here: tokens only.
+ */
+:root {
+  --text-scale: 1;
+  --line-spacing: 1.5;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --font-interface: "Goudy Old Style", "Sorts Mill Goudy", Garamond, Georgia, serif;
+  --font-reading: var(--font-interface);
+  --font-transcript: var(--font-interface);
+  --font-notes: var(--font-interface);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: calc(100% * var(--text-scale));
+}
+
+:root[data-density="compact"] {
+  --space-1: 0.125rem;
+  --space-2: 0.3rem;
+  --space-3: 0.6rem;
+  --space-4: 1rem;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-interface);
+  line-height: var(--line-spacing);
+}
+
+code,
+kbd,
+samp,
+pre {
+  font-family: var(--font-mono);
+}
+
+input,
+select,
+button,
+textarea {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-control);
+  border-radius: 4px;
+  padding: var(--space-1) var(--space-2);
+}
+
+button {
+  background: var(--chip);
+  cursor: pointer;
+}
+
+a {
+  color: var(--accent-ink);
+}
+
+/* Visible focus in every theme (spec 8A.4). */
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Reduced motion: the setting, or the system preference when set to "Use system setting". */
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] *::before,
+:root[data-motion="reduce"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
