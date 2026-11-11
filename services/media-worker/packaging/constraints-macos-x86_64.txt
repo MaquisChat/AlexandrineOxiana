@@ -1,0 +1,21 @@
+# The Intel-Mac pin set (R133, ADR 0014 section 3). Used by apps/desktop/scripts/build-sidecars.mjs
+# automatically on an Intel Mac, or with `--constraints <this file>`.
+#
+# A package named here is pinned to this version even where pyproject.toml pins it directly: the
+# build script drops the version from the direct requirement and lets this file decide. Everything
+# not named here keeps the default pins.
+#
+# Checked 2026-11-11 with a cross-platform resolve (`build-sidecars.mjs --resolve-for macos-x86_64`):
+# with these pins every dependency has a CPython 3.13 wheel for macOS 15 x86_64; with the default
+# pins `rawpy==0.28.0` has none. Review this list whenever a dependency is updated.
+
+# 1.24 dropped Intel Macs. Only for the Silero voice-activity model. Pulls in sympy and coloredlogs.
+onnxruntime==1.23.2
+# 10.14 dropped Intel wheels; this one already needs macOS 15.0.
+pikepdf==10.13.0.post1
+# 17.13 needs pikepdf >= 10.15 (default pin: 17.14.1). Two months of OCR fixes behind.
+ocrmypdf==17.12.1
+# No x86_64 wheel since 0.26.0 (default pin: 0.28.0). Older LibRaw: newer cameras' RAW files unreadable.
+rawpy==0.25.1
+# 49.0.0 removed x86_64 macOS. Used by pdfminer.six for encrypted PDFs only.
+cryptography==48.0.1

@@ -6,7 +6,8 @@
  * jobs indicator. While the library is read-only the drop zone and every edit button are off. A
  * locked encrypted project shows UnlockProject in place of its sources. "New project" opens the
  * new-project dialog (Task 60); the project it creates is selected through the address, like any
- * other selection.
+ * other selection. "New recovery code…" (an unlocked encrypted project) opens the new-recovery-code
+ * dialog (Task 61).
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
@@ -24,6 +25,7 @@ import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { PATHS } from "../navigation";
 import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
+import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 
@@ -97,7 +99,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** The new-project dialog is open. */
   const [creating, setCreating] = useState(false);
   const newProjectButton = useRef<HTMLButtonElement>(null);
-  /** The dialog shows a recovery code not yet confirmed: a library close waits for it. */
+  /** The new-recovery-code dialog is open, for this project. */
+  const [recovering, setRecovering] = useState<ProjectSummary | null>(null);
+  const recoveryButton = useRef<HTMLButtonElement>(null);
+  /** A dialog shows a recovery code not yet confirmed: a library close waits for it. */
   const holdClose = useRef(false);
   /** The library closed while that code was on screen. */
   const [closedUnder, setClosedUnder] = useState(false);
@@ -425,6 +430,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               Lock project
             </button>
           )}
+          {project?.encrypted && !locked && (
+            <button type="button" ref={recoveryButton} disabled={readOnly} onClick={() => setRecovering(project)}>
+              New recovery code…
+            </button>
+          )}
           {!locked && !readOnly && project && (
             <a href={importHref(project.id)} onClick={(e) => follow(e, importHref(project.id))}>
               Import
@@ -438,6 +448,9 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.appearance} onClick={(e) => follow(e, PATHS.appearance)}>
             Appearance
           </a>
+          <a href={PATHS.extension} onClick={(e) => follow(e, PATHS.extension)}>
+            Browser extension
+          </a>
           {onSwitchLibrary && (
             <button type="button" onClick={onSwitchLibrary}>
               Switch library
@@ -445,6 +458,28 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           )}
         </div>
       </header>
+      {recovering && (
+        <NewRecoveryCode
+          api={api}
+          project={recovering}
+          returnFocusTo={() => {
+            // The opener, unless it is gone or off meanwhile: then the project list.
+            const b = recoveryButton.current;
+            if (b && !b.disabled) return b;
+            return document.querySelector<HTMLElement>(".ao-projects button[aria-current='true'], .ao-projects button");
+          }}
+          onRecoveryPending={(pending) => {
+            holdClose.current = pending;
+          }}
+          libraryClosed={closedUnder}
+          onLocked={() => markLocked(recovering.id)}
+          onClose={() => {
+            setRecovering(null);
+            // The library went away while the recovery code was on screen: now leave it.
+            if (closedUnder) closedRef.current?.();
+          }}
+        />
+      )}
       {resolving && (
         <PendingWritesDialog
           api={api}
@@ -510,7 +545,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               <p role="status">
                 “<UserText>{unresolved.create.name}</UserText>” was created.
                 {unresolved.create.encrypted &&
-                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Asking for a new recovery code from the project's settings is planned, but not available yet."}
+                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Once it is unlocked, choose “New recovery code…” to get a recovery code you can save."}
               </p>
             ) : unresolved.state === "not-created" ? (
               <p role="status">
@@ -519,7 +554,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             ) : (
               <p role="alert">
                 “<UserText>{unresolved.create.name}</UserText>” may have been created: the library service did not answer, so the app cannot tell yet.
-                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose."}
+                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose, and “New recovery code…” gives it a new one."}
                 {" "}Do not create it again until this is settled.
                 {unresolved.state === "still-unknown" && " The app still cannot tell: the service did not answer. Try again in a moment."}
               </p>
