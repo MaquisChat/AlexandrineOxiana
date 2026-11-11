@@ -5,7 +5,7 @@
  */
 import { useId, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
-import type { LibraryApi, ProjectSummary } from "../api/library";
+import { errorText, type LibraryApi, type ProjectSummary } from "../api/library";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 
@@ -35,7 +35,7 @@ export function UnlockProject({ api, project, onUnlocked }: UnlockProjectProps) 
       onUnlocked();
     } catch (err) {
       if (err instanceof ApiClientError && err.code === "WRONG_PASSPHRASE") setError(WRONG_PASSPHRASE_MESSAGE);
-      else setError(err instanceof ApiClientError ? err.message : "The project could not be unlocked.");
+      else setError(errorText(err, "The project could not be unlocked."));
     } finally {
       setBusy(false);
     }

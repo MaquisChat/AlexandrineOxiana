@@ -4,9 +4,8 @@
  * library is read-only. Archived HTML snapshots are never rendered here: captured HTML is shown
  * only through SnapshotFrame (R101).
  */
-import { useEffect, useId, useState, type FormEvent } from "react";
-import { ApiClientError } from "../api/client";
-import type { Creator, LibraryApi, SourceFile, SourcePatch } from "../api/library";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { errorText, isProjectLocked, type Creator, type LibraryApi, type SourceFile, type SourcePatch } from "../api/library";
 import { CitePanel } from "../components/CitePanel";
 import { typeLabel } from "../components/SourceTable";
 import { UserText } from "../components/UserText";
@@ -19,6 +18,8 @@ export interface SourceDetailProps {
   readOnly: boolean;
   onClose: () => void;
   onChanged?: () => void;
+  /** The service said the project is locked (R114 I4): the shell shows UnlockProject. */
+  onLocked?: () => void;
 }
 
 const IDENTIFIER_LABELS: Record<string, string> = { doi: "DOI", isbn: "ISBN", issn: "ISSN", pmid: "PubMed ID", pmcid: "PubMed Central ID", arxiv: "arXiv", url: "Web address" };
@@ -29,7 +30,7 @@ export function creatorName(c: Creator): string {
 }
 
 const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).at(-1) ?? p;
-const message = (err: unknown, fallback: string) => (err instanceof ApiClientError ? err.message : fallback);
+const message = (err: unknown, fallback: string) => errorText(err, fallback);
 
 function formatBytes(n: number | undefined): string {
   if (n === undefined) return "";
@@ -38,7 +39,7 @@ function formatBytes(n: number | undefined): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged }: SourceDetailProps) {
+export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onChanged, onLocked }: SourceDetailProps) {
   const [file, setFile] = useState<SourceFile | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [editing, setEditing] = useState(false);
@@ -46,7 +47,13 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   const [saving, setSaving] = useState(false);
   const id = useId();
 
+  // Read again only when the source changes (not when the parent re-renders with a new api object).
+  const apiRef = useRef(api);
+  apiRef.current = api;
+  const lockedRef = useRef(onLocked);
+  lockedRef.current = onLocked;
   useEffect(() => {
+    const api = apiRef.current;
     let live = true;
     setFile(undefined);
     setError(undefined);
@@ -54,11 +61,15 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
     api.sources
       .get(projectId, sourceId)
       .then((f) => live && setFile(f))
-      .catch((err: unknown) => live && setError(message(err, "This source could not be read.")));
+      .catch((err: unknown) => {
+        if (!live) return;
+        if (isProjectLocked(err)) lockedRef.current?.();
+        setError(message(err, "This source could not be read."));
+      });
     return () => {
       live = false;
     };
-  }, [api, projectId, sourceId]);
+  }, [projectId, sourceId]);
 
   const src = file?.source;
   const variants = src?.title?.variants ?? [];
@@ -88,6 +99,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       setEditing(false);
       onChanged?.();
     } catch (err) {
+      if (isProjectLocked(err)) onLocked?.();
       setError(message(err, "The change could not be saved."));
     } finally {
       setSaving(false);
@@ -135,7 +147,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
                 <input id={`${id}-publisher`} dir="auto" value={draft.publisher} onChange={(e) => setDraft({ ...draft, publisher: e.target.value })} />
               </div>
               <div className="ao-row">
-                <button type="submit" disabled={saving}>
+                <button type="submit" disabled={saving || readOnly}>
                   Save
                 </button>
                 <button type="button" onClick={() => setEditing(false)}>
@@ -164,7 +176,9 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
             {src.issued && (
               <>
                 <dt>Date</dt>
-                <dd>{src.issued}</dd>
+                <dd>
+                  <UserText>{src.issued}</UserText>
+                </dd>
               </>
             )}
             {src.publisher && (
@@ -182,7 +196,9 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
               <>
                 <dt>Citation key</dt>
                 <dd>
-                  <code>{src.citationKey}</code>
+                  <code>
+                    <UserText>{src.citationKey}</UserText>
+                  </code>
                 </dd>
               </>
             )}

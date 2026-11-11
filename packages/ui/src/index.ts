@@ -13,7 +13,7 @@ export { AppearanceProvider, useAppearance } from "./theme/AppearanceProvider";
 export { contrastRatio } from "./theme/contrast";
 export { FONT_PRESETS, fontStack, type FontChoice } from "./theme/fonts";
 export { THEMES, codeColors } from "./theme/themes";
-export { libraryApi, profilesFromGovernance, type LibraryApi } from "./api/library";
+export { libraryApi, type LibraryApi } from "./api/library";
 export { LibraryRoutes, isLibraryPath, navigate, usePathname } from "./routes/library";
 export { DropZone, pathsFromDataTransfer } from "./components/DropZone";
 export { StatusBanner, bannersFor, volumeOf, type BannerVariant } from "./components/StatusBanner";

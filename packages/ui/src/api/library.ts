@@ -7,7 +7,6 @@
  * Citations are always rendered by the service (participant codes and withheld sources are applied
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
-import { parse } from "yaml";
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 
 // ---------------------------------------------------------------------------------------------
@@ -69,6 +68,8 @@ export interface ProjectSummary {
   unlocked: boolean;
   backups?: unknown;
   acknowledgements?: string[];
+  /** Compliance profiles (R114 I2: sent by the service from integration on). */
+  profiles?: string[];
 }
 
 export interface Collection {
@@ -184,18 +185,8 @@ export type CitationFormat = "text" | "html" | "rtf";
 export const PROFILE_IDS = ["irb", "gdpr", "hipaa", "dmp"] as const;
 export type ProfileId = (typeof PROFILE_IDS)[number];
 
-/**
- * The compliance profiles a governance.yaml names (`profiles:`), for the project badges. Anything
- * unreadable or unknown shows no badge: the service, not this, decides what the rules allow.
- */
-export function profilesFromGovernance(yaml: string): ProfileId[] {
-  let doc: unknown;
-  try {
-    doc = parse(yaml, { schema: "core", maxAliasCount: 20 });
-  } catch {
-    return [];
-  }
-  const list = doc && typeof doc === "object" ? (doc as { profiles?: unknown }).profiles : undefined;
+/** Keeps only the profile ids the UI knows (badges are labels; the service decides what rules allow). */
+export function knownProfiles(list: unknown): ProfileId[] {
   if (!Array.isArray(list)) return [];
   return [...new Set(list.filter((p): p is ProfileId => typeof p === "string" && (PROFILE_IDS as readonly string[]).includes(p)))];
 }
@@ -215,7 +206,8 @@ export function libraryApi(client: ApiClient) {
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),
       close: () => r<{ closed: true }>("POST", "/libraries/close"),
-      reconnect: (path: string, libraryId: string) => r<ReconnectResult>("POST", "/libraries/reconnect", { body: { path, libraryId } }),
+      reconnect: (path: string, libraryId: string, opts: { signal?: AbortSignal } = {}) =>
+        r<ReconnectResult>("POST", "/libraries/reconnect", { body: { path, libraryId }, ...(opts.signal ? { signal: opts.signal } : {}) }),
       /** Folders holding this library, streamed as the service finds them; an error line is thrown. */
       async *locate(libraryId: string, opts: { roots?: string[]; signal?: AbortSignal } = {}): AsyncGenerator<FoundLibrary, void, undefined> {
         const body = { libraryId, ...(opts.roots ? { roots: opts.roots } : {}) };
@@ -224,6 +216,9 @@ export function libraryApi(client: ApiClient) {
           if (line.found) yield line.found;
           if (line.done) return;
         }
+        if (opts.signal?.aborted) return;
+        // Ended without its closing line: the search was cut off.
+        throw new ApiClientError(0, { code: "INTERNAL", message: "The search stopped before it finished." });
       },
       rebuildIndex: () => r<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index"),
     },
@@ -271,3 +266,30 @@ export function libraryApi(client: ApiClient) {
 }
 
 export type LibraryApi = ReturnType<typeof libraryApi>;
+
+// ---------------------------------------------------------------------------------------------
+// Errors in plain language (R114 I4)
+
+const CODE_LEAD: Partial<Record<string, string>> = {
+  POLICY_DENIED: "The project's rules don't allow this.",
+  READ_ONLY: "This library is read-only, so nothing was changed.",
+  LIBRARY_OFFLINE: "The library is offline, so nothing was changed. It reconnects when its drive returns.",
+  PROJECT_LOCKED: "This project is locked. Unlock it to continue.",
+  UNAVAILABLE: "The library service could not be reached.",
+  RATE_LIMITED: "Too many attempts. Wait a moment, then try again.",
+  CONFLICT: "Something changed in the meantime.",
+  WORKER_UNAVAILABLE: "The media helper is not running yet.",
+};
+
+/** What to show for a failed call: plain words for the code, then the service's message and reason. */
+export function errorText(err: unknown, fallback: string): string {
+  if (!(err instanceof ApiClientError)) return fallback;
+  const parts: string[] = [];
+  const lead = CODE_LEAD[err.code];
+  if (lead) parts.push(lead);
+  if (err.message && !parts.includes(err.message) && !(err.code === "PROJECT_LOCKED" || err.code === "READ_ONLY")) parts.push(err.message);
+  if (err.reason && !parts.some((p) => p.includes(err.reason!))) parts.push(err.reason);
+  return parts.join(" ") || fallback;
+}
+
+export const isProjectLocked = (err: unknown): boolean => err instanceof ApiClientError && err.code === "PROJECT_LOCKED";

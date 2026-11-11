@@ -64,8 +64,12 @@ export function DropZone({ onPaths, disabled = false, disabledReason, target = "
   const hintId = useId();
 
   const onDragOver = (e: DragEvent) => {
-    if (disabled) return;
+    // Always prevented, even while disabled: otherwise the webview would navigate to the dropped file.
     e.preventDefault();
+    if (disabled) {
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+      return;
+    }
     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
     setOver(true);
   };

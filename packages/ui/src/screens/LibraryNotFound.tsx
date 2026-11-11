@@ -6,6 +6,7 @@
  */
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
+import { errorText } from "../api/library";
 import type { CurrentLibrary, FoundLibrary, LibraryApi, LibraryEntry } from "../api/library";
 import { volumeOf } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
@@ -22,7 +23,23 @@ export interface LibraryNotFoundProps {
 
 type Mode = "none" | "locate" | "search" | "wait";
 
-const message = (err: unknown, fallback: string) => (err instanceof ApiClientError ? err.message : fallback);
+const message = (err: unknown, fallback: string) => errorText(err, fallback);
+/** The drive is simply not back yet: keep waiting. Anything else is shown and ends the wait. */
+const notYet = (err: unknown) => err instanceof ApiClientError && (err.code === "NOT_FOUND" || err.code === "LIBRARY_OFFLINE");
+
+/** Resolves after `ms`, or at once when `signal` aborts. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done() {
+      clearTimeout(t);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 
 export function LibraryNotFound({ api, library, onOpened, onOpenDifferent, waitIntervalMs = 5000 }: LibraryNotFoundProps) {
   const [mode, setMode] = useState<Mode>("none");
@@ -32,7 +49,7 @@ export function LibraryNotFound({ api, library, onOpened, onOpenDifferent, waitI
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const search = useRef<AbortController | undefined>(undefined);
-  const waitTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const waiting = useRef<AbortController | undefined>(undefined);
   const id = useId();
   const last = library.lastKnownPaths[0];
   const volume = last ? volumeOf(last) : "the library's drive";
@@ -40,8 +57,8 @@ export function LibraryNotFound({ api, library, onOpened, onOpenDifferent, waitI
   const stopAll = () => {
     search.current?.abort();
     search.current = undefined;
-    clearTimeout(waitTimer.current);
-    waitTimer.current = undefined;
+    waiting.current?.abort();
+    waiting.current = undefined;
     setSearching(false);
   };
   useEffect(() => stopAll, []);
@@ -85,20 +102,34 @@ export function LibraryNotFound({ api, library, onOpened, onOpenDifferent, waitI
     }
   };
 
+  // Tries the last known place (reconnect checks it is this library, by id) until it answers, the
+  // wait is stopped (Stop, another choice, unmount) or a real error comes back. Every await is
+  // followed by a check of the wait's own AbortController, so nothing opens after it stopped.
   const startWaiting = () => {
     if (!last) return setError("This library has no last known place to wait for. Locate it or search for it instead.");
-    const tryOnce = async () => {
-      try {
-        const r = await api.libraries.open(last);
-        waitTimer.current = undefined;
-        onOpened(r);
-        return;
-      } catch {
-        // still not there: try again
+    const ac = new AbortController();
+    waiting.current = ac;
+    const loop = async () => {
+      while (!ac.signal.aborted) {
+        try {
+          const r = await api.libraries.reconnect(last, library.libraryId, { signal: ac.signal });
+          if (ac.signal.aborted) return;
+          waiting.current = undefined;
+          onOpened(r);
+          return;
+        } catch (err) {
+          if (ac.signal.aborted) return;
+          if (!notYet(err)) {
+            waiting.current = undefined;
+            setMode("none");
+            setError(message(err, "The library could not be reconnected there."));
+            return;
+          }
+        }
+        await pause(waitIntervalMs, ac.signal);
       }
-      waitTimer.current = setTimeout(() => void tryOnce(), waitIntervalMs);
     };
-    waitTimer.current = setTimeout(() => void tryOnce(), 0);
+    void loop();
   };
 
   const submitLocate = (e: FormEvent) => {

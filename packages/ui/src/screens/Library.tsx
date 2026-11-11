@@ -6,10 +6,10 @@
  * jobs indicator. While the library is read-only the drop zone and every edit button are off. A
  * locked encrypted project shows UnlockProject in place of its sources.
  */
-import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
-import { ApiClientError } from "../api/client";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
-import { profilesFromGovernance } from "../api/library";
+import { errorText, isProjectLocked } from "../api/library";
+import { projectProfiles } from "../api/profilesFallback";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
@@ -34,9 +34,14 @@ export interface LibraryProps {
   onSwitchLibrary?: () => void;
   /** In-app navigation for links (falls back to ordinary links). */
   navigate?: (path: string) => void;
+  /** The service reports no library open any more (library.state open:false). */
+  onClosed?: () => void;
 }
 
-const message = (err: unknown, fallback: string) => (err instanceof ApiClientError ? err.message : fallback);
+const message = (err: unknown, fallback: string) => errorText(err, fallback);
+
+/** Sources asked for per page; "Load more" asks for the next page by offset. */
+export const SOURCE_PAGE_SIZE = 100;
 const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).at(-1) ?? p;
 
 const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
@@ -49,7 +54,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({ mode: current.mode, ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}) });
   const [index, setIndex] = useState<{ done: number; total: number } | undefined>();
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -65,12 +70,52 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
   const [outcomes, setOutcomes] = useState<AttachOutcome[] | undefined>();
   const [attaching, setAttaching] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const [sourcesError, setSourcesError] = useState<string | undefined>();
+  const [loadingMore, setLoadingMore] = useState(false);
   const [reload, setReload] = useState(0);
 
   const readOnly = state.mode !== "read-write";
   const project = projects?.find((p) => p.id === projectId);
   const locked = !!project && project.encrypted && !project.unlocked && !unlockedHere.has(project.id);
   const refresh = useCallback(() => setReload((n) => n + 1), []);
+
+  const closedRef = useRef(onClosed);
+  closedRef.current = onClosed;
+
+  /**
+   * Forgets everything read from a project that is now locked (R114): its collections, tags,
+   * sources, open source and attach outcomes; UnlockProject shows in their place.
+   */
+  const forgetDecrypted = useCallback(() => {
+    setCollections([]);
+    setTags({ tags: [], workspaceTags: [] });
+    setSources(undefined);
+    setOpenSource(undefined);
+    setOutcomes(undefined);
+  }, []);
+  const markLocked = useCallback(
+    (id: string) => {
+      setUnlockedHere((s) => new Set([...s].filter((x) => x !== id)));
+      // The service says it is locked, so it is an encrypted project, whatever the list said.
+      setProjects((list) => list?.map((p) => (p.id === id ? { ...p, encrypted: true, unlocked: false } : p)));
+      forgetDecrypted();
+    },
+    [forgetDecrypted],
+  );
+  /** A failure: PROJECT_LOCKED returns to UnlockProject; anything else is shown in plain words. */
+  const fail = useCallback(
+    (err: unknown, fallback: string, show: (m: string) => void = setError) => {
+      if (isProjectLocked(err) && projectIdRef.current) {
+        markLocked(projectIdRef.current);
+        setError(undefined);
+        return;
+      }
+      show(message(err, fallback));
+    },
+    [markLocked],
+  );
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
 
   // ---- service events: library state, index progress, background jobs ----
   useEffect(() => {
@@ -79,7 +124,14 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
     const listen = async () => {
       try {
         for await (const e of api.events({ signal: ac.signal })) {
-          if (e.type === "library.state" && e.data && typeof e.data === "object") setState((s) => ({ ...s, ...(e.data as LibraryState) }));
+          if (e.type === "library.state" && e.data && typeof e.data === "object") {
+            const d = e.data as LibraryState;
+            if (d.open === false) {
+              closedRef.current?.();
+              continue;
+            }
+            setState((s) => ({ ...s, ...d }));
+          }
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
             if (typeof d.done !== "number" || typeof d.total !== "number") continue;
@@ -113,15 +165,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
         if (!live) return;
         setProjects(list);
         setProjectId((id) => id ?? list[0]?.id);
-        const entries = await Promise.all(
-          list.map(async (p) => {
-            try {
-              return [p.id, profilesFromGovernance((await api.projects.governance(p.id)).yaml)] as const;
-            } catch {
-              return [p.id, [] as ProfileId[]] as const;
-            }
-          }),
-        );
+        const entries = await Promise.all(list.map(async (p) => [p.id, await projectProfiles(p, api.projects.governance)] as const));
         if (live) setProfiles(Object.fromEntries(entries));
       })
       .catch((err: unknown) => live && setError(message(err, "The projects could not be read.")));
@@ -140,7 +184,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
         setCollections(c.collections);
         setTags({ tags: t.tags, workspaceTags: t.workspaceTags });
       })
-      .catch((err: unknown) => live && setError(message(err, "The collections and tags could not be read.")));
+      .catch((err: unknown) => live && fail(err, "The collections and tags could not be read."));
     return () => {
       live = false;
     };
@@ -151,16 +195,35 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
     if (!projectId || locked) return;
     const ac = new AbortController();
     api.sources
-      .search(projectId, { text: filter.text, ...(filter.collection ? { collection: filter.collection } : {}), ...(filter.tag ? { tag: filter.tag } : {}) }, { signal: ac.signal })
+      .search(projectId, { ...query(), limit: SOURCE_PAGE_SIZE }, { signal: ac.signal })
       .then((r) => {
+        if (ac.signal.aborted) return;
         setSources(r);
-        setError(undefined);
+        setSourcesError(undefined); // only the sources' own error: other errors stay until dismissed or replaced
       })
       .catch((err: unknown) => {
-        if (!ac.signal.aborted) setError(message(err, "The sources could not be read."));
+        if (!ac.signal.aborted) fail(err, "The sources could not be read.", setSourcesError);
       });
     return () => ac.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, projectId, locked, filter, reload]);
+
+  const query = () => ({ text: filter.text, ...(filter.collection ? { collection: filter.collection } : {}), ...(filter.tag ? { tag: filter.tag } : {}) });
+
+  const loadMore = async () => {
+    if (!projectId || !sources) return;
+    const pid = projectId;
+    setLoadingMore(true);
+    try {
+      const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length });
+      if (projectIdRef.current !== pid) return;
+      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : r));
+    } catch (err) {
+      fail(err, "More sources could not be read.", setSourcesError);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   const selectProject = (id: string) => {
     if (id === projectId) return;
@@ -178,7 +241,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
     setError(undefined);
     run()
       .then(refresh)
-      .catch((err: unknown) => setError(message(err, `${what} could not be done.`)));
+      .catch((err: unknown) => fail(err, `${what} could not be done.`));
   };
 
   const attach = async (paths: string[]) => {
@@ -189,7 +252,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
       setOutcomes(await api.sources.attach(projectId, paths));
       refresh();
     } catch (err) {
-      setError(message(err, "The files could not be attached."));
+      fail(err, "The files could not be attached.");
     } finally {
       setAttaching(false);
     }
@@ -220,8 +283,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
               onClick={() =>
                 edit("Locking the project", async () => {
                   await api.projects.lock(project.id);
-                  setUnlockedHere((s) => new Set([...s].filter((x) => x !== project.id)));
-                  setProjects((list) => list?.map((p) => (p.id === project.id ? { ...p, unlocked: false } : p)));
+                  markLocked(project.id);
                 })
               }
             >
@@ -259,6 +321,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
               readOnly={readOnly}
               onSelect={(collection) => setFilter((f) => ({ ...f, collection }))}
               onCreate={(name, parentId) => edit("Creating the collection", () => api.collections.create(project.id, name, parentId))}
+              onRename={(cid, name) => edit("Renaming the collection", () => api.collections.update(project.id, cid, { name }))}
+              onDelete={(cid) =>
+                edit("Deleting the collection", async () => {
+                  await api.collections.remove(project.id, cid);
+                  setFilter((f) => (f.collection === cid ? { ...f, collection: undefined } : f));
+                })
+              }
             />
             <TagList
               tags={tags.tags}
@@ -290,6 +359,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
             project={project}
             onUnlocked={() => {
               setUnlockedHere((s) => new Set([...s, project.id]));
+              setProjects((list) => list?.map((p) => (p.id === project.id ? { ...p, unlocked: true } : p)));
               refresh();
             }}
           />
@@ -328,10 +398,26 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate }
                 ))}
               </ul>
             )}
-            {sources === undefined ? <p aria-live="polite">Loading sources…</p> : <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} />}
+            {sourcesError && (
+              <p role="alert" className="ao-error">
+                {sourcesError}
+              </p>
+            )}
+            {sources === undefined ? (
+              !sourcesError && <p aria-live="polite">Loading sources…</p>
+            ) : (
+              <>
+                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} />
+                {sources.items.length < sources.total && (
+                  <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
+                    Load more sources
+                  </button>
+                )}
+              </>
+            )}
             {openSource && (
               <div className="ao-library__detail">
-                <SourceDetail api={api} projectId={project.id} sourceId={openSource} readOnly={readOnly} onClose={() => setOpenSource(undefined)} onChanged={refresh} />
+                <SourceDetail api={api} projectId={project.id} sourceId={openSource} readOnly={readOnly} onClose={() => setOpenSource(undefined)} onChanged={refresh} onLocked={() => markLocked(project.id)} />
               </div>
             )}
           </>

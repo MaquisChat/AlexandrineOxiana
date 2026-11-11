@@ -6,7 +6,7 @@
  */
 import { useEffect, useId, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
-import type { CurrentLibrary, LibraryApi, LibraryEntry } from "../api/library";
+import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry } from "../api/library";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 
@@ -16,7 +16,7 @@ export interface LibraryChooserProps {
   onNotFound: (library: LibraryEntry) => void;
 }
 
-const message = (err: unknown, fallback: string) => (err instanceof ApiClientError ? err.message : fallback);
+const message = (err: unknown, fallback: string) => errorText(err, fallback);
 const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 
 export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProps) {

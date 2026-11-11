@@ -5,8 +5,7 @@
  * shown as text — HTML and RTF output are never rendered as markup.
  */
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
-import { ApiClientError } from "../api/client";
-import type { CitationFormat, LibraryApi, StyleEntry } from "../api/library";
+import { errorText, type CitationFormat, type LibraryApi, type StyleEntry } from "../api/library";
 import { SEARCH_DEBOUNCE_MS } from "./SearchBox";
 import { UserText } from "./UserText";
 import "./library.css";
@@ -20,7 +19,7 @@ export interface CitePanelProps {
   initialStyle?: StyleEntry;
 }
 
-const message = (err: unknown) => (err instanceof ApiClientError ? err.message : "The citation could not be made.");
+const message = (err: unknown) => errorText(err, "The citation could not be made.");
 
 export function CitePanel({ api, projectId, sourceIds, initialStyle = DEFAULT_STYLE }: CitePanelProps) {
   const [style, setStyle] = useState<StyleEntry>(initialStyle);

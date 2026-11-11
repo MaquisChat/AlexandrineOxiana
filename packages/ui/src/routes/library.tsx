@@ -1,8 +1,10 @@
 /**
  * The library screens' routes (R113): "/" and "/library" show the open library, or the chooser
- * when none is open, or "Library not found" for a library that is not where it was. Links to other
- * screens (the review queue at /import/review, appearance settings) use `navigate()`, which keeps
- * the app in one page (history.pushState) and tells listeners through a popstate event.
+ * when none is open, or "Library not found" for a library that is not where it was. On any other
+ * path (appearance settings, the review queue…) they render only a "Back to library" link. Links
+ * use `navigate()`, which keeps the app in one page (history.pushState) and tells listeners through
+ * a popstate event. While mounted, a file dropped outside a drop zone never navigates the app away.
+ * App.tsx composes <LibraryRoutes> beside the other tasks' routes (composition settled at merge).
  */
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../api/client";
@@ -33,7 +35,42 @@ export function usePathname(): string {
 
 type View = { kind: "loading" } | { kind: "chooser" } | { kind: "not-found"; library: LibraryEntry } | { kind: "library"; current: CurrentLibrary; path?: string | undefined };
 
+/** Files dropped anywhere but a drop zone must not make the webview open them (and leave the app). */
+function useDropGuard(): void {
+  useEffect(() => {
+    const stop = (e: DragEvent) => e.preventDefault();
+    window.addEventListener("dragover", stop);
+    window.addEventListener("drop", stop);
+    return () => {
+      window.removeEventListener("dragover", stop);
+      window.removeEventListener("drop", stop);
+    };
+  }, []);
+}
+
+export function BackToLibrary() {
+  return (
+    <nav aria-label="Library" className="ao-back">
+      <a
+        href="/"
+        onClick={(e) => {
+          e.preventDefault();
+          navigate("/");
+        }}
+      >
+        Back to library
+      </a>
+    </nav>
+  );
+}
+
 export function LibraryRoutes({ client }: { client: ApiClient }) {
+  const path = usePathname();
+  useDropGuard();
+  return isLibraryPath(path) ? <LibraryFlow client={client} /> : <BackToLibrary />;
+}
+
+function LibraryFlow({ client }: { client: ApiClient }) {
   const api = useMemo(() => libraryApi(client), [client]);
   const [view, setView] = useState<View>({ kind: "loading" });
   const [known, setKnown] = useState<LibraryEntry[]>([]);
@@ -75,6 +112,7 @@ export function LibraryRoutes({ client }: { client: ApiClient }) {
           current={view.current}
           {...(view.path ? { libraryPath: view.path } : {})}
           navigate={navigate}
+          onClosed={chooser}
           onSwitchLibrary={() => {
             void api.libraries.close().catch(() => {});
             chooser();

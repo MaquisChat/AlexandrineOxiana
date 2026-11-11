@@ -5,6 +5,7 @@
  */
 import { useId, useState, type FormEvent } from "react";
 import type { Tag } from "../api/library";
+import { CodeSwatch } from "./CodeSwatch";
 import { UserText } from "./UserText";
 import "./library.css";
 
@@ -19,7 +20,9 @@ export interface TagListProps {
   onCreate: (name: string, scope: "project" | "workspace") => void;
 }
 
-function TagRow({ tag, selected, onSelect, readOnly, onRename, onDelete }: { tag: Tag; selected: boolean; onSelect: () => void; readOnly: boolean; onRename?: (name: string) => void; onDelete?: () => void }) {
+const HEX = /^#[0-9a-fA-F]{6}$/;
+
+function TagRow({ tag, position, selected, onSelect, readOnly, onRename, onDelete }: { tag: Tag; position: number; selected: boolean; onSelect: () => void; readOnly: boolean; onRename?: (name: string) => void; onDelete?: () => void }) {
   const [mode, setMode] = useState<"view" | "rename" | "delete">("view");
   const [name, setName] = useState(tag.name);
   const fieldId = useId();
@@ -32,7 +35,8 @@ function TagRow({ tag, selected, onSelect, readOnly, onRename, onDelete }: { tag
   return (
     <li className="ao-tag">
       <button type="button" className="ao-chip" aria-pressed={selected} onClick={onSelect}>
-        <UserText>{tag.name}</UserText>
+        {/* A tag's own colour only as a validated #rrggbb, through CodeSwatch (shape + name, never colour alone). */}
+        {typeof tag.color === "string" && HEX.test(tag.color) ? <CodeSwatch index={position} name={tag.name} color={tag.color} /> : <UserText>{tag.name}</UserText>}
       </button>
       {onRename && (
         <button
@@ -116,16 +120,16 @@ export function TagList({ tags, workspaceTags, selectedId, onSelect, readOnly = 
       <h2 className="ao-pane-title">Tags</h2>
       {tags.length === 0 && workspaceTags.length === 0 && <p className="ao-muted">No tags yet.</p>}
       <ul className="ao-plain-list">
-        {tags.map((t) => (
-          <TagRow key={t.id} tag={t} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} onRename={(n) => onRename(t.id, n)} onDelete={() => onDelete(t.id)} />
+        {tags.map((t, i) => (
+          <TagRow key={t.id} tag={t} position={i + 1} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} onRename={(n) => onRename(t.id, n)} onDelete={() => onDelete(t.id)} />
         ))}
       </ul>
       {workspaceTags.length > 0 && (
         <>
           <h3 className="ao-pane-subtitle">Workspace tags</h3>
           <ul className="ao-plain-list">
-            {workspaceTags.map((t) => (
-              <TagRow key={t.id} tag={t} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} />
+            {workspaceTags.map((t, i) => (
+              <TagRow key={t.id} tag={t} position={tags.length + i + 1} selected={selectedId === t.id} onSelect={() => toggle(t.id)} readOnly={readOnly} />
             ))}
           </ul>
           <p className="ao-muted ao-small-text">Workspace tags are shared by every project. Renaming or deleting them is not available yet.</p>

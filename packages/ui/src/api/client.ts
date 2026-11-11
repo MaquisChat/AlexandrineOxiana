@@ -129,6 +129,8 @@ async function errorFrom(res: Response): Promise<ApiClientError> {
 
 /** Largest single event the client accepts (R105); a bigger one is an error, not unbounded memory. */
 export const MAX_SSE_EVENT_BYTES = 1024 * 1024;
+/** Largest single NDJSON line, in UTF-8 bytes (R114 I5). */
+export const MAX_NDJSON_LINE_BYTES = 1024 * 1024;
 
 /**
  * Incremental parser for a text/event-stream (WHATWG HTML §9.2): lines end with CRLF, LF or CR (a
@@ -212,7 +214,7 @@ function fullyDecoded(path: string): string {
   try {
     cur = decodeURIComponent(path);
   } catch {
-    throw new Error(`A service path must be valid percent-encoding (got "${path}").`);
+    throw new Error("A service path must be valid percent-encoding."); // the path is not echoed: it could carry a secret
   }
   for (let i = 0; i < 8; i++) {
     let next: string;
@@ -237,7 +239,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
 
   function urlFor(path: string, query?: RequestOptions["query"]): string {
     if (!path.startsWith("/") || path.startsWith("//") || /[?#]|%3f|%23/i.test(path)) {
-      throw new Error(`A service path must start with "/" and have no query or fragment (got "${path}"); pass query values in opts.query.`);
+      throw new Error('A service path must start with "/" and have no query or fragment; pass query values in opts.query.'); // not echoed
     }
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(query ?? {})) {
@@ -279,6 +281,11 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     return send<T>(method, url, o);
   }
 
+  /**
+   * NDJSON (R114 I5): an abort ends the generator quietly; a stream that ends in the middle of a
+   * line is an error (truncated); every line — and any unfinished line — is capped at
+   * MAX_NDJSON_LINE_BYTES of UTF-8, measured with TextEncoder, however it arrives.
+   */
   async function* ndjson<T>(method: Method, path: string, o: RequestOptions = {}): AsyncGenerator<T, void, undefined> {
     const url = urlFor(path, o.query);
     const headers: Record<string, string> = { ...auth, Accept: "application/x-ndjson" };
@@ -291,47 +298,54 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     let res: Response;
     try {
       res = await doFetch(url, init);
-    } catch (err) {
+    } catch {
       if (o.signal?.aborted) return;
-      throw err instanceof ApiClientError ? err : unreachable();
+      throw unreachable();
     }
     if (!res.ok) throw await errorFrom(res);
     if (!res.body) return;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const encoder = new TextEncoder();
+    const tooLarge = () => new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The library service sent a line larger than 1 MB; the stream was closed." });
     const parse = (line: string): T => {
+      if (encoder.encode(line).length > MAX_NDJSON_LINE_BYTES) throw tooLarge();
       try {
         return JSON.parse(line) as T;
       } catch {
         throw unexpected(res.status);
       }
     };
+    let buf = "";
+    // A read the body never answers still ends promptly on abort.
+    const aborted = new Promise<"aborted">((resolve) => o.signal?.addEventListener("abort", () => resolve("aborted"), { once: true }));
     try {
       for (;;) {
-        let chunk: ReadableStreamReadResult<Uint8Array>;
+        let chunk: ReadableStreamReadResult<Uint8Array> | "aborted";
         try {
-          chunk = await reader.read();
+          chunk = await Promise.race([reader.read(), aborted]);
         } catch (err) {
           if (o.signal?.aborted) return;
-          throw err;
+          throw err instanceof ApiClientError ? err : unreachable();
         }
+        if (chunk === "aborted" || o.signal?.aborted) return;
         if (chunk.done) break;
         buf += decoder.decode(chunk.value, { stream: true });
         let nl = buf.indexOf("\n");
         while (nl >= 0) {
-          const line = buf.slice(0, nl).trim();
+          const line = buf.slice(0, nl).replace(/\r$/, "");
           buf = buf.slice(nl + 1);
-          if (line) yield parse(line);
+          if (line.trim()) yield parse(line);
           if (o.signal?.aborted) return;
           nl = buf.indexOf("\n");
         }
-        if (buf.length > MAX_SSE_EVENT_BYTES) {
-          throw new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The library service sent a line larger than 1 MB; the stream was closed." });
-        }
+        // An unfinished line: characters are at least one byte each, so measure only when it could be over.
+        if (buf.length > MAX_NDJSON_LINE_BYTES / 4 && encoder.encode(buf).length > MAX_NDJSON_LINE_BYTES) throw tooLarge();
       }
-      const rest = (buf + decoder.decode()).trim();
-      if (rest) yield parse(rest);
+      buf += decoder.decode();
+      if (buf.trim()) {
+        throw new ApiClientError(0, { code: "INTERNAL", message: "The library service's answer was cut off before it finished." });
+      }
     } finally {
       reader.cancel().catch(() => {});
     }

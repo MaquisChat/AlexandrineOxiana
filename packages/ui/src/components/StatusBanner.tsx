@@ -14,6 +14,7 @@ export type BannerVariant =
   | { kind: "read-only"; reason?: string }
   | { kind: "offline"; volume: string }
   | { kind: "index-rebuilding"; done: number; total: number }
+  /** `detail` is accepted for the record but never shown (R114 I1). */
   | { kind: "warning"; warning: string; project: string; detail?: string };
 
 const READ_ONLY_REASONS: Record<string, string> = {
@@ -22,8 +23,26 @@ const READ_ONLY_REASONS: Record<string, string> = {
   "move-incomplete": "a move into this folder has not finished",
 };
 
-/** Plain-language text for each warning the service raises; `p` is the project's name. */
+/**
+ * Plain-language text for every warning the service raises (R114 I1): the library's integrity
+ * warnings (packages/library/src/repo/audit-store.ts IntegrityWarning kinds) and the projects'
+ * standing warnings. `p` is the project's name ("library" for library-wide ones). The service's
+ * detail is never shown: it can carry ids, paths and transaction names.
+ */
 const WARNINGS: Record<string, (p: string) => string> = {
+  "chain-broken": (p) => `The audit log of ${p} does not hold together: an entry was changed or removed outside the app. Your sources are unchanged; check the verification report.`,
+  "head-mismatch": (p) => `The audit log of ${p} does not match the record this computer keeps of it. It may have been changed outside the app; check the verification report.`,
+  truncated: (p) => `The audit log of ${p} is shorter than this computer's record of it: recent entries may have been removed outside the app.`,
+  empty: (p) => `The audit log of ${p} is empty although this computer has a record of it. It may have been replaced outside the app.`,
+  "anchor-missing": (p) => `The audit log may have been changed outside the app (${p}): this computer has no record to check it against. It is checked from now on.`,
+  "anchors-unreadable": () => "This computer's record of the audit logs could not be read, so they could not be checked this time. Nothing in the library was changed.",
+  "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
+  "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
+  "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
+  "txn-recovery-skipped-audit-unverifiable": (p) => `An interrupted change in ${p} was left as it is, because its audit log could not be checked first. It is tried again on the next open.`,
+  "trimmed-incomplete-audit-line": (p) => `The last entry of an audit log in ${p} was cut off by a crash and has been removed. The removal is recorded.`,
+  "incomplete-audit-line-pending": (p) => `The last entry of an audit log in ${p} was cut off by a crash. It is tidied up when the library is next opened with write access.`,
+  "audit-append-failed-at-open": (p) => `A check made while opening ${p} could not be recorded in the audit log, so changes to ${p} are off until the library is opened again.`,
   "backup-failed": (p) => `The last automatic backup of ${p} failed. Your sources are unchanged; the backup is tried again tomorrow, or make one now from the project's settings.`,
   "deleted-records-unreadable": (p) =>
     `The record of deleted items in ${p} could not be read. It was set aside; deleting still works, but re-importing from Zotero is paused until the record is reset.`,
@@ -32,8 +51,13 @@ const WARNINGS: Record<string, (p: string) => string> = {
   "destroy-incomplete": (p) =>
     `A destruction of raw data in ${p} did not finish: some files could not be overwritten yet. They are kept out of the project and overwriting is tried again each time the library opens.`,
   "retention-due": (p) => `${p} has reached its retention date. Review which raw data must now be destroyed or kept.`,
-  "anchor-missing": (p) => `The audit log may have been changed outside the app (${p}): this computer has no record to check it against. It has been checked again from now on.`,
 };
+
+/** The sentence for a warning kind; an unknown kind gets a generic sentence (never the detail). */
+export function warningText(kind: string, project: string): string {
+  const known = Object.hasOwn(WARNINGS, kind) ? WARNINGS[kind] : undefined;
+  return known ? known(project) : `Something in ${project} needs attention. Open the verification report for details.`;
+}
 
 function text(v: BannerVariant): string {
   switch (v.kind) {
@@ -47,11 +71,8 @@ function text(v: BannerVariant): string {
       return `Offline — reconnecting when ${v.volume} returns. Nothing can be changed until then; nothing is lost.`;
     case "index-rebuilding":
       return `Index rebuilding ${v.done}/${v.total}. Search results may be incomplete until it finishes.`;
-    case "warning": {
-      const known = WARNINGS[v.warning];
-      if (known) return known(v.project);
-      return v.detail ? `Something in ${v.project} needs attention: ${v.detail}` : `Something in ${v.project} needs attention.`;
-    }
+    case "warning":
+      return warningText(v.warning, v.project);
   }
 }
 
