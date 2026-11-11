@@ -671,17 +671,34 @@ export class ServiceState {
     ocrQueueFor(s.repo).setWorker(client);
     // During a move nothing is resumed: the library open after it resumes (R106 C1).
     if (s.lib.mode !== "read-write" || this.moving) return;
-    this.startWork("worker-resume", async () => {
-      await client.resumePending();
-    });
+    this.resumeWorkerJobs(s);
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) this.resumeProject(s, p.id);
   }
 
-  /** Resumes a project's pending viewing proxies and OCR (at open / worker ready / unlock). */
-  resumeProject(s: Session, projectId: string): void {
+  /**
+   * Resubmits the worker jobs left pending (all projects at launch; one project at its unlock,
+   * including jobs a lock cancelled before they started, R142), as registered work (R106 C1): a
+   * move or close waits for it, it stops between jobs when asked and continues on the library open
+   * afterwards, and nothing starts during a move. The journal claim keeps each rerun to one run.
+   */
+  resumeWorkerJobs(s: Session, projectId?: string): void {
+    const client = s.workerClient;
+    if (!client || s.lib.mode !== "read-write" || this.moving) return;
+    void this.startWork("worker-resume", async (ctl) => {
+      await client.resumePending(projectId, { shouldStop: () => ctl.stopping });
+      if (ctl.stopping) return (next: Session) => this.resumeWorkerJobs(next, projectId);
+    });
+  }
+
+  /**
+   * Resumes a project's pending viewing proxies and OCR (at open / worker ready / unlock); at an
+   * unlock (`workerJobs`) also its pending worker jobs.
+   */
+  resumeProject(s: Session, projectId: string, opts: { workerJobs?: boolean } = {}): void {
     if (!s.workerClient || s.lib.mode !== "read-write" || this.moving) return;
     this.track(proxyQueueFor(s.repo).resumePending(projectId), "resuming viewing proxies");
     this.track(ocrQueueFor(s.repo).resumePending(projectId), "resuming OCR");
+    if (opts.workerJobs) this.resumeWorkerJobs(s, projectId);
   }
 
   // ---- state for the UI ----------------------------------------------------------------
