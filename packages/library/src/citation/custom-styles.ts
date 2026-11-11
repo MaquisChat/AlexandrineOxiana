@@ -59,7 +59,7 @@ import type { Library } from "../library.js";
 import { appendLibraryEvent, authorizeProcessing, type Repo } from "../repo/repo.js";
 import { SandboxError, renderInSandbox } from "./sandbox.js";
 import { repoLibrary } from "../repo/repo.js";
-import { cslBundleDir } from "../resources.js";
+import { ResourceMissingError, cslBundleDir } from "../resources.js";
 
 export const CSL_NS = "http://purl.org/net/xbiblio/csl";
 export const CUSTOM_STYLE_MAX_BYTES = 1024 * 1024;
@@ -261,6 +261,7 @@ async function probeStyle(xml: string): Promise<void> {
       cites: citeprocCitationItems([{ item: PROBE_ITEM, locator: "1", label: "page" }]),
     });
   } catch (e) {
+    if (e instanceof ResourceMissingError) throw e; // a damaged installation, not the researcher's style
     throw new CustomStyleError(e instanceof SandboxError && e.reason !== "error" ? REASONS.tooSlow : REASONS.unusable);
   }
   if (out.includes("CSL STYLE ERROR")) throw new CustomStyleError(REASONS.unusable);

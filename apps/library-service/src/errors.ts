@@ -51,6 +51,7 @@ import {
   ProjectLockedError,
   ReadOnlyLibraryError,
   RecoveryPendingError,
+  ResourceMissingError,
   WorkerJobError,
   WorkerUnavailableError,
   WrongLibraryError,
@@ -123,6 +124,8 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
+  // A file of the app itself is missing (a damaged installation); its message names what, never where.
+  if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");
   if (err instanceof ParticipantCodeMissingError) return new ApiError(409, "CONFLICT", "A participant in these sources has no participant code yet, so they cannot be cited.");
   if (err instanceof ExportDestinationError) return new ApiError(400, "VALIDATION", err.message);

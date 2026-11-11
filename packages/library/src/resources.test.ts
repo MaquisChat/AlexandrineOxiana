@@ -16,7 +16,26 @@ import {
   resourceRoots,
   sandboxWorkerUrl,
   sourceResolver,
+  useResolverForTests,
 } from "./resources.js";
+
+describe("resources: the test seam (R47)", () => {
+  it("replaces the resolver only while NODE_ENV is test, and is restored with undefined", () => {
+    const fake = { ...sourceResolver(), roots: () => ({ layout: "bundle" as const, root: "/x" }) };
+    useResolverForTests(fake);
+    expect(resourceRoots().layout).toBe("bundle");
+    useResolverForTests(undefined);
+    expect(resourceRoots().layout).toBe("source");
+    const env = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(() => useResolverForTests(fake)).toThrow(/test/);
+    } finally {
+      process.env.NODE_ENV = env;
+    }
+    expect(resourceRoots().layout).toBe("source");
+  });
+});
 
 const PKG_DIR = fileURLToPath(new URL("../", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));

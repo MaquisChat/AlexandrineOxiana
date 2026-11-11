@@ -974,6 +974,14 @@ describe("review round 1: smaller route fixes (R99 minors)", () => {
     expect(toApiError(new lib.ExportDestinationError("x")).status).toBe(400);
     expect(toApiError(new lib.RestoreError("x")).status).toBe(400);
   });
+
+  it("a file missing from the installation is 503 UNAVAILABLE with its plain message (not INTERNAL, not the user's fault)", async () => {
+    const { toApiError } = await import("./errors.js");
+    const lib = await import("@ao/library");
+    const t = toApiError(new lib.ResourceMissingError("the web page cleaner"));
+    expect([t.status, t.code]).toEqual([503, "UNAVAILABLE"]);
+    expect(t.message).toMatch(/web page cleaner is missing from the installation/);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

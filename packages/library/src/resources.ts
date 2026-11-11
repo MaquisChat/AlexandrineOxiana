@@ -98,7 +98,8 @@ export function bundleResolver(root: string, info: { libraryVersion: string }): 
     cslBundleDir: () => join(root, BUNDLE_LAYOUT.csl),
     citeprocRequireFrom: () => {
       need(join("node_modules", "citeproc", "package.json"), "the citation processor (citeproc)");
-      // A file directly in the folder: require("citeproc") from it looks in <root>/node_modules only.
+      // A file directly in the folder: require("citeproc") from it finds <root>/node_modules/citeproc
+      // (checked just above), before Node would look anywhere else.
       return join(root, "package.json");
     },
     mediaWorkerSourceDir: () => undefined,
@@ -116,7 +117,16 @@ function resolver(): Resolver {
   return current;
 }
 
-export const resourceRoots = (): ResourceRoots => resolver().roots();
+/**
+ * Test seam (R47): replaces the resolver, only while NODE_ENV is "test"; `undefined` restores the
+ * real one. Lets a test simulate a damaged installation.
+ */
+export function useResolverForTests(r: Resolver | undefined): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("useResolverForTests is only available in tests (NODE_ENV=test).");
+  current = r;
+}
+
+export const resourceRoots =(): ResourceRoots => resolver().roots();
 export const sandboxWorkerUrl = (): URL => resolver().sandboxWorkerUrl();
 export const htmlStripWorkerUrl = (): URL => resolver().htmlStripWorkerUrl();
 export const migrationsUrl = (): URL => resolver().migrationsUrl();
