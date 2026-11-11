@@ -262,13 +262,15 @@ describe("Library screen", () => {
     await user.click(resolve);
     const dialog = await screen.findByRole("dialog", { name: "Interrupted changes" });
     const first = await within(dialog).findByRole("group", { name: "Interrupted change in Dissertation" });
-    expect((within(first).getByRole("button", { name: "Keep it" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(first).queryByRole("button", { name: "Keep it" })).toBeNull();
     const second = within(dialog).getByRole("group", { name: "Interrupted change in library" });
     expect(within(second).queryByRole("button", { name: "Roll it back" })).toBeNull();
-    expect(second.textContent).toMatch(/cannot be undone or kept here/);
+    expect(second.textContent).toMatch(/restore the project from a backup/);
     await user.click(within(first).getByRole("button", { name: "Roll it back" }));
     // A confirmation first.
     expect(resolved).toEqual([]);
+    // An unverifiable change: the roll-back needs an explicit acknowledgement (41b2 I3).
+    await user.click(within(first).getByRole("checkbox", { name: /I understand/ }));
     await user.click(within(first).getByRole("button", { name: "Yes, roll it back" }));
     await waitFor(() => expect(resolved).toEqual([{ txn: T1, choice: "roll-back" }]));
     await waitFor(() => expect(within(dialog).queryByRole("group", { name: "Interrupted change in Dissertation" })).toBeNull());

@@ -82,6 +82,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [sourcesError, setSourcesError] = useState<string | undefined>();
   const [loadingMore, setLoadingMore] = useState(false);
   const [reload, setReload] = useState(0);
+  /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
+  const [stateSeq, setStateSeq] = useState(0);
 
   const readOnly = state.mode !== "read-write";
   const project = projects?.find((p) => p.id === projectId);
@@ -141,6 +143,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             }
             // Each event is the whole state: a reason or lock holder it no longer names is gone.
             setState(({ readOnlyReason: _r, lockedBy: _l, ...s }) => ({ ...s, ...d }));
+            setStateSeq((n) => n + 1);
           }
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
@@ -324,10 +327,12 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         <PendingWritesDialog
           api={api}
           readOnly={readOnly}
+          changed={stateSeq}
           onClose={() => {
             const from = resolving.from;
             setResolving(null);
-            from?.focus();
+            // After the dialog is gone and the page is no longer inert.
+            setTimeout(() => from?.focus());
           }}
           onResolved={refresh}
         />
