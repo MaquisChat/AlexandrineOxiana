@@ -137,7 +137,8 @@ describe("stripHtmlSnapshot round 3 (R104)", () => {
   it("every snapshot starts with a CSP meta; idempotent on ordinary pages", async () => {
     const page = `<html><head><title>T</title><meta http-equiv="Content-Security-Policy" content="default-src *"></head><body><p>x</p></body></html>`;
     const once = await stripHtmlSnapshot(page);
-    expect(once.startsWith(`<meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">`)).toBe(true);
+    // R107: the policy gained default-src 'none' …, and sits first in the head (so a doctype still comes first).
+    expect(once.startsWith(`<html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">`)).toBe(true);
     expect(once).not.toContain("default-src *");
     expect(await stripHtmlSnapshot(once)).toBe(once);
   });
@@ -183,4 +184,182 @@ describe("stripHtmlSnapshot round 3 (R104)", () => {
     expect(htmlStripStats().peak).toBeLessThanOrEqual(2);
     expect(process.memoryUsage().rss - rss0).toBeLessThan(1024 * 1024 * 1024);
   }, 120_000);
+});
+
+describe("stripHtmlSnapshot round 4 (R107)", () => {
+  const refusedFast = async (page: string) => {
+    const { HtmlSnapshotRefusedError } = await import("./browser-capture.js");
+    const t0 = Date.now();
+    await expect(stripHtmlSnapshot(page)).rejects.toBeInstanceOf(HtmlSnapshotRefusedError);
+    expect(Date.now() - t0).toBeLessThan(3_000);
+  };
+
+  it.each([
+    ["unmatched end tags", "<div></x>".repeat(30_000)],
+    ["stray </p> (an empty p each, never a pop)", "<div></p>".repeat(30_000)],
+    ["120k boolean attributes", `<p ${Array.from({ length: 120_000 }, (_, i) => `b${i}`).join(" ")}>x</p>`],
+    ["a quote inside an unquoted value", `<a x=a"b>${"<div>".repeat(30_000)}">`],
+    ["implied table elements", "<table><td>".repeat(1_900)],
+  ])("pre-scan refuses quickly: %s", async (_name, page) => {
+    await refusedFast(page);
+  });
+
+  it("the pre-scan is linear: 4 MB in well under a second; attribute bytes are capped at 4 MB", async () => {
+    const { prescan, PRESCAN_LIMITS } = await import("./html-strip.mjs");
+    expect(PRESCAN_LIMITS.attributeBytes).toBe(4 * 1024 * 1024);
+    const block = `<section class="c"><h2 id="h">Title</h2><p>Some <b>text</b> &amp; <a href="/x?y=1">a link</a>.</p><!-- note --><script>if(a<b&&c<d){x()}</script></section>`;
+    const page = block.repeat(Math.ceil((4 * 1024 * 1024) / block.length));
+    // Comment-, script- and attribute-heavy shapes, and the adversarial ones above.
+    const shapes = [page, "<!--<div>-->".repeat(350_000), `<p title="${"a".repeat(4 * 1024 * 1024)}">`, "<div></x>".repeat(400_000), `<script>${"<div>".repeat(800_000)}</script>`];
+    for (const s of shapes) {
+      const t0 = performance.now();
+      prescan(s);
+      expect(performance.now() - t0, s.slice(0, 30)).toBeLessThan(700);
+    }
+    expect(prescan(`<p a="${"x".repeat(4 * 1024 * 1024)}">`)).toMatch(/attribute/);
+  });
+
+  it("ordinary pages are accepted and stripped normally", async () => {
+    const js = "for(var i=0;i<n;i++){if(a<b&&c<d){x(i)}}";
+    const scripts = `<html><body>${`<script>${js}</script><p>para</p>`.repeat(1_500)}<p>end visible</p></body></html>`;
+    const json = `<html><body><script type="application/json">${JSON.stringify({ items: Array.from({ length: 2_500 }, () => "<div>") })}</script><p>end visible</p></body></html>`;
+    const minified = `var a=function(e){return e<1?0:e>2?1:2};${"function f(t){for(var n=0;n<t.length;n++)if(t[n]<0&&t[n]>-9)return'<div class=\"x\">'+t[n]+'</div>';return null}".repeat(80)}`;
+    const article = `<article class="post"><header><h2><a href="/p/1?utm=x">A post title</a></h2><span class="meta" data-ts="1">Nov 1</span></header><p>Some text with <em>emphasis</em>, <a href="/t">a link</a> and <img src="/i.png" alt="i" loading="lazy">.</p><ul><li>one<li>two<li>three</ul></article>`;
+    let real = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Page</title><style>.a{color:red}</style><script>${minified}</script></head><body><nav><ul><li><a href="/">Home</a></li></ul></nav><main>`;
+    while (real.length < 2 * 1024 * 1024) real += article + (real.length % 7 === 0 ? `<script>${minified}</script>` : "");
+    real += `<p>end visible</p></main></body></html>`;
+    for (const page of [scripts, json, real]) {
+      const out = await stripHtmlSnapshot(page);
+      expect(out).toContain("end visible");
+      expect(out.toLowerCase()).not.toContain("<script");
+    }
+  }, 60_000);
+
+  it("the per-capture time budget is 10 s; after a time-out the same page is refused for 10 minutes", async () => {
+    const bc = await import("./browser-capture.js");
+    expect(bc.HTML_STRIP_TIMEOUT_MS).toBe(10_000);
+    expect(bc.HTML_STRIP_RETRY_AFTER_TIMEOUT_MS).toBe(10 * 60_000);
+    const page = `<p>timed out ${Math.random()}</p>`;
+    bc.htmlStripTuning.timeoutMs = 1;
+    try {
+      await expect(stripHtmlSnapshot(page)).rejects.toThrow(/in time/);
+    } finally {
+      bc.htmlStripTuning.timeoutMs = bc.HTML_STRIP_TIMEOUT_MS;
+    }
+    const started = bc.htmlStripStats().started;
+    await expect(stripHtmlSnapshot(page)).rejects.toThrow(/recently/);
+    expect(bc.htmlStripStats().started).toBe(started); // refused without a worker
+    await expect(stripHtmlSnapshot(`${page}<p>another</p>`)).resolves.toContain("another");
+  });
+
+  it("at most 8 snapshots wait for a worker; beyond that the snapshot is refused (busy, screenshot kept)", async () => {
+    const bc = await import("./browser-capture.js");
+    expect(bc.HTML_STRIP_MAX_WAITING).toBe(8);
+    const pages = Array.from({ length: 14 }, (_, i) => `<div>${`<p class="c${i}">x <b>y</b></p>`.repeat(30_000)}</div>`);
+    const all = await Promise.allSettled(pages.map((p) => stripHtmlSnapshot(p)));
+    const busy = all.filter((r) => r.status === "rejected" && /busy/i.test(String((r.reason as Error).message)));
+    expect(busy).toHaveLength(14 - 2 - 8);
+    expect(busy.every((r) => (r as PromiseRejectedResult).reason instanceof bc.HtmlSnapshotRefusedError)).toBe(true);
+    expect(all.filter((r) => r.status === "fulfilled")).toHaveLength(10);
+  }, 120_000);
+
+  it("meta refresh is removed entirely", async () => {
+    const out = await stripHtmlSnapshot(`<html><head><meta http-equiv="refresh" content="5; url=/next"><meta http-equiv="REFRESH" content="0"></head><body><p>x</p></body></html>`);
+    expect(out.toLowerCase()).not.toContain("refresh");
+    expect(out).not.toContain("/next");
+  });
+
+  it("the CSP meta is the first child of head after re-parsing, also with a BOM and a doctype", async () => {
+    const CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+    const pages = [
+      `<p>plain</p>`,
+      `<!DOCTYPE html><html><head><title>T</title></head><body><p>x</p></body></html>`,
+      `\uFEFF<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><p>x</p></body></html>`,
+      `\uFEFF<p>bom only</p>`,
+      `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src *"><p>x</p>`,
+    ];
+    for (const page of pages) {
+      const out = await stripHtmlSnapshot(page);
+      expect(out.startsWith("\uFEFF")).toBe(false);
+      // As stored, and as a browser reads the file if it is saved with a BOM (the decoder drops it).
+      for (const raw of [out, new TextDecoder().decode(Buffer.from(`\uFEFF${out}`))]) {
+        const doc: any = parse(raw);
+        const html = doc.childNodes.find((n: any) => n.tagName === "html");
+        const head = html.childNodes.find((n: any) => n.tagName === "head");
+        const first = head.childNodes.find((n: any) => n.tagName);
+        expect(first?.tagName, page).toBe("meta");
+        expect(Object.fromEntries(first.attrs.map((a: any) => [a.name, a.value]))).toEqual({ "http-equiv": "Content-Security-Policy", content: CSP });
+        expect(doc.mode, page).toBe(page.toLowerCase().includes("doctype") ? "no-quirks" : "quirks");
+      }
+      expect(out).not.toContain("default-src *");
+      expect(await stripHtmlSnapshot(out)).toBe(out);
+    }
+  });
+
+  it("queries are stripped from unquoted -webkit-image-set candidates, URL-like custom properties and bare relative data-* values", async () => {
+    const out = await stripHtmlSnapshot(
+      `<style>.a{background:-webkit-image-set(/c.png?sig=SECRETU 1x, d.png?k=SECRETV 2x)} :root{--x:'/p/q?token=SECRETW';--y:/r/s?t=SECRETY}</style>` +
+        `<div style="--z:&quot;img/a.png?sig=SECRETZ&quot;" data-next="next?session=SECRETS" data-q="a?b" data-n="3">x</div><p>ok</p>`,
+    );
+    for (const s of ["SECRETU", "SECRETV", "SECRETW", "SECRETY", "SECRETZ", "SECRETS"]) expect(out).not.toContain(s);
+    expect(out).toContain("-webkit-image-set(/c.png 1x, d.png 2x)");
+    expect(out).toContain("--x:'/p/q'");
+    expect(out).toContain('data-next="next"');
+    expect(out).toContain('data-q="a?b"');
+  });
+});
+
+describe("pre-scan model (R107 I1): never below what parse5 builds", () => {
+  // Random tag soup (HTML elements; no template or foreign content), seeded: a unit repeated 40 times
+  // must not let parse5 build more depth or elements than the pre-scan counted (an attacker repeats).
+  const TAGS = ("div p b i a span table tr td th tbody li ul ol dd dt form button select option caption object font nobr em h1 h2 pre br img input col colgroup " +
+    "noscript xmp iframe plaintext marquee applet html body head frameset image hr code s u small strong title style script textarea x").split(" ");
+  let seed = 20261111;
+  const rnd = (n: number) => {
+    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+    return seed % n;
+  };
+  const unit = () => {
+    let s = "";
+    for (let k = 3 + rnd(25); k > 0; k--) {
+      const t = TAGS[rnd(TAGS.length)];
+      const r = rnd(100);
+      if (r < 50) s += `<${t}${rnd(5) === 0 ? ` a=${rnd(5)}` : ""}${rnd(20) === 0 ? "/" : ""}>`;
+      else if (r < 80) s += `</${t}>`;
+      else if (r < 95) s += "x";
+      else s += ["<!--", "-->", '"', "'", " "][rnd(5)];
+    }
+    return s;
+  };
+  const built = (html: string) => {
+    let depth = 0;
+    let elements = 0;
+    const stack: Array<[any, number]> = [[parse(html), 0]];
+    while (stack.length) {
+      const [n, d] = stack.pop()!;
+      if (n.tagName) {
+        elements++;
+        depth = Math.max(depth, d + 1);
+      }
+      for (const c of n.childNodes ?? []) stack.push([c, n.tagName ? d + 1 : d]);
+    }
+    return { depth, elements };
+  };
+
+  it("for 600 random units repeated 40 times", async () => {
+    const { prescanCounts } = await import("./html-strip.mjs");
+    for (let k = 0; k < 600; k++) {
+      const page = unit().repeat(40);
+      let c: { maxDepth: number; elements: number };
+      try {
+        c = prescanCounts(page);
+      } catch (err) {
+        if ((err as Error).constructor.name === "PrescanRefused") continue;
+        throw err;
+      }
+      const real = built(page);
+      expect(c.maxDepth, page.slice(0, 200)).toBeGreaterThanOrEqual(real.depth);
+      expect(c.elements, page.slice(0, 200)).toBeGreaterThanOrEqual(real.elements);
+    }
+  }, 60_000);
 });

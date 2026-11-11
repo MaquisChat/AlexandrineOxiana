@@ -287,7 +287,8 @@ describe("Task 30 review round 1 (R98, R99)", () => {
     expect(out).toContain("after");
     // Unclosed script on a large input stays linear (and is dropped to the end).
     const t0 = Date.now();
-    await expect(stripHtmlSnapshot("<script>".repeat(100_000))).rejects.toThrow(); // refused by the pre-scan (R104)
+    // One unclosed script (the rest is its text, as a browser reads it, R107): stripped, nothing left of it.
+    await expect(stripHtmlSnapshot("<script>".repeat(100_000))).resolves.not.toContain("<script");
     expect(Date.now() - t0).toBeLessThan(10_000);
 
     const gov = `${OPEN_GOV.replace("downloader]", "downloader, browser_capture]")}protocol:\n  platforms: [youtube]\n`;

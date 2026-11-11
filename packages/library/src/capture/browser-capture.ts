@@ -17,7 +17,7 @@
  * sandboxed iframe (no allow-scripts, no allow-same-origin, CSP script-src 'none', separate origin
  * or blob), never in the app's webview. See stripHtmlSnapshot.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
@@ -225,11 +225,17 @@ export async function captureBrowserPage(
 // ------------------------------------------------------------------------------------------
 // HTML snapshot stripping (R41/R42 applied to markup; R101 N1/N2, R102 N4)
 
-/** How long one snapshot may take to strip, and each worker's heap cap (R104 I2). */
-export const HTML_STRIP_TIMEOUT_MS = 30_000;
+/** The time budget of one snapshot in its worker (R107), and each worker's heap cap (R104 I2). */
+export const HTML_STRIP_TIMEOUT_MS = 10_000;
 const HTML_STRIP_HEAP_MB = 256;
-/** Workers stripping at the same time; more requests wait their turn (R104 I2). */
+/** Workers stripping at the same time; more requests wait their turn (R104 I2) … */
 export const HTML_STRIP_MAX_WORKERS = 2;
+/** … at most this many (R107); beyond that a snapshot is refused at once (its screenshot kept). */
+export const HTML_STRIP_MAX_WAITING = 8;
+/** A page that ran out of time is refused at once if sent again within this long (R107). */
+export const HTML_STRIP_RETRY_AFTER_TIMEOUT_MS = 10 * 60_000;
+/** Test seam: the time budget in force (HTML_STRIP_TIMEOUT_MS). */
+export const htmlStripTuning = { timeoutMs: HTML_STRIP_TIMEOUT_MS };
 const STRIP_WORKER = new URL("./html-strip-worker.mjs", import.meta.url);
 
 /** The page's HTML was not stored (too large or deep, or markup that does not settle); the screenshot still is. */
@@ -239,15 +245,24 @@ export class HtmlSnapshotRefusedError extends InvalidInputError {
 
 let active = 0;
 let peak = 0;
+let started = 0;
 const waiting: Array<() => void> = [];
+/** Pages (sha256 of their HTML) that ran out of time, and when (R107). */
+const timedOut = new Map<string, number>();
 
-/** Workers running now and the most seen at once (tests, diagnostics). */
-export function htmlStripStats(): { active: number; peak: number; queued: number } {
-  return { active, peak, queued: waiting.length };
+/** Workers running now, the most seen at once, those waiting, and workers started so far (tests, diagnostics). */
+export function htmlStripStats(): { active: number; peak: number; queued: number; started: number } {
+  return { active, peak, queued: waiting.length, started };
 }
 
+const BUSY = "The service is busy, so the page's HTML was not kept; its screenshot was.";
+const TIMED_OUT = "The page's HTML could not be processed in time, so only its screenshot was kept.";
+
 async function slot(): Promise<() => void> {
-  if (active >= HTML_STRIP_MAX_WORKERS) await new Promise<void>((r) => waiting.push(r));
+  if (active >= HTML_STRIP_MAX_WORKERS) {
+    if (waiting.length >= HTML_STRIP_MAX_WAITING) throw new HtmlSnapshotRefusedError(BUSY);
+    await new Promise<void>((r) => waiting.push(r));
+  }
   active++;
   peak = Math.max(peak, active);
   return () => {
@@ -256,8 +271,9 @@ async function slot(): Promise<() => void> {
   };
 }
 
-function runWorker(html: string): Promise<string> {
+function runWorker(html: string, hash: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    started++;
     const worker = new Worker(STRIP_WORKER, { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
     let settled = false;
     const finish = (fn: () => void) => {
@@ -267,7 +283,14 @@ function runWorker(html: string): Promise<string> {
       void worker.terminate().catch(() => {});
       fn();
     };
-    const timer = setTimeout(() => finish(() => reject(new HtmlSnapshotRefusedError("The page's HTML could not be processed in time, so only its screenshot was kept."))), HTML_STRIP_TIMEOUT_MS);
+    const timer = setTimeout(
+      () =>
+        finish(() => {
+          timedOut.set(hash, Date.now());
+          reject(new HtmlSnapshotRefusedError(TIMED_OUT));
+        }),
+      htmlStripTuning.timeoutMs,
+    );
     worker.once("message", (m: { ok: boolean; html?: string; refused?: boolean; reason?: string }) =>
       finish(() =>
         m.ok && typeof m.html === "string"
@@ -281,18 +304,24 @@ function runWorker(html: string): Promise<string> {
 }
 
 /**
- * The page's HTML as stored (html-strip.mjs: pre-scan limits, parse5 to a fixpoint, CSP meta
- * prefixed), in a worker thread from a pool of HTML_STRIP_MAX_WORKERS so a large or adversarial page
- * never blocks the service's event loop or its memory. HtmlSnapshotRefusedError when not kept.
+ * The page's HTML as stored (html-strip.mjs: pre-scan limits, parse5 to a fixpoint, CSP meta first
+ * in its head), in a worker thread from a pool of HTML_STRIP_MAX_WORKERS so a large or adversarial
+ * page never blocks the service's event loop or its memory. Each snapshot has HTML_STRIP_TIMEOUT_MS;
+ * at most HTML_STRIP_MAX_WAITING wait for a worker, and a page that ran out of time is refused at
+ * once for HTML_STRIP_RETRY_AFTER_TIMEOUT_MS (R107). HtmlSnapshotRefusedError when not kept.
  *
  * Archived snapshots are only ever rendered in a sandboxed iframe — no allow-scripts, no
  * allow-same-origin, CSP `script-src 'none'`, served from a separate origin or a blob — never in
  * the app's webview (R101, binding for Tasks 33/34). This stripping is defence in depth.
  */
 export async function stripHtmlSnapshot(html: string): Promise<string> {
+  const hash = createHash("sha256").update(html).digest("hex");
+  const now = Date.now();
+  for (const [h, at] of timedOut) if (now - at >= HTML_STRIP_RETRY_AFTER_TIMEOUT_MS) timedOut.delete(h);
+  if (timedOut.has(hash)) throw new HtmlSnapshotRefusedError("The page's HTML ran out of time recently, so only its screenshot was kept.");
   const release = await slot();
   try {
-    return await runWorker(html);
+    return await runWorker(html, hash);
   } finally {
     release();
   }
