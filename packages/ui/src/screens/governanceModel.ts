@@ -56,6 +56,7 @@ export interface Config {
     languages: string[];
     requireBeforeCapture: boolean;
   };
+  dmp: { repository: string | null; formats: string[]; metadataStandard: string | null; embargoUntil: string | null };
   exceptions: Array<{ control: string; value: unknown; reason: string; by: string; at: string }>;
 }
 
@@ -78,7 +79,22 @@ export const DEFAULTS: Config = {
   encryption: { atRest: "required" },
   sharing: { locationMetadata: "coarsen" },
   protocol: { number: null, approvedFrom: null, expires: null, platforms: [], populations: [], languages: [], requireBeforeCapture: false },
+  dmp: { repository: null, formats: [], metadataStandard: null, embargoUntil: null },
   exceptions: [],
+};
+
+/** Largest governance.yaml the service accepts (GOVERNANCE_MAX_BYTES); refused before parsing (R117 I7). */
+export const GOVERNANCE_MAX_BYTES = 64 * 1024;
+/** Aliases a governance file may expand (each can expand a whole subtree). */
+const MAX_ALIASES = 10;
+
+/** Profile rules that are not control values (mirrors vendorRequires / cloudFolderNeedsApproval in the profile YAMLs). */
+export const PROFILE_VENDOR_RULES: Partial<Record<Profile, string>> = {
+  hipaa: "every outside vendor needs a signed business associate agreement (BAA)",
+  gdpr: "every outside vendor needs a data processing agreement (DPA)",
+};
+export const PROFILE_RESIDENCY_RULES: Partial<Record<Profile, string>> = {
+  hipaa: "approved cloud-synced folders count only when at least one is listed under residency.approvedCloudFolders; public cloud is never allowed",
 };
 
 /** A control path and what a profile requires there. */
@@ -105,7 +121,11 @@ export const PROFILE_REQUIREMENTS: Record<Profile, Requirement[]> = {
     { control: "audit.enabled", value: true, kind: "minimum" },
     { control: "sharing.locationMetadata", value: "strip", kind: "minimum" },
   ],
-  dmp: [{ control: "retention.rawDataDestroyAfter", value: null, kind: "present" }],
+  dmp: [
+    { control: "dmp.repository", value: null, kind: "present" },
+    { control: "dmp.formats", value: null, kind: "present" },
+    { control: "retention.rawDataDestroyAfter", value: null, kind: "present" },
+  ],
 };
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -125,9 +145,10 @@ export function getPath(o: unknown, path: string): unknown {
 
 /** The rules as written, with defaults filled in. Throws on YAML that cannot be read. */
 export function readConfig(text: string): Config {
+  if (new TextEncoder().encode(text).length > GOVERNANCE_MAX_BYTES) throw new Error("governance.yaml is larger than 64 KB");
   const doc = parseDocument(text, { uniqueKeys: true });
   if (doc.errors.length) throw new Error(doc.errors[0]!.message.split("\n")[0]);
-  const raw = doc.toJS({ maxAliasCount: 20 }) as unknown;
+  const raw = doc.toJS({ maxAliasCount: MAX_ALIASES }) as unknown;
   if (raw !== null && raw !== undefined && !isObj(raw)) throw new Error("The top level of governance.yaml must be a mapping");
   return merge(DEFAULTS, raw ?? {}) as Config;
 }
@@ -189,6 +210,7 @@ export function hasException(cfg: Config, control: string, value: unknown): bool
 
 /** Sets `path` to `value` in the YAML text, keeping comments and layout elsewhere. */
 export function setIn(text: string, path: string, value: unknown): string {
+  readConfig(text); // size and alias limits before editing
   const doc = parseDocument(text, { uniqueKeys: true }) as Document;
   if (!isMap(doc.contents)) doc.contents = doc.createNode({}) as never;
   doc.setIn(path.split("."), doc.createNode(value));
@@ -197,9 +219,9 @@ export function setIn(text: string, path: string, value: unknown): string {
 
 /** Appends an exception (spec 6.2: a recorded justification for loosening a profile requirement). */
 export function addException(text: string, e: Config["exceptions"][number]): string {
+  const list = readConfig(text).exceptions;
   const doc = parseDocument(text, { uniqueKeys: true }) as Document;
   if (!isMap(doc.contents)) doc.contents = doc.createNode({}) as never;
-  const list = (doc.toJS() as { exceptions?: unknown[] } | null)?.exceptions ?? [];
   doc.setIn(["exceptions"], doc.createNode([...list, e]));
   return String(doc);
 }

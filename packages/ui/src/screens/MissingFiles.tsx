@@ -19,7 +19,12 @@ const SKIP_REASON: Record<string, string> = {
 
 const files = (n: number) => (n === 1 ? "1 file" : `${n.toLocaleString("en-US")} files`);
 
-export function MissingFiles({ api }: { api: GovernanceApi }) {
+/** Whether the app runs on Windows (the webview's user agent names it). */
+function onWindows(): boolean {
+  return typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+}
+
+export function MissingFiles({ api, isWindows = onWindows() }: { api: GovernanceApi; isWindows?: boolean }) {
   const ids = useId();
   const [integrity, setIntegrity] = useState<IntegrityAnswer | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -95,9 +100,11 @@ export function MissingFiles({ api }: { api: GovernanceApi }) {
             void search();
           }}
         >
+          {isWindows ? (
           <p className="ao-warning">
             On Windows, searching a folder kept in OneDrive or another cloud-storage service can make it download files that are stored online only. Choose the folder that holds the missing files, not a whole drive.
           </p>
+          ) : null}
           <div className="ao-field">
             <label htmlFor={`${ids}-dir`}>Folder to search</label>
             <input id={`${ids}-dir`} type="text" value={folder} onChange={(e) => setFolder(e.target.value)} />

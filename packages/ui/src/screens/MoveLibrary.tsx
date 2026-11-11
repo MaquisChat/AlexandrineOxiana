@@ -4,12 +4,14 @@
  * (copy, then every file verified, then switch; streamed as NDJSON) → the verification result →
  * "Delete old copy", which stays disabled until the move was verified, and asks for a typed
  * confirmation. The service keeps the move's single-use token for 15 minutes: if the stream is cut
- * off (or another window started the move: MOVE_IN_PROGRESS), the token is fetched again from
- * GET /libraries/move/status.
+ * off (the client's cut-off error, or a stream that ends without an answer), the token is fetched
+ * again from GET /libraries/move/status — only for the move this screen started (same destination,
+ * R117 I8). A move started elsewhere (MOVE_IN_PROGRESS) is reported, never taken over. Closing the
+ * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../api/client";
-import type { GovernanceApi, MovePlan, MoveProgress } from "../api/governance";
+import { isStreamCutOff, type GovernanceApi, type MovePlan, type MoveProgress } from "../api/governance";
 import { ConfirmDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
@@ -23,7 +25,9 @@ const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
 const isMoveInProgress = (err: unknown) =>
   err instanceof ApiClientError && (err.code === "MOVE_IN_PROGRESS" || (err.status === 409 && /already running/i.test(err.message)));
 
-export function MoveLibrary({ api, pollMs = 2000 }: { api: GovernanceApi; pollMs?: number }) {
+const sameRoot = (a: string, b: string) => a.replace(/[\\/]+$/, "") === b.replace(/[\\/]+$/, "");
+
+export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: GovernanceApi; pollMs?: number; maxPolls?: number }) {
   const ids = useId();
   const [dest, setDest] = useState("");
   const [stage, setStage] = useState<Stage>("pick");
@@ -36,20 +40,25 @@ export function MoveLibrary({ api, pollMs = 2000 }: { api: GovernanceApi; pollMs
   const [deleting, setDeleting] = useState(false);
   const [deletedNote, setDeletedNote] = useState<string | null>(null);
   const alive = useRef(true);
+  const stream = useRef<AbortController | null>(null);
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
+      stream.current?.abort();
     };
   }, []);
 
-  /** Asks the service for the finished move's token, repeatedly until there is one (the move runs to its end on the service). */
-  const pickUp = async (note: string) => {
+  /**
+   * Asks the service for the token of the move this screen started (to `target`), repeatedly until
+   * it is there (the move runs to its end on the service). Another move's token is never taken.
+   */
+  const pickUp = async (target: string, note: string) => {
     setWaiting(true);
-    for (let i = 0; i < 900 && alive.current; i++) {
+    for (let i = 0; i < maxPolls && alive.current; i++) {
       try {
         const { pending } = await api.moveStatus();
-        if (pending) {
+        if (pending && sameRoot(pending.newRoot, target)) {
           if (!alive.current) return;
           setWaiting(false);
           setVerified({ token: pending.confirmToken, newRoot: pending.newRoot, message: note });
@@ -68,10 +77,10 @@ export function MoveLibrary({ api, pollMs = 2000 }: { api: GovernanceApi; pollMs
     }
   };
 
+  /** Another move (started elsewhere) is running: report it; its old copy is that window's to delete. */
   const inProgress = () => {
-    setError("This library is already being moved. This page shows the result as soon as the move is done.");
-    setStage("moving");
-    void pickUp("The move finished and was verified.");
+    setError("This library is already being moved from another window. Its result, and deleting its old copy, are offered there.");
+    setStage("pick");
   };
 
   const check = async () => {
@@ -90,8 +99,11 @@ export function MoveLibrary({ api, pollMs = 2000 }: { api: GovernanceApi; pollMs
     setError(null);
     setProgress(null);
     setStage("moving");
+    const target = dest.trim();
+    const ac = new AbortController();
+    stream.current = ac;
     try {
-      for await (const line of api.move(dest.trim(), exclude)) {
+      for await (const line of api.move(target, exclude, ac.signal)) {
         if ("progress" in line) setProgress(line.progress);
         else if ("error" in line) {
           setError(`${line.error.message} The move stopped; nothing was deleted, and the library stays where it was.`);
@@ -104,10 +116,16 @@ export function MoveLibrary({ api, pollMs = 2000 }: { api: GovernanceApi; pollMs
           return;
         }
       }
-      // Cut off without an answer: the move carries on in the service; ask it.
-      await pickUp("The move finished and was verified (the connection to it was interrupted).");
+      if (ac.signal.aborted || !alive.current) return; // the screen was closed
+      // Ended without an answer: the move carries on in the service; ask it.
+      await pickUp(target, "The move finished and was verified (the connection to it was interrupted).");
     } catch (err) {
+      if (!alive.current) return;
       if (isMoveInProgress(err)) return inProgress();
+      if (isStreamCutOff(err)) {
+        await pickUp(target, "The move finished and was verified (the connection to it was interrupted).");
+        return;
+      }
       setError(err instanceof Error ? err.message : "The move could not be started.");
       setStage(plan ? "plan" : "pick");
     }

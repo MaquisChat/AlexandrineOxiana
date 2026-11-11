@@ -3,7 +3,7 @@
  * integrity", which checks the hash chain and the head recorded outside the library (R12, R82):
  * intact, broken at a position, or UNVERIFIED when this computer holds no anchor to compare with.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import type { AuditCheck, AuditPage, GovernanceApi } from "../api/governance";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
@@ -29,13 +29,13 @@ function Verdict({ check }: { check: AuditCheck }) {
   }
   if (!check.anchored) {
     return (
-      <p role="status" aria-label="Integrity" className="ao-warning">
+      <p role="status" className="ao-warning">
         UNVERIFIED — {plural(check.events)}, hash chain intact, but this computer has no anchor (a record of the log's last event kept outside the library) to compare it with, so a shortened log could not be detected.
       </p>
     );
   }
   return (
-    <p role="status" aria-label="Integrity" className="ao-ok">
+    <p role="status" className="ao-ok">
       {plural(check.events)} — hash chain intact
     </p>
   );
@@ -48,6 +48,7 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
   const [check, setCheck] = useState<AuditCheck | null>(null);
   const [checking, setChecking] = useState(false);
   const before = cursors[cursors.length - 1];
+  const ids = useId();
 
   const load = useCallback(async () => {
     try {
@@ -84,7 +85,12 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
         </button>
         {checking ? <span role="status">Checking the hash chain…</span> : null}
       </div>
-      {check ? <Verdict check={check} /> : null}
+      {check ? (
+        <section aria-labelledby={`${ids}-check`}>
+          <h2 id={`${ids}-check`}>Integrity check</h2>
+          <Verdict check={check} />
+        </section>
+      ) : null}
       {error ? (
         <p role="alert" className="ao-warning">
           {error}

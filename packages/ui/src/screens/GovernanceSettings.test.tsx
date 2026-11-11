@@ -43,6 +43,34 @@ async function loaded() {
 }
 
 describe("Governance settings", () => {
+  it("refuses a governance.yaml over 64 KB without parsing it (R117 I7)", async () => {
+    serve({ yaml: `# ${"x".repeat(70 * 1024)}\nencryption:\n  atRest: optional\n` });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/larger than 64 KB/);
+  });
+
+  it("refuses YAML that expands many aliases (R117 I7)", async () => {
+    const bomb = `a: &a [x, x, x, x]\nb: &b [*a, *a, *a, *a]\nc: &c [*b, *b, *b, *b]\nd: [*c, *c, *c, *c, *c, *c]\n`;
+    serve({ yaml: bomb });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be read/);
+  });
+
+  it("shows the Funder DMP section, and what HIPAA and GDPR require of vendors and cloud folders", async () => {
+    serve({ yaml: "profiles: [hipaa, gdpr, dmp]\ndmp:\n  repository: Zenodo\n  formats: [csv, pdf]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const dmp = card("Data management plan");
+    expect((within(dmp).getByRole("textbox", { name: "Repository" }) as HTMLInputElement).value).toBe("Zenodo");
+    expect((within(dmp).getByRole("textbox", { name: "Formats" }) as HTMLInputElement).value).toBe("csv, pdf");
+    expect(within(dmp).getAllByText(/Required by Funder DMP/).length).toBeGreaterThan(0);
+    const proc = card("Processing location");
+    expect(proc.textContent).toMatch(/HIPAA: every outside vendor needs a signed business associate agreement \(BAA\)/);
+    expect(proc.textContent).toMatch(/GDPR: every outside vendor needs a data processing agreement \(DPA\)/);
+    expect(card("Data residency").textContent).toMatch(/HIPAA: approved cloud-synced folders count only when at least one is listed/);
+  });
+
+
   it("shows one card per control (9), each with its value", async () => {
     serve();
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
@@ -163,13 +191,38 @@ describe("Governance settings", () => {
     expect(cap.puts[1]!.body.yaml).toContain("enabled: false");
   });
 
+  it("shows a result for each dropped protocol document, including the refused ones", async () => {
+    serve();
+    server.use(
+      http.post(url(`/projects/${PID}/protocol/documents`), () =>
+        HttpResponse.json({
+          results: [
+            { file: "letter.pdf", outcome: "added", document: { name: "letter.pdf", bytes: 10, encrypted: false } },
+            { file: "tool.exe", outcome: "failed", reason: "Only a PDF, Word, OpenDocument, plain text or an image can be added as a protocol document." },
+          ],
+          documents: [{ name: "letter.pdf", bytes: 10, encrypted: false }],
+        }),
+      ),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const f = (n: string) => Object.assign(new File(["x"], n), { path: `/Users/ana/${n}` });
+    fireEvent.drop(within(card("Protocol record")).getByText(/Drop approval documents here/), { dataTransfer: { files: [f("letter.pdf"), f("tool.exe")], types: ["Files"] } });
+    const results = await within(card("Protocol record")).findByRole("list", { name: "Results of the last drop" });
+    expect(results.textContent).toMatch(/letter\.pdf: added/);
+    expect(results.textContent).toMatch(/tool\.exe: not added — Only a PDF/);
+  });
+
   it("attaches protocol approval documents dropped on the protocol record", async () => {
     serve();
     let posted: any;
     server.use(
       http.post(url(`/projects/${PID}/protocol/documents`), async ({ request }) => {
         posted = await request.json();
-        return HttpResponse.json({ documents: [{ name: "IRB approval letter.pdf", bytes: 2048, encrypted: true }] });
+        return HttpResponse.json({
+          results: [{ file: "IRB approval letter.pdf", outcome: "added", document: { name: "IRB approval letter.pdf", bytes: 2048, encrypted: true } }],
+          documents: [{ name: "IRB approval letter.pdf", bytes: 2048, encrypted: true }],
+        });
       }),
     );
     render(<GovernanceSettings api={makeApi()} projectId={PID} />);
@@ -177,7 +230,7 @@ describe("Governance settings", () => {
     const zone = within(card("Protocol record")).getByText(/Drop approval documents here/);
     const file = Object.assign(new File(["%PDF"], "IRB approval letter.pdf"), { path: "/Users/ana/IRB approval letter.pdf" });
     fireEvent.drop(zone, { dataTransfer: { files: [file], types: ["Files"] } });
-    expect(await within(card("Protocol record")).findByText("IRB approval letter.pdf")).toBeTruthy();
+    expect((await within(card("Protocol record")).findAllByText("IRB approval letter.pdf")).length).toBe(2);
     expect(posted).toEqual({ paths: ["/Users/ana/IRB approval letter.pdf"] });
     expect(within(card("Protocol record")).getByText(/encrypted/)).toBeTruthy();
   });

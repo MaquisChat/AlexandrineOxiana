@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
@@ -133,7 +133,52 @@ describe("Move library", () => {
     await waitFor(() => expect(deleted).toEqual({ token: "tok-after-reconnect" }));
   });
 
-  it("MOVE_IN_PROGRESS: says a move is already running, and picks it up once it finished", async () => {
+  it("a stream cut off in the middle of a line (the client's cut-off error) also asks move/status", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(url("/libraries/move"), () => new HttpResponse(`${JSON.stringify({ progress: { phase: "copy", filesDone: 1, fileCount: 120, bytesDone: 1, totalBytes: 5 } })}\n{"progress":{"pha`, { headers: { "content-type": "application/x-ndjson" } })),
+      http.get(url("/libraries/move/status"), () => HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-cut", expiresAt: "2026-11-11T10:15:00.000Z" } })),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    expect(await screen.findByRole("status", { name: "Verification" })).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("picks up only the move it started: a finished move to another place is not offered for deletion", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(url("/libraries/move"), () => new HttpResponse("", { headers: { "content-type": "application/x-ndjson" } })),
+      http.get(url("/libraries/move/status"), () => HttpResponse.json({ pending: { oldRoot: "/x", newRoot: "/Volumes/Other/Library", confirmToken: "not-mine", expiresAt: "2026-11-11T10:15:00.000Z" } })),
+    );
+    server.use(http.post(url("/libraries/move/plan"), () => HttpResponse.json({ ...PLAN, perProject: [PLAN.perProject[0]!] })));
+    render(<MoveLibrary api={makeApi()} pollMs={5} maxPolls={3} />);
+    await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
+    await user.click(screen.getByRole("button", { name: "Check destination" }));
+    await user.click(within(await screen.findByRole("region", { name: "Move plan" })).getByRole("button", { name: "Move library" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/No finished move/);
+    expect(screen.queryByRole("status", { name: "Verification" })).toBeNull();
+    expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("stops reading the move's stream when the screen closes", async () => {
+    const user = userEvent.setup();
+    const s = controlledStream();
+    let req: Request | undefined;
+    server.use(
+      http.post(url("/libraries/move"), ({ request }) => {
+        req = request;
+        return s.response();
+      }),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    await waitFor(() => expect(req).toBeDefined());
+    cleanup();
+    await waitFor(() => expect(req!.signal.aborted).toBe(true));
+  });
+
+  it("MOVE_IN_PROGRESS: says a move is already running, and does not offer another move's old copy", async () => {
     const user = userEvent.setup();
     let polls = 0;
     server.use(
@@ -147,7 +192,8 @@ describe("Move library", () => {
     await user.type(screen.getByRole("textbox", { name: "Destination folder" }), DEST);
     await user.click(screen.getByRole("button", { name: "Check destination" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/already being moved/);
-    expect(await screen.findByRole("status", { name: "Verification" }, { timeout: 2000 })).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(false);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("status", { name: "Verification" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete old copy", hidden: false }) === null || (screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

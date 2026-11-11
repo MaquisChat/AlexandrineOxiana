@@ -32,7 +32,7 @@ describe("Missing files", () => {
         });
       }),
     );
-    render(<MissingFiles api={makeApi()} />);
+    render(<MissingFiles api={makeApi()} isWindows />);
     const list = await screen.findByRole("list", { name: "Missing files" });
     expect(within(list).getAllByRole("listitem")).toHaveLength(2);
     const user = userEvent.setup();
@@ -47,6 +47,15 @@ describe("Missing files", () => {
     expect(res.textContent).toMatch(/only online-only copies were found/i);
     expect(res.textContent).toMatch(/Audio\/interview\.m4a/);
     await waitFor(() => expect(within(screen.getByRole("list", { name: "Missing files" })).getAllByRole("listitem")).toHaveLength(1));
+  });
+
+  it("shows the cloud-download warning only on Windows", async () => {
+    server.use(http.get(url("/libraries/integrity"), () => HttpResponse.json(report(["Projects/A/x.pdf"]))));
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    await screen.findByRole("list", { name: "Missing files" });
+    await userEvent.setup().click(screen.getByRole("button", { name: "Search a folder…" }));
+    expect(screen.queryByText(/On Windows/)).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Folder to search" })).toBeTruthy();
   });
 
   it("says when nothing is missing", async () => {

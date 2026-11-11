@@ -8,9 +8,9 @@
  * elsewhere: the edits stay and the person can reload. Violations the service reports are shown on
  * the card of their control. Also: protocol approval documents and the retention list.
  */
-import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { ApiClientError } from "../api/client";
-import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, RetentionDue, Violation } from "../api/governance";
+import type { DestructionCertificate, GovernanceApi, Profile, ProtocolDocument, ProtocolDocumentResult, RetentionDue, Violation } from "../api/governance";
 import { FileDrop } from "../components/FileDrop";
 import { ConfirmDialog, ReasonDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
@@ -21,6 +21,8 @@ import {
   PROCESSING_OPS,
   PROFILE_LABEL,
   PROFILE_REQUIREMENTS,
+  PROFILE_RESIDENCY_RULES,
+  PROFILE_VENDOR_RULES,
   PROFILES,
   RESIDENCY_KINDS,
   RESIDENCY_LABEL,
@@ -52,7 +54,24 @@ const describe = (v: unknown) => JSON.stringify(v);
 
 export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; projectId: string }) {
   const [saved, setSaved] = useState<{ yaml: string; sha256: string } | null>(null);
-  const [text, setText] = useState("");
+  const [text, setTextNow] = useState("");
+  // What the cards show is parsed from `parseText`: at once for form edits, 300 ms after the last
+  // keystroke in the raw editor (R117 I7: no full parse per keystroke of a large file).
+  const [parseText, setParseText] = useState("");
+  const setText = useCallback((next: string | ((t: string) => string)) => {
+    setTextNow((t) => {
+      const v = typeof next === "function" ? next(t) : next;
+      setParseText(v);
+      return v;
+    });
+  }, []);
+  const rawTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const typeRaw = (v: string) => {
+    setTextNow(v);
+    clearTimeout(rawTimer.current);
+    rawTimer.current = setTimeout(() => setParseText(v), 300);
+  };
+  useEffect(() => () => clearTimeout(rawTimer.current), []);
   const [violations, setViolations] = useState<Violation[]>([]);
   const [reasons, setReasons] = useState<string[]>([]);
   const [pending, setPending] = useState<Pending | null>(null);
@@ -74,7 +93,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "The rules could not be loaded.");
     }
-  }, [api, projectId]);
+  }, [api, projectId, setText]);
 
   useEffect(() => {
     void load();
@@ -82,11 +101,11 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
 
   const parsed = useMemo((): { cfg: Config | null; error: string | null } => {
     try {
-      return { cfg: readConfig(text), error: null };
+      return { cfg: readConfig(parseText), error: null };
     } catch (err) {
       return { cfg: null, error: err instanceof Error ? err.message : "governance.yaml cannot be read" };
     }
-  }, [text]);
+  }, [parseText]);
   const savedCfg = useMemo(() => {
     try {
       return saved ? readConfig(saved.yaml) : null;
@@ -239,6 +258,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
             ))}
           </fieldset>
           <Required cfg={cfg} control="residency.allowed" />
+          <ProfileNotes cfg={cfg} rules={PROFILE_RESIDENCY_RULES} />
         </ControlCard>
 
         <ControlCard violations={violations} title="Processing location" controls={["processing", "vendors"]}>
@@ -246,6 +266,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
           {PROCESSING_OPS.map((op) => (
             <ListInput key={op} label={PROCESSING_LABEL[op]} disabled={off} value={cfg?.processing[op] ?? []} onCommit={(v) => change(`processing.${op}`, v)} />
           ))}
+          <ProfileNotes cfg={cfg} rules={PROFILE_VENDOR_RULES} />
         </ControlCard>
 
         <ControlCard violations={violations} title="Identifiability" controls={["identifiability.containsIdentifiable", "identifiability.pseudonymizeFileNames"]}>
@@ -317,6 +338,20 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
           <CheckControl cfg={cfg} onChange={change} control="protocol.requireBeforeCapture" label="A protocol record is required before capture" />
           <ProtocolDocuments api={api} projectId={projectId} />
         </ControlCard>
+
+        <ControlCard violations={violations} title="Data management plan" controls={["dmp"]}>
+          <p className="ao-hint">What the funder's data management plan promises: where the data will be deposited, and in which formats.</p>
+          <div className="ao-field">
+            <TextField label="Repository" disabled={off} value={cfg?.dmp.repository ?? ""} onChange={(v) => change("dmp.repository", v || null)} />
+            <Required cfg={cfg} control="dmp.repository" />
+          </div>
+          <div className="ao-field">
+            <ListInput label="Formats" disabled={off} value={cfg?.dmp.formats ?? []} onCommit={(v) => change("dmp.formats", v)} />
+            <Required cfg={cfg} control="dmp.formats" />
+          </div>
+          <TextField label="Metadata standard" disabled={off} value={cfg?.dmp.metadataStandard ?? ""} onChange={(v) => change("dmp.metadataStandard", v || null)} />
+          <TextField type="date" label="Embargo until" disabled={off} value={cfg?.dmp.embargoUntil ?? ""} onChange={(v) => change("dmp.embargoUntil", v || null)} />
+        </ControlCard>
       </div>
 
       <div className="ao-actions">
@@ -341,7 +376,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
       {rawOpen ? (
         <div id={`${rawId}-raw`} className="ao-raw">
           <label htmlFor={`${rawId}-text`}>governance.yaml</label>
-          <textarea id={`${rawId}-text`} className="ao-code" rows={18} spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} />
+          <textarea id={`${rawId}-text`} className="ao-code" rows={18} spellCheck={false} value={text} onChange={(e) => typeRaw(e.target.value)} />
         </div>
       ) : null}
       {pending ? <ReasonDialog message={pending.message} onConfirm={confirmReason} onCancel={() => setPending(null)} /> : null}
@@ -353,6 +388,21 @@ function Required({ cfg, control }: { cfg: Config | null; control: string }) {
   const by = cfg ? requiredBy(cfg, control) : [];
   if (!by.length) return null;
   return <span className="ao-gov-req">Required by {by.map((b) => PROFILE_LABEL[b.profile]).join(", ")}</span>;
+}
+
+/** Profile rules that are not a single value (vendor agreements, cloud folders), for the selected profiles. */
+function ProfileNotes({ cfg, rules }: { cfg: Config | null; rules: Partial<Record<Profile, string>> }) {
+  const list = (cfg?.profiles ?? []).filter((p) => rules[p]);
+  if (!list.length) return null;
+  return (
+    <ul className="ao-list">
+      {list.map((p) => (
+        <li key={p}>
+          <span className="ao-gov-req">Required by {PROFILE_LABEL[p]}</span> {PROFILE_LABEL[p]}: {rules[p]}
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 function ControlCard({ title, controls, children, violations }: { title: string; controls: string[]; children: ReactNode; violations: Violation[] }) {
@@ -432,13 +482,16 @@ const size = (n: number) => (n < 1024 ? `${n} bytes` : n < 1024 * 1024 ? `${Math
 
 function ProtocolDocuments({ api, projectId }: { api: GovernanceApi; projectId: string }) {
   const [docs, setDocs] = useState<ProtocolDocument[]>([]);
+  const [results, setResults] = useState<ProtocolDocumentResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     api.protocolDocuments(projectId).then((r) => setDocs(r.documents), () => setError("The approval documents could not be listed."));
   }, [api, projectId]);
   const add = async (paths: string[]) => {
     try {
-      setDocs((await api.addProtocolDocuments(projectId, paths)).documents);
+      const r = await api.addProtocolDocuments(projectId, paths);
+      setDocs(r.documents);
+      setResults(r.results);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "The documents could not be added.");
@@ -458,7 +511,17 @@ function ProtocolDocuments({ api, projectId }: { api: GovernanceApi; projectId: 
       ) : (
         <p className="ao-hint">No approval documents yet.</p>
       )}
-      <FileDrop prompt="Drop approval documents here (kept in the project's protocol folder)." fieldLabel="Or add a document by its full path" onPaths={(p) => void add(p)} />
+      <FileDrop prompt="Drop approval documents here (PDF, Word, OpenDocument, plain text or images, up to 100 MB each; kept in the project's protocol folder)." fieldLabel="Or add a document by its full path" onPaths={(p) => void add(p)} />
+      {results ? (
+        <ul className="ao-list" aria-label="Results of the last drop">
+          {results.map((r, i) => (
+            <li key={i} className={r.outcome === "failed" ? "ao-deny" : undefined}>
+              <UserText>{r.file}</UserText>
+              {r.outcome === "added" ? ": added" : `: not added — ${r.reason ?? ""}`}
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {error ? (
         <p role="alert" className="ao-warning">
           {error}

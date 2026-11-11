@@ -60,7 +60,10 @@ describe("Audit log", () => {
     server.use(http.get(url(`/projects/${PID}/audit/verify`), () => HttpResponse.json({ ok: true, events: 48211, anchored: true, alteredAt: [] })));
     render(<AuditLog api={makeApi()} projectId={PID} />);
     await userEvent.setup().click(await screen.findByRole("button", { name: "Verify integrity" }));
-    expect((await screen.findByRole("status", { name: "Integrity" })).textContent).toBe("48,211 events — hash chain intact");
+    const region = await screen.findByRole("region", { name: "Integrity check" });
+    expect(within(region).getByRole("status").textContent).toBe("48,211 events — hash chain intact");
+    // No aria-label overriding what the status says (R117).
+    expect(within(region).getByRole("status").getAttribute("aria-label")).toBeNull();
   });
 
   it("Verify integrity shows where the chain breaks", async () => {
@@ -82,7 +85,7 @@ describe("Audit log", () => {
     server.use(http.get(url(`/projects/${PID}/audit/verify`), () => HttpResponse.json({ ok: true, events: 12, anchored: false, alteredAt: [] })));
     render(<AuditLog api={makeApi()} projectId={PID} />);
     await userEvent.setup().click(await screen.findByRole("button", { name: "Verify integrity" }));
-    const out = await screen.findByRole("status", { name: "Integrity" });
+    const out = within(await screen.findByRole("region", { name: "Integrity check" })).getByRole("status");
     expect(out.textContent).toMatch(/^UNVERIFIED/);
     expect(out.textContent).toMatch(/12 events/);
     expect(out.textContent).toMatch(/no anchor/);

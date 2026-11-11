@@ -6,7 +6,15 @@
  * Governance edits always name the version they were made from (`baseSha256`, the sha256 GET
  * returned; R99): the service answers 409 CONFLICT when the file changed elsewhere meanwhile.
  */
-import type { ApiClient } from "./client";
+import { ApiClientError, type ApiClient } from "./client";
+
+/**
+ * The client's error for a stream that ended unexpectedly: cut off in the middle of a line, or the
+ * connection lost while reading (status 0). The work may still be running on the service.
+ */
+export function isStreamCutOff(err: unknown): boolean {
+  return err instanceof ApiClientError && err.status === 0 && (err.code === "UNAVAILABLE" || err.code === "INTERNAL");
+}
 
 export type Profile = "irb" | "gdpr" | "hipaa" | "dmp";
 
