@@ -82,13 +82,16 @@ export interface ApiClient {
    * A streamed NDJSON response (e.g. POST /libraries/locate): each line parsed as JSON, yielded as it
    * arrives, until the stream ends or `signal` aborts. Same URL, header and error rules as request().
    */
-  ndjson<T>(method: Method, path: string, opts?: RequestOptions): AsyncGenerator<T, void, undefined>;
+  ndjson<T>(method: Method, path: string, opts?: NdjsonOptions): AsyncGenerator<T, void, undefined>;
   /**
    * Server-sent events from GET /events, until the stream ends or `signal` aborts. `onOpen` is
    * called once the service has accepted the stream (events published from then on arrive).
    */
   events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
 }
+
+/** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
+export type NdjsonOptions = RequestOptions & { onOpen?: () => void };
 
 export interface ClientOptions {
   fetch?: typeof fetch;
@@ -289,7 +292,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
    * line is an error (truncated); every line — and any unfinished line — is capped at
    * MAX_NDJSON_LINE_BYTES of UTF-8, measured with TextEncoder, however it arrives.
    */
-  async function* ndjson<T>(method: Method, path: string, o: RequestOptions = {}): AsyncGenerator<T, void, undefined> {
+  async function* ndjson<T>(method: Method, path: string, o: NdjsonOptions = {}): AsyncGenerator<T, void, undefined> {
     const url = urlFor(path, o.query);
     const headers: Record<string, string> = { ...auth, Accept: "application/x-ndjson" };
     const init: RequestInit = { method, headers };
@@ -306,6 +309,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       throw unreachable();
     }
     if (!res.ok) throw await errorFrom(res);
+    o.onOpen?.();
     if (!res.body) return;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

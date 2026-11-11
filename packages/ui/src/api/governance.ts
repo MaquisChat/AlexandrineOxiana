@@ -258,8 +258,9 @@ export function governanceApi(client: ApiClient) {
 
     movePlan: (dest: string) => r<MovePlan>("POST", "/libraries/move/plan", { body: { dest } }),
     /** Streams the move's progress; ends with `done` (verified and switched) or `error`. */
-    move: (dest: string, excludeProjectIds: string[], signal?: AbortSignal) =>
-      client.ndjson<MoveLine>("POST", "/libraries/move", { body: { dest, excludeProjectIds }, ...(signal ? { signal } : {}) }),
+    /** `onOpen`: the service accepted the move (its answer's headers arrived); from then on a broken stream is not "not started". */
+    move: (dest: string, excludeProjectIds: string[], signal?: AbortSignal, onOpen?: () => void) =>
+      client.ndjson<MoveLine>("POST", "/libraries/move", { body: { dest, excludeProjectIds }, ...(signal ? { signal } : {}), ...(onOpen ? { onOpen } : {}) }),
     moveStatus: () => r<{ pending: PendingMove | null }>("GET", "/libraries/move/status"),
     deleteOldCopy: (token: string) => r<{ warnings: string[]; [k: string]: unknown }>("POST", "/libraries/move/delete-old", { body: { token } }),
 

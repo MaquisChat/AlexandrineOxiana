@@ -161,6 +161,26 @@ describe("Move library", () => {
     expect((screen.getByRole("button", { name: "Delete old copy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("a move the service answered (headers received) whose stream broke before any line asks move/status, never \"nothing was copied\"", async () => {
+    const user = userEvent.setup();
+    let polled = 0;
+    server.use(
+      http.post(url("/libraries/move"), () => {
+        const body = new ReadableStream<Uint8Array>({ start: (c) => setTimeout(() => c.error(new TypeError("network connection lost")), 5) });
+        return new HttpResponse(body, { headers: { "content-type": "application/x-ndjson" } });
+      }),
+      http.get(url("/libraries/move/status"), () => {
+        polled++;
+        return HttpResponse.json({ pending: { oldRoot: "/Users/ana/Library", newRoot: DEST, confirmToken: "tok-headers", expiresAt: "2026-11-11T10:15:00.000Z" } });
+      }),
+    );
+    const plan = await planFor(user, { ...PLAN, perProject: [PLAN.perProject[0]!] });
+    await user.click(within(plan).getByRole("button", { name: "Move library" }));
+    expect(await screen.findByRole("status", { name: "Verification" })).toBeTruthy();
+    expect(polled).toBeGreaterThan(0);
+    expect(screen.queryByText(/Nothing was copied or changed/)).toBeNull();
+  });
+
   it("a move the service could not be reached for is \"could not be started\", not a cut-off stream", async () => {
     const user = userEvent.setup();
     let polled = false;

@@ -6,7 +6,9 @@
  * confirmation. The service keeps the move's single-use token for 15 minutes: if the stream is cut
  * off (the client's cut-off error, or a stream that ends without an answer), the token is fetched
  * again from GET /libraries/move/status — only for the move this screen started (same destination,
- * R117 I8). A move started elsewhere (MOVE_IN_PROGRESS) is reported, never taken over. Closing the
+ * R117 I8). Once the service has answered the move request (its headers arrived), any broken
+ * stream is treated so, even before a first line: the move may be running there, so it is never
+ * reported as "nothing was copied". A move started elsewhere (MOVE_IN_PROGRESS) is reported, never taken over. Closing the
  * screen stops reading the stream (the move itself carries on in the service).
  */
 import { useEffect, useId, useRef, useState } from "react";
@@ -103,8 +105,10 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
     const ac = new AbortController();
     stream.current = ac;
     let started = false;
+    /** The service answered: the move may be running there even if no line arrives. */
+    let reached = false;
     try {
-      for await (const line of api.move(target, exclude, ac.signal)) {
+      for await (const line of api.move(target, exclude, ac.signal, () => (reached = true))) {
         started = true;
         if ("progress" in line) setProgress(line.progress);
         else if ("error" in line) {
@@ -124,7 +128,7 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
     } catch (err) {
       if (!alive.current) return;
       if (isMoveInProgress(err)) return inProgress();
-      if (isStreamCutOff(err, started)) {
+      if (reached || isStreamCutOff(err, started)) {
         await pickUp(target, "The move finished and was verified (the connection to it was interrupted).");
         return;
       }
