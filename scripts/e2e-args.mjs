@@ -13,6 +13,14 @@ export function parseE2eArgs(argv) {
  * Extra arguments with no suite flag would reach more than one suite (a spec path of one suite is
  * not a path in another), so the runner refuses them. With no extra arguments every suite runs.
  */
+/**
+ * The Playwright JSON that stands in for a suite that ran but wrote no results (it crashed before
+ * its reporter ran): `pnpm report` shows it as a failure instead of leaving the suite out.
+ */
+export function noResults(suite, status) {
+  return { suites: [], errors: [{ message: `the ${suite} suite wrote no results (exit status ${status})` }] };
+}
+
 export function needsSuiteFlag({ only, args }) {
   return !only && args.length > 0;
 }

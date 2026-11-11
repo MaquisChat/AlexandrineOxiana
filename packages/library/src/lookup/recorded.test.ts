@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_GOVERNANCE } from "@ao/core";
 import { MockAgent } from "undici";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpClient, LookupHttpError } from "./http.js";
 import { lookupDoi } from "./index.js";
 import { LOOKUP_FIXTURES_ENV, recordedLookupsFromEnv } from "./recorded.js";
@@ -92,6 +92,27 @@ describe("lookup fixtures switch", () => {
   it("an answer file outside the folder is refused", async () => {
     await writeFile(join(tmp, "answers.json"), JSON.stringify({ v: 1, answers: { [CR_URL]: { status: 200, file: "../secret.json" } } }));
     expect(() => recordedLookupsFromEnv({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: tmp })).toThrow(/file name/);
+  });
+
+  it("a recorded answer whose file is missing fails at start, not as a raw file error later", async () => {
+    await writeFile(join(tmp, "answers.json"), JSON.stringify({ v: 1, answers: { [CR_URL]: { status: 200, file: "missing.json" } } }));
+    expect(() => recordedLookupsFromEnv({ NODE_ENV: "test", [LOOKUP_FIXTURES_ENV]: tmp })).toThrow(/missing\.json/);
+  });
+
+  it("reads process.env by default: honoured under NODE_ENV=test, ignored otherwise", async () => {
+    vi.stubEnv(LOOKUP_FIXTURES_ENV, FIX);
+    try {
+      vi.stubEnv("NODE_ENV", "production");
+      const prod = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: agent, sleep: async () => {} });
+      expect((await prod.getJson<{ message: { title: string[] } }>(CR_URL, opts))?.message.title).toEqual(["From the network"]);
+      expect(reached).toEqual([CR_URL]);
+      vi.stubEnv("NODE_ENV", "test");
+      const t = new HttpClient({ libraryRoot: join(tmp, "Lib"), dispatcher: agent, sleep: async () => {} });
+      expect((await t.getJson<{ message: { title: string[] } }>(CR_URL, opts))?.message.title).toEqual(["Rivers and Memory in Upland Villages"]);
+      expect(reached).toEqual([CR_URL]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("drives a real DOI lookup: the title comes from the recorded Crossref answer", async () => {

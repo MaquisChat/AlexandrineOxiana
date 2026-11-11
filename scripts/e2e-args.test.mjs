@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { needsSuiteFlag, parseE2eArgs } from "./e2e-args.mjs";
+import { needsSuiteFlag, noResults, parseE2eArgs } from "./e2e-args.mjs";
+import { buildReport } from "./test-report.mjs";
+
+test("a suite that wrote no results is reported as a failure, never as nothing", () => {
+  const md = buildReport({ playwrightApp: noResults("app", 1) });
+  assert.match(md, /0 of 1 checks passed/);
+  assert.match(md, /✗ The app end to end: Playwright could not run the tests: the app suite wrote no results \(exit status 1\)/);
+});
 
 test("the suite flag is found anywhere in argv (R116)", () => {
   assert.deepEqual(parseE2eArgs(["--", "--extension-only", "e2e/extension.spec.ts", "--trace", "off"]), { only: "extension", args: ["e2e/extension.spec.ts", "--trace", "off"] });

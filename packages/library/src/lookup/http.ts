@@ -82,7 +82,11 @@ export interface HttpClientOptions {
   timeoutMs?: number;
   /** Overall deadline of one attempt, redirects and body included (default 60 s). */
   attemptTimeoutMs?: number;
-  /** Where the recorded-answers switch is read (default process.env; honoured only under NODE_ENV=test). */
+  /**
+   * TESTS ONLY: where the recorded-answers switch is read (default process.env; honoured only under
+   * NODE_ENV=test). Application code never passes it. Note that vitest sets NODE_ENV=test, so an
+   * AO_LOOKUP_FIXTURES exported in a developer's shell also reaches the library's own tests.
+   */
   env?: NodeJS.ProcessEnv;
 }
 

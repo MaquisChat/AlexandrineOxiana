@@ -11,7 +11,7 @@ import { expect, test } from "./fixtures.js";
 const LIBRARY_NAME = "Estuary fieldwork";
 const PROJECT_NAME = "Tide-line interviews";
 
-test("creates a library at a typed folder, and its project is listed on the library screen", async ({ page, app }) => {
+test("creates a library at a typed folder; a project made through the service is listed on the library screen", async ({ page, app }) => {
   // The chooser: nothing registered yet on this device.
   await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
   await expect(page.getByText("No libraries yet.")).toBeVisible();

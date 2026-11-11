@@ -11,9 +11,9 @@
 // suite's spec path never reaches another.
 //
 // Each suite writes its JSON results to reports/playwright-<suite>.json for `pnpm report`.
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { needsSuiteFlag, parseE2eArgs } from "./e2e-args.mjs";
+import { needsSuiteFlag, noResults, parseE2eArgs } from "./e2e-args.mjs";
 
 mkdirSync("reports", { recursive: true });
 let parsed;
@@ -48,7 +48,11 @@ for (const s of SUITES) {
     console.log(`Skipping the ${s.name} end-to-end tests: ${s.dir} does not exist yet.`);
     continue;
   }
+  // A stale result from an earlier run must never stand in for this one.
+  const report = `reports/${s.report}`;
+  rmSync(report, { force: true });
   const r = suite(s.filter, s.report, only === s.name ? args : []);
+  if (!existsSync(report)) writeFileSync(report, JSON.stringify(noResults(s.name, r)));
   status = status || r;
 }
 process.exit(status);

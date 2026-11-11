@@ -7,8 +7,11 @@
  *  - starts the service as its `start` script does (`node --max-old-space-size=512 --import tsx
  *    src/main.ts`), with a fresh random token, port 0, NODE_ENV=test, AO_CONFIG_DIR in the temporary
  *    folder, the recorded lookup answers (AO_LOOKUP_FIXTURES, honoured only in test mode) and the
- *    fake yt-dlp / gallery-dl first on PATH; it waits for `AO_SERVICE_READY port=<n>`. The service
- *    starts the real media worker itself when a library opens;
+ *    fake yt-dlp / gallery-dl named in AO_YTDLP_BIN / AO_GALLERYDL_BIN (the worker would otherwise
+ *    run the real gallery-dl from its venv) and first on PATH; it waits for
+ *    `AO_SERVICE_READY port=<n>`. The service starts the real media worker itself when a library
+ *    opens (or a route needs it). If start-up fails, the child and anything it started are killed
+ *    before the temporary folder is removed;
  *  - on teardown stops the service with SIGTERM (its graceful shutdown stops the worker), checks it
  *    exited cleanly, and fails the test if any process it started is still running.
  *
@@ -109,10 +112,20 @@ function serviceEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
   for (const k of Object.keys(env)) {
     const u = k.toUpperCase();
     if (u.startsWith("AO_") || u.startsWith("FAKE_") || u.startsWith("PLAYWRIGHT_") || u === "INIT_CWD" || u === "NODE_OPTIONS") delete env[k];
-    // Nothing the service or worker starts may find a way out to the network.
+    // The developer's or runner's proxy is not the service's business. (This does not stop a direct
+    // connection: the guards against the network are the fake tools and the recorded answers.)
     if (["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "GLOBAL_AGENT_HTTP_PROXY"].includes(u)) delete env[k];
   }
-  return { ...env, PATH: `${FAKE_TOOLS}${delimiter}${process.env.PATH ?? ""}`, ...extra };
+  return {
+    ...env,
+    PATH: `${FAKE_TOOLS}${delimiter}${process.env.PATH ?? ""}`,
+    // The worker runs gallery-dl as `python -m gallery_dl` (the real one, from its venv) unless
+    // AO_GALLERYDL_BIN is set, and prefers AO_YTDLP_BIN over a managed binary or PATH
+    // (services/media-worker/ao_worker/download.py): both name the fakes, so no capture reaches the network.
+    AO_YTDLP_BIN: join(FAKE_TOOLS, "yt-dlp"),
+    AO_GALLERYDL_BIN: join(FAKE_TOOLS, "gallery-dl"),
+    ...extra,
+  };
 }
 
 /** pid → [ppid, command] for every process (ps; Linux and macOS). */
@@ -144,7 +157,7 @@ function descendants(pid: number): Array<{ pid: number; command: string }> {
 }
 
 /** Whether `pid` is still running (a zombie waiting to be reaped counts as gone). */
-function running(pid: number): boolean {
+export function running(pid: number): boolean {
   try {
     process.kill(pid, 0);
   } catch {
@@ -174,7 +187,34 @@ async function within<T>(p: Promise<T>, ms: number): Promise<T | "timeout"> {
   }
 }
 
-async function startService(root: string): Promise<{ child: ChildProcess; port: number; token: string; log: string[] }> {
+/** Kills `child` and everything it started (SIGKILL), and waits for `child` to exit. */
+async function killTree(child: ChildProcess): Promise<void> {
+  const started = child.pid ? descendants(child.pid) : [];
+  const exit = exited(child);
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  for (const p of started) {
+    try {
+      process.kill(p.pid, "SIGKILL");
+    } catch {
+      // gone already
+    }
+  }
+  if (child.pid !== undefined) await within(exit, 10_000); // a child that never spawned never exits
+}
+
+export interface StartOptions {
+  /** The command to start instead of the service (harness tests of the start-up path). */
+  command?: string[];
+  /** How long to wait for `AO_SERVICE_READY` (default 60 s). */
+  readyTimeoutMs?: number;
+}
+
+/**
+ * Starts the service and waits for its ready line. On every failure (no ready line in time, early
+ * exit, a spawn error) the child and anything it started are killed before the promise rejects, so
+ * the caller can remove the temporary folder safely.
+ */
+export async function startService(root: string, opts: StartOptions = {}): Promise<{ child: ChildProcess; port: number; token: string; log: string[] }> {
   // 64 hex characters: well over the 32 the service requires, and nothing a URL would need to escape.
   const token = randomBytes(32).toString("hex");
   const env = serviceEnv({
@@ -186,25 +226,36 @@ async function startService(root: string): Promise<{ child: ChildProcess; port: 
     AO_MODELS_DIR: join(root, "models"),
     AO_LOOKUP_FIXTURES: LOOKUP_FIXTURES,
   });
-  const child = spawn(process.execPath, ["--max-old-space-size=512", "--import", "tsx", "src/main.ts"], { cwd: SERVICE_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+  const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];
+  const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
   const log: string[] = [];
   createInterface({ input: child.stderr! }).on("line", (l) => log.push(`[stderr] ${l}`));
-  const port = await new Promise<number>((done, fail) => {
-    const timer = setTimeout(() => fail(new Error(`The service did not print AO_SERVICE_READY within 60 s.\n${log.join("\n")}`)), 60_000);
-    createInterface({ input: child.stdout! }).on("line", (l) => {
-      log.push(l);
-      const m = /^AO_SERVICE_READY port=(\d+)\s*$/.exec(l);
-      if (m) {
+  const readyMs = opts.readyTimeoutMs ?? 60_000;
+  try {
+    const port = await new Promise<number>((done, fail) => {
+      const timer = setTimeout(() => fail(new Error(`The service did not print AO_SERVICE_READY within ${readyMs} ms.\n${log.join("\n")}`)), readyMs);
+      createInterface({ input: child.stdout! }).on("line", (l) => {
+        log.push(l);
+        const m = /^AO_SERVICE_READY port=(\d+)\s*$/.exec(l);
+        if (m) {
+          clearTimeout(timer);
+          done(Number(m[1]));
+        }
+      });
+      child.once("error", (err) => {
         clearTimeout(timer);
-        done(Number(m[1]));
-      }
+        fail(new Error(`The service could not be started: ${err.message}`));
+      });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        fail(new Error(`The service exited before it was ready (code ${code}, signal ${signal}).\n${log.join("\n")}`));
+      });
     });
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      fail(new Error(`The service exited before it was ready (code ${code}, signal ${signal}).\n${log.join("\n")}`));
-    });
-  });
-  return { child, port, token, log };
+    return { child, port, token, log };
+  } catch (err) {
+    await killTree(child);
+    throw err;
+  }
 }
 
 /** Stops the service and everything it started; returns what went wrong (empty when all is well). */
@@ -242,9 +293,10 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     const root = await mkdtemp(join(tmpdir(), "ao-e2e-"));
     const configDir = join(root, "config");
     const librariesDir = join(root, "libraries");
-    await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
     let svc: Awaited<ReturnType<typeof startService>> | undefined;
+    let problems: string[] = [];
     try {
+      await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
       svc = await startService(root);
       const { port, token, log, child } = svc;
       const baseUrl = `http://127.0.0.1:${port}`;
@@ -275,20 +327,27 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
       };
       await use(harness);
     } finally {
-      const problems = svc ? await stopService(svc.child) : [];
-      if (svc && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
-        await testInfo.attach("service-log", { body: svc.log.join("\n"), contentType: "text/plain" });
+      try {
+        if (svc) problems = await stopService(svc.child);
+        if (svc && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
+          await testInfo.attach("service-log", { body: svc.log.join("\n"), contentType: "text/plain" });
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
       }
-      await rm(root, { recursive: true, force: true });
-      expect(problems, "the service and the processes it started stop cleanly").toEqual([]);
     }
+    expect(problems, "the service and the processes it started stop cleanly").toEqual([]);
   },
 
-  blocked: async ({}, use) => {
-    const list: Blocked = [];
-    await use(list);
-    expect(list, "the page made no request outside the app and its service").toEqual([]);
-  },
+  // Automatic, so a test that replaces `page` still fails on a request outside the app and service.
+  blocked: [
+    async ({}, use) => {
+      const list: Blocked = [];
+      await use(list);
+      expect(list, "the page made no request outside the app and its service").toEqual([]);
+    },
+    { auto: true },
+  ],
 
   page: async ({ page, app, blocked, browserName }, use) => {
     const context = page.context();

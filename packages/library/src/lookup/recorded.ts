@@ -13,7 +13,7 @@
  * The answer files are the plain response bodies the library's own tests use
  * (tests/fixtures/lookup/*.json), so one recording serves both.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 import { LookupHttpError } from "./http.js";
 
@@ -45,6 +45,7 @@ export function recordedLookupsFromEnv(env: NodeJS.ProcessEnv = process.env): Re
     if (a?.status !== 200 || typeof a.file !== "string" || basename(a.file) !== a.file || a.file.startsWith(".")) {
       throw new Error(`${LOOKUP_FIXTURES_ENV}: the answer for ${url} needs status 200 with a plain file name in the folder, or status 404`);
     }
+    if (!existsSync(join(dir, a.file))) throw new Error(`${LOOKUP_FIXTURES_ENV}: the answer for ${url} names ${a.file}, which is not in the folder`);
   }
   return {
     answer(url) {
