@@ -57,7 +57,10 @@ describe("Recheck project (R99)", () => {
     ev.send("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} });
     const user = userEvent.setup();
     render(<Library api={testApi()} current={CURRENT_RW as never} />);
-    await user.click(await screen.findByRole("button", { name: "Ethnography at Work" }));
+    // Step by step (the projects, then the sources, then the open source): each waits for what the one before it loaded.
+    await screen.findByRole("button", { name: "Recheck project" });
+    const table = await screen.findByRole("table", { name: "Sources" });
+    await user.click(await within(table).findByRole("button", { name: "Ethnography at Work" }));
     await screen.findByRole("button", { name: "Title: Verified" });
 
     const button = screen.getByRole("button", { name: "Recheck project" });
