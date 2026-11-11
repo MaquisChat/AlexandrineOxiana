@@ -1250,7 +1250,9 @@ describe("review round 3: move and background work (R106)", () => {
 
   it("pending writes found by the move are 409 CONFLICT with a plain message, never POLICY_DENIED", async () => {
     const { toApiError } = await import("./errors.js");
-    const { MoveNotAllowedError } = await import("@ao/library");
+    const { MoveNotAllowedError, PendingWriteIncompleteError } = await import("@ao/library");
+    const inc = toApiError(new PendingWriteIncompleteError("019a7000-0000-7000-8000-0000000000c1", "The change could not be undone completely: a step failed."));
+    expect([inc.status, inc.code, inc.message]).toEqual([409, "CONFLICT", "The change could not be undone completely: a step failed."]);
     const e = toApiError(new MoveNotAllowedError("pending-writes" as never, "Some changes were interrupted"));
     expect([e.status, e.code]).toEqual([409, "CONFLICT"]);
   });
@@ -1827,18 +1829,35 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
     const list = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string; status: string; canKeep: boolean; canRollBack: boolean; project: string }>;
     expect(list.find((p) => p.txn === bad)).toMatchObject({ status: "invalid", canKeep: false, canRollBack: false, project: "library" });
     const g = list.find((p) => p.txn === good)!;
-    expect(g).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: true, project: "Study" });
+    // R131 a: an unverifiable marker offers no choice, and says why in plain words.
+    expect(g).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: false, project: "Study" });
+    expect((g as { detail?: string }).detail).toMatch(/backup/);
     expect(JSON.stringify(list)).not.toContain(path);
 
     const keep = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "keep" } });
     expect(keep.status).toBe(409);
     expect(keep.json.error.code).toBe("CONFLICT");
+    const back = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "roll-back" } });
+    expect(back.status).toBe(409);
+    expect(back.json.error.reason).toBe("allowed: none");
+    expect(await readFile(join(path, folder, "half-written.txt"), "utf8")).toBe("half");
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${bad}/resolve`, body: { choice: "roll-back" } })).status).toBe(409);
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "maybe" } })).status).toBe(400);
-    const r = await call({ method: "POST", url: `/libraries/pending-writes/${good}/resolve`, body: { choice: "roll-back" } });
+    // A plainly uncommitted change (its marker matches the audit log) can be rolled back.
+    const fine = "019a7000-0000-7000-8000-0000000000c2";
+    const nowLines = (await readFile(join(path, folder, "audit", "0001.jsonl"), "utf8")).trim().split("\n").length;
+    await writeFile(
+      join(path, ".tmp", `txn-${fine}.json`),
+      JSON.stringify({ formatVersion: 1, txn: fine, projectId: pid, projectFolder: folder, auditEvents: 1, auditSeqBefore: nowLines, entries: [{ kind: "created", path: `${folder}/half-written-2.txt` }] }),
+    );
+    await writeFile(join(path, folder, "half-written-2.txt"), "half");
+    const listed = (await call({ url: "/libraries/pending-writes" })).json.pendingWrites as Array<{ txn: string }>;
+    expect(listed.find((p) => p.txn === fine)).toMatchObject({ status: "uncommitted", canKeep: false, canRollBack: true });
+    const r = await call({ method: "POST", url: `/libraries/pending-writes/${fine}/resolve`, body: { choice: "roll-back" } });
     expect(r.status, r.body).toBe(200);
-    expect(r.json).toMatchObject({ txn: good, choice: "roll-back" });
-    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites.map((p: { txn: string }) => p.txn)).toEqual([bad]);
+    expect(r.json).toMatchObject({ txn: fine, choice: "roll-back" });
+    await expect(readFile(join(path, folder, "half-written-2.txt"))).rejects.toThrow();
+    expect((await call({ url: "/libraries/pending-writes" })).json.pendingWrites.map((p: { txn: string }) => p.txn).sort()).toEqual([bad, good].sort());
     const audit = JSON.stringify((await call({ url: `/projects/${pid}/audit` })).json);
     expect(audit).toContain("txn.resolve");
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${"019a7000-0000-7000-8000-0000000000ff"}/resolve`, body: { choice: "keep" } })).status).toBe(404);
