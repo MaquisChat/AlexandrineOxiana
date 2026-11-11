@@ -65,6 +65,11 @@ export interface JobRecord {
   job?: StoredJob;
   /** Failed or cancelled jobs: a fixed error code (never a message, which may quote paths). */
   error?: string;
+  /**
+   * The run this line belongs to: a fresh token on each resubmission's claim line, carried by that
+   * run's later lines. A claim succeeds only on the very record it was decided on (`claimJobRecord`).
+   */
+  attempt?: string;
 }
 
 export type ProjectKey = { key: Uint8Array; keyId: string } | null;
@@ -177,6 +182,24 @@ function encode(rec: JobRecord, key: ProjectKey): string {
   return key ? sealLine(key.key, key.keyId, rec.projectId, json, PURPOSE) : json;
 }
 
+/** A temporary file of `writeFileAtomic` for the journal (left only by a crash during compaction). */
+const COMPACTION_TEMP = /^journal\.jsonl\.tmp-[0-9a-f]{16}$/;
+
+/**
+ * Removes what a crash during compaction left in `jobs/`: regular files named exactly as
+ * `writeFileAtomic` names its temporary copy of the journal. Called in the file's turn, when no
+ * compaction of this process is writing one (the library lock makes it the only writer).
+ */
+async function sweepCompactionTemps(root: string, projectRel: string): Promise<void> {
+  const dir = join(root, ...projectRel.split("/"), "jobs");
+  const names = await fsp.readdir(dir).catch(() => [] as string[]);
+  for (const n of names) {
+    if (!COMPACTION_TEMP.test(n)) continue;
+    const st = await fsp.lstat(join(dir, n)).catch(() => null);
+    if (st?.isFile()) await fsp.rm(join(dir, n), { force: true }).catch(() => {});
+  }
+}
+
 async function prepare(root: string, projectRel: string): Promise<string> {
   const projectDir = join(root, ...projectRel.split("/"));
   const path = journalPath(root, projectRel);
@@ -192,13 +215,39 @@ async function prepare(root: string, projectRel: string): Promise<string> {
  */
 export async function appendJobRecords(root: string, projectRel: string, key: ProjectKey, recs: JobRecord[]): Promise<void> {
   if (recs.length === 0) return;
+  await serialize(journalPath(root, projectRel), () => appendNow(root, projectRel, key, recs));
+}
+
+/** The append itself; callers hold the file's turn in `serialize`. */
+async function appendNow(root: string, projectRel: string, key: ProjectKey, recs: JobRecord[]): Promise<void> {
   const text = recs.map((r) => `${encode(r, key)}\n`).join("");
-  const path = journalPath(root, projectRel);
-  await serialize(path, async () => {
-    await prepare(root, projectRel);
-    const torn = await incompleteTail(path);
-    if (torn) await truncateDurable(path, torn.keep);
-    await appendDurable(path, text, FILE_MODE);
+  const path = await prepare(root, projectRel);
+  const torn = await incompleteTail(path);
+  if (torn) await truncateDurable(path, torn.keep);
+  await appendDurable(path, text, FILE_MODE);
+}
+
+/**
+ * Claims a job for one run (R142, "resubmitted once"): appends `next` only if the job's newest
+ * record in the journal is still exactly `expected` (the record the decision to rerun was made
+ * on) and still pending. Reading and appending happen in the file's turn, so of two overlapping
+ * resubmissions (a launch and an unlock, two unlocks) exactly one claims each pending record; the
+ * other finds the claim (or the finished job) and does nothing. A crash after the claim leaves a
+ * pending record that the next launch claims again: the job runs once, not zero times or twice.
+ */
+export async function claimJobRecord(
+  root: string,
+  projectRel: string,
+  key: ProjectKey,
+  expected: JobRecord,
+  next: JobRecord,
+): Promise<boolean> {
+  return serialize(journalPath(root, projectRel), async () => {
+    const journal = await readJobJournal(root, projectRel, expected.projectId, key);
+    const newest = journal.records.get(expected.id);
+    if (!newest || !isPending(newest) || JSON.stringify(newest) !== JSON.stringify(expected)) return false;
+    await appendNow(root, projectRel, key, [next]);
+    return true;
   });
 }
 
@@ -250,6 +299,7 @@ export async function compactJobJournal(
 ): Promise<boolean> {
   const path = journalPath(root, projectRel);
   return serialize(path, async () => {
+    await sweepCompactionTemps(root, projectRel);
     const raw = await readMaybe(path);
     if (!raw) return false;
     const parsed = parseJobJournal(raw.toString("utf8"), projectId, key ? key.key : null);

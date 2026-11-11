@@ -561,18 +561,20 @@ describe("R142 fix round 2: a rerun happens once", () => {
     return { project, key };
   }
 
-  /** A worker whose job i takes ms[i] (by its `n` param); counts the runs that completed. */
+  /**
+   * A worker whose job i takes ms[i] (by its `n` param). `completed` lists the runs that were
+   * carried through (a run the client cancelled, e.g. because of a lock before it started, does not count).
+   */
   async function countingWorker(ms: number[]) {
-    const completed: number[] = [];
     const w = await stubWorker(async (job) => {
       const i = Number(job.body.params.n);
       await new Promise((r) => setTimeout(r, ms[i] ?? 0));
       await mkdir(dirname(job.body.output), { recursive: true });
       await writeFile(job.body.output, "jpeg");
-      completed.push(i);
       return { status: "done", result: { output: job.body.output, meta: {} } };
     });
-    return { w, completed };
+    const runs = () => [...w.jobs.values()].filter((j) => !j.cancelled).map((j) => Number(j.body.params.n));
+    return { w, completed: { sort: () => runs().sort() } };
   }
 
   const statuses = async (project: { id: string; folder: string }) =>
@@ -603,7 +605,7 @@ describe("R142 fix round 2: a rerun happens once", () => {
     const { project } = await lockCancelled(2);
     const { w, completed } = await countingWorker([80, 5]);
     const first = client(w).resumePending(project.id); // the first unlock's resubmission
-    while (w.jobs.size === 0) await new Promise((r) => setTimeout(r, 2)); // its first job is running
+    while (!(await statuses(project)).includes("running")) await new Promise((r) => setTimeout(r, 2)); // its first job is running
     repo.lockProject(project.id); // a running job may finish (R142)
     await repo.unlockProject(project.id, "pw");
     const second = client(w).resumePending(project.id); // the second unlock's
@@ -624,7 +626,7 @@ describe("R142 fix round 2: a rerun happens once", () => {
     const { w, completed } = await countingWorker([0]);
     await client(w).resumePending();
     await client(w).resumePending();
-    expect(completed).toEqual([0]);
+    expect(completed.sort()).toEqual([0]);
     expect(await statuses(project)).toEqual(["done"]);
   });
 });
