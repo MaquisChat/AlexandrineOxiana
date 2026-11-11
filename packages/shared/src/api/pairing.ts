@@ -7,6 +7,8 @@
  *  - `POST /extension/pair`                     → PairingCodeIssued (any earlier code stops working)
  *  - `GET /extension/pair/status`               → PairingCodeStatus of the code most recently issued
  *  - `GET /extension/pair/status/:codeId`       → PairingCodeStatus of that code
+ * The status routes are the only UI-token routes that need an Origin header: the desktop app's page
+ * always sends one, and a caller without one (a command-line tool) is refused (Task 46c, review M5).
  */
 
 /** The form of a code's id: 16 lowercase hexadecimal characters. */
@@ -36,15 +38,25 @@ export interface PairingCodeBrowser {
 export type PairingCodeStatus =
   /** No code issued since the service started, or not a code it knows. */
   | { state: "none" }
-  /** Valid now. */
+  /** Valid now. `validForMs` is never more than the code's lifetime. */
   | { state: "active"; codeId: string; expiresAt: string; validForMs: number }
+  /**
+   * The right code was given and the pairing is being saved: the code is spent, but not yet `used`.
+   * It ends as `used` once the pairing is saved, or as `invalidated` (`not-saved`) if saving failed.
+   */
+  | { state: "confirming"; codeId: string }
   /** A browser was paired with it. */
   | { state: "used"; codeId: string; usedAt: string; browser: PairingCodeBrowser }
   /** Its time ran out. */
   | { state: "expired"; codeId: string; expiredAt: string }
-  /** Stopped after too many wrong tries (R96: 5). */
-  | { state: "invalidated"; codeId: string; invalidatedAt: string }
+  /**
+   * Stopped working without pairing anything: after too many wrong tries (R96: 5), or because the
+   * right code's pairing could not be saved (the extension was told it failed).
+   */
+  | { state: "invalidated"; codeId: string; invalidatedAt: string; reason: PairingCodeInvalidReason }
   /** A newer code was issued while this one was still valid. */
   | { state: "replaced"; codeId: string; replacedAt: string };
+
+export type PairingCodeInvalidReason = "wrong-tries" | "not-saved";
 
 export type PairingCodeState = PairingCodeStatus["state"];

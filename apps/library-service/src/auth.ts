@@ -92,11 +92,18 @@ export interface PairingOptions {
 /** What became of an issued code (Task 46c), kept in memory only: a restart forgets every code. */
 type CodeEnd =
   | { state: "used"; at: number; browser: { id: string; origin: string } }
-  | { state: "expired" | "invalidated" | "replaced"; at: number };
+  | { state: "invalidated"; at: number; reason: "wrong-tries" | "not-saved" }
+  | { state: "expired" | "replaced"; at: number };
 interface CodeRecord {
   /** Not a secret: names the code in the status route. */
   id: string;
   expires: number;
+  /**
+   * Set while a right code's pairing is being written (fix round 1, I1): the code is spent, but it is
+   * reported as `confirming`, never `used`, until the write has succeeded; a newer code or the clock
+   * does not end it meanwhile.
+   */
+  confirming?: true;
   end?: CodeEnd;
 }
 
@@ -136,7 +143,7 @@ export class Pairing {
   newCode(): PairingCodeIssued {
     const now = this.now();
     const prev = this.history.at(-1);
-    if (prev && !prev.end) prev.end = now > prev.expires ? { state: "expired", at: prev.expires } : { state: "replaced", at: now };
+    if (prev && !prev.end && !prev.confirming) prev.end = now > prev.expires ? { state: "expired", at: prev.expires } : { state: "replaced", at: now };
     const value = String(randomInt(0, 1_000_000)).padStart(6, "0");
     const expires = now + this.ttlMs;
     const record: CodeRecord = { id: randomBytes(8).toString("hex"), expires };
@@ -154,17 +161,19 @@ export class Pairing {
     const r = codeId === undefined ? this.history.at(-1) : this.history.find((x) => x.id === codeId);
     if (!r) return { state: "none" };
     const now = this.now();
-    if (!r.end && now > r.expires) r.end = { state: "expired", at: r.expires };
+    if (!r.end && !r.confirming && now > r.expires) r.end = { state: "expired", at: r.expires };
     const iso = (t: number) => new Date(t).toISOString();
     const e = r.end;
-    if (!e) return { state: "active", codeId: r.id, expiresAt: iso(r.expires), validForMs: Math.max(0, r.expires - now) };
+    if (!e && r.confirming) return { state: "confirming", codeId: r.id };
+    // Never more than the code's lifetime, even when the clock steps back (review M4).
+    if (!e) return { state: "active", codeId: r.id, expiresAt: iso(r.expires), validForMs: Math.min(this.ttlMs, Math.max(0, r.expires - now)) };
     switch (e.state) {
       case "used":
         return { state: "used", codeId: r.id, usedAt: iso(e.at), browser: { ...e.browser } };
       case "expired":
         return { state: "expired", codeId: r.id, expiredAt: iso(e.at) };
       case "invalidated":
-        return { state: "invalidated", codeId: r.id, invalidatedAt: iso(e.at) };
+        return { state: "invalidated", codeId: r.id, invalidatedAt: iso(e.at), reason: e.reason };
       case "replaced":
         return { state: "replaced", codeId: r.id, replacedAt: iso(e.at) };
     }
@@ -191,7 +200,7 @@ export class Pairing {
   async confirm(code: string, origin: string): Promise<string | undefined> {
     const c = this.code;
     if (!c || this.now() > c.expires || c.attempts >= this.maxAttempts) {
-      if (c && !c.record.end) c.record.end = c.attempts >= this.maxAttempts ? { state: "invalidated", at: this.now() } : { state: "expired", at: c.expires };
+      if (c && !c.record.end) c.record.end = c.attempts >= this.maxAttempts ? { state: "invalidated", at: this.now(), reason: "wrong-tries" } : { state: "expired", at: c.expires };
       this.code = undefined;
       return undefined;
     }
@@ -199,7 +208,7 @@ export class Pairing {
       c.attempts++;
       if (c.attempts >= this.maxAttempts) {
         this.code = undefined;
-        c.record.end = { state: "invalidated", at: this.now() };
+        c.record.end = { state: "invalidated", at: this.now(), reason: "wrong-tries" };
       }
       return undefined;
     }
@@ -207,8 +216,8 @@ export class Pairing {
     const token = randomBytes(32).toString("base64url");
     const at = this.now();
     const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(at).toISOString() };
-    // Marked before the write, so a code issued meanwhile does not call this one "replaced".
-    c.record.end = { state: "used", at, browser: { id: entry.id, origin } };
+    // Spent now (never usable twice), but "used" only once the pairing is durably written (I1).
+    c.record.confirming = true;
     let next: PairingFile;
     try {
       next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, (cur) => ({
@@ -217,11 +226,14 @@ export class Pairing {
         extensions: [...(Array.isArray(cur?.extensions) ? cur.extensions.filter((e) => e.origin !== origin) : []), entry],
       }));
     } catch (err) {
-      // Used up, but nothing was paired: the code no longer works.
-      c.record.end = { state: "invalidated", at: this.now() };
+      // Spent, but nothing was paired: the code no longer works, and the status says why.
+      delete c.record.confirming;
+      c.record.end = { state: "invalidated", at: this.now(), reason: "not-saved" };
       throw err;
     }
     this.paired = next.extensions;
+    delete c.record.confirming;
+    c.record.end = { state: "used", at, browser: { id: entry.id, origin } };
     return token;
   }
 

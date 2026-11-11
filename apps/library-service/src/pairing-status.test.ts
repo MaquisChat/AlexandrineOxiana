@@ -7,8 +7,21 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deviceDeps, type Deps } from "@ao/library";
+
+/** The pairings file write, held open or failed by a test (fix round 1, I1). */
+const write = vi.hoisted(() => ({ before: undefined as undefined | (() => Promise<void>), release: undefined as undefined | (() => void) }));
+vi.mock("@ao/library", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@ao/library")>();
+  return {
+    ...real,
+    updateAppSetting: async (...args: Parameters<typeof real.updateAppSetting>) => {
+      if (write.before) await write.before();
+      return real.updateAppSetting(...args);
+    },
+  };
+});
 import type { PairingCodeIssued, PairingCodeStatus } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
@@ -43,6 +56,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  write.release?.(); // a held write never outlives its test, even a failed one
+  write.before = undefined;
+  write.release = undefined;
   await svc?.close();
   await rm(tmp, { recursive: true, force: true });
 });
@@ -106,6 +122,76 @@ describe("GET /extension/pair/status", () => {
     expect((await status(c.codeId)).json.state).toBe("used");
   });
 
+  it("used only once the pairing is written: while the write is pending it says confirming, never used", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    write.release = release;
+    let entered!: () => void;
+    const started = new Promise<void>((r) => (entered = r));
+    write.before = async () => {
+      entered();
+      await held;
+    };
+    const c = await issue();
+    const pending = confirm(c.code);
+    await started;
+    const during = await status(c.codeId);
+    expect(during.json).toEqual({ state: "confirming", codeId: c.codeId });
+    expect((await status()).json.state).toBe("confirming");
+    // The code is already spent: a second try fails, and is not counted against the pending one.
+    expect((await confirm(c.code, OTHER_EXT)).statusCode).toBe(401);
+    // A new code issued meanwhile does not call the pending one replaced.
+    const second = await issue();
+    // Its time running out meanwhile does not call it expired either.
+    now += 10 * 60_000;
+    expect((await status(c.codeId)).json.state).toBe("confirming");
+    release();
+    expect((await pending).statusCode).toBe(200);
+    const listed = (await svc.app.inject({ method: "GET", url: "/extension/pairings", headers: ui })).json().extensions as Array<{ id: string }>;
+    expect(listed).toHaveLength(1);
+    expect((await status(c.codeId)).json).toMatchObject({ state: "used", browser: { id: listed[0]!.id, origin: EXT } });
+    expect((await status(second.codeId)).json.state).toBe("expired");
+  });
+
+  it("a pairing that could not be written ends the code as invalidated, saying why, and is never reported as used", async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((r) => (entered = r));
+    let fail!: () => void;
+    const failing = new Promise<void>((_, rej) => (fail = () => rej(new Error("disk full"))));
+    write.release = () => fail();
+    write.before = async () => {
+      entered();
+      await failing;
+    };
+    const c = await issue();
+    const pending = confirm(c.code);
+    await started;
+    expect((await status(c.codeId)).json.state).toBe("confirming");
+    fail();
+    const r = await pending;
+    expect(r.statusCode).toBe(500);
+    expect(r.body).not.toContain(c.code);
+    const after = await status(c.codeId);
+    expect(after.json).toEqual({ state: "invalidated", codeId: c.codeId, invalidatedAt: new Date(now).toISOString(), reason: "not-saved" });
+    expect((await svc.app.inject({ method: "GET", url: "/extension/pairings", headers: ui })).json().extensions).toEqual([]);
+    // Still spent: it never works a second time.
+    write.before = undefined;
+    expect((await confirm(c.code)).statusCode).toBe(401);
+    expect(logs).not.toContain(c.code);
+  });
+
+  it("five wrong tries say so as the reason", async () => {
+    const c = await issue();
+    for (let i = 0; i < 5; i++) await confirm(wrongOf(c.code));
+    expect((await status(c.codeId)).json).toMatchObject({ state: "invalidated", reason: "wrong-tries" });
+  });
+
+  it("the time left never exceeds the code's lifetime, even when the service's clock steps back", async () => {
+    const c = await issue();
+    now -= 60 * 60_000;
+    expect((await status(c.codeId)).json).toMatchObject({ state: "active", validForMs: 5 * 60_000 });
+  });
+
   it("expired once its time is up, whether or not anyone tried it", async () => {
     const c = await issue();
     now += 5 * 60_000 + 1;
@@ -121,7 +207,7 @@ describe("GET /extension/pair/status", () => {
     expect((await status(c.codeId)).json.state).toBe("active");
     now += 1000;
     expect((await confirm(wrongOf(c.code))).statusCode).toBe(401);
-    expect((await status(c.codeId)).json).toEqual({ state: "invalidated", codeId: c.codeId, invalidatedAt: new Date(now).toISOString() });
+    expect((await status(c.codeId)).json).toEqual({ state: "invalidated", codeId: c.codeId, invalidatedAt: new Date(now).toISOString(), reason: "wrong-tries" });
     expect((await confirm(c.code)).statusCode).toBe(401);
     expect((await status(c.codeId)).json.state).toBe("invalidated");
   });
@@ -216,6 +302,14 @@ describe("who may read a code's status (R96)", () => {
       expect(r.json.error?.code).toBe("FORBIDDEN");
       expect(r.body).not.toContain(c.code);
       expect((await status(id, { authorization: `Bearer ${token}` })).statusCode).toBe(403);
+    }
+  });
+
+  it("refused with a Host that is not the service's own (DNS rebinding), even with the UI token and the app's origin", async () => {
+    for (const host of ["evil.example", "attacker.localhost", "127.0.0.2"]) {
+      const r = await svc.app.inject({ method: "GET", url: "/extension/pair/status", headers: { ...ui, host } });
+      expect(r.statusCode, host).toBe(403);
+      expect(r.json().error.code).toBe("FORBIDDEN");
     }
   });
 
