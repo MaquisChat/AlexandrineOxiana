@@ -195,6 +195,14 @@ Specification: Task 34 in the old plan, which was written before several rulings
 - Verify: `pnpm --filter @ao/ui exec vitest run src/screens/ExtensionPairing.test.tsx`.
 - Model: Sonnet.
 
+**Task 63 — A capture's state can be read again; one classifier [ledger: R146, R41, R43, R96; ADR 0009]**
+- Depends: 34b. Parallel: 62.
+- Files: `apps/library-service/src/routes/capture.ts`, `packages/library/src/capture/`, `packages/core/src/` or `packages/shared/src/` (the classifier and the acknowledgement text), `packages/ui/src/api/capture.ts`, `packages/ui/src/screens/Capture.tsx`, tests.
+- Why: found by the Task 34b review. Progress reaches the screen only as events, so anything missed while the connection was down is gone, a capture started before the screen opened is invisible, and the screen keeps its own copy of the address classifier because the real one lives where the UI may not import it.
+- Accept: the service can list a project's running and recent capture queues and return one queue's items with their outcomes; the screen reads them on opening and after a reconnect, so a running capture is always visible and "unknown" outcomes disappear; a second identical capture while one runs is refused or joined, in plain words. A failed tools update returns a proper error with its reason. The address classifier and the acknowledgement text have one definition that the library and the UI both import; the UI's copy and its parity test are deleted.
+- Verify: service and library tests; `pnpm --filter @ao/ui exec vitest run src/screens/Capture.test.tsx`; the capture scenario (Task 34f) reloads the page mid-capture.
+- Model: Opus.
+
 **Task 62 — Transcription as a job; flags survive a human edit [ledger: R143, R99, R142; SPEC 5.2, 5.8]**
 - Depends: 34c, 51. Parallel: 48 (UI half).
 - Files: `apps/library-service/src/routes/sources.ts`, `packages/library/src/worker-client.ts` and the transcript store, `packages/shared/src/api/transcripts.ts`, `packages/ui/src/screens/TranscriptViewer.tsx`, tests.
@@ -435,10 +443,11 @@ Update after every task; commit and push.
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | in review | db52fdb (worktree branch) | adversarial review dispatched |
+| 34b Capture screen | fix round 1 | db52fdb (worktree branch) | spec met; 3 Important (R146); completed by new Task 63 |
 | 34c Transcript viewer | fix round 1 | 4b9a723 (worktree branch) | spec met; 4 Important (R143); two of them completed by new Task 62 |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
 | 34e Pairing screen | fix round 1 | f48170a (worktree branch) | 2 Important; its fix to the shared dialog shell is confirmed real and kept |
+| 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
