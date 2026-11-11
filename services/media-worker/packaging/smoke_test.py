@@ -11,16 +11,21 @@ twice:
    `$AO_TOOLS_DIR/bin`, which is put first on PATH (what the tools manager will do), and the
    `tiny` speech model is in `$AO_MODELS_DIR`. Video proxy, OCR and transcription must work.
 
-Each run ends with SIGTERM while a job is running; the worker and every process it started must be
-gone afterwards.
+Outputs are checked independently of what the worker reports about them: image proxies are
+decoded with Pillow (format, size, not blank), the video proxy is probed and fully decoded with
+the supplied ffprobe/ffmpeg, the transcript must contain words of the clip with valid timings.
 
-Network: every proxy variable points at a local "sentinel" that refuses and records each request.
-Nothing may be requested while starting and answering /health. Then the sentinel's port is closed,
-so every later request is refused as on a machine with no network. The only download is the optional
-one of the `tiny` model, done before any worker starts (needs `huggingface_hub`, so run this
-script with the build venv's Python; it is not used by the worker).
+Each run ends with SIGTERM (in run 2 while a job is running); the worker and every process it
+started must be gone afterwards. A worker is also stopped if the test itself fails.
 
-Exit code 0 when every required check passed. `--report` writes the results as JSON.
+Network: every proxy variable points at a local "sentinel" that refuses (HTTP 403) and records
+each request. Nothing may be requested while starting and answering /health, nor while
+transcribing with the model on disk. The only download is that of the `tiny` model, done before
+any worker starts (needs `huggingface_hub`, so run this script with the build venv's Python).
+
+Every acceptance check is required: a missing fixture, model or tool FAILS the run, unless it is
+named in `--allow-missing` (model, clip, dng, ffmpeg, tesseract), which turns that absence into a
+reported skip. Exit code 0 when every required check passed. `--report` writes the results as JSON.
 """
 from __future__ import annotations
 
@@ -41,31 +46,46 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
+DOWNLOADED = REPO / "tests" / "fixtures" / "downloaded"
+SPEECH_CLIP = DOWNLOADED / "librispeech-voices-sp0307-sg0042.wav"
+DNG_FILE = DOWNLOADED / "canon-eos-5d-mark-iii-14bit.dng"
+# The clip says "I had that curiosity beside me at this moment." The tiny model must get at least
+# two of these words right.
+CLIP_WORDS = ("curiosity", "beside", "moment")
 TOKEN = "smoke-" + os.urandom(16).hex()
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # our own requests never use a proxy
+ABSENCES = ("model", "clip", "dng", "ffmpeg", "tesseract")
 
 
 class Results:
-    def __init__(self) -> None:
+    def __init__(self, allow_missing: set[str]) -> None:
         self.checks: list[dict] = []
         self.info: dict = {}
+        self.allow_missing = allow_missing
 
-    def check(self, name: str, ok: bool, detail: object = None, required: bool = True) -> bool:
-        self.checks.append({"name": name, "ok": bool(ok), "required": required, "detail": detail})
-        mark = "PASS" if ok else ("FAIL" if required else "WARN")
-        print(f"  {mark} {name}" + (f" — {detail}" if detail not in (None, "") else ""), flush=True)
+    def check(self, name: str, ok: bool, detail: object = None) -> bool:
+        self.checks.append({"name": name, "status": "pass" if ok else "fail", "detail": detail})
+        print(f"  {'PASS' if ok else 'FAIL'} {name}" + (f" — {detail}" if detail not in (None, "") else ""), flush=True)
         return ok
 
+    def missing(self, name: str, what: str, reason: str) -> None:
+        """A check that could not run because `what` is absent: a failure unless allowed."""
+        if what in self.allow_missing:
+            self.checks.append({"name": name, "status": "skipped", "detail": f"{reason} (allowed by --allow-missing {what})"})
+            print(f"  SKIP {name} — {reason} (allowed by --allow-missing {what})", flush=True)
+        else:
+            self.check(name, False, f"{reason}; name it in --allow-missing to skip this check")
+
     @property
-    def ok(self) -> bool:
-        return all(c["ok"] for c in self.checks if c["required"])
+    def failed(self) -> list[str]:
+        return [c["name"] for c in self.checks if c["status"] == "fail"]
 
 
 # ---------- network sentinel ----------
 
 
 class Sentinel:
-    """A local HTTP proxy that refuses everything and records what was asked for."""
+    """A local HTTP proxy that refuses everything (403) and records what was asked for."""
 
     def __init__(self) -> None:
         self.requests: list[str] = []
@@ -93,9 +113,7 @@ class Sentinel:
         out, self.requests = self.requests, []
         return out
 
-    def go_offline(self) -> None:
-        """Closes the port: from now on a request is refused, as on a machine with no network
-        (huggingface_hub falls back to the model on disk only for that kind of failure)."""
+    def close(self) -> None:
         self.server.shutdown()
         self.server.server_close()
 
@@ -113,7 +131,7 @@ class Worker:
         line = self.proc.stdout.readline()  # the ready line
         self.start_sec = time.monotonic() - t0
         if not line.startswith("AO_WORKER_READY port="):
-            self.proc.kill()
+            self.kill()
             raise RuntimeError(f"no ready line (got {line!r}); stderr: {' | '.join(self.stderr[-10:])}")
         self.port = int(line.strip().split("=", 1)[1])
         self.base = f"http://127.0.0.1:{self.port}"
@@ -121,6 +139,16 @@ class Worker:
     def _drain(self) -> None:
         for line in self.proc.stderr:
             self.stderr.append(line.rstrip())
+
+    def kill(self) -> None:
+        """Stops the worker however the test ended (SIGTERM, then SIGKILL)."""
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(10)
 
     def request(self, method: str, path: str, body: object | None = None, auth: bool = True):
         data = None if body is None else json.dumps(body).encode()
@@ -179,28 +207,30 @@ def alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    # A zombie child of ours counts as gone once reaped; ps shows the state.
     r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
     return bool(r.stdout.strip()) and not r.stdout.strip().startswith("Z")
 
 
-# ---------- fixtures ----------
+# ---------- fixtures and independent checks of outputs ----------
 
 
 def make_fixtures(d: Path, ffmpeg: str | None) -> dict:
-    """A HEIC photo, an image-only PDF and (with ffmpeg) two videos. Made with this Python's
-    pillow / pillow-heif and the system ffmpeg; the worker never sees these tools."""
+    """A HEIC photo (with content, rotated by EXIF), an image-only PDF and (with ffmpeg) two videos.
+    Made with this Python's pillow / pillow-heif and the system ffmpeg; the worker never sees them."""
     import pillow_heif
     from PIL import Image, ImageDraw, ImageFont
 
     pillow_heif.register_heif_opener()
     out: dict = {}
     heic = d / "IMG_0001.HEIC"
-    img = Image.new("RGB", (2016, 1512), (40, 120, 200))
+    img = Image.linear_gradient("L").resize((2016, 1512)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((200, 200, 900, 700), fill=(200, 40, 40))
+    draw.ellipse((1100, 600, 1800, 1300), fill=(40, 160, 60))
     exif = Image.Exif()
     exif[0x010F] = "Apple"
-    exif[0x0112] = 6
-    img.save(heic, format="HEIF", exif=exif.tobytes(), quality=50)
+    exif[0x0112] = 6  # display rotated 90°: the 2016×1512 photo shows as 1512×2016
+    img.save(heic, format="HEIF", exif=exif.tobytes(), quality=60)
     out["heic"] = heic
 
     # Three pages, so ocrmypdf (--jobs 2) works on pages in parallel and runs tesseract per page.
@@ -225,6 +255,67 @@ def make_fixtures(d: Path, ffmpeg: str | None) -> dict:
     return out
 
 
+def inspect_jpeg(path: Path, max_edge: int, portrait: bool | None) -> tuple[bool, dict]:
+    """Decodes the proxy with Pillow (not the worker): JPEG, longest edge `max_edge`, orientation,
+    and not blank (pixel values vary)."""
+    from PIL import Image, ImageStat
+
+    if not path.is_file():
+        return False, {"error": "no output file"}
+    with Image.open(path) as im:
+        im.load()
+        fmt, (w, h) = im.format, im.size
+        spread = max(ImageStat.Stat(im.convert("L")).stddev)
+    facts = {"format": fmt, "width": w, "height": h, "stddev": round(spread, 1)}
+    ok = fmt == "JPEG" and max(w, h) == max_edge and spread > 10
+    if portrait is not None:
+        ok = ok and (h > w) == portrait
+    return ok, facts
+
+
+def probe(ffprobe: Path, path: Path) -> dict:
+    r = subprocess.run([str(ffprobe), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+                       capture_output=True, text=True)
+    return json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+
+
+def inspect_video(bin_: Path, src: Path, out: Path, height: int) -> tuple[bool, dict]:
+    """Probes the proxy with the supplied ffprobe and decodes every frame with the supplied ffmpeg."""
+    if not out.is_file():
+        return False, {"error": "no output file"}
+    info, src_info = probe(bin_ / "ffprobe", out), probe(bin_ / "ffprobe", src)
+    v = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), {})
+    a = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), {})
+    dur, src_dur = float(info.get("format", {}).get("duration") or 0), float(src_info.get("format", {}).get("duration") or 0)
+    decode = subprocess.run([str(bin_ / "ffmpeg"), "-v", "error", "-i", str(out), "-f", "null", "-"], capture_output=True, text=True)
+    facts = {"container": info.get("format", {}).get("format_name"), "video": v.get("codec_name"), "audio": a.get("codec_name"),
+             "height": v.get("height"), "duration": round(dur, 2), "inputDuration": round(src_dur, 2),
+             "decodes": decode.returncode == 0 and not decode.stderr.strip()}
+    ok = ("mp4" in (facts["container"] or "") and facts["video"] == "h264" and facts["audio"] == "aac"
+          and facts["height"] == height and src_dur > 0 and abs(dur - src_dur) <= 0.25 and facts["decodes"])
+    return ok, facts
+
+
+def inspect_transcript(out: Path, duration: float) -> tuple[bool, dict]:
+    seg_file, vtt_file = out / "segments.json", out / "transcript.vtt"
+    if not seg_file.is_file() or not vtt_file.is_file():
+        return False, {"error": "no transcript files"}
+    segs = json.loads(seg_file.read_text(encoding="utf-8"))
+    text = " ".join(s.get("text", "") for s in segs)
+    found = [w for w in CLIP_WORDS if w in text.lower()]
+    timed = [s for s in segs if 0 <= s.get("start", -1) < s.get("end", -1) <= duration + 0.5]
+    vtt = vtt_file.read_text(encoding="utf-8")
+    facts = {"segments": len(segs), "timedSegments": len(timed), "wordsFound": found, "text": text.strip()[:80]}
+    return len(found) >= 2 and bool(timed) and vtt.startswith("WEBVTT") and "-->" in vtt, facts
+
+
+def wav_duration(path: Path) -> float:
+    import wave
+
+    with wave.open(str(path)) as w:
+        return w.getnframes() / w.getframerate()
+
+
 def ensure_model(models: Path, allow_download: bool) -> tuple[bool, str]:
     """Makes sure faster-whisper's `tiny` model is in `models` (Hugging Face cache layout)."""
     try:
@@ -233,7 +324,8 @@ def ensure_model(models: Path, allow_download: bool) -> tuple[bool, str]:
         return False, "faster_whisper not importable in the smoke test's Python; cannot check or fetch the model"
     try:
         path = download_model("tiny", cache_dir=str(models), local_files_only=True)
-        return True, f"tiny model already on disk ({Path(path).name})"
+        if (Path(path) / "model.bin").is_file():
+            return True, f"tiny model already on disk ({Path(path).name})"
     except Exception:  # noqa: BLE001 - not cached
         pass
     if not allow_download:
@@ -291,61 +383,62 @@ def sigterm_check(res: Results, w: Worker, label: str, job_id: str | None) -> No
     res.check(f"{label}: no child process left behind", not left, f"left: {sorted(left)}" if left else None)
 
 
-def run_without_tools(res: Results, exe: Path, root: Path, fx: dict, dng: Path | None) -> None:
+def run_without_tools(res: Results, exe: Path, root: Path, fx: dict) -> None:
     print("run 1: no tools, no models", flush=True)
     sentinel = Sentinel()
-    empty = root / "empty-bin"
-    empty.mkdir()
-    models = root / "models-empty"
-    tools = root / "tools-empty"
-    models.mkdir()
-    tools.mkdir()
-    out = root / "out1"
+    empty, models, tools, out = root / "empty-bin", root / "models-empty", root / "tools-empty", root / "out1"
+    for d in (empty, models, tools):
+        d.mkdir()
     w = Worker(exe, clean_env(root, str(empty), models, tools, sentinel.url), cwd=root)
-    res.info["startSec"] = [round(w.start_sec, 2)]
-    res.check("starts and prints its ready line", True, f"{w.start_sec:.2f} s to ready line")
-    status, health = w.request("GET", "/health")
-    res.check("/health answers", status == 200 and health.get("ok") is True, health if status != 200 else None)
-    v = health.get("versions", {}) if isinstance(health, dict) else {}
-    res.info["healthVersions"] = v
-    res.check("/health reports the bundled libraries",
-              all(v.get(k) for k in ("python", "faster_whisper", "pillow", "pillow_heif", "rawpy", "ocrmypdf", "gallery_dl")),
-              {k: v.get(k) for k in ("python", "faster_whisper", "pillow_heif", "rawpy", "ocrmypdf", "gallery_dl")})
-    res.check("/health reports ffmpeg, tesseract and yt-dlp as absent",
-              v.get("ffmpeg") is None and v.get("tesseract") is None and v.get("yt_dlp") is None,
-              {k: v.get(k) for k in ("ffmpeg", "tesseract", "yt_dlp")})
-    status, _ = w.request("GET", "/health", auth=False)
-    res.check("a request without the token is refused", status == 401, status)
-    net = sentinel.take()
-    res.check("no network request while starting and answering /health", not net, net or None)
-    sentinel.go_offline()
+    try:
+        res.info["startSec"] = [round(w.start_sec, 2)]
+        res.check("starts and prints its ready line", True, f"{w.start_sec:.2f} s to ready line")
+        status, health = w.request("GET", "/health")
+        res.check("/health answers", status == 200 and health.get("ok") is True, health if status != 200 else None)
+        v = health.get("versions", {}) if isinstance(health, dict) else {}
+        res.info["healthVersions"] = v
+        res.check("/health reports the bundled libraries",
+                  all(v.get(k) for k in ("python", "faster_whisper", "pillow", "pillow_heif", "rawpy", "ocrmypdf", "gallery_dl")),
+                  {k: v.get(k) for k in ("python", "faster_whisper", "pillow_heif", "rawpy", "ocrmypdf", "gallery_dl")})
+        res.check("/health reports ffmpeg, tesseract and yt-dlp as absent",
+                  v.get("ffmpeg") is None and v.get("tesseract") is None and v.get("yt_dlp") is None,
+                  {k: v.get(k) for k in ("ffmpeg", "tesseract", "yt_dlp")})
+        status, _ = w.request("GET", "/health", auth=False)
+        res.check("a request without the token is refused", status == 401, status)
+        net = sentinel.take()
+        res.check("no network request while starting and answering /health", not net, net or None)
 
-    j = w.run("image.proxy", fx["heic"], out / "heic.jpg", {"maxEdge": 1024})
-    res.check("image proxy of a HEIC photo (pillow-heif)", j["status"] == "done" and (out / "heic.jpg").stat().st_size > 0,
-              j.get("result", {}).get("meta") if j["status"] == "done" else j.get("error"))
-    if dng:
-        j = w.run("image.proxy", dng, out / "dng.jpg", {"maxEdge": 1024})
-        res.check("image proxy of the DNG fixture (rawpy)", j["status"] == "done" and (out / "dng.jpg").stat().st_size > 0,
-                  j.get("result", {}).get("meta") if j["status"] == "done" else j.get("error"))
-    else:
-        res.check("image proxy of the DNG fixture (rawpy)", False, "fixture missing: run `pnpm fetch-fixtures`", required=False)
+        j = w.run("image.proxy", fx["heic"], out / "heic.jpg", {"maxEdge": 1024})
+        ok, facts = inspect_jpeg(out / "heic.jpg", 1024, portrait=True) if j["status"] == "done" else (False, j.get("error"))
+        res.check("HEIC photo → JPEG proxy (pillow-heif): decoded by Pillow, 1024 px, EXIF rotation applied, not blank", ok, facts)
+        name = "DNG fixture → JPEG proxy (rawpy): decoded by Pillow, 1024 px, not blank"
+        if DNG_FILE.exists():
+            j = w.run("image.proxy", DNG_FILE, out / "dng.jpg", {"maxEdge": 1024})
+            ok, facts = inspect_jpeg(out / "dng.jpg", 1024, portrait=None) if j["status"] == "done" else (False, j.get("error"))
+            res.check(name, ok, facts)
+        else:
+            res.missing(name, "dng", "fixture missing: run `pnpm fetch-fixtures`")
 
-    j = w.run("pdf.ocr", fx["pdf"], out / "ocr.pdf")
-    res.check("OCR without tesseract fails clearly", j["status"] == "failed" and j["error"]["code"] == "MISSING_DEPENDENCY", j.get("error"))
-    res.info["ocrWithoutTesseract"] = j.get("error")
+        j = w.run("pdf.ocr", fx["pdf"], out / "ocr.pdf")
+        res.check("OCR without tesseract fails clearly", j["status"] == "failed" and j["error"]["code"] == "MISSING_DEPENDENCY", j.get("error"))
+        res.info["ocrWithoutTesseract"] = j.get("error")
 
-    if "clip" in fx:
-        j = w.run("video.proxy", fx["clip"], out / "clip.mp4")
-        res.check("video proxy without ffmpeg fails (no crash)", j["status"] == "failed", j.get("error"))
-        res.info["videoWithoutFfmpeg"] = j.get("error")
+        if "clip" in fx:
+            j = w.run("video.proxy", fx["clip"], out / "clip.mp4")
+            res.check("video proxy without ffmpeg fails (no crash)", j["status"] == "failed", j.get("error"))
+            res.info["videoWithoutFfmpeg"] = j.get("error")
 
-    clip = REPO / "tests" / "fixtures" / "downloaded" / "librispeech-voices-sp0307-sg0042.wav"
-    if clip.exists():
-        j = w.run("audio.transcribe", clip, out / "t", {"model": "tiny", "language": "en"})
-        res.check("transcription with no model on disk fails clearly (ctranslate2 loaded)",
-                  j["status"] == "failed" and j["error"]["code"] == "MODEL_UNAVAILABLE", j.get("error"))
-        res.info["transcribeWithoutModel"] = j.get("error")
-    sigterm_check(res, w, "run 1", None)
+        if SPEECH_CLIP.exists():
+            j = w.run("audio.transcribe", SPEECH_CLIP, out / "t", {"model": "tiny", "language": "en"})
+            err = j.get("error") or {}
+            res.check("transcription with no model on disk and no network: MODEL_UNAVAILABLE, not installed",
+                      j["status"] == "failed" and err.get("code") == "MODEL_UNAVAILABLE" and "not installed" in err.get("message", ""), err)
+            res.info["transcribeWithoutModel"] = err
+            res.info["networkTranscriptionWithoutModel"] = sentinel.take()
+        sigterm_check(res, w, "run 1", None)
+    finally:
+        w.kill()
+        sentinel.close()
 
 
 def run_with_tools(res: Results, exe: Path, root: Path, fx: dict, models: Path, have_model: bool) -> None:
@@ -363,47 +456,55 @@ def run_with_tools(res: Results, exe: Path, root: Path, fx: dict, models: Path, 
     res.info["toolsLinked"] = linked
     out = root / "out2"
     w = Worker(exe, clean_env(root, str(bin_), models, tools, sentinel.url), cwd=root)
-    res.info["startSec"].append(round(w.start_sec, 2))
-    status, health = w.request("GET", "/health")
-    v = health.get("versions", {}) if isinstance(health, dict) else {}
-    res.check("/health finds the supplied tools", all(v.get(n) for n in ("ffmpeg", "tesseract") if n in linked),
-              {k: v.get(k) for k in ("ffmpeg", "tesseract")})
-    net = sentinel.take()
-    res.check("no network request while starting and answering /health (run 2)", not net, net or None)
-    sentinel.go_offline()
+    try:
+        res.info["startSec"].append(round(w.start_sec, 2))
+        status, health = w.request("GET", "/health")
+        v = health.get("versions", {}) if isinstance(health, dict) else {}
+        res.check("/health finds the supplied tools", all(v.get(n) for n in ("ffmpeg", "tesseract") if n in linked),
+                  {k: v.get(k) for k in ("ffmpeg", "tesseract")})
+        net = sentinel.take()
+        res.check("no network request while starting and answering /health (run 2)", not net, net or None)
 
-    if "ffmpeg" in linked and "ffprobe" in linked and "clip" in fx:
-        j = w.run("video.proxy", fx["clip"], out / "clip.mp4", {"maxHeight": 240})
-        res.check("video proxy with ffmpeg from the tools folder", j["status"] == "done" and j["result"]["meta"]["height"] == 240,
-                  j.get("result", {}).get("meta") if j["status"] == "done" else j.get("error"))
-    else:
-        res.check("video proxy with ffmpeg from the tools folder", False, "ffmpeg/ffprobe not on this machine")
+        name = "video proxy with ffmpeg from the tools folder: probed and decoded (MP4, H.264/AAC, 240 lines, input's duration)"
+        if "ffmpeg" in linked and "ffprobe" in linked and "clip" in fx:
+            j = w.run("video.proxy", fx["clip"], out / "clip.mp4", {"maxHeight": 240})
+            ok, facts = inspect_video(bin_, fx["clip"], out / "clip.mp4", 240) if j["status"] == "done" else (False, j.get("error"))
+            res.check(name, ok, facts)
+        else:
+            res.missing(name, "ffmpeg", "ffmpeg/ffprobe not on this machine")
 
-    if "tesseract" in linked:
-        j = w.run("pdf.ocr", fx["pdf"], out / "ocr.pdf")
-        text = j.get("result", {}).get("meta", {}).get("sidecarText", "") if j["status"] == "done" else ""
-        words = [w for w in ("ARCHIVE", "LEDGER", "FOLIO") if w in text.upper()]
-        res.check("OCR of 3 pages with tesseract from the tools folder (no ghostscript)",
-                  j["status"] == "done" and j["result"]["meta"]["pages"] == 3 and len(words) == 3,
-                  {"pages": j["result"]["meta"]["pages"], "words": words} if j["status"] == "done" else j.get("error"))
-    else:
-        res.check("OCR with tesseract from the tools folder (no ghostscript)", False, "tesseract not on this machine")
+        name = "OCR of 3 pages with tesseract from the tools folder (no ghostscript)"
+        if "tesseract" in linked:
+            j = w.run("pdf.ocr", fx["pdf"], out / "ocr.pdf")
+            text = j.get("result", {}).get("meta", {}).get("sidecarText", "") if j["status"] == "done" else ""
+            words = [x for x in ("ARCHIVE", "LEDGER", "FOLIO") if x in text.upper()]
+            res.check(name, j["status"] == "done" and j["result"]["meta"]["pages"] == 3 and len(words) == 3,
+                      {"pages": j["result"]["meta"]["pages"], "words": words} if j["status"] == "done" else j.get("error"))
+        else:
+            res.missing(name, "tesseract", "tesseract not on this machine")
 
-    clip = REPO / "tests" / "fixtures" / "downloaded" / "librispeech-voices-sp0307-sg0042.wav"
-    if have_model and clip.exists():
-        t0 = time.monotonic()
-        j = w.run("audio.transcribe", clip, out / "t", {"model": "tiny", "language": "en"}, timeout=600)
-        ok = j["status"] == "done" and (out / "t" / "segments.json").exists()
-        segs = json.loads((out / "t" / "segments.json").read_text()) if ok else []
-        res.check("transcription of the test clip with the tiny model on disk", ok and len(segs) > 0,
-                  {"segments": len(segs), "sec": round(time.monotonic() - t0, 1),
-                   "text": " ".join(s["text"] for s in segs)[:60]} if ok else j.get("error"))
-    else:
-        res.check("transcription of the test clip with the tiny model on disk", False,
-                  "model or clip not available; run 1 proved ctranslate2 loads and reports MODEL_UNAVAILABLE", required=False)
+        name = (f"transcription of the test clip with the tiny model on disk: at least 2 of {list(CLIP_WORDS)}, "
+                "a timed segment, a VTT file")
+        if not SPEECH_CLIP.exists():
+            res.missing(name, "clip", "speech clip missing: run `pnpm fetch-fixtures`")
+        elif not have_model:
+            res.missing(name, "model", res.info.get("model", "tiny model not available"))
+        else:
+            sentinel.take()
+            t0 = time.monotonic()
+            j = w.run("audio.transcribe", SPEECH_CLIP, out / "t", {"model": "tiny", "language": "en"}, timeout=600)
+            ok, facts = inspect_transcript(out / "t", wav_duration(SPEECH_CLIP)) if j["status"] == "done" else (False, j.get("error"))
+            if isinstance(facts, dict):
+                facts["sec"] = round(time.monotonic() - t0, 1)
+            res.check(name, ok, facts)
+            net = sentinel.take()
+            res.check("no network request while transcribing with the model on disk (the proxy refuses everything)", not net, net or None)
 
-    job = w.submit("video.proxy", fx["long"], out / "long.mp4") if "long" in fx and "ffmpeg" in linked else None
-    sigterm_check(res, w, "run 2", job)
+        job = w.submit("video.proxy", fx["long"], out / "long.mp4") if "long" in fx and "ffmpeg" in linked else None
+        sigterm_check(res, w, "run 2", job)
+    finally:
+        w.kill()
+        sentinel.close()
 
 
 def main() -> int:
@@ -412,10 +513,14 @@ def main() -> int:
     ap.add_argument("--models-dir", type=Path, default=Path(os.environ.get("AO_SMOKE_MODELS_DIR") or Path.home() / ".cache" / "ao-worker-smoke-models"),
                     help="where the tiny model is kept between runs (outside the bundle)")
     ap.add_argument("--no-model-download", action="store_true")
+    ap.add_argument("--allow-missing", default="", help=f"comma-separated absences reported as skips instead of failures: {', '.join(ABSENCES)}")
     ap.add_argument("--report", type=Path)
     args = ap.parse_args()
+    allow = {x.strip() for x in args.allow_missing.split(",") if x.strip()}
+    if allow - set(ABSENCES):
+        ap.error(f"--allow-missing takes {', '.join(ABSENCES)}; not {', '.join(sorted(allow - set(ABSENCES)))}")
     exe = args.worker.resolve()
-    res = Results()
+    res = Results(allow)
 
     r = subprocess.run([str(exe), "--self-check"], capture_output=True, text=True, env={"PATH": os.devnull, "HOME": tempfile.gettempdir()}, timeout=120)
     try:
@@ -442,15 +547,17 @@ def main() -> int:
         fxdir = root / "fixtures"
         fxdir.mkdir()
         fx = make_fixtures(fxdir, shutil.which("ffmpeg"))
-        dng = REPO / "tests" / "fixtures" / "downloaded" / "canon-eos-5d-mark-iii-14bit.dng"
-        run_without_tools(res, exe, root, fx, dng if dng.exists() else None)
+        run_without_tools(res, exe, root, fx)
         run_with_tools(res, exe, root, fx, args.models_dir, have_model)
 
-    res.info["ok"] = res.ok
+    failed = res.failed
+    skipped = [c["name"] for c in res.checks if c["status"] == "skipped"]
+    res.info["ok"] = not failed
     if args.report:
         args.report.write_text(json.dumps({"checks": res.checks, "info": res.info}, indent=1, default=str))
-    failed = [c["name"] for c in res.checks if c["required"] and not c["ok"]]
-    print(f"smoke test: {'PASSED' if not failed else 'FAILED'} ({sum(c['ok'] for c in res.checks)}/{len(res.checks)} checks)"
+    passed = sum(c["status"] == "pass" for c in res.checks)
+    print(f"smoke test: {'PASSED' if not failed else 'FAILED'} ({passed}/{len(res.checks)} checks passed"
+          + (f", {len(skipped)} SKIPPED: {'; '.join(skipped)}" if skipped else "") + ")"
           + (f"; failed: {'; '.join(failed)}" if failed else ""), flush=True)
     return 0 if not failed else 1
 

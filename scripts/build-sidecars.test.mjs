@@ -12,14 +12,22 @@ test("target triples follow Tauri's sidecar names", () => {
 });
 
 test("arguments", () => {
-  assert.deepEqual(parseArgs([]), { smoke: false, skipBuild: false, clean: false, constraints: undefined, resolveFor: undefined, noModelDownload: false });
-  assert.deepEqual(parseArgs(["--smoke", "--constraints", "c.txt"]), { smoke: true, skipBuild: false, clean: false, constraints: "c.txt", resolveFor: undefined, noModelDownload: false });
+  const none = { smoke: false, skipBuild: false, clean: false, constraints: undefined, resolveFor: undefined, noModelDownload: false, allowMissing: [], listSymlinks: false };
+  assert.deepEqual(parseArgs([]), none);
+  assert.deepEqual(parseArgs(["--smoke", "--constraints", "c.txt"]), { ...none, smoke: true, constraints: "c.txt" });
   assert.equal(parseArgs(["--constraints=none"]).constraints, "none");
   assert.equal(parseArgs(["--resolve-for", "macos-x86_64"]).resolveFor, "macos-x86_64");
   assert.equal(parseArgs(["--skip-build", "--smoke", "--no-model-download"]).noModelDownload, true);
   assert.throws(() => parseArgs(["--bogus"]), /unknown option/);
   assert.throws(() => parseArgs(["--constraints"]), /needs a value/);
   assert.throws(() => parseArgs(["--resolve-for", "windows"]), /macos-x86_64/);
+});
+
+test("--allow-missing names absences the smoke test may skip; nothing is allowed by default", () => {
+  assert.deepEqual(parseArgs(["--smoke", "--allow-missing", "model,dng"]).allowMissing, ["model", "dng"]);
+  assert.deepEqual(parseArgs(["--allow-missing=clip"]).allowMissing, ["clip"]);
+  assert.throws(() => parseArgs(["--allow-missing", "model,everything"]), /model, clip, dng, ffmpeg, tesseract/);
+  assert.equal(parseArgs(["--list-symlinks", "--skip-build"]).listSymlinks, true);
 });
 
 test("the Intel constraints file is chosen by default on an Intel Mac only", () => {

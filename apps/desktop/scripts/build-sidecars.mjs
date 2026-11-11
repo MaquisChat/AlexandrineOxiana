@@ -5,6 +5,11 @@
 //   node apps/desktop/scripts/build-sidecars.mjs [--smoke] [--constraints <file>|none] [--clean]
 //   node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke     # smoke-test the last build
 //   node apps/desktop/scripts/build-sidecars.mjs --resolve-for macos-x86_64   # check a pin set, no build
+//   node apps/desktop/scripts/build-sidecars.mjs --skip-build --list-symlinks  # symbolic links in the bundle
+//
+// The smoke test fails when a fixture, the speech model or a tool it needs is missing.
+// `--allow-missing model,clip,dng,ffmpeg,tesseract` (any of them) reports those absences as skips;
+// never use it for a run that must prove the packaged worker (CI does not).
 //
 // Output (git-ignored): apps/desktop/sidecars/ao-worker-<target triple>/ with the executable
 // `ao-worker` (`ao-worker.exe` on Windows), its `_internal/` folder and `sidecar-manifest.json`.
@@ -19,7 +24,7 @@
 // `--smoke` runs services/media-worker/packaging/smoke_test.py, which needs ffmpeg, ffprobe and
 // tesseract on this machine and may download the `tiny` speech model once (outside the bundle).
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -31,6 +36,7 @@ const PACKAGING = join(WORKER, "packaging");
 const BUILD = join(DESKTOP, ".build");
 const OUT = join(DESKTOP, "sidecars");
 const INTEL_CONSTRAINTS = join(PACKAGING, "constraints-macos-x86_64.txt");
+const SMOKE_ABSENCES = ["model", "clip", "dng", "ffmpeg", "tesseract"];
 const RESOLVE_TARGETS = {
   "macos-x86_64": { platform: "macosx_15_0_x86_64", constraints: INTEL_CONSTRAINTS },
   "macos-arm64": { platform: "macosx_15_0_arm64", constraints: undefined },
@@ -51,7 +57,7 @@ export function defaultConstraints(platform = process.platform, arch = process.a
 }
 
 export function parseArgs(argv) {
-  const out = { smoke: false, skipBuild: false, clean: false, constraints: undefined, resolveFor: undefined, noModelDownload: false };
+  const out = { smoke: false, skipBuild: false, clean: false, constraints: undefined, resolveFor: undefined, noModelDownload: false, allowMissing: [], listSymlinks: false };
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s, 2);
     const value = () => {
@@ -63,6 +69,12 @@ export function parseArgs(argv) {
     else if (flag === "--skip-build") out.skipBuild = true;
     else if (flag === "--clean") out.clean = true;
     else if (flag === "--no-model-download") out.noModelDownload = true;
+    else if (flag === "--list-symlinks") out.listSymlinks = true;
+    else if (flag === "--allow-missing") {
+      out.allowMissing = value().split(",").map((x) => x.trim()).filter(Boolean);
+      const bad = out.allowMissing.filter((x) => !SMOKE_ABSENCES.includes(x));
+      if (bad.length) throw new Error(`--allow-missing takes ${SMOKE_ABSENCES.join(", ")}; not ${bad.join(", ")}`);
+    }
     else if (flag === "--constraints") out.constraints = value();
     else if (flag === "--resolve-for") {
       out.resolveFor = value();
@@ -192,6 +204,18 @@ function largestItems(bundle, n = 10) {
 
 const mb = (b) => `${(b / 1e6).toFixed(1)} MB`;
 
+/** Symbolic links inside the bundle (PyInstaller links shared libraries kept in `<pkg>.libs` or
+ *  `.dylibs` into `_internal/`; they matter for macOS code signing and Tauri's resource copy). */
+function symlinks(dir, base = dir, out = []) {
+  for (const e of readdirSync(dir)) {
+    const p = join(dir, e);
+    const st = lstatSync(p);
+    if (st.isSymbolicLink()) out.push({ path: relative(base, p), target: readlinkSync(p) });
+    else if (st.isDirectory()) symlinks(p, base, out);
+  }
+  return out;
+}
+
 // ---------- main ----------
 
 function build(python, opts, triple, bundle) {
@@ -219,6 +243,7 @@ function build(python, opts, triple, bundle) {
     ...(c.file ? ["--constraints", c.file] : []), "--out", join(bundle, "sidecar-manifest.json")]);
   console.log(`\nbuilt ${relative(REPO, bundle)} in ${((Date.now() - t0) / 1000).toFixed(0)} s; ${mb(sizeOf(bundle))} on disk. Largest items:`);
   for (const i of largestItems(bundle)) console.log(`  ${mb(i.bytes).padStart(9)}  ${i.path}`);
+  console.log(`  ${symlinks(bundle).length} symbolic links inside (--skip-build --list-symlinks lists them)`);
   return v.py;
 }
 
@@ -238,9 +263,15 @@ function main() {
   } else {
     py = build(python, opts, triple, bundle);
   }
+  if (opts.listSymlinks) {
+    const links = symlinks(bundle);
+    console.log(`${links.length} symbolic links in ${relative(REPO, bundle)}:`);
+    for (const l of links) console.log(`  ${l.path} -> ${l.target}`);
+  }
   if (opts.smoke) {
     run(py, ["-I", join(PACKAGING, "smoke_test.py"), "--worker", exe, "--report", join(OUT, `ao-worker-${triple}.smoke.json`),
-      ...(opts.noModelDownload ? ["--no-model-download"] : [])]);
+      ...(opts.noModelDownload ? ["--no-model-download"] : []),
+      ...(opts.allowMissing.length ? ["--allow-missing", opts.allowMissing.join(",")] : [])]);
   }
   console.log(`\nworker: ${relative(REPO, exe)}  (AO_WORKER_BIN=${exe})`);
 }
