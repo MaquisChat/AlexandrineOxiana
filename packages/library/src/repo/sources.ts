@@ -29,7 +29,7 @@ import { GovernanceViolationError, ImmutableProvenanceError, NotFoundError } fro
 import { decryptBytes, deepEqual, foldName, kindFor, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type RefuseHook, type MutateRequest, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { assignableWorkspaceTags } from "./collections.js";
+import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { appendReviewEntry, type ReviewInput } from "./review.js";
@@ -429,6 +429,8 @@ async function writeNewSource(
   inTx: CreateInTx | undefined,
 ): Promise<SourceFile> {
   const st = tx.state;
+  // A new source may be given only tags that exist now: no workspace tag being deleted (41a N2).
+  await refuseUnknownTags(core, st, [], draft.tagIds);
   const id = newId();
   tx.entity("source", id);
   const short = shortId(id, takenShortIds(st));

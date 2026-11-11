@@ -12,7 +12,7 @@ import { readMaybe } from "./io.js";
 import { CHANGE_LOG_MODE, runMutation, type MutateRequest } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
 import { editSource, readSourceFile, storeRequest } from "./sources.js";
-import type { RepoCore } from "./state.js";
+import type { ProjectState, RepoCore } from "./state.js";
 
 /** Organizing metadata carries no identifiable data of its own. */
 const ORGANIZE: MutateRequest = { action: "store", store: { identifiable: false, hasLocation: false } };
@@ -236,6 +236,22 @@ export async function assignableWorkspaceTags(core: RepoCore): Promise<Tag[]> {
 }
 
 /**
+ * Refuses (NotFoundError) a source write that adds a tag which is neither one of the project's tags
+ * nor a workspace tag a source may be given now (41a I2, N2), exactly as setMembership checks.
+ * Called inside the governed change, so it is ordered against a workspace-tag delete: a write
+ * before the delete's mark is swept by it; one after the mark, or after the delete finished, is
+ * refused here. Tags the source already carried are left alone.
+ */
+export async function refuseUnknownTags(core: RepoCore, st: ProjectState, before: readonly string[], after: readonly string[]): Promise<void> {
+  const added = [...new Set(after)].filter((t) => !before.includes(t));
+  if (!added.length) return;
+  const data = await readFullData(core, st);
+  const ws = await assignableWorkspaceTags(core);
+  const unknown = added.find((t) => !data.tags.some((x) => x.id === t) && !ws.some((x) => x.id === t));
+  if (unknown) throw new NotFoundError("Tag", unknown);
+}
+
+/**
  * Workspace tag operations that span projects (create, rename, delete) run one at a time, so two of
  * them never interleave their per-project changes (41a M7). Each step inside still takes the
  * ordinary write queue (`core.serial`), so other writes run between projects.
@@ -393,14 +409,19 @@ export async function deleteWorkspaceTag(core: RepoCore, id: string): Promise<vo
 
 async function deleteWorkspaceTagNow(core: RepoCore, id: string): Promise<void> {
   await workspaceTag(core, id);
-  const targets = workspaceChangeTargets(core);
-  await core.serial(async () => {
+  workspaceChangeTargets(core); // refused before anything is written
+  // The projects to sweep are taken in the same step as the mark (41a N5): a project created by
+  // work queued before the mark is swept too.
+  const targets = await core.serial(async () => {
     core.assertWritable();
+    const projects = workspaceChangeTargets(core);
     const { tags, deleting } = await readTagsFile(core);
     if (!tags.some((t) => t.id === id)) throw new NotFoundError("Tag", id);
-    if (deleting.includes(id)) return;
-    const body: TagsJson = { formatVersion: 1, tags, deleting: [...deleting, id] };
-    await writeFileAtomic(tagsPath(core), JSON.stringify(body, null, 2));
+    if (!deleting.includes(id)) {
+      const body: TagsJson = { formatVersion: 1, tags, deleting: [...deleting, id] };
+      await writeFileAtomic(tagsPath(core), JSON.stringify(body, null, 2));
+    }
+    return projects;
   });
   for (const projectId of targets) {
     await runMutation(

@@ -4,6 +4,7 @@
  * one transaction (R26: txn marker, change log, audit). Nothing here is part of the public Repo API.
  */
 import { Asset, SourceFile, encName, newId, originalFileName, withCollisionSuffix } from "@ao/core";
+import { refuseUnknownTags } from "./collections.js";
 import { NotFoundError } from "./errors.js";
 import { decryptBytes, foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
@@ -62,6 +63,8 @@ export function runImportChange<T>(
         readSource: (id) => readSourceFile(core, st, id),
         async writeSource(before, sf) {
           const parsed = SourceFile.parse(sf);
+          // No import write (bulk run, merge, review edit) may add a workspace tag being deleted (41a N2).
+          await refuseUnknownTags(core, st, before?.source.tagIds ?? [], parsed.source.tagIds);
           await writeSourceFile(core, tx, parsed);
           tx.record("source", parsed.source.id, before?.source ?? null, parsed.source);
           // New links to a participant whose consent was withdrawn: queued for review (R117 I1).
