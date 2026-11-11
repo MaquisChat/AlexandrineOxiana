@@ -162,6 +162,51 @@ describe("createClient", () => {
   });
 });
 
+describe("mediaUrl() — the address a media element loads (R135)", () => {
+  const TICKET = "Ab3_-".repeat(8) + "xyz"; // 43 base64url characters
+  const B64_TOKEN = "Q".repeat(40); // a token that could sit inside a ticket-shaped path
+
+  it("gives the base URL plus the ticket path, nothing else, and fetches nothing", () => {
+    const f = fakeFetch(() => json({}));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    expect(api.mediaUrl(`/media/${TICKET}`)).toBe(`${BASE}/media/${TICKET}`);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("refuses anything but /media/<43 base64url characters>: a query, a fragment, other routes, other hosts", () => {
+    const api = createClient(BASE, TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    for (const path of [
+      `/media/${TICKET}?x=1`,
+      `/media/${TICKET}?`,
+      `/media/${TICKET}#t=10`,
+      `/media/${TICKET}%3Fx=1`,
+      `/media/${TICKET}%23t`,
+      `/media/${TICKET}/x`,
+      `/media/${TICKET.slice(1)}`,
+      "/projects",
+      `//evil.example/media/${TICKET}`,
+      `http://127.0.0.1:4317/media/${TICKET}`,
+      `/media/../media/${TICKET}`,
+    ]) {
+      expect(() => api.mediaUrl(path), path).toThrow(/media address/);
+    }
+  });
+
+  it("refuses an address carrying the service token, however it is written", () => {
+    const api = createClient(BASE, B64_TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    expect(() => api.mediaUrl(`/media/${B64_TOKEN}abc`)).toThrow(/token/);
+    expect(() => api.mediaUrl(`/media/abc${B64_TOKEN}`)).toThrow(/token/);
+    expect(() => api.mediaUrl(`/media/${TICKET}`)).not.toThrow();
+  });
+
+  it("the ordinary request paths still refuse ?, # and the token (unchanged by the media address)", () => {
+    const api = createClient(BASE, B64_TOKEN, { fetch: fakeFetch(() => json({})).fetch });
+    for (const path of [`/media/${TICKET}?a=1`, `/media/${TICKET}#f`, `/media/${B64_TOKEN}abc`]) {
+      expect(() => api.request("GET", path), path).toThrow(/path|token/);
+    }
+  });
+});
+
 describe("events() — SSE over fetch streaming (not EventSource)", () => {
   function streamOf(chunks: string[]) {
     const enc = new TextEncoder();
