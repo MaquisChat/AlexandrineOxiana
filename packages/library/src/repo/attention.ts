@@ -409,7 +409,7 @@ export async function moveOutboxIntoProject(core: RepoCore, st: ProjectState): P
 
 /** One mark as the audit screen lists it (no paths, no messages). */
 export interface AttentionMark {
-  /** The record id, or for something that is not a valid record its file name ("" for the folder). */
+  /** The record id, or for something that is not a valid record its file name ("-" when the attention folder itself is not a folder). */
   id: string;
   kind: "audit-unrecorded" | "permissions-not-set" | "unreadable" | "waiting";
   action?: string;
@@ -438,7 +438,7 @@ export async function listMarks(core: RepoCore, st: ProjectState): Promise<Atten
   });
   return [
     ...records.map((r) => view(r, false)),
-    ...unreadable.map((u): AttentionMark => ({ id: u.file, kind: "unreadable", canSetAside: true })),
+    ...unreadable.map((u): AttentionMark => ({ id: u.file === "" ? "-" : u.file, kind: "unreadable", canSetAside: true })),
     ...(await readOutbox(core.library.appConfigDir, core.library.id)).filter((e) => e.projectId === st.project.id).map((e) => view(e.record, true)),
   ];
 }
@@ -453,7 +453,7 @@ export async function markForSetAside(
   const { records, unreadable } = await readAttention(core.root, st.rel);
   const rec = records.find((r) => r.id === id);
   if (rec) return { summary: { kind: rec.kind, record: rec }, remove: () => removeAttention(core.root, st.rel, rec.id) };
-  const u = unreadable.find((x) => x.file === id);
+  const u = unreadable.find((x) => (x.file === "" ? "-" : x.file) === id);
   if (!u) return null;
   const abs = u.file === "" ? dirOf(core.root, st.rel) : join(dirOf(core.root, st.rel), u.file);
   await assertContained(projectDir, abs);

@@ -152,6 +152,41 @@ export class Repo {
     return setAsideMarkIn(this.core, projectId, markId, reason);
   }
 
+  /** A page of the library's own audit log, newest first (like `readAudit`), with the latest entry's repeat count. */
+  async readLibraryAuditPage(opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number; repeats?: { seq: number; count: number; lastAt: string } }> {
+    const { events: all, repeats } = await readLibraryAudit(this.core.root);
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    const older = opts.beforeSeq === undefined ? all : all.filter((e) => e.seq < opts.beforeSeq!);
+    return { events: older.slice(-limit).reverse(), total: all.length, ...(repeats ? { repeats } : {}) };
+  }
+
+  /** Checks the library's own audit log against its anchor, like `verifyAudit` for a project (R154 a). Reads only. */
+  verifyLibraryAudit(): Promise<AuditCheck> {
+    const core = this.core;
+    return core.serial(async () => {
+      const raw = await AuditStore.read(join(core.root, LIBRARY_AUDIT_DIR));
+      const verify = verifyChain(raw as AuditEvent[]);
+      let anchors: Awaited<ReturnType<RepoCore["anchors"]["readAll"]>> | undefined;
+      try {
+        anchors = await core.anchors.readAll();
+      } catch (err) {
+        if (!(err instanceof AnchorsUnreadableError)) throw err;
+      }
+      const anchor = anchors?.[libraryAnchorKey(core)];
+      const problem = raw.length === 0 && !anchor ? null : checkAnchor(raw, verify, anchor, core.device);
+      const alteredAt = raw
+        .filter((e): e is AuditEvent => !!e && (e.action === "audit.anchor-mismatch" || e.action === "audit.anchor-missing"))
+        .map((e) => e.at);
+      return {
+        ok: !problem && anchors !== undefined && alteredAt.length === 0,
+        events: raw.length,
+        anchored: !!anchor,
+        alteredAt,
+        ...(problem ? { problem } : anchors === undefined ? { problem: { kind: "anchors-unreadable" as const, detail: "the record of audit heads kept outside the library could not be read" } } : {}),
+      };
+    });
+  }
+
   libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult; repeats?: { seq: number; count: number; lastAt: string } }> {
     return readLibraryAudit(this.core.root);
   }
