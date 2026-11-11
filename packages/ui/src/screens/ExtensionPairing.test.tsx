@@ -177,6 +177,19 @@ describe("Pair a browser", () => {
   });
 });
 
+describe("the route", () => {
+  it("has one owner at its path and shows the screen with a Back to library link", async () => {
+    const { ROUTES, routeFor } = await import("../App");
+    const { createClient } = await import("../api/client");
+    const { PATHS } = await import("../navigation");
+    expect(ROUTES.filter((r) => r.matches(PATHS.extension))).toHaveLength(1);
+    server.use(...pairingService().handlers);
+    render(routeFor({ pathname: PATHS.extension, search: "?project=p1" }, createClient("http://127.0.0.1:4318", "t".repeat(40) + "-task34e")));
+    expect(screen.getByRole("link", { name: "Back to library" }).getAttribute("href")).toBe("/?project=p1");
+    expect(await screen.findByRole("heading", { name: "Browser extension" })).toBeTruthy();
+  });
+});
+
 describe("Paired browsers", () => {
   it("lists each browser by origin with when it was paired", async () => {
     server.use(...pairingService({ pairings: [BROWSER_A, BROWSER_B] }).handlers);

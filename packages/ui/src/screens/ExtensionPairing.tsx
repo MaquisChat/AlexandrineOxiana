@@ -11,9 +11,9 @@
  * wrong attempts looks to this screen like a code still valid, so the text says what to do then
  * (show a new code; any new code replaces the old one).
  */
-import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { ApiClientError } from "../api/client";
-import type { ExtensionApi, PairedBrowser } from "../api/extension";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { ApiClientError, type ApiClient } from "../api/client";
+import { extensionApi, type ExtensionApi, type PairedBrowser } from "../api/extension";
 import { errorText } from "../api/library";
 import { ChoiceDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
@@ -34,6 +34,12 @@ const when = (iso: string): string => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "at an unknown time" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 };
+
+/** The route's wrapper: one api object per client, so the screen's effects do not restart on every render. */
+export function ExtensionPairingRoute({ client }: { client: ApiClient }) {
+  const api = useMemo(() => extensionApi(client), [client]);
+  return <ExtensionPairing api={api} />;
+}
 
 export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; pollMs?: number }) {
   const ids = useId();
