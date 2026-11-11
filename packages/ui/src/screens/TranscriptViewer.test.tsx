@@ -149,17 +149,36 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(played).toBe(before);
   });
 
-  it("a project locked during playback: renewal is refused and a plain message is shown", async () => {
+  it("a project locked during playback: renewal is refused, the transcript is hidden, and Try again brings it back after unlocking", async () => {
     const onLocked = vi.fn();
     const { svc } = await open({}, { onLocked });
     await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
     server.use(http.post(url("/projects/:id/sources/:sid/assets/:aid/media-ticket"), () => serviceErrorBody(423, "PROJECT_LOCKED", "This project is locked.")));
     fireEvent(media()!, new Event("error"));
-    expect(await screen.findByText(/The project was locked, so the recording stopped/)).toBeTruthy();
+    expect(await screen.findByText(/This project is locked, so its transcript and recording are not shown/)).toBeTruthy();
     expect(onLocked).toHaveBeenCalled();
     expect(svc.log.tickets).toHaveLength(1);
-    // The transcript stays readable.
-    expect(screen.getByText("Hello and welcome.")).toBeTruthy();
+    expect(screen.queryByText("Hello and welcome.")).toBeNull();
+    expect(media()).toBeNull();
+    // Unlocked elsewhere: Try again reads everything again and plays with a new ticket.
+    server.use(...svc.handlers);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("Hello and welcome.")).toBeTruthy();
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
+  });
+
+  it("a save refused because the project was locked keeps the edits for after unlocking", async () => {
+    const { svc } = await open();
+    const user = userEvent.setup();
+    await user.click(within(segmentItems()[0]!).getByRole("button", { name: "Edit segment at 0:00" }));
+    await user.type(screen.getByLabelText("Text of the segment at 0:00"), " Again.");
+    server.use(http.post(url("/projects/:id/sources/:sid/transcripts"), () => serviceErrorBody(423, "PROJECT_LOCKED", "This project is locked.")));
+    await user.click(screen.getByRole("button", { name: "Save edits as a new version" }));
+    expect(await screen.findByText(/This project is locked/)).toBeTruthy();
+    expect(screen.getByText(/edits that are not saved are kept here/)).toBeTruthy();
+    server.use(...svc.handlers);
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    expect(((await screen.findByLabelText("Text of the segment at 0:00")) as HTMLTextAreaElement).value).toBe("Hello and welcome. Again.");
   });
 
   it("the library closed: the recording stops with the service's reason", async () => {

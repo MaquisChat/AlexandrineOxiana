@@ -44,7 +44,7 @@ const MODEL_LABELS: Record<TranscriptionModel, string> = {
   small: "small (fastest)",
 };
 
-const LOCKED = "This project is locked. Unlock it in the library to see this transcript.";
+const LOCKED = "This project is locked, so its transcript and recording are not shown. Unlock it in the library, then choose Try again.";
 const UNSAVED = "You have edits that are not saved. Save them as a new version or discard them first.";
 
 /** A language code in words ("en" → "English"); "und" → "Language not known". */
@@ -112,6 +112,8 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
 
   const [source, setSource] = useState<SourceFile | undefined>();
   const [locked, setLocked] = useState(false);
+  /** Bumped by "Try again" (after unlocking): everything is read again; unsaved edits are kept. */
+  const [attempt, setAttempt] = useState(0);
   const [loadError, setLoadError] = useState<string | undefined>();
   const [versions, setVersions] = useState<VersionEntry[] | undefined>();
   const [selected, setSelected] = useState<string | undefined>();
@@ -194,7 +196,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
     );
     void loadVersions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+  }, [key, attempt]);
 
   // The chosen version's segments.
   useEffect(() => {
@@ -213,7 +215,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
         if (!sawLocked(err)) setTranscriptError(errorText(err, "This version could not be read."));
       },
     );
-  }, [selected, projectId, sourceId, sawLocked]);
+  }, [selected, projectId, sourceId, sawLocked, attempt]);
 
   // Unsaved edits are not lost: the window asks before closing; in-app links and navigate() are
   // refused; Back and Forward land on a copy of this address and are refused too.
@@ -322,8 +324,8 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       await loadVersions({ id: r.id });
     } catch (err) {
       if (!mounted.current || k !== keyRef.current || mine !== actionSeq.current) return;
-      // The edits stay on screen even when the project was locked meanwhile.
-      if (isProjectLocked(err)) lockedRef.current?.();
+      // The edits are kept (hidden while the project is locked; shown again after Try again).
+      sawLocked(err);
       setSaveError(`Your edits were not saved and are still here. ${errorText(err, "The library service did not answer.")}`);
     } finally {
       if (mounted.current && k === keyRef.current && mine === actionSeq.current) setSaving(false);
@@ -345,8 +347,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       await loadVersions({ paths: r.files });
     } catch (err) {
       if (!mounted.current || k !== keyRef.current) return;
-      if (isProjectLocked(err)) lockedRef.current?.();
-      setTranscribeFailure(transcribeError(err, chosen));
+      if (!sawLocked(err)) setTranscribeFailure(transcribeError(err, chosen));
     } finally {
       if (mounted.current && k === keyRef.current) setTranscribing(null);
     }
@@ -364,9 +365,31 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       </h1>
 
       {locked && (
-        <p role="alert" className="ao-error">
-          {LOCKED}
-        </p>
+        <div className="ao-tx__locked">
+          <p role="alert" className="ao-error">
+            {LOCKED}
+          </p>
+          {dirty && <p>Your edits that are not saved are kept here until you save or discard them.</p>}
+          <div className="ao-row">
+            <button
+              type="button"
+              onClick={() => {
+                setLocked(false);
+                setLoadError(undefined);
+                setTranscriptError(undefined);
+                setSaveError(undefined);
+                setAttempt((n) => n + 1);
+              }}
+            >
+              Try again
+            </button>
+            {dirty && (
+              <button type="button" onClick={discard}>
+                Discard edits
+              </button>
+            )}
+          </div>
+        </div>
       )}
       {loadError && !locked && (
         <p role="alert" className="ao-error">
@@ -385,6 +408,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
               label="Recording"
               onTime={onTime}
               onLocked={() => {
+                setLocked(true);
                 lockedRef.current?.();
               }}
               control={player}
@@ -430,12 +454,12 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
           {UNSAVED}
         </p>
       )}
-      {saveError && (
+      {saveError && !locked && (
         <p role="alert" className="ao-error">
           {saveError}
         </p>
       )}
-      {transcriptError && (
+      {transcriptError && !locked && (
         <p role="alert" className="ao-error">
           {transcriptError}
         </p>
@@ -449,7 +473,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
 
       {!locked && selected && !transcript && !transcriptError && <p aria-live="polite">Loading the transcript…</p>}
 
-      {transcript && !transcript.timed && (
+      {!locked && transcript && !transcript.timed && (
         <section aria-label="Transcript text" className="ao-tx__whole">
           {wholeDraft === undefined ? (
             <>
@@ -469,7 +493,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
         </section>
       )}
 
-      {transcript?.timed && (
+      {!locked && transcript?.timed && (
         <ol aria-label="Transcript segments" className="ao-tx__segments">
           {segments.map((s, i) => {
             const flags = s.flags ? flagLabels(s.flags) : [];
