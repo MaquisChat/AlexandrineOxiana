@@ -38,6 +38,17 @@ describe("CollectionTree", () => {
 });
 
 describe("CollectionTree expand, collapse, rename, delete", () => {
+  it("an open rename closes when another collection is selected, so it never renames the wrong one (41b1 M2)", async () => {
+    const onRename = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(<CollectionTree collections={COLLECTIONS.collections} selectedId="c1" onSelect={vi.fn()} onRename={onRename} />);
+    await user.click(screen.getByRole("button", { name: "Rename collection Chapter 1" }));
+    expect(screen.getByLabelText("New name for Chapter 1")).toBeTruthy();
+    rerender(<CollectionTree collections={COLLECTIONS.collections} selectedId="c4" onSelect={vi.fn()} onRename={onRename} />);
+    expect(screen.queryByLabelText(/New name for/)).toBeNull();
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
   it("parents carry aria-expanded; Left collapses (hiding children) and Right expands", async () => {
     const user = userEvent.setup();
     render(<CollectionTree collections={COLLECTIONS.collections} selectedId={undefined} onSelect={vi.fn()} />);
