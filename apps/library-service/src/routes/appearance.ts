@@ -3,7 +3,7 @@
  * `<appConfigDir>/appearance.json` (a readable file, owner-only). PUT merges and validates.
  */
 import type { FastifyInstance } from "fastify";
-import { readAppSetting, updateAppSetting } from "@ao/library";
+import { RESEARCHER_NAME_MAX, readAppSetting, researcherName, researcherNameOk, setResearcherName, updateAppSetting } from "@ao/library";
 import { GENERIC_FAMILIES, inferGenericFamily, isGenericFamily, isUsableFontFamily, type GenericFamily } from "@ao/shared";
 import { badRequest } from "../errors.js";
 import { bodyOf, type Ctx, type Obj } from "./util.js";
@@ -111,6 +111,15 @@ export function mergeAppearance(cur: AppearanceSettings, patch: Obj): Appearance
 
 export function registerAppearance(app: FastifyInstance, ctx: Ctx): void {
   const dir = ctx.state.deps.appConfigDir;
+
+  // The researcher's display name on this device (R84/R117): the photographer of device imports and
+  // the `by` of destruction certificates. Device settings, like appearance; null clears it.
+  app.get("/settings/researcher", async () => ({ name: (await researcherName(dir)) ?? null }));
+  app.put("/settings/researcher", async (req) => {
+    const name = bodyOf(req).name;
+    if (name !== null && !researcherNameOk(name)) throw badRequest(`"name" must be 1 to ${RESEARCHER_NAME_MAX} characters without control or direction characters, or null.`);
+    return { name: (await setResearcherName(dir, name)) ?? null };
+  });
   const current = async (): Promise<AppearanceSettings> => {
     const stored = await readAppSetting<Obj>(dir, FILE);
     try {

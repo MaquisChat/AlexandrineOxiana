@@ -109,6 +109,30 @@ export function updateAppSetting<T>(dir: string, name: string, edit: (cur: T | u
   return run;
 }
 
+/** The researcher's display name on this device (R84/R117): photographer of device imports, `by` of destruction certificates. */
+export const RESEARCHER_SETTING = "researcher.json";
+export const RESEARCHER_NAME_MAX = 200;
+
+/** A usable display name: 1–200 characters once trimmed, no control, format (bidi, zero-width) or line-separator characters. */
+export function researcherNameOk(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const t = v.trim();
+  return t.length > 0 && t.length <= RESEARCHER_NAME_MAX && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(t);
+}
+
+/** The researcher's display name on this device, or undefined when none is set (or the file is not usable). */
+export async function researcherName(dir: string): Promise<string | undefined> {
+  const v = await readAppSetting<{ name?: unknown }>(dir, RESEARCHER_SETTING);
+  return v && researcherNameOk(v.name) ? v.name.trim() : undefined;
+}
+
+/** Sets (or, with null, clears) the researcher's display name on this device. */
+export async function setResearcherName(dir: string, name: string | null): Promise<string | undefined> {
+  if (name !== null && !researcherNameOk(name)) throw new TypeError("not a usable researcher name");
+  const next = await updateAppSetting<{ name?: string }>(dir, RESEARCHER_SETTING, () => (name === null ? {} : { name: name.trim() }));
+  return next.name;
+}
+
 /** One path segment character: anything but whitespace, separators, quotes and angle brackets. */
 const SEG = String.raw`[^\s/\\"'<>|]`;
 /** An absolute POSIX path; spaces are taken only inside folder names (another "/" follows). */

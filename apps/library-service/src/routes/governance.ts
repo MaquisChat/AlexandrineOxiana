@@ -14,7 +14,7 @@ import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
 import { effectivePolicy, parseGovernance } from "@ao/core";
-import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, retentionDue, scrubPaths } from "@ao/library";
+import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, researcherName, retentionDue, scrubPaths } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
 
@@ -136,9 +136,9 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
     const assetIds = strArray(b, "assetIds", { max: 10_000, itemMax: 64 });
     if (optBool(b, "confirm") !== true) throw badRequest("Destroying raw data cannot be undone: confirm it (confirm: true).");
     const includeDerived = optBool(b, "includeDerived") ?? false;
-    // Who destroys the data is the researcher this service runs as (the OS user; the app has no
-    // separate researcher-name setting yet), never text from the request (R117).
-    const by = whoAmI();
+    // Who destroys the data is the researcher named in this device's settings, else the OS user this
+    // service runs as; never text from the request (R117).
+    const by = (await researcherName(state.deps.appConfigDir)) ?? whoAmI();
     // Only originals that are due now can be destroyed through here; checked again inside the change.
     const now = state.deps.clock();
     const due = new Set((await retentionDue(s.repo, projectId, now)).flatMap((d) => d.assetIds));

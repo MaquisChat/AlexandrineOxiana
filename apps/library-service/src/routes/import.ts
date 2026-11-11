@@ -10,6 +10,7 @@ import {
   adapterFor,
   listWatchedFolders,
   removeWatchedFolder,
+  researcherName,
   startZoteroWebImport,
   watchFolder,
   zoteroWebAdapter,
@@ -151,7 +152,16 @@ export function registerImport(app: FastifyInstance, ctx: Ctx): void {
     const sessionId = optStr(b, "sessionId", 64);
     const participantIds = strArray(b, "participantIds", { optional: true, max: 1000, itemMax: 64 });
     const options = (optObj(b, "options") ?? {}) as ImportOptionsInput & { researcherName?: string };
-    const h = await s.bulk.importDeviceFolder(projectId, dir, { ...options, ...(sessionId ? { sessionId } : {}), ...(participantIds.length ? { participantIds } : {}) });
+    // The photographer: the name given for this import, else this device's researcher name (R84/R117).
+    const given = typeof options.researcherName === "string" ? options.researcherName.trim() : "";
+    const researcher = given || (await researcherName(state.deps.appConfigDir));
+    const { researcherName: _given, ...rest } = options;
+    const h = await s.bulk.importDeviceFolder(projectId, dir, {
+      ...rest,
+      ...(researcher ? { researcherName: researcher } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(participantIds.length ? { participantIds } : {}),
+    });
     state.followBatch(s, projectId, h);
     return { batchId: h.batchId };
   });

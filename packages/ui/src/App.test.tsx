@@ -11,7 +11,10 @@ useMockService();
 afterEach(() => window.history.replaceState(null, "", "/"));
 
 const service = { baseUrl: BASE, token: TOKEN };
-const appearance = () => http.get(url("/settings/appearance"), () => HttpResponse.json(DEFAULT_APPEARANCE));
+const appearance = () => [
+  http.get(url("/settings/appearance"), () => HttpResponse.json(DEFAULT_APPEARANCE)),
+  http.get(url("/settings/researcher"), () => HttpResponse.json({ name: null })),
+];
 
 function at(path: string) {
   window.history.replaceState(null, "", path);
@@ -25,20 +28,21 @@ describe("the app's one router (R118)", () => {
   });
 
   it("shows the library at / with no Back to library link", async () => {
-    server.use(appearance(), ...libraryHandlers());
+    server.use(...appearance(), ...libraryHandlers());
     render(<App service={service} />);
     expect(await screen.findByRole("navigation", { name: "Projects" })).toBeTruthy();
     expect(screen.queryByRole("link", { name: "Back to library" })).toBeNull();
   });
 
   it("Appearance link opens the settings in place; Back to library returns without a reload", async () => {
-    server.use(appearance(), ...libraryHandlers());
+    server.use(...appearance(), ...libraryHandlers());
     const user = userEvent.setup();
     render(<App service={service} />);
     await user.click(await screen.findByRole("link", { name: "Appearance" }));
     expect(window.location.pathname).toBe(PATHS.appearance);
     expect(window.location.hash).toBe("");
     expect(await screen.findByRole("heading", { name: /Appearance/ })).toBeTruthy();
+    expect(await screen.findByRole("textbox", { name: "Your name as researcher" })).toBeTruthy();
     expect(screen.queryByRole("navigation", { name: "Projects" })).toBeNull();
     const back = screen.getByRole("link", { name: "Back to library" });
     expect(back.getAttribute("href")).toBe("/");
@@ -48,7 +52,7 @@ describe("the app's one router (R118)", () => {
   });
 
   it("/import/review shows the review queue with a working Back to library link", async () => {
-    server.use(appearance(), ...libraryHandlers(), http.get(url("/projects/:id/imports"), () => HttpResponse.json({ batches: [] })));
+    server.use(...appearance(), ...libraryHandlers(), http.get(url("/projects/:id/imports"), () => HttpResponse.json({ batches: [] })));
     at(PATHS.reviewQueue);
     const user = userEvent.setup();
     render(<App service={service} />);
@@ -58,7 +62,7 @@ describe("the app's one router (R118)", () => {
   });
 
   it("the library's needs-review link reaches the review queue", async () => {
-    server.use(appearance(), ...libraryHandlers(), http.get(url("/projects/:id/imports"), () => HttpResponse.json({ batches: [] })));
+    server.use(...appearance(), ...libraryHandlers(), http.get(url("/projects/:id/imports"), () => HttpResponse.json({ batches: [] })));
     render(<App service={service} />);
     await screen.findByRole("navigation", { name: "Projects" });
     act(() => navigate(PATHS.reviewQueue));
@@ -69,7 +73,7 @@ describe("the app's one router (R118)", () => {
   });
 
   it("the Import link in the library opens the wizard for the selected project", async () => {
-    server.use(appearance(), ...libraryHandlers());
+    server.use(...appearance(), ...libraryHandlers());
     const user = userEvent.setup();
     render(<App service={service} />);
     const header = (await screen.findByRole("heading", { level: 1 })).closest("header")!;
@@ -80,7 +84,7 @@ describe("the app's one router (R118)", () => {
   });
 
   it("Governance and records opens the Task 36 screens for the library's project, with Back to library", async () => {
-    server.use(appearance(), ...libraryHandlers(), http.get(url("/projects/:id/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })));
+    server.use(...appearance(), ...libraryHandlers(), http.get(url("/projects/:id/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })));
     const user = userEvent.setup();
     render(<App service={service} />);
     const header = (await screen.findByRole("heading", { level: 1 })).closest("header")!;
@@ -93,7 +97,7 @@ describe("the app's one router (R118)", () => {
   });
 
   it("an unknown path says so and offers Back to library", async () => {
-    server.use(appearance(), ...libraryHandlers());
+    server.use(...appearance(), ...libraryHandlers());
     at("/nowhere");
     render(<App service={service} />);
     expect(screen.getByRole("heading", { name: "Page not found" })).toBeTruthy();
@@ -101,7 +105,7 @@ describe("the app's one router (R118)", () => {
   });
 
   it("a file dropped anywhere outside a drop zone does not navigate the app away", () => {
-    server.use(appearance(), ...libraryHandlers());
+    server.use(...appearance(), ...libraryHandlers());
     render(<App service={service} />);
     expect(fireEvent.dragOver(document.body)).toBe(false);
     expect(fireEvent.drop(document.body)).toBe(false);

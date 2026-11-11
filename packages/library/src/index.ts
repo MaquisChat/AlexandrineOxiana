@@ -232,7 +232,18 @@ export {
 export type { FolderWatch, WatchDeps, WatchEvent, WatchSettingsDeps } from "./import/watch.js";
 export { ARCHIVE_LIMITS } from "./extract/zip.js";
 export * from "./lookup/index.js";
-export { appConfigDir, deviceDeps, ensurePrivateDir, readAppSetting, scrubPaths, updateAppSetting } from "./app-settings.js";
+export {
+  RESEARCHER_NAME_MAX,
+  appConfigDir,
+  deviceDeps,
+  ensurePrivateDir,
+  readAppSetting,
+  researcherName,
+  researcherNameOk,
+  scrubPaths,
+  setResearcherName,
+  updateAppSetting,
+} from "./app-settings.js";
 export {
   ASSET_TEXT_MAX_BYTES,
   CONFIRMABLE_FIELDS,

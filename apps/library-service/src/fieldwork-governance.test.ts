@@ -207,3 +207,46 @@ describe("retention (spec 6.3(5))", () => {
     expect((await call({ url: `/projects/${pid}/retention` })).json.due).toEqual([]);
   });
 });
+
+describe("researcher name (device setting, R84/R117 carry-over)", () => {
+  it("GET/PUT /settings/researcher keeps a display name on this device; invalid names are refused", async () => {
+    expect((await call({ url: "/settings/researcher" })).json).toEqual({ name: null });
+    for (const name of ["", "   ", "a".repeat(201), "Ana‮Souza", "Ana\nSouza", 7]) {
+      expect((await call({ method: "PUT", url: "/settings/researcher", body: { name } })).status, JSON.stringify(name)).toBe(400);
+    }
+    const put = await call({ method: "PUT", url: "/settings/researcher", body: { name: "  Ana Souza " } });
+    expect(put.status, put.body).toBe(200);
+    expect(put.json).toEqual({ name: "Ana Souza" });
+    expect((await call({ url: "/settings/researcher" })).json).toEqual({ name: "Ana Souza" });
+    expect(JSON.parse(await readFile(join(tmp, "config", "researcher.json"), "utf8"))).toEqual({ name: "Ana Souza" });
+    expect((await call({ method: "PUT", url: "/settings/researcher", body: { name: null } })).json).toEqual({ name: null });
+  });
+
+  it("the destruction certificate names the researcher from the setting (still never from the request)", async () => {
+    await call({ method: "PUT", url: "/settings/researcher", body: { name: "Ana Souza" } });
+    const { assetId } = await newSource();
+    const r = await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true, by: "Somebody Else" } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.certificate.actor).toBe("Ana Souza");
+    expect(JSON.stringify(r.json.certificate)).not.toContain("Somebody Else");
+  });
+
+  it("a device import without a researcher name in its options uses the setting as the photographer", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    await call({ method: "PUT", url: "/settings/researcher", body: { name: "Ana Souza" } });
+    const dir = join(tmp, "DCIM");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "note.txt"), "x");
+    const dev = await call({ method: "POST", url: "/projects", body: { name: "Device", governanceYaml: FIELD_GOV.replace("captureMethods: [manual_upload]", "captureMethods: [manual_upload, device_import]"), encryption: { enabled: false } } });
+    expect(dev.status, dev.body).toBe(200);
+    const devPid = dev.json.project.id as string;
+    const r = await call({ method: "POST", url: `/projects/${devPid}/device-import`, body: { dir } });
+    expect(r.status, r.body).toBe(200);
+    await svc.state.idle();
+    const folder = svc.state.session!.repo.getProject(devPid).folder;
+    const { readdir } = await import("node:fs/promises");
+    const batches = (await readdir(join(tmp, "Lib", folder, "imports"))).sort();
+    const rec = JSON.parse(await readFile(join(tmp, "Lib", folder, "imports", batches.at(-1)!, "batch.json"), "utf8"));
+    expect(rec.adapterOptions).toEqual({ researcherName: "Ana Souza" });
+  });
+});
