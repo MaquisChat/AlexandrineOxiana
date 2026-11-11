@@ -78,17 +78,18 @@ beforeEach(async () => {
 afterEach(async () => {
   seams.crashAt = undefined;
   seams.failUndo = undefined;
+  seams.failAuditAppendFor = undefined;
   await lib.close();
   ring.clear();
   await rm(tmp, { recursive: true, force: true });
 });
 
 /** A change interrupted before its audit event, left unresolved on reopen because an earlier audit event was altered. */
-async function unverifiableOnReopen() {
+async function unverifiableOnReopen(crash: "before-audit" | "torn-audit" = "before-audit") {
   let repo = await repoFor();
   const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
   await add(repo, pid, "Kept");
-  seams.crashAt = "before-audit";
+  seams.crashAt = crash;
   await expect(add(repo, pid, "Half written")).rejects.toBeInstanceOf(SimulatedCrash);
   // Alter an early audit event: the chain before the interrupted change no longer verifies.
   const seg = join(lib.root, repo.getProject(pid).folder, "audit", "0001.jsonl");
@@ -101,17 +102,49 @@ async function unverifiableOnReopen() {
   return { repo, pid };
 }
 
+/**
+ * A plainly uncommitted change (interrupted before its audit event) whose automatic rollback on
+ * reopen failed part-way: the marker stays, the project is blocked, and the researcher may roll it back.
+ */
+async function uncommittedOnReopen() {
+  let repo = await repoFor();
+  const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+  await add(repo, pid, "Kept");
+  seams.crashAt = "before-audit";
+  await expect(add(repo, pid, "Half written")).rejects.toBeInstanceOf(SimulatedCrash);
+  seams.failUndo = "append";
+  repo = await reopen();
+  seams.failUndo = undefined;
+  expect(repo.integrityWarnings.map((w) => w.kind)).toContain("rolled-back-incomplete-write");
+  return { repo, pid };
+}
+
+const titlesOf = async (repo: Repo, pid: string) =>
+  (await Promise.all(repo.listSourceIds(pid).map((id) => repo.getSource(pid, id)))).map((s) => s.source.title.variants[0]!.value).sort();
+
+/** Every file of the project's audit log and change logs, byte for byte. */
+async function logBytes(repo: Repo, pid: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  const folder = join(lib.root, repo.getProject(pid).folder);
+  for (const sub of ["audit", "changes"]) {
+    for (const f of (await readdir(join(folder, sub)).catch(() => [] as string[])).sort()) out[`${sub}/${f}`] = (await readFile(join(folder, sub, f))).toString("base64");
+  }
+  return out;
+}
+
+const anchorsFile = () => join(tmp, "config", "audit-anchors.json");
+const anchorOf = async (pid: string) => (JSON.parse(await readFile(anchorsFile(), "utf8")) as { anchors: Record<string, { seq: number; hash: string }> }).anchors[`${lib.id}/${pid}`];
+
 describe("pending writes (R27)", () => {
   it("lists an interrupted change recovery could not settle, with the choices it allows", async () => {
-    const { repo, pid } = await unverifiableOnReopen();
-    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("txn-recovery-skipped-audit-unverifiable");
+    const { repo, pid } = await uncommittedOnReopen();
     const list = await repo.pendingWrites();
-    expect(list).toEqual([expect.objectContaining({ projectId: pid, status: "unverifiable", canRollBack: true, canKeep: false })]);
+    expect(list).toEqual([expect.objectContaining({ projectId: pid, status: "uncommitted", canRollBack: true, canKeep: false })]);
     expect(list[0]!.txn).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it("roll back: undoes the half-written change, removes the marker, audits the choice and lifts the block", async () => {
-    const { repo, pid } = await unverifiableOnReopen();
+    const { repo, pid } = await uncommittedOnReopen();
     await expect(add(repo, pid, "Blocked")).rejects.toBeInstanceOf(RecoveryPendingError);
     const [pw] = await repo.pendingWrites();
     await expect(repo.resolvePendingWrite(pw!.txn, "keep")).rejects.toBeInstanceOf(PendingWriteChoiceError);
@@ -119,18 +152,17 @@ describe("pending writes (R27)", () => {
     expect(r).toMatchObject({ txn: pw!.txn, choice: "roll-back" });
     expect(await markers()).toEqual([]);
     expect(await repo.pendingWrites()).toEqual([]);
-    const titles = (await Promise.all(repo.listSourceIds(pid).map((id) => repo.getSource(pid, id)))).map((s) => s.source.title.variants[0]!.value);
-    expect(titles).toEqual(["Kept"]);
+    expect(await titlesOf(repo, pid)).toEqual(["Kept"]);
     const resolved = (await audit(repo, pid)).filter((e) => e.action === "txn.resolve");
     expect(resolved).toHaveLength(1);
-    expect(resolved[0]!.details).toMatchObject({ txn: pw!.txn, choice: "roll-back", status: "unverifiable" });
+    expect(resolved[0]!.details).toMatchObject({ txn: pw!.txn, choice: "roll-back", status: "uncommitted" });
     expect(repo.integrityWarnings.some((w) => w.detail.includes(pw!.txn))).toBe(false);
     // The project takes changes again.
     await add(repo, pid, "After");
   });
 
   it("a rollback step that fails keeps the marker and records nothing", async () => {
-    const { repo, pid } = await unverifiableOnReopen();
+    const { repo, pid } = await uncommittedOnReopen();
     const [pw] = await repo.pendingWrites();
     const before = (await audit(repo, pid)).length;
     seams.failUndo = "append";
@@ -179,5 +211,192 @@ describe("pending writes (R27)", () => {
     expect((await ro.pendingWrites()).map((p) => p.txn)).toEqual([pw!.txn]);
     await expect(ro.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(ReadOnlyLibraryError);
     expect(pid).toBeTruthy();
+  });
+});
+
+describe("pending writes: an unverifiable change is never acted on (R131 a, b)", () => {
+  it("P3: chain before the change does not verify (torn audit line): no choice is offered, roll-back is refused and nothing changes", async () => {
+    const { repo, pid } = await unverifiableOnReopen("torn-audit");
+    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("txn-recovery-skipped-audit-unverifiable");
+    const [pw] = await repo.pendingWrites();
+    expect(pw).toMatchObject({ projectId: pid, status: "unverifiable", canKeep: false, canRollBack: false });
+    expect(pw!.detail).toMatch(/audit/);
+    expect(pw!.detail).not.toContain(lib.root);
+    const before = await logBytes(repo, pid);
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    await expect(repo.resolvePendingWrite(pw!.txn, "keep")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    expect(await logBytes(repo, pid)).toEqual(before);
+    expect(await markers()).toHaveLength(1);
+    await expect(add(repo, pid, "Still blocked")).rejects.toBeInstanceOf(RecoveryPendingError);
+  });
+
+  it("P1: the anchor is past the change's start (a later change committed): no choice, roll-back refused, the later change's log and the anchor untouched", async () => {
+    const repo = await repoFor();
+    const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    seams.crashAt = "before-audit";
+    await expect(add(repo, pid, "T1 half written")).rejects.toBeInstanceOf(SimulatedCrash);
+    // The marker outlives its session: a later change in the same project commits.
+    await add(repo, pid, "T2");
+    const [pw] = await repo.pendingWrites();
+    expect(pw).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: false });
+    const anchor = await anchorOf(pid);
+    const before = await logBytes(repo, pid);
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+    expect(await logBytes(repo, pid)).toEqual(before);
+    expect(await anchorOf(pid)).toEqual(anchor);
+    expect(await markers()).toHaveLength(1);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toEqual([]);
+  });
+
+  it("an append offset that does not land on a line boundary: recovery on open does not roll back, and no choice is offered (R131 b, e)", async () => {
+    let repo = await repoFor();
+    const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    await add(repo, pid, "Kept");
+    seams.crashAt = "before-audit";
+    await expect(add(repo, pid, "Half written")).rejects.toBeInstanceOf(SimulatedCrash);
+    const [name] = await markers();
+    const path = join(lib.root, ".tmp", name!);
+    const m = JSON.parse(await readFile(path, "utf8")) as { entries: Array<{ kind: string; path?: string; prevSize?: number }> };
+    const log = m.entries.find((e) => e.kind === "append" && e.path!.includes("/changes/"))!;
+    log.prevSize = log.prevSize! - 1; // mid-line: truncating there would cut a committed line
+    await writeFile(path, JSON.stringify(m));
+    const before = await logBytes(repo, pid);
+    repo = await reopen();
+    expect(repo.integrityWarnings.map((w) => w.kind)).toContain("txn-recovery-skipped-audit-unverifiable");
+    expect(await markers()).toHaveLength(1);
+    const after = await logBytes(repo, pid);
+    for (const k of Object.keys(before).filter((k) => k.startsWith("changes/"))) expect(after[k], k).toBe(before[k]);
+    const [pw] = await repo.pendingWrites();
+    expect(pw).toMatchObject({ status: "unverifiable", canKeep: false, canRollBack: false });
+    expect(pw!.detail).toMatch(/line/);
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(PendingWriteChoiceError);
+  });
+});
+
+describe("pending writes: the resolve is durable before it acts (R131 c, d)", () => {
+  afterEach(() => {
+    seams.failAuditAppendFor = undefined;
+  });
+
+  /** After reopening: the choice was carried out and audited exactly once, and the project takes changes. */
+  async function finishedAfterReopen(txn: string, pid: string) {
+    const repo = await reopen();
+    expect(await markers()).toEqual([]);
+    const resolved = (await audit(repo, pid)).filter((e) => e.action === "txn.resolve");
+    expect(resolved.map((e) => e.details)).toEqual([expect.objectContaining({ txn, choice: "roll-back", status: "uncommitted" })]);
+    expect(await titlesOf(repo, pid)).toEqual(["Kept"]);
+    const kinds = repo.integrityWarnings.map((w) => w.kind);
+    for (const k of ["chain-broken", "head-mismatch", "truncated", "anchor-missing", "incomplete-audit-line-pending", "audit-append-failed-at-open"] as const) expect(kinds).not.toContain(k);
+    await add(repo, pid, "After");
+    return repo;
+  }
+
+  it("P2: the audit append fails after the rollback: the marker keeps the recorded choice, nothing is silent, and the next open completes and audits it", async () => {
+    const { repo, pid } = await uncommittedOnReopen();
+    const [pw] = await repo.pendingWrites();
+    seams.failAuditAppendFor = pid;
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toThrow(/simulated audit append failure/);
+    seams.failAuditAppendFor = undefined;
+    expect(await markers()).toHaveLength(1);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toEqual([]);
+    await expect(add(repo, pid, "Still blocked")).rejects.toBeInstanceOf(RecoveryPendingError);
+    // Offered again with the recorded choice only.
+    expect(await repo.pendingWrites()).toEqual([expect.objectContaining({ txn: pw!.txn, canRollBack: true, canKeep: false })]);
+    await finishedAfterReopen(pw!.txn, pid);
+  });
+
+  it("P2 (same session): resolving again after a failed audit append finishes it, audited once", async () => {
+    const { repo, pid } = await uncommittedOnReopen();
+    const [pw] = await repo.pendingWrites();
+    seams.failAuditAppendFor = pid;
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toThrow();
+    seams.failAuditAppendFor = undefined;
+    await repo.resolvePendingWrite(pw!.txn, "roll-back");
+    expect(await markers()).toEqual([]);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toHaveLength(1);
+    await add(repo, pid, "After");
+  });
+
+  for (const point of ["before-changes", "before-audit", "before-marker-delete"] as const) {
+    it(`a crash ${point === "before-changes" ? "before the action" : point === "before-audit" ? "between the action and the audit event" : "after the audit event, before the marker is removed"}: the next open finishes it, audited exactly once`, async () => {
+      const { repo, pid } = await uncommittedOnReopen();
+      const [pw] = await repo.pendingWrites();
+      seams.crashAt = point;
+      await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(SimulatedCrash);
+      expect(await markers()).toHaveLength(1);
+      await finishedAfterReopen(pw!.txn, pid);
+    });
+  }
+
+  it("keep: a crash after the audit event leaves a marker the next open removes, with no second record", async () => {
+    let repo = await repoFor();
+    const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    seams.crashAt = "before-marker-delete";
+    await expect(add(repo, pid, "Committed")).rejects.toBeInstanceOf(SimulatedCrash);
+    const [pw] = await repo.pendingWrites();
+    seams.crashAt = "before-marker-delete";
+    await expect(repo.resolvePendingWrite(pw!.txn, "keep")).rejects.toBeInstanceOf(SimulatedCrash);
+    repo = await reopen();
+    expect(await markers()).toEqual([]);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve").map((e) => e.details)).toEqual([expect.objectContaining({ txn: pw!.txn, choice: "keep", status: "committed" })]);
+    expect(repo.listSourceIds(pid)).toHaveLength(1);
+  });
+
+  it("a recorded choice whose step fails on open stays recorded and blocks the project; the open after that completes it", async () => {
+    let repo = (await uncommittedOnReopen()).repo;
+    const pid = repo.listProjects()[0]!.id;
+    const [pw] = await repo.pendingWrites();
+    seams.crashAt = "before-changes";
+    await expect(repo.resolvePendingWrite(pw!.txn, "roll-back")).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.failUndo = "append";
+    repo = await reopen();
+    seams.failUndo = undefined;
+    expect(await markers()).toHaveLength(1);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toEqual([]);
+    await expect(add(repo, pid, "Blocked")).rejects.toBeInstanceOf(RecoveryPendingError);
+    await finishedAfterReopen(pw!.txn, pid);
+  });
+
+  it("(d) a resolve never moves the anchor past a mismatch: recorded on the next open instead", async () => {
+    const { repo, pid } = await uncommittedOnReopen();
+    // The anchor names the change's start but with a different event there.
+    const raw = JSON.parse(await readFile(anchorsFile(), "utf8")) as { anchors: Record<string, { seq: number; hash: string }> };
+    raw.anchors[`${lib.id}/${pid}`]!.hash = "0".repeat(64);
+    await writeFile(anchorsFile(), JSON.stringify(raw));
+    const anchor = await anchorOf(pid);
+    const [pw] = await repo.pendingWrites();
+    expect(pw).toMatchObject({ status: "uncommitted", canRollBack: true });
+    await repo.resolvePendingWrite(pw!.txn, "roll-back");
+    expect(await anchorOf(pid)).toEqual(anchor);
+    expect((await audit(repo, pid)).filter((e) => e.action === "txn.resolve")).toHaveLength(1);
+    // Writes would move the anchor: they wait for the next open, which records the mismatch first.
+    await expect(add(repo, pid, "Not yet")).rejects.toBeInstanceOf(RecoveryPendingError);
+    const again = await reopen();
+    expect((await audit(again, pid)).map((e) => e.action)).toContain("audit.anchor-mismatch");
+    await add(again, pid, "After");
+  });
+
+  it("M1: after a rollback that removed a torn audit line, the project is not kept blocked by the stale warning", async () => {
+    let repo = await repoFor();
+    const pid = (await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } })).project.id;
+    await add(repo, pid, "Kept");
+    seams.crashAt = "torn-audit";
+    await expect(add(repo, pid, "Half written")).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.failUndo = "append";
+    repo = await reopen();
+    seams.failUndo = undefined;
+    const [pw] = await repo.pendingWrites();
+    expect(pw).toMatchObject({ status: "uncommitted", canRollBack: true });
+    await repo.resolvePendingWrite(pw!.txn, "roll-back");
+    expect(repo.integrityWarnings.map((w) => w.kind)).not.toContain("incomplete-audit-line-pending");
+    await add(repo, pid, "After");
+  });
+
+  it("M3: a read-only library lists markers but offers no choice", async () => {
+    const { pid } = await uncommittedOnReopen();
+    const ro = await openTestRepo(await openLibrary(lib.root, mkDeps({ deviceId: "dev-B", hostname: "host-B", pid: 99 })), ring, { clock: () => new Date(NOW), tz: "UTC" });
+    const [pw] = await ro.pendingWrites();
+    expect(pw).toMatchObject({ projectId: pid, canKeep: false, canRollBack: false });
+    expect(pw!.detail).toMatch(/read-only/);
   });
 });
