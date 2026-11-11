@@ -87,7 +87,7 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     render(<FieldCheck review={FIELD_PUBLISHER_SINGLE} label="Publisher" value="University Press" readOnly={false} onConfirm={onConfirm} />);
     await user.click(screen.getByRole("button", { name: "Publisher: Single source" }));
     await user.click(screen.getByRole("button", { name: "Confirm this value" }));
-    expect(onConfirm).toHaveBeenCalledWith("publisher", "University Press");
+    expect(onConfirm).toHaveBeenCalledWith("/publisher", "University Press");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
@@ -103,7 +103,7 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     expect((recorded as HTMLInputElement).checked).toBe(true);
     await user.click(lookup);
     await user.click(within(pop).getByRole("button", { name: "Confirm this value" }));
-    expect(onConfirm).toHaveBeenCalledWith("issued", "2018");
+    expect(onConfirm).toHaveBeenCalledWith("/issued", "2018");
   });
 
   it("a conflict can be resolved by typing another value", async () => {
@@ -114,7 +114,7 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     await user.click(screen.getByRole("radio", { name: "Type another value" }));
     await user.type(screen.getByRole("textbox", { name: "Your value" }), "2018-05");
     await user.click(screen.getByRole("button", { name: "Confirm this value" }));
-    expect(onConfirm).toHaveBeenCalledWith("issued", "2018-05");
+    expect(onConfirm).toHaveBeenCalledWith("/issued", "2018-05");
   });
 
   it("an empty typed value is not sent", async () => {
@@ -140,7 +140,7 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     await user.click(screen.getByRole("button", { name: "Title: Conflict" }));
     await user.click(screen.getByRole("radio", { name: /A Study/ }));
     await user.click(screen.getByRole("button", { name: "Confirm this value" }));
-    expect(onConfirm).toHaveBeenCalledWith("title", { variants: [{ lang: "en", kind: "original", value: "Ethnography at Work: A Study" }, { lang: "fr", kind: "translated", value: "L'ethnographie" }] });
+    expect(onConfirm).toHaveBeenCalledWith("/title", { variants: [{ lang: "en", kind: "original", value: "Ethnography at Work: A Study" }, { lang: "fr", kind: "translated", value: "L'ethnographie" }] });
   });
 
   it("a failed confirm says why in plain words and keeps the popover, the choice and the typed text", async () => {
@@ -162,7 +162,7 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     expect((screen.getByRole("textbox", { name: "Your value" }) as HTMLInputElement).value).toBe("2017");
     fail = false;
     await user.click(screen.getByRole("button", { name: "Confirm this value" }));
-    expect(onConfirm).toHaveBeenLastCalledWith("issued", "2017");
+    expect(onConfirm).toHaveBeenLastCalledWith("/issued", "2017");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
@@ -189,12 +189,109 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     expect(screen.getByText(/read-only/)).toBeTruthy();
   });
 
-  it("a field the service cannot confirm on its own (an identifier inside the identifiers) says so instead of offering Confirm", async () => {
+  it("an identifier (R149): Confirm posts the badge's own key, /identifiers/doi, unchanged", async () => {
+    const onConfirm = vi.fn(noop);
     const user = userEvent.setup();
-    render(<FieldCheck review={{ ...FIELD_DOI_CONFIRMED, status: "unverified" }} label="DOI" value="10.1000/xyz" readOnly={false} onConfirm={noop} />);
+    render(<FieldCheck review={{ ...FIELD_DOI_CONFIRMED, status: "unverified" }} label="DOI" value="10.1000/xyz" readOnly={false} onConfirm={onConfirm} />);
     await user.click(screen.getByRole("button", { name: "DOI: Unverified" }));
-    expect(screen.queryByRole("button", { name: "Confirm this value" })).toBeNull();
-    expect(screen.getByText(/cannot be confirmed here/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(onConfirm).toHaveBeenCalledWith("/identifiers/doi", "10.1000/xyz");
+  });
+
+  it("an identifier conflict with no evidence entries still shows the competing value and its source, and choosing it posts it (R149)", async () => {
+    const onConfirm = vi.fn(noop);
+    const user = userEvent.setup();
+    const review: FieldReview = {
+      field: "/identifiers/doi",
+      status: "conflict",
+      checks: ["doi-lookup"],
+      reason: "The DOI resolves to a different work.",
+      values: [{ value: "10.1/other", from: { kind: "lookup", label: "an online lookup (crossref)", provider: "crossref" } }],
+      evidence: [],
+    };
+    render(<FieldCheck review={review} label="DOI" value="10.1/mine" readOnly={false} onConfirm={onConfirm} />);
+    await user.click(screen.getByRole("button", { name: "DOI: Conflict" }));
+    const pop = screen.getByRole("dialog", { name: "DOI: evidence" });
+    expect(pop.textContent).not.toContain("Edit details");
+    const other = within(pop).getByRole("radio", { name: /10\.1\/other.*an online lookup \(crossref\)/ });
+    await user.click(other);
+    await user.click(within(pop).getByRole("button", { name: "Confirm this value" }));
+    expect(onConfirm).toHaveBeenCalledWith("/identifiers/doi", "10.1/other");
+  });
+
+  it("a conflict on a field that cannot be confirmed here still lists the competing values with their sources (never hidden), without false advice", async () => {
+    const user = userEvent.setup();
+    const review: FieldReview = {
+      field: "/caseAttributes/site",
+      status: "conflict",
+      checks: ["cross-source"],
+      values: [{ value: "North clinic", from: { kind: "zotero", label: "the Zotero record" } }],
+      evidence: [],
+    };
+    render(<FieldCheck review={review} label="Site" value="South clinic" readOnly={false} onConfirm={noop} />);
+    await user.click(screen.getByRole("button", { name: "Site: Conflict" }));
+    const pop = screen.getByRole("dialog");
+    const list = within(pop).getByRole("list", { name: "Values the sources give for Site" });
+    expect(within(list).getByText("North clinic").closest("[dir=auto]")).toBeTruthy();
+    expect(within(list).getByText("the Zotero record")).toBeTruthy();
+    expect(within(pop).queryByRole("button", { name: "Confirm this value" })).toBeNull();
+    expect(pop.textContent).not.toContain("Edit details");
+    expect(pop.textContent).toContain("cannot be confirmed from this screen");
+  });
+
+  it("is a modal dialog (R113, R145): the rest of the page is inert while it is open, and only one is open at a time", async () => {
+    const user = userEvent.setup();
+    const outside = vi.fn();
+    render(
+      <>
+        <button type="button" onClick={outside}>
+          Edit details
+        </button>
+        <FieldCheck review={FIELD_PUBLISHER_SINGLE} label="Publisher" value="University Press" readOnly={false} onConfirm={noop} />
+        <FieldCheck review={FIELD_ISSUED_CONFLICT} label="Date" value="2019" readOnly={false} onConfirm={noop} />
+      </>,
+    );
+    const background = screen.getByRole("button", { name: "Edit details" });
+    await user.click(screen.getByRole("button", { name: "Publisher: Single source" }));
+    const pop = screen.getByRole("dialog", { name: "Publisher: evidence" });
+    expect(pop.getAttribute("aria-modal")).toBe("true");
+    expect(background.closest("[inert]")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Date: Conflict" }).closest("[inert]")).toBeTruthy();
+    expect(pop.closest("[inert]")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(document.querySelector("[inert]")).toBeNull();
+  });
+
+  it("focus (R145): moves in on open, Tab and Shift+Tab stay inside and wrap, and Close returns it to the badge", async () => {
+    const user = userEvent.setup();
+    render(<FieldCheck review={FIELD_ISSUED_CONFLICT} label="Date" value="2019" readOnly={false} onConfirm={noop} />);
+    const badge = screen.getByRole("button", { name: "Date: Conflict" });
+    await user.click(badge);
+    const pop = screen.getByRole("dialog");
+    const first = within(pop).getByRole("radio", { name: /2019/ });
+    const close = within(pop).getByRole("button", { name: "Close" });
+    expect(document.activeElement).toBe(first);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(close);
+    await user.tab();
+    expect(document.activeElement).toBe(first);
+    for (let i = 0; i < 5; i++) {
+      await user.tab({ shift: true });
+      expect(pop.contains(document.activeElement)).toBe(true);
+    }
+    await user.click(close);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(badge));
+  });
+
+  it("focus (R145): after a successful Confirm it returns to the badge", async () => {
+    const user = userEvent.setup();
+    render(<FieldCheck review={FIELD_PUBLISHER_SINGLE} label="Publisher" value="University Press" readOnly={false} onConfirm={noop} />);
+    const badge = screen.getByRole("button", { name: "Publisher: Single source" });
+    await user.click(badge);
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(badge));
   });
 
   it("a value that is not text is never shown as raw JSON", async () => {

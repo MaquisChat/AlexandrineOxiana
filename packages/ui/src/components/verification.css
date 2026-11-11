@@ -61,23 +61,35 @@
   color: var(--muted);
 }
 
-.ao-evidence {
-  position: absolute;
-  inset-inline-start: 0;
-  top: 100%;
-  z-index: 10;
-  width: min(30rem, 80vw);
-  margin-top: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--line-strong);
-  border-radius: 6px;
+/*
+ * The evidence dialog uses the shared dialog shell (ReasonDialog.tsx), whose classes are styled in
+ * GovernanceScreens.css; the same rules are repeated here so the dialog looks the same on the
+ * library screen, which does not load that file.
+ */
+.ao-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--backdrop);
+}
+
+.ao-dialog {
   background: var(--surface);
   color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: var(--space-3) var(--space-4);
+  max-width: 34rem;
+  width: calc(100% - 2rem);
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
 }
 
 .ao-evidence__title {
   margin: 0 0 var(--space-1);
-  font-size: 1rem;
+  font-size: 1.2rem;
 }
 
 .ao-evidence__item {

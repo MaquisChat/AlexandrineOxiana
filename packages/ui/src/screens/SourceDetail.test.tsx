@@ -122,9 +122,30 @@ describe("SourceDetail: verification (Task 34d)", () => {
     await user.click(await screen.findByRole("button", { name: "Publication date: Conflict" }));
     await user.click(screen.getByRole("radio", { name: /2018/ }));
     await user.click(screen.getByRole("button", { name: "Confirm this value" }));
-    expect(await screen.findByRole("button", { name: "Publication date: Confirmed by you" })).toBeTruthy();
-    expect(body).toEqual({ field: "issued", value: "2018" });
+    const confirmed = await screen.findByRole("button", { name: "Publication date: Confirmed by you" });
+    expect(body).toEqual({ field: "/issued", value: "2018" });
+    // R145: focus is back on the badge (re-rendered with its new status), and the page is no longer inert.
+    await waitFor(() => expect(document.activeElement).toBe(confirmed));
+    expect(document.querySelector("[inert]")).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("a DOI is confirmed through the field route under its own key (R149), and its badge then says Confirmed by you", async () => {
+    let body: unknown;
+    const doiUnverified = { ...FIELD_DOI_CONFIRMED, status: "unverified" as const, reason: "The DOI could not be checked." };
+    server.use(
+      ...sourceHandlers(withFields([doiUnverified])),
+      http.patch(url("/projects/:id/sources/:sid/fields"), async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json(withFields([FIELD_DOI_CONFIRMED]));
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "DOI: Unverified" }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(await screen.findByRole("button", { name: "DOI: Confirmed by you" })).toBeTruthy();
+    expect(body).toEqual({ field: "/identifiers/doi", value: "10.1000/xyz" });
   });
 
   it("a confirm the service refuses is explained in plain words; the popover and the choice stay", async () => {
