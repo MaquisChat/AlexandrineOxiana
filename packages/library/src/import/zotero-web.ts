@@ -34,7 +34,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "../resources.js";
 import * as nodePath from "node:path";
 import { join } from "node:path";
 import { Transform } from "node:stream";
@@ -54,7 +54,7 @@ import { extraCitationKey, ownValue, recordFields, zoteroAnnotation, zoteroCreat
 import { ZOTERO_NOTES, type NotImported } from "./zotero-local.js";
 import type { BatchHandle, BulkImportDeps } from "./bulk/run.js";
 
-const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 
 export const ZOTERO_API_ORIGIN = "https://api.zotero.org";
 
