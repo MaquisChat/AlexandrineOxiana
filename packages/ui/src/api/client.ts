@@ -78,8 +78,11 @@ export interface ApiClient {
     get(): Promise<AppearanceSettings>;
     put(patch: AppearancePatch): Promise<AppearanceSettings>;
   };
-  /** Server-sent events from GET /events, until the stream ends or `signal` aborts. */
-  events(opts?: { signal?: AbortSignal }): AsyncGenerator<ServiceEvent, void, undefined>;
+  /**
+   * Server-sent events from GET /events, until the stream ends or `signal` aborts. `onOpen` is
+   * called once the service has accepted the stream (events published from then on arrive).
+   */
+  events(opts?: { signal?: AbortSignal; onOpen?: () => void }): AsyncGenerator<ServiceEvent, void, undefined>;
 }
 
 export interface ClientOptions {
@@ -274,7 +277,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     return send<T>(method, url, o);
   }
 
-  async function* events(o: { signal?: AbortSignal } = {}): AsyncGenerator<ServiceEvent, void, undefined> {
+  async function* events(o: { signal?: AbortSignal; onOpen?: () => void } = {}): AsyncGenerator<ServiceEvent, void, undefined> {
     const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "text/event-stream" } };
     if (o.signal) init.signal = o.signal;
     let res: Response;
@@ -285,6 +288,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       throw unreachable();
     }
     if (!res.ok) throw await errorFrom(res);
+    o.onOpen?.();
     if (!res.body) return;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

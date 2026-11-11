@@ -9,7 +9,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../../api/client";
-import { importApi, type BatchState, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
+import { importApi, isValidId, type BatchState, type ImportPolicy, type ProjectInfo, type ScanSummary } from "../../api/import";
 import { UserText } from "../../components/UserText";
 import { ErrorNote, errorText } from "./shared";
 import { StepOptions, defaultOptions, type WizardOptions } from "./StepOptions";
@@ -53,20 +53,41 @@ export interface ImportWizardProps {
   projectId?: string;
 }
 
+/** What was scanned: the start request uses exactly this (R115 I2). */
+interface Scanned {
+  projectId: string;
+  choice: SourceChoice;
+  summary: ScanSummary;
+}
+
 export function ImportWizard({ client, projectId: initialProject }: ImportWizardProps) {
   const api = useMemo(() => importApi(client), [client]);
   const [step, setStep] = useState<Step>("source");
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [projectId, setProjectId] = useState(initialProject ?? "");
+  const [projectId, setProjectIdState] = useState(isValidId(initialProject) ? initialProject : "");
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
   const [choice, setChoice] = useState<SourceChoice>({ kind: "folder", path: "" });
-  const [summary, setSummary] = useState<ScanSummary | null>(null);
+  const [scanned, setScanned] = useState<Scanned | null>(null);
   const [approvals, setApprovals] = useState<OutsideApprovals>(NO_APPROVALS);
   const [options, setOptions] = useState<WizardOptions | null>(null);
   const [batchId, setBatchId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /** Any edit after a scan makes it stale: the scan and its approvals are dropped. */
+  const invalidate = () => {
+    setScanned(null);
+    setApprovals(NO_APPROVALS);
+  };
+  const setProjectId = (id: string) => {
+    setProjectIdState(id);
+    invalidate();
+  };
+  const editChoice = (c: SourceChoice) => {
+    setChoice(c);
+    invalidate();
+  };
 
   useEffect(() => {
     let live = true;
@@ -75,7 +96,7 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
       .then((list) => {
         if (!live) return;
         setProjects(list);
-        setProjectId((cur) => cur || (list.find((p) => p.unlocked !== false)?.id ?? ""));
+        setProjectIdState((cur) => (cur && list.some((p) => p.id === cur) ? cur : (list.find((p) => p.unlocked !== false && isValidId(p.id))?.id ?? "")));
       })
       .catch((e: unknown) => live && setError(errorText(e)));
     return () => {
@@ -84,7 +105,7 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
   }, [api]);
 
   useEffect(() => {
-    if (!projectId) return;
+    if (!isValidId(projectId)) return;
     let live = true;
     setPolicy(null);
     setOptions(null); // defaults follow the project's rules
@@ -103,8 +124,10 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
   const scan = async () => {
     setBusy(true);
     setError(null);
+    const snapshot = { projectId, choice };
     try {
-      setSummary(await api.dryRun(projectId, adapterOf(choice)));
+      const summary = await api.dryRun(snapshot.projectId, adapterOf(snapshot.choice));
+      setScanned({ ...snapshot, summary });
       setApprovals(NO_APPROVALS);
       setStep("scan");
     } catch (e) {
@@ -115,20 +138,22 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
   };
 
   const start = async () => {
+    if (!scanned) return;
     setBusy(true);
     setError(null);
     const approveOutside = approveOutsideOf(approvals);
     const o = { ...opts, ...(approveOutside ? { approveOutside } : {}) };
+    const c = scanned.choice;
     try {
       const r =
-        choice.kind === "device"
-          ? await api.deviceImport(projectId, {
-              dir: choice.dir,
-              ...(choice.sessionId ? { sessionId: choice.sessionId } : {}),
-              ...(choice.participantIds.length ? { participantIds: choice.participantIds } : {}),
-              options: o,
+        c.kind === "device"
+          ? await api.deviceImport(scanned.projectId, {
+              dir: c.dir,
+              ...(c.sessionId ? { sessionId: c.sessionId } : {}),
+              ...(c.participantIds.length ? { participantIds: c.participantIds } : {}),
+              options: { ...o, ...(c.researcherName.trim() ? { researcherName: c.researcherName.trim() } : {}) },
             })
-          : await api.start(projectId, adapterOf(choice), o);
+          : await api.start(scanned.projectId, adapterOf(c), o);
       setBatchId(r.batchId);
       setStep("run");
     } catch (e) {
@@ -173,21 +198,22 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
           projectId={projectId}
           onProject={setProjectId}
           choice={choice}
-          onChoice={setChoice}
+          onChoice={editChoice}
           busy={busy}
           error={error}
           onScan={() => void scan()}
+          {...(scanned ? { onNext: () => setStep("scan") } : {})}
         />
       )}
-      {step === "scan" && summary && (
+      {step === "scan" && scanned && (
         <>
-          <StepScan summary={summary} sourceName={describeChoice(choice)} approvals={approvals} onApprovals={setApprovals} />
+          <StepScan summary={scanned.summary} sourceName={describeChoice(scanned.choice)} approvals={approvals} onApprovals={setApprovals} device={scanned.choice.kind === "device"} />
           <Nav onBack={() => setStep("source")} onNext={() => setStep("review")} />
         </>
       )}
       {step === "review" && (
         <>
-          <StepReview policy={effectivePolicy} likelyDuplicates={summary?.likelyDuplicates ?? 0} />
+          <StepReview policy={effectivePolicy} likelyDuplicates={scanned?.summary.likelyDuplicates ?? 0} />
           <Nav onBack={() => setStep("scan")} onNext={() => setStep("options")} />
         </>
       )}
@@ -199,14 +225,14 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
             <button type="button" onClick={() => setStep("review")} disabled={busy}>
               Back
             </button>
-            <button type="button" className="ao-import__primary" onClick={() => void start()} disabled={busy || policy === null}>
+            <button type="button" className="ao-import__primary" onClick={() => void start()} disabled={busy || policy === null || !scanned}>
               Start import
             </button>
           </div>
         </>
       )}
-      {step === "run" && batchId && <StepRun client={client} api={api} projectId={projectId} batchId={batchId} onEnded={ended} />}
-      {step === "report" && batchId && <StepReport api={api} projectId={projectId} batchId={batchId} {...(runError ? { error: runError } : {})} />}
+      {step === "run" && batchId && scanned && <StepRun client={client} api={api} projectId={scanned.projectId} batchId={batchId} onEnded={ended} />}
+      {step === "report" && batchId && scanned && <StepReport api={api} projectId={scanned.projectId} batchId={batchId} {...(runError ? { error: runError } : {})} />}
     </main>
   );
 }

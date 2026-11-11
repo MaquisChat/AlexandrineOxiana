@@ -10,6 +10,7 @@
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
+import { isId } from "@ao/core/src/ids";
 import type { ApiClient } from "./client";
 
 // ---------------------------------------------------------------------------------------------
@@ -242,7 +243,28 @@ export interface ImportPolicy {
 // ---------------------------------------------------------------------------------------------
 // Methods
 
-const seg = (s: string) => encodeURIComponent(s);
+/** One path segment: never empty, "." or ".." (they would change the route), always encoded. */
+export function seg(s: string): string {
+  if (typeof s !== "string" || s === "" || s === "." || s === "..") throw new Error(`"${String(s)}" cannot be part of a service path.`);
+  return encodeURIComponent(s);
+}
+
+/** True for a project or batch id the service could have made (a UUIDv7, the core Id). */
+export const isValidId = (s: string | null | undefined): s is string => typeof s === "string" && isId(s);
+
+/** The id, checked as a UUIDv7 before it is put in a path (R115 I3). */
+function id(kind: "project" | "batch", s: string): string {
+  if (!isValidId(s)) throw new Error(`"${String(s)}" is not a valid ${kind} id.`);
+  return seg(s);
+}
+const pid = (s: string) => id("project", s);
+const bid = (s: string) => id("batch", s);
+
+/** When a UUIDv7 id was minted (ms since 1970), or undefined for anything else. */
+export function idTime(s: string): number | undefined {
+  if (!isValidId(s)) return undefined;
+  return parseInt(s.slice(0, 8) + s.slice(9, 13), 16);
+}
 
 /**
  * The import-relevant reading of a project's governance.yaml. Unreadable rules count as the
@@ -265,36 +287,44 @@ export function importApi(client: ApiClient) {
   return {
     projects: async () => (await r<{ projects: ProjectInfo[] }>("GET", "/projects")).projects,
     policy: async (projectId: string): Promise<ImportPolicy> =>
-      importPolicyFromYaml((await r<{ yaml: string }>("GET", `/projects/${seg(projectId)}/governance`)).yaml),
+      importPolicyFromYaml((await r<{ yaml: string }>("GET", `/projects/${pid(projectId)}/governance`)).yaml),
 
     dryRun: (projectId: string, adapter: ImportAdapter, approveOutside?: ApproveOutside) =>
-      r<ScanSummary>("POST", `/projects/${seg(projectId)}/import/dry-run`, { body: { adapter, ...(approveOutside ? { approveOutside } : {}) } }),
+      r<ScanSummary>("POST", `/projects/${pid(projectId)}/import/dry-run`, { body: { adapter, ...(approveOutside ? { approveOutside } : {}) } }),
     start: (projectId: string, adapter: ImportAdapter, options: ImportOptions) =>
-      r<{ batchId: string }>("POST", `/projects/${seg(projectId)}/import`, { body: { adapter, options } }),
-    deviceImport: (projectId: string, body: { dir: string; sessionId?: string; participantIds?: string[]; options: Omit<ImportOptions, "approveOutside"> }) =>
-      r<{ batchId: string }>("POST", `/projects/${seg(projectId)}/device-import`, { body }),
-    batches: async (projectId: string) => (await r<{ batches: BatchSummary[] }>("GET", `/projects/${seg(projectId)}/imports`)).batches,
+      r<{ batchId: string }>("POST", `/projects/${pid(projectId)}/import`, { body: { adapter, options } }),
+    deviceImport: (projectId: string, body: { dir: string; sessionId?: string; participantIds?: string[]; options: ImportOptions & { researcherName?: string } }) =>
+      r<{ batchId: string }>("POST", `/projects/${pid(projectId)}/device-import`, { body }),
+    batches: async (projectId: string) => (await r<{ batches: BatchSummary[] }>("GET", `/projects/${pid(projectId)}/imports`)).batches,
 
-    pause: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${seg(batchId)}/pause`),
-    resume: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${seg(batchId)}/resume`),
-    cancel: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${seg(batchId)}/cancel`),
-    undo: (batchId: string) => r<UndoResult>("POST", `/imports/${seg(batchId)}/undo`),
-    report: (batchId: string) => r<ImportReport>("GET", `/imports/${seg(batchId)}/report`),
-    review: async (batchId: string) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${seg(batchId)}/review`)).items,
+    pause: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/pause`),
+    resume: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/resume`),
+    cancel: (batchId: string) => r<{ batchId: string; action: string }>("POST", `/imports/${bid(batchId)}/cancel`),
+    undo: (batchId: string) => r<UndoResult>("POST", `/imports/${bid(batchId)}/undo`),
+    report: (batchId: string) => r<ImportReport>("GET", `/imports/${bid(batchId)}/report`),
+    review: async (batchId: string) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`)).items,
 
     /** Review routes take the project in the body (R97). */
-    decide: (projectId: string, itemId: string, decision: ReviewDecision) =>
-      r<{ decided: boolean }>("POST", `/review/${seg(itemId)}/decide`, { body: { projectId, decision } }),
-    bulkEdit: (projectId: string, itemIds: string[], patch: ReviewPatch) =>
-      r<{ edited: number }>("POST", "/review/bulk-edit", { body: { projectId, itemIds, patch } }),
+    decide: (projectId: string, itemId: string, decision: ReviewDecision) => {
+      pid(projectId);
+      return r<{ decided: boolean }>("POST", `/review/${seg(itemId)}/decide`, { body: { projectId, decision } });
+    },
+    bulkEdit: (projectId: string, itemIds: string[], patch: ReviewPatch) => {
+      pid(projectId);
+      return r<{ edited: number }>("POST", "/review/bulk-edit", { body: { projectId, itemIds, patch } });
+    },
 
-    source: (projectId: string, sourceId: string) => r<SourceFile>("GET", `/projects/${seg(projectId)}/sources/${seg(sourceId)}`),
+    source: (projectId: string, sourceId: string) => r<SourceFile>("GET", `/projects/${pid(projectId)}/sources/${seg(sourceId)}`),
     searchSources: async (projectId: string, text: string) =>
-      (await r<{ items: SourceListItem[] }>("GET", `/projects/${seg(projectId)}/sources`, { query: { text, limit: 20 } })).items,
-    collections: async (projectId: string) => (await r<{ collections: Collection[] }>("GET", `/projects/${seg(projectId)}/collections`)).collections,
-    tags: async (projectId: string) => (await r<{ tags: Tag[] }>("GET", `/projects/${seg(projectId)}/tags`)).tags,
-    participants: async (projectId: string) => (await r<{ participants: Participant[] }>("GET", `/projects/${seg(projectId)}/participants`)).participants,
-    sessions: async (projectId: string) => (await r<{ sessions: FieldSession[] }>("GET", `/projects/${seg(projectId)}/sessions`)).sessions,
+      (await r<{ items: SourceListItem[] }>("GET", `/projects/${pid(projectId)}/sources`, { query: { text, limit: 20 } })).items,
+    collections: async (projectId: string) => (await r<{ collections: Collection[] }>("GET", `/projects/${pid(projectId)}/collections`)).collections,
+    /** The project's tags and the workspace's (both can be added to a source). */
+    tags: async (projectId: string) => {
+      const t = await r<{ tags: Tag[]; workspaceTags?: Tag[] }>("GET", `/projects/${pid(projectId)}/tags`);
+      return [...t.tags, ...(t.workspaceTags ?? []).map((w) => ({ ...w, scope: "workspace" }))];
+    },
+    participants: async (projectId: string) => (await r<{ participants: Participant[] }>("GET", `/projects/${pid(projectId)}/participants`)).participants,
+    sessions: async (projectId: string) => (await r<{ sessions: FieldSession[] }>("GET", `/projects/${pid(projectId)}/sessions`)).sessions,
   };
 }
 

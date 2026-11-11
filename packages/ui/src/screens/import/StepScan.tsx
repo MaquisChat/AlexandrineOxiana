@@ -2,6 +2,7 @@
  * Step 2: the dry run's inventory (nothing has changed yet), and — when the source points at files
  * outside its own folders — the approval of those files (R67, the user's decision): per folder or
  * per file, with an optional "remember this folder". The approvals go with the start request.
+ * Approving a folder approves its subfolders too, as the engine does (R115 I1).
  */
 import type { ApproveOutside, ScanSummary } from "../../api/import";
 import { UserText } from "../../components/UserText";
@@ -15,17 +16,24 @@ export interface OutsideApprovals {
 
 export const NO_APPROVALS: OutsideApprovals = { folders: [], files: [], remember: [] };
 
-/** The `approveOutside` option, or undefined when nothing was approved. */
-export function approveOutsideOf(a: OutsideApprovals): ApproveOutside | undefined {
-  const files = a.files.filter((f) => !a.folders.some((d) => under(d, f)));
-  if (!a.folders.length && !files.length) return undefined;
-  return { folders: [...a.folders], files, rememberFolders: a.remember.filter((r) => a.folders.includes(r)) };
+/** True when `path` is `folder` itself or lies inside it (any depth). */
+export function within(folder: string, path: string): boolean {
+  const f = folder.replace(/[\\/]+$/, "");
+  return path === f || path.startsWith(`${f}/`) || path.startsWith(`${f}\\`);
 }
 
-const under = (folder: string, file: string) => {
-  const f = folder.replace(/[\\/]+$/, "");
-  return file.startsWith(`${f}/`) || file.startsWith(`${f}\\`);
-};
+/** The approved folder (other than `folder`) that already covers `folder`, if any (the outermost). */
+export function coveredBy(folder: string, approved: string[]): string | undefined {
+  return approved.filter((a) => a !== folder && within(a, folder)).sort((a, b) => a.length - b.length)[0];
+}
+
+/** The `approveOutside` option, or undefined when nothing was approved. */
+export function approveOutsideOf(a: OutsideApprovals): ApproveOutside | undefined {
+  const folders = a.folders.filter((f) => !coveredBy(f, a.folders));
+  const files = a.files.filter((f) => !folders.some((d) => within(d, f)));
+  if (!folders.length && !files.length) return undefined;
+  return { folders, files, rememberFolders: a.remember.filter((r) => folders.includes(r)) };
+}
 
 function byFolder(outside: ScanSummary["outsideFiles"]): Array<[string, ScanSummary["outsideFiles"]]> {
   const m = new Map<string, ScanSummary["outsideFiles"]>();
@@ -51,9 +59,11 @@ export interface StepScanProps {
   sourceName: string;
   approvals: OutsideApprovals;
   onApprovals(a: OutsideApprovals): void;
+  /** A camera or phone folder (device import): pairing happens during the import. */
+  device?: boolean;
 }
 
-export function StepScan({ summary, sourceName, approvals, onApprovals }: StepScanProps) {
+export function StepScan({ summary, sourceName, approvals, onApprovals, device }: StepScanProps) {
   return (
     <Section title="Scan results">
       <p className="ao-import__hint">
@@ -92,8 +102,8 @@ export function StepScan({ summary, sourceName, approvals, onApprovals }: StepSc
         <details className="ao-import__details">
           <summary>Unreadable files ({fmt(summary.unreadable.length)})</summary>
           <ul>
-            {summary.unreadable.map((u) => (
-              <li key={u.path}>
+            {summary.unreadable.map((u, i) => (
+              <li key={`${i}:${u.path}`}>
                 <UserText>{u.path}</UserText>: {u.reason}
               </li>
             ))}
@@ -102,10 +112,15 @@ export function StepScan({ summary, sourceName, approvals, onApprovals }: StepSc
       )}
       {summary.notes.length > 0 && (
         <ul className="ao-import__notes">
-          {summary.notes.map((n) => (
-            <li key={n}>{n}</li>
+          {summary.notes.map((n, i) => (
+            <li key={`${i}:${n}`}>{n}</li>
           ))}
         </ul>
+      )}
+      {device && (
+        <p className="ao-import__note">
+          This scan reads the folder as files only. Pairing photos, video and audio with the session and participants happens during the import, so the counts here are approximate.
+        </p>
       )}
       <p className="ao-import__hint">
         Identify runs as part of the scan and the import: each item is matched from its own metadata, the file's embedded data, identifiers in its text, sidecar files, its file name and — only where
@@ -125,11 +140,13 @@ function OutsideFiles({ outside, approvals, onApprovals }: { outside: ScanSummar
   return (
     <Section title="Files outside the source folder" level={3} className="ao-import__outside">
       <p>
-        {count(outside.length, "file")} that the source links to {outside.length === 1 ? "is" : "are"} stored outside the folder you chose. Approve the folders or files you expect; items whose files
-        are not approved are imported without the file, and the report lists them.
+        {count(outside.length, "file")} that the source links to {outside.length === 1 ? "is" : "are"} stored outside the folder you chose. Approve the folders or files you expect; approving a folder
+        also approves its subfolders. Items whose files are not approved are imported without the file, and the report lists them.
       </p>
       {byFolder(outside).map(([folder, files]) => {
-        const folderOn = approvals.folders.includes(folder);
+        const cover = coveredBy(folder, approvals.folders);
+        const own = approvals.folders.includes(folder) && !cover;
+        const folderOn = own || !!cover;
         return (
           <fieldset key={folder} className="ao-import__outside-folder">
             <legend>
@@ -137,22 +154,26 @@ function OutsideFiles({ outside, approvals, onApprovals }: { outside: ScanSummar
                 <UserText>{folder}</UserText>
               </code>
             </legend>
+            <p className="ao-import__hint">{count(files.length, "file")} in this folder</p>
+            {cover && (
+              <p className="ao-import__hint">
+                covered by <UserText>{cover}</UserText> (including its subfolders)
+              </p>
+            )}
             <label className="ao-import__choice">
-              <input type="checkbox" checked={folderOn} onChange={(e) => onApprovals(toggle("folders", folder, e.target.checked))} />
-              <span>
-                Approve every file in <UserText>{folder}</UserText> ({count(files.length, "file")})
-              </span>
+              <input type="checkbox" checked={folderOn} disabled={!!cover} onChange={(e) => onApprovals(toggle("folders", folder, e.target.checked))} />
+              <span>Approve this folder and its subfolders</span>
             </label>
             <label className="ao-import__choice ao-import__choice--indent">
-              <input type="checkbox" checked={approvals.remember.includes(folder)} disabled={!folderOn} onChange={(e) => onApprovals(toggle("remember", folder, e.target.checked))} />
+              <input type="checkbox" checked={own && approvals.remember.includes(folder)} disabled={!own} onChange={(e) => onApprovals(toggle("remember", folder, e.target.checked))} />
               <span>
                 Remember <UserText>{folder}</UserText> for later imports
               </span>
             </label>
             <ul className="ao-import__outside-files">
-              {files.map((f, i) =>
+              {files.map((f) =>
                 f.file ? (
-                  <li key={`${f.file}-${i}`}>
+                  <li key={`file:${f.file}`}>
                     <label className="ao-import__choice">
                       <input
                         type="checkbox"
@@ -166,7 +187,7 @@ function OutsideFiles({ outside, approvals, onApprovals }: { outside: ScanSummar
                     </label>
                   </li>
                 ) : (
-                  <li key={`${f.item}-${i}`}>
+                  <li key={`item:${f.item}`}>
                     <UserText>{f.item}</UserText> <span className="ao-import__hint">(approve the folder to include this file)</span>
                   </li>
                 ),

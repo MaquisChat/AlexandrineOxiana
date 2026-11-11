@@ -14,7 +14,7 @@ export type SourceChoice =
   | { kind: "reference"; format: RefFormat; path: string }
   | { kind: "zotero-local"; dataDir: string }
   | { kind: "zotero-web"; libraryType: "user" | "group"; libraryId: string; full: boolean }
-  | { kind: "device"; dir: string; sessionId: string; participantIds: string[] };
+  | { kind: "device"; dir: string; sessionId: string; participantIds: string[]; researcherName: string };
 
 type Kind = SourceChoice["kind"];
 
@@ -69,9 +69,11 @@ export interface StepSourceProps {
   busy: boolean;
   error: string | null;
   onScan(): void;
+  /** Back to the scan results, offered while the choice is still the one that was scanned. */
+  onNext?: () => void;
 }
 
-export function StepSource({ api, projects, projectId, onProject, choice, onChoice, busy, error, onScan }: StepSourceProps) {
+export function StepSource({ api, projects, projectId, onProject, choice, onChoice, busy, error, onScan, onNext }: StepSourceProps) {
   const [invalid, setInvalid] = useState<string | null>(null);
   const pathProps = (label: string, value: string, set: (v: string) => void, placeholder: string) => (
     <label className="ao-import__field">
@@ -87,7 +89,7 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
     if (kind === "reference") onChoice({ kind, format: "bibtex", path });
     else if (kind === "zotero-local") onChoice({ kind, dataDir: path });
     else if (kind === "zotero-web") onChoice({ kind, libraryType: "user", libraryId: "", full: false });
-    else if (kind === "device") onChoice({ kind, dir: path, sessionId: "", participantIds: [] });
+    else if (kind === "device") onChoice({ kind, dir: path, sessionId: "", participantIds: [], researcherName: "" });
     else onChoice({ kind, path });
   };
 
@@ -99,6 +101,8 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
 
   return (
     <Section title="Source">
+      {/* Nothing can change while the scan runs: what is scanned is what is imported (R115 I2). */}
+      <fieldset className="ao-import__plain" disabled={busy}>
       <label className="ao-import__field">
         <span>Project</span>
         <select value={projectId} onChange={(e) => onProject(e.target.value)}>
@@ -178,11 +182,17 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
         {choice.kind === "device" && <DeviceFields api={api} projectId={projectId} choice={choice} onChoice={onChoice} field={pathProps} />}
       </div>
 
+      </fieldset>
       <ErrorNote error={invalid ?? error} />
       <div className="ao-import__actions">
-        <button type="button" className="ao-import__primary" onClick={scan} disabled={busy || !projectId}>
+        <button type="button" className={onNext ? undefined : "ao-import__primary"} onClick={scan} disabled={busy || !projectId}>
           Scan
         </button>
+        {onNext && (
+          <button type="button" className="ao-import__primary" onClick={onNext} disabled={busy}>
+            Next
+          </button>
+        )}
         {busy && <span role="status">Scanning… nothing is changed yet.</span>}
       </div>
     </Section>
@@ -202,6 +212,7 @@ function DeviceFields({
   onChoice(c: SourceChoice): void;
   field: (label: string, value: string, set: (v: string) => void, placeholder: string) => ReactElement;
 }) {
+  const hintId = useId();
   const [sessions, setSessions] = useState<FieldSession[]>([]);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -222,13 +233,20 @@ function DeviceFields({
 
   const toggle = (id: string, on: boolean) =>
     onChoice({ ...choice, participantIds: on ? [...choice.participantIds, id] : choice.participantIds.filter((x) => x !== id) });
+  const session = sessions.find((s) => s.id === choice.sessionId);
+  // With a session chosen, only its participants are offered; choices outside it are dropped.
+  const offered = session ? participants.filter((p) => session.participantIds.includes(p.id)) : participants;
+  const pickSession = (sessionId: string) => {
+    const sel = sessions.find((s) => s.id === sessionId);
+    onChoice({ ...choice, sessionId, participantIds: sel ? choice.participantIds.filter((id) => sel.participantIds.includes(id)) : choice.participantIds });
+  };
 
   return (
     <>
       {field("Camera or phone folder", choice.dir, (dir) => onChoice({ ...choice, dir }), "/Volumes/PHONE/DCIM")}
       <label className="ao-import__field">
         <span>Fieldwork session</span>
-        <select value={choice.sessionId} onChange={(e) => onChoice({ ...choice, sessionId: e.target.value })}>
+        <select value={choice.sessionId} onChange={(e) => pickSession(e.target.value)}>
           <option value="">No session</option>
           {sessions.map((s) => (
             <option key={s.id} value={s.id}>
@@ -240,14 +258,21 @@ function DeviceFields({
       </label>
       <fieldset className="ao-import__choices">
         <legend>Participants</legend>
-        {participants.length === 0 && <p className="ao-import__hint">This project has no participants yet.</p>}
-        {participants.map((p) => (
+        {offered.length === 0 && <p className="ao-import__hint">{session ? "This session has no participants." : "This project has no participants yet."}</p>}
+        {offered.map((p) => (
           <label key={p.id} className="ao-import__choice">
             <input type="checkbox" checked={choice.participantIds.includes(p.id)} onChange={(e) => toggle(p.id, e.target.checked)} />
             <UserText>{p.code}</UserText>
           </label>
         ))}
       </fieldset>
+      <label className="ao-import__field">
+        <span>Researcher name</span>
+        <input type="text" value={choice.researcherName} aria-describedby={`${hintId}-researcher`} onChange={(e) => onChoice({ ...choice, researcherName: e.target.value })} />
+      </label>
+      <p id={`${hintId}-researcher`} className="ao-import__hint">
+        Optional: recorded as who made the photos and recordings.
+      </p>
       <ErrorNote error={error} />
     </>
   );

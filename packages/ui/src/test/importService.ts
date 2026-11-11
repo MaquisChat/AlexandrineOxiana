@@ -10,7 +10,13 @@ import type { ImportReport, ReviewItem, ScanSummary } from "../api/import";
 export const BASE = "http://127.0.0.1:4100";
 export const TOKEN = "t".repeat(40);
 
-export const PROJECT = { id: "p1", name: "Thesis", encrypted: false, unlocked: true };
+/** UUIDv7 ids (the service's Id), as the UI validates them before use (R115 I3). */
+export const P1 = "019a6f00-0000-7000-8000-000000000001";
+export const P2 = "019a6f00-0000-7000-8000-000000000002";
+export const B1 = "019a7000-0000-7000-8000-0000000000b1";
+export const B7 = "019a7000-0000-7000-8000-0000000000b7";
+
+export const PROJECT = { id: P1, name: "Thesis", encrypted: false, unlocked: true };
 
 /** Governance that neither pseudonymises names nor requires encryption. */
 export const OPEN_GOVERNANCE = "identifiability:\n  containsIdentifiable: false\n  pseudonymizeFileNames: false\nencryption:\n  atRest: optional\n";
@@ -29,7 +35,7 @@ export const SUMMARY: ScanSummary = {
 };
 
 export const REPORT: ImportReport = {
-  batchId: "b1",
+  batchId: B1,
   number: 4,
   kind: "folder",
   state: "finished",
@@ -56,6 +62,10 @@ export interface ServiceMock {
   /** Pushes one SSE event to every open /events stream. */
   emit(type: string, data: unknown): void;
   client: ApiClient;
+  /** Replaces what GET /projects/:id/imports answers. */
+  setBatches(b: unknown[]): void;
+  /** Most source requests in flight at once. */
+  peakSourceRequests(): number;
 }
 
 export interface ServiceSetup {
@@ -69,7 +79,18 @@ export interface ServiceSetup {
   batches?: unknown[];
   participants?: unknown[];
   sessions?: unknown[];
+  workspaceTags?: Array<{ id: string; name: string; color?: string }>;
   extra?: RequestHandler[];
+  /** "close": every /events stream ends right after its ": connected" comment. */
+  events?: "open" | "close";
+  /** Delay (ms) before each source answer. */
+  sourceDelayMs?: number;
+  /** Delay (ms) before the dry run answers. */
+  dryRunDelayMs?: number;
+  /** Delay (ms) before the governance answers. */
+  governanceDelayMs?: number;
+  /** Source ids whose first request fails (HTTP 500). */
+  failSourcesOnce?: string[];
 }
 
 export const server = setupServer();
@@ -91,6 +112,11 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     return body;
   };
   const url = (p: string) => `${BASE}${p}`;
+  const wait = (ms: number | undefined) => (ms ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+  let batches = o.batches ?? [];
+  let inFlight = 0;
+  let peak = 0;
+  const failOnce = new Set(o.failSourcesOnce ?? []);
 
   // Replaces the previous test's handlers (rather than resetting after each test), so a request a
   // component sends while a test is being torn down still finds a handler.
@@ -98,27 +124,29 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     ...(o.extra ?? []),
     http.get(url("/projects"), async ({ request }) => {
       await rec(request, "/projects");
-      return HttpResponse.json({ projects: [PROJECT, { id: "p2", name: "Fieldwork", encrypted: true, unlocked: true }] });
+      return HttpResponse.json({ projects: [PROJECT, { id: P2, name: "Fieldwork", encrypted: true, unlocked: true }] });
     }),
     http.get(url("/projects/:id/governance"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/governance`);
+      await wait(o.governanceDelayMs);
       return HttpResponse.json({ yaml: o.governance ?? OPEN_GOVERNANCE, sha256: "0".repeat(64), violations: [] });
     }),
     http.post(url("/projects/:id/import/dry-run"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/import/dry-run`);
+      await wait(o.dryRunDelayMs);
       return HttpResponse.json(o.summary ?? SUMMARY);
     }),
     http.post(url("/projects/:id/import"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/import`);
-      return HttpResponse.json({ batchId: "b1" });
+      return HttpResponse.json({ batchId: B1 });
     }),
     http.post(url("/projects/:id/device-import"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/device-import`);
-      return HttpResponse.json({ batchId: "b1" });
+      return HttpResponse.json({ batchId: B1 });
     }),
     http.get(url("/projects/:id/imports"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/imports`);
-      return HttpResponse.json({ batches: o.batches ?? [] });
+      return HttpResponse.json({ batches });
     }),
     http.get(url("/projects/:id/participants"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/participants`);
@@ -134,10 +162,18 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     }),
     http.get(url("/projects/:id/tags"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/tags`);
-      return HttpResponse.json({ tags: o.tags ?? [], workspaceTags: [] });
+      return HttpResponse.json({ tags: o.tags ?? [], workspaceTags: o.workspaceTags ?? [] });
     }),
     http.get(url("/projects/:id/sources/:sid"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}`);
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      try {
+        await wait(o.sourceDelayMs);
+      } finally {
+        inFlight--;
+      }
+      if (failOnce.delete(params.sid as string)) return HttpResponse.json({ error: { code: "INTERNAL", message: "The source could not be read." } }, { status: 500 });
       const s = o.sources?.[params.sid as string];
       return s ? HttpResponse.json(s) : HttpResponse.json({ error: { code: "NOT_FOUND", message: "That source was not found." } }, { status: 404 });
     }),
@@ -175,6 +211,10 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
           ctl = c;
           streams.add(c);
           c.enqueue(enc.encode(": connected\n\n"));
+          if (o.events === "close") {
+            streams.delete(c);
+            c.close();
+          }
         },
         cancel() {
           streams.delete(ctl);
@@ -198,5 +238,9 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
       }
     },
     client: createClient(BASE, TOKEN),
+    setBatches(b) {
+      batches = b;
+    },
+    peakSourceRequests: () => peak,
   };
 }
