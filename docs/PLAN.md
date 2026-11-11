@@ -428,8 +428,8 @@ Update after every task; commit and push.
 | 37g Signing | blocked | | needs Apple Developer credentials |
 | 37h Desktop end-to-end | not started | | |
 | 37i Guide and checklist | not started | | |
-| 52 Review pages | in progress | | dispatched |
-| 53 Apply review findings | blocked | | needs owner review |
+| 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
+| 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
 | 55 Owner hands-on tests | blocked | | needs signed Mac build |
 | 56 Close out | not started | | |
