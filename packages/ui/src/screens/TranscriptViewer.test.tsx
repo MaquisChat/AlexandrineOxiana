@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { transcriptApi } from "../api/transcripts";
+import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
 import { BASE, server, testClient, url, useMockService } from "../test/service";
 import { humanTranscript, humanVersion, machineTranscript, machineVersion, MACHINE_VERSIONS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
@@ -40,6 +41,29 @@ afterEach(async () => {
   await new Promise((r) => setTimeout(r, 20));
   vi.restoreAllMocks();
 });
+
+let windowScrolls = 0;
+
+/**
+ * Gives the segment list a layout (jsdom has none): 150 px visible, each segment 100 px high, and
+ * counts any scrolling of the window.
+ */
+function layOut(): HTMLElement {
+  const list = segmentList();
+  Object.defineProperty(list, "clientHeight", { configurable: true, value: 150 });
+  segmentItems().forEach((li, i) => {
+    Object.defineProperty(li, "offsetTop", { configurable: true, value: i * 100 });
+    Object.defineProperty(li, "offsetHeight", { configurable: true, value: 100 });
+  });
+  windowScrolls = 0;
+  window.scrollTo = (() => {
+    windowScrolls++;
+  }) as typeof window.scrollTo;
+  window.scrollBy = (() => {
+    windowScrolls++;
+  }) as typeof window.scrollBy;
+  return list;
+}
 
 /** Moves the player to `t` seconds as a browser would report it. */
 function playTo(el: HTMLMediaElement, t: number) {
@@ -189,15 +213,60 @@ describe("TranscriptViewer — the player and its media ticket", () => {
     expect(await screen.findByText(/The recording stopped and could not be started again/)).toBeTruthy();
   });
 
-  it("a recording that fails again straight after a renewal is not renewed in a loop", async () => {
+  it("a recording that keeps failing at the same place is renewed at most twice, then says so and offers Try again (review I1)", async () => {
     const { svc } = await open();
     await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
-    fireEvent(media()!, new Event("error"));
-    await waitFor(() => expect(svc.log.tickets).toHaveLength(2));
-    await waitFor(() => expect(media()!.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[1]!.path}`));
-    fireEvent(media()!, new Event("error"));
+    const el = media()!;
+    fireEvent(el, new Event("play"));
+    playTo(el, 4);
+    // The reviewer's probe: each renewed ticket loads (metadata and first data) and fails again at the same place.
+    for (let cycle = 0; cycle < 6; cycle++) {
+      fireEvent(el, new Event("error"));
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 30));
+      });
+      fireEvent(el, new Event("loadedmetadata"));
+      fireEvent(el, new Event("loadeddata"));
+      playTo(el, 4.5);
+    }
     expect(await screen.findByText(/The recording could not be played/)).toBeTruthy();
-    expect(svc.log.tickets).toHaveLength(2);
+    expect(svc.log.tickets).toHaveLength(3);
+    // Every ticket asked for is revoked once it is replaced or given up.
+    await waitFor(() => expect([...svc.log.revoked].sort()).toEqual(svc.log.tickets.map((t) => t.path).sort()));
+    expect(el.getAttribute("src")).toBeNull();
+    // The researcher chooses to try again: a new ticket, resumed where it stopped.
+    await userEvent.setup().click(screen.getByRole("button", { name: "Try the recording again" }));
+    await waitFor(() => expect(svc.log.tickets).toHaveLength(4));
+    await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[3]!.path}`));
+    fireEvent(el, new Event("loadedmetadata"));
+    expect(el.currentTime).toBe(4.5);
+    expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+  });
+
+  it("a recording that plays on after a renewal still gets renewals later", async () => {
+    const { svc } = await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const el = media()!;
+    for (let cycle = 0; cycle < 4; cycle++) {
+      const at = 10 + cycle * 60;
+      playTo(el, at);
+      fireEvent(el, new Event("error"));
+      await waitFor(() => expect(svc.log.tickets).toHaveLength(cycle + 2));
+      await waitFor(() => expect(el.getAttribute("src")).toBe(`${BASE}${svc.log.tickets[cycle + 1]!.path}`));
+      fireEvent(el, new Event("loadedmetadata"));
+      // Real progress: the position moves well past where it failed.
+      playTo(el, at + 30);
+    }
+    expect(svc.log.tickets).toHaveLength(5);
+    expect(screen.queryByText(/The recording could not be played/)).toBeNull();
+  });
+
+  it("too many recordings open at once is said in one plain sentence (review M3)", async () => {
+    const svc = transcriptService();
+    server.use(http.post(url("/projects/:id/sources/:sid/assets/:aid/media-ticket"), () => serviceErrorBody(429, "RATE_LIMITED", "Too many recordings are open at once. Close one, then try again.")), ...svc.handlers);
+    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    const msg = await screen.findByText(/recording could not be opened/);
+    expect(msg.textContent).toBe("The recording could not be opened: too many recordings are open at once. Close another recording, then choose Try the recording again.");
   });
 
   it("a source with no recording still shows its transcript and asks for no ticket", async () => {
@@ -215,19 +284,88 @@ describe("TranscriptViewer — the player and its media ticket", () => {
 });
 
 describe("TranscriptViewer — player and segments in step", () => {
-  it("marks the segment playing and scrolls it into view without moving focus", async () => {
+  it("marks the segment playing and scrolls only the segment list to it, never the window, without moving focus (review I4)", async () => {
     await open();
     await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const list = layOut();
     const picker = screen.getByLabelText("Version");
     picker.focus();
-    playTo(media()!, 3);
-    await waitFor(() => expect(segmentItems()[1]!.getAttribute("aria-current")).toBe("true"));
-    expect(within(segmentItems()[1]!).getByText("Now playing")).toBeTruthy();
+    playTo(media()!, 6);
+    await waitFor(() => expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true"));
+    expect(within(segmentItems()[2]!).getByText("Now playing")).toBeTruthy();
     expect(segmentItems()[0]!.getAttribute("aria-current")).toBeNull();
-    expect(scrolled).toContain(segmentItems()[1]);
+    await waitFor(() => expect(list.scrollTop).toBe(200 + 100 - 150));
+    expect(scrolled).toEqual([]);
+    expect(windowScrolls).toBe(0);
     expect(document.activeElement).toBe(picker);
     // Not announced: the list is not a live region.
     expect(segmentList().closest("[aria-live]")).toBeNull();
+  });
+
+  it("smooth scrolling unless reduced motion is asked for", async () => {
+    await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const list = layOut();
+    const smooth: unknown[] = [];
+    list.scrollTo = ((o: ScrollToOptions) => {
+      smooth.push(o);
+      list.scrollTop = o.top ?? 0;
+    }) as typeof list.scrollTo;
+    playTo(media()!, 6);
+    await waitFor(() => expect(smooth).toEqual([{ top: 150, behavior: "smooth" }]));
+    act(() => setMedia({ reducedMotion: true }));
+    list.scrollTop = 0;
+    playTo(media()!, 3);
+    await waitFor(() => expect(segmentItems()[1]!.getAttribute("aria-current")).toBe("true"));
+    // Segment 1 (100-200) is below a list scrolled to 0 with 150 visible: brought into view at once.
+    await waitFor(() => expect(list.scrollTop).toBe(50));
+    expect(smooth).toHaveLength(1);
+  });
+
+  it("Follow playback can be turned off", async () => {
+    await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const list = layOut();
+    const toggle = screen.getByRole("checkbox", { name: "Follow playback" }) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    await userEvent.setup().click(toggle);
+    expect(toggle.checked).toBe(false);
+    playTo(media()!, 6);
+    await waitFor(() => expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true"));
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it("following pauses while the researcher scrolls the list, and Back to the playing segment resumes it", async () => {
+    await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const list = layOut();
+    fireEvent.wheel(list, { deltaY: 40 });
+    list.scrollTop = 7;
+    playTo(media()!, 6);
+    await waitFor(() => expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true"));
+    expect(list.scrollTop).toBe(7);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Back to the playing segment" }));
+    await waitFor(() => expect(list.scrollTop).toBe(150));
+    expect(screen.queryByRole("button", { name: "Back to the playing segment" })).toBeNull();
+    playTo(media()!, 0.5);
+    await waitFor(() => expect(list.scrollTop).toBe(0));
+  });
+
+  it("following pauses while focus is inside the list or a segment is being edited", async () => {
+    await open();
+    await waitFor(() => expect(media()?.getAttribute("src")).toBeTruthy());
+    const list = layOut();
+    const user = userEvent.setup();
+    act(() => within(segmentItems()[0]!).getByRole("button", { name: "Play from 0:00" }).focus());
+    playTo(media()!, 6);
+    await waitFor(() => expect(segmentItems()[2]!.getAttribute("aria-current")).toBe("true"));
+    expect(list.scrollTop).toBe(0);
+    expect(screen.getByRole("button", { name: "Back to the playing segment" })).toBeTruthy();
+    await user.click(within(segmentItems()[0]!).getByRole("button", { name: "Edit segment at 0:00" }));
+    act(() => screen.getByLabelText("Version").focus());
+    playTo(media()!, 3);
+    await waitFor(() => expect(segmentItems()[1]!.getAttribute("aria-current")).toBe("true"));
+    expect(list.scrollTop).toBe(0);
   });
 
   it("activating a segment from the keyboard seeks the player", async () => {

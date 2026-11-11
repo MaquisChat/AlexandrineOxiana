@@ -7,11 +7,18 @@
  * element then fails its next read, and the player asks for a new ticket and resumes where it was,
  * playing or paused. If that is refused (locked project, closed library) it says so in plain words.
  *
+ * Renewal is not a loop (R143): a recording that fails again at the same place (a damaged or cut
+ * file, for example) is renewed at most twice without real progress — the position moving
+ * RENEWAL_PROGRESS_S beyond where it failed; loading alone does not count. Then the player stops,
+ * says so, and offers "Try the recording again". Every ticket is revoked once it is replaced or
+ * given up.
+ *
  * The ticket address is a secret (R135 5): it goes to the element only — never shown as text,
  * logged, stored, or put in the page address. No `crossorigin` attribute: the service expects the
  * element's plain (no-cors) range reads.
  */
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked } from "../api/library";
 import type { TranscriptApi } from "../api/transcripts";
 
@@ -24,7 +31,8 @@ export interface MediaTicketPlayerProps {
   api: Pick<TranscriptApi, "ticket" | "revokeTicket" | "mediaUrl">;
   projectId: string;
   sourceId: string;
-  asset: { id: string; mime: string };
+  /** `kind` ("audio" / "video") chooses the element when the recorded type is missing. */
+  asset: { id: string; mime: string; kind?: string };
   /** Accessible name of the player. */
   label: string;
   /** The playback position, as the element reports it. */
@@ -34,9 +42,26 @@ export interface MediaTicketPlayerProps {
   control?: MutableRefObject<PlayerControl | null>;
 }
 
-type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { kind: "failed"; message: string };
+/** Renewals allowed in a row without real progress. */
+export const MAX_RENEWALS_WITHOUT_PROGRESS = 2;
+/** How far (seconds) playback must move beyond the failure for it to count as progress. */
+export const RENEWAL_PROGRESS_S = 3;
 
-const isVideo = (mime: string) => /^video\//i.test(mime);
+type Phase = { kind: "loading" } | { kind: "ready" } | { kind: "renewing" } | { kind: "failed"; message: string; retry: boolean };
+
+const isVideo = (asset: { mime: string; kind?: string }) => /^video\//i.test(asset.mime) || (!/^audio\//i.test(asset.mime) && asset.kind === "video");
+
+const RETRY = "Try the recording again";
+
+function refusal(err: unknown, renewing: boolean): string {
+  if (isProjectLocked(err)) return renewing ? "The project was locked, so the recording stopped. Unlock the project to play it again." : "The recording cannot be played while the project is locked.";
+  if (err instanceof ApiClientError && err.code === "RATE_LIMITED") {
+    return `${renewing ? "The recording stopped" : "The recording could not be opened"}: too many recordings are open at once. Close another recording, then choose ${RETRY}.`;
+  }
+  return renewing
+    ? `The recording stopped and could not be started again. ${errorText(err, "The library service did not answer.")}`
+    : `The recording could not be opened. ${errorText(err, "The library service did not answer.")}`;
+}
 
 export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTime, onLocked, control }: MediaTicketPlayerProps) {
   const elRef = useRef<HTMLMediaElement | null>(null);
@@ -47,6 +72,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
   timeRef.current = onTime;
   const lockedRef = useRef(onLocked);
   lockedRef.current = onLocked;
+  const retryRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const el = elRef.current;
@@ -59,30 +85,35 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
     let resume: { at: number; play: boolean } | null = null;
     let wantPlay = false;
     let lastTime = 0;
-    /** Renewals since the recording last loaded data: one is tried, never a loop. */
+    /** Renewals since playback last made real progress, and where the last failure happened. */
     let renewals = 0;
+    let failedAt = 0;
 
     const revoke = (path: string) => {
       void api.revokeTicket(path).catch(() => {});
     };
 
-    const attach = async () => {
+    /** Lets go of the ticket and stops the element reading. */
+    const release = () => {
+      if (ticket) revoke(ticket);
+      ticket = null;
+      el.removeAttribute("src");
+      try {
+        el.load();
+      } catch {
+        /* nothing to stop */
+      }
+    };
+
+    const attach = async (renewing: boolean) => {
       let path: string;
       try {
         path = (await api.ticket(projectId, sourceId, asset.id)).path;
       } catch (err) {
         if (!live) return;
         if (isProjectLocked(err)) lockedRef.current?.();
-        const renewing = ticket !== null;
-        const locked = isProjectLocked(err);
-        const message = renewing
-          ? locked
-            ? "The project was locked, so the recording stopped. Unlock the project to play it again."
-            : `The recording stopped and could not be started again. ${errorText(err, "The library service did not answer.")}`
-          : locked
-            ? "The recording cannot be played while the project is locked."
-            : `The recording could not be opened. ${errorText(err, "The library service did not answer.")}`;
-        setPhase({ kind: "failed", message });
+        release();
+        setPhase({ kind: "failed", message: refusal(err, renewing), retry: !isProjectLocked(err) });
         return;
       }
       if (!live) {
@@ -94,7 +125,8 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         address = api.mediaUrl(path);
       } catch {
         revoke(path);
-        setPhase({ kind: "failed", message: "The library service gave an address the player cannot use." });
+        release();
+        setPhase({ kind: "failed", message: "The library service gave an address the player cannot use.", retry: true });
         return;
       }
       const old = ticket;
@@ -106,17 +138,20 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
 
     const onError = () => {
       if (!ticket || !live) return;
-      if (renewals >= 1) {
-        setPhase({ kind: "failed", message: "The recording could not be played. Its file may be damaged or in a format this app cannot play." });
+      resume = { at: lastTime, play: wantPlay };
+      if (renewals >= MAX_RENEWALS_WITHOUT_PROGRESS) {
+        release();
+        setPhase({ kind: "failed", message: `The recording could not be played: it stopped at the same place again. Its file may be damaged or in a format this app cannot play. You can choose ${RETRY}.`, retry: true });
         return;
       }
       renewals++;
-      resume = { at: lastTime, play: wantPlay };
+      failedAt = lastTime;
       setPhase({ kind: "renewing" });
-      void attach();
+      void attach(true);
     };
     const onTimeUpdate = () => {
       lastTime = el.currentTime;
+      if (renewals > 0 && lastTime >= failedAt + RENEWAL_PROGRESS_S) renewals = 0;
       timeRef.current?.(el.currentTime);
     };
     const onPlay = () => {
@@ -126,7 +161,7 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
       wantPlay = false;
     };
     const onMetadata = () => {
-      if (!resume) return;
+      if (!resume || !ticket) return;
       const r = resume;
       resume = null;
       el.currentTime = r.at;
@@ -135,18 +170,22 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         if (p && typeof p.catch === "function") p.catch(() => {});
       }
     };
-    const onData = () => {
-      renewals = 0;
-    };
     el.addEventListener("error", onError);
     el.addEventListener("timeupdate", onTimeUpdate);
     el.addEventListener("seeked", onTimeUpdate);
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
     el.addEventListener("loadedmetadata", onMetadata);
-    el.addEventListener("loadeddata", onData);
     setPhase({ kind: "loading" });
-    void attach();
+    void attach(false);
+
+    retryRef.current = () => {
+      if (!live) return;
+      renewals = 0;
+      resume = { at: lastTime, play: resume?.play ?? false };
+      setPhase({ kind: "loading" });
+      void attach(false);
+    };
 
     if (control) {
       control.current = {
@@ -160,27 +199,19 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
 
     return () => {
       live = false;
+      retryRef.current = null;
       el.removeEventListener("error", onError);
       el.removeEventListener("timeupdate", onTimeUpdate);
       el.removeEventListener("seeked", onTimeUpdate);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
       el.removeEventListener("loadedmetadata", onMetadata);
-      el.removeEventListener("loadeddata", onData);
       if (control) control.current = null;
-      if (ticket) revoke(ticket);
-      ticket = null;
-      // Stop reading: without a source the element lets its connection go.
-      el.removeAttribute("src");
-      try {
-        el.load();
-      } catch {
-        /* nothing to stop */
-      }
+      release();
     };
   }, [projectId, sourceId, asset.id, control]);
 
-  const Element = isVideo(asset.mime) ? "video" : "audio";
+  const Element = isVideo(asset) ? "video" : "audio";
   return (
     <div className="ao-tx__player">
       <Element key={asset.id} ref={elRef as never} controls preload="metadata" aria-label={label} className="ao-tx__media" />
@@ -195,9 +226,16 @@ export function MediaTicketPlayer({ api, projectId, sourceId, asset, label, onTi
         </p>
       )}
       {phase.kind === "failed" && (
-        <p className="ao-error" role="alert">
-          {phase.message}
-        </p>
+        <div className="ao-row">
+          <p className="ao-error" role="alert">
+            {phase.message}
+          </p>
+          {phase.retry && (
+            <button type="button" onClick={() => retryRef.current?.()}>
+              {RETRY}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
