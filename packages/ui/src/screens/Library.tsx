@@ -678,6 +678,14 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             ) : sources.total === 0 && (listRebuilding || indexState === "rebuilding") ? (
               // An index being rebuilt is never passed off as an empty library (D8).
               <p role="status">The library's search index is being rebuilt from its files. The sources appear here as soon as it has finished; nothing in the library has been lost.</p>
+            ) : sources.total === 0 && (sources.index ?? state.index)?.state === "failed" ? (
+              <p role="status">
+                The sources cannot be listed: the library's search index could not be rebuilt. Your sources are safe in the library folder;{" "}
+                <a href={PATHS.missingFiles} onClick={(e) => follow(e, PATHS.missingFiles)}>
+                  rebuild the library from its folder
+                </a>{" "}
+                to list them again.
+              </p>
             ) : (
               <>
                 <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} />

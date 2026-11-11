@@ -189,6 +189,17 @@ describe("Library screen", () => {
     expect(within(banner).getByRole("link", { name: "Rebuild library from folder" }).getAttribute("href")).toBe("/missing-files");
   });
 
+  it("D8: when the index could not be rebuilt and lists nothing, the list says so instead of “no sources”", async () => {
+    const failed = { state: "failed", message: "x" };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ total: 0, items: [], index: failed })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    expect(await screen.findByText(/The sources cannot be listed: the library's search index could not be rebuilt/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
   it("D8: a read-only library says its index cannot be built here and search looks at titles only", async () => {
     const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "field-laptop", index: { state: "unavailable", reason: "locked-by-other-device" } };
     server.use(
