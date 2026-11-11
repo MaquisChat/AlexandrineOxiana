@@ -409,8 +409,8 @@ Update after every task; commit and push.
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762, b207182 | GitHub's runners cannot resolve ubuntu.com; mirror fallback added; done when a run is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | re-review 2 | | round 2 fixes in; reviewer checking |
-| 44 Scenarios 1, 2, 5, 7 | not started | | |
+| 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
+| 44 Scenarios 1, 2, 5, 7 | not started | | unblocked (43, 60 done); starts when Task 45 has merged, since both may extend `e2e/fixtures.ts` |
 | 45 Scenarios 3, 4, 6, 8 | in progress | | implementer dispatched |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
