@@ -65,7 +65,7 @@ describe("StatusBanner", () => {
       "invalid-txn-marker", "incomplete-write-pending", "txn-recovery-skipped-audit-unverifiable", "trimmed-incomplete-audit-line",
       "incomplete-audit-line-pending", "audit-append-failed-at-open", "deleted-records-unreadable", "annotations-unreadable",
       "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due", "protocol-manifest-unreadable",
-      "recovery-code-unshown",
+      "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();

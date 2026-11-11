@@ -41,18 +41,21 @@ function Verdict({ check }: { check: AuditCheck }) {
   );
 }
 
-/** Operations named in plain words where the raw name would not tell a researcher what happened (Task 61). */
-const PLAIN_OPS: Record<string, string> = {
-  "project.recovery-code": "A new recovery code was issued",
+/**
+ * Operations named in plain words where the raw name would not tell a researcher what happened
+ * (Task 61): what an allowed event did, and what a refused one asked for (M-d).
+ */
+const PLAIN_OPS: Record<string, { allowed: string; refused: string }> = {
+  "project.recovery-code": { allowed: "A new recovery code was issued", refused: "A new recovery code was asked for" },
 };
 const PLAIN_ACTIONS: Record<string, string> = {
   "key.recovery-activated": "A new recovery code was put in place when the library opened (it may not have been shown)",
 };
 
 /** The "what" cell: a plain description where there is one, else the operation, else the entity type. */
-function whatOf(e: { action: string; details?: Record<string, unknown> | undefined; entity?: { type: string } | undefined }): string {
+function whatOf(e: { action: string; details?: Record<string, unknown> | undefined; entity?: { type: string } | undefined; decision?: { result?: string } | undefined }): string {
   const op = typeof e.details?.op === "string" ? e.details.op : undefined;
-  if (op && Object.hasOwn(PLAIN_OPS, op)) return PLAIN_OPS[op]!;
+  if (op && Object.hasOwn(PLAIN_OPS, op)) return e.decision?.result === "deny" ? PLAIN_OPS[op]!.refused : PLAIN_OPS[op]!.allowed;
   if (Object.hasOwn(PLAIN_ACTIONS, e.action)) return PLAIN_ACTIONS[e.action]!;
   return op ?? (e.entity ? e.entity.type : "");
 }
