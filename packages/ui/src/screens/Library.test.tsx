@@ -181,6 +181,23 @@ describe("Library screen", () => {
     expect(governanceReads).toBe(0);
   });
 
+  it("badges come only from GET /projects: a project without profiles shows none and its rules are never read", async () => {
+    let governanceReads = 0;
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: PROJECTS.projects.map(({ profiles: _p, ...p }) => p) })),
+      http.get(url("/projects/:id/governance"), () => {
+        governanceReads++;
+        return HttpResponse.json({ yaml: "profiles: [irb]\n", sha256: "a".repeat(64), violations: [] });
+      }),
+      ...libraryHandlers(),
+    );
+    renderLibrary();
+    const diss = await screen.findByRole("button", { name: /Dissertation/ });
+    await screen.findByRole("tree", { name: "Collections" });
+    expect(diss.textContent).not.toMatch(/IRB/);
+    expect(governanceReads).toBe(0);
+  });
+
   it("PROJECT_LOCKED during an edit returns to UnlockProject and clears what was decrypted", async () => {
     server.use(http.patch(url("/projects/:id/tags/:tid"), () => serviceError(423, "PROJECT_LOCKED", "This project is locked.")), ...libraryHandlers());
     const user = userEvent.setup();

@@ -8,8 +8,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
-import { errorText, isProjectLocked } from "../api/library";
-import { projectProfiles } from "../api/profilesFallback";
+import { errorText, isProjectLocked, knownProfiles } from "../api/library";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
 import { JobsIndicator, type Job } from "../components/JobsIndicator";
@@ -163,12 +162,12 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     let live = true;
     api.projects
       .list()
-      .then(async ({ projects: list }) => {
+      .then(({ projects: list }) => {
         if (!live) return;
         setProjects(list);
         setProjectId((id) => id ?? list[0]?.id);
-        const entries = await Promise.all(list.map(async (p) => [p.id, await projectProfiles(p, api.projects.governance)] as const));
-        if (live) setProfiles(Object.fromEntries(entries));
+        // The badges are the profiles the service reads from each project's rules (R118).
+        setProfiles(Object.fromEntries(list.map((p) => [p.id, knownProfiles(p.profiles)])));
       })
       .catch((err: unknown) => live && setError(message(err, "The projects could not be read.")));
     return () => {

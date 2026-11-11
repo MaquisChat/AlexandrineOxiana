@@ -71,8 +71,8 @@ export const CURRENT_RW = { libraryId: "lib-1", name: "Thesis library", mode: "r
 
 export const PROJECTS = {
   projects: [
-    { id: "p1", name: "Dissertation", folder: "Dissertation", encrypted: false, unlocked: true },
-    { id: "p2", name: "Clinic interviews", folder: "Clinic interviews", encrypted: true, unlocked: false },
+    { id: "p1", name: "Dissertation", folder: "Dissertation", encrypted: false, unlocked: true, profiles: ["irb", "gdpr"] },
+    { id: "p2", name: "Clinic interviews", folder: "Clinic interviews", encrypted: true, unlocked: false, profiles: ["hipaa"] },
   ],
 };
 

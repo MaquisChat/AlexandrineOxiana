@@ -68,7 +68,7 @@ export interface ProjectSummary {
   unlocked: boolean;
   backups?: unknown;
   acknowledgements?: string[];
-  /** Compliance profiles (R114 I2: sent by the service from integration on). */
+  /** Compliance profiles named by the project's rules (sent by the service, R118). */
   profiles?: string[];
 }
 

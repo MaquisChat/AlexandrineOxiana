@@ -1683,3 +1683,23 @@ describe("integration: the extension's routes (R111)", () => {
     await svc.state.idle();
   });
 });
+
+describe("screens integration (R118)", () => {
+  beforeEach(() => start());
+
+  it("(a) GET /projects sends each project's compliance profiles; unreadable rules give none", async () => {
+    await openNewLibrary();
+    const open = await newProject(OPEN_GOV, false, "Open");
+    const hipaa = await newProject(HIPAA_GOV, true, "Clinic");
+    // Rules are plain text: a locked project still shows its badges.
+    expect((await call({ method: "POST", url: `/projects/${hipaa}/lock` })).status).toBe(200);
+    const projects = (await call({ url: "/projects" })).json.projects as Array<{ id: string; profiles: string[] }>;
+    expect(projects.find((p) => p.id === open)?.profiles).toEqual([]);
+    expect(projects.find((p) => p.id === hipaa)?.profiles).toEqual(["hipaa"]);
+    const folder = (projects.find((p) => p.id === open) as unknown as { folder: string }).folder;
+    const lib = join(tmp, "Lib");
+    await writeFile(join(lib, folder, "governance.yaml"), "profiles: [not-a-profile\n");
+    const again = (await call({ url: "/projects" })).json.projects as Array<{ id: string; profiles: string[] }>;
+    expect(again.find((p) => p.id === open)?.profiles).toEqual([]);
+  });
+});

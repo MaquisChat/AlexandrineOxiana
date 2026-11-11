@@ -17,7 +17,16 @@ async function captureMethods(repo: Repo, projectId: string): Promise<string[]> 
   }
 }
 
-function projectView(repo: Repo, p: Project) {
+/** The compliance profiles the project's rules name (badges in the UI); unreadable rules name none. */
+async function profilesOf(repo: Repo, projectId: string): Promise<string[]> {
+  try {
+    return [...parseGovernance(await repo.getGovernanceText(projectId)).profiles];
+  } catch {
+    return [];
+  }
+}
+
+async function projectView(repo: Repo, p: Project) {
   return {
     id: p.id,
     name: p.name,
@@ -26,6 +35,7 @@ function projectView(repo: Repo, p: Project) {
     unlocked: repo.isUnlocked(p.id),
     ...(p.backups ? { backups: p.backups } : {}),
     ...(p.captureAcknowledgements ? { acknowledgements: Object.keys(p.captureAcknowledgements) } : {}),
+    profiles: await profilesOf(repo, p.id),
   };
 }
 
@@ -39,7 +49,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
       // The extension sees only what its project picker needs.
       return { projects: await Promise.all(projects.map(async (p) => ({ id: p.id, name: p.name, captureMethods: await captureMethods(s.repo, p.id) }))) };
     }
-    return { projects: projects.map((p) => projectView(s.repo, p)) };
+    return { projects: await Promise.all(projects.map((p) => projectView(s.repo, p))) };
   });
 
   app.post("/projects", async (req) => {
@@ -60,7 +70,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     });
     state.publishState();
     // The recovery code is shown once, here; it is never logged or stored.
-    return { project: projectView(s.repo, project), ...(recoveryCode ? { recoveryCode } : {}) };
+    return { project: await projectView(s.repo, project), ...(recoveryCode ? { recoveryCode } : {}) };
   });
 
   app.post("/projects/:id/unlock", async (req) => {
