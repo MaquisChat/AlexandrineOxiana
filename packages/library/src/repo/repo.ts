@@ -2,7 +2,7 @@
 import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent } from "@ao/core";
+import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
@@ -90,6 +90,7 @@ import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from ".
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 import { attentionWarnings, newAttentionId, reasonOf, removeAttention, settleAttention, writeAttention, type AttentionRecord } from "./attention.js";
 import { SimulatedCrash, maybeCrash } from "./seams.js";
+import { readLibraryAudit } from "./library-audit.js";
 
 /** Package-internal: run after a project is unlocked (best effort; failures never undo the unlock). */
 const unlockHooks: Array<(repo: Repo, projectId: string) => Promise<void>> = [];
@@ -119,6 +120,11 @@ export class Repo {
   /** Index sink failures after committed mutations (the index is rebuildable). */
   get indexErrors(): ReadonlyArray<{ op: string; error: unknown }> {
     return this.core.indexErrors;
+  }
+
+  /** The library's own audit log (refused project creations, Task 50) and whether its chain verifies. */
+  libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult }> {
+    return readLibraryAudit(this.core.root);
   }
 
   listProjects(): Project[] {
@@ -505,6 +511,15 @@ export async function openRepoInternal(
   // truncated; what is left was cut off outside a transaction and is not a committed record.
   // The workspace change log has no transactions and no audit chain: it is trimmed and reported.
   reportIncompleteLines(core, "*", await scanIncompleteLines(core.root, "", writable), writable);
+  // The library's own audit log (refusals with no project, Task 50): reported when it does not verify.
+  const libAudit = await readLibraryAudit(core.root).catch(() => null);
+  if (libAudit && !libAudit.verify.ok) {
+    core.integrityWarnings.push({
+      projectId: "*",
+      kind: "chain-broken",
+      detail: `the library's audit log breaks at event ${libAudit.verify.brokenAt + 1} (${libAudit.verify.reason}); it changed outside the app`,
+    });
+  }
   const incomplete = new Map<string, IncompleteLine[]>();
   const loaded = await loadProjects(core, async (p) => {
     const lines = await scanIncompleteLines(core.root, p.rel, writable && !unattributed && !isPending(p));
