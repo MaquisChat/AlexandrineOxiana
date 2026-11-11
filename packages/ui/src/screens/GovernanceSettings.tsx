@@ -20,7 +20,6 @@ import {
   PROCESSING_LABEL,
   PROCESSING_OPS,
   PROFILE_LABEL,
-  PROFILE_REQUIREMENTS,
   PROFILE_RESIDENCY_RULES,
   PROFILE_VENDOR_RULES,
   PROFILES,
@@ -32,11 +31,11 @@ import {
   hasException,
   isLooser,
   nowUtc,
+  profileOnEntries,
   readConfig,
   requiredBy,
   setIn,
   setManyIn,
-  tightened,
   type Config,
 } from "./governanceModel";
 import "./GovernanceScreens.css";
@@ -146,13 +145,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
     const profiles = on ? [...new Set([...cfg.profiles, profile])] : cfg.profiles.filter((p) => p !== profile);
     if (on) {
       // Every requirement of the profile, worked out from the rules already parsed, applied in one edit (R119).
-      const entries: Array<[string, unknown]> = [["profiles", profiles]];
-      for (const req of PROFILE_REQUIREMENTS[profile]) {
-        const before = getPath(cfg, req.control);
-        const after = tightened(req.control, before, req);
-        if (describe(after) !== describe(before)) entries.push([req.control, after]);
-      }
-      setText(setManyIn(text, entries));
+      setText(setManyIn(text, profileOnEntries(cfg, profile)));
       return;
     }
     setPending({

@@ -115,6 +115,12 @@ describe("Library screen", () => {
     expect(await screen.findByText(/Read-only \(locked by lab-mac\)/)).toBeTruthy();
   });
 
+  it("a read-only library offers no new project", async () => {
+    server.use(...libraryHandlers({ current: { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" } }));
+    renderLibrary({ libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" });
+    expect(await screen.findByRole("button", { name: "New project" })).toHaveProperty("disabled", true);
+  });
+
   it("a read-only library shows the banner and disables the drop zone and edit buttons", async () => {
     const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device" };
     server.use(...libraryHandlers({ current: ro }));
