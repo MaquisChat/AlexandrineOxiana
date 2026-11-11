@@ -45,7 +45,8 @@ export async function openDecrypted(path: string, getKey: (keyId: string) => Uin
  * The same over a file already open (e.g. opened without following symbolic links). The returned
  * file owns `fh`: its close() closes it, and so does a failure here.
  */
-export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: string) => Uint8Array | undefined): Promise<DecryptedFile> {
+export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: string) => Uint8Array | undefined, opts: { cacheChunks?: number } = {}): Promise<DecryptedFile> {
+  const cacheChunks = Math.max(1, opts.cacheChunks ?? CACHE_CHUNKS);
   try {
     const { size: fileSize } = await fh.stat();
     const header = Buffer.alloc(HEADER_LEN);
@@ -89,7 +90,7 @@ export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: st
         throw new DecryptionError(`authentication failed at chunk ${i}`);
       }
       cache.set(i, pt);
-      if (cache.size > CACHE_CHUNKS) {
+      if (cache.size > cacheChunks) {
         const oldest = cache.keys().next().value!;
         cache.get(oldest)?.fill(0);
         cache.delete(oldest);

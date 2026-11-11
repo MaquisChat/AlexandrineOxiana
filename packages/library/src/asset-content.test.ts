@@ -54,6 +54,8 @@ describe("openAssetContent", () => {
         expect((await collect(c.range(data.length - 1, data.length - 1))).equals(data.subarray(data.length - 1))).toBe(true);
         expect((await collect(c.range(CHUNK_SIZE, CHUNK_SIZE))).equals(data.subarray(CHUNK_SIZE, CHUNK_SIZE + 1))).toBe(true);
         expect(() => c.range(0, data.length)).toThrow(RangeError);
+        expect((await c.read(a, 30)).equals(data.subarray(a, a + 30))).toBe(true);
+        expect(() => c.read(data.length - 1, 2)).toThrow(RangeError);
       } finally {
         await c.close();
       }

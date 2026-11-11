@@ -43,6 +43,8 @@ export interface AssetContent {
   size: number;
   /** Bytes `start` to `end` inclusive, as a stream (RangeError when outside the file). */
   range(start: number, end: number): Readable;
+  /** `length` bytes from `position` at once (e.g. the first slice, read before any header is sent). */
+  read(position: number, length: number): Promise<Buffer>;
   /** Releases the file (and wipes the decryption key copy); any stream still reading then fails. Idempotent. */
   close(): Promise<void>;
 }
@@ -82,7 +84,8 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     const st = await fh.stat();
     if (!st.isFile()) throw new NotFoundError("Asset", assetId);
     if (key) {
-      dec = await openDecryptedHandle(fh, (id) => (id === key.keyId ? key.key : undefined));
+      // One decrypted chunk cached: reads for display are sequential (R140 review M8).
+      dec = await openDecryptedHandle(fh, (id) => (id === key.keyId ? key.key : undefined), { cacheChunks: 1 });
       size = dec.size;
     } else {
       size = st.size;
@@ -110,6 +113,10 @@ export async function openAssetContent(repo: Repo, projectId: string, sourceId: 
     asset,
     mime: asset.mime,
     size,
+    read(position, length) {
+      if (!Number.isInteger(position) || !Number.isInteger(length) || position < 0 || length < 0 || position + length > size) throw new RangeError("range outside the file");
+      return read(position, length);
+    },
     range(start, end) {
       if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= size) throw new RangeError("range outside the file");
       async function* gen(): AsyncGenerator<Buffer> {
