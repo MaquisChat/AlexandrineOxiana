@@ -415,10 +415,6 @@ button:disabled,
 }
 
 /* ---- interrupted changes (R27) ---- */
-.ao-new-project {
-  margin: var(--space-2) 0;
-}
-
 .ao-pending-backdrop {
   position: fixed;
   inset: 0;

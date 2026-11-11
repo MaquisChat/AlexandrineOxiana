@@ -11,7 +11,15 @@
  *
  * An encrypted project's recovery code is returned by the service once. It is shown here once,
  * through UserText, with a copy button; it is never logged, put in the address or stored, and the
- * dialog cannot be closed until the researcher confirms it is saved.
+ * dialog cannot be closed until the researcher confirms it is saved. Until then nothing in the app
+ * takes it away (R134 I2): unloading asks first, in-app links and Back/Forward are refused with a
+ * plain message, and a library closed underneath waits for the confirmation.
+ *
+ * An answer lost after sending (the service unreachable, a 5xx, an unreadable answer) leaves the
+ * outcome unknown (R134 I1). The project list read just before sending is compared with a fresh one:
+ * a new project with the name sent was created (said plainly, and opened; its recovery code cannot
+ * be shown again); none means nothing was made and creating again is allowed; an unreadable list
+ * means the app cannot tell, so nothing is resent until "Check again" settles it.
  *
  * Keyboard: focus starts in the name; Tab stays inside; Escape cancels (not while creating, and not
  * at the recovery code). The page behind is inert. Focus returns to `returnFocusTo` (the button that
@@ -25,6 +33,7 @@ import { ApiClientError } from "../api/client";
 import type { Profile } from "../api/governance";
 import { errorText, type LibraryApi, type ProjectSummary } from "../api/library";
 import { UserText } from "../components/UserText";
+import { blockNavigation } from "../navigation";
 import { PROFILE_LABEL, PROFILE_REQUIREMENTS, PROFILE_VENDOR_RULES, PROFILES, profileOnEntries, readConfig, setManyIn } from "./governanceModel";
 import "../components/library.css";
 import "./NewProject.css";
@@ -100,20 +109,41 @@ function requirementText(p: Profile): string {
 /** The service refused because the rules need encryption (GovernanceViolationError in createProject). */
 const needsEncryption = (err: unknown) => err instanceof ApiClientError && err.code === "VALIDATION" && /enable encryption/i.test(err.message);
 
-const FOCUSABLE = "input:not([disabled]), button:not([disabled]), [tabindex='-1']";
+const FOCUSABLE = "input:not(:disabled), button:not(:disabled), [tabindex='-1']";
 
 export interface NewProjectProps {
   api: Pick<LibraryApi, "projects">;
   /** The project was created and the dialog is finished (after the recovery code was confirmed). */
   onCreated: (project: ProjectSummary) => void;
   onCancel: () => void;
-  /** Where focus goes when the dialog closes (the button that opened it). */
-  returnFocusTo?: HTMLElement | null | undefined;
+  /** Where focus goes when the dialog closes (the button that opened it), worked out at closing time. */
+  returnFocusTo?: () => HTMLElement | null | undefined;
+  /**
+   * Whether a recovery code is on screen and not yet confirmed (R134): the library screen then keeps
+   * the dialog even if the library is closed underneath, and tells it with `libraryClosed`.
+   */
+  onRecoveryPending?: (pending: boolean) => void;
+  /** The library was closed while the recovery code was on screen. */
+  libraryClosed?: boolean;
 }
 
 type Field = "name" | "pass" | "again";
 
-export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProjectProps) {
+/** The service's limit on a passphrase (routes/projects.ts, UTF-16 units like maxLength). */
+const PASSPHRASE_MAX = 1024;
+
+/**
+ * A failed create whose outcome is unknown (R134): the service may have made the project before the
+ * answer was lost. Only a 4xx refusal says for certain that nothing was made.
+ */
+const outcomeUnknown = (err: unknown) => !(err instanceof ApiClientError) || err.status < 400 || err.status >= 500;
+
+/** After an answer was lost: being checked, or the check could not be made. */
+type Uncertain = "checking" | "cannot-tell";
+
+export const LEAVE_REFUSED = "Save the recovery code first. It is shown only here, and leaving now would lose it for good. Tick “I have saved the recovery code”, then choose Done.";
+
+export function NewProject({ api, onCreated, onCancel, returnFocusTo, onRecoveryPending, libraryClosed }: NewProjectProps) {
   const id = useId();
   const [name, setName] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -129,16 +159,28 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
   const [made, setMade] = useState<{ project: ProjectSummary; code: string } | null>(null);
   const [saved, setSaved] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  /** An attempt to leave the recovery code was refused. */
+  const [leaveRefused, setLeaveRefused] = useState(false);
+  /** The answer to a create was lost (R134 I1). */
+  const [uncertain, setUncertain] = useState<Uncertain | null>(null);
+  /** A project found after a lost answer: created, but its recovery code was never shown. */
+  const [found, setFound] = useState<ProjectSummary | null>(null);
+  /** What a lost answer is checked against: the name sent and the projects listed before sending. */
+  const pendingCheck = useRef<{ name: string; before: Set<string> } | null>(null);
+  /** A request (create or check) is in flight: no second one (state is too late for two events in one tick). */
+  const inFlight = useRef(false);
 
   const box = useRef<HTMLDivElement>(null);
+  const checkButton = useRef<HTMLButtonElement>(null);
+  const foundHeading = useRef<HTMLHeadingElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const passRef = useRef<HTMLInputElement>(null);
   const againRef = useRef<HTMLInputElement>(null);
   const alertRef = useRef<HTMLParagraphElement>(null);
   const codeHeading = useRef<HTMLHeadingElement>(null);
   const [host] = useState(() => document.createElement("div"));
-  const returnTo = useRef<HTMLElement | null>(null);
-  returnTo.current = returnFocusTo ?? returnTo.current;
+  const returnTo = useRef(returnFocusTo);
+  returnTo.current = returnFocusTo;
 
   // Rendered on <body>; everything else is inert while it is open. On close the page is made
   // usable again first, then focus goes back to the opener.
@@ -155,19 +197,79 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
     return () => {
       for (const el of made) el.removeAttribute("inert");
       host.remove();
-      (returnTo.current ?? before)?.focus?.();
+      (returnTo.current?.() ?? before)?.focus?.();
     };
   }, [host]);
 
   useEffect(() => {
     if (made) codeHeading.current?.focus();
   }, [made]);
+  useEffect(() => {
+    if (found) foundHeading.current?.focus();
+  }, [found]);
+
+  // While the recovery code is on screen and not confirmed, nothing may take it away (R134 I2):
+  // unloading asks first; in-app links and navigate() are refused; Back and Forward land on a copy
+  // of this same address (pushed now, without state) and are refused too. All of it ends when the
+  // code is confirmed or the dialog goes.
+  const pendingRef = useRef(onRecoveryPending);
+  pendingRef.current = onRecoveryPending;
+  const guarding = made !== null;
+  /** Ends the guards at once (Done: whatever the parent does next, such as leaving a closed library, may navigate). */
+  const releaseGuard = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (!guarding) return;
+    pendingRef.current?.(true);
+    const refuse = () => setLeaveRefused(true);
+    const onUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = ""; // older engines ask only when this is set
+    };
+    window.addEventListener("beforeunload", onUnload);
+    const unblock = blockNavigation(refuse);
+    const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    window.history.pushState(null, "", here);
+    let restoring = false;
+    const onPop = () => {
+      if (restoring) return;
+      refuse();
+      restoring = true;
+      window.history.pushState(null, "", here);
+      // Screens that already followed the address follow it back (in the same task, before React renders).
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      restoring = false;
+    };
+    window.addEventListener("popstate", onPop);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      window.removeEventListener("beforeunload", onUnload);
+      window.removeEventListener("popstate", onPop);
+      unblock();
+      pendingRef.current?.(false);
+    };
+    releaseGuard.current = release;
+    return release;
+  }, [guarding]);
 
   const requirement = encryptionRequirement({ profiles, identifiable });
   const mandatory = requirement.required || serviceNeedsEncryption;
   const encrypt = mandatory || encryptChoice;
+  /** Nothing can be changed or sent while a request is in flight or a lost answer is unresolved. */
+  const locked = busy || uncertain !== null;
 
-  const toggleProfile = (p: Profile, on: boolean) => setProfiles((list) => (on ? [...new Set([...list, p])] : list.filter((x) => x !== p)));
+  // A rules change makes the service's earlier refusal stale: the dialog's own decision applies again.
+  const toggleProfile = (p: Profile, on: boolean) => {
+    setServiceNeedsEncryption(false);
+    setProfiles((list) => (on ? [...new Set([...list, p])] : list.filter((x) => x !== p)));
+  };
+  const chooseIdentifiable = (on: boolean) => {
+    setServiceNeedsEncryption(false);
+    setIdentifiable(on);
+  };
+  /** Editing a field clears the mark on it. */
+  const edited = (f: Field) => setError((e) => (e?.field === f ? null : e));
 
   const show = (text: string, field?: Field) => {
     setError(field ? { text, field } : { text });
@@ -175,38 +277,78 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
     setTimeout(() => target.current?.focus());
   };
 
+  /** After a lost answer: is there a new project with that name? Never resends (R134 I1). */
+  const check = async () => {
+    const p = pendingCheck.current;
+    if (!p || inFlight.current) return;
+    inFlight.current = true;
+    setBusy(true);
+    setUncertain("checking");
+    setError(null);
+    try {
+      const { projects: now } = await api.projects.list();
+      const fresh = now.filter((x) => !p.before.has(x.id) && x.name === p.name);
+      pendingCheck.current = null;
+      setUncertain(null);
+      if (fresh.length) setFound(fresh[fresh.length - 1]!);
+      else show("The library service did not answer, and the project was not created, so nothing was changed. You can create it again.", encrypt ? "pass" : undefined);
+    } catch {
+      setUncertain("cannot-tell");
+      setError({ text: "The app cannot tell whether the project was created: the library service did not answer. Creating it again now could make a second copy, so check first when the service is back." });
+      setTimeout(() => checkButton.current?.focus());
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  };
+
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (busy) return;
+    if (inFlight.current || pendingCheck.current) return;
     const trimmed = name.trim();
     if (!trimmed) return show("Give the project a name.", "name");
     if (encrypt && !pass) return show("Choose a passphrase for the project and enter it twice.", "pass");
+    if (encrypt && pass.length > PASSPHRASE_MAX) return show(`The passphrase is too long: use at most ${PASSPHRASE_MAX} characters.`, "pass");
     if (encrypt && pass !== again) return show("The two passphrases do not match. Enter the same passphrase in both fields.", "again");
+    inFlight.current = true;
     setError(null);
     setBusy(true);
     const secret = pass;
     // The passphrase is sent once and not kept (as when unlocking).
     setPass("");
     setAgain("");
+    let lost = false;
     try {
-      const r = await api.projects.create({
-        name: trimmed,
-        governanceYaml: newProjectRules({ profiles, identifiable, encrypt }),
-        encryption: encrypt ? { enabled: true, passphrase: secret } : { enabled: false },
-      });
-      if (r.recoveryCode) setMade({ project: r.project, code: r.recoveryCode });
-      else onCreated(r.project);
-    } catch (err) {
-      if (needsEncryption(err)) {
-        setServiceNeedsEncryption(true);
-        setEncryptChoice(true);
-        show("These rules require encryption, so the project was not created. Encryption is now on: choose a passphrase, enter it twice, and create the project again.", "pass");
-      } else {
-        show(errorText(err, "The project could not be created. Nothing was changed."));
+      // What exists before sending: a lost answer is checked against it.
+      const before = new Set((await api.projects.list()).projects.map((x) => x.id));
+      try {
+        const r = await api.projects.create({
+          name: trimmed,
+          governanceYaml: newProjectRules({ profiles, identifiable, encrypt }),
+          encryption: encrypt ? { enabled: true, passphrase: secret } : { enabled: false },
+        });
+        if (r.recoveryCode) setMade({ project: r.project, code: r.recoveryCode });
+        else onCreated(r.project);
+      } catch (err) {
+        if (outcomeUnknown(err)) {
+          pendingCheck.current = { name: trimmed, before };
+          lost = true;
+        } else if (needsEncryption(err)) {
+          setServiceNeedsEncryption(true);
+          setEncryptChoice(true);
+          show("These rules require encryption, so the project was not created. Encryption is now on: choose a passphrase, enter it twice, and create the project again.", "pass");
+        } else {
+          show(errorText(err, "The project could not be created. Nothing was changed."));
+        }
       }
+    } catch (err) {
+      // The list before sending could not be read: nothing was sent.
+      show(errorText(err, "The project could not be created. Nothing was changed."));
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
+    if (lost) await check();
   };
 
   const copy = async () => {
@@ -224,6 +366,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
     if (!made || !saved) return;
     const project = made.project;
     setMade(null); // the code is not kept once confirmed
+    releaseGuard.current?.();
     onCreated(project);
   };
 
@@ -232,7 +375,7 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
       e.preventDefault();
       e.stopPropagation();
       // Never at the recovery code: it is shown once and must be saved first.
-      if (!busy && !made) onCancel();
+      if (!busy && !made && !found) onCancel();
       return;
     }
     if (e.key !== "Tab" || !box.current) return;
@@ -269,6 +412,16 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
             <h2 id={titleId} ref={codeHeading} tabIndex={-1}>
               Save the recovery code
             </h2>
+            {leaveRefused && (
+              <p role="alert" className="ao-error">
+                {LEAVE_REFUSED}
+              </p>
+            )}
+            {libraryClosed && (
+              <p role="status" className="ao-newproject__warning">
+                The library was closed while this was open. The project was created; once you have saved its recovery code, you return to choosing a library.
+              </p>
+            )}
             <p>
               <UserText>{made.project.name}</UserText> is created and encrypted. This is its recovery code. This is the only time it is shown: the app does not keep a copy.
             </p>
@@ -297,16 +450,54 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
               </button>
             </div>
           </>
+        ) : found ? (
+          <>
+            <h2 id={titleId} ref={foundHeading} tabIndex={-1}>
+              The project was created
+            </h2>
+            {found.encrypted ? (
+              <>
+                <p>
+                  <UserText>{found.name}</UserText> was created, but the library service's answer was lost on the way, so its recovery code could not be shown, and it cannot be shown again.
+                </p>
+                <p className="ao-newproject__warning">
+                  The project opens with the passphrase you just chose. Keep that passphrase safe: for now it is the only way to open the project. Asking for a new recovery code from the project's settings is planned, but not available yet.
+                </p>
+              </>
+            ) : (
+              <p>
+                <UserText>{found.name}</UserText> was created. The library service's answer was lost on the way, but the project is there.
+              </p>
+            )}
+            <div className="ao-row ao-newproject__actions">
+              <button type="button" onClick={() => onCreated(found)}>
+                Open the project
+              </button>
+            </div>
+          </>
         ) : (
           <>
             <h2 id={titleId}>New project</h2>
             <form onSubmit={(e) => void submit(e)} noValidate>
               <div className="ao-newproject__field">
                 <label htmlFor={`${id}-name`}>Project name</label>
-                <input id={`${id}-name`} ref={nameRef} type="text" autoComplete="off" maxLength={NAME_MAX} value={name} onChange={(e) => setName(e.target.value)} {...fieldError("name")} />
+                <input
+                  id={`${id}-name`}
+                  ref={nameRef}
+                  type="text"
+                  autoComplete="off"
+                  maxLength={NAME_MAX}
+                  readOnly={locked}
+                  value={name}
+                  onChange={(e) => {
+                    edited("name");
+                    setName(e.target.value);
+                  }}
+                  {...fieldError("name")}
+                />
               </div>
 
-              <fieldset className="ao-newproject__group">
+              <fieldset className="ao-newproject__group" disabled={locked}>
                 <legend>Compliance profiles</legend>
                 <p className="ao-muted">Turn on each set of rules this project must follow. You can make the rules stricter later under Governance.</p>
                 {PROFILES.map((p) => (
@@ -322,10 +513,10 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
                 ))}
               </fieldset>
 
-              <fieldset className="ao-newproject__group">
+              <fieldset className="ao-newproject__group" disabled={locked}>
                 <legend>Data and encryption</legend>
                 <label className="ao-newproject__choice">
-                  <input type="checkbox" checked={identifiable} onChange={(e) => setIdentifiable(e.target.checked)} aria-describedby={`${id}-ident`} />
+                  <input type="checkbox" checked={identifiable} onChange={(e) => chooseIdentifiable(e.target.checked)} aria-describedby={`${id}-ident`} />
                   This project holds identifiable information about people
                 </label>
                 <p id={`${id}-ident`} className="ao-muted ao-newproject__needs">
@@ -335,7 +526,8 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
                   <input type="checkbox" checked={encrypt} disabled={mandatory} onChange={(e) => setEncryptChoice(e.target.checked)} aria-describedby={`${id}-enc`} />
                   Encrypt this project
                 </label>
-                <p id={`${id}-enc`} className="ao-muted ao-newproject__needs">
+                {/* Announced when it changes: the checkbox it describes is skipped by Tab while disabled. */}
+                <p id={`${id}-enc`} className="ao-muted ao-newproject__needs" aria-live="polite">
                   {mandatory ? `Encryption is required. ${serviceNeedsEncryption && !requirement.required ? "The project's rules require it." : requirement.reasons.join(" ")}` : "Encryption is optional for these rules."}
                 </p>
                 {encrypt && (
@@ -345,11 +537,35 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
                     </p>
                     <div className="ao-newproject__field">
                       <label htmlFor={`${id}-pass`}>Passphrase</label>
-                      <input id={`${id}-pass`} ref={passRef} type="password" autoComplete="new-password" value={pass} onChange={(e) => setPass(e.target.value)} {...fieldError("pass")} />
+                      <input
+                        id={`${id}-pass`}
+                        ref={passRef}
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={PASSPHRASE_MAX}
+                        value={pass}
+                        onChange={(e) => {
+                          edited("pass");
+                          setPass(e.target.value);
+                        }}
+                        {...fieldError("pass")}
+                      />
                     </div>
                     <div className="ao-newproject__field">
                       <label htmlFor={`${id}-again`}>Passphrase again</label>
-                      <input id={`${id}-again`} ref={againRef} type="password" autoComplete="new-password" value={again} onChange={(e) => setAgain(e.target.value)} {...fieldError("again")} />
+                      <input
+                        id={`${id}-again`}
+                        ref={againRef}
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={PASSPHRASE_MAX}
+                        value={again}
+                        onChange={(e) => {
+                          edited("again");
+                          setAgain(e.target.value);
+                        }}
+                        {...fieldError("again")}
+                      />
                     </div>
                   </>
                 )}
@@ -360,14 +576,23 @@ export function NewProject({ api, onCreated, onCancel, returnFocusTo }: NewProje
                   <UserText>{error.text}</UserText>
                 </p>
               )}
+              {uncertain === "cannot-tell" && !busy && (
+                <div className="ao-row">
+                  <button type="button" ref={checkButton} onClick={() => void check()}>
+                    Check again
+                  </button>
+                </div>
+              )}
               {busy && (
                 <p role="status" className="ao-muted">
-                  Creating the project…
+                  {uncertain === "checking" ? "Checking whether the project was created…" : "Creating the project… This cannot be cancelled once sent."}
                 </p>
               )}
               <div className="ao-row ao-newproject__actions">
-                <button type="submit">Create project</button>
-                <button type="button" onClick={() => !busy && onCancel()}>
+                <button type="submit" disabled={locked}>
+                  Create project
+                </button>
+                <button type="button" disabled={busy} onClick={() => !busy && onCancel()}>
                   Cancel
                 </button>
               </div>

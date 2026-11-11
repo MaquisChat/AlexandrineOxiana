@@ -167,6 +167,9 @@ describe("New project dialog", () => {
     expect(alert.textContent).toMatch(/passphrases do not match/i);
     expect(within(dialog).getByLabelText("Passphrase again").getAttribute("aria-invalid")).toBe("true");
     expect(posted).toHaveLength(0);
+    // Correcting the field clears its mark.
+    await user.type(within(dialog).getByLabelText("Passphrase again"), "x");
+    expect(within(dialog).getByLabelText("Passphrase again").getAttribute("aria-invalid")).toBeNull();
   });
 
   it("asks for a name and a passphrase before asking the service", async () => {

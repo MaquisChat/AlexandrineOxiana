@@ -97,6 +97,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** The new-project dialog is open. */
   const [creating, setCreating] = useState(false);
   const newProjectButton = useRef<HTMLButtonElement>(null);
+  /** The dialog shows a recovery code not yet confirmed: a library close waits for it. */
+  const holdClose = useRef(false);
+  /** The library closed while that code was on screen. */
+  const [closedUnder, setClosedUnder] = useState(false);
   /** Counts library.state events: an open "Resolve…" dialog reads its list again on each. */
   const [stateSeq, setStateSeq] = useState(0);
 
@@ -168,7 +172,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "library.state" && e.data && typeof e.data === "object") {
             const d = e.data as LibraryState;
             if (d.open === false) {
-              closedRef.current?.();
+              // A new project's recovery code on screen is never taken away (R134 I2): the dialog
+              // says the library closed, and the library is left once the code is confirmed.
+              if (holdClose.current) setClosedUnder(true);
+              else closedRef.current?.();
               continue;
             }
             // Each event is the whole state: a reason or lock holder it no longer names is gone.
@@ -432,12 +439,26 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         {creating && (
           <NewProject
             api={api}
-            returnFocusTo={newProjectButton.current}
+            returnFocusTo={() => {
+              // The opener, unless it was disabled meanwhile (the library turned read-only): then the project list.
+              const b = newProjectButton.current;
+              if (b && !b.disabled) return b;
+              return document.querySelector<HTMLElement>(".ao-projects button[aria-current='true'], .ao-projects button");
+            }}
+            onRecoveryPending={(pending) => {
+              holdClose.current = pending;
+            }}
+            libraryClosed={closedUnder}
             onCancel={() => setCreating(false)}
             onCreated={(made) => {
+              setCreating(false);
+              if (closedUnder) {
+                // The library went away while the recovery code was on screen: now leave it.
+                closedRef.current?.();
+                return;
+              }
               setProjects((list) => [...(list ?? []).filter((p) => p.id !== made.id), made]);
               setProfiles((all) => ({ ...all, [made.id]: knownProfiles(made.profiles) }));
-              setCreating(false);
               // Selected like any other project: the address names it (41b2 I1).
               selectProject(made.id);
             }}
