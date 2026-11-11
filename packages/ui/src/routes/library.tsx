@@ -54,7 +54,7 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   const opened = (current: CurrentLibrary) => setView({ kind: "library", current, path: known.find((l) => l.libraryId === current.libraryId)?.lastKnownPaths[0] });
   const chooser = () => {
     // A project of the library that was open means nothing to the next one.
-    if (projectInQuery(window.location.search)) navigate(withProject({ pathname: window.location.pathname, search: window.location.search }), { replace: true });
+    if (isLibraryPath(window.location.pathname) && projectInQuery(window.location.search)) navigate(withProject({ pathname: window.location.pathname, search: window.location.search }), { replace: true });
     setView({ kind: "chooser" });
   };
 
@@ -79,7 +79,8 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
           navigate={navigate}
           projectFromAddress={projectInQuery(loc.search)}
           onProjectSelected={(id) => {
-            if (projectInQuery(window.location.search) !== id) navigate(withProject({ pathname: window.location.pathname, search: window.location.search }, id), { replace: true });
+            // Only while the library is the screen shown: never rewrite another screen's address.
+            if (isLibraryPath(window.location.pathname) && projectInQuery(window.location.search) !== id) navigate(withProject({ pathname: window.location.pathname, search: window.location.search }, id), { replace: true });
           }}
           onClosed={chooser}
           onSwitchLibrary={() => {

@@ -271,10 +271,18 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
 
   const selectedRef = useRef(onProjectSelected);
   selectedRef.current = onProjectSelected;
+  /**
+   * The project this screen last wrote into the address, until the address shows it: a render with
+   * an older address (a selection made just before) must not undo the selection.
+   */
+  const written = useRef<string | undefined>(undefined);
   const selectProject = useCallback(
     (id: string | undefined) => {
       setUnknownProject(false);
-      if (id) selectedRef.current?.(id);
+      if (id && selectedRef.current) {
+        written.current = id;
+        selectedRef.current(id);
+      }
       if (id === projectIdRef.current) return;
       projectIdRef.current = id;
       staleMore();
@@ -292,6 +300,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   // ---- the project named in the address (41b2 I1): honoured on every way into the library ----
   useEffect(() => {
     if (!projects) return;
+    if (written.current !== undefined) {
+      if (projectFromAddress !== written.current) return; // the address has not caught up yet
+      written.current = undefined;
+    }
     if (!projectFromAddress) {
       // No project named: keep the one selected, else the first; either way the address names it.
       selectProject(projectIdRef.current ?? projects[0]?.id);
