@@ -930,6 +930,30 @@ describe("R125: backups are governed and audited", () => {
     expect(events.map((e) => e.action)).toEqual(expect.arrayContaining(["backup", "backup.create"]));
   });
 
+  it("R138: a double request, and the scheduler at the same moment, never leave a backup that is not the file it records", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, false, "Double");
+    await svc.state.idle();
+    const [a, b, sched] = await Promise.all([
+      call({ method: "POST", url: `/projects/${pid}/backups` }),
+      call({ method: "POST", url: `/projects/${pid}/backups` }),
+      svc.state.runScheduledBackups(),
+    ]);
+    expect(a.status, a.body).toBe(200);
+    expect(b.status, b.body).toBe(200);
+    expect(a.json.backup.file).not.toBe(b.json.backup.file);
+    expect(sched.every((r) => r.ok)).toBe(true);
+    const repo = svc.state.session!.repo;
+    const list = await listBackups(repo, pid);
+    expect(new Set(list.map((x) => x.file)).size).toBe(list.length);
+    const { createHash } = await import("node:crypto");
+    for (const x of list) {
+      const bytes = await readFile(join(svc.state.session!.lib.root, "Backups", x.file));
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(x.sha256);
+    }
+  });
+
   it("a refused manual backup → 403 POLICY_DENIED with the engine's reason; nothing is made; the denial is audited", async () => {
     await start();
     const path = await openNewLibrary();
