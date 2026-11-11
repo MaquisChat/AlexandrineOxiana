@@ -22,8 +22,12 @@ import "./ExtensionPairing.css";
 type Outcome = "expired" | "used";
 interface ShownCode {
   digits: string;
-  /** Milliseconds since the epoch. */
+  /** The service's expiry time, milliseconds since the epoch. */
   deadline: number;
+  /** When this screen asked for the code (milliseconds); a pairing earlier than this is not this code's. */
+  issuedAt: number;
+  /** The ids of the browsers paired when the code was issued, or null when the list was unknown. */
+  baseline: Set<string> | null;
 }
 
 const CODE_FORMAT = /^\d{6}$/;
@@ -36,12 +40,13 @@ const when = (iso: string): string => {
 };
 
 /** The route's wrapper: one api object per client, so the screen's effects do not restart on every render. */
-export function ExtensionPairingRoute({ client }: { client: ApiClient }) {
+export function ExtensionPairingRoute({ client, port }: { client: ApiClient; port?: number | undefined }) {
   const api = useMemo(() => extensionApi(client), [client]);
-  return <ExtensionPairing api={api} />;
+  return <ExtensionPairing api={api} {...(port !== undefined ? { port } : {})} />;
 }
 
-export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; pollMs?: number }) {
+/** `port` is the service's port (not a secret; the extension's popup asks for it). The token never reaches this screen. */
+export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionApi; pollMs?: number; port?: number }) {
   const ids = useId();
   const [code, setCode] = useState<ShownCode | null>(null);
   const [remaining, setRemaining] = useState(0);
@@ -63,8 +68,6 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
   const listSeq = useRef(0);
   const issuingNow = useRef(false);
   const browsersRef = useRef<PairedBrowser[] | null>(null);
-  /** The ids of the browsers paired when the shown code was issued; a new id means the code was used. */
-  const baseline = useRef<Set<string> | null>(null);
   const warned = useRef(false);
   const heading = useRef<HTMLHeadingElement>(null);
 
@@ -114,7 +117,6 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
     setCode(null);
     setOutcome(next);
     setAnnouncement("");
-    baseline.current = null;
   };
 
   // The countdown: the visible clock changes every second; the announcement only at sensible moments.
@@ -124,7 +126,7 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
     if (deadline === undefined) return;
     const left = () => Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     setRemaining(left());
-    const t = setInterval(() => {
+    const check = () => {
       const s = left();
       if (s <= 0) {
         clearInterval(t);
@@ -136,25 +138,53 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
         warned.current = true;
         setAnnouncement("Less than 1 minute left. The code is about to expire.");
       }
-    }, 1000);
-    return () => clearInterval(t);
+    };
+    const t = setInterval(check, 1000);
+    // After sleep or a background tab the timers may not have run: look again as soon as the page is back.
+    document.addEventListener("visibilitychange", check);
+    window.addEventListener("focus", check);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", check);
+      window.removeEventListener("focus", check);
+    };
   }, [deadline]);
 
-  // While a code is shown, a new entry in the list of paired browsers means it was used.
+  // While a code is shown, a pairing that is new since it was issued, and not older than it, means it was used.
+  // One poll at a time; the polling ends with the code (expiry, use, replacement) or with the screen.
   useEffect(() => {
-    if (!active) return;
-    const t = setInterval(() => {
-      void refresh(true).then((list) => {
-        if (!list || !alive.current) return;
-        if (!baseline.current) {
-          baseline.current = new Set(list.map((b) => b.id));
-          return;
-        }
-        if (list.some((b) => !baseline.current!.has(b.id))) clearCode("used");
-      });
-    }, pollMs);
-    return () => clearInterval(t);
-  }, [active, pollMs, refresh]);
+    if (!code) return;
+    const mine = code;
+    let stopped = false;
+    let inFlight = false;
+    const ac = new AbortController();
+    const poll = async () => {
+      if (inFlight || stopped) return;
+      inFlight = true;
+      try {
+        const list = await api.list(ac.signal);
+        if (stopped || !alive.current) return;
+        browsersRef.current = list;
+        setBrowsers(list);
+        setListError(null);
+        const used = list.some((b) => {
+          const at = Date.parse(b.pairedAt);
+          return !(mine.baseline?.has(b.id) ?? false) && !Number.isNaN(at) && at >= mine.issuedAt;
+        });
+        if (used) clearCode("used");
+      } catch {
+        // a failed poll is silent; the next one tries again
+      } finally {
+        inFlight = false;
+      }
+    };
+    const t = setInterval(() => void poll(), pollMs);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+      ac.abort();
+    };
+  }, [code, pollMs, api]);
 
   const issue = async () => {
     if (issuingNow.current) return;
@@ -164,6 +194,8 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
     clearCode(null); // an earlier code stops working the moment a new one is made
     const my = ++issueSeq.current;
     const ac = signal();
+    const issuedAt = Date.now();
+    const known = browsersRef.current ? new Set(browsersRef.current.map((b) => b.id)) : null;
     try {
       const r = await api.issueCode(ac.signal);
       if (!alive.current || my !== issueSeq.current) return;
@@ -173,9 +205,8 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
         return;
       }
       warned.current = false;
-      baseline.current = browsersRef.current ? new Set(browsersRef.current.map((b) => b.id)) : null;
       setRemaining(Math.max(0, Math.ceil((deadlineAt - Date.now()) / 1000)));
-      setCode({ digits: r.code, deadline: deadlineAt });
+      setCode({ digits: r.code, deadline: deadlineAt, issuedAt, baseline: known });
       setAnnouncement(`A pairing code is showing. It is valid for ${Math.max(1, Math.round((deadlineAt - Date.now()) / 60000))} minutes.`);
     } catch (err) {
       if (!alive.current || my !== issueSeq.current) return;
@@ -231,14 +262,19 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
 
       <section className="ao-card" aria-labelledby={`${ids}-pair`}>
         <h2 id={`${ids}-pair`}>Pair a browser</h2>
-        <ol className="ao-pairing-steps">
+        <ol className="ao-pairing-steps" aria-label="Steps">
           <li>Choose “{showLabel}” below. A code of six digits appears here.</li>
-          <li>Open the extension's popup in the browser you want to pair, type this app's port and the code, and confirm.</li>
+          <li>Open the extension's popup in the browser you want to pair (its “Pair with the desktop app” page). Type the number shown as “Port” below into its “Port” field and the six digits into its “Pairing code” field, then press “Pair”.</li>
           <li>This page tells you when the code was used. The code works once, for 5 minutes, and stops after 5 wrong tries.</li>
         </ol>
+        {port !== undefined ? (
+          <div role="group" aria-label="Service port" className="ao-pairing-port">
+            <span>Port</span> <strong>{port}</strong>
+          </div>
+        ) : null}
         <div className="ao-actions">
           {/* The second click of a double click (detail 2) is ignored, so it never asks for two codes. */}
-          <button type="button" onClick={(e) => e.detail < 2 && void issue()} disabled={issuing}>
+          <button type="button" onClick={(e) => e.detail < 2 && void issue()} aria-busy={issuing || undefined}>
             {showLabel}
           </button>
         </div>
@@ -249,15 +285,16 @@ export function ExtensionPairing({ api, pollMs = 3000 }: { api: ExtensionApi; po
           </p>
         ) : null}
 
+        <p role="status" aria-label="Pairing code time" className="ao-visually-hidden">
+          {announcement}
+        </p>
         {code ? (
           <div className="ao-pairing-code-box">
             <p role="img" aria-label={`Pairing code: ${code.digits.split("").join(" ")}`} className="ao-pairing-code">
-              {code.digits.slice(0, 3)} {code.digits.slice(3)}
+              <span>{code.digits.slice(0, 3)}</span>
+              <span>{code.digits.slice(3)}</span>
             </p>
             <p className="ao-hint">Valid for {clock(remaining)}</p>
-            <p role="status" aria-label="Pairing code time" className="ao-visually-hidden">
-              {announcement}
-            </p>
             <p className="ao-hint">If the extension says the code is not valid, show a new code: it replaces this one.</p>
           </div>
         ) : null}

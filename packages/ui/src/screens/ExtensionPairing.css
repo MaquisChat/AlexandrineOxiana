@@ -46,3 +46,18 @@
 .ao-pairing h2[tabindex="-1"]:focus {
   outline: none;
 }
+
+.ao-pairing-code span + span {
+  margin-inline-start: 0.5em;
+}
+
+.ao-pairing-port {
+  margin: var(--space-2) 0;
+  font-size: 1.25rem;
+}
+
+.ao-pairing-port strong {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  color: var(--ink);
+}

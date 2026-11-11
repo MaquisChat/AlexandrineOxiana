@@ -31,7 +31,8 @@ describe("Pair a browser", () => {
     expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
     await show(user);
     const code = await screen.findByRole("img", { name: codeName("482916") });
-    expect(code.textContent).toBe("482 916");
+    expect(code.textContent).toBe("482916"); // two spans with a gap in CSS: a copy is the six digits only
+    expect(code.querySelectorAll("span")).toHaveLength(2);
     expect(svc.state.issued).toBe(1);
     // Instructions for the extension's side.
     expect(screen.getByText(/extension's popup/i)).toBeTruthy();
@@ -108,7 +109,7 @@ describe("Pair a browser", () => {
     render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
     await show(user);
     await screen.findByRole("img", { name: /Pairing code/ });
-    svc.state.pairings.push(BROWSER_B);
+    svc.state.pairings.push({ ...BROWSER_B, pairedAt: new Date().toISOString() });
     await tick(2500);
     expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
     expect(document.body.textContent).not.toMatch(/482\s?916/);
@@ -174,6 +175,161 @@ describe("Pair a browser", () => {
     for (const spy of [log, err]) expect(JSON.stringify(spy.mock.calls)).not.toMatch(/482916/);
     log.mockRestore();
     err.mockRestore();
+  });
+});
+
+const getsOf = (svc: ReturnType<typeof pairingService>) => {
+  let n = 0;
+  server.events.on("request:start", ({ request }) => {
+    if (request.method === "GET" && request.url.endsWith("/extension/pairings")) n++;
+  });
+  void svc;
+  return () => n;
+};
+
+describe("used detection and polling (review I2)", () => {
+  it("a pairing that landed before a new code was issued does not mark the new code used", async () => {
+    const svc = pairingService({ codes: [{ code: "111111" }, { code: "222222" }], pairings: [BROWSER_A] });
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: codeName("111111") });
+    // The extension confirmed code 1 just now; the screen has not read the list yet.
+    svc.state.pairings.push({ ...BROWSER_B, pairedAt: new Date().toISOString() });
+    await tick(50);
+    await user.click(screen.getByRole("button", { name: "Show a new code" }));
+    await screen.findByRole("img", { name: codeName("222222") });
+    await tick(5000);
+    expect(screen.getByRole("img", { name: codeName("222222") })).toBeTruthy();
+    expect(screen.queryByRole("status", { name: "Pairing result" })).toBeNull();
+    // The list itself did learn of the new browser.
+    expect(within(screen.getByRole("region", { name: "Paired browsers" })).getAllByRole("listitem")).toHaveLength(2);
+  });
+
+  it("a pairing made by an earlier code never marks the current one used, even when first seen later", async () => {
+    const svc = pairingService({ pairings: [BROWSER_A] });
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    svc.state.pairings.push({ ...BROWSER_B, pairedAt: new Date(Date.now() - 60_000).toISOString() });
+    await tick(5000);
+    expect(screen.getByRole("img", { name: /Pairing code/ })).toBeTruthy();
+  });
+
+  it("still notices a use when the list could not be read at issue time", async () => {
+    const svc = pairingService();
+    server.use(http.get(url("/extension/pairings"), () => HttpResponse.error(), { once: true }), ...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await screen.findByRole("alert");
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    svc.state.pairings.push({ ...BROWSER_B, pairedAt: new Date().toISOString() });
+    await tick(2500);
+    expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
+    expect(screen.getByRole("status", { name: "Pairing result" })).toBeTruthy();
+  });
+
+  it("polling stops on expiry, on use, and on leaving the screen", async () => {
+    const svc = pairingService({ codes: [{ code: "482916", ttlMs: 10_000 }, { code: "135790" }] });
+    server.use(...svc.handlers);
+    const count = getsOf(svc);
+    const user = fakeClock();
+    const { unmount } = render(<ExtensionPairing api={makeApi()} pollMs={2000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    await tick(12_000); // expired
+    expect(screen.getByRole("alert").textContent).toMatch(/expired/i);
+    const afterExpiry = count();
+    await tick(10_000);
+    expect(count()).toBe(afterExpiry);
+    await user.click(screen.getByRole("button", { name: "Show a new code" }));
+    await screen.findByRole("img", { name: codeName("135790") });
+    svc.state.pairings.push({ ...BROWSER_B, pairedAt: new Date().toISOString() });
+    await tick(2500);
+    expect(screen.getByRole("status", { name: "Pairing result" })).toBeTruthy(); // used
+    const afterUse = count();
+    await tick(10_000);
+    expect(count()).toBe(afterUse);
+    await user.click(screen.getByRole("button", { name: "Show a new code" }));
+    await screen.findByRole("img", { name: /Pairing code/ });
+    await tick(2500);
+    unmount();
+    const afterLeave = count();
+    await tick(10_000);
+    expect(count()).toBe(afterLeave);
+    server.events.removeAllListeners();
+  });
+
+  it("never runs two polls at once, however slow the list is", async () => {
+    let first = true;
+    let active = 0;
+    let most = 0;
+    server.use(
+      ...pairingService().handlers.slice(0, 1),
+      http.get(url("/extension/pairings"), async () => {
+        if (first) {
+          first = false; // the read when the screen opens is not a poll
+          return HttpResponse.json({ extensions: [] });
+        }
+        active++;
+        most = Math.max(most, active);
+        await new Promise((r) => setTimeout(r, 250));
+        active--;
+        return HttpResponse.json({ extensions: [] });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} pollMs={50} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    await new Promise((r) => setTimeout(r, 900));
+    expect(most).toBe(1);
+  });
+});
+
+describe("the expiry follows the service's time (item 4)", () => {
+  it("a sleeping machine or background tab: on return the expired code is removed at once", async () => {
+    const svc = pairingService({ codes: [{ code: "482916" }] });
+    server.use(...svc.handlers);
+    const user = fakeClock();
+    render(<ExtensionPairing api={makeApi()} pollMs={1_000_000} />);
+    await show(user);
+    await screen.findByRole("img", { name: /Pairing code/ });
+    vi.setSystemTime(Date.now() + 10 * 60_000); // the timers did not run while asleep
+    act(() => void document.dispatchEvent(new Event("visibilitychange")));
+    expect(screen.queryByRole("img", { name: /Pairing code/ })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toMatch(/expired/i);
+  });
+});
+
+describe("the service's port (review I1)", () => {
+  it("shows the port beside the code, with a name, and the instructions match the popup's fields", async () => {
+    server.use(...pairingService().handlers);
+    render(<ExtensionPairing api={makeApi()} port={48123} />);
+    const group = screen.getByRole("group", { name: "Service port" });
+    expect(group.textContent).toContain("48123");
+    const steps = screen.getByRole("list", { name: "Steps" }).textContent ?? "";
+    expect(steps).toMatch(/“Port”/);
+    expect(steps).toMatch(/“Pairing code”/);
+    expect(steps).toMatch(/Pair/);
+  });
+
+  it("the app passes the port only: the screen shows it and nothing else of the connection", async () => {
+    const { App } = await import("../App");
+    const { PATHS } = await import("../navigation");
+    const token = "q".repeat(40) + "-secret";
+    server.use(...pairingService().handlers);
+    window.history.pushState(null, "", PATHS.extension);
+    render(<App service={{ baseUrl: "http://127.0.0.1:4318", token }} />);
+    const group = await screen.findByRole("group", { name: "Service port" });
+    expect(group.textContent).toContain("4318");
+    expect(document.body.innerHTML).not.toContain(token);
+    expect(document.body.innerHTML).not.toContain("http://127.0.0.1");
+    window.history.pushState(null, "", "/");
   });
 });
 
