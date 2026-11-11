@@ -409,12 +409,12 @@ Update after every task; commit and push.
 | 41b Review: interface | done | c413047 | 5 Important fixed and re-reviewed; 12 Minors fixed, 19 deferred in the ledger |
 | 42 CI coverage | awaiting CI | ae3f762, b207182 | GitHub's runners cannot resolve ubuntu.com; mirror fallback added; done when a run is green |
 | 43 End-to-end harness | done | 9f91216 | Chromium and WebKit; service untouched (R130); 2 Important fixed and re-reviewed |
-| 60 New-project dialog | fix round 2 | | one path of I1 open (duplicate after a failed check) |
+| 60 New-project dialog | re-review 2 | | round 2 fixes in; reviewer checking |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | in progress | | implementer dispatched |
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
-| 34a Service additions | not started | | |
+| 34a Service additions | in progress | | R135 ruled; implementer dispatched |
 | 34b Capture screen | not started | | |
 | 34c Transcript viewer | not started | | |
 | 34d Verification badges | not started | | |
@@ -422,7 +422,7 @@ Update after every task; commit and push.
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | not started | | |
+| 49 Backups governed | in progress | | implementer dispatched |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | not started | | |
 | 61 New recovery code | not started | | found by the Task 60 review |
