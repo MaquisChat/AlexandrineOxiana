@@ -119,8 +119,16 @@ Format: **Depends** (tasks that must be merged first) · **Parallel** (may run a
 - Verify: `pnpm e2e -- --app-only --trace off`; `pnpm test:scripts`; if the fallback was used, `pnpm --filter @ao/library-service exec vitest run` showing the default still refuses.
 - Model: Opus.
 
+**Task 60 — New-project dialog (found by Task 43)**
+- Depends: 41b fixes merged (both touch `packages/ui/src/screens/Library.tsx`). Parallel: 45.
+- Files: `packages/ui/src/api/library.ts`, `packages/ui/src/screens/NewProject.tsx` (new), `packages/ui/src/screens/Library.tsx`, tests beside them; `e2e/smoke.spec.ts` (replace the `fixme`).
+- Why: the service can create a project (`POST /projects`) but nothing in the UI calls it; the first end-to-end run could only create one through the service. The original plan specified listing projects and never creating one.
+- Accept: from the library screen a researcher can create a project: a name; the compliance profiles (IRB, GDPR, HIPAA, data-management plan) as toggles, showing what each requires; encryption, switched on and not optional whenever the chosen rules require it (the service refuses a project with the default rules and no encryption), with a passphrase entered twice; the recovery code shown once, with an explicit "I have saved it" step before the dialog can close; every refusal from the service shown in plain words. The dialog follows R113 (labels, keyboard, focus, inert background). The new project is selected afterwards.
+- Verify: `pnpm --filter @ao/ui exec vitest run src/screens/NewProject.test.tsx src/screens/Library.test.tsx`; `lint:css`, `lint:colours`; `pnpm e2e -- --app-only e2e/smoke.spec.ts --trace off` with the `fixme` replaced by the real step.
+- Model: Opus.
+
 **Task 44 — Scenarios 1, 2, 5, 7**
-- Depends: 43. Parallel: 45.
+- Depends: 43, 60 (scenario 1 creates a project through the UI). Parallel: 45.
 - Files: `e2e/library.spec.ts`.
 - Accept: scenarios from the old plan's Task 37 list: (1) create a library and an IRB+GDPR project with encryption, recovery code shown once; (2) attach a PDF with a DOI, title filled from the recorded Crossref answer, copy an APA citation; (5) dark theme and a different typeface survive a reload; (7) delete `library.sqlite`, reopen, search works. Each product defect found is filed as a line in section 7, not patched inside this task unless it is a one-line fix.
 - Verify: `pnpm e2e -- --app-only e2e/library.spec.ts --trace off` in both browsers.
@@ -392,7 +400,8 @@ Update after every task; commit and push.
 | 41a Review: library and service | in review | | reviewer dispatched |
 | 41b Review: interface | in review | | two reviewers (fix rounds; integration) |
 | 42 CI coverage | awaiting CI | ae3f762 | done when a run on GitHub is green |
-| 43 End-to-end harness | not started | | |
+| 43 End-to-end harness | in review | 604c185 (worktree branch) | Chromium and WebKit pass; service untouched |
+| 60 New-project dialog | not started | | found by Task 43 |
 | 44 Scenarios 1, 2, 5, 7 | not started | | |
 | 45 Scenarios 3, 4, 6, 8 | not started | | |
 | 46 Fix scenario findings | not started | | |
@@ -439,7 +448,7 @@ Update after every task; commit and push.
 
 ## 10. After Phase 1 (outline only)
 
-- **Windows desktop app.** The same shell with Windows helpers and signing; path-length and reserved-name checks on a real machine; the cloud-placeholder limit recorded in ADR 0010.
+- **Windows desktop app.** The same shell with Windows helpers and signing; Chromium's local-network-access check refuses calls from the shell's origin (`http://tauri.localhost`) to the loopback service unless the permission is granted (found by Task 43; the Windows web view is Chromium, the Mac one is not affected); path-length and reserved-name checks on a real machine; the cloud-placeholder limit recorded in ADR 0010.
 - **Phase 2, capture and media.** Web page snapshots and whole-site archive; optional official platform interfaces; scheduled profile monitoring; translation; speaker separation; multilingual transcript editor; cross-language search; research watches, the Research Inbox and desktop research agents.
 - **Phase 3, annotation and coding.** Highlights on PDF, EPUB, web, video and images; codebook, coding, memos, retrieval; REFI-QDA exchange. The `Anchor` and `Annotation` models already exist.
 - **Phase 4, writing integrations.** Word add-in, Obsidian plugin, Scrivener scan; quote cards, screenshots, clips.
@@ -454,6 +463,7 @@ Each phase gets its own plan when it starts.
 - 2026-11-11: owner confirmed; `handoff/2026-11-11` pushed at `0832c77` (not yet merged into the working branch: that is Task 39). Plan checked against the ledger and amended (section 12). `docs/handoff/LEDGER-INDEX.md` added.
 - 2026-11-11: owner decided against a second backup folder in Phase 1; to be settled with sync (Phase 5). Plan still awaits approval.
 - 2026-11-11: owner approved the plan. Milestone I started: handoff docs merged and corrected (39), rulings R120–R128 recorded (40), build fixed (38), CI extended (42), three reviewers dispatched for the never-reviewed commits (41a, 41b).
+- 2026-11-11: reviews of the never-reviewed commits found 1 Critical and 9 Important defects (ledger, R131); fixes dispatched. Task 43 built the harness: real UI, service and worker pass in Chromium and WebKit with the service unchanged. It found that the UI cannot create a project: Task 60 added.
 
 ## 12. What the ledger check changed
 

@@ -1,6 +1,10 @@
 name: CI
 on:
   push:
+    # A push that changes only documentation does not need the suite (and would cancel a run in progress).
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
     branches: [main]
   workflow_dispatch:
