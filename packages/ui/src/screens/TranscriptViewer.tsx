@@ -18,7 +18,7 @@
  * Every answer is checked against the project, source and request it was for, so one that arrives
  * after they changed (or after the screen closed) is dropped.
  */
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { TranscriptResponse, TranscriptSaveRequest, TranscriptSegment, TranscriptVersionSummary } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
@@ -26,6 +26,7 @@ import { TRANSCRIPTION_MODELS, type TranscriptApi, type TranscriptionModel } fro
 import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
 import { UserText } from "../components/UserText";
 import { blockNavigation } from "../navigation";
+import { setTranscriptionRun, subscribeTranscriptionRuns, transcriptionRun } from "./transcriptionRuns";
 import { buildVtt, carriedFlags, flagLabels, formatTime, machineBaseOf, segmentAt, versionEntries, type VersionEntry } from "./transcriptModel";
 import "../components/library.css";
 import "./TranscriptViewer.css";
@@ -70,7 +71,7 @@ function versionLabel(v: VersionEntry): string {
   return `${v.madeBy}, ${dateText(v.at)}${flagged}`;
 }
 
-/** Plain words for a failed transcription, with what the service reported. */
+/** Plain words for a failed transcription, with what the service reported (never a raw code). */
 function transcribeError(err: unknown, model: string): string {
   if (!(err instanceof ApiClientError)) return "Transcription could not be started.";
   const said = err.message ? ` The service said: “${err.message}”` : "";
@@ -85,8 +86,19 @@ function transcribeError(err: unknown, model: string): string {
       return `The recording's file could not be found in the library.${said}`;
     case "INVALID_PARAMS":
       return `The speech tool refused these settings on this computer.${said}`;
+    case "INTERRUPTED":
+      return `The transcription was interrupted before it finished (the media helper stopped). Nothing was saved; you can start it again.${said}`;
+    case "CANCELLED":
+      return `The transcription was stopped before it finished. Nothing was saved.${said}`;
+    case "ENCRYPTION_REQUIRED":
+      return `This project is encrypted and the media helper could not work on it encrypted, so nothing was transcribed.${said}`;
+    case "INPUT_NOT_DECRYPTABLE":
+      return `The recording could not be decrypted for transcription. Lock and unlock the project, then try again.${said}`;
+    case "TOOL_FAILED":
+      return `The speech tool failed while transcribing.${said}`;
   }
-  if (err.code === "WORKER_UNAVAILABLE") return `The media helper that runs speech recognition is not running. ${err.message}`.trim();
+  if (err.code === "WORKER_UNAVAILABLE") return "The media helper that runs speech recognition is not running. Start the app again, then try again.";
+  if (err.code === "INTERNAL" && err.reason) return `The media helper could not finish the transcription.${said === ` The service said: “The media helper could not finish the job.”` ? "" : said}`;
   return errorText(err, "Transcription failed.");
 }
 
@@ -133,8 +145,9 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
   const [notice, setNotice] = useState<string | undefined>();
   const [refused, setRefused] = useState(false);
   const [model, setModel] = useState<TranscriptionModel>("medium");
-  const [transcribing, setTranscribing] = useState<TranscriptionModel | null>(null);
   const [transcribeFailure, setTranscribeFailure] = useState<string | undefined>();
+  /** This source's re-transcription in this session (it outlives the screen; R143). */
+  const run = useSyncExternalStore(subscribeTranscriptionRuns, () => transcriptionRun(key));
 
   const listSeq = useRef(0);
   const readSeq = useRef(0);
@@ -394,27 +407,60 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
     }
   };
 
-  const transcribe = async () => {
-    if (transcribing) return;
-    const chosen = model;
-    const k = keyRef.current;
-    setTranscribing(chosen);
-    setTranscribeFailure(undefined);
-    setNotice(undefined);
-    try {
-      const r = await apiRef.current.transcribe(projectId, sourceId, { model: chosen });
-      if (!mounted.current || k !== keyRef.current) return;
+  // A run's outcome is taken up by whichever viewer of this source is open when it is known.
+  useEffect(() => {
+    if (!run || (run.state !== "finished" && run.state !== "failed")) return;
+    setTranscriptionRun(key, undefined);
+    if (run.state === "finished") {
+      const r = run.result;
       const flagged = r.flaggedSegments === 1 ? "1 segment is" : `${r.flaggedSegments} segments are`;
       setNotice(`The new transcript is ready (${flagged} flagged for review). ${dirtyRef.current ? "It is listed under Version." : "It is shown below."}`);
-      await loadVersions({ paths: r.files });
+      void loadVersions({ paths: r.files });
+    } else if (!sawLocked(run.error)) {
+      setTranscribeFailure(transcribeError(run.error, run.model));
+    }
+  }, [run, key, loadVersions, sawLocked]);
+
+  const transcribe = () => {
+    if (run) return;
+    const k = key;
+    const chosen = model;
+    const startedAt = new Date().toISOString();
+    const transcribeApi = apiRef.current;
+    setTranscribeFailure(undefined);
+    setNotice(undefined);
+    setTranscriptionRun(k, { state: "running", model: chosen, startedAt });
+    transcribeApi.transcribe(projectId, sourceId, { model: chosen }).then(
+      (result) => setTranscriptionRun(k, { state: "finished", model: chosen, startedAt, result }),
+      (error: unknown) => {
+        // The request was sent and no answer came back: the service may still be transcribing.
+        const lost = error instanceof ApiClientError && error.status === 0;
+        setTranscriptionRun(k, lost ? { state: "unknown", model: chosen, startedAt } : { state: "failed", model: chosen, startedAt, error });
+      },
+    );
+  };
+
+  /** After a lost connection: a machine version made since the run started means it finished. */
+  const checkForNewVersions = async () => {
+    if (run?.state !== "unknown") return;
+    const since = Date.parse(run.startedAt) - 5_000;
+    const k = keyRef.current;
+    try {
+      const r = await apiRef.current.versions(projectId, sourceId);
+      if (!mounted.current || k !== keyRef.current) return;
+      const fresh = r.versions.filter((v) => v.origin === "machine" && Date.parse(String((v.derivation as { at?: unknown } | undefined)?.at ?? "")) >= since);
+      if (fresh.length) {
+        setTranscriptionRun(k, { state: "finished", model: run.model, startedAt: run.startedAt, result: { sourceId, folder: "", files: fresh.map((v) => v.path), flaggedSegments: fresh[0]!.flaggedSegments ?? 0 } });
+      } else {
+        setNotice("No new version yet. The transcription may still be going; check again in a few minutes.");
+      }
     } catch (err) {
       if (!mounted.current || k !== keyRef.current) return;
-      if (!sawLocked(err)) setTranscribeFailure(transcribeError(err, chosen));
-    } finally {
-      if (mounted.current && k === keyRef.current) setTranscribing(null);
+      if (!sawLocked(err)) setNotice(`The versions could not be checked. ${errorText(err, "The library service did not answer.")}`);
     }
   };
 
+  const busy = run?.state === "running" || run?.state === "unknown";
   const media = useMemo(() => source?.assets.find((a) => a.role === "original" && a.status !== "destroyed" && typeof a.mime === "string" && /^(audio|video)\//i.test(a.mime)), [source]);
   const title = source?.source.title.variants[0];
   const human = transcript?.origin === "human-edit";
@@ -669,25 +715,37 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
           <h2 id={`${id}-again`}>Transcribe again</h2>
           {media ? (
             <>
-              <p className="ao-muted">Runs speech recognition on this computer again and adds the result as a new version. Earlier versions are kept.</p>
+              <p className="ao-muted">
+                Runs speech recognition on this computer again and adds the result as a new version; earlier versions are kept. This can take several minutes for a long recording. Leaving this screen does not stop it: the new version appears under Version when it finishes.
+              </p>
               <div className="ao-row">
                 <label htmlFor={`${id}-model`}>Speech model</label>
-                <select id={`${id}-model`} value={model} disabled={transcribing !== null} onChange={(e) => setModel(e.target.value as TranscriptionModel)}>
+                <select id={`${id}-model`} value={model} disabled={busy} onChange={(e) => setModel(e.target.value as TranscriptionModel)}>
                   {TRANSCRIPTION_MODELS.map((m) => (
                     <option key={m} value={m}>
                       {MODEL_LABELS[m]}
                     </option>
                   ))}
                 </select>
-                <button type="button" onClick={() => void transcribe()} disabled={transcribing !== null}>
+                <button type="button" onClick={transcribe} disabled={busy} aria-describedby={busy ? `${id}-run` : undefined}>
                   Re-transcribe
                 </button>
               </div>
-              {transcribing && (
-                <div className="ao-tx__progress" role="status">
-                  <progress aria-label="Transcription in progress" />
-                  <p>{`Transcribing with the ${transcribing} model. This can take several minutes for a long recording; you can keep reading and listening meanwhile.`}</p>
-                </div>
+              <div id={`${id}-run`} role="status" className="ao-tx__progress">
+                {run?.state === "running" && (
+                  <>
+                    <progress aria-label="Transcription in progress" />
+                    <p>{`Transcribing with the ${run.model} model. This can take several minutes. You can leave this screen: the transcription goes on, and the new version will appear under Version. Re-transcribe is off for this source until it finishes.`}</p>
+                  </>
+                )}
+                {run?.state === "unknown" && (
+                  <p>{`The connection to the library service was lost while transcribing with the ${run.model} model. The transcription may still be going: the new version will appear in the version list when it finishes. Re-transcribe is off for this source for the rest of this session, so the same recording is not transcribed twice while the outcome is not known.`}</p>
+                )}
+              </div>
+              {run?.state === "unknown" && (
+                <button type="button" onClick={() => void checkForNewVersions()}>
+                  Check for new versions
+                </button>
               )}
               {transcribeFailure && (
                 <p role="alert" className="ao-error">

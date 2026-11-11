@@ -7,6 +7,7 @@ import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
 import { BASE, server, testClient, url, useMockService } from "../test/service";
 import { humanTranscript, humanVersion, machineTranscript, machineVersion, MACHINE_VERSIONS, SEGMENTS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
+import { resetTranscriptionRuns } from "./transcriptionRuns";
 import { TranscriptViewer } from "./TranscriptViewer";
 
 useMockService();
@@ -22,6 +23,7 @@ let played = 0;
 beforeEach(() => {
   scrolled = [];
   played = 0;
+  resetTranscriptionRuns();
   window.history.replaceState(null, "", "/transcript?project=p1&source=s1");
   // jsdom has no media playback and no scrolling: the tests drive the element's events and properties.
   vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(function () {
@@ -610,12 +612,107 @@ describe("TranscriptViewer — transcribe again", () => {
     expect(alert.textContent).not.toMatch(/MODEL_UNAVAILABLE|\{/);
   });
 
-  it("a media helper that is not running is explained", async () => {
+  it("a media helper that is not running is explained once, without the raw reason (review M2)", async () => {
     await open();
     server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(503, "WORKER_UNAVAILABLE", "The media helper is not running.", "spawn python ENOENT")));
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Re-transcribe" }));
-    expect(await screen.findByText(/The media helper is not running/)).toBeTruthy();
+    const msg = await screen.findByText(/media helper that runs speech recognition is not running/);
+    expect(msg.textContent!.match(/not running/g)).toHaveLength(1);
+    expect(msg.textContent).not.toMatch(/ENOENT/);
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("an interrupted run and other worker codes are said in words, never as a raw code (review M2)", async () => {
+    await open();
+    for (const [code, words] of [
+      ["INTERRUPTED", /was interrupted before it finished/],
+      ["CANCELLED", /was stopped before it finished/],
+      ["ENCRYPTION_REQUIRED", /encrypted/],
+      ["INPUT_NOT_DECRYPTABLE", /could not be decrypted/],
+      ["TOOL_FAILED", /speech tool failed/],
+      ["SOMETHING_NEW", /could not finish the transcription/],
+    ] as const) {
+      server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(502, "INTERNAL", "The media helper could not finish the job.", code)));
+      await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
+      const msg = await screen.findByText(words);
+      expect(msg.textContent).not.toContain(code);
+    }
+  });
+
+  it("a connection lost while transcribing says the run may still be going, offers Check for new versions, and keeps Re-transcribe off for this source (review I2)", async () => {
+    const svc = transcriptService();
+    let calls = 0;
+    server.use(
+      http.post(url("/projects/:id/sources/:sid/transcribe"), () => {
+        calls++;
+        return HttpResponse.error();
+      }),
+      ...svc.handlers,
+    );
+    const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    expect(screen.getByText(/Leaving this screen does not stop it/)).toBeTruthy();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
+    const msg = await screen.findByText(/may still be going/);
+    expect(msg.textContent).not.toMatch(/could not be reached/);
+    expect(screen.queryByText(/could not be reached/)).toBeNull();
+    const button = screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(document.getElementById(button.getAttribute("aria-describedby")!.split(" ")[0]!)?.textContent).toMatch(/off for this source/);
+    // Leaving and coming back in the same session: still off, still explained.
+    view.unmount();
+    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/may still be going/)).toBeTruthy();
+    // Nothing new yet.
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Check for new versions" }));
+    expect(await screen.findByText(/No new version yet/)).toBeTruthy();
+    // The run finished on the service: the check finds it.
+    const at = new Date(Date.now() + 60_000).toISOString();
+    svc.state.versions.push(machineVersion("v2", "vtt", at, "medium"));
+    svc.state.transcripts.v2 = machineTranscript("v2", [{ start: 0, end: 2, lang: "en", text: "Hello, and welcome.", flags: [] }]);
+    await user.click(screen.getByRole("button", { name: "Check for new versions" }));
+    expect(await screen.findByText(/The new transcript is ready/)).toBeTruthy();
+    expect(await screen.findByText("Hello, and welcome.")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  it("leaving while a transcription runs and coming back shows it still running, then its new version (review I2)", async () => {
+    const svc = transcriptService();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    server.use(
+      http.post(url("/projects/:id/sources/:sid/transcribe"), async () => {
+        calls++;
+        await gate;
+        const at = new Date(Date.now() + 60_000).toISOString();
+        svc.state.versions.push(machineVersion("v2", "vtt", at, "small"));
+        svc.state.transcripts.v2 = machineTranscript("v2", [{ start: 0, end: 2, lang: "en", text: "Hello, and welcome.", flags: [] }]);
+        return HttpResponse.json({ sourceId: "s1", folder: "sources/s1", files: [svc.state.versions.at(-1)!.path], flaggedSegments: 0 });
+      }),
+      ...svc.handlers,
+    );
+    const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
+    await screen.findByRole("progressbar", { name: "Transcription in progress" });
+    view.unmount();
+    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    expect(screen.getByRole("progressbar", { name: "Transcription in progress" })).toBeTruthy();
+    expect(screen.getByText(/You can leave this screen/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(true);
+    release();
+    expect(await screen.findByText(/The new transcript is ready/)).toBeTruthy();
+    expect(await screen.findByText("Hello, and welcome.")).toBeTruthy();
+    expect((screen.getByLabelText("Version") as HTMLSelectElement).value).toBe("v2");
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(calls).toBe(1);
   });
 });
 
