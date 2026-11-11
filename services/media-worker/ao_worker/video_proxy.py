@@ -3,6 +3,10 @@
 Location: `keep` copies container metadata; `strip` and `coarsen` drop all of it
 (`-map_metadata -1`) and write back only permitted tags (creation time, device make/model) plus,
 for `coarsen`, the coarsened ISO 6709 location. Progress comes from `-progress pipe:1`.
+
+ffmpeg and ffprobe are the app's own copies in the tools folder, else the system's (tools.which);
+with neither the job fails with TOOL_NOT_INSTALLED (tool `ffmpeg`) and the media stays "proxy
+pending" (R83, R90 c) until ffmpeg is installed and the job is retried.
 """
 from __future__ import annotations
 
@@ -30,9 +34,18 @@ PERMITTED_TAGS = (
 LOCATION_TAGS = ("location", "com.apple.quicktime.location.iso6709")
 
 
+def _program(name: str) -> str:
+    from .tools import not_installed, which
+
+    found = which(name)
+    if found is None:
+        raise not_installed("ffmpeg")
+    return found
+
+
 def probe(path: Path) -> dict:
     r = subprocess.run(
-        ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        [_program("ffprobe"), "-v", "error", "-protocol_whitelist", "file", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         capture_output=True, text=True, env=child_env(),
     )
     if r.returncode != 0:
@@ -66,6 +79,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     out = Path(job.output)
     if not src.is_file():
         raise JobError("INPUT_NOT_FOUND", "the input file does not exist")
+    _program("ffmpeg")
     info = probe(src)
     streams = info.get("streams", [])
     if not any(s.get("codec_type") == "video" for s in streams):
@@ -81,7 +95,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     tmp = out.with_name(f".{out.name}.{os.getpid()}.part.mp4")
     movflags = "+faststart+use_metadata_tags"
     argv = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-y",
+        _program("ffmpeg"), "-nostdin", "-hide_banner", "-v", "error", "-y",
         "-protocol_whitelist", "file,pipe",
         "-i", str(src),
         "-map", "0:v:0", "-map", "0:a:0?",

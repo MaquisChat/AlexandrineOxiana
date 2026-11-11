@@ -1,9 +1,13 @@
-"""capture.download: yt-dlp (managed standalone binary) and gallery-dl (pinned Python dependency).
+"""capture.download: yt-dlp (managed standalone binary) and gallery-dl (an optional download).
 
 yt-dlp resolution order (ADR 0009): `AO_YTDLP_BIN`, then the managed binary in `AO_TOOLS_DIR`,
-then `yt-dlp` on PATH; only when none exists is the official standalone release downloaded into
-`AO_TOOLS_DIR` and verified against the release's SHA2-256SUMS. gallery-dl runs as
-`python -m gallery_dl` from the worker's own environment unless `AO_GALLERYDL_BIN` is set.
+then `yt-dlp` on PATH. A capture never downloads it: when none exists the job fails with
+`TOOL_NOT_INSTALLED` (tool `video-downloader`), and the first-use tools dialogue installs it
+(`install_ytdlp`: the official standalone release, verified against that release's SHA2-256SUMS).
+yt-dlp is told which JavaScript runtime to use (`--js-runtimes deno:<path>`, ADR 0014) whenever
+one is installed. gallery-dl is no longer inside the worker (GPL-2.0-only): `AO_GALLERYDL_BIN`, else
+the app's own copy in the tools folder (tools.py), run as `python -m gallery_dl`; else the job fails
+with `TOOL_NOT_INSTALLED` (tool `image-downloader`).
 
 Comments (`includeComments`): yt-dlp `--write-comments` puts them in the info JSON; the worker moves
 them to `<id>.comments.json` next to it (listed in `meta.comments`, never in `files` or `infoJson`).
@@ -19,7 +23,6 @@ logged; error details are redacted the same way.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import logging
 import os
@@ -31,11 +34,11 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from .jobs import Job, JobContext, JobError, child_env
+from . import fetch
+from .jobs import Job, JobCancelled, JobContext, JobError, child_env
 
 log = logging.getLogger("ao_worker.download")
 
@@ -49,6 +52,11 @@ QUALITY_FORMATS = {
 }
 DATE_RE = re.compile(r"^\d{8}$")
 YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
+# Hosts the release files may come from (GitHub redirects downloads to its file host).
+YTDLP_HOSTS = ("github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
+# Largest file accepted as the yt-dlp program (it is about 38 MB) and as the checksum list.
+YTDLP_MAX_BYTES = 200 * 1024 * 1024
+SUMS_MAX_BYTES = 1024 * 1024
 _TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(\.\d+)?$")
 
 ERROR_CODES = ("LOGIN_REQUIRED", "RATE_LIMITED", "NOT_FOUND_OR_REMOVED", "GEO_BLOCKED", "PRIVATE", "EXTRACTOR_ERROR")
@@ -135,9 +143,13 @@ def managed_ytdlp_path() -> Path:
 
 
 def _fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "ao-worker"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return r.read()
+    """A small file (the checksum list), with the same redirect rules as every tool download."""
+    req = urllib.request.Request(url, headers={"User-Agent": fetch.USER_AGENT})
+    with fetch.opener(YTDLP_HOSTS).open(req, timeout=120) as r:
+        data = r.read(SUMS_MAX_BYTES + 1)
+    if len(data) > SUMS_MAX_BYTES:
+        raise ToolError("TOOL_DOWNLOAD_FAILED", "the yt-dlp checksum list is larger than expected")
+    return data
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -148,7 +160,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _latest_tag() -> str:
     """The latest release tag, from the redirect of `releases/latest/download/SHA2-256SUMS`
     (→ `…/releases/download/<tag>/SHA2-256SUMS`)."""
-    req = urllib.request.Request(YTDLP_RELEASES + "latest/download/SHA2-256SUMS", method="HEAD", headers={"User-Agent": "ao-worker"})
+    req = urllib.request.Request(YTDLP_RELEASES + "latest/download/SHA2-256SUMS", method="HEAD", headers={"User-Agent": fetch.USER_AGENT})
     location = ""
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=60):
@@ -164,39 +176,57 @@ def _latest_tag() -> str:
     return tag
 
 
-def _download_ytdlp(dest: Path) -> None:
-    """Downloads the official standalone yt-dlp release to `dest`, verified against SHA2-256SUMS."""
+def _download_ytdlp(dest: Path, progress=None, cancelled=None) -> None:
+    """Downloads the official standalone yt-dlp release to `dest`, verified against SHA2-256SUMS
+    before it is made executable; nothing is left behind on failure or cancel."""
     asset = ytdlp_asset_name()
     try:
         # One tag for both files, so a release published in between cannot mix checksums and binary.
         tag = _latest_tag()
         base = f"{YTDLP_RELEASES}download/{tag}/"
         sums = _fetch(base + "SHA2-256SUMS").decode("utf-8", "replace")
-        payload = _fetch(base + asset)
-    except OSError as e:
+    except (ToolError, JobCancelled):
+        raise
+    except JobError as e:
+        raise ToolError(e.code, e.message, e.detail) from e
+    except (OSError, ValueError) as e:
         raise ToolError("TOOL_DOWNLOAD_FAILED", "yt-dlp could not be downloaded", type(e).__name__) from e
     expected = None
     for line in sums.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1].lstrip("*") == asset:
+        if len(parts) == 2 and parts[1].lstrip("*") == asset and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
             expected = parts[0].lower()
-    if expected is None or hashlib.sha256(payload).hexdigest() != expected:
-        raise ToolError("TOOL_CHECKSUM_MISMATCH", "the downloaded yt-dlp does not match the release checksum")
+    if expected is None:
+        raise ToolError("TOOL_CHECKSUM_MISMATCH", "the yt-dlp release lists no checksum for this computer's program")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".yt-dlp.", dir=dest.parent)
+    tmp = dest.parent / f".yt-dlp.{os.getpid()}.{os.urandom(6).hex()}"
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-        os.chmod(tmp, 0o755)
+        try:
+            fetch.download(base + asset, tmp, sha256=expected, size=None, hosts=YTDLP_HOSTS, max_bytes=YTDLP_MAX_BYTES,
+                           progress=progress, cancelled=cancelled)
+        except fetch.ToolInstallError as e:
+            raise ToolError(e.code, e.message.replace("the download", "the yt-dlp download"), e.detail) from e
+        os.chmod(tmp, 0o755)  # verified: only now is it made executable
+        from .tools import _strip_quarantine
+
+        _strip_quarantine(tmp)
+        if tool_version([str(tmp)]) is None:
+            raise ToolError("TOOL_UNUSABLE", "the downloaded yt-dlp does not run on this computer, so it was not installed")
         os.replace(tmp, dest)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise
-    log.info("installed managed yt-dlp")
+    log.info("installed managed yt-dlp %s", tag)
 
 
-def resolve_ytdlp(download: bool = True) -> tuple[str, bool] | None:
-    """(path, managed). Env override, managed binary, PATH; downloads only when nothing else exists."""
+def install_ytdlp(progress=None, cancelled=None) -> None:
+    """The video downloader's first part (tools.py): the latest release into the tools folder."""
+    _download_ytdlp(managed_ytdlp_path(), progress=progress, cancelled=cancelled)
+
+
+def resolve_ytdlp(download: bool = False) -> tuple[str, bool] | None:
+    """(path, managed). Env override, managed binary, PATH. With `download`, the latest release is
+    installed when nothing else exists (only `POST /tools/update` asks for that; a capture never does)."""
     env = os.environ.get("AO_YTDLP_BIN")
     if env:
         return env, False
@@ -212,9 +242,17 @@ def resolve_ytdlp(download: bool = True) -> tuple[str, bool] | None:
     return str(managed), True
 
 
-def gallerydl_cmd() -> list[str]:
+def gallerydl_cmd() -> tuple[list[str], dict[str, str]] | None:
+    """(argv, extra environment) for gallery-dl: `AO_GALLERYDL_BIN`, else the app's own copy; None when neither."""
     env = os.environ.get("AO_GALLERYDL_BIN")
-    return [env] if env else [sys.executable, "-m", "gallery_dl"]
+    if env:
+        return [env], {}
+    from .tools import gallerydl_env, gallerydl_lib
+
+    lib = gallerydl_lib()
+    if lib is None:
+        return None
+    return [sys.executable, "-m", "gallery_dl"], gallerydl_env(lib)
 
 
 def tool_version(argv: list[str]) -> str | None:
@@ -234,12 +272,12 @@ def ytdlp_version() -> str | None:
 
 
 def gallerydl_version() -> str | None:
-    if os.environ.get("AO_GALLERYDL_BIN"):
-        return tool_version(gallerydl_cmd())
-    try:
-        return metadata.version("gallery-dl")
-    except metadata.PackageNotFoundError:
+    cmd = gallerydl_cmd()
+    if cmd is None:
         return None
+    from .tools import run_version
+
+    return run_version([*cmd[0], "--version"], cmd[1])
 
 
 def update_tools() -> dict:
@@ -270,7 +308,7 @@ def update_tools() -> dict:
 # ---------- arguments ----------
 
 
-def build_ytdlp_args(url: str, out: str, params: dict) -> list[str]:
+def build_ytdlp_args(url: str, out: str, params: dict, js_runtime: str | None = None) -> list[str]:
     args = [
         "--ignore-config", "--newline", "--no-color",
         "-o", os.path.join(out, "%(id)s.%(ext)s"),
@@ -297,6 +335,9 @@ def build_ytdlp_args(url: str, out: str, params: dict) -> list[str]:
         args += ["--cookies-from-browser", params["cookiesFromBrowser"]]
     if params.get("quality"):
         args += ["-f", QUALITY_FORMATS[params["quality"]]]
+    if js_runtime:
+        # Named explicitly (ADR 0014, R133): yt-dlp needs a JavaScript runtime for YouTube.
+        args += ["--js-runtimes", f"deno:{js_runtime}"]
     return [*args, "--", url]
 
 
@@ -410,20 +451,27 @@ def run(job: Job, ctx: JobContext) -> dict:
     out = Path(job.output)
     out.mkdir(parents=True, exist_ok=True)
     log.info("capture job %s tool=%s url=%s", job.id, tool, strip_url(job.input))
+    from .tools import deno_path, not_installed
+
+    extra_env: dict[str, str] = {}
     if tool == "yt-dlp":
-        resolved = resolve_ytdlp()
-        assert resolved is not None
+        resolved = resolve_ytdlp(download=False)
+        if resolved is None:
+            raise not_installed("video-downloader")
         cmd = [resolved[0]]
         version = tool_version(cmd)
-        argv = [*cmd, *build_ytdlp_args(job.input, str(out), params)]
+        argv = [*cmd, *build_ytdlp_args(job.input, str(out), params, js_runtime=deno_path())]
     else:
-        cmd = gallerydl_cmd()
+        g = gallerydl_cmd()
+        if g is None:
+            raise not_installed("image-downloader")
+        cmd, extra_env = g
         version = gallerydl_version()
         argv = [*cmd, *build_gallerydl_args(job.input, str(out), params)]
 
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace", dir=ctx.workdir) as errf:
         proc = ctx.popen(argv, stdout=subprocess.PIPE, stderr=errf, stdin=subprocess.DEVNULL,
-                         text=True, encoding="utf-8", errors="replace", bufsize=1)
+                         text=True, encoding="utf-8", errors="replace", bufsize=1, extra_env=extra_env)
         assert proc.stdout is not None
         item, items = 1, 1
         for line in proc.stdout:
