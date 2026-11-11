@@ -7,12 +7,15 @@
  * The preview is plain text (the record's details and its files' names): the service has no route
  * that serves an imported file's content for preview yet.
  *
- * In projects that pseudonymise names, titles taken from file names and collections made from
- * folder names are flagged (R64): both can carry participants' names.
+ * In projects that pseudonymise names, titles taken from file names, and collections and tags the
+ * batch made from folder names, are flagged (R64): they can carry participants' names. A collection
+ * or tag counts as made by the batch when its id (a UUIDv7) was minted while a folder, ZIP or device
+ * batch ran: the service does not list what a batch created.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../../api/client";
 import {
+  idTime,
   importApi,
   type BatchSummary,
   type Candidate,
@@ -55,10 +58,24 @@ export interface ReviewQueueProps {
   batchId: string;
 }
 
+/** Source requests in flight at once (R115 I4). */
+export const SOURCE_POOL = 6;
+
+/** What the batch made from folder names: collections and tags minted while it ran (R64). */
+function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
+  if (!batch || !FOLDER_KINDS.has(batch.kind)) return false;
+  const t = idTime(id);
+  const from = Date.parse(batch.startedAt);
+  const to = batch.finishedAt ? Date.parse(batch.finishedAt) : Date.now();
+  if (t === undefined || Number.isNaN(from)) return false;
+  return t >= from - 1000 && t <= to + 1000;
+}
+
 export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
   const [items, setItems] = useState<ReviewItem[] | null>(null);
   const [sources, setSources] = useState<Record<string, SourceFile>>({});
+  const [failed, setFailed] = useState<ReadonlySet<string>>(new Set());
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
   const [batch, setBatch] = useState<BatchSummary | undefined>(undefined);
   const [collections, setCollections] = useState<Collection[]>([]);
@@ -68,45 +85,122 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState("");
+  const [focusId, setFocusId] = useState<{ id: string | null } | null>(null);
+  const showButtons = useRef(new Map<string, HTMLButtonElement>());
+  const title = useRef<HTMLHeadingElement>(null);
 
-  const loadSources = useCallback(
-    async (list: ReviewItem[]) => {
-      const got = await Promise.all(
-        list.map(async (i) => (i.sourceId ? ([i.sourceId, await api.source(projectId, i.sourceId).catch(() => undefined)] as const) : undefined)),
-      );
-      setSources((cur) => {
-        const next = { ...cur };
-        for (const g of got) if (g?.[1]) next[g[0]] = g[1];
-        return next;
-      });
+  // ---- source loading: a queue served by SOURCE_POOL workers, the current item first ----
+  const pool = useRef({ queue: [] as string[], active: 0, live: true });
+  // Answers are applied as they arrive, gathered over a frame so a long queue does not re-render
+  // once per answer; the shown item's answer is applied at once.
+  const arrived = useRef(new Map<string, SourceFile>());
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shownSid = useRef<string | undefined>(undefined);
+  const flush = useCallback(() => {
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    flushTimer.current = null;
+    if (!arrived.current.size) return;
+    const got = arrived.current;
+    arrived.current = new Map();
+    setSources((cur) => {
+      const next = { ...cur };
+      for (const [k, v] of got) next[k] = v;
+      return next;
+    });
+  }, []);
+  const pump = useCallback(() => {
+    const p = pool.current;
+    while (p.live && p.active < SOURCE_POOL && p.queue.length) {
+      const sid = p.queue.shift()!;
+      p.active++;
+      api
+        .source(projectId, sid)
+        .then(
+          (sf) => {
+            if (!p.live) return;
+            arrived.current.set(sid, sf);
+            if (sid === shownSid.current) flush();
+            else flushTimer.current ??= setTimeout(flush, 16);
+            setFailed((cur) => (cur.has(sid) ? new Set([...cur].filter((x) => x !== sid)) : cur));
+          },
+          () => {
+            if (p.live) setFailed((cur) => new Set(cur).add(sid));
+          },
+        )
+        .finally(() => {
+          p.active--;
+          pump();
+        });
+    }
+  }, [api, projectId, flush]);
+  /** Loads these sources next (ahead of what is already queued). */
+  const loadFirst = useCallback(
+    (sids: string[]) => {
+      const p = pool.current;
+      p.queue = [...sids, ...p.queue.filter((x) => !sids.includes(x))];
+      pump();
     },
-    [api, projectId],
+    [pump],
   );
 
   useEffect(() => {
+    const p = { queue: [] as string[], active: 0, live: true };
+    pool.current = p;
     let live = true;
     setError(null);
-    (async () => {
-      try {
-        const list = await api.review(batchId);
+    api.review(batchId).then(
+      (list) => {
         if (!live) return;
         setItems(list);
         setCurrent(list[0]?.id ?? null);
-        await loadSources(list);
-      } catch (e) {
-        if (live) setError(errorText(e));
-      }
-    })();
-    api.policy(projectId).then((p) => live && setPolicy(p), () => live && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
+        p.queue = list.flatMap((i) => (i.sourceId ? [i.sourceId] : []));
+        pump();
+      },
+      (e: unknown) => live && setError(errorText(e)),
+    );
+    api.policy(projectId).then((x) => live && setPolicy(x), () => live && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
     api.collections(projectId).then((c) => live && setCollections(c), () => {});
     api.tags(projectId).then((t) => live && setTags(t), () => {});
     api.batches(projectId).then((b) => live && setBatch(b.find((x) => x.batchId === batchId)), () => {});
     return () => {
       live = false;
+      p.live = false;
+      if (flushTimer.current) clearTimeout(flushTimer.current);
+      flushTimer.current = null;
+      arrived.current = new Map();
     };
-  }, [api, projectId, batchId, loadSources]);
+  }, [api, projectId, batchId, pump]);
 
-  const titleFor = (i: ReviewItem) => (i.sourceId ? titleOf(sources[i.sourceId]) : "") || "Untitled item";
+  // The item shown is loaded before the rest of the queue.
+  const currentItem = items?.find((i) => i.id === current);
+  shownSid.current = currentItem?.sourceId;
+  useEffect(() => {
+    const sid = currentItem?.sourceId;
+    if (sid && pool.current.queue.includes(sid)) loadFirst([sid]);
+  }, [currentItem?.sourceId, loadFirst]);
+
+  // After a decision, focus moves to the next item's row (or the heading when none is left).
+  useEffect(() => {
+    if (!focusId) return;
+    const el = focusId.id ? showButtons.current.get(focusId.id) : undefined;
+    (el ?? title.current)?.focus();
+  }, [focusId]);
+
+  const titleFor = (i: ReviewItem, n: number) => (i.sourceId ? titleOf(sources[i.sourceId]) : "") || `item ${fmt(n)}`;
+
+  const retry = useCallback(
+    (sid: string) => {
+      setFailed((cur) => new Set([...cur].filter((x) => x !== sid)));
+      loadFirst([sid]);
+    },
+    [loadFirst],
+  );
+  const toggle = useCallback((id: string, on: boolean) => setSelected((s) => (on ? [...s, id] : s.filter((x) => x !== id))), []);
+  const showRef = useCallback((id: string, el: HTMLButtonElement | null) => {
+    if (el) showButtons.current.set(id, el);
+    else showButtons.current.delete(id);
+  }, []);
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
 
   const decide = async (item: ReviewItem, decision: ReviewDecision, done: string) => {
     setBusy(true);
@@ -116,10 +210,12 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
       const list = items ?? [];
       const at = list.findIndex((x) => x.id === item.id);
       const rest = list.filter((x) => x.id !== item.id);
+      const next = rest[Math.min(at, rest.length - 1)]?.id ?? null;
       setItems(rest);
-      setCurrent(rest[Math.min(at, rest.length - 1)]?.id ?? null);
+      setCurrent(next);
       setSelected((s) => s.filter((x) => x !== item.id));
-      setStatus(`${done}: ${titleFor(item)}`);
+      setStatus(`${done}: ${titleFor(item, at + 1)}`);
+      setFocusId({ id: next });
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -131,11 +227,29 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     if (!selected.length) return;
     setBusy(true);
     setError(null);
-    const ids = items?.filter((i) => selected.includes(i.id)).map((i) => i.id) ?? [];
+    const chosen = items?.filter((i) => selected.includes(i.id)) ?? [];
     try {
-      const r = await api.bulkEdit(projectId, ids, patch);
+      const r = await api.bulkEdit(
+        projectId,
+        chosen.map((i) => i.id),
+        patch,
+      );
       setStatus(`${done} ${count(r.edited, "item")}.`);
-      await loadSources(items?.filter((i) => ids.includes(i.id)) ?? []);
+      // The service applied the patch; the loaded records are updated in place (no refetch).
+      const sids = new Set(chosen.flatMap((i) => (i.sourceId ? [i.sourceId] : [])));
+      setSources((cur) => {
+        const next = { ...cur };
+        for (const sid of sids) {
+          const sf = next[sid];
+          if (!sf) continue;
+          const s = { ...sf.source };
+          if (patch.type) s.type = patch.type;
+          if (patch.tagIds) s.tagIds = [...new Set([...s.tagIds, ...patch.tagIds])];
+          if (patch.collectionId) s.collectionIds = [...new Set([...s.collectionIds, patch.collectionId])];
+          next[sid] = { ...sf, source: s };
+        }
+        return next;
+      });
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -143,12 +257,14 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     }
   };
 
-  const item = items?.find((i) => i.id === current);
-  const flagCollections = policy?.pseudonymizeNames === true && (batch === undefined || FOLDER_KINDS.has(batch.kind));
+  const item = currentItem;
+  const flagging = policy?.pseudonymizeNames === true;
 
   return (
     <main className="ao-import ao-review" aria-labelledby="ao-review-title">
-      <h1 id="ao-review-title">Review queue</h1>
+      <h1 id="ao-review-title" ref={title} tabIndex={-1}>
+        Review queue
+      </h1>
       <ErrorNote error={error} />
       <p className="ao-visually-hidden" role="status">
         {status}
@@ -171,23 +287,23 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
               <span>Select all</span>
             </label>
             <ul className="ao-review__list" aria-label={`Items waiting for review (${fmt(items.length)})`}>
-              {items.map((i) => {
-                const t = titleFor(i);
-                return (
-                  <li key={i.id} className={i.id === current ? "ao-review__row ao-review__row--current" : "ao-review__row"}>
-                    <input
-                      type="checkbox"
-                      aria-label={`Select ${t}`}
-                      checked={selected.includes(i.id)}
-                      onChange={(e) => setSelected((s) => (e.target.checked ? [...s, i.id] : s.filter((x) => x !== i.id)))}
-                    />
-                    <button type="button" className="ao-review__show" aria-label={`Show ${t}`} aria-pressed={i.id === current} onClick={() => setCurrent(i.id)}>
-                      <UserText className="ao-review__row-title">{t}</UserText>
-                      <span className="ao-import__hint">{i.reasons[0] ?? ""}</span>
-                    </button>
-                  </li>
-                );
-              })}
+              {items.map((i, at) => (
+                <Row
+                  key={i.id}
+                  id={i.id}
+                  sourceId={i.sourceId}
+                  n={at + 1}
+                  title={titleFor(i, at + 1)}
+                  reason={i.reasons[0] ?? ""}
+                  current={i.id === current}
+                  selected={selectedSet.has(i.id)}
+                  broken={!!i.sourceId && failed.has(i.sourceId)}
+                  onToggle={toggle}
+                  onShow={setCurrent}
+                  onRetry={retry}
+                  showRef={showRef}
+                />
+              ))}
             </ul>
           </div>
           {item && (
@@ -197,10 +313,12 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
               projectId={projectId}
               item={item}
               source={item.sourceId ? sources[item.sourceId] : undefined}
+              loadFailed={!!item.sourceId && failed.has(item.sourceId)}
+              onRetry={() => item.sourceId && retry(item.sourceId)}
               collections={collections}
               tags={tags}
-              flagTitle={policy?.pseudonymizeNames === true && titleFromFileName(item, item.sourceId ? sources[item.sourceId] : undefined)}
-              flagCollections={flagCollections}
+              flagTitle={flagging && titleFromFileName(item, item.sourceId ? sources[item.sourceId] : undefined)}
+              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batch) : () => false}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
             />
@@ -210,6 +328,39 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     </main>
   );
 }
+
+interface RowProps {
+  id: string;
+  sourceId: string | undefined;
+  n: number;
+  title: string;
+  reason: string;
+  current: boolean;
+  selected: boolean;
+  broken: boolean;
+  onToggle(id: string, on: boolean): void;
+  onShow(id: string): void;
+  onRetry(sourceId: string): void;
+  showRef(id: string, el: HTMLButtonElement | null): void;
+}
+
+/** One queue row; re-renders only when its own props change (queues can hold thousands). */
+const Row = memo(function Row({ id, sourceId, n, title: t, reason, current, selected, broken, onToggle, onShow, onRetry, showRef }: RowProps) {
+  return (
+    <li className={current ? "ao-review__row ao-review__row--current" : "ao-review__row"}>
+      <input type="checkbox" aria-label={`Select ${t}`} checked={selected} onChange={(e) => onToggle(id, e.target.checked)} />
+      <button type="button" className="ao-review__show" aria-label={`Show ${t}`} aria-pressed={current} ref={(el) => showRef(id, el)} onClick={() => onShow(id)}>
+        <UserText className="ao-review__row-title">{t}</UserText>
+        <span className="ao-import__hint">{broken ? "Could not be loaded." : reason}</span>
+      </button>
+      {broken && sourceId && (
+        <button type="button" aria-label={`Retry loading item ${fmt(n)}`} onClick={() => onRetry(sourceId)}>
+          Retry
+        </button>
+      )}
+    </li>
+  );
+});
 
 function BulkBar({ count: n, collections, tags, busy, onBulk }: { count: number; collections: Collection[]; tags: Tag[]; busy: boolean; onBulk(p: ReviewPatch, done: string): void }) {
   const [type, setType] = useState("");
@@ -277,26 +428,39 @@ interface ItemPanelProps {
   projectId: string;
   item: ReviewItem;
   source: SourceFile | undefined;
+  loadFailed: boolean;
+  onRetry(): void;
   collections: Collection[];
   tags: Tag[];
   flagTitle: boolean;
-  flagCollections: boolean;
+  /** True for a collection or tag id the batch made from a folder name (R64). */
+  flagFolderNames(id: string): boolean;
   busy: boolean;
   onDecide(d: ReviewDecision, done: string): void;
 }
 
-function ItemPanel({ api, projectId, item, source, collections, tags, flagTitle, flagCollections, busy, onDecide }: ItemPanelProps) {
+function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collections, tags, flagTitle, flagFolderNames, busy, onDecide }: ItemPanelProps) {
   const [mode, setMode] = useState<"view" | "edit" | "merge">("view");
   const s = source?.source;
   const title = titleOf(source);
   const inCollections = (s?.collectionIds ?? []).map((id) => collections.find((c) => c.id === id)?.name ?? id);
   const itsTags = (s?.tagIds ?? []).map((id) => ({ id, index: tags.findIndex((t) => t.id === id) + 1, tag: tags.find((t) => t.id === id) }));
+  const folderCollections = (s?.collectionIds ?? []).some(flagFolderNames);
+  const folderTags = (s?.tagIds ?? []).some(flagFolderNames);
 
   return (
     <div className="ao-review__panel">
       <div className="ao-review__side-by-side">
         <Section title="Imported record" level={2} className="ao-review__record">
-          {!source && <p role="status">Loading…</p>}
+          {!source && !loadFailed && <p role="status">Loading…</p>}
+          {!source && loadFailed && (
+            <div className="ao-import__error" role="alert">
+              <p>This item's record could not be loaded.</p>
+              <button type="button" onClick={onRetry}>
+                Retry
+              </button>
+            </div>
+          )}
           {source && s && (
             <>
               <UserText as="p" className="ao-review__title">
@@ -376,9 +540,14 @@ function ItemPanel({ api, projectId, item, source, collections, tags, flagTitle,
                   </>
                 )}
               </dl>
-              {flagCollections && inCollections.length > 0 && (
+              {folderCollections && (
                 <p className="ao-import__warning">
                   These collection names come from folder names, which can carry participants' names. Check them, and rename the collection or move the item if one names someone.
+                </p>
+              )}
+              {folderTags && (
+                <p className="ao-import__warning">
+                  These tag names come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.
                 </p>
               )}
             </>
@@ -386,7 +555,7 @@ function ItemPanel({ api, projectId, item, source, collections, tags, flagTitle,
           <Section title="Why it needs review" level={3}>
             <ul>
               {item.reasons.map((r, i) => (
-                <li key={i}>
+                <li key={`${i}:${r}`}>
                   <UserText>{r}</UserText>
                 </li>
               ))}
@@ -396,7 +565,17 @@ function ItemPanel({ api, projectId, item, source, collections, tags, flagTitle,
                 Confidence {Math.round(item.confidence * 100)}%{item.method ? `, from ${item.method}` : ""}
               </p>
             )}
-            {item.hints && item.hints.length > 0 && <p className="ao-import__hint">Found in the file but not confirmed: {item.hints.join(", ")}</p>}
+            {item.hints && item.hints.length > 0 && (
+              <p className="ao-import__hint">
+                Found in the file but not confirmed:{" "}
+                {item.hints.map((h, i) => (
+                  <span key={`${i}:${h}`}>
+                    {i > 0 ? ", " : ""}
+                    <UserText>{h}</UserText>
+                  </span>
+                ))}
+              </p>
+            )}
             {item.duplicateOf && (
               <>
                 <p>
@@ -519,12 +698,16 @@ function MergeForm({ api, projectId, item, busy, onMerge }: { api: ReturnType<ty
   const [text, setText] = useState("");
   const [results, setResults] = useState<SourceListItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const latest = useRef(0);
+  /** Only the answer to the latest search is shown, whatever order the answers arrive in. */
   const search = async () => {
+    const n = ++latest.current;
     setError(null);
     try {
-      setResults((await api.searchSources(projectId, text.trim())).filter((r) => r.id !== item.sourceId));
+      const found = (await api.searchSources(projectId, text.trim())).filter((r) => r.id !== item.sourceId);
+      if (n === latest.current) setResults(found);
     } catch (e) {
-      setError(errorText(e));
+      if (n === latest.current) setError(errorText(e));
     }
   };
   return (

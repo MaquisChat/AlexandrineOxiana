@@ -5,7 +5,7 @@
  */
 import { useEffect, useMemo, useState, type ReactElement } from "react";
 import type { ApiClient } from "../api/client";
-import { importApi, type BatchSummary, type ProjectInfo } from "../api/import";
+import { importApi, isValidId, type BatchSummary, type ProjectInfo } from "../api/import";
 import { ImportWizard } from "../screens/import/ImportWizard";
 import { ReviewQueue } from "../screens/import/ReviewQueue";
 import { ErrorNote, errorText, fmt } from "../screens/import/shared";
@@ -36,12 +36,23 @@ export function importRoute(loc: RouteLocation, client: ApiClient): ReactElement
   const key = `${path}${loc.search}`;
   const q = new URLSearchParams(loc.search);
   if (path === IMPORT_PATHS.wizard) {
+    // An id from the address is used only when it is a valid id (R115 I3); otherwise it is ignored.
     const project = q.get("project");
-    return <ImportWizard key={key} client={client} {...(project ? { projectId: project } : {})} />;
+    return <ImportWizard key={key} client={client} {...(isValidId(project) ? { projectId: project } : {})} />;
   }
   if (path === IMPORT_PATHS.review) {
     const project = q.get("project");
     const batch = q.get("batch");
+    if ((project !== null && !isValidId(project)) || (batch !== null && !isValidId(batch))) {
+      return (
+        <main className="ao-import" aria-labelledby="ao-review-bad">
+          <h1 id="ao-review-bad">Review queue</h1>
+          <p className="ao-import__error" role="alert">
+            This link is not a valid review queue link: its project or import id is not a valid id. Open the review queue from an import report instead.
+          </p>
+        </main>
+      );
+    }
     return <ReviewRoute key={key} client={client} project={project ?? ""} batch={batch ?? ""} />;
   }
   return null;

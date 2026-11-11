@@ -235,7 +235,7 @@ describe("Review queue", () => {
     const n = 2000;
     const review = Array.from({ length: n }, (_, i) => item(i + 1));
     const sources = Object.fromEntries(review.map((r, i) => [r.sourceId!, source(i + 1, `Paper ${i + 1}`)]));
-    const { m, user } = setup({ review, sources, sourceDelayMs: 5 });
+    const { m, user } = setup({ review, sources, sourceDelayMs: 1 });
     const accept = await screen.findByRole("button", { name: "Accept" });
     await waitFor(() => expect((accept as HTMLButtonElement).disabled).toBe(false));
     const sourceCalls = () => m.calls.filter((c) => c.method === "GET" && /\/sources\/s\d+$/.test(c.path));
@@ -243,10 +243,12 @@ describe("Review queue", () => {
     expect(sourceCalls().length).toBeLessThan(n); // not waiting for the whole queue
     await user.click(accept);
     await waitFor(() => expect(m.bodies("POST /review/r1/decide")).toHaveLength(1));
-    await waitFor(() => expect(sourceCalls().length).toBe(n), { timeout: 15000 });
+    // Polled (not waitFor, which re-runs on every DOM change of a 2,000-row list).
+    for (const end = Date.now() + 30000; sourceCalls().length < n && Date.now() < end; ) await new Promise((r) => setTimeout(r, 100));
+    expect(sourceCalls().length).toBe(n);
     expect(m.peakSourceRequests()).toBeLessThanOrEqual(6);
     expect(m.peakSourceRequests()).toBeGreaterThan(1);
-  }, 20000);
+  }, 40000);
 
   it("a title that failed to load can be retried", async () => {
     const { user } = setup({ ...BASE, failSourcesOnce: ["s2"] });
