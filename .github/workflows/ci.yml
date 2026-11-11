@@ -9,9 +9,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# One run at a time per branch. A run in progress is allowed to finish (a full run takes about half
+# an hour on GitHub's two-processor runners, and tasks are merged more often than that, so cancelling
+# meant no run ever completed); GitHub keeps only the newest waiting run, so at most one run waits.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
