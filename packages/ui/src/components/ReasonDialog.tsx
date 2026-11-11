@@ -5,7 +5,7 @@
  * cancels (not while the action runs), Tab stays inside and skips disabled controls. The dialog is
  * rendered on <body> and everything else is made inert while it is open (R117).
  */
-import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 const FOCUSABLE = "textarea:not([disabled]), input:not([disabled]), select:not([disabled]), button:not([disabled])";
@@ -46,7 +46,8 @@ export function useTrap(onCancel: () => void, busy = false) {
 function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; children: ReactNode }) {
   const { ref, onKeyDown } = useTrap(onCancel, busy);
   const [host] = useState(() => document.createElement("div"));
-  useEffect(() => {
+  // A layout effect: the host must be in the document before useTrap's effect moves focus into the dialog.
+  useLayoutEffect(() => {
     document.body.appendChild(host);
     const others = [...document.body.children].filter((el) => el !== host && !el.hasAttribute("inert"));
     for (const el of others) el.setAttribute("inert", "");
