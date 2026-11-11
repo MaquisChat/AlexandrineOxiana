@@ -12,7 +12,7 @@
  * `validForMs` against this page's own clock only, so the two clocks are never compared.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { PAIRING_CODE_ID } from "@ao/shared";
+import { PAIRING_CODE_ID, type PairingCodeStatus } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { extensionApi, type ExtensionApi, type PairedBrowser } from "../api/extension";
 import { errorText } from "../api/library";
@@ -21,7 +21,7 @@ import { UserText } from "../components/UserText";
 import "./ExtensionPairing.css";
 
 /** How a code left the page (other than being replaced from here). */
-type Outcome = { kind: "expired" } | { kind: "used"; origin: string } | { kind: "invalidated" } | { kind: "replaced" } | { kind: "unknown" };
+type Outcome = { kind: "expired" } | { kind: "used"; origin: string; browserId: string } | { kind: "invalidated" } | { kind: "not-saved" } | { kind: "replaced" } | { kind: "unknown" };
 interface ShownCode {
   digits: string;
   /** Not a secret: names the code in the status route. */
@@ -32,6 +32,29 @@ interface ShownCode {
 
 const CODE_FORMAT = /^\d{6}$/;
 
+/** Reads of the list after a use, waiting for the paired browser to appear in it (review round 1, I1). */
+const LIST_TRIES_AFTER_USE = 5;
+
+/** The status answer, if it has the shape it should (review round 1, M2); anything else is ignored. */
+function statusOf(s: unknown): PairingCodeStatus | undefined {
+  if (typeof s !== "object" || s === null) return undefined;
+  const v = s as { state?: unknown; browser?: { id?: unknown; origin?: unknown }; reason?: unknown };
+  switch (v.state) {
+    case "used":
+      return typeof v.browser?.id === "string" && typeof v.browser.origin === "string" ? (s as PairingCodeStatus) : undefined;
+    case "invalidated":
+      return v.reason === "wrong-tries" || v.reason === "not-saved" ? (s as PairingCodeStatus) : undefined;
+    case "active":
+    case "confirming":
+    case "expired":
+    case "replaced":
+    case "none":
+      return s as PairingCodeStatus;
+    default:
+      return undefined;
+  }
+}
+
 const clock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 
 const when = (iso: string): string => {
@@ -40,9 +63,10 @@ const when = (iso: string): string => {
 };
 
 /** What the screen says when a code stopped working without being used (role="alert"). */
-const ENDED: Record<"expired" | "invalidated" | "replaced" | "unknown", string> = {
+const ENDED: Record<"expired" | "invalidated" | "not-saved" | "replaced" | "unknown", string> = {
   expired: "The code expired and was removed from this page. Show a new code to pair.",
   invalidated: "The code no longer works: it stopped after 5 wrong tries, and was removed from this page. Show a new code to pair.",
+  "not-saved": "The pairing did not complete: the right code was typed, but this app could not save the pairing, so the browser is not paired. The code no longer works. Show a new code and pair again.",
   replaced: "A newer code was made (in another window of this app), so this one no longer works and was removed from this page. Show a new code to pair here.",
   unknown: "The code no longer works: the library service does not know it any more (it may have restarted). Show a new code to pair.",
 };
@@ -69,6 +93,10 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
   const [revokeError, setRevokeError] = useState<string | null>(null);
   const [revoked, setRevoked] = useState<string | null>(null);
   const [focusList, setFocusList] = useState(0);
+  /** The service refused to say what became of the code (review round 1, M1). */
+  const [statusRefused, setStatusRefused] = useState(false);
+  /** A used code's browser never appeared in the list (review round 1, I1). */
+  const [pairedMissing, setPairedMissing] = useState(false);
 
   const alive = useRef(true);
   const aborts = useRef(new Set<AbortController>());
@@ -100,17 +128,19 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
    * that began before it can never bring the revoked browser back: review N1).
    */
   const refresh = useCallback(
-    async (quiet = false): Promise<void> => {
+    async (quiet = false): Promise<PairedBrowser[] | undefined> => {
       const my = ++listSeq.current;
       const ac = signal();
       try {
         const list = await api.list(ac.signal);
-        if (!alive.current || my !== listSeq.current) return;
+        if (!alive.current || my !== listSeq.current) return undefined;
         browsersRef.current = list;
         setBrowsers(list);
         setListError(null);
+        return list;
       } catch (err) {
         if (alive.current && my === listSeq.current && !quiet) setListError(errorText(err, "The list of paired browsers could not be read."));
+        return undefined;
       } finally {
         done(ac);
       }
@@ -127,6 +157,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
     setCode(null);
     setOutcome(next);
     setAnnouncement("");
+    setStatusRefused(false);
+    setPairedMissing(false);
   };
 
   // The countdown: the visible clock changes every second; the announcement only at sensible moments.
@@ -172,8 +204,9 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
       if (inFlight || stopped) return;
       inFlight = true;
       try {
-        const s = await api.codeStatus(codeId, ac.signal);
-        if (stopped || !alive.current) return;
+        const s = statusOf(await api.codeStatus(codeId, ac.signal));
+        if (stopped || !alive.current || !s) return; // an answer in the wrong shape is ignored (M2)
+        // `confirming` (the pairing is being saved) and `active` keep the code and the asking.
         // An ending answer stops this poll at once, before React commits the cleared code: a tick in
         // between would otherwise ask again and act twice (a second list read).
         if (s.state === "used" || s.state === "expired" || s.state === "invalidated" || s.state === "replaced" || s.state === "none") {
@@ -182,11 +215,13 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
         }
         switch (s.state) {
           case "used":
-            clearCode({ kind: "used", origin: s.browser.origin });
-            void refresh(true);
+            // The service says `used` only once the pairing is saved; the list is then read until it shows it.
+            clearCode({ kind: "used", origin: s.browser.origin, browserId: s.browser.id });
+            break;
+          case "invalidated":
+            clearCode({ kind: s.reason === "not-saved" ? "not-saved" : "invalidated" });
             break;
           case "expired":
-          case "invalidated":
           case "replaced":
             clearCode({ kind: s.state });
             break;
@@ -196,8 +231,15 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
           default:
             break; // still active
         }
-      } catch {
-        // a failed read is silent; the next one tries again
+      } catch (err) {
+        // A failed read (no answer, or the service busy) is silent and the next one tries again; a
+        // refusal (4xx) will not change, so the asking stops and the screen says so (M1).
+        if (stopped || !alive.current) return;
+        if (err instanceof ApiClientError && err.status >= 400 && err.status < 500) {
+          stopped = true;
+          clearInterval(t);
+          setStatusRefused(true);
+        }
       } finally {
         inFlight = false;
       }
@@ -208,7 +250,30 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
       clearInterval(t);
       ac.abort();
     };
-  }, [code, pollMs, api, refresh]);
+  }, [code, pollMs, api]);
+
+  // After a use, the list is read until the paired browser is in it: at once, then every `pollMs`, at
+  // most LIST_TRIES_AFTER_USE times; if it never appears, the screen says so instead of looking empty.
+  const usedBrowser = outcome?.kind === "used" ? outcome.browserId : undefined;
+  useEffect(() => {
+    if (usedBrowser === undefined) return;
+    let stopped = false;
+    let tries = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const has = () => (browsersRef.current ?? []).some((b) => b.id === usedBrowser);
+    const attempt = async () => {
+      tries++;
+      await refresh(true);
+      if (stopped || !alive.current || has()) return;
+      if (tries >= LIST_TRIES_AFTER_USE) setPairedMissing(true);
+      else timer = setTimeout(() => void attempt(), pollMs);
+    };
+    void attempt();
+    return () => {
+      stopped = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [usedBrowser, pollMs, refresh]);
 
   const issue = async () => {
     if (issuingNow.current) return;
@@ -265,6 +330,9 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
     setRevokeBusy(false);
     setRevoking(null);
     setRevoked(target.origin);
+    // The "was paired" message is no longer true once that browser is revoked (M3).
+    setOutcome((o) => (o?.kind === "used" && o.browserId === target.id ? null : o));
+    setPairedMissing(false);
     const next = (browsersRef.current ?? []).filter((b) => b.id !== target.id);
     browsersRef.current = next;
     setBrowsers(next);
@@ -317,6 +385,11 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
         <p role="status" aria-label="Pairing code time" className="ao-visually-hidden">
           {announcement}
         </p>
+        {statusRefused ? (
+          <p role="alert" className="ao-warning">
+            This page cannot tell what became of the code: the library service refused to say. The code stays here until it expires. If the extension says it is paired, it is; otherwise show a new code.
+          </p>
+        ) : null}
         {code ? (
           <div className="ao-pairing-code-box">
             <p className="ao-pairing-label" aria-hidden="true">
@@ -350,6 +423,11 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
         {listError ? (
           <p role="alert" className="ao-warning">
             {listError}
+          </p>
+        ) : null}
+        {pairedMissing ? (
+          <p role="alert" className="ao-warning">
+            The code was used, but the paired browser is not in the list yet. Reload this page to see it; if it is still missing, pair the browser again with a new code.
           </p>
         ) : null}
         {revoked ? (
