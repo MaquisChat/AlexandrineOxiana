@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COOKIES_ACKNOWLEDGEMENT } from "../api/capture";
 import { ANON_RULES, errorResponse, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
-import { Capture } from "./Capture";
+import { Capture, CaptureRoute } from "./Capture";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
@@ -357,6 +357,19 @@ describe("Capture screen — profile", () => {
       });
     });
     expect(await screen.findByText(/1 new post saved.*2 posts no longer on the platform/)).toBeTruthy();
+  });
+});
+
+describe("Capture route", () => {
+  it("opens the project named in the address; an unknown one opens none", async () => {
+    const m = mockCapture();
+    const first = render(<CaptureRoute client={m.client} loc={{ pathname: "/capture", search: `?project=${P2}` }} />);
+    await waitFor(() => expect(m.calls.some((c) => c.path === `/projects/${P2}/governance`)).toBe(true));
+    expect((screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement).value).toBe(P2);
+    first.unmount();
+    render(<CaptureRoute client={m.client} loc={{ pathname: "/capture", search: "?project=019a6f00-0000-7000-8000-0000000000ff" }} />);
+    expect(await screen.findByText(/not one of this library's projects/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Capture links" })).toBeNull();
   });
 });
 

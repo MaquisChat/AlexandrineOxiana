@@ -122,7 +122,7 @@ function toolsErrorText(err: unknown, fallback: string): string {
 function updateLines(u: ToolsUpdate): string[] {
   const out: string[] = [];
   const { old, new: now, managed } = u.ytDlp;
-  if (!managed) out.push(`yt-dlp ${now ?? old ?? ""} is this computer's own installation, so the app did not change it.`.replace("  ", " "));
+  if (!managed) out.push(`yt-dlp${now ?? old ? ` ${now ?? old}` : ""} is this computer's own installation, so the app did not change it.`);
   else if (old === null && now) out.push(`yt-dlp was installed: ${now}.`);
   else if (old && now && old === now) out.push(`yt-dlp is up to date (${now}).`);
   else out.push(`yt-dlp: ${old ?? "not installed"} → ${now ?? "not installed"}`);
@@ -260,7 +260,6 @@ export function Capture({ client, projectId }: CaptureProps) {
   const [legalError, setLegalError] = useState<string | null>(null);
   const [legalRefused, setLegalRefused] = useState(false);
   const legalRef = useRef<HTMLInputElement>(null);
-  const sessionRef = useRef<HTMLInputElement>(null);
   // Profile.
   const [profileUrl, setProfileUrl] = useState("");
   const [since, setSince] = useState("");
@@ -608,15 +607,15 @@ export function Capture({ client, projectId }: CaptureProps) {
         <legend>Options for links and profiles</legend>
         <div className="ao-capture__row">
           <label>
-            <input ref={sessionRef} type="checkbox" checked={useSession} aria-describedby={ids.session} onChange={(e) => onSessionChange(e.target.checked)} /> Use my browser session
+            <input type="checkbox" checked={useSession} aria-describedby={ids.session} onChange={(e) => onSessionChange(e.target.checked)} /> Use my browser session
           </label>
           <label htmlFor={`${id}-browser`}>Browser</label>
           <select id={`${id}-browser`} value={browser} disabled={!useSession} onChange={(e) => setBrowser(e.target.value as BrowserName)}>
-              {BROWSERS.map((b) => (
-                <option key={b.value} value={b.value}>
-                  {b.label}
-                </option>
-              ))}
+            {BROWSERS.map((b) => (
+              <option key={b.value} value={b.value}>
+                {b.label}
+              </option>
+            ))}
           </select>
         </div>
         <Hint id={ids.session}>For posts that need you to be signed in. The downloader reads your signed-in session from that browser; it is never copied or stored.</Hint>
@@ -637,12 +636,12 @@ export function Capture({ client, projectId }: CaptureProps) {
             <span>Transcription model</span>
           </label>
           <select id={`${id}-model`} value={model} disabled={transcribe === "no"} onChange={(e) => setModel(e.target.value)}>
-              <option value="">The default model</option>
-              {MODELS.map((m) => (
-                <option key={m.value} value={m.value}>
-                  {m.label}
-                </option>
-              ))}
+            <option value="">The default model</option>
+            {MODELS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
           </select>
           <Hint id={`${id}-transcribe-hint`}>A profile capture transcribes only when “Transcribe” is chosen.</Hint>
         </fieldset>
