@@ -18,6 +18,8 @@
  *  - any command-line argument to the program (the service takes none), and a runtime argument that
  *    names a token;
  *  - the token's value appearing anywhere in the environment or the arguments;
+ *  - standard input that is a terminal: a typed token would be echoed on screen and kept in the
+ *    scrollback; pipe it in instead;
  *  - no line within TOKEN_STDIN_TIMEOUT_MS, or standard input closed before one;
  *  - a token outside 32–512 characters from `A–Z a–z 0–9 . _ ~ + / = -` (the minimum the service has
  *    always required, and the characters a bearer token may carry: auth.ts bearerOf).
@@ -63,6 +65,15 @@ function checkLaunch(src: StartupTokenSource): void {
   }
   if (src.execArgv.some((a) => /token/i.test(a))) {
     throw new StartupTokenError("A runtime command-line argument names a token. The service takes its access token only on standard input, as one line.");
+  }
+}
+
+/** Refusals of the input itself: a terminal. */
+function checkInput(input: Readable): void {
+  if ((input as Readable & { isTTY?: boolean }).isTTY === true) {
+    throw new StartupTokenError(
+      "Standard input is a terminal: a token typed there would be shown on screen. Pipe the access token in instead, for example: printf '%s\\n' \"$TOKEN\" | <the start command>.",
+    );
   }
 }
 
@@ -133,7 +144,14 @@ function readFirstLine(input: Readable, timeoutMs: number): Promise<string> {
 /** The service's access token, read from standard input after the launch is checked (see the file comment). */
 export async function readStartupToken(src: StartupTokenSource): Promise<string> {
   checkLaunch(src);
+  checkInput(src.input);
   const token = await readFirstLine(src.input, src.timeoutMs ?? TOKEN_STDIN_TIMEOUT_MS);
   checkToken(token, src);
   return token;
+}
+
+/** The message of a start-up error, with the token (once known) replaced by `[token]` (R96, R98). */
+export function startupErrorMessage(err: unknown, token: string | undefined): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return token ? message.split(token).join("[token]") : message;
 }

@@ -129,7 +129,8 @@ describe("the access token on standard input (R98)", () => {
     const { code, ms } = await r.exit;
     expect(code).not.toBe(0);
     expect(r.err()).toMatch(/standard input closed before an access token arrived/i);
-    expect(ms).toBeLessThan(TOKEN_STDIN_TIMEOUT_MS + 30_000);
+    // Not after waiting out the limit: the time is start-up (loading the modules) only.
+    expect(ms).toBeLessThan(TOKEN_STDIN_TIMEOUT_MS);
   });
 
   it("refuses and exits when no token arrives within the time limit", async () => {

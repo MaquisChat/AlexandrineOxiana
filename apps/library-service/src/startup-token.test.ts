@@ -4,7 +4,7 @@
  */
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { readStartupToken, StartupTokenError, TOKEN_STDIN_TIMEOUT_MS } from "./startup-token.js";
+import { readStartupToken, startupErrorMessage, StartupTokenError, TOKEN_STDIN_TIMEOUT_MS } from "./startup-token.js";
 
 const TOKEN = "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8._~+/=-";
 const clean = { env: { PATH: "/usr/bin" } as NodeJS.ProcessEnv, argv: ["/usr/bin/node", "/x/main.ts"], execArgv: ["--max-old-space-size=512", "--import", "tsx"] };
@@ -133,5 +133,30 @@ describe("readStartupToken", () => {
       expect(err.message).toMatch(/command line|argument/i);
       expect(err.message).not.toContain(TOKEN);
     }
+  });
+
+  it("refuses a terminal on standard input (a typed token would be echoed on screen) without reading it", async () => {
+    const input = Object.assign(source(), { isTTY: true });
+    input.write(`${TOKEN}\n`);
+    const err = await refusal(readStartupToken({ ...clean, input, timeoutMs: 1000 }));
+    expect(err.message).toMatch(/terminal/i);
+    expect(err.message).not.toContain(TOKEN);
+    expect(input.listenerCount("data")).toBe(0);
+  });
+
+  it("an error on standard input after the token line does not throw (it is no longer read)", async () => {
+    const input = source();
+    const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
+    input.write(`${TOKEN}\n`);
+    expect(await p).toBe(TOKEN);
+    expect(() => input.emit("error", new Error("EPIPE"))).not.toThrow();
+  });
+});
+
+describe("startupErrorMessage", () => {
+  it("replaces the token wherever a later start-up error carries it", () => {
+    expect(startupErrorMessage(new Error(`bad ${TOKEN} and ${TOKEN}`), TOKEN)).toBe("bad [token] and [token]");
+    expect(startupErrorMessage(`plain ${TOKEN}`, TOKEN)).toBe("plain [token]");
+    expect(startupErrorMessage(new Error("no token read yet"), undefined)).toBe("no token read yet");
   });
 });

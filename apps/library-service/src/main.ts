@@ -13,7 +13,8 @@
  *   printf '%s\n' "$TOKEN" | node --max-old-space-size=512 --import tsx apps/library-service/src/main.ts
  *
  * It is never taken from the environment or the command line: the service refuses to start if
- * AO_SERVICE_TOKEN is set, if it is given any argument, if the token does not arrive within
+ * AO_SERVICE_TOKEN is set, if it is given any argument, if standard input is a terminal (a typed
+ * token would be echoed: pipe it in), if the token does not arrive within
  * TOKEN_STDIN_TIMEOUT_MS, or if it is not 32–512 characters from `A–Z a–z 0–9 . _ ~ + / = -`. After
  * the one line, standard input is no longer read but stays open (closing it does not stop the
  * service). The token is never printed: not in a log line, an error, or the ready line.
@@ -32,7 +33,7 @@
  */
 import { openLibrary } from "@ao/library";
 import { createService } from "./server.js";
-import { readStartupToken } from "./startup-token.js";
+import { readStartupToken, startupErrorMessage } from "./startup-token.js";
 
 /** Exceeds the worst-case graceful close (R99): SUSPEND_TIMEOUT_MS for imports plus closing the rest. */
 export const FORCE_EXIT_MS = 90_000;
@@ -73,8 +74,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  let message = err instanceof Error ? err.message : String(err);
-  if (knownToken) message = message.split(knownToken).join("[token]");
-  process.stderr.write(`The library service could not start: ${message}\n`);
+  process.stderr.write(`The library service could not start: ${startupErrorMessage(err, knownToken)}\n`);
   process.exit(1);
 });
