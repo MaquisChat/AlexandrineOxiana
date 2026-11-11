@@ -13,7 +13,9 @@
  *    opens (or a route needs it). If start-up fails, the child and anything it started are killed
  *    before the temporary folder is removed;
  *  - on teardown stops the service with SIGTERM (its graceful shutdown stops the worker), checks it
- *    exited cleanly, and fails the test if any process it started is still running.
+ *    exited cleanly, and fails the test if any process it started is still running;
+ *  - `app.restart()` does the same mid-test and starts a new service on the same settings folder (a
+ *    relaunch of the app), with a new port and token that the page is handed on its next load.
  *
  * Per test, `page`: the built UI (packages/ui/dist) under the desktop shell's own origin,
  * http://tauri.localhost, answered from disk by Playwright (pushState paths fall back to index.html),
@@ -53,10 +55,10 @@ export interface AppHarness {
   configDir: string;
   /** An empty folder for the test's libraries. */
   librariesDir: string;
-  /** http://127.0.0.1:<port> */
+  /** http://127.0.0.1:<port> (of the service running now: a restart changes it). */
   baseUrl: string;
   port: number;
-  /** The UI token (for direct calls in test set-up; the page gets it through window.__AO_SERVICE__). */
+  /** The UI token (for direct calls in test set-up; the page gets it through window.__AO_SERVICE__). A restart changes it. */
   token: string;
   /** A direct call to the service with the UI token, as test set-up (no Origin header: not a browser). */
   api<T = unknown>(method: string, path: string, body?: unknown): Promise<ApiAnswer<T>>;
@@ -64,6 +66,15 @@ export interface AppHarness {
   childProcesses(): string[];
   /** The service's output so far (stdout and stderr), for failure messages. */
   log(): string;
+  /**
+   * Quits and relaunches the service as the desktop shell would: SIGTERM, checked to stop cleanly
+   * with everything it started; then `whileStopped` (e.g. renaming the library folder outside the
+   * app); then a new service on the same app settings folder, with a new port and token. The page
+   * gets the new connection on its next load (navigate or reload after this); the old address is refused.
+   */
+  restart(whileStopped?: () => Promise<void>): Promise<void>;
+  /** Called after each restart (the page fixture hands the new connection over with it). */
+  onRestart(listener: () => Promise<void>): void;
 }
 
 /** Requests the page made to anywhere but the app's origin and the service: refused, and the test fails. */
@@ -294,23 +305,25 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     const configDir = join(root, "config");
     const librariesDir = join(root, "libraries");
     let svc: Awaited<ReturnType<typeof startService>> | undefined;
-    let problems: string[] = [];
+    const problems: string[] = [];
+    /** The output of every service this test started (a restart starts another). */
+    const logs: string[][] = [];
+    const restartListeners: Array<() => Promise<void>> = [];
     try {
       await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
       svc = await startService(root);
-      const { port, token, log, child } = svc;
-      const baseUrl = `http://127.0.0.1:${port}`;
+      logs.push(svc.log);
       const harness: AppHarness = {
         root,
         configDir,
         librariesDir,
-        baseUrl,
-        port,
-        token,
+        baseUrl: `http://127.0.0.1:${svc.port}`,
+        port: svc.port,
+        token: svc.token,
         async api<T>(method: string, path: string, body?: unknown) {
-          const res = await fetch(`${baseUrl}${path}`, {
+          const res = await fetch(`${harness.baseUrl}${path}`, {
             method,
-            headers: { authorization: `Bearer ${token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+            headers: { authorization: `Bearer ${harness.token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
             ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
           });
           const text = await res.text();
@@ -322,15 +335,29 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
           }
           return { status: res.status, body: parsed as T };
         },
-        childProcesses: () => (child.pid ? descendants(child.pid).map((p) => p.command) : []),
-        log: () => log.join("\n"),
+        childProcesses: () => (svc?.child.pid ? descendants(svc.child.pid).map((p) => p.command) : []),
+        log: () => logs.map((l) => l.join("\n")).join("\n--- the service was restarted ---\n"),
+        async restart(whileStopped) {
+          const old = svc!;
+          svc = undefined;
+          problems.push(...(await stopService(old.child)));
+          expect(problems, "the service and the processes it started stop cleanly before a restart").toEqual([]);
+          await whileStopped?.();
+          svc = await startService(root);
+          logs.push(svc.log);
+          harness.port = svc.port;
+          harness.baseUrl = `http://127.0.0.1:${svc.port}`;
+          harness.token = svc.token;
+          for (const l of restartListeners) await l();
+        },
+        onRestart: (listener) => void restartListeners.push(listener),
       };
       await use(harness);
     } finally {
       try {
-        if (svc) problems = await stopService(svc.child);
-        if (svc && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
-          await testInfo.attach("service-log", { body: svc.log.join("\n"), contentType: "text/plain" });
+        if (svc) problems.push(...(await stopService(svc.child)));
+        if (logs.length && (problems.length || testInfo.status !== testInfo.expectedStatus)) {
+          await testInfo.attach("service-log", { body: logs.map((l) => l.join("\n")).join("\n--- the service was restarted ---\n"), contentType: "text/plain" });
         }
       } finally {
         await rm(root, { recursive: true, force: true });
@@ -351,7 +378,8 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
 
   page: async ({ page, app, blocked, browserName }, use) => {
     const context = page.context();
-    const service = new URL(app.baseUrl).host;
+    // Read at each request: a restart moves the service to another port (and the old one is refused).
+    const service = () => new URL(app.baseUrl).host;
     // Chromium's Local Network Access treats a page Playwright answers itself as public, so its
     // calls to the loopback service need the permission a user (or the shell) would grant; without
     // it every call fails with "Permission was denied for this request to access the `loopback`
@@ -359,7 +387,7 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     if (browserName === "chromium") await context.grantPermissions(["local-network-access"], { origin: APP_ORIGIN });
     // Everything but the service goes through here: the app's origin is answered from disk, the rest is refused.
     await context.route(
-      (url) => url.host !== service,
+      (url) => url.host !== service(),
       async (route) => {
         const url = new URL(route.request().url());
         if (url.origin !== APP_ORIGIN) {
@@ -372,13 +400,18 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
       },
     );
     // As the desktop shell will: the connection on window before any app code runs, in the app's own
-    // top-level document only (never in a snapshot frame or any other origin).
-    await context.addInitScript(
-      ({ baseUrl, token, origin }) => {
-        if (window === window.top && window.location.origin === origin) (window as unknown as { __AO_SERVICE__?: unknown }).__AO_SERVICE__ = { baseUrl, token };
-      },
-      { baseUrl: app.baseUrl, token: app.token, origin: APP_ORIGIN },
-    );
+    // top-level document only (never in a snapshot frame or any other origin). After a restart the
+    // shell hands over the new connection: a later init script runs after this one and replaces it.
+    const handOver = async () => {
+      await context.addInitScript(
+        ({ baseUrl, token, origin }) => {
+          if (window === window.top && window.location.origin === origin) (window as unknown as { __AO_SERVICE__?: unknown }).__AO_SERVICE__ = { baseUrl, token };
+        },
+        { baseUrl: app.baseUrl, token: app.token, origin: APP_ORIGIN },
+      );
+    };
+    await handOver();
+    app.onRestart(handOver);
     await page.goto(`${APP_ORIGIN}/`);
     await use(page);
   },

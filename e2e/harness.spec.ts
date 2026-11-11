@@ -59,7 +59,34 @@ test("the media worker would run the fake capture tools, never the real ones", a
   expect(r.body.versions).toMatchObject({ yt_dlp: "2026.10.22", gallery_dl: "1.30.10" });
 });
 
-test("a request to anywhere but the app and its service is refused", async ({ page, app, blocked }) => {
+test("a restart relaunches the service on the same settings: new port and token, the page handed the new connection, the old address refused", async ({ page, app, blocked }) => {
+  const created = await app.api("POST", "/libraries", { path: join(app.librariesDir, "Restart library"), name: "Restart library" });
+  expect(created.status).toBe(200);
+  const before = { port: app.port, token: app.token };
+  let ranWhileStopped = false;
+  await app.restart(async () => {
+    ranWhileStopped = true;
+    // Stopped: nothing answers on the old port.
+    await expect(fetch(`http://127.0.0.1:${before.port}/libraries`)).rejects.toThrow();
+  });
+  expect(ranWhileStopped).toBe(true);
+  expect(app.port).not.toBe(before.port);
+  expect(app.token).not.toBe(before.token);
+  // The settings survived: the library is known, and (as on a relaunch) none is open.
+  const listed = await app.api<{ libraries: Array<{ name: string }>; current?: unknown }>("GET", "/libraries");
+  expect(listed.body.libraries.map((l) => l.name)).toEqual(["Restart library"]);
+  expect(listed.body.current).toBeUndefined();
+  await page.goto(`${APP_ORIGIN}/`);
+  await expect(page.getByRole("button", { name: "Open Restart library" })).toBeVisible();
+  expect(await page.evaluate(() => "__AO_SERVICE__" in window)).toBe(false);
+  // The page cannot reach the old address any more.
+  const old = await page.evaluate(async (url) => fetch(url).then(() => "reached", () => "refused"), `http://127.0.0.1:${before.port}/libraries`);
+  expect(old).toBe("refused");
+  expect(blocked).toEqual([`http://127.0.0.1:${before.port}/libraries`]);
+  blocked.length = 0;
+});
+
+test("a request to anywhere but the app and its service is refused",async ({ page, app, blocked }) => {
   // The app's CSP already refuses other sites; another loopback port is what it would let through.
   // (A low port such as 1 would be refused by WebKit's own list of unsafe ports, before the harness sees it.)
   const elsewhere = `http://127.0.0.1:${app.port < 65535 ? app.port + 1 : app.port - 1}/`;
