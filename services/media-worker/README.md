@@ -105,3 +105,57 @@ MP4 muxer writes it with four decimals, e.g. `+40.7000-074.0000/`).
   fragments (`download.strip_url`); error details are redacted the same way and show the home
   folder as `~`.
 - Responses contain no absolute paths except under the caller's own `output`.
+
+## Packaging
+
+The desktop app ships the worker as a self-contained folder built with PyInstaller (one folder,
+one build per platform and architecture; no universal2 build, ADR 0014). The user's machine needs
+no Python.
+
+```sh
+node apps/desktop/scripts/build-sidecars.mjs           # build for this machine
+node apps/desktop/scripts/build-sidecars.mjs --smoke   # build, then run the smoke test
+node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke
+node apps/desktop/scripts/build-sidecars.mjs --resolve-for macos-x86_64   # check a pin set, no build
+```
+
+It needs Python 3.12+ (`$PYTHON`, else `python3.13`/`python3.12`/`python3`) and PyPI. It makes a
+build venv per pin set under `apps/desktop/.build/` and writes
+`apps/desktop/sidecars/ao-worker-<target triple>/` (both git-ignored): the executable `ao-worker`,
+its `_internal/` folder and `sidecar-manifest.json` (worker and Python version, platform,
+architecture, pin set, and every bundled package with its version, licence and licence files).
+PyInstaller is a build-time dependency only (the `packaging` extra). The spec, the frozen entry
+point and the smoke test are in `packaging/`; the spec says, for each hidden import and data
+file, what broke without it.
+
+**Inside:** the worker, its Python dependencies and gallery-dl. **Not inside** (R126): ffmpeg,
+ffprobe, tesseract, ghostscript, yt-dlp and the speech models. The packaged worker finds them the
+same way as from source: ffmpeg, ffprobe and tesseract on `PATH` (the shell puts the tools
+folder's `bin` first on `PATH`), yt-dlp through `AO_YTDLP_BIN` or `AO_TOOLS_DIR`, models in
+`AO_MODELS_DIR`. It starts and answers `/health` with none of them present.
+
+**How the shell starts it:** exactly like the source worker, with the executable as the whole
+command: `AO_WORKER_BIN=<folder>/ao-worker` for `startWorker`, which passes `AO_WORKER_TOKEN`,
+`AO_WORKER_PORT=0` and `AO_WORKER_EXIT_ON_STDIN_EOF=1` in the environment and reads
+`AO_WORKER_READY port=<n>` from stdout. SIGTERM ends it (exit 0) and its job processes. The
+executable also runs `ao-worker -m ocrmypdf …` and `ao-worker -m gallery_dl …`, because the worker
+starts those as `sys.executable -m`, and `ao-worker --self-check`; it refuses anything else.
+
+**Two pin sets (R133):** the default pins in `pyproject.toml`, and the Intel-Mac set in
+`packaging/constraints-macos-x86_64.txt` (older onnxruntime, pikepdf, ocrmypdf, rawpy and
+cryptography, which no longer publish Intel-Mac wheels). On an Intel Mac the build script uses
+the Intel set by default (`--constraints none` to override); `--constraints <file>` selects one
+elsewhere. A package named in a constraints file is pinned by it even where `pyproject.toml` pins
+it directly. Every dependency must be a wheel. `--resolve-for macos-x86_64` (or `macos-arm64`)
+checks on any machine that a pin set resolves to wheels for that Mac.
+
+**Smoke test** (`packaging/smoke_test.py`, run with `--smoke`): from a temporary folder with a
+clean environment (no venv, no `PYTHONPATH`/`PYTHONHOME`), it checks the self-check, the ready
+line, `/health`, HEIC and DNG image proxies, and clear failures for OCR, video proxies and
+transcription with no tools or models; then, with this machine's ffmpeg, ffprobe and tesseract
+linked into `$AO_TOOLS_DIR/bin` and the `tiny` model in `AO_MODELS_DIR`, a video proxy, a
+three-page OCR and a transcription; and that SIGTERM leaves no process behind. Every proxy
+variable points at a local sentinel: nothing may be requested while starting and answering
+`/health`, and later requests are refused as on a machine with no network. The only download is
+the `tiny` model, once, before any worker starts (kept in `~/.cache/ao-worker-smoke-models` or
+`$AO_SMOKE_MODELS_DIR`; `--no-model-download` skips it). CI runs it on `main` and on manual runs.
