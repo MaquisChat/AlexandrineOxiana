@@ -40,7 +40,7 @@ AO_WORKER_TOKEN=<random, ≥16 chars> AO_WORKER_PORT=0 .venv/bin/python -m ao_wo
 | --- | --- |
 | `AO_WORKER_TOKEN` | required; every request needs `Authorization: Bearer <token>` |
 | `AO_WORKER_PORT` | port on 127.0.0.1 (`0` = any free port; the chosen one is printed) |
-| `AO_MODELS_DIR` | faster-whisper model cache (downloaded on first use) |
+| `AO_MODELS_DIR` | faster-whisper model cache (Hugging Face cache layout). A model already there is loaded with no network contact; an absent one is downloaded on first use, and if that fails the job fails with `MODEL_UNAVAILABLE` ("not installed and could not be downloaded") |
 | `AO_TOOLS_DIR` | managed standalone yt-dlp binary (ADR 0009) |
 | `AO_YTDLP_BIN` / `AO_GALLERYDL_BIN` | use this executable instead |
 | `AO_WORKER_EXIT_ON_STDIN_EOF=1` | exit when stdin closes (set by `startWorker`, so the worker dies with the app) |
@@ -105,3 +105,88 @@ MP4 muxer writes it with four decimals, e.g. `+40.7000-074.0000/`).
   fragments (`download.strip_url`); error details are redacted the same way and show the home
   folder as `~`.
 - Responses contain no absolute paths except under the caller's own `output`.
+
+## Packaging
+
+The desktop app ships the worker as a self-contained folder built with PyInstaller (one folder,
+one build per platform and architecture; no universal2 build, ADR 0014). The user's machine needs
+no Python.
+
+```sh
+node apps/desktop/scripts/build-sidecars.mjs           # build for this machine
+node apps/desktop/scripts/build-sidecars.mjs --smoke   # build, then run the smoke test
+node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke
+node apps/desktop/scripts/build-sidecars.mjs --resolve-for macos-x86_64   # check a pin set, no build
+```
+
+It needs Python 3.12+ (`$PYTHON`, else `python3.13`/`python3.12`/`python3`) and PyPI. It makes a
+build venv per pin set under `apps/desktop/.build/` and writes
+`apps/desktop/sidecars/ao-worker-<target triple>/` (both git-ignored): the executable `ao-worker`,
+its `_internal/` folder and `sidecar-manifest.json` (worker and Python version, platform,
+architecture, pin set, and every bundled package with its version, licence and licence files).
+PyInstaller is a build-time dependency only (the `packaging` extra). The spec, the frozen entry
+point and the smoke test are in `packaging/`; the spec says, for each hidden import and data
+file, what broke without it.
+
+**Inside:** the worker, its Python dependencies and gallery-dl. **Not inside** (R126): ffmpeg,
+ffprobe, tesseract, ghostscript, yt-dlp and the speech models. The packaged worker finds them the
+same way as from source: ffmpeg, ffprobe and tesseract on `PATH` (the shell puts the tools
+folder's `bin` first on `PATH`), yt-dlp through `AO_YTDLP_BIN` or `AO_TOOLS_DIR`, models in
+`AO_MODELS_DIR`. It starts and answers `/health` with none of them present.
+
+**How the shell starts it:** exactly like the source worker, with the executable as the whole
+command: `AO_WORKER_BIN=<folder>/ao-worker` for `startWorker`, which passes `AO_WORKER_TOKEN`,
+`AO_WORKER_PORT=0` and `AO_WORKER_EXIT_ON_STDIN_EOF=1` in the environment and reads
+`AO_WORKER_READY port=<n>` from stdout. SIGTERM ends it (exit 0) and its job processes. The
+executable also runs `ao-worker -m ocrmypdf …` and `ao-worker -m gallery_dl …`, because the worker
+starts those as `sys.executable -m`, and `ao-worker --self-check`; it refuses anything else.
+
+**Two pin sets (R133):** the default pins in `pyproject.toml`, and the Intel-Mac set in
+`packaging/constraints-macos-x86_64.txt` (older onnxruntime, pikepdf, ocrmypdf, rawpy and
+cryptography, which no longer publish Intel-Mac wheels). On an Intel Mac the build script uses
+the Intel set by default (`--constraints none` to override); `--constraints <file>` selects one
+elsewhere. A package named in a constraints file is pinned by it even where `pyproject.toml` pins
+it directly. Every dependency must be a wheel. `--resolve-for macos-x86_64` (or `macos-arm64`)
+checks on any machine that a pin set resolves to wheels for that Mac.
+
+**Smoke test** (`packaging/smoke_test.py`, run with `--smoke`): from a temporary folder with a
+clean environment (no venv, no `PYTHONPATH`/`PYTHONHOME`) it checks the self-check, the ready
+line, `/health`, and clear failures for OCR, video proxies and transcription with no tools or
+models; then, with this machine's ffmpeg, ffprobe and tesseract linked into `$AO_TOOLS_DIR/bin`
+and the `tiny` model in `AO_MODELS_DIR`, the outputs themselves, checked independently of what
+the worker reports: HEIC and DNG proxies decoded with Pillow (JPEG, 1024 px, EXIF rotation
+applied, not blank), the video proxy probed and fully decoded with the supplied ffprobe/ffmpeg
+(MP4, H.264/AAC, 240 lines, the input's duration), a three-page OCR, and a transcript containing
+at least two of "curiosity", "beside", "moment" with a timed segment. SIGTERM must leave no
+process behind. Every proxy variable points at a local sentinel that refuses and records
+requests: none may be made while starting, answering `/health`, or transcribing with the model on
+disk. The only download is the `tiny` model, once, before any worker starts (kept in
+`~/.cache/ao-worker-smoke-models` or `$AO_SMOKE_MODELS_DIR`; `--no-model-download` skips it). A
+missing fixture, model or tool **fails** the run; `--allow-missing model,clip,dng,ffmpeg,tesseract`
+turns the named absences into reported skips, for local experiments only (CI and the commands
+above do not use it). CI runs the smoke test on `main` and on manual runs.
+
+**Licences:** the build writes `licenses/` next to the executable: each bundled package's own
+licence files (`packages/<name>/`), the build Python's licence, the GNU GPL-2.0, GPL-3.0, LGPL-2.1
+and LGPL-3.0 texts (`gnu/`, copied from `packaging/licenses/`), and `README.txt`, a table of every
+native library in the bundle with the package that carries it and its licence *as stated* by
+that wheel's files, by the library itself (FFmpeg) or "unknown". The same facts are in
+`sidecar-manifest.json` (`packages[].binaryWheelStatement`,
+`packages[].copyleftIncludingNativeLibraries`, `nativeLibraries`). Facts only, no legal
+assessment. The manifest must match the bundle exactly: every `*.dist-info` folder and every
+native library in `_internal/` must be listed, and everything listed must be there. Writing the
+manifest fails the build otherwise, and `--smoke` checks it again
+(`manifest.py --bundle <folder> --out <folder>/sidecar-manifest.json --check`). The package list
+follows the extras a requirement asks for (ocrmypdf needs `pikepdf[pdfa]`, which brings
+jsonschema and referencing). Unit tests: `services/media-worker/tests/test_packaging_manifest.py`.
+
+**Symbolic links (for the Mac build):** PyInstaller links every shared library that a wheel keeps
+in `<package>.libs/` (or `.dylibs/` on macOS) into the top of `_internal/` (64 links in the Linux
+build); its macOS library-path rewriting expects them there. `--skip-build --list-symlinks` lists
+them. PyInstaller has no spec or command-line option to turn them off; a hook can suppress them
+for matching paths (`bindepend_symlink_suppression` in a hook, or
+`hook_api.add_bindepend_symlink_suppression_pattern()`). Untested on macOS, where suppressing them
+may break library loading; signing and copying them into the app is for Tasks 37f/37g.
+
+**Speech models:** a model already in `AO_MODELS_DIR` is loaded from disk with no network
+contact. Only an absent model is downloaded (logged); a failed download is `MODEL_UNAVAILABLE`.
