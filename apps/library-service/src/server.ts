@@ -134,10 +134,6 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     if ((req.url.split("?")[0] ?? "") !== "/events") {
       inFlight++;
       reply.raw.once("close", requestEnded);
-      if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS") {
-        inFlightMutating++;
-        reply.raw.once("close", () => inFlightMutating--);
-      }
     }
     // 1. DNS rebinding: only our own host names, on our port.
     if (!hostAllowed(req.headers.host, port)) return fail(reply, new ApiError(403, "FORBIDDEN", "This host name is not allowed."));
@@ -181,10 +177,16 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
 
   // During a library move nothing may change anything (R102 N2): every non-read request waits it out.
+  // A change is counted as in flight only once its body has been read (R108), so a slow upload
+  // never holds up a move: it is refused here if a move started meanwhile.
   app.addHook("preHandler", async (req: FastifyRequest, reply: FastifyReply) => {
-    if (!state.moving || req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
-    if (`${req.method} ${req.routeOptions.url ?? ""}` === "POST /libraries/move") return fail(reply, new ApiError(409, "CONFLICT", "A move of this library is already running."));
-    return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", "The library is being moved. Try again when the move has finished."));
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
+    if (state.moving) {
+      if (`${req.method} ${req.routeOptions.url ?? ""}` === "POST /libraries/move") return fail(reply, new ApiError(409, "CONFLICT", "A move of this library is already running."));
+      return fail(reply, new ApiError(503, "MOVE_IN_PROGRESS", "The library is being moved. Try again when the move has finished."));
+    }
+    inFlightMutating++;
+    reply.raw.once("close", () => inFlightMutating--);
   });
 
   app.setErrorHandler((err: unknown, req, reply) => {

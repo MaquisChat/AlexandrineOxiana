@@ -100,6 +100,7 @@ export function toApiError(err: unknown): ApiError {
     if (err.denied) return new ApiError(403, "POLICY_DENIED", "This project's rules do not allow that.", err.reason);
     // Running (being paused or undone) or already finished: a state conflict (R102, by kind — R106).
     if (err.kind === "running" || err.kind === "finished") return new ApiError(409, "CONFLICT", err.reason);
+    if (err.kind === "locked") return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.", err.reason);
     return new ApiError(400, "VALIDATION", err.reason);
   }
   if (err instanceof ReadOnlyLibraryError) return new ApiError(409, "READ_ONLY", "This library is open read-only, so nothing can be changed.");

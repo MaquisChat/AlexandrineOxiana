@@ -196,7 +196,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
       const pending = state.recordMove({ oldRoot, newRoot: r.newRoot, confirmToken: r.confirmToken });
       // The library now lives at the destination (the move closed the old copy): open it there, retrying once.
       // If it still cannot be opened, what was paused resumes once it is (R106).
-      state.resumeWhenOpened(r.newRoot, paused);
+      state.resumeWhenOpened(r.newRoot, paused, oldRoot);
       let lib: Library | undefined;
       for (let attempt = 0; attempt < 2 && !lib; attempt++) {
         try {

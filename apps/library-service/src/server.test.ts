@@ -1295,3 +1295,137 @@ describe("review round 3: appearance (R105, service side)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Task 30 review round 4 (R108)
+
+describe("review round 4: stopped work, in-flight changes, refusals, resumes (R108)", () => {
+  it("T8: a capture queue stopped by a move whose new copy cannot be opened never runs against another library; it resumes on its own", async () => {
+    let fails = 0;
+    const { openLibrary: realOpen } = await import("@ao/library");
+    const dest = join(tmp, "Moved");
+    let failMove = false;
+    await start({
+      worker: slowProvider(40),
+      autoStartWorker: true,
+      openLibrary: async (root, d, o) => {
+        if (root === dest && fails < 2) {
+          fails++;
+          throw new Error("EIO");
+        }
+        return realOpen(root, d, o);
+      },
+      beforeExecuteMove: async () => {
+        if (failMove) throw new Error("the copy failed");
+      },
+    });
+    await openNewLibrary();
+    const pid = await newProject(`${OPEN_GOV}captureMethods: [manual_upload, downloader]\n`);
+    const urls = Array.from({ length: 15 }, (_, i) => `https://www.youtube.com/watch?v=aoT8${String(i).padStart(7, "0")}`);
+    const third = nextEvent((e) => e.type === "capture.progress" && e.data.done === 3);
+    const { queueId } = (await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls } })).json;
+    await third;
+    // The move finishes, but the moved copy cannot be opened (twice): the queue is stopped part-way.
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest } })).body).toContain("LIBRARY_OFFLINE");
+    expect(fails).toBe(2);
+    const stoppedAt = svc.state.captureQueue(queueId)!.done;
+    expect(stoppedAt).toBeLessThan(15);
+    // Another library is opened, and a move of it is rolled back.
+    const other = await openNewLibrary("Other");
+    const otherPid = await newProject(OPEN_GOV, false, "Elsewhere");
+    failMove = true;
+    expect((await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "OtherMoved") } })).body).toContain("error");
+    failMove = false;
+    await svc.state.idle();
+    // Nothing ran against the other library.
+    expect(svc.state.session!.lib.root).toBe(other);
+    expect(svc.state.workKinds()).not.toContain("capture");
+    expect(svc.state.captureQueue(queueId)).toMatchObject({ done: stoppedAt, finished: false });
+    expect((await auditOps(otherPid)).filter((o) => o === "capture.link")).toHaveLength(0);
+    // Opening the moved copy resumes the queue there.
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: dest } })).status).toBe(200);
+    await svc.state.idle();
+    expect(svc.state.captureQueue(queueId)).toMatchObject({ done: 15, total: 15, finished: true });
+    expect((await auditOps(pid)).filter((o) => o === "capture.link")).toHaveLength(15);
+  }, 60_000);
+
+  it("a request whose body is still arriving does not hold up a move (counted only once its body is read)", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const port = await svc.listen();
+    // A change whose upload has started but not finished.
+    const body = JSON.stringify({ paths: [await fixturePdf()] });
+    const slow = httpRequest({
+      host: "127.0.0.1",
+      port,
+      method: "POST",
+      path: `/projects/${pid}/attach`,
+      headers: { ...auth, host: `127.0.0.1:${port}`, "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) },
+    });
+    const slowDone = new Promise<number>((resolve) => {
+      slow.on("response", (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      });
+      slow.on("error", () => resolve(0));
+    });
+    slow.write(body.slice(0, 5));
+    await new Promise((r) => setTimeout(r, 100));
+    const t0 = Date.now();
+    const moved = await fetch(`http://127.0.0.1:${port}/libraries/move`, {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ dest: join(tmp, "Moved") }),
+    });
+    expect(await moved.text()).toContain('"done":true');
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    slow.end(body.slice(5));
+    expect(await slowDone).toBe(200); // read after the move: it applies to the moved library
+    const listed = (await (await fetch(`http://127.0.0.1:${port}/projects/${pid}/sources`, { headers: auth })).json()) as { total: number };
+    expect(listed.total).toBe(1);
+  }, 30_000);
+
+  it("an import refused because the project is locked is 423 PROJECT_LOCKED", async () => {
+    const { toApiError } = await import("./errors.js");
+    const { BatchRefusedError } = await import("@ao/library");
+    expect([toApiError(new BatchRefusedError("locked", false, "locked")).status, toApiError(new BatchRefusedError("locked", false, "locked")).code]).toEqual([423, "PROJECT_LOCKED"]);
+    await start();
+    await openNewLibrary();
+    const pid = await newProject(OPEN_GOV.replace("atRest: optional", "atRest: required"), true);
+    const dir = await pdfFolder(3, "locked");
+    await call({ method: "POST", url: `/projects/${pid}/lock` });
+    const r = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } });
+    expect([r.status, r.json.error.code]).toEqual([423, "PROJECT_LOCKED"]);
+  });
+
+  it("batches being resumed are in the work registry: a move's quiesce waits for them and pauses them", async () => {
+    await start();
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(20, "rs");
+    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
+    await p;
+    expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("cancelled"); // stopped, resumable from its record
+    // Resuming takes a while to reach the point where the batch is running.
+    const s = svc.state.session!;
+    const bulk = s.bulk!;
+    const realResume = bulk.resumeBatch.bind(bulk);
+    bulk.resumeBatch = async (...args) => {
+      await new Promise((r) => setTimeout(r, 300));
+      return realResume(...args);
+    };
+    svc.state.resumeBatches([{ projectId: pid, batchId }]);
+    expect(svc.state.workKinds()).toContain("resume-import");
+    expect(await svc.state.drainWork(10_000)).toBe(true);
+    expect(s.batches.has(batchId)).toBe(true); // drained only once it was running (and so can be paused)
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    await svc.state.idle();
+    expect(await batchState(pid, batchId)).toBe("finished");
+    expect((await call({ url: `/projects/${pid}/sources?limit=100` })).json.total).toBe(20);
+  }, 60_000);
+});

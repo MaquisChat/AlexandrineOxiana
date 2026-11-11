@@ -144,9 +144,9 @@ export const REASONS = {
 /**
  * Why a batch was refused, for callers that map it (R106): `denied` the project's rules; `running`
  * the batch is running (or being paused or undone) now; `finished` it has already finished or been
- * undone; `invalid` the options, the source or the record.
+ * undone; `locked` the project is locked (R108); `invalid` the options, the source or the record.
  */
-export type BatchRefusalKind = "denied" | "running" | "finished" | "invalid";
+export type BatchRefusalKind = "denied" | "running" | "finished" | "locked" | "invalid";
 
 /** A batch could not start (or resume): the options or the project's rules do not allow it. */
 export class BatchRefusedError extends Error {
@@ -374,7 +374,7 @@ async function preflight(repo: Repo, projectId: string, kind: ImportBatch["sourc
     );
   } catch (err) {
     if (err instanceof PolicyDeniedError) throw new BatchRefusedError(err.reason, true);
-    if (err instanceof ProjectLockedError) throw new BatchRefusedError("The project is locked. Unlock it, then try again.");
+    if (err instanceof ProjectLockedError) throw new BatchRefusedError("The project is locked. Unlock it, then try again.", false, "locked");
     throw err;
   }
   return notes;

@@ -158,8 +158,8 @@ export class ServiceState {
   private workSeq = 0;
   /** Background work running now: capture queues, profile captures, recheck jobs, retries, worker resumption, backups. */
   private readonly work = new Map<number, { kind: string; ctl: WorkControl; done: Promise<void> }>();
-  /** Work stopped part-way for a move (or shutdown): continued on the library open afterwards. */
-  private stoppedWork: Array<(s: Session) => void> = [];
+  /** Work stopped part-way for a move (or shutdown): continued only on its own library (by root, R108). */
+  private stoppedWork: Array<{ root: string | undefined; cont: (s: Session) => void }> = [];
   /** Mutating requests in progress (set by the server; the move waits for them, R106 I1). */
   inFlightMutating: () => number = () => 0;
   /** After a move whose new copy could not be opened: what to resume once it is (R106). */
@@ -173,10 +173,11 @@ export class ServiceState {
   startWork(kind: string, fn: (ctl: WorkControl) => Promise<((s: Session) => void) | void>): void {
     const id = ++this.workSeq;
     const ctl: WorkControl = { stopping: false };
+    const root = this.session?.lib.root;
     const done = fn(ctl)
       .then(
         (cont) => {
-          if (cont) this.stoppedWork.push(cont);
+          if (cont) this.stoppedWork.push({ root, cont });
         },
         (err: unknown) => this.opts.log.warn({ err: this.describe(err) }, `${kind} failed`),
       )
@@ -200,11 +201,13 @@ export class ServiceState {
     return ok;
   }
 
-  /** Continues the work stopped for a move, on the library open now. */
+  /** Continues the work stopped for a move, when it belongs to the library open now (R108); the rest waits for its own. */
   restartStoppedWork(): void {
     const s = this.session;
     if (!s) return;
-    for (const cont of this.stoppedWork.splice(0)) {
+    const mine = this.stoppedWork.filter((w) => w.root === s.lib.root);
+    this.stoppedWork = this.stoppedWork.filter((w) => w.root !== s.lib.root);
+    for (const { cont } of mine) {
       try {
         cont(s);
       } catch (err) {
@@ -213,8 +216,12 @@ export class ServiceState {
     }
   }
 
-  /** Remembers what to resume when the library at `root` is opened (after a failed open). */
-  resumeWhenOpened(root: string, batches: Array<{ projectId: string; batchId: string }>): void {
+  /**
+   * After a move from `fromRoot` to `root`: the work stopped for it now belongs to `root`, and what
+   * was paused resumes when the library there is opened (now, or after a failed open).
+   */
+  resumeWhenOpened(root: string, batches: Array<{ projectId: string; batchId: string }>, fromRoot?: string): void {
+    if (fromRoot !== undefined) for (const w of this.stoppedWork) if (w.root === fromRoot) w.root = root;
     this.pendingResume = { root, batches };
   }
 
@@ -531,16 +538,21 @@ export class ServiceState {
     return paused;
   }
 
-  /** After a move (or a failed one): the batches paused for it are resumed in the library now open. */
+  /**
+   * After a move (or a failed one): the batches paused for it are resumed in the library now open.
+   * Each resume is in the work registry (R108), so a move's quiesce waits until the batch runs (and
+   * can be paused) instead of missing it.
+   */
   resumeBatches(list: Array<{ projectId: string; batchId: string }>): void {
     const s = this.session;
-    if (!s?.bulk) return;
+    const bulk = s?.bulk;
+    if (!s || !bulk) return;
     for (const b of list) {
       if (!s.repo.listProjects().some((p) => p.id === b.projectId)) continue;
-      this.track(
-        s.bulk.resumeBatch(b.projectId, b.batchId).then((h) => this.followBatch(s, b.projectId, h)),
-        "resuming an import",
-      );
+      this.startWork("resume-import", async () => {
+        const h = await bulk.resumeBatch(b.projectId, b.batchId);
+        this.followBatch(s, b.projectId, h);
+      });
     }
   }
 
