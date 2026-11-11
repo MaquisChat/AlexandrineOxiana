@@ -38,7 +38,14 @@ export interface DecryptedFile {
 
 /** Opens `path` for random-access decryption; throws KeyNotAvailableError when `getKey` has no key. */
 export async function openDecrypted(path: string, getKey: (keyId: string) => Uint8Array | undefined): Promise<DecryptedFile> {
-  const fh = await fsp.open(path, "r");
+  return openDecryptedHandle(await fsp.open(path, "r"), getKey);
+}
+
+/**
+ * The same over a file already open (e.g. opened without following symbolic links). The returned
+ * file owns `fh`: its close() closes it, and so does a failure here.
+ */
+export async function openDecryptedHandle(fh: fsp.FileHandle, getKey: (keyId: string) => Uint8Array | undefined): Promise<DecryptedFile> {
   try {
     const { size: fileSize } = await fh.stat();
     const header = Buffer.alloc(HEADER_LEN);
