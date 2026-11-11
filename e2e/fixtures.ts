@@ -36,7 +36,7 @@ import { tmpdir } from "node:os";
 import { delimiter, extname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { test as base, expect, type Page } from "@playwright/test";
-import { FAKE_TOOLS, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
+import { FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
 export const APP_ORIGIN = "http://tauri.localhost";
@@ -383,5 +383,85 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     await use(page);
   },
 });
+
+/**
+ * Rules of a project without identifiable data and without online lookups: the default rules
+ * require encryption (the service refuses them without it), and a lookup with no recorded answer
+ * fails on purpose. Scenarios that need neither use these.
+ */
+export const OPEN_RULES = "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\nprocessing:\n  metadata_lookup: []\n";
+
+/**
+ * Test set-up through the service: a library at `librariesDir/<folder>` and a project in it with
+ * `governanceYaml` (encrypted with `passphrase` when one is given, else not), then the page loaded
+ * onto the library screen with that project selected. (The UI has no "New project" control yet; the
+ * library chooser itself is covered by the smoke test.)
+ */
+export async function libraryWithProject(
+  app: AppHarness,
+  page: Page,
+  o: { library: string; folder?: string; project: string; governanceYaml?: string; passphrase?: string },
+): Promise<{ libraryPath: string; projectId: string; projectFolder: string }> {
+  const libraryPath = join(app.librariesDir, o.folder ?? o.library);
+  const lib = await app.api("POST", "/libraries", { path: libraryPath, name: o.library });
+  expect(lib.status, JSON.stringify(lib.body)).toBe(200);
+  const encryption = o.passphrase ? { enabled: true, passphrase: o.passphrase } : { enabled: false };
+  const created = await app.api<{ project: { id: string; folder: string } }>("POST", "/projects", { name: o.project, governanceYaml: o.governanceYaml ?? OPEN_RULES, encryption });
+  expect(created.status, JSON.stringify(created.body)).toBe(200);
+  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(created.body.project.id)}`);
+  await expect(page.getByRole("heading", { level: 1, name: o.library })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: o.project })).toHaveAttribute("aria-current", "true");
+  return { libraryPath, projectId: created.body.project.id, projectFolder: created.body.project.folder };
+}
+
+/**
+ * A step the product cannot do yet because of a recorded defect: it is not run, it shows in the
+ * report as a skipped step named "FIXME <defect>: <title>", and the test carries a "fixme"
+ * annotation naming the defect. The body is the step as it should pass once the defect is fixed:
+ * replace `blockedBy(...)` with `test.step(...)` then. The scenario goes on after it as far as it can.
+ *
+ * With AO_E2E_CHECK_DEFECTS=1 the body is run instead, and the step fails if it passes: a check that
+ * each recorded defect still reproduces (a body that fails may leave the page elsewhere; the steps
+ * after a blocked one start from a known address for that reason).
+ */
+export async function blockedBy(defect: string, title: string, body: () => Promise<void>): Promise<void> {
+  test.info().annotations.push({ type: "fixme", description: `${defect}: ${title}` });
+  if (process.env.AO_E2E_CHECK_DEFECTS === "1") {
+    await test.step(`DEFECT CHECK ${defect}: ${title}`, async () => {
+      const outcome = await body().then(
+        () => "passed",
+        // (without the colour codes of Playwright's messages)
+        (err: unknown) => `reproduces: ${String(err instanceof Error ? err.message : err).replace(/\u001b\[[0-9;]*m/gu, "").split("\n")[0]}`,
+      );
+      test.info().annotations.push({ type: "defect-check", description: `${defect} ${outcome}` });
+      if (outcome === "passed") throw new Error(`${defect} no longer reproduces ("${title}" passes): replace blockedBy with test.step.`);
+    });
+    return;
+  }
+  await test.step.skip(`FIXME ${defect}: ${title}`, body);
+}
+
+/**
+ * The plaintext of a file the service stored encrypted, decrypted with the library's own code (the
+ * project key unwrapped from `keys/project-key.json` with the passphrase) in a child process run from
+ * packages/library, so the test reads exactly what the app would. The plaintext is written to
+ * `output`, which must be inside the test's temporary folder; the passphrase goes by environment,
+ * never on a command line.
+ */
+export function decryptStoredFile(app: AppHarness, o: { projectRoot: string; file: string; passphrase: string; output: string }): void {
+  if (!resolve(o.output).startsWith(app.root + sep)) throw new Error("decryptStoredFile writes only inside the test's temporary folder");
+  const code = [
+    'import { readFile, writeFile } from "node:fs/promises";',
+    'import { unwrapKey } from "./src/crypto/keys.ts";',
+    'import { decryptBytes } from "./src/repo/io.ts";',
+    "const o = JSON.parse(process.env.AO_E2E_DECRYPT);",
+    'const kf = JSON.parse(await readFile(o.keyFile, "utf8"));',
+    "const key = await unwrapKey(kf.passphrase, o.passphrase);",
+    "await writeFile(o.output, await decryptBytes((id) => (id === kf.keyId ? key : undefined), await readFile(o.file)));",
+  ].join("\n");
+  const env = { ...process.env, AO_E2E_DECRYPT: JSON.stringify({ keyFile: join(o.projectRoot, "keys", "project-key.json"), passphrase: o.passphrase, file: o.file, output: o.output }) };
+  const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: LIBRARY_DIR, env, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) throw new Error(`Decrypting a stored file failed (status ${r.status}): ${r.stderr}`);
+}
 
 export { expect, type Page };
