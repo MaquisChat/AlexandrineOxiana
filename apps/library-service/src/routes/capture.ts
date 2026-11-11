@@ -126,7 +126,12 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   type Slot = { lib: object; queueId?: string; done?: Promise<void> };
   const linkSlots = new Map<string, Slot[]>();
   function activeSlots(callerId: string, lib: object): Slot[] {
-    const live = (linkSlots.get(callerId) ?? []).filter((x) => x.lib === lib && (x.queueId === undefined || state.captureQueue(x.queueId)?.finished === false));
+    const live = (linkSlots.get(callerId) ?? []).filter((x) => {
+      if (x.queueId === undefined) return x.lib === lib;
+      // A queue carried on by a move runs on the moved library: its slot follows it (41a N4).
+      const q = state.captureQueue(x.queueId);
+      return q?.finished === false && (q.lib ?? x.lib) === lib;
+    });
     linkSlots.set(callerId, live);
     return live;
   }

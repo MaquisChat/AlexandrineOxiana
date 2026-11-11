@@ -1671,6 +1671,25 @@ describe("integration: the extension's routes (R111)", () => {
     await svc.state.idle();
   });
 
+  it("41a N4: a links queue carried across a library move keeps its slot (one running and one waiting, still)", async () => {
+    const provider = slowProvider(30);
+    await start({ worker: provider, pairing: { confirmPerMinute: 100 } });
+    await openNewLibrary();
+    const pid = await newProject(LINKS_GOV);
+    const token = await pair();
+    const second = nextEvent((e) => e.type === "capture.progress" && e.data.done === 2);
+    const a = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: Array.from({ length: 12 }, (_, i) => yt("m", i)) });
+    expect(a.status, a.body).toBe(200);
+    await second;
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(svc.state.captureQueue(a.json.queueId)?.finished).toBe(false);
+    const c = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("n", 1)] });
+    const d = await ext(token, "POST", "/capture/browser/links", { projectId: pid, urls: [yt("o", 1)] });
+    expect([c.status, d.status]).toEqual([200, 429]);
+    await svc.state.idle();
+  });
+
   it("R116: queues from different callers share one per-platform lane (no two downloads from one platform at once)", async () => {
     const provider = slowProvider(10);
     await start({ worker: provider, pairing: { confirmPerMinute: 100 } });

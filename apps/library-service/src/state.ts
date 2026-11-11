@@ -229,10 +229,11 @@ export class ServiceState {
 
   // ---- capture queues ----
 
-  private readonly captures = new Map<string, { projectId: string; done: number; total: number; finished: boolean }>();
+  /** `lib`: the library the queue's current run belongs to (it changes when a move carries the queue on, 41a N4). */
+  private readonly captures = new Map<string, { projectId: string; done: number; total: number; finished: boolean; lib?: object }>();
 
   /** The progress of a capture queue (also after a move). */
-  captureQueue(queueId: string): { projectId: string; done: number; total: number; finished: boolean } | undefined {
+  captureQueue(queueId: string): { projectId: string; done: number; total: number; finished: boolean; lib?: object } | undefined {
     return this.captures.get(queueId);
   }
 
@@ -246,6 +247,7 @@ export class ServiceState {
     const offset = at.offset ?? 0;
     const total = at.total ?? urls.length;
     const info = this.captures.get(queueId) ?? { projectId, done: offset, total, finished: false };
+    if (this.session) info.lib = this.session.lib;
     this.captures.set(queueId, info);
     // Every way out but a continuation after a move marks the queue finished (41a I3): an unfinished
     // queue keeps an extension's links slot taken.
