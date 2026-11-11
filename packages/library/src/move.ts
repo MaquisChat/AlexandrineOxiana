@@ -41,7 +41,8 @@ import {
 import { addKnownPath, registerLibrary } from "./registry.js";
 import { PathEscapeError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { appendLibraryEvent, openRepo, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
+import { newAttentionId, projectFolderOf, reasonOf, writeAttention } from "./repo/attention.js";
+import { openRepo, recordOrMark, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
 import { parseProjectJson } from "./repo/state.js";
 
 export { MOVE_JOURNAL, MOVED_MARKER };
@@ -527,8 +528,25 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   const moved = plan.perProject.filter((p) => !exclude.includes(p.projectId));
   const denied = moved.filter((p) => p.decision.result === "deny");
   if (denied.length > 0) {
+    // Each refusal is audited in the refused project (Task 50); one that cannot be is marked for the next open.
+    const details = {
+      op: "library.move",
+      toHint: hintFor(dest, deps),
+      destinationKind: plan.destination.kind,
+      destinationCertain: plan.destinations.every((d) => d.certain),
+      ...(plan.destination.cloudFolderId ? { cloudFolderId: plan.destination.cloudFolderId } : {}),
+    };
+    let unrecorded = false;
+    for (const p of denied) {
+      const reason = p.decision.result === "deny" ? p.decision.reason : "";
+      const w = await auditOrMark(lib.root, p.projectId, p.folder, opts.sourceRepo, lib, "move", details, { actor: opts.actor, deps }, { reason });
+      if (w?.includes("could not be marked")) unrecorded = true;
+    }
     const why = denied.map((p) => `${p.name}: ${p.decision.result === "deny" ? p.decision.reason : ""}`).join("; ");
-    throw new MoveNotAllowedError("policy-denied", `Some projects may not be moved there (exclude them or choose another destination): ${why}`);
+    throw new MoveNotAllowedError(
+      "policy-denied",
+      `Some projects may not be moved there (exclude them or choose another destination): ${why}${unrecorded ? " (this refusal could not be recorded in the audit log)" : ""}`,
+    );
   }
   const excludedFolders = plan.perProject.filter((p) => exclude.includes(p.projectId)).map((p) => p.folder);
   const { movedAway } = await readProjects(lib.root);
@@ -794,10 +812,58 @@ async function runSwitch(dest: string, j: Journal, rec: PendingOldCopy, deps: De
 }
 
 /**
+ * Records `action` for one project through `repo` when it is open on the library at `root` and
+ * holds the project; otherwise (no open repo, or not this library) marks the project as needing
+ * attention (`<Project>/attention/`) so the next writable open records it late (Task 50, R28,
+ * R82). Returns a plain warning when the event was not recorded now.
+ */
+async function auditOrMark(
+  root: string,
+  projectId: string,
+  folder: string | null,
+  repo: Repo | undefined,
+  lib: Pick<Library, "id" | "root"> | undefined,
+  action: string,
+  details: Record<string, unknown>,
+  who: { actor?: string; deps: Deps },
+  refusal?: { reason: string },
+  cause?: unknown,
+): Promise<string | undefined> {
+  if (repo) {
+    const l = repoLibrary(repo);
+    const sameLib = resolve(l.root) === resolve(root) && (!lib || l.id === lib.id);
+    if (sameLib && repo.listProjects().some((p) => p.id === projectId)) return recordOrMark(repo, projectId, action, details, refusal);
+  }
+  const what = `The ${action} audit event could not be recorded for project ${projectId}${cause !== undefined ? ` (${msg(cause)})` : ""}`;
+  try {
+    const rel = folder ?? (await projectFolderOf(root, projectId));
+    if (!rel) throw new Error("the project folder was not found");
+    await writeAttention(root, rel, {
+      formatVersion: 1,
+      id: newAttentionId(),
+      kind: "audit-unrecorded",
+      occurredAt: who.deps.clock().toISOString(),
+      actor: who.actor ?? "local-user",
+      device: who.deps.deviceId,
+      action,
+      ...(refusal ? { decision: { result: "deny" as const, reason: refusal.reason } } : {}),
+      details,
+      state: "ready",
+      reason: cause !== undefined ? reasonOf(cause) : "RepoNotOpen",
+    });
+  } catch (e) {
+    return `${what}; the project could not be marked as needing attention either (${msg(e)})`;
+  }
+  return `${what}; the project is marked as needing attention and the event is recorded when the library is next opened`;
+}
+
+/**
  * Appends `action` to each project through `ctx.repo` or a repo opened on
  * `root` (which also records the location hint when it opens the library).
- * A failure is reported in `warnings` and does not undo the move: the data is
- * already verified at the destination.
+ * A failure does not undo the move (the data is already verified at the
+ * destination): it is reported in `warnings` and the project is marked as
+ * needing attention, so the next writable open records the event (Task 50).
+ * A mark is only written in a folder that holds the expected library.
  */
 async function auditIn(
   root: string,
@@ -811,8 +877,10 @@ async function auditIn(
 ): Promise<void> {
   if (projectIds.length === 0) return;
   let lib: Library | undefined;
+  let repo: Repo | undefined;
+  let cause: unknown;
   try {
-    let repo = ctx.repo;
+    repo = ctx.repo;
     if (repo) {
       const l = repoLibrary(repo);
       if (resolve(l.root) !== resolve(root) || l.id !== check.expectId) throw new Error("the repo passed is not open on this library");
@@ -822,15 +890,22 @@ async function auditIn(
       if (lib.mode !== "read-write") throw new Error(`the library opened read-only (${lib.readOnlyReason ?? "unknown"}); pass its open repo`);
       repo = await openRepo(lib, new KeyRing(), { clock: deps.clock, ...(ctx.tz ? { tz: ctx.tz } : {}), ...(ctx.actor ? { actor: ctx.actor } : {}) });
     }
-    for (const id of projectIds) {
-      try {
-        await appendLibraryEvent(repo, id, action, details);
-      } catch (err) {
-        warnings.push(`The ${action} audit event could not be recorded for project ${id} (${msg(err)})`);
+  } catch (err) {
+    repo = undefined;
+    cause = err;
+  }
+  try {
+    if (!repo) {
+      const meta = await fsp.readFile(join(root, "library.json"), "utf8").then((t) => JSON.parse(t) as Partial<LibraryJson>, () => null);
+      if (meta?.libraryId !== check.expectId) {
+        warnings.push(`The ${action} audit events could not be recorded (${msg(cause)})`);
+        return;
       }
     }
-  } catch (err) {
-    warnings.push(`The ${action} audit events could not be recorded (${msg(err)})`);
+    for (const id of projectIds) {
+      const w = await auditOrMark(root, id, null, repo, undefined, action, details, { actor: ctx.actor, deps }, undefined, cause);
+      if (w) warnings.push(w);
+    }
   } finally {
     await lib?.close();
   }
