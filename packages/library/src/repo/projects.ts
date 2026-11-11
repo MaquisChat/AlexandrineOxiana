@@ -68,7 +68,7 @@ async function recordCreateRefusal(core: RepoCore, at: string, name: string, enc
   } catch (err) {
     core.integrityWarnings.push({
       projectId: "*",
-      kind: "audit-unrecorded",
+      kind: "refusal-unrecorded",
       detail: `a refused project creation could not be recorded in the library's audit log (${err instanceof Error ? err.name : "Error"})`,
     });
   }

@@ -97,7 +97,7 @@ describe("Task 50: a refused project creation is audited in the library's audit 
     await expect(repo.createProject({ name: "S", governanceYaml: NEEDS_ENCRYPTION, encryption: { enabled: false } })).rejects.toBeInstanceOf(
       GovernanceViolationError,
     );
-    expect(repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: "*", kind: "audit-unrecorded" }));
+    expect(repo.integrityWarnings).toContainEqual(expect.objectContaining({ projectId: "*", kind: "refusal-unrecorded" }));
   });
 
   it("a library audit log changed outside the app is reported on open; an incomplete last line is trimmed and reported", async () => {

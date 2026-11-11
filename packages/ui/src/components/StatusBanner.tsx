@@ -57,6 +57,13 @@ const WARNINGS: Record<string, (p: string) => string> = {
     `A key file waiting to be put in place in ${p} was not the one recorded when its recovery code was issued, so it was removed and not used. ${p}'s recovery code and passphrase are unchanged.`,
   "recovery-staging-unverifiable": (p) =>
     `A new recovery code for ${p} is waiting to be put in place, but ${p}'s audit log does not verify, so the app cannot tell whether it was really issued. Nothing was changed: the current recovery code and the passphrase still work. Open the verification report for details.`,
+  "audit-unrecorded": (p) =>
+    `A change to ${p} could not be recorded in its audit log. The change was kept; it is recorded when the library is next opened, and this warning stays until then.`,
+  "permissions-not-set": (p) =>
+    `A file restored to ${p} could not be made private to you on this disk. The file was kept; making it private is tried again each time the library opens.`,
+  "audit-recorded-late": (p) =>
+    `Changes to ${p} that could not be recorded at the time were recorded in the audit log of ${p} now. They are marked as recorded late.`,
+  "refusal-unrecorded": () => "A refused request could not be recorded in the library's audit log. Nothing was changed.",
   "retention-due": (p) => `${p} has reached its retention date. Review which raw data must now be destroyed or kept.`,
 };
 
