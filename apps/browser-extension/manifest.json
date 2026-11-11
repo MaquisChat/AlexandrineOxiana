@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Alexandrine Oxiana capture",
+  "short_name": "AO capture",
+  "version": "0.1.0",
+  "description": "Capture the page you are viewing (screenshot, page HTML, caption and details) into your Alexandrine Oxiana library on this computer.",
+  "minimum_chrome_version": "121",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "incognito": "not_allowed",
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "Capture with Alexandrine Oxiana",
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self'; style-src 'self'"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "capture@alexandrine-oxiana.invalid",
+      "strict_min_version": "128.0"
+    }
+  }
+}
