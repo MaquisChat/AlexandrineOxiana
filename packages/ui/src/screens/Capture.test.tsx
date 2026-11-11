@@ -209,7 +209,7 @@ describe("Capture screen — progress", () => {
       m.emit("capture.progress", { queueId: "q1", projectId: P1, done: "1", finished: true });
       await new Promise((r) => setTimeout(r, 50));
     });
-    expect(screen.queryByText(/signed-in session/)).toBeNull();
+    expect(screen.queryByText(/This post needs a signed-in session/)).toBeNull();
     expect(screen.getByText("Capturing now")).toBeTruthy();
   });
 
@@ -362,7 +362,7 @@ describe("Capture screen — profile", () => {
 
 describe("Capture screen — capture tools", () => {
   it("shows the tools' versions and updates them, old → new", async () => {
-    const { m, user } = await setup();
+    const { m, user } = await setup({ updateDelayMs: 80 });
     const tools = screen.getByRole("region", { name: "Capture tools" });
     await within(tools).findByText("2026.10.01");
     expect(within(tools).getByText("1.32.19")).toBeTruthy();
