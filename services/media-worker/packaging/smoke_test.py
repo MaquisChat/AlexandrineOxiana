@@ -54,7 +54,7 @@ DNG_FILE = DOWNLOADED / "canon-eos-5d-mark-iii-14bit.dng"
 CLIP_WORDS = ("curiosity", "beside", "moment")
 TOKEN = "smoke-" + os.urandom(16).hex()
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # our own requests never use a proxy
-ABSENCES = ("model", "clip", "dng", "ffmpeg", "tesseract")
+ABSENCES = ("model", "clip", "dng", "ffmpeg", "tesseract", "gallery-dl")
 
 
 class Results:
@@ -398,11 +398,16 @@ def run_without_tools(res: Results, exe: Path, root: Path, fx: dict) -> None:
         v = health.get("versions", {}) if isinstance(health, dict) else {}
         res.info["healthVersions"] = v
         res.check("/health reports the bundled libraries",
-                  all(v.get(k) for k in ("python", "faster_whisper", "pillow", "pillow_heif", "rawpy", "ocrmypdf", "gallery_dl")),
-                  {k: v.get(k) for k in ("python", "faster_whisper", "pillow_heif", "rawpy", "ocrmypdf", "gallery_dl")})
-        res.check("/health reports ffmpeg, tesseract and yt-dlp as absent",
-                  v.get("ffmpeg") is None and v.get("tesseract") is None and v.get("yt_dlp") is None,
-                  {k: v.get(k) for k in ("ffmpeg", "tesseract", "yt_dlp")})
+                  all(v.get(k) for k in ("python", "faster_whisper", "pillow", "pillow_heif", "rawpy", "ocrmypdf")),
+                  {k: v.get(k) for k in ("python", "faster_whisper", "pillow_heif", "rawpy", "ocrmypdf")})
+        # gallery-dl is not inside the worker any more (GPL-2.0-only): a first-use download (Task 48a).
+        res.check("/health reports ffmpeg, tesseract, yt-dlp and gallery-dl as absent",
+                  all(v.get(k) is None for k in ("ffmpeg", "tesseract", "yt_dlp", "gallery_dl")),
+                  {k: v.get(k) for k in ("ffmpeg", "tesseract", "yt_dlp", "gallery_dl")})
+        status, cat = w.request("GET", "/tools")
+        res.check("/tools lists the optional tools with nothing downloaded",
+                  status == 200 and {t["id"] for t in cat.get("tools", [])} >= {"ffmpeg", "ocr", "video-downloader", "image-downloader", "speech-tiny"},
+                  cat if status != 200 else None)
         status, _ = w.request("GET", "/health", auth=False)
         res.check("a request without the token is refused", status == 401, status)
         net = sentinel.take()
@@ -420,13 +425,14 @@ def run_without_tools(res: Results, exe: Path, root: Path, fx: dict) -> None:
             res.missing(name, "dng", "fixture missing: run `pnpm fetch-fixtures`")
 
         j = w.run("pdf.ocr", fx["pdf"], out / "ocr.pdf")
-        res.check("OCR without tesseract fails clearly", j["status"] == "failed" and j["error"]["code"] == "MISSING_DEPENDENCY", j.get("error"))
+        res.check("OCR without tesseract fails clearly, naming the tool (TOOL_NOT_INSTALLED, ocr)",
+                  j["status"] == "failed" and j["error"]["code"] == "TOOL_NOT_INSTALLED" and j["error"].get("tool") == "ocr", j.get("error"))
         res.info["ocrWithoutTesseract"] = j.get("error")
 
         name = "video proxy without ffmpeg fails (no crash)"
         if "clip" in fx:
             j = w.run("video.proxy", fx["clip"], out / "clip.mp4")
-            res.check(name, j["status"] == "failed", j.get("error"))
+            res.check(name, j["status"] == "failed" and (j.get("error") or {}).get("tool") == "ffmpeg", j.get("error"))
             res.info["videoWithoutFfmpeg"] = j.get("error")
         else:
             res.missing(name, "ffmpeg", "no test video: this machine has no ffmpeg to make one")
@@ -434,8 +440,8 @@ def run_without_tools(res: Results, exe: Path, root: Path, fx: dict) -> None:
         if SPEECH_CLIP.exists():
             j = w.run("audio.transcribe", SPEECH_CLIP, out / "t", {"model": "tiny", "language": "en"})
             err = j.get("error") or {}
-            res.check("transcription with no model on disk and no network: MODEL_UNAVAILABLE, not installed",
-                      j["status"] == "failed" and err.get("code") == "MODEL_UNAVAILABLE" and "not installed" in err.get("message", ""), err)
+            res.check("transcription with no model on disk: TOOL_NOT_INSTALLED naming speech-tiny, nothing downloaded",
+                      j["status"] == "failed" and err.get("code") == "TOOL_NOT_INSTALLED" and err.get("tool") == "speech-tiny", err)
             res.info["transcribeWithoutModel"] = err
             res.info["networkTranscriptionWithoutModel"] = sentinel.take()
         sigterm_check(res, w, "run 1", None)
@@ -518,6 +524,7 @@ def main() -> int:
     ap.add_argument("--no-model-download", action="store_true")
     ap.add_argument("--allow-missing", default="", help=f"comma-separated absences reported as skips instead of failures: {', '.join(ABSENCES)}")
     ap.add_argument("--report", type=Path)
+    ap.add_argument("--gallery-dl-wheel", type=Path, help="the pinned gallery-dl wheel (ao_worker/toolpins.py), to check the bundle runs it")
     args = ap.parse_args()
     allow = {x.strip() for x in args.allow_missing.split(",") if x.strip()}
     if allow - set(ABSENCES):
@@ -533,10 +540,22 @@ def main() -> int:
     res.check("self-check imports every native library (incl. pikepdf, rawpy, onnxruntime, cryptography, Silero VAD)", sc.get("ok"), sc.get("failed") or None)
     res.info["selfCheck"] = sc.get("versions")
     r = subprocess.run([str(exe), "-m", "gallery_dl", "--version"], capture_output=True, text=True, env={"PATH": os.devnull}, timeout=60)
-    res.check("gallery-dl runs from the bundle (`ao-worker -m gallery_dl`)", r.returncode == 0, r.stdout.strip() or r.stderr[-300:])
-    r = subprocess.run([str(exe), "-m", "gallery_dl", "--list-extractors"], capture_output=True, text=True, env={"PATH": os.devnull}, timeout=120)
-    res.check("gallery-dl finds its extractors (imported by name at run time)", r.returncode == 0 and "instagram" in r.stdout.lower(),
-              f"{r.stdout.count(chr(10))} lines" if r.returncode == 0 else r.stderr[-300:])
+    res.check("gallery-dl is not inside the bundle (GPL-2.0-only; a first-use download)", r.returncode != 0, r.stdout.strip() or r.stderr[-300:])
+    name = "a downloaded gallery-dl runs with the bundle's Python (`ao-worker -m gallery_dl`, AO_GALLERYDL_LIB)"
+    if args.gallery_dl_wheel:
+        lib = Path(tempfile.mkdtemp(prefix="ao-smoke-gdl-")) / "lib"
+        import zipfile
+
+        with zipfile.ZipFile(args.gallery_dl_wheel) as z:
+            z.extractall(lib)  # our own pinned wheel, checked by the caller
+        env = {"PATH": os.devnull, "AO_GALLERYDL_LIB": str(lib)}
+        r = subprocess.run([str(exe), "-m", "gallery_dl", "--version"], capture_output=True, text=True, env=env, timeout=60)
+        res.check(name, r.returncode == 0, r.stdout.strip() or r.stderr[-300:])
+        r = subprocess.run([str(exe), "-m", "gallery_dl", "--list-extractors"], capture_output=True, text=True, env=env, timeout=120)
+        res.check("the downloaded gallery-dl finds its extractors and the standard library it needs", r.returncode == 0 and "instagram" in r.stdout.lower(),
+                  f"{r.stdout.count(chr(10))} lines" if r.returncode == 0 else r.stderr[-300:])
+    else:
+        res.missing(name, "gallery-dl", "pass --gallery-dl-wheel <the pinned gallery_dl-1.32.19-py3-none-any.whl>")
     r = subprocess.run([str(exe), "--version"], capture_output=True, text=True, env={"PATH": os.devnull}, timeout=60)
     res.check("anything else is refused (not a general interpreter)", r.returncode == 2, r.returncode)
 
