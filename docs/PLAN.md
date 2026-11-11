@@ -428,7 +428,7 @@ Update after every task; commit and push.
 | 34b Capture screen | in progress | | implementer dispatched |
 | 34c Transcript viewer | in review | 4b9a723 (worktree branch) | adversarial review dispatched; re-transcribe progress needs a service change |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
-| 34e Pairing screen | in progress | | implementer dispatched |
+| 34e Pairing screen | in review | f48170a (worktree branch) | review dispatched; also changes the shared dialog shell (claim to be verified) |
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
