@@ -875,7 +875,9 @@ export async function projectWarnings(repo: Repo, projectId: string): Promise<st
     const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown>; undestroyed?: Record<string, unknown> }) : undefined;
     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
     const stuck = m?.undestroyed && typeof m.undestroyed === "object" && Object.hasOwn(m.undestroyed, projectId) ? m.undestroyed[projectId] : undefined;
-    if (Array.isArray(stuck) && stuck.length) out.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
+    // Per destruction certificate (R2-I2): the warning stands while any of them has a backup left.
+    const lists = Array.isArray(stuck) ? [stuck] : stuck && typeof stuck === "object" ? Object.values(stuck as Record<string, unknown>) : [];
+    if (lists.some((l) => Array.isArray(l) && l.length > 0)) out.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
     const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
     if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
       out.push(BACKUP_AUDIT_PENDING_WARNING);

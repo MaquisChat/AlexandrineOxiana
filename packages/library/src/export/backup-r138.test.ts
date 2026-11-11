@@ -22,6 +22,7 @@ import {
   backupIfDue,
   backupProject,
   backupSeams,
+  holdingNotRemoved,
   listBackups,
   pruneBackups,
   restoreBackup,
@@ -333,7 +334,8 @@ describe("fix round 2", () => {
     expect(bk.status).toBe("pending");
     expect(bk.deleted).toEqual([`Backups/${nameOf(a)}`]);
     expect(bk.removedAt).toEqual({ [`Backups/${nameOf(a)}`]: "2026-12-02T10:15:00.000Z" });
-    expect(bk.notRemoved).toEqual([{ file: `Backups/${nameOf(b)}`, reason: "It could not be overwritten and removed (simulated overwrite failure)." }]);
+    const notRemovedEntry = { file: `Backups/${nameOf(b)}`, reason: "It could not be overwritten and removed (simulated overwrite failure).", at: "2026-12-02T10:15:00.000Z" };
+    expect(bk.notRemoved).toEqual([notRemovedEntry]);
     expect(bk.lastError).toBe("A backup holding the destroyed files could not be removed (simulated overwrite failure); the step will be tried again");
     expect(bk.note).toBeUndefined();
     expect(existsSync(b.path)).toBe(true);
@@ -346,7 +348,11 @@ describe("fix round 2", () => {
     expect(cert.backups.status).toBe("deleted");
     expect(cert.backups.deleted.sort()).toEqual([`Backups/${nameOf(a)}`, `Backups/${nameOf(b)}`].sort());
     expect(cert.backups.removedAt).toEqual({ [`Backups/${nameOf(a)}`]: "2026-12-02T10:15:00.000Z", [`Backups/${nameOf(b)}`]: "2026-12-03T08:00:00.000Z" });
-    expect(cert.backups.notRemoved ?? []).toEqual([]);
+    // Point 3 (round 3): amended, not rewritten: the original "not removed" entry stays, and the
+    // later removal is appended with its time.
+    expect(cert.backups.notRemoved).toEqual([notRemovedEntry]);
+    expect((cert.backups as Bk & { amendments?: unknown }).amendments).toEqual([{ at: "2026-12-03T08:00:00.000Z", removed: [`Backups/${nameOf(b)}`] }]);
+    expect((cert.backups as Bk & { outstanding?: unknown }).outstanding).toBeUndefined();
     expect(cert.backups.lastError).toBeUndefined();
     expect(existsSync(b.path)).toBe(false);
     expect(await projectWarnings(kit.repo, p.id)).not.toContain("destruction-backups-pending");
@@ -425,5 +431,100 @@ describe("fix round 2", () => {
     expect(ev.map((e) => e.decision?.result)).toEqual(["allow", "deny"]);
     const id = (ev[0]!.details as { backupId: string }).backupId;
     expect(ev[1]!.details).toMatchObject({ op: "backup.create", backupId: id, file: "Linked - backup - modified 2026-11-10 0930.zip", at: "commit" });
+  });
+});
+
+describe("fix round 3", () => {
+  afterEach(() => {
+    shredSeams.failFor = undefined;
+  });
+  const nameOf = (x: { path: string }) => x.path.slice(x.path.lastIndexOf("/") + 1);
+  const HOUR = 3_600_000;
+
+  it("R2-I1: 48 hours of a removal that keeps failing write ONE audit event (a daily summary); the retry backs off to daily; the warning stays; the success is recorded and clears it", async () => {
+    const p = await makeProject(kit, RETAIN, false, "Hourly");
+    const sf = await rawSource(p);
+    const old = await backupProject(kit.repo, p.id);
+    const t0 = new Date("2026-12-02T10:00:00.000Z").getTime();
+    kit.clock.now = new Date(t0);
+    shredSeams.failFor = (path) => path.endsWith(nameOf(old));
+    await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+    const before = (await auditEvents(kit, p)).length;
+    let attempted = 0;
+    for (let h = 1; h <= 48; h++) {
+      kit.clock.now = new Date(t0 + h * HOUR);
+      attempted += (await resumeDestruction(kit.repo, p.id)).length;
+      expect(await projectWarnings(kit.repo, p.id)).toContain("destruction-backups-pending");
+    }
+    const during = (await auditEvents(kit, p)).slice(before);
+    // Hourly for the first day (hours 1–23), then daily (hour 47): 24 attempts, one summary event.
+    expect(attempted).toBe(24);
+    expect(during.map((e) => e.action)).toEqual(["retention.backups"]);
+    expect(during[0]!.details).toMatchObject({ summary: true, attempts: 24, status: "pending", notRemoved: [`Backups/${nameOf(old)}`] });
+    // The removal now works: the next due retry (a day after the last) records it and clears the warning.
+    shredSeams.failFor = undefined;
+    kit.clock.now = new Date(t0 + 71 * HOUR);
+    const [path] = await resumeDestruction(kit.repo, p.id);
+    const cert = JSON.parse(await readFile(path!, "utf8")) as { backups: { status: string; amendments?: unknown } };
+    expect(cert.backups.status).toBe("deleted");
+    expect(cert.backups.amendments).toEqual([{ at: new Date(t0 + 71 * HOUR).toISOString(), removed: [`Backups/${nameOf(old)}`] }]);
+    const last = (await auditEvents(kit, p)).filter((e) => e.action === "retention.backups").at(-1)!;
+    expect(last.details).toMatchObject({ status: "deleted", removed: [`Backups/${nameOf(old)}`], notRemoved: [] });
+    expect(existsSync(old.path)).toBe(false);
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain("destruction-backups-pending");
+  });
+
+  it("R2-I2: a later destruction that settles cleanly does not clear the warning for an earlier one's backup still on disk", async () => {
+    const p = await makeProject(kit, RETAIN, false, "Two Destructions");
+    const first = await rawSource(p);
+    const x = await backupProject(kit.repo, p.id);
+    kit.clock.now = new Date("2026-12-02T10:00:00.000Z");
+    shredSeams.failFor = (path) => path.endsWith(nameOf(x));
+    await destroyRaw(kit.repo, p.id, [first.assets[0]!.id], "tester");
+    shredSeams.failFor = undefined;
+    expect(await holdingNotRemoved(kit.repo, p.id)).toEqual([`Backups/${nameOf(x)}`]);
+    // Destruction B: another file, held only by a backup made after it was added.
+    const second = await rawSource(p);
+    kit.clock.now = new Date("2026-12-02T10:05:00.000Z");
+    await backupProject(kit.repo, p.id, { prune: false });
+    kit.clock.now = new Date("2026-12-02T10:10:00.000Z");
+    const rb = await destroyRaw(kit.repo, p.id, [second.assets[0]!.id], "tester");
+    expect((rb.certificate.backups as { status: string }).status).toBe("deleted");
+    expect(await projectWarnings(kit.repo, p.id)).toContain("destruction-backups-pending");
+    expect(await holdingNotRemoved(kit.repo, p.id)).toEqual([`Backups/${nameOf(x)}`]);
+    expect(existsSync(x.path)).toBe(true);
+    // Removing X clears it.
+    kit.clock.now = new Date("2026-12-02T11:10:00.000Z");
+    await resumeDestruction(kit.repo, p.id);
+    expect(existsSync(x.path)).toBe(false);
+    expect(await holdingNotRemoved(kit.repo, p.id)).toEqual([]);
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain("destruction-backups-pending");
+  });
+
+  it("point 4: the retry removes only backups holding data an audited destruction really destroyed; a certificate edited to name live data removes nothing", async () => {
+    const p = await makeProject(kit, RETAIN, false, "Forged");
+    const gone = await rawSource(p);
+    const live = await rawSource(p);
+    const both = await backupProject(kit.repo, p.id);
+    kit.clock.now = new Date("2026-12-02T10:00:00.000Z");
+    // A real destruction whose backups step stays pending (removal fails).
+    shredSeams.failFor = (path) => path.endsWith(nameOf(both));
+    const r = await destroyRaw(kit.repo, p.id, [gone.assets[0]!.id], "tester");
+    shredSeams.failFor = undefined;
+    // A later backup holds only the live file (and the fresh one made by the destruction too).
+    kit.clock.now = new Date("2026-12-02T10:30:00.000Z");
+    const liveOnly = await backupProject(kit.repo, p.id, { prune: false });
+    // Someone edits the certificate on disk to claim the live file was destroyed.
+    const { writeFile } = await import("node:fs/promises");
+    const cert = JSON.parse(await readFile(r.certificatePath, "utf8")) as { assets: Array<{ assetId: string }> };
+    cert.assets = [{ assetId: live.assets[0]!.id }];
+    await writeFile(r.certificatePath, JSON.stringify(cert));
+    kit.clock.now = new Date("2026-12-02T11:30:00.000Z");
+    await resumeDestruction(kit.repo, p.id);
+    // Nothing that holds only live data went; the live file is still stored.
+    expect(existsSync(liveOnly.path)).toBe(true);
+    const stillThere = await kit.repo.getSource(p.id, live.source.id);
+    expect(stillThere.assets[0]!.status).not.toBe("destroyed");
+    expect(existsSync(join(kit.lib.root, ...stillThere.assets[0]!.path.split("/")))).toBe(true);
   });
 });

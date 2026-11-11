@@ -40,11 +40,14 @@ import {
   listBackups,
   plainErrorText,
   pruneBackupsHeld,
+  retentionRetry,
   setHoldingNotRemoved,
+  setRetentionRetry,
   unresolvedBackupsOf,
   withProjectMaintenance,
   DEFAULT_KEEP,
   type MaintenanceHold,
+  type RetentionRetry,
 } from "./export/backup.js";
 import { decryptBytes } from "./repo/io.js";
 import { NotFoundError } from "./repo/errors.js";
@@ -108,12 +111,21 @@ interface CertificateBackups {
   note?: string;
   /** When each backup in `deleted` was actually removed (a retry shows its later time). */
   removedAt?: Record<string, string>;
-  /** Holding backups the last attempt could NOT remove, each with the plain reason (N1); retried. */
-  notRemoved?: Array<{ file: string; reason: string }>;
+  /**
+   * Every recorded failure to remove a holding backup, with the plain reason and when (N1). Kept
+   * after a later removal: the certificate is amended, never rewritten.
+   */
+  notRemoved?: Array<{ file: string; reason: string; at?: string }>;
+  /** Later removals of backups an earlier attempt could not remove, appended with their time. */
+  amendments?: Array<{ at: string; removed: string[] }>;
+  /** Holding backups still in place after the last recorded attempt (retried). */
+  outstanding?: string[];
   /** Why the last attempt stopped (plain; retried). */
   lastError?: string;
 }
 
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
 const TRASH = /^trash-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-[0-9a-f]+$/u;
 
 /** Files in orphan `.tmp/trash-*` folders named like one of `names` (no live transaction marker). */
@@ -292,33 +304,53 @@ const union = (a: string[], b: string[]) => [...new Set([...a, ...b])];
 const plainError = (repo: Repo, err: unknown) => `${backupFailureReason(repo, err).replace(/[.]$/u, "")}; the step will be tried again`;
 
 /**
- * The backups step of a destruction (R92 I3): the backups holding destroyed files are worked out
- * again now (from the manifest's asset ids); a fresh backup is made first (once), then each of
- * them is overwritten and removed, the manifest updated after each. Whatever fails leaves the
- * step `pending` with `lastError` (retried by resumeDestruction), and `deleted` lists exactly what
- * was removed. Unreadable project-named backups (a rebuilt manifest) are never deleted blindly:
- * the step stays `unknown-pending`. The certificate is updated in a governed, audited change.
+ * The backups step of a destruction (R92 I3, R138 e): the backups holding destroyed files are
+ * worked out again now (from the manifest's asset ids, and only for assets the governed, audited
+ * destruction really marked destroyed); a fresh backup is tried first, then each holding backup is
+ * overwritten and removed, the manifest updated after each. A backup that could not be removed is
+ * named in `notRemoved` with its reason; the step stays `pending` (retried by resumeDestruction).
+ * Unreadable project-named backups (a rebuilt manifest) are never deleted blindly: the step stays
+ * `unknown-pending`. The certificate is amended, never rewritten (point 3): `notRemoved` entries
+ * stay, and later removals are appended to `amendments` with their time. It is updated in a
+ * governed, audited change.
+ *
+ * `retry` (resumeDestruction): a retry whose outcome is the same as the last recorded one (nothing
+ * removed, the same backups still in place, no new fresh backup) changes nothing in the certificate
+ * and writes no audit event; at most one summarising `retention.backups` event a day records how
+ * many attempts were made meanwhile (R2-I1). A refused or failed fresh backup is tried again at
+ * most once a day.
  */
-async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: string, certificateRel: string): Promise<Record<string, unknown>> {
+async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: string, certificateRel: string, retry = false): Promise<Record<string, unknown>> {
   const cert = await readCertificate(repo, projectId, certificateRel);
   const b = cert.backups;
   if (b.status !== "pending" && b.status !== "unknown-pending") return cert;
-  const ids = new Set((cert.assets ?? []).map((a) => a.assetId).filter((x): x is string => typeof x === "string"));
-  const held = await holdingBackups(repo, projectId, ids);
+  // Only assets the audited destruction marked destroyed: a certificate edited by hand cannot make
+  // this remove backups that hold live data (point 4).
+  const claimed = new Set((cert.assets ?? []).map((a) => a.assetId).filter((x): x is string => typeof x === "string"));
+  const ids = await reallyDestroyed(repo, projectId, claimed);
+  const held = ids.size ? await holdingBackups(repo, projectId, ids) : { files: [], unresolved: [] };
+  const now = repoClock(repo)();
+  const at = now.toISOString();
+  const key = retryKey(projectId, certificateRel);
+  const rec = retry ? await retentionRetry(repo, key) : undefined;
   const next: CertificateBackups = {
     ...b,
     containing: union(b.containing, [...held.files, ...held.unresolved].map((f) => `Backups/${f}`)),
     deleted: [...b.deleted],
   };
   const unresolvedLeft = held.unresolved.length > 0;
-  const at = repoClock(repo)().toISOString();
-  // A fresh backup first, when it can be made (R90 d); the holding backups are removed whether or
-  // not it could (R138 e): destruction never depends on a new backup succeeding.
-  if (held.files.length && !next.freshBackup) {
+  // A fresh backup first, when it can be made (R90 d), at most once a day on a retry; the holding
+  // backups are removed whether or not it could (R138 e).
+  let freshMade = false;
+  const freshDue = !rec?.lastFreshAt || now.getTime() - Date.parse(rec.lastFreshAt) >= DAY_MS;
+  let freshTried = false;
+  if (held.files.length && !next.freshBackup && (!retry || freshDue)) {
+    freshTried = true;
     try {
       const fresh = await backupProjectHeld(repo, hold, projectId, { prune: false });
       next.freshBackup = `Backups/${basename(fresh.path)}`;
       delete next.freshBackupFailed;
+      freshMade = true;
     } catch (err) {
       // backupProject has recorded `backup-failed` with the same reason.
       next.freshBackupFailed = backupFailureReason(repo, err);
@@ -326,33 +358,55 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   }
   // Each holding backup: removed (with when), or named as NOT removed with the plain reason (N1).
   let removedNow: string[] = [];
-  let notRemoved: Array<{ file: string; reason: string }> = [];
+  let failedNow: Array<{ file: string; reason: string }> = [];
+  let otherError: string | undefined;
   try {
     const r = await destroyBackups(repo, projectId, held.files);
     removedNow = r.deleted.map((f) => `Backups/${f}`);
-    notRemoved = r.failed.map(({ file, error }) => ({ file: `Backups/${file}`, reason: `It could not be overwritten and removed (${plainErrorText(repo, error)}).` }));
-    if (r.failed.length) throw new Error(`A backup holding the destroyed files could not be removed (${plainErrorText(repo, r.failed[0]!.error)}); the step will be tried again`);
-    delete next.lastError;
-    next.status = unresolvedLeft ? "unknown-pending" : "deleted";
+    failedNow = r.failed.map(({ file, error }) => ({ file: `Backups/${file}`, reason: `It could not be overwritten and removed (${plainErrorText(repo, error)}).` }));
+    if (r.failed.length) otherError = `A backup holding the destroyed files could not be removed (${plainErrorText(repo, r.failed[0]!.error)}); the step will be tried again`;
   } catch (err) {
-    next.status = unresolvedLeft ? "unknown-pending" : "pending";
-    next.lastError = notRemoved.length && err instanceof Error ? err.message : plainError(repo, err);
+    otherError = plainError(repo, err);
   }
+  const outstanding = failedNow.map((x) => x.file);
+  next.status = unresolvedLeft ? "unknown-pending" : otherError ? "pending" : "deleted";
+
+  // A retry that changed nothing: no certificate rewrite, no audit event, except one summary a day.
+  if (retry && rec && !removedNow.length && !freshMade && sameFiles(outstanding, rec.outstanding) && next.status === b.status) {
+    const attempts = rec.attemptsSinceRecord + 1;
+    if (now.getTime() - Date.parse(rec.lastRecordedAt) >= DAY_MS) {
+      await appendLibraryEvent(repo, projectId, "retention.backups", { status: b.status, summary: true, attempts, removed: [], notRemoved: outstanding, ...(next.freshBackupFailed ? { freshBackupFailed: next.freshBackupFailed } : {}) });
+      await setRetentionRetry(repo, key, { ...rec, lastAttemptAt: at, lastRecordedAt: at, attemptsSinceRecord: 0, ...(freshTried ? { lastFreshAt: at } : {}) });
+    } else {
+      await setRetentionRetry(repo, key, { ...rec, lastAttemptAt: at, attemptsSinceRecord: attempts, ...(freshTried ? { lastFreshAt: at } : {}) });
+    }
+    return cert;
+  }
+
+  if (otherError) next.lastError = otherError;
+  else delete next.lastError;
   next.deleted = union(next.deleted, removedNow);
   next.removedAt = { ...(b.removedAt ?? {}), ...Object.fromEntries(removedNow.map((f) => [f, at])) };
-  if (notRemoved.length) next.notRemoved = notRemoved;
-  else delete next.notRemoved;
+  // Amended, not replaced: earlier "not removed" entries stay; a new failure is added once.
+  const earlier = b.notRemoved ?? [];
+  const added = failedNow.filter((f) => !earlier.some((e) => e.file === f.file && e.reason === f.reason)).map((f) => ({ ...f, at }));
+  if (earlier.length || added.length) next.notRemoved = [...earlier, ...added];
+  // Later removals of backups an earlier attempt could not remove.
+  const late = removedNow.filter((f) => earlier.some((e) => e.file === f));
+  if (late.length) next.amendments = [...(b.amendments ?? []), { at, removed: late }];
+  next.outstanding = outstanding;
+  if (!outstanding.length) delete next.outstanding;
   // The note says only what happened (N1): composed from the outcome above.
   delete next.note;
   if (next.freshBackupFailed && !next.freshBackup) {
     const reason = next.freshBackupFailed;
     const stop = /[.!?]$/u.test(reason) ? "" : ".";
-    const one = notRemoved.length === 1;
-    next.note = notRemoved.length
+    const one = outstanding.length === 1;
+    next.note = outstanding.length
       ? `No new backup could be made after the destruction: ${reason}${stop} ${one ? "A backup that holds the destroyed files could not be removed yet" : "Some backups that hold the destroyed files could not be removed yet"} (see notRemoved); removing ${one ? "it" : "them"} is tried again.`
       : `The earlier backups that held the destroyed files were removed. No new backup could be made afterwards: ${reason}${stop} This project has no backup until one succeeds.`;
   }
-  await setHoldingNotRemoved(repo, projectId, notRemoved.map((x) => x.file)).catch(() => {});
+  await setHoldingNotRemoved(repo, projectId, certificateRel, outstanding).catch(() => {});
   if (next.status === "deleted") {
     // Pruning keeps its own record when it cannot be audited (backup-audit-pending): not this step's failure.
     await pruneBackupsHeld(repo, hold, projectId, repo.getProject(projectId).backups?.keep ?? DEFAULT_KEEP).catch(() => {});
@@ -366,21 +420,60 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     },
     { op: "retention.backups", entity: { type: "project", id: projectId } },
   );
-  // The same facts as the certificate: what was removed now, and what could not be.
+  // The same facts as the certificate: what was removed now, and what could not be (with why).
   await appendLibraryEvent(repo, projectId, "retention.backups", {
     status: next.status,
     deleted: next.deleted.length,
     removed: removedNow,
-    notRemoved: notRemoved.map((x) => x.file),
+    notRemoved: outstanding,
+    ...(failedNow.length ? { reasons: failedNow } : {}),
+    ...(retry && rec ? { attempts: rec.attemptsSinceRecord + 1 } : {}),
     ...(next.freshBackupFailed && !next.freshBackup ? { freshBackupFailed: next.freshBackupFailed } : {}),
   });
+  // The retry record: started by a failure, reset by each recorded outcome, gone once settled.
+  if (next.status === "deleted") await setRetentionRetry(repo, key, undefined);
+  else {
+    await setRetentionRetry(repo, key, {
+      firstFailedAt: rec?.firstFailedAt ?? at,
+      ...(retry ? { lastAttemptAt: at } : {}),
+      lastRecordedAt: at,
+      attemptsSinceRecord: 0,
+      outstanding,
+      ...(freshTried ? { lastFreshAt: at } : rec?.lastFreshAt ? { lastFreshAt: rec.lastFreshAt } : {}),
+    });
+  }
   return updated;
 }
 
+const sameFiles = (a: string[], b: string[]) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
+const retryKey = (projectId: string, rel: string) => `${projectId}:${rel}`;
+
+/** Ids among `claimed` whose asset the project really records as destroyed. */
+async function reallyDestroyed(repo: Repo, projectId: string, claimed: ReadonlySet<string>): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const id of repo.listSourceIds(projectId)) {
+    const sf = await repo.getSource(projectId, id);
+    for (const a of sf.assets) if (a.status === "destroyed" && claimed.has(a.id)) out.add(a.id);
+  }
+  return out;
+}
+
+/**
+ * Whether a retry of this certificate's backups step is due (R2-I1): hourly during the first day
+ * after its first failure, then once a day. The first retry after a destruction is always due.
+ */
+function retryDue(rec: RetentionRetry | undefined, now: Date): boolean {
+  if (!rec?.lastAttemptAt) return true;
+  const since = now.getTime() - Date.parse(rec.lastAttemptAt);
+  const age = now.getTime() - Date.parse(rec.firstFailedAt);
+  return since >= (age < DAY_MS ? HOUR_MS : DAY_MS);
+}
 
 /**
  * Finishes (or retries) destructions whose backups step is not done (a crash, a quit or a failure
- * after the destruction): returns the certificates (absolute paths) worked on. For Task 30, at start.
+ * after the destruction): returns the certificates (absolute paths) worked on. It never destroys
+ * raw data itself: it only finishes removing backups that hold data an audited destruction already
+ * destroyed. Run by the service at open, at unlock and hourly, with a back-off (retryDue).
  */
 export function resumeDestruction(repo: Repo, projectId: string): Promise<string[]> {
   return withProjectMaintenance(repo, projectId, (hold) => resumeLocked(repo, hold, projectId));
@@ -396,6 +489,7 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
     return [];
   }
   const out: string[] = [];
+  const now = repoClock(repo)();
   for (const n of names) {
     const rel = `${dirRel}/${n}`;
     let status: string | undefined;
@@ -405,7 +499,8 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
       continue;
     }
     if (status !== "pending" && status !== "unknown-pending") continue;
-    await settleBackups(repo, hold, projectId, rel);
+    if (!retryDue(await retentionRetry(repo, retryKey(projectId, rel)), now)) continue;
+    await settleBackups(repo, hold, projectId, rel, true);
     out.push(join(root, ...rel.split("/")));
   }
   return out;

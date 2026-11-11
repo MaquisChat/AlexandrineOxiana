@@ -303,8 +303,10 @@ interface BackupState {
   failures: Record<string, BackupFailure>;
   /** Backups and prunes not yet settled, by backup id / prune id. */
   pending: Record<string, PendingOp>;
-  /** Per project: backups holding destroyed raw data that could not be removed yet (N1, `destruction-backups-pending`). */
-  undestroyed: Record<string, string[]>;
+  /** Per project, per destruction certificate: backups holding destroyed raw data not removed yet (N1, R2-I2). */
+  undestroyed: Record<string, Record<string, string[]>>;
+  /** Per destruction certificate (`<projectId>:<rel>`): the retry record of its backups step (R2-I1). */
+  retries: Record<string, RetentionRetry>;
 }
 
 /** Why the project's last backup failed (plain text; never a path), and when. */
@@ -336,6 +338,18 @@ function pendingOf(v: unknown): Record<string, PendingOp> {
   return out;
 }
 
+/** Per project, per certificate lists of file names (a project's plain list, as round 2 wrote it, counts under "*"). */
+function undestroyedOf(v: unknown): Record<string, Record<string, string[]>> {
+  const out: Record<string, Record<string, string[]>> = {};
+  if (!isObject(v)) return out;
+  const names = (x: unknown) => (Array.isArray(x) ? x.filter((f): f is string => typeof f === "string") : []);
+  for (const [pid, per] of Object.entries(v)) {
+    if (Array.isArray(per)) out[pid] = { "*": names(per) };
+    else if (isObject(per)) out[pid] = Object.fromEntries(Object.entries(per).map(([k, x]) => [k, names(x)]));
+  }
+  return out;
+}
+
 async function readState(dir: string): Promise<BackupState> {
   try {
     const raw = await readMaybe(join(dir, BACKUPS_STATE));
@@ -345,10 +359,11 @@ async function readState(dir: string): Promise<BackupState> {
       owners: s.owners && typeof s.owners === "object" ? s.owners : {},
       failures: s.failures && typeof s.failures === "object" ? s.failures : {},
       pending: pendingOf(s.pending),
-      undestroyed: s.undestroyed && typeof s.undestroyed === "object" && !Array.isArray(s.undestroyed) ? s.undestroyed : {},
+      undestroyed: undestroyedOf(s.undestroyed),
+      retries: isObject(s.retries) ? (s.retries as Record<string, RetentionRetry>) : {},
     };
   } catch {
-    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {} };
+    return { formatVersion: 1, owners: {}, failures: {}, pending: {}, undestroyed: {}, retries: {} };
   }
 }
 
@@ -1246,13 +1261,46 @@ export async function destroyBackups(
 }
 
 /**
- * Package-internal (retention, N1): the backups of the project that hold destroyed raw data and
- * could not be removed yet: the project's warning `destruction-backups-pending` until they are.
+ * Package-internal (retention, N1, R2-I2): the backups that hold raw data destroyed by one
+ * destruction (its certificate) and could not be removed yet. Kept per certificate, so one
+ * destruction settling never clears another's: the project's warning `destruction-backups-pending`
+ * stands while any certificate has one.
  */
-export function setHoldingNotRemoved(repo: Repo, projectId: string, files: string[]): Promise<void> {
+export function setHoldingNotRemoved(repo: Repo, projectId: string, certificateRel: string, files: string[]): Promise<void> {
   return withState(repo, (s) => {
-    if (files.length) s.undestroyed[projectId] = files;
+    const mine = { ...(s.undestroyed[projectId] ?? {}) };
+    if (files.length) mine[certificateRel] = files;
+    else delete mine[certificateRel];
+    if (Object.keys(mine).length) s.undestroyed[projectId] = mine;
     else delete s.undestroyed[projectId];
+  });
+}
+
+/** Package-internal: every backup of the project still to be removed for a destruction (all certificates). */
+export async function holdingNotRemoved(repo: Repo, projectId: string): Promise<string[]> {
+  const u = (await readState(backupsDir(repo))).undestroyed;
+  return Object.hasOwn(u, projectId) ? [...new Set(Object.values(u[projectId]!).flat())].sort() : [];
+}
+
+/** Package-internal (retention, R2-I1): the retry record of one destruction's backups step. */
+export interface RetentionRetry {
+  firstFailedAt: string;
+  lastAttemptAt?: string;
+  lastRecordedAt: string;
+  attemptsSinceRecord: number;
+  outstanding: string[];
+  lastFreshAt?: string;
+}
+
+export async function retentionRetry(repo: Repo, key: string): Promise<RetentionRetry | undefined> {
+  const r = (await readState(backupsDir(repo))).retries;
+  return Object.hasOwn(r, key) ? r[key] : undefined;
+}
+
+export function setRetentionRetry(repo: Repo, key: string, rec: RetentionRetry | undefined): Promise<void> {
+  return withState(repo, (s) => {
+    if (rec) s.retries[key] = rec;
+    else delete s.retries[key];
   });
 }
 
