@@ -411,7 +411,6 @@ Known, not yet scheduled above, or accepted as limits:
   - D6: in WebKit one typeface stays in error, so fonts never finish loading (to be checked in the real Mac web view).
   - D7: right-to-left title headings are laid out left to right.
 - A UI test, ReviewQueue "loads titles six at a time", takes about 40 s under heavy machine load and passes alone; find out why without loosening its limit (for Task 46 or Task 54).
-- Found by Task 37d: transcription contacts the model hub on every model load, even when the model is already on disk, and fails if a proxy refuses (a project that must stay offline should never need the network to transcribe; for Task 48).
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Defects found by Task 44 are added here when it runs.
 
@@ -451,7 +450,7 @@ Update after every task; commit and push.
 | 37a Service bundle | not started | | |
 | 37b Token on standard input | not started | | |
 | 37c Desktop shell | not started | | |
-| 37d Worker packaging | in review | 72cb7cc (worktree branch) | 540 MB bundle; smoke test passes on Linux; licence facts for the owner |
+| 37d Worker packaging | fix round 1 | 72cb7cc (worktree branch) | approved with fixes: stronger smoke test, accurate licence manifest, offline model load (R144) |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs Apple Developer credentials |
