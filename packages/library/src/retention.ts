@@ -489,14 +489,12 @@ async function scan(repo: Repo, projectId: string): Promise<{ list: Audited[]; c
 const AUDIT_CHANGED =
   "The audit log of this project is not as the app left it: it was changed outside the app. The app removes no backup on its word until the library has been opened again and the log checked.";
 const AUDIT_UNVERIFIED =
-  "The audit log of this project does not hold together: an entry was changed or removed outside the app. The app removes no backup on its word; the backups still listed can be removed by hand.";
+  "The audit log of this project does not hold together: an entry was changed or removed outside the app. The app removes no backup on its word. If the backups still listed are removed by hand, the app records that they are gone.";
 const FILES_DISAGREE = "While its files and the audit log disagree, the app removes no backup for this destruction by itself. If the backups still listed are removed by hand, the app records that they are gone.";
 const UNRECORDED =
   "The audit log does not record this destruction certificate in the form the app now keeps (it was written by an earlier version of the app, or outside it), so the app does not remove the backups it lists by itself. If they hold destroyed data, remove them by hand.";
 const stateProblem = (file: string) =>
   `The app's own note of the backups still to remove (backups-state.json in the Backups folder) names "${fileOf(file)}" for this destruction, and the audit log does not. Nothing was removed for this destruction this time, and the note was corrected from the audit log.`;
-/** Problems with the audit log itself: nothing may be appended to it about them, and nothing is recorded on its word. */
-const aboutAudit = (problem: string | undefined) => problem === AUDIT_CHANGED || problem === AUDIT_UNVERIFIED;
 
 /** A file in the retention folder as it is (decrypted when sealed): null when it is not there, "unreadable" when it cannot be opened. */
 async function readPlain(repo: Repo, projectId: string, rel: string): Promise<Buffer | null | "unreadable"> {
@@ -963,34 +961,36 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
         const extra = (Object.hasOwn(found, rel) ? found[rel]!.files : []).find((f) => !listedIn(a, f));
         if (extra !== undefined) problem = stateProblem(extra);
       }
-      const rec = problem ? undefined : await retentionRetry(repo, retryKey(projectId, rel));
-      if (!problem && !retryDue(rec, a, now)) {
-        // Not tried this time: what the last try found about the log still stands.
-        if (Object.hasOwn(found, rel) && found[rel]!.problem === AUDIT_UNVERIFIED) problem = AUDIT_UNVERIFIED;
-      } else if (!problem) {
-        // Before anything is removed: the whole log, its chain verified, read again.
-        const checked = await verifiedAuditEvents(repo, projectId);
-        const sure = checked.ok ? auditedDestructions(checked.events).list.find((x) => x.certificateSha256 === a.certificateSha256) : undefined;
-        if (!sure) {
-          problem = AUDIT_UNVERIFIED;
-          // The attempt counts for the back-off: the log is not read in full again at every pass.
-          const at = now.toISOString();
-          await setRetentionRetry(repo, retryKey(projectId, rel), {
-            firstFailedAt: rec?.firstFailedAt ?? a.amendments[0]?.at ?? at,
-            lastAttemptAt: at,
-            lastRecordedAt: a.lastRecordedAt ?? rec?.lastRecordedAt ?? at,
-            attemptsSinceRecord: (rec?.attemptsSinceRecord ?? 0) + 1,
-            ...(rec?.lastFreshAt ? { lastFreshAt: rec.lastFreshAt } : {}),
-          }).catch(() => {});
+      if (!problem) {
+        const rec = await retentionRetry(repo, retryKey(projectId, rel));
+        if (!retryDue(rec, a, now)) {
+          // Not tried this time: what the last try found about the log still stands.
+          if (Object.hasOwn(found, rel) && found[rel]!.problem === AUDIT_UNVERIFIED) problem = AUDIT_UNVERIFIED;
         } else {
-          a = sure;
-          await settleBackups(repo, hold, projectId, a, { retry: true, ...(disk?.original ? { certificate: disk.original } : {}) });
-          out.push(join(lib.root, ...rel.split("/")));
+          // Before anything is removed: the whole log, its chain verified, read again.
+          const checked = await verifiedAuditEvents(repo, projectId);
+          const sure = checked.ok ? auditedDestructions(checked.events).list.find((x) => x.certificateSha256 === a.certificateSha256) : undefined;
+          if (sure) {
+            a = sure;
+            await settleBackups(repo, hold, projectId, a, { retry: true, ...(disk?.original ? { certificate: disk.original } : {}) });
+            out.push(join(lib.root, ...rel.split("/")));
+          } else {
+            problem = AUDIT_UNVERIFIED;
+            // The attempt counts for the back-off: the log is not read in full again at every pass.
+            const at = now.toISOString();
+            await setRetentionRetry(repo, retryKey(projectId, rel), {
+              firstFailedAt: rec?.firstFailedAt ?? a.amendments[0]?.at ?? at,
+              lastAttemptAt: at,
+              lastRecordedAt: a.lastRecordedAt ?? rec?.lastRecordedAt ?? at,
+              attemptsSinceRecord: (rec?.attemptsSinceRecord ?? 0) + 1,
+              ...(rec?.lastFreshAt ? { lastFreshAt: rec.lastFreshAt } : {}),
+            }).catch(() => {});
+          }
         }
-      } else if (problem && !aboutAudit(problem)) {
-        // Nothing is removed while they disagree; a listed backup that is gone is still recorded as gone.
-        await settleBackups(repo, hold, projectId, a, { retry: true, observeOnly: true });
       }
+      // Nothing is removed while something disagrees; a listed backup that is gone is still recorded
+      // as gone. Not while the log itself changed under the app: nothing is appended to it then.
+      if (problem && problem !== AUDIT_CHANGED) await settleBackups(repo, hold, projectId, a, { retry: true, observeOnly: true });
       // Said once in the audit log, not at every pass.
       if (problem && problem !== AUDIT_CHANGED && outstandingOf(a).length && scanned.reportedProblem !== problem) {
         await appendLibraryEvent(repo, projectId, "retention.backups", {

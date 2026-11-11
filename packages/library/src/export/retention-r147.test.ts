@@ -84,6 +84,12 @@ const reports = async (p: Project) => (await auditEvents(kit, p)).filter((e) => 
 const completions = async (p: Project) =>
   (await auditEvents(kit, p)).filter((e) => (e.action === "retention.backups" || detailsOf(e).op === "retention.backups") && ["deleted", "no-longer-present"].includes(String(detailsOf(e).status)));
 
+/** How many times the audit log records a backup as removed by the app, and as no longer present. */
+async function recordedAs(p: Project, file: string): Promise<{ removed: number; gone: number }> {
+  const ev = await amendmentEvents(p);
+  return { removed: ev.filter((e) => detailsOf(e).removed?.includes(file)).length, gone: ev.filter((e) => detailsOf(e).noLongerPresent?.includes(file)).length };
+}
+
 interface Stuck {
   p: Project;
   sf: SourceFile;
@@ -338,6 +344,12 @@ describe("the certificate and backups-state.json are conveniences; the audit log
     expect(said).toHaveLength(1);
     expect(detailsOf(said[0]!).problem).toMatch(/audit log .* does not hold together/u);
     expect((await readDestruction(kit.repo, p.id, certificatePath)).outstanding).toEqual([rel(x)]);
+    // Removed by hand: recorded as gone (never as removed by the app), and the warning ends.
+    await rm(x.path);
+    later(HOUR / 2);
+    await resumeDestruction(kit.repo, p.id);
+    expect(await recordedAs(p, rel(x))).toEqual({ removed: 0, gone: 1 });
+    expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
   });
 
   it("backups-state.json deleted: the retry still knows what is outstanding from the audit log, and writes nothing more to it for a retry that changes nothing", async () => {
@@ -638,11 +650,7 @@ describe("the certificate written at the destruction is never rewritten", () => 
 });
 
 describe("crash safety: a removal that was not recorded", () => {
-  /** How many times the audit log records X as removed, and as no longer present. */
-  async function recorded(p: Project, file: string): Promise<{ removed: number; gone: number }> {
-    const ev = await amendmentEvents(p);
-    return { removed: ev.filter((e) => detailsOf(e).removed?.includes(file)).length, gone: ev.filter((e) => detailsOf(e).noLongerPresent?.includes(file)).length };
-  }
+  const recorded = recordedAs;
 
   const cases: Array<[string, () => void]> = [
     ["between removing the backup and recording it", () => (backupSeams.crashAt = "before-removal-record")],
