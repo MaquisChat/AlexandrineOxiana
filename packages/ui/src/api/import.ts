@@ -7,7 +7,9 @@
  * The service has no secrets route (yet): the Zotero Web API key cannot be stored from the UI. It is
  * set with `ao secrets set zotero-api-key` (Task 26 CLI) and read by the service from the OS keyring.
  */
-import { effectivePolicy, parseGovernance } from "@ao/core";
+// Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
+import { effectivePolicy } from "@ao/core/src/governance/merge";
+import { parseGovernance } from "@ao/core/src/governance/schema";
 import type { ApiClient } from "./client";
 
 // ---------------------------------------------------------------------------------------------

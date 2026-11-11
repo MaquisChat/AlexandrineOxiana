@@ -1,9 +1,8 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { importApi, importPolicyFromYaml, isProgressFor } from "./import";
 import { mockService, OPEN_GOVERNANCE, PSEUDONYMISING_GOVERNANCE, server } from "../test/importService";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
-afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
 describe("importPolicyFromYaml", () => {

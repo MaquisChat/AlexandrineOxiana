@@ -92,7 +92,9 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
   };
   const url = (p: string) => `${BASE}${p}`;
 
-  server.use(
+  // Replaces the previous test's handlers (rather than resetting after each test), so a request a
+  // component sends while a test is being torn down still finds a handler.
+  server.resetHandlers(
     ...(o.extra ?? []),
     http.get(url("/projects"), async ({ request }) => {
       await rec(request, "/projects");
