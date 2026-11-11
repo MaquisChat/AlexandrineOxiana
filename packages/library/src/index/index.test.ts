@@ -127,17 +127,18 @@ afterEach(async () => {
 
 
 describe("schema", () => {
-  it("uses WAL, records schemaVersion 1 and creates the required tables", () => {
+  it("uses WAL, records schemaVersion 2 and creates the required tables", () => {
     expect(handle.db.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
     const names = (handle.db.prepare("SELECT name FROM sqlite_master").all() as Array<{ name: string }>).map((r) => r.name);
     for (const t of [
       "projects", "sources", "assets", "collections", "tags", "source_collections", "source_tags", "participants",
-      "sessions", "consents", "import_batches", "review_items", "jobs", "meta", "source_text", "source_hashes",
+      "sessions", "consents", "review_items", "jobs", "meta", "source_text", "source_hashes",
     ]) expect(names).toContain(t);
+    expect(names).not.toContain("import_batches"); // never written; dropped by migration 0002
     // reopening does not re-run migrations
     handle.reopen();
-    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
   });
 });
 
@@ -608,17 +609,17 @@ describe("review fixes", () => {
     expect(search(handle.db, { text: "stays" }).total).toBe(1);
   });
 
-  it("I4: rebuild carries review_items, import_batches and jobs over", async () => {
+  it("I4: rebuild carries review_items over; jobs come from the journals (R31), never from old rows", async () => {
     const pid = await openProject();
     handle.db.prepare("INSERT INTO review_items VALUES ('r1', ?, NULL, NULL, 'import', 'pending', '{\"a\":1}', ?)").run(pid, NOW);
-    handle.db.prepare("INSERT INTO import_batches VALUES ('b1', ?, 1, ?, NULL, '{}')").run(pid, NOW);
-    handle.db.prepare("INSERT INTO jobs VALUES ('j1', ?, 'ocr', 'queued', '{}', ?)").run(pid, NOW);
+    handle.db.prepare("INSERT INTO jobs VALUES ('j1', ?, 'pdf.ocr', 'queued', '{}', ?)").run(pid, NOW);
     await rebuildIndex(handle, ring, lib);
     expect(handle.db.prepare("SELECT id, kind, status, payload_json FROM review_items").all()).toEqual([
       { id: "r1", kind: "import", status: "pending", payload_json: '{"a":1}' },
     ]);
-    expect(handle.db.prepare("SELECT id FROM import_batches").all()).toEqual([{ id: "b1" }]);
-    expect(handle.db.prepare("SELECT id FROM jobs").all()).toEqual([{ id: "j1" }]);
+    // This version writes a job's journal line before its row: a row without one is not a record.
+    // (Rows of databases made before the journal are upgraded: job-journal.test.ts.)
+    expect(handle.db.prepare("SELECT id FROM jobs").all()).toEqual([]);
   });
 
   it("I5: rebuild restores extracted text from ocr-text and transcript (.vtt) assets, plain and encrypted", async () => {
