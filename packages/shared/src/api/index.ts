@@ -3,5 +3,6 @@
  * (Task 34a starts this; Task 47 moves the remaining routes here).
  */
 export * from "./media.js";
+export * from "./pairing.js";
 export * from "./sources.js";
 export * from "./transcripts.js";

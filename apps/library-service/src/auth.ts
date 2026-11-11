@@ -14,11 +14,12 @@
  *    Access-Control-Allow-Origin, never `*`.
  *  - Pairing: `POST /extension/pair` (UI token) makes a 6-digit code (crypto.randomInt), single use,
  *    valid 5 minutes; `POST /extension/pair/confirm` allows 5 wrong attempts, then the code is
- *    invalidated; confirm calls are rate-limited.
+ *    invalidated; confirm calls are rate-limited. `GET /extension/pair/status[/:codeId]` (UI token,
+ *    from the shell's origin only) says what became of a code, by its non-secret id (Task 46c).
  */
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { readAppSetting, updateAppSetting } from "@ao/library";
-import { isCredentialQueryKey } from "@ao/shared";
+import { isCredentialQueryKey, type PairingCodeIssued, type PairingCodeStatus } from "@ao/shared";
 
 /** The UI token from the environment, which is then removed from it (child processes never see it). */
 export function readServiceToken(env: NodeJS.ProcessEnv = process.env): string {
@@ -88,9 +89,24 @@ export interface PairingOptions {
   now?: () => number;
 }
 
+/** What became of an issued code (Task 46c), kept in memory only: a restart forgets every code. */
+type CodeEnd =
+  | { state: "used"; at: number; browser: { id: string; origin: string } }
+  | { state: "expired" | "invalidated" | "replaced"; at: number };
+interface CodeRecord {
+  /** Not a secret: names the code in the status route. */
+  id: string;
+  expires: number;
+  end?: CodeEnd;
+}
+
+/** Codes whose status can still be read by id (the newest last). */
+const CODE_HISTORY = 16;
+
 /** Extension pairing: one active code at a time; paired extensions persisted by token hash. */
 export class Pairing {
-  private code: { value: string; expires: number; attempts: number } | undefined;
+  private code: { value: string; expires: number; attempts: number; record: CodeRecord } | undefined;
+  private readonly history: CodeRecord[] = [];
   private paired: PairedExtension[] = [];
   private loaded = false;
   /** Confirm calls per origin in the last minute (R98: limited per origin). */
@@ -117,11 +133,41 @@ export class Pairing {
   }
 
   /** A new 6-digit code; the desktop app may ask again at any time (any earlier code stops working). */
-  newCode(): { code: string; expiresAt: string } {
+  newCode(): PairingCodeIssued {
+    const now = this.now();
+    const prev = this.history.at(-1);
+    if (prev && !prev.end) prev.end = now > prev.expires ? { state: "expired", at: prev.expires } : { state: "replaced", at: now };
     const value = String(randomInt(0, 1_000_000)).padStart(6, "0");
-    const expires = this.now() + this.ttlMs;
-    this.code = { value, expires, attempts: 0 };
-    return { code: value, expiresAt: new Date(expires).toISOString() };
+    const expires = now + this.ttlMs;
+    const record: CodeRecord = { id: randomBytes(8).toString("hex"), expires };
+    this.history.push(record);
+    if (this.history.length > CODE_HISTORY) this.history.shift();
+    this.code = { value, expires, attempts: 0, record };
+    return { code: value, codeId: record.id, expiresAt: new Date(expires).toISOString(), validForMs: this.ttlMs };
+  }
+
+  /**
+   * What became of the code with this id, or of the code most recently issued (Task 46c). Never the
+   * code itself. `none`: no code since the service started, or an id it does not know.
+   */
+  status(codeId?: string): PairingCodeStatus {
+    const r = codeId === undefined ? this.history.at(-1) : this.history.find((x) => x.id === codeId);
+    if (!r) return { state: "none" };
+    const now = this.now();
+    if (!r.end && now > r.expires) r.end = { state: "expired", at: r.expires };
+    const iso = (t: number) => new Date(t).toISOString();
+    const e = r.end;
+    if (!e) return { state: "active", codeId: r.id, expiresAt: iso(r.expires), validForMs: Math.max(0, r.expires - now) };
+    switch (e.state) {
+      case "used":
+        return { state: "used", codeId: r.id, usedAt: iso(e.at), browser: { ...e.browser } };
+      case "expired":
+        return { state: "expired", codeId: r.id, expiredAt: iso(e.at) };
+      case "invalidated":
+        return { state: "invalidated", codeId: r.id, invalidatedAt: iso(e.at) };
+      case "replaced":
+        return { state: "replaced", codeId: r.id, replacedAt: iso(e.at) };
+    }
   }
 
   /** Whether another confirm call from `origin` is allowed now (sliding one-minute window). */
@@ -145,22 +191,36 @@ export class Pairing {
   async confirm(code: string, origin: string): Promise<string | undefined> {
     const c = this.code;
     if (!c || this.now() > c.expires || c.attempts >= this.maxAttempts) {
+      if (c && !c.record.end) c.record.end = c.attempts >= this.maxAttempts ? { state: "invalidated", at: this.now() } : { state: "expired", at: c.expires };
       this.code = undefined;
       return undefined;
     }
     if (typeof code !== "string" || !/^\d{6}$/.test(code) || !sameSecret(code, c.value)) {
       c.attempts++;
-      if (c.attempts >= this.maxAttempts) this.code = undefined;
+      if (c.attempts >= this.maxAttempts) {
+        this.code = undefined;
+        c.record.end = { state: "invalidated", at: this.now() };
+      }
       return undefined;
     }
     this.code = undefined;
     const token = randomBytes(32).toString("base64url");
-    const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(this.now()).toISOString() };
-    const next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, (cur) => ({
-      v: 1,
-      // One pairing per extension origin: pairing again replaces its token.
-      extensions: [...(Array.isArray(cur?.extensions) ? cur.extensions.filter((e) => e.origin !== origin) : []), entry],
-    }));
+    const at = this.now();
+    const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(at).toISOString() };
+    // Marked before the write, so a code issued meanwhile does not call this one "replaced".
+    c.record.end = { state: "used", at, browser: { id: entry.id, origin } };
+    let next: PairingFile;
+    try {
+      next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, (cur) => ({
+        v: 1,
+        // One pairing per extension origin: pairing again replaces its token.
+        extensions: [...(Array.isArray(cur?.extensions) ? cur.extensions.filter((e) => e.origin !== origin) : []), entry],
+      }));
+    } catch (err) {
+      // Used up, but nothing was paired: the code no longer works.
+      c.record.end = { state: "invalidated", at: this.now() };
+      throw err;
+    }
     this.paired = next.extensions;
     return token;
   }
