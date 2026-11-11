@@ -1060,6 +1060,24 @@ describe("Task 50: no refusal or audit failure is silent", () => {
     expect(await projectWarnings(r, a.id)).toEqual([]);
   });
 
+  it("a library.old-copy-deleted event that cannot be written marks the project in the new copy", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    seams.failAuditAppendFor = b.id;
+    const out = await deleteOldCopy(lib.root, res.confirmToken);
+    expect(out.rootRemoved).toBe(true);
+    expect(out.warnings.join(" ")).toMatch(/needing attention/);
+    expect(await attentionOf(dest, b.folder)).toHaveLength(1);
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+    seams.failAuditAppendFor = undefined;
+    const d = await openLibrary(dest, mkDeps());
+    open.push(d);
+    await openTestRepo(d, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    expect((await auditOf(dest, b.folder)).filter((e) => e.action === "library.old-copy-deleted")).toHaveLength(1);
+    expect(await attentionOf(dest, b.folder)).toEqual([]);
+  });
+
   it("a crash after the failed append and before the mark leaves the move unfinished, which the next open reports and completeMove records", async () => {
     const { lib, a, b } = await fixture();
     const dest = join(tmp, "Dest");
