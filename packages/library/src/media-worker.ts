@@ -50,7 +50,7 @@ export async function startMediaWorker(opts: { repo?: Repo | undefined; index?: 
     handle,
     get client() {
       if (!repo) throw new Error("this worker was started without a library");
-      client ??= new WorkerClient({ repo, worker: handle, pollMs: opts.pollMs ?? 200, ...(index ? { index: { db: index.db } } : {}) });
+      client ??= new WorkerClient({ repo, worker: handle, pollMs: opts.pollMs ?? 200, ...(index ? { index } : {}) });
       return client;
     },
     versions: async () => (await call<{ versions: Record<string, string | null> }>(handle, "GET", "/health")).versions,

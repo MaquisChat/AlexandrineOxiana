@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { newId, sealEvent, verifyChain, type AuditEvent, type SourceFile } from "@ao/core";
 import { UnsafeFileError } from "../extract/errors.js";
 import { decryptBytes } from "../repo/io.js";
+import { appendJobRecords } from "../job-journal.js";
 import { projectDataKey, projectWarnings } from "../repo/repo.js";
 import { restoreSeams } from "../repo/restore.js";
 import { AuditChainInvalidError, BACKUPS_MANIFEST, BACKUPS_STATE, RestoreError, backupIfDue, backupSeams, backupProject, listBackups, restoreBackup, setBackupSettings } from "./backup.js";
@@ -207,6 +208,23 @@ describe("restoreBackup", () => {
     await expect(restoreBackup(kit.repo, copied)).rejects.toBeInstanceOf(AuditChainInvalidError);
     expect((await readdir(join(kit.lib.root, "Projects"))).sort()).toEqual(projectsBefore);
     expect(kit.repo.listProjects()).toHaveLength(1);
+  });
+
+  it("a project's job journal (R31) is backed up; the restored copy starts without the original's jobs", async () => {
+    for (const encrypted of [false, true]) {
+      const p = await makeProject(kit, encrypted ? PSEUDO_GOV : OPEN_GOV, encrypted, encrypted ? "Jobs E" : "Jobs P");
+      const at = "2026-11-10T09:30:00.000Z";
+      await appendJobRecords(kit.lib.root, p.folder, projectDataKey(kit.repo, p.id), [
+        { v: 1, id: newId(), projectId: p.id, kind: "pdf.ocr", status: "queued", createdAt: at, updatedAt: at,
+          job: { type: "pdf.ocr", input: join(kit.lib.root, p.folder, "x.pdf"), output: join(kit.lib.root, ".tmp", "o.pdf"), params: {} } },
+      ]);
+      const r = await backupProject(kit.repo, p.id);
+      const restored = await restoreBackup(kit.repo, r.path);
+      const folder = kit.repo.getProject(restored.projectId).folder;
+      // its records name the original's files and work: they stay with the original
+      expect((await walk(join(kit.lib.root, folder))).some((f) => f.startsWith("jobs/"))).toBe(false);
+      expect((await walk(join(kit.lib.root, p.folder))).some((f) => f.startsWith("jobs/"))).toBe(true);
+    }
   });
 
   it("an encrypted backup restores with the passphrase when the project is locked", async () => {
