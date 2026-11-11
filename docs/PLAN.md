@@ -427,7 +427,7 @@ Update after every task; commit and push.
 | 46 Fix scenario findings | not started | | |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | in progress | | implementer dispatched |
+| 34b Capture screen | in review | db52fdb (worktree branch) | adversarial review dispatched |
 | 34c Transcript viewer | in review | 4b9a723 (worktree branch) | adversarial review dispatched; re-transcribe progress needs a service change |
 | 34d Verification badges | in progress | | implementer dispatched; also closes defect D3 |
 | 34e Pairing screen | in review | f48170a (worktree branch) | review dispatched; also changes the shared dialog shell (claim to be verified) |
