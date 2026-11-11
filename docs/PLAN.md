@@ -430,7 +430,7 @@ Update after every task; commit and push.
 | 48 Tools dialogue | not started | | |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | not started | | |
-| 49 Backups governed | fix round 2 | 91f78f4 (worktree branch) | round 1 confirmed; one new Important (certificate wording when a removal fails) |
+| 49 Backups governed | fix round 3 | fdb61e9 (worktree branch) | rounds 1 and 2 confirmed; two Important in the automatic retry of pending removals |
 | 50 No silent refusals | not started | | |
 | 51 Job records in files | fix round 1 | 20993f0 (worktree branch) | spec met; 2 Important (R142) |
 | 61 New recovery code | fix round 1 | 35be129 (worktree branch) | spec met; 3 Important (R141) |
