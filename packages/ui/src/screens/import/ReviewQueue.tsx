@@ -8,14 +8,16 @@
  * that serves an imported file's content for preview yet.
  *
  * In projects that pseudonymise names, titles taken from file names, and collections and tags the
- * batch made from folder names, are flagged (R64): they can carry participants' names. A collection
- * or tag counts as made by the batch when its id (a UUIDv7) was minted while a folder, ZIP or device
- * batch ran: the service does not list what a batch created.
+ * batch made from folder names, are flagged (R64): they can carry participants' names. What the
+ * batch made is what the service reports it created (BatchSummary.created, R118).
+ *
+ * The list shows the titles the service sends with the items (R118); a record is fetched for the
+ * item shown, and — as a fallback for items sent without a title — for those items, a pool of
+ * SOURCE_POOL requests at a time, the shown item first (R115 I4).
  */
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../../api/client";
 import {
-  idTime,
   importApi,
   type BatchSummary,
   type Candidate,
@@ -61,14 +63,10 @@ export interface ReviewQueueProps {
 /** Source requests in flight at once (R115 I4). */
 export const SOURCE_POOL = 6;
 
-/** What the batch made from folder names: collections and tags minted while it ran (R64). */
+/** What the batch made from folder names (R64): the collections and tags it reports it created (R118). */
 function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
-  if (!batch || !FOLDER_KINDS.has(batch.kind)) return false;
-  const t = idTime(id);
-  const from = Date.parse(batch.startedAt);
-  const to = batch.finishedAt ? Date.parse(batch.finishedAt) : Date.now();
-  if (t === undefined || Number.isNaN(from)) return false;
-  return t >= from - 1000 && t <= to + 1000;
+  if (!batch?.created || !FOLDER_KINDS.has(batch.kind)) return false;
+  return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id);
 }
 
 export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
@@ -90,7 +88,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
   const title = useRef<HTMLHeadingElement>(null);
 
   // ---- source loading: a queue served by SOURCE_POOL workers, the current item first ----
-  const pool = useRef({ queue: [] as string[], active: 0, live: true });
+  const pool = useRef({ queue: [] as string[], active: 0, live: true, asked: new Set<string>() });
   // Answers are applied as they arrive, gathered over a frame so a long queue does not re-render
   // once per answer; the shown item's answer is applied at once.
   const arrived = useRef(new Map<string, SourceFile>());
@@ -112,6 +110,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     const p = pool.current;
     while (p.live && p.active < SOURCE_POOL && p.queue.length) {
       const sid = p.queue.shift()!;
+      p.asked.add(sid);
       p.active++;
       api
         .source(projectId, sid)
@@ -124,6 +123,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
             setFailed((cur) => (cur.has(sid) ? new Set([...cur].filter((x) => x !== sid)) : cur));
           },
           () => {
+            p.asked.delete(sid); // a retry may ask again
             if (p.live) setFailed((cur) => new Set(cur).add(sid));
           },
         )
@@ -133,18 +133,19 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
         });
     }
   }, [api, projectId, flush]);
-  /** Loads these sources next (ahead of what is already queued). */
+  /** Loads these sources next (ahead of what is already queued); one already asked for is not asked again. */
   const loadFirst = useCallback(
     (sids: string[]) => {
       const p = pool.current;
-      p.queue = [...sids, ...p.queue.filter((x) => !sids.includes(x))];
+      const fresh = sids.filter((x) => !p.asked.has(x));
+      p.queue = [...fresh, ...p.queue.filter((x) => !fresh.includes(x))];
       pump();
     },
     [pump],
   );
 
   useEffect(() => {
-    const p = { queue: [] as string[], active: 0, live: true };
+    const p = { queue: [] as string[], active: 0, live: true, asked: new Set<string>() };
     pool.current = p;
     let live = true;
     setError(null);
@@ -153,7 +154,8 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
         if (!live) return;
         setItems(list);
         setCurrent(list[0]?.id ?? null);
-        p.queue = list.flatMap((i) => (i.sourceId ? [i.sourceId] : []));
+        // Titles come with the items; only items sent without one need their record for the list.
+        p.queue = list.flatMap((i) => (i.sourceId && !i.title ? [i.sourceId] : []));
         pump();
       },
       (e: unknown) => live && setError(errorText(e)),
@@ -171,12 +173,12 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     };
   }, [api, projectId, batchId, pump]);
 
-  // The item shown is loaded before the rest of the queue.
+  // The item shown is loaded (its full record, for the preview) before the rest of the queue.
   const currentItem = items?.find((i) => i.id === current);
   shownSid.current = currentItem?.sourceId;
   useEffect(() => {
     const sid = currentItem?.sourceId;
-    if (sid && pool.current.queue.includes(sid)) loadFirst([sid]);
+    if (sid) loadFirst([sid]);
   }, [currentItem?.sourceId, loadFirst]);
 
   // After a decision, focus moves to the next item's row (or the heading when none is left).
@@ -186,7 +188,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     (el ?? title.current)?.focus();
   }, [focusId]);
 
-  const titleFor = (i: ReviewItem, n: number) => (i.sourceId ? titleOf(sources[i.sourceId]) : "") || `item ${fmt(n)}`;
+  const titleFor = (i: ReviewItem, n: number) => (i.sourceId ? titleOf(sources[i.sourceId]) : "") || i.title || `item ${fmt(n)}`;
 
   const retry = useCallback(
     (sid: string) => {

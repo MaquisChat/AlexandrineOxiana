@@ -614,7 +614,7 @@ processing:
     // Dry run: the linked PDF outside the data folder is listed for approval.
     const dry = await bulk.dryRun(p.id, zoteroLocalAdapter(dataDir));
     expect(dry.items).toBe(5);
-    expect(dry.outsideFiles).toEqual([{ item: "zotero:BBBB2222", folder: await realpath(linkedDir) }]);
+    expect(dry.outsideFiles).toEqual([{ item: "zotero:BBBB2222", folder: await realpath(linkedDir), file: expect.stringMatching(new RegExp(`^${(await realpath(linkedDir)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\\\/][^\\\\/]+$`)) }]);
 
     // Not approved: the item imports without it, with the note.
     const h = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir));

@@ -239,9 +239,10 @@ export interface ScanSummary {
   notes: string[];
   /**
    * Files outside the source's folders and the library's approved folders (R67), for the wizard to
-   * ask about: the item's label and the folder the file is in. Never written anywhere.
+   * ask about: the item's label, the folder the file is in and the file's own real path (symbolic
+   * links followed: what an approval of that one file must name, R118). Never written anywhere.
    */
-  outsideFiles: Array<{ item: string; folder: string }>;
+  outsideFiles: Array<{ item: string; folder: string; file: string }>;
 }
 
 export interface BatchSummary {
@@ -252,6 +253,8 @@ export interface BatchSummary {
   startedAt: string;
   finishedAt?: string;
   counts: ImportBatch["counts"];
+  /** The collections and tags this batch created, by id (R118; see ImportReport.created). */
+  created: { collectionIds: string[]; tagIds: string[] };
 }
 
 const CAPTURE_METHOD: Record<ImportBatch["source"]["kind"], Provenance["captureMethod"]> = {
@@ -1749,6 +1752,7 @@ export async function listBatches(repo: Repo, projectId: string): Promise<BatchS
         startedAt: r.startedAt,
         ...(r.finishedAt ? { finishedAt: r.finishedAt } : {}),
         counts: r.counts,
+        created: { collectionIds: [...r.createdCollectionIds], tagIds: [...r.createdTagIds] },
       });
     } catch {
       // unreadable record: not listed
@@ -1828,7 +1832,7 @@ export async function dryRun(
         for (const x of item.files) {
           const c = await policy.check(x.path);
           if (c.ok) inside.push(x);
-          else summary.outsideFiles.push({ item: reportLabel(item.key, null), folder: dirname(c.real) }); // no tag: no batch secret yet
+          else summary.outsideFiles.push({ item: reportLabel(item.key, null), folder: dirname(c.real), file: c.real }); // no tag: no batch secret yet
         }
         item = { ...item, files: inside };
       }

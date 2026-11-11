@@ -30,6 +30,11 @@ export interface ImportReport {
   keptFields: Array<{ item: string; fields: string[] }>;
   governance: GovernanceNote[];
   notes: string[];
+  /**
+   * The collections and tags this batch created (R118), by id, in the order it made them. An undo
+   * removes the ones nobody else used, so some may no longer exist.
+   */
+  created: { collectionIds: string[]; tagIds: string[] };
 }
 
 /** An item key safe to show: an absolute path (from a foreign adapter) is cut to its last part. */
@@ -140,6 +145,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     keptFields: [...latest.values()].filter((e) => e.merge?.kept?.length).map((e) => ({ item: reportLabel(e.key, rec.secret), fields: e.merge!.kept! })),
     governance: rec.governance,
     notes: [...rec.notes, ...droppedNote([...latest.values()].reduce((n, e) => n + (e.annotationsDropped ?? 0), 0))],
+    created: { collectionIds: [...rec.createdCollectionIds], tagIds: [...rec.createdTagIds] },
   };
   return report;
 }

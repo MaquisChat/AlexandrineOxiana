@@ -171,27 +171,16 @@ function OutsideFiles({ outside, approvals, onApprovals }: { outside: ScanSummar
               </span>
             </label>
             <ul className="ao-import__outside-files">
-              {files.map((f) =>
-                f.file ? (
-                  <li key={`file:${f.file}`}>
-                    <label className="ao-import__choice">
-                      <input
-                        type="checkbox"
-                        checked={folderOn || approvals.files.includes(f.file)}
-                        disabled={folderOn}
-                        onChange={(e) => onApprovals(toggle("files", f.file!, e.target.checked))}
-                      />
-                      <span>
-                        Approve <UserText>{f.file}</UserText> (<UserText>{f.item}</UserText>)
-                      </span>
-                    </label>
-                  </li>
-                ) : (
-                  <li key={`item:${f.item}`}>
-                    <UserText>{f.item}</UserText> <span className="ao-import__hint">(approve the folder to include this file)</span>
-                  </li>
-                ),
-              )}
+              {files.map((f) => (
+                <li key={`file:${f.file}`}>
+                  <label className="ao-import__choice">
+                    <input type="checkbox" checked={folderOn || approvals.files.includes(f.file)} disabled={folderOn} onChange={(e) => onApprovals(toggle("files", f.file, e.target.checked))} />
+                    <span>
+                      Approve <UserText>{f.file}</UserText> (<UserText>{f.item}</UserText>)
+                    </span>
+                  </label>
+                </li>
+              ))}
             </ul>
           </fieldset>
         );

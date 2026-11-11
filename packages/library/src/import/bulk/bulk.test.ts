@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { MockAgent } from "undici";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ExifTool } from "exiftool-vendored";
-import type { AuditEvent, Project, SourceDraft } from "@ao/core";
+import { primary, type AuditEvent, type Project, type SourceDraft } from "@ao/core";
 import { FIXTURE_DOI, buildCameraTiff, buildImportFolder, buildPdf, buildZip, type ImportFolderFixture } from "../../../../../tests/fixtures/generate.mjs";
 import { LOCATION_REASON, createAttach } from "../attach.js";
 import { ProxyQueue } from "../proxies.js";
@@ -801,6 +801,47 @@ const folderWith = async (name: string, files: Record<string, Buffer>) => {
   for (const [n, b] of Object.entries(files)) await writeFile(join(dir, n), b);
   return dir;
 };
+
+describe("screens integration (R118 d): what the batch created", () => {
+  it("the report and the batch list name the collections and tags the batch created (and only those)", async () => {
+    const p = await project();
+    const already = await repo.createCollection(p.id, "Fieldwork");
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const { collections } = await projectCollectionsAndTags(repo, p.id);
+    const made = collections.filter((c) => c.id !== already.id).map((c) => c.id).sort();
+    expect(made.length).toBeGreaterThan(0);
+    const report = await bulk.batchReport(p.id, h.batchId);
+    expect([...report.created.collectionIds].sort()).toEqual(made);
+    expect(report.created.collectionIds).not.toContain(already.id);
+    expect(report.created.tagIds).toEqual([]);
+    const listed = (await bulk.listBatches(p.id))[0]!;
+    expect([...listed.created.collectionIds].sort()).toEqual(made);
+
+    const p2 = await project();
+    const { handle: h2 } = await run(p2, folderAdapter(folder), { structure: "tags" });
+    const tags = (await projectCollectionsAndTags(repo, p2.id)).tags.map((t) => t.id).sort();
+    const r2 = await bulk.batchReport(p2.id, h2.batchId);
+    expect([...r2.created.tagIds].sort()).toEqual(tags);
+    expect(r2.created.collectionIds).toEqual([]);
+  });
+});
+
+describe("screens integration (R118 f): review items carry their title", () => {
+  it("listReview gives each item the current title of its source", async () => {
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const review = await bulk.listReview(p.id, h.batchId);
+    expect(review.length).toBeGreaterThan(0);
+    for (const e of review) {
+      const sf = await repo.getSource(p.id, e.sourceId!);
+      expect(e.title).toBe(primary(sf.source.title));
+    }
+    // A later edit shows: the title is read when listed, not stored with the entry.
+    const first = review[0]!;
+    await repo.updateSource(p.id, first.sourceId!, { title: { variants: [{ lang: "en", kind: "original", value: "Corrected Title" }] } });
+    expect((await bulk.listReview(p.id, h.batchId)).find((e) => e.id === first.id)!.title).toBe("Corrected Title");
+  });
+});
 
 describe("review round 1: undo (R61)", () => {
   it("keeps a batch tag and a batch collection that the user put to use, and says so", async () => {

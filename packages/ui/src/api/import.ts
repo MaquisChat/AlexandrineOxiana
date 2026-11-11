@@ -54,7 +54,8 @@ export interface ScanSummary {
    * label and the folder the file is in. `file` (the file's own path) is used for per-file approval
    * when the service sends it; today's service sends only item and folder.
    */
-  outsideFiles: Array<{ item: string; folder: string; file?: string }>;
+  /** `file` is the file's real path: what approving that one file names (R118). */
+  outsideFiles: Array<{ item: string; folder: string; file: string }>;
 }
 
 export type BatchState = "running" | "paused" | "cancelled" | "finished" | "failed" | "undone" | "interrupted";
@@ -93,6 +94,7 @@ export interface ImportReport {
   keptFields: Array<{ item: string; fields: string[] }>;
   governance: GovernanceNote[];
   notes: string[];
+  created?: CreatedByBatch;
 }
 
 export interface BatchSummary {
@@ -103,6 +105,14 @@ export interface BatchSummary {
   startedAt: string;
   finishedAt?: string;
   counts: { created: number; merged: number; skipped: number; failed: number; needsReview: number };
+  /** The collections and tags this batch created, by id (R118); absent from an older service. */
+  created?: CreatedByBatch;
+}
+
+/** What a batch created (R118): an undo removes those nobody else used, so some may be gone. */
+export interface CreatedByBatch {
+  collectionIds: string[];
+  tagIds: string[];
 }
 
 export interface UndoResult {
@@ -139,6 +149,8 @@ export interface ReviewItem {
   duplicateOf?: { sourceId: string; reason: string };
   hints?: string[];
   batchId?: string;
+  /** The source's current title, sent with the item (R118); the source itself is fetched only when it is missing. */
+  title?: string;
 }
 
 export type ReviewDecision =
@@ -259,12 +271,6 @@ function id(kind: "project" | "batch", s: string): string {
 }
 const pid = (s: string) => id("project", s);
 const bid = (s: string) => id("batch", s);
-
-/** When a UUIDv7 id was minted (ms since 1970), or undefined for anything else. */
-export function idTime(s: string): number | undefined {
-  if (!isValidId(s)) return undefined;
-  return parseInt(s.slice(0, 8) + s.slice(9, 13), 16);
-}
 
 /**
  * The import-relevant reading of a project's governance.yaml. Unreadable rules count as the

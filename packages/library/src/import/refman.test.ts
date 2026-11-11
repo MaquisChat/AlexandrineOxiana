@@ -1145,7 +1145,7 @@ processing:
       const p = await project();
       const s = await bulkImport().dryRun(p.id, bibtexAdapter(bib));
       // Dry-run labels have no HMAC tag (there is no batch secret yet; R70).
-      expect(s.outsideFiles).toEqual([{ item: "outref", folder: await realpath(outside) }]);
+      expect(s.outsideFiles).toEqual([{ item: "outref", folder: await realpath(outside), file: await realpath(outsidePdf) }]);
     });
 
     it("without approval the item imports metadata-only with a note", async () => {
@@ -1191,7 +1191,7 @@ processing:
       const linkBib = await writeExport("link.bib", "@article{linkref, title={Linked Reference}, author={Doe, J.}, file={files/link.pdf}}\n");
       const p = await project();
       const bulk = bulkImport();
-      expect((await bulk.dryRun(p.id, bibtexAdapter(linkBib))).outsideFiles).toEqual([{ item: expect.stringContaining("linkref"), folder: await realpath(outside) }]);
+      expect((await bulk.dryRun(p.id, bibtexAdapter(linkBib))).outsideFiles).toEqual([{ item: expect.stringContaining("linkref"), folder: await realpath(outside), file: await realpath(outsidePdf) }]);
       await (await bulk.startBatch(p.id, bibtexAdapter(linkBib))).done;
       expect((await sourceOf(p, "linkref")).assets).toEqual([]);
     });
@@ -1203,7 +1203,7 @@ processing:
       await symlink(outsidePdf, join(scanned, "link.pdf"));
       const p = await project();
       const bulk = bulkImport();
-      expect((await bulk.dryRun(p.id, folderAdapter(scanned))).outsideFiles).toEqual([{ item: "link.pdf", folder: await realpath(outside) }]);
+      expect((await bulk.dryRun(p.id, folderAdapter(scanned))).outsideFiles).toEqual([{ item: "link.pdf", folder: await realpath(outside), file: await realpath(outsidePdf) }]);
       const r = await (await bulk.startBatch(p.id, folderAdapter(scanned))).done;
       expect(r.counts.failed).toBe(1);
       expect(repo.listSourceIds(p.id)).toHaveLength(1);

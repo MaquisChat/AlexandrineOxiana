@@ -1765,3 +1765,38 @@ describe("screens integration (R118): workspace tags", () => {
     expect(r.json.error.message).toContain("Clinic");
   });
 });
+
+describe("screens integration (R118): import routes", () => {
+  beforeEach(() => start());
+
+  it("(d, e, f) dry-run outside files carry their real path; report and batch list name what the batch created; review items carry titles", async () => {
+    const { mkdir, realpath, symlink } = await import("node:fs/promises");
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = await pdfFolder(2, "scan");
+    await mkdir(join(dir, "Chapter"), { recursive: true });
+    await writeFile(join(dir, "Chapter", "c.pdf"), await buildPdf({ title: "Chapter Notes on Delta Kinship", author: "Ana Souza", lines: ["c"] }));
+    const outside = await fixturePdf("elsewhere.pdf", "Elsewhere Paper on River Trade");
+    if (process.platform !== "win32") await symlink(outside, join(dir, "link.pdf"));
+
+    const dry = await call({ method: "POST", url: `/projects/${pid}/import/dry-run`, body: { adapter: { kind: "folder", path: dir } } });
+    expect(dry.status, dry.body).toBe(200);
+    if (process.platform !== "win32") expect(dry.json.outsideFiles).toEqual([{ item: "link.pdf", folder: await realpath(dirname(outside)), file: await realpath(outside) }]);
+
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir }, options: { structure: "collections" } } })).json;
+    await svc.state.idle();
+    const collections = (await call({ url: `/projects/${pid}/collections` })).json.collections as Array<{ id: string; name: string }>;
+    const chapter = collections.find((c) => c.name === "Chapter")!;
+    const report = await call({ url: `/imports/${batchId}/report` });
+    expect(report.status, report.body).toBe(200);
+    expect(report.json.created).toEqual({ collectionIds: [chapter.id], tagIds: [] });
+    expect((await call({ url: `/projects/${pid}/imports` })).json.batches[0].created).toEqual({ collectionIds: [chapter.id], tagIds: [] });
+
+    const review = (await call({ url: `/imports/${batchId}/review` })).json.items as Array<{ sourceId?: string; title?: string }>;
+    expect(review.length).toBeGreaterThan(0);
+    for (const item of review) {
+      const sf = (await call({ url: `/projects/${pid}/sources/${item.sourceId}` })).json;
+      expect(item.title).toBe(sf.source.title.variants[0].value);
+    }
+  });
+});

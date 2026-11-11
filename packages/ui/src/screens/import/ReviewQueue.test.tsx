@@ -45,7 +45,17 @@ const idAt = (iso: string, n: number) => {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-7000-8000-${n.toString(16).padStart(12, "0")}`;
 };
 
-const BATCH = { batchId: B1, number: 4, kind: "folder", state: "finished", startedAt: "2026-11-11T10:00:00.000Z", finishedAt: "2026-11-11T10:20:00.000Z", counts: { created: 3, merged: 0, skipped: 0, failed: 0, needsReview: 3 } };
+const BATCH = {
+  batchId: B1,
+  number: 4,
+  kind: "folder",
+  state: "finished",
+  startedAt: "2026-11-11T10:00:00.000Z",
+  finishedAt: "2026-11-11T10:20:00.000Z",
+  counts: { created: 3, merged: 0, skipped: 0, failed: 0, needsReview: 3 },
+  // The collection and tag the R64 tests' batch made (idAt 10:05 n=1, 10:06 n=3).
+  created: { collectionIds: [idAt("2026-11-11T10:05:00.000Z", 1)], tagIds: [idAt("2026-11-11T10:06:00.000Z", 3)] },
+};
 
 const BASE: ServiceSetup = {
   review: [
@@ -208,6 +218,35 @@ describe("Review queue", () => {
       expect(within(preview).getAllByText(/participants' names/i).length).toBeGreaterThan(0);
     });
 
+    it("flags by the ids the batch reports it created, not by when an id was minted (R118)", async () => {
+      // Made during the batch's run but not by it (another window), and made by it but with an id outside its run.
+      const sameTime = idAt("2026-11-11T10:07:00.000Z", 4);
+      const ours = idAt("2026-09-01T09:00:00.000Z", 5);
+      setup({
+        ...flagged,
+        batches: [{ ...BATCH, created: { collectionIds: [ours], tagIds: [] } }],
+        collections: [{ id: sameTime, name: "Someone else's" }, { id: ours, name: "Amina Rahimi" }],
+        tags: [],
+        sources: { s1: source(1, "Interview 3", { collectionIds: [sameTime] }) },
+      });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      await within(preview).findByText("Someone else's");
+      expect(within(preview).queryByText(/collection names come from folder names/i)).toBeNull();
+    });
+
+    it("flags a collection whose id the batch reports as created", async () => {
+      const ours = idAt("2026-09-01T09:00:00.000Z", 5);
+      setup({
+        ...flagged,
+        batches: [{ ...BATCH, created: { collectionIds: [ours], tagIds: [] } }],
+        collections: [{ id: ours, name: "Amina Rahimi" }],
+        tags: [],
+        sources: { s1: source(1, "Interview 3", { collectionIds: [ours] }) },
+      });
+      const preview = await screen.findByRole("region", { name: "Imported record" });
+      expect(await within(preview).findByText(/collection names come from folder names/i)).toBeTruthy();
+    });
+
     it("does not flag collections and tags that existed before the batch", async () => {
       setup({ ...flagged, sources: { s1: source(1, "Interview 3", { collectionIds: [older], tagIds: [] }) } });
       const preview = await screen.findByRole("region", { name: "Imported record" });
@@ -231,7 +270,19 @@ describe("Review queue", () => {
     });
   });
 
-  it("loads titles six at a time, the current item first, and it can be acted on early", async () => {
+  it("shows the titles the service sends at once; only the shown item's record is fetched (R118)", async () => {
+    const n = 300;
+    const review = Array.from({ length: n }, (_, i) => item(i + 1, { title: `Listed paper ${i + 1}` }));
+    const sources = Object.fromEntries(review.map((r, i) => [r.sourceId!, source(i + 1, `Listed paper ${i + 1}`)]));
+    const { m } = setup({ review, sources });
+    expect(await screen.findByRole("checkbox", { name: "Select Listed paper 300" })).toBeTruthy();
+    await within(screen.getByRole("region", { name: "Imported record" })).findByText("Listed paper 1");
+    await new Promise((r) => setTimeout(r, 200));
+    const fetched = m.calls.filter((c) => c.method === "GET" && /\/sources\/s\d+$/.test(c.path)).map((c) => c.path);
+    expect(fetched).toEqual([expect.stringMatching(/\/sources\/s1$/)]);
+  });
+
+  it("loads titles six at a time (items sent without a title), the current item first, and it can be acted on early", async () => {
     const n = 2000;
     const review = Array.from({ length: n }, (_, i) => item(i + 1));
     const sources = Object.fromEntries(review.map((r, i) => [r.sourceId!, source(i + 1, `Paper ${i + 1}`)]));

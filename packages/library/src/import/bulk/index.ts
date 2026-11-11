@@ -2,7 +2,7 @@
 import type { ImportOptionsInput } from "@ao/core";
 import type { ReviewEntry } from "../../repo/review.js";
 import { batchReport, type ImportReport } from "./report.js";
-import { bulkEditReview, decideReview, listReview, type ReviewDecision, type ReviewPatch } from "./review.js";
+import { bulkEditReview, decideReview, listReview, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "./review.js";
 import {
   dryRun,
   listBatches,
@@ -24,7 +24,7 @@ export interface BulkImport {
   /** Folder, ZIP, reference-manager export and Calibre batches find their source from the record; other kinds need the adapter. */
   resumeBatch(projectId: string, batchId: string, adapter?: ImportSourceAdapter): Promise<BatchHandle>;
   listBatches(projectId: string): Promise<BatchSummary[]>;
-  listReview(projectId: string, batchId: string): Promise<ReviewEntry[]>;
+  listReview(projectId: string, batchId: string): Promise<ListedReviewEntry[]>;
   decideReview(projectId: string, itemId: string, decision: ReviewDecision): Promise<void>;
   bulkEditReview(projectId: string, itemIds: string[], patch: ReviewPatch): Promise<void>;
   batchReport(projectId: string, batchId: string): Promise<ImportReport>;

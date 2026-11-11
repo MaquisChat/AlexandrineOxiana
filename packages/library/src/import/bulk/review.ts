@@ -12,7 +12,7 @@
  *   keep-both         keep the source as it is
  */
 import { join } from "node:path";
-import { BIBLIO_FIELDS, biblioOf, newId, recheckSourceFile, type FieldEvidence, type LookupEvidence, type SourceDraft, type SourceFile, type SourceType } from "@ao/core";
+import { BIBLIO_FIELDS, biblioOf, newId, primary, recheckSourceFile, type FieldEvidence, type LookupEvidence, type SourceDraft, type SourceFile, type SourceType } from "@ao/core";
 import { NotFoundError } from "../../repo/errors.js";
 import type { ReviewEntry } from "../../repo/review.js";
 import { storeRequest } from "../../repo/sources.js";
@@ -37,8 +37,28 @@ export interface ReviewPatch {
 }
 
 /** Pending review entries of one batch. */
-export async function listReview(repo: Repo, projectId: string, batchId: string): Promise<ReviewEntry[]> {
-  return (await projectReviewEntries(repo, projectId)).filter((e) => e.batchId === batchId && e.status === "pending");
+/** A pending review item as listed: the entry plus its source's current title (R118), when it has a source that can be read. */
+export type ListedReviewEntry = ReviewEntry & { title?: string };
+
+export async function listReview(repo: Repo, projectId: string, batchId: string): Promise<ListedReviewEntry[]> {
+  const entries = (await projectReviewEntries(repo, projectId)).filter((e) => e.batchId === batchId && e.status === "pending");
+  // The title is read now (a review decision or edit may have changed it), a few sources at a time.
+  const out: ListedReviewEntry[] = entries.map((e) => ({ ...e }));
+  let next = 0;
+  const worker = async () => {
+    for (let i = next++; i < out.length; i = next++) {
+      const e = out[i]!;
+      if (!e.sourceId) continue;
+      try {
+        const title = primary((await repo.getSource(projectId, e.sourceId)).source.title);
+        if (title) e.title = title;
+      } catch {
+        // a source that cannot be read is listed without its title
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, out.length) }, worker));
+  return out;
 }
 
 async function pendingEntry(repo: Repo, projectId: string, itemId: string): Promise<ReviewEntry & { sourceId: string }> {
