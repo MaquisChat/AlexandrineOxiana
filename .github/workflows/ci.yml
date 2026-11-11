@@ -66,6 +66,13 @@ jobs:
       - name: Browser extension end-to-end tests
         if: matrix.python == '3.13'
         run: pnpm e2e -- --extension-only --trace off
+      # The app end to end (e2e/): the built UI, the real service and media worker, in Chromium and WebKit.
+      - name: Install WebKit for the app end-to-end tests
+        if: matrix.python == '3.13'
+        run: pnpm --filter @ao/e2e exec playwright install --with-deps webkit
+      - name: App end-to-end tests
+        if: matrix.python == '3.13'
+        run: pnpm e2e -- --app-only --trace off
       - run: pnpm report
         if: always()
       - uses: actions/upload-artifact@v4

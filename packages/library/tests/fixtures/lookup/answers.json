@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "answers": {
+    "https://api.crossref.org/works/10.5555/ao.fixture.2021.001": { "status": 200, "file": "crossref-work.json" },
+    "https://api.openalex.org/works/doi:10.5555/ao.fixture.2021.001": { "status": 200, "file": "openalex-work.json" }
+  }
+}

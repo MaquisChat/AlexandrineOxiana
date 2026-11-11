@@ -1,8 +1,8 @@
 // Plain-language test report.
 // Turns Vitest / pytest / Playwright results into reports/test-report.md.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { basename, resolve, dirname } from "node:path";
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // EDIT ME: map a test file name to the plain-language area it checks.
@@ -19,6 +19,7 @@ export const AREA_NAMES = {
   "library.test.ts": "Library folder",
   "test-report.test.mjs": "Test report",
   "e2e-args.test.mjs": "End-to-end test arguments",
+  "recorded.test.ts": "Recorded lookup answers (test mode)",
 };
 
 export function areaName(file) {
@@ -58,25 +59,99 @@ function fromPytest(xml) {
   return out;
 }
 
-function fromPlaywright(json) {
-  const out = [];
-  const walk = (suite, file) => {
-    const f = suite.file ?? file;
-    for (const spec of suite.specs ?? []) {
-      const ok = (spec.tests ?? []).every((t) => ["expected", "skipped"].includes(t.status));
-      out.push({ area: areaName(spec.file ?? f ?? "end-to-end"), name: spec.title, passed: ok });
+/** Where the app's end-to-end results (e2e/, run by `pnpm e2e`) are listed. */
+export const APP_E2E_AREA = "The app end to end";
+
+// A spec passes only when at least one of its tests ran and every one that ran passed; specs whose
+// tests were all skipped are left out (as skipped unit tests are). A spec with no test at all, a spec
+// file containing none, and a run that found no tests or could not start are failures, never passes.
+// `playwright test` options that take a value (so the value is not a spec-file filter).
+const PW_VALUE_OPTIONS = new Set(["-c", "--config", "--project", "--trace", "--workers", "-j", "--reporter", "--shard", "--timeout", "--retries", "--repeat-each", "--max-failures", "--output", "--global-timeout", "--update-snapshots", "--update-source-method", "--tsconfig", "--browser"]);
+// Options that leave out tests on purpose: then a file without results is not a finding.
+const PW_NARROWING = new Set(["-g", "--grep", "--grep-invert", "--last-failed", "--only-changed", "--tag"]);
+
+/** Whether the run recorded in `config.argv` was asked for every test (no file filter, no grep). */
+function unfiltered(argv) {
+  const i = argv.indexOf("test");
+  if (i < 0) return false;
+  const rest = argv.slice(i + 1);
+  for (let k = 0; k < rest.length; k++) {
+    const a = rest[k];
+    const name = a.split("=")[0];
+    if (PW_NARROWING.has(name)) return false;
+    if (PW_VALUE_OPTIONS.has(name)) {
+      if (!a.includes("=")) k++;
+      continue;
     }
-    for (const s of suite.suites ?? []) walk(s, f);
+    if (!a.startsWith("-")) return false; // a spec file or path filter
+  }
+  return true;
+}
+
+/** Spec files Playwright would pick up by default under `dir` (*.spec.* / *.test.*, js or ts). */
+function specFilesOnDisk(dir) {
+  const out = [];
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(spec|test)\.[cm]?[jt]sx?$/.test(e.name)) out.push(p);
+    }
   };
-  for (const s of json.suites ?? []) walk(s);
+  walk(dir);
   return out;
 }
 
-export function buildReport(results = {}) {
+function fromPlaywright(json, area, listSpecFiles = specFilesOnDisk) {
+  const out = [];
+  const areaOf = (file) => area ?? areaName(file ?? "end-to-end");
+  const walk = (suite, file) => {
+    const f = suite.file ?? file;
+    for (const spec of suite.specs ?? []) {
+      const tests = spec.tests ?? [];
+      const ran = tests.filter((t) => t.status !== "skipped");
+      if (tests.length && !ran.length) continue;
+      out.push({ area: areaOf(spec.file ?? f), name: spec.title, passed: ran.length > 0 && ran.every((t) => t.status === "expected") });
+    }
+    for (const s of suite.suites ?? []) walk(s, f);
+    // A file's own suite with nothing in it: the spec file contains no tests.
+    if (suite.file && !file && !(suite.specs ?? []).length && !(suite.suites ?? []).length) {
+      out.push({ area: areaOf(suite.file), name: `${basename(suite.file)} contains no tests`, passed: false });
+    }
+  };
+  for (const s of json.suites ?? []) walk(s);
+  // Playwright leaves a spec file with no tests out of its results entirely: compare with the disk.
+  const cfg = json.config;
+  if (cfg?.rootDir && Array.isArray(cfg.argv) && unfiltered(cfg.argv)) {
+    const reported = new Set((json.suites ?? []).map((s) => s.file).filter(Boolean));
+    const dirs = [...new Set((cfg.projects ?? []).map((p) => p.testDir).filter(Boolean))];
+    const files = [...new Set(dirs.flatMap((d) => listSpecFiles(d)))].map((f) => relative(cfg.rootDir, f).split(sep).join("/"));
+    for (const f of files.sort()) if (!reported.has(f)) out.push({ area: areaOf(f), name: `${basename(f)} contains no tests`, passed: false });
+  }
+  for (const e of json.errors ?? []) {
+    const msg = String(e?.message ?? e?.value ?? "unknown error").split("\n")[0];
+    out.push({ area: areaOf(), name: `Playwright could not run the tests: ${msg}`, passed: false });
+  }
+  if (!out.length && !(json.suites ?? []).length) out.push({ area: areaOf(), name: "no tests ran", passed: false });
+  return out;
+}
+
+/** `opts.listSpecFiles(dir)`: the spec files under a Playwright testDir (default: read from disk). */
+export function buildReport(results = {}, opts = {}) {
+  const list = opts.listSpecFiles;
   const checks = [
     ...(results.vitest ? fromVitest(results.vitest) : []),
     ...(results.pytest ? fromPytest(results.pytest) : []),
-    ...(results.playwright ? fromPlaywright(results.playwright) : []),
+    ...(results.playwrightExtension ? fromPlaywright(results.playwrightExtension, undefined, list) : []),
+    ...(results.playwrightApp ? fromPlaywright(results.playwrightApp, APP_E2E_AREA, list) : []),
+    ...(results.playwright ? fromPlaywright(results.playwright, undefined, list) : []),
   ];
   const lines = ["# Test report", ""];
   if (checks.length === 0) {
@@ -113,6 +188,8 @@ function main() {
   const md = buildReport({
     vitest: json("vitest.json"),
     pytest: read("pytest.xml"),
+    playwrightExtension: json("playwright-extension.json"),
+    playwrightApp: json("playwright-app.json"),
     playwright: json("playwright.json"),
   });
   mkdirSync(dir, { recursive: true });
