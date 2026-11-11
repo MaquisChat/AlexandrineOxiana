@@ -1,0 +1,124 @@
+/**
+ * Choose a library (spec 4.5 "Multiple libraries"): the registered libraries with where each was
+ * last seen, opened at its last known place; one that is not there goes to "Library not found".
+ * A library can also be opened, or created, at a typed folder (the desktop shell's folder picker
+ * arrives with Task 37).
+ */
+import { useEffect, useId, useState, type FormEvent } from "react";
+import { ApiClientError } from "../api/client";
+import type { CurrentLibrary, LibraryApi, LibraryEntry } from "../api/library";
+import { UserText } from "../components/UserText";
+import "../components/library.css";
+
+export interface LibraryChooserProps {
+  api: Pick<LibraryApi, "libraries">;
+  onOpened: (current: CurrentLibrary) => void;
+  onNotFound: (library: LibraryEntry) => void;
+}
+
+const message = (err: unknown, fallback: string) => (err instanceof ApiClientError ? err.message : fallback);
+const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+
+export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProps) {
+  const [libraries, setLibraries] = useState<LibraryEntry[] | undefined>();
+  const [error, setError] = useState<string | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [path, setPath] = useState("");
+  const [name, setName] = useState("");
+  const id = useId();
+
+  useEffect(() => {
+    let live = true;
+    api.libraries
+      .list()
+      .then((r) => live && setLibraries(r.libraries))
+      .catch((err: unknown) => {
+        if (!live) return;
+        setLibraries([]);
+        setError(message(err, "The list of libraries could not be read."));
+      });
+    return () => {
+      live = false;
+    };
+  }, [api]);
+
+  const open = async (entry: LibraryEntry) => {
+    const at = entry.lastKnownPaths[0];
+    if (!at) return onNotFound(entry);
+    setBusy(true);
+    setError(undefined);
+    try {
+      onOpened(await api.libraries.open(at));
+    } catch (err) {
+      if (err instanceof ApiClientError && (err.code === "NOT_FOUND" || err.code === "LIBRARY_OFFLINE" || err.code === "VALIDATION")) onNotFound(entry);
+      else setError(message(err, "The library could not be opened."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openTyped = async (e: FormEvent, create: boolean) => {
+    e.preventDefault();
+    const p = path.trim();
+    if (!isAbsolute(p)) return setError("Give the library folder's full path, for example /Users/you/Research library or D:\\Research library.");
+    if (create && !name.trim()) return setError("Give the new library a name.");
+    setBusy(true);
+    setError(undefined);
+    try {
+      onOpened(create ? await api.libraries.create(p, name.trim()) : await api.libraries.open(p));
+    } catch (err) {
+      setError(message(err, create ? "The library could not be created." : "The library could not be opened."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <main className="ao-page">
+      <h1>Choose a library</h1>
+      {libraries === undefined ? (
+        <p aria-live="polite">Loading libraries…</p>
+      ) : libraries.length === 0 ? (
+        <p>No libraries yet. Open a library folder, or create a new library below.</p>
+      ) : (
+        <ul aria-label="Libraries" className="ao-plain-list">
+          {libraries.map((l) => (
+            <li key={l.libraryId} className="ao-card">
+              <h2 className="ao-pane-title">
+                <UserText>{l.name}</UserText>
+              </h2>
+              {l.lastKnownPaths[0] && (
+                <p className="ao-path">
+                  <UserText>{l.lastKnownPaths[0]}</UserText>
+                </p>
+              )}
+              <button type="button" disabled={busy} aria-label={`Open ${l.name}`} onClick={() => void open(l)}>
+                Open
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {error && (
+        <p role="alert" className="ao-error">
+          {error}
+        </p>
+      )}
+      <h2 className="ao-pane-title">Another library</h2>
+      <form className="ao-inline-form" onSubmit={(e) => void openTyped(e, false)}>
+        <label htmlFor={`${id}-path`}>Library folder</label>
+        <input id={`${id}-path`} dir="auto" value={path} onChange={(e) => setPath(e.target.value)} />
+        <button type="submit" disabled={busy}>
+          Open library
+        </button>
+      </form>
+      <form className="ao-inline-form" onSubmit={(e) => void openTyped(e, true)}>
+        <label htmlFor={`${id}-name`}>New library name</label>
+        <input id={`${id}-name`} dir="auto" value={name} onChange={(e) => setName(e.target.value)} />
+        <button type="submit" disabled={busy}>
+          Create a new library in that folder
+        </button>
+      </form>
+    </main>
+  );
+}

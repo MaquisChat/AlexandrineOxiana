@@ -27,8 +27,8 @@ describe("CitePanel", () => {
         return HttpResponse.json({ text: "(Smith, 2019, p. 4)" });
       }),
     );
+    const user = userEvent.setup(); // installs its own clipboard: stubbed after it
     const writeText = stubClipboard();
-    const user = userEvent.setup();
     render(<CitePanel api={testApi()} projectId="p1" sourceIds={["s1"]} />);
     await user.click(screen.getByRole("button", { name: "Copy citation" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("(Smith, 2019, p. 4)"));
@@ -50,8 +50,8 @@ describe("CitePanel", () => {
         return HttpResponse.json({ text: "Smith 2019" });
       }),
     );
+    const user = userEvent.setup(); // installs its own clipboard: stubbed after it
     const writeText = stubClipboard();
-    const user = userEvent.setup();
     render(<CitePanel api={testApi()} projectId="p1" sourceIds={["s1"]} />);
     await user.type(screen.getByRole("combobox", { name: "Citation style" }), "chicago");
     await waitFor(() => expect(queries).toContain("chicago"));
@@ -65,8 +65,8 @@ describe("CitePanel", () => {
 
   it("a refusal from the service is shown and nothing is copied", async () => {
     server.use(http.post(url("/cite"), () => HttpResponse.json({ error: { code: "POLICY_DENIED", message: "This source is withheld from citations by the project's rules." } }, { status: 403 })));
+    const user = userEvent.setup(); // installs its own clipboard: stubbed after it
     const writeText = stubClipboard();
-    const user = userEvent.setup();
     render(<CitePanel api={testApi()} projectId="p1" sourceIds={["s1"]} />);
     await user.click(screen.getByRole("button", { name: "Copy citation" }));
     expect((await screen.findByRole("alert")).textContent).toContain("withheld from citations");

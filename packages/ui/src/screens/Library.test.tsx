@@ -52,12 +52,13 @@ describe("Library screen", () => {
 
   it("typing in search asks GET …/sources?text= once, 250 ms after the last key", async () => {
     const seen: Array<{ text: string | null; at: number }> = [];
+    // The first matching handler wins: the recording one goes before the fixtures.
     server.use(
-      ...libraryHandlers(),
       http.get(url("/projects/:id/sources"), ({ request }) => {
         seen.push({ text: new URL(request.url).searchParams.get("text"), at: Date.now() });
         return HttpResponse.json(SOURCES);
       }),
+      ...libraryHandlers(),
     );
     const user = userEvent.setup();
     renderLibrary();

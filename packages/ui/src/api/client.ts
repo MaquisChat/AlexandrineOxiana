@@ -78,6 +78,11 @@ export interface ApiClient {
     get(): Promise<AppearanceSettings>;
     put(patch: AppearancePatch): Promise<AppearanceSettings>;
   };
+  /**
+   * A streamed NDJSON response (e.g. POST /libraries/locate): each line parsed as JSON, yielded as it
+   * arrives, until the stream ends or `signal` aborts. Same URL, header and error rules as request().
+   */
+  ndjson<T>(method: Method, path: string, opts?: RequestOptions): AsyncGenerator<T, void, undefined>;
   /** Server-sent events from GET /events, until the stream ends or `signal` aborts. */
   events(opts?: { signal?: AbortSignal }): AsyncGenerator<ServiceEvent, void, undefined>;
 }
@@ -274,6 +279,64 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     return send<T>(method, url, o);
   }
 
+  async function* ndjson<T>(method: Method, path: string, o: RequestOptions = {}): AsyncGenerator<T, void, undefined> {
+    const url = urlFor(path, o.query);
+    const headers: Record<string, string> = { ...auth, Accept: "application/x-ndjson" };
+    const init: RequestInit = { method, headers };
+    if (o.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(o.body);
+    }
+    if (o.signal) init.signal = o.signal;
+    let res: Response;
+    try {
+      res = await doFetch(url, init);
+    } catch (err) {
+      if (o.signal?.aborted) return;
+      throw err instanceof ApiClientError ? err : unreachable();
+    }
+    if (!res.ok) throw await errorFrom(res);
+    if (!res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const parse = (line: string): T => {
+      try {
+        return JSON.parse(line) as T;
+      } catch {
+        throw unexpected(res.status);
+      }
+    };
+    try {
+      for (;;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (err) {
+          if (o.signal?.aborted) return;
+          throw err;
+        }
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        let nl = buf.indexOf("\n");
+        while (nl >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line) yield parse(line);
+          if (o.signal?.aborted) return;
+          nl = buf.indexOf("\n");
+        }
+        if (buf.length > MAX_SSE_EVENT_BYTES) {
+          throw new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The library service sent a line larger than 1 MB; the stream was closed." });
+        }
+      }
+      const rest = (buf + decoder.decode()).trim();
+      if (rest) yield parse(rest);
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+  }
+
   async function* events(o: { signal?: AbortSignal } = {}): AsyncGenerator<ServiceEvent, void, undefined> {
     const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "text/event-stream" } };
     if (o.signal) init.signal = o.signal;
@@ -316,6 +379,7 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
       get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),
     },
+    ndjson,
     events,
   };
 }
