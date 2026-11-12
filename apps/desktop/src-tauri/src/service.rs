@@ -81,10 +81,40 @@ pub fn parse_ready_line(line: &str) -> Option<u16> {
     rest.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
-/// A start-up refusal the service printed: its own plain sentence (they never carry a path or the token, R96).
+/// A start-up refusal the service printed: its own plain sentence (it never carries the token,
+/// R96, R98), with any file-system path in it replaced, since a system error can name one.
 fn plain_reason(line: &str) -> Option<String> {
     let l = line.trim();
-    (l.starts_with("The library service will not start:") || l.starts_with("The library service could not start:")).then(|| l.to_string())
+    (l.starts_with("The library service will not start:") || l.starts_with("The library service could not start:")).then(|| scrub_paths(l))
+}
+
+fn looks_like_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.len() > 1 && b[0] == b'/') || s.starts_with("~/") || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || s.starts_with("\\\\")
+}
+
+/// Replaces quoted and unquoted paths (POSIX, home-relative, Windows) with "[a folder]".
+fn scrub_paths(s: &str) -> String {
+    const PATH: &str = "[a folder]";
+    // Quoted paths first: they may contain spaces.
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find(['\'', '"']) {
+        let q = rest[i..].chars().next().unwrap();
+        out.push_str(&rest[..=i]);
+        let after = &rest[i + 1..];
+        match after.find(q) {
+            Some(j) if looks_like_path(&after[..j]) => {
+                out.push_str(PATH);
+                out.push(q);
+                rest = &after[j + 1..];
+            }
+            _ => rest = after,
+        }
+    }
+    out.push_str(rest);
+    // Then unquoted ones, word by word.
+    out.split(' ').map(|w| if looks_like_path(w) { PATH } else { w }).collect::<Vec<_>>().join(" ")
 }
 
 /// Makes this process the reaper of its orphaned descendants (Linux), so a helper whose parent
@@ -380,6 +410,20 @@ setInterval(() => {}, 1000);
         bad.program = dir.join("no-such-program");
         assert!(matches!(start(&bad, TOKEN, Duration::from_secs(5), quiet()).err().unwrap(), StartError::Spawn));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_names_no_path() {
+        assert_eq!(
+            plain_reason("The library service could not start: EACCES: permission denied, mkdir '/home/r/.config/alexandrine oxiana'").unwrap(),
+            "The library service could not start: EACCES: permission denied, mkdir '[a folder]'"
+        );
+        assert_eq!(
+            plain_reason(r"The library service could not start: EPERM, open C:\Users\r\AppData\x.json").unwrap(),
+            "The library service could not start: EPERM, open [a folder]"
+        );
+        assert_eq!(plain_reason("The library service will not start: NODE_PATH is set.").unwrap(), "The library service will not start: NODE_PATH is set.");
+        assert_eq!(plain_reason("anything else"), None);
     }
 
     #[test]

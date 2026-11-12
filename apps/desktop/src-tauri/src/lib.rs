@@ -42,10 +42,22 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(95);
 
 const APP_NAME: &str = "Alexandrine Oxiana";
 
+/// How long a start-up error window waits for a person before the program exits by itself (its
+/// helpers are already stopped by then); a few seconds in test mode.
+fn fail_window_limit() -> Duration {
+    if test_mode() { Duration::from_secs(3) } else { Duration::from_secs(600) }
+}
+
 #[derive(Default)]
 struct Shell {
     service: Mutex<Option<Service>>,
     stopping: AtomicBool,
+    /// Closing has begun: the helpers are being stopped while the single-instance guard is held.
+    closing: AtomicBool,
+    /// The helpers are confirmed gone: the event loop may now end (and release the guard).
+    helpers_stopped: AtomicBool,
+    /// Someone opened the app again while it was closing: it starts again once the helpers are gone.
+    relaunch: AtomicBool,
     /// Start-up failed: the program exits non-zero however its error window is closed.
     failed: AtomicBool,
 }
@@ -60,7 +72,9 @@ fn log_helper(line: &str) {
     eprintln!("[service] {line}");
 }
 
-/// Shows a plain error window, stops what was started, and exits non-zero.
+/// Reports a start-up failure at once on standard error, stops what was started, shows a plain
+/// error window, and exits non-zero when it is closed or after `fail_window_limit()` unanswered
+/// (so an unattended start, or the launch check, never waits on a window no one sees).
 fn fail(app: &AppHandle, shell: &Shell, message: &str) -> ! {
     eprintln!("{APP_NAME} could not start: {message}");
     if test_mode() {
@@ -72,11 +86,18 @@ fn fail(app: &AppHandle, shell: &Shell, message: &str) -> ! {
     if let Some(mut s) = started {
         s.stop(Duration::from_secs(10));
     }
-    app.dialog()
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let dialog = app
+        .dialog()
         .message(format!("{message}\n\nThe app will close. If this keeps happening, reinstall the app."))
         .title(format!("{APP_NAME} could not start"))
-        .kind(MessageDialogKind::Error)
-        .blocking_show();
+        .kind(MessageDialogKind::Error);
+    std::thread::spawn(move || {
+        dialog.blocking_show();
+        let _ = tx.send(());
+    });
+    // Closed by a person, or unanswered after the limit: exit either way (nothing is left running).
+    let _ = rx.recv_timeout(fail_window_limit());
     std::process::exit(1);
 }
 
@@ -90,17 +111,22 @@ fn launch(app: AppHandle, shell: Arc<Shell>) {
         Ok(d) => d,
         Err(_) => fail(&app, &shell, "The app's data folder could not be found."),
     };
+    // Everything the service keeps lives under the shell's own data folder (R159), whose place is
+    // decided by the app identifier (tauri.conf.json `identifier`, the one place it is defined):
+    // app settings, pairings and the outbox (`settings/`), the tools and the speech models.
+    let config_dir = data.join("settings");
     let tools_dir = data.join("tools");
     let models_dir = data.join("models");
-    let _ = std::fs::create_dir_all(&tools_dir);
-    let _ = std::fs::create_dir_all(&models_dir);
+    for d in [&config_dir, &tools_dir, &models_dir] {
+        let _ = std::fs::create_dir_all(d);
+    }
     let token = match token::new_token() {
         Ok(t) => t,
         Err(m) => fail(&app, &shell, &format!("A new access key could not be made: {m}.")),
     };
     let env = helper_env::service_env(
         std::env::vars_os(),
-        &helper_env::ServiceConfig { worker_bin: helpers.worker_bin.as_deref(), tools_dir: &tools_dir, models_dir: &models_dir },
+        &helper_env::ServiceConfig { worker_bin: helpers.worker_bin.as_deref(), config_dir: &config_dir, tools_dir: &tools_dir, models_dir: &models_dir },
     );
     let launch = Launch { program: helpers.node.clone(), args: service::service_args(&helpers.service_dir), cwd: helpers.service_dir.clone(), env };
     let svc = match service::start(&launch, &token, READY_TIMEOUT, Arc::new(log_helper)) {
@@ -162,7 +188,15 @@ fn watch_service(app: AppHandle, shell: Arc<Shell>) {
     });
 }
 
-fn focus_main(app: &AppHandle) {
+fn focus_main(app: &AppHandle, shell: &Shell) {
+    if shell.closing.load(Ordering::SeqCst) {
+        // Opened again while closing: once the helpers are gone, the app starts again by itself.
+        shell.relaunch.store(true, Ordering::SeqCst);
+        if test_mode() {
+            println!("AO_SHELL_RELAUNCH_REQUESTED");
+        }
+        return;
+    }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
@@ -189,6 +223,10 @@ fn on_termination_signals(app: AppHandle) {
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) != 0 {
             return;
+        }
+        // Close-on-exec: the pipe stays in this process, not in the service or the web view's processes.
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         WRITE_FD = fds[1];
         for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
@@ -224,9 +262,11 @@ pub fn run() {
     service::become_subreaper();
     let shell = Arc::new(Shell::default());
     let setup_shell = shell.clone();
+    let instance_shell = shell.clone();
+    let loop_shell = shell.clone();
     let app = tauri::Builder::default()
         // First, so that a second launch hands over to the first before it starts anything.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| focus_main(app)))
+        .plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| focus_main(app, &instance_shell)))
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -244,21 +284,63 @@ pub fn run() {
             eprintln!("{APP_NAME} could not start its window system.");
             std::process::exit(1);
         });
-    let code = app.run_return(|_app, event| {
-        if let RunEvent::ExitRequested { .. } = event {
-            // The window is gone; the helpers are stopped once the event loop has ended.
+    // Closing (the last window closed, or a termination signal): the exit is held back until the
+    // helpers are confirmed gone, because ending the event loop releases the single-instance guard
+    // (the plugin's cleanup runs on RunEvent::Exit). While the guard is held, a second launch hands
+    // over to this instance, which notes it and starts the app again once the helpers are gone:
+    // never a second service beside a first that is still stopping (which would find the library
+    // in use), and the researcher's "open" is not lost.
+    let code = app.run_return(move |app, event| {
+        if let RunEvent::ExitRequested { api, code, .. } = event {
+            if loop_shell.helpers_stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            api.prevent_exit();
+            if loop_shell.closing.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.hide();
+            }
+            let app = app.clone();
+            let shell = loop_shell.clone();
+            std::thread::spawn(move || {
+                stop_helpers(&shell);
+                shell.helpers_stopped.store(true, Ordering::SeqCst);
+                if shell.relaunch.load(Ordering::SeqCst) {
+                    if test_mode() {
+                        println!("AO_SHELL_RELAUNCHING");
+                    }
+                    app.request_restart();
+                } else {
+                    app.exit(code.unwrap_or(0));
+                }
+            });
         }
     });
+    // Normally already done above; this covers an event loop that ended any other way.
+    stop_helpers(&shell);
+    std::process::exit(if shell.failed.load(Ordering::SeqCst) { 1 } else { code });
+}
+
+/// Stops the service (which stops the worker) and waits for both to be gone (see `Service::stop`).
+fn stop_helpers(shell: &Shell) {
     shell.stopping.store(true, Ordering::SeqCst);
     let taken = shell.service.lock().unwrap().take();
-    if let Some(mut svc) = taken {
-        let how = svc.stop(SHUTDOWN_GRACE);
-        if how == Stopped::Forced {
-            eprintln!("{APP_NAME}: the library service did not stop in time and was stopped forcibly");
-        }
-        if test_mode() {
-            println!("AO_SHELL_STOPPED {}", if how == Stopped::Clean { "clean" } else { "forced" });
+    let Some(mut svc) = taken else { return };
+    if test_mode() {
+        println!("AO_SHELL_CLOSING");
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var("AO_SHELL_TEST_SLOW_STOP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            // The launch check's slowed quit: the helpers keep running a while, as during an import's pause.
+            std::thread::sleep(Duration::from_millis(ms.min(60_000)));
         }
     }
-    std::process::exit(if shell.failed.load(Ordering::SeqCst) { 1 } else { code });
+    let how = svc.stop(SHUTDOWN_GRACE);
+    if how == Stopped::Forced {
+        eprintln!("{APP_NAME}: the library service did not stop in time and was stopped forcibly");
+    }
+    if test_mode() {
+        println!("AO_SHELL_STOPPED {}", if how == Stopped::Clean { "clean" } else { "forced" });
+    }
 }

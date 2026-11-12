@@ -59,6 +59,9 @@ fn passes(name: &OsStr) -> bool {
 pub struct ServiceConfig<'a> {
     /// The packaged media worker (AO_WORKER_BIN); without one the service runs with AO_NO_WORKER=1.
     pub worker_bin: Option<&'a Path>,
+    /// The app settings folder (AO_CONFIG_DIR): settings, pairings, the outbox (R159: under the
+    /// shell's own data folder, so nothing is split across two places).
+    pub config_dir: &'a Path,
     /// The tools folder (AO_TOOLS_DIR): yt-dlp, and ffmpeg/tesseract under `bin/`.
     pub tools_dir: &'a Path,
     /// The speech models folder (AO_MODELS_DIR).
@@ -78,11 +81,12 @@ where
         None => OsString::new(),
     };
     let mut dirs = vec![tools_bin];
-    // An empty entry would mean "the current folder": dropped.
-    dirs.extend(std::env::split_paths(&path).filter(|p| !p.as_os_str().is_empty()));
+    // An empty or relative entry would be looked up from the helper's working folder: dropped.
+    dirs.extend(std::env::split_paths(&path).filter(|p| p.is_absolute()));
     let joined = std::env::join_paths(dirs).unwrap_or(path);
     out.push(("PATH".into(), joined));
     out.push(("AO_SERVICE_PORT".into(), "0".into()));
+    out.push(("AO_CONFIG_DIR".into(), cfg.config_dir.as_os_str().to_owned()));
     out.push(("AO_TOOLS_DIR".into(), cfg.tools_dir.as_os_str().to_owned()));
     out.push(("AO_MODELS_DIR".into(), cfg.models_dir.as_os_str().to_owned()));
     match cfg.worker_bin {
@@ -134,16 +138,19 @@ mod tests {
         let tools = PathBuf::from("/data/tools");
         let models = PathBuf::from("/data/models");
         let worker = PathBuf::from("/app/ao-worker/ao-worker");
-        let env = service_env(parent(), &ServiceConfig { worker_bin: Some(&worker), tools_dir: &tools, models_dir: &models });
+        let settings = PathBuf::from("/data/settings");
+        let env = service_env(parent(), &ServiceConfig { worker_bin: Some(&worker), config_dir: &settings, tools_dir: &tools, models_dir: &models });
         let mut names: Vec<String> = env.iter().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
         names.sort();
         assert_eq!(
             names,
-            ["AO_MODELS_DIR", "AO_SERVICE_PORT", "AO_TOOLS_DIR", "AO_WORKER_BIN", "HOME", "HTTPS_PROXY", "LANG", "LC_TIME", "PATH", "TZ", "XDG_CONFIG_HOME"]
+            ["AO_CONFIG_DIR", "AO_MODELS_DIR", "AO_SERVICE_PORT", "AO_TOOLS_DIR", "AO_WORKER_BIN", "HOME", "HTTPS_PROXY", "LANG", "LC_TIME", "PATH", "TZ", "XDG_CONFIG_HOME"]
         );
         assert_eq!(get(&env, "AO_SERVICE_PORT").unwrap(), "0");
         assert_eq!(get(&env, "AO_WORKER_BIN").unwrap(), "/app/ao-worker/ao-worker");
         assert_eq!(get(&env, "AO_TOOLS_DIR").unwrap(), "/data/tools");
+        // R159: the app settings (pairings, the outbox) live under the shell's own data folder too.
+        assert_eq!(get(&env, "AO_CONFIG_DIR").unwrap(), "/data/settings");
         assert_eq!(get(&env, "AO_MODELS_DIR").unwrap(), "/data/models");
         let path: Vec<PathBuf> = std::env::split_paths(get(&env, "PATH").unwrap()).collect();
         assert_eq!(path, [PathBuf::from("/data/tools/bin"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
@@ -152,7 +159,7 @@ mod tests {
     #[test]
     fn no_worker_means_ao_no_worker() {
         let tools = PathBuf::from("/t");
-        let env = service_env(parent(), &ServiceConfig { worker_bin: None, tools_dir: &tools, models_dir: &tools });
+        let env = service_env(parent(), &ServiceConfig { worker_bin: None, tools_dir: &tools, models_dir: &tools, config_dir: &tools });
         assert_eq!(get(&env, "AO_NO_WORKER").unwrap(), "1");
         assert!(get(&env, "AO_WORKER_BIN").is_none());
     }
@@ -164,7 +171,7 @@ mod tests {
         }
         let parent = vec![(OsString::from("XDG_NODE_OPTIONS"), OsString::from("x")), (OsString::from("NODE_OPTIONS"), OsString::from("y"))];
         let t = PathBuf::from("/t");
-        let env = service_env(parent, &ServiceConfig { worker_bin: None, tools_dir: &t, models_dir: &t });
+        let env = service_env(parent, &ServiceConfig { worker_bin: None, tools_dir: &t, models_dir: &t, config_dir: &t });
         assert!(get(&env, "NODE_OPTIONS").is_none());
         // An XDG_ name is passed by prefix; it is not one of the redirecting names.
         assert!(get(&env, "XDG_NODE_OPTIONS").is_some());
@@ -173,11 +180,11 @@ mod tests {
     #[test]
     fn a_missing_path_still_gets_the_tools_folder() {
         let t = PathBuf::from("/t");
-        let env = service_env(Vec::new(), &ServiceConfig { worker_bin: None, tools_dir: &t, models_dir: &t });
+        let env = service_env(Vec::new(), &ServiceConfig { worker_bin: None, tools_dir: &t, models_dir: &t, config_dir: &t });
         let path: Vec<PathBuf> = std::env::split_paths(get(&env, "PATH").unwrap()).collect();
         assert_eq!(path, [PathBuf::from("/t/bin")]);
-        // Empty entries (the current folder) are dropped.
-        let env = service_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin::/bin:"))], &ServiceConfig { worker_bin: None, tools_dir: &t, models_dir: &t });
+        // Empty and relative entries (the current folder, or one under it) are dropped.
+        let env = service_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin::.:bin:./x:/bin:"))], &ServiceConfig { worker_bin: None, tools_dir: &t, models_dir: &t, config_dir: &t });
         let path: Vec<PathBuf> = std::env::split_paths(get(&env, "PATH").unwrap()).collect();
         assert_eq!(path, [PathBuf::from("/t/bin"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
     }
