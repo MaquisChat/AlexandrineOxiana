@@ -256,9 +256,11 @@ async function populate(
 /**
  * True when the index no longer matches the files: its recorded change state differs from the
  * library's. Per project, readable change logs (unencrypted, or key in the ring — sealed lines are
- * opened) are compared by newest change id; locked projects by manifest mtime.
+ * opened) are compared by newest change id; locked projects by manifest mtime. Always true while
+ * a migration's "rebuild needed" mark is set (R161 a): only a completed rebuild clears it.
  */
 export async function isIndexStale(root: string, db: IndexDb, keyRing: KeyRing): Promise<boolean> {
+  if (getMeta(db, "needsRebuild") !== undefined) return true;
   const recorded = getMeta(db, "projectStamps");
   if (recorded === undefined) return true;
   const current = await computeStamps(root, keyRing);

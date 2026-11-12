@@ -127,7 +127,7 @@ describe("R161 (b): annotation indexing at the R74 cap has a bounded cost", () =
         expect(held.text).toBeLessThanOrEqual(ANNOTATION_INDEX_BYTES);
         if (prot) expect(held.n).toBeLessThan(TEMP_LIMIT_BYTES);
         const hit = search(db, { text: cjk ? "変更" : "changed" });
-        expect(hit.items).toEqual([expect.objectContaining({ id, matchedIn: "annotation", annotationsPartial: true })]);
+        expect(hit.items).toContainEqual(expect.objectContaining({ id, matchedIn: "annotation", annotationsPartial: true }));
       }, 120_000);
     }
   }

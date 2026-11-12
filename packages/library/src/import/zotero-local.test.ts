@@ -1120,7 +1120,7 @@ processing:
     expect(find(p, "numbers").items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
   });
 
-  it("Task 58: a source holding the cap's worth of annotations (10,000, ~16 MB of text) imports, edits, rebuilds and searches in reasonable time", async () => {
+  it("Task 58: a source holding the cap's worth of annotations (10,000, ~16 MB of text) imports, edits, rebuilds and searches in reasonable time; its first 2 MB are searchable", async () => {
     const filler = (i: number, n: number) => {
       const words = ["market", "vendor", "street", "policy", "memory", "kitchen", "harvest", "ledger", "rumour", "ration"];
       let s = "";
@@ -1148,20 +1148,26 @@ processing:
     const chars = a.annotations.reduce((n, x) => n + (x.quote?.length ?? 0) + (x.body?.length ?? 0), 0);
     expect(chars).toBeGreaterThan(15_000_000);
     t = performance.now();
-    const hit = find(p, "okapi9997 comment9997");
+    const hit = find(p, "okapi1000 comment1000");
     times.search = performance.now() - t;
-    expect(hit.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    // The first 2 MB are searchable (R161 b), and the source says only part of them is.
+    expect(hit.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation", annotationsPartial: true })]);
+    expect(find(p, "okapi9997").total).toBe(0);
     t = performance.now();
     await repo.updateSource(p.id, a.source.id, { title: { variants: [{ lang: "en", kind: "original", value: "Renamed" }] } });
     times.edit = performance.now() - t;
-    expect(find(p, "okapi9997").total).toBe(1);
-    const row = () => handle.db.prepare("SELECT annotations, annotation_bigrams FROM main.source_text WHERE source_id = ?").get(a.source.id);
+    expect(find(p, "okapi1000").total).toBe(1);
+    const row = () =>
+      handle.db
+        .prepare("SELECT c.seq, c.sha256, a.annotations, a.annotation_bigrams FROM main.annotation_chunks c JOIN main.annotation_text a ON a.rowid = c.fts_rowid WHERE c.source_id = ? ORDER BY c.seq")
+        .all(a.source.id);
     const before = row();
     t = performance.now();
     await rebuildIndex(handle, ring, lib);
     times.rebuild = performance.now() - t;
     expect(row()).toEqual(before);
-    expect(find(p, "okapi0 renamed").items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(find(p, "okapi0 comment0").items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(find(p, "renamed").items).toEqual([expect.objectContaining({ id: a.source.id })]);
     console.log(`Task 58 cap test (ms): ${JSON.stringify(Object.fromEntries(Object.entries(times).map(([k, v]) => [k, Math.round(v)])))}`);
     // Generous ceilings for a loaded shared machine; the times are reported above.
     expect(times.edit).toBeLessThan(15_000);

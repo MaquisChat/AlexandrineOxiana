@@ -9,12 +9,13 @@
  * (`v_*`) present both stores as one to `search` and `findSourceBy`.
  */
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { primary, type ConsentRecord, type Collection, type Participant, type Project, type Session, type SourceFile, type SourceType, type Tag } from "@ao/core";
 import type { ReviewItemRow } from "../repo/review.js";
 import { migrationsUrl } from "../resources.js";
-import { MAX_INDEXED_ANNOTATION_TEXT, annotationText, cjkBigrams } from "./text.js";
+import { annotationChunks, cjkBigrams } from "./text.js";
 
 export type IndexDb = Database.Database;
 
@@ -37,6 +38,8 @@ export interface SourceRow {
    * (Task 58) — the search terms are not all in its own record. Absent otherwise.
    */
   matchedIn?: "annotation";
+  /** Only part of its annotations' text is searchable (more than 2 MB or 10,000 annotations; R161 b). */
+  annotationsPartial?: true;
 }
 
 /** Owns the live connection so a rebuild can swap it; everything that writes must go through it. */
@@ -123,14 +126,16 @@ export function setMeta(db: IndexDb, key: string, value: string): void {
 // TEMP schema (in memory, per connection): content of unlocked encrypted projects.
 
 const FTS_COLUMNS = `source_id UNINDEXED, project_id UNINDEXED, title_all, creators, container, extracted_text, cjk_bigrams,
-  annotations, annotation_bigrams, tokenize = 'unicode61 remove_diacritics 2'`;
+  tokenize = 'unicode61 remove_diacritics 2'`;
+const ANNOTATION_FTS_COLUMNS = `source_id UNINDEXED, project_id UNINDEXED, annotations, annotation_bigrams,
+  tokenize = 'unicode61 remove_diacritics 2'`;
 
 const TEMP_SQL = `
 CREATE TEMP TABLE IF NOT EXISTS t_sources (
   id TEXT PRIMARY KEY, fts_rowid INTEGER NOT NULL UNIQUE, project_id TEXT NOT NULL, type TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '', creators_text TEXT NOT NULL DEFAULT '', issued_year TEXT, folder TEXT NOT NULL,
   needs_review INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, platform TEXT, platform_post_id TEXT,
-  doi TEXT, isbn13 TEXT, sha256s_json TEXT NOT NULL DEFAULT '[]'
+  doi TEXT, isbn13 TEXT, sha256s_json TEXT NOT NULL DEFAULT '[]', annotations_partial INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS temp.t_sources_project ON t_sources (project_id);
 CREATE INDEX IF NOT EXISTS temp.t_sources_platform_post ON t_sources (platform, platform_post_id);
@@ -154,12 +159,17 @@ CREATE TEMP TABLE IF NOT EXISTS t_consents (
   expires TEXT, withdrawn_at TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS temp.t_source_text USING fts5(${FTS_COLUMNS});
+CREATE VIRTUAL TABLE IF NOT EXISTS temp.t_annotation_text USING fts5(${ANNOTATION_FTS_COLUMNS});
+CREATE TEMP TABLE IF NOT EXISTS t_annotation_chunks (
+  source_id TEXT NOT NULL, seq INTEGER NOT NULL, fts_rowid INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (source_id, seq)
+);
 
 CREATE TEMP VIEW IF NOT EXISTS v_sources AS
   SELECT s.id, s.project_id, s.type,
          COALESCE(t.title, s.title) AS title, COALESCE(t.creators_text, s.creators_text) AS creators_text,
          s.issued_year, s.folder, COALESCE(t.needs_review, s.needs_review) AS needs_review,
-         CASE WHEN s.locked = 1 AND t.id IS NULL THEN 1 ELSE 0 END AS locked
+         CASE WHEN s.locked = 1 AND t.id IS NULL THEN 1 ELSE 0 END AS locked,
+         COALESCE(t.annotations_partial, s.annotations_partial) AS annotations_partial
   FROM main.sources s LEFT JOIN temp.t_sources t ON t.id = s.id;
 -- A tag id listed by several unlocked encrypted projects is one tag.
 CREATE TEMP VIEW IF NOT EXISTS v_tags AS
@@ -180,6 +190,9 @@ interface Store {
   hashes: string;
   isbns: string;
   fts: string;
+  /** Annotation text (R161 b): its FTS table and the chunk table (rowid and hash per chunk). */
+  annFts: string;
+  annChunks: string;
   assets: string;
   colls: string;
   tags: string;
@@ -192,11 +205,13 @@ interface Store {
 }
 const MAIN: Store = {
   sources: "main.sources", hashes: "main.source_hashes", isbns: "main.source_isbns", fts: "main.source_text",
+  annFts: "main.annotation_text", annChunks: "main.annotation_chunks",
   assets: "main.assets", colls: "main.source_collections", tags: "main.source_tags", collections: "main.collections",
   tagTable: "main.tags", participants: "main.participants", sessions: "main.sessions", consents: "main.consents",
 };
 const TEMP: Store = {
   sources: "temp.t_sources", hashes: "temp.t_source_hashes", isbns: "temp.t_source_isbns", fts: "temp.t_source_text",
+  annFts: "temp.t_annotation_text", annChunks: "temp.t_annotation_chunks",
   assets: "temp.t_assets", colls: "temp.t_source_collections", tags: "temp.t_source_tags", collections: "temp.t_collections",
   tagTable: "temp.t_tags", participants: "temp.t_participants", sessions: "temp.t_sessions", consents: "temp.t_consents",
 };
@@ -259,8 +274,6 @@ interface FtsText {
   titleAll: string;
   creators: string;
   container: string;
-  /** The text of the source's annotations (Task 58, R74): see annotationText. */
-  annotations: string;
 }
 
 function putSource(db: IndexDb, S: Store, d: Detail, fts: FtsText | null, extractedText: string | undefined): void {
@@ -296,9 +309,41 @@ function putSource(db: IndexDb, S: Store, d: Detail, fts: FtsText | null, extrac
   const extracted = extractedText ?? old?.extracted_text ?? "";
   const bigrams = cjkBigrams([fts.titleAll, fts.creators, fts.container, extracted].join("\n"));
   db.prepare(
-    `INSERT INTO ${S.fts} (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams, annotations, annotation_bigrams)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(ftsRowid, d.id, d.projectId, fts.titleAll, fts.creators, fts.container, extracted, bigrams, fts.annotations, cjkBigrams(fts.annotations));
+    `INSERT INTO ${S.fts} (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(ftsRowid, d.id, d.projectId, fts.titleAll, fts.creators, fts.container, extracted, bigrams);
+}
+
+/**
+ * Writes the source's annotation text (R161 b): at most 2 MB, in chunks of at most 64 KB, one row
+ * each, in one statement per chunk. A chunk whose text and project are unchanged (its hash) is not
+ * rewritten, so an edit that leaves the annotations alone costs one read of the chunk hashes.
+ */
+function putAnnotations(db: IndexDb, S: Store, sourceId: string, projectId: string, list: SourceFile["annotations"]): void {
+  const { chunks, partial } = annotationChunks(list);
+  const old = db.prepare(`SELECT seq, fts_rowid, sha256 FROM ${S.annChunks} WHERE source_id = ? ORDER BY seq`).all(sourceId) as Array<{ seq: number; fts_rowid: number; sha256: string }>;
+  const insert = db.prepare(`INSERT INTO ${S.annFts} (source_id, project_id, annotations, annotation_bigrams) VALUES (?, ?, ?, ?)`);
+  const drop = db.prepare(`DELETE FROM ${S.annFts} WHERE rowid = ?`);
+  const record = db.prepare(`INSERT OR REPLACE INTO ${S.annChunks} (source_id, seq, fts_rowid, sha256) VALUES (?, ?, ?, ?)`);
+  chunks.forEach((text, seq) => {
+    const sha = createHash("sha256").update(projectId).update("\u0000").update(text).digest("hex");
+    const prev = old[seq];
+    if (prev && prev.sha256 === sha) return;
+    if (prev) drop.run(prev.fts_rowid);
+    const rowid = Number(insert.run(sourceId, projectId, text, cjkBigrams(text)).lastInsertRowid);
+    record.run(sourceId, seq, rowid, sha);
+  });
+  for (const prev of old.slice(chunks.length)) drop.run(prev.fts_rowid);
+  db.prepare(`DELETE FROM ${S.annChunks} WHERE source_id = ? AND seq >= ?`).run(sourceId, chunks.length);
+  db.prepare(`UPDATE ${S.sources} SET annotations_partial = ? WHERE id = ?`).run(partial ? 1 : 0, sourceId);
+}
+
+/** Removes the source's annotation text from one store. */
+function clearAnnotations(db: IndexDb, S: Store, sourceId: string): void {
+  for (const r of db.prepare(`SELECT fts_rowid FROM ${S.annChunks} WHERE source_id = ?`).all(sourceId) as Array<{ fts_rowid: number }>) {
+    db.prepare(`DELETE FROM ${S.annFts} WHERE rowid = ?`).run(r.fts_rowid);
+  }
+  db.prepare(`DELETE FROM ${S.annChunks} WHERE source_id = ?`).run(sourceId);
 }
 
 export interface IndexSourceOptions {
@@ -347,19 +392,20 @@ export function indexSource(db: IndexDb, sf: SourceFile, extractedText?: string,
     titleAll: s.title.variants.map((v) => v.value).join(" • "),
     creators: detail.creatorsText,
     container: s.container ? s.container.variants.map((v) => v.value).join(" • ") : "",
-    annotations: annotationText(sf.annotations, MAX_INDEXED_ANNOTATION_TEXT),
   };
   const prot = opts.protected === true;
   db.transaction(() => {
     const S = prot ? TEMP : MAIN;
     if (prot) {
       putSource(db, MAIN, manifestDetail(detail), null, undefined);
+      clearAnnotations(db, MAIN, s.id);
       if (opts.withTemp === false) {
         replaceMembership(db, s.id, s.projectIds, null);
         return;
       }
     }
     putSource(db, S, detail, fts, extractedText);
+    putAnnotations(db, S, s.id, projectId, sf.annotations);
     db.prepare(`DELETE FROM ${S.assets} WHERE source_id = ?`).run(s.id);
     for (const a of sf.assets) {
       db.prepare(`INSERT OR REPLACE INTO ${S.assets} (id, source_id, role, kind, path, sha256, bytes, mime, encrypted) VALUES (?,?,?,?,?,?,?,?,?)`).run(
@@ -414,6 +460,7 @@ export function indexLockedSource(
 function deleteSourceFrom(db: IndexDb, S: Store, id: string): void {
   const r = db.prepare(`SELECT fts_rowid FROM ${S.sources} WHERE id = ?`).get(id) as { fts_rowid: number } | undefined;
   if (r) db.prepare(`DELETE FROM ${S.fts} WHERE rowid = ?`).run(r.fts_rowid);
+  clearAnnotations(db, S, id);
   for (const t of [S.sources, S.hashes, S.isbns, S.assets, S.colls, S.tags]) {
     db.prepare(`DELETE FROM ${t} WHERE ${t === S.sources ? "id" : "source_id"} = ?`).run(id);
   }
@@ -439,6 +486,8 @@ export function purgeProject(db: IndexDb, projectId: string): void {
     db.prepare("DELETE FROM temp.t_tags WHERE project_id = ?").run(projectId);
     // safety net: anything else still keyed by the project
     db.prepare("DELETE FROM temp.t_source_text WHERE project_id = ?").run(projectId);
+    db.prepare("DELETE FROM temp.t_annotation_text WHERE project_id = ?").run(projectId);
+    db.prepare("DELETE FROM temp.t_annotation_chunks WHERE source_id NOT IN (SELECT id FROM temp.t_sources)").run();
   })();
 }
 
@@ -484,7 +533,7 @@ export function upsertReviewItem(db: IndexDb, row: ReviewItemRow): void {
 export type SourceQuery = { platform: string; postId: string } | { doi: string } | { isbn: string } | { sha256: string };
 
 export const SOURCE_COLUMNS =
-  "s.id, s.project_id, s.type, s.title, s.creators_text, s.issued_year, s.folder, s.needs_review, s.locked";
+  "s.id, s.project_id, s.type, s.title, s.creators_text, s.issued_year, s.folder, s.needs_review, s.locked, s.annotations_partial";
 
 export interface RawRow {
   id: string;
@@ -496,6 +545,7 @@ export interface RawRow {
   folder: string;
   needs_review: number;
   locked: number;
+  annotations_partial: number;
 }
 
 export function toRow(r: RawRow): SourceRow {
@@ -509,6 +559,7 @@ export function toRow(r: RawRow): SourceRow {
     folder: r.folder,
     needsReview: r.needs_review === 1,
     locked: r.locked === 1,
+    ...(r.annotations_partial === 1 ? { annotationsPartial: true as const } : {}),
   };
 }
 
