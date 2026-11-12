@@ -35,6 +35,7 @@ describe("the capture queue", () => {
     render(<CaptureQueue queues={[q]} />);
     const row = screen.getAllByRole("listitem")[0]!;
     expect(within(row).getAllByText(/is not installed/i)).toHaveLength(1);
+    expect(within(row).getByText(reason)).toBeTruthy(); // the library's sentence naming the tool, not a generic one
     expect(within(row).getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(PATHS.tools);
   });
 

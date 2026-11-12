@@ -316,6 +316,7 @@ const OUTCOME_TEXT: Record<string, string> = {
   TOOL_UPDATE_FAILED: "The downloader tool could not be updated. Try again later.",
   TOOL_MISSING: "A tool this capture needs is not installed on this computer.",
   MISSING_DEPENDENCY: "A tool this capture needs is not installed on this computer.",
+  TOOL_NOT_INSTALLED: "A tool this capture needs is not installed on this computer, so nothing was saved. Install it from the optional tools screen, then capture the link again.",
   MODEL_UNAVAILABLE: "The transcription model could not be loaded or downloaded. Check the internet connection, or choose another model.",
   FFMPEG_FAILED: "The video could not be converted. The file may be damaged.",
   UNSUPPORTED_INPUT: "The downloaded file is not a recording the app can read.",
@@ -371,7 +372,7 @@ export function itemExplanation(it: QueueItem): { ui?: string; service?: string 
       const code = it.errorCode;
       if (code === "POLICY_DENIED") return { ui: OUTCOME_TEXT.POLICY_DENIED!, ...(reason ? { service: reason } : {}) };
       // A whole list sent as a link (or a code the UI does not know): the library's own sentence.
-      if (reason && (code === undefined || code === "POLICY_CHANGED" || code === "RATE_LIMITED" || !Object.hasOwn(OUTCOME_TEXT, code))) return { service: reason };
+      if (reason && (code === undefined || code === "POLICY_CHANGED" || code === "RATE_LIMITED" || code === "TOOL_NOT_INSTALLED" || !Object.hasOwn(OUTCOME_TEXT, code))) return { service: reason };
       return { ui: outcomeText(code) };
     }
     case "incomplete":
