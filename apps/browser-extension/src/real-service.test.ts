@@ -168,6 +168,8 @@ describe("a paired browser across a relaunch of the real service (R171, defect D
     const r = await api.changePort(String(port));
     expect(r.pairing).toEqual({ ...paired, port });
     expect((await api.getPairing())?.token).toBe(paired.token);
+    // The service records the port without making the request wait: let that write finish.
+    await svc.pairing.idle();
     const after = await ui("GET", "/extension/pairings");
     expect(after.extensions[0].port).toBe(port);
   });
