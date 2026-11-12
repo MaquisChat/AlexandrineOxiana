@@ -6,8 +6,7 @@ import { transcriptApi } from "../api/transcripts";
 import { setMedia } from "../test/media";
 import { navigate } from "../navigation";
 import { BASE, server, testClient, url, useMockService } from "../test/service";
-import { humanTranscript, humanVersion, machineTranscript, sourceFile, machineVersion, MACHINE_VERSIONS, SEGMENTS, serviceErrorBody, transcriptService } from "../test/msw-transcripts";
-import { resetTranscriptionRuns } from "./transcriptionRuns";
+import { humanTranscript, humanVersion, job, machineTranscript, sourceFile, machineVersion, MACHINE_VERSIONS, SEGMENTS, serviceErrorBody, storedHumanTranscript, transcriptService } from "../test/msw-transcripts";
 import { TranscriptViewer } from "./TranscriptViewer";
 
 useMockService();
@@ -23,7 +22,6 @@ let played = 0;
 beforeEach(() => {
   scrolled = [];
   played = 0;
-  resetTranscriptionRuns();
   window.history.replaceState(null, "", "/transcript?project=p1&source=s1");
   // jsdom has no media playback and no scrolling: the tests drive the element's events and properties.
   vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(function () {
@@ -125,46 +123,30 @@ describe("TranscriptViewer — segments and flags", () => {
     expect(item.querySelector("img")).toBeNull();
   });
 
-  it("a person's edit keeps the machine flags on segments the person did not change, and marks changed or re-timed ones (review I3)", async () => {
-    const edited = [
-      { ...SEGMENTS[0]!, text: "Hello, and welcome." },
-      { ...SEGMENTS[1]! },
-      { ...SEGMENTS[2]!, end: 8.5 },
+  it("a person's edit shows the flags the service stored: unchanged segments keep the machine flags, edited and added ones are not checked (Task 62)", async () => {
+    const segments = [
+      { ...SEGMENTS[0]!, text: "Hello, and welcome.", flags: null, edit: "edited" as const },
+      { ...SEGMENTS[1]!, edit: "unchanged" as const },
+      { start: 9, end: 10, lang: "en", text: "A line the person heard.", flags: null, edit: "added" as const },
     ];
-    await open({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0", edited) } }, { waitFor: "Hello, and welcome." });
-    await waitFor(() => expect(segmentItems()[1]!.textContent).toMatch(/Flagged for review: Possibly invented text over silence/));
+    const { svc } = await open({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: storedHumanTranscript("h0", segments) } }, { waitFor: "Hello, and welcome." });
+    expect(segmentItems()[1]!.textContent).toMatch(/Flagged for review: Possibly invented text over silence/);
+    expect(segmentItems()[1]!.textContent).not.toMatch(/not checked/);
     expect(segmentItems()[0]!.textContent).toMatch(/Edited by a person — not checked/);
     expect(segmentItems()[0]!.textContent).not.toMatch(/Flagged/);
-    expect(segmentItems()[2]!.textContent).toMatch(/Edited by a person — not checked/);
-    expect(segmentItems()[2]!.textContent).not.toMatch(/Repeated text/);
-    expect(segmentItems()[1]!.textContent).not.toMatch(/not checked/);
-    expect(screen.getByText(/edited by a person/i, { selector: "p.ao-tx__note" }).textContent).toMatch(/speech recognition version of/);
+    expect(segmentItems()[2]!.textContent).toMatch(/Added by a person — not checked/);
+    expect(screen.getByText(/edited by a person/i, { selector: "p.ao-tx__note" }).textContent).toMatch(/left unchanged show the flags/);
+    // No second version is read to work the flags out: they come with the edit.
+    expect(svc.log.reads).toEqual(["h0"]);
   });
 
-  it("a person's edit whose machine version cannot be read says flags are not available, rather than showing none", async () => {
-    const svc = transcriptService({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0") } });
-    server.use(
-      http.get(url("/projects/:id/sources/:sid/transcripts/:aid"), ({ params }) =>
-        params.aid === "h0" ? HttpResponse.json(svc.state.transcripts.h0) : serviceErrorBody(404, "NOT_FOUND", "That transcript was not found."),
-      ),
-      ...svc.handlers,
-    );
-    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
-    await screen.findByText("Hello and welcome.");
-    expect(await screen.findByText(/Flags are not available for this version/)).toBeTruthy();
-    expect(screen.queryByText(/Flagged/)).toBeNull();
-  });
-
-  it("a person's edit that does not name its base uses the newest machine version made before it, and says so", async () => {
-    const h = humanVersion("h0", "2026-11-05T09:00:00.000Z");
-    (h.derivation as { params: Record<string, unknown> }).params = {};
-    const later = machineVersion("v9", "vtt", "2026-11-06T09:00:00.000Z", "large-v3");
-    await open({
-      versions: [...MACHINE_VERSIONS, h, later],
-      transcripts: { h0: { ...humanTranscript("h0"), basedOn: undefined } as never, v9: machineTranscript("v9", SEGMENTS.map((x) => ({ ...x, flags: [] }))) },
-    }, { waitFor: "Thanks for watching.", select: "h0" });
-    await waitFor(() => expect(segmentItems()[1]!.textContent).toMatch(/Possibly invented text over silence/));
-    expect(screen.getByText(/does not record which version it was edited from/)).toBeTruthy();
+  it("an edit saved before flags were stored shows every segment as not checked, never as clean (Task 62)", async () => {
+    await open({ versions: [...MACHINE_VERSIONS, humanVersion("h0")], transcripts: { h0: humanTranscript("h0") } });
+    for (const item of segmentItems()) {
+      expect(item.textContent).toMatch(/Not checked/);
+      expect(item.textContent).not.toMatch(/Flagged/);
+    }
+    expect(screen.getByText(/edited by a person/i, { selector: "p.ao-tx__note" }).textContent).toMatch(/before the app recorded/);
   });
 });
 
@@ -692,152 +674,202 @@ describe("TranscriptViewer — editing and versions", () => {
   });
 });
 
-describe("TranscriptViewer — transcribe again", () => {
-  it("re-transcribes with another model, shows that it is working, and the new version appears in the picker", async () => {
-    const svc = transcriptService();
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    server.use(
-      http.post(url("/projects/:id/sources/:sid/transcribe"), async ({ request, params }) => {
-        svc.log.transcribed.push({ sid: String(params.sid), body: (await request.json()) as Record<string, unknown> });
-        await gate;
-        const at = "2026-11-03T10:00:00.000Z";
-        svc.state.versions.push(machineVersion("v2", "vtt", at, "medium"), machineVersion("j2", "json", at, "medium"));
-        svc.state.transcripts.v2 = machineTranscript("v2", [{ start: 0, end: 2, lang: "en", text: "Hello, and welcome.", flags: [] }]);
-        return HttpResponse.json({ sourceId: "s1", folder: "sources/s1", files: [svc.state.versions.at(-2)!.path, svc.state.versions.at(-1)!.path], flaggedSegments: 0 });
-      }),
-      ...svc.handlers,
-    );
-    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
+describe("TranscriptViewer — transcribe again (a job, Task 62)", () => {
+  /** The viewer with the mocked service; resolves once the transcript and the event stream are open. */
+  async function openJob(opts: Parameters<typeof transcriptService>[0] = {}) {
+    const svc = transcriptService(opts);
+    server.use(...svc.handlers);
+    const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
     await screen.findByText("Hello and welcome.");
+    await waitFor(() => expect(svc.streams()).toBe(1));
+    return { svc, view };
+  }
+  const button = () => screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement;
+  const runStatus = () => document.querySelector(".ao-tx__progress")!;
+  /** A finished run's new version, as the service stores it. */
+  function newVersion(svc: ReturnType<typeof transcriptService>, model = "medium") {
+    const at = new Date(Date.now() + 60_000).toISOString();
+    svc.state.versions.push(machineVersion("v2", "vtt", at, model), machineVersion("j2", "json", at, model));
+    svc.state.transcripts.v2 = machineTranscript("v2", [{ start: 0, end: 2, lang: "en", text: "Hello, and welcome.", flags: [] }]);
+    return { files: [svc.state.versions.at(-2)!.path, svc.state.versions.at(-1)!.path], flaggedSegments: 0 };
+  }
+
+  it("starts a job with the model chosen, shows its progress from the job's events, and the new version appears when it is done", async () => {
+    const { svc } = await openJob();
     const user = userEvent.setup();
     await user.selectOptions(screen.getByLabelText("Speech model"), "medium");
-    await user.click(screen.getByRole("button", { name: "Re-transcribe" }));
+    await user.click(button());
     expect(await screen.findByText(/Transcribing with the medium model/)).toBeTruthy();
-    expect(screen.getByRole("progressbar", { name: "Transcription in progress" })).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(svc.log.transcribed[0]).toEqual({ sid: "s1", body: { model: "medium" } });
-    release();
+    expect(svc.log.transcribed).toEqual([{ sid: "s1", body: { model: "medium" } }]);
+    expect(button().disabled).toBe(true);
+    const j = svc.state.job!;
+    act(() => svc.update({ ...j, status: "running", progress: 0.4, updatedAt: new Date().toISOString() }));
+    const bar = (await screen.findByRole("progressbar", { name: "Transcription in progress" })) as HTMLProgressElement;
+    await waitFor(() => expect(bar.value).toBeCloseTo(0.4));
+    const result = newVersion(svc);
+    act(() => svc.update({ ...j, status: "done", progress: 1, result, updatedAt: new Date().toISOString() }));
     expect(await screen.findByText(/The new transcript is ready/)).toBeTruthy();
     const picker = screen.getByLabelText("Version") as HTMLSelectElement;
-    await waitFor(() => expect(picker.options).toHaveLength(2));
-    expect(picker.value).toBe("v2");
-    expect(picker.options[1]!.textContent).toMatch(/model medium/);
+    await waitFor(() => expect(picker.value).toBe("v2"));
+    expect(await screen.findByText("Hello, and welcome.")).toBeTruthy();
+    expect(button().disabled).toBe(false);
+  });
+
+  it("progress is not announced on every event: the status text changes only with the job's status", async () => {
+    const { svc } = await openJob();
+    await userEvent.setup().click(button());
+    await screen.findByText(/Transcribing with the medium model/);
+    const j = svc.state.job!;
+    act(() => svc.update({ ...j, status: "running", progress: 0.2, updatedAt: new Date().toISOString() }));
+    const bar = (await screen.findByRole("progressbar", { name: "Transcription in progress" })) as HTMLProgressElement;
+    await waitFor(() => expect(bar.value).toBeCloseTo(0.2));
+    const live = screen.getAllByRole("status").find((el) => el.contains(screen.getByText(/Transcribing with the medium model/)))!;
+    const said = live.textContent;
+    expect(live.contains(bar)).toBe(false); // the bar is outside the live region
+    act(() => svc.update({ ...j, status: "running", progress: 0.6, updatedAt: new Date().toISOString() }));
+    await waitFor(() => expect(bar.value).toBeCloseTo(0.6));
+    expect(live.textContent).toBe(said);
+  });
+
+  it("a run started before the screen opened is shown when it opens (its state is read), and Re-transcribe stays off until it ends", async () => {
+    const running = job({ status: "running", progress: 0.5, model: "small" });
+    const { svc } = await openJob({ job: running });
+    expect(await screen.findByRole("progressbar", { name: "Transcription in progress" })).toBeTruthy();
+    expect(screen.getByText(/Transcribing with the small model/)).toBeTruthy();
+    expect(button().disabled).toBe(true);
+    const result = newVersion(svc, "small");
+    act(() => svc.update({ ...running, status: "done", progress: 1, result, updatedAt: new Date().toISOString() }));
+    expect(await screen.findByText(/The new transcript is ready/)).toBeTruthy();
+    expect(button().disabled).toBe(false);
+    expect(svc.log.transcribed).toHaveLength(0);
+  });
+
+  it("after the event stream drops, the job's state is read again, so a run that ended meanwhile is not missed", async () => {
+    const running = job({ status: "running", progress: 0.5 });
+    const { svc } = await openJob({ job: running });
+    await screen.findByRole("progressbar", { name: "Transcription in progress" });
+    const reads = svc.log.jobReads;
+    svc.state.job = { ...running, status: "done", progress: 1, result: newVersion(svc), updatedAt: new Date().toISOString() };
+    svc.closeStreams(); // the done event was missed
+    await waitFor(() => expect(svc.log.jobReads).toBeGreaterThan(reads), { timeout: 5000 });
+    await waitFor(() => expect(button().disabled).toBe(false));
     expect(await screen.findByText("Hello, and welcome.")).toBeTruthy();
   });
 
-  it("a missing speech model is explained in plain words with what the service reported", async () => {
-    await open();
-    server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(502, "INTERNAL", "The media helper could not finish the job.", "MODEL_UNAVAILABLE")));
+  it("Stop sends one request however often it is pressed; the run ends as stopped and focus returns to Re-transcribe", async () => {
+    const { svc } = await openJob();
     const user = userEvent.setup();
-    await user.selectOptions(screen.getByLabelText("Speech model"), "large-v3");
-    await user.click(screen.getByRole("button", { name: "Re-transcribe" }));
-    const alert = await screen.findByText(/speech model “large-v3” on this computer could not be loaded; it may be damaged\. Remove it and install it again from the Optional tools screen/);
-    expect(alert.textContent).toMatch(/The media helper could not finish the job\./);
-    expect(alert.textContent).not.toMatch(/MODEL_UNAVAILABLE|\{/);
+    await user.click(button());
+    const stop = await screen.findByRole("button", { name: "Stop transcribing" });
+    await waitFor(() => expect(document.activeElement).toBe(stop)); // Re-transcribe is off now: focus is not left on it
+    await user.dblClick(stop);
+    await waitFor(() => expect(svc.log.cancelled).toHaveLength(1));
+    expect(await screen.findByText(/Stopping/)).toBeTruthy();
+    const j = svc.state.job!;
+    act(() => svc.update({ ...j, status: "cancelled", error: { code: "CANCELLED", message: "The transcription was stopped before it finished. Nothing was saved." }, updatedAt: new Date().toISOString() }));
+    expect(await screen.findByText(/was stopped before it finished/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop transcribing" })).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(button()));
+    expect(svc.log.cancelled).toEqual([j.jobId]);
+  });
+
+  it("a request refused because the source is already being transcribed shows that run instead of an error", async () => {
+    const { svc } = await openJob();
+    server.use(
+      http.post(url("/projects/:id/sources/:sid/transcribe"), () => {
+        svc.state.job = job({ status: "running", progress: 0.3, model: "large-v3" });
+        return serviceErrorBody(409, "CONFLICT", "This recording is already being transcribed.", "TRANSCRIPTION_RUNNING");
+      }),
+    );
+    await userEvent.setup().click(button());
+    expect(await screen.findByText(/Transcribing with the large-v3 model/)).toBeTruthy();
+    expect(screen.getByText(/already being transcribed/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a start whose answer was lost reads the job's state, so the run it may have started is shown, not started twice", async () => {
+    const { svc } = await openJob();
+    let calls = 0;
+    server.use(
+      http.post(url("/projects/:id/sources/:sid/transcribe"), () => {
+        calls++;
+        svc.state.job = job({ status: "queued" });
+        return HttpResponse.error();
+      }),
+    );
+    await userEvent.setup().click(button());
+    expect(await screen.findByText(/Transcribing with the medium model/)).toBeTruthy();
+    expect(button().disabled).toBe(true);
+    expect(calls).toBe(1);
+    expect(screen.queryByText(/may still be going/)).toBeNull();
+  });
+
+  it("a double click starts one job", async () => {
+    const { svc } = await openJob();
+    await userEvent.setup().dblClick(button());
+    await screen.findByText(/Transcribing with the medium model/);
+    expect(svc.log.transcribed).toHaveLength(1);
   });
 
   it("a media helper that is not running is explained once, without the raw reason (review M2)", async () => {
-    await open();
+    await openJob();
     server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(503, "WORKER_UNAVAILABLE", "The media helper is not running.", "spawn python ENOENT")));
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Re-transcribe" }));
+    await userEvent.setup().click(button());
     const msg = await screen.findByText(/media helper that runs speech recognition is not running/);
     expect(msg.textContent!.match(/not running/g)).toHaveLength(1);
     expect(msg.textContent).not.toMatch(/ENOENT/);
-    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(button().disabled).toBe(false);
   });
 
-  it("an interrupted run and other worker codes are said in words, never as a raw code (review M2)", async () => {
-    await open();
+  it("a run that fails is said in words with what the service reported, never as a raw code (review M2)", async () => {
+    const { svc } = await openJob();
     for (const [code, words] of [
+      ["MODEL_UNAVAILABLE", /speech model “medium” on this computer could not be loaded/],
       ["INTERRUPTED", /was interrupted before it finished/],
-      ["CANCELLED", /was stopped before it finished/],
       ["ENCRYPTION_REQUIRED", /encrypted/],
       ["INPUT_NOT_DECRYPTABLE", /could not be decrypted/],
       ["TOOL_FAILED", /speech tool failed/],
       ["SOMETHING_NEW", /could not finish the transcription/],
     ] as const) {
-      server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(502, "INTERNAL", "The media helper could not finish the job.", code)));
-      await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
+      await userEvent.setup().click(button());
+      await screen.findByText(/Transcribing with the medium model/);
+      const j = svc.state.job!;
+      act(() => svc.update({ ...j, status: "failed", error: { code: "INTERNAL", message: "The media helper could not finish the job.", reason: code }, updatedAt: new Date(Date.now() + 120_000).toISOString() }));
       const msg = await screen.findByText(words);
       expect(msg.textContent).not.toContain(code);
     }
   });
 
-  it("a connection lost while transcribing says the run may still be going, offers Check for new versions, and keeps Re-transcribe off for this source (review I2)", async () => {
-    const svc = transcriptService();
-    let calls = 0;
-    server.use(
-      http.post(url("/projects/:id/sources/:sid/transcribe"), () => {
-        calls++;
-        return HttpResponse.error();
-      }),
-      ...svc.handlers,
-    );
-    const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
-    await screen.findByText("Hello and welcome.");
-    expect(screen.getByText(/Leaving this screen does not stop it/)).toBeTruthy();
-    await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
-    const msg = await screen.findByText(/may still be going/);
-    expect(msg.textContent).not.toMatch(/could not be reached/);
-    expect(screen.queryByText(/could not be reached/)).toBeNull();
-    const button = screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    expect(document.getElementById(button.getAttribute("aria-describedby")!.split(" ")[0]!)?.textContent).toMatch(/off for this source/);
-    // Leaving and coming back in the same session: still off, still explained.
-    view.unmount();
-    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
-    await screen.findByText("Hello and welcome.");
-    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/may still be going/)).toBeTruthy();
-    // Nothing new yet.
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Check for new versions" }));
-    expect(await screen.findByText(/No new version yet/)).toBeTruthy();
-    // The run finished on the service: the check finds it.
-    const at = new Date(Date.now() + 60_000).toISOString();
-    svc.state.versions.push(machineVersion("v2", "vtt", at, "medium"));
-    svc.state.transcripts.v2 = machineTranscript("v2", [{ start: 0, end: 2, lang: "en", text: "Hello, and welcome.", flags: [] }]);
-    await user.click(screen.getByRole("button", { name: "Check for new versions" }));
-    expect(await screen.findByText(/The new transcript is ready/)).toBeTruthy();
-    expect(await screen.findByText("Hello, and welcome.")).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
-    expect(calls).toBe(1);
+  it("a speech model the job found missing is named, with a link to install it", async () => {
+    const { svc } = await openJob();
+    await userEvent.setup().click(button());
+    await screen.findByText(/Transcribing with the medium model/);
+    const j = svc.state.job!;
+    act(() => svc.update({ ...j, status: "failed", error: { code: "TOOL_NOT_INSTALLED", message: "A tool this needs is not installed on this computer.", reason: "speech-medium" }, updatedAt: new Date(Date.now() + 120_000).toISOString() }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/speech model “medium” is not installed/i);
+    expect(alert.textContent).not.toMatch(/speech-medium|TOOL_NOT_INSTALLED/);
   });
 
-  it("leaving while a transcription runs and coming back shows it still running, then its new version (review I2)", async () => {
-    const svc = transcriptService();
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    let calls = 0;
-    server.use(
-      http.post(url("/projects/:id/sources/:sid/transcribe"), async () => {
-        calls++;
-        await gate;
-        const at = new Date(Date.now() + 60_000).toISOString();
-        svc.state.versions.push(machineVersion("v2", "vtt", at, "small"));
-        svc.state.transcripts.v2 = machineTranscript("v2", [{ start: 0, end: 2, lang: "en", text: "Hello, and welcome.", flags: [] }]);
-        return HttpResponse.json({ sourceId: "s1", folder: "sources/s1", files: [svc.state.versions.at(-1)!.path], flaggedSegments: 0 });
-      }),
-      ...svc.handlers,
-    );
-    const view = render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
-    await screen.findByText("Hello and welcome.");
-    await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
-    await screen.findByRole("progressbar", { name: "Transcription in progress" });
+  it("on opening, a failed run newer than the newest version is shown; an older one is not", async () => {
+    const failed = job({ status: "failed", error: { code: "INTERNAL", message: "The media helper could not finish the job.", reason: "TOOL_FAILED" }, updatedAt: "2026-11-02T10:00:00.000Z" });
+    const first = await openJob({ job: failed });
+    expect(await screen.findByText(/speech tool failed/)).toBeTruthy();
+    first.view.unmount();
+    await openJob({ job: { ...failed, updatedAt: "2026-10-01T10:00:00.000Z" } });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText(/speech tool failed/)).toBeNull();
+  });
+
+  it("an event for another source, and answers after the screen closed, are dropped", async () => {
+    const { svc, view } = await openJob();
+    act(() => svc.update(job({ sourceId: "s2", status: "running", progress: 0.5 })));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("progressbar", { name: "Transcription in progress" })).toBeNull();
+    expect(button().disabled).toBe(false);
     view.unmount();
-    render(<TranscriptViewer api={api()} projectId="p1" sourceId="s1" />);
-    await screen.findByText("Hello and welcome.");
-    expect(screen.getByRole("progressbar", { name: "Transcription in progress" })).toBeTruthy();
-    expect(screen.getByText(/You can leave this screen/)).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(true);
-    release();
-    expect(await screen.findByText(/The new transcript is ready/)).toBeTruthy();
-    expect(await screen.findByText("Hello, and welcome.")).toBeTruthy();
-    expect((screen.getByLabelText("Version") as HTMLSelectElement).value).toBe("v2");
-    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
-    expect(calls).toBe(1);
+    act(() => svc.update(job({ status: "running", progress: 0.5 })));
+    await waitFor(() => expect(svc.streams()).toBe(0));
   });
 });
 

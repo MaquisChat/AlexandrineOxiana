@@ -7,30 +7,35 @@
  *   (`aria-current`, a visible "Now playing") and scrolled into view without moving focus; the list
  *   is not a live region, so a screen reader is not told of every change. Each segment's time is a
  *   button that moves playback there.
- * - Flagged segments carry their flags in words (spec 5.8), never colour alone. A person's edit has
- *   `flags: null`: no flags are shown and the screen says the edit was not checked.
+ * - Flagged segments carry their flags in words (spec 5.8), never colour alone. A person's edit
+ *   shows the flags the service stored with it (Task 62): segments the person left unchanged keep
+ *   the machine flags; edited and added ones are marked "not checked". An edit saved before flags
+ *   were stored (`flagsStored: false`) marks every segment "not checked", never clean.
  * - Edits are saved as a NEW human-edit version; the version it came from is kept (the machine
  *   transcript is never overwritten). Unsaved edits are guarded against loss (leaving, closing the
  *   window, switching version); a failed save keeps the text.
- * - "Re-transcribe" runs speech recognition again with another model; the new version joins the
- *   version picker when it is stored.
+ * - "Re-transcribe" starts speech recognition again as a job (Task 62): the service answers at once,
+ *   progress arrives as `job.progress` events (the bar is outside the live region, so it is not
+ *   announced on every event), and the job's state is read when the screen opens and whenever the
+ *   event stream (re)connects, so a run started before the screen opened, or one that ended while
+ *   the stream was down, is shown. "Stop transcribing" asks the service to stop it. The new version
+ *   joins the version picker when it is stored.
  *
  * Every answer is checked against the project, source and request it was for, so one that arrives
  * after they changed (or after the screen closed) is dropped.
  */
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { TranscriptResponse, TranscriptSaveRequest, TranscriptSegment, TranscriptVersionSummary } from "@ao/shared";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { TranscriptionJob, TranscriptResponse, TranscriptSaveRequest, TranscriptVersionSummary } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
-import { TRANSCRIPTION_MODELS, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
+import { TRANSCRIPTION_MODELS, transcriptionJobOf, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
 import { isPlayableRecording } from "../components/TranscriptLink";
 import { MissingToolNotice, modelOptionLabel, SpeechModelNotice, useSpeechModels } from "../components/MissingToolNotice";
 import { DEFAULT_SPEECH_MODEL, type ToolsApi } from "../api/tools";
 import { UserText } from "../components/UserText";
 import { blockNavigation } from "../navigation";
-import { setTranscriptionRun, subscribeTranscriptionRuns, transcriptionRun } from "./transcriptionRuns";
-import { buildVtt, carriedFlags, flagLabels, formatTime, machineBaseOf, segmentAt, versionEntries, type VersionEntry } from "./transcriptModel";
+import { buildVtt, flagLabels, formatTime, segmentAt, versionEntries, type VersionEntry } from "./transcriptModel";
 import "../components/library.css";
 import "./TranscriptViewer.css";
 
@@ -118,7 +123,23 @@ function transcribeError(err: unknown, model: string): string {
 
 type Drafts = ReadonlyMap<number, string>;
 
-type BaseState = { kind: "ready"; forId: string; segments: TranscriptSegment[]; guessed: boolean; at?: string } | { kind: "unavailable"; forId: string };
+const isActive = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "queued" | "running" } => j?.status === "queued" || j?.status === "running";
+const isEnded = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "done" | "failed" | "cancelled" } => j?.status === "done" || j?.status === "failed" || j?.status === "cancelled";
+
+/** A job's failure as the service error it is, so the words and the missing-tool link are the same as for a refused start. */
+const jobError = (j: TranscriptionJob): ApiClientError | undefined =>
+  j.error ? new ApiClientError(j.error.code === "TOOL_NOT_INSTALLED" ? 409 : 502, j.error) : undefined;
+
+/** The newest of two ISO times, or whether `a` is later than `b` (a missing `b`: true). */
+const laterThan = (a: string, b: string | undefined) => b === undefined || a > b;
+
+/** "Edited by a person — not checked" and the like, for a segment no check ran on (null: it was checked). */
+function notChecked(human: boolean, s: { flags: string[] | null; edit?: string }): string | undefined {
+  if (!human || s.flags !== null) return undefined;
+  if (s.edit === "added") return "Added by a person — not checked";
+  if (s.edit === "edited") return "Edited by a person — not checked";
+  return "Not checked";
+}
 
 /**
  * A new project or source starts the viewer afresh (its player closes and revokes its ticket, and
@@ -146,8 +167,6 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   const [loadError, setLoadError] = useState<string | undefined>();
   const [versions, setVersions] = useState<VersionEntry[] | undefined>();
   const [rawVersions, setRawVersions] = useState<TranscriptVersionSummary[]>([]);
-  /** A human edit's machine base and the flags carried from it (R143), for the transcript shown. */
-  const [base, setBase] = useState<BaseState | undefined>();
   const [selected, setSelected] = useState<string | undefined>();
   const [transcript, setTranscript] = useState<TranscriptResponse | undefined>();
   const [transcriptError, setTranscriptError] = useState<string | undefined>();
@@ -162,8 +181,12 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   const [model, setModel] = useState<TranscriptionModel>(DEFAULT_SPEECH_MODEL);
   const [transcribeFailure, setTranscribeFailure] = useState<string | undefined>();
   const [failedWith, setFailedWith] = useState<unknown>(); // the error behind transcribeFailure (Task 48b)
-  /** This source's re-transcription in this session (it outlives the screen; R143). */
-  const run = useSyncExternalStore(subscribeTranscriptionRuns, () => transcriptionRun(key));
+  /** The source's newest transcription job (Task 62): undefined until read, null when there is none. */
+  const [job, setJob] = useState<TranscriptionJob | null | undefined>();
+  const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  /** Said with the run (e.g. a start refused because one is already going). */
+  const [jobNote, setJobNote] = useState<string | undefined>();
 
   const listSeq = useRef(0);
   const readSeq = useRef(0);
@@ -251,40 +274,6 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
       },
     );
   }, [selected, projectId, sourceId, sawLocked, attempt]);
-
-  // A person's edit carries `flags: null` (no check ran on it). Until the service stores flags per
-  // segment (Task 62), the machine version it came from is read and its flags are shown on every
-  // segment the person left exactly as it was; the others are marked as edited and not checked.
-  const baseSeq = useRef(0);
-  const baseOf = transcript?.origin === "human-edit" && transcript.timed ? machineBaseOf(transcript.id, rawVersions) : undefined;
-  const humanId = transcript?.origin === "human-edit" && transcript.timed ? transcript.id : undefined;
-  const baseId = baseOf?.id;
-  const baseGuessed = baseOf?.guessed ?? false;
-  const baseAt = baseOf?.at;
-  useEffect(() => {
-    const mine = ++baseSeq.current;
-    setBase(undefined);
-    if (!humanId) return;
-    if (!baseId) {
-      setBase({ kind: "unavailable", forId: humanId });
-      return;
-    }
-    const k = keyRef.current;
-    apiRef.current.read(projectId, sourceId, baseId).then(
-      (t) => {
-        if (!mounted.current || k !== keyRef.current || mine !== baseSeq.current) return;
-        setBase({ kind: "ready", forId: humanId, segments: t.segments, guessed: baseGuessed, ...(baseAt ? { at: baseAt } : {}) });
-      },
-      () => {
-        if (!mounted.current || k !== keyRef.current || mine !== baseSeq.current) return;
-        setBase({ kind: "unavailable", forId: humanId });
-      },
-    );
-  }, [humanId, baseId, baseGuessed, baseAt, projectId, sourceId]);
-  const carried = useMemo(
-    () => (transcript && base?.kind === "ready" && base.forId === transcript.id ? carriedFlags(transcript.segments, base.segments) : undefined),
-    [transcript, base],
-  );
 
   // Unsaved edits are not lost: the window asks before closing; in-app links and navigate() are
   // refused; Back and Forward land on a copy of this address and are refused too.
@@ -427,61 +416,157 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
     }
   };
 
-  // A run's outcome is taken up by whichever viewer of this source is open when it is known.
-  useEffect(() => {
-    if (!run || (run.state !== "finished" && run.state !== "failed")) return;
-    setTranscriptionRun(key, undefined);
-    if (run.state === "finished") {
-      const r = run.result;
-      const flagged = r.flaggedSegments === 1 ? "1 segment is" : `${r.flaggedSegments} segments are`;
-      setNotice(`The new transcript is ready (${flagged} flagged for review). ${dirtyRef.current ? "It is listed under Version." : "It is shown below."}`);
-      void loadVersions({ paths: r.files });
-    } else if (!sawLocked(run.error)) {
-      setTranscribeFailure(transcribeError(run.error, run.model));
-      setFailedWith(run.error);
-    }
-  }, [run, key, loadVersions, sawLocked]);
+  // ---- transcription as a job (Task 62) ----
 
-  const transcribe = () => {
-    if (run) return;
-    const k = key;
-    const chosen = model;
-    const startedAt = new Date().toISOString();
-    const transcribeApi = apiRef.current;
-    setTranscribeFailure(undefined);
-    setNotice(undefined);
-    setTranscriptionRun(k, { state: "running", model: chosen, startedAt });
-    transcribeApi.transcribe(projectId, sourceId, { model: chosen }).then(
-      (result) => setTranscriptionRun(k, { state: "finished", model: chosen, startedAt, result }),
-      (error: unknown) => {
-        // The request was sent and no answer came back: the service may still be transcribing.
-        const lost = error instanceof ApiClientError && error.status === 0;
-        setTranscriptionRun(k, lost ? { state: "unknown", model: chosen, startedAt } : { state: "failed", model: chosen, startedAt, error });
-      },
-    );
-  };
+  /**
+   * Takes a job's state, from an event, a read or a start. An answer older than what is shown (the
+   * same job updated earlier, or an older job) is dropped, so a slow read never undoes an event.
+   */
+  const accept = useCallback((j: TranscriptionJob | null) => {
+    if (!mounted.current) return;
+    setJob((prev) => {
+      if (!j) return prev ?? null;
+      if (prev && prev.jobId === j.jobId && j.updatedAt < prev.updatedAt) return prev;
+      if (prev && prev.jobId !== j.jobId && j.startedAt < prev.startedAt) return prev;
+      return j;
+    });
+  }, []);
 
-  /** After a lost connection: a machine version made since the run started means it finished. */
-  const checkForNewVersions = async () => {
-    if (run?.state !== "unknown") return;
-    const since = Date.parse(run.startedAt) - 5_000;
+  const jobSeq = useRef(0);
+  /** Reads the source's newest job; returns it (undefined when the read failed or was overtaken). */
+  const readJob = useCallback(async (): Promise<TranscriptionJob | null | undefined> => {
+    const mine = ++jobSeq.current;
     const k = keyRef.current;
     try {
-      const r = await apiRef.current.versions(projectId, sourceId);
-      if (!mounted.current || k !== keyRef.current) return;
-      const fresh = r.versions.filter((v) => v.origin === "machine" && Date.parse(String((v.derivation as { at?: unknown } | undefined)?.at ?? "")) >= since);
-      if (fresh.length) {
-        setTranscriptionRun(k, { state: "finished", model: run.model, startedAt: run.startedAt, result: { sourceId, folder: "", files: fresh.map((v) => v.path), flaggedSegments: fresh[0]!.flaggedSegments ?? 0 } });
-      } else {
-        setNotice("No new version yet. The transcription may still be going; check again in a few minutes.");
-      }
+      const r = await apiRef.current.transcription(projectId, sourceId);
+      if (!mounted.current || k !== keyRef.current || mine !== jobSeq.current) return undefined;
+      accept(r.job);
+      return r.job;
     } catch (err) {
-      if (!mounted.current || k !== keyRef.current) return;
-      if (!sawLocked(err)) setNotice(`The versions could not be checked. ${errorText(err, "The library service did not answer.")}`);
+      if (mounted.current && k === keyRef.current) sawLocked(err);
+      return undefined;
+    }
+  }, [projectId, sourceId, accept, sawLocked]);
+
+  // The job's state on opening, and its events while the screen is open: each (re)connection of the
+  // stream reads the state again, so nothing that happened while it was down is missed.
+  useEffect(() => {
+    const ac = new AbortController();
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    void readJob();
+    const listen = async () => {
+      try {
+        for await (const e of apiRef.current.events({ signal: ac.signal, onOpen: () => void readJob() })) {
+          if (e.type !== "job.progress") continue;
+          const j = transcriptionJobOf(e.data);
+          if (j && j.projectId === projectId && j.sourceId === sourceId) accept(j);
+        }
+      } catch {
+        // the stream dropped: listen again shortly
+      }
+      if (!ac.signal.aborted) retry = setTimeout(() => void listen(), 2000);
+    };
+    void listen();
+    return () => {
+      ac.abort();
+      clearTimeout(retry);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, attempt]);
+
+  const transcribeButton = useRef<HTMLButtonElement | null>(null);
+  const stopButton = useRef<HTMLButtonElement | null>(null);
+  const startingRef = useRef(false);
+  const stoppingRef = useRef(false);
+  /** Move focus to Stop once the run shows (the Re-transcribe button pressed is turned off). */
+  const focusStop = useRef(false);
+  /** Jobs this screen saw queued or running: their end is told once. */
+  const seen = useRef(new Set<string>());
+  const told = useRef(new Set<string>());
+
+  useEffect(() => {
+    if (isActive(job)) {
+      seen.current.add(job.jobId);
+      if (focusStop.current) {
+        focusStop.current = false;
+        stopButton.current?.focus();
+      }
+      return;
+    }
+    stoppingRef.current = false;
+    setStopping(false);
+    if (!isEnded(job) || !seen.current.has(job.jobId) || told.current.has(job.jobId)) return;
+    told.current.add(job.jobId);
+    if (job.status === "done") {
+      const n = job.result?.flaggedSegments;
+      const flagged = n === undefined ? "" : ` (${n === 1 ? "1 segment is" : `${n} segments are`} flagged for review)`;
+      setNotice(`The new transcript is ready${flagged}. ${dirtyRef.current ? "It is listed under Version." : "It is shown below."}`);
+      void loadVersions({ paths: job.result?.files ?? [] });
+    }
+    // The Stop button went away with the run: focus is not left on nothing.
+    if (!document.activeElement || document.activeElement === document.body) transcribeButton.current?.focus();
+  }, [job, loadVersions]);
+
+  const transcribe = async () => {
+    if (isActive(job) || startingRef.current) return;
+    startingRef.current = true;
+    const chosen = model;
+    focusStop.current = document.activeElement === transcribeButton.current;
+    setStarting(true);
+    setTranscribeFailure(undefined);
+    setFailedWith(undefined);
+    setNotice(undefined);
+    setJobNote(undefined);
+    try {
+      const r = await apiRef.current.transcribe(projectId, sourceId, { model: chosen });
+      accept(r.job);
+    } catch (err) {
+      if (!mounted.current) return;
+      const running = err instanceof ApiClientError && err.reason === "TRANSCRIPTION_RUNNING";
+      const lost = err instanceof ApiClientError && err.status === 0;
+      if (running || lost) {
+        // The run already going, or the one this request may have started: shown, never started twice.
+        const now = await readJob();
+        if (!mounted.current) return;
+        if (isActive(now)) {
+          if (running) setJobNote("This recording is already being transcribed; that run is shown here.");
+          return;
+        }
+        if (running) return;
+      }
+      focusStop.current = false;
+      if (!sawLocked(err)) {
+        setTranscribeFailure(transcribeError(err, chosen));
+        setFailedWith(err);
+      }
+    } finally {
+      startingRef.current = false;
+      if (mounted.current) setStarting(false);
     }
   };
 
-  const busy = run?.state === "running" || run?.state === "unknown";
+  const stop = async () => {
+    const j = job;
+    if (!isActive(j) || stoppingRef.current || j.cancelRequested) return;
+    stoppingRef.current = true;
+    setStopping(true);
+    try {
+      const r = await apiRef.current.cancelTranscription(projectId, j.jobId);
+      accept(r.job);
+    } catch (err) {
+      if (!mounted.current) return;
+      stoppingRef.current = false;
+      setStopping(false);
+      if (!sawLocked(err)) setNotice(`The transcription could not be stopped. ${errorText(err, "The library service did not answer.")}`);
+    }
+  };
+
+  const busy = isActive(job) || starting;
+  const newestVersionAt = versions?.reduce<string | undefined>((m, v) => (v.at && (m === undefined || v.at > m) ? v.at : m), undefined);
+  // A run that ended badly: told when this screen saw it run, or when it is newer than the newest version.
+  const jobFailure = job && (job.status === "failed" || job.status === "cancelled") && job.error && (seen.current.has(job.jobId) || laterThan(job.updatedAt, newestVersionAt)) ? job : undefined;
+  const failureText = transcribeFailure ?? (jobFailure ? transcribeError(jobError(jobFailure), jobFailure.model ?? model) : undefined);
+  const failureFrom = transcribeFailure ? failedWith : jobFailure ? jobError(jobFailure) : undefined;
   const media = useMemo(() => source?.assets.find(isPlayableRecording), [source]);
   const title = source?.source.title.variants[0];
   const human = transcript?.origin === "human-edit";
@@ -596,11 +681,9 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
 
       {!locked && human && transcript?.timed && (
         <p className="ao-tx__note">
-          {base?.kind === "ready"
-            ? `This version was edited by a person. The checks for invented or repeated text run only on what speech recognition wrote: segments left unchanged show the flags found in the speech recognition version of ${dateText(base.at)}; segments the person changed are marked as not checked.${base.guessed ? " This edit does not record which version it was edited from, so the newest speech recognition version made before it was used." : ""}`
-            : base?.kind === "unavailable"
-              ? "This version was edited by a person. Flags are not available for this version: the speech recognition version it was edited from could not be read, so no segment here shows the checks' results. Open a speech recognition version under Version to see its flags."
-              : "This version was edited by a person. Finding which segments the person changed…"}
+          {transcript.flagsStored
+            ? "This version was edited by a person. The checks for invented or repeated text run only on what speech recognition wrote: segments left unchanged show the flags found by speech recognition; segments the person changed or added are marked as not checked."
+            : "This version was edited by a person before the app recorded which segments were changed, so no segment here shows the checks' results: every segment is marked as not checked. Open a speech recognition version under Version to see its flags."}
         </p>
       )}
       {!locked && human && transcript && !transcript.timed && (
@@ -659,9 +742,8 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
           }}
         >
           {segments.map((s, i) => {
-            const fromMachine = carried?.[i];
-            const flags = s.flags ? flagLabels(s.flags) : Array.isArray(fromMachine) ? flagLabels(fromMachine) : [];
-            const unchecked = fromMachine === "edited";
+            const flags = s.flags ? flagLabels(s.flags) : [];
+            const unchecked = notChecked(human, s);
             const draft = drafts.get(i);
             const at = formatTime(s.start);
             const cls = ["ao-tx__seg", flags.length ? "ao-tx__seg--flagged" : "", i === current ? "ao-tx__seg--current" : ""].filter(Boolean).join(" ");
@@ -715,7 +797,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
                     </button>
                   </>
                 )}
-                {unchecked && <p className="ao-tx__unchecked">Edited by a person — not checked</p>}
+                {unchecked && <p className="ao-tx__unchecked">{unchecked}</p>}
                 {flags.length > 0 && (
                   <p className="ao-tx__flags">
                     <span className="ao-tx__flag-mark" aria-hidden="true">
@@ -748,30 +830,39 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
                     </option>
                   ))}
                 </select>
-                <button type="button" onClick={transcribe} disabled={busy || installedModels?.[model] === false} aria-describedby={busy ? `${id}-run` : undefined}>
+                <button
+                  type="button"
+                  ref={transcribeButton}
+                  onClick={() => void transcribe()}
+                  disabled={busy || installedModels?.[model] === false}
+                  aria-describedby={busy ? `${id}-run` : undefined}
+                >
                   Re-transcribe
                 </button>
               </div>
               <SpeechModelNotice model={model} installed={installedModels} />
               <div id={`${id}-run`} role="status" className="ao-tx__progress">
-                {run?.state === "running" && (
-                  <>
-                    <progress aria-label="Transcription in progress" />
-                    <p>{`Transcribing with the ${run.model} model. This can take several minutes. You can leave this screen: the transcription goes on, and the new version will appear under Version. Re-transcribe is off for this source until it finishes.`}</p>
-                  </>
-                )}
-                {run?.state === "unknown" && (
-                  <p>{`The connection to the library service was lost while transcribing with the ${run.model} model. The transcription may still be going: the new version will appear in the version list when it finishes. Re-transcribe is off for this source for the rest of this session, so the same recording is not transcribed twice while the outcome is not known.`}</p>
-                )}
+                {isActive(job) &&
+                  (job.cancelRequested || stopping
+                    ? "Stopping the transcription… The media helper is asked to stop; nothing of this run is saved."
+                    : `Transcribing with the ${job.model ?? "chosen"} model. This can take several minutes. You can leave this screen: the transcription goes on, and the new version will appear under Version. Re-transcribe is off for this source until it finishes.`)}
+                {isActive(job) && jobNote && ` ${jobNote}`}
               </div>
-              {run?.state === "unknown" && (
-                <button type="button" onClick={() => void checkForNewVersions()}>
-                  Check for new versions
-                </button>
+              {isActive(job) && (
+                <div className="ao-row">
+                  {job.progress === undefined ? (
+                    <progress aria-label="Transcription in progress" />
+                  ) : (
+                    <progress aria-label="Transcription in progress" max={1} value={job.progress} />
+                  )}
+                  <button type="button" ref={stopButton} onClick={() => void stop()} disabled={stopping || job.cancelRequested === true}>
+                    Stop transcribing
+                  </button>
+                </div>
               )}
-              {transcribeFailure && (
+              {failureText && !busy && (
                 <p role="alert" className="ao-error">
-                  <MissingToolNotice from={failedWith}>{transcribeFailure}</MissingToolNotice>
+                  <MissingToolNotice from={failureFrom}>{failureText}</MissingToolNotice>
                 </p>
               )}
             </>

@@ -7,13 +7,12 @@ import { SPEECH_MODELS } from "@ao/shared";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { applyProgress, linkQueue, profileQueue } from "../api/capture";
 import { toolsApi } from "../api/tools";
 import { transcriptApi } from "../api/transcripts";
 import { PATHS } from "../navigation";
 import { SourceDetail } from "../screens/SourceDetail";
-import { resetTranscriptionRuns } from "../screens/transcriptionRuns";
 import { TranscriptViewer } from "../screens/TranscriptViewer";
 import { serviceErrorBody, transcriptService } from "../test/msw-transcripts";
 import { catalogue, toolsService } from "../test/msw-tools";
@@ -24,10 +23,6 @@ useMockService();
 
 const P = "019a6f00-0000-7000-8000-000000000001";
 const A = "https://www.youtube.com/watch?v=aaaaaaaa";
-
-beforeEach(() => {
-  resetTranscriptionRuns();
-});
 
 describe("the capture queue", () => {
   it("a link that failed for a missing downloader says so and links to the tools screen", () => {
