@@ -1,4 +1,5 @@
 /** Repository state: the open library, its projects, and helpers every repo module uses. */
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -124,6 +125,9 @@ export interface ProjectState {
   auditUnverified?: boolean;
 }
 
+/** The repo whose write-queue turn the current code runs in, if any. */
+const inTurn = new AsyncLocalStorage<RepoCore>();
+
 export class RepoCore {
   readonly projects = new Map<string, ProjectState>();
   readonly integrityWarnings: IntegrityWarning[] = [];
@@ -185,9 +189,15 @@ export class RepoCore {
 
   /** Runs write operations one at a time, so audit sequence numbers and files never interleave. */
   serial<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(fn, fn);
+    const turn = () => inTurn.run(this, fn);
+    const run = this.queue.then(turn, turn);
     this.queue = run.catch(() => {});
     return run;
+  }
+
+  /** True while running in a turn of this repo's write queue (`serial`): no other write is in progress. */
+  holdsTurn(): boolean {
+    return inTurn.getStore() === this;
   }
 
   state(projectId: string): ProjectState {
