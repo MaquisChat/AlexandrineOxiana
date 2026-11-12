@@ -491,12 +491,13 @@ async function scan(repo: Repo, projectId: string): Promise<{ list: Audited[]; c
 const AUDIT_CHANGED =
   "The audit log of this project is not as the app left it: it was changed outside the app. The app removes no backup on its word until the library has been opened again and the log checked.";
 const AUDIT_UNVERIFIED =
-  "The audit log of this project does not hold together: an entry was changed or removed outside the app. The app removes no backup on its word. If the backups still listed are removed by hand, the app records that they are gone.";
+  "The audit log of this project does not hold together: an entry was changed or removed outside the app. Until it does, the app removes no backup on its word, records nothing about these backups and does not end this warning, also when a backup listed here is no longer in the Backups folder.";
 const FILES_DISAGREE = "While its files and the audit log disagree, the app removes no backup for this destruction by itself. If the backups still listed are removed by hand, the app records that they are gone.";
 const UNRECORDED =
   "The audit log does not record this destruction certificate in the form the app now keeps (it was written by an earlier version of the app, or outside it), so the app does not remove the backups it lists by itself. If they hold destroyed data, remove them by hand.";
-const stateProblem = (file: string) =>
-  `The app's own note of the backups still to remove (backups-state.json in the Backups folder) names "${fileOf(file)}" for this destruction, and the audit log does not. Nothing was removed for this destruction this time, and the note was corrected from the audit log.`;
+/** Never with the name the note gives: it is text from a file anyone can edit, and may be a path (R96). */
+const STATE_DISAGREES =
+  "The app's own note of the backups still to remove (backups-state.json in the Backups folder) names a backup for this destruction that the audit log does not. Nothing was removed for this destruction this time, and the note was corrected from the audit log.";
 
 /** A file in the retention folder as it is (decrypted when sealed): null when it is not there, "unreadable" when it cannot be opened. */
 async function readPlain(repo: Repo, projectId: string, rel: string): Promise<Buffer | null | "unreadable"> {
@@ -686,6 +687,11 @@ interface SettleOptions {
   retry: boolean;
   /** Nothing is removed and no backup is made: only listed backups that are found gone are recorded. */
   observeOnly?: boolean;
+  /**
+   * With `observeOnly`: asked once something would be recorded, before anything is written. False:
+   * the audit log does not hold together, and this pass writes nothing (R174).
+   */
+  mayRecord?: () => Promise<boolean>;
   /** The certificate as written at the destruction (verified), for the ids of the destroyed assets. */
   certificate?: Record<string, unknown>;
 }
@@ -750,6 +756,9 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     else if (s.entry.projectId === projectId && (!Array.isArray(s.entry.assets) || s.entry.assets.some((id) => destroyed.has(id)))) toDelete.push(f);
     else notHolding.push(f);
   }
+  // An observing pass has nothing to do unless a listed backup is gone; and it records that only on
+  // the word of a log that holds together: otherwise nothing is written, not even to the manifest.
+  if (!act && (!gone.length || (opts.mayRecord !== undefined && !(await opts.mayRecord())))) return undefined;
 
   // A fresh backup first, when it can be made (R90 d), at most once a day on a retry; the listed
   // backups are removed whether or not it could (R138 e).
@@ -952,8 +961,12 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
   const out: string[] = [];
   const now = repoClock(repo)();
   let firstError: unknown;
-  /** Whether the whole log, read in this pass, held together (undefined: not read in full yet). */
+  /**
+   * Whether the whole log, read in this pass with its chain verified, holds together. Asked before
+   * anything is written or dropped (R174): a pass that changes nothing does not read the log in full.
+   */
   let holds: boolean | undefined;
+  const logHolds = async (): Promise<boolean> => (holds ??= view.headMatches && (await verifiedAuditEvents(repo, projectId)).ok);
   for (const scanned of view.list) {
     let a = scanned;
     if (!outstandingOf(a).length) continue;
@@ -965,7 +978,7 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
       problem = view.headMatches ? disk!.problem : AUDIT_CHANGED;
       if (!problem) {
         const extra = (Object.hasOwn(found, rel) ? found[rel]!.files : []).find((f) => !listedIn(a, f));
-        if (extra !== undefined) problem = stateProblem(extra);
+        if (extra !== undefined) problem = STATE_DISAGREES;
       }
       if (!problem) {
         const rec = await retentionRetry(repo, retryKey(projectId, rel));
@@ -994,20 +1007,22 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
             }).catch(() => {});
           }
         }
-      }
-      // Nothing is removed while something disagrees; a listed backup that is gone is still recorded
-      // as gone. Not while the log itself changed under the app: nothing is appended to it then.
-      if (problem && problem !== AUDIT_CHANGED) await settleBackups(repo, hold, projectId, a, { retry: true, observeOnly: true });
-      // Said once in the audit log, not at every pass.
-      if (problem && problem !== AUDIT_CHANGED && outstandingOf(a).length && scanned.reportedProblem !== problem) {
-        await appendLibraryEvent(repo, projectId, "retention.backups", {
-          certificate: a.certificate,
-          certificateSha256: a.certificateSha256,
-          status: statusOf(a),
-          problem,
-          removed: [],
-          notRemoved: outstandingOf(a),
-        });
+      } else if (problem !== AUDIT_CHANGED) {
+        // A convenience disagrees: nothing is removed. A listed backup that is gone is still recorded
+        // as gone, and the disagreement is said once in the audit log (not at every pass): both only
+        // on the word of a log that holds together. Otherwise this pass writes nothing (R174).
+        await settleBackups(repo, hold, projectId, a, { retry: true, observeOnly: true, mayRecord: logHolds });
+        if (outstandingOf(a).length && scanned.reportedProblem !== problem && (await logHolds())) {
+          await appendLibraryEvent(repo, projectId, "retention.backups", {
+            certificate: a.certificate,
+            certificateSha256: a.certificateSha256,
+            status: statusOf(a),
+            problem,
+            removed: [],
+            notRemoved: outstandingOf(a),
+          });
+        }
+        if (holds === false) problem = AUDIT_UNVERIFIED;
       }
     } catch (err) {
       if (err instanceof SimulatedCrash) throw err;
@@ -1023,23 +1038,16 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
     const files = await unrecordedOutstanding(repo, Buffer.isBuffer(buf) ? parseObject(buf) : undefined).catch(() => []);
     if (files.length) notes[`${dirRel}/${n}`] = { files, problem: UNRECORDED };
   }
-  // A backup that is still in the Backups folder leaves the note, and so the warning, only on the
-  // word of a log that holds together (R147 4). The lines read above are not checked against the
-  // chain, so before a noted backup that is still there is dropped, the whole log is read and
-  // verified (unless this pass already did). If it does not hold, the backup stays noted, with why.
+  // A noted backup leaves the note, and so the warning, only on the word of a log that holds
+  // together (R147 4, R174), whether or not its file is still in the Backups folder. The lines read
+  // above are not checked against the chain, so before anything noted is dropped the whole log is
+  // read and verified (unless this pass already did). If it does not hold, everything noted stays.
   try {
     const leaving = Object.entries(found).flatMap(([rel, note]) =>
       note.files.filter((f) => isBackupRel(f) && isBackupFileName(fileOf(f)) && !notes[rel]?.files.includes(f)).map((file) => ({ rel, file })),
     );
-    if (leaving.length) {
-      const files = await backupFilesNow(repo, leaving.map((x) => fileOf(x.file)));
-      const there = leaving.filter((x) => files.get(fileOf(x.file))?.present === true);
-      if (there.length) {
-        holds ??= (await verifiedAuditEvents(repo, projectId)).ok;
-        if (!holds) {
-          for (const x of there) notes[x.rel] = { files: [...new Set([...(notes[x.rel]?.files ?? []), x.file])], problem: view.headMatches ? AUDIT_UNVERIFIED : AUDIT_CHANGED };
-        }
-      }
+    if (leaving.length && !(await logHolds())) {
+      for (const x of leaving) notes[x.rel] = { files: [...new Set([...(notes[x.rel]?.files ?? []), x.file])], problem: view.headMatches ? AUDIT_UNVERIFIED : AUDIT_CHANGED };
     }
   } catch (err) {
     if (err instanceof SimulatedCrash) throw err;
