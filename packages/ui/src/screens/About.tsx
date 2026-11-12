@@ -225,7 +225,8 @@ function LicenceTextsPart({ label, load }: { label: string; load: () => Promise<
 
   const toggle = () => {
     if (loading.current) return; // a second click while loading sends nothing more
-    if (open) {
+    // Open: hide it, unless loading failed; then the click tries again at once.
+    if (open && state.status !== "failed") {
       setOpen(false);
       return;
     }
@@ -278,7 +279,7 @@ function FullLicenceTexts({ loaders }: { loaders: LicenceTextLoaders }) {
       ) : (
         <>
           <p>
-            The licence and notice files of every package the app ships, collected when the app was built. Each identical text appears once, with every copyright line from its copies. A package that ships no
+            The licence and notice files of every package the app ships, collected when the app was built. Each file is shown whole, as its package ships it; identical files appear once, under every package they apply to. A package that ships no
             licence text of its own is named, with the standard text used for it.
           </p>
           {parts.map((p) => (

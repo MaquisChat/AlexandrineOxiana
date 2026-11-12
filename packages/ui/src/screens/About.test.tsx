@@ -12,6 +12,7 @@ import { createClient } from "../api/client";
 import { ROUTES, routeFor } from "../App";
 import type { AppLocation } from "../navigation";
 import { BASE, CURRENT_RW, libraryHandlers, server, TOKEN, testApi, url, useMockService } from "../test/service";
+import ABOUT_SOURCE from "./About.tsx?raw";
 import { About, BUILT_LICENCE_TEXTS, BUILT_NOTICES, parseNpmNotices } from "./About";
 import { Library } from "./Library";
 import { LibraryChooser } from "./LibraryChooser";
@@ -181,9 +182,10 @@ describe("full licence texts (Task 37j)", () => {
     await user.click(button);
     expect(await screen.findByText("These licence texts could not be loaded. Try again.")).toBeTruthy();
     expect(document.body.textContent).not.toContain("/assets/x.js");
-    await user.click(button); // closes
-    await user.click(button); // opens and tries again
+    await user.click(button); // one click tries again (review M7)
     expect(await screen.findByText("MIT terms")).toBeTruthy();
+    expect(calls).toBe(2);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
   });
 
   it("an answer that arrives after the screen is gone is dropped", async () => {
@@ -202,9 +204,18 @@ describe("full licence texts (Task 37j)", () => {
     expect(screen.getByRole("region", { name: "Full licence texts" }).textContent).toMatch(/added by the desktop build/);
   });
 
-  it("the build's texts are loaded on demand, never part of the main bundle", () => {
+  it("the build's texts are loaded on demand, never part of the main bundle (review M2)", () => {
     for (const load of Object.values(BUILT_LICENCE_TEXTS)) expect(typeof load).toBe("function");
     for (const text of Object.values(BUILT_NOTICES)) expect(text).not.toMatch(/^=== Text 1 of/m);
+    // What the bundler sees: the texts' glob is lazy, and the eager glob takes only the lists.
+    const source = ABOUT_SOURCE;
+    const globs = [...source.matchAll(/import\.meta\.glob\(\s*"([^"]*generated\/notices[^"]*)"\s*,\s*\{([^}]*)\}/g)].map((m) => ({ pattern: m[1], options: m[2] }));
+    const texts = globs.filter((g) => g.pattern.includes("LICENCES"));
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.options).not.toMatch(/eager/);
+    const eager = globs.filter((g) => /eager:\s*true/.test(g.options));
+    expect(eager).toHaveLength(1);
+    expect(eager[0]!.pattern).toMatch(/\*\.\{json,md\}$/);
   });
 });
 
