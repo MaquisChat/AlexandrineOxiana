@@ -10,6 +10,7 @@ import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkerJobError, WorkerToolError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob, type WorkerToolsClient } from "@ao/library";
 import type { ToolJob, ToolsResponse } from "@ao/shared";
+import { failureTool } from "./routes/jobs.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -287,5 +288,14 @@ describe("tool errors elsewhere", () => {
     const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: { model: "small" } });
     expect(r.status, r.body).toBe(409);
     expect(r.json.error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: "speech-small" });
+  });
+});
+
+describe("GET /jobs names the missing tool of a failed viewing copy or OCR job", () => {
+  it("video proxies need ffmpeg, OCR needs ocr; other failures and image proxies name none", () => {
+    expect(failureTool("video.proxy", "TOOL_NOT_INSTALLED")).toBe("ffmpeg");
+    expect(failureTool("ocr", "TOOL_NOT_INSTALLED")).toBe("ocr");
+    expect(failureTool("video.proxy", "FFMPEG_FAILED")).toBeUndefined();
+    expect(failureTool("image.proxy", "TOOL_NOT_INSTALLED")).toBeUndefined();
   });
 });
