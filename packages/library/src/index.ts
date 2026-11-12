@@ -108,6 +108,7 @@ export * from "./index/index.js";
 
 export {
   JOB_OPS,
+  JobInterruptedError,
   WorkerClient,
   WorkerJobError,
   WorkerToolError,
@@ -117,7 +118,10 @@ export {
   startWorker,
 } from "./worker-client.js";
 export type {
+  JobAbout,
+  JobRecord,
   JobResult,
+  ResumeExtras,
   StartWorkerOptions,
   ToolAction,
   WorkerClientOptions,
