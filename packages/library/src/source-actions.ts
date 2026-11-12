@@ -70,6 +70,8 @@ export async function confirmField(repo: Repo, projectId: string, sourceId: stri
   return updateSourceRechecked(repo, projectId, sourceId, { [name]: value } as Partial<Omit<Source, "id">>, {
     fieldEvidence: (cur) => [...cur.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
     verification: (next) => recheckSourceFile(next, {}).verification,
+    // The capture entries this confirm settles are resolved in this same change (R176 1).
+    resolveReview: "confirmation",
   });
 }
 
@@ -105,6 +107,8 @@ async function confirmIdentifier(repo: Repo, projectId: string, sourceId: string
   return updateSourceRechecked(repo, projectId, sourceId, (cur) => ({ identifiers: { ...cur.identifiers, [key]: value } }), {
     fieldEvidence: (c) => [...c.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
     verification: (next) => recheckSourceFile(next, {}).verification,
+    // The capture entries this confirm settles are resolved in this same change (R176 1).
+    resolveReview: "confirmation",
   });
 }
 

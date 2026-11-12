@@ -42,7 +42,37 @@ export type ListedReviewEntry = ReviewEntry & { title?: string };
 
 export async function listReview(repo: Repo, projectId: string, batchId: string): Promise<ListedReviewEntry[]> {
   const entries = (await projectReviewEntries(repo, projectId)).filter((e) => e.batchId === batchId && e.status === "pending");
-  // The title is read now (a review decision or edit may have changed it), a few sources at a time.
+  return withTitles(repo, projectId, entries);
+}
+
+/** Which part of the project's queue to list (listProjectReview). */
+export interface ProjectReviewQuery {
+  offset?: number;
+  /** Entries to return (0: only the total). Default: all. */
+  limit?: number;
+  /** Only the entries of this source. */
+  sourceId?: string;
+}
+
+/**
+ * The project's whole review queue (R172): every pending entry of every kind — import batch items,
+ * items queued by a drag-and-drop attach (no batch), verification entries queued by captures and by
+ * consent withdrawals — oldest first. An entry whose source is no longer in the project is left out
+ * (nothing is left to decide). `total` counts every entry the query matches; titles are read for the
+ * page returned only. Refused while the project is locked (its queue is sealed).
+ */
+export async function listProjectReview(repo: Repo, projectId: string, q: ProjectReviewQuery = {}): Promise<{ total: number; items: ListedReviewEntry[] }> {
+  const present = new Set(repo.listSourceIds(projectId));
+  const entries = (await projectReviewEntries(repo, projectId))
+    .filter((e) => e.status === "pending" && !!e.sourceId && present.has(e.sourceId) && (q.sourceId === undefined || e.sourceId === q.sourceId))
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const offset = Math.max(0, q.offset ?? 0);
+  const page = entries.slice(offset, q.limit === undefined ? undefined : offset + Math.max(0, q.limit));
+  return { total: entries.length, items: await withTitles(repo, projectId, page) };
+}
+
+/** The entries with their sources' current titles, read now (a decision or edit may have changed them), a few at a time. */
+async function withTitles(repo: Repo, projectId: string, entries: ReviewEntry[]): Promise<ListedReviewEntry[]> {
   const out: ListedReviewEntry[] = entries.map((e) => ({ ...e }));
   let next = 0;
   const worker = async () => {
@@ -166,11 +196,11 @@ export async function decideReview(repo: Repo, projectId: string, itemId: string
         // The Zotero items the reviewed source stands for are remembered on the target (R74 M5).
         const merged = applyMerge(tgt, added, missingFields(tgt, cur.source as unknown as SourceDraft), cur.fieldEvidence, tx.at, tx.actor, [], zoteroKeysOf(cur));
         await ops.writeSource(tgt, merged.next);
-        const { tombstoned } = await ops.deleteSource(cur.source.id);
+        const { tombstoned } = await ops.deleteSource(cur.source.id, { keepReview: entry.id });
         line = { outcome: "merged", sourceId: tgt.source.id, mergedInto: tgt.source.id, ...(snapshot ? { snapshot } : {}), merge: merged.record, ...(tombstoned.length ? { tombstoned } : {}) };
       } else if (d.action === "skip") {
         // A skip is the user's deletion: recorded (R73), and journaled so undo takes it back (R74 I3).
-        const { tombstoned } = await ops.deleteSource(cur.source.id);
+        const { tombstoned } = await ops.deleteSource(cur.source.id, { keepReview: entry.id });
         line = { outcome: "skipped", sourceId: cur.source.id, ...(tombstoned.length ? { tombstoned } : {}) };
       }
       if (batchDir && itemKey) {

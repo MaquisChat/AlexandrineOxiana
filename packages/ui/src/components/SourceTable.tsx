@@ -2,8 +2,10 @@
  * The sources of the current view: title (opens the source), creators, year, type, and whether the
  * source waits for review. Titles and creators are source text (dir=auto). A locked project's
  * sources have no title until it is unlocked. A text search that found a source only through its
- * annotations says so ("Found in an annotation", Task 58).
+ * annotations says so ("Found in an annotation", Task 58). "Needs review" leads to the project's
+ * review queue at that source's entries (Task 67) when the screen gives the way there.
  */
+import type { MouseEvent } from "react";
 import type { SourceRow } from "../api/library";
 import { UserText } from "./UserText";
 import "./library.css";
@@ -41,9 +43,13 @@ export interface SourceTableProps {
   limited?: boolean | undefined;
   /** An index rebuild is running (N3). */
   rebuilding?: boolean | undefined;
+  /** Where a source's "Needs review" leads (the project's review queue at that source, Task 67). */
+  reviewHref?: ((sourceId: string) => string) | undefined;
+  /** Follows that link in the app. */
+  onFollow?: ((e: MouseEvent, href: string) => void) | undefined;
 }
 
-export function SourceTable({ items, total, onOpen, selectedId, incomplete, limited, rebuilding }: SourceTableProps) {
+export function SourceTable({ items, total, onOpen, selectedId, incomplete, limited, rebuilding, reviewHref, onFollow }: SourceTableProps) {
   return (
     <div className="ao-sources">
       <p className="ao-muted" aria-live="polite">
@@ -84,7 +90,14 @@ export function SourceTable({ items, total, onOpen, selectedId, incomplete, limi
                     <UserText>{s.title || "Untitled"}</UserText>
                   </button>
                 )}
-                {s.needsReview && <span className="ao-badge ao-badge--review">Needs review</span>}
+                {s.needsReview &&
+                  (reviewHref ? (
+                    <a className="ao-badge ao-badge--review" href={reviewHref(s.id)} aria-label={`Needs review: ${s.title || "Untitled"}`} onClick={(e) => onFollow?.(e, reviewHref(s.id))}>
+                      Needs review
+                    </a>
+                  ) : (
+                    <span className="ao-badge ao-badge--review">Needs review</span>
+                  ))}
                 {s.matchedIn === "annotation" && <span className="ao-muted"> Found in an annotation</span>}
                 {s.annotationsPartial && <span className="ao-muted"> (Only part of its annotations is searchable)</span>}
               </td>

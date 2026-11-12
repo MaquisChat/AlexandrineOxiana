@@ -2,7 +2,7 @@ import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
 import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
-export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup" | "set-aside";
+export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup" | "set-aside" | "review-withdrawal";
 
 export interface PolicyRequest {
   action: PolicyAction;
@@ -28,6 +28,8 @@ export interface PolicyRequest {
   sync?: Record<string, never>;
   /** Setting aside a mark that cannot be repaired (Task 50, R154 d): the researcher's reason. */
   setAside?: { reason: string };
+  /** Recording that a source flagged by a consent withdrawal was reviewed (Task 67, R176 2): the researcher's reason. */
+  reviewWithdrawal?: { reason: string };
 }
 
 export type Condition =
@@ -230,6 +232,17 @@ function setAside(req: PolicyRequest, warnings: string[]): PolicyDecision {
 }
 
 /**
+ * Recording that a source flagged by a consent withdrawal was reviewed (R176 2, following R157):
+ * allowed in every profile, but only with a reason that is not empty once trimmed.
+ */
+function reviewWithdrawal(req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const s = need(req.reviewWithdrawal, "reviewWithdrawal");
+  str(s.reason, "reviewWithdrawal.reason");
+  if (s.reason.trim() === "") return deny("A reason is required to record that this source was reviewed after the withdrawal", warnings);
+  return allow(warnings);
+}
+
+/**
  * Whether the project's data may be kept on this kind of storage (residency): "kind" when the kind
  * is not in the effective `residency.allowed`; "folder" when it is a cloud folder that must be, and
  * is not, on the approved list (HIPAA, or whenever that list is non-empty); else null.
@@ -322,6 +335,8 @@ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
       return deny("Sync is not enabled in this version", warnings);
     case "set-aside":
       return setAside(req, warnings);
+    case "review-withdrawal":
+      return reviewWithdrawal(req, warnings);
     case "delete":
     case "view":
     case "share":
