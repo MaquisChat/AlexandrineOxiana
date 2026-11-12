@@ -8,10 +8,12 @@
     "build:sidecars": "node scripts/build-sidecars.mjs",
     "smoke:sidecars": "node scripts/build-sidecars.mjs --skip-build --smoke",
     "build:linux": "node scripts/build-linux.mjs",
+    "build:macos": "node scripts/build-macos.mjs",
     "launch-check": "node scripts/launch-check.mjs",
     "e2e": "playwright test -c e2e/playwright.config.ts",
     "typecheck": "tsc -p e2e/tsconfig.json",
-    "test": "node --test scripts/launch-check.test.mjs scripts/notices.test.mjs && vitest run --dir e2e && cargo test --locked --manifest-path src-tauri/Cargo.toml"
+    "test": "node --test scripts/launch-check.test.mjs scripts/notices.test.mjs scripts/node-release.test.mjs scripts/build-macos.test.mjs scripts/mac-targets.test.mjs && vitest run --dir e2e && node scripts/notices-targets.mjs --fetch && cargo test --locked --manifest-path src-tauri/Cargo.toml",
+    "notices:targets": "node scripts/notices-targets.mjs --fetch"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"

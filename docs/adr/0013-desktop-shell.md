@@ -166,6 +166,64 @@ the media worker itself, as it always has.
   helpers stop: a second launch during closing starts no second service; the first instance notes
   it and starts the app again once its helpers are gone.
 
+### In the Mac app (Task 37f; written and checked on Linux, not yet run on a Mac)
+
+- **One pinned Node.js.** `apps/desktop/macos/pins.json` pins the release (v22.23.4) and the SHA-256
+  of `node-<v>-darwin-arm64.tar.gz` and `…-darwin-x64.tar.gz`, copied from the release's
+  `SHASUMS256.txt`. `apps/desktop/scripts/node-release.mjs` downloads the archive once, checks it
+  before extracting anything, and deletes a cached copy that does not match. The workflow installs
+  the same version to run the build, the service folder is built with the extracted release first on
+  `PATH`, and the build fails unless `build-info.json` names darwin, the runner's architecture and
+  exactly that version. `bin/node` ships; `LICENSE` from the same archive goes into the notices
+  (ADR 0015).
+- **Where the helpers go.** `Contents/Resources/{node/node, library-service/, ao-worker/}`, which is
+  the resource folder Tauri gives the shell on macOS (`${exe_dir}/../Resources`, tauri-utils 2.10.2
+  `platform.rs`). They are copied by `bundle.macOS.files` in `src-tauri/tauri.macos.conf.json`, not by
+  `bundle.resources`: in tauri-bundler 2.10.4 `resources` are copied file by file with `fs::copy`,
+  which follows symbolic links, while `macOS.files` uses `copy_dir`, which keeps them (the PyInstaller
+  worker links its shared libraries into `_internal/`). A Rust test ties the configuration to
+  `paths.rs`.
+- **Signing** is done by the build script from `apps/desktop/macos/signing.json` (Tauri bundles with
+  `--no-sign`): ad hoc for now (R151); with an identity (Task 37g) every Mach-O file inside out with
+  the hardened runtime and per-part entitlements. Node's official binary keeps its publisher's
+  signature in the ad-hoc build, and with it its entitlements, which include
+  `allow-dyld-environment-variables`, `disable-library-validation` and `get-task-allow`. The shell
+  never passes a `DYLD_*` variable (R153), and the ad-hoc build is for the owner's own tests (R151);
+  Task 37g must re-sign Node with our identity and our entitlements before anything is given to
+  anyone else.
+- **Started without the file on `main` (R167 a).** GitHub offers "Run workflow" only for a workflow on
+  the default branch, so a build is also started by a tag from the working branch: `vX.Y.Z-mac.N`
+  (both), `-arm.N`, `-intel.N`; X.Y.Z must be the app's version (`apps/desktop/scripts/mac-targets.mjs`).
+- **The crates only a Mac links** (the objc2 family, core-foundation, block2, dispatch2, …) were
+  put through the licence-text collection on Linux for `aarch64-apple-darwin` and
+  `x86_64-apple-darwin` (`apps/desktop/scripts/notices-targets.mjs`, run by the desktop package's
+  tests): 191 crates each, all with a licence; 14 ship no text of their own and get the standard text
+  of their identifier, listed as such (R165).
+
+### If the Mac web view blocks the page's calls to the service (R167 c; the plan for the first Mac run, not code)
+
+Launch check A's in-page probe (its `fetch` and `events` lines) is where this shows. If the page at
+`tauri://localhost` cannot reach `http://127.0.0.1:<port>` although App Transport Security allows
+local networking (`src-tauri/Info.plist`), try, in this order, stopping at the first that works:
+
+1. **The name `localhost` instead of the numeric loopback address**: the shell hands the page
+   `http://localhost:<port>`. WebKit may treat `localhost` as potentially trustworthy where it
+   blocks `127.0.0.1` as mixed content. The content-security policy already allows
+   `http://localhost:*`. This is one reviewed change made together: the service's Host check
+   accepts `localhost:<port>` (it must still refuse any other name, R96), and the client's address
+   check (the shell's `src-tauri/src/connection.rs`, which makes the address, and the launch check's `probeProblems`) accepts
+   `http://localhost:<port>`; the service keeps listening on 127.0.0.1 only. The resolution of
+   `localhost` to `::1` first must be handled (the service does not listen there), for example by
+   listening on both loopback addresses.
+2. Only after that, and each only with a ruling: a custom scheme served by the shell that forwards to
+   the service (changes the content-security policy and moves the token into the shell; wry buffers
+   custom-protocol responses, which breaks the event stream); serving the interface from the service
+   itself (same origin; changes R96's Origin list, the policy and Tauri's remote-URL capabilities);
+   TLS on loopback with a per-launch certificate (wry has no trust hook for subresource requests).
+
+None of these may loosen the content-security policy or the web view's capabilities without a
+ruling (R113, R96).
+
 ## Consequences
 
 - The shell ships two things per architecture: a Node 22 binary and this folder. The folder must be

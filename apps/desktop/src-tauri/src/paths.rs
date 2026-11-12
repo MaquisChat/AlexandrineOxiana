@@ -106,6 +106,59 @@ mod tests {
         fs::remove_dir_all(&r).unwrap();
     }
 
+    /// The Mac bundle (tauri.macos.conf.json, `bundle.macOS.files`) copies the three staged helper
+    /// folders into Contents/Resources, which is the resource folder on macOS (tauri-utils
+    /// `resource_dir`: `${exe_dir}/../Resources`). Laid out as that configuration copies them, they
+    /// are found.
+    #[test]
+    fn the_mac_bundle_puts_the_helpers_where_they_are_looked_for() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.macos.conf.json")).unwrap();
+        let files = conf["bundle"]["macOS"]["files"].as_object().expect("bundle.macOS.files");
+        let mut dests: Vec<&str> = files.keys().map(|k| k.strip_prefix("Resources/").expect("each goes into Contents/Resources")).collect();
+        dests.sort();
+        assert_eq!(dests, ["ao-worker", "library-service", "node"]);
+        for (dest, src) in files {
+            let staged = src.as_str().unwrap();
+            assert_eq!(staged, format!("../.build/macos-resources/{}", dest.strip_prefix("Resources/").unwrap()), "{dest}");
+        }
+        // The staged folders' contents (build-macos.mjs stageResources): node/node, library-service/, ao-worker/ao-worker.
+        let r = tmp("macos");
+        touch(&r.join("node").join("node"));
+        touch(&r.join("library-service").join("service.mjs"));
+        touch(&r.join("ao-worker").join("ao-worker"));
+        let p = resolve(Some(&r), &Overrides::default()).unwrap();
+        assert_eq!(p.node, r.join("node").join(NODE_EXE));
+        assert_eq!(p.worker_bin, Some(r.join("ao-worker").join(WORKER_EXE)));
+        fs::remove_dir_all(&r).unwrap();
+    }
+
+    /// tauri.conf.json with tauri.macos.conf.json merged over it (as tauri-cli does on macOS) is a
+    /// valid Tauri configuration (unknown keys are refused), with the minimum macOS of R133.
+    #[test]
+    fn the_mac_configuration_is_valid_tauri_configuration() {
+        fn merge(base: &mut serde_json::Value, over: &serde_json::Value) {
+            match (base, over) {
+                (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+                    for (k, v) in o {
+                        merge(b.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+                    }
+                }
+                (b, o) => *b = o.clone(),
+            }
+        }
+        let mut conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        merge(&mut conf, &serde_json::from_str(include_str!("../tauri.macos.conf.json")).unwrap());
+        let parsed: tauri::utils::config::Config = serde_json::from_value(conf).expect("a valid Tauri configuration");
+        assert_eq!(parsed.bundle.macos.minimum_system_version.as_deref(), Some("15.0"));
+        assert!(parsed.bundle.active);
+        assert_eq!(parsed.bundle.macos.files.len(), 3);
+        assert_eq!(parsed.bundle.macos.signing_identity, None, "signing is the build script's (macos/signing.json)");
+        // The page's security is the same on every platform.
+        let base: tauri::utils::config::Config = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(parsed.app.security.csp, base.app.security.csp);
+        assert_eq!(parsed.app.security.capabilities, base.app.security.capabilities);
+    }
+
     #[test]
     fn overrides_win_over_the_resources() {
         let r = tmp("override");

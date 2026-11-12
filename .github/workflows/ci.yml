@@ -267,6 +267,12 @@ jobs:
       - name: Build the desktop app (service folder, notices, interface, shell)
         timeout-minutes: 25
         run: pnpm --filter @ao/desktop run build:linux
+      # The crates only the Mac builds link (objc2, core-foundation, ...) through the same fail-closed
+      # licence-text collection (R165, R167): a Cargo.lock change that brings in one without a licence is
+      # found here, not on a Mac. Fetches those crates' sources once (crates.io); about a second after that.
+      - name: Licence texts of the Mac targets' Rust crates
+        timeout-minutes: 5
+        run: pnpm --filter @ao/desktop run notices:targets
       - name: The shell's Rust tests
         timeout-minutes: 15
         run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml

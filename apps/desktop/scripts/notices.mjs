@@ -204,18 +204,23 @@ function npmPackages(list, readPackage) {
 
 // ---------- the build step ----------
 
-function hostTriple() {
+export function hostTriple() {
   const out = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
   const m = /^host: (\S+)$/m.exec(out);
   if (!m) throw new Error("rustc did not report its host");
   return m[1];
 }
 
+/** The crates compiled into the shell for a target triple (cargo metadata, filtered to that platform). */
+export function shippedCratesFor(target) {
+  const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--format-version", "1", "--locked", "--filter-platform", target], { cwd: TAURI, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }));
+  return shippedCrates(metadata);
+}
+
 export function writeNotices(outDir, nodeExe = process.execPath) {
   mkdirSync(outDir, { recursive: true });
   const standard = loadStandardTexts();
-  const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--format-version", "1", "--locked", "--filter-platform", hostTriple()], { cwd: TAURI, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }));
-  const shipped = shippedCrates(metadata);
+  const shipped = shippedCratesFor(hostTriple());
   const crates = crateNotices(shipped);
   writeFileSync(join(outDir, "shell-crates.json"), JSON.stringify(crates, null, 1) + "\n");
   // The source files each notices file was made from: for scripts/notices/check-verbatim.mjs, beside
