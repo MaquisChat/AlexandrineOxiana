@@ -10,7 +10,40 @@
  * researcher is sent (R7, R126).
  */
 import type { ToolAction, ToolId, ToolInfo, ToolJob, ToolJobResponse, ToolsResponse } from "@ao/shared";
-import type { ApiClient } from "./client";
+import { ApiClientError, type ApiClient } from "./client";
+import { errorText } from "./library";
+import { TRANSCRIPTION_MODELS, type TranscriptionModel } from "./transcripts";
+
+/**
+ * PLACEHOLDER (R158) — DELETE at the merge that brings `DEFAULT_SPEECH_MODEL` (and the list of
+ * accepted models) into `@ao/shared` from Task 48a, and use those instead. The default is "medium"
+ * per R158 (SPEC 5.2 names none). The models the app accepts are, until then, TRANSCRIPTION_MODELS
+ * (api/transcripts.ts, the service's MODELS); this file adds no list of its own.
+ */
+export const PLACEHOLDER_DEFAULT_SPEECH_MODEL: TranscriptionModel = "medium";
+
+/** The speech models the app accepts (R158), and the default one. */
+export const ACCEPTED_SPEECH_MODELS: readonly TranscriptionModel[] = TRANSCRIPTION_MODELS;
+export const DEFAULT_SPEECH_MODEL: TranscriptionModel = PLACEHOLDER_DEFAULT_SPEECH_MODEL;
+
+/** The tool that holds a speech model (`medium` → `speech-medium`). */
+export const speechTool = (model: string): ToolId => `speech-${model}` as ToolId;
+
+/** Whether a feature of the app uses this tool: any tool but a speech model the app does not accept (R158). */
+export function usedByApp(id: string): boolean {
+  const size = speechSize(id);
+  return size === undefined || (ACCEPTED_SPEECH_MODELS as readonly string[]).includes(size);
+}
+
+/**
+ * A failed tools request in plain words. The reason of a 503 (the media helper's start-up message,
+ * which can name commands or paths) is never shown; other reasons are internal codes and are left out.
+ */
+export function toolsErrorText(err: unknown, fallback: string): string {
+  if (!(err instanceof ApiClientError)) return fallback;
+  if (err.code === "WORKER_UNAVAILABLE") return `${fallback} The media helper is not running. Restart the app, then try again.`;
+  return errorText(new ApiClientError(err.status, { code: err.code, message: err.message }), fallback);
+}
 
 export type { ToolAction, ToolId, ToolInfo, ToolJob } from "@ao/shared";
 

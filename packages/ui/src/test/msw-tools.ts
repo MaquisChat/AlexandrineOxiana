@@ -159,8 +159,8 @@ export interface ToolsState {
   failNextPost?: { status: number; code: string; message: string; reason?: string };
   /** The answer to the next cancel, if a test wants an error (the job is left as it is). */
   failNextCancel?: { status: number; code: string; message: string; reason?: string };
-  /** Each GET /tools takes the first gate, if any: its answer is the catalogue as it was when asked, sent once the gate opens. */
-  gates: Array<Promise<void>>;
+  /** Each GET /tools takes the first gate, if any: it answers once `wait` resolves, with `body` (a stale reading) or the catalogue as it was when asked. */
+  gates: Array<{ wait: Promise<void>; body?: unknown }>;
   /** The platform the catalogue reports (null: no tool is offered for this computer). */
   platform: string | null;
   /** The answer to GET /tools, if a test wants an error. */
@@ -209,10 +209,10 @@ export function toolsService(opts: { tools?: ToolInfo[]; jobs?: ToolJob[]; base?
         state.requests.push("GET /tools");
         const gate = state.gates.shift();
         const snapshot = JSON.parse(JSON.stringify({ platform: state.platform, tools: withJobs(), jobs: state.jobs })) as unknown;
-        if (gate) await gate;
+        if (gate) await gate.wait;
         if (state.holdCatalogue) await state.holdCatalogue;
         if (state.failCatalogue) return apiError(state.failCatalogue.status, state.failCatalogue.code, state.failCatalogue.message);
-        return HttpResponse.json(gate ? (snapshot as never) : { platform: state.platform, tools: withJobs(), jobs: state.jobs });
+        return HttpResponse.json(gate ? ((gate.body ?? snapshot) as never) : { platform: state.platform, tools: withJobs(), jobs: state.jobs });
       }),
       http.post(url("/tools/jobs/:jobId/cancel"), ({ params }) => {
         state.requests.push(`POST /tools/jobs/${String(params.jobId)}/cancel`);

@@ -1,60 +1,75 @@
 /**
- * Optional tools (Task 48b; R126, R133, R152): the app does not bundle these, so this screen lists
- * each one from the media helper's catalogue (GET /tools) with what it is for, what stops working
- * without it, its download size and whether it is installed, and installs, updates or removes it
- * as a job of the service (POST /tools/:id/:action; progress read from GET /tools/jobs/:id).
+ * Optional tools (Task 48b; R126, R133, R152, R156, R158): the app does not bundle these, so this
+ * screen lists each one from the media helper's catalogue (GET /tools) with what it is for, what
+ * stops working without it, its download size and whether it is installed, and installs, updates or
+ * removes it as a job of the service (POST /tools/:id/:action; progress read from GET /tools/jobs/:id).
  *
+ * - Only tools a feature of the app uses are offered (R158): a speech model the app does not accept
+ *   is not listed, unless the app installed it earlier, when it can only be removed.
  * - A tool the catalogue marks unavailable on this computer (OCR today) is shown with its reason and
  *   cannot be installed. The video downloader and the JavaScript runtime it needs are one choice.
- * - Downloading contacts only the tool's publisher (the hosts come from the catalogue) and sends
- *   nothing about projects or the researcher (R7).
+ * - Downloading contacts only the tool's publisher (the hosts come from the catalogue, when it lists
+ *   them) and sends nothing about projects or the researcher (R7).
  * - Without ffmpeg, media that carries a location stays "proxy pending" and is left out of exports
- *   (R83, R90 c).
+ *   (R83, R90 c): said once, by the catalogue's text or else by this screen.
  * - Jobs (R99): progress is visible; the live region speaks at the start, half way and the end only;
- *   a running job can be cancelled; leaving and coming back (or a reload) finds it again, because the
- *   catalogue carries each tool's latest job. One request per action (a double click sends one);
- *   answers that arrive after the screen was left, or after a newer reading, are dropped; every
- *   failure is said in plain words with a way to try again.
+ *   an install or update can be stopped (a remove cannot); after a stop the catalogue is read again
+ *   and the screen says what is installed now, part by part. Leaving and coming back (or a reload)
+ *   finds a running job again, because the catalogue carries each tool's latest job. One request per
+ *   action; answers that arrive after the screen was left, or after a newer reading, are dropped;
+ *   every failure is said in plain words, and its Try again repeats exactly what failed.
  */
 import type { ToolAction, ToolId, ToolInfo, ToolJob } from "@ao/shared";
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { ApiClient } from "../api/client";
-import { errorText } from "../api/library";
-import { formatSize, hostsOf, remainingOf, speechSize, toolsApi, type ToolsApi } from "../api/tools";
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { ApiClientError, type ApiClient } from "../api/client";
+import { DEFAULT_SPEECH_MODEL, formatSize, hostsOf, remainingOf, speechSize, toolsApi, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { UserText } from "../components/UserText";
 import type { AppLocation } from "../navigation";
 import "./GovernanceScreens.css";
 import "./ToolsSetup.css";
 
 const GROUPS: Array<{ id: ToolInfo["group"]; title: string; hint: string }> = [
-  { id: "speech", title: "Speech recognition", hint: "Speech models turn recordings into transcripts. Bigger models are slower and more accurate; most interviews need only the small one." },
+  { id: "speech", title: "Speech recognition", hint: "Speech models turn recordings into transcripts. Bigger models are slower and more accurate." },
   { id: "capture", title: "Saving from the web", hint: "Downloaders save videos and picture posts from the links you capture." },
-  { id: "media", title: "Video and audio conversion", hint: "Makes viewing copies of videos and reads the sound of recordings." },
+  { id: "media", title: "Video conversion", hint: "Makes viewing copies of videos, including copies that leave out or coarsen a recorded location." },
   { id: "documents", title: "Scanned documents", hint: "Reads the text of scanned pages so they can be searched." },
 ];
 
-/** Speed and accuracy of each speech model, in plain words. */
+/** Speed and accuracy of each speech model the app accepts, in plain words. */
 const SPEECH_HINT: Record<string, string> = {
-  tiny: "Fastest and least accurate: for a quick first look at a recording.",
-  small: "A good balance of speed and accuracy for most interviews.",
-  medium: "Slower, and more accurate than the small model.",
+  small: "Fastest of the models the app uses, and the least accurate.",
+  medium: "More accurate than the small model, and slower.",
   "large-v3": "Slowest and most accurate: for difficult recordings, on a fast computer.",
 };
 
 const FFMPEG_WITHOUT =
   "Without ffmpeg, media that carries a location stays “proxy pending”: its viewing copy, with the location coarsened or removed, is not made, and the media is left out of exports.";
 
-const VERB: Record<ToolAction, { doing: string; done: string; button: string }> = {
-  install: { doing: "Installing", done: "installed", button: "Install" },
-  update: { doing: "Updating", done: "updated", button: "Update" },
-  remove: { doing: "Removing", done: "removed", button: "Remove" },
+const VERB: Record<ToolAction, { doing: string; done: string }> = {
+  install: { doing: "Installing", done: "installed" },
+  update: { doing: "Updating", done: "updated" },
+  remove: { doing: "Removing", done: "removed" },
 };
 
 type Mark = "start" | "half" | "end";
 
+/** A failed request on one tool, and what its Try again repeats (exactly the request that failed). */
 interface RequestError {
   text: string;
-  action: ToolAction;
+  retry?: { label: string; run: () => void };
+}
+
+/** One spoken message: the tool's name is catalogue text (UserText), the rest fixed words. */
+interface Said {
+  lead: string;
+  name: string;
+  tail: string;
+}
+
+/** What is on this computer now, from the catalogue, part by part for a tool of several parts. */
+function installedNow(t: ToolInfo): string {
+  if (t.components.length > 1) return `${t.components.map((c) => `${c.name} is ${c.installed ? "installed" : "not installed"}`).join("; ")}.`;
+  return `${t.name} is ${t.installed ? "installed" : "not installed"}.`;
 }
 
 /** The route's wrapper: one api object per client; `?tool=<id>` brings that tool into view. */
@@ -70,7 +85,9 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reqErrors, setReqErrors] = useState<Partial<Record<ToolId, RequestError>>>({});
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
-  const [announcement, setAnnouncement] = useState("");
+  /** Tools whose job was just stopped, while the catalogue is read again. */
+  const [checking, setChecking] = useState<ReadonlySet<string>>(new Set());
+  const [announcement, setAnnouncement] = useState<{ n: number; said: Said[] }>({ n: 0, said: [] });
 
   const alive = useRef(true);
   const aborts = useRef(new Set<AbortController>());
@@ -111,7 +128,7 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
       setLoadError(null);
     } catch (err) {
       if (!alive.current || my !== loadSeq.current) return;
-      setLoadError(errorText(err, "The list of optional tools could not be read."));
+      setLoadError(toolsErrorText(err, "The list of optional tools could not be read."));
     } finally {
       release(ac);
     }
@@ -146,10 +163,13 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
         if (stopped || !alive.current) return;
         const fresh = got.filter((g): g is { id: string; j: ToolJob } => !!g.j && g.j.jobId === g.id);
         if (fresh.length) {
-          setTools((ts) => ts && ts.map((t) => {
-            const f = fresh.find((g) => g.j.toolId === t.id && t.job?.jobId === g.id);
-            return f ? { ...t, job: f.j } : t;
-          }));
+          setTools((ts) =>
+            ts &&
+            ts.map((t) => {
+              const f = fresh.find((g) => g.j.toolId === t.id && t.job?.jobId === g.id);
+              return f ? { ...t, job: f.j } : t;
+            }),
+          );
         }
         // Ended, or no longer known to the service (it restarted): the catalogue says what is installed now.
         if (got.some((g) => !g.j || g.j.status !== "running")) void load();
@@ -165,10 +185,11 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     };
   }, [runningKey, pollMs, api, load]);
 
-  // The live region: the start, half way and the end of each job, never every step.
+  // The live region: the start, half way and the end of each job, never every step; every change
+  // seen in one reading is said (not only the last).
   useEffect(() => {
     if (!tools) return;
-    let say = "";
+    const said: Said[] = [];
     for (const t of tools) {
       const j = t.job;
       if (!j) continue;
@@ -184,23 +205,25 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
           if (j.status !== "running") m.add("end");
         }
       }
+      let say: Said | undefined;
       if (!m.has("start")) {
         m.add("start");
-        say = `${v.doing} ${t.name} started.`;
+        say = { lead: `${v.doing} `, name: t.name, tail: " started." };
       }
       if (j.status === "running" && j.progress >= 0.5 && !m.has("half")) {
         m.add("half");
-        say = `${v.doing} ${t.name}: half way.`;
+        say = { lead: `${v.doing} `, name: t.name, tail: ": half way." };
       }
       if (j.status !== "running" && !m.has("end")) {
         m.add("end");
         m.add("half");
-        if (j.status === "done") say = `${t.name} is ${v.done}.`;
-        else if (j.status === "cancelled") say = `${v.doing} ${t.name} was cancelled.`;
-        else say = `${v.doing} ${t.name} did not finish.`;
+        if (j.status === "done") say = { lead: "", name: t.name, tail: ` is ${v.done}.` };
+        else if (j.status === "cancelled") say = { lead: `${v.doing} `, name: t.name, tail: " was stopped." };
+        else say = { lead: `${v.doing} `, name: t.name, tail: " did not finish." };
       }
+      if (say) said.push(say);
     }
-    if (say) setAnnouncement(say);
+    if (said.length) setAnnouncement((a) => ({ n: a.n + 1, said }));
   }, [tools]);
 
   // Focus is not left on nothing when a job's Cancel button goes away: it moves to the tool's heading.
@@ -223,20 +246,22 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     h.focus();
   }, [tools, focusTool]);
 
-  const setBusyKey = (key: string, on: boolean) =>
-    setBusy((b) => {
+  const setIn = (set: (f: (s: ReadonlySet<string>) => ReadonlySet<string>) => void, key: string, on: boolean) =>
+    set((b) => {
       const n = new Set(b);
       if (on) n.add(key);
       else n.delete(key);
       return n;
     });
 
+  const clearError = (id: ToolId) => setReqErrors(({ [id]: _gone, ...rest }) => rest);
+
   const act = async (t: ToolInfo, action: ToolAction) => {
     const key = `${t.id}:act`;
     if (inFlight.current.has(key)) return;
     inFlight.current.add(key);
-    setBusyKey(key, true);
-    setReqErrors(({ [t.id]: _gone, ...rest }) => rest);
+    setIn(setBusy, key, true);
+    clearError(t.id);
     const ac = controller();
     try {
       const job = await api.start(t.id, action, ac.signal);
@@ -246,11 +271,14 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
       headings.current.get(t.id)?.focus();
     } catch (err) {
       if (!alive.current) return;
-      setReqErrors((e) => ({ ...e, [t.id]: { text: errorText(err, `${VERB[action].doing} ${t.name} could not be started.`), action } }));
+      setReqErrors((e) => ({
+        ...e,
+        [t.id]: { text: toolsErrorText(err, `${VERB[action].doing} ${t.name} could not be started.`), retry: { label: `Try again: ${action} ${t.name}`, run: () => void act(t, action) } },
+      }));
     } finally {
       release(ac);
       inFlight.current.delete(key);
-      if (alive.current) setBusyKey(key, false);
+      if (alive.current) setIn(setBusy, key, false);
     }
   };
 
@@ -258,31 +286,49 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     const key = `${job.jobId}:cancel`;
     if (inFlight.current.has(key)) return;
     inFlight.current.add(key);
-    setBusyKey(key, true);
+    setIn(setBusy, key, true);
+    clearError(t.id);
+    const doing = VERB[job.action].doing;
     const ac = controller();
     try {
       const j = await api.cancel(job.jobId, ac.signal);
       if (!alive.current) return;
       putJob(j);
-      if (j.status !== "running") void load();
+      // What a stop left behind is known only from the catalogue (a part may have arrived first).
+      setIn(setChecking, t.id, true);
+      await load();
+      if (alive.current) setIn(setChecking, t.id, false);
     } catch (err) {
       if (!alive.current) return;
-      setReqErrors((e) => ({ ...e, [t.id]: { text: errorText(err, `${VERB[job.action].doing} ${t.name} could not be cancelled.`), action: job.action } }));
+      if (err instanceof ApiClientError && err.code === "NOT_FOUND") {
+        // The job had ended (or the service restarted): nothing to stop; say what is installed now.
+        setReqErrors((e) => ({ ...e, [t.id]: { text: "That job had already ended, so there was nothing to stop. The list shows what is installed now." } }));
+        void load();
+      } else {
+        setReqErrors((e) => ({
+          ...e,
+          [t.id]: { text: toolsErrorText(err, `${doing} ${t.name} could not be stopped.`), retry: { label: `Try again: cancel ${doing.toLowerCase()} ${t.name}`, run: () => void cancel(t, job) } },
+        }));
+      }
     } finally {
       release(ac);
       inFlight.current.delete(key);
-      if (alive.current) setBusyKey(key, false);
+      if (alive.current) setIn(setBusy, key, false);
     }
   };
 
-  const groups = GROUPS.map((g) => ({ ...g, tools: (tools ?? []).filter((t) => t.group === g.id) }));
-  const others = (tools ?? []).filter((t) => !GROUPS.some((g) => g.id === t.group));
+  // Only tools a feature uses (R158); one the app installed earlier stays listed so it can be removed.
+  const listed = (tools ?? []).filter((t) => usedByApp(t.id) || t.managed);
+  const groups = GROUPS.map((g) => ({ ...g, tools: listed.filter((t) => t.group === g.id) }));
+  const others = listed.filter((t) => !GROUPS.some((g) => g.id === t.group));
   if (others.length) groups.push({ id: "documents", title: "Other tools", hint: "", tools: others });
+  const anyHosts = listed.some((t) => hostsOf(t).length > 0);
 
   const card = (t: ToolInfo) => {
     const hid = `${ids}-${t.id}`;
     const job = t.job;
     const running = job?.status === "running";
+    const used = usedByApp(t.id);
     const size = speechSize(t.id);
     const hosts = hostsOf(t, { missingOnly: !t.installed });
     const systemOnly = t.installed && !t.managed && t.components.some((c) => c.source === "system" || c.source === "override");
@@ -290,6 +336,7 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     const failed = job?.status === "failed" ? job : undefined;
     const actBusy = busy.has(`${t.id}:act`);
     const remaining = remainingOf(t);
+    const hint = size ? (size === DEFAULT_SPEECH_MODEL ? `The app's default model. ${SPEECH_HINT[size] ?? ""}`.trim() : SPEECH_HINT[size]) : undefined;
     return (
       <section key={t.id} className="ao-card ao-tool" aria-labelledby={hid}>
         <h3
@@ -303,18 +350,25 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
           <UserText>{t.name}</UserText>
         </h3>
         <UserText as="p">{t.purpose}</UserText>
-        {size && SPEECH_HINT[size] ? <p className="ao-hint">{SPEECH_HINT[size]}</p> : null}
+        {hint ? <p className="ao-hint">{hint}</p> : null}
+        {!used ? <p className="ao-hint">No feature of the app uses it, so it is not offered any more. You can remove it.</p> : null}
         <p>
           Without it: <UserText>{t.without}</UserText>
         </p>
-        {t.id === "ffmpeg" ? <p>{FFMPEG_WITHOUT}</p> : null}
+        {t.id === "ffmpeg" && !/proxy pending/i.test(t.without) ? <p>{FFMPEG_WITHOUT}</p> : null}
         {t.components.length > 1 ? (
           <div>
             <p>One choice; it includes:</p>
             <ul className="ao-tool__parts">
               {t.components.map((c) => (
                 <li key={c.id}>
-                  <UserText>{c.name}</UserText> {c.version ? <span className="ao-hint">(<UserText>{c.version}</UserText>)</span> : null}
+                  <UserText>{c.name}</UserText>
+                  {c.version ? (
+                    <span className="ao-hint">
+                      {" "}
+                      (<UserText>{c.version}</UserText>)
+                    </span>
+                  ) : null}
                 </li>
               ))}
             </ul>
@@ -345,7 +399,11 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
             Downloads from: <UserText>{hosts.join(", ")}</UserText>
           </p>
         ) : null}
-        {t.notice ? <UserText as="p" className="ao-hint">{t.notice}</UserText> : null}
+        {t.notice ? (
+          <UserText as="p" className="ao-hint">
+            {t.notice}
+          </UserText>
+        ) : null}
 
         {running && job ? (
           <div className="ao-tool__job">
@@ -355,12 +413,21 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
               </span>
               <progress max={100} value={Math.round(Math.min(1, Math.max(0, job.progress)) * 100)} aria-label={`${VERB[job.action].doing} ${t.name}`} />
             </label>
-            <button type="button" aria-label={`Cancel ${VERB[job.action].doing.toLowerCase()} ${t.name}`} disabled={busy.has(`${job.jobId}:cancel`)} onClick={() => void cancel(t, job)}>
-              Cancel
-            </button>
+            {/* A remove cannot be stopped part-way, so it offers no Cancel. */}
+            {job.action !== "remove" ? (
+              <button type="button" aria-label={`Cancel ${VERB[job.action].doing.toLowerCase()} ${t.name}`} disabled={busy.has(`${job.jobId}:cancel`)} onClick={() => void cancel(t, job)}>
+                Cancel
+              </button>
+            ) : null}
           </div>
         ) : null}
-        {job?.status === "cancelled" ? <p>{VERB[job.action].doing} was cancelled. Nothing was changed.</p> : null}
+        {job?.status === "cancelled" ? (
+          checking.has(t.id) ? (
+            <p>Stopping… reading what is installed now.</p>
+          ) : (
+            <UserText as="p">{`Stopped. ${installedNow(t)}`}</UserText>
+          )
+        ) : null}
         {failed && !reqError ? (
           <div role="alert" className="ao-warning">
             <p>
@@ -374,25 +441,28 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
         {reqError ? (
           <div role="alert" className="ao-warning">
             <UserText as="p">{reqError.text}</UserText>
-            <button type="button" aria-label={`Try again: ${reqError.action} ${t.name}`} disabled={actBusy} onClick={(e) => e.detail < 2 && void act(t, reqError.action)}>
-              Try again
-            </button>
+            {reqError.retry ? (
+              <button type="button" aria-label={reqError.retry.label} disabled={actBusy} onClick={(e) => e.detail < 2 && reqError.retry!.run()}>
+                Try again
+              </button>
+            ) : null}
           </div>
         ) : null}
 
         {!running ? (
           <div className="ao-actions">
-            {!t.installed && t.available ? (
+            {!t.installed && t.available && used ? (
               <button type="button" aria-label={`Install ${t.name}`} disabled={actBusy} onClick={(e) => e.detail < 2 && void act(t, "install")}>
                 Install
               </button>
             ) : null}
-            {t.installed && t.managed ? (
+            {t.installed && t.managed && used ? (
               <button type="button" aria-label={`Update ${t.name}`} disabled={actBusy} onClick={(e) => e.detail < 2 && void act(t, "update")}>
                 {t.updateAvailable ? "Update (a newer version is available)" : "Update"}
               </button>
             ) : null}
-            {t.installed && t.managed ? (
+            {/* Any part the app installed can be removed, also a part left by a stopped install. */}
+            {t.managed ? (
               <button type="button" aria-label={`Remove ${t.name}`} disabled={actBusy} onClick={(e) => e.detail < 2 && void act(t, "remove")}>
                 Remove
               </button>
@@ -408,11 +478,21 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
       <h1>Optional tools</h1>
       <p>The app does not include these tools, so that its own download stays small. Install only the ones you need; you can remove them again here.</p>
       <p>
-        Each download contacts only the tool's publisher{(tools ?? []).some((t) => hostsOf(t).length > 0) ? ", at the addresses listed with the tool," : ""} and sends nothing about your projects or about you. Each
-        file is checked against its published checksum before it is used.
+        Each download contacts only the tool's publisher{anyHosts ? ", at the addresses listed with the tool," : ""} and sends nothing about your projects or about you. Each file is checked against its
+        published checksum before it is used.
       </p>
       <p role="status" aria-label="Tool progress" className="ao-visually-hidden">
-        {announcement}
+        {/* Keyed by count, so the same words said again are announced again. */}
+        <span key={announcement.n}>
+          {announcement.said.map((s, i) => (
+            <Fragment key={i}>
+              {i > 0 ? " " : null}
+              {s.lead}
+              <UserText>{s.name}</UserText>
+              {s.tail}
+            </Fragment>
+          ))}
+        </span>
       </p>
       {loadError ? (
         <div role="alert" className="ao-warning">

@@ -294,9 +294,10 @@ describe("the optional tools screen", () => {
     await user.click(screen.getByRole("button", { name: `Install ${FFMPEG}` }));
     await user.click(screen.getByRole("button", { name: "Install Image downloader" }));
     await screen.findByRole("progressbar", { name: /Installing Image downloader/ });
-    // The reading that follows ffmpeg's end is held; it was taken while the image downloader still ran.
+    // The reading that follows ffmpeg's end is held, and answers late with what was true before.
     let release!: () => void;
-    svc.state.gates.push(new Promise<void>((r) => (release = r)));
+    const before = catalogue().map((t) => (t.id === "ffmpeg" ? { ...t, installed: true, usable: true, managed: true, remainingSize: 0 } : t));
+    svc.state.gates.push({ wait: new Promise<void>((r) => (release = r)), body: { platform: "linux-x64", tools: before, jobs: [] } });
     svc.finish(svc.jobOf("ffmpeg")!.jobId);
     await waitFor(() => expect(svc.state.gates).toHaveLength(0));
     svc.finish(svc.jobOf("image-downloader")!.jobId);
