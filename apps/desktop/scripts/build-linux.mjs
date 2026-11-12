@@ -2,7 +2,8 @@
 // Builds the desktop app on Linux (Task 37c), in this order: the library service folder
 // (apps/library-service/dist/library-service); the notices the About screen shows from the helpers'
 // own builds, copied to apps/desktop/generated/notices/ (the service build's THIRD-PARTY-NOTICES.md,
-// and the packaged worker's sidecar-manifest.json when build:sidecars has made one); the interface
+// and the packaged worker's sidecar-manifest.json when build:sidecars has made one) and the licence
+// lists of the shell's own Rust crates and the interface's npm packages (notices.mjs); the interface
 // (packages/ui/dist, which reads those notices and is embedded in the shell); and the Tauri shell
 // (apps/desktop/src-tauri/target/<profile>/alexandrine-oxiana). Debug profile by default (what the
 // launch check runs); `--release` builds the release profile instead (no developer tools, no test mode).
@@ -44,6 +45,9 @@ const sidecars = join(REPO, "apps", "desktop", "sidecars");
 const worker = existsSync(sidecars) ? readdirSync(sidecars).map((d) => join(sidecars, d, "sidecar-manifest.json")).find((f) => existsSync(f)) : undefined;
 if (worker) copyFileSync(worker, join(NOTICES, "worker-sidecar-manifest.json"));
 process.stdout.write(`build:linux: notices: the service's npm packages${worker ? " and the packaged worker's manifest" : " (no packaged worker yet: its manifest is not included)"}\n`);
+
+// The shell's own Rust crates and the interface's npm packages (R159 c); fails on one without a licence.
+step("the licence lists of the shell's crates and the interface's packages", process.execPath, [join(REPO, "apps", "desktop", "scripts", "notices.mjs"), NOTICES]);
 
 step("the interface", "pnpm", ["--filter", "@ao/ui", "run", "build"]);
 step(`the shell (${release ? "release" : "debug"})`, "cargo", ["build", "--locked", ...(release ? ["--release"] : [])], TAURI);

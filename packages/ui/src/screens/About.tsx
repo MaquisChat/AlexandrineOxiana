@@ -31,13 +31,83 @@ export interface BuiltNotices {
   npm?: string;
   /** The packaged worker's sidecar-manifest.json. */
   worker?: string;
+  /** The shell's own Rust crates (apps/desktop/scripts/notices.mjs, from `cargo metadata`). */
+  crates?: string;
+  /** The interface's production npm packages (notices.mjs, from `pnpm list`). */
+  interfaceNpm?: string;
 }
+
+const built = (key: keyof BuiltNotices, file: string): BuiltNotices => {
+  const text = fileNamed(GENERATED, file);
+  return text === undefined ? {} : { [key]: text };
+};
 
 /** The notices the desktop build supplied to this build of the interface (none in other builds). */
 export const BUILT_NOTICES: BuiltNotices = {
-  ...(fileNamed(GENERATED, "library-service-THIRD-PARTY-NOTICES.md") !== undefined ? { npm: fileNamed(GENERATED, "library-service-THIRD-PARTY-NOTICES.md")! } : {}),
-  ...(fileNamed(GENERATED, "worker-sidecar-manifest.json") !== undefined ? { worker: fileNamed(GENERATED, "worker-sidecar-manifest.json")! } : {}),
+  ...built("npm", "library-service-THIRD-PARTY-NOTICES.md"),
+  ...built("worker", "worker-sidecar-manifest.json"),
+  ...built("crates", "shell-crates.json"),
+  ...built("interfaceNpm", "interface-npm.json"),
 };
+
+interface ListedNotice {
+  name: string;
+  version: string;
+  licence: string;
+  source?: string;
+}
+
+/** A list notices.mjs wrote, or undefined if it cannot be read. */
+function parseList(json: string): ListedNotice[] | undefined {
+  try {
+    const v: unknown = JSON.parse(json);
+    if (!Array.isArray(v)) return undefined;
+    const text = (x: unknown) => (typeof x === "string" ? x : "");
+    return v.map((e: Record<string, unknown>) => ({ name: text(e?.name), version: text(e?.version), licence: text(e?.licence), ...(typeof e?.source === "string" ? { source: e.source } : {}) }));
+  } catch {
+    return undefined;
+  }
+}
+
+function ListSection({ id, title, tableLabel, intro, json, withSource }: { id: string; title: string; tableLabel: string; intro: string; json: string | undefined; withSource?: boolean }) {
+  const list = json === undefined ? undefined : parseList(json);
+  return (
+    <section aria-labelledby={id} className="ao-card">
+      <h2 id={id} className="ao-pane-title">
+        {title}
+      </h2>
+      {json === undefined ? (
+        <p>{NOT_IN_THIS_BUILD}</p>
+      ) : list === undefined ? (
+        <p>This list could not be read.</p>
+      ) : (
+        <>
+          <p>{intro}</p>
+          <table className="ao-table" aria-label={tableLabel}>
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Version</th>
+                <th scope="col">Licence</th>
+                {withSource && <th scope="col">Source</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {list.map((e) => (
+                <tr key={`${e.name}@${e.version}`}>
+                  <UserText as="td">{e.name}</UserText>
+                  <UserText as="td">{e.version}</UserText>
+                  <UserText as="td">{e.licence}</UserText>
+                  {withSource && <UserText as="td">{e.source ?? ""}</UserText>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </section>
+  );
+}
 
 export interface NpmNotice {
   name: string;
@@ -98,7 +168,7 @@ function LicenceText({ title, text }: { title: string; text: string | undefined 
   );
 }
 
-const NOT_IN_THIS_BUILD = "This list is added by the desktop build of the app, from the build of the helper itself; this build of the interface does not include it.";
+const NOT_IN_THIS_BUILD = "This list is added by the desktop build of the app, from the builds of what it ships; this build of the interface does not include it.";
 
 export function About({ notices = BUILT_NOTICES }: { notices?: BuiltNotices }) {
   const notice = fileNamed(CSL, "NOTICE.md");
@@ -142,6 +212,22 @@ export function About({ notices = BUILT_NOTICES }: { notices?: BuiltNotices }) {
           return <LicenceText key={file} title={`${FONT_NAMES[stem] ?? stem}: SIL Open Font License 1.1`} text={text} />;
         })}
       </section>
+
+      <ListSection
+        id="ao-about-crates"
+        title="The app's own Rust crates"
+        tableLabel="Rust crates in the app"
+        intro="Compiled into the app's program. Crates under the Mozilla Public License 2.0 are available in source form where their row says."
+        json={notices.crates}
+        withSource
+      />
+      <ListSection
+        id="ao-about-ui-npm"
+        title="The interface's npm packages"
+        tableLabel="npm packages in the interface"
+        intro="The packages the app's interface is built from."
+        json={notices.interfaceNpm}
+      />
 
       <section aria-labelledby="ao-about-npm" className="ao-card">
         <h2 id="ao-about-npm" className="ao-pane-title">

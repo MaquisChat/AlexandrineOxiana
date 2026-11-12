@@ -85,6 +85,27 @@ describe("About", () => {
     expect(screen.getByRole("region", { name: "The media helper's packages" }).textContent).toContain("ffmpeg");
   });
 
+  it("lists the shell's own Rust crates (MPL-2.0 ones with where their source is) and the interface's npm packages (R159 c)", () => {
+    const crates = JSON.stringify([
+      { name: "cssparser", version: "0.29.6", licence: "MPL-2.0", source: "https://github.com/servo/rust-cssparser (version 0.29.6; also https://crates.io/crates/cssparser/0.29.6)" },
+      { name: "tauri", version: "2.12.5", licence: "Apache-2.0 OR MIT" },
+    ]);
+    const npm = JSON.stringify([{ name: "react", version: "19.3.1", licence: "MIT" }]);
+    render(<About notices={{ crates, interfaceNpm: npm }} />);
+    const rust = screen.getByRole("table", { name: "Rust crates in the app" });
+    expect(within(rust).getAllByRole("row")).toHaveLength(3);
+    expect(within(rust).getByText("Apache-2.0 OR MIT")).toBeTruthy();
+    expect(rust.textContent).toContain("https://github.com/servo/rust-cssparser (version 0.29.6");
+    const ui = screen.getByRole("table", { name: "npm packages in the interface" });
+    expect(within(ui).getByText("react")).toBeTruthy();
+  });
+
+  it("without the desktop build's data, says where the shell's lists come from", () => {
+    render(<About notices={{}} />);
+    expect(screen.getByRole("region", { name: "The app's own Rust crates" }).textContent).toMatch(/added by the desktop build/);
+    expect(screen.getByRole("region", { name: "The interface's npm packages" }).textContent).toMatch(/added by the desktop build/);
+  });
+
   it("a damaged worker manifest is said to be unreadable, not shown half", () => {
     render(<About notices={{ worker: "{not json" }} />);
     expect(screen.getByRole("region", { name: "The media helper's packages" }).textContent).toMatch(/could not be read/);

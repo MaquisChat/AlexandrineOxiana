@@ -9,6 +9,6 @@
     "smoke:sidecars": "node scripts/build-sidecars.mjs --skip-build --smoke",
     "build:linux": "node scripts/build-linux.mjs",
     "launch-check": "node scripts/launch-check.mjs",
-    "test": "node --test scripts/launch-check.test.mjs && cargo test --locked --manifest-path src-tauri/Cargo.toml"
+    "test": "node --test scripts/launch-check.test.mjs scripts/notices.test.mjs && cargo test --locked --manifest-path src-tauri/Cargo.toml"
   }
 }
