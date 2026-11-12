@@ -10,10 +10,30 @@
  *
  * Elements are found by role and accessible name. The link is captured by the fake tools of the
  * harness (no network).
+ *
+ * Then scenarios 9, 10 and 11 (Task 34f), described where they start below: two links captured and
+ * picked up again after a reload, with a transcript edited and transcribed again; a profile captured
+ * twice, the post missing the second time flagged and nothing deleted (with defect D17); a planted
+ * DOI and title conflict settled from the project's review queue.
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { expect, libraryWithProject, OPEN_RULES, test, type AppHarness, type FakeControl, type Page } from "./fixtures.js";
+import {
+  APP_ORIGIN,
+  blockedBy,
+  DEFECT_TIMEOUT,
+  expect,
+  expectDefect,
+  libraryWithProject,
+  OPEN_RULES,
+  plantCaptureConflict,
+  test,
+  type AppHarness,
+  type Defect,
+  type FakeControl,
+  type Page,
+  type PlantedConflict,
+} from "./fixtures.js";
 
 const LINK = "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
 
@@ -117,6 +137,7 @@ interface AuditEvent {
   seq?: number;
   action?: string;
   entity?: { type?: string; id?: string };
+  decision?: { result?: string };
   details?: Record<string, unknown>;
 }
 
@@ -178,6 +199,17 @@ const fakesOf = (app: AppHarness): FakeControl => {
 /** One queue of the capture queue, by its heading. */
 const queueSection = (page: Page, heading: string | RegExp) =>
   page.getByRole("region", { name: "Capture queue" }).locator("section").filter({ has: page.getByRole("heading", { level: 3, name: heading }) });
+
+/**
+ * Defect D17 (found by Task 34f; the number is provisional): a post that a profile capture finds
+ * missing is stored as "unavailable on the platform", but nothing in the interface says so for that
+ * post: the library row and the source's details look like any other source; only the run's summary
+ * on the Capture screen counts "1 post no longer on the platform", without saying which.
+ */
+const D17: Defect = {
+  id: "D17",
+  title: "a post a profile capture finds missing is stored as no longer on the platform, but neither its library row nor its details say so",
+};
 
 test.describe("capture from the web (scenarios 9, 10, 11)", () => {
   test.use({ fakeControl: true });
@@ -306,4 +338,190 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       for (const a of transcripts) expect(existsSync(onDisk(libraryPath, a)), `${a.path} is on disk`).toBe(true);
     });
   });
+
+  test("scenario 10: a profile captured twice with no maximum number of items (R43); the post missing the second time is flagged as removed at the source, and nothing is deleted", async ({ page, app }) => {
+    const run = await captureProfileTwice(page, app);
+    await test.step("the post missing the second time is shown as no longer on the platform, in the library and its details", async () => {
+      await blockedBy(D17);
+    });
+    await test.step("in the library list, the missing post's row is still there", async () => {
+      await page.getByRole("link", { name: "Back to library" }).click();
+      await expect(page.getByRole("table", { name: "Sources" }).getByRole("button", { name: run.missingTitle, exact: true })).toBeVisible();
+    });
+  });
+
+  test(`${D17.id}: ${D17.title}`, async ({ page, app }) => {
+    const run = await captureProfileTwice(page, app);
+    await page.getByRole("link", { name: "Back to library" }).click();
+    await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: run.missingTitle, exact: true }).click();
+    const details = page.getByRole("region", { name: "Source details" });
+    await expect(details).toBeVisible();
+    expectDefect(D17);
+    await expect(details).toContainText(/no longer on the platform|removed (from|at) the (platform|source)/i, { timeout: DEFECT_TIMEOUT });
+  });
+
+  test("scenario 11: a planted DOI and title conflict appears in the project's review queue, counted in the header link; choosing a value shows confirmed by you, the entry leaves the queue, and the audit log holds the confirmation", async ({ page, app }) => {
+    const library = "Verification library";
+    const conflict: PlantedConflict = { title: ["Rivers and Memory", "Rivers and Memories in Upland Villages"], doi: ["10.5555/rivers.1", "10.5555/rivers.2"] };
+    let projectId = "";
+    await test.step("set-up: the capture methods allowed in the Governance form; then, with the service stopped, a captured source whose title and DOI conflict with what verification found is planted with the library's own code", async () => {
+      const made = await libraryWithProject(app, page, { library, project: "Upland study" });
+      projectId = made.projectId;
+      await allowCapture(page, library);
+      await app.restart(async () => plantCaptureConflict(app, { library: made.libraryPath, projectId, ...conflict }));
+      await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(projectId)}`);
+      await expect(page.getByRole("heading", { level: 1, name: library })).toBeVisible();
+    });
+
+    let sourceId = "";
+    await test.step("the stored record: both fields in conflict, one pending review entry", async () => {
+      const [stored] = await storedSources(app, projectId);
+      sourceId = stored!.source.id;
+      expect(stored!.fields.filter((f) => f.field === "/title" || f.field === "/identifiers/doi").map((f) => f.status)).toEqual(["conflict", "conflict"]);
+    });
+
+    await test.step("the header's review queue link counts it; it leads to the entry, under From captures, with the DOI and the title in conflict", async () => {
+      const link = libraryHeader(page, library).getByRole("link", { name: "Review queue (1 waiting)" });
+      await expect(link).toBeVisible();
+      await link.click();
+      await expect(page.getByRole("heading", { level: 1, name: "Review queue" })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 2, name: "From captures" })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Why it needs review" })).toContainText("disagree on the title and the DOI");
+      await expect(page.getByRole("button", { name: "DOI: Conflict" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Title: Conflict" })).toBeVisible();
+    });
+
+    await test.step("open the DOI's conflict, both values shown with their sources; choose the platform's: the DOI shows Confirmed by you", async () => {
+      await page.getByRole("button", { name: "DOI: Conflict" }).click();
+      const dialog = page.getByRole("dialog");
+      await expect(dialog.getByRole("radio", { name: /10\.5555\/rivers\.1/ })).toBeVisible();
+      await dialog.getByRole("radio", { name: /10\.5555\/rivers\.2/ }).check();
+      await dialog.getByRole("button", { name: "Confirm this value" }).click();
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "DOI: Confirmed by you" })).toBeVisible();
+    });
+
+    await test.step("choose the title's value, the last field in conflict: it shows Confirmed by you and the entry leaves the queue", async () => {
+      await page.getByRole("button", { name: "Title: Conflict" }).click();
+      const dialog = page.getByRole("dialog");
+      await dialog.getByRole("radio", { name: /Rivers and Memories in Upland Villages/ }).check();
+      await dialog.getByRole("button", { name: "Confirm this value" }).click();
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByText("Nothing is waiting for review in this project.")).toBeVisible();
+      await page.getByRole("link", { name: "Back to library" }).click();
+      await expect(libraryHeader(page, library).getByRole("link", { name: "Review queue", exact: true })).toBeVisible();
+    });
+
+    await test.step("stored: the chosen values, both fields confirmed by the researcher, the entry resolved; the audit log holds both confirmations", async () => {
+      const stored = (await app.api<SourceRecord>("GET", `/projects/${projectId}/sources/${sourceId}`)).body;
+      expect(titleOf(stored)).toBe(conflict.title[1]);
+      expect(stored.source.identifiers.doi).toBe(conflict.doi[1]);
+      expect(stored.fields.filter((f) => f.field === "/title" || f.field === "/identifiers/doi").map((f) => f.status)).toEqual(["user-confirmed", "user-confirmed"]);
+      const rows = await app.api<{ items: Array<{ id: string; needsReview: boolean }> }>("GET", `/projects/${projectId}/sources`);
+      expect(rows.body.items.find((i) => i.id === sourceId)?.needsReview).toBe(false);
+      // One governed, allowed write of the source per confirmation (each with its crash-safety txn,
+      // R26); the one that confirmed the last field records that it resolved the review entry by
+      // confirmation (R176 1). (The audit entry names the operation, not the field: which field
+      // changed is in the change log.)
+      const audit = await auditLog(app, projectId);
+      const writes = audit.filter((e) => e.entity?.type === "source" && e.entity.id === sourceId && e.details?.op === "source.update");
+      expect(writes, JSON.stringify(audit, null, 1)).toHaveLength(2);
+      for (const w of writes) {
+        expect(w).toMatchObject({ action: "store", decision: { result: "allow" } });
+        expect(w.details?.txn).toBeTruthy();
+      }
+      expect(writes[0]!.details).not.toHaveProperty("reviewResolved");
+      expect(writes[1]!.details?.reviewResolved).toMatchObject({ by: "confirmation", entries: [expect.any(String)] });
+    });
+  });
 });
+
+
+const T0 = 1767312000; // 2026-01-02
+const ttId = (n: number) => `71000000000000000${String(n).padStart(2, "0")}`;
+const PROFILE_LINK = "https://www.tiktok.com/@fake.dancer";
+/** The synthetic TikTok profile the fake yt-dlp lists (its FAKE_PROFILE_FILE), with posts `ns`, newest first. */
+const profile = (ns: number[]) => ({
+  platform: "tiktok",
+  handle: "fake.dancer",
+  displayName: "Fake Dancer",
+  bio: "Synthetic test profile. Nothing here is real.",
+  links: ["https://example.org/links"],
+  avatar: "https://p16.example/avatar.jpeg",
+  followers: 1200,
+  following: 34,
+  items: ns.map((n) => ({ id: ttId(n), caption: `Dance number ${n} at the market\n#dance #market`, timestamp: T0 + n * 86400 })),
+});
+
+/**
+ * Scenario 10 up to the second run: a profile of three posts captured from the Capture screen with
+ * no maximum number of items, then captured again with post 2 gone. Leaves the page on the Capture
+ * screen; returns the missing post's title.
+ */
+async function captureProfileTwice(page: Page, app: AppHarness): Promise<{ missingTitle: string }> {
+  const library = "Profile library";
+  const { projectId, libraryPath } = await libraryWithProject(app, page, { library, project: "Dance study" });
+  const fakes = fakesOf(app);
+  const posts = async () => (await storedSources(app, projectId)).filter((s) => s.source.identifiers.platformPostId !== undefined);
+  let firstFiles: string[] = [];
+
+  await test.step("set-up: a TikTok profile of three posts for the fake downloader; the capture methods allowed in the Governance form", async () => {
+    await fakes.setProfile(profile([3, 2, 1]));
+    await allowCapture(page, library);
+    await openCapture(page, library);
+  });
+
+  /** Captures the profile from the screen; the request's options. */
+  const captureIt = async (): Promise<Record<string, unknown>> => {
+    await page.getByRole("textbox", { name: "Profile, channel or playlist link" }).fill(PROFILE_LINK);
+    const answer = page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === `/projects/${projectId}/capture-profile`);
+    await page.getByRole("button", { name: "Capture profile" }).click();
+    const sent = await answer;
+    expect(sent.status()).toBe(200);
+    return (sent.request().postDataJSON() as { options: Record<string, unknown> }).options;
+  };
+  const latest = () => queueSection(page, `Profile capture: ${PROFILE_LINK}`).first();
+
+  await test.step("first run, with the maximum number of items left empty: no limit is sent or applied, removed posts are looked for, three posts saved", async () => {
+    // R43: a maximum would turn removed-item detection off; none is set unless the researcher types one.
+    await expect(page.getByRole("spinbutton", { name: "Maximum number of items" })).toHaveValue("");
+    await expect(page.getByText(/removed-item detection is off for this capture/)).toHaveCount(0);
+    const options = await captureIt();
+    expect(options).not.toHaveProperty("maxItems");
+    await expect(latest().getByText("The profile capture finished.")).toBeVisible({ timeout: 60_000 });
+    await expect(latest()).toContainText("Finished: 3 new posts saved");
+    await expect(latest().getByText(/Removed posts were not looked for/)).toHaveCount(0);
+    const listing = fakes.runs("yt-dlp").filter((a) => a.at(-1)?.includes("@fake.dancer"));
+    expect(listing.length).toBeGreaterThanOrEqual(1);
+    for (const args of listing) expect(args, "the profile is listed whole").not.toContain("--playlist-end");
+    const stored = await posts();
+    expect(stored.map((s) => s.source.identifiers.platformPostId).sort()).toEqual([ttId(1), ttId(2), ttId(3)]);
+    firstFiles = stored.flatMap((s) => s.assets.map((a) => onDisk(libraryPath, a)));
+    expect(firstFiles.length).toBeGreaterThanOrEqual(3);
+  });
+
+  let missingTitle = "";
+  await test.step("second run, post 2 gone from the profile: the run reports one post no longer on the platform", async () => {
+    await fakes.setProfile(profile([3, 1]));
+    await captureIt();
+    await expect(queueSection(page, `Profile capture: ${PROFILE_LINK}`)).toHaveCount(2);
+    await expect(latest().getByText("The profile capture finished.")).toBeVisible({ timeout: 60_000 });
+    await expect(latest()).toContainText("1 post no longer on the platform");
+    await expect(latest().getByText(/Removed posts were not looked for/)).toHaveCount(0);
+  });
+
+  await test.step("stored: post 2 is flagged unavailable on the platform; its record and every file of the first run are still there; nothing was deleted", async () => {
+    const stored = await posts();
+    expect(stored).toHaveLength(3);
+    const gone = stored.find((s) => s.source.identifiers.platformPostId === ttId(2))!;
+    expect(gone.source.availability.status).toBe("unavailable-on-platform");
+    expect(gone.source.availability.firstNoticedAt).toBeTruthy();
+    for (const s of stored.filter((x) => x !== gone)) expect(s.source.availability.status).toBe("available");
+    for (const f of firstFiles) expect(existsSync(f), `${f} is still on disk`).toBe(true);
+    const audit = await auditLog(app, projectId);
+    expect(audit.filter((e) => /delete|destroy|remove/i.test(e.action ?? "")), "no deletion in the audit log").toEqual([]);
+    expect(audit.filter((e) => e.action === "capture.profile")).toHaveLength(2);
+    missingTitle = titleOf(gone);
+  });
+  return { missingTitle };
+}

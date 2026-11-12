@@ -98,6 +98,8 @@ export interface FakeControl {
   release(tool: FakeTool): Promise<void>;
   /** Runs of `tool` waiting at the hold now. */
   held(tool: FakeTool): number;
+  /** The arguments of every run of `tool` so far, oldest first. */
+  runs(tool: FakeTool): string[][];
   /**
    * Plants speech model `name` in the worker's models folder as the tools dialogue would leave it
    * (a snapshot named by refs/main, with the files the worker checks), so the app reports it
@@ -258,12 +260,13 @@ function fakeWrapper(tool: FakeTool, control: string): string {
   return [
     "#!/usr/bin/env node",
     '"use strict";',
-    'const { existsSync, rmSync, writeFileSync } = require("node:fs");',
+    'const { appendFileSync, existsSync, rmSync, writeFileSync } = require("node:fs");',
     'const { spawnSync } = require("node:child_process");',
     `const CONTROL = ${JSON.stringify(control)};`,
     `const TOOL = ${JSON.stringify(join(FAKE_TOOLS, tool))};`,
     `const NAME = ${JSON.stringify(tool)};`,
     "const args = process.argv.slice(2);",
+    'appendFileSync(CONTROL + "/runs-" + NAME + ".jsonl", JSON.stringify(args) + "\\n");',
     "const env = { ...process.env };",
     'if (existsSync(CONTROL + "/profile.json")) env.FAKE_PROFILE_FILE = CONTROL + "/profile.json";',
     "const run = () => {",
@@ -301,6 +304,10 @@ async function fakeControlFor(root: string): Promise<{ env: Record<string, strin
     hold: (tool) => writeFile(join(dir, `hold-${tool}`), ""),
     release: (tool) => rm(join(dir, `hold-${tool}`), { force: true }),
     held: (tool) => readdirSync(dir).filter((n) => n.startsWith(`held-${tool}-`)).length,
+    runs: (tool) => {
+      const file = join(dir, `runs-${tool}.jsonl`);
+      return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as string[]) : [];
+    },
     async installSpeechModel(name) {
       const repo = join(root, "models", `models--Systran--faster-whisper-${name}`);
       const snapshot = join(repo, "snapshots", "e2e-fake");
