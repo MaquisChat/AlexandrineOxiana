@@ -487,16 +487,16 @@ Update after every task; commit and push.
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
 | 34d Verification badges | approved; one binary reader, then verification before merge | cc2fe64 (worktree branch) | reviewed with probes over two fix rounds (R145, R149); after Task 57 merges its `blob()` uses move onto `bytes()` |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | fix round 1 in re-review | 7a59e9a (worktree branch) | a locked project's captures are neither probed nor kept in memory; a queue stops at a lock; one expected-failure test waits for Task 34d's merge |
+| 63 Capture state readable; one classifier | fix round 2 | 7a59e9a (worktree branch) | I1 and I2 closed; new Important: a queue outlives a lock that is undone before its download ends |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | approved; verification before merge | 4587f98 (worktree branch) | reviewed with probes over one fix round; 2 new Minor deferred |
+| 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | fix round 5 | 6bdcab6 (worktree branch) | round 4 reviewed against R147: sound for deletion; 2 Important for what is written (a restore rewrites certificates; a pass writes on an unverified chain); R175 |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
-| 51 Job records in files | approved; verification before merge | 82fbf40 (worktree branch) | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
+| 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
@@ -512,7 +512,7 @@ Update after every task; commit and push.
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
-| 65 The browser extension as a download | approved; verification before merge | 01a66d3 (worktree branch) | reviewed with probes, then one fix round (the update instructions) reviewed by the controller |
+| 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | in progress | | dispatched 2026-11-12 after Task 46c merged |
 | 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
