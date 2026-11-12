@@ -37,6 +37,14 @@ describe("device-level notices (Task 68)", () => {
     expect(t).toMatch(/kept beside the app's settings/);
   });
 
+  it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
+    const t = warningText("watched-folders-unreadable", "library");
+    expect(t).toMatch(/list of watched folders could not be read when this library was opened/);
+    expect(t).toMatch(/files put in them are not imported/);
+    expect(t).toMatch(/Open the library again/);
+    expect(t).not.toMatch(/needs attention/);
+  });
+
   it("“Got it” is a keyboard-operable button that names the notice it dismisses", async () => {
     const onDismiss = vi.fn();
     render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={onDismiss} />);

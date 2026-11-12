@@ -147,3 +147,26 @@ describe("device-level notices in the library state", () => {
     expect(d.body).not.toContain(tmp);
   });
 });
+
+describe("watched folders that cannot be read when a library opens (review round 2, Rm4)", () => {
+  it("are said in the library's state for this session (not a stored notice), and not when they can be read", async () => {
+    await start();
+    await openLibrary();
+    const p = await call({ method: "POST", url: "/projects", body: { name: "P", governanceYaml: "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\ncaptureMethods: [manual_upload]\n", encryption: { enabled: false } } });
+    expect(p.status, p.body).toBe(200);
+    await svc!.state.idle?.();
+    const fine = svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> };
+    expect(fine.integrityWarnings.map((w) => w.kind)).not.toContain("watched-folders-unreadable");
+    await mkdir(join(deps.appConfigDir, "watched-folders.json"));
+    await start();
+    await openLibrary();
+    await svc!.state.idle?.();
+    for (let i = 0; i < 50 && !(svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string }> }).integrityWarnings.some((w) => w.kind === "watched-folders-unreadable"); i++) await new Promise((r) => setTimeout(r, 20));
+    const s = svc!.state.libraryState() as { integrityWarnings: Array<{ kind: string; project: string; detail: string }> };
+    const w = s.integrityWarnings.find((x) => x.kind === "watched-folders-unreadable");
+    expect(w).toMatchObject({ project: "library" });
+    expect(w!.detail).not.toContain(tmp);
+    // A session warning, not a stored notice.
+    expect((await stateNow()).notices).toEqual([]);
+  });
+});

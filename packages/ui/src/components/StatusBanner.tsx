@@ -64,6 +64,9 @@ const WARNINGS: Record<string, (p: string) => string> = {
   empty: (p) => `The audit log of ${p} is empty although this computer has a record of it. It may have been replaced outside the app.`,
   "anchor-missing": (p) => `The audit log may have been changed outside the app (${p}): this computer has no record to check it against. It is checked from now on.`,
   "anchors-unreadable": () => "This computer's record of the audit logs could not be read, so they could not be checked this time. Nothing in the library was changed.",
+  // For this session only (Task 68 round 2, Rm4): the service could not read this computer's watched folders at open.
+  "watched-folders-unreadable": () =>
+    "This computer's list of watched folders could not be read when this library was opened, so its watched folders are not running now: files put in them are not imported. Open the library again to try again.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,

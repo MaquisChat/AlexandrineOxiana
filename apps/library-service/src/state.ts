@@ -26,6 +26,7 @@ import {
   scrubPaths,
   startMediaWorker,
   startWatchedFolders,
+  WatchedFoldersUnreadableError,
   type BackupFailure,
   type PendingRemoval,
   type BatchHandle,
@@ -97,6 +98,9 @@ export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerPro
   },
 });
 
+/** The session warning when this computer's watched folders could not be read at open (Rm4). */
+export const WATCHED_FOLDERS_UNREADABLE = "watched-folders-unreadable";
+
 export interface Session {
   lib: Library;
   repo: Repo;
@@ -119,6 +123,11 @@ export interface Session {
   indexRebuild?: { ac: AbortController; done: Promise<unknown> };
   /** While on, index writes record no change stamps: from the open until the staleness check has run (M6). */
   stampHold: { on: boolean };
+  /**
+   * Warnings for this session only, shown with the library's integrity warnings (Task 68 fix round 2,
+   * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
+   */
+  sessionWarnings?: Array<{ kind: string; detail: string }>;
 }
 
 /**
@@ -833,7 +842,20 @@ export class ServiceState {
   /** Starts the project's watched folders (all of them; replaces any running). */
   async startWatches(s: Session, projectId: string): Promise<void> {
     await this.stopWatches(s, projectId);
-    const watches = await startWatchedFolders(this.watchDeps(s, projectId), projectId);
+    let watches: FolderWatch[];
+    try {
+      watches = await startWatchedFolders(this.watchDeps(s, projectId), projectId);
+    } catch (err) {
+      // Never silent (R154; Task 68 round 2, Rm4): said on screen for this session, once.
+      if (err instanceof WatchedFoldersUnreadableError && this.session === s) {
+        s.sessionWarnings ??= [];
+        if (!s.sessionWarnings.some((w) => w.kind === WATCHED_FOLDERS_UNREADABLE)) {
+          s.sessionWarnings.push({ kind: WATCHED_FOLDERS_UNREADABLE, detail: err.message });
+          this.publishState();
+        }
+      }
+      throw err;
+    }
     if (this.session !== s) {
       await Promise.all(watches.map((w) => w.stop()));
       return;
@@ -1141,12 +1163,15 @@ export class ServiceState {
   private cachedPendingRemovals: Record<string, PendingRemoval[]> = {};
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
-    return s.repo.integrityWarnings.map((w) => ({
-      projectId: w.projectId,
-      project: w.projectId === "*" ? "library" : (names.get(w.projectId) ?? "a project"),
-      kind: w.kind,
-      detail: scrubPaths(w.detail, this.roots),
-    }));
+    return [
+      ...s.repo.integrityWarnings.map((w) => ({
+        projectId: w.projectId,
+        project: w.projectId === "*" ? "library" : (names.get(w.projectId) ?? "a project"),
+        kind: w.kind,
+        detail: scrubPaths(w.detail, this.roots),
+      })),
+      ...(s.sessionWarnings ?? []).map((w) => ({ projectId: "*", project: "library", kind: w.kind, detail: scrubPaths(w.detail, this.roots) })),
+    ];
   }
 
   /** The projects' standing warnings (backup failed, deletion records unreadable), by project id. */
