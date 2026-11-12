@@ -516,7 +516,7 @@ Update after every task; commit and push.
 | 62 Transcription as a job | complete | d2c21b5 (merge) | reviewed with probes over one fix round and a final check; verification clean throughout; GitHub's run on the merge to be read before the next merge |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
-| 34f Scenarios 9–11 | in progress | | dispatched 2026-11-12 on top of Task 67's approved branch; no product code |
+| 34f Scenarios 9–11 | in review | 8039125 (worktree branch) | five runs of five in both browsers; found D17; its D17 step turns into a passing check after Task 69 |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
