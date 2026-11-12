@@ -92,7 +92,18 @@ async function readProjectJson(root: string, rel: string): Promise<ProjectJson |
  * incrementally (only the affected project), and index encrypted projects' content in memory only.
  * Without `ctx`, a source of an unknown project is treated as protected (kept in memory only).
  */
-export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRing: KeyRing }): IndexSink {
+export function createIndexSink(
+  handle: IndexHandle,
+  ctx?: { root: string; keyRing: KeyRing },
+  opts: {
+    /**
+     * While true, writes do not record change stamps (M6): set from the open until the staleness
+     * check has run, so a write made before it cannot refresh a project's stamp and hide a change
+     * made outside the app. The written rows are indexed as usual.
+     */
+    holdStamps?: () => boolean;
+  } = {},
+): IndexSink {
   /** Looks up where a project lives and whether it is encrypted (project.json read once per call). */
   async function info(projectId: string) {
     const row = handle.db.prepare("SELECT folder, encrypted FROM projects WHERE id = ?").get(projectId) as
@@ -111,7 +122,7 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     return { prot: data.project.encryption.enabled, rel, data, k: projectKey(data, ctx.keyRing) };
   }
   async function stamp(i: { rel?: string | undefined; data?: ProjectJson | undefined }) {
-    if (!ctx) return;
+    if (!ctx || opts.holdStamps?.()) return;
     if (i.rel && i.data) await recordProjectStamp(handle.db, ctx.root, ctx.keyRing, i.rel, i.data);
     else await recordStamps(handle.db, ctx.root, ctx.keyRing);
   }

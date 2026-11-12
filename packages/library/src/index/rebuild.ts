@@ -11,7 +11,7 @@ import { REVIEW_FILE, parseReviewFile, reviewRow, type ReviewItemRow } from "../
 import type { Manifest } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, type Stamps } from "./changes.js";
 import {
-  INDEX_FILE, IndexHandle, checkpointTruncate, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta, upsertReviewItem,
+  INDEX_FILE, IndexHandle, checkpointTruncate, deleteMeta, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta, upsertReviewItem,
   type IndexDb,
 } from "./db.js";
 import { readExtractedText, readSource } from "./load.js";
@@ -33,6 +33,8 @@ export interface RebuildOptions {
   reloadProject?: typeof indexUnlockedProject;
   /** Stops the rebuild between sources (e.g. the library is closing); the old database stays in place. */
   signal?: AbortSignal;
+  /** Test seam (a crash point): runs once the new index is built, just before its mark is cleared. */
+  beforeComplete?: () => void | Promise<void>;
 }
 
 /**
@@ -44,6 +46,26 @@ export interface RebuildOptions {
 const CARRIED_TABLES = ["review_items", "import_batches", "jobs"] as const;
 
 const REBUILD_PREFIX = `${INDEX_FILE}.rebuild-`;
+
+/**
+ * The lasting "rebuild needed" mark (meta key, R161 a). Its value says why:
+ * - "annotations": migration 0002 left an older index without annotation text;
+ * - "missing" / "unreadable": library.sqlite was missing or could not be opened, and a new, empty
+ *   one was started; until a rebuild completes it holds only what was written since (half-built);
+ * - "stale" / "forced": a rebuild was started on an index that did not match the files, or was asked for;
+ * - "rebuilding": only in a new index while it is being built.
+ * Only a completed rebuild clears it; while it is set the index counts as stale.
+ */
+const NEEDS_REBUILD = "needsRebuild";
+
+/** Marks that mean the index holds only part of the library (it was missing or unreadable): never shown as its content. */
+const PARTIAL_MARKS = new Set(["missing", "unreadable", "rebuilding"]);
+
+/** True when the index holds only part of the library: it was started empty and no rebuild has completed since (C1). */
+export function indexIsPartial(db: IndexDb): boolean {
+  const mark = getMeta(db, NEEDS_REBUILD);
+  return mark !== undefined && PARTIAL_MARKS.has(mark);
+}
 
 async function rmIndexFiles(path: string): Promise<void> {
   for (const suffix of ["", "-wal", "-shm", "-journal"]) await fsp.rm(path + suffix, { force: true });
@@ -76,8 +98,14 @@ export async function rebuildIndex(
   try {
     const carried = readCarried(handle.isOpen ? handle.db : undefined);
     nextDb = openIndexAt(tmp);
+    // The new index is marked from its first write (R161 a, Task 46a C1); clearing the mark is the
+    // last change made to it, so only a completed build can ever be taken for the library's content.
+    setMeta(nextDb, NEEDS_REBUILD, "rebuilding");
     const result = await populate(nextDb, root, keyRing, carried, onProgress, opts.signal);
     opts.signal?.throwIfAborted();
+    await opts.beforeComplete?.();
+    opts.signal?.throwIfAborted();
+    deleteMeta(nextDb, NEEDS_REBUILD);
     checkpointTruncate(nextDb);
     nextDb.pragma("journal_mode = DELETE"); // one self-contained file
     nextDb.close();
@@ -266,7 +294,7 @@ async function populate(
  * a migration's "rebuild needed" mark is set (R161 a): only a completed rebuild clears it.
  */
 export async function isIndexStale(root: string, db: IndexDb, keyRing: KeyRing): Promise<boolean> {
-  if (getMeta(db, "needsRebuild") !== undefined) return true;
+  if (getMeta(db, NEEDS_REBUILD) !== undefined) return true;
   const recorded = getMeta(db, "projectStamps");
   if (recorded === undefined) return true;
   const current = await computeStamps(root, keyRing);
@@ -280,32 +308,39 @@ function sameStamps(a: Stamps, b: Stamps): boolean {
   return ka.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
 }
 
-/** Why a library's index must be rebuilt as soon as it is opened. */
-export type IndexRebuildNeed = "missing" | "unreadable";
+/**
+ * Why a library's index must be rebuilt as soon as it is opened: library.sqlite was missing or
+ * unreadable (a new one was started), or it carries the "rebuild needed" mark (an earlier rebuild did
+ * not complete, or a migration left content out).
+ */
+export type IndexRebuildNeed = "missing" | "unreadable" | "marked";
 
 export interface CheckedIndex {
   handle: IndexHandle;
-  /** library.sqlite was missing (a new, empty one was made) or unreadable (set aside, a new one made). */
+  /** Rebuild at once, whatever the staleness check would say; undefined when only that check decides. */
   needsRebuild: IndexRebuildNeed | undefined;
+  /** The index holds only part of the library (see indexIsPartial): its list is not the library's content. */
+  partial: boolean;
   /** Plain-language notes (never a path). */
   warnings: string[];
 }
 
 /**
  * Opens a read-write library's index for use (spec 4.3, 9: the files are the record, the index is
- * rebuildable). Says whether library.sqlite was missing, so an empty index is never taken for an
- * empty library; an index that cannot be opened is kept aside as `library.sqlite.corrupt-<time>`
- * and a new one started. Staleness is checked separately (`rebuildIndexIfNeeded`), since it reads
- * every project's change log.
+ * rebuildable). A missing library.sqlite is started empty, and an unreadable one is kept aside as
+ * `library.sqlite.corrupt-<time>` and started again; either way the new one is marked at once
+ * ("missing" / "unreadable"), so that what is written into it before a rebuild completes is never
+ * taken for the library's content, even after a crash (C1). Staleness is checked separately
+ * (`rebuildIndexIfNeeded`), since it reads every project's change log.
  */
 export async function openIndexChecked(root: string, now: () => Date = () => new Date()): Promise<CheckedIndex> {
   const dbPath = join(root, INDEX_FILE);
   const warnings: string[] = [];
-  let needsRebuild: IndexRebuildNeed | undefined;
+  let started: "missing" | "unreadable" | undefined;
   try {
     await fsp.access(dbPath);
   } catch {
-    needsRebuild = "missing";
+    started = "missing";
     // A WAL without its database is no use to the new one.
     for (const s of ["-wal", "-shm"]) await fsp.rm(dbPath + s, { force: true });
   }
@@ -325,15 +360,22 @@ export async function openIndexChecked(root: string, now: () => Date = () => new
     for (const s of ["-wal", "-shm"]) await fsp.rm(dbPath + s, { force: true });
     warnings.push("library.sqlite could not be opened; it was kept as library.sqlite.corrupt-<time> and rebuilt");
     handle = new IndexHandle(root);
-    needsRebuild = "unreadable";
+    started = "unreadable";
   }
-  return { handle, needsRebuild, warnings };
+  if (started) setMeta(handle.db, NEEDS_REBUILD, started);
+  const needsRebuild: IndexRebuildNeed | undefined = started ?? (getMeta(handle.db, NEEDS_REBUILD) !== undefined ? "marked" : undefined);
+  return { handle, needsRebuild, partial: indexIsPartial(handle.db), warnings };
 }
 
 export interface RebuildIfNeededOptions {
-  /** Rebuild whatever the index says (it was missing or unreadable, or the researcher asked). */
+  /** Rebuild whatever the index says (it was missing, unreadable or marked, or the researcher asked). */
   force?: boolean;
   onProgress?: (done: number, total: number) => void;
+  /**
+   * Called once the decision is made: `stale` false (current, nothing done) or true (a rebuild
+   * follows, and the index has been marked). Until then an index sink should hold its stamps (M6).
+   */
+  onChecked?: (stale: boolean) => void;
   /** Called once, when a rebuild is about to start (not when the index is current). */
   onStart?: () => void;
   signal?: AbortSignal;
@@ -346,11 +388,14 @@ const MAX_PASSES = 3;
 
 /**
  * Rebuilds the index when `force` is set or it no longer matches the files (`isIndexStale`; a check
- * that fails counts as stale). A change written while a pass walked the files makes it stale again,
- * so it is checked after each pass and rebuilt again (at most three passes). Returns the last pass's
- * result, or undefined when the index was current. A read-only library cannot rebuild
- * (ReadOnlyLibraryError). Locked encrypted projects are indexed from their manifests only; unlocking
- * one completes it (R30).
+ * that fails counts as stale). Before the first pass the live index is marked ("stale" or "forced",
+ * unless it already carries a mark, which is kept): a rebuild that does not complete (a close, a move,
+ * a failure, a crash) leaves the mark, so the next open rebuilds again, and writes made meanwhile
+ * cannot make the index look current (C1). A change written while a pass walked the files makes it
+ * stale again, so it is checked after each pass and rebuilt again (at most three passes). Returns
+ * the last pass's result, or undefined when the index was current. A read-only library cannot
+ * rebuild (ReadOnlyLibraryError). Locked encrypted projects are indexed from their manifests only;
+ * unlocking one completes it (R30).
  */
 export async function rebuildIndexIfNeeded(
   handle: IndexHandle,
@@ -360,11 +405,20 @@ export async function rebuildIndexIfNeeded(
 ): Promise<RebuildResult | undefined> {
   if (library.mode !== "read-write") throw new ReadOnlyLibraryError(library.readOnlyReason);
   const stale = async () => isIndexStale(handle.root, handle.db, keyRing).catch(() => true);
-  if (!opts.force && !(await stale())) return undefined;
+  const mark = (why: string) => {
+    if (getMeta(handle.db, NEEDS_REBUILD) === undefined) setMeta(handle.db, NEEDS_REBUILD, why);
+  };
+  if (!opts.force && !(await stale())) {
+    opts.onChecked?.(false);
+    return undefined;
+  }
+  mark(opts.force ? "forced" : "stale");
+  opts.onChecked?.(true);
   opts.onStart?.();
   let result: RebuildResult | undefined;
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     opts.signal?.throwIfAborted();
+    if (pass > 0) mark("stale"); // changed during the last pass: marked again until this one completes
     result = await rebuildIndex(handle, keyRing, library, opts.onProgress, { ...opts.rebuild, ...(opts.signal ? { signal: opts.signal } : {}) });
     if (!(await stale())) break;
   }

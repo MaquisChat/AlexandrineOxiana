@@ -122,6 +122,10 @@ export function setMeta(db: IndexDb, key: string, value: string): void {
   db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
 }
 
+export function deleteMeta(db: IndexDb, key: string): void {
+  db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+}
+
 // ---------------------------------------------------------------------------------------------
 // TEMP schema (in memory, per connection): content of unlocked encrypted projects.
 
