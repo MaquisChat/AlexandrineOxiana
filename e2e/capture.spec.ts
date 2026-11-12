@@ -460,11 +460,11 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       expect(stored.fields.filter((f) => f.field === "/title" || f.field === "/identifiers/doi").map((f) => f.status)).toEqual(["user-confirmed", "user-confirmed"]);
       const rows = await app.api<{ items: Array<{ id: string; needsReview: boolean }> }>("GET", `/projects/${projectId}/sources`);
       expect(rows.body.items.find((i) => i.id === sourceId)?.needsReview).toBe(false);
-      // What the audit log records of a confirmation today: one generic, allowed `store` write of the
-      // source (`op: "source.update"`, with its crash-safety txn, R26) per confirmation, and on the one
-      // that confirmed the last field, that it resolved the review entry by confirmation (R176 1).
-      // Neither entry names the field or the value, or says that the write was a confirmation; this
-      // test asserts no more than that.
+      // What the audit log records of a confirmation: one allowed `store` write of the source
+      // (`op: "source.update"`, with its crash-safety txn, R26) per confirmation, naming the field
+      // confirmed and whether the recorded value was kept or another chosen (R191; both were changed
+      // here), and on the one that confirmed the last field, that it resolved the review entry by
+      // confirmation (R176 1). Neither entry holds a value or an alternative.
       const audit = await auditLog(app, projectId);
       const writes = audit.filter((e) => e.entity?.type === "source" && e.entity.id === sourceId && e.details?.op === "source.update");
       expect(writes, JSON.stringify(audit, null, 1)).toHaveLength(2);
@@ -474,6 +474,8 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       }
       expect(writes[0]!.details).not.toHaveProperty("reviewResolved");
       expect(writes[1]!.details?.reviewResolved).toMatchObject({ by: "confirmation", entries: [expect.any(String)] });
+      expect(writes.map((w) => w.details?.confirmed)).toEqual([[{ field: "/identifiers/doi", choice: "changed" }], [{ field: "/title", choice: "changed" }]]);
+      for (const v of [...conflict.title, ...conflict.doi]) expect(JSON.stringify(writes)).not.toContain(v);
     });
   });
 });
