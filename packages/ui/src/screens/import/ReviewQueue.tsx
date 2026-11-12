@@ -26,7 +26,7 @@
  * project's entries are neither listed nor decided, and nothing about them is shown; answers for
  * another project, after a lock or after the screen closed are dropped.
  */
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
 import type { ApiClient } from "../../api/client";
 import {
   importApi,
@@ -43,9 +43,11 @@ import {
   type SourceListItem,
   type Tag,
 } from "../../api/import";
+import { PROJECT_REVIEW_PAGE_MAX } from "@ao/shared";
 import { isProjectLocked, libraryApi } from "../../api/library";
 import { verificationApi, type FieldReview } from "../../api/verification";
 import { CodeSwatch } from "../../components/CodeSwatch";
+import { DialogShell } from "../../components/ReasonDialog";
 import { UserText } from "../../components/UserText";
 import { FieldCheck } from "../../components/VerificationBadge";
 import { inAppLink, PATHS } from "../../navigation";
@@ -125,7 +127,8 @@ function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
 }
 
 /** The group an entry is listed under in the project's queue. */
-const groupOf = (i: ReviewItem): ReviewGroup => i.group ?? (i.kind === "import" ? (i.batchId ? "import" : "attach") : Object.keys(i.fields).length ? "capture" : "withdrawal");
+/** The group an entry is listed under: the service's, from the library's cause (R176 3); never guessed here from fields. */
+const groupOf = (i: ReviewItem): ReviewGroup => i.group ?? (i.kind === "import" ? (i.batchId ? "import" : "attach") : i.cause?.kind === "consent-withdrawal" ? "withdrawal" : "capture");
 
 const GROUP_TITLES: Record<Exclude<ReviewGroup, "import">, string> = {
   attach: "Added by hand",
@@ -359,6 +362,33 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
   }, []);
   const selectedSet = useMemo(() => new Set(selected), [selected]);
 
+  /** The items as rendered last (read by answers, which may arrive after other changes). */
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const currentRef = useRef(current);
+  currentRef.current = current;
+  /**
+   * Entries that left the queue: removed from the view; when the one shown is among them, the next
+   * entry is shown and focused (the heading when none is left), and `said` goes on the status line.
+   */
+  const leave = (ids: string[], said: (n: number) => string) => {
+    const list = itemsRef.current ?? [];
+    const gone = new Set(ids);
+    const at = list.findIndex((x) => gone.has(x.id));
+    if (at < 0) return;
+    const rest = list.filter((x) => !gone.has(x.id));
+    const shown = currentRef.current;
+    const shownGone = !!shown && gone.has(shown);
+    const next = shownGone ? (rest[Math.min(at, rest.length - 1)]?.id ?? null) : shown;
+    itemsRef.current = rest;
+    currentRef.current = next;
+    setItems(rest);
+    setCurrent(next);
+    setSelected((s) => s.filter((x) => !gone.has(x)));
+    setStatus(said(at + 1));
+    if (shownGone) setFocusId({ id: next });
+  };
+
   const decide = async (item: ReviewItem, decision: ReviewDecision, done: string) => {
     // One request per decision, however often it is pressed.
     if (busyRef.current) return;
@@ -369,15 +399,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     try {
       await api.decide(projectId, item.id, decision);
       if (g !== gen.current) return;
-      const list = items ?? [];
-      const at = list.findIndex((x) => x.id === item.id);
-      const rest = list.filter((x) => x.id !== item.id);
-      const next = rest[Math.min(at, rest.length - 1)]?.id ?? null;
-      setItems(rest);
-      setCurrent(next);
-      setSelected((s) => s.filter((x) => x !== item.id));
-      setStatus(`${done}: ${titleFor(item, at + 1)}`);
-      setFocusId({ id: next });
+      leave([item.id], (n) => `${done}: ${titleFor(item, n)}`);
     } catch (e) {
       if (g !== gen.current) return;
       if (isProjectLocked(e)) forget();
@@ -388,7 +410,12 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
     }
   };
 
-  /** A capture's field confirmed through the source screen's confirm (R149): the record it answers replaces the one shown. */
+  /**
+   * A field confirmed through the source screen's confirm (R149): the record it answers replaces the
+   * one shown. In the project's queue, the service is then asked which of that source's entries are
+   * left: the confirm that settles a capture entry's last field resolves it in the library (R176 1),
+   * and the entry leaves the view.
+   */
   const verification = useMemo(() => verificationApi(client), [client]);
   const confirmField = async (item: ReviewItem, field: string, value: unknown) => {
     const g = gen.current;
@@ -399,6 +426,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
       if (g !== gen.current) return;
       store.set([[sid, after as unknown as SourceFile]]);
       setStatus(`Confirmed: ${FIELD_LABELS[field] ?? field}`);
+      if (projectWide && item.kind === "verification") void entriesLeft(item, g);
     } catch (e) {
       if (g !== gen.current) return;
       if (isProjectLocked(e)) {
@@ -406,6 +434,50 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         return;
       }
       throw new Error(errorText(e));
+    }
+  };
+
+  /** After a confirm: the source's entries the service still lists; the others left the queue. */
+  const entriesLeft = async (item: ReviewItem, g: number) => {
+    const sid = item.sourceId!;
+    try {
+      const page = await api.projectReview(projectId, { source: sid, limit: PROJECT_REVIEW_PAGE_MAX });
+      if (g !== gen.current) return;
+      const still = new Set(page.items.map((x) => x.id));
+      const gone = (itemsRef.current ?? []).filter((x) => x.sourceId === sid && !still.has(x.id)).map((x) => x.id);
+      if (gone.length) leave(gone, (n) => `Every field is confirmed; the entry left the queue: ${titleFor(item, n)}`);
+    } catch (e) {
+      if (g !== gen.current) return;
+      if (isProjectLocked(e)) forget();
+      // Otherwise the entry stays shown; the next reading of the queue settles it.
+    }
+  };
+
+  /**
+   * "Reviewed after the withdrawal" (R176 2): the library's own decision, with the researcher's
+   * reason as typed. Resolves true when recorded (or when the view moved on); false when another
+   * action was still running (nothing sent); throws a plain-language message when not recorded.
+   */
+  const reviewWithdrawal = async (item: ReviewItem, reason: string): Promise<boolean> => {
+    if (busyRef.current) return false;
+    busyRef.current = true;
+    const g = gen.current;
+    setBusy(true);
+    try {
+      await api.reviewedAfterWithdrawal(projectId, item.id, reason);
+      if (g !== gen.current) return true;
+      leave([item.id], (n) => `Recorded as reviewed after the withdrawal: ${titleFor(item, n)}`);
+      return true;
+    } catch (e) {
+      if (g !== gen.current) return true;
+      if (isProjectLocked(e)) {
+        forget();
+        return true;
+      }
+      throw new Error(errorText(e));
+    } finally {
+      busyRef.current = false;
+      if (g === gen.current) setBusy(false);
     }
   };
 
@@ -571,6 +643,8 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               loadFailed={!!item.sourceId && failed.has(item.sourceId)}
               onRetry={() => item.sourceId && retry(item.sourceId)}
               onConfirm={(field, value) => confirmField(item, field, value)}
+              onReview={(reason) => reviewWithdrawal(item, reason)}
+              busy={busy}
             />
           )}
         </div>
@@ -626,15 +700,21 @@ interface VerificationPanelProps {
   loadFailed: boolean;
   onRetry(): void;
   onConfirm(field: string, value: unknown): Promise<void>;
+  /** "Reviewed after the withdrawal" with the reason as typed: true when recorded; throws a plain message when not. */
+  onReview(reason: string): Promise<boolean>;
+  busy: boolean;
 }
 
 /**
- * A verification entry: a capture saved with fields to check (each field's badge and its evidence
- * dialog, the source screen's own confirm, R149), or a source flagged after a consent withdrawal.
+ * A verification entry (R176): a capture saved with fields to check (each field's badge and its
+ * evidence dialog, the source screen's own confirm, R149; confirming the last one resolves the entry
+ * in the library), or a source flagged after a consent withdrawal ("Reviewed after the withdrawal",
+ * with a reason).
  */
-function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm }: VerificationPanelProps) {
+function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm, onReview, busy }: VerificationPanelProps) {
   const s = source?.source;
   const withdrawal = groupOf(item) === "withdrawal";
+  const [reviewing, setReviewing] = useState(false);
   return (
     <div className="ao-review__panel">
       <Section title={withdrawal ? "Flagged source" : "Captured source"} level={2} className="ao-review__record">
@@ -675,16 +755,83 @@ function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm }: Ver
             ))}
           </ul>
         </Section>
-        {source && (
-          <FieldsToCheck item={item} source={source} pointers={Object.keys(item.fields)} onConfirm={onConfirm}>
-            {(allConfirmed) =>
-              allConfirmed && <p className="ao-import__hint">Every field here is confirmed. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>
-            }
-          </FieldsToCheck>
+        {!withdrawal && source && <FieldsToCheck item={item} source={source} pointers={Object.keys(item.fields)} onConfirm={onConfirm} />}
+        {!withdrawal && Object.keys(item.fields).length > 0 && (
+          <p className="ao-import__hint">Keeping the value shown is confirming it. Once every field here is confirmed, the entry leaves the queue.</p>
         )}
-        {withdrawal && <p className="ao-import__hint">Nothing has been deleted. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>}
+        {withdrawal && (
+          <Section title="Your decision" level={3}>
+            <p>
+              Nothing has been deleted. Recording “Reviewed after the withdrawal” says that you have reviewed this source, with your reason, and changes nothing else about the source.
+            </p>
+            <p className="ao-import__hint">
+              To remove the source, destroy its files or leave it out of an export, use the tools for those: they are not part of this decision.
+            </p>
+            <div className="ao-import__actions">
+              <button type="button" className="ao-import__primary" disabled={busy} onClick={() => setReviewing(true)}>
+                Reviewed after the withdrawal…
+              </button>
+            </div>
+            {reviewing && <WithdrawalReviewDialog onCancel={() => setReviewing(false)} onRecord={async (reason) => (await onReview(reason)) && setReviewing(false)} />}
+          </Section>
+        )}
       </Section>
     </div>
+  );
+}
+
+/**
+ * The reason for "Reviewed after the withdrawal" (R176 2) on the shared dialog shell (R145: focus in,
+ * Tab and Shift+Tab kept inside, Escape closes when not saving, focus restored to the opener). The
+ * reason is required and sent exactly as typed; a refusal is said in plain words and the dialog stays
+ * open with the text.
+ */
+function WithdrawalReviewDialog({ onRecord, onCancel }: { onRecord(reason: string): Promise<unknown>; onCancel(): void }) {
+  const id = useId();
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+  const savingRef = useRef(false);
+  const ok = reason.trim() !== "" && !saving;
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!ok || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setError(undefined);
+    try {
+      await onRecord(reason);
+    } catch (err) {
+      setError(err instanceof Error && err.message ? err.message : "The library service did not answer.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  };
+  return (
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={saving}>
+      <h2 id={`${id}-t`}>Reviewed after the withdrawal</h2>
+      <p id={`${id}-d`}>Record that you have reviewed this source after the participant's consent was withdrawn. This changes nothing else about the source.</p>
+      <form onSubmit={(e) => void submit(e)}>
+        <label className="ao-stack">
+          Your reason (required; kept exactly as you type it)
+          <textarea dir="auto" rows={4} value={reason} disabled={saving} onChange={(e) => setReason(e.target.value)} />
+        </label>
+        {error && (
+          <p role="alert" className="ao-error">
+            The decision was not recorded. {error}
+          </p>
+        )}
+        <div className="ao-actions">
+          <button type="submit" disabled={!ok} aria-busy={saving || undefined}>
+            Record the decision
+          </button>
+          <button type="button" onClick={onCancel} disabled={saving}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </DialogShell>
   );
 }
 

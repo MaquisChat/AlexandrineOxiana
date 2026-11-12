@@ -107,7 +107,7 @@ export interface ServiceSetup {
   locked?: string[];
   /** Decisions answered PROJECT_LOCKED (the project was locked meanwhile). */
   decideLocked?: boolean;
-  /** What PATCH /projects/:id/sources/:sid/fields answers, by source id (the record after the confirm). */
+  /** What PATCH /projects/:id/sources/:sid/fields answers, by source id (the record after the confirm; a list: one per confirm, in turn). */
   confirmed?: Record<string, unknown>;
 }
 
@@ -138,6 +138,8 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
   let keyStored = !!o.zoteroKey?.stored;
   const queues = new Map(Object.entries(o.projectReview ?? {}).map(([k, v]) => [k, [...v]]));
   const locked = new Set(o.locked ?? []);
+  // Copied: a list is answered in turn, and the setup object may be shared between tests.
+  const confirmedSeq = new Map(Object.entries(o.confirmed ?? {}).map(([k, v]) => [k, Array.isArray(v) ? [...v] : v]));
   const lockedAnswer = () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked. Its passphrase is needed." } }, { status: 423 });
   const noStore = () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "No secure key store is available on this computer, so the key was not saved." } }, { status: 503 });
 
@@ -284,8 +286,38 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     http.patch(url("/projects/:id/sources/:sid/fields"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}/fields`);
       if (locked.has(params.id as string)) return lockedAnswer();
-      const after = o.confirmed?.[params.sid as string];
-      return after ? HttpResponse.json(after) : HttpResponse.json({ error: { code: "VALIDATION", message: "That field cannot be set here." } }, { status: 400 });
+      const sid = params.sid as string;
+      // One record, or a list answered in turn (the last one repeats).
+      const seq = confirmedSeq.get(sid);
+      const after = (Array.isArray(seq) ? (seq.length > 1 ? seq.shift() : seq[0]) : seq) as { fields?: Array<{ field: string; status: string }> } | undefined;
+      if (!after) return HttpResponse.json({ error: { code: "VALIDATION", message: "That field cannot be set here." } }, { status: 400 });
+      // As the library does (R176 1): a capture entry none of whose fields is left unsettled is resolved by the confirm.
+      const settled = new Set(["verified", "single-source", "user-confirmed"]);
+      const q = queues.get(params.id as string);
+      if (q) {
+        for (let i = q.length - 1; i >= 0; i--) {
+          const e = q[i]!;
+          if (e.sourceId === sid && e.group === "capture" && Object.keys(e.fields).every((f) => settled.has(after.fields?.find((x) => x.field === f)?.status ?? ""))) q.splice(i, 1);
+        }
+      }
+      return HttpResponse.json(after);
+    }),
+    // "Reviewed after the withdrawal" (R176 2), as routes/review.ts answers it (WithdrawalReviewedRequest / Response).
+    http.post(url("/review/:itemId/reviewed-after-withdrawal"), async ({ request, params }) => {
+      const b = (await rec(request, `/review/${params.itemId as string}/reviewed-after-withdrawal`)) as { projectId?: string; reason?: unknown };
+      if (o.decideLocked || (b?.projectId && locked.has(b.projectId))) return lockedAnswer();
+      if (typeof b?.reason !== "string") return HttpResponse.json({ error: { code: "VALIDATION", message: '"reason" is required.' } }, { status: 400 });
+      if (b.reason.trim() === "") {
+        return HttpResponse.json(
+          { error: { code: "POLICY_DENIED", message: "This project's rules do not allow that.", reason: "A reason is required to record that this source was reviewed after the withdrawal" } },
+          { status: 403 },
+        );
+      }
+      const q = b.projectId ? queues.get(b.projectId) : undefined;
+      const at = q ? q.findIndex((e) => e.id === params.itemId) : -1;
+      if (at < 0) return HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed." } }, { status: 409 });
+      const [e] = q!.splice(at, 1);
+      return HttpResponse.json({ entry: { id: e!.id, sourceId: e!.sourceId, status: "resolved", decision: "reviewed-after-withdrawal", resolvedAt: "2026-11-12T10:00:00.000Z", reason: b.reason } });
     }),
     http.get(url("/events"), async ({ request }) => {
       await rec(request, "/events");

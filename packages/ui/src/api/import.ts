@@ -11,10 +11,10 @@
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
 import { isId } from "@ao/core/src/ids";
-import { PICTURE_MAX_BYTES, type ProjectReviewPage, type ReviewGroup, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type ProjectReviewPage, type ReviewCause, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
 
-export type { ProjectReviewPage, ReviewGroup, ZoteroDataFolder };
+export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -166,6 +166,8 @@ export interface ReviewItem {
   title?: string;
   /** In the project's whole queue (Task 67): where the entry came from. */
   group?: ReviewGroup;
+  /** Verification entries: what queued it (R176 3). */
+  cause?: ReviewCause;
 }
 
 export type ReviewDecision =
@@ -341,6 +343,12 @@ export function importApi(client: ApiClient) {
     decide: (projectId: string, itemId: string, decision: ReviewDecision) => {
       pid(projectId);
       return r<{ decided: boolean }>("POST", `/review/${seg(itemId)}/decide`, { body: { projectId, decision } });
+    },
+    /** "Reviewed after the withdrawal" (R176 2): the reason is required and sent exactly as typed. */
+    reviewedAfterWithdrawal: (projectId: string, itemId: string, reason: string) => {
+      pid(projectId);
+      const body: WithdrawalReviewedRequest = { projectId, reason };
+      return r<WithdrawalReviewedResponse>("POST", `/review/${seg(itemId)}/reviewed-after-withdrawal`, { body });
     },
     bulkEdit: (projectId: string, itemIds: string[], patch: ReviewPatch) => {
       pid(projectId);

@@ -6,7 +6,8 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewItem } from "../../api/import";
-import { B1, mockService, P1, P2, server, type ServiceSetup } from "../../test/importService";
+import { http, HttpResponse } from "msw";
+import { BASE as SERVICE, B1, mockService, P1, P2, server, type ServiceSetup } from "../../test/importService";
 import { ReviewQueue } from "./ReviewQueue";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -20,7 +21,8 @@ const entry = (n: number, group: NonNullable<ReviewItem["group"]>, extra: Partia
   group,
   status: "pending",
   createdAt: `2026-11-11T10:0${n % 10}:00.000Z`,
-  fields: group === "capture" ? { "/title": "conflict" } : {},
+  fields: group === "capture" ? { "/title": "conflict", "/issued": "conflict" } : {},
+  ...(group === "capture" ? { cause: { kind: "capture-conflict" as const } } : group === "withdrawal" ? { cause: { kind: "consent-withdrawal" as const, consentIds: ["c1"] } } : {}),
   reasons: [
     group === "withdrawal"
       ? "Consent from participant P-001 (scope: audio) was withdrawn on 2026-11-11 (phoned). Decide whether this source may still be kept or used; nothing has been deleted."
@@ -45,8 +47,19 @@ const titleReview = (status: string) => ({
   evidence: [],
 });
 
+const issuedReview = (status: string) => ({
+  field: "/issued",
+  status,
+  checks: ["lookup"],
+  values: [
+    { value: "2019", from: { kind: "page-dom", label: "the web page" } },
+    { value: "2020", from: { kind: "platform-json", label: "the platform's data" } },
+  ],
+  evidence: [],
+});
+
 const record = (n: number, title = `Entry ${n}`, fields: unknown[] = []) => ({
-  source: { id: `s${n}`, type: "webpage", title: { variants: [{ lang: "en", kind: "original", value: title }] }, creators: [], collectionIds: [], tagIds: [], provenance: {} },
+  source: { id: `s${n}`, type: "webpage", title: { variants: [{ lang: "en", kind: "original", value: title }] }, issued: "2019", creators: [], collectionIds: [], tagIds: [], provenance: {} },
   assets: [],
   fieldEvidence: [],
   fields,
@@ -58,8 +71,11 @@ const QUEUE = [entry(1, "import"), entry(2, "attach"), entry(3, "capture"), entr
 const BASE: ServiceSetup = {
   batches: [BATCH],
   projectReview: { [P1]: QUEUE },
-  sources: { s1: record(1), s2: record(2), s3: record(3, "Entry 3", [titleReview("conflict")]), s4: record(4) },
-  confirmed: { s3: record(3, "Entry three, revised", [titleReview("user-confirmed")]) },
+  sources: { s1: record(1), s2: record(2), s3: record(3, "Entry 3", [issuedReview("conflict"), titleReview("conflict")]), s4: record(4) },
+  // The first confirm settles the title, the second the date (the last of the entry's fields: it is resolved, R176 1).
+  confirmed: {
+    s3: [record(3, "Entry three, revised", [issuedReview("conflict"), titleReview("user-confirmed")]), record(3, "Entry three, revised", [issuedReview("user-confirmed"), titleReview("user-confirmed")])],
+  },
 };
 
 function setup(o: ServiceSetup = BASE, props: { sourceId?: string; pageSize?: number } = {}) {
@@ -194,21 +210,114 @@ describe("the project's whole review queue (Task 67)", () => {
     view.unmount();
   });
 
-  // ---- Awaiting the coordinator's ruling: the library has no decision for verification entries ----
-  it.fails("[awaits a ruling] a capture's entry leaves the view once its conflicting field is confirmed", async () => {
-    const { user } = setup();
+  // ---- R176: verification entries are resolved by the library's own ways ----
+  it("a capture's entry stays while one of its fields is unsettled, and leaves the view once its last field is confirmed; focus moves to the next entry (R176 1)", async () => {
+    const { m, user } = setup();
     await user.click(await screen.findByRole("button", { name: "Show Entry 3" }));
-    await user.click(await screen.findByRole("button", { name: "Title: Conflict" }));
-    const dialog = await screen.findByRole("dialog");
-    await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
-    await screen.findByRole("button", { name: "Title: Confirmed by you" });
-    await waitFor(() => expect(screen.queryByRole("heading", { name: "From captures" })).toBeNull(), { timeout: 1000 });
+    const confirm = async (badge: string, choice: RegExp) => {
+      await user.click(await screen.findByRole("button", { name: badge }));
+      const dialog = await screen.findByRole("dialog");
+      await user.click(within(dialog).getByRole("radio", { name: choice }));
+      await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    };
+    await confirm("Title: Conflict", /Entry three, revised/);
+    expect(await screen.findByRole("button", { name: "Title: Confirmed by you" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "From captures" })).toBeTruthy();
+    await confirm("Publication date: Conflict", /2020/);
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "From captures" })).toBeNull());
+    // The view asked the service which of that source's entries are left (the library resolved this one).
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/review`)).toHaveLength(3);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show Entry 4" })));
+    expect(screen.getByRole("status").textContent).toMatch(/Every field is confirmed/);
   });
 
-  it.fails("[awaits a ruling] an entry after a consent withdrawal can be decided in the view", async () => {
+  it("an entry after a consent withdrawal says plainly what the decision does and does not do", async () => {
     const { user } = setup();
     await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
-    await screen.findByRole("region", { name: "Why it needs review" });
-    expect(screen.getByRole("group", { name: "Decide this item" })).toBeTruthy();
+    const why = await screen.findByRole("region", { name: "Why it needs review" });
+    expect(why.textContent).toMatch(/Consent from participant P-001/);
+    expect(screen.getByText(/changes nothing else about the source/)).toBeTruthy();
+    expect(screen.getByText(/To remove the source, destroy its files or leave it out of an export, use the tools for those/)).toBeTruthy();
+  });
+
+  it("Reviewed after the withdrawal: a dialog that keeps focus, needs a reason, sends it as typed, and the entry leaves the view (R176 2, R145)", async () => {
+    const { m, user } = setup();
+    await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+    const open = await screen.findByRole("button", { name: "Reviewed after the withdrawal…" });
+    await user.click(open);
+    const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+    const reason = within(dialog).getByRole("textbox", { name: /Your reason/ });
+    expect(document.activeElement).toBe(reason);
+    const submit = within(dialog).getByRole("button", { name: "Record the decision" });
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    expect((submit as HTMLButtonElement).disabled).toBe(true);
+    await user.type(reason, "   ");
+    expect((submit as HTMLButtonElement).disabled).toBe(true);
+    await user.clear(reason);
+    const typed = "  Spoke with P-001: the audio may be kept, not quoted.";
+    await user.type(reason, typed);
+    // Tab and Shift+Tab stay inside the dialog.
+    cancel.focus();
+    await user.tab();
+    expect(document.activeElement).toBe(reason);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(cancel);
+    await user.click(submit);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(m.bodies("POST /review/r4/reviewed-after-withdrawal")).toEqual([{ projectId: P1, reason: typed }]);
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "After a consent withdrawal" })).toBeNull());
+    expect(screen.getByRole("status").textContent).toMatch(/Recorded as reviewed after the withdrawal/);
+  });
+
+  it("Escape closes the dialog without sending anything, and focus returns to the button that opened it", async () => {
+    const { m, user } = setup();
+    await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+    const open = await screen.findByRole("button", { name: "Reviewed after the withdrawal…" });
+    await user.click(open);
+    await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(open);
+    expect(m.calls.filter((c) => c.path.endsWith("/reviewed-after-withdrawal"))).toHaveLength(0);
+  });
+
+  it("a double click on Record the decision sends one request", async () => {
+    const { m, user } = setup();
+    await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+    await user.click(await screen.findByRole("button", { name: "Reviewed after the withdrawal…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+    await user.type(within(dialog).getByRole("textbox", { name: /Your reason/ }), "Checked");
+    await user.dblClick(within(dialog).getByRole("button", { name: "Record the decision" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(m.bodies("POST /review/r4/reviewed-after-withdrawal")).toHaveLength(1);
+  });
+
+  it("a refused decision is said in plain words in the dialog, which stays open with the reason typed", async () => {
+    const refuse = http.post(`${SERVICE}/review/:itemId/reviewed-after-withdrawal`, () =>
+      HttpResponse.json({ error: { code: "POLICY_DENIED", message: "This project's rules do not allow that.", reason: "A reason is required to record that this source was reviewed after the withdrawal" } }, { status: 403 }),
+    );
+    const { user } = setup({ ...BASE, extra: [refuse] });
+    await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+    await user.click(await screen.findByRole("button", { name: "Reviewed after the withdrawal…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+    await user.type(within(dialog).getByRole("textbox", { name: /Your reason/ }), "Checked");
+    await user.click(within(dialog).getByRole("button", { name: "Record the decision" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toMatch(/was not recorded/);
+    expect(alert.textContent).toMatch(/A reason is required/);
+    expect((within(dialog).getByRole("textbox", { name: /Your reason/ }) as HTMLTextAreaElement).value).toBe("Checked");
+  });
+
+  it("a decision refused because the project was locked meanwhile forgets every entry shown", async () => {
+    const { user } = setup({ ...BASE, decideLocked: true });
+    await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+    await user.click(await screen.findByRole("button", { name: "Reviewed after the withdrawal…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+    await user.type(within(dialog).getByRole("textbox", { name: /Your reason/ }), "Checked");
+    await user.click(within(dialog).getByRole("button", { name: "Record the decision" }));
+    await screen.findByLabelText(/passphrase/i);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByText(/Entry \d/)).toBeNull();
   });
 });
