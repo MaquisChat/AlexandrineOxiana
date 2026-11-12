@@ -515,7 +515,7 @@ Update after every task; commit and push.
 | 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | done | 700b7eb | reviewed with probes over one fix round; D1, D2, D6, D7 closed; none of D1–D8 is open; "Needs review" follows every pending entry (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
-| 47 Shared API types | accepted; to take the working branch and be verified after the build's tasks | 0c09f2b (worktree branch) | reviewed with probes over two fix rounds (R184); no run-time change; not on the Mac build's path |
+| 47 Shared API types | accepted; verification with 34f running | 0c09f2b (worktree branch) | reviewed with probes over two fix rounds (R184); no run-time change |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
@@ -525,11 +525,11 @@ Update after every task; commit and push.
 | 62 Transcription as a job | complete | d2c21b5 (merge) | reviewed with probes over one fix round and a final check; verification clean throughout; GitHub's run on the merge to be read before the next merge |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
-| 34f Scenarios 9–11 | approved; a last small round after Task 69 (the D17 step, six minors) | 8039125 (worktree branch) | five runs of five in both browsers; found D17; its review found D20 |
+| 34f Scenarios 9–11 | approved; last round done; verification with 47 running | ce2190b (worktree branch) | the D17 step is a normal check; found D17, its review found D20 |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | approved and verified; merge waits for the test fix | c4a8aa7 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); verification clean throughout; closes D15 when merged |
+| 50b Restore asks the policy engine | approved and verified with 69 and 70; merge waits for GitHub's result on the test fix | c4a8aa7 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); closes D15 when merged |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -551,8 +551,8 @@ Update after every task; commit and push.
 | 68 Settings writers never write what they did not read (D16) | merged; one of its tests fails on GitHub (a test fault, skipped here as root) and is being fixed | c02679b (merge) | reviewed with probes over two fix rounds (R178, R181); D16 closed; GitHub's run 201 red until the test fix is pushed (R187) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
-| 69 Show that a captured item is no longer available (D17) | approved; verification with 50b and 70 running | d965f8a (worktree branch) | reviewed with probes over one fix round (R185, R186); on the Mac build's path |
-| 70 A read never mistakes a write in progress for tampering (D21) | approved; verification with 50b and 69 running | c17e6b7 (worktree branch) | reviewed with probes (R188); four minors on the final review's list |
+| 69 Show that a captured item is no longer available (D17) | approved and verified with 50b and 70; merge waits for GitHub's result on the test fix | d965f8a (worktree branch) | reviewed with probes over one fix round (R185, R186) |
+| 70 A read never mistakes a write in progress for tampering (D21) | approved and verified with 50b and 69; merge waits for GitHub's result on the test fix | c17e6b7 (worktree branch) | reviewed with probes (R188) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
