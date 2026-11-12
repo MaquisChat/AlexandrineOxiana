@@ -41,7 +41,7 @@ import {
 import { addKnownPath, registerLibrary } from "./registry.js";
 import { PathEscapeError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { newAttentionId, projectFolderOf, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
+import { holdsLock, newAttentionId, projectFolderOf, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import { openRepo, recordOrMark, recoveryPendingProjects, repoLibrary, type Repo } from "./repo/repo.js";
 import { parseProjectJson } from "./repo/state.js";
 
@@ -539,7 +539,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
     let unrecorded = false;
     for (const p of denied) {
       const reason = p.decision.result === "deny" ? p.decision.reason : "";
-      const w = await auditOrMark(lib.root, p.projectId, p.folder, opts.sourceRepo, lib, "move", details, { actor: opts.actor, deps }, { libraryId: lib.id, held: lib.mode === "read-write" }, { reason });
+      const w = await auditOrMark(lib.root, p.projectId, p.folder, opts.sourceRepo, lib, "move", details, { actor: opts.actor, deps }, { libraryId: lib.id, held: await holdsLock(lib) }, { reason });
       if (w?.includes("either")) unrecorded = true;
     }
     const why = denied.map((p) => `${p.name}: ${p.decision.result === "deny" ? p.decision.reason : ""}`).join("; ");
@@ -908,7 +908,7 @@ async function auditIn(
   }
   try {
     // This device may write into the folder only while it holds that library's lock (R154 e).
-    const held = lib !== undefined && lib.mode === "read-write" && lib.id === check.expectId && !isClosed(lib);
+    const held = lib !== undefined && lib.id === check.expectId && (await holdsLock(lib));
     for (const id of projectIds) {
       const w = await auditOrMark(root, id, null, repo, undefined, action, details, { actor: ctx.actor, deps }, { libraryId: check.expectId, held }, undefined, cause);
       if (w) warnings.push(w);

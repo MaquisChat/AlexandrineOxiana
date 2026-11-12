@@ -3,12 +3,12 @@
  * desktop UI (its token and origin only), with no absolute paths, and the interface is told when a
  * mark or refusal appears.
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { deviceDeps, type Deps } from "@ao/library";
+import { acquireLock, deviceDeps, type Deps } from "@ao/library";
 import { createService, type LibraryService } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -169,4 +169,28 @@ describe("the interface is told when a mark may appear", () => {
     expect(published).toBeGreaterThanOrEqual(1);
     off();
   });
+});
+
+describe("N1 (R154 e): nothing is written into a library another device holds, on the service's own path", () => {
+  it("POST /libraries/move/delete-old with the session's read-only repo keeps the marks on this computer", async () => {
+    const created = await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: OPEN_GOV, encryption: { enabled: false } } });
+    expect(created.status).toBe(200);
+    const dest = join(tmp, "Moved");
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    const done = moved.body.trim().split("\n").map((l: string) => JSON.parse(l)).at(-1);
+    expect(done.done, moved.body).toBe(true);
+    // Another device takes the new copy; this app opens it read-only.
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await acquireLock(dest, { ...deps, deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1, isPidAlive: () => true });
+    const opened = await call({ method: "POST", url: "/libraries/open", body: { path: dest } });
+    expect(opened.status, opened.body).toBe(200);
+    expect(svc.state.session!.lib.readOnlyReason).toBe("locked-by-other-device");
+    const r = await call({ method: "POST", url: "/libraries/move/delete-old", body: { token: done.result.confirmToken } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.warnings.join(" ")).toMatch(/kept on this computer/);
+    expect(r.body).not.toContain(tmp);
+    expect(await readdir(join(dest, "Projects", "Study")).then((n) => n.includes("attention"))).toBe(false);
+    const outbox = await readdir(join(tmp, "config", "attention-outbox"));
+    expect(outbox).toHaveLength(1);
+  }, 60_000);
 });

@@ -38,6 +38,8 @@ import { join } from "node:path";
 import type { AuditEvent } from "@ao/core";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { absPath, assertContained, readMaybe } from "./io.js";
+import { isClosed, type Library } from "../library.js";
+import { readLock } from "../lock.js";
 import { parseProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export const ATTENTION_DIR = "attention";
@@ -197,6 +199,16 @@ export async function attentionWarnings(root: string, projectRel: string, blocke
   if (unreadable.length > 0) out.push(ATTENTION_UNREADABLE_WARNING);
   if (records.some((r) => r.kind === "permissions-not-set")) out.push(PERMISSIONS_NOT_SET_WARNING);
   return out;
+}
+
+/**
+ * Whether this device holds `lib`'s lock now (N1): the handle is open read-write and the lock file
+ * names this device. Checked at the point of writing a mark, whatever object the caller passed.
+ */
+export async function holdsLock(lib: Library): Promise<boolean> {
+  if (lib.mode !== "read-write" || isClosed(lib)) return false;
+  const l = await readLock(lib.root).catch(() => null);
+  return l !== null && l !== "corrupt" && l.deviceId === lib.deviceId;
 }
 
 // ---- device-local outbox (R154 e) ----------------------------------------------------------------

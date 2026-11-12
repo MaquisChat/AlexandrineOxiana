@@ -91,6 +91,7 @@ import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditRe
 import {
   AUDIT_WAITING_WARNING,
   attentionWarnings,
+  holdsLock,
   listMarks,
   markForSetAside,
   moveOutboxIntoProject,
@@ -791,6 +792,8 @@ export async function recordOrMark(
     if (!st) return `${what}; the project could not be marked as needing attention`;
     try {
       maybeCrash("before-attention-mark");
+      // Never into a library another device holds (N1): checked now, not by the repo handed in.
+      if (!(await holdsLock(core.library))) throw new Error("this computer does not hold the library's lock");
       await writeAttention(core.root, st.rel, {
         formatVersion: 1,
         id: newAttentionId(),
@@ -833,6 +836,7 @@ export async function recordOrMark(
 /** Package-internal: the project's standing attention warnings, read through this repo. */
 export async function writeProjectAttention(repo: Repo, projectId: string, rec: AttentionRecord): Promise<void> {
   const core = cores.get(repo)!;
+  if (!(await holdsLock(core.library))) throw new Error("this computer does not hold the library's lock");
   await writeAttention(core.root, core.state(projectId).rel, rec);
 }
 

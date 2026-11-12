@@ -1097,6 +1097,24 @@ describe("Task 50: no refusal or audit failure is silent", () => {
     expect(left).toEqual([]);
   });
 
+  it("P2b / N1: handed a read-only repo of a library another device holds, nothing is written there; the marks wait on this device", async () => {
+    const { lib, a, b } = await fixture();
+    const dest = join(tmp, "Dest");
+    const res = await executeMove(lib, dest, { deps: mkDeps(), env });
+    const depsB: Deps = { ...mkDeps(), deviceId: "dev-B", hostname: "host-B", pid: process.pid + 1 };
+    await acquireLock(dest, depsB);
+    const ro = await openLibrary(dest, mkDeps());
+    open.push(ro);
+    expect(ro.readOnlyReason).toBe("locked-by-other-device");
+    const roRepo = await openTestRepo(ro, ring, { clock: () => now, tz: "UTC", scryptN: FAST });
+    const out = await deleteOldCopy(lib.root, res.confirmToken, { destRepo: roRepo });
+    expect(out.warnings.join(" ")).toMatch(/kept on this computer/);
+    expect(out.warnings.join(" ")).not.toMatch(/marked as needing attention/);
+    expect(await attentionOf(dest, a.folder)).toEqual([]);
+    expect(await attentionOf(dest, b.folder)).toEqual([]);
+    expect(await projectWarnings(roRepo, a.id)).toEqual(["audit-waiting"]);
+  });
+
   it("a library.old-copy-deleted event that cannot be written marks the project in the new copy", async () => {
     const { lib, a, b } = await fixture();
     const dest = join(tmp, "Dest");

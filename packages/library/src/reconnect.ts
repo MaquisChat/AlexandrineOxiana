@@ -34,7 +34,7 @@ import { listUnfinishedMoves, movedToFor } from "./old-copies.js";
 import { recordLocation } from "./registry.js";
 import { ReadOnlyLibraryError } from "./repo/errors.js";
 import { assertContained } from "./repo/io.js";
-import { newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
+import { holdsLock, newAttentionId, projectFolders, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./repo/attention.js";
 import {
   appendLibraryEvent,
   openRepo,
@@ -672,7 +672,7 @@ export async function reconnect(p: string, expectedId: string, deps: Deps, opts:
           reason: writable ? reasonOf(repoError) : "ReadOnlyLibrary",
         };
         try {
-          if (!writable) throw new Error("not held");
+          if (!(await holdsLock(library))) throw new Error("not held");
           await writeAttention(root, rel, rec);
           marked++;
         } catch {
