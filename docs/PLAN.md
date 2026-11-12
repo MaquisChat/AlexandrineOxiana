@@ -493,7 +493,7 @@ Update after every task; commit and push.
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | approved; verification before merge | 4587f98 (worktree branch) | reviewed with probes over one fix round; 2 new Minor deferred |
-| 49 Backups governed | fix round 4 in review | 6bdcab6 (worktree branch) | R147 built: the list is decided once and kept in the audit log; the certificate is never rewritten; a fresh reviewer |
+| 49 Backups governed | fix round 5 | 6bdcab6 (worktree branch) | round 4 reviewed against R147: sound for deletion; 2 Important for what is written (a restore rewrites certificates; a pass writes on an unverified chain); R175 |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
 | 51 Job records in files | approved; verification before merge | 82fbf40 (worktree branch) | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
