@@ -292,8 +292,17 @@ export class ServiceState {
     return (this.captureRegistry ??= new CaptureQueueRegistry({ now: () => this.opts.now().getTime() }));
   }
 
-  /** Queues and profile runs ended from outside whose run has not returned yet (queue id → project id; no address). */
-  private readonly endedCaptures = new Map<string, string>();
+  /** Queues and profile runs ended from outside whose run has not returned yet (queue id → project and why; no address). */
+  private readonly endedCaptures = new Map<string, { projectId: string; why: "lock" | "close" }>();
+  /** The abort signal of each running capture: aborted when it is ended, so its worker job is asked to stop (N5). */
+  private readonly captureAborts = new Map<string, AbortController>();
+
+  /** The signal a running capture passes to its downloads (one per queue or profile run). */
+  captureSignal(queueId: string): AbortSignal {
+    let c = this.captureAborts.get(queueId);
+    if (!c) this.captureAborts.set(queueId, (c = new AbortController()));
+    return c.signal;
+  }
   /** Profile runs running now (queue id → project id). */
   private readonly profileRuns = new Map<string, string>();
 
@@ -301,8 +310,9 @@ export class ServiceState {
    * Ends every running capture of `projectId` at once, as a fact (Task 63 fix round 2, I3): at its
    * lock, and for an encrypted project when its library closes or moves (R30, R50). Each running
    * queue or profile run is marked ended here, and its end is published here, once. From then on it
-   * stores, records and publishes nothing, whatever the project's state is later: a download in
-   * flight is discarded when it comes back (it cannot be cancelled in the worker). It keeps its
+   * stores, records and publishes nothing, whatever the project's state is later. Its download in
+   * flight is asked to stop (its signal is aborted: the worker client sends the worker's cancel, N5),
+   * and whatever comes back is discarded. It keeps its
    * extension slot and holds the project's new captures off (409 CAPTURE_STOPPING) until its run has
    * really returned. The readable records of the project's queues are forgotten at once; the ended
    * queues keep only their progress counters (no address) until they return.
@@ -311,7 +321,8 @@ export class ServiceState {
     const error = why === "lock" ? "ProjectLockedError: the project was locked, so the capture stopped" : "LibraryClosedError: the library was closed or moved, so the capture stopped";
     const end = (queueId: string) => {
       if (this.endedCaptures.has(queueId)) return; // ended already (a second lock)
-      this.endedCaptures.set(queueId, projectId);
+      this.endedCaptures.set(queueId, { projectId, why });
+      this.captureAborts.get(queueId)?.abort();
       this.events.publish("capture.progress", { queueId, projectId, finished: true, error });
     };
     for (const [id, q] of this.captures) {
@@ -328,10 +339,10 @@ export class ServiceState {
     return this.endedCaptures.has(queueId);
   }
 
-  /** Whether an ended capture of `projectId` is still finishing its current download. */
-  captureStopping(projectId: string): boolean {
-    for (const pid of this.endedCaptures.values()) if (pid === projectId) return true;
-    return false;
+  /** Why an ended capture of `projectId` is still finishing its current download (a lock, or a close or move), if one is. */
+  captureStopping(projectId: string): "lock" | "close" | undefined {
+    for (const e of this.endedCaptures.values()) if (e.projectId === projectId) return e.why;
+    return undefined;
   }
 
   /** A profile run starts (its end is `profileRunEnded`). */
@@ -342,6 +353,7 @@ export class ServiceState {
   /** A profile run has returned: true when it had been ended from outside (then nothing of it is published). */
   profileRunEnded(queueId: string): boolean {
     this.profileRuns.delete(queueId);
+    this.captureAborts.delete(queueId);
     return this.endedCaptures.delete(queueId);
   }
 
@@ -368,6 +380,7 @@ export class ServiceState {
     // is not continued, and only now gives its extension slot back.
     if (this.endedCaptures.delete(queueId)) {
       this.captures.delete(queueId);
+      this.captureAborts.delete(queueId);
       return Promise.resolve();
     }
     const offset = at.offset ?? 0;
@@ -382,6 +395,7 @@ export class ServiceState {
     // queue keeps an extension's links slot taken.
     const fail = (err: unknown) => {
       info.finished = true;
+      this.captureAborts.delete(queueId);
       this.captureQueues.finish(queueId, { error: err });
       this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) });
     };
@@ -394,6 +408,7 @@ export class ServiceState {
       const release = () => {
         this.endedCaptures.delete(queueId);
         this.captures.delete(queueId);
+        this.captureAborts.delete(queueId);
       };
       try {
         const s = this.requireSession();
@@ -411,7 +426,7 @@ export class ServiceState {
             if (info.finished) this.captureQueues.finish(queueId, {});
             this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished });
           },
-          { shouldStop: () => ctl.stopping, cancelled: ended },
+          { shouldStop: () => ctl.stopping, cancelled: ended, signal: this.captureSignal(queueId) },
         );
       } catch (err) {
         if (ended()) release();
@@ -428,6 +443,7 @@ export class ServiceState {
         return () => void this.startCaptureQueue(queueId, projectId, rest, opts, { offset: next, total });
       }
       info.finished = true;
+      this.captureAborts.delete(queueId);
       this.captureQueues.finish(queueId, {});
       return;
     });

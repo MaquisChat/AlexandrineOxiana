@@ -435,6 +435,27 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
   });
 
+  it("N7: a run ended during a rate-limit wait starts no more downloads", async () => {
+    const p = await project();
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    let ended = false;
+    let submits = 0;
+    let atEnd = -1;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      submits++;
+      return submit(...args);
+    });
+    const c = createLinkCapture({ repo, worker: client, index: handle, sleep: async () => {
+      ended = true; // the run is ended (a lock) while it waits
+      atEnd = submits;
+    } });
+    const err = await c.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { cancelled: () => ended }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("CaptureCancelledError");
+    expect(atEnd).toBeGreaterThan(0);
+    expect(submits).toBe(atEnd);
+  });
+
   it("rate limited: waits 60, 120 and 240 s, then pauses; a re-run resumes without duplicates", async () => {
     const p = await project();
     process.env.FAKE_TOOL_MODE = "ratelimit";

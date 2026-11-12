@@ -100,6 +100,8 @@ export interface ItemContext {
   metadataOnly: boolean;
   /** The run was ended from outside (Task 63 I3): a download that comes back then is discarded. */
   cancelled?: () => boolean;
+  /** Aborted when the run is ended: the worker job in flight is asked to stop (N5). */
+  signal?: AbortSignal;
 }
 
 /** How a queue or a run is ended from outside (Task 63 I3): asked between links and before every store. */
@@ -108,6 +110,11 @@ export interface CaptureControl {
   shouldStop?: () => boolean;
   /** Ended for good (a lock, a close): a download that comes back is discarded, nothing more is stored. */
   cancelled?: () => boolean;
+  /**
+   * Aborted when the capture is ended: the worker job in flight is asked to stop (the worker client
+   * sends the worker's cancel), so an ended capture frees the worker promptly (N5).
+   */
+  signal?: AbortSignal;
 }
 
 /** The shared machinery of link and profile capture (package-internal). */
@@ -124,7 +131,7 @@ export interface CaptureCore {
   writeJson(work: string, name: string, data: unknown, projectId: string, encrypted: boolean): Promise<string>;
   makeWork(): Promise<{ work: string; done: () => Promise<void> }>;
   /** One post's full platform metadata (metadata-only download), stripped; undefined when it cannot be read. */
-  fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<Record<string, unknown> | undefined>;
+  fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, signal?: AbortSignal): Promise<Record<string, unknown> | undefined>;
   captureItem(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item: ItemContext): Promise<CaptureOutcome>;
 }
 
@@ -156,7 +163,7 @@ export interface LinkCapture {
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
     /** Ended from outside: CaptureCancelledError at the next check, nothing more stored. */
-    control?: Pick<CaptureControl, "cancelled">,
+    control?: Pick<CaptureControl, "cancelled" | "signal">,
   ): Promise<ProfileCaptureReport>;
   /** One link at a time, in order; `onProgress(done, total, outcome)` after each. */
   captureUrls(
@@ -334,12 +341,13 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return path;
   }
 
-  async function download(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, work: string, metadataOnly: boolean, comments = false): Promise<JobResult> {
+  async function download(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, work: string, metadataOnly: boolean, comments = false, signal?: AbortSignal): Promise<JobResult> {
     const tool = toolFor(c);
     return worker.submit(projectId, {
       type: "capture.download",
       input: c.canonicalUrl,
       output: work,
+      ...(signal ? { signal } : {}),
       params: {
         tool,
         ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
@@ -500,7 +508,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       // 5. Download. The raw tool output (info JSON with request headers) stays in this folder.
       let result: JobResult;
       try {
-        result = await download(projectId, c, opts, work, !!existing || !!item?.metadataOnly, !existing && !!item?.includeComments);
+        result = await download(projectId, c, opts, work, !!existing || !!item?.metadataOnly, !existing && !!item?.includeComments, control?.signal ?? item?.signal);
       } catch (err) {
         if (err instanceof WorkerJobError) return workerFailed(url, err);
         if (err instanceof WorkerUnavailableError) return failed(url, "WORKER_UNAVAILABLE");
@@ -652,12 +660,12 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     }
   }
 
-  async function fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<Record<string, unknown> | undefined> {
+  async function fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
     const { work, done } = await makeWork();
     try {
       let r: JobResult;
       try {
-        r = await download(projectId, c, opts, work, true);
+        r = await download(projectId, c, opts, work, true, false, signal);
       } catch (err) {
         if (err instanceof WorkerJobError || err instanceof WorkerUnavailableError) return undefined;
         throw err;

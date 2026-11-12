@@ -241,13 +241,13 @@ export function createProfileCapture(core: CaptureCore) {
     profileUrl: string,
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
-    control?: { cancelled?: () => boolean },
+    control?: { cancelled?: () => boolean; signal?: AbortSignal },
   ): Promise<ProfileCaptureReport> {
     if (opts.cookiesFromBrowser && !core.acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(profileUrl);
     if ((c.kind !== "profile" && c.kind !== "playlist") || c.platform === "other") return failedReport("UNSUPPORTED_URL");
     if (invalidOptions(opts)) return failedReport("INVALID_OPTIONS");
-    return core.inLane(c.platform, () => run(projectId, c, opts, onProgress, control?.cancelled));
+    return core.inLane(c.platform, () => run(projectId, c, opts, onProgress, control?.cancelled, control?.signal));
   }
 
   async function run(
@@ -256,6 +256,7 @@ export function createProfileCapture(core: CaptureCore) {
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
     isCancelled: () => boolean = () => false,
+    signal?: AbortSignal,
   ): Promise<ProfileCaptureReport> {
     /** Ended from outside (Task 63 I3): nothing more is stored, the run ends here (its batch stays as an interrupted one). */
     const check = () => {
@@ -321,10 +322,14 @@ export function createProfileCapture(core: CaptureCore) {
     let results: ListingResult[] = [];
     let toolVersion = "unknown";
     for (;;) {
-      const r = await enumerate(projectId, c, opts, tool);
-      // Rate limited, even part-way through a list: wait and list again, or pause.
+      const r = await enumerate(projectId, c, opts, tool, signal);
+      // Rate limited, even part-way through a list: wait and list again, or pause (not once ended, N7).
       if (r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED")) {
-        if (await backOff()) continue;
+        check();
+        if (await backOff()) {
+          check();
+          continue;
+        }
         pause();
         return audited(projectId, platform, report);
       }
@@ -517,6 +522,7 @@ export function createProfileCapture(core: CaptureCore) {
       includeComments,
       metadataOnly: opts.metadataOnly === true,
       cancelled: isCancelled,
+      ...(signal ? { signal } : {}),
     };
     const fresh = entries.filter((e) => !isKnown(e.id));
     const freshIds = new Set(fresh.map((e) => e.id));
@@ -590,7 +596,7 @@ export function createProfileCapture(core: CaptureCore) {
           await save(recordFiles());
           report.reappeared++;
         }
-        const edit = await recordEdit(projectId, sid, e, platform, tool, opts, check);
+        const edit = await recordEdit(projectId, sid, e, platform, tool, opts, check, signal);
         if (edit === "policy-changed") {
           policyChanged();
           break;
@@ -689,7 +695,14 @@ export function createProfileCapture(core: CaptureCore) {
       }
       // Ended while the post downloaded: nothing of it was stored, and nothing more is.
       if (out.status === "failed" && out.errorCode === "CANCELLED") throw new CaptureCancelledError();
-      if (out.status === "failed" && out.errorCode === "RATE_LIMITED" && (await backOff())) continue;
+      if (out.status === "failed" && out.errorCode === "RATE_LIMITED") {
+        // Ended before or during the wait: no further attempt is started (N7).
+        if (item.cancelled?.()) throw new CaptureCancelledError();
+        if (await backOff()) {
+          if (item.cancelled?.()) throw new CaptureCancelledError();
+          continue;
+        }
+      }
       return out;
     }
   }
@@ -699,6 +712,7 @@ export function createProfileCapture(core: CaptureCore) {
     c: ClassifiedUrl,
     opts: ProfileCaptureOptions,
     tool: CaptureTool,
+    signal?: AbortSignal,
   ): Promise<{ results: ListingResult[]; error?: string; tool?: string; toolVersion: string }> {
     const results: ListingResult[] = [];
     let toolVersion = "unknown";
@@ -711,6 +725,7 @@ export function createProfileCapture(core: CaptureCore) {
             type: "capture.download",
             input: listing.url,
             output: work,
+            ...(signal ? { signal } : {}),
             params: {
               tool,
               ...(tool === "yt-dlp" ? { flatList: true } : {}),
@@ -841,6 +856,7 @@ export function createProfileCapture(core: CaptureCore) {
     tool: CaptureTool,
     opts: ProfileCaptureOptions,
     check: () => void = () => {},
+    signal?: AbortSignal,
   ): Promise<"edited" | "unchanged" | "policy-changed"> {
     const root = repoLibrary(repo).root;
     const sf = await repo.getSource(projectId, sourceId);
@@ -855,10 +871,16 @@ export function createProfileCapture(core: CaptureCore) {
     const flat = stripSnapshot(e.raw, { localPrefixes: [root] });
     const suspect = platform === "youtube" ? differs(stored.title, flat.title) : differs(captionOf(stored), captionOf(flat));
     if (!suspect) return "unchanged";
-    const now = await core.fetchMetadata(projectId, classifyUrl(e.url), {
-      transcribe: false,
-      ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
-    });
+    const now = await core.fetchMetadata(
+      projectId,
+      classifyUrl(e.url),
+      {
+        transcribe: false,
+        ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
+      },
+      signal,
+    );
+    check(); // ended while it fetched: nothing is stored
     if (!now) return "unchanged";
     const newCap = captionOf(now);
     const newYtTitle = platform === "youtube" && typeof now.title === "string" ? now.title : undefined;

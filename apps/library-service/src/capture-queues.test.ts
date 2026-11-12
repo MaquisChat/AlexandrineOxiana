@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { WorkerToolError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob } from "@ao/library";
+import { WorkerJobError, WorkerToolError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob } from "@ao/library";
 import type { CaptureQueueDetail, CaptureQueueListResponse } from "@ao/shared";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
@@ -42,7 +42,7 @@ const gates: Array<() => void> = [];
  * A stand-in worker whose downloads wait until released, then fail because the video downloader is
  * not installed (TOOL_NOT_INSTALLED naming the tool): a queue stays running until `release()`.
  */
-function gatedWorker(): WorkerProvider & { calls: WorkerJob[]; release(): void } {
+function gatedWorker(opts: { honoursCancel?: boolean } = {}): WorkerProvider & { calls: WorkerJob[]; release(): void } {
   const calls: WorkerJob[] = [];
   let open!: () => void;
   const gate = new Promise<void>((r) => (open = r));
@@ -56,7 +56,12 @@ function gatedWorker(): WorkerProvider & { calls: WorkerJob[]; release(): void }
       const client = {
         async submit(_pid: string, job: WorkerJob): Promise<JobResult> {
           calls.push(job);
-          await gate;
+          // A worker that honours a cancel stops the job when its signal is aborted (as the worker
+          // client's poll does: POST /jobs/:id/cancel, then the job ends cancelled). By default the
+          // download does not stop by itself, as a slow one would not.
+          const cancelled = opts.honoursCancel && job.signal ? new Promise<void>((r) => (job.signal!.aborted ? r() : job.signal!.addEventListener("abort", () => r()))) : new Promise<void>(() => {});
+          await Promise.race([gate, cancelled]);
+          if (opts.honoursCancel && job.signal?.aborted) throw new WorkerJobError("CANCELLED", "the job was cancelled");
           throw new WorkerToolError("TOOL_NOT_INSTALLED", "yt-dlp is not installed", "video-downloader");
         },
         async resumePending() {
@@ -573,6 +578,54 @@ describe("a lock ends a project's running captures for good (fix round 2: I3, R1
     expect(svc.state.captureQueue(queueId)).toBeUndefined();
     expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
     expect((await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT2] } })).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("N5: the lock asks the in-flight download to stop; the project's captures are accepted again without waiting for it; nothing of it is published", async () => {
+    const worker = gatedWorker({ honoursCancel: true });
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const q = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT, YT2] } });
+    await until(() => worker.calls.length > 0);
+    expect((await lock(pid)).status).toBe(200);
+    expect(worker.calls[0]!.signal?.aborted).toBe(true);
+    expect((await unlock(pid)).status).toBe(200);
+    // The gate is never opened: the slow download ended because it was asked to.
+    let status = 0;
+    await until(async () => (status = (await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } })).status) === 200);
+    expect(status).toBe(200);
+    expect(worker.calls.filter((j) => j.input.includes("aoTest00001"))).toHaveLength(0);
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === q.json.queueId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.data.error).toMatch(/^ProjectLockedError/);
+    expect(svc.state.captureQueue(q.json.queueId as string)).toBeUndefined();
+  });
+
+  it("N5: a profile run's download is asked to stop at the lock too", async () => {
+    const worker = gatedWorker({ honoursCancel: true });
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    expect((await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: PROFILE } })).status).toBe(200);
+    await until(() => worker.calls.length > 0);
+    expect((await lock(pid)).status).toBe(200);
+    expect(worker.calls[0]!.signal?.aborted).toBe(true);
+    expect((await unlock(pid)).status).toBe(200);
+    await until(async () => (await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: PROFILE } })).status === 200);
+  });
+
+  it("N6: while a capture ended by a close or move still finishes, the refusal says the library was closed or moved", async () => {
+    const { pid, worker } = await running();
+    svc.state.endCaptures(pid, "close");
+    const r = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
+    expect(r.status).toBe(409);
+    expect(r.json.error.reason).toBe("CAPTURE_STOPPING");
+    expect(r.json.error.message).toMatch(/library was closed or moved/);
+    expect(r.json.error.message).not.toMatch(/locked/);
+    worker.release();
     await svc.state.idle();
   });
 });

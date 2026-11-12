@@ -98,8 +98,9 @@ export const LINK_QUEUES_PER_EXTENSION = 2;
 
 const LINKS_RUNNING =
   "At least one of these links is already waiting or being captured in this project, in a capture that is still running, so nothing new was queued. Wait until that capture has finished, or leave the link out.";
-const STOPPING =
-  "A capture of this project that was ended (the project was locked) is still finishing its current download, so nothing new was queued. Try again in a moment.";
+/** While an ended capture still finishes: what ended it, in plain words (N6). */
+const stopping = (why: "lock" | "close"): string =>
+  `A capture of this project that was stopped when ${why === "lock" ? "the project was locked" : "the library was closed or moved"} is still finishing its current download, so nothing new was queued. Try again in a moment.`;
 const PROFILE_RUNNING = "This profile, channel or playlist is already being captured in this project, so nothing new was started. Wait until that capture has finished.";
 
 /** A locked project's queues are not shown (423), as its sources are not. */
@@ -127,7 +128,8 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     requireUnlocked(s, projectId);
     // An ended capture's download still occupies the worker: its addresses are forgotten, so the
     // whole project waits until it has returned (I3).
-    if (state.captureStopping(projectId)) throw new ApiError(409, "CONFLICT", STOPPING, CAPTURE_STOPPING);
+    const ending = state.captureStopping(projectId);
+    if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
     if (state.captureQueues.runningConflict(projectId, urls)) throw new ApiError(409, "CONFLICT", LINKS_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
@@ -195,7 +197,8 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const worker = await state.workerClient();
     // Checked and recorded with nothing awaited in between (as for links).
     requireUnlocked(s, projectId);
-    if (state.captureStopping(projectId)) throw new ApiError(409, "CONFLICT", STOPPING, CAPTURE_STOPPING);
+    const ending = state.captureStopping(projectId);
+    if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
     if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     const queues = state.captureQueues;
@@ -215,7 +218,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
             queues.progress(queueId, done, total, outcome);
             state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false });
           },
-          { cancelled: () => state.captureEnded(queueId) },
+          { cancelled: () => state.captureEnded(queueId), signal: state.captureSignal(queueId) },
         );
         if (state.profileRunEnded(queueId)) return; // its end was published when it was ended
         queues.finish(queueId, { report });
