@@ -171,7 +171,9 @@ the media worker itself, as it always has.
 - The shell ships two things per architecture: a Node 22 binary and this folder. The folder must be
   built on (or for) the same platform, architecture and Node ABI as the Node it runs with; the Mac
   workflow (Task 37f) builds it on each of the two Mac runners with the pinned Node version and
-  checks `build-info.json` against the Node it packages.
+  checks `build-info.json` against the Node it packages. Node's own `LICENSE` (which also covers the
+  libraries Node bundles) travels with the app: the desktop build takes it from the same release
+  archive as the binary (ADR 0015).
 - Every `.node` file in `node_modules/` and the Node binary must be signed with our identity in the
   Mac build (Task 37f). ExifTool stays a Perl script run by the system Perl (ADR 0014, risk R5).
 - A new dependency that loads files by a path relative to its own source, or a module by a computed
