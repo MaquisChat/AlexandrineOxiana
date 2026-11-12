@@ -357,16 +357,17 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(0);
   });
 
-  // Task 63 fix round 1, item 3. EXPECTED TO FAIL until the repository's updateSource can build its
-  // patch from the source it reads inside the governed transaction (Task 34d, repo/sources.ts): the
-  // profile run reads the source's title before its write, so an edit made in between is lost.
-  it.fails("KNOWN DEFECT (fixed by Task 34d): a title edit made while a profile run records an edit is not lost", async () => {
+  // Task 63 item 3: the run's title edit is read, merged and written in one governed change, so an
+  // edit made at the same time is kept (R26).
+  it("a title edit made while a profile run records an edit is not lost: both land, each audited", async () => {
     const p = await project();
     await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
     const target = ttId(6);
     const sid = (await byPost(p.id, target)).source.id;
     const prof = synthetic();
     await setProfile({ ...prof, items: prof.items.map((it) => (it.id === target ? { ...it, caption: "Evening dance at the old market (edited)\n#dance" } : it)) });
+    const updatesOf = async () => (await auditEvents(p.folder)).filter((e) => e.entity?.type === "source" && e.entity.id === sid && e.action === "store");
+    const before = (await updatesOf()).length;
     // The researcher adds a translated title while the run is between its read and its write.
     const add = repo.addOriginalAsset.bind(repo);
     vi.spyOn(repo, "addOriginalAsset").mockImplementation(async (...args) => {
@@ -378,6 +379,10 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     const values = (await byPost(p.id, target)).source.title.variants.map((v) => v.value);
     expect(values).toContain("Evening dance at the old market (edited)");
     expect(values).toContain("Tanz Nummer 6");
+    // Two source updates (the researcher's and the run's), each its own governed change with its own audit entry.
+    const updates = (await updatesOf()).slice(before).filter((e) => e.details?.["op"] === "source.update");
+    expect(updates).toHaveLength(2);
+    expect(new Set(updates.map((e) => e.details?.["txn"])).size).toBe(2);
   });
 
   it("a run ended while a post downloads (Task 63 fix round 2, I3): the post is not stored and the run stops there", async () => {

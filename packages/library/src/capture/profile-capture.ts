@@ -886,19 +886,30 @@ export function createProfileCapture(core: CaptureCore) {
     }
 
     const newTitle = platform === "youtube" ? newYtTitle : firstLine(newCap);
-    const variants = sf.source.title.variants;
-    if (newTitle && !variants.some((v) => norm(v.value) === norm(newTitle))) {
-      const lang = (variants.find((v) => v.kind === "original") ?? variants[0])?.lang ?? "und";
-      const title: MultiText = { variants: [...variants, { lang, kind: "original", value: newTitle, producedBy: { by: "machine", tool: "platform-edit", at } }] };
+    if (newTitle) {
       const ref = platform === "youtube" ? "/title" : `/${["description", "desc", "caption"].find((k) => typeof now[k] === "string") ?? "description"}`;
-      const evidence: FieldEvidence = { field: "/title", value: title, source: { kind: "platform-json", provider: tool, ref }, at };
       // Recheck against the first snapshot (provenance) plus the edited text from the new one.
       const ctx = groundingSnapshot(sf.source.provenance.platformSnapshot, platform === "youtube" ? newTitle : (newCap ?? newTitle));
-      check();
-      await updateSourceRechecked(repo, projectId, sourceId, { title }, {
-        fieldEvidence: (cur) => [...cur.fieldEvidence, evidence],
-        verification: (next) => recheckSourceFile(next, { platformSnapshot: ctx }).verification,
-      });
+      /** The title with the edited text added, from the source as read inside the governed change. */
+      const withEdit = (variants: MultiText["variants"]): MultiText | undefined => {
+        if (variants.some((v) => norm(v.value) === norm(newTitle))) return undefined;
+        const lang = (variants.find((v) => v.kind === "original") ?? variants[0])?.lang ?? "und";
+        return { variants: [...variants, { lang, kind: "original", value: newTitle, producedBy: { by: "machine", tool: "platform-edit", at } }] };
+      };
+      if (withEdit(sf.source.title.variants)) {
+        check();
+        // Read, merged and written in one governed, audited transaction (R26): a title edit made
+        // meanwhile (by the researcher, or another run) is kept, not overwritten.
+        await updateSourceRechecked(repo, projectId, sourceId, (cur) => ({ title: withEdit(cur.title.variants) ?? cur.title }), {
+          fieldEvidence: (cur) => {
+            const title = withEdit(cur.source.title.variants);
+            if (!title) return cur.fieldEvidence;
+            const evidence: FieldEvidence = { field: "/title", value: title, source: { kind: "platform-json", provider: tool, ref }, at };
+            return [...cur.fieldEvidence, evidence];
+          },
+          verification: (next) => recheckSourceFile(next, { platformSnapshot: ctx }).verification,
+        });
+      }
     }
     return "edited";
   }
