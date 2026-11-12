@@ -330,6 +330,50 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
     expect(svc!.state.libraryState().index).toBeUndefined();
   });
 
+  it("M3: \"Rebuild library from folder\" pressed while the open's rebuild runs waits for it, then rebuilds (no refusal)", async () => {
+    const held = heldRebuild();
+    await svc!.close();
+    await start({ rebuildIndexIfNeeded: held.seam });
+    const { path, pid } = await libraryWithSources();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await deleteIndex(path);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await held.started;
+    const manual = call({ method: "POST", url: "/libraries/rebuild-index" });
+    await new Promise((r) => setTimeout(r, 100));
+    held.release();
+    const r = await manual;
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ indexed: 2, lockedProjects: 0, errors: 0 });
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(2);
+  });
+
+  it("M4: a manual rebuild stopped by closing the library answers 409 in plain words, not a raw error", async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((r) => (entered = r));
+    await svc!.close();
+    await start({
+      // Only the researcher's (forced) rebuild is held; it stops when the library closes.
+      rebuildIndexIfNeeded: async (h, ring, lib, opts = {}) => {
+        if (opts.force) {
+          entered();
+          await new Promise<void>((_, reject) => opts.signal?.addEventListener("abort", () => reject(opts.signal!.reason as Error), { once: true }));
+        }
+        return rebuildIndexIfNeeded(h, ring, lib, opts);
+      },
+    });
+    await libraryWithSources();
+    await svc!.state.idle();
+    const manual = call({ method: "POST", url: "/libraries/rebuild-index" });
+    await started;
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const r = await manual;
+    expect(r.status, r.body).toBe(409);
+    expect(r.json.error.code).toBe("CONFLICT");
+    expect(r.json.error.message).toMatch(/stopped because the library was closed or moved/);
+    expect(r.body).not.toMatch(/AbortError|aborted/i);
+  });
+
   it("closing the library while its index is rebuilding stops the rebuild and releases the lock", async () => {
     const { path } = await libraryWithSources();
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);

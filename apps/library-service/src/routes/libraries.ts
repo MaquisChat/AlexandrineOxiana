@@ -65,6 +65,10 @@ function absPath(o: Record<string, unknown>, key: string): string {
   return p;
 }
 
+/** A rebuild the researcher asked for, stopped because the library was closed or moved meanwhile (M4). */
+const stoppedByClose = () =>
+  new ApiError(409, "CONFLICT", "The rebuild stopped because the library was closed or moved. Open the library and choose \"Rebuild library from folder\" again if it is still needed.");
+
 export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
@@ -337,8 +341,17 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   // "Rebuild library from folder" (spec 4.3): the index made again from the files, whatever its state.
   app.post("/libraries/rebuild-index", async () => {
     const s = state.requireWritable();
-    const r = await state.rebuildIndex(s, true);
-    return { indexed: r?.indexed ?? 0, lockedProjects: r?.lockedProjects.length ?? 0, errors: r?.errors.length ?? 0 };
+    // One already running (e.g. the open's): wait for it, then rebuild as asked (M3).
+    for (let i = 0; s.indexRebuild && i < 3; i++) await s.indexRebuild.done;
+    if (state.session !== s) throw stoppedByClose();
+    try {
+      const r = await state.rebuildIndex(s, true);
+      return { indexed: r?.indexed ?? 0, lockedProjects: r?.lockedProjects.length ?? 0, errors: r?.errors.length ?? 0 };
+    } catch (err) {
+      // Stopped between sources because the library closed or moved (M4): said in plain words.
+      if (err instanceof Error && err.name === "AbortError") throw stoppedByClose();
+      throw err;
+    }
   });
 
   // Server-sent events; read with fetch streaming and the Authorization header (never a query token).
