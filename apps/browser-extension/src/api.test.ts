@@ -172,3 +172,125 @@ describe("pairing", () => {
     expect(await createApi({ fetch: fakeFetch(service).fn, storage }).getPairing()).toMatchObject({ token: "a".repeat(43) });
   });
 });
+
+describe("the app's port changed (R171, defect D13)", () => {
+  const OLD = 48123;
+  const NEW = 51234;
+  const paired = (storage: ReturnType<typeof memoryStorage>) => (storage.data.pairing = { port: OLD, token: TOKEN, pairedAt: "2026-11-01T10:00:00.000Z" });
+
+  it("names both possible causes when the app does not answer on the saved port", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const api = createApi({ fetch: (async () => Promise.reject(new TypeError("Failed to fetch"))) as unknown as typeof fetch, storage });
+    const err = (await api.listProjects().catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.code).toBe("UNREACHABLE");
+    expect(err.message).toContain(`port ${OLD}`);
+    expect(err.message).toMatch(/closed/i);
+    expect(err.message).toMatch(/port changed|changed its port/i);
+    expect(err.message).not.toContain(TOKEN);
+    expect(storage.data.pairing).toBeDefined();
+  });
+
+  it("checks the new port with one authorised request (the token in the header only), then saves it, keeping the token", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const { fn, calls } = fakeFetch(service);
+    const api = createApi({ fetch: fn, storage });
+    const r = await api.changePort(` ${NEW} `);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(`http://127.0.0.1:${NEW}/projects`);
+    expect(calls[0]!.init.method).toBe("GET");
+    expect(headerOf(calls[0]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(calls[0]!.url).not.toContain(TOKEN);
+    expect(r.pairing).toEqual({ port: NEW, token: TOKEN, pairedAt: "2026-11-01T10:00:00.000Z" });
+    expect(r.projects).toEqual([{ id: "p1", name: "Estuary", captureMethods: ["browser_capture", "downloader"] }]);
+    expect(storage.data.pairing).toEqual({ port: NEW, token: TOKEN, pairedAt: "2026-11-01T10:00:00.000Z" });
+    // Later calls go to the new port.
+    await api.listProjects();
+    expect(calls[1]!.url).toBe(`http://127.0.0.1:${NEW}/projects`);
+  });
+
+  it("a desktop app with no library open accepts the token too (503 LIBRARY_OFFLINE): the port is saved", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const { fn } = fakeFetch(() => ({ status: 503, body: { error: { code: "LIBRARY_OFFLINE", message: "No library is open." } } }));
+    const r = await createApi({ fetch: fn, storage }).changePort(String(NEW));
+    expect(r.projects).toBeNull();
+    expect(storage.data.pairing).toMatchObject({ port: NEW, token: TOKEN });
+  });
+
+  it("keeps the old port, and says why, when nothing answers on the new one", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const api = createApi({ fetch: (async () => Promise.reject(new TypeError("Failed to fetch"))) as unknown as typeof fetch, storage });
+    const err = (await api.changePort(String(NEW)).catch((e: unknown) => e)) as ApiError;
+    expect(err.code).toBe("UNREACHABLE");
+    expect(err.message).toContain(`port ${NEW}`);
+    expect(err.message).toContain(`port ${OLD}`);
+    expect(storage.data.pairing).toMatchObject({ port: OLD, token: TOKEN });
+  });
+
+  it("keeps the old port and the token when the new port refuses the token (401 or 403): it may be another program", async () => {
+    for (const status of [401, 403]) {
+      const storage = memoryStorage();
+      paired(storage);
+      const { fn } = fakeFetch(() => ({ status, body: { error: { code: status === 401 ? "UNAUTHORIZED" : "FORBIDDEN", message: "no" } } }));
+      const err = (await createApi({ fetch: fn, storage }).changePort(String(NEW)).catch((e: unknown) => e)) as ApiError;
+      expect(err.code).toBe("NOT_ACCEPTED");
+      expect(err.message).toContain(`port ${NEW}`);
+      expect(err.message).toMatch(/pair again/i);
+      expect(storage.data.pairing).toMatchObject({ port: OLD, token: TOKEN });
+    }
+  });
+
+  it("keeps the old port when the answer is not the desktop app's (another program on that port)", async () => {
+    for (const r of [{ status: 404, body: "<html>" }, { status: 200, body: { hello: "world" } }, { status: 500, body: { error: { code: "INTERNAL", message: "x" } } }]) {
+      const storage = memoryStorage();
+      paired(storage);
+      const err = (await createApi({ fetch: fakeFetch(() => r).fn, storage }).changePort(String(NEW)).catch((e: unknown) => e)) as ApiError;
+      expect(err.code, JSON.stringify(r)).toBe("BAD_REPLY");
+      expect(err.message).toContain(`port ${OLD}`);
+      expect(storage.data.pairing).toMatchObject({ port: OLD });
+    }
+  });
+
+  it("refuses a bad port before contacting anything, and needs a pairing", async () => {
+    const storage = memoryStorage();
+    const { fn, calls } = fakeFetch(service);
+    const api = createApi({ fetch: fn, storage });
+    await expect(api.changePort(String(NEW))).rejects.toMatchObject({ code: "NOT_PAIRED" });
+    paired(storage);
+    for (const bad of ["", "0", "70000", "12a", "1.5", "-1"]) await expect(api.changePort(bad), bad).rejects.toMatchObject({ code: "BAD_PORT" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a check that is called off saves nothing", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const ac = new AbortController();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const fn = (async (_input: RequestInfo | URL, init: RequestInit = {}) => {
+      await gate;
+      if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      return new Response(JSON.stringify({ projects: [] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const p = createApi({ fetch: fn, storage }).changePort(String(NEW), { signal: ac.signal });
+    ac.abort();
+    release();
+    await expect(p).rejects.toMatchObject({ code: "ABORTED" });
+    expect(storage.data.pairing).toMatchObject({ port: OLD });
+  });
+
+  it("saves nothing when the pairing changed while the port was checked (unpaired meanwhile)", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const { fn } = fakeFetch((url) => {
+      delete storage.data.pairing;
+      return service(url);
+    });
+    await expect(createApi({ fetch: fn, storage }).changePort(String(NEW))).rejects.toMatchObject({ code: "CHANGED" });
+    expect(storage.data.pairing).toBeUndefined();
+  });
+});
