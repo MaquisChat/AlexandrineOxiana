@@ -6,7 +6,8 @@
  *    (in the app, no reload) the badge is gone.
  *  - Scenario 11's queue step: a planted DOI and title conflict (planted with the library's own code
  *    while the service is stopped, the only way to plant one) appears in the review queue under
- *    "From captures" with conflict badges; choosing a value shows "Confirmed by you".
+ *    "From captures" with conflict badges; choosing a value shows "Confirmed by you"; confirming the
+ *    last field resolves the entry (R176 1): it leaves the queue, and the row's badge is gone.
  *
  * Elements are found by role and accessible name, as a keyboard or screen-reader user finds them.
  */
@@ -102,7 +103,7 @@ function plantConflict(app: AppHarness, o: { library: string; projectId: string 
     "    '/title': { status: 'conflict', checks: ['sources-agree'], reason: 'The page and the platform data give different titles.', current: 'Rivers and Memory', values: [{ value: 'Rivers and Memory', source: page }, { value: 'Rivers and Memories in Upland Villages', source: platform }] },",
     "    '/identifiers/doi': { status: 'conflict', checks: ['sources-agree'], reason: 'The page and the platform data give different DOIs.', current: '10.5555/rivers.1', values: [{ value: '10.5555/rivers.1', source: page }, { value: '10.5555/rivers.2', source: platform }] },",
     "  },",
-    "  reviewItem: { fields: { '/title': 'conflict', '/identifiers/doi': 'conflict' }, reasons: ['The page and the platform data disagree on the title and the DOI.'] },",
+    "  reviewItem: { fields: { '/title': 'conflict', '/identifiers/doi': 'conflict' }, reasons: ['The page and the platform data disagree on the title and the DOI.'], cause: { kind: 'capture-conflict' } },",
     "});",
     "checked.handle.close();",
     "await lib.close();",
@@ -112,7 +113,7 @@ function plantConflict(app: AppHarness, o: { library: string; projectId: string 
   if (r.status !== 0) throw new Error(`Planting the conflict failed (status ${r.status}): ${r.stderr}`);
 }
 
-test("scenario 11 (the review queue step): a planted DOI and title conflict appears in the review queue with conflict badges; choosing a value shows confirmed by you", async ({ page, app }) => {
+test("scenario 11 (the review queue step): a planted DOI and title conflict appears in the review queue with conflict badges; choosing a value shows confirmed by you; the last one clears the entry and the badge", async ({ page, app }) => {
   let projectId = "";
   let libraryPath = "";
   await test.step("set-up: a library and a project; with the service stopped, a captured source whose DOI and title conflict is planted with the library's own code", async () => {
@@ -145,12 +146,23 @@ test("scenario 11 (the review queue step): a planted DOI and title conflict appe
     await expect(page.getByRole("button", { name: "DOI: Confirmed by you" })).toBeFocused();
   });
 
-  await test.step("choosing the title's value shows Confirmed by you", async () => {
+  await test.step("choosing the title's value, the last field in conflict, resolves the entry: it leaves the queue (R176 1)", async () => {
+    await markPage(page);
     await page.getByRole("button", { name: "Title: Conflict" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByRole("radio", { name: /Rivers and Memories in Upland Villages/ }).check();
     await dialog.getByRole("button", { name: "Confirm this value" }).click();
-    await expect(page.getByRole("button", { name: "Title: Confirmed by you" })).toBeVisible();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("Nothing is waiting for review in this project.")).toBeVisible();
+    await expect(page.getByRole("heading", { level: 2, name: "From captures" })).toHaveCount(0);
+  });
+
+  await test.step("back in the library, in the app (no reload), the row's badge is gone", async () => {
+    await page.getByRole("link", { name: "Back to library" }).click();
+    const row = page.getByRole("table", { name: "Sources" }).getByRole("row").filter({ hasText: "Rivers and Memories in Upland Villages" });
+    await expect(row.getByRole("button", { name: "Rivers and Memories in Upland Villages", exact: true })).toBeVisible();
+    await expect(row.getByRole("link", { name: /^Needs review/ })).toHaveCount(0);
+    expect(await stillSamePage(page), "the page was not reloaded").toBe(true);
   });
 
   await test.step("the confirmations are the researcher's own evidence in the stored record", async () => {
