@@ -58,7 +58,75 @@ and Rust 1.97 with cargo. Then:
   SIGKILL of the shell, and after a service that refuses to start. It needs `xvfb-run` and
   `dbus-daemon`; `ffmpeg` for its audio and video checks. The worker: `AO_DESKTOP_WORKER_BIN`, else
   the packaged worker in `sidecars/`, else the development one (`pnpm setup:py`).
-- `pnpm --filter @ao/desktop test`: the launch check's own tests and the shell's Rust tests.
+- `pnpm --filter @ao/desktop test`: the launch check's own tests, the desktop end-to-end harness's
+  unit tests (`e2e/*.test.ts`, Vitest) and the shell's Rust tests.
+
+## The desktop end-to-end test (Linux)
+
+`pnpm e2e -- --desktop-only` (from the repository root; not part of a plain `pnpm e2e`, because it
+needs the built app) drives the debug build `build:linux` makes through its real window, by
+WebDriver: `tauri-driver` in front of the system's `WebKitWebDriver`. One scenario
+(`e2e/desktop.e2e.ts`): the library chooser; the first-use Optional tools dialog ("Not now"); a
+library at a typed folder and a project; a PDF attached with "Choose files…" through the native GTK file dialog; the
+source listed; the stored copy, the untouched original and the audit entries on disk; the window
+closed as its close button does; no process of the app left; nothing under the real home folder
+created or modified. Its results are in `pnpm report` under
+"The desktop app end to end".
+
+- Each run gets a private Xvfb display and D-Bus session bus, and its home, settings, data and
+  libraries under one temporary folder (`e2e/desktop.ts`, `e2e/lifetime.ts`). Every process it
+  starts (Xvfb, the bus and the session services it starts, such as dconf and the portals, the
+  drivers, the app and its helpers, xdotool) gets HOME and the XDG folders there, and each is
+  started in its own process group. The `run` fixture (`e2e/fixtures.ts`) stops all of them,
+  unmounts the document portal and removes the folder however the test ends, a time-out included,
+  and saves the app's output and the clean-up's own notes (`e2e/test-results/*/shell-output.txt`)
+  when the test did not pass or the clean-up left something; a last sweep at process exit covers a
+  run that was never torn down. The app runs without its test mode: no
+  NODE_ENV, no probe. It starts its own service with its own token, which the test never sees; what
+  the service wrote is read from disk.
+- The native file dialog is the real one. WebDriver cannot reach it, so the test finds it on the
+  display by its title and types the file's path into it with `xdotool` (Ctrl+L, the path, Return).
+  Only the person's key presses are made by the test.
+- Closing: the test sends the window the window manager's close message (`WM_DELETE_WINDOW`, `e2e/x11.ts`).
+  WebDriver's own "close window" is not used, because WebKitWebDriver kills the app's process the
+  moment its last window closes.
+- Not covered: the native folder picker ("Choose folder…"): the library is created at a folder typed
+  into the chooser, because the GTK folder chooser completes a typed path with a trailing "/" and
+  Return then opens the folder instead of choosing it; a file dropped from another program (an OS drag
+  and drop cannot be made under Xvfb); and the macOS app (there is no WebDriver for the Mac web view).
+- **If a run was killed.** A test runner killed outright (SIGKILL, or a crashed terminal session)
+  runs no clean-up at all, so its run stays behind: Xvfb, the bus and its portals, the drivers, the
+  app with its service and worker, a FUSE mount of the document portal, and the run's folder in the
+  temporary folder. Nothing in the test process can prevent that. The next run finds such leftovers
+  (a run folder whose owning test process is gone) and stops with a list of them, before starting
+  anything. When no desktop test is running, remove them with:
+
+  ```sh
+  # 1. stop every process of an earlier run (each carries its run folder in its environment)
+  for p in $(grep -l "ao-desktop-e2e-" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3); do kill -KILL "$p"; done
+  # 2. unmount the document portals' file systems, then remove the run folders
+  for m in $(awk '$2 ~ /ao-desktop-e2e-/ {print $2}' /proc/self/mounts); do fusermount3 -u -z "$m"; done; rm -rf "${TMPDIR:-/tmp}"/ao-desktop-e2e-*
+  ```
+- The real home folder is checked before and after the run, but only where this run's programs
+  would write (GTK's and dconf's settings, the portals' stores, WebKitGTK's and the app's folders;
+  `HOME_WATCHED` in `e2e/desktop.ts`), so other programs of a person's session can run alongside.
+  That the run's processes use no other place in the real home is checked per process: each has HOME
+  and every XDG folder inside the run's folder.
+- The WebDriver client is `e2e/webdriver.ts`, a few W3C commands over `fetch`; the published clients
+  bring in packages under licences other than MIT, Apache-2.0 and BSD. Playwright (`@playwright/test`
+  1.63.0, Apache-2.0) is only the test runner; no browser of its own is started.
+
+It needs, besides the built app (Ubuntu 24.04 package names):
+
+```sh
+apt-get install -y webkit2gtk-driver xvfb dbus xdotool
+cargo install tauri-driver --version =2.1.0 --locked   # or set TAURI_DRIVER to its path
+```
+
+and the media worker as the launch check finds it (`pnpm setup:py` is enough). CI runs the build,
+`cargo test`, the launch check and this scenario in the `desktop` job of `.github/workflows/ci.yml`:
+on `main`, on manual runs, and on working-branch pushes that change `apps/desktop/**`,
+`apps/library-service/scripts/**`, `services/media-worker/packaging/**` or the workflow.
 
 To run the debug shell by hand:
 
@@ -79,5 +147,4 @@ apps/desktop/src-tauri/target/debug/alexandrine-oxiana
 
 `.build/` (build venvs, PyInstaller's work files) and `sidecars/` (the output) are git-ignored.
 The target triple follows Tauri's sidecar names (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`x86_64-unknown-linux-gnu`). The Mac build workflow (37f), signing (37g) and the desktop
-end-to-end test (37h) are other tasks.
+`x86_64-unknown-linux-gnu`). The Mac build workflow (37f) and signing (37g) are other tasks.
