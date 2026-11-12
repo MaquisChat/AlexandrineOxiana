@@ -22,17 +22,26 @@ import { newAttentionId, writeAttention, type UnrecordedAudit } from "../repo/at
 import { PolicyDeniedError } from "../repo/errors.js";
 import { encryptBytes } from "../repo/io.js";
 import { projectDataKey, projectWarnings } from "../repo/repo.js";
-import { restoreSeams } from "../repo/restore.js";
+import { restoreSeams as seamsOfRestore } from "../repo/restore.js";
+import { seams } from "../repo/testing.js";
 import { backupsAwaitingRemoval, destroyRaw, listDestructions, readDestruction, resumeDestruction, type DestroyResult } from "../retention.js";
-import { BACKUPS_STATE, RestoreError, backupProject, backupSeams, holdingNotRemoved, restoreBackup, type BackupResult, type RestoreResult } from "./backup.js";
+import {
+  BACKUPS_STATE,
+  DestructionRecordError,
+  RestoreError,
+  backupProject,
+  backupSeams,
+  holdingNotRemoved,
+  restoreBackup,
+  withProjectMaintenance,
+  type BackupResult,
+  type RestoreOptions,
+  type RestoreResult,
+} from "./backup.js";
 import { OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
 
-/** The seams of a restore, as this task leaves them (set and cleared by these tests only). */
-const seamsOfRestore = restoreSeams as { crashAfterRename?: boolean; failBeforeRename?: boolean; beforeAdopt?: (staging: string) => Promise<void> };
-/** A restore's answer, with what this task adds to it. */
-type Restored = RestoreResult & { leftOut?: Array<{ sourceId: string; assetId: string; destroyedAt: string }> };
-const restore = (path: string, opts: { passphrase?: string; locationEnv?: LocationEnv } = {}, repo = kit.repo) =>
-  restoreBackup(repo, path, opts as { passphrase?: string }) as Promise<Restored>;
+type Restored = RestoreResult;
+const restore = (path: string, opts: RestoreOptions = {}, repo = kit.repo) => restoreBackup(repo, path, opts);
 
 let kit: Kit;
 beforeEach(async () => {
@@ -42,6 +51,7 @@ afterEach(async () => {
   shredSeams.failFor = undefined;
   backupSeams.failBackup = false;
   backupSeams.freeBytes = undefined;
+  seams.failAuditAppendFor = undefined;
   seamsOfRestore.beforeAdopt = undefined;
   seamsOfRestore.failBeforeRename = false;
   seamsOfRestore.crashAfterRename = false;
@@ -272,6 +282,62 @@ describe("1. a restore is decided by the policy engine before anything is writte
     }
   });
 
+  it("a refusal that neither audit log can take still refuses, and the library warns", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Unrecorded");
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    const count = (await eventsOf(p.id)).length;
+    seams.failAuditAppendFor = p.id;
+    const err = await restore(b.path, { locationEnv: onNetwork() }).catch((e: unknown) => e);
+    seams.failAuditAppendFor = undefined;
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    await expectNothingRestored(folders, [p.id]);
+    expect((await eventsOf(p.id)).length).toBe(count);
+    expect(await libraryRefusals()).toEqual([]);
+    const warned = kit.repo.integrityWarnings.filter((w) => w.kind === "refusal-unrecorded");
+    expect(warned).toHaveLength(1);
+    expect(warned[0]!.detail).toMatch(/refused restore/u);
+    expect(warned[0]!.detail).not.toContain(kit.tmp);
+  });
+
+  it("a file that is not a readable project backup is refused in plain words, before anything is written", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Not A Backup");
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    let spaceAsked = false;
+    backupSeams.freeBytes = async () => {
+      spaceAsked = true;
+      return Number.MAX_SAFE_INTEGER;
+    };
+    await expect(restore(await craft(b, { "project.json": "{ not json" }, "torn.zip"))).rejects.toThrow(/project\.json cannot be read/u);
+    await expect(restore(await craft(b, { "project.json": null }, "other.zip"))).rejects.toThrow(/not a project backup/u);
+    for (const n of ["torn.zip", "other.zip"]) await expect(restore(join(kit.tmp, n))).rejects.toBeInstanceOf(RestoreError);
+    expect(spaceAsked).toBe(false);
+    await expectNothingRestored(folders, [p.id]);
+  });
+
+  it("a copy of a backup kept elsewhere is restored holding the maintenance lock of the project it is a backup of", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Elsewhere Copy");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    const copy = join(kit.tmp, "kept elsewhere.zip");
+    await writeFile(copy, await readFile(b.path));
+    let finished = false;
+    let pass: Promise<unknown> = Promise.resolve();
+    await withProjectMaintenance(kit.repo, p.id, async () => {
+      // As if the project were being backed up, pruned or having raw data destroyed.
+      pass = restore(copy).then(() => {
+        finished = true;
+      });
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(finished).toBe(false);
+      expect(ids()).toEqual([p.id]);
+    });
+    await pass;
+    expect(finished).toBe(true);
+    expect(ids()).toHaveLength(2);
+  });
+
   it("decided again in the commit turn, against the rules that would go live: a refusal there is audited, and nothing is restored", async () => {
     const p = await makeProject(kit, OPEN_GOV, false, "Changed Meanwhile");
     await addSource(kit, p, { title: "x" });
@@ -456,6 +522,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     };
     const err = (await restore(s.offline).catch((e: unknown) => e)) as Error;
     expect(err).toBeInstanceOf(RestoreError);
+    expect(err).toBeInstanceOf(DestructionRecordError);
     expect(err.message).toMatch(/audit log of the project "Origin" does not hold together/u);
     expect(err.message).toMatch(/[Nn]othing was restored/u);
     expect(err.message).not.toContain(kit.tmp);

@@ -48,7 +48,9 @@
  * recovery code, as stored in the project — never the key itself; a backup keeps the passphrase
  * the project had when it was made). A manifest that cannot be read is kept aside and rebuilt from
  * each backup's own backup.json (sealed ones with the project key when it is unlocked; the key file
- * is taken from the project again); files that cannot be read then are listed as `unresolved` and
+ * is taken from the project again); so is one that is missing while backup files are there (D15,
+ * R174 c: a manifest that is merely absent never means "no backups"), before anything is decided
+ * from it; files that cannot be read then are listed as `unresolved` and
  * treated as possibly holding the data of the project that owns them (R92 I2): by the owner the
  * state file recorded, else by the key a sealed file names, else by name (R94). They are tried
  * again whenever the manifest is read and when a project is unlocked, and move into the manifest
@@ -62,7 +64,11 @@
  * archive declares, writes runs of zeros as holes, reads a sealed backup in place
  * (crypto/random-access.ts: decrypted chunk by chunk, never written out as a zip), verifies its
  * audit chain, and makes it a NEW project (repo/restore.ts). A restored encrypted project keeps the
- * key (and key id) of the project it was made from: unlocking either unlocks both.
+ * key (and key id) of the project it was made from: unlocking either unlocks both. A restore is
+ * governed (Task 50b): the policy engine decides before anything is unpacked and again in the commit
+ * turn, a refusal is audited, files a recorded destruction destroyed are left out by what the audit
+ * logs say, and a copy that inherits backups still to be removed has its warning from the moment it
+ * is live (see `restoreBackup`).
  *
  * `backupIfDue(projectId, now)` (Task 30's daily scheduler): a backup when automatic backups are on
  * (`project.backups.automatic`, default on), the project is unlocked, and the last backup is a day

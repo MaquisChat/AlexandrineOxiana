@@ -156,6 +156,8 @@ export const RESTORE_NEEDS_ENCRYPTION = "The rules of the project in this backup
 export const RESTORE_SEALED_BUT_PLAIN = "This backup is sealed, but the project in it is not an encrypted one, so it would come back unencrypted; it was not restored";
 
 const denyOf = (reason: string, warnings: string[] = []): PolicyDecision => ({ result: "deny", reason, warnings });
+/** The longest text of a parse error kept in a refusal's reason. */
+const REASON_MAX = 600;
 
 /**
  * The policy decision for a restore. The rules asked are the backup's own (they become the new
@@ -177,7 +179,10 @@ export function decideRestore(core: RepoCore, r: RestoreRequest, at: string): Po
       restore: { destinations: r.destinations },
     });
   } catch (e) {
-    return denyOf(`Policy could not be evaluated: ${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}`);
+    // The text comes from a file brought from outside (the backup's rules): scrubbed of paths, and
+    // kept short, before it becomes a recorded reason.
+    const why = scrubPaths(e instanceof Error ? e.message : String(e), [core.root]);
+    return denyOf(`Policy could not be evaluated: ${why.length > REASON_MAX ? `${why.slice(0, REASON_MAX)}…` : why}`);
   }
   if (d.result === "deny") return d;
   if (d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "encrypt") && !r.project.encrypted) return denyOf(RESTORE_NEEDS_ENCRYPTION, d.warnings);

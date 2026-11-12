@@ -60,7 +60,14 @@
  * file of another content under a listed name is a later backup and is never touched. The original
  * and the copy each record the step in their own log: the one that removed the file as removed, the
  * other as no longer present. Within one project, a backup removed for another of its destructions
- * is recorded as removed, under that destruction (`removedUnder`).
+ * is recorded as removed, under that destruction (`removedUnder`). The copy's warning stands from
+ * the restore itself: the list it inherits is noted for it as the last step before it goes live
+ * (`inheritedOutstanding`, called by the restore), and its own passes settle it.
+ *
+ * What a restore must not bring back (R174 d) is read from the same record (`destroyedOnRecord`):
+ * the destruction's own audit event names the destroyed assets by id (`destroyedAssets`), and a
+ * certificate adds the files' sha256 only while it is the file that event recorded. A restore is
+ * refused while a project's audit log does not hold together.
  *
  * Destruction holds the project's maintenance lock (R138 a). Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed`
  * (counts and the certificate's sha256), each amendment's `delete` event (op `retention.backups`)
