@@ -478,7 +478,7 @@ Update after every task; commit and push.
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
 | 34d Verification badges | fix round 2 | 68e004a (worktree branch) | F1–F5 closed; two new Important: a confirm at the same moment as another can be lost; focus is lost when a confirmed field's badge moves |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | in progress | 69e5e6d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
+| 63 Capture state readable; one classifier | in review | e76247e (worktree branch) | built; a second capture of a running address is refused, not joined (ruled) |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
@@ -503,7 +503,7 @@ Update after every task; commit and push.
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
-| 65 The browser extension as a download | in review | 463b568 (worktree branch) | built: a reproducible zip and a Linux job in the Mac workflow; no Mac build started |
+| 65 The browser extension as a download | approved; verification before merge | 01a66d3 (worktree branch) | reviewed with probes, then one fix round (the update instructions) reviewed by the controller |
 | 66 A paired browser survives a relaunch (D13) | not started | | waits for 46c and 65 |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
