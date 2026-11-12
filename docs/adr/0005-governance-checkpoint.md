@@ -31,9 +31,10 @@ The library holds material governed by IRB, GDPR, HIPAA and funder rules. Every 
   - It is anchored in this computer's anchors file under `<libraryId>/*`.
   - Every open compares it with that anchor. A broken chain, a changed event, a log cut short, or a missing or emptied log this computer wrote to raises the library-wide warning (`chain-broken`, `head-mismatch`, `truncated`, `empty` or `anchor-missing`). When writable, the open records what it found in the log (`audit.anchor-mismatch` or `audit.anchor-missing`) before anchoring it again.
   - An incomplete last line left by a crash is trimmed at a writable open, and the trim is recorded (`audit.trimmed-incomplete-line`, with size and hash).
-  - A refusal identical to the latest entry on the same UTC day is not appended again: it is counted against that entry in `audit/repeats.json`. That counter is not chained.
+  - Repeated refusals (R154 a as amended, N6): the day's first refusal of a kind is a normal chained entry. A later identical refusal that UTC day is dropped, not counted: nothing about it is kept outside the chain. The audit screen says, for each refusal, that further identical ones that day are not listed. "Identical" means every field the entry shows is equal: action, actor, device, decision and every detail, `encrypted` included. Anything that differs is a new entry.
   - The head is kept in memory, so an append does not read the log.
   - The service reads it (`GET /libraries/audit`) and verifies it (`GET /libraries/audit/verify`), with the UI token only. The audit screen shows it.
+- No absolute path is ever stored in a log (N5). Every event's reason and details have absolute paths replaced by `<path>` before the event is sealed, whatever produced the text (an `ELOOP` or `EACCES` message, for example).
 - Never silent (R28, R82, R154; Task 50).
   - A library move refused by a project's residency rules is audited in each refused project as a `move` deny: who, the destination's kind, its location hint and the rule's reason.
   - Sometimes an action has already happened and only its audit event cannot be written: a library move, split or old-copy deletion, a reconnect, a relink, or a move refused with no open repo. The action is not undone. The project is marked as needing attention with a record in `<Project>/attention/<id>.json`: owner-only, holding the action, its details, when, who and an error code, never a message or an absolute path.
@@ -41,23 +42,31 @@ The library holds material governed by IRB, GDPR, HIPAA and funder rules. Every 
 - Records never steer a privileged action (R154 c).
   - An unrecorded event may only name the actions above. Only `move` may carry a refusal, and the details may not carry `txn`, `attentionId` or `recordedLate`.
   - A permissions record names source ids only, never a path or a mode.
-  - Anything else in the attention folder is never acted on. The project shows `attention-unreadable` for it.
+  - Anything else in the attention folder is an unrecognised item (N2, N10). That includes a damaged file, a file over 64 KiB, a sync client's conflict copy such as "abc 2.json", a folder, a link, or `attention` itself when it is not a folder. Such an item is never read beyond its size, never followed, never parsed and never acted on. It is listed once by name, with an opaque id (`u-` and a hash of the name), and the project shows `attention-unreadable`.
 - Repair. Each writable open of a project whose audit log verifies, and that accepts writes, appends the unrecorded event late.
   - The late event carries `details.recordedLate`: when it happened, why it was late, whether it was interrupted, and `by`, the computer recording it now. It also carries `details.attentionId`, so a repair is never recorded twice.
   - A file restored without owner-only permissions is restricted again to owner read and write at most. The repair never adds a bit and covers every file of the named sources, as the project's own index places them. The result is checked and audited with counts as `library.permissions-restricted`.
   - A repair raises `audit-recorded-late`. The audit screen shows late entries with both times.
 - Nothing is written under another computer's lock (R154 e).
+  - Who holds the lock is checked when a mark is written: the library handle must be open read-write and the lock file must name this computer (N1). It does not matter which repo or library object the caller passed, so the service's read-only session repo writes nothing either.
   - A mark for a library this computer does not hold, or whose project folder cannot take it, waits in this computer's outbox, `<appConfigDir>/attention-outbox/<libraryId>/<id>.json`. It is shown here as `audit-waiting`.
-  - It is delivered at this computer's next writable open of that library. It is settled there; or, when the project cannot take the event now, it is moved into the project's folder. The outbox file is removed only after that, and the attention id keeps a crash from recording it twice.
+  - It is delivered at this computer's next writable open of that library. It is settled there; or, when the project cannot take the event now, it is moved into the project's folder.
+  - Delivery is exactly once (N4):
+    - the receiving side recognises every attention id its log already holds, including ids appended earlier in the same pass;
+    - an outbox entry whose id the project's folder also holds is the same mark, so the outbox copy is dropped;
+    - a copy (outbox or folder) is removed only after its event is durable.
+    - The tests crash before the append, after the append, and between moving a mark into the project and removing the outbox copy: the event is recorded once each time.
+  - An outbox entry for a project the library no longer has is recorded in the library's log, with `projectMissing`, and then removed (N9).
 - Set aside (R154 d). A mark that cannot be repaired can be set aside on the audit screen with a reason.
-  - It is decided by `evaluate` as `delete` (op `attention.set-aside`).
+  - It is decided by `evaluate` as its own operation, `set-aside` (N7). It is allowed in every profile, but the engine itself refuses it without a reason that is non-empty once trimmed, so the decision has substance. That refusal is audited like any other.
   - It is audited with the reason, who, when and the mark itself (its record, or for an unreadable file its size and SHA-256). The record goes in the project's log when that log verifies and accepts writes, else in the library's log.
-  - Only then is the mark removed. A refusal is audited, and the mark stays.
+  - Only then is the mark put aside: moved (renamed) into `<Project>/attention-set-aside/`, never deleted, never followed if it is a link. A refusal is audited, and the mark stays.
+  - The audit screen shows, for a set-aside, which mark, the reason, who and when, in both the project's log and the library's log (N3).
   - A mark waiting in this computer's outbox cannot be set aside: it is delivered when the lock is held.
 - The banner words each case by its cause. These are the warnings while a mark stands; a mark that is repaired or set aside raises none:
   - `audit-unrecorded`: recorded at the next writable open.
   - `audit-unrecorded-blocked`: the project's log does not verify or a problem is unresolved; set it aside.
-  - `attention-unreadable`: review and set aside.
+  - `attention-unreadable`: an unrecognised item; review and set aside.
   - `permissions-not-set`: retried at each open, or set aside.
   - `audit-waiting`: delivered when this computer next holds the lock.
 - Known limits:
