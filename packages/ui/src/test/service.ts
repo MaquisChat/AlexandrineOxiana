@@ -154,6 +154,8 @@ export function libraryHandlers(opts: { current?: Record<string, unknown>; state
     http.get(url("/projects/:id/tags"), j(TAGS)),
     http.get(url("/projects/:id/sources"), j(SOURCES)),
     http.get(url("/projects/:id/sources/:sid"), j(SOURCE_FILE)),
+    // The project's review queue (Task 67): the count the library's link shows (s2 waits).
+    http.get(url("/projects/:id/review"), j({ items: [], total: 1, offset: 0, limit: 0 })),
     http.get(url("/styles"), j(STYLES)),
     http.get(url("/events"), () => sse([{ type: "library.state", data: state }, ...(opts.events ?? [])])),
   ];

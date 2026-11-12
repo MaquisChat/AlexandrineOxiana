@@ -115,7 +115,9 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   const removed = new Set<string>();
   for (const id of ids) {
     if (!hasSource(repo, projectId, id)) continue;
-    // Not the user's deletion: no deletion record, so a later run imports the item again (R73).
+    // Not the user's deletion: no deletion record, so a later run imports the item again (R73). Its
+    // pending review entries are read and resolved ("undone") inside this same change (coordinator's
+    // ruling 3; fix round 2, N3: an entry queued while the undo runs is not missed).
     await importChange(repo, projectId, { action: "delete" }, (ops) => ops.deleteSource(id, { undo: true }), { op: "source.delete", entity: { type: "source", id } });
     removed.add(id);
   }
