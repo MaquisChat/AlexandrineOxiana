@@ -6,6 +6,10 @@
  * unlocked afterwards as it was before, no key derived for the restore stays in the session, and
  * nothing is readable afterwards that was not readable before. A copy restored that way is locked
  * until it is unlocked itself, which is audited as every unlock is.
+ *
+ * Fix round 2 (R182 a): when the project the backup belongs to is locked and its audit log records
+ * a destruction, its sealed certificate cannot be read, and the restore is refused, naming both
+ * ways out. A locked original with no destruction on record is decided as before.
  */
 import { existsSync } from "node:fs";
 import { readFile, readdir, writeFile } from "node:fs/promises";
@@ -17,7 +21,7 @@ import type { LocationEnv } from "../location.js";
 import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import { restoreSeams } from "../repo/restore.js";
 import { destroyRaw } from "../retention.js";
-import { RestoreError, backupProject, restoreBackup, type BackupResult, type RestoreOptions } from "./backup.js";
+import { DestructionRecordError, RestoreError, backupProject, backupSeams, restoreBackup, type BackupResult, type RestoreOptions } from "./backup.js";
 import { PASS, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
 
 let kit: Kit;
@@ -26,6 +30,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   shredSeams.failFor = undefined;
+  backupSeams.freeBytes = undefined;
   restoreSeams.beforeAdopt = undefined;
   restoreSeams.failBeforeRename = false;
   restoreSeams.crashAfterRename = false;
@@ -164,7 +169,7 @@ describe("a restore given a passphrase leaves every project as locked as it was"
   });
 });
 
-describe("a locked original at the decision: its rules and its audit log are not sealed, so both are read without unlocking it", () => {
+describe("a locked original at the decision (R182): its rules are read without unlocking it; with a destruction on record the restore is refused", () => {
   it("the rules it has now are asked as for an unlocked project: a rule tightened since the backup refuses, and the original stays locked", async () => {
     const p = await makeProject(kit, PSEUDO_GOV, true, "Tightened And Locked");
     const sf = await addSource(kit, p, { title: "inside" });
@@ -180,73 +185,127 @@ describe("a locked original at the decision: its rules and its audit log are not
     expect(kit.repo.listProjects().map((x) => x.id)).toEqual([p.id]);
   });
 
-  /** A locked encrypted project whose raw file was destroyed while a backup holding it could not be removed. */
-  async function destroyedAndLocked(): Promise<Locked & { raw: SourceFile; x: BackupResult; certificatePath: string }> {
+  interface Destroyed extends Locked {
+    raw: SourceFile;
+    /** A second source holding the same bytes as the destroyed file, under ids of its own; it was not destroyed. */
+    twin: SourceFile;
+    /** The backup made before the destruction, which could not be removed: it holds the raw file under both ids. */
+    x: BackupResult;
+  }
+
+  /** An encrypted project whose raw file was destroyed at 10:00 while the backup holding it could not be removed; then locked, unless `lock` is false. */
+  async function destroyedOriginal(opts: { lock?: boolean } = {}): Promise<Destroyed> {
     const p = await makeProject(kit, RETAIN_SEALED, true, "Destroyed And Locked");
-    const f = await scratchFile(kit, "interview.mp3", "RAW interview audio bytes");
-    const raw = await addSource(kit, p, { type: "interview", title: "Interview one", identifiable: true, files: [{ path: f, role: "original", handling: "copy" }] });
+    const bytes = "RAW interview audio bytes";
+    const raw = await addSource(kit, p, { type: "interview", title: "Interview one", identifiable: true, files: [{ path: await scratchFile(kit, "interview.mp3", bytes), role: "original", handling: "copy" }] });
+    const twin = await addSource(kit, p, { type: "interview", title: "Interview one, second copy", identifiable: true, files: [{ path: await scratchFile(kit, "interview copy.mp3", bytes), role: "original", handling: "copy" }] });
+    expect(twin.assets[0]!.sha256).toBe(raw.assets[0]!.sha256);
+    expect(twin.assets[0]!.id).not.toBe(raw.assets[0]!.id);
     const sf = await addSource(kit, p, { title: "inside" });
     kit.clock.now = new Date("2026-12-02T09:59:00.000Z");
     const x = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
     kit.clock.now = new Date("2026-12-02T10:00:00.000Z");
     shredSeams.failFor = (path) => path.endsWith(basename(x.path));
-    const d = await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
     shredSeams.failFor = undefined;
     expect(existsSync(x.path)).toBe(true);
-    kit.repo.lockProject(p.id);
-    return { p, sf, b: x, raw, x, certificatePath: d.certificatePath };
+    if (opts.lock !== false) kit.repo.lockProject(p.id);
+    return { p, sf, b: x, raw, twin, x };
   }
 
-  it("what it destroyed is read from its audit log: the destroyed file stays out, the restore says its sealed certificate was not read, and the original stays locked", async () => {
-    const o = await destroyedAndLocked();
-    const r = await restore(o.x.path, { passphrase: PASS, locationEnv: onDisk() });
-    await expectStillLocked(o);
-    expect(r.leftOut).toHaveLength(1);
-    expect(r.leftOut[0]!.destroyedAt).toBe("2026-12-02T10:00:00.000Z");
-    const said = r.notes.join(" ");
-    expect(said).toMatch(/1 file was destroyed earlier under a retention rule and was not restored/u);
-    // What could not be read, and what the researcher can do.
-    expect(said).toMatch(/project "Destroyed And Locked" is locked/u);
-    expect(said).toMatch(/destruction certificates? .* sealed/u);
-    expect(said).toMatch(/[Uu]nlock that project/u);
-    expect(said).not.toContain(kit.tmp);
-    const last = (await eventsOf(r.projectId)).at(-1)!;
-    expect(detailsOf(last)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1, destructionCertificatesSealed: [o.p.id] });
+  /** The three forms a destruction has had in the audit log; the two older ones are made by rewriting the log (the chain made whole, the library opened anew). */
+  const FORMS: Array<[string, ((events: AuditEvent[]) => AuditEvent[]) | undefined]> = [
+    ["the entry as it is written now (it names the destroyed files by id)", undefined],
+    [
+      "the earlier form (the entry does not name the files)",
+      (events) =>
+        events.map((e) => {
+          if (e.action === "delete" && detailsOf(e).op === "retention.destroy") delete (e.details as Record<string, unknown>).destroyedAssets;
+          return e;
+        }),
+    ],
+    ["the earliest form (a `retention.destroyed` event alone)", (events) => events.filter((e) => !(e.action === "delete" && String(detailsOf(e).op).startsWith("retention.")))],
+  ];
 
-    await kit.repo.unlockProject(r.projectId, PASS);
+  for (const [form, rewrite] of FORMS) {
+    it(`a locked original with a destruction on record, ${form}: refused in plain words that name both ways out; still locked, nothing left behind, and the refusal is in that project's own log`, async () => {
+      const o = await destroyedOriginal();
+      if (rewrite) {
+        await rewriteAudit(o.p, rewrite);
+        await kit.reopen();
+      }
+      expect(kit.repo.isUnlocked(o.p.id)).toBe(false);
+      const recorded = (await eventsOf(o.p.id)).filter((e) => e.action === "retention.destroyed" || (e.action === "delete" && detailsOf(e).op === "retention.destroy"));
+      expect(recorded.length).toBeGreaterThan(0);
+      const folders = (await readdir(join(kit.lib.root, "Projects"))).sort();
+      const count = (await eventsOf(o.p.id)).length;
+      let spaceAsked = false;
+      backupSeams.freeBytes = async () => {
+        spaceAsked = true; // asked right before the first file would be written
+        return Number.MAX_SAFE_INTEGER;
+      };
+
+      const err = (await restore(o.x.path, { passphrase: PASS, locationEnv: onDisk() }).catch((e: unknown) => e)) as Error;
+      expect(err).toBeInstanceOf(DestructionRecordError);
+      expect(err).toBeInstanceOf(RestoreError);
+      expect(err.message).toBe(
+        'The project "Destroyed And Locked" is locked, and its audit log records that raw data was destroyed under a retention rule. This backup belongs to that project. Its destruction certificate is sealed, so while the project is locked the app cannot check the backup against it, and nothing was restored here. Unlock that project and restore the backup again, or restore the backup into another library.',
+      );
+      expect(err.message).not.toContain(kit.tmp);
+
+      // Nothing was unpacked, nothing is left behind, and nothing was unlocked.
+      expect(spaceAsked).toBe(false);
+      expect((await readdir(join(kit.lib.root, "Projects"))).sort()).toEqual(folders);
+      expect(kit.repo.listProjects().map((x) => x.id)).toEqual([o.p.id]);
+      await expectStillLocked(o);
+
+      // Audited where a refusal belongs (R179): in the backup's own project's log, which is intact; none in the library's log.
+      const events = await eventsOf(o.p.id);
+      expect(events).toHaveLength(count + 1);
+      expect(events.at(-1)).toMatchObject({ action: "restore", entity: { type: "project", id: o.p.id }, decision: { result: "deny", reason: err.message } });
+      expect(detailsOf(events.at(-1)!)).toMatchObject({ op: "project.restore", at: "decision", file: basename(o.x.path), backupSha256: o.x.sha256 });
+      expect(JSON.stringify(events.at(-1))).not.toContain(kit.tmp);
+      expect((await kit.repo.libraryAudit()).events.filter((e) => e.action === "restore")).toEqual([]);
+    });
+  }
+
+  it("the same original unlocked first (the way out the refusal names): allowed; the destroyed file is left out by its id, and the same bytes kept under another id by the certificate's sha256", async () => {
+    const o = await destroyedOriginal();
+    await kit.repo.unlockProject(o.p.id, PASS);
+    const r = await restore(o.x.path, { locationEnv: onDisk() });
     const back = await Promise.all(kit.repo.listSourceIds(r.projectId).map((id) => kit.repo.getSource(r.projectId, id)));
-    const interview = back.find((s) => titleOf(s) === "Interview one")!;
-    expect(interview.assets[0]).toMatchObject({ status: "destroyed", destroyedAt: "2026-12-02T10:00:00.000Z" });
-    expect(existsSync(join(kit.lib.root, ...interview.assets[0]!.path.split("/")))).toBe(false);
+    const byTitle = (t: string) => back.find((s) => titleOf(s) === t)!;
+    for (const t of ["Interview one", "Interview one, second copy"]) {
+      expect(byTitle(t).assets[0]).toMatchObject({ status: "destroyed", destroyedAt: "2026-12-02T10:00:00.000Z" });
+      expect(existsSync(join(kit.lib.root, ...byTitle(t).assets[0]!.path.split("/")))).toBe(false);
+    }
+    expect(byTitle("inside")).toBeDefined();
+    expect(r.leftOut.map((x) => x.assetId).sort()).toEqual([byTitle("Interview one").assets[0]!.id, byTitle("Interview one, second copy").assets[0]!.id].sort());
+    expect(r.notes).toEqual(["2 files were destroyed earlier under a retention rule and were not restored."]);
+    const last = (await eventsOf(r.projectId)).at(-1)!;
+    expect(detailsOf(last)).toMatchObject({ op: "project.restore", leftOutDestroyed: 2 });
+    expect(detailsOf(last)).not.toHaveProperty("destructionCertificatesSealed");
   });
 
-  it("an earlier form of its destruction entry, which needs the sealed certificate: refused (fail closed), naming both ways out; the original stays locked", async () => {
-    const o = await destroyedAndLocked();
-    // The entry as it was written before it named the destroyed files: the chain made whole again, the library opened anew.
-    await rewriteWithoutDestroyedAssets(o.p);
-    await kit.reopen();
-    expect(kit.repo.isUnlocked(o.p.id)).toBe(false);
-    const err = (await restore(o.x.path, { passphrase: PASS, locationEnv: onDisk() }).catch((e: unknown) => e)) as Error;
-    expect(err).toBeInstanceOf(RestoreError);
-    expect(err.message).toMatch(/without naming the files that were destroyed/u);
-    expect(err.message).toMatch(/is sealed, and its project is locked/u);
-    expect(err.message).toMatch(/can be restored into another library/u);
-    expect(err.message).toMatch(/[Uu]nlock that project and try again/u);
-    expect(err.message).not.toContain(kit.tmp);
+  it("a locked original with no destruction on record: nothing needs its key, so the restore is decided as before and says nothing of certificates", async () => {
+    const o = await lockedOriginal("Nothing Destroyed", RETAIN_SEALED);
+    const r = await restore(o.b.path, { passphrase: PASS, locationEnv: onDisk() });
     await expectStillLocked(o);
-    expect(kit.repo.listProjects().map((x) => x.id)).toEqual([o.p.id]);
+    expect(kit.repo.isUnlocked(r.projectId)).toBe(false);
+    expect(r.leftOut).toEqual([]);
+    expect(r.notes).toEqual([]);
+    expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).not.toHaveProperty("destructionCertificatesSealed");
   });
 });
 
-/** Rewrites the project's audit log on disk without `destroyedAssets` in its destruction entry, the chain made whole again (one segment). */
-async function rewriteWithoutDestroyedAssets(p: Project): Promise<void> {
+/** Rewrites the project's audit log on disk as `change` returns it, the chain made whole again (one segment). */
+async function rewriteAudit(p: Project, change: (events: AuditEvent[]) => AuditEvent[]): Promise<void> {
   const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
   const names = (await readdir(dir)).sort();
   expect(names).toHaveLength(1);
   const events = (await readFile(join(dir, names[0]!), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as AuditEvent);
   let prev: { seq: number; hash: string } | null = null;
-  const lines = events.map((e) => {
-    if (e.action === "delete" && detailsOf(e).op === "retention.destroy") delete (e.details as Record<string, unknown>).destroyedAssets;
+  const lines = change(events).map((e) => {
     const { seq: _s, hash: _h, prevHash: _p, ...rest } = e;
     const sealed = sealEvent(rest, prev);
     prev = { seq: sealed.seq, hash: sealed.hash };

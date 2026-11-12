@@ -19,6 +19,7 @@ import { sealEvent, verifyChain, type AuditEvent, type Project, type SourceFile 
 import { shredSeams } from "../fs/shred.js";
 import type { LocationEnv } from "../location.js";
 import { newAttentionId, writeAttention, type UnrecordedAudit } from "../repo/attention.js";
+import { AuditStore } from "../repo/audit-store.js";
 import { PolicyDeniedError } from "../repo/errors.js";
 import { encryptBytes } from "../repo/io.js";
 import { projectDataKey, projectWarnings } from "../repo/repo.js";
@@ -557,15 +558,33 @@ async function scene(opts: { destroy?: boolean; name?: string } = {}): Promise<S
   return { p, raw, kept, offline, r };
 }
 
-/** The raw file was left out and marked destroyed; the paper came back. */
-async function expectRawLeftOut(r: Restored): Promise<void> {
+/** What the restore says of one file left out only because records the app cannot vouch for name it (R182 d): never that it was destroyed. */
+const UNVERIFIED_ONE = "1 file was left out because unverified records name it as destroyed; the app cannot confirm that it was destroyed.";
+
+/**
+ * The raw file was left out and marked destroyed; the paper came back. `on`: a verified record (it
+ * was destroyed), or records the app cannot vouch for, which is said and counted apart (R182 d).
+ */
+async function expectRawLeftOut(r: Restored, on: "verified" | "unverified" = "verified"): Promise<void> {
   const files = await restoredFiles(r.projectId);
   expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
   expect(files["Kept paper"]!.onDisk).toBe(true);
   expect(files["Kept paper"]!.status).not.toBe("destroyed");
-  expect(r.notes.join(" ")).toMatch(/1 file was destroyed earlier under a retention rule and was not restored/u);
-  expect(r.leftOut).toEqual([{ sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z" }]);
-  expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
+  const entry = { sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z" };
+  const details = detailsOf((await eventsOf(r.projectId)).at(-1)!);
+  expect(details.op).toBe("project.restore");
+  if (on === "verified") {
+    expect(r.notes[0]).toBe("1 file was destroyed earlier under a retention rule and was not restored.");
+    expect(r.leftOut).toEqual([entry]);
+    expect(details).toMatchObject({ leftOutDestroyed: 1 });
+    expect(details).not.toHaveProperty("leftOutUnverified");
+  } else {
+    expect(r.notes[0]).toBe(UNVERIFIED_ONE);
+    expect(r.notes.join(" ")).not.toMatch(/destroyed earlier under a retention rule/u);
+    expect(r.leftOut).toEqual([{ ...entry, unverified: true }]);
+    expect(details).toMatchObject({ leftOutUnverified: 1 });
+    expect(details).not.toHaveProperty("leftOutDestroyed");
+  }
 }
 
 /** Rewrites the project's audit log on disk with `edit` applied to each entry and the chain made whole again (one segment). */
@@ -791,14 +810,19 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
       expect(files["Kept paper"]!.onDisk).toBe(true);
       expect(r.leftOut).toHaveLength(1);
+      // Not said to have been destroyed: the only ground is evidence nothing vouches for (R182 d).
+      expect(r.leftOut[0]).toMatchObject({ unverified: true });
+      expect(r.notes[0]).toBe(UNVERIFIED_ONE);
       const said = r.notes.join(" ");
+      expect(said).not.toMatch(/destroyed earlier under a retention rule/u);
       expect(said).toMatch(/audit log of the project "Bystander" does not hold together/u);
       // Both kinds of evidence were there to read, and neither is vouched for (fix round 1, ruling 2).
       expect(said).toMatch(/rests on the destruction entries that can still be read in its audit log and its certificate files/u);
       expect(said).toMatch(/1 file of this backup/u);
       expect(said).not.toContain(kit.tmp);
       expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "unverified-log-and-certificate-files", leftOut: 1 }]);
-      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutUnverified: 1 });
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).not.toHaveProperty("leftOutDestroyed");
       // Nothing was refused, so nothing is recorded as refused.
       expect(await libraryRefusals()).toEqual([]);
       expect(await refusalsIn(s.p.id)).toEqual([]);
@@ -846,7 +870,8 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       const files = await restoredFiles(r.projectId);
       expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
       expect(files["Kept paper"]!.onDisk).toBe(true);
-      expect(r.leftOut).toEqual([{ sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z" }]);
+      expect(r.leftOut).toEqual([{ sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z", unverified: true }]);
+      expect(r.notes[0]).toBe(UNVERIFIED_ONE);
       const said = r.notes.join(" ");
       expect(said).toMatch(/audit log of the project "Origin \(restored 2026-12-02\)" does not hold together/u);
       expect(said).toMatch(/cannot vouch for what that project destroyed/u);
@@ -854,8 +879,36 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(said).toMatch(/1 file of this backup that they name as destroyed was left out/u);
       expect(said).not.toContain(kit.tmp);
       expect(await notVerified(r.projectId)).toEqual([{ projectId: c.id, basis: "unverified-log-entries", leftOut: 1 }]);
-      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutUnverified: 1 });
       expect(await libraryRefusals()).toEqual([]);
+    });
+
+    it("fix round 2 (R182 c, N1): the log cut right after an intact destruction entry, with no final newline: that last line is read as evidence like any other, and the file stays out", async () => {
+      const s = await scene();
+      const fresh = abs((s.r.certificate.backups as { freshBackup: string }).freshBackup);
+      const copy = await restore(fresh);
+      const c = kit.repo.getProject(copy.projectId);
+      await rm(join(kit.lib.root, s.p.folder), { recursive: true, force: true });
+      await rm(join(kit.lib.root, c.folder, "retention", basename(s.r.certificatePath)));
+      await kit.reopen();
+      expect(ids()).toEqual([c.id]);
+      // Outside the app, while it runs: everything after the destruction entry is cut off, its own line end included.
+      const dir = join(kit.lib.root, c.folder, "audit");
+      const segment = join(dir, (await readdir(dir)).sort().at(-1)!);
+      const lines = (await readFile(segment, "utf8")).split("\n");
+      const i = lines.findIndex((l) => l.includes('"op":"retention.destroy"') && l.includes('"destroyedAssets"'));
+      expect(i).toBeGreaterThan(-1);
+      expect(i).toBeLessThan(lines.filter((l) => l.trim()).length - 1);
+      await writeFile(segment, lines.slice(0, i + 1).join("\n"));
+      expect((await readFile(segment, "utf8")).endsWith("\n")).toBe(false);
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(files["Kept paper"]!.onDisk).toBe(true);
+      expect(r.notes.join(" ")).toMatch(/rests on the destruction entries that can still be read in its audit log/u);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: c.id, basis: "unverified-log-entries", leftOut: 1 }]);
+      // The audit store's own reading of an incomplete last line is as it was: this is the evidence reading only.
+      expect(await AuditStore.read(dir)).toHaveLength(i);
     });
 
     it("fix round 1, ruling 2: a log so damaged that no entry can be read: the restore goes ahead on the certificate files alone; with those gone too it says it could not establish that project's destructions at all", async () => {
@@ -927,7 +980,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       await kit.reopen();
       expect(ids()).toEqual([]);
       const r = await restore(s.offline);
-      await expectRawLeftOut(r);
+      await expectRawLeftOut(r, "unverified");
       const said = r.notes.join(" ");
       expect(said).toMatch(/project folder "Origin" could not be loaded \(its project\.json is missing or cannot be read\)/u);
       expect(said).toMatch(/cannot vouch for what that project destroyed/u);
@@ -947,7 +1000,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       await kit.reopen();
       expect(ids()).toEqual([]);
       const r = await restore(s.offline);
-      await expectRawLeftOut(r);
+      await expectRawLeftOut(r, "unverified");
       expect(r.notes.join(" ")).toMatch(/project folder "Origin" could not be loaded/u);
       expect(r.notes.join(" ")).toMatch(/rests on its certificate files alone/u);
       expect(await notVerified(r.projectId)).toEqual([{ folder: "Origin", notLoaded: true, basis: "certificate-files-alone", leftOut: 1 }]);
@@ -962,6 +1015,49 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(said).toMatch(/could not be established at all/u);
       expect(said).not.toContain(kit.tmp);
       expect(await notVerified(again.projectId)).toContainEqual({ folder: "Origin", notLoaded: true, basis: "nothing-could-be-read", leftOut: 0 });
+    });
+
+    /** Planted outside the app: a folder that is no project, with something shaped like an audit log that names an asset as destroyed. */
+    async function plantFolder(name: string, assetId: string): Promise<void> {
+      const dir = join(kit.lib.root, "Projects", name, "audit");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "0001.jsonl"), `${JSON.stringify({ seq: 1, at: "2026-12-01T08:00:00.000Z", action: "delete", details: { op: "retention.destroy", destroyedAssets: [assetId] } })}\n`);
+    }
+
+    it("fix round 2 (R182 d, N2): a file left out only because a planted folder names it is not said to have been destroyed", async () => {
+      const s = await scene({ destroy: false });
+      await plantFolder("Junk", s.kept.assets[0]!.id);
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      // The accepted direction: unverified evidence keeps a file out, here a file that was never destroyed.
+      expect(files["Kept paper"]).toMatchObject({ onDisk: false });
+      expect(files["Interview one"]!.onDisk).toBe(true);
+      // What is said of it: left out, on what ground; never that it was destroyed.
+      expect(r.notes[0]).toBe(UNVERIFIED_ONE);
+      expect(r.notes.join(" ")).not.toMatch(/destroyed earlier under a retention rule/u);
+      expect(r.notes.join(" ")).toMatch(/project folder "Junk" could not be loaded/u);
+      expect(r.leftOut).toEqual([{ sourceId: files["Kept paper"]!.sourceId, assetId: files["Kept paper"]!.assetId, destroyedAt: "2026-12-01T08:00:00.000Z", unverified: true }]);
+      const details = detailsOf((await eventsOf(r.projectId)).at(-1)!);
+      expect(details).toMatchObject({ op: "project.restore", leftOutUnverified: 1 });
+      expect(details).not.toHaveProperty("leftOutDestroyed");
+      expect(await notVerified(r.projectId)).toEqual([{ folder: "Junk", notLoaded: true, basis: "unverified-log-entries", leftOut: 1 }]);
+    });
+
+    it("fix round 2 (R182 d, N2): one file destroyed on a verified record and one named only by a planted folder are counted and said apart", async () => {
+      const s = await scene();
+      await plantFolder("Junk", s.kept.assets[0]!.id);
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(files["Kept paper"]).toMatchObject({ onDisk: false });
+      expect(r.notes[0]).toBe("1 file was destroyed earlier under a retention rule and was not restored.");
+      expect(r.notes[1]).toBe(UNVERIFIED_ONE);
+      expect(r.notes[2]).toMatch(/project folder "Junk" could not be loaded/u);
+      expect(r.notes).toHaveLength(3);
+      expect(r.leftOut).toHaveLength(2);
+      expect(r.leftOut).toContainEqual({ sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z" });
+      expect(r.leftOut).toContainEqual({ sourceId: files["Kept paper"]!.sourceId, assetId: files["Kept paper"]!.assetId, destroyedAt: "2026-12-01T08:00:00.000Z", unverified: true });
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1, leftOutUnverified: 1 });
     });
 
     it("a folder in Projects that holds no audit log and no retention records is not a project's remains: nothing is said of it", async () => {
@@ -993,7 +1089,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     expect(r.notes).toHaveLength(1);
   });
 
-  it("a locked project with a recorded destruction does not stop a restore: what it destroyed is in its audit log, readable without its key", async () => {
+  it("R182 (b): another locked project with a recorded destruction does not stop a restore: what it destroyed is in its audit log, readable without its key; its sealed certificate is not read, and the notes and the audit entry say so", async () => {
     const q = await makeProject(kit, RETAIN.replace("atRest: optional", "atRest: required"), true, "Locked One");
     const qRaw = await rawSource(q, "raw bytes of the locked project");
     const s = await scene();
@@ -1001,6 +1097,12 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     kit.repo.lockProject(q.id);
     const r = await restore(s.offline);
     await expectRawLeftOut(r);
+    expect(r.notes).toEqual([
+      "1 file was destroyed earlier under a retention rule and was not restored.",
+      'The project "Locked One" is locked, and its destruction certificate is sealed, so it was not read. The files that project destroyed were recognised by the ids its audit log names; the same file kept under another id in this backup could not be recognised. To be sure, unlock that project and restore the backup again.',
+    ]);
+    expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ destructionCertificatesSealed: [q.id] });
+    expect(kit.repo.isUnlocked(q.id)).toBe(false);
   });
 
   it("what a mark recorded late says (Task 50) is never read as a destruction", async () => {
