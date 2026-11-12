@@ -108,10 +108,16 @@ function QueueView({ q }: { q: CaptureQueueState }) {
         </div>
       )}
       <MissingToolNotice from={q} as="p" />
-      {q.gap && (
+      {q.gap && !q.forgotten && (
         <p className="ao-capture-queue__note">
           Progress was missed while the connection to the library service was down. Items marked “Not known” are updated as soon as the library service can be reached again; until then, look in the
           library for the captured sources.
+        </p>
+      )}
+      {q.gap && q.forgotten && (
+        <p className="ao-capture-queue__note">
+          Progress was missed while the connection to the library service was down, and this capture can no longer be read from the library service (it was restarted, or the capture ended long ago).
+          Items marked “Not known” may have been captured: look in the library for the captured sources.
         </p>
       )}
       {r && (r.status !== "failed" || hasCounts(r) || q.items.length > 0) && (

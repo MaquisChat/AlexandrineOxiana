@@ -409,6 +409,8 @@ export interface CaptureQueueState {
   report?: ProfileReport;
   /** Progress may have been missed: the event stream was down while this queue ran (R146). */
   gap?: boolean;
+  /** Missed progress that cannot be read any more: the service no longer knows the queue (review M2). */
+  forgotten?: boolean;
   /** When the service started it (read again) or when this screen did; queues are shown in this order. */
   startedAt?: string;
   startedBy?: CaptureStartedBy;

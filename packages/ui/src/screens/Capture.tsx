@@ -350,8 +350,8 @@ export function Capture({ client, projectId }: CaptureProps) {
   /** The connection's generation: changes at every open and every loss, so a read asked on another connection is dropped. */
   const conn = useRef(0);
   const readSeq = useRef(0);
-  /** Queues already looked up after an event of theirs (each once). */
-  const looked = useRef(new Set<string>());
+  /** Queues already looked up after an event of theirs (each once), with the connection they were read on. */
+  const looked = useRef(new Map<string, number>());
   const [ack, setAck] = useState<{ from: "checkbox" | "service" } | null>(null);
   const [ackBusy, setAckBusy] = useState(false);
   const [ackError, setAckError] = useState<string | null>(null);
@@ -415,24 +415,37 @@ export function Capture({ client, projectId }: CaptureProps) {
   /** Whether a read asked on connection `gen` (and read number `seq`) may still be used. */
   const current = (gen: number, seq?: number) => live.current && connected.current && gen === conn.current && (seq === undefined || seq === readSeq.current);
 
-  /** Reads the project's running and recent queues (on opening, after a reconnect, after a CAPTURE_RUNNING refusal). */
+  /**
+   * Reads the project's running and recent queues (on opening, after a reconnect, after a
+   * CAPTURE_RUNNING refusal), and any queue shown with missed progress that the list leaves out; one
+   * the service no longer knows is marked so (review M2). A queue already read after an event on this
+   * connection is not read again (review M8).
+   */
   const readQueues = useCallback(async () => {
     const gen = conn.current;
     const seq = ++readSeq.current;
     try {
       const list = await api.queues(projectId);
       if (!current(gen, seq)) return;
+      const listed = new Set(list.map((q) => q.queueId));
+      const missed = queuesNow.current.filter((q) => q.gap && !listed.has(q.queueId)).map((q) => q.queueId);
+      const ids = [...listed, ...missed].filter((id) => looked.current.get(id) !== gen);
+      const gone: string[] = [];
       const details = await Promise.all(
-        list.map((q) =>
-          api.queue(projectId, q.queueId).catch((err: unknown) => {
-            // Forgotten between the list and its read: left out.
-            if (err instanceof ApiClientError && err.code === "NOT_FOUND") return undefined;
+        ids.map((id) =>
+          api.queue(projectId, id).catch((err: unknown) => {
+            // Forgotten by the service (restarted, or finished long ago): left out, and said so if shown.
+            if (err instanceof ApiClientError && err.code === "NOT_FOUND") {
+              gone.push(id);
+              return undefined;
+            }
             throw err;
           }),
         ),
       );
       if (!current(gen, seq)) return;
       adopt(details.filter((d) => d !== undefined).map(queueFromDetail));
+      if (gone.length) setQueues((qs) => qs.map((q) => (q.gap && gone.includes(q.queueId) ? { ...q, forgotten: true } : q)));
     } catch {
       // Not readable now: what was seen stays, with its gap note; the next reconnect reads again.
     }
@@ -442,8 +455,8 @@ export function Capture({ client, projectId }: CaptureProps) {
   const readOne = useCallback(
     (queueId: string) => {
       if (looked.current.has(queueId)) return;
-      looked.current.add(queueId);
       const gen = conn.current;
+      looked.current.set(queueId, gen);
       api.queue(projectId, queueId).then(
         (d) => {
           if (current(gen)) adopt([queueFromDetail(d)]);
@@ -965,7 +978,7 @@ export function Capture({ client, projectId }: CaptureProps) {
       {notice && <p role="status">{notice}</p>}
 
       <p className="ao-capture__hint">
-        Captures started earlier or from the browser extension are shown here too, for as long as the library service runs; a finished capture stays listed for an hour.
+        Captures started earlier or from the browser extension are shown here too, for as long as the library service runs; a finished capture stays listed for up to an hour.
       </p>
       <CaptureQueue queues={queues} />
 

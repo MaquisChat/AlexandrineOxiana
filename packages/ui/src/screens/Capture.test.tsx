@@ -33,9 +33,13 @@ async function setup(o: CaptureSetup = {}, projectId = P1) {
   const m = mockCapture(o);
   const user = userEvent.setup();
   const view = render(<Capture client={m.client} projectId={projectId} />);
-  // Ready: the rules are read and the event stream is open.
+  // Ready: the rules are read and the event stream is open, on both sides: the mock counts a stream
+  // when it answers, the screen has it once its fetch resolves, and then reads the queues (onOpen).
+  // Waiting for only the mock's side let a test unmount while the screen's fetch was still resolving;
+  // its abort then never reached the mock's stream (review M6).
   await screen.findByRole("button", { name: "Capture links" });
   await waitFor(() => expect(m.streams()).toBe(1));
+  await waitFor(() => expect(m.calls.some((c) => c.path === `/projects/${projectId}/captures`)).toBe(true));
   await waitFor(() => expect(m.calls.some((c) => c.path === `/projects/${projectId}/governance`)).toBe(true));
   await waitFor(() => expect(screen.queryByText(/Reading this project's rules/)).toBeNull());
   return { m, user, view };
@@ -410,6 +414,32 @@ describe("Capture screen — progress", () => {
     // The next connection's read is.
     await waitFor(() => expect(within(queue).getByText("Saved")).toBeTruthy());
     await waitFor(() => expect(within(queue).queryByText("Not known")).toBeNull());
+  });
+
+  it("a capture with missed progress that the service no longer knows says so, instead of promising an update (review M2)", async () => {
+    const { m, user } = await setup();
+    await paste(user, [YT, IG]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await act(async () => m.emit("capture.progress", { queueId: "q1", projectId: P1, done: 1, total: 2, finished: false, outcome: { url: YT, status: "created" } }));
+    await waitFor(() => expect(within(queue).getByText("Saved")).toBeTruthy());
+    const reads = m.calls.filter((c) => c.path === `/projects/${P1}/captures/q1`).length;
+    await act(async () => m.closeStreams());
+    // After the reconnect the service lists nothing and does not know q1 (restarted, or forgotten).
+    await waitFor(() => expect(m.calls.filter((c) => c.path === `/projects/${P1}/captures/q1`).length).toBeGreaterThan(reads));
+    await waitFor(() => expect(within(queue).getByText(/can no longer be read from the library service/)).toBeTruthy());
+    expect(within(queue).queryByText(/updated as soon as/)).toBeNull();
+    expect(within(queue).getByText("Not known")).toBeTruthy();
+  });
+
+  it("an event of an unknown capture while the opening read is on its way: that capture is read once (review M8)", async () => {
+    const { m } = await setup({ queuesDelayMs: 200, queues: [{ ...running(), queueId: "x", startedBy: "extension", urls: [YT], total: 1 }] });
+    await act(async () => m.emit("capture.progress", { queueId: "x", projectId: P1, done: 0, total: 1, finished: false }));
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(within(queue).getByText(/Sent from the browser extension/)).toBeTruthy());
+    await waitFor(() => expect(m.queueReads()).toBe(1));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/captures/x`)).toHaveLength(1);
   });
 
   it("an event of a capture the screen does not know reads that capture once", async () => {
