@@ -10,6 +10,12 @@
  * the screen asks GET /extension/pair/status/:codeId (by the code's non-secret id), one request at a
  * time, and stops asking when the code ends or the screen is left. The countdown uses the service's
  * `validForMs` against this page's own clock only, so the two clocks are never compared.
+ *
+ * The app's port across launches (R171, defect D13): the service listens again on its last port when
+ * it can, but when that port was taken it starts on another, and a browser paired before still holds
+ * the old one. The list answer says the service's port now and, per browser, the port it last reached
+ * the service on; when one differs, the screen says what happened, shows the new port, and tells the
+ * researcher what to do in that browser's popup ("Use a different port"; no new pairing needed).
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { PAIRING_CODE_ID, type PairingCodeStatus } from "@ao/shared";
@@ -77,8 +83,15 @@ export function ExtensionPairingRoute({ client, port }: { client: ApiClient; por
   return <ExtensionPairing api={api} {...(port !== undefined ? { port } : {})} />;
 }
 
-/** `port` is the service's port (not a secret; the extension's popup asks for it). The token never reaches this screen. */
-export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionApi; pollMs?: number; port?: number }) {
+/** While the "port changed" notice is shown, the list is read again this often, at most LIST_POLLS_MAX times (I3). */
+const LIST_POLL_MS = 5000;
+const LIST_POLLS_MAX = 120;
+
+/**
+ * `port` is the service's port (not a secret; the extension's popup asks for it). The token never reaches this screen.
+ * `listPollMs` and `listPollMax` set the quiet re-reading of the list while the "port changed" notice is shown (tests shorten them).
+ */
+export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_POLL_MS, listPollMax = LIST_POLLS_MAX }: { api: ExtensionApi; pollMs?: number; port?: number; listPollMs?: number; listPollMax?: number }) {
   const ids = useId();
   const [code, setCode] = useState<ShownCode | null>(null);
   const [remaining, setRemaining] = useState(0);
@@ -87,6 +100,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
   const [issueError, setIssueError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [browsers, setBrowsers] = useState<PairedBrowser[] | null>(null);
+  /** The service's port now, as its list answer says it (R171). */
+  const [servicePort, setServicePort] = useState<number | undefined>(undefined);
   const [listError, setListError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<PairedBrowser | null>(null);
   const [revokeBusy, setRevokeBusy] = useState(false);
@@ -132,10 +147,12 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
       const my = ++listSeq.current;
       const ac = signal();
       try {
-        const list = await api.list(ac.signal);
+        const answer = await api.list(ac.signal);
         if (!alive.current || my !== listSeq.current) return undefined;
+        const list = answer.extensions;
         browsersRef.current = list;
         setBrowsers(list);
+        setServicePort(answer.port);
         setListError(null);
         return list;
       } catch (err) {
@@ -274,6 +291,38 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
       if (timer !== undefined) clearTimeout(timer);
     };
   }, [usedBrowser, pollMs, refresh]);
+
+  // While a browser is shown with an old port, the list is read again quietly (fix round 1, I3): the
+  // notice goes by itself once that browser has reached the app on the current port. One read at a
+  // time, at most `listPollMax` reads; it stops when no notice is left and when the screen is left;
+  // `refresh` drops an answer older than a newer read. The live region's words change only when the
+  // port or the set of browsers with an old port changes, so a read announces nothing.
+  // R171: the port now (the service's word first), and the browsers that hold an older one.
+  const currentPort = servicePort ?? port;
+  const oldPort = (b: PairedBrowser) => currentPort !== undefined && b.port !== undefined && b.port !== currentPort;
+  const portMoved = currentPort !== undefined && (browsers ?? []).some(oldPort);
+  useEffect(() => {
+    if (!portMoved) return;
+    let stopped = false;
+    let reading = false;
+    let reads = 0;
+    const t = setInterval(() => {
+      if (stopped || reading) return;
+      if (reads >= listPollMax) {
+        clearInterval(t);
+        return;
+      }
+      reads++;
+      reading = true;
+      void refresh(true).finally(() => {
+        reading = false;
+      });
+    }, listPollMs);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
+  }, [portMoved, listPollMs, listPollMax, refresh]);
 
   const issue = async () => {
     if (issuingNow.current) return;
@@ -420,6 +469,21 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
         <h2 id={`${ids}-list`} ref={heading} tabIndex={-1}>
           Paired browsers
         </h2>
+        {/* Always mounted, and its words change only when the port or the set of browsers with an old
+            port changes, so screen readers announce it once (R171). */}
+        <div role="status" aria-label="The app's port changed" className={portMoved ? "ao-warning ao-pairing-moved" : undefined}>
+          {portMoved ? (
+            <>
+              <p>
+                <strong>This app's port changed.</strong> When the app was last opened, it could not use its earlier port again (most often because another program had taken it), so it now uses port{" "}
+                <span className="ao-pairing-port-value">{currentPort}</span>. The browsers marked “Old port” below still use the earlier port, so they cannot capture until they are given the new one.
+              </p>
+              <p>
+                In each of those browsers, open the extension's popup, choose “Use a different port”, type {currentPort} and choose “Check and save”. The pairing stays valid: there is no need to pair again.
+              </p>
+            </>
+          ) : null}
+        </div>
         {listError ? (
           <p role="alert" className="ao-warning">
             {listError}
@@ -447,6 +511,19 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
                   <UserText>{b.origin}</UserText>
                   <br />
                   <span className="ao-hint">Paired {when(b.pairedAt)}</span>
+                  {oldPort(b) ? (
+                    <>
+                      <br />
+                      <span className="ao-pairing-old-port">
+                        Old port: {b.port}. This app now uses port {currentPort}.
+                      </span>
+                    </>
+                  ) : currentPort !== undefined && b.port === undefined ? (
+                    <>
+                      <br />
+                      <span className="ao-hint">Paired before this app kept its port. If this browser says the app is not answering, give it port {currentPort} in its popup (“Use a different port”).</span>
+                    </>
+                  ) : null}
                 </span>
                 <button type="button" className="ao-danger" aria-label={`Revoke ${b.origin}`} onClick={() => { setRevokeError(null); setRevoking(b); }}>
                   Revoke
