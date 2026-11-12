@@ -473,6 +473,32 @@ describe("SourceDetail: background work for the source (R84)", () => {
     expect(reads).toBe(settled);
   });
 
+  it("re-review N4: a project locked during the follow-up after Try again ends the follow-up and goes to unlock, once", async () => {
+    let retried = false;
+    let readsAfter = 0;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid"), () => {
+        if (!retried) return HttpResponse.json(PROXY_FAILED_SOURCE);
+        readsAfter++;
+        return serviceError(423, "PROJECT_LOCKED", "This project is locked.");
+      }),
+      http.get(url("/styles"), () => HttpResponse.json(STYLES)),
+      http.post(url("/jobs/retry"), () => {
+        retried = true;
+        return HttpResponse.json({ retrying: true });
+      }),
+    );
+    const onLocked = vi.fn();
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} onLocked={onLocked} retryPollMs={20} />);
+    const work = await screen.findByRole("region", { name: "Viewing copies and text recognition" });
+    await user.click(within(work).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(onLocked).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(readsAfter).toBe(1);
+    expect(onLocked).toHaveBeenCalledTimes(1);
+  });
+
   it("review F4: answers to the follow-up reads are dropped once another source is shown", async () => {
     let retried = false;
     server.use(

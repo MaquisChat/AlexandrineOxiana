@@ -345,8 +345,15 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
             showFile(f as VerifiedSource);
             setRetry((r) => (r.state === "started" ? { ...r, reads: r.reads + 1 } : r));
           })
-          .catch(() => {
-            if (g === gen.current) setRetry((r) => (r.state === "started" ? { ...r, reads: r.reads + 1 } : r));
+          .catch((err: unknown) => {
+            if (g !== gen.current) return;
+            // A locked project ends the follow-up and goes to unlock (re-review N4); other failures count as a read.
+            if (isProjectLocked(err)) {
+              setRetry({ state: "idle" });
+              lockedRef.current?.();
+              return;
+            }
+            setRetry((r) => (r.state === "started" ? { ...r, reads: r.reads + 1 } : r));
           });
       },
       retry.reads === 0 ? 0 : retryPollMs,
