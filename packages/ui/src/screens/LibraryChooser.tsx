@@ -112,9 +112,9 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
         <ul aria-label="Libraries" className="ao-plain-list">
           {libraries.map((l) => (
             <li key={l.libraryId} className="ao-card">
-              <h2 className="ao-pane-title">
-                <UserText>{l.name}</UserText>
-              </h2>
+              <UserText as="h2" className="ao-pane-title">
+                {l.name}
+              </UserText>
               {l.lastKnownPaths[0] && (
                 <p className="ao-path">
                   <UserText>{l.lastKnownPaths[0]}</UserText>
