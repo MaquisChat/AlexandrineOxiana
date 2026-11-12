@@ -206,6 +206,25 @@ describe("retention (spec 6.3(5))", () => {
     expect(JSON.stringify(r.json)).not.toContain(tmp);
     expect((await call({ url: `/projects/${pid}/retention` })).json.due).toEqual([]);
   });
+
+  it("the project's time zone (R93): GET retention shows it (null: UTC); PUT /time-zone sets a real zone or clears it", async () => {
+    expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBeNull();
+    const r = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: "asia/tokyo" } });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toEqual({ timeZone: "Asia/Tokyo" });
+    expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBe("Asia/Tokyo");
+    expect(svc.state.session!.repo.getProject(pid).timeZone).toBe("Asia/Tokyo");
+    for (const timeZone of ["Mars/Olympus", "+05:00", "", 7, ["UTC"], "x".repeat(300)]) {
+      const bad = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone } });
+      expect(bad.status, JSON.stringify(timeZone)).toBe(400);
+      expect(bad.json.error.code).toBe("VALIDATION");
+    }
+    expect((await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: {} })).status).toBe(400);
+    expect(svc.state.session!.repo.getProject(pid).timeZone).toBe("Asia/Tokyo");
+    const cleared = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: null } });
+    expect(cleared.json).toEqual({ timeZone: null });
+    expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBeNull();
+  });
 });
 
 describe("researcher name (device setting, R84/R117 carry-over)", () => {

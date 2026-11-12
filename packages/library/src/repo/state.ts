@@ -8,6 +8,8 @@ import {
   Project,
   Session,
   Tag,
+  dateRuleZone,
+  type DateRule,
   type SourceFile,
   type AuditEvent,
 } from "@ao/core";
@@ -154,6 +156,14 @@ export class RepoCore {
 
   get root(): string {
     return this.library.root;
+  }
+
+  /**
+   * The zone a project's date rule is read in (R160 as amended, `dateRuleZone`): its time zone
+   * when set, else the computer's zone (`tz`) for protocol and other dates, UTC for retention.
+   */
+  zoneOf(project: { timeZone?: string | undefined }, rule: DateRule = "protocol"): string {
+    return dateRuleZone(project, rule, this.tz);
   }
 
   abs(rel: string): string {

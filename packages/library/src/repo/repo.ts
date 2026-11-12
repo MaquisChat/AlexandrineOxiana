@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, DateRule, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -87,6 +87,7 @@ import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutco
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
+import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 import {
   AUDIT_WAITING_WARNING,
@@ -1128,7 +1129,7 @@ export async function pseudonymizesIdentifiable(repo: Repo, projectId: string): 
     projectId,
     actor: core.actor,
     now: core.clock().toISOString(),
-    tz: core.tz,
+    tz: core.zoneOf(core.state(projectId).project),
     store: { identifiable: true, hasLocation: false, legalBasis: "(evaluated for naming only)" },
   });
   if (d.result === "deny") return true;
@@ -1192,7 +1193,7 @@ export async function lookupPolicyInfo(
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   const policy = await projectPolicy(repo, projectId);
-  return { policy, actor: core.actor, ...(core.tz ? { tz: core.tz } : {}), clock: core.clock, sensitive: core.encrypted(st) };
+  return { policy, actor: core.actor, tz: core.zoneOf(st.project), clock: core.clock, sensitive: core.encrypted(st) };
 }
 
 /** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
@@ -1208,6 +1209,15 @@ export function addWatchedFolderEntry(repo: Repo, projectId: string, options: un
 /** Package-internal (watched folders): removes a watch's record from project.json (governed, audited). */
 export function removeWatchedFolderEntry(repo: Repo, projectId: string, id: string): Promise<void> {
   return removeWatchedFolderRecord(cores.get(repo)!, projectId, id);
+}
+
+/**
+ * Package-internal: the zone a project's date rule is read in (R160 as amended): its time zone
+ * when set, else the computer's for protocol dates and UTC for retention (`dateRuleZone`).
+ */
+export function projectDateZone(repo: Repo, projectId: string, rule: DateRule): string {
+  const core = cores.get(repo)!;
+  return core.zoneOf(core.state(projectId).project, rule);
 }
 
 /** Package-internal: the researcher's time zone the repo names dated files in. */
@@ -1301,6 +1311,14 @@ export function setProjectBackupSettings(repo: Repo, projectId: string, settings
   return setBackupSettingsIn(cores.get(repo)!, projectId, settings);
 }
 
+/**
+ * Sets (a real IANA zone name) or clears (null) the project's time zone, in which its calendar
+ * rules such as the retention date are read (R92, R93); governed and audited. Absent: UTC.
+ */
+export function setProjectTimeZone(repo: Repo, projectId: string, tz: string | null): Promise<Project> {
+  return setTimeZoneIn(cores.get(repo)!, projectId, tz);
+}
+
 /** Package-internal (citations, exports): the project's pseudonym map (handle or name → code); empty unless encrypted. */
 export async function projectPseudonymMap(repo: Repo, projectId: string): Promise<Map<string, string>> {
   const core = cores.get(repo)!;
@@ -1367,7 +1385,7 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
     try {
       const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
       if (!raw) throw new Error("governance.yaml is missing");
-      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "set-aside", projectId, actor: core.actor, now: at, tz: core.tz, setAside: { reason: why } });
+      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "set-aside", projectId, actor: core.actor, now: at, tz: core.zoneOf(st.project), setAside: { reason: why } });
       decision = d.result === "deny" ? { result: "deny", reason: d.reason } : { result: "allow" };
     } catch (e) {
       // Never an error message here: it can name an absolute path (N5).

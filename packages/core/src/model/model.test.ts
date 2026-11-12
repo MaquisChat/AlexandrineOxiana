@@ -10,10 +10,46 @@ import {
   BIBLIO_FIELDS,
   Source,
   SourceFile,
+  dateRuleZone,
   inLang,
   newId,
   primary,
+  timeZoneName,
 } from "../index.js";
+
+describe("project time zone (Task 58, R93)", () => {
+  it("accepts IANA zone names, in their usual spelling (aliases as written)", () => {
+    expect(timeZoneName("Europe/Berlin")).toBe("Europe/Berlin");
+    expect(timeZoneName("europe/berlin")).toBe("Europe/Berlin");
+    expect(timeZoneName("UTC")).toBe("UTC");
+    expect(timeZoneName("America/Argentina/Buenos_Aires")).toBe("America/Argentina/Buenos_Aires");
+    expect(timeZoneName("Pacific/Kiritimati")).toBe("Pacific/Kiritimati");
+  });
+  it("refuses anything that is not a zone name: unknown zones, offsets, padding, paths, overlong text", () => {
+    for (const bad of ["", "Mars/Olympus", "+05:00", "-0300", "Europe/Berlin\n", " Europe/Berlin", "../etc/passwd", "Europe//Berlin", "x".repeat(65), "Europe/Berlin; x", "Local", "\u0000"]) {
+      expect(timeZoneName(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+  it("refuses legacy and offset-style zones (Etc/GMT+2 means UTC-2) and stores a wrongly cased alias in the runtime's spelling (M4)", () => {
+    for (const bad of ["Etc/GMT+2", "Etc/GMT-5", "GMT+2", "SystemV/AST4", "EST", "CET", "EST5EDT", "Etc/UTC"]) expect(timeZoneName(bad), bad).toBeUndefined();
+    expect(timeZoneName("America/Argentina/buenos_aires")).toBe(timeZoneName("America/Buenos_Aires"));
+    expect(timeZoneName("utc")).toBe("UTC");
+  });
+});
+
+describe("the zone of a project's date rules (Task 58, R160 as amended)", () => {
+  it("a set zone governs protocol and retention dates; unset, protocol dates use the computer's zone and retention UTC", () => {
+    expect(dateRuleZone({ timeZone: "Asia/Tokyo" }, "protocol", "Europe/Paris")).toBe("Asia/Tokyo");
+    expect(dateRuleZone({ timeZone: "Asia/Tokyo" }, "retention", "Europe/Paris")).toBe("Asia/Tokyo");
+    expect(dateRuleZone({}, "protocol", "Europe/Paris")).toBe("Europe/Paris");
+    expect(dateRuleZone({}, "retention", "Europe/Paris")).toBe("UTC");
+    // A stored value that names no zone counts as unset.
+    expect(dateRuleZone({ timeZone: "Mars/Olympus" }, "protocol", "Europe/Paris")).toBe("Europe/Paris");
+    expect(dateRuleZone({ timeZone: "Mars/Olympus" }, "retention", "Europe/Paris")).toBe("UTC");
+    // No computer zone given: this runtime's.
+    expect(dateRuleZone({}, "protocol", undefined)).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  });
+});
 
 const now = "2026-11-09T10:00:00.000Z";
 

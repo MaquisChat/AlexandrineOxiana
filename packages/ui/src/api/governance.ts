@@ -76,6 +76,8 @@ export interface ProtocolDocumentResult {
 
 export interface RetentionDue {
   destroyAfter: string | null;
+  /** The project's time zone the date is read in (R93); null or absent: UTC. */
+  timeZone?: string | null;
   due: Array<{ sourceId: string; title: string; assetIds: string[] }>;
 }
 
@@ -226,6 +228,8 @@ export function governanceApi(client: ApiClient) {
       r<{ results: ProtocolDocumentResult[]; documents: ProtocolDocument[] }>("POST", `${p(projectId)}/protocol/documents`, { body: { paths } }),
 
     retention: (projectId: string) => r<RetentionDue>("GET", `${p(projectId)}/retention`),
+    /** Sets (an IANA zone name) or clears (null: UTC) the time zone the project's dates are read in (R93). */
+    setTimeZone: (projectId: string, timeZone: string | null) => r<{ timeZone: string | null }>("PUT", `${p(projectId)}/time-zone`, { body: { timeZone } }),
     destroyRaw: (projectId: string, assetIds: string[]) =>
       r<{ certificate: DestructionCertificate; certificateFile: string }>("POST", `${p(projectId)}/retention/destroy`, { body: { assetIds, confirm: true } }),
 
