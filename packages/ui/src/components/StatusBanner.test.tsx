@@ -1,6 +1,73 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
+
+describe("device-level notices (Task 68)", () => {
+  it("the identity notice: what happened, what it changes (not the locks: review round 1, M2), the damaged file kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "device-identity-renewed" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
+    // R181 b: only what is true.
+    expect(t).toMatch(/Your libraries and what is in them are unchanged/);
+    expect(t).toMatch(/A library that was open when the app last stopped may show as read-only for up to 2 minutes; open it again after that/);
+    expect(t).toMatch(/recorded under this computer's new identity/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("the old-copies notice: what happened, old copies may still be here, the damaged list is kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/list of old library copies awaiting deletion was damaged and was set aside/);
+    expect(t).toMatch(/may still be on this computer/);
+    // Not an overstatement when only part of the list was damaged (review round 1, M6).
+    expect(t).toMatch(/Some old copies/);
+    expect(t).toMatch(/a move that had not finished may not be able to finish from here/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("the watched-folders notice: what happened, what stopped, what to do, the damaged list is kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "watched-folders-list-set-aside" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/list of watched folders was damaged and was set aside/);
+    // Partial damage is not overstated, and no screen that does not exist is named (R181 d; review Rm3).
+    expect(t).toMatch(/some watched folders on this computer may have stopped/);
+    expect(t).toMatch(/files put in those folders are not imported/);
+    expect(t).not.toMatch(/added again|import settings/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("watched folders that could not be read at open: a plain warning for this session (review round 2, Rm4)", () => {
+    const t = warningText("watched-folders-unreadable", "library");
+    expect(t).toMatch(/list of watched folders could not be read when this library was opened/);
+    expect(t).toMatch(/files put in them are not imported/);
+    expect(t).toMatch(/Open the library again/);
+    expect(t).not.toMatch(/needs attention/);
+  });
+
+  it("“Got it” is a keyboard-operable button that names the notice it dismisses", async () => {
+    const onDismiss = vi.fn();
+    render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={onDismiss} />);
+    const b = screen.getByRole("button", { name: "Got it" });
+    b.focus();
+    await userEvent.setup().keyboard("{Enter}");
+    expect(onDismiss).toHaveBeenCalledWith("old-copies-list-set-aside");
+  });
+
+  it("bannersFor: one banner per known notice, after the others; none for an unknown kind or none at all", () => {
+    expect(bannersFor({ mode: "read-write", notices: [] })).toEqual([]);
+    expect(
+      bannersFor({
+        mode: "read-only",
+        readOnlyReason: "newer-format",
+        notices: [
+          { kind: "old-copies-list-set-aside", at: "2026-11-12T10:15:30.000Z" },
+          { kind: "unknown-kind" as never, at: "2026-11-12T10:15:30.000Z" },
+        ],
+      }),
+    ).toEqual([{ kind: "read-only-newer-format" }, { kind: "notice", notice: "old-copies-list-set-aside" }]);
+  });
+});
 
 describe("StatusBanner", () => {
   it("read-only, locked by another computer", () => {

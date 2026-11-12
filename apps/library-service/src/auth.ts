@@ -19,9 +19,7 @@
  *    from the shell's origin only) says what became of a code, by its non-secret id (Task 46c).
  */
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { readAppSetting, updateAppSetting } from "@ao/library";
+import { AppSettingUnreadableError, readAppSettingStrict, setAppSettingAside, updateAppSettingStrict } from "@ao/library";
 import { isCredentialQueryKey, type PairingCodeIssued, type PairingCodeStatus } from "@ao/shared";
 
 const digest = (s: string) => createHash("sha256").update(s, "utf8").digest();
@@ -76,41 +74,20 @@ const portOk = (v: unknown): v is number => typeof v === "number" && Number.isIn
 
 interface PairingFile {
   v: 1;
-  extensions: PairedExtension[];
+  /** As read; only the usable entries are used (usablePairings), the others are kept as they are. */
+  extensions: unknown[];
 }
 
 const PAIRINGS_FILE = "extension-pairings.json";
 
-/** The pairings file could not be read as a pairings file: nothing was written (fix round 1, I1). */
-export class PairingsUnreadableError extends Error {
-  constructor() {
-    super("The list of paired browsers could not be read, so it was not changed.");
-    this.name = "PairingsUnreadableError";
-  }
-}
+/** A pairings file as the app writes it: `{ v, extensions: [...] }` (entries checked one by one when used). */
+const isPairingFile = (f: unknown): f is PairingFile => typeof f === "object" && f !== null && Array.isArray((f as { extensions?: unknown }).extensions);
 
-/**
- * The pairings file as it is on disk, read inside `updateAppSetting`'s per-file lock. Missing: no
- * pairings yet. Anything else that is not a readable pairings file (unreadable, not JSON, truncated,
- * the wrong shape): throws, so that no edit ever writes a list it did not read, which would drop
- * every pairing (fix round 1, I1).
- */
-function readPairingsStrict(configDir: string): PairingFile {
-  let raw: string;
-  try {
-    raw = readFileSync(join(configDir, PAIRINGS_FILE), "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { v: 1, extensions: [] };
-    throw new PairingsUnreadableError();
-  }
-  let f: unknown;
-  try {
-    f = JSON.parse(raw);
-  } catch {
-    throw new PairingsUnreadableError();
-  }
-  if (typeof f !== "object" || f === null || !Array.isArray((f as { extensions?: unknown }).extensions)) throw new PairingsUnreadableError();
-  return f as PairingFile;
+/** The usable pairings of a file's list; others are left in the file as they are, never used. */
+function usablePairings(list: unknown[]): PairedExtension[] {
+  return list
+    .filter((e): e is PairedExtension => typeof (e as PairedExtension | null)?.tokenSha256 === "string" && typeof (e as PairedExtension).origin === "string" && isExtensionOrigin((e as PairedExtension).origin))
+    .map(({ port, ...e }) => (portOk(port) ? { ...e, port } : e));
 }
 
 export interface PairingOptions {
@@ -171,14 +148,74 @@ export class Pairing {
     this.now = opts.now ?? Date.now;
   }
 
+  /**
+   * Reads the pairings at start (Task 68): missing is "none yet". A file that cannot be read leaves
+   * no pairing usable and marks the file unreadable: the app says so and offers a reset (`reset()`);
+   * nothing is written over it.
+   */
   async load(): Promise<void> {
-    const f = await readAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE);
-    this.paired = Array.isArray(f?.extensions)
-      ? f.extensions
-          .filter((e) => typeof e?.tokenSha256 === "string" && typeof e.origin === "string" && isExtensionOrigin(e.origin))
-          .map(({ port, ...e }) => (portOk(port) ? { ...e, port } : e))
-      : [];
+    try {
+      const f = await readAppSettingStrict(this.configDir, PAIRINGS_FILE, isPairingFile);
+      this.paired = usablePairings(f?.extensions ?? []);
+      this.unreadable = false;
+      this.notLoaded = false;
+    } catch (err) {
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+      this.paired = [];
+      this.unreadable = true;
+      this.notLoaded = true;
+    }
     this.loaded = true;
+  }
+
+  /**
+   * No pairing could be read since the service started (the file was unreadable at start and has not
+   * been read since): a token cannot be checked at all, so the service answers every extension
+   * request with 503, never 401 (Task 68 fix round 1, M5). Pairings read earlier keep working.
+   */
+  notLoaded = false;
+
+  /**
+   * The pairings file is there but cannot be read (Task 68), as last found: at start (then no
+   * browser is paired) or by `checkFile()`. While it is, every change is refused; the pairings
+   * already in memory keep working (Task 66 I1).
+   */
+  unreadable = false;
+
+  /**
+   * Reads the file again for the list route (Task 68): says whether it cannot be read now. A file
+   * that could not be read at start and can be read again is taken up (a passing error heals).
+   */
+  async checkFile(): Promise<boolean> {
+    try {
+      const f = await readAppSettingStrict(this.configDir, PAIRINGS_FILE, isPairingFile);
+      if (this.unreadable) this.paired = usablePairings(f?.extensions ?? []);
+      this.unreadable = false;
+      this.notLoaded = false;
+    } catch (err) {
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+      this.unreadable = true;
+    }
+    return this.unreadable;
+  }
+
+  /**
+   * The way out (Task 68, M8): sets the unreadable pairings file aside (kept, renamed, never
+   * deleted) and starts with no pairing; every browser must be paired again. Refused when the file
+   * can be read (AppSettingReadableError). Returns the name it was kept under.
+   */
+  async reset(now: Date): Promise<string> {
+    const keptAs = await setAppSettingAside(this.configDir, PAIRINGS_FILE, isPairingFile, now);
+    this.paired = [];
+    this.unreadable = false;
+    this.notLoaded = false;
+    return keptAs;
+  }
+
+  /** A strict write failed on an unreadable file: the list says so from now on; memory is kept (Task 66 I1). */
+  private noteUnreadable(err: unknown): never {
+    if (err instanceof AppSettingUnreadableError) this.unreadable = true;
+    throw err;
   }
 
   /** A new 6-digit code; the desktop app may ask again at any time (any earlier code stops working). */
@@ -262,19 +299,20 @@ export class Pairing {
     c.record.confirming = true;
     let next: PairingFile;
     try {
-      next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, () => ({
+      // One pairing per extension origin: pairing again replaces its token. Built only on a list
+      // that was read (Task 66 I1, Task 68).
+      next = await updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => ({
+        ...(cur ?? {}),
         v: 1,
-        // One pairing per extension origin: pairing again replaces its token. Built only on a list
-        // that was read (fix round 1, I1).
-        extensions: [...readPairingsStrict(this.configDir).extensions.filter((e) => e?.origin !== origin), entry],
+        extensions: [...(cur?.extensions ?? []).filter((e) => (e as PairedExtension | null)?.origin !== origin), entry],
       }));
     } catch (err) {
       // Spent, but nothing was paired: the code no longer works, and the status says why.
       delete c.record.confirming;
       c.record.end = { state: "invalidated", at: this.now(), reason: "not-saved" };
-      throw err;
+      this.noteUnreadable(err);
     }
-    this.paired = next.extensions;
+    this.paired = usablePairings(next.extensions);
     delete c.record.confirming;
     c.record.end = { state: "used", at, browser: { id: entry.id, origin } };
     return token;
@@ -327,12 +365,12 @@ export class Pairing {
     const e = this.paired.find((x) => x.id === id);
     if (port === undefined || !e || e.port === port) return;
     let held = false;
-    await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, () => {
-      const cur = readPairingsStrict(this.configDir);
-      held = cur.extensions.some((x) => x?.id === id);
+    await updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => {
+      const list = cur?.extensions ?? [];
+      held = list.some((x) => (x as PairedExtension | null)?.id === id);
       // Not there any more (unpaired meanwhile): the write puts back exactly what was read.
-      return { ...cur, extensions: cur.extensions.map((x) => (x?.id === id ? { ...x, port } : x)) };
-    });
+      return { ...(cur ?? { v: 1 }), extensions: list.map((x) => ((x as PairedExtension | null)?.id === id ? { ...(x as object), port } : x)) };
+    }).catch((err: unknown) => this.noteUnreadable(err));
     // Only the one field, in memory too; the list itself stays the one the service holds.
     if (held) this.paired = this.paired.map((x) => (x.id === id ? { ...x, port } : x));
   }
@@ -347,12 +385,12 @@ export class Pairing {
 
   async unpair(id: string): Promise<boolean> {
     const before = this.paired.length;
-    const next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, () => {
-      // Built only on a list that was read (fix round 1, I1).
-      const cur = readPairingsStrict(this.configDir);
-      return { ...cur, extensions: cur.extensions.filter((e) => e?.id !== id) };
-    });
-    this.paired = next.extensions;
+    // Built only on a list that was read (Task 66 I1, Task 68).
+    const next = await updateAppSettingStrict<PairingFile>(this.configDir, PAIRINGS_FILE, isPairingFile, (cur) => ({
+      ...(cur ?? { v: 1 }),
+      extensions: (cur?.extensions ?? []).filter((e) => (e as PairedExtension | null)?.id !== id),
+    })).catch((err: unknown) => this.noteUnreadable(err));
+    this.paired = usablePairings(next.extensions);
     return this.paired.length < before;
   }
 

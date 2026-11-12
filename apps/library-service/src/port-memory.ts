@@ -14,7 +14,7 @@
  */
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
-import { readAppSetting, updateAppSetting } from "@ao/library";
+import { readAppSetting, writeAppSetting } from "@ao/library";
 
 export const PORT_SETTING = "service-port.json";
 
@@ -49,7 +49,7 @@ export async function rememberedPort(configDir: string): Promise<number | undefi
 }
 
 export async function rememberPort(configDir: string, port: number): Promise<void> {
-  await updateAppSetting<PortFile>(configDir, PORT_SETTING, () => ({ v: 1, port }));
+  await writeAppSetting<PortFile>(configDir, PORT_SETTING, { v: 1, port });
 }
 
 export interface ListenOptions {
