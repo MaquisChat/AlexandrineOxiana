@@ -72,6 +72,8 @@ export async function confirmField(repo: Repo, projectId: string, sourceId: stri
     verification: (next) => recheckSourceFile(next, {}).verification,
     // The capture entries this confirm settles are resolved in this same change (R176 1).
     resolveReview: "confirmation",
+    // The audit entry names the field and whether the value was kept or changed (R191).
+    confirmed: [pointer],
   });
 }
 
@@ -109,6 +111,7 @@ async function confirmIdentifier(repo: Repo, projectId: string, sourceId: string
     verification: (next) => recheckSourceFile(next, {}).verification,
     // The capture entries this confirm settles are resolved in this same change (R176 1).
     resolveReview: "confirmation",
+    confirmed: [pointer],
   });
 }
 

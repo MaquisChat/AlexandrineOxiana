@@ -203,9 +203,15 @@ describe("settled as R176 and R177 say (R190 b)", () => {
     const [entry] = await pendingOf(sid);
     await confirmField(kit.repo, p.id, sid, "/title", mt("Rivers and Memories"));
     expect(await pendingOf(sid)).toHaveLength(1);
+    const before = await auditEvents(kit, p);
     await confirmField(kit.repo, p.id, sid, "/issued", "2020");
     expect(await pendingOf(sid)).toEqual([]);
     expect((await entriesOf(sid)).find((e) => e.id === entry!.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    // The settling confirm is audited once, with the confirmation and the resolution, and queues nothing.
+    const added = (await auditEvents(kit, p)).slice(before.length);
+    expect(added).toHaveLength(1);
+    expect(added[0]!.details).toMatchObject({ op: "source.update", confirmed: [{ field: "/issued", choice: "changed" }], reviewResolved: { entries: [entry!.id], by: "confirmation" } });
+    expect(added[0]!.details).not.toHaveProperty("reviewQueued");
   });
 
   it("a recheck that clears the conflict settles it", async () => {

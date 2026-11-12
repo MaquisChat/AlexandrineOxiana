@@ -650,9 +650,16 @@ export async function updateSource(
      * field in conflict or unconfirmed are resolved in this same change, and the audit event says so (R176 1).
      */
     resolveReview?: "confirmation" | "recheck";
+    /**
+     * A confirmation (R191): the fields the researcher confirmed in this change, as the verification
+     * report names them (`/title`, `/identifiers/doi`). The audit entry names each and whether the
+     * recorded value was kept or another chosen; never the value.
+     */
+    confirmed?: readonly string[];
   } = {},
 ): Promise<SourceFile> {
   let resolved: string[] = [];
+  let confirmed: FieldConfirmation[] = [];
   let by: ReexaminedBy | undefined;
   let queued: { entry: string; fields: string[] } | undefined;
   core.assertWritable();
@@ -702,6 +709,7 @@ export async function updateSource(
       if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
+      confirmed = (extra.confirmed ?? []).map((field) => ({ field, choice: deepEqual(atPointer(cur.source, field), atPointer(source, field)) ? "kept" : "changed" }));
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
       // A field the recomputed report newly puts in conflict is queued for review in this change (R190 a),
@@ -720,9 +728,30 @@ export async function updateSource(
     {
       op: "source.update",
       entity: { type: "source", id },
-      auditDetails: () => ({ ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}), ...(queued ? { reviewQueued: queued } : {}) }),
+      auditDetails: () => ({
+        ...(confirmed.length ? { confirmed } : {}),
+        ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
+        ...(queued ? { reviewQueued: queued } : {}),
+      }),
     },
   );
+}
+
+/**
+ * One field a confirmation settled, as its audit entry records it (R191): the field as the
+ * verification report names it, and whether the researcher kept the value recorded or chose
+ * another. Never the value, an alternative or anything the researcher typed.
+ */
+export interface FieldConfirmation {
+  field: string;
+  choice: "kept" | "changed";
+}
+
+/** The value at a `/a/b` pointer of a source (undefined when absent). */
+function atPointer(source: Source, pointer: string): unknown {
+  let v: unknown = source;
+  for (const part of pointer.split("/").slice(1)) v = v && typeof v === "object" ? (v as Record<string, unknown>)[part] : undefined;
+  return v;
 }
 
 /** Rewrites one source inside a running mutation (membership, fieldwork links). */
