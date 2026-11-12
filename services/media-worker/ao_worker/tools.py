@@ -319,10 +319,10 @@ def _download_size(c: Component) -> tuple[int, bool]:
 
 
 def hosts_of(c: Component) -> list[str]:
-    """The host names a component's download contacts (R158), derived from its pins, never typed
-    again: the pinned addresses' hosts and the exact hosts a redirect may lead to; for yt-dlp the
-    release host (its checksum file comes from there too) and the hosts its files are served from.
-    Only bare host names (a `.suffix` redirect allowance is not one host). Nothing for a part that
+    """The hosts a component's download contacts (R158), derived from the allow-list the download
+    code enforces, so the two cannot drift: the pinned addresses' hosts, every host a redirect may
+    lead to (a suffix rule `.hf.co` is given as `*.hf.co`), and the hosts a program's own updater
+    contacts. For yt-dlp: the release host and `download.YTDLP_HOSTS`. Nothing for a part that
     cannot be downloaded for this computer."""
     from urllib.parse import urlsplit
 
@@ -335,7 +335,8 @@ def hosts_of(c: Component) -> list[str]:
         if isinstance(d, Unavailable):
             return []
         found = [urlsplit(x.url).hostname or "" for x in d] + list(c.hosts)
-    return list(dict.fromkeys(h.lower() for h in found if h and not h.startswith(".")))
+    found += list(c.update_hosts)
+    return list(dict.fromkeys(("*" + h if h.startswith(".") else h).lower() for h in found if h))
 
 
 def catalogue() -> dict:

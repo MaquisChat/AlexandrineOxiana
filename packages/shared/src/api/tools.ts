@@ -65,9 +65,12 @@ export interface ToolComponent {
   downloadSize: number;
   sizeApproximate: boolean;
   /**
-   * The host names its download contacts (R158), derived from its pins: the pinned addresses' hosts
-   * and the exact hosts a redirect may lead to; for yt-dlp the release host and its file hosts.
-   * Absent in answers from before Task 48a fix round 2.
+   * The hosts its download contacts (R158), derived from the allow-list the worker enforces: the
+   * pinned addresses' hosts, every host a redirect may lead to, and the hosts a program's own
+   * updater contacts (yt-dlp: `api.github.com`). Each entry is either a host name
+   * (`huggingface.co`) or a `*.suffix` pattern meaning any server under that domain (`*.hf.co`).
+   * Empty when nothing can be downloaded for this computer; absent in answers from before Task 48a
+   * fix round 2.
    */
   hosts?: string[];
 }

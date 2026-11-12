@@ -37,7 +37,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from . import fetch
+from . import fetch, toolpins
 from .jobs import Job, JobCancelled, JobContext, JobError, child_env
 
 log = logging.getLogger("ao_worker.download")
@@ -52,8 +52,9 @@ QUALITY_FORMATS = {
 }
 DATE_RE = re.compile(r"^\d{8}$")
 YTDLP_RELEASES = "https://github.com/yt-dlp/yt-dlp/releases/"
-# Hosts the release files may come from (GitHub redirects downloads to its file host).
-YTDLP_HOSTS = ("github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
+# Hosts the release files may come from (GitHub redirects downloads to its file host): the
+# catalogue's own list for yt-dlp, so what the screen names is what is enforced (R158).
+YTDLP_HOSTS = toolpins.COMPONENTS["yt-dlp"].hosts
 # Largest file accepted as the yt-dlp program (it is about 38 MB) and as the checksum list.
 YTDLP_MAX_BYTES = 200 * 1024 * 1024
 SUMS_MAX_BYTES = 1024 * 1024

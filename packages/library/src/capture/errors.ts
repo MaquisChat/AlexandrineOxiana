@@ -2,6 +2,7 @@
  * Link-capture errors and the plain-language reasons shown to the researcher. Reasons are fixed
  * sentences: they never carry cookies, tokens, URLs or file paths from the tools' output.
  */
+import { isSpeechModel } from "@ao/shared";
 
 /** The one-time explanation shown before the downloader may use the researcher's browser session (spec 5.1). */
 export const COOKIES_ACKNOWLEDGEMENT =
@@ -51,8 +52,9 @@ function toolName(tool: string | undefined): string {
   if (tool === "image-downloader") return "The image downloader";
   if (tool === "ffmpeg") return "The video tools (ffmpeg)";
   if (tool === "ocr") return "Text recognition (OCR)";
-  const m = /^speech-(tiny|small|medium|large-v3)$/.exec(tool ?? "");
-  if (m) return `The ${m[1]} speech model`;
+  // The speech models are the shared ones (R158): no list of names of its own here.
+  const model = tool?.startsWith("speech-") ? tool.slice("speech-".length) : "";
+  if (isSpeechModel(model)) return `The ${model} speech model`;
   return "A tool this needs";
 }
 
