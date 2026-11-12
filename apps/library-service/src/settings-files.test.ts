@@ -220,6 +220,21 @@ describe("an unreadable pairings file never makes a browser forget its pairing (
     expect((await extGet(token)).json().error?.code).not.toBe("UNAVAILABLE");
   });
 
+  it("after the file heals, the FIRST request carrying the extension's Origin passes (review round 2, Rm1)", async () => {
+    await start();
+    const token = await pair();
+    const saved = await readFile(cfg("extension-pairings.json"), "utf8");
+    await writeFile(cfg("extension-pairings.json"), "garbage{");
+    await start();
+    expect((await extPost(token)).statusCode).toBe(503);
+    await writeFile(cfg("extension-pairings.json"), saved);
+    const first = await extPost(token);
+    expect(first.statusCode).not.toBe(403);
+    expect(first.statusCode).not.toBe(401);
+    // Past authentication: what answers now is the route (no library is open in this test).
+    expect(first.json().error?.code).toBe("LIBRARY_OFFLINE");
+  });
+
   it("with the file readable, an unknown token is still 401 (nothing changes there)", async () => {
     await start();
     await pair();

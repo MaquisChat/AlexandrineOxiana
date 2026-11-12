@@ -191,10 +191,15 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     const path = req.url.split("?")[0] ?? "";
     const preflightOpen = req.method === "OPTIONS" && OPEN_ROUTES.has(`POST ${path}`);
     if (origin !== undefined) {
-      const ok = SHELL_ORIGINS.has(origin) || pairing.isPairedOrigin(origin) || ((OPEN_ROUTES.has(route) || preflightOpen) && isExtensionOrigin(origin));
+      const allowed = () => SHELL_ORIGINS.has(origin) || pairing.isPairedOrigin(origin) || ((OPEN_ROUTES.has(route) || preflightOpen) && isExtensionOrigin(origin));
+      let ok = allowed();
       // The pairings file cannot be read (Task 68 fix round 1, M5): an extension is told so, never
-      // refused as unpaired, so that it keeps its token; nothing is let through.
-      if (!ok && isExtensionOrigin(origin) && (await pairingsUnreadable())) return fail(reply, PAIRINGS_UNREADABLE);
+      // refused as unpaired, so that it keeps its token; nothing is let through. When the check finds
+      // the file readable again, the origin is judged again on what was just read (round 2, Rm1).
+      if (!ok && isExtensionOrigin(origin) && pairing.notLoaded) {
+        if (await pairingsUnreadable()) return fail(reply, PAIRINGS_UNREADABLE);
+        ok = allowed();
+      }
       if (!ok) return fail(reply, new ApiError(403, "FORBIDDEN", "Requests from this origin are not allowed."));
       reply.header("Access-Control-Allow-Origin", origin).header("Vary", "Origin");
       if (req.method === "OPTIONS") {
