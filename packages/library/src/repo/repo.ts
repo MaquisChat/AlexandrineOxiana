@@ -84,7 +84,14 @@ import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
-import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
+import {
+  adoptRestoredProject as adoptRestoredIn,
+  authorizeRestoreIn,
+  refuseRestoreIn,
+  type DestructionRecordError,
+  type RestoreRequest,
+  type StagedRestore,
+} from "./restore.js";
 import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
@@ -1338,6 +1345,25 @@ export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<t
   return adoptRestoredIn(cores.get(repo)!, s);
 }
 
+/**
+ * Package-internal (restore, Task 50b): the policy decision for a restore, made before anything of
+ * the backup is unpacked. A deny is audited and thrown as PolicyDeniedError.
+ */
+export function authorizeRestore(repo: Repo, r: RestoreRequest): ReturnType<typeof authorizeRestoreIn> {
+  return authorizeRestoreIn(cores.get(repo)!, r);
+}
+
+/** Package-internal (restore): audits a restore refused because the record of destructions cannot be read. */
+export function refuseRestore(repo: Repo, r: RestoreRequest, err: DestructionRecordError): Promise<void> {
+  return refuseRestoreIn(cores.get(repo)!, r, err);
+}
+
+/** Package-internal (restore): the head of the project's audit log as this process holds it. */
+export function auditHeadOf(repo: Repo, projectId: string): { seq: number; hash: string } | null {
+  const head = cores.get(repo)!.state(projectId).audit.head;
+  return head ? { seq: head.seq, hash: head.hash } : null;
+}
+
 /** Package-internal (retention, R90 d): the governed destruction change. */
 export function destroyProjectAssets(repo: Repo, projectId: string, input: DestroyInput): ReturnType<typeof destroyAssets> {
   return destroyAssets(cores.get(repo)!, projectId, input);
@@ -1388,6 +1414,17 @@ export async function verifiedAuditEvents(repo: Repo, projectId: string): Promis
     if (!r.verify.ok || !endsAt(r.verify.head, head)) return { ok: false as const };
     return { ok: true as const, events: r.events };
   });
+}
+
+/**
+ * Package-internal (restore, in its commit turn): `verifiedAuditEvents` for a caller that already
+ * holds the write queue, where nothing is appended meanwhile. Never call it outside the queue.
+ */
+export async function verifiedAuditEventsInQueue(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+  const st = cores.get(repo)!.state(projectId);
+  const events = (await AuditStore.read(st.audit.dir)) as AuditEvent[];
+  const verify = verifyChain(events);
+  return verify.ok && endsAt(verify.head, st.audit.head) ? { ok: true, events } : { ok: false };
 }
 
 const endsAt = (last: { seq: number; hash: string } | null, head: { seq: number; hash: string } | null): boolean =>

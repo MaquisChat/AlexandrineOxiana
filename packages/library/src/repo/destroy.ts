@@ -12,7 +12,10 @@
  *     `.json.enc`, sealed with the project key, in an encrypted project).
  * The change's own audit event (the commit point) names the certificate, its sha256 and the
  * backups that hold the destroyed files (R147): which backups must go is decided once, here, and
- * recorded where it cannot be edited quietly. The certificate is never rewritten afterwards: later
+ * recorded where it cannot be edited quietly. It also names the destroyed assets by id
+ * (`destroyedAssets`; ids only: no file name, no fingerprint of a file's content), so what a
+ * restore must never bring back is known from the audit log itself, whatever becomes of the
+ * certificate file (R174 d). The certificate is never rewritten afterwards: later
  * facts are amendment files beside it (`amendDestruction`), each written in a governed change whose
  * audit event carries the amendment's sha256 and what it reports.
  */
@@ -133,7 +136,13 @@ export async function destroyAssets(
       const text = certificateText(certificate);
       const certificateSha256 = sha256Of(text);
       await tx.writeFile(rel, text, tx.encrypted ? { encrypt: true } : { mode: 0o600 });
-      recorded = { certificate: name, certificateSha256, backupsToRemove: [...input.backups.toRemove], backupsUnreadable: [...input.backups.unreadable] };
+      recorded = {
+        certificate: name,
+        certificateSha256,
+        backupsToRemove: [...input.backups.toRemove],
+        backupsUnreadable: [...input.backups.unreadable],
+        destroyedAssets: destroyed.map((d) => d.asset.id),
+      };
       return { certificateRel: rel, certificate, certificateSha256, at: tx.at, destroyed: destroyed.map((d) => d.asset) };
     },
     { op: "retention.destroy", entity: { type: "project", id: projectId }, auditDetails: () => recorded },

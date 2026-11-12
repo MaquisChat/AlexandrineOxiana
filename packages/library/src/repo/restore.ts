@@ -4,6 +4,10 @@
  * becomes a NEW project, never replacing one:
  *
  *   1. its audit chain must verify (and match the head the backup recorded, when it did);
+ *   1b. the policy engine decides, in this turn (R138 c), against the rules that would go live with
+ *      the copy (the `governance.yaml` unpacked from the backup) and where the library is
+ *      (`decideRestore`): a refusal is audited and nothing is restored. The same decision was made
+ *      before anything was unpacked (`authorizeRestoreIn`);
  *   2. everything the library indexes by id gets a fresh id (the project, its sources, assets,
  *      annotations, collections, project tags, participants, sessions and consents), so the copy
  *      never collides with the project it was made from (the registry stays unique); library-relative
@@ -14,23 +18,41 @@
  *      are evidence and are copied byte for byte (R147): the copy's audit log vouches for them;
  *   3. a `project.restored` event naming the backup's sha256 is appended to the copy's audit log;
  *   An encrypted copy keeps the data key, and key id, of the project it was made from (the
- *   backup is sealed with it): unlocking either project unlocks both. Assets whose sha256 a
- *   destruction certificate of this library lists are not brought back (marked destroyed, R92);
+ *   backup is sealed with it): unlocking either project unlocks both. Files a destruction recorded
+ *   in this library destroyed are not brought back (marked destroyed, R92): which files is read in
+ *   this turn from the audit logs (R174 d; the caller's reader, `StagedRestore.destroyed`), never
+ *   from a certificate file the audit log does not vouch for;
  *   ids of import batches, review entries and pending jobs are new too, and so are the keys of
  *   provenance.fileHashes and its importBatchId (the one exception to R76, restore only);
  *   3b. the copy is anchored (R12) before it goes live, so a crash after the rename is no "missing anchor";
+ *   3c. what the copy inherits as still to be done is noted last before it goes live
+ *      (`StagedRestore.beforeLive`: the backups a destruction still lists, R175), and taken back if
+ *      the rename fails, so the copy never exists without its warning;
  *   4. the staging folder is renamed into place (the commit point: a crash before it leaves only a
  *      staging folder, which the next open removes), the project is loaded and anchored (R12).
  */
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
-import { newId, sanitizeSegment, verifyChain, withCollisionSuffix, type AuditEvent, type Project } from "@ao/core";
+import {
+  evaluate,
+  newId,
+  parseGovernance,
+  sanitizeSegment,
+  verifyChain,
+  withCollisionSuffix,
+  type AuditEvent,
+  type PolicyDecision,
+  type PolicyRequest,
+  type Project,
+} from "@ao/core";
+import { scrubPaths } from "../app-settings.js";
 import { renameWithRetry, writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
 import { AuditStore } from "./audit-store.js";
-import { DESTRUCTION_CERTIFICATE } from "./destroy.js";
+import { PolicyDeniedError } from "./errors.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
+import { appendLibraryRefusal } from "./library-audit.js";
 import { loadProjectFolder, parseProjectJson, type Manifest, type RepoCore } from "./state.js";
 import { listSourceIds, readSourceFile } from "./sources.js";
 
@@ -50,7 +72,52 @@ export class RestoreError extends Error {
   }
 }
 
+/**
+ * What was destroyed under a retention rule in this library cannot be read with certainty (an audit
+ * log that does not hold together, or a recorded destruction that does not say which files), so
+ * nothing is restored: the app does not guess (R174 d). A plain message, no paths.
+ */
+export class DestructionRecordError extends RestoreError {
+  constructor(
+    message: string,
+    /** The project whose audit log or record it is. */
+    readonly projectId: string,
+    /** That project's audit log itself does not hold together (the refusal is never recorded in it). */
+    readonly logNotIntact: boolean,
+  ) {
+    super(message);
+    this.name = "DestructionRecordError";
+  }
+}
+
 const SEALED_PURPOSES = ["ao-changes", "ao-review", "ao-import-journal"];
+
+/** Every kind of storage the library's folder may be on, as the policy engine is asked (as for a backup, R125). */
+export type RestoreDestinations = NonNullable<PolicyRequest["restore"]>["destinations"];
+
+/** What a restore is decided on: the backup's own project and rules, and where the library is. Never a path. */
+export interface RestoreRequest {
+  /** The project as the backup's project.json describes it. */
+  project: { id: string; name: string; encrypted: boolean; timeZone?: string };
+  /** `governance.yaml` as the backup holds it: the rules the new project would have. Null: it holds none. */
+  governanceYaml: string | null;
+  /** The backup file is sealed with a project key. */
+  sealed: boolean;
+  destinations: RestoreDestinations;
+  backupSha256: string;
+  /** The backup's file name, when it is one of this library's backups (a name, never a path). */
+  file?: string;
+}
+
+/** What recorded destructions say a restore must not bring back (R174 d). */
+export interface DestroyedRecord {
+  /** Asset id (in the project the data was destroyed in) → when it was destroyed. */
+  byId: ReadonlyMap<string, string>;
+  /** sha256 of a destroyed file → when, from certificates the audit log vouches for. */
+  bySha256: ReadonlyMap<string, string>;
+  /** Plain sentences for the restore's notes: what could not be read from a certificate, or was not taken into account. */
+  notes: readonly string[];
+}
 
 export interface StagedRestore {
   /** Absolute staging folder (`<Library>/Projects/.creating-<id>`). */
@@ -61,6 +128,133 @@ export interface StagedRestore {
   expectedHead?: { seq: number; hash: string } | null;
   /** Local date (YYYY-MM-DD) for the folder name. */
   date: string;
+  /** The backup file is sealed. */
+  sealed: boolean;
+  /** Where the library is, as it was decided on before anything was unpacked: asked again in the commit turn. */
+  destinations: RestoreDestinations;
+  /** The backup's file name, when it is one of this library's backups. */
+  file?: string;
+  /**
+   * What recorded destructions say must not come back, read in the commit turn (it must not take
+   * the write queue). Throws DestructionRecordError when that cannot be read with certainty.
+   */
+  destroyed: () => Promise<DestroyedRecord>;
+  /**
+   * Called in the commit turn, last before the copy goes live, with the audit events it starts
+   * with: notes what the copy inherits (the warnings that then stand for it), and returns how to
+   * take that back should the copy not go live after all. It must not take the write queue.
+   */
+  beforeLive?: (copy: { projectId: string; folder: string; events: AuditEvent[] }) => Promise<{ warnings: string[]; undo: () => Promise<void> }>;
+}
+
+// ------------------------------------------------------------------------------------------
+// The decision (Task 50b)
+
+/** Rules that require encryption at rest, for a project that is not encrypted: it would come back unencrypted. */
+export const RESTORE_NEEDS_ENCRYPTION = "The rules of the project in this backup require encryption at rest, but the project in it is not encrypted; it was not restored";
+/** A sealed archive whose project is not an encrypted one: unpacking it would write its files unencrypted. */
+export const RESTORE_SEALED_BUT_PLAIN = "This backup is sealed, but the project in it is not an encrypted one, so it would come back unencrypted; it was not restored";
+
+const denyOf = (reason: string, warnings: string[] = []): PolicyDecision => ({ result: "deny", reason, warnings });
+
+/**
+ * The policy decision for a restore. The rules asked are the backup's own (they become the new
+ * project's); the engine checks them against where the library is and gives an `encrypt` condition
+ * when they require encryption at rest (`action: 'restore'`). A condition the project in the backup
+ * cannot honour is a deny, as for every governed write. Never throws: rules that are missing or
+ * cannot be read, and any failure to decide, are a deny (fail closed).
+ */
+export function decideRestore(core: RepoCore, r: RestoreRequest, at: string): PolicyDecision {
+  let d: PolicyDecision;
+  try {
+    if (r.governanceYaml === null) throw new Error("the backup holds no governance.yaml");
+    d = evaluate(parseGovernance(r.governanceYaml), {
+      action: "restore",
+      projectId: r.project.id,
+      actor: core.actor,
+      now: at,
+      tz: core.zoneOf(r.project),
+      restore: { destinations: r.destinations },
+    });
+  } catch (e) {
+    return denyOf(`Policy could not be evaluated: ${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}`);
+  }
+  if (d.result === "deny") return d;
+  if (d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "encrypt") && !r.project.encrypted) return denyOf(RESTORE_NEEDS_ENCRYPTION, d.warnings);
+  if (r.sealed && !r.project.encrypted) return denyOf(RESTORE_SEALED_BUT_PLAIN, d.warnings);
+  return d;
+}
+
+/**
+ * Audits a refused restore (never silent, R154): in the log of the project the backup belongs to,
+ * when that project is in this library and its log can take it; otherwise in the library's own log
+ * (where the same refusal is listed once a day, R157). If neither can be written the refusal still
+ * stands and the library warns (`refusal-unrecorded`). The backup is named by its sha256, and by its
+ * file name only when it is one of this library's backups: never a path. Caller holds the write queue.
+ */
+export async function recordRestoreRefusal(
+  core: RepoCore,
+  r: RestoreRequest,
+  reason: string,
+  stage: "decision" | "commit",
+  opts: { warnings?: string[]; logNotIntact?: string } = {},
+): Promise<void> {
+  const at = core.clock().toISOString();
+  const what = { op: "project.restore", backupSha256: r.backupSha256, ...(r.file ? { file: r.file } : {}), at: stage };
+  const st = core.projects.get(r.project.id);
+  if (st && st.recoveryPending !== true && st.auditUnverified !== true && opts.logNotIntact !== st.project.id) {
+    try {
+      await core.auditNow(st, {
+        ...core.auditBase(st, at),
+        action: "restore",
+        entity: { type: "project", id: st.project.id },
+        decision: { result: "deny", reason },
+        details: { ...what, ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) },
+      });
+      return;
+    } catch {
+      // the library's own log takes it
+    }
+  }
+  try {
+    await appendLibraryRefusal(core, {
+      at,
+      actor: core.actor,
+      device: core.device,
+      ...(st ? { projectId: st.project.id } : {}),
+      action: "restore",
+      decision: { result: "deny", reason },
+      details: { ...what, name: r.project.name, encrypted: r.project.encrypted, ...(st ? { projectLogNotIntact: true } : {}) },
+    });
+  } catch (err) {
+    core.integrityWarnings.push({
+      projectId: "*",
+      kind: "refusal-unrecorded",
+      detail: `a refused restore could not be recorded in the library's audit log (${err instanceof Error ? err.name : "Error"})`,
+    });
+  }
+}
+
+/**
+ * Before anything of a backup is unpacked: the decision. A deny is audited and thrown as
+ * PolicyDeniedError; nothing has been written.
+ */
+export async function authorizeRestoreIn(core: RepoCore, r: RestoreRequest): Promise<PolicyDecision> {
+  core.assertWritable();
+  return core.serial(async () => {
+    core.assertWritable();
+    const d = decideRestore(core, r, core.clock().toISOString());
+    if (d.result === "deny") {
+      await recordRestoreRefusal(core, r, d.reason, "decision", { warnings: d.warnings });
+      throw new PolicyDeniedError(d.reason, "restore");
+    }
+    return d;
+  });
+}
+
+/** Before anything is unpacked: a refusal because the record of destructions cannot be read, audited like a deny. */
+export function refuseRestoreIn(core: RepoCore, r: RestoreRequest, err: DestructionRecordError): Promise<void> {
+  return core.serial(() => recordRestoreRefusal(core, r, err.message, "decision", err.logNotIntact ? { logNotIntact: err.projectId } : {}));
 }
 
 type Json = unknown;
@@ -114,38 +308,12 @@ function auditProjectProblem(events: AuditEvent[], projectId: string): string | 
   return current === projectId ? null : "it belongs to another project";
 }
 
-/** sha256 → time destroyed, from every readable destruction certificate of the library's projects. */
-async function destroyedHashes(core: RepoCore): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  for (const st of core.projects.values()) {
-    let names: string[];
-    try {
-      // Certificates only: the amendments kept beside them name no destroyed file.
-      names = (await fsp.readdir(core.abs(`${st.rel}/retention`))).filter((n) => DESTRUCTION_CERTIFICATE.test(n));
-    } catch {
-      continue;
-    }
-    for (const n of names) {
-      try {
-        let raw: Buffer = await fsp.readFile(core.abs(`${st.rel}/retention/${n}`));
-        if (n.endsWith(".enc")) {
-          const keyId = st.project.encryption.keyId;
-          const k = keyId ? core.keyRing.get(keyId) : undefined;
-          if (!k) continue; // locked: its certificates cannot be read now
-          raw = await decryptBytes((id) => (id === keyId ? k : undefined), raw);
-        }
-        const cert = JSON.parse(raw.toString("utf8")) as { at?: string; assets?: Array<{ sha256?: string }> };
-        for (const a of cert.assets ?? []) if (typeof a.sha256 === "string" && typeof cert.at === "string") out.set(a.sha256, cert.at);
-      } catch {
-        // unreadable certificate: skipped
-      }
-    }
-  }
-  return out;
-}
-
-/** Test seam: the process "dies" right after the copy was renamed into place. */
-export const restoreSeams: { crashAfterRename?: boolean } = {};
+/**
+ * Test seams. `crashAfterRename`: the process "dies" right after the copy was renamed into place.
+ * `failBeforeRename`: the last step before the rename fails. `beforeAdopt`: runs once the backup is
+ * unpacked, before the commit turn (given the staging folder).
+ */
+export const restoreSeams: { crashAfterRename?: boolean; failBeforeRename?: boolean; beforeAdopt?: (staging: string) => Promise<void> } = {};
 
 async function walkFiles(dir: string, base = ""): Promise<string[]> {
   const out: string[] = [];
@@ -163,11 +331,17 @@ const pretty = (text: string) => /\n\s/u.test(text);
  * Turns the unpacked backup in `s.staging` into a new project of the library. Caller holds nothing;
  * this runs in the repository's write queue. The staging folder is removed on failure.
  */
-export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Promise<{ project: Project; notes: string[] }> {
+export async function adoptRestoredProject(
+  core: RepoCore,
+  s: StagedRestore,
+): Promise<{ project: Project; notes: string[]; leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string }>; warnings: string[] }> {
   core.assertWritable();
   return core.serial(async () => {
     core.assertWritable();
     const staging = s.staging;
+    /** The copy is in place under its own name. */
+    let live = false;
+    let undoInherited: (() => Promise<void>) | undefined;
     try {
       const raw = await readMaybe(join(staging, "project.json"));
       if (!raw) throw new RestoreError("This file is not a project backup (it has no project.json)");
@@ -189,6 +363,22 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       }
       const wrongProject = auditProjectProblem(events as AuditEvent[], old.id);
       if (wrongProject) throw new AuditChainInvalidError(wrongProject);
+
+      // 1b. The decision again, in this turn (R138 c), against the rules that would go live with the copy.
+      const rules = await readMaybe(join(staging, "governance.yaml"));
+      const request: RestoreRequest = {
+        project: { id: old.id, name: old.name, encrypted: old.encryption.enabled, ...(old.timeZone ? { timeZone: old.timeZone } : {}) },
+        governanceYaml: rules ? rules.toString("utf8") : null,
+        sealed: s.sealed,
+        destinations: s.destinations,
+        backupSha256: s.backupSha256,
+        ...(s.file ? { file: s.file } : {}),
+      };
+      const decided = decideRestore(core, request, core.clock().toISOString());
+      if (decided.result === "deny") {
+        await recordRestoreRefusal(core, request, decided.reason, "commit", { warnings: decided.warnings });
+        throw new PolicyDeniedError(decided.reason, "restore");
+      }
 
       // The key, for an encrypted project (the caller made sure it is in the key ring).
       const keyId = old.encryption.enabled ? old.encryption.keyId : undefined;
@@ -255,24 +445,35 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
         }
       }
 
-      // Files destroyed under a retention rule are not brought back (R92): by their sha256 in the
-      // library's destruction certificates.
-      const destroyedAt = await destroyedHashes(core);
+      // Files destroyed under a retention rule are not brought back (R92, R174 d). Which files is
+      // read now, in the commit turn, from the audit logs of this library: an asset a destruction's
+      // own audit entry names (by its id), or whose sha256 a certificate the audit log vouches for
+      // lists. If that cannot be read with certainty nothing is restored, and the refusal is audited.
+      let record: DestroyedRecord;
+      try {
+        record = await s.destroyed();
+      } catch (err) {
+        if (err instanceof DestructionRecordError) await recordRestoreRefusal(core, request, err.message, "commit", err.logNotIntact ? { logNotIntact: err.projectId } : {});
+        throw err;
+      }
       const notes: string[] = [];
-      let skipped = 0;
+      /** What was left out, by the ids the backup holds (given as the copy's ids in the answer). */
+      const left: Array<{ sourceId: string; assetId: string; destroyedAt: string }> = [];
       for (const [f, raw] of parsedSources) {
-        const sf = raw as { assets: Array<{ id: string; path: string; sha256: string; status?: string; destroyedAt?: string; linked?: unknown }> };
+        const sf = raw as { source: { id: string }; assets: Array<{ id: string; path: string; sha256: string; status?: string; destroyedAt?: string; linked?: unknown }> };
         for (const a of sf.assets) {
-          const at = destroyedAt.get(a.sha256);
+          const at = record.byId.get(a.id) ?? record.bySha256.get(a.sha256);
           if (!at || a.status === "destroyed" || a.linked) continue;
           if (a.path.startsWith(`${old.folder}/`)) await shredPath(join(staging, ...a.path.slice(old.folder.length + 1).split("/")));
           a.status = "destroyed";
           a.destroyedAt = at;
-          skipped++;
+          left.push({ sourceId: sf.source.id, assetId: a.id, destroyedAt: at });
         }
         parsedSources.set(f, sf as unknown as Record<string, unknown>);
       }
+      const skipped = left.length;
       if (skipped) notes.push(`${skipped} ${skipped === 1 ? "file was" : "files were"} destroyed earlier under a retention rule and ${skipped === 1 ? "was" : "were"} not restored.`);
+      notes.push(...record.notes);
 
       const projectsDir = join(core.root, "Projects");
       const taken = await namesIn(projectsDir);
@@ -368,8 +569,16 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
         projectId: newProjectId,
         action: "project.restored",
         entity: { type: "project", id: newProjectId },
-        decision: { result: "allow" },
-        details: { backupSha256: s.backupSha256, restoredFrom: old.id, fromAuditHead: verify.head ? { seq: verify.head.seq, hash: verify.head.hash } : null },
+        // The engine's decision (1b), with its conditions: this event is the restore's allow record.
+        decision: decided.result === "allow_with_conditions" ? { result: decided.result, conditions: decided.conditions } : { result: "allow" },
+        details: {
+          op: "project.restore",
+          backupSha256: s.backupSha256,
+          restoredFrom: old.id,
+          fromAuditHead: verify.head ? { seq: verify.head.seq, hash: verify.head.hash } : null,
+          ...(skipped ? { leftOutDestroyed: skipped } : {}),
+          ...(decided.warnings.length ? { warnings: decided.warnings } : {}),
+        },
       });
 
       // Anchored before it goes live: a crash after the rename never looks like a missing anchor (R92).
@@ -383,7 +592,13 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
         throw new RestoreError("A project folder with this name appeared meanwhile; nothing was restored");
       }
       await fsp.rmdir(final);
+      // 3c. What the copy inherits is noted last before it goes live (R175), and taken back below
+      // if it does not: the copy never exists without the warning for backups it must see removed.
+      const inherited = await s.beforeLive?.({ projectId: newProjectId, folder: newRel, events: events as AuditEvent[] });
+      undoInherited = inherited?.undo;
+      if (restoreSeams.failBeforeRename) throw new Error("simulated failure before the rename");
       await renameWithRetry(staging, final);
+      live = true;
       if (restoreSeams.crashAfterRename) throw new Error("simulated crash after the rename");
       const loaded = await loadProjectFolder(core, folderName);
       if (!loaded) throw new RestoreError("The restored project could not be opened");
@@ -396,8 +611,14 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       } catch (error) {
         core.indexErrors.push({ op: "project.restored", error });
       }
-      return { project: structuredClone(st.project), notes };
+      return {
+        project: structuredClone(st.project),
+        notes,
+        leftOut: left.map((x) => ({ sourceId: ids.get(x.sourceId) ?? x.sourceId, assetId: ids.get(x.assetId) ?? x.assetId, destroyedAt: x.destroyedAt })),
+        warnings: inherited?.warnings ?? [],
+      };
     } catch (err) {
+      if (!live) await undoInherited?.().catch(() => {});
       await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
       throw err;
     }

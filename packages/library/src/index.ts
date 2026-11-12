@@ -193,6 +193,7 @@ export {
   BACKUP_LIMITS,
   BackupNotRecordedError,
   DEFAULT_KEEP,
+  DestructionRecordError,
   RestoreError,
   PruneNotRecordedError,
   backupFailure,
@@ -203,7 +204,7 @@ export {
   restoreBackup,
   setBackupSettings,
 } from "./export/backup.js";
-export type { BackupEntry, BackupFailure, BackupOptions, BackupResult, RestoreResult } from "./export/backup.js";
+export type { BackupEntry, BackupFailure, BackupOptions, BackupResult, RestoreOptions, RestoreResult } from "./export/backup.js";
 export { ExportDestinationError, ExportFailedError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
 export type { ProjectExportResult } from "./export/project-export.js";
 export { DESTRUCTION_NOTICE, backupsAwaitingRemoval, destroyRaw, listDestructions, readDestruction, resumeDestruction, retentionDue } from "./retention.js";

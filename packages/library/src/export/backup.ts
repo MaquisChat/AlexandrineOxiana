@@ -90,16 +90,20 @@ import { PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../
 import { SimulatedCrash } from "../repo/seams.js";
 import { foldName, namesIn, readMaybe } from "../repo/io.js";
 import type { ProjectKeyFile } from "../repo/projects.js";
-import { AuditChainInvalidError, RestoreError } from "../repo/restore.js";
+import { AuditChainInvalidError, DestructionRecordError, RestoreError, restoreSeams, type RestoreRequest } from "../repo/restore.js";
+import { parseProjectJson } from "../repo/state.js";
 import {
+  DESTRUCTION_BACKUPS_PENDING_WARNING,
   addKeyToRing,
   adoptRestoredProject,
   appendLibraryEvent,
   authorizeProcessing,
+  authorizeRestore,
   keyFromRing,
   onProjectOpened,
   onProjectUnlocked,
   lookupPolicyInfo,
+  refuseRestore,
   repoClock,
   repoLibrary,
   repoTz,
@@ -109,8 +113,11 @@ import {
   type Repo,
 } from "../repo/repo.js";
 import { isDue, projectTimeZone } from "../retention-date.js";
+// The readers a restore needs live with the destruction's record in retention.ts, which imports this
+// module: the two refer to each other, and neither uses the other while it is being loaded.
+import { destroyedOnRecord, inheritedOutstanding, type DestroyedOnRecord } from "../retention.js";
 
-export { AuditChainInvalidError, RestoreError };
+export { AuditChainInvalidError, DestructionRecordError, RestoreError };
 
 export const BACKUPS_MANIFEST = "backups-manifest.json";
 export const DEFAULT_KEEP = 10;
@@ -1516,10 +1523,26 @@ export interface RestoreResult {
   projectId: string;
   /** Library-relative folder of the new project. */
   folder: string;
-  /** What the restore left out or changed (plain text). */
+  /** What the restore left out or changed, and why (plain text). */
   notes: string[];
-  /** `retention-due`: the restored project's retention date has passed. */
+  /**
+   * `retention-due`: the restored project's retention date has passed.
+   * `destruction-backups-pending`: it inherits backups a destruction still lists for removal (R175).
+   */
   warnings: string[];
+  /**
+   * Files not brought back because a destruction recorded in this library destroyed them (R174 d):
+   * the source and asset (by their ids in the new project, where the asset is marked destroyed) and
+   * when it was destroyed.
+   */
+  leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string }>;
+}
+
+export interface RestoreOptions {
+  /** A sealed backup of a locked project: its passphrase (or recovery code). */
+  passphrase?: string;
+  /** Where things are on this machine, to classify the library's folder (default: probed). */
+  locationEnv?: LocationEnv;
 }
 
 async function freeBytes(dir: string): Promise<number> {
@@ -1528,29 +1551,122 @@ async function freeBytes(dir: string): Promise<number> {
   return Number(s.bavail) * Number(s.bsize);
 }
 
+/** A backup's project.json is read whole to decide on it; larger than this it is not a backup the app made. */
+const PROJECT_JSON_MAX = 256 * 1024 * 1024;
+
+/** A backup file opened for reading single entries: as it is, or through the project key when sealed. */
+async function openBackup(repo: Repo, abs: string): Promise<{ src: ZipSource; failure: () => unknown; close: () => Promise<void> }> {
+  if (!abs.endsWith(".enc")) return { src: abs, failure: () => undefined, close: async () => {} };
+  const z = await openSealedZip(abs, (id) => keyFromRing(repo, id));
+  return { src: { reader: z.reader, size: z.size }, failure: z.failure, close: z.close };
+}
+
+/**
+ * The project a backup file says it is of (its backup.json, else its project.json), when it can be
+ * read now: a sealed one only while its key is unlocked. Undefined otherwise.
+ */
+async function projectIdIn(repo: Repo, abs: string): Promise<string | undefined> {
+  let z: Awaited<ReturnType<typeof openBackup>> | undefined;
+  try {
+    if (abs.endsWith(".enc") && !keyFromRing(repo, await readKeyId(abs))) return undefined;
+    z = await openBackup(repo, abs);
+    const header = await readArchiveEntry(z.src, "backup.json");
+    const id = header ? (JSON.parse(header.toString("utf8")) as { projectId?: unknown }).projectId : undefined;
+    if (typeof id === "string") return id;
+    const pj = await readArchiveEntry(z.src, "project.json", PROJECT_JSON_MAX);
+    const own = pj ? (JSON.parse(pj.toString("utf8")) as { project?: { id?: unknown } }).project?.id : undefined;
+    return typeof own === "string" ? own : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await z?.close().catch(() => {});
+  }
+}
+
+/**
+ * What a restore is decided on (Task 50b), read from the archive itself before anything is
+ * unpacked: the project it holds and the rules it carries (`governance.yaml`; none: the decision
+ * is a refusal). The archive's names were checked already (extractArchive's first pass).
+ */
+async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: Pick<RestoreRequest, "destinations" | "backupSha256" | "file">): Promise<RestoreRequest> {
+  const undecryptable = () => new RestoreError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
+  const z = await openBackup(repo, abs).catch(() => {
+    throw undecryptable();
+  });
+  try {
+    const raw = await readArchiveEntry(z.src, "project.json", PROJECT_JSON_MAX);
+    if (!raw) throw new RestoreError("This file is not a project backup (it has no project.json)");
+    let project: Project;
+    try {
+      project = parseProjectJson(JSON.parse(raw.toString("utf8"))).project;
+    } catch {
+      throw new RestoreError("The backup's project.json cannot be read");
+    }
+    const rules = await readArchiveEntry(z.src, "governance.yaml");
+    return {
+      project: { id: project.id, name: project.name, encrypted: project.encryption.enabled, ...(project.timeZone ? { timeZone: project.timeZone } : {}) },
+      governanceYaml: rules ? rules.toString("utf8") : null,
+      sealed,
+      ...rest,
+    };
+  } catch (err) {
+    if (err instanceof RestoreError) throw err;
+    if (z.failure()) throw undecryptable();
+    throw new RestoreError("The backup could not be read; it was not restored");
+  } finally {
+    await z.close().catch(() => {});
+  }
+}
+
 /**
  * Restores a backup made by backupProject as a NEW project of this library (never over an existing
  * one). A sealed backup needs the project's key: the project unlocked in this app, or `passphrase`
  * (or the recovery code), checked against the key file the backup manifest kept.
+ *
+ * Governed (Task 50b, R138): before anything is written, the policy engine decides
+ * (`action: 'restore'`) on the rules the backup carries, which become the new project's: every kind
+ * of storage the library's folder may be on must be in their `residency.allowed`, and
+ * `encryption.atRest: required` gives an `encrypt` condition that a project which is not encrypted
+ * cannot honour (refused: nothing comes back unencrypted under such rules). Rules that are missing
+ * or cannot be read refuse it too. The decision is made again in the commit turn, under the write
+ * queue, against the rules as unpacked; the allow is recorded with its conditions in the copy's
+ * `project.restored` event. A refusal throws PolicyDeniedError and is audited as a `restore` deny:
+ * in the log of the project the backup belongs to when it is in this library, else in the library's
+ * own log (never a path: the backup's sha256, and its file name when it is one of this library's).
+ *
+ * What is not brought back (R174 d): files a destruction recorded in this library destroyed, read
+ * from the audit logs (retention.ts `destroyedOnRecord`) before anything is unpacked and again in
+ * the commit turn. While that record cannot be read with certainty the restore is refused
+ * (DestructionRecordError, audited the same way). The answer says what was left out, and why.
+ *
+ * A copy that inherits backups a destruction still lists for removal has its
+ * `destruction-backups-pending` warning from the moment it is live (R175): the note behind it is
+ * written in the commit turn, last before the rename, and taken back if the rename fails. (The note
+ * lives in `Backups/backups-state.json`, outside every project folder, so no project transaction
+ * can hold it; and no retry pass is run here, because a pass makes a backup and removes files.)
+ *
+ * One at a time with a backup, a prune and a destruction of the project the backup belongs to (the
+ * maintenance lock, R138 a): by the manifest for one of this library's backups, else by what the
+ * file itself says it is a backup of.
  */
-export async function restoreBackup(repo: Repo, path: string, opts: { passphrase?: string } = {}): Promise<RestoreResult> {
-  // One of this library's backups is restored holding its project's maintenance lock (R138 a), so a
-  // destruction or a prune cannot remove it meanwhile. A file from elsewhere belongs to no project here.
+export async function restoreBackup(repo: Repo, path: string, opts: RestoreOptions = {}): Promise<RestoreResult> {
   const abs = resolve(path);
-  const owner =
+  const listed =
     resolve(dirname(abs)) === resolve(backupsDir(repo)) ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs))?.projectId : undefined;
+  const owner = listed ?? (await projectIdIn(repo, abs));
   if (owner && projectExists(repo, owner)) return withProjectMaintenance(repo, owner, () => restoreLocked(repo, path, opts));
   return restoreLocked(repo, path, opts);
 }
 
-async function restoreLocked(repo: Repo, path: string, opts: { passphrase?: string }): Promise<RestoreResult> {
+async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Promise<RestoreResult> {
   const lib = repoLibrary(repo);
   if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
   const abs = resolve(path);
   const sealed = abs.endsWith(".enc");
   const backupSha256 = await sha256Of(abs);
   // The manifest entry, when the backup is one of this library's.
-  const entry = resolve(dirname(abs)) === resolve(backupsDir(repo)) ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs)) : undefined;
+  const inBackups = resolve(dirname(abs)) === resolve(backupsDir(repo));
+  const entry = inBackups ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs)) : undefined;
   if (entry && entry.sha256 !== backupSha256) throw new RestoreError("This backup was changed after it was made; it was not restored");
 
   let source: ZipSource = abs;
@@ -1584,12 +1700,29 @@ async function restoreLocked(repo: Repo, path: string, opts: { passphrase?: stri
   }
   const projectsDir = join(lib.root, "Projects");
   const staging = join(projectsDir, `.creating-${newId()}`);
+  const file = inBackups && isBackupFileName(basename(abs)) ? basename(abs) : undefined;
+  /** Where the project would live, as the decision was asked: classified as for a backup (R125). */
+  let destinations: RestoreRequest["destinations"] | undefined;
+  /** The record of destructions as read before anything was unpacked; the commit turn reads again only what changed since. */
+  let prior: DestroyedOnRecord | undefined;
   try {
     let entries;
     try {
       entries = await extractArchive(source, staging, BACKUP_LIMITS, undefined, {
         sparse: true,
         beforeWrite: async (declared) => {
+          // Nothing is written yet. The policy engine decides, on the backup's own rules and where
+          // the library is; and what was destroyed in this library must be readable with certainty.
+          // A refusal of either is audited and thrown from here: nothing is unpacked.
+          destinations = await backupDestinations(projectsDir, opts.locationEnv ?? (await defaultLocationEnv()));
+          const request = await restoreRequestOf(repo, abs, sealed, { destinations, backupSha256, ...(file ? { file } : {}) });
+          await authorizeRestore(repo, request);
+          try {
+            prior = await destroyedOnRecord(repo);
+          } catch (err) {
+            if (err instanceof DestructionRecordError) await refuseRestore(repo, request, err);
+            throw err;
+          }
           if ((await freeBytes(projectsDir)) < declared + FREE_MARGIN) {
             throw new RestoreError("There is not enough free space on this disk to restore this backup");
           }
@@ -1611,13 +1744,34 @@ async function restoreLocked(repo: Repo, path: string, opts: { passphrase?: stri
         throw new RestoreError("The backup's description (backup.json) cannot be read");
       }
     }
+    // Decided before the first file was written, or nothing was unpacked at all.
+    if (!destinations) throw new RestoreError("The backup could not be read; it was not restored");
     const date = formatModified(repoClock(repo)(), repoTz(repo)).slice(0, 10);
-    const { project, notes } = await adoptRestoredProject(repo, { staging, backupSha256, ...(expectedHead !== undefined ? { expectedHead } : {}), date });
-    const warnings: string[] = [];
+    await restoreSeams.beforeAdopt?.(staging);
+    const { project, notes, leftOut, warnings: inherited } = await adoptRestoredProject(repo, {
+      staging,
+      backupSha256,
+      ...(expectedHead !== undefined ? { expectedHead } : {}),
+      date,
+      sealed,
+      destinations,
+      ...(file ? { file } : {}),
+      // In the commit turn (it holds the write queue): what was destroyed, as the audit logs say now.
+      destroyed: () => destroyedOnRecord(repo, { inQueue: true, ...(prior ? { prior } : {}) }),
+      // In the commit turn, last before the copy goes live: the backups it inherits as still to be
+      // removed are noted, so its warning stands from that moment (R175); taken back if it does not go live.
+      beforeLive: async (copy) => {
+        const outstanding = inheritedOutstanding(copy.events, copy.folder);
+        if (!Object.keys(outstanding).length) return { warnings: [], undo: async () => {} };
+        await setDestructionNotes(repo, copy.projectId, outstanding);
+        return { warnings: [DESTRUCTION_BACKUPS_PENDING_WARNING], undo: () => setDestructionNotes(repo, copy.projectId, {}) };
+      },
+    });
+    const warnings: string[] = [...inherited];
     const { policy } = await lookupPolicyInfo(repo, project.id);
     const due = policy?.retention.rawDataDestroyAfter;
     if (due && isDue(due, repoClock(repo)(), projectTimeZone(repo, project.id))) warnings.push("retention-due");
-    return { projectId: project.id, folder: project.folder, notes, warnings };
+    return { projectId: project.id, folder: project.folder, notes, warnings, leftOut };
   } catch (err) {
     await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
     throw err;
