@@ -380,11 +380,34 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
 
   it("reads only, builds on the two runners R133 names, and never overlaps", () => {
     assert.deepEqual(block("permissions").slice(1), ["  contents: read"]);
-    assert.match(wf, /"runner":"macos-15","arch":"arm64"/);
-    assert.match(wf, /"runner":"macos-15-intel","arch":"x64"/);
+    // The runners come from scripts/mac-targets.mjs (tested in mac-targets.test.mjs) through the plan job.
+    assert.match(wf, /run: node apps\/desktop\/scripts\/mac-targets\.mjs >> "\$GITHUB_OUTPUT"/);
+    assert.match(wf, /include: \$\{\{ fromJSON\(needs\.plan\.outputs\.matrix\) \}\}/);
     assert.match(block("concurrency").join("\n"), /cancel-in-progress: false/);
     assert.doesNotMatch(wf, /secrets\./);
     assert.match(wf, new RegExp(`MACOSX_DEPLOYMENT_TARGET: "${PINS.minimumSystemVersion.replace(".", "\\.")}"`));
+  });
+
+  it("pins every action by full commit id, with its release named (R167 b)", () => {
+    const uses = wf.split("\n").filter((l) => /^\s*-?\s*uses:/.test(l));
+    assert.ok(uses.length >= 10);
+    for (const l of uses) assert.match(l, /uses: [\w.-]+\/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$/, l);
+  });
+
+  it("uploads the download straight after the build, before any check can fail", () => {
+    const at = (s) => wf.indexOf(s);
+    assert.ok(at("name: Upload the disk image") > at("id: build"));
+    assert.ok(at("name: Upload the disk image") < at("name: Tools the checks hand to the worker"));
+    assert.doesNotMatch(wf.slice(at("name: Upload the disk image"), at("name: Tools the checks")), /\n\s+if:/);
+  });
+
+  it("saves the caches even when a later step failed", () => {
+    for (const name of ["Save the Rust build cache", "Save the build caches"]) {
+      const block = wf.slice(wf.indexOf(`name: ${name}`), wf.indexOf("uses:", wf.indexOf(`name: ${name}`)));
+      assert.match(block, /if: always\(\)/, name);
+    }
+    assert.doesNotMatch(wf, /uses: actions\/cache@/, "restore and save are separate steps");
+    assert.match(wf, /!apps\/desktop\/src-tauri\/target\/\*\/bundle/);
   });
 
   it("gives every step a time limit", () => {
