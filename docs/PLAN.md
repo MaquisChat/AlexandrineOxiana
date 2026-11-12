@@ -495,7 +495,7 @@ Update after every task; commit and push.
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | approved; last check of two commits, then verification | cc7ea13 (worktree branch) | reviewed with probes over two fix rounds; the working branch taken; `recordEdit` fixed; an ended capture's download is cancelled |
+| 63 Capture state readable; one classifier | approved; verification before merge | cc7ea13 (worktree branch) | reviewed with probes over two fix rounds and a final check; `recordEdit` fixed; an ended capture's download is cancelled |
 | 62 Transcription as a job | in progress | | dispatched 2026-11-12 after Task 51 merged; also carries N-5 of Task 51 (a close stops a rerun) |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
@@ -521,7 +521,7 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | approved; taking the working branch, then verification | 4e4f35a (worktree branch) | reviewed with probes over one fix round |
+| 66 A paired browser survives a relaunch (D13) | approved; takes the working branch once more after Task 63, then verification | 69121dc (worktree branch) | reviewed with probes over one fix round |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
 | 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
