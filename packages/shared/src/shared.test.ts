@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES, reviewGroup } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -91,5 +91,13 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
     for (const n of ["serif", "Sans-Serif", "MONOSPACE", "system-ui", "ui-rounded", "Emoji", "math", "fangsong"]) expect(reservedFontName(n), n).toBe("generic-family");
     for (const n of ["Sorts Mill Goudy", "sorts mill goudy", "ATKINSON HYPERLEGIBLE", "opendyslexic", " OpenDyslexic "]) expect(reservedFontName(n), n).toBe("bundled-face");
     for (const n of ["Junicode", "Brill", "Serif Pro", "Goudy", "revert2"]) expect(reservedFontName(n), n).toBeNull();
+  });
+
+  it("review queue groups (Task 67, R176): import with a batch, import without one, verification by its cause", () => {
+    expect(reviewGroup({ kind: "import", batchId: "b1" })).toBe("import");
+    expect(reviewGroup({ kind: "import" })).toBe("attach");
+    // Verification entries by their cause (R176 3: recorded, or read by the library's reviewCauseOf), never by their fields.
+    expect(reviewGroup({ kind: "verification", cause: { kind: "capture-conflict" } })).toBe("capture");
+    expect(reviewGroup({ kind: "verification", cause: { kind: "consent-withdrawal", consentIds: ["c1"] } })).toBe("withdrawal");
   });
 });

@@ -221,6 +221,8 @@ describe("Fieldwork", () => {
     await user.type(within(dialog).getByRole("textbox", { name: /Reason/ }), "Asked by phone");
     await user.click(within(dialog).getByRole("button", { name: "Withdraw consent" }));
     expect((await screen.findByRole("status", { name: "Fieldwork result" })).textContent).toMatch(/2 sources were flagged for review; nothing was deleted/);
+    // What was put in the review queue is found there: the project's whole queue (Task 67).
+    expect(screen.getByRole("link", { name: "Open the review queue" }).getAttribute("href")).toBe(`/import/review?project=${PID}`);
     expect(db.calls.at(-1)).toMatchObject({ method: "POST", body: { reason: "Asked by phone" } });
     await waitFor(() => expect(within(c).getByText((_, el) => el?.tagName === "STRONG" && /Withdrawn on 2026-11-11/.test(el.textContent ?? ""))).toBeTruthy());
     expect(within(c).queryByRole("button", { name: "Withdraw consent of P-001" })).toBeNull();

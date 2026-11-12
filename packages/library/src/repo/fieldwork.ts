@@ -433,6 +433,7 @@ export async function withdrawConsent(
         await appendReviewEntry(core, tx, {
           sourceId,
           kind: "verification",
+          cause: { kind: "consent-withdrawal", consentIds: [c.id] },
           fields: {},
           reasons: [
             `Consent from participant ${p?.code ?? "(unknown)"} (scope: ${c.scope}) was withdrawn on ${tx.at.slice(0, 10)}${why}. ` +

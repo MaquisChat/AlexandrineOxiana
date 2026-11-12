@@ -3,13 +3,14 @@
  * write and delete sources, copy files in as further originals, and update review entries, all in
  * one transaction (R26: txn marker, change log, audit). Nothing here is part of the public Repo API.
  */
+import { isDeepStrictEqual } from "node:util";
 import { Asset, SourceFile, encName, newId, originalFileName, withCollisionSuffix } from "@ao/core";
 import { refuseUnknownTags } from "./collections.js";
 import { NotFoundError } from "./errors.js";
 import { decryptBytes, foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { appendReviewEntry, appendReviewUpdate, readReviewEntries, type ReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, appendReviewUpdate, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
@@ -22,7 +23,7 @@ export interface ImportOps {
   /** Writes the source file (recorded in the change log and indexed after commit). */
   writeSource(before: SourceFile | null, sf: SourceFile): Promise<void>;
   /** Deletes a source (a deletion record is kept for incrementally imported ones, R73; `undo`: none); returns the keys newly recorded. */
-  deleteSource(id: string, opts?: { undo?: boolean }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
+  deleteSource(id: string, opts?: { undo?: boolean; keepReview?: string; reviewEntries?: boolean }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
   /** Clears the deletion records of these Zotero item keys (R73); returns those that were recorded. */
   clearDeletions(zoteroKeys: string[]): Promise<string[]>;
   /** Records these Zotero item keys as deleted here (undo puts back what it cleared, R74 I3); returns those newly recorded. */
@@ -52,6 +53,8 @@ export function runImportChange<T>(
   opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
 ): Promise<T> {
   core.assertWritable();
+  /** Capture entries resolved by this change, because a write gave an existing source a new report (R176 1). */
+  const resolved: string[] = [];
   return runMutation(
     core,
     projectId,
@@ -78,6 +81,9 @@ export function runImportChange<T>(
           const nowAnn = new Set(parsed.annotations.map((a) => a.id));
           for (const a of before?.annotations ?? []) if (!nowAnn.has(a.id)) tx.record("annotation", a.id, a, null);
           if (!st.sources.has(parsed.source.id)) tx.onCommit(() => st.sources.set(parsed.source.id, parsed.source.folder));
+          // An existing source given a new report (a review decision's fields, a merge, an incremental
+          // update): its capture entries are re-examined in this change. A new source has none yet.
+          if (before && !isDeepStrictEqual(before.verification, parsed.verification)) resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
           tx.index((sink) => sink.indexSource(parsed));
         },
         deleteSource: (id, o) => deleteSourceInTx(core, tx, id, o),
@@ -151,7 +157,12 @@ export function runImportChange<T>(
       if (opts.entity) tx.entity(opts.entity.type, opts.entity.id);
       return fn(ops);
     },
-    { op: opts.op, ...(opts.entity ? { entity: opts.entity } : {}), ...(opts.refuse ? { refuse: opts.refuse } : {}) },
+    {
+      op: opts.op,
+      ...(opts.entity ? { entity: opts.entity } : {}),
+      ...(opts.refuse ? { refuse: opts.refuse } : {}),
+      auditDetails: () => (resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}),
+    },
   );
 }
 

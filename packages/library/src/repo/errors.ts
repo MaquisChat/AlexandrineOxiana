@@ -156,6 +156,14 @@ export class DestroyedParentError extends Error {
   }
 }
 
+/** A review entry was already decided (two decisions at once: the first one stands, R176). */
+export class ReviewEntryDecidedError extends Error {
+  override name = "ReviewEntryDecidedError";
+  constructor() {
+    super("This entry has already been reviewed.");
+  }
+}
+
 /** A request's value is not acceptable (a plain message for the person; services answer 400 VALIDATION). */
 export class InvalidInputError extends Error {
   override name = "InvalidInputError";
