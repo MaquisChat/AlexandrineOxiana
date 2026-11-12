@@ -462,7 +462,7 @@ Update after every task; commit and push.
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
 | 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
-| 58 Ledger loose ends | fix round 3 | 8db0c1c (worktree branch) | matching fixed; last item: a multi-word search over many annotated sources must not block the service for seconds |
+| 58 Ledger loose ends | re-review of fix round 3 | 466c35e (worktree branch) | search speed reported fixed (two words under 100 ms at 5,000 annotated sources) |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
@@ -471,7 +471,7 @@ Update after every task; commit and push.
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
-| 37h Desktop end-to-end | in review | 205ec11 (worktree branch) | drives the real app window and the real file dialog; 5 of 5 runs passed |
+| 37h Desktop end-to-end | fix round 1 | 205ec11 (worktree branch) | spec met; 2 Important: a hung run cleaned nothing up; the run wrote to the real home folder |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
