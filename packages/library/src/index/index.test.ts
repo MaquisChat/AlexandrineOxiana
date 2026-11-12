@@ -19,7 +19,9 @@ import {
   indexSource,
   isIndexStale,
   openIndex,
+  openIndexChecked,
   rebuildIndex,
+  rebuildIndexIfNeeded,
   search,
 } from "./index.js";
 import { changeLogReads, newestProjectChangeId } from "./changes.js";
@@ -818,6 +820,116 @@ describe("change-log stamp, read incrementally (R62)", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("D8: a missing or stale index is rebuilt when the library is opened", () => {
+  async function seedTwo() {
+    const pid = await openProject();
+    await repo.createSource(pid, draft("Harbour ledger of 1932"), files(), { provenance: prov() });
+    await repo.createSource(pid, draft("Salt marsh survey"), files(), { provenance: prov() });
+    return pid;
+  }
+
+  it("openIndexChecked: says the index was missing, and creates an empty one to rebuild into", async () => {
+    await seedTwo();
+    handle.close();
+    for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
+    const c = await openIndexChecked(lib.root);
+    try {
+      expect(c.needsRebuild).toBe("missing");
+      expect(search(c.handle.db, {}).total).toBe(0);
+    } finally {
+      c.handle.close();
+    }
+  });
+
+  it("openIndexChecked: an existing index needs no rebuild by itself (staleness is checked later)", async () => {
+    await seedTwo();
+    handle.close();
+    const c = await openIndexChecked(lib.root);
+    expect(c.needsRebuild).toBeUndefined();
+    expect(search(c.handle.db, {}).total).toBe(2);
+    c.handle.close();
+  });
+
+  it("openIndexChecked: an unreadable index is set aside (it is only a cache) and a new one started", async () => {
+    await seedTwo();
+    handle.close();
+    for (const s of ["-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
+    await writeFile(join(lib.root, INDEX_FILE), "this is not a database at all, it is long enough to be read as a header ".repeat(20));
+    const c = await openIndexChecked(lib.root);
+    try {
+      expect(c.needsRebuild).toBe("unreadable");
+      expect((await readdir(lib.root)).some((f) => f.startsWith(`${INDEX_FILE}.corrupt-`))).toBe(true);
+      expect(c.warnings.join(" ")).not.toContain(lib.root);
+    } finally {
+      c.handle.close();
+    }
+  });
+
+  it("rebuildIndexIfNeeded: a current index is left alone; a stale one is rebuilt, with progress", async () => {
+    await seedTwo();
+    expect(await rebuildIndexIfNeeded(handle, ring, lib)).toBeUndefined();
+    // a change made by something that does not feed the index: stale
+    const plain = await mkRepo(false);
+    const pid = plain.listProjects()[0]!.id;
+    await plain.createSource(pid, draft("Tide notes"), files(), { provenance: prov() });
+    expect(search(handle.db, { text: "tide" }).total).toBe(0);
+    const progress: Array<[number, number]> = [];
+    let started = 0;
+    const r = await rebuildIndexIfNeeded(handle, ring, lib, { onStart: () => started++, onProgress: (d, t) => progress.push([d, t]) });
+    expect(r).toMatchObject({ indexed: 3, errors: [] });
+    expect(started).toBe(1);
+    expect(progress.at(-1)).toEqual([3, 3]);
+    expect(search(handle.db, { text: "tide" }).total).toBe(1);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+  });
+
+  it("rebuildIndexIfNeeded: force rebuilds even a current index", async () => {
+    await seedTwo();
+    const r = await rebuildIndexIfNeeded(handle, ring, lib, { force: true });
+    expect(r).toMatchObject({ indexed: 2 });
+  });
+
+  it("rebuildIndexIfNeeded: a change made during the rebuild is caught by a second pass", async () => {
+    const pid = await seedTwo();
+    const plain = await mkRepo(false);
+    let passes = 0;
+    const r = await rebuildIndexIfNeeded(handle, ring, lib, {
+      force: true,
+      rebuild: {
+        beforeRename: async () => {
+          // written after the first pass walked the files (no sink: only a rebuild can see it)
+          if (passes++ === 0) await plain.createSource(pid, draft("Written during the rebuild"), files(), { provenance: prov() });
+        },
+      },
+    });
+    expect(passes).toBe(2);
+    expect(r).toMatchObject({ indexed: 3 });
+    expect(search(handle.db, { text: "during" }).total).toBe(1);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+  });
+
+  it("rebuildIndexIfNeeded: an aborted rebuild leaves the old index in place and open", async () => {
+    await seedTwo();
+    const ac = new AbortController();
+    await expect(
+      rebuildIndexIfNeeded(handle, ring, lib, {
+        force: true,
+        signal: ac.signal,
+        onProgress: (d) => {
+          if (d === 1) ac.abort();
+        },
+      }),
+    ).rejects.toThrow();
+    expect(handle.isOpen).toBe(true);
+    expect(search(handle.db, {}).total).toBe(2);
+    expect((await readdir(lib.root)).filter((f) => f.includes("rebuild"))).toEqual([]);
+  });
+
+  it("rebuildIndexIfNeeded: refuses a read-only library", async () => {
+    await expect(rebuildIndexIfNeeded(handle, ring, { mode: "read-only", readOnlyReason: "locked-by-other-device" }, { force: true })).rejects.toBeInstanceOf(ReadOnlyLibraryError);
   });
 });
 

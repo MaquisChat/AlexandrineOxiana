@@ -117,6 +117,18 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
                   <td>{fmt(report.counts[k])}</td>
                 </tr>
               ))}
+              {report.files && (
+                <>
+                  <tr>
+                    <th scope="row">Files copied into the library</th>
+                    <td>{fmt(report.files.copied)}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Files left as links</th>
+                    <td>{fmt(report.files.linked)}</td>
+                  </tr>
+                </>
+              )}
             </tbody>
           </table>
 

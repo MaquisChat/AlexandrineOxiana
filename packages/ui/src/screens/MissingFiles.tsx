@@ -2,10 +2,12 @@
  * Missing-files report (spec 4.5): files the library expects but cannot find, from the integrity
  * check. "Search a folder…" looks there for each one by hash and name and relinks what it finds.
  * On Windows, looking into a cloud-synced folder (OneDrive, Dropbox, …) can make files that are
- * kept online only download, so the search warns before it starts (Task 14 deferred minor).
+ * kept online only download, so the search warns before it starts (Task 14 deferred minor). The
+ * library's other maintenance action, "Rebuild library from folder" (spec 4.3, D8), is here too.
  */
 import { useCallback, useEffect, useId, useState } from "react";
 import type { GovernanceApi, IntegrityAnswer, RelinkResult } from "../api/governance";
+import { RebuildIndex } from "../components/RebuildIndex";
 import "./GovernanceScreens.css";
 
 const SKIP_REASON: Record<string, string> = {
@@ -162,6 +164,7 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
           ))}
         </section>
       ) : null}
+      <RebuildIndex api={api} />
     </main>
   );
 }

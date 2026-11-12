@@ -87,8 +87,10 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const limit = intParam(q.limit, "limit", 1, 500, 50);
     const offset = intParam(q.offset, "offset", 0, 10_000_000, 0);
     if (q.type !== undefined && !SourceType.safeParse(q.type).success) throw badRequest(`"${q.type}" is not a source type.`);
+    // While the index is rebuilt (or cannot be written), the list says so (D8).
+    const index = s.indexStatus ? { index: s.indexStatus } : {};
     if (s.index) {
-      return search(s.index.db, {
+      const found = search(s.index.db, {
         projectId,
         ...(q.text ? { text: q.text.slice(0, 500) } : {}),
         ...(q.type ? { types: [q.type as SourceType] } : {}),
@@ -97,6 +99,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
         limit,
         offset,
       });
+      return { ...found, ...index };
     }
     // A read-only library has no index we may write: list from the files (titles only when unlocked).
     const items = [];
@@ -112,7 +115,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false });
     }
     // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
-    return { total: items.length, items: items.slice(offset, offset + limit), limited: true };
+    return { total: items.length, items: items.slice(offset, offset + limit), limited: true, ...index };
   });
 
   const record = (sf: SourceFile) => sourceRecord(sf, state.roots);
@@ -149,6 +152,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   });
 
   // Researcher-set value of one field, recorded as their own evidence (→ user-confirmed when it agrees).
+  // `field` is a top-level field or one identifier under the verification report's key ("/identifiers/doi", R149);
+  // anything else is refused by the library (InvalidInputError → 400 VALIDATION).
   app.patch("/projects/:id/sources/:sid/fields", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);

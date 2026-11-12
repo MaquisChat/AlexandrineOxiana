@@ -96,12 +96,13 @@ test("a restart relaunches the service on the same settings: a new token, the pa
   expect(app.token).not.toBe(before.token);
   const oldToken = await fetch(`${app.baseUrl}/libraries`, { headers: { authorization: `Bearer ${before.token}` } });
   expect(oldToken.status, "the new service refuses the old token").toBe(401);
-  // The settings survived: the library is known, and (as on a relaunch) none is open.
-  const listed = await app.api<{ libraries: Array<{ name: string }>; current?: unknown }>("GET", "/libraries");
+  // The settings survived: the library is known and, as on a relaunch of the app, the library that
+  // was open is open again (D5: remembered in the settings folder, which the restart keeps).
+  const listed = await app.api<{ libraries: Array<{ name: string }>; current?: { name: string } }>("GET", "/libraries");
   expect(listed.body.libraries.map((l) => l.name)).toEqual(["Restart library"]);
-  expect(listed.body.current).toBeUndefined();
+  expect(listed.body.current?.name).toBe("Restart library");
   await page.goto(`${APP_ORIGIN}/`);
-  await expect(page.getByRole("button", { name: "Open Restart library" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Restart library" })).toBeVisible();
   expect(await page.evaluate(() => "__AO_SERVICE__" in window)).toBe(false);
   // The page cannot reach the old address any more (when the new service did not get the same port).
   if (app.port !== before.port) {

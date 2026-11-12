@@ -587,28 +587,34 @@ export async function updateSource(
   core: RepoCore,
   projectId: string,
   id: string,
-  patch: SourcePatch,
+  /**
+   * The change, or (package-internal) a function that builds it from the source as read inside the
+   * governed change, so a merge with the current value never works on a stale read (lost update).
+   */
+  patchOrBuild: SourcePatch | ((cur: Source) => SourcePatch),
   /** Package-internal: also replace the source file's field evidence and verification (a recheck after a machine change). */
   extra: { fieldEvidence?: (cur: SourceFile) => FieldEvidence[]; verification?: (next: SourceFile) => Record<string, FieldVerification> } = {},
 ): Promise<SourceFile> {
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
-  const check = (cur: SourceFile) => {
+  const build = (cur: SourceFile): SourcePatch => (typeof patchOrBuild === "function" ? patchOrBuild(cur.source) : patchOrBuild);
+  const check = (cur: SourceFile, patch: SourcePatch) => {
     if ("provenance" in patch && !deepEqual(patch.provenance, cur.source.provenance)) throw new ImmutableProvenanceError();
     for (const f of FIXED_FIELDS) {
       if (f in patch && patch[f] !== cur.source[f]) throw new TypeError(`${f} cannot be changed`);
     }
   };
   const current = await readSourceFile(core, st, id);
-  check(current);
+  check(current, build(current));
   return runMutation(
     core,
     projectId,
     storeRequest(current.source.provenance),
     async (tx) => {
       const cur = await readSourceFile(core, st, id);
-      check(cur);
+      const patch = build(cur);
+      check(cur, patch);
       // Collections and tags set by the patch must exist (checked in this change, R99).
       if (patch.collectionIds || patch.tagIds) {
         const data = await readFullData(core, tx.state);

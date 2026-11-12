@@ -37,7 +37,15 @@ import {
   type CaptureOptions,
   CaptureQueueRegistry,
   createLinkCapture,
+  forgetLastOpenLibrary,
+  lastOpenLibrary,
+  listLibraries,
+  indexIsPartial,
+  openIndexChecked,
   openLibrary,
+  rebuildIndexIfNeeded,
+  rememberLastOpenLibrary,
+  type RebuildResult,
 } from "@ao/library";
 import type { CaptureStartedBy } from "@ao/shared";
 import { ApiError } from "./errors.js";
@@ -98,7 +106,29 @@ export interface Session {
   moveTokens: Map<string, string>;
   workerClient: WorkerClient | undefined;
   unsubscribe: Array<() => void>;
+  /** The index is being rebuilt, could not be rebuilt, or cannot be written (read-only); absent when it is ready (D8). */
+  indexStatus?: IndexStatus;
+  /** The rebuild running now (stopped when the library closes or moves). */
+  indexRebuild?: { ac: AbortController; done: Promise<unknown> };
+  /** While on, index writes record no change stamps: from the open until the staleness check has run (M6). */
+  stampHold: { on: boolean };
 }
+
+/**
+ * The state of the open library's index, as `index` in GET /libraries, the open's answer,
+ * `library.state` and the source list (D8): absent when it is ready.
+ */
+export type IndexStatus =
+  /**
+   * `partial`: the index was missing or unreadable and no rebuild has completed since, so it holds
+   * only what was written meanwhile: the list is not the library's content (C1); the interface shows
+   * "being rebuilt" (or the failure) in its place, never a short list.
+   */
+  | { state: "rebuilding"; done: number; total: number; partial?: true }
+  /** `message`: plain language, paths scrubbed. */
+  | { state: "failed"; message: string; partial?: true }
+  /** A read-only library: nothing may write its index, so sources are listed from the files. */
+  | { state: "unavailable"; reason: string };
 
 export interface StateOptions {
   deps: Deps;
@@ -113,7 +143,14 @@ export interface StateOptions {
   suspendTimeoutMs?: number;
   /** Opens a library (test seam; default the library's openLibrary). */
   openLibrary?: typeof openLibrary;
+  /** Rebuilds the index when needed (test seam; default the library's rebuildIndexIfNeeded). */
+  rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
+  /** Test seam (a fake clock): starts the timer of GET /libraries' wait at start; returns its cancel. */
+  startupTimer?: (fire: () => void, ms: number) => () => void;
 }
+
+/** How long GET /libraries waits, once, for the reopen at start (D5, I1). */
+export const STARTUP_WAIT_MS = 30_000;
 
 /** A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99). */
 export interface PendingMove {
@@ -460,8 +497,18 @@ export class ServiceState {
     return s as Session & { index: IndexHandle; bulk: BulkImport };
   }
 
-  /** Makes `lib` the open library (closing any other first). */
-  async adopt(lib: Library): Promise<Session> {
+  /**
+   * Makes `lib` the open library (closing any other first) and remembers it for the next start
+   * (D5). A read-write library's index is checked: missing or unreadable, it is rebuilt from the
+   * files in the background, as is a stale one (D8); `newLibrary` skips that (nothing to index).
+   */
+  async adopt(lib: Library, opts: { newLibrary?: boolean; stillWanted?: () => boolean } = {}): Promise<Session> {
+    const unwanted = async (): Promise<never> => {
+      // The reopen at start was superseded (I1): released at once, never replacing the open library.
+      await lib.close().catch(() => {});
+      throw new Error("superseded");
+    };
+    if (opts.stillWanted && !opts.stillWanted()) return unwanted();
     if (this.shuttingDown) {
       // Opened while the service was stopping: released at once, never adopted (R101 M7).
       await lib.close().catch(() => {});
@@ -472,9 +519,23 @@ export class ServiceState {
     const ring = new KeyRing();
     let index: IndexHandle | undefined;
     let repo: Repo;
+    let needsRebuild = false;
+    let partial = false;
+    // Held until the staleness check has run (a new library has nothing to check).
+    const stampHold = { on: !opts.newLibrary };
     try {
-      index = lib.mode === "read-write" ? new IndexHandle(lib.root) : undefined;
-      repo = await openRepo(lib, ring, { actor: actor(), tz: this.tz, ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }) } : {}) });
+      if (lib.mode === "read-write") {
+        const checked = await openIndexChecked(lib.root, this.opts.now, opts.newLibrary ? { newLibrary: true } : {});
+        index = checked.handle;
+        needsRebuild = checked.needsRebuild !== undefined;
+        partial = checked.partial;
+        for (const w of checked.warnings) this.opts.log.warn({ warning: w }, "index");
+      }
+      repo = await openRepo(lib, ring, {
+        actor: actor(),
+        tz: this.tz,
+        ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }, { holdStamps: () => stampHold.on }) } : {}),
+      });
     } catch (err) {
       index?.close();
       await lib.close().catch(() => {});
@@ -492,10 +553,201 @@ export class ServiceState {
       moveTokens: new Map(),
       workerClient: undefined,
       unsubscribe: [],
+      stampHold,
     };
+    if (!index) s.indexStatus = { state: "unavailable", reason: lib.readOnlyReason ?? "read-only" };
+    // Never shown as an empty library while the index is rebuilt (D8).
+    else if (needsRebuild) s.indexStatus = { state: "rebuilding", done: 0, total: 0, ...(partial ? { partial: true as const } : {}) };
+    if (opts.stillWanted && !opts.stillWanted()) {
+      index?.close();
+      return unwanted();
+    }
     this.session = s;
+    this.notFound = undefined;
     this.activate(s);
+    if (index && !opts.newLibrary) this.startIndexRebuild(s, needsRebuild);
+    await rememberLastOpenLibrary(lib.id, this.deps).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "remembering the open library"));
     return s;
+  }
+
+  // ---- the index (D8) --------------------------------------------------------------------
+
+  /**
+   * Rebuilds the open library's index when `force` is set or it no longer matches the files: the
+   * state says `rebuilding` while it runs (progress as `job.progress` kind "index"), then ready, or
+   * `failed` with a plain reason (also sent as `job.progress` with ok:false). Resolves with the
+   * result (undefined when the index was current); rejects when it failed. One at a time: while one
+   * runs, a second is refused (409).
+   */
+  async rebuildIndex(s: Session, force: boolean): Promise<RebuildResult | undefined> {
+    const index = s.index;
+    if (!index || s.lib.mode !== "read-write") throw new ApiError(409, "READ_ONLY", "This library is open read-only, so its index cannot be rebuilt.", s.lib.readOnlyReason ?? "read-only");
+    if (s.indexRebuild) throw new ApiError(409, "CONFLICT", "The library's index is already being rebuilt.");
+    const ac = new AbortController();
+    const rebuild = this.opts.rebuildIndexIfNeeded ?? rebuildIndexIfNeeded;
+    const live = () => this.session === s && !ac.signal.aborted;
+    // Whether the live index holds only part of the library (its mark says so until a rebuild completes).
+    const partialOf = (): { partial?: true } => (index.isOpen && indexIsPartial(index.db) ? { partial: true } : {});
+    const run = (async () => {
+      try {
+        const r = await rebuild(index, s.ring, s.lib, {
+          force,
+          signal: ac.signal,
+          // Decided (and marked when stale): writes may record their stamps again (M6).
+          onChecked: () => {
+            s.stampHold.on = false;
+          },
+          onStart: () => {
+            if (!live()) return;
+            s.indexStatus = { state: "rebuilding", done: 0, total: 0, ...partialOf() };
+            this.publishState();
+          },
+          onProgress: (done, total) => {
+            if (!live()) return;
+            s.indexStatus = { state: "rebuilding", done, total, ...partialOf() };
+            this.events.publish("job.progress", { kind: "index", done, total });
+          },
+        });
+        if (live()) {
+          const wasShown = s.indexStatus !== undefined;
+          s.indexStatus = undefined;
+          if (r?.errors.length) this.opts.log.warn({ errors: r.errors.length }, "index rebuild: some folders could not be read");
+          if (wasShown || r) this.publishState();
+        }
+        return r;
+      } catch (err) {
+        if (live()) {
+          const message = `The library's search index could not be rebuilt (${scrubPaths(err instanceof Error ? err.message : String(err), this.roots)}). Your sources are safe in the library folder; try "Rebuild library from folder" again.`;
+          s.indexStatus = { state: "failed", message, ...partialOf() };
+          this.events.publish("job.progress", { kind: "index", ok: false, error: message });
+          this.publishState();
+        }
+        throw err;
+      } finally {
+        if (s.indexRebuild?.ac === ac) s.indexRebuild = undefined;
+      }
+    })();
+    s.indexRebuild = { ac, done: run.catch(() => {}) };
+    return run;
+  }
+
+  /** `rebuildIndex` in the background (work registry); a failure is in the state, never thrown. */
+  startIndexRebuild(s: Session, force: boolean): void {
+    if (s.indexRebuild) {
+      // One already runs: a forced one follows it.
+      if (force) void this.startWork("index", async () => {
+        await s.indexRebuild?.done;
+        if (this.session === s && !s.indexRebuild) await this.rebuildIndex(s, true).catch(() => {});
+      });
+      return;
+    }
+    void this.startWork("index", async () => {
+      await this.rebuildIndex(s, force).catch(() => {});
+    });
+  }
+
+  /** Stops a running rebuild between sources (the old index stays) and waits for it to end. */
+  async stopIndexRebuild(s: Session): Promise<void> {
+    const r = s.indexRebuild;
+    if (!r) return;
+    r.ac.abort();
+    await r.done;
+  }
+
+  // ---- the library open when the service last ran (D5, I1) -------------------------------
+
+  /** The remembered library could not be opened at start: named for the "Library not found" screen. */
+  notFound: { libraryId: string; name: string } | undefined;
+  /** The remembered library is still being opened (the attempt at start has not ended): named for the interface. */
+  reopening: { libraryId: string; name: string } | undefined;
+  /** Settles when the reopen at start has ended. */
+  startup: Promise<void> = Promise.resolve();
+  /** The one attempt at start; `superseded` once the researcher opens, creates or closes a library. */
+  private reopenAttempt: { superseded: boolean } | undefined;
+  /** GET /libraries' one wait for the attempt (shared by every request that comes during it). */
+  private startupWait: Promise<void> | undefined;
+
+  /**
+   * At start: reopens the library open when the service last ran, at its last known place, as one
+   * tracked attempt (I1). While it runs, `reopening` names it. A folder that is gone, unreadable or
+   * holds another library leaves it closed and named in `notFound`. Once the attempt is superseded
+   * (the researcher opened, created or closed a library: `supersedeReopen`) or the service is
+   * stopping, its late result is dropped: what it opened is closed again and its lock released, and
+   * it never replaces the library open now. Never throws.
+   */
+  reopenLast(): Promise<void> {
+    const attempt = { superseded: false };
+    this.reopenAttempt = attempt;
+    this.startupWait = undefined; // a new attempt: GET /libraries may wait for it once
+    const dropped = () => attempt.superseded || this.shuttingDown;
+    this.startup = (async () => {
+      try {
+        const id = await lastOpenLibrary(this.deps);
+        if (!id || this.session || dropped()) return;
+        const entry = (await listLibraries(this.deps).catch(() => [])).find((e) => e.libraryId === id);
+        if (!entry || dropped()) return; // not known any more: the chooser
+        this.reopening = { libraryId: entry.libraryId, name: entry.name };
+        const at = entry.lastKnownPaths[0];
+        try {
+          if (!at) throw new Error("no known location");
+          const lib = await this.openLibrary(at);
+          if (dropped()) {
+            await lib.close().catch(() => {});
+            return;
+          }
+          if (lib.id !== id) {
+            await lib.close().catch(() => {});
+            throw new Error("another library is at the remembered place");
+          }
+          this.roots.add(lib.root);
+          await this.adopt(lib, { stillWanted: () => !dropped() });
+        } catch (err) {
+          if (dropped()) return; // superseded meanwhile: nothing to report
+          this.notFound = { libraryId: entry.libraryId, name: entry.name };
+          this.opts.log.warn({ err: this.describe(err) }, "the last open library could not be reopened");
+        }
+      } finally {
+        if (this.reopenAttempt === attempt) {
+          this.reopenAttempt = undefined;
+          this.reopening = undefined;
+        }
+      }
+    })().catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "reopening the last library"));
+    return this.startup;
+  }
+
+  /** The researcher chose (opened, created or closed a library): the reopen at start no longer applies (I1). */
+  supersedeReopen(): void {
+    if (!this.reopenAttempt) return;
+    this.reopenAttempt.superseded = true;
+    this.reopenAttempt = undefined;
+    this.reopening = undefined;
+  }
+
+  /**
+   * For GET /libraries: waits for the reopen at start, once and for at most STARTUP_WAIT_MS (a network
+   * drive that does not answer). Requests during that wait share it; afterwards it resolves at once,
+   * and the answer names the library still being opened (`reopening`).
+   */
+  waitForStartup(): Promise<void> {
+    if (!this.startupWait) {
+      const setTimer =
+        this.opts.startupTimer ??
+        ((fire: () => void, ms: number) => {
+          const t = setTimeout(fire, ms);
+          return () => clearTimeout(t);
+        });
+      let cancel = () => {};
+      const deadline = new Promise<void>((r) => (cancel = setTimer(r, STARTUP_WAIT_MS)));
+      this.startupWait = Promise.race([this.startup, deadline]).finally(() => cancel());
+    }
+    return this.startupWait;
+  }
+
+  /** The researcher closed the library: the next start shows the chooser (D5). */
+  async forgetOpenLibrary(): Promise<void> {
+    this.notFound = undefined;
+    await forgetLastOpenLibrary(this.deps).catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "forgetting the open library"));
   }
 
   /**
@@ -624,6 +876,8 @@ export class ServiceState {
   async quiesce(s: Session): Promise<Array<{ projectId: string; batchId: string }>> {
     // A ticket never outlives the library where it was issued (R135 2): ended as the move starts.
     this.media.revokeAll();
+    // An index rebuild stops between sources (the library at its new place checks its index again).
+    await this.stopIndexRebuild(s);
     const ms = this.opts.suspendTimeoutMs ?? SUSPEND_TIMEOUT_MS;
     // Background work first: captures and rechecks stop between items, the rest finishes (R106 C1).
     if (!(await this.drainWork(ms))) {
@@ -697,7 +951,12 @@ export class ServiceState {
   }
 
   /** Closes the open library: running batches cancelled, watches stopped, queues disposed of, lock released. */
+  /**
+   * Closes the open library. Every request that opens, creates, reconnects or closes a library calls
+   * this first, so it is also where the reopen at start is superseded (I1).
+   */
   async closeLibrary(): Promise<void> {
+    this.supersedeReopen();
     // Media tickets end with the library (R135 2), and so do their streams.
     this.media.revokeAll();
     const s = this.session;
@@ -706,6 +965,7 @@ export class ServiceState {
     // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
     this.stopBackupScheduler();
+    await this.stopIndexRebuild(s);
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
     const { stuck } = await this.suspendBatches(s).catch(() => ({ paused: [], stuck: [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b })) }));
@@ -814,6 +1074,7 @@ export class ServiceState {
       mode: s.lib.mode,
       ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
       ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
+      ...(s.indexStatus ? { index: s.indexStatus } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
       projectWarnings: this.cachedProjectWarnings,
     };
