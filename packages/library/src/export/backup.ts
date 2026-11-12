@@ -247,11 +247,23 @@ const writeManifest = async (dir: string, m: BackupManifest) => {
   await writeFileAtomic(join(dir, BACKUPS_MANIFEST), `${JSON.stringify(m, null, 2)}\n`, { mode: 0o600 });
 };
 
-/** The manifest; a damaged one is kept aside and rebuilt from the backups themselves (R92 I2). */
+/**
+ * The manifest; a damaged one is kept aside and rebuilt from the backups themselves (R92 I2). So is
+ * one that is missing while backup files are there (D15, R174 c): "no backups" is never concluded
+ * from a file that is merely absent. Everything that decides from the manifest reads it through
+ * here (a destruction's list, a retry pass, a prune, a restore's choice of backup), so the rebuild
+ * always comes first. Only a Backups folder that holds no backup file gives an empty manifest.
+ */
 async function loadManifest(repo: Repo): Promise<BackupManifest> {
   const dir = backupsDir(repo);
   const raw = await readMaybe(join(dir, BACKUPS_MANIFEST));
-  if (!raw) return { formatVersion: 1, backups: [] };
+  if (!raw) {
+    const rebuilt = await rebuildManifest(repo);
+    // Nothing to list: nothing is written (a library that never made a backup keeps no manifest).
+    if (!rebuilt.backups.length && !rebuilt.unresolved?.length) return { formatVersion: 1, backups: [] };
+    await writeManifest(dir, rebuilt);
+    return rebuilt;
+  }
   let m: BackupManifest;
   try {
     const parsed = JSON.parse(raw.toString("utf8")) as BackupManifest;
@@ -442,17 +454,25 @@ async function projectKeyFile(repo: Repo, projectId: string): Promise<ProjectKey
   }
 }
 
-/** Every backup-named file, read back from its own backup.json; unreadable ones are `unresolved`. */
+/**
+ * Every backup-named file, read back from its own backup.json; unreadable ones are `unresolved`.
+ * An archive that has its name but whose backup is not settled yet (its `backup.create` event may
+ * never be written) is not a backup and is left out: settling lists it, or removes it (R125).
+ * No Backups folder: no backups. A folder that cannot be listed is an error, never "no backups".
+ */
 async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
   const dir = backupsDir(repo);
   const m: BackupManifest = { formatVersion: 1, backups: [], unresolved: [] };
   let names: string[] = [];
   try {
     names = (await fsp.readdir(dir)).filter((n) => BACKUP_NAME.test(n)).sort();
-  } catch {
-    return m;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return m;
+    throw new Error(`The Backups folder cannot be read (${(err as NodeJS.ErrnoException).code ?? "error"}), so the app cannot tell which backups exist.`, { cause: err });
   }
+  const unsettled = new Set(Object.values((await readState(dir)).pending).flatMap((op) => (op.kind === "create" && op.file ? [op.file] : [])));
   for (const file of names) {
+    if (unsettled.has(file)) continue;
     const e = await readEntry(repo, file);
     if (e) m.backups.push(e);
     else m.unresolved!.push(file);
@@ -929,9 +949,7 @@ async function settleCreate(repo: Repo, id: string, op: Extract<PendingOp, { kin
       await fail("The finished backup was damaged on disk before it was listed; it was removed.");
       return "dropped";
     }
-    await withManifest(repo, async (m) => {
-      if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
-    });
+    await withManifest(repo, async (m) => list(m, entry));
     await withState(repo, (s) => {
       s.owners[entry.file] = op.projectId;
       delete s.failures[op.projectId]; // a backup succeeded
@@ -1144,9 +1162,7 @@ async function backupLocked(repo: Repo, projectId: string, opts: BackupOptions, 
       activeTemps.delete(result.tmp);
     }
     crashPoint("before-manifest");
-    await withManifest(repo, async (m) => {
-      if (!m.backups.some((b) => b.file === entry.file)) m.backups.push(entry);
-    });
+    await withManifest(repo, async (m) => list(m, entry));
     await withState(repo, (s) => {
       s.owners[entry.file] = projectId;
       delete s.failures[projectId];
@@ -1316,6 +1332,15 @@ export async function forgetMissingBackups(repo: Repo, files: string[]): Promise
   await withManifest(repo, async (m) => {
     for (const f of names) if (!(await isThere(join(dir, f)))) forget(m, f);
   });
+}
+
+/**
+ * Lists a backup that was just made and recorded. A name is only ever given while no file has it
+ * (R138 b), so an entry already under this name is of a backup removed outside the app: replaced.
+ */
+function list(m: BackupManifest, entry: BackupEntry): void {
+  forget(m, entry.file);
+  m.backups.push(entry);
 }
 
 function forget(m: BackupManifest, file: string): void {
