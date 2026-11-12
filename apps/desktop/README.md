@@ -163,9 +163,13 @@ The Intel runner (`macos-15-intel`), its pins and the worker's Intel pin set sta
 unused; one switch, `INTEL_BUILDS` in `scripts/mac-targets.mjs`, turns them back on. While it is off,
 everything below that mentions Intel is refused in plain words and builds nothing.
 
-**Not yet run.** The workflow and the build script were written and checked on Linux (Task 37f); the
-first run on a Mac is the first time any of it meets macOS. What could not be checked is listed in
-the Task 37f report under "Unverified until the first Mac run".
+**First run on a Mac: 2026-11-12** (run 1 of "Desktop (macOS)", Apple Silicon, macOS 15.8, about 15
+minutes without caches). The app and its disk image were built and signed ad hoc; the packaged
+worker's smoke test passed; the launch check A–D passed on the debug app, with the page reaching the
+service and the worker from the origin `tauri://localhost` (requests, events, pictures, audio and
+video). Check R on the release app failed on the check's own mistake: it waited for a worker, which
+the app starts only when a library is opened. What a Mac run cannot show, and the owner's own tests
+must: opening the downloaded app from Finder ("Open Anyway", below), and using it.
 
 ### What the workflow does
 
@@ -195,9 +199,10 @@ of the app (`scripts/mac-targets.mjs`). For each architecture it:
 4. checks it on the runner: the packaged worker's smoke test (with Homebrew's ffmpeg and tesseract,
    which the app itself does not ship), the launch check A–D on the debug build of the app (the same
    bundle layout; only a debug build reports what the check reads), and check R on the release app
-   run from the mounted disk image: its service and worker start from the app's own resources, the
-   service listens on 127.0.0.1 and refuses a request without its token, and nothing is left after
-   the app is stopped; and writes the sizes and checksums in the run's summary.
+   run from the mounted disk image: its service starts from the app's own resources, listens on
+   127.0.0.1 and refuses a request without its token, and nothing is left after the app is stopped
+   (no worker is expected in R: the service starts it when a library is opened, which only A–D do);
+   and writes the sizes and checksums in the run's summary.
 
 On a Mac with the same tools, `pnpm --filter @ao/desktop run build:macos` does step 2 by hand;
 `node scripts/build-macos.mjs --dry-run [--arch arm64|x64]` prints the steps on any system.

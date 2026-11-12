@@ -469,7 +469,7 @@ Update after every task; commit and push.
 | 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; the Intel question is closed (not built, R169); one owner confirmation pending (minimum macOS 15) |
-| 37f Mac builds in CI | first Mac run in progress (Apple Silicon) | | started by build request 1 at the owner's word (R168); Apple Silicon only, the Intel download is switched off (R169); the workflow was written and paper-reviewed but had never run |
+| 37f Mac builds in CI | second Mac run requested | | run 1 (2026-11-12, Apple Silicon, 15 min): the app and disk image built and signed; worker smoke test and launch check A–D passed on a Mac; check R failed on the check's own mistake (it waited for a worker that starts only when a library opens), now corrected; Apple Silicon only (R169) |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
