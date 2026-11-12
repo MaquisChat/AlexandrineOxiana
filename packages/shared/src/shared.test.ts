@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId } from "./index.js";
+import { CREDENTIAL_QUERY_KEYS, GENERIC_FAMILIES, MEDIA_TICKET_PATH, isMediaTicketPath, inferGenericFamily, isCredentialQueryKey, isGenericFamily, isUsableFontFamily, splitFontFamilies, isZoteroApiKeyShape, sniffFontFormat, USER_FONT_MIME, isUserFontId, reservedFontName, CSS_WIDE_KEYWORDS, GENERIC_FONT_KEYWORDS, BUNDLED_FONT_FAMILIES } from "./index.js";
 
 describe("@ao/shared", () => {
   it("credential query keys (R96/R98), any case", () => {
@@ -77,5 +77,19 @@ describe("speech models (R158): one definition", () => {
     expect(isSpeechModel("huge")).toBe(false);
     const speechTools = TOOL_IDS.filter((t) => t.startsWith("speech-"));
     expect(speechTools.sort()).toEqual(SPEECH_MODELS.map((m) => speechToolId(m)).sort());
+  });
+});
+
+describe("font names a researcher's own file cannot take (Task 57 M5): one list", () => {
+  it("CSS-wide keywords, generic families and bundled faces, in any case", () => {
+    expect([...CSS_WIDE_KEYWORDS]).toEqual(["inherit", "initial", "unset", "revert", "revert-layer", "default"]);
+    expect([...GENERIC_FONT_KEYWORDS].sort()).toEqual(
+      ["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded", "emoji", "math", "fangsong"].sort(),
+    );
+    expect([...BUNDLED_FONT_FAMILIES].sort()).toEqual(["Atkinson Hyperlegible", "OpenDyslexic", "Sorts Mill Goudy"]);
+    for (const n of ["inherit", "Initial", "UNSET", "revert-layer", "Default"]) expect(reservedFontName(n), n).toBe("css-keyword");
+    for (const n of ["serif", "Sans-Serif", "MONOSPACE", "system-ui", "ui-rounded", "Emoji", "math", "fangsong"]) expect(reservedFontName(n), n).toBe("generic-family");
+    for (const n of ["Sorts Mill Goudy", "sorts mill goudy", "ATKINSON HYPERLEGIBLE", "opendyslexic", " OpenDyslexic "]) expect(reservedFontName(n), n).toBe("bundled-face");
+    for (const n of ["Junicode", "Brill", "Serif Pro", "Goudy", "revert2"]) expect(reservedFontName(n), n).toBeNull();
   });
 });
