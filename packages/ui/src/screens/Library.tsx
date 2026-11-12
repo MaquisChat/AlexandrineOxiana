@@ -325,6 +325,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   }, [indexState, refresh]);
   // A list read while the index was being rebuilt is read again shortly (its end may have been missed).
   const listRebuilding = sources?.index?.state === "rebuilding";
+  // A partial index (missing or unreadable, no rebuild completed since) holds only what was written
+  // meanwhile: its list is never shown as the library's content (C1).
+  const listIndex = sources?.index ?? state.index;
+  const listPartial = !!listIndex && "partial" in listIndex && listIndex.partial === true;
   useEffect(() => {
     if (!listRebuilding) return;
     const t = setTimeout(refresh, 2000);
@@ -724,10 +728,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             )}
             {sources === undefined ? (
               !sourcesError && <p aria-live="polite">Loading sources…</p>
-            ) : sources.total === 0 && (listRebuilding || indexState === "rebuilding") ? (
+            ) : (sources.total === 0 || listPartial) && (listRebuilding || indexState === "rebuilding") ? (
               // An index being rebuilt is never passed off as an empty library (D8).
               <p role="status">The library's search index is being rebuilt from its files. The sources appear here as soon as it has finished; nothing in the library has been lost.</p>
-            ) : sources.total === 0 && (sources.index ?? state.index)?.state === "failed" ? (
+            ) : (sources.total === 0 || listPartial) && listIndex?.state === "failed" ? (
               <p role="status">
                 The sources cannot be listed: the library's search index could not be rebuilt. Your sources are safe in the library folder;{" "}
                 <a href={PATHS.missingFiles} onClick={(e) => follow(e, PATHS.missingFiles)}>

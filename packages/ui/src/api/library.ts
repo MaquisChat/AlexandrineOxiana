@@ -26,8 +26,9 @@ export type ReadOnlyReason = "locked-by-other-device" | "newer-format" | "offlin
  * the index is ready.
  */
 export type IndexStatus =
-  | { state: "rebuilding"; done: number; total: number }
-  | { state: "failed"; message: string }
+  /** `partial`: the index holds only part of the library until the rebuild completes (C1): no list is shown. */
+  | { state: "rebuilding"; done: number; total: number; partial?: true }
+  | { state: "failed"; message: string; partial?: true }
   | { state: "unavailable"; reason: string };
 
 /** The library the service has open (libraryView in routes/libraries.ts). */

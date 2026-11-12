@@ -231,6 +231,38 @@ describe("Library screen", () => {
     expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
   });
 
+  it("C1: a partial index being rebuilt is never shown as a short list: “being rebuilt” in its place", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0, partial: true };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, total: 1, items: SOURCES.items.slice(0, 1), index: rebuilding })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText(/The library's search index is being rebuilt from its files/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a partial index whose rebuild failed is never shown as a short list: the failure in its place", async () => {
+    const failed = { state: "failed", message: "x", partial: true };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, total: 1, items: SOURCES.items.slice(0, 1), index: failed })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    expect(await screen.findByText(/The sources cannot be listed: the library's search index could not be rebuilt/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a whole index being rebuilt (not partial) keeps its list shown", async () => {
+    const rebuilding = { state: "rebuilding", done: 1, total: 4 };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, index: rebuilding })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText("Ethnography at Work")).toBeTruthy();
+  });
+
   it("D8: a read-only library says its index cannot be built here and search looks at titles only", async () => {
     const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "field-laptop", index: { state: "unavailable", reason: "locked-by-other-device" } };
     server.use(
