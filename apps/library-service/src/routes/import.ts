@@ -21,6 +21,7 @@ import {
 } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { ServiceState } from "../state.js";
+import { registerZotero } from "./zotero.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
 
 const PATH_KINDS = new Set(["folder", "zip", "bibtex", "ris", "csl-json", "zotero-rdf", "calibre", "zotero-local"]);
@@ -68,6 +69,8 @@ export async function batchProject(state: ServiceState, batchId: string): Promis
 
 export function registerImport(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
+  // Before an import: the Zotero Web key and where the Zotero data folder is (Task 57).
+  registerZotero(app, ctx);
 
   app.post("/projects/:id/import/dry-run", async (req) => {
     const s = state.requireWritable();

@@ -6,6 +6,7 @@ import type { FastifyInstance } from "fastify";
 import { RESEARCHER_NAME_MAX, readAppSetting, researcherName, researcherNameOk, setResearcherName, updateAppSetting } from "@ao/library";
 import { GENERIC_FAMILIES, inferGenericFamily, isGenericFamily, isUsableFontFamily, type GenericFamily } from "@ao/shared";
 import { badRequest } from "../errors.js";
+import { registerFonts } from "./fonts.js";
 import { bodyOf, type Ctx, type Obj } from "./util.js";
 
 const FILE = "appearance.json";
@@ -111,6 +112,8 @@ export function mergeAppearance(cur: AppearanceSettings, patch: Obj): Appearance
 
 export function registerAppearance(app: FastifyInstance, ctx: Ctx): void {
   const dir = ctx.state.deps.appConfigDir;
+  // Typefaces from the researcher's own files (R100, Task 57).
+  registerFonts(app, ctx);
 
   // The researcher's display name on this device (R84/R117): the photographer of device imports and
   // the `by` of destruction certificates. Device settings, like appearance; null clears it.

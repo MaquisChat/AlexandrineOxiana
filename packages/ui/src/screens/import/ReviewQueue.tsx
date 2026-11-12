@@ -4,8 +4,8 @@
  * both (and accept one of the candidates); for a selection: Set type, Add tag, Move to collection.
  * Every review request names the project in its body (R97).
  *
- * The preview is plain text (the record's details and its files' names): the service has no route
- * that serves an imported file's content for preview yet.
+ * The preview is the record's details and its files' names, and the file under review where it is
+ * a picture (FilePreview: the service's picture route, shown through a blob: address, R135 1).
  *
  * In projects that pseudonymise names, titles taken from file names, and collections and tags the
  * batch made from folder names, are flagged (R64): they can carry participants' names. What the
@@ -33,6 +33,7 @@ import {
 } from "../../api/import";
 import { CodeSwatch } from "../../components/CodeSwatch";
 import { UserText } from "../../components/UserText";
+import { assetName, FilePreview } from "./FilePreview";
 import { count, ErrorNote, errorText, fmt, Section, SOURCE_TYPES, typeLabel } from "./shared";
 import "./import.css";
 
@@ -505,8 +506,8 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
                       <ul className="ao-review__plain-list">
                         {source.assets.map((a) => (
                           <li key={a.id}>
-                            <UserText>{a.fileName ?? a.id}</UserText>
-                            {a.mediaType ? <span className="ao-import__hint"> ({a.mediaType})</span> : null}
+                            <UserText>{assetName(a)}</UserText>
+                            {(a.mime ?? a.mediaType) ? <span className="ao-import__hint"> ({a.mime ?? a.mediaType})</span> : null}
                           </li>
                         ))}
                       </ul>
@@ -552,6 +553,7 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
                   These tag names come from folder names, which can carry participants' names. Check them, and rename or remove a tag that names someone.
                 </p>
               )}
+              <FilePreview api={api} projectId={projectId} source={source} />
             </>
           )}
           <Section title="Why it needs review" level={3}>

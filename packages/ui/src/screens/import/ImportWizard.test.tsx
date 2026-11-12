@@ -234,16 +234,91 @@ describe("Bulk Import wizard", () => {
     });
   });
 
-  it("Zotero web uses the library id and explains how the key is stored", async () => {
+  it("Zotero web uses the library id", async () => {
     const { m, user } = setup();
     await screen.findByRole("option", { name: "Thesis" });
     await user.click(screen.getByRole("radio", { name: "Zotero (web)" }));
     await user.click(screen.getByRole("radio", { name: "Group library" }));
     await user.type(screen.getByRole("textbox", { name: "Library ID" }), "123456");
-    expect(screen.getByText(/ao secrets set zotero-api-key/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Scan" }));
     await screen.findByRole("heading", { name: "Scan results" });
     expect(m.bodies(`POST /projects/${P1}/import/dry-run`)).toEqual([{ adapter: { kind: "zotero-web", libraryType: "group", libraryId: "123456" } }]);
+  });
+
+  describe("the Zotero Web key (R78)", () => {
+    const KEY = "Zk7Qp2Lm9Xc4Vb8Nn1Rt6Yw3";
+    async function toWeb(o: ServiceSetup = {}) {
+      const s = setup(o);
+      await screen.findByRole("option", { name: "Thesis" });
+      await s.user.click(screen.getByRole("radio", { name: "Zotero (web)" }));
+      return s;
+    }
+
+    it("is stored in the system password store from here, never shown again, and can be removed", async () => {
+      const { m, user } = await toWeb();
+      await screen.findByText("No Zotero key is stored on this computer.");
+      const field = screen.getByLabelText("Zotero API key") as HTMLInputElement;
+      expect(field.type).toBe("password");
+      expect(field.autocomplete).toBe("off");
+      await user.type(field, KEY);
+      await user.dblClick(screen.getByRole("button", { name: "Store key" }));
+      await screen.findByText("A Zotero key is stored on this computer.");
+      expect(m.bodies("PUT /secrets/zotero-api-key")).toEqual([{ apiKey: KEY }]); // a double click sends one request
+      expect((screen.getByLabelText("Zotero API key") as HTMLInputElement).value).toBe("");
+      expect(document.body.innerHTML).not.toContain(KEY);
+      expect(screen.getByRole("status").textContent).toMatch(/stored/);
+      await user.click(screen.getByRole("button", { name: "Remove key" }));
+      await screen.findByText("No Zotero key is stored on this computer.");
+      expect(m.bodies("DELETE /secrets/zotero-api-key")).toHaveLength(1);
+      // The key never went into an address.
+      expect(m.calls.every((c) => !c.path.includes(KEY))).toBe(true);
+    });
+
+    it("says the key is already stored, and refuses something that is not a key before sending it", async () => {
+      const { m, user } = await toWeb({ zoteroKey: { stored: true } });
+      await screen.findByText("A Zotero key is stored on this computer.");
+      await user.type(screen.getByLabelText("Zotero API key"), "not a key");
+      await user.click(screen.getByRole("button", { name: "Replace key" }));
+      expect(await screen.findByText(/24 letters and digits/)).toBeTruthy();
+      expect(m.bodies("PUT /secrets/zotero-api-key")).toEqual([]);
+    });
+
+    it("on a computer without a password store, says so in plain words", async () => {
+      const { user } = await toWeb({ zoteroKey: { noStore: true } });
+      expect(await screen.findByText(/No secure key store is available on this computer/)).toBeTruthy();
+      await user.type(screen.getByLabelText("Zotero API key"), KEY);
+      await user.click(screen.getByRole("button", { name: "Store key" }));
+      expect(await screen.findByRole("alert")).toBeTruthy();
+      expect(document.body.innerHTML).not.toContain(KEY);
+    });
+  });
+
+  describe("finding the Zotero data folder", () => {
+    it("offers the folders the service found; choosing one fills the field and imports nothing", async () => {
+      const { m, user } = setup({
+        zoteroFolders: [
+          { path: "/data/moved/Zotero", from: "zotero-setting" },
+          { path: "/home/u/Zotero", from: "usual-place" },
+        ],
+      });
+      await screen.findByRole("option", { name: "Thesis" });
+      await user.click(screen.getByRole("radio", { name: "Zotero library" }));
+      const found = await screen.findByRole("group", { name: "Zotero data folders found on this computer" });
+      expect(within(found).getByText(/Zotero's own setting/)).toBeTruthy();
+      await user.click(within(found).getByRole("button", { name: "Use /home/u/Zotero" }));
+      expect((screen.getByRole("textbox", { name: "Zotero data folder" }) as HTMLInputElement).value).toBe("/home/u/Zotero");
+      expect(m.bodies(`POST /projects/${P1}/import/dry-run`)).toEqual([]);
+      await user.click(screen.getByRole("button", { name: "Scan" }));
+      await screen.findByRole("heading", { name: "Scan results" });
+      expect(m.bodies(`POST /projects/${P1}/import/dry-run`)).toEqual([{ adapter: { kind: "zotero-local", dataDir: "/home/u/Zotero" } }]);
+    });
+
+    it("says when none was found", async () => {
+      const { user } = setup();
+      await screen.findByRole("option", { name: "Thesis" });
+      await user.click(screen.getByRole("radio", { name: "Zotero library" }));
+      expect(await screen.findByText(/No Zotero data folder was found in the usual places/)).toBeTruthy();
+    });
   });
 
   it("reference files carry their format", async () => {
