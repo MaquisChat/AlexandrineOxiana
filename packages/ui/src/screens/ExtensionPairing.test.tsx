@@ -803,3 +803,154 @@ describe("Paired browsers", () => {
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Paired browsers" })));
   });
 });
+
+describe("the app's port changed since a browser was paired (R171, defect D13)", () => {
+  const NOW = 4318;
+  const OLD = 51234;
+  const NOTICE = "The app's port changed";
+  const noticeText = () => screen.queryByRole("status", { name: NOTICE })?.textContent ?? "";
+
+  it("says so in plain words when a paired browser holds an older port: what happened, the new port, what to do in the browser", async () => {
+    const svc = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }, { ...BROWSER_B, port: NOW }] });
+    server.use(...svc.handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    const notice = screen.getByRole("status", { name: NOTICE });
+    const text = notice.textContent ?? "";
+    expect(text).toMatch(/opened/i);
+    // It does not assert a cause it cannot know (review M3): the usual one, as the usual one.
+    expect(text).toMatch(/most often because another program/i);
+    expect(text).toContain(String(NOW));
+    expect(text).toMatch(/“Use a different port”/);
+    expect(text).toMatch(/“Check and save”/);
+    expect(text).toMatch(/no need to pair again/i);
+    // The current port is easy to read and copy: on its own, in a selectable element.
+    expect(notice.querySelector(".ao-pairing-port-value")?.textContent).toBe(String(NOW));
+    // The browser that holds the old port is marked in the list; the other is not.
+    const rowA = screen.getByText(BROWSER_A.origin).closest("li")!;
+    const rowB = screen.getByText(BROWSER_B.origin).closest("li")!;
+    expect(rowA.textContent).toContain(`Old port: ${OLD}`);
+    expect(rowB.textContent).not.toMatch(/Old port/);
+    // Its origin comes from outside: shown through UserText.
+    expect(within(rowA).getByText(BROWSER_A.origin).getAttribute("dir")).toBe("auto");
+  });
+
+  it("says nothing when every paired browser holds the current port, or none is paired", async () => {
+    server.use(...pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: NOW }] }).handlers);
+    const { unmount } = render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(noticeText()).toBe("");
+    expect(document.body.textContent).not.toMatch(/Old port/);
+    unmount();
+    server.use(...pairingService({ port: NOW }).handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await screen.findByText("No browser is paired yet.");
+    expect(noticeText()).toBe("");
+  });
+
+  it("a browser paired before ports were kept gets a hint on its row, not the notice", async () => {
+    server.use(...pairingService({ port: NOW, pairings: [BROWSER_A] }).handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(noticeText()).toBe("");
+    const row = screen.getByText(BROWSER_A.origin).closest("li")!;
+    expect(row.textContent).toMatch(new RegExp(`give it port ${NOW}`));
+  });
+
+  it("the notice is announced once: a later read of the same list does not change it; it goes when the old-port browser is revoked", async () => {
+    const svc = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }, { ...BROWSER_B, port: NOW }] });
+    server.use(...svc.handlers);
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    const first = noticeText();
+    const region = screen.getByRole("status", { name: NOTICE });
+    // Revoking the other browser reads the list again: the notice's words do not change (no new announcement).
+    await user.click(screen.getByRole("button", { name: `Revoke ${BROWSER_B.origin}` }));
+    await user.click(screen.getByRole("button", { name: "Revoke pairing" }));
+    await waitFor(() => expect(svc.state.deleted).toEqual([BROWSER_B.id]));
+    await waitFor(() => expect(svc.state.listReads).toBeGreaterThanOrEqual(2));
+    expect(noticeText()).toBe(first);
+    // The same live region, not a new one (a new node would be announced again: review M7).
+    expect(screen.getByRole("status", { name: NOTICE })).toBe(region);
+    await user.click(screen.getByRole("button", { name: `Revoke ${BROWSER_A.origin}` }));
+    await user.click(screen.getByRole("button", { name: "Revoke pairing" }));
+    await waitFor(() => expect(noticeText()).toBe(""));
+  });
+
+  it("the notice goes by itself once the browser has reached the app on the current port, without the screen being reopened (fix round 1, I3)", async () => {
+    const svc = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }, { ...BROWSER_B, port: NOW }] });
+    server.use(...svc.handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} listPollMs={30} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    const region = screen.getByRole("status", { name: NOTICE });
+    const first = noticeText();
+    // Reads while nothing changed keep the words and the node: no announcement on each read.
+    const reads = svc.state.listReads;
+    await waitFor(() => expect(svc.state.listReads).toBeGreaterThanOrEqual(reads + 2));
+    expect(noticeText()).toBe(first);
+    expect(screen.getByRole("status", { name: NOTICE })).toBe(region);
+    // The browser takes the new port in its popup; the service records it.
+    svc.state.pairings[0] = { ...svc.state.pairings[0]!, port: NOW };
+    await waitFor(() => expect(noticeText()).toBe(""));
+    expect(screen.getByText(BROWSER_A.origin).closest("li")!.textContent).not.toMatch(/Old port/);
+    // With no notice left, the reading stops.
+    const after = svc.state.listReads;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(svc.state.listReads).toBe(after);
+  });
+
+  it("the reading stops when the screen is left, and after a bounded number of reads", async () => {
+    const svc = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }] });
+    server.use(...svc.handlers);
+    const { unmount } = render(<ExtensionPairing api={makeApi()} port={NOW} listPollMs={20} listPollMax={3} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    await waitFor(() => expect(svc.state.listReads).toBe(4)); // the first read, then 3 more
+    await new Promise((r) => setTimeout(r, 200));
+    expect(svc.state.listReads).toBe(4);
+    expect(noticeText()).not.toBe("");
+    unmount();
+
+    const svc2 = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }] });
+    server.use(...svc2.handlers);
+    const second = render(<ExtensionPairing api={makeApi()} port={NOW} listPollMs={20} />);
+    await waitFor(() => expect(svc2.state.listReads).toBeGreaterThanOrEqual(2));
+    second.unmount();
+    const left = svc2.state.listReads;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(svc2.state.listReads).toBeLessThanOrEqual(left + 1); // at most one already on its way
+  });
+
+  it("one read at a time, however slow the service; an answer older than a newer read is dropped", async () => {
+    let inFlight = 0;
+    let most = 0;
+    let n = 0;
+    server.use(
+      http.get(url("/extension/pairings"), async () => {
+        inFlight++;
+        most = Math.max(most, inFlight);
+        const mine = ++n;
+        // The second read is slow and says the old port; the later ones say the new one.
+        await new Promise((r) => setTimeout(r, mine === 2 ? 300 : 10));
+        inFlight--;
+        return HttpResponse.json({ extensions: [{ ...BROWSER_A, port: mine <= 2 ? OLD : NOW }], port: NOW });
+      }),
+    );
+    render(<ExtensionPairing api={makeApi()} port={NOW} listPollMs={20} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    await waitFor(() => expect(noticeText()).toBe(""), { timeout: 3000 });
+    expect(most).toBe(1);
+  });
+
+  it("takes the port from the service's answer, and ignores one that is not a port", async () => {
+    // The page was given no port: the service's answer is enough.
+    server.use(...pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }] }).handlers);
+    const { unmount } = render(<ExtensionPairing api={makeApi()} />);
+    await waitFor(() => expect(noticeText()).toContain(String(NOW)));
+    unmount();
+    server.use(http.get(url("/extension/pairings"), () => HttpResponse.json({ extensions: [{ ...BROWSER_A, port: OLD }], port: "4318" })));
+    render(<ExtensionPairing api={makeApi()} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(noticeText()).toBe("");
+  });
+});

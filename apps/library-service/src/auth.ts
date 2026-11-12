@@ -19,6 +19,8 @@
  *    from the shell's origin only) says what became of a code, by its non-secret id (Task 46c).
  */
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { readAppSetting, updateAppSetting } from "@ao/library";
 import { isCredentialQueryKey, type PairingCodeIssued, type PairingCodeStatus } from "@ao/shared";
 
@@ -63,7 +65,14 @@ export interface PairedExtension {
   origin: string;
   tokenSha256: string;
   pairedAt: string;
+  /**
+   * The service's port this browser last reached it on: at pairing, then at its latest accepted
+   * request (R171). Absent in pairings saved before ports were kept.
+   */
+  port?: number;
 }
+
+const portOk = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 65535;
 
 interface PairingFile {
   v: 1;
@@ -71,6 +80,38 @@ interface PairingFile {
 }
 
 const PAIRINGS_FILE = "extension-pairings.json";
+
+/** The pairings file could not be read as a pairings file: nothing was written (fix round 1, I1). */
+export class PairingsUnreadableError extends Error {
+  constructor() {
+    super("The list of paired browsers could not be read, so it was not changed.");
+    this.name = "PairingsUnreadableError";
+  }
+}
+
+/**
+ * The pairings file as it is on disk, read inside `updateAppSetting`'s per-file lock. Missing: no
+ * pairings yet. Anything else that is not a readable pairings file (unreadable, not JSON, truncated,
+ * the wrong shape): throws, so that no edit ever writes a list it did not read, which would drop
+ * every pairing (fix round 1, I1).
+ */
+function readPairingsStrict(configDir: string): PairingFile {
+  let raw: string;
+  try {
+    raw = readFileSync(join(configDir, PAIRINGS_FILE), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { v: 1, extensions: [] };
+    throw new PairingsUnreadableError();
+  }
+  let f: unknown;
+  try {
+    f = JSON.parse(raw);
+  } catch {
+    throw new PairingsUnreadableError();
+  }
+  if (typeof f !== "object" || f === null || !Array.isArray((f as { extensions?: unknown }).extensions)) throw new PairingsUnreadableError();
+  return f as PairingFile;
+}
 
 export interface PairingOptions {
   /** How long a code is valid (default 5 minutes). */
@@ -115,6 +156,10 @@ export class Pairing {
   private readonly maxAttempts: number;
   private readonly perMinute: number;
   private readonly now: () => number;
+  /** The port the service listens on, once it listens (R171). */
+  private currentPort: number | undefined;
+  /** Port recordings under way, by pairing id: a burst of requests makes one write (R171). */
+  private readonly recording = new Map<string, Promise<void>>();
 
   constructor(
     private readonly configDir: string,
@@ -128,7 +173,11 @@ export class Pairing {
 
   async load(): Promise<void> {
     const f = await readAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE);
-    this.paired = Array.isArray(f?.extensions) ? f.extensions.filter((e) => typeof e?.tokenSha256 === "string" && typeof e.origin === "string" && isExtensionOrigin(e.origin)) : [];
+    this.paired = Array.isArray(f?.extensions)
+      ? f.extensions
+          .filter((e) => typeof e?.tokenSha256 === "string" && typeof e.origin === "string" && isExtensionOrigin(e.origin))
+          .map(({ port, ...e }) => (portOk(port) ? { ...e, port } : e))
+      : [];
     this.loaded = true;
   }
 
@@ -208,15 +257,16 @@ export class Pairing {
     this.code = undefined;
     const token = randomBytes(32).toString("base64url");
     const at = this.now();
-    const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(at).toISOString() };
+    const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(at).toISOString(), ...(this.currentPort !== undefined ? { port: this.currentPort } : {}) };
     // Spent now (never usable twice), but "used" only once the pairing is durably written (I1).
     c.record.confirming = true;
     let next: PairingFile;
     try {
-      next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, (cur) => ({
+      next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, () => ({
         v: 1,
-        // One pairing per extension origin: pairing again replaces its token.
-        extensions: [...(Array.isArray(cur?.extensions) ? cur.extensions.filter((e) => e.origin !== origin) : []), entry],
+        // One pairing per extension origin: pairing again replaces its token. Built only on a list
+        // that was read (fix round 1, I1).
+        extensions: [...readPairingsStrict(this.configDir).extensions.filter((e) => e?.origin !== origin), entry],
       }));
     } catch (err) {
       // Spent, but nothing was paired: the code no longer works, and the status says why.
@@ -241,6 +291,52 @@ export class Pairing {
     return hit;
   }
 
+  /** The service now listens on `port`: new pairings are made on it (R171). */
+  setPort(port: number): void {
+    this.currentPort = port;
+  }
+
+  /** The port the service listens on, once it does. */
+  get port(): number | undefined {
+    return this.currentPort;
+  }
+
+  /**
+   * The paired browser `id` was just accepted on the service's current port (R171): when that is
+   * not the port its pairing holds, the pairing takes it. The file is re-read inside the per-file
+   * lock and only that pairing's `port` changes: nothing else of any pairing, and no pairing is
+   * added or removed. If the file cannot be read as a pairings file, nothing is written and nothing
+   * changes in memory (fix round 1, I1); the next accepted request tries again. Rejects when nothing
+   * could be saved; the request is answered all the same.
+   */
+  noteReachedOnCurrentPort(id: string): Promise<void> {
+    const under = this.recording.get(id);
+    if (under) return under;
+    const run = this.recordPort(id).finally(() => this.recording.delete(id));
+    this.recording.set(id, run);
+    return run;
+  }
+
+  /** Resolves once every port recording under way has ended (shutdown and tests). */
+  async idle(): Promise<void> {
+    await Promise.allSettled([...this.recording.values()]);
+  }
+
+  private async recordPort(id: string): Promise<void> {
+    const port = this.currentPort;
+    const e = this.paired.find((x) => x.id === id);
+    if (port === undefined || !e || e.port === port) return;
+    let held = false;
+    await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, () => {
+      const cur = readPairingsStrict(this.configDir);
+      held = cur.extensions.some((x) => x?.id === id);
+      // Not there any more (unpaired meanwhile): the write puts back exactly what was read.
+      return { ...cur, extensions: cur.extensions.map((x) => (x?.id === id ? { ...x, port } : x)) };
+    });
+    // Only the one field, in memory too; the list itself stays the one the service holds.
+    if (held) this.paired = this.paired.map((x) => (x.id === id ? { ...x, port } : x));
+  }
+
   isPairedOrigin(origin: string): boolean {
     return this.paired.some((e) => e.origin === origin);
   }
@@ -251,7 +347,11 @@ export class Pairing {
 
   async unpair(id: string): Promise<boolean> {
     const before = this.paired.length;
-    const next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, (cur) => ({ v: 1, extensions: (cur?.extensions ?? []).filter((e) => e.id !== id) }));
+    const next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, () => {
+      // Built only on a list that was read (fix round 1, I1).
+      const cur = readPairingsStrict(this.configDir);
+      return { ...cur, extensions: cur.extensions.filter((e) => e?.id !== id) };
+    });
     this.paired = next.extensions;
     return this.paired.length < before;
   }

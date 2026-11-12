@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,6 +26,7 @@ describe("governance routes (R113, R118)", () => {
       http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Coastal kinship" }, { id: "p2", name: "Clinic" }] })),
       http.get(url("/projects/p2/audit"), () => HttpResponse.json({ events: [], total: 0 })),
       http.get(url("/projects/p2/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
     );
     window.history.replaceState(null, "", "/governance");
     render(<Host />);
@@ -49,8 +50,46 @@ describe("governance routes (R113, R118)", () => {
     expect((screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement).value).toBe("");
   });
 
+  it.each([
+    ["a locked project", { projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: false }] }, { mode: "read-write" }, "This project is locked. Unlock it in the library to change its rules."],
+    ["a read-only library", { projects: [{ id: "p1", name: "Clinic", encrypted: false, unlocked: true }] }, { mode: "read-only", readOnlyReason: "locked-by-other-device" }, "This library is open read-only here, so its rules cannot be changed."],
+  ])("the Governance form of %s shows the rules, capture methods included, but cannot change them, and says why (D11)", async (_what, projects, current, why) => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json(projects)),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", ...current } })),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "captureMethods: [manual_upload, browser_capture]\n", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<Host />);
+    expect(await screen.findByText(why)).toBeTruthy();
+    const capture = await screen.findByRole("region", { name: "Capture methods" });
+    const browser = within(capture).getByRole("checkbox", { name: /Browser capture/ }) as HTMLInputElement;
+    expect(browser.checked).toBe(true);
+    expect(browser.disabled).toBe(true);
+  });
+
+  it("a writable library and an unlocked project leave the form editable", async () => {
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ id: "p1", name: "Clinic", encrypted: true, unlocked: true }] })),
+      http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: { libraryId: "l1", name: "Lib", mode: "read-write" } })),
+      http.get(url("/projects/p1/governance"), () => HttpResponse.json({ yaml: "", sha256: "a".repeat(64), violations: [] })),
+      http.get(url("/projects/p1/protocol/documents"), () => HttpResponse.json({ documents: [] })),
+      http.get(url("/projects/p1/retention"), () => HttpResponse.json({ destroyAfter: null, due: [] })),
+    );
+    window.history.replaceState(null, "", "/governance?project=p1");
+    render(<Host />);
+    const capture = await screen.findByRole("region", { name: "Capture methods" });
+    await waitFor(() => expect((within(capture).getByRole("checkbox", { name: /Browser capture/ }) as HTMLInputElement).disabled).toBe(false));
+    expect(screen.queryByText(/cannot be changed|Unlock it in the library/)).toBeNull();
+  });
+
   it("a failed project list is shown (41b2 M2)", async () => {
-    server.use(http.get(url("/projects"), () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "The service is not answering." } }, { status: 503 })));
+    server.use(
+      http.get(url("/projects"), () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "The service is not answering." } }, { status: 503 })),
+      http.get(url("/libraries"), () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "The service is not answering." } }, { status: 503 })),
+    );
     window.history.replaceState(null, "", "/governance");
     render(<Host />);
     expect((await screen.findByRole("alert")).textContent).toMatch(/projects could not be read|could not be reached/);

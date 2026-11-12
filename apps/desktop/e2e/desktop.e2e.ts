@@ -8,7 +8,8 @@
  *
  *   the window shows the library chooser → a library is created at a typed folder → a project is created in the New
  *   project dialog → a PDF is attached with "Choose files…" through the native file dialog → the
- *   library lists the source → what the service persisted is on disk (the stored copy, the original
+ *   library lists the source → a typed path field (Appearance, "Font file path") is filled with its
+ *   "Choose file…" through the native file dialog (D12) → what the service persisted is on disk (the stored copy, the original
  *   untouched, the audit entry) → the window is closed → no process of the app is left, and nothing
  *   under the real home folder was created or modified.
  *
@@ -138,6 +139,22 @@ test("the built Linux app: create a library and a project, attach a file through
       const table = await d.byRole("table", "Sources", { timeoutMs: 30_000 });
       await d.byRole("button", PDF_TITLE, { within: table, timeoutMs: 30_000 });
       expect(await d.countByRole("alert", null)).toBe(0);
+    });
+
+    await test.step("a typed path field's “Choose file…” fills it through the native file dialog (D12): Appearance → Font file path", async () => {
+      const font = join(d.filesDir, "Junicode.woff2");
+      writeFileSync(font, Buffer.from("wOF2-test-only"));
+      await s.click(await d.byRole("link", "Appearance"));
+      const fonts = await d.byRole("region", "Your own font files", { timeoutMs: 30_000 });
+      const field = await d.byRole("textbox", "Font file path", { within: fonts });
+      expect(await s.property(field, "value")).toBe("");
+      await s.click(await d.byRole("button", "Choose file…", { within: fonts }));
+      // The real GTK file chooser, titled by the page's request (PathField: "Choose a font file").
+      await d.pickInFileDialog("Choose a font file", font);
+      await until("the chosen path in the field", 30_000, async () => (await s.property(field, "value")) === font);
+      // Only put in the field: nothing is sent until "Add font file", which this step does not press.
+      await s.click(await d.byRole("link", "Back to library"));
+      await d.byRole("heading", LIBRARY, { level: 1, timeoutMs: 30_000 });
     });
 
     await test.step("what the service persisted: the stored copy, the original untouched, the audit entry", async () => {

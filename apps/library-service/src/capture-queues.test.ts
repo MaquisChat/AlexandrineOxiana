@@ -374,6 +374,24 @@ describe("a locked project (Task 63 fix round 1: I1, I2; R30, R50, R142)", () =>
     await svc.state.idle();
   });
 
+  it("Task 66 (R171): a paired browser's port is still recorded when its capture is refused with 423, and the answer is the same as the desktop app's", async () => {
+    const { pid, worker } = await lockedWhileRunning();
+    // Paired while the service was on another port (as before a relaunch), then it listens on a new one.
+    svc.pairing.setPort(50001);
+    const ext = await extensionToken();
+    const port = await svc.listen(0);
+    const host = { host: `127.0.0.1:${port}` };
+    const urls = [YT2];
+    const ui = await call({ method: "POST", url: `/projects/${pid}/capture`, headers: host, body: { urls } });
+    const fromExt = await call({ method: "POST", url: "/capture/browser/links", noAuth: true, headers: { ...host, authorization: `Bearer ${ext}`, origin: EXT }, body: { projectId: pid, urls } });
+    expect(fromExt.status).toBe(423);
+    expect([fromExt.status, fromExt.json.error]).toEqual([ui.status, ui.json.error]);
+    await svc.pairing.idle();
+    expect(svc.pairing.list()[0]!.port).toBe(port);
+    worker.release();
+    await svc.state.idle();
+  });
+
   it("I2: at the lock, the running queue's record is forgotten at once and it stops before its next link; another project's queue is untouched", async () => {
     const { pid, plain, queueId, plainQueue, worker, events } = await lockedWhileRunning();
     expect(svc.state.captureQueues.detail(pid, queueId)).toBeUndefined();
@@ -472,6 +490,23 @@ describe("a lock ends a project's running captures for good (fix round 2: I3, R1
     const fresh = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
     expect(fresh.status).toBe(200);
     expect((await call({ url: `/projects/${pid}/captures` })).json.queues.map((q: { queueId: string }) => q.queueId)).toEqual([fresh.json.queueId]);
+    await svc.state.idle();
+  });
+
+  it("Task 66 (R171): a paired browser's port is still recorded when its capture is refused with 409 CAPTURE_STOPPING", async () => {
+    const { pid, worker } = await running();
+    svc.pairing.setPort(50001);
+    const ext = await extensionToken();
+    const port = await svc.listen(0);
+    const host = { host: `127.0.0.1:${port}` };
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock`, headers: host })).status).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, headers: host, body: { secret: PASS } })).status).toBe(200);
+    const fromExt = await call({ method: "POST", url: "/capture/browser/links", noAuth: true, headers: { ...host, authorization: `Bearer ${ext}`, origin: EXT }, body: { projectId: pid, urls: [YT] } });
+    expect(fromExt.status).toBe(409);
+    expect(fromExt.json.error).toMatchObject({ code: "CONFLICT", reason: "CAPTURE_STOPPING" });
+    await svc.pairing.idle();
+    expect(svc.pairing.list()[0]!.port).toBe(port);
+    worker.release();
     await svc.state.idle();
   });
 

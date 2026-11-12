@@ -37,8 +37,11 @@ export const codeIdOf = (n: number) => `c0de${String(n).padStart(12, "0")}`;
  * kept as the service keeps it (a new code replaces an active one; past its time it is expired);
  * `end` sets what became of a code, `pairWith` pairs a browser with the newest code.
  */
-export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: number }>; pairings?: PairedBrowser[] } = {}) {
+export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: number }>; pairings?: PairedBrowser[]; port?: number } = {}) {
   const state = {
+    /** The service's port now, as `GET /extension/pairings` says it (R171); absent: not said. */
+    port: opts.port as number | undefined,
+    listReads: 0,
     pairings: [...(opts.pairings ?? [])],
     issued: 0,
     codes: opts.codes ?? [{ code: "482916" }],
@@ -82,7 +85,10 @@ export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: num
         state.statusReads.push(String(params.codeId));
         return HttpResponse.json(statusOf(String(params.codeId)));
       }),
-      http.get(url("/extension/pairings"), () => HttpResponse.json({ extensions: state.pairings })),
+      http.get(url("/extension/pairings"), () => {
+        state.listReads++;
+        return HttpResponse.json({ extensions: state.pairings, ...(state.port !== undefined ? { port: state.port } : {}) });
+      }),
       http.delete(url("/extension/pairings/:pid"), ({ params }) => {
         const i = state.pairings.findIndex((p) => p.id === params.pid);
         if (i < 0) return apiError(404, "NOT_FOUND", "That pairing was not found.");

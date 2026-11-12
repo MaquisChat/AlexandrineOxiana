@@ -5,7 +5,8 @@
  */
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createNetServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -204,4 +205,113 @@ s.listen(0, "127.0.0.1", () => console.log("AO_WORKER_READY port=" + s.address()
     expect(r.out()).not.toContain(TOKEN);
     expect(r.err()).not.toContain(TOKEN);
   });
+});
+
+describe("the port across launches (R171, defect D13)", () => {
+  const portFile = () => join(deps.appConfigDir, "service-port.json");
+  const holdPort = (port: number) =>
+    new Promise<Server>((resolve, reject) => {
+      const s = createNetServer();
+      s.once("error", reject);
+      s.listen(port, "127.0.0.1", () => resolve(s));
+    });
+  const release = (s: Server) => new Promise<void>((res) => s.close(() => res()));
+
+  it("asked for any port, it listens again on the port it used last time", async () => {
+    const a = run({ stdin: `${TOKEN}\n` });
+    const first = await ready(a);
+    expect(await stop(a), a.err()).toBe(0);
+    expect(JSON.parse(await readFile(portFile(), "utf8"))).toEqual({ v: 1, port: first });
+    const b = run({ stdin: `${TOKEN}\n` });
+    expect(await ready(b)).toBe(first);
+    expect((await fetch(`http://127.0.0.1:${first}/libraries`, { headers: auth })).status).toBe(200);
+    expect(await stop(b), b.err()).toBe(0);
+  }, 60_000);
+
+  it("when the remembered port is taken, it starts on another, says so in the ready line, and remembers the new one", async () => {
+    const a = run({ stdin: `${TOKEN}\n` });
+    const first = await ready(a);
+    expect(await stop(a), a.err()).toBe(0);
+    const blocker = await holdPort(first);
+    try {
+      const b = run({ stdin: `${TOKEN}\n` });
+      const second = await ready(b);
+      expect(second).not.toBe(first);
+      expect(b.out()).toContain(`AO_SERVICE_READY port=${second}\n`);
+      expect(JSON.parse(await readFile(portFile(), "utf8"))).toEqual({ v: 1, port: second });
+      expect(await stop(b), b.err()).toBe(0);
+    } finally {
+      await release(blocker);
+    }
+  }, 60_000);
+
+  it("a settings folder where the port cannot be written does not stop it; its log says so without a path", async () => {
+    await mkdir(portFile(), { recursive: true });
+    const a = run({ stdin: `${TOKEN}\n` });
+    const port = await ready(a);
+    expect((await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth })).status).toBe(200);
+    expect(await stop(a), a.err()).toBe(0);
+    const all = a.out() + a.err();
+    const line = all.split("\n").find((l) => /port could not be remembered/i.test(l));
+    expect(line, all).toBeDefined();
+    expect(line).not.toContain(tmp);
+    expect(line).not.toContain("service-port.json");
+  }, 60_000);
+
+  it("two services started at once on the same settings folder both start (both reaching for the remembered port)", async () => {
+    const z = run({ stdin: `${TOKEN}\n` });
+    const remembered0 = await ready(z);
+    expect(await stop(z), z.err()).toBe(0);
+    const a = run({ stdin: `${TOKEN}\n` });
+    const b = run({ stdin: `${TOKEN}\n` });
+    const [pa, pb] = await Promise.all([ready(a), ready(b)]);
+    expect(pa).not.toBe(pb);
+    // One of them has the port used last time; the other fell back to another.
+    expect([pa, pb]).toContain(remembered0);
+    expect((await fetch(`http://127.0.0.1:${pa}/libraries`, { headers: auth })).status).toBe(200);
+    expect((await fetch(`http://127.0.0.1:${pb}/libraries`, { headers: auth })).status).toBe(200);
+    const remembered = (JSON.parse(await readFile(portFile(), "utf8")) as { port: number }).port;
+    expect([pa, pb]).toContain(remembered);
+    expect(await stop(a), a.err()).toBe(0);
+    expect(await stop(b), b.err()).toBe(0);
+  }, 60_000);
+
+  it("the remembered port and the reopen of the last library (Task 46a) do not hold each other up when either file is missing or unreadable", async () => {
+    // A remembered port, and the last library's record unreadable (a folder in its place).
+    const a = run({ stdin: `${TOKEN}\n` });
+    const first = await ready(a);
+    expect(await stop(a), a.err()).toBe(0);
+    await rm(join(deps.appConfigDir, "last-library.json"), { recursive: true, force: true });
+    await mkdir(join(deps.appConfigDir, "last-library.json"));
+    const b = run({ stdin: `${TOKEN}\n` });
+    expect(await ready(b)).toBe(first);
+    expect((await fetch(`http://127.0.0.1:${first}/libraries`, { headers: auth })).status).toBe(200);
+    expect(await stop(b), b.err()).toBe(0);
+    // The last library remembered at a place that is gone, and the port file unreadable.
+    const lib = join(tmp, "Lib");
+    await (await createLibrary(lib, "Lib", deps)).close();
+    const c = run({ env: baseEnv({ AO_NO_WORKER: "1", AO_LIBRARY: lib }), stdin: `${TOKEN}\n` });
+    await ready(c);
+    expect(await stop(c), c.err()).toBe(0);
+    await rm(lib, { recursive: true, force: true });
+    await rm(portFile(), { force: true });
+    await mkdir(portFile());
+    const d = run({ stdin: `${TOKEN}\n` });
+    const port = await ready(d);
+    const r = await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth });
+    expect(r.status).toBe(200);
+    expect(await stop(d), d.err()).toBe(0);
+  }, 90_000);
+
+  it("an explicit AO_SERVICE_PORT is used exactly, and neither read from nor written to the remembered port", async () => {
+    const probe = await holdPort(0);
+    const explicit = (probe.address() as { port: number }).port;
+    await release(probe);
+    await mkdir(deps.appConfigDir, { recursive: true });
+    await writeFile(portFile(), JSON.stringify({ v: 1, port: 50123 }));
+    const a = run({ env: baseEnv({ AO_NO_WORKER: "1", AO_SERVICE_PORT: String(explicit) }), stdin: `${TOKEN}\n` });
+    expect(await ready(a)).toBe(explicit);
+    expect(await stop(a), a.err()).toBe(0);
+    expect(JSON.parse(await readFile(portFile(), "utf8"))).toEqual({ v: 1, port: 50123 });
+  }, 60_000);
 });

@@ -4,6 +4,7 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
+import { PairingsUnreadableError } from "./auth.js";
 import {
   AcknowledgementRequiredError,
   PendingWriteChoiceError,
@@ -128,6 +129,8 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
+  // The app's list of paired browsers could not be read: nothing was changed (Task 66, I1).
+  if (err instanceof PairingsUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
   // A file of the app itself is missing (a damaged installation); its message names what, never where.
   if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");

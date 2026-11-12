@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { App, ROUTES } from "./App";
 import { navigate, PATHS } from "./navigation";
 import { DEFAULT_APPEARANCE } from "./theme/appearance";
-import { BASE, libraryHandlers, server, TOKEN, url, useMockService } from "./test/service";
+import { BASE, libraryHandlers, PROJECTS, server, TOKEN, url, useMockService } from "./test/service";
+
+const PID = "01890a5d-ac96-774b-bcce-b302099a8057";
 
 useMockService();
 afterEach(() => window.history.replaceState(null, "", "/"));
@@ -82,6 +84,34 @@ describe("the app's one router (R118)", () => {
     expect(window.location.pathname).toBe(PATHS.importWizard);
     expect(new URLSearchParams(window.location.search).get("project")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Back to library" })).toBeTruthy();
+  });
+
+  it("the Capture link beside Import opens the Capture screen for the selected project, by keyboard too (D10)", async () => {
+    server.use(
+      ...appearance(),
+      // The Capture screen takes only real project ids (UUIDv7).
+      http.get(url("/projects"), () => HttpResponse.json({ projects: [{ ...PROJECTS.projects[0], id: PID }] })),
+      ...libraryHandlers(),
+      // The Capture screen's own requests are not this test's subject.
+      http.all(url("/*"), () => HttpResponse.json({ error: { code: "NOT_FOUND", message: "Not in this test." } }, { status: 404 })),
+    );
+    const user = userEvent.setup();
+    render(<App service={service} />);
+    const header = (await screen.findByRole("heading", { level: 1 })).closest("header")!;
+    const link = await within(header).findByRole("link", { name: "Capture from the web" });
+    expect(link.getAttribute("href")).toBe(`${PATHS.capture}?project=${PID}`);
+    // In the same row as Import, right after it.
+    const row = [...link.parentElement!.children];
+    expect(row[row.indexOf(link) - 1]?.textContent).toBe("Import");
+    // Reached with the keyboard: Tab moves onto it from Import, Enter follows it.
+    within(header).getByRole("link", { name: "Import" }).focus();
+    await user.tab();
+    expect(document.activeElement).toBe(link);
+    await user.keyboard("{Enter}");
+    expect(window.location.pathname).toBe(PATHS.capture);
+    expect(new URLSearchParams(window.location.search).get("project")).toBe(PID);
+    expect(await screen.findByRole("heading", { level: 1, name: "Capture" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Back to library" }).getAttribute("href")).toBe(`/?project=${PID}`);
   });
 
   it("Governance and records opens the Task 36 screens for the library's project, with Back to library", async () => {

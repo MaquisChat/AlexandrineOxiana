@@ -7,6 +7,7 @@
  *  - `POST /extension/pair`                     → PairingCodeIssued (any earlier code stops working)
  *  - `GET /extension/pair/status`               → PairingCodeStatus of the code most recently issued
  *  - `GET /extension/pair/status/:codeId`       → PairingCodeStatus of that code
+ *  - `GET /extension/pairings`                  → PairedBrowsers (with the service's port now, R171)
  * The status routes are the only UI-token routes that need an Origin header: the desktop app's page
  * always sends one, and a caller without one (a command-line tool) is refused (Task 46c, review M5).
  */
@@ -24,6 +25,29 @@ export interface PairingCodeIssued {
   expiresAt: string;
   /** How long the code is valid from this answer on, in milliseconds (needs no clock but the reader's). */
   validForMs: number;
+}
+
+/** One paired browser in `GET /extension/pairings` (never its token). */
+export interface PairedBrowser {
+  /** The pairing's id. */
+  id: string;
+  /** The extension's origin, e.g. `chrome-extension://<id>`. */
+  origin: string;
+  pairedAt: string;
+  /**
+   * The service's port this browser last reached it on: at pairing, then at its latest accepted
+   * request (R171). Absent for a pairing saved before ports were kept, until that browser next
+   * reaches the service. When it differs from the list's `port`, the service's port changed since
+   * (the app was reopened and its old port was taken), and that browser needs the new port.
+   */
+  port?: number;
+}
+
+/** `GET /extension/pairings` (UI token). */
+export interface PairedBrowsers {
+  extensions: PairedBrowser[];
+  /** The port the service listens on now (not a secret); absent only before it listens. */
+  port?: number;
 }
 
 /** The browser a code paired: as `GET /extension/pairings` lists it. */
