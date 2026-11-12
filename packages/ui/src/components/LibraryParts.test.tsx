@@ -155,6 +155,12 @@ describe("TagList", () => {
   });
 });
 
+// Task 69 (M2): the date is shown in the researcher's own time zone, so the expected day comes from
+// the machine's zone (getDate, not the formatter under test). Mid-November keeps month and year the
+// same in every zone, so the test checks the local day and the wording wherever it runs.
+const NOTICED_AT = "2026-11-15T12:00:00.000Z";
+const NOTICED_TEXT = `No longer available at its source, noticed on Nov ${new Date(NOTICED_AT).getDate()}, 2026`;
+
 describe("SourceTable", () => {
   it("shows title, creators and year; the title opens the source", async () => {
     const onOpen = vi.fn();
@@ -196,10 +202,10 @@ describe("SourceTable", () => {
     render(
       <SourceTable
         items={[
-          { ...base, id: "a", title: "Gone post", availability: { status: "unavailable-on-platform", firstNoticedAt: "2026-11-03T12:00:00.000Z" } },
+          { ...base, id: "a", title: "Gone post", availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED_AT } },
           { ...base, id: "b", title: "Gone, date unknown", availability: { status: "unavailable-on-platform" } },
           { ...base, id: "c", title: "Present post", availability: { status: "available" } },
-          { ...base, id: "d", title: "Part saved", availability: { status: "incomplete", firstNoticedAt: "2026-11-03T12:00:00.000Z" } },
+          { ...base, id: "d", title: "Part saved", availability: { status: "incomplete", firstNoticedAt: NOTICED_AT } },
           { ...base, id: "e", title: "Future", availability: { status: "some-future-status" } },
           { ...base, id: "f", title: "No field" },
         ]}
@@ -209,12 +215,20 @@ describe("SourceTable", () => {
     );
     const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
     const marks = screen.getAllByRole("note");
-    expect(marks.map((m) => m.getAttribute("aria-label"))).toEqual(["No longer available at its source, noticed on Nov 3, 2026", "No longer available at its source"]);
-    expect(within(rows[1]!).getByRole("note", { name: "No longer available at its source, noticed on Nov 3, 2026" }).textContent).toBe("No longer available at its source, noticed on Nov 3, 2026");
+    expect(marks.map((m) => m.getAttribute("aria-label"))).toEqual([NOTICED_TEXT, "No longer available at its source"]);
+    expect(within(rows[1]!).getByRole("note", { name: NOTICED_TEXT }).textContent).toBe(NOTICED_TEXT);
     expect(within(rows[2]!).getByRole("note").textContent).toBe("No longer available at its source");
     for (const r of rows.slice(3)) expect(r.textContent).not.toMatch(/available|noticed/i);
     // Words, not colour alone: a badge from the theme's classes.
     expect(marks[0]!.className).toContain("ao-badge");
+  });
+
+  it("the mark's words are set apart from \"Needs review\" in the row's text (Task 69 M4)", () => {
+    const base = { projectId: "p1", type: "social-post", creatorsText: "", folder: "f", locked: false };
+    render(<SourceTable items={[{ ...base, id: "a", title: "Gone post", needsReview: true, availability: { status: "unavailable-on-platform" } }]} total={1} onOpen={vi.fn()} reviewHref={(id) => `#/review/${id}`} />);
+    const row = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row")[1]!;
+    expect(row.textContent).toContain("Needs review No longer available at its source");
+    expect(screen.getByRole("link", { name: "Needs review: Gone post" })).toBeTruthy();
   });
 
   it("says when only part of a source's annotations is searchable, when the index is incomplete, and when search covers titles only (R161)", () => {

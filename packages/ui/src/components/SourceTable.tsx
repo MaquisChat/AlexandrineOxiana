@@ -8,7 +8,7 @@
  */
 import type { MouseEvent } from "react";
 import type { SourceRow } from "../api/library";
-import { AvailabilityMark } from "./AvailabilityMark";
+import { AvailabilityMark, availabilityText } from "./AvailabilityMark";
 import { UserText } from "./UserText";
 import "./library.css";
 
@@ -100,7 +100,12 @@ export function SourceTable({ items, total, onOpen, selectedId, incomplete, limi
                   ) : (
                     <span className="ao-badge ao-badge--review">Needs review</span>
                   ))}
-                {!s.locked && <AvailabilityMark availability={s.availability} />}
+                {!s.locked && availabilityText(s.availability) && (
+                  <>
+                    {/* A word break before it, so its words never run on from the badge before (M4). */}{" "}
+                    <AvailabilityMark availability={s.availability} />
+                  </>
+                )}
                 {s.matchedIn === "annotation" && <span className="ao-muted"> Found in an annotation</span>}
                 {s.annotationsPartial && <span className="ao-muted"> (Only part of its annotations is searchable)</span>}
               </td>
