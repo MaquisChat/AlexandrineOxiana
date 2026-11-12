@@ -164,9 +164,10 @@ the Task 37f report under "Unverified until the first Mac run".
 
 ### What the workflow does
 
-`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started by hand or when a
-version tag (`v1.2.3`) is pushed, never on a branch push: Mac minutes are billed at ten times Linux
-minutes. For each architecture it:
+`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started from a tag or by
+hand (both below), never on a branch push: Mac minutes are billed at ten times Linux minutes. A
+short first job on Linux decides which downloads to build and refuses a tag that is not a version
+of the app (`scripts/mac-targets.mjs`). For each architecture it:
 
 1. installs the pinned tools: Node.js (the release in `macos/pins.json`), pnpm, Python 3.13,
    Rust 1.97 and tauri-cli (`pins.json`), with caches keyed on the lock files;
@@ -178,15 +179,16 @@ minutes. For each architecture it:
    the worker into `Contents/Resources` (`src-tauri/tauri.macos.conf.json`; where
    `src-tauri/src/paths.rs` looks), signs the app as `macos/signing.json` says (today ad hoc), fails
    if any program or library in it needs a macOS newer than 15.0, and makes the disk image
-   `dist-macos/Alexandrine-Oxiana-<version>-<apple-silicon|intel>.dmg` with its `.sha256`;
-3. checks it on the runner: the packaged worker's smoke test (with Homebrew's ffmpeg and tesseract,
-   which the app itself does not ship), the launch check A–E on the debug build of the app (the same
+   `dist-macos/Alexandrine-Oxiana-<version>-<apple-silicon|intel>.dmg` with its `.sha256`
+   (`hdiutil` is tried up to three times: it fails now and then with "Resource busy");
+3. uploads the disk image and its SHA-256 as the run's artefacts at once, so a check that fails
+   afterwards never costs the download; the caches are saved even when a step failed;
+4. checks it on the runner: the packaged worker's smoke test (with Homebrew's ffmpeg and tesseract,
+   which the app itself does not ship), the launch check A–D on the debug build of the app (the same
    bundle layout; only a debug build reports what the check reads), and check R on the release app
    run from the mounted disk image: its service and worker start from the app's own resources, the
    service listens on 127.0.0.1 and refuses a request without its token, and nothing is left after
-   the app is stopped;
-4. uploads the disk image and its SHA-256 as the run's artefacts, and writes the sizes and checksums
-   in the run's summary.
+   the app is stopped; and writes the sizes and checksums in the run's summary.
 
 On a Mac with the same tools, `pnpm --filter @ao/desktop run build:macos` does step 2 by hand;
 `node scripts/build-macos.mjs --dry-run [--arch arm64|x64]` prints the steps on any system.
@@ -195,12 +197,46 @@ On a Mac with the same tools, `pnpm --filter @ao/desktop run build:macos` does s
 the page reaching the service and the worker, the granted commands, the helpers' environment, the
 second launch), B (SIGTERM), C (SIGKILL: the service sees its standard input close) and D (a service
 that refuses to start) are expected to work as on Linux: they use only the shell's own test output,
-standard input and signals. E (opened again while closing) depends on the single-instance plugin on
-macOS and is the least certain. On a Mac the processes are read with `ps` instead of `/proc`, there
-is no virtual display or D-Bus (the runner has a logged-in desktop session), and the helpers'
-environment is read with `ps -E`.
+standard input and signals. The check runs the program inside the bundle directly (not through
+`open`), so that it can read the program's output. **E (opened again while closing) is skipped on a
+Mac**, with its reason printed: there Tauri restarts a bundled app through LaunchServices
+(`open -n`; tauri 2.12.5 `src/process.rs`), so the restarted app's output never reaches the check.
+At the start and the end the check looks for any process of any copy of the app (its program, or
+Node.js or the worker from an app's resources) and stops it; one found at the end is a failure. On a
+Mac the processes are read with `ps` instead of `/proc`, there is no virtual display or D-Bus (the
+runner has a logged-in desktop session), and the helpers' environment is read with `ps -E`. A check
+that cannot see what it checks fails ("could not check"): an environment that cannot be read, or
+that lacks the names the service (`PATH`, `AO_SERVICE_PORT`, `AO_CONFIG_DIR`) or the worker
+(`AO_WORKER_PORT`) always has, and a leftover-process search that cannot find a stand-in process
+carrying its marker.
 
-### Starting it by hand (on the GitHub website)
+### Starting a build
+
+**From a tag (works from any branch).** A tag whose name says the version and the architectures
+starts a build:
+
+| Tag | Builds |
+| --- | --- |
+| `v0.0.0-mac.1` | both downloads |
+| `v0.0.0-arm.1` | Apple Silicon only |
+| `v0.0.0-intel.1` | Intel only |
+| `v0.0.0` | both (a release) |
+
+The version (`0.0.0` here) must be the app's version, `version` in `src-tauri/tauri.conf.json`;
+otherwise the run stops in its first minute, on Linux, before any Mac time is spent. The last number
+counts attempts: each new build needs a new tag (`-mac.2`, `-mac.3`, …). Because it spends Mac
+minutes, a tag is pushed only at the owner's word (R167). From a checkout of the branch to build:
+
+```sh
+git tag v0.0.0-mac.1
+git push origin v0.0.0-mac.1
+```
+
+**With the "Run workflow" button (on the GitHub website).** GitHub shows this button only for a
+workflow whose file is on the repository's default branch (`main`). Until the owner agrees to put
+`.github/workflows/desktop-macos.yml` on `main` (it does nothing there by itself: it has no branch
+trigger), the button does not exist and a build is started for the owner with a tag, as above. Once
+the file is on `main`:
 
 1. Open the repository on github.com and click **Actions** (top of the page).
 2. In the list on the left, click **Desktop (macOS)**.
@@ -220,12 +256,14 @@ days. Which one: Apple menu > About This Mac: "Chip: Apple M…" means Apple Sil
 
 ### Opening the unsigned app the first time ("Open Anyway", R151)
 
-1. Double-click the `.zip`, then the `.dmg`, and drag **Alexandrine Oxiana** onto **Applications**.
+1. Open the downloaded `.zip` (Safari may already have unpacked it into a folder), then the `.dmg`,
+   and drag **Alexandrine Oxiana** onto **Applications**.
 2. Open it from Applications. macOS says it cannot check the app for malicious software. Click
    **Done** (not "Move to Trash").
 3. Open **System Settings > Privacy & Security** and scroll down to **Security**. Next to the
    message that Alexandrine Oxiana was blocked, click **Open Anyway**, confirm with your password or
-   Touch ID, then click **Open**.
+   Touch ID, then click **Open**. The button is offered only for a while (about an hour) after the
+   blocked attempt; if it is gone, open the app again and repeat step 3.
 
 This is needed once per download. From then on the app opens normally. On macOS 15 the older way
 (Control-click the app, then Open) no longer skips this step.
@@ -243,7 +281,13 @@ under the hardened runtime (to be confirmed by trying, not added in advance):
 - **Node.js** (`node`): `com.apple.security.cs.allow-jit` for V8's compiler; possibly
   `com.apple.security.cs.allow-unsigned-executable-memory`. Not
   `com.apple.security.cs.disable-library-validation` while every `.node` file is signed with our
-  Team ID, and never `com.apple.security.cs.allow-dyld-environment-variables` (R153).
+  Team ID, and never `com.apple.security.cs.allow-dyld-environment-variables` (R153). **Re-signing
+  Node.js is required, not optional:** the ad-hoc build ships Node's official binary with its
+  publisher's signature (Developer ID "Node.js Foundation"), whose entitlements include
+  `allow-dyld-environment-variables`, `disable-library-validation` and `get-task-allow` (read from
+  v22.23.4 darwin-arm64 in the Task 37f review). The shell never passes a `DYLD_*` variable (R153),
+  so this is not reachable through the app, and the ad-hoc build is for the owner's own tests
+  (R151); a build for anyone else must replace that signature with ours and our entitlements.
 - **the worker** (`worker`): none at first; `com.apple.security.cs.allow-unsigned-executable-memory`
   only if a ctypes or cffi callback fails (ADR 0014).
 
