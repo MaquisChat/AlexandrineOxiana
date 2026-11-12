@@ -112,6 +112,8 @@ export interface ProjectState {
    * audit or change-log line could not be trimmed, or an audit append failed while opening.
    */
   recoveryPending?: boolean;
+  /** The project's audit log did not verify when opened: marks cannot be recorded in it (Task 50). */
+  auditUnverified?: boolean;
 }
 
 export class RepoCore {
@@ -127,6 +129,11 @@ export class RepoCore {
   readonly device: string;
   readonly scryptN: number | undefined;
   readonly auditSegmentSize: number | undefined;
+  /** The library's own audit log (Task 50, R154 a), loaded at open; its latest event. */
+  libraryAudit?: AuditStore;
+  libraryAuditLast?: AuditEvent | null;
+  /** The library log's entries of its latest day, for dropping a repeated refusal (N6). */
+  libraryAuditRecent?: AuditEvent[];
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(

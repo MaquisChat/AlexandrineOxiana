@@ -40,6 +40,7 @@ import type { Readable } from "node:stream";
 import { decryptStream, encryptStream } from "../crypto/format.js";
 import { copyFileAtomic, renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
+import { scrubPaths } from "../app-settings.js";
 
 const SMALL_FILE_BYTES = 256 * 1024;
 import type { AuditInput } from "./audit-store.js";
@@ -373,7 +374,9 @@ async function decide(
   try {
     cfg = await governanceOf(core, st);
   } catch (e) {
-    cfgError = `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}`;
+    // Error text from the file system can name absolute paths: scrubbed here, where it is captured,
+    // before it becomes a recorded reason (Task 50 N5; the researcher's own text is never touched).
+    cfgError = `Policy could not be evaluated: ${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}`;
     if (fallback) cfg = fallback;
   }
   const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
