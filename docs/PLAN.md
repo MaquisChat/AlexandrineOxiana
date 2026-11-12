@@ -452,8 +452,8 @@ Update after every task; commit and push.
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | in progress | | implementer dispatched |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48a Tools: worker and service | in review | afa7bd5 (worktree branch) | built; OCR unavailable until our CI builds tesseract (Task 37f); speech models no longer download by themselves |
-| 48b Tools: the dialogue | not started | | after 48a |
+| 48a Tools: worker and service | fix round 1 | afa7bd5 (worktree branch) | download protections held under probes; 4 Important: a missing tool is not named in capture outcomes, the worker-bundle CI job, a slow download cannot be cancelled, four untested protections |
+| 48b Tools: the dialogue | in progress | | implementer dispatched, building on 48a's branch (R156) |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | in progress | | implementer dispatched |
 | 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
