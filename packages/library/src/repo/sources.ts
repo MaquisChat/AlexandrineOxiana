@@ -140,7 +140,21 @@ async function assertProvenanceUnchanged(core: RepoCore, tx: Tx, sf: SourceFile)
 /** The annotations file of a source folder (R74 I4). */
 const annotationsRel = (folder: string, encrypted: boolean) => `${folder}/${encrypted ? "annotations.json.enc" : "annotations.json"}`;
 
+/** An annotation-file problem a read found, to be recorded once confirmed (R77). */
+type AnnotationProblem = { file: string; kind: "annotations-unreadable" | "annotations-hash-mismatch"; detail: string };
+
 export async function readSourceFile(core: RepoCore, st: ProjectState, id: string): Promise<SourceFile> {
+  let read = await readSourcePair(core, st, id);
+  // A read outside the write queue can fall between the two files a write updates (the annotations
+  // file, then source.json): a problem is confirmed in the queue's turn, after any write in progress,
+  // and recorded only if it is still there (D21). Inside a turn no write is in progress.
+  if (read.problem && !core.holdsTurn()) read = await core.serial(() => readSourcePair(core, st, id));
+  if (read.problem) annotationWarning(core, st, read.problem.file, read.problem.kind, read.problem.detail);
+  return read.sf;
+}
+
+/** Reads source.json and its annotations file; a problem with the pair is returned, not recorded. */
+async function readSourcePair(core: RepoCore, st: ProjectState, id: string): Promise<{ sf: SourceFile; problem?: AnnotationProblem }> {
   const folder = sourceFolderOf(st, id);
   const encrypted = core.encrypted(st);
   const read = async (rel: string): Promise<string | null> => {
@@ -156,6 +170,7 @@ export async function readSourceFile(core: RepoCore, st: ProjectState, id: strin
   // Annotations in their own file; a source.json from before keeps them inline (moved on its next
   // write). A missing or damaged file never makes the source unreadable (R77): no annotations,
   // and an integrity warning; a file whose hash differs from the recorded one is read, with a warning.
+  let problem: AnnotationProblem | undefined;
   if (!sf.annotations.length && sf.annotationCount) {
     const rel = annotationsRel(folder, encrypted);
     let anns: string | null = null;
@@ -164,14 +179,14 @@ export async function readSourceFile(core: RepoCore, st: ProjectState, id: strin
       if (anns === null) throw new Error("missing");
       sf.annotations = Annotation.array().parse(JSON.parse(anns));
       if (sf.annotationsSha256 && createHash("sha256").update(anns).digest("hex") !== sf.annotationsSha256) {
-        annotationWarning(core, st, rel, "annotations-hash-mismatch", "The annotations file of a source was changed outside the app; it was read as it is.");
+        problem = { file: rel, kind: "annotations-hash-mismatch", detail: "The annotations file of a source was changed outside the app; it was read as it is." };
       }
     } catch {
       sf.annotations = [];
-      annotationWarning(core, st, rel, "annotations-unreadable", "The annotations file of a source is missing or damaged; the source is shown without annotations.");
+      problem = { file: rel, kind: "annotations-unreadable", detail: "The annotations file of a source is missing or damaged; the source is shown without annotations." };
     }
   }
-  return sf;
+  return problem ? { sf, problem } : { sf };
 }
 
 /** Records an annotation-file integrity warning once per file (R77). */
