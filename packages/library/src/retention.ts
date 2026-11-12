@@ -948,6 +948,8 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
   const out: string[] = [];
   const now = repoClock(repo)();
   let firstError: unknown;
+  /** Whether the whole log, read in this pass, held together (undefined: not read in full yet). */
+  let holds: boolean | undefined;
   for (const scanned of view.list) {
     let a = scanned;
     if (!outstandingOf(a).length) continue;
@@ -969,6 +971,7 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
         } else {
           // Before anything is removed: the whole log, its chain verified, read again.
           const checked = await verifiedAuditEvents(repo, projectId);
+          holds = checked.ok;
           const sure = checked.ok ? auditedDestructions(checked.events).list.find((x) => x.certificateSha256 === a.certificateSha256) : undefined;
           if (sure) {
             a = sure;
@@ -1015,6 +1018,30 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
     const buf = await readPlain(repo, projectId, `${dirRel}/${n}`).catch(() => null);
     const files = await unrecordedOutstanding(repo, Buffer.isBuffer(buf) ? parseObject(buf) : undefined).catch(() => []);
     if (files.length) notes[`${dirRel}/${n}`] = { files, problem: UNRECORDED };
+  }
+  // A backup that is still in the Backups folder leaves the note, and so the warning, only on the
+  // word of a log that holds together (R147 4). The lines read above are not checked against the
+  // chain, so before a noted backup that is still there is dropped, the whole log is read and
+  // verified (unless this pass already did). If it does not hold, the backup stays noted, with why.
+  try {
+    const leaving = Object.entries(found).flatMap(([rel, note]) =>
+      note.files.filter((f) => isBackupRel(f) && isBackupFileName(fileOf(f)) && !notes[rel]?.files.includes(f)).map((file) => ({ rel, file })),
+    );
+    if (leaving.length) {
+      const files = await backupFilesNow(repo, leaving.map((x) => fileOf(x.file)));
+      const there = leaving.filter((x) => files.get(fileOf(x.file))?.present === true);
+      if (there.length) {
+        holds ??= (await verifiedAuditEvents(repo, projectId)).ok;
+        if (!holds) {
+          for (const x of there) notes[x.rel] = { files: [...new Set([...(notes[x.rel]?.files ?? []), x.file])], problem: view.headMatches ? AUDIT_UNVERIFIED : AUDIT_CHANGED };
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof SimulatedCrash) throw err;
+    // It could not be checked: what was noted stays as it was.
+    for (const [rel, note] of Object.entries(found)) notes[rel] ??= note;
+    firstError ??= err;
   }
   await setDestructionNotes(repo, projectId, notes).catch(() => {});
   if (firstError !== undefined) throw firstError;

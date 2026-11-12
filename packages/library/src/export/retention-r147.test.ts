@@ -16,7 +16,7 @@ import { shredSeams } from "../fs/shred.js";
 import { newAttentionId, writeAttention, type UnrecordedAudit } from "../repo/attention.js";
 import { projectWarnings } from "../repo/repo.js";
 import { SimulatedCrash, seams } from "../repo/testing.js";
-import { destroyRaw, listDestructions, readDestruction, resumeDestruction } from "../retention.js";
+import { backupsAwaitingRemoval, destroyRaw, listDestructions, readDestruction, resumeDestruction } from "../retention.js";
 import { backupProject, backupSeams, holdingNotRemoved, type BackupResult } from "./backup.js";
 import { addSource, auditEvents, makeKit, makeProject, plainOf, scratchFile, type Kit } from "./test-kit.js";
 
@@ -351,6 +351,46 @@ describe("the certificate and backups-state.json are conveniences; the audit log
     await resumeDestruction(kit.repo, p.id);
     expect(await recordedAs(p, rel(x))).toEqual({ removed: 0, gone: 1 });
     expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+  });
+
+  it("an audit log changed on disk to say the stuck backup was removed: the warning is not cleared on its word while the backup is still there", async () => {
+    const { p, x, certificatePath } = await stuck();
+    // The record of the first step is rewritten to claim the removal (not the last entry: the log still ends where the app left it).
+    const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
+    const segment = join(dir, (await readdir(dir)).sort().at(-1)!);
+    const lines = (await readFile(segment, "utf8")).split("\n");
+    const i = lines.findIndex((l) => l.includes('"op":"retention.backups"') && l.includes('"action":"delete"'));
+    expect(i).toBeGreaterThan(-1);
+    expect(i).toBeLessThan(lines.filter((l) => l.trim()).length - 1);
+    const forged = JSON.parse(lines[i]!) as { details: Details };
+    Object.assign(forged.details, { status: "deleted", removed: [rel(x)], notRemoved: [] });
+    lines[i] = JSON.stringify(forged);
+    await writeFile(segment, lines.join("\n"));
+    expect(verifyChain(await auditEvents(kit, p)).ok).toBe(false);
+
+    for (let n = 0; n < 2; n++) {
+      later(HOUR);
+      await resumeDestruction(kit.repo, p.id);
+      // Nothing is removed on the word of such a log, and nothing is given up on its word either.
+      expect(existsSync(x.path)).toBe(true);
+      expect(await holdingNotRemoved(kit.repo, p.id)).toEqual([rel(x)]);
+      expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+      const waiting = await backupsAwaitingRemoval(kit.repo, p.id);
+      expect(waiting).toEqual([{ certificateFile: `${kit.repo.getProject(p.id).folder}/retention/${basename(certificatePath)}`, backups: [rel(x)], reason: expect.stringMatching(/audit log .* does not hold together/u) }]);
+      expect(waiting[0]!.reason).not.toContain(kit.lib.root);
+    }
+    // A restart changes nothing of that.
+    const again = await kit.reopen();
+    later(HOUR);
+    await resumeDestruction(again, p.id);
+    expect(existsSync(x.path)).toBe(true);
+    expect(await projectWarnings(again, p.id)).toContain(WARNING);
+    // Removed by hand: nothing is left to warn about.
+    await rm(x.path);
+    later(HOUR);
+    await resumeDestruction(again, p.id);
+    expect(await projectWarnings(again, p.id)).not.toContain(WARNING);
+    expect(await holdingNotRemoved(again, p.id)).toEqual([]);
   });
 
   it("backups-state.json deleted: the retry still knows what is outstanding from the audit log, and writes nothing more to it for a retry that changes nothing", async () => {
