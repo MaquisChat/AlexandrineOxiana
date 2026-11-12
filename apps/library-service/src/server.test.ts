@@ -1189,6 +1189,47 @@ processing:
     expect(shown.json.certificates[0]).toMatchObject({ verified: false, status: "pending", outstanding: [`Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`], problem: expect.stringMatching(/audit log/u) });
     expect(shown.body).not.toContain(tmp);
   });
+
+  it("R147: a pass that only observes still tells the interface what changed (automatic backups off)", async () => {
+    await openNewLibrary();
+    const { pid, certificatePath, backup } = await stuckDestruction();
+    const held = `Backups/${backup.slice(backup.lastIndexOf("/") + 1)}`;
+    // No scheduled backup for this project: nothing else in the pass publishes the library state.
+    expect((await call({ method: "PUT", url: `/projects/${pid}/backup-settings`, body: { automatic: false } })).status).toBe(200);
+    await svc.state.idle();
+    const published: Waiting[] = [];
+    const off = svc.state.events.subscribe((e) => {
+      if (e.type === "library.state") published.push((e.data as { destructionBackupsPending: Waiting }).destructionBackupsPending);
+    });
+    try {
+      // The certificate is changed on disk: the pass removes nothing, and the interface is told why.
+      const cert = JSON.parse(await readFile(certificatePath, "utf8")) as { assets: unknown[] };
+      cert.assets = [];
+      await writeFile(certificatePath, JSON.stringify(cert));
+      later(HOUR);
+      await svc.state.runScheduledBackups();
+      await svc.state.idle();
+      expect(existsSync(backup)).toBe(true);
+      expect(published.at(-1)?.[pid]).toEqual([{ certificateFile: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.json$/u), backups: [held], reason: expect.stringMatching(/audit log/u) }]);
+      // Nothing changes: nothing more is published.
+      const told = published.length;
+      later(HOUR);
+      await svc.state.runScheduledBackups();
+      await svc.state.idle();
+      expect(published).toHaveLength(told);
+      // The researcher removes the backup by hand: the pass records that it is gone, and the interface is told the warning has ended.
+      await rm(backup);
+      later(HOUR);
+      await svc.state.runScheduledBackups();
+      await svc.state.idle();
+      expect(await statusOf(pid, certificatePath)).toBe("no-longer-present");
+      expect(published.length).toBeGreaterThan(told);
+      expect(published.at(-1)?.[pid]).toBeUndefined();
+      expect((svc.state.libraryState() as { projectWarnings: Record<string, string[]> }).projectWarnings[pid]).not.toContain("destruction-backups-pending");
+    } finally {
+      off();
+    }
+  });
 });
 
 describe("review round 1: smaller route fixes (R99 minors)", () => {

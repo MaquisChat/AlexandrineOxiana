@@ -5,6 +5,7 @@
  * Everything that changes the library goes through `@ao/library`.
  */
 import { userInfo } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import {
   HttpClient,
   IndexHandle,
@@ -730,13 +731,19 @@ export class ServiceState {
       out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
       const f = out[p.id]!.includes("backup-failed") ? await backupFailure(s.repo, p.id).catch(() => undefined) : undefined;
       if (f) failures[p.id] = { ...f, reason: scrubPaths(f.reason, this.roots) };
-      const w = out[p.id]!.includes("destruction-backups-pending") ? await backupsAwaitingRemoval(s.repo, p.id).catch(() => []) : [];
-      if (w.length) waiting[p.id] = w.map((x) => (x.reason ? { ...x, reason: scrubPaths(x.reason, this.roots) } : x));
+      const w = out[p.id]!.includes("destruction-backups-pending") ? await this.pendingRemovals(s, p.id) : [];
+      if (w.length) waiting[p.id] = w;
     }
     this.cachedProjectWarnings = out;
     this.cachedBackupFailures = failures;
     this.cachedPendingRemovals = waiting;
     return out;
+  }
+
+  /** Which backups still wait to be removed after a destruction in the project, and why (R147), as the interface is told: path-scrubbed. */
+  private async pendingRemovals(s: Session, projectId: string): Promise<PendingRemoval[]> {
+    const w = await backupsAwaitingRemoval(s.repo, projectId).catch((): PendingRemoval[] => []);
+    return w.map((x) => (x.reason ? { ...x, reason: scrubPaths(x.reason, this.roots) } : x));
   }
 
   /** Recomputes the project warnings, then sends `library.state`. */
@@ -775,7 +782,10 @@ export class ServiceState {
           this.opts.log.warn({ err: this.describe(err) }, "resuming a destruction failed");
           return ["failed"];
         });
-        if (worked.length) retried = true;
+        // A pass that only observes (the files and the audit log disagree) tries nothing, yet may
+        // change what stands behind the warning: the interface is told whenever that is no longer
+        // what it was last told.
+        if (worked.length || !isDeepStrictEqual(await this.pendingRemovals(s, p.id), this.cachedPendingRemovals[p.id] ?? [])) retried = true;
       }
       if (p.backups?.automatic === false) continue;
       try {
