@@ -46,6 +46,8 @@ const APP_NAME: &str = "Alexandrine Oxiana";
 struct Shell {
     service: Mutex<Option<Service>>,
     stopping: AtomicBool,
+    /// Start-up failed: the program exits non-zero however its error window is closed.
+    failed: AtomicBool,
 }
 
 /// Debug builds only: with NODE_ENV=test the shell reports what the launch check needs on its
@@ -62,10 +64,12 @@ fn log_helper(line: &str) {
 fn fail(app: &AppHandle, shell: &Shell, message: &str) -> ! {
     eprintln!("{APP_NAME} could not start: {message}");
     if test_mode() {
-        println!("AO_SHELL_FAILED");
+        println!("AO_SHELL_FAILED {message}");
     }
     shell.stopping.store(true, Ordering::SeqCst);
-    if let Some(mut s) = shell.service.lock().unwrap().take() {
+    shell.failed.store(true, Ordering::SeqCst);
+    let started = shell.service.lock().unwrap().take();
+    if let Some(mut s) = started {
         s.stop(Duration::from_secs(10));
     }
     app.dialog()
@@ -105,7 +109,7 @@ fn launch(app: AppHandle, shell: Arc<Shell>) {
     };
     let port = svc.port;
     if test_mode() {
-        println!("AO_SHELL_SERVICE pid={} port={port}", svc.pid());
+        println!("AO_SHELL_SERVICE pid={} port={port} shell={}", svc.pid(), std::process::id());
     }
     *shell.service.lock().unwrap() = Some(svc);
 
@@ -256,5 +260,5 @@ pub fn run() {
             println!("AO_SHELL_STOPPED {}", if how == Stopped::Clean { "clean" } else { "forced" });
         }
     }
-    std::process::exit(code);
+    std::process::exit(if shell.failed.load(Ordering::SeqCst) { 1 } else { code });
 }
