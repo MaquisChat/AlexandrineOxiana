@@ -28,28 +28,41 @@ from the packages' own files, into one readable file per part:
 | Python packages and native libraries of the worker | `services/media-worker/packaging/manifest.py` | `licenses/THIRD-PARTY-LICENCES.txt` | in the worker folder; a copy in the interface |
 | Typefaces; citation styles and citeproc-js | (files in the repository) | the OFL texts; `NOTICE.md`, CC BY-SA 3.0, CPAL-1.0 | in the interface and the service folder, as before |
 
-The rules, the same in the JavaScript (`apps/desktop/scripts/licence-texts.mjs`) and the Python
+The rules, the same in the JavaScript (`scripts/notices/licence-texts.mjs`) and the Python
 (`services/media-worker/packaging/licence_texts.py`) builds:
 
-1. **Texts come from the package.** The crate's source in the cargo registry (its top-level
-   `LICENSE*`, `COPYING*`, `NOTICE*`, `COPYRIGHT*`, `AUTHORS*` files and its Cargo.toml
-   `license-file`), the npm package's folder, the wheel's dist-info licence files, Node's own
-   `LICENSE`. Nothing is downloaded beyond what the builds already download.
-2. **A package that ships no text** is named in its file's "No licence text shipped by the package"
-   section and gets the standard text of each identifier it declares, from `licences/standard/`:
-   SPDX texts copied unmodified from one tagged release, each with its source and checksum in that
-   folder's README. A text is never typed in or made up from an identifier. The only other source
-   allowed is a text from the same project that a build names (the napi-rs platform binaries take
-   their parent package's LICENSE). A Python wheel whose metadata gives no usable identifier may
-   give it in its own SBOM (tokenizers).
-3. **Fail closed.** A shipped package with no licence identifier, or with one for which there is
-   neither a shipped text nor a standard text, fails the build with the package named.
-4. **Each identical text once.** Texts are grouped by their wording without their copyright lines;
-   every distinct copyright line of every copy is kept with the group, and the group names every
-   package (and file) that uses it.
+1. **Texts come from the package, verbatim (R165).** The crate's source in the cargo registry and
+   the npm package's folder (their root `LICENSE*`, `LICENCE*`, `COPYING*`, `UNLICENSE*`, `NOTICE*`,
+   `COPYRIGHT*`, `AUTHORS*` and third-party files, a root `licenses/` folder, Cargo's `license-file`,
+   npm's `SEE LICENSE IN <file>`); the wheel's dist-info licence files and the licence and notice
+   files it installs beside the package (onnxruntime's `LICENSE` and `ThirdPartyNotices.txt`, which
+   PyInstaller does not copy); Node's own `LICENSE`. Nothing inside a file is extracted, moved or
+   rewritten. Nothing is downloaded beyond what the builds already download.
+2. **A package without a licence text of its own** (a NOTICE, AUTHORS or third-party list is not
+   one) is named in its file's "No licence text shipped by the package" section and gets the
+   standard text of each identifier it declares, from `licences/standard/`: SPDX texts copied
+   unmodified from one tagged release, each with its source and checksum in that folder's README.
+   A text is never typed in or made up from an identifier. The only other source allowed is a text
+   from the same project that a build names (the napi-rs platform binaries take their parent
+   package's LICENSE). A Python wheel whose metadata gives no usable identifier may give it in its
+   own SBOM (tokenizers).
+3. **Fail closed.** A shipped package with no licence identifier, or without a licence text and
+   with an identifier that has no standard text, fails the build with the package named. So does a
+   notices file that does not contain every source file whole (each generator checks before
+   writing; `scripts/notices/check-verbatim.mjs` checks written files against the source list each
+   generator leaves beside its output, outside what ships).
+4. **Only whole identical files are merged (R165).** Two files are the same only if they are equal
+   after normalising line endings and trailing whitespace. Each distinct file is shipped once, in
+   full, under a heading naming every package (and file) it applies to; two MIT texts that differ
+   only in their copyright line are two files.
 5. **Only what ships.** For the shell: the normal-dependency closure for the build's target, without
    build and dev dependencies and without proc-macro crates or what only they need (they run inside
-   the compiler). MPL-2.0 parts name where their source is.
+   the compiler). MPL-2.0 parts name where their source is (crates: repository and crates.io; npm:
+   repository and npm; Python: the source address in the package's metadata and its PyPI page).
+6. **Known gaps are named, never filled.** Where a package's own SBOM lists components its program
+   contains (the `@napi-rs/canvas` binary: 141, including Skia and MPL-2.0 crates), the list is
+   shipped by name (and the SBOM beside the package's licence in the service folder); where the
+   package ships no texts for them, that is said in the "No licence text" section.
 
 The About screen's "Full licence texts" section shows each file on request through `UserText`. The
 files are separate chunks of the interface, loaded only when the person asks: they are never in the
@@ -68,13 +81,16 @@ file is not there.
 
 ## Consequences
 
-- A release carries the notices its licences require, and a new dependency without a licence, or
-  without a text the builds can find, stops the build instead of shipping silently.
-- The interface grows by the size of the texts (about 0.8 MB before the worker's file, compressed about 110 kB), all in
-  chunks that load only on request.
+- Every licence and notice file the shipped packages carry travels with the app, unaltered, and a
+  new dependency without a licence, or without a text the builds can find, stops the build instead
+  of shipping silently. That is not the same as every notice their licences may require: what a
+  package bundles without shipping texts for it is a named gap (below).
+- The interface grows by the size of the texts (about 1.1 MB before the service's and the worker's
+  files, which add about 0.4 MB and 1.1 MB), all in chunks that load only on request.
 - Some things are visible but not solved here, and are listed for the owner's licence review (Task
   56): native libraries the worker's PyInstaller build takes from the build machine whose licence
-  nothing in the bundle states; Rust crates statically linked inside wheels (tokenizers, for one)
-  whose texts their wheels do not carry; and the standard texts used for packages that ship none,
-  which carry the SPDX placeholders instead of the package's own copyright line.
+  nothing in the bundle states; components that wheels and the canvas binary link in and list in
+  their SBOMs without shipping texts for them (tokenizers, the canvas binary); and the standard
+  texts used for packages that ship none, which carry the SPDX placeholders instead of the
+  package's own copyright line.
 - Adding a standard text means copying it from the same SPDX release and recording its checksum.
