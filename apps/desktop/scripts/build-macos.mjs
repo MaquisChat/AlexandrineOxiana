@@ -214,8 +214,29 @@ function capture(cmd, args, opts = {}) {
   return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
 
-/** Every regular Mach-O file under `dir` (symbolic links are not followed). */
-function machOFiles(dir, out = []) {
+const FILETYPE = { 1: "object", 2: "execute", 6: "dylib", 8: "bundle", 9: "dylib_stub", 10: "dsym", 11: "kext_bundle" };
+/** The kinds of Mach-O file codesign signs as code; an object file or debug symbols are data. */
+const SIGNABLE = new Set(["execute", "dylib", "bundle"]);
+
+/** The Mach-O file type (of the first slice of a universal file), or null. */
+export function machoFileType(src) {
+  const at = typeof src === "function" ? src : (o, n) => src.subarray(o, o + n);
+  const head = at(0, 8);
+  if (head.length < 8) return null;
+  let base = 0;
+  const be = head.readUInt32BE(0);
+  if (be === 0xcafebabe || be === 0xcafebabf) {
+    const entry = at(8, 32);
+    base = be === 0xcafebabf ? Number(entry.readBigUInt64BE(8)) : entry.readUInt32BE(8);
+  }
+  const h = at(base, 16);
+  if (h.length < 16 || ![0xfeedfacf, 0xfeedface].includes(h.readUInt32LE(0))) return null;
+  const t = h.readUInt32LE(12);
+  return FILETYPE[t] ?? `type ${t}`;
+}
+
+/** Every regular Mach-O file under `dir` (symbolic links are not followed): {path, slices, filetype, signable}. */
+export function machOFiles(dir, out = []) {
   for (const e of readdirSync(dir)) {
     const p = join(dir, e);
     const st = lstatSync(p);
@@ -230,7 +251,10 @@ function machOFiles(dir, out = []) {
           return b;
         };
         const slices = machoMinOs(reader);
-        if (slices) out.push({ path: p, slices });
+        if (slices) {
+          const filetype = machoFileType(reader);
+          out.push({ path: p, slices, filetype, signable: SIGNABLE.has(filetype) });
+        }
       } finally {
         closeSync(fd);
       }
@@ -243,7 +267,10 @@ function sign(app) {
   const identity = process.env.APPLE_SIGNING_IDENTITY || SIGNING.identity;
   const signing = { ...SIGNING, identity };
   step(`clear extended attributes of ${PRODUCT}.app (they make codesign fail)`, "xattr", ["-cr", app]);
-  const files = machOFiles(app).map((f) => ({ path: f.path, signed: capture("codesign", ["--verify", "--strict", f.path]).ok }));
+  const all = machOFiles(app);
+  const data = all.filter((f) => !f.signable);
+  if (data.length) process.stdout.write(`build:macos: not signed (Mach-O data, not code): ${data.map((f) => `${relative(app, f.path)} (${f.filetype})`).join(", ")}\n`);
+  const files = all.filter((f) => f.signable).map((f) => ({ path: f.path, signed: capture("codesign", ["--verify", "--strict", f.path]).ok }));
   const calls = signingPlan({ app, machO: files, signing });
   process.stdout.write(`build:macos: signing ${identity === "-" ? "ad hoc" : `as ${identity}`}: ${files.length} Mach-O files in the app, ${files.filter((f) => f.signed).length} already signed; ${calls.length} codesign calls\n`);
   for (const c of calls) {
@@ -257,18 +284,43 @@ function sign(app) {
   process.stdout.write(`${capture("codesign", ["--display", "--verbose=2", app]).out}\n`);
 }
 
-function checkMinOs(app) {
+/** The minimum-macOS check over every Mach-O file under `app`: {files, newest, none, problems}. */
+export function minOsReport(app, minimum) {
   const files = machOFiles(app);
-  const problems = minOsProblems(files.map((f) => ({ path: relative(app, f.path), slices: f.slices })), PINS.minimumSystemVersion);
-  const stated = files.filter((f) => f.slices.every((s) => s.minos === null));
-  process.stdout.write(`build:macos: ${files.length} Mach-O files; the newest minimum macOS among them: ${files.flatMap((f) => f.slices.map((s) => s.minos).filter(Boolean)).reduce((a, b) => (newer(b, a) ? b : a), "0.0")}${stated.length ? `; ${stated.length} state none` : ""}\n`);
-  if (problems.length) {
-    process.stderr.write(`build:macos: files that would not run on macOS ${PINS.minimumSystemVersion}:\n  ${problems.join("\n  ")}\n`);
+  return {
+    files: files.length,
+    newest: files.flatMap((f) => f.slices.map((s) => s.minos).filter(Boolean)).reduce((a, b) => (newer(b, a) ? b : a), "0.0"),
+    none: files.filter((f) => f.slices.every((s) => s.minos === null)).length,
+    problems: minOsProblems(files.map((f) => ({ path: relative(app, f.path), slices: f.slices })), minimum),
+  };
+}
+
+function checkMinOs(app) {
+  const r = minOsReport(app, PINS.minimumSystemVersion);
+  process.stdout.write(`build:macos: ${r.files} Mach-O files; the newest minimum macOS among them: ${r.newest}${r.none ? `; ${r.none} state none` : ""}\n`);
+  if (r.problems.length) {
+    process.stderr.write(`build:macos: files that would not run on macOS ${PINS.minimumSystemVersion}:\n  ${r.problems.join("\n  ")}\n`);
     process.exit(1);
   }
 }
 
-function makeDmg(app, target) {
+/**
+ * Runs `run` (returning {ok, out}) up to `attempts` times with `waitMs` between; returns the success
+ * with the earlier failures' messages, or throws with all of them. (hdiutil create fails now and then
+ * on GitHub's Mac runners with "Resource busy".)
+ */
+export async function runWithRetries({ attempts = 3, waitMs = 10_000, wait = (ms) => new Promise((r) => setTimeout(r, ms)), run }) {
+  const failures = [];
+  for (let i = 1; i <= attempts; i++) {
+    const r = await run(i);
+    if (r.ok) return { ok: true, out: r.out, failures };
+    failures.push(r.out);
+    if (i < attempts) await wait(waitMs);
+  }
+  throw new Error(`failed after ${attempts} attempts:\n${failures.map((f, i) => `  attempt ${i + 1}: ${f}`).join("\n")}`);
+}
+
+async function makeDmg(app, target) {
   const work = join(BUILD, `dmg-${target.label}`);
   rmSync(work, { recursive: true, force: true });
   mkdirSync(work, { recursive: true });
@@ -276,7 +328,15 @@ function makeDmg(app, target) {
   symlinkSync("/Applications", join(work, "Applications"));
   mkdirSync(OUT, { recursive: true });
   const dmg = join(OUT, target.dmgName(BASE_CONF.version));
-  step(`the disk image ${relative(REPO, dmg)}`, "hdiutil", dmgArgs({ srcFolder: work, out: dmg }));
+  process.stdout.write(`build:macos: the disk image ${relative(REPO, dmg)}\n`);
+  const r = await runWithRetries({
+    run: (i) => {
+      const c = capture("hdiutil", dmgArgs({ srcFolder: work, out: dmg }));
+      if (!c.ok) process.stdout.write(`build:macos: hdiutil create, attempt ${i}, failed: ${c.out}\n`);
+      return c;
+    },
+  });
+  if (r.failures.length) process.stdout.write(`build:macos: the disk image was made after ${r.failures.length} failed attempt(s)\n`);
   const hash = createHash("sha256").update(readFileSync(dmg)).digest("hex");
   writeFileSync(`${dmg}.sha256`, `${hash}  ${target.dmgName(BASE_CONF.version)}\n`);
   process.stdout.write(`build:macos: ${relative(REPO, dmg)} sha256 ${hash}\n`);

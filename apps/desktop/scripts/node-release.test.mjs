@@ -90,8 +90,10 @@ describe("ensureNodeRelease", () => {
     const pin = pinFor("node-v22.0.0-darwin-arm64.tar.gz", dir, bytes);
     writeFileSync(join(cache, pin.archive), "a truncated earlier download");
     const asked = [];
-    const fetchImpl = async (url) => {
+    const fetchImpl = async (url, opts) => {
       asked.push(url);
+      // The pinned address only: a redirect to another place is an error, not followed.
+      assert.equal(opts?.redirect, "error");
       return new Response(bytes);
     };
     const r = await ensureNodeRelease({ cacheDir: cache, pin, fetchImpl });

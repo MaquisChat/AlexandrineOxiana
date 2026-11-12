@@ -55,7 +55,8 @@ export async function ensureNodeRelease({ cacheDir, pin = nodePin(), fetchImpl =
   }
   if (!existsSync(archive)) {
     log(`node: downloading ${pin.url}`);
-    const res = await fetchImpl(pin.url);
+    // The pinned address only: a redirect elsewhere is refused rather than followed.
+    const res = await fetchImpl(pin.url, { redirect: "error" });
     if (!res.ok) throw new Error(`could not download ${pin.url}: HTTP ${res.status}`);
     const part = `${archive}.part`;
     writeFileSync(part, Buffer.from(await res.arrayBuffer()));

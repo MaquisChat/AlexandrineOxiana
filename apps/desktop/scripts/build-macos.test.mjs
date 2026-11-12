@@ -10,6 +10,9 @@ import { after, describe, it } from "node:test";
 import {
   checkBuildInfo,
   dmgArgs,
+  machOFiles,
+  minOsReport,
+  runWithRetries,
   MACOS_CONF,
   machoMinOs,
   macosTarget,
@@ -162,7 +165,7 @@ const enc = (v) => {
   return (a << 16) | (b << 8) | c;
 };
 /** A thin 64-bit little-endian Mach-O header with the given load commands. */
-function thin(cpu, cmds) {
+function thin(cpu, cmds, filetype = 2) {
   const bodies = cmds.map(([cmd, v]) => {
     const b = Buffer.alloc(cmd === LC_BUILD_VERSION ? 24 : 16);
     b.writeUInt32LE(cmd, 0);
@@ -180,7 +183,7 @@ function thin(cpu, cmds) {
   const h = Buffer.alloc(32);
   h.writeUInt32LE(0xfeedfacf, 0);
   h.writeUInt32LE(cpu, 4);
-  h.writeUInt32LE(2, 12);
+  h.writeUInt32LE(filetype, 12);
   h.writeUInt32LE(bodies.length, 16);
   h.writeUInt32LE(bodies.reduce((n, b) => n + b.length, 0), 20);
   return Buffer.concat([h, ...bodies]);
@@ -224,6 +227,58 @@ describe("machoMinOs", () => {
     const javaClass = Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x34, 0, 0, 0, 0]);
     assert.equal(machoMinOs(javaClass), null);
     assert.equal(machoMinOs(Buffer.from([0xcf, 0xfa])), null);
+  });
+});
+
+describe("machOFiles and minOsReport (a folder on disk)", () => {
+  it("finds the regular Mach-O files, their type and minimum macOS, skipping links and other files", () => {
+    const app = mkdtempSync(join(root, "app-"));
+    mkdirSync(join(app, "Contents", "MacOS"), { recursive: true });
+    mkdirSync(join(app, "Contents", "Resources", "w", "_internal"), { recursive: true });
+    writeFileSync(join(app, "Contents", "MacOS", "prog"), thin(ARM64, [[LC_BUILD_VERSION, "15.0"]]));
+    writeFileSync(join(app, "Contents", "Resources", "w", "_internal", "lib.dylib"), thin(ARM64, [[LC_BUILD_VERSION, "14.0"]], 6));
+    writeFileSync(join(app, "Contents", "Resources", "w", "_internal", "x.o"), thin(ARM64, [[LC_BUILD_VERSION, "15.0"]], 1));
+    writeFileSync(join(app, "Contents", "Resources", "w", "script.py"), "print('hello, this is long enough to be read')\n");
+    symlinkSync("_internal/lib.dylib", join(app, "Contents", "Resources", "w", "lib.dylib"));
+    const files = machOFiles(app).map((f) => ({ path: f.path.slice(app.length + 1), filetype: f.filetype, signable: f.signable, minos: f.slices[0].minos }));
+    files.sort((a, b) => a.path.localeCompare(b.path));
+    assert.deepEqual(files, [
+      { path: "Contents/MacOS/prog", filetype: "execute", signable: true, minos: "15.0" },
+      { path: "Contents/Resources/w/_internal/lib.dylib", filetype: "dylib", signable: true, minos: "14.0" },
+      // An object file is not code that runs: it is not signed (codesign would refuse it).
+      { path: "Contents/Resources/w/_internal/x.o", filetype: "object", signable: false, minos: "15.0" },
+    ]);
+    assert.deepEqual(minOsReport(app, "15.0"), { files: 3, newest: "15.0", none: 0, problems: [] });
+    writeFileSync(join(app, "Contents", "Resources", "w", "_internal", "new.so"), thin(ARM64, [[LC_BUILD_VERSION, "26.0"]], 8));
+    const r = minOsReport(app, "15.0");
+    assert.equal(r.newest, "26.0");
+    assert.equal(r.problems.length, 1);
+    assert.match(r.problems[0], /^Contents\/Resources\/w\/_internal\/new\.so \(arm64\) needs macOS 26\.0/);
+  });
+});
+
+describe("runWithRetries (the disk image)", () => {
+  it("tries up to three times with a wait between, and keeps each failure's message", async () => {
+    const waits = [];
+    let n = 0;
+    const r = await runWithRetries({ attempts: 3, wait: async (ms) => waits.push(ms), waitMs: 5000, run: () => (++n < 3 ? { ok: false, out: `hdiutil: create failed - Resource busy (${n})` } : { ok: true, out: "created" }) });
+    assert.equal(n, 3);
+    assert.deepEqual(waits, [5000, 5000]);
+    assert.deepEqual(r, { ok: true, out: "created", failures: ["hdiutil: create failed - Resource busy (1)", "hdiutil: create failed - Resource busy (2)"] });
+  });
+  it("gives up after the last attempt with every message", async () => {
+    let n = 0;
+    await assert.rejects(
+      runWithRetries({ attempts: 3, wait: async () => {}, waitMs: 1, run: () => ({ ok: false, out: `busy ${++n}` }) }),
+      (e) => /3 attempts/.test(e.message) && /busy 1/.test(e.message) && /busy 2/.test(e.message) && /busy 3/.test(e.message),
+    );
+    assert.equal(n, 3);
+  });
+  it("does not retry what succeeded", async () => {
+    let n = 0;
+    const r = await runWithRetries({ attempts: 3, wait: async () => assert.fail("no wait"), waitMs: 1, run: () => (n++, { ok: true, out: "" }) });
+    assert.equal(n, 1);
+    assert.deepEqual(r.failures, []);
   });
 });
 
