@@ -48,6 +48,10 @@ export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, re
 export type { LockInfo } from "./lock.js";
 export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, parseWindowsDrives } from "./location.js";
 export type { Location, LocationEnv, MountInfo } from "./location.js";
+export { OldCopiesUnreadableError } from "./old-copies.js";
+export { WatchedFoldersUnreadableError } from "./import/watch.js";
+export { ApprovedFoldersUnreadableError } from "./import/approved-folders.js";
+export { NOTICES_FILE, deviceNoticesIdle, dismissDeviceNotice, raiseDeviceNotice, readDeviceNotices } from "./device-notices.js";
 export {
   InvalidConfirmTokenError,
   MOVED_MARKER,
@@ -100,7 +104,7 @@ export type {
   RelinkSkipReason,
   WatchOptions,
 } from "./reconnect.js";
-export { addKnownPath, forgetLastOpenLibrary, forgetLibrary, lastOpenLibrary, listLibraries, recordLocation, registerLibrary, rememberLastOpenLibrary } from "./registry.js";
+export { addKnownPath, forgetLastOpenLibrary, forgetLibrary, lastOpenLibrary, listLibraries, recordLocation, registerLibrary, rememberLastOpenLibrary, settleDamagedRegistry } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 
 export * from "./repo/index.js";
@@ -255,11 +259,17 @@ export {
   deviceDeps,
   ensurePrivateDir,
   readAppSetting,
+  readAppSettingStrict,
+  updateAppSettingStrict,
+  setAppSettingAside,
+  DeviceIdUnreadableError,
+  AppSettingUnreadableError,
+  AppSettingReadableError,
   researcherName,
   researcherNameOk,
   scrubPaths,
   setResearcherName,
-  updateAppSetting,
+  writeAppSetting,
 } from "./app-settings.js";
 export {
   ASSET_TEXT_MAX_BYTES,

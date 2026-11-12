@@ -23,7 +23,7 @@ import {
   planMove,
 } from "./move.js";
 import { acquireLock, releaseLock } from "./lock.js";
-import { addPendingOldCopy, markPendingComplete } from "./old-copies.js";
+import { OldCopiesUnreadableError, addPendingOldCopy, markPendingComplete } from "./old-copies.js";
 import { listLibraries } from "./registry.js";
 import { projectWarnings, type Repo } from "./repo/index.js";
 import { SimulatedCrash, openTestRepo, seams } from "./repo/testing.js";
@@ -1147,5 +1147,28 @@ describe("Task 50: no refusal or audit failure is silent", () => {
     await completeMove(dest, mkDeps(), env);
     for (const f of [a.folder, b.folder]) expect((await auditOf(dest, f)).filter((e) => e.action === "library.move")).toHaveLength(1);
     expect(await attentionOf(dest, a.folder)).toEqual([]);
+  });
+});
+
+describe("the list of old library copies cannot be read (Task 68, ruling 1)", () => {
+  it("the move is stopped before anything is switched, says so in plain words, and writes nothing to the list", async () => {
+    const { lib } = await fixture();
+    const before = await hashes(lib.root, notLock);
+    const cfgDir = join(tmp, "config");
+    await mkdir(cfgDir, { recursive: true });
+    // A folder where the list should be: it cannot be read (and could not be replaced).
+    await mkdir(join(cfgDir, "pending-old-copies.json"));
+    const regBefore = await listLibraries(mkDeps());
+    const err = (await executeMove(lib, join(tmp, "Moved", "Lib"), { deps: mkDeps(), env }).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(OldCopiesUnreadableError);
+    expect(err.message).toMatch(/stopped before anything was switched/);
+    expect(err.message).toMatch(/still where it was/);
+    expect(err.message).toMatch(/no old copy is listed for deletion/);
+    expect(err.message).not.toContain(tmp);
+    // Nothing switched: the library is where it was, unchanged; the registry and the list are as before.
+    expect(await hashes(lib.root, notLock)).toEqual(before);
+    expect(await listLibraries(mkDeps())).toEqual(regBefore);
+    expect((await stat(join(cfgDir, "pending-old-copies.json"))).isDirectory()).toBe(true);
+    expect(await readdir(join(cfgDir, "old-copies")).catch(() => [])).toEqual([]);
   });
 });

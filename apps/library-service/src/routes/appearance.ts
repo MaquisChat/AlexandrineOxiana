@@ -3,13 +3,15 @@
  * `<appConfigDir>/appearance.json` (a readable file, owner-only). PUT merges and validates.
  */
 import type { FastifyInstance } from "fastify";
-import { RESEARCHER_NAME_MAX, readAppSetting, researcherName, researcherNameOk, setResearcherName, updateAppSetting } from "@ao/library";
+import { AppSettingUnreadableError, RESEARCHER_NAME_MAX, readAppSettingStrict, researcherName, researcherNameOk, setResearcherName, updateAppSettingStrict } from "@ao/library";
 import { GENERIC_FAMILIES, inferGenericFamily, isGenericFamily, isUsableFontFamily, type GenericFamily } from "@ao/shared";
 import { badRequest } from "../errors.js";
 import { registerFonts } from "./fonts.js";
+import { registerSettingsReset } from "./settings-reset.js";
 import { bodyOf, type Ctx, type Obj } from "./util.js";
 
-const FILE = "appearance.json";
+export const APPEARANCE_FILE = "appearance.json";
+const FILE = APPEARANCE_FILE;
 const GOUDY = "'Goudy Old Style', 'Sorts Mill Goudy', Garamond, Georgia, serif";
 const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
@@ -110,10 +112,26 @@ export function mergeAppearance(cur: AppearanceSettings, patch: Obj): Appearance
   return next;
 }
 
+/**
+ * An appearance file as the app writes it: an object whose values this app accepts (Task 68). Any
+ * other content (not JSON, truncated, a value it refuses) is unreadable: never written over.
+ */
+export function isAppearanceFile(v: unknown): v is Obj {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  try {
+    mergeAppearance(DEFAULT_APPEARANCE, v as Obj);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function registerAppearance(app: FastifyInstance, ctx: Ctx): void {
   const dir = ctx.state.deps.appConfigDir;
   // Typefaces from the researcher's own files (R100, Task 57).
   registerFonts(app, ctx);
+  // The way out for a settings file that stays unreadable (Task 68).
+  registerSettingsReset(app, ctx);
 
   // The researcher's display name on this device (R84/R117): the photographer of device imports and
   // the `by` of destruction certificates. Device settings, like appearance; null clears it.
@@ -124,11 +142,14 @@ export function registerAppearance(app: FastifyInstance, ctx: Ctx): void {
     return { name: (await setResearcherName(dir, name)) ?? null };
   });
   const current = async (): Promise<AppearanceSettings> => {
-    const stored = await readAppSetting<Obj>(dir, FILE);
     try {
+      const stored = await readAppSettingStrict(dir, FILE, isAppearanceFile);
       return stored ? mergeAppearance(DEFAULT_APPEARANCE, stored) : DEFAULT_APPEARANCE;
-    } catch {
-      return DEFAULT_APPEARANCE; // a hand-edited file that is not valid: the defaults, until saved again
+    } catch (err) {
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+      // Shown with the defaults so the app stays usable; a change is refused until the file is
+      // readable or reset (Task 68), so the defaults are never written over it.
+      return DEFAULT_APPEARANCE;
     }
   };
 
@@ -137,15 +158,8 @@ export function registerAppearance(app: FastifyInstance, ctx: Ctx): void {
   app.put("/settings/appearance", async (req) => {
     const patch = bodyOf(req);
     mergeAppearance(DEFAULT_APPEARANCE, patch); // a bad value is refused before anything is written
-    // Merged inside the serialised read-modify-write, so concurrent PUTs all apply (R105).
-    return updateAppSetting<AppearanceSettings>(dir, FILE, (cur) => {
-      let base = DEFAULT_APPEARANCE;
-      try {
-        if (cur) base = mergeAppearance(DEFAULT_APPEARANCE, cur as unknown as Obj);
-      } catch {
-        // a hand-edited file that is not valid: start from the defaults
-      }
-      return mergeAppearance(base, patch);
-    });
+    // Merged inside the serialised read-modify-write, so concurrent PUTs all apply (R105); only over
+    // what was read: a file that cannot be read refuses the change (503, reason "appearance", Task 68).
+    return updateAppSettingStrict<Obj>(dir, FILE, isAppearanceFile, (cur) => mergeAppearance(cur ? mergeAppearance(DEFAULT_APPEARANCE, cur) : DEFAULT_APPEARANCE, patch) as unknown as Obj) as unknown as Promise<AppearanceSettings>;
   });
 }

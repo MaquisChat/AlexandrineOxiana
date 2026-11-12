@@ -5,7 +5,7 @@
  */
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -313,5 +313,21 @@ describe("the port across launches (R171, defect D13)", () => {
     expect(await ready(a)).toBe(explicit);
     expect(await stop(a), a.err()).toBe(0);
     expect(JSON.parse(await readFile(portFile(), "utf8"))).toEqual({ v: 1, port: 50123 });
+  }, 60_000);
+});
+
+describe("this computer's identity cannot be read (Task 68, ruling 2)", () => {
+  it("the service does not start with a new identity: it says why in plain words, without a path, and writes nothing", async () => {
+    await mkdir(deps.appConfigDir, { recursive: true });
+    await rm(join(deps.appConfigDir, "device.json"), { force: true });
+    await mkdir(join(deps.appConfigDir, "device.json"));
+    const r = run({ stdin: `${TOKEN}\n` });
+    const { code } = await r.exit;
+    expect(code).not.toBe(0);
+    expect(r.out()).not.toMatch(/AO_SERVICE_READY/);
+    expect(r.err()).toMatch(/could not start: This computer's identity for the app .* could not be read, so it was not replaced/);
+    expect(r.err()).not.toContain(deps.appConfigDir);
+    expect(r.err()).not.toContain(TOKEN);
+    expect((await stat(join(deps.appConfigDir, "device.json"))).isDirectory()).toBe(true);
   }, 60_000);
 });

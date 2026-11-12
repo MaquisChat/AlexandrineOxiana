@@ -29,6 +29,7 @@ import { MOVED_MARKER, MOVE_JOURNAL, isClosed, openLibraryInternal, projectMoved
 import { classifyLocation, type Location, type LocationEnv } from "./location.js";
 import { acquireLock, peekLock, readLock, releaseLock } from "./lock.js";
 import {
+  OldCopiesUnreadableError,
   addPendingOldCopy,
   getPendingOldCopy,
   isExpired,
@@ -663,6 +664,7 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
   const moveId = newId();
   // Durably, before the old copy is marked: the destination stays findable after any crash
   // (listUnfinishedMoves, Library.movedTo, and the registry's known paths).
+  // A list that cannot be read stops the move here, before anything is switched (Task 68, ruling 1).
   const rec = await addPendingOldCopy(
     deps,
     {
@@ -676,7 +678,9 @@ export async function executeMove(lib: Library, destRoot: string, opts: MoveOpti
       moveId,
     },
     { files: hashes, dirs: src.dirs.map((d) => d.rel) },
-  );
+  ).catch((err: unknown) => {
+    throw err instanceof OldCopiesUnreadableError ? new OldCopiesUnreadableError("move") : err;
+  });
   await addKnownPath(lib.id, dest, deps);
   j.phase = "switching";
   j.filesDone = [...done];

@@ -5,7 +5,7 @@
  * bytes with the FontFace API — so no service address is ever put in a stylesheet and the page's
  * content-security policy (font-src 'self') stays as it is.
  */
-import { USER_FONT_MAX_BYTES, isUserFontId, type UserFont, type UserFontAddRequest, type UserFontDeleteResponse, type UserFontListResponse } from "@ao/shared";
+import { USER_FONT_MAX_BYTES, isUserFontId, type ResettableSetting, type SettingsResetRequest, type SettingsResetResponse, type UserFont, type UserFontAddRequest, type UserFontDeleteResponse, type UserFontListResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
 
 export type { UserFont };
@@ -25,6 +25,14 @@ export function fontsApi(client: FontsClient) {
       return client.request<UserFont>("POST", "/settings/fonts", { body });
     },
     remove: (id: string) => client.request<UserFontDeleteResponse>("DELETE", fontPath(id)),
+    /**
+     * Sets an unreadable settings file aside and starts it empty (Task 68): POST /settings/reset, sent
+     * only after the screen's confirmation. The appearance screen uses it for "fonts" and "appearance".
+     */
+    resetSettingsFile: (file: Extract<ResettableSetting, "fonts" | "appearance">) => {
+      const body: SettingsResetRequest = { file, confirm: true };
+      return client.request<SettingsResetResponse>("POST", "/settings/reset", { body });
+    },
     /** The kept copy's bytes. */
     file: (id: string, signal?: AbortSignal) => client.bytes(fontPath(id), { maxBytes: USER_FONT_MAX_BYTES, ...(signal ? { signal } : {}) }),
   };

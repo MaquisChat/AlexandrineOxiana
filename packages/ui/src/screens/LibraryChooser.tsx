@@ -5,10 +5,11 @@
  * folder picker fills that field too (PathField). A chosen folder is only put in the field:
  * it reaches the service when Open or Create is used, and the service decides.
  */
-import { useEffect, useId, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
-import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry } from "../api/library";
+import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
 import { PathField } from "../components/PathField";
+import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
 import { navigate, PATHS } from "../navigation";
 import "../components/library.css";
@@ -28,13 +29,31 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
   const [busy, setBusy] = useState(false);
   const [path, setPath] = useState("");
   const [name, setName] = useState("");
+  // This computer's own notices (Task 68 fix round 1, M1): seen here too, with the same "Got it".
+  const [notices, setNotices] = useState<LibraryState["notices"]>([]);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const [noticeGone, setNoticeGone] = useState(0);
+  useEffect(() => {
+    if (noticeGone > 0) heading.current?.focus();
+  }, [noticeGone]);
+  const notice = useNoticeDismiss(
+    (kind) => api.libraries.dismissNotice(kind),
+    (kind) => {
+      setNotices((list) => (list ?? []).filter((n) => n.kind !== kind));
+      setNoticeGone((n) => n + 1);
+    },
+  );
   const id = useId();
 
   useEffect(() => {
     let live = true;
     api.libraries
       .list()
-      .then((r) => live && setLibraries(r.libraries))
+      .then((r) => {
+        if (!live) return;
+        setLibraries(r.libraries);
+        setNotices(r.notices ?? []);
+      })
       .catch((err: unknown) => {
         if (!live) return;
         setLibraries([]);
@@ -78,7 +97,10 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
 
   return (
     <main className="ao-page">
-      <h1>Choose a library</h1>
+      <h1 ref={heading} tabIndex={-1}>
+        Choose a library
+      </h1>
+      <DeviceNoticeBanners notices={notices} onDismiss={notice.onDismiss} error={notice.error} />
       {libraries === undefined ? (
         <p aria-live="polite">Loading libraries…</p>
       ) : libraries.length === 0 ? (

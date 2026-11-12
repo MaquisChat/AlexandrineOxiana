@@ -812,3 +812,22 @@ async function wrapper(mode: string, env: Record<string, string> = {}): Promise<
   await mkdir(dir, { recursive: true });
   return dir;
 }
+
+describe("this computer's identity renewed by the command-line tool (Task 68 fix round 1, I2)", () => {
+  it("a damaged device.json: the tool says so on standard error and the notice is written before it exits", async () => {
+    const cfg = join(tmp, "config-renewed");
+    await mkdir(cfg, { recursive: true });
+    await writeFile(join(cfg, "device.json"), "garbage{");
+    // A quick command that fails: the notice must be written all the same.
+    const r = await ao(["library", "open", join(tmp, "no-such-library")], { AO_CONFIG_DIR: cfg });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
+    expect(r.stderr).not.toContain(cfg);
+    const notices = JSON.parse(await readFile(join(cfg, "notices.json"), "utf8")) as { notices: Array<{ kind: string }> };
+    expect(notices.notices.map((n) => n.kind)).toEqual(["device-identity-renewed"]);
+    expect((await readdir(cfg)).filter((n) => n.startsWith("device.json.corrupt-"))).toHaveLength(1);
+    // A second run reads the new identity: nothing said again.
+    const again = await ao(["library", "open", join(tmp, "no-such-library")], { AO_CONFIG_DIR: cfg });
+    expect(again.stderr).not.toMatch(/had to be renewed/);
+  }, 60_000);
+});
