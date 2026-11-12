@@ -3,9 +3,15 @@
  * (projects whose rules allow browser capture), "Capture this page", and "Capture profile as I
  * scroll" with its counter and Finish. Everything shown is React text — nothing from a page or the
  * service is ever rendered as HTML.
+ *
+ * When the desktop app does not answer on the saved port (R171, defect D13), the popup names the two
+ * possible causes (the app is closed; the app's port changed when it was reopened) and offers "Use a
+ * different port" beside "Unpair": the researcher types the port the app shows, the popup checks it
+ * with one authorised request and saves it only if the app accepts the token there. It never looks
+ * for a port itself (R110).
  */
-import { useCallback, useEffect, useState } from "react";
-import type { Api, Pairing } from "../api.js";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { ApiError, type Api, type Pairing } from "../api.js";
 import type { PendingByProject } from "../pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus, ProjectChoice } from "../types.js";
 
@@ -36,6 +42,39 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [status, setStatus] = useState("");
   const [profile, setProfile] = useState<ProfileStatus>({ active: false, count: 0 });
   const [pending, setPending] = useState<PendingByProject>({});
+  /** The app did not answer on the saved port (R171). */
+  const [unreachable, setUnreachable] = useState(false);
+  /** "Use a different port": the field is open, what is typed, the check under way, why it failed. */
+  const [portOpen, setPortOpen] = useState(false);
+  const [newPort, setNewPort] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [portError, setPortError] = useState("");
+  const ids = useId();
+  const checkingNow = useRef(false);
+  const checkAbort = useRef<AbortController | undefined>(undefined);
+  const alive = useRef(true);
+  const changeButton = useRef<HTMLButtonElement>(null);
+  const portInput = useRef<HTMLInputElement>(null);
+  const pairedLine = useRef<HTMLSpanElement>(null);
+  /** Where focus goes once the field closes: back to its button, or to the line naming the new port. */
+  const [focusAfter, setFocusAfter] = useState<{ to: "button" | "paired" } | null>(null);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      checkAbort.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (portOpen) portInput.current?.focus();
+  }, [portOpen]);
+
+  useEffect(() => {
+    if (!focusAfter) return;
+    (focusAfter.to === "button" ? changeButton.current : pairedLine.current)?.focus();
+  }, [focusAfter]);
 
   const refresh = useCallback(async () => {
     const pairing = await bridge.api.getPairing();
@@ -48,9 +87,12 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       const list = (await bridge.api.listProjects()).filter((p) => p.captureMethods.includes("browser_capture"));
       setProjects(list);
       setProjectId((cur) => (list.some((p) => p.id === cur) ? cur : (list[0]?.id ?? "")));
+      setUnreachable(false);
     } catch (e) {
       setProjects([]);
-      setStatus(message(e));
+      // Not answering: said once, with both causes and what to do, in its own notice (R171).
+      if (e instanceof ApiError && e.code === "UNREACHABLE") setUnreachable(true);
+      else setStatus(message(e));
       if (!(await bridge.api.getPairing())) setLoad({ state: "unpaired" });
     }
     if (tab !== undefined) setProfile(statusOf(await bridge.send<ProfileStatus>({ type: "profile-status", tabId: tab })));
@@ -88,7 +130,56 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     }
   }
 
+  function closePortField(focusTo: "button" | "paired") {
+    checkAbort.current?.abort();
+    checkAbort.current = undefined;
+    checkingNow.current = false;
+    setChecking(false);
+    setPortOpen(false);
+    setNewPort("");
+    setPortError("");
+    setFocusAfter({ to: focusTo });
+  }
+
+  /** One authorised request to the typed port; saved only when the app accepts the token there (R171). */
+  async function checkPort(e: React.FormEvent) {
+    e.preventDefault();
+    if (checkingNow.current) return;
+    checkingNow.current = true;
+    const ac = new AbortController();
+    checkAbort.current = ac;
+    setChecking(true);
+    setPortError("");
+    try {
+      const r = await bridge.api.changePort(newPort, { signal: ac.signal });
+      if (!alive.current || ac.signal.aborted) return;
+      const list = (r.projects ?? []).filter((p) => p.captureMethods.includes("browser_capture"));
+      setLoad({ state: "paired", pairing: r.pairing });
+      setProjects(list);
+      setProjectId((cur) => (list.some((p) => p.id === cur) ? cur : (list[0]?.id ?? "")));
+      setUnreachable(false);
+      setStatus(
+        r.projects === null
+          ? `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged. No library is open in the desktop app yet: open one, then open this popup again.`
+          : `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged. Choose a project below.`,
+      );
+      closePortField("paired");
+    } catch (err) {
+      if (!alive.current || ac.signal.aborted) return;
+      setPortError(message(err));
+      portInput.current?.focus();
+    } finally {
+      if (checkAbort.current === ac) {
+        checkAbort.current = undefined;
+        checkingNow.current = false;
+        if (alive.current) setChecking(false);
+      }
+    }
+  }
+
   async function unpair() {
+    if (portOpen) closePortField("button");
+    setUnreachable(false);
     await bridge.api.unpair();
     setProjects(undefined);
     setStatus("Unpaired. The desktop app's list of paired extensions can remove it there too.");
@@ -141,11 +232,71 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   return (
     <main className="popup">
       <p className="paired">
-        <span>Paired with the desktop app (port {load.pairing.port}).</span>{" "}
+        <span ref={pairedLine} tabIndex={-1}>
+          Paired with the desktop app (port {load.pairing.port}).
+        </span>{" "}
+        {unreachable || portOpen ? (
+          <>
+            <button type="button" className="link" ref={changeButton} aria-expanded={portOpen} aria-controls={`${ids}-port`} onClick={() => (portOpen ? closePortField("button") : setPortOpen(true))}>
+              Use a different port
+            </button>{" "}
+          </>
+        ) : null}
         <button type="button" className="link" onClick={() => void unpair()}>
           Unpair
         </button>
       </p>
+
+      {unreachable ? (
+        <div role="alert" className="notice">
+          <p>The desktop app is not answering on port {load.pairing.port}.</p>
+          <p>
+            Either the app is closed: open it, then open this popup again. Or the app's port changed when it was reopened: its Browser extension screen then shows the new port. Enter that port with “Use a different port”. The pairing stays valid, so there is no need to pair again.
+          </p>
+        </div>
+      ) : null}
+
+      {portOpen ? (
+        <form
+          id={`${ids}-port`}
+          aria-label="Use a different port"
+          onSubmit={(e) => void checkPort(e)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              closePortField("button");
+            }
+          }}
+        >
+          <label>
+            New port (as shown in the desktop app)
+            <input
+              ref={portInput}
+              inputMode="numeric"
+              autoComplete="off"
+              value={newPort}
+              onChange={(e) => setNewPort(e.target.value.trim())}
+              maxLength={5}
+              required
+              aria-invalid={portError ? true : undefined}
+              aria-describedby={portError ? `${ids}-port-error` : undefined}
+            />
+          </label>
+          {portError ? (
+            <p id={`${ids}-port-error`} role="alert" className="error">
+              {portError}
+            </p>
+          ) : null}
+          <div className="actions">
+            <button type="submit" disabled={checking} aria-busy={checking || undefined}>
+              Check and save
+            </button>
+            <button type="button" onClick={() => closePortField("button")}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : null}
 
       {projects === undefined ? (
         <p>Loading projects…</p>
