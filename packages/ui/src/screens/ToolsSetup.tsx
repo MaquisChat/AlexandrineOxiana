@@ -407,7 +407,10 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     <main className="ao-screen ao-tools">
       <h1>Optional tools</h1>
       <p>The app does not include these tools, so that its own download stays small. Install only the ones you need; you can remove them again here.</p>
-      <p>Each download contacts only the tool's publisher, at the addresses listed with the tool, and sends nothing about your projects or about you. Each file is checked against its published checksum before it is used.</p>
+      <p>
+        Each download contacts only the tool's publisher{(tools ?? []).some((t) => hostsOf(t).length > 0) ? ", at the addresses listed with the tool," : ""} and sends nothing about your projects or about you. Each
+        file is checked against its published checksum before it is used.
+      </p>
       <p role="status" aria-label="Tool progress" className="ao-visually-hidden">
         {announcement}
       </p>
