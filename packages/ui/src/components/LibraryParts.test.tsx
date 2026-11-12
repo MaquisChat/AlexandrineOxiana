@@ -201,7 +201,13 @@ describe("SourceTable", () => {
     expect(rows[2]!.textContent).not.toContain("part of its annotations");
     expect(screen.queryByRole("note")).toBeNull();
     rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete />);
-    expect(screen.getByRole("note").textContent).toMatch(/search index of this library is being brought up to date: the text of annotations is not searchable yet/i);
+    // N3: a state and its remedy, not a rebuild that is not running.
+    const note = screen.getByRole("note").textContent;
+    expect(note).toMatch(/Annotations are not searchable yet: this library's search index needs rebuilding/);
+    expect(note).toMatch(/rebuild-index/);
+    expect(note).not.toMatch(/being/);
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete rebuilding />);
+    expect(screen.getByRole("note").textContent).toMatch(/The search index is being rebuilt: annotations become searchable when it finishes/);
     rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} limited />);
     expect(screen.getByRole("note").textContent).toMatch(/only titles are searched/i);
   });

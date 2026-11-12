@@ -39,9 +39,11 @@ export interface SourceTableProps {
   incomplete?: boolean | undefined;
   /** A read-only library: only titles were searched (Task 58 M6). */
   limited?: boolean | undefined;
+  /** An index rebuild is running (N3). */
+  rebuilding?: boolean | undefined;
 }
 
-export function SourceTable({ items, total, onOpen, selectedId, incomplete, limited }: SourceTableProps) {
+export function SourceTable({ items, total, onOpen, selectedId, incomplete, limited, rebuilding }: SourceTableProps) {
   return (
     <div className="ao-sources">
       <p className="ao-muted" aria-live="polite">
@@ -52,9 +54,14 @@ export function SourceTable({ items, total, onOpen, selectedId, incomplete, limi
         <p role="note" className="ao-hint">
           This library is open read-only, so only titles are searched: not the full text, and not annotations.
         </p>
+      ) : incomplete && rebuilding ? (
+        <p role="note" className="ao-hint">
+          The search index is being rebuilt: annotations become searchable when it finishes.
+        </p>
       ) : incomplete ? (
         <p role="note" className="ao-hint">
-          The search index of this library is being brought up to date: the text of annotations is not searchable yet. It will be once the library's index has been rebuilt.
+          Annotations are not searchable yet: this library's search index needs rebuilding. To rebuild it now, close the library here and run the command-line tool&apos;s
+          rebuild-index command on it; other searches work meanwhile.
         </p>
       ) : null}
       <table aria-label="Sources" className="ao-table">

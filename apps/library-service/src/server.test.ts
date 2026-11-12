@@ -196,6 +196,10 @@ describe("libraries, projects, sources", () => {
     setMeta(idx, "needsRebuild", "annotations");
     expect((await call({ url: `/projects/${pid}/sources` })).json.incomplete).toBe(true);
     idx.prepare("DELETE FROM meta WHERE key = 'needsRebuild'").run();
+    // A query with too many words is refused in plain words (N1).
+    const many = await call({ url: `/projects/${pid}/sources?text=${encodeURIComponent(Array.from({ length: 17 }, (_, i) => `w${i}`).join(" "))}` });
+    expect(many.status).toBe(400);
+    expect(many.json.error).toMatchObject({ code: "VALIDATION", message: "Use at most 16 words in a search." });
     const one = await call({ url: `/projects/${pid}/sources/${sid}` });
     expect(one.json.source.id).toBe(sid);
     expect((await call({ url: `/projects/${pid}/sources/01ZZZZZZZZZZZZZZZZZZZZZZZZ` })).status).toBe(404);

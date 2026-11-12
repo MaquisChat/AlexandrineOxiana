@@ -192,7 +192,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
             if (typeof d.done !== "number" || typeof d.total !== "number") continue;
-            if (d.kind === "index") setIndex({ done: d.done, total: d.total });
+            if (d.kind === "index") {
+              setIndex({ done: d.done, total: d.total });
+              // A finished rebuild: read the sources again, so a "needs rebuilding" note goes at once (N3).
+              if (d.done >= d.total) refresh();
+            }
             else {
               const key = `${d.kind ?? "job"}:${d.jobId ?? ""}`;
               const finished = d.finished === true || d.done >= d.total;
@@ -693,7 +697,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               !sourcesError && <p aria-live="polite">Loading sources…</p>
             ) : (
               <>
-                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} />
+                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} rebuilding={!!index && index.done < index.total} />
                 {sources.items.length < sources.total && (
                   <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
                     Load more sources
