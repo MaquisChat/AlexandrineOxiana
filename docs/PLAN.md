@@ -478,14 +478,14 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | approved; verification before merge | 0dd8c3d (worktree branch) | reviewed with probes over one fix round; the working branch taken (one conflict with Task 51, resolved and tested) |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; verification before merge | ae4de75 (worktree branch) | reviewed with probes over one fix round; "Needs review" follows every pending entry (R172); D14 remains for Task 67 |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | approved; verification before merge | 51eaf8d (worktree branch) | reviewed with probes over two fix rounds (R145, R149); the working branch taken; `bytes()` is the one binary reader |
+| 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | fix round 2 in re-review | 2b7f9f2 (worktree branch) | a lock ends a project's running captures for good; the working branch taken; one expected-failure test waits for Task 34d's merge |
 | 62 Transcription as a job | in progress | | dispatched 2026-11-12 after Task 51 merged; also carries N-5 of Task 51 (a close stops a rerun) |
