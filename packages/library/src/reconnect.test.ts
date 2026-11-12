@@ -8,7 +8,7 @@ import type { AuditEvent, Provenance, SourceDraft } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
-import { IndexHandle } from "./index/db.js";
+import { IndexHandle, getMeta, setMeta } from "./index/db.js";
 import { rebuildIndex } from "./index/rebuild.js";
 import { LibraryMovedError, WrongLibraryError, createLibrary, openLibrary, type Library } from "./library.js";
 import { acquireLock, readLock, releaseLock } from "./lock.js";
@@ -314,6 +314,24 @@ describe("reconnect", () => {
     expect(ev).toHaveLength(1);
     expect(ev[0]!.details).toMatchObject({ hint: "host-A:Research (renamed)", rebuilt: true, integrity: { checked: 3, missing: 0 } });
     expect(JSON.stringify(ev[0]!.details)).not.toContain(tmp);
+  });
+
+  it("R161 (a): an index marked by a migration as needing a rebuild is rebuilt, which clears the mark", async () => {
+    const { lib } = await fixture();
+    const h = new IndexHandle(lib.root);
+    await rebuildIndex(h, ring, lib);
+    setMeta(h.db, "needsRebuild", "annotations"); // as migration 0002 leaves an older index
+    h.close();
+    await lib.close();
+    const r = await reconnect(lib.root, lib.id, mkDeps(), { keyRing: ring });
+    open.push(r.library);
+    expect(r.rebuilt).toBe(true);
+    const after = new IndexHandle(lib.root);
+    try {
+      expect(getMeta(after.db, "needsRebuild")).toBeUndefined();
+    } finally {
+      after.close();
+    }
   });
 
   it("accepts the path of library.json itself and skips the rebuild when the index is current", async () => {
