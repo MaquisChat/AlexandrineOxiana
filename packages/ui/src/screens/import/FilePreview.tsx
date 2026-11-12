@@ -40,7 +40,9 @@ export function FilePreview({ api, projectId, source }: { api: ImportApi; projec
   const picture = pictureFor(source.assets);
   const assetId = picture?.id;
   const name = picture ? assetName(picture) : "";
-  const [view, setView] = useState<View>({ state: "none" });
+  // The first paint of an item with a picture already says it is loading (M9); the effect then
+  // fetches it. ItemPanel is keyed by the item, so this initial state is per item.
+  const [view, setView] = useState<View>(() => (assetId ? { state: "loading", name } : { state: "none" }));
 
   useEffect(() => {
     if (!assetId) {

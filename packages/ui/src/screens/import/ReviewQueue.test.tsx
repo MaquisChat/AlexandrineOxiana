@@ -1,9 +1,11 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReviewItem } from "../../api/import";
+import type { ImportApi, ReviewItem, SourceFile } from "../../api/import";
 import { http, HttpResponse } from "msw";
 import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type ServiceSetup, B1, P1 } from "../../test/importService";
+import { renderToStaticMarkup } from "react-dom/server";
+import { FilePreview } from "./FilePreview";
 import { ReviewQueue } from "./ReviewQueue";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -460,6 +462,17 @@ describe("Review queue: the file under review (Task 57, R135)", () => {
     await screen.findByRole("img", { name: "Preview of photo-1.png" });
     cleanup();
     expect(revoked).toEqual(made);
+  });
+
+  it("the first render of an item with a picture says it is loading, never \"No preview\" (M9)", () => {
+    // Rendered once, with no effect run: what the browser paints first.
+    const api = { picture: () => new Promise<Blob>(() => {}) } as unknown as ImportApi;
+    const photo = pictureSource(1, "Market photo", [{ id: "a1", role: "original", kind: "image", mime: "image/png", path: "Sources/s1/photo-1.png", bytes: 8 }]) as unknown as SourceFile;
+    const first = renderToStaticMarkup(<FilePreview api={api} projectId={P1} source={photo} />);
+    expect(first).toContain("Loading the picture");
+    expect(first).not.toContain("No preview");
+    const paper = pictureSource(2, "Second paper", [{ id: "a2", role: "original", kind: "pdf", mime: "application/pdf", path: "Sources/s2/paper-2.pdf", bytes: 900 }]) as unknown as SourceFile;
+    expect(renderToStaticMarkup(<FilePreview api={api} projectId={P1} source={paper} />)).toContain("No preview of this file can be shown here");
   });
 
   it("a picture that cannot be read says so in plain words", async () => {
