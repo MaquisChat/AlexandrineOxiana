@@ -339,6 +339,16 @@ describe("fix round 1, I1: a listed field that has left the report is settled (c
     expect((await entriesOf(sid))[0]!.status).toBe(settled ? "resolved" : "pending");
   });
 
+  it("a machine change that recomputes the report (a profile refresh, a browser capture's evidence) re-examines the entries too (M5)", async () => {
+    const { updateSourceRechecked } = await import("./repo/repo.js");
+    const { recheckSourceFile } = await import("@ao/core");
+    const sid = await videoWithUnverifiedPostId();
+    await kit.repo.updateSource(p.id, sid, {}); // the report is not touched: still pending
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "pending" });
+    await updateSourceRechecked(kit.repo, p.id, sid, { type: "webpage" }, { verification: (n) => recheckSourceFile(n, {}).verification });
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "resolved", decision: "rechecked" });
+  });
+
   it("a social post with no creators: a typed creator confirmed through the confirm resolves the entry", async () => {
     const sf = await kit.repo.createSource(p.id, draft("A post", { type: "social-post" }), [], {
       provenance: provenance(),
