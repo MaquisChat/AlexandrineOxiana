@@ -195,6 +195,11 @@ export interface DestructionRecord {
   outstanding: string[];
   /** Why the app does not remove this destruction's backups by itself (plain words), if so. */
   problem?: string;
+  /**
+   * In a restored copy: the id of the project the data was destroyed in. The certificate and its
+   * amendments were copied byte for byte, so they name that project's ids and folder (R175).
+   */
+  inheritedFrom?: string;
 }
 
 /** What `destroyRaw` returns: the certificate as presented (see DestructionRecord), where it is, and what was written. */
@@ -345,7 +350,7 @@ async function destroyRawLocked(repo: Repo, hold: MaintenanceHold, projectId: st
     certificateSha256: res.certificateSha256,
   });
   // What the change's own audit event now says of this destruction: the list this call works on.
-  const audited = newAudited(basename(res.certificateRel), res.certificateSha256, res.at, toRemove, unreadable);
+  const audited = newAudited(projectId, basename(res.certificateRel), res.certificateSha256, res.at, toRemove, unreadable);
   const amendments: DestructionAmendment[] = [];
   if (containing.length) {
     const written = await settleBackups(repo, hold, projectId, audited, { retry: false, certificate: res.certificate });
@@ -381,6 +386,13 @@ interface Audited {
   certificate: string;
   certificateSha256: string;
   at: string;
+  /**
+   * The project the data was destroyed in: this one, or, in a restored copy, the project the copy
+   * was made from (the destruction is then inherited with the audit log, R175).
+   */
+  projectId: string;
+  /** Listed backup → the sha256 the audit log recorded when that backup was made (none: the log does not record its making). */
+  made: Map<string, string>;
   /** Decided at the destruction: backups that hold the destroyed files. */
   toRemove: string[];
   /** Backups that could not be read then and may hold them. */
@@ -403,10 +415,12 @@ interface Audited {
   reused: Set<string>;
 }
 
-const newAudited = (certificate: string, certificateSha256: string, at: string, toRemove: string[], unreadable: string[]): Audited => ({
+const newAudited = (projectId: string, certificate: string, certificateSha256: string, at: string, toRemove: string[], unreadable: string[]): Audited => ({
   certificate,
   certificateSha256,
   at,
+  projectId,
+  made: new Map(),
   toRemove,
   unreadable,
   removed: new Map(),
@@ -442,6 +456,8 @@ function auditedDestructions(events: Iterable<AuditEvent | null>): { list: Audit
   const bySha = new Map<string, Audited>();
   const list: Audited[] = [];
   const certificateHashes = new Set<string>();
+  /** Backup → the sha256 recorded when the backup of that name was last made. */
+  const made = new Map<string, string>();
   for (const e of events) {
     if (!e || typeof e !== "object") continue;
     const d = (e.details ?? {}) as Record<string, unknown>;
@@ -450,7 +466,9 @@ function auditedDestructions(events: Iterable<AuditEvent | null>): { list: Audit
       if (typeof d.certificate !== "string" || !DESTRUCTION_CERTIFICATE.test(d.certificate) || typeof d.certificateSha256 !== "string") continue;
       certificateHashes.add(d.certificateSha256);
       if (bySha.has(d.certificateSha256)) continue;
-      const a = newAudited(d.certificate, d.certificateSha256, e.at, strings(d.backupsToRemove).filter(isBackupRel), strings(d.backupsUnreadable).filter(isBackupRel));
+      const a = newAudited(e.projectId ?? "", d.certificate, d.certificateSha256, e.at, strings(d.backupsToRemove).filter(isBackupRel), strings(d.backupsUnreadable).filter(isBackupRel));
+      // Which file each listed name stood for at that moment: the backup last made under it.
+      for (const f of a.toRemove) if (made.has(f)) a.made.set(f, made.get(f)!);
       bySha.set(a.certificateSha256, a);
       list.push(a);
       continue;
@@ -474,6 +492,8 @@ function auditedDestructions(events: Iterable<AuditEvent | null>): { list: Audit
     } else if (e.action === "backup.create" && typeof d.file === "string") {
       const f = backupRel(d.file);
       for (const x of list) if (listedIn(x, f) && !settledIn(x, f)) x.reused.add(f);
+      if (typeof d.sha256 === "string") made.set(f, d.sha256);
+      else made.delete(f);
     }
   }
   return { list, certificateHashes };
@@ -495,6 +515,8 @@ const AUDIT_UNVERIFIED =
 const FILES_DISAGREE = "While its files and the audit log disagree, the app removes no backup for this destruction by itself. If the backups still listed are removed by hand, the app records that they are gone.";
 const UNRECORDED =
   "The audit log does not record this destruction certificate in the form the app now keeps (it was written by an earlier version of the app, or outside it), so the app does not remove the backups it lists by itself. If they hold destroyed data, remove them by hand.";
+const CANNOT_TELL =
+  "The audit log this project was restored with does not record the making of this backup, so the app cannot tell whether the file now under this name is the backup that was listed. It was left as it is. If it holds the destroyed data, remove it by hand.";
 /** Never with the name the note gives: it is text from a file anyone can edit, and may be a path (R96). */
 const STATE_DISAGREES =
   "The app's own note of the backups still to remove (backups-state.json in the Backups folder) names a backup for this destruction that the audit log does not. Nothing was removed for this destruction this time, and the note was corrected from the audit log.";
@@ -641,6 +663,7 @@ export async function listDestructions(repo: Repo, projectId: string): Promise<D
       status: statusOf(a),
       outstanding: outstandingOf(a),
       ...(problem ? { problem } : {}),
+      ...(a.projectId !== projectId ? { inheritedFrom: a.projectId } : {}),
     });
   }
   // Certificates the audit log does not record in this form (an earlier version's, or not the app's).
@@ -740,10 +763,15 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   // fresh backup is never taken for a listed one.
   const files = await backupFilesNow(repo, left.map(fileOf));
   const destroyed = opts.certificate ? destroyedIds(opts.certificate) : undefined;
+  // An inherited destruction (R175): the listed backups are the origin's. This project's audit log
+  // cannot see what the origin did after the copy was made, so a file is removed only when it is, byte
+  // for byte, the backup the inherited log recorded under that name: never one that only carries the name.
+  const inherited = a.projectId !== projectId;
   const gone: string[] = [];
   const missing: string[] = [];
   const notHolding: string[] = [];
   const toDelete: string[] = [];
+  const unidentified: string[] = [];
   for (const f of left) {
     const s = files.get(fileOf(f));
     if (a.reused.has(f)) gone.push(f);
@@ -751,9 +779,9 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
       gone.push(f);
       missing.push(f);
     } else if (!act) continue;
-    else if (a.toRemove.includes(f)) toDelete.push(f);
+    else if (a.toRemove.includes(f)) (inherited && !a.made.has(f) ? unidentified : toDelete).push(f);
     else if (!s.entry || !destroyed) continue; // still cannot be read: stays listed, never deleted blindly
-    else if (s.entry.projectId === projectId && (!Array.isArray(s.entry.assets) || s.entry.assets.some((id) => destroyed.has(id)))) toDelete.push(f);
+    else if (s.entry.projectId === a.projectId && (!Array.isArray(s.entry.assets) || s.entry.assets.some((id) => destroyed.has(id)))) toDelete.push(f);
     else notHolding.push(f);
   }
   // An observing pass has nothing to do unless a listed backup is gone; and it records that only on
@@ -784,12 +812,19 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   let otherError: string | undefined;
   try {
     if (toDelete.length) {
-      const r = await removeHoldingBackups(repo, toDelete.map(fileOf));
+      const names = toDelete.map(fileOf);
+      // Of an inherited list: only the very file that was listed, and never at the same time as a
+      // backup, a prune, a restore or a destruction of the project it belongs to (R138 a).
+      const expect = inherited ? new Map(toDelete.flatMap((f) => (a.made.has(f) ? [[fileOf(f), a.made.get(f)!] as const] : []))) : undefined;
+      const remove = () => removeHoldingBackups(repo, names, expect);
+      const r = inherited && repo.listProjects().some((p) => p.id === a.projectId) ? await withProjectMaintenance(repo, a.projectId, remove) : await remove();
       removed = r.removed.map(backupRel);
-      gone.push(...r.gone.map(backupRel));
+      // A file of another content under a listed name is a later backup: the listed one is gone.
+      gone.push(...r.gone.map(backupRel), ...r.other.map(backupRel));
       failed = r.failed.map(({ file, error }) => ({ file: backupRel(file), reason: `It could not be overwritten and removed (${plainErrorText(repo, error)}).` }));
       if (r.failed.length) otherError = `A backup holding the destroyed files could not be removed (${plainErrorText(repo, r.failed[0]!.error)}); the step will be tried again`;
     }
+    failed.push(...unidentified.map((file) => ({ file, reason: CANNOT_TELL })));
     await forgetMissingBackups(repo, missing.map(fileOf));
   } catch (err) {
     if (err instanceof SimulatedCrash) throw err;

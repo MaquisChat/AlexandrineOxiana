@@ -1268,22 +1268,34 @@ async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise
  * destruction and recorded in the audit log), one by one, the manifest updated after each. A file
  * that is there is overwritten and removed (`removed`). One that is not there is `gone`: the app did
  * not remove it. Either way the manifest lists it no longer. A failure does not stop the others.
- * Only plain names of the backup pattern, inside Backups/, are ever touched.
+ * Only plain names of the backup pattern, inside Backups/, are ever touched. With `expect` (name →
+ * sha256, for a list inherited through a restore, R175) a file is removed only when its bytes are
+ * those: one of another content is `other` and is left alone, with its manifest entry.
  */
-export async function removeHoldingBackups(repo: Repo, files: string[]): Promise<{ removed: string[]; gone: string[]; failed: Array<{ file: string; error: unknown }> }> {
+export async function removeHoldingBackups(
+  repo: Repo,
+  files: string[],
+  expect?: ReadonlyMap<string, string>,
+): Promise<{ removed: string[]; gone: string[]; other: string[]; failed: Array<{ file: string; error: unknown }> }> {
   const dir = backupsDir(repo);
   const removed: string[] = [];
   const gone: string[] = [];
+  const other: string[] = [];
   const failed: Array<{ file: string; error: unknown }> = [];
   for (const f of files) {
-    if (!isBackupFileName(f)) {
-      failed.push({ file: f, error: new Error("this is not the name of a backup") });
+    if (!isBackupFileName(f) || (expect && !expect.has(f))) {
+      failed.push({ file: f, error: new Error(isBackupFileName(f) ? "the making of this backup is not on record" : "this is not the name of a backup") });
       continue;
     }
     try {
       await withManifest(repo, async (m) => {
         const abs = join(dir, f);
         const present = await isThere(abs);
+        // Another file under this name: not the backup that was meant. Left alone, with its manifest entry.
+        if (present && expect && (await sha256Of(abs)) !== expect.get(f)) {
+          other.push(f);
+          return;
+        }
         if (present) await shredPath(abs);
         forget(m, f);
         (present ? removed : gone).push(f);
@@ -1293,7 +1305,7 @@ export async function removeHoldingBackups(repo: Repo, files: string[]): Promise
       failed.push({ file: f, error });
     }
   }
-  return { removed, gone, failed };
+  return { removed, gone, other, failed };
 }
 
 /** Package-internal (retention, R147): clears the manifest entries of backups that are no longer in Backups/ (and only of those). */

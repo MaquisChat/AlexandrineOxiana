@@ -9,7 +9,9 @@
  *      never collides with the project it was made from (the registry stays unique); library-relative
  *      paths move to the new folder `Projects/<name> (restored <YYYY-MM-DD>)`. Ids and paths are
  *      rewritten in every JSON file and JSON-lines record (sealed ones are opened and sealed again
- *      for the new project id); provenance is never touched (R76). Workspace tags keep their ids;
+ *      for the new project id); provenance is never touched (R76). Workspace tags keep their ids.
+ *      The audit log and everything in `retention/` (destruction certificates and their amendments)
+ *      are evidence and are copied byte for byte (R147): the copy's audit log vouches for them;
  *   3. a `project.restored` event naming the backup's sha256 is appended to the copy's audit log;
  *   An encrypted copy keeps the data key, and key id, of the project it was made from (the
  *   backup is sealed with it): unlocking either project unlocks both. Assets whose sha256 a
@@ -292,9 +294,12 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       const nextData = map(data) as typeof data;
       nextData.project = { ...nextData.project, id: newProjectId, name: `${old.name} (restored ${s.date})`, folder: newRel };
       await writeText(join(staging, "project.json"), JSON.stringify(nextData, null, 2));
-      // Every other JSON file and JSON-lines record (audit log excepted: it is never rewritten).
+      // Every other JSON file and JSON-lines record. Two things are evidence and are never rewritten,
+      // not a byte: the audit log, and the destruction certificates with the amendments beside them
+      // (R147): their sha256 is in the audit log the copy inherits, and must keep verifying there.
+      // They go on naming the ids and the folder of the project the data was destroyed in.
       for (const f of files) {
-        if (f.startsWith("audit/") || f === "project.json" || f === "backup.json" || sourceFiles.includes(f) || /^Sources\/[^/]+\/annotations\.json(\.enc)?$/u.test(f)) continue;
+        if (f.startsWith("audit/") || f.startsWith("retention/") || f === "project.json" || f === "backup.json" || sourceFiles.includes(f) || /^Sources\/[^/]+\/annotations\.json(\.enc)?$/u.test(f)) continue;
         const abs = join(staging, f);
         if (/\.json(\.enc)?$/u.test(f)) {
           const text = await readText(abs);
