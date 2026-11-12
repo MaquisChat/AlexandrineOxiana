@@ -142,9 +142,11 @@ export function ImportWizard({ client, projectId: initialProject }: ImportWizard
     setBusy(true);
     setError(null);
     const approveOutside = approveOutsideOf(approvals);
-    // Zotero's linked files are copied with "Copy into the library" unless kept as links by choice (R136).
-    const o = { ...opts, ...(scanned.summary.linkedFiles ? { linkedFiles: opts.linkedFiles ?? "copy" } : {}), ...(approveOutside ? { approveOutside } : {}) };
     const c = scanned.choice;
+    // "Copy into the library" copies linked files (Zotero's) unless kept as links by choice (R136),
+    // even ones the scan did not see (M2). A device import has no linked files.
+    const copyLinked = c.kind !== "device" && opts.fileHandling === "copy";
+    const o = { ...opts, ...(copyLinked ? { linkedFiles: opts.linkedFiles ?? "copy" } : {}), ...(approveOutside ? { approveOutside } : {}) };
     try {
       const r =
         c.kind === "device"

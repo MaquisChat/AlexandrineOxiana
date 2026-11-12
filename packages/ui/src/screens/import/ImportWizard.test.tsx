@@ -8,6 +8,8 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
 
 const DEFAULT_OPTIONS = { fileHandling: "copy", structure: "collections", duplicates: "merge", ocr: true, transcribe: false };
+/** What a Bulk Import start sends by default: "Copy into the library" also copies linked files (R136, M2). */
+const START_OPTIONS = { ...DEFAULT_OPTIONS, linkedFiles: "copy" };
 
 function setup(o: ServiceSetup = {}) {
   const m = mockService(o);
@@ -70,7 +72,7 @@ describe("Bulk Import wizard", () => {
     expect((screen.getByRole("checkbox", { name: "OCR scanned PDFs" }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole("checkbox", { name: "Transcribe audio and video" }) as HTMLInputElement).checked).toBe(false);
     await runToReport(m, user);
-    expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/data/papers" }, options: DEFAULT_OPTIONS }]);
+    expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/data/papers" }, options: START_OPTIONS }]);
     expect(m.bodies(`GET /imports/${B1}/report`)).toHaveLength(1);
     expect(screen.getByText("1,280")).toBeTruthy();
   });
@@ -190,7 +192,7 @@ describe("Bulk Import wizard", () => {
         {
           adapter: { kind: "folder", path: "/data/papers" },
           options: {
-            ...DEFAULT_OPTIONS,
+            ...START_OPTIONS,
             approveOutside: { folders: ["/home/u/Zotero/linked"], files: ["/mnt/archive/lee.pdf"], rememberFolders: ["/home/u/Zotero/linked"] },
           },
         },
@@ -230,7 +232,7 @@ describe("Bulk Import wizard", () => {
       expect(screen.getByText(/not approved.*imported without the file/i)).toBeTruthy();
       await toOptions(user);
       await runToReport(m, user);
-      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual(DEFAULT_OPTIONS);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual(START_OPTIONS);
     });
   });
 
@@ -347,7 +349,7 @@ describe("Bulk Import wizard", () => {
       expect((screen.getByRole("checkbox", { name: "Approve this folder and its subfolders" }) as HTMLInputElement).checked).toBe(false);
       await toOptions(user);
       await runToReport(m, user);
-      expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/b" }, options: DEFAULT_OPTIONS }]);
+      expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/b" }, options: START_OPTIONS }]);
     });
 
     it("going back without an edit keeps the scan", async () => {
@@ -505,7 +507,7 @@ describe("Bulk Import wizard", () => {
       const keep = screen.getByRole("checkbox", { name: "Keep the 2 files Zotero links to where they are, as links" }) as HTMLInputElement;
       expect(keep.checked).toBe(false);
       await runToReport(m, user);
-      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual({ ...DEFAULT_OPTIONS, linkedFiles: "copy" });
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual(START_OPTIONS);
     });
 
     it("keeping them as links is an explicit choice, with the warning", async () => {
@@ -532,6 +534,14 @@ describe("Bulk Import wizard", () => {
       await scanFolder(user);
       await toOptions(user);
       expect(screen.queryByRole("checkbox", { name: /where they are, as links/ })).toBeNull();
+    });
+
+    it("M2: “Copy into the library” always asks for linked files to be copied, even when the scan found none (a link added since is copied too)", async () => {
+      const { m, user } = setup();
+      await scanFolder(user);
+      await toOptions(user);
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: { linkedFiles?: string } }).options.linkedFiles).toBe("copy");
     });
 
     it("the report gives the number of files copied and the number left as links", async () => {
