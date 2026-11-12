@@ -89,9 +89,15 @@ def downloads_for(c: Component) -> tuple[Download, ...] | Unavailable:
 
 
 def not_installed(tool_id: str) -> JobError:
-    """The error a job gives when the tool it needs is missing (the interface links to the tools dialogue)."""
+    """The error a job gives when the tool it needs is missing (the interface links to the tools
+    dialogue). When it cannot be downloaded for this computer, the message says why instead."""
     tool = toolpins.TOOLS.get(tool_id)
     name = tool.name if tool else tool_id
+    for cid in tool.components if tool else ():
+        c = toolpins.COMPONENTS[cid]
+        d = downloads_for(c) if c.kind != "ytdlp" else ()
+        if isinstance(d, Unavailable) and not component_status(c).installed:
+            return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed, and it cannot be downloaded for this computer yet. {d.reason}", tool=tool_id)
     return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed. Install it from the tools dialogue.", tool=tool_id)
 
 
@@ -382,7 +388,8 @@ def sweep(root: Path | None = None) -> None:
             continue
         for n in names:
             p = r / n
-            if n.startswith(".staging."):
+            if n.startswith((".staging.", ".trash.")):
+                # .trash.: a removal that did not finish; never brought back.
                 shutil.rmtree(p, ignore_errors=True)
             elif n.startswith(".old."):
                 parts = n.split(".", 3)  # ['', 'old', '<id>', '<folder>']
@@ -449,7 +456,10 @@ def install_component(c: Component, progress: Progress, cancelled: Callable[[], 
     root = root_of(c)
     with _lock(c.id):
         try:
-            root.mkdir(parents=True, exist_ok=True)
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Private whatever the umask: nobody else may swap a program the worker runs.
+            if os.name != "nt":
+                os.chmod(root, 0o700)
         except OSError as e:
             raise fetch._write_error(e) from e
         _check_space(root, sum(d.size + d.unpacked for d in plan))
@@ -535,9 +545,9 @@ def remove_component(c: Component) -> bool:
     with _lock(c.id):
         if not os.path.lexists(final) or (c.kind != "model" and not (final / MARKER).is_file()):
             return False
-        old = root / f".old.{uuid.uuid4().hex}.{c.folder}"
-        os.rename(final, old)
-        shutil.rmtree(old, ignore_errors=True)
+        trash = root / f".trash.{uuid.uuid4().hex}.{c.folder}"
+        os.rename(final, trash)
+        shutil.rmtree(trash, ignore_errors=True)
     clear_checks()
     log.info("removed %s", c.id)
     return True

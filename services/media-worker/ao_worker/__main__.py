@@ -54,6 +54,7 @@ def main() -> int:
         server.serve_forever()
     finally:
         server.manager.shutdown()  # cancels jobs and kills their process groups
+        server.tool_manager.shutdown()
         server.server_close()
     return 0
 

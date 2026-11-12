@@ -104,6 +104,7 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
       .run(action, toolId, {
         signal: entry.ac.signal,
         onProgress: (p) => {
+          if (entry.ac.signal.aborted) return;
           if (job.status !== "running" || p <= job.progress) return;
           job.progress = Math.min(1, p);
           publish(job);
@@ -111,12 +112,14 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
       })
       .then(
         (result) => {
+          if (job.status !== "running") return; // cancelled meanwhile: the catalogue tells what is installed
           job.status = "done";
           job.progress = 1;
           job.result = pick(result);
           if (action !== "remove") retryWaitingWork(toolId);
         },
         (err: unknown) => {
+          if (job.status !== "running") return;
           if ((err instanceof WorkerJobError && err.code === "CANCELLED") || entry.ac.signal.aborted) {
             job.status = "cancelled";
             return;
@@ -126,6 +129,7 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
         },
       )
       .finally(() => {
+        if (job.finishedAt) return;
         job.finishedAt = new Date().toISOString();
         publish(job);
       });
@@ -177,7 +181,14 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
     requireShell(req);
     const e = jobs.get(paramsOf(req).jobId ?? "");
     if (!e) throw notFound("That tool job");
-    if (e.job.status === "running") e.ac.abort();
+    if (e.job.status === "running") {
+      // Shown as cancelled at once (R: never "running" after a cancel); the worker ends the download
+      // within about a second, and a late answer from it is ignored.
+      e.ac.abort();
+      e.job.status = "cancelled";
+      e.job.finishedAt = new Date().toISOString();
+      publish(e.job);
+    }
     return { job: { ...e.job } };
   });
 }

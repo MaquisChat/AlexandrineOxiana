@@ -36,7 +36,9 @@ const PACKAGING = join(WORKER, "packaging");
 const BUILD = join(DESKTOP, ".build");
 const OUT = join(DESKTOP, "sidecars");
 const INTEL_CONSTRAINTS = join(PACKAGING, "constraints-macos-x86_64.txt");
-const SMOKE_ABSENCES = ["model", "clip", "dng", "ffmpeg", "tesseract"];
+// The same list as `ABSENCES` in packaging/smoke_test.py (scripts/build-sidecars.test.mjs checks). gallery-dl is
+// not one: it is not inside the worker (R152), and the smoke run checks that a capture needing it names it.
+export const SMOKE_ABSENCES = ["model", "clip", "dng", "ffmpeg", "tesseract"];
 const RESOLVE_TARGETS = {
   "macos-x86_64": { platform: "macosx_15_0_x86_64", constraints: INTEL_CONSTRAINTS },
   "macos-arm64": { platform: "macosx_15_0_arm64", constraints: undefined },

@@ -13,6 +13,9 @@ import errno
 import hashlib
 import logging
 import os
+import socket
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,8 +28,73 @@ log = logging.getLogger("ao_worker.fetch")
 
 USER_AGENT = "ao-worker"
 CHUNK = 1 << 16
-TIMEOUT_SEC = 60
+# Connecting and reading the response headers.
+TIMEOUT_SEC = 30
 MAX_REDIRECTS = 5
+# A body that sends no byte for this long is given up on (a hung host must not hold a job slot).
+STALL_SEC = 30.0
+# The whole body must arrive within DEADLINE_BASE_SEC + size / DEADLINE_MIN_RATE (bytes per second),
+# so a host that drips just often enough to dodge the stall limit is given up on too.
+DEADLINE_BASE_SEC = 300.0
+DEADLINE_MIN_RATE = 50_000
+# How often the watchdog looks at cancel, stall and deadline (a cancel takes effect within about this).
+WATCH_SEC = 0.2
+
+
+def deadline_for(size: int) -> float:
+    """Seconds the body of a `size`-byte download may take."""
+    return DEADLINE_BASE_SEC + max(0, size) / DEADLINE_MIN_RATE
+
+
+class _Watchdog:
+    """Ends a blocked read when the job is cancelled, the host stalls or the deadline passes, by
+    shutting the connection's socket down (the read then returns or raises at once)."""
+
+    def __init__(self, resp, cancelled: Callable[[], bool] | None, deadline: float):
+        self.resp = resp
+        self.cancelled = cancelled
+        self.deadline = time.monotonic() + deadline
+        self.last = time.monotonic()
+        self.reason: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="download-watchdog", daemon=True)
+        self._thread.start()
+
+    def poke(self) -> None:
+        self.last = time.monotonic()
+
+    def _run(self) -> None:
+        while not self._stop.wait(WATCH_SEC):
+            now = time.monotonic()
+            if self.cancelled and self.cancelled():
+                self.reason = "cancelled"
+            elif now - self.last > STALL_SEC:
+                self.reason = "stalled"
+            elif now > self.deadline:
+                self.reason = "deadline"
+            if self.reason:
+                self._shut()
+                return
+
+    def _shut(self) -> None:
+        sock = getattr(getattr(getattr(self.resp, "fp", None), "raw", None), "_sock", None)
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def check(self) -> None:
+        """Raises for what made the watchdog end the read (if anything)."""
+        if self.reason == "cancelled":
+            raise JobCancelled()
+        if self.reason == "stalled":
+            raise ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download stopped: the server stopped sending")
+        if self.reason == "deadline":
+            raise ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download took too long and was given up")
 
 
 class ToolInstallError(JobError):
@@ -108,6 +176,8 @@ def download(
     digest = hashlib.sha256()
     n = 0
     ok = False
+    created = False
+    watch: _Watchdog | None = None
     try:
         try:
             resp = opener(hosts).open(req, timeout=TIMEOUT_SEC)
@@ -120,18 +190,24 @@ def download(
         with resp:
             try:
                 f = _open_for_write(dest)
+                created = True
             except OSError as e:
                 raise _write_error(e) from e
+            watch = _Watchdog(resp, cancelled, deadline_for(limit))
             with f:
                 while True:
                     if cancelled and cancelled():
                         raise JobCancelled()
                     try:
-                        chunk = resp.read(CHUNK)
+                        # read1: whatever has arrived (one socket read), so a drip cannot hold the loop.
+                        chunk = resp.read1(CHUNK)
                     except Exception as e:  # noqa: BLE001 - OSError, timeouts, http.client.IncompleteRead
+                        watch.check()
                         raise ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download was cut off", type(e).__name__) from e
+                    watch.check()
                     if not chunk:
                         break
+                    watch.poke()
                     n += len(chunk)
                     if n > limit:
                         raise ToolInstallError("TOOL_CHECKSUM_MISMATCH", "the download is larger than expected, so it was not used")
@@ -156,7 +232,9 @@ def download(
         log.info("downloaded %s (%d bytes)", _show(url), n)
         return n
     finally:
-        if not ok:
+        if watch is not None:
+            watch.stop()
+        if not ok and created:  # never a file that was there before
             try:
                 dest.unlink()
             except OSError:

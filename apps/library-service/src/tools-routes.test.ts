@@ -10,6 +10,8 @@ import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkerJobError, WorkerToolError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob, type WorkerToolsClient } from "@ao/library";
 import type { ToolJob, ToolsResponse } from "@ao/shared";
+import { toApiError } from "./errors.js";
+import { failureTool } from "./routes/jobs.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -37,7 +39,7 @@ interface Run {
 }
 
 /** A stand-in worker whose tool jobs the test finishes by hand. */
-function stubWorker(over: { transcribeError?: Error } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
+function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
   const runs: Run[] = [];
   const p: WorkerProvider & { runs: Run[]; updateError?: Error } = {
     runs,
@@ -54,7 +56,7 @@ function stubWorker(over: { transcribeError?: Error } = {}): WorkerProvider & { 
               progress: (n) => opts.onProgress?.(n),
               finish: (x) => (x instanceof Error ? reject(x) : resolve(x)),
             };
-            opts.signal?.addEventListener("abort", () => reject(new WorkerJobError("CANCELLED", "the job was cancelled")));
+            if (!over.ignoreAbort) opts.signal?.addEventListener("abort", () => reject(new WorkerJobError("CANCELLED", "the job was cancelled")));
             runs.push(r);
           }),
       } as unknown as WorkerToolsClient;
@@ -225,6 +227,24 @@ describe("installing a tool", () => {
     await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "cancelled");
   });
 
+  it("a cancelled job is shown as cancelled at once, even while the media helper is still ending it", async () => {
+    const worker = stubWorker({ ignoreAbort: true });
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    const c = await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
+    expect(c.json.job.status).toBe("cancelled");
+    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
+    expect(((await call({ url: "/tools" })).json as ToolsResponse).jobs.every((j) => j.status !== "running")).toBe(true);
+    // a late success from the helper does not bring it back to life
+    worker.runs[0]!.finish({ installed: ["ffmpeg"] });
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
+    // and the tool can be asked for again: a new job
+    const again = await call({ method: "POST", url: "/tools/ffmpeg/install" });
+    expect(again.json.job.jobId).not.toBe(job.jobId);
+  });
+
   it("a failed install is recorded with the worker's code and a plain message, never a bare 500", async () => {
     const worker = stubWorker();
     await start({ worker, autoStartWorker: false });
@@ -268,6 +288,14 @@ describe("tool errors elsewhere", () => {
     expect(r.json.error).toMatchObject({ code: "TOOL_FAILED", reason: "TOOL_UPDATE_FAILED" });
   });
 
+  it("a damaged model is the media helper's failure, not a failed tool install", async () => {
+    const e = toApiError(new WorkerToolError("MODEL_UNAVAILABLE", "the small model on disk could not be read", "speech-small"));
+    expect(e.status).toBe(502);
+    expect(e.code).toBe("INTERNAL");
+    expect(e.reason).toBe("MODEL_UNAVAILABLE");
+    expect(toApiError(new WorkerToolError("TOOL_UPDATE_FAILED", "x", "video-downloader")).code).toBe("TOOL_FAILED");
+  });
+
   it("a transcription whose speech model is missing is 409 TOOL_NOT_INSTALLED naming the tool", async () => {
     const worker = stubWorker({ transcribeError: new WorkerToolError("TOOL_NOT_INSTALLED", "Speech model: small is not installed.", "speech-small") });
     await start({ worker, autoStartWorker: false });
@@ -287,5 +315,14 @@ describe("tool errors elsewhere", () => {
     const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: { model: "small" } });
     expect(r.status, r.body).toBe(409);
     expect(r.json.error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: "speech-small" });
+  });
+});
+
+describe("GET /jobs names the missing tool of a failed viewing copy or OCR job", () => {
+  it("video proxies need ffmpeg, OCR needs ocr; other failures and image proxies name none", () => {
+    expect(failureTool("video.proxy", "TOOL_NOT_INSTALLED")).toBe("ffmpeg");
+    expect(failureTool("ocr", "TOOL_NOT_INSTALLED")).toBe("ocr");
+    expect(failureTool("video.proxy", "FFMPEG_FAILED")).toBeUndefined();
+    expect(failureTool("image.proxy", "TOOL_NOT_INSTALLED")).toBeUndefined();
   });
 });

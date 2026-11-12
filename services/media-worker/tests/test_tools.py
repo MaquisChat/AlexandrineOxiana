@@ -40,8 +40,9 @@ class Files:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def add(self, path: str, body: bytes = b"", status: int = 200, headers: dict | None = None,
-            truncate: int | None = None, slow: float = 0.0) -> str:
-        self.routes[path] = {"body": body, "status": status, "headers": headers or {}, "truncate": truncate, "slow": slow}
+            truncate: int | None = None, slow: float = 0.0, step: int = 4096, silent: float = 0.0) -> str:
+        """`slow`: pause after every `step` bytes; `silent`: send the headers, then nothing for that long."""
+        self.routes[path] = {"body": body, "status": status, "headers": headers or {}, "truncate": truncate, "slow": slow, "step": step, "silent": silent}
         return self.base + path
 
     def _handler(self):
@@ -70,10 +71,15 @@ class Files:
                 if head:
                     return
                 data = body if r["truncate"] is None else body[: r["truncate"]]
+                if r["silent"]:
+                    self.wfile.flush()
+                    time.sleep(r["silent"])
+                    return
                 if r["slow"]:
-                    for i in range(0, len(data), 4096):
+                    step = r["step"]
+                    for i in range(0, len(data), step):
                         try:
-                            self.wfile.write(data[i:i + 4096])
+                            self.wfile.write(data[i:i + step])
                             self.wfile.flush()
                         except OSError:
                             return
@@ -131,11 +137,11 @@ FFMPEG_OK = script("ffmpeg version 9.0.2 fake")
 
 
 def ffmpeg_component(files: Files, ffmpeg_zip: bytes | None = None, ffprobe_zip: bytes | None = None, *,
-                     sha_override: str | None = None, truncate: int | None = None, slow: float = 0.0,
+                     sha_override: str | None = None, truncate: int | None = None, slow: float = 0.0, step: int = 4096,
                      hosts=("127.0.0.1",), path_prefix="/ffmpeg") -> Component:
     a = ffmpeg_zip if ffmpeg_zip is not None else zip_bytes({"ffmpeg": FFMPEG_OK})
     b = ffprobe_zip if ffprobe_zip is not None else zip_bytes({"ffprobe": script("ffprobe version 9.0.2 fake")})
-    ua = files.add(f"{path_prefix}/ffmpeg.zip", a, truncate=truncate, slow=slow)
+    ua = files.add(f"{path_prefix}/ffmpeg.zip", a, truncate=truncate, slow=slow, step=step)
     ub = files.add(f"{path_prefix}/ffprobe.zip", b)
     return Component(
         id="ffmpeg", name="ffmpeg and ffprobe", version="9.0.2", licence="GPL", kind="pinned", root="tools", folder="ffmpeg",
@@ -684,3 +690,207 @@ def test_image_downloader_installs_and_captures_run_it_as_its_own_program(worker
     assert meta["toolVersion"] == "1.32.19"
     info = json.loads(Path(meta["infoJson"][0]).read_text())
     assert info["from"] == str(worker_env["tools"] / "gallery-dl" / "lib")  # the app's copy, not the worker's
+
+
+# ---------- slow hosts: cancel, stall limit and deadline (fix round 1, I3) ----------
+
+
+def test_a_dripping_download_is_cancelled_within_about_a_second(worker, worker_env, files, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    # one byte every 0.1 s: never silent long enough to time out, and a 64 KiB read never fills
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files, zip_bytes({"ffmpeg": FFMPEG_OK + b"#" * 5000}), slow=0.1, step=1))
+    jid = worker.request("POST", "/tools/ffmpeg/install")[1]["id"]
+    time.sleep(0.6)
+    t = time.monotonic()
+    assert worker.request("POST", f"/jobs/{jid}/cancel")[0] == 202
+    job = worker.wait(jid, timeout=10)
+    assert job["status"] == "cancelled"
+    assert time.monotonic() - t < 2.0
+    assert not (worker_env["tools"] / "ffmpeg").exists() and staging_left(worker_env["tools"]) == []
+
+
+def test_a_host_that_stops_sending_is_given_up_on(worker, worker_env, files, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    monkeypatch.setattr(fetch, "STALL_SEC", 0.5)
+    c = ffmpeg_component(files)
+    files.add("/ffmpeg/ffmpeg.zip", zip_bytes({"ffmpeg": FFMPEG_OK}), silent=5.0)
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", c)
+    t = time.monotonic()
+    job = worker.wait(worker.request("POST", "/tools/ffmpeg/install")[1]["id"], timeout=10)
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "TOOL_DOWNLOAD_FAILED" and "stopped" in job["error"]["message"]
+    assert time.monotonic() - t < 3.0
+    assert staging_left(worker_env["tools"]) == []
+
+
+def test_a_download_slower_than_its_deadline_is_given_up_on(worker, worker_env, files, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    monkeypatch.setattr(fetch, "DEADLINE_BASE_SEC", 0.5)
+    monkeypatch.setattr(fetch, "DEADLINE_MIN_RATE", 10 ** 9)
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files, zip_bytes({"ffmpeg": FFMPEG_OK + b"#" * 5000}), slow=0.05, step=10))
+    t = time.monotonic()
+    job = worker.wait(worker.request("POST", "/tools/ffmpeg/install")[1]["id"], timeout=10)
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "TOOL_DOWNLOAD_FAILED" and "too long" in job["error"]["message"]
+    assert time.monotonic() - t < 3.0
+
+
+def test_the_deadline_scales_with_the_declared_size():
+    assert fetch.deadline_for(3_000_000_000) > fetch.deadline_for(1_000_000) >= fetch.DEADLINE_BASE_SEC
+
+
+# ---------- protections each guarded by a test (fix round 1, I4) ----------
+
+
+def test_a_download_longer_than_its_pin_is_refused(worker, worker_env, files, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    c = ffmpeg_component(files)
+    good = c.downloads["any"][0]
+    # the server sends the pinned bytes and then more; the pin's size and hash are those of the prefix
+    files.add("/ffmpeg/ffmpeg.zip", files.routes["/ffmpeg/ffmpeg.zip"]["body"] + b"MORE" * 1000)
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", c)
+    job = worker.wait(worker.request("POST", "/tools/ffmpeg/install")[1]["id"])
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "TOOL_CHECKSUM_MISMATCH" and "larger" in job["error"]["message"]
+    assert good.size < len(files.routes["/ffmpeg/ffmpeg.zip"]["body"])
+    assert not (worker_env["tools"] / "ffmpeg").exists()
+
+
+def test_an_unpinned_download_is_capped_at_its_limit(worker_env, files, tmp_path):
+    files.add("/big", b"x" * 5000)
+    with pytest.raises(fetch.ToolInstallError) as e:
+        fetch.download(files.base + "/big", tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=1000)
+    assert e.value.code == "TOOL_CHECKSUM_MISMATCH"
+    assert not (tmp_path / "f").exists()
+
+
+def test_a_redirect_from_https_down_to_http_is_refused():
+    import urllib.request
+
+    h = fetch._Redirects(("example.org",))
+    req = urllib.request.Request("https://example.org/tool.zip")
+    with pytest.raises(fetch.ToolInstallError) as e:
+        h.redirect_request(req, None, 302, "Found", {}, "http://example.org/tool.zip")
+    assert e.value.code == "TOOL_DOWNLOAD_FAILED"
+    # the same host over https is followed
+    assert h.redirect_request(req, None, 302, "Found", {}, "https://example.org/other.zip") is not None
+
+
+def test_not_enough_free_space_refuses_before_downloading(worker, worker_env, files, monkeypatch):
+    import collections
+
+    no_system(monkeypatch, "ffmpeg")
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files))
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(tools.shutil, "disk_usage", lambda p: usage(10**9, 10**9, 1000))
+    job = worker.wait(worker.request("POST", "/tools/ffmpeg/install")[1]["id"])
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "TOOL_WRITE_FAILED" and "space" in job["error"]["message"]
+    assert files.requests == []
+    assert staging_left(worker_env["tools"]) == []
+
+
+def test_a_folder_without_its_install_marker_is_not_installed(worker_env, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    folder = worker_env["tools"] / "ffmpeg"
+    folder.mkdir()
+    for n in ("ffmpeg", "ffprobe"):
+        (folder / n).write_bytes(FFMPEG_OK)
+        (folder / n).chmod(0o755)
+    assert tools.which("ffmpeg") is None
+    t = {x["id"]: x for x in tools.catalogue()["tools"]}["ffmpeg"]
+    assert t["installed"] is False
+    (folder / tools.MARKER).write_text("{}")
+    assert tools.which("ffmpeg") == str(folder / "ffmpeg")
+
+
+# ---------- minors (fix round 1) ----------
+
+
+def test_a_half_removed_tool_is_not_brought_back_by_the_sweep(worker_env):
+    root = worker_env["tools"]
+    trash = root / ".trash.deadbeef.ffmpeg"  # a removal the worker did not live to finish
+    trash.mkdir()
+    (trash / tools.MARKER).write_text("{}")
+    (trash / "ffmpeg").write_bytes(FFMPEG_OK)
+    tools.sweep()
+    assert not trash.exists() and not (root / "ffmpeg").exists()
+
+
+def test_remove_moves_the_folder_aside_under_the_trash_prefix(worker_env, monkeypatch):
+    root = worker_env["tools"]
+    folder = root / "ffmpeg"
+    folder.mkdir()
+    (folder / tools.MARKER).write_text("{}")
+    seen = []
+    real = tools.shutil.rmtree
+    monkeypatch.setattr(tools.shutil, "rmtree", lambda p, **k: (seen.append(Path(p).name), real(p, **k)))
+    assert tools.remove_component(toolpins.COMPONENTS["ffmpeg"]) is True
+    assert seen and all(n.startswith(".trash.") for n in seen)
+
+
+def test_the_tools_folder_is_private(worker, worker_env, files, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    root = worker_env["tools"] / "fresh"
+    monkeypatch.setenv("AO_TOOLS_DIR", str(root))
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files))
+    old = os.umask(0o002)
+    try:
+        job = worker.wait(worker.request("POST", "/tools/ffmpeg/install")[1]["id"])
+    finally:
+        os.umask(old)
+    assert job["status"] == "done", job
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_a_missing_tool_that_cannot_be_installed_here_says_why(worker_env, monkeypatch):
+    monkeypatch.setenv("PATH", str(FAKE_BIN))
+    e = tools.not_installed("ocr")
+    assert e.code == "TOOL_NOT_INSTALLED" and e.tool == "ocr"
+    assert "tools dialogue" not in e.message
+    assert "tesseract" in e.message
+    assert "tools dialogue" in tools.not_installed("ffmpeg").message
+
+
+def test_an_existing_file_is_never_deleted_by_a_failed_download(worker_env, files, tmp_path):
+    dest = tmp_path / "keep"
+    dest.write_text("mine")
+    files.add("/x", b"abc")
+    with pytest.raises(fetch.ToolInstallError):
+        fetch.download(files.base + "/x", dest, sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=10)
+    assert dest.read_text() == "mine"
+
+
+def test_an_archive_entry_with_permission_bits_only_counts_as_a_regular_file(tmp_path):
+    from ao_worker import unpack
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        info = zipfile.ZipInfo("ffmpeg")
+        info.external_attr = 0o755 << 16  # no file-type bits, as some zip tools write
+        z.writestr(info, FFMPEG_OK)
+    archive = tmp_path / "a.zip"
+    archive.write_bytes(buf.getvalue())
+    (tmp_path / "out").mkdir()
+    unpack.extract_zip(archive, tmp_path / "out", members={"ffmpeg": "ffmpeg"}, max_bytes=10_000)
+    assert (tmp_path / "out" / "ffmpeg").read_bytes() == FFMPEG_OK
+
+
+def test_tool_jobs_do_not_take_the_media_jobs_slots(worker, worker_env, files, monkeypatch, tmp_path):
+    from ao_worker import jobs
+
+    no_system(monkeypatch, "ffmpeg")
+    big = zip_bytes({"ffmpeg": FFMPEG_OK + b"#" * 400_000})
+    started = []
+    for i in range(jobs.MAX_RUNNING):
+        monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files, big, slow=0.05, path_prefix=f"/p{i}"))
+        started.append(worker.request("POST", "/tools/ffmpeg/install")[1]["id"])
+    time.sleep(0.3)
+    # a capture still runs at once (the installs take several seconds more)
+    t = time.monotonic()
+    job = worker.run("capture.download", "https://www.youtube.com/watch?v=abc123", str(tmp_path / "c"), {"tool": "yt-dlp"}, timeout=15)
+    assert job["status"] == "done", job
+    assert time.monotonic() - t < 2.5
+    assert all(worker.request("GET", f"/jobs/{j}")[1]["status"] in ("running", "queued") for j in started)
+    for jid in started:
+        worker.request("POST", f"/jobs/{jid}/cancel")

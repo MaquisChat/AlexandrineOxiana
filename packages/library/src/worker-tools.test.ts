@@ -26,7 +26,7 @@ interface FakeTools {
 }
 
 /** A stand-in for the worker's /tools routes and the /jobs routes of its tool jobs. */
-async function fakeTools(script: { final: Record<string, unknown>; polls?: number; submitStatus?: number; submitBody?: unknown } = { final: { status: "done", result: { tool: "ffmpeg", action: "install", installed: ["ffmpeg"] } } }): Promise<FakeTools> {
+async function fakeTools(script: { final: Record<string, unknown>; polls?: number; submitStatus?: number; submitBody?: unknown; ignoreCancel?: boolean } = { final: { status: "done", result: { tool: "ffmpeg", action: "install", installed: ["ffmpeg"] } } }): Promise<FakeTools> {
   const requests: FakeTools["requests"] = [];
   let polls = 0;
   let cancelled = false;
@@ -44,7 +44,7 @@ async function fakeTools(script: { final: Record<string, unknown>; polls?: numbe
     }
     if (req.method === "POST" && req.url === "/tools/update") return send(script.submitStatus ?? 200, script.submitBody ?? {});
     if (req.method === "POST" && req.url === "/jobs/w1/cancel") {
-      cancelled = true;
+      cancelled = !script.ignoreCancel;
       return send(202, { id: "w1", status: "running" });
     }
     if (req.method === "GET" && req.url === "/jobs/w1") {
@@ -106,6 +106,17 @@ describe("WorkerToolsClient", () => {
     expect(err).toBeInstanceOf(WorkerJobError);
     expect((err as WorkerJobError).code).toBe("CANCELLED");
     expect(f.requests.some((r) => r.method === "POST" && r.url === "/jobs/w1/cancel")).toBe(true);
+  });
+
+  it("a worker that does not end a cancelled job is given up on after the grace period", async () => {
+    const f = await started({ final: { status: "done", result: {} }, polls: 100000, ignoreCancel: true });
+    const ac = new AbortController();
+    const t = Date.now();
+    const p = new WorkerToolsClient(f, { pollMs: 5, cancelGraceMs: 100 }).run("install", "ffmpeg", { signal: ac.signal });
+    setTimeout(() => ac.abort(), 20);
+    const err = await p.catch((e: unknown) => e);
+    expect((err as WorkerJobError).code).toBe("CANCELLED");
+    expect(Date.now() - t).toBeLessThan(2000);
   });
 
   it("an unknown tool is the worker's 404 code, not a crash", async () => {
