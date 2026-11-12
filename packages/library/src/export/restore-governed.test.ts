@@ -790,6 +790,34 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "nothing-could-be-read", leftOut: 0 }]);
     });
 
+    it("another project's destruction recorded without its files (the earlier form of the entry), its certificate not verifying: not refused; the certificate as found still excludes, and it is said", async () => {
+      const z = await makeProject(kit, RETAIN, false, "Earlier Form");
+      const zRaw = await rawSource(z);
+      const s = await scene({ destroy: false });
+      backupSeams.failBackup = true;
+      const zr = await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+      backupSeams.failBackup = false;
+      await rewriteAudit(z, (e) => {
+        if (e.action === "delete" && detailsOf(e).op === "retention.destroy") delete (e.details as Details).destroyedAssets;
+      });
+      await kit.reopen();
+      expect(verifyChain(await eventsOf(z.id)).ok).toBe(true);
+      // Changed on disk: it no longer is the file the entry recorded, but it still names the file.
+      const cert = JSON.parse(await readFile(zr.certificatePath, "utf8")) as Record<string, unknown>;
+      await writeFile(zr.certificatePath, `${JSON.stringify({ ...cert, edited: true }, null, 2)}\n`);
+      const r = await restore(s.offline);
+      expect((await restoredFiles(r.projectId))["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(r.notes.join(" ")).toMatch(/project "Earlier Form" records a destruction of raw data .* without naming the files/u);
+      expect(r.notes.join(" ")).toMatch(/certificate file alone/u);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, certificate: basename(zr.certificatePath), basis: "certificate-files-alone", leftOut: 1 }]);
+
+      await rm(zr.certificatePath);
+      const again = await restore(s.offline);
+      expect((await restoredFiles(again.projectId))["Interview one"]!.onDisk).toBe(true);
+      expect(again.notes.join(" ")).toMatch(/could not be established at all/u);
+      expect(await notVerified(again.projectId)).toEqual([{ projectId: z.id, certificate: basename(zr.certificatePath), basis: "nothing-could-be-read", leftOut: 0 }]);
+    });
+
     it("every audit log holds together: nothing of this is said or recorded", async () => {
       const s = await scene();
       const r = await restore(s.offline);

@@ -74,9 +74,22 @@ export class RestoreError extends Error {
 }
 
 /**
- * What was destroyed under a retention rule in this library cannot be read with certainty (an audit
- * log that does not hold together, or a recorded destruction that does not say which files), so
- * nothing is restored: the app does not guess (R174 d). A plain message, no paths.
+ * The file is not a backup this app can read: not a backup at all, damaged, or changed since it was
+ * made. Refused, and the refusal is recorded in the library's own audit log (R179). A plain message,
+ * no paths.
+ */
+export class UnreadableBackupError extends RestoreError {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnreadableBackupError";
+  }
+}
+
+/**
+ * What the project a backup belongs to destroyed under a retention rule cannot be read with
+ * certainty (its audit log does not hold together, or records a destruction that does not say which
+ * files), so the backup is not restored into this library: the app does not guess (R174 d, R179).
+ * A plain message that names the way out, no paths.
  */
 export class DestructionRecordError extends RestoreError {
   constructor(
@@ -110,14 +123,34 @@ export interface RestoreRequest {
   file?: string;
 }
 
-/** What recorded destructions say a restore must not bring back (R174 d). */
-export interface DestroyedRecord {
+/** One source of knowledge about files destroyed in this library: a destruction, or what stands in for one. */
+export interface DestroyedSource {
+  /** The project whose record it is. */
+  projectId: string;
+  /**
+   * `recorded`: a destruction that project's verified audit log records.
+   * `certificate-only`: certificate files taken as they are on disk because the audit log cannot
+   * vouch for them (R179). Unverified evidence still excludes: it errs towards not bringing data back.
+   * `unrecorded`: a certificate file a verified audit log does not record. It counts for nothing.
+   */
+  basis: "recorded" | "certificate-only" | "unrecorded";
   /** Asset id (in the project the data was destroyed in) → when it was destroyed. */
   byId: ReadonlyMap<string, string>;
-  /** sha256 of a destroyed file → when, from certificates the audit log vouches for. */
+  /** sha256 of a destroyed file → when. */
   bySha256: ReadonlyMap<string, string>;
-  /** Plain sentences for the restore's notes: what could not be read from a certificate, or was not taken into account. */
-  notes: readonly string[];
+  /**
+   * A sentence for the restore's notes, given how many files of the backup this source left out
+   * (for `unrecorded`: how many it names that the restore brought back). Undefined: it has no
+   * bearing on this restore, and nothing is said.
+   */
+  note?: (files: number) => string | undefined;
+  /** What the restore's audit entry says of this source, when it is not a verified record. */
+  audit?: (leftOut: number) => Record<string, unknown>;
+}
+
+/** What the destructions on record in this library say a restore must not bring back (R174 d, R179). */
+export interface DestroyedRecord {
+  sources: readonly DestroyedSource[];
 }
 
 export interface StagedRestore {
@@ -136,10 +169,11 @@ export interface StagedRestore {
   /** The backup's file name, when it is one of this library's backups. */
   file?: string;
   /**
-   * What recorded destructions say must not come back, read in the commit turn (it must not take
-   * the write queue). Throws DestructionRecordError when that cannot be read with certainty.
+   * What the destructions on record say must not come back, read in the commit turn (it must not
+   * take the write queue), given the id of the project the backup belongs to. Throws
+   * DestructionRecordError when that project's own record cannot be read with certainty.
    */
-  destroyed: () => Promise<DestroyedRecord>;
+  destroyed: (ownProjectId: string) => Promise<DestroyedRecord>;
   /**
    * Called in the commit turn, last before the copy goes live, with the audit events it starts
    * with: notes what the copy inherits (the warnings that then stand for it), and returns how to
@@ -153,8 +187,11 @@ export interface StagedRestore {
 
 /** Rules that require encryption at rest, for a project that is not encrypted: it would come back unencrypted. */
 export const RESTORE_NEEDS_ENCRYPTION = "The rules of the project in this backup require encryption at rest, but the project in it is not encrypted; it was not restored";
-/** The same, by the rules the project the backup was made from has now. */
-export const RESTORE_NEEDS_ENCRYPTION_NOW = "The rules the original project has now require encryption at rest, but the project in this backup is not encrypted; it was not restored";
+/** The same, by the rules the project the backup was made from has now: which rule, and the two ways out (R179). */
+export const RESTORE_NEEDS_ENCRYPTION_NOW =
+  "The rules the original project has now require encryption at rest, but the project in this backup is not encrypted. Restore the backup into another library, or change that rule in the original project's rules.";
+/** The original project's rules cannot be read: the two ways out (R179). */
+const REPAIR_OR_ELSEWHERE = "Repair that project's rules in the governance editor, or restore this backup into another library.";
 /** A sealed archive whose project is not an encrypted one: unpacking it would write its files unencrypted. */
 export const RESTORE_SEALED_BUT_PLAIN = "This backup is sealed, but the project in it is not an encrypted one, so it would come back unencrypted; it was not restored";
 
@@ -184,7 +221,12 @@ function askRules(core: RepoCore, r: RestoreRequest, at: string, yaml: string | 
     // and kept short, before it becomes a recorded reason.
     const why = scrubPaths(e instanceof Error ? e.message : String(e), [core.root]);
     const short = why.length > REASON_MAX ? `${why.slice(0, REASON_MAX)}…` : why;
-    return denyOf(`Policy could not be evaluated: ${rules === "original" ? "the rules the original project has now cannot be read: " : ""}${short}`);
+    // Which rules could not be read; for the original's, what can be done about it (R179).
+    return denyOf(
+      rules === "original"
+        ? `Policy could not be evaluated: the rules the original project has now cannot be read (${short}). ${REPAIR_OR_ELSEWHERE}`
+        : `Policy could not be evaluated: the rules in this backup cannot be read (${short}).`,
+    );
   }
   if (d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "encrypt") && !r.project.encrypted) {
     return denyOf(rules === "backup" ? RESTORE_NEEDS_ENCRYPTION : RESTORE_NEEDS_ENCRYPTION_NOW, d.warnings);
@@ -214,7 +256,10 @@ export async function decideRestore(core: RepoCore, r: RestoreRequest, at: strin
     const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
     yaml = raw ? raw.toString("utf8") : null;
   } catch (e) {
-    return denyOf(`Policy could not be evaluated: the rules the original project has now cannot be read: ${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}`, own.warnings);
+    return denyOf(
+      `Policy could not be evaluated: the rules the original project has now cannot be read (${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}). ${REPAIR_OR_ELSEWHERE}`,
+      own.warnings,
+    );
   }
   const now = askRules(core, r, at, yaml, "original", st.project);
   const warnings = [...new Set([...own.warnings, ...now.warnings])];
@@ -290,6 +335,39 @@ export async function authorizeRestoreIn(core: RepoCore, r: RestoreRequest): Pro
       throw new PolicyDeniedError(d.reason, "restore");
     }
     return d;
+  });
+}
+
+/**
+ * Audits the refusal of a file that is not a readable backup (R179; never silent, R154): in the
+ * library's own audit log, because such a file is no backup of any project here. The entry holds
+ * the file's base name (never a path), its sha256 and what that covers (the whole file; or nothing,
+ * when the file could not be read at all), and the plain reason. The same refusal is listed once a
+ * day (R157). If the entry cannot be written the refusal stands and the library warns.
+ */
+export function recordUnreadableBackup(core: RepoCore, f: { file: string; sha256?: string; reason: string }): Promise<void> {
+  return core.serial(async () => {
+    try {
+      await appendLibraryRefusal(core, {
+        at: core.clock().toISOString(),
+        actor: core.actor,
+        device: core.device,
+        action: "restore",
+        decision: { result: "deny", reason: f.reason },
+        details: {
+          op: "project.restore",
+          notABackup: true,
+          file: f.file,
+          ...(f.sha256 ? { backupSha256: f.sha256, sha256Covers: "the whole file" } : { sha256Covers: "nothing: the file could not be read" }),
+        },
+      });
+    } catch (err) {
+      core.integrityWarnings.push({
+        projectId: "*",
+        kind: "refusal-unrecorded",
+        detail: `a refused restore could not be recorded in the library's audit log (${err instanceof Error ? err.name : "Error"})`,
+      });
+    }
   });
 }
 
@@ -385,12 +463,12 @@ export async function adoptRestoredProject(
     let undoInherited: (() => Promise<void>) | undefined;
     try {
       const raw = await readMaybe(join(staging, "project.json"));
-      if (!raw) throw new RestoreError("This file is not a project backup (it has no project.json)");
+      if (!raw) throw new UnreadableBackupError("This file is not a project backup (it has no project.json)");
       let data;
       try {
         data = parseProjectJson(JSON.parse(raw.toString("utf8")));
       } catch {
-        throw new RestoreError("The backup's project.json cannot be read");
+        throw new UnreadableBackupError("The backup's project.json cannot be read");
       }
       const old = data.project;
 
@@ -465,7 +543,7 @@ export async function adoptRestoredProject(
           const id = (JSON.parse(await readText(join(staging, f))) as { id?: unknown }).id;
           if (typeof id === "string") ids.set(id, newId());
         } catch {
-          throw new RestoreError("An import record in the backup cannot be read");
+          throw new UnreadableBackupError("An import record in the backup cannot be read");
         }
       }
       for (const f of files.filter((x) => x.endsWith(".jsonl") && !x.startsWith("audit/"))) {
@@ -488,35 +566,60 @@ export async function adoptRestoredProject(
         }
       }
 
-      // Files destroyed under a retention rule are not brought back (R92, R174 d). Which files is
-      // read now, in the commit turn, from the audit logs of this library: an asset a destruction's
-      // own audit entry names (by its id), or whose sha256 a certificate the audit log vouches for
-      // lists. If that cannot be read with certainty nothing is restored, and the refusal is audited.
+      // Files destroyed under a retention rule are not brought back (R92, R174 d, R179). Which files
+      // is read now, in the commit turn, from this library's record of destructions: an asset a
+      // destruction's own audit entry names (by its id), or whose sha256 a certificate the audit log
+      // vouches for lists; and, for a project whose audit log does not verify, whatever its
+      // certificate files name (unverified evidence still excludes). If the backup's own project's
+      // record cannot be read with certainty nothing is restored, and the refusal is audited.
       let record: DestroyedRecord;
       try {
-        record = await s.destroyed();
+        record = await s.destroyed(old.id);
       } catch (err) {
         if (err instanceof DestructionRecordError) await recordRestoreRefusal(core, request, err.message, "commit", err.logNotIntact ? { logNotIntact: err.projectId } : {});
         throw err;
       }
       const notes: string[] = [];
+      // A verified record decides first; evidence the audit log cannot vouch for only ever adds to what is left out.
+      const excluding = [...record.sources.filter((x) => x.basis === "recorded"), ...record.sources.filter((x) => x.basis === "certificate-only")];
+      const leftBy = new Map<DestroyedSource, number>();
+      /** What the copy keeps: the ids and sha256 of the stored files that are brought back. */
+      const kept = { ids: new Set<string>(), sha256: new Set<string>() };
       /** What was left out, by the ids the backup holds (given as the copy's ids in the answer). */
       const left: Array<{ sourceId: string; assetId: string; destroyedAt: string }> = [];
       for (const [f, raw] of parsedSources) {
         const sf = raw as { source: { id: string }; assets: Array<{ id: string; path: string; sha256: string; status?: string; destroyedAt?: string; linked?: unknown }> };
         for (const a of sf.assets) {
-          const at = record.byId.get(a.id) ?? record.bySha256.get(a.sha256);
-          if (!at || a.status === "destroyed" || a.linked) continue;
+          if (a.status === "destroyed" || a.linked) continue;
+          const by = excluding.find((x) => x.byId.has(a.id) || x.bySha256.has(a.sha256));
+          if (!by) {
+            kept.ids.add(a.id);
+            kept.sha256.add(a.sha256);
+            continue;
+          }
+          const at = by.byId.get(a.id) ?? by.bySha256.get(a.sha256)!;
           if (a.path.startsWith(`${old.folder}/`)) await shredPath(join(staging, ...a.path.slice(old.folder.length + 1).split("/")));
           a.status = "destroyed";
           a.destroyedAt = at;
           left.push({ sourceId: sf.source.id, assetId: a.id, destroyedAt: at });
+          leftBy.set(by, (leftBy.get(by) ?? 0) + 1);
         }
         parsedSources.set(f, sf as unknown as Record<string, unknown>);
       }
       const skipped = left.length;
       if (skipped) notes.push(`${skipped} ${skipped === 1 ? "file was" : "files were"} destroyed earlier under a retention rule and ${skipped === 1 ? "was" : "were"} not restored.`);
-      notes.push(...record.notes);
+      // What each source has to say about this restore (nothing, when it has no bearing on it), and
+      // what the audit entry records of evidence the audit log could not vouch for.
+      const notVerified: Array<Record<string, unknown>> = [];
+      for (const src of record.sources) {
+        const files =
+          src.basis === "unrecorded"
+            ? [...src.byId.keys()].filter((id) => kept.ids.has(id)).length + [...src.bySha256.keys()].filter((h) => kept.sha256.has(h)).length
+            : (leftBy.get(src) ?? 0);
+        const note = src.note?.(files);
+        if (note) notes.push(note);
+        if (src.audit) notVerified.push(src.audit(files));
+      }
 
       const projectsDir = join(core.root, "Projects");
       const taken = await namesIn(projectsDir);
@@ -566,7 +669,7 @@ export async function adoptRestoredProject(
             }
             const o = JSON.parse(line) as { ct?: unknown; nonce?: unknown };
             if (typeof o.ct === "string" && typeof o.nonce === "string") {
-              if (!key) throw new RestoreError("The backup holds sealed records but no key");
+              if (!key) throw new UnreadableBackupError("The backup holds sealed records but no key");
               let opened: { json: string; purpose: string } | undefined;
               for (const purpose of SEALED_PURPOSES) {
                 try {
@@ -576,7 +679,7 @@ export async function adoptRestoredProject(
                   // another purpose
                 }
               }
-              if (!opened) throw new RestoreError("A sealed record in the backup cannot be read");
+              if (!opened) throw new UnreadableBackupError("A sealed record in the backup cannot be read");
               out.push(sealLine(key, keyId!, newProjectId, JSON.stringify(map(JSON.parse(opened.json))), opened.purpose));
             } else out.push(JSON.stringify(map(o)));
           }
@@ -620,6 +723,9 @@ export async function adoptRestoredProject(
           restoredFrom: old.id,
           fromAuditHead: verify.head ? { seq: verify.head.seq, hash: verify.head.hash } : null,
           ...(skipped ? { leftOutDestroyed: skipped } : {}),
+          // Projects whose record of destructions the audit log could not vouch for, and what the
+          // list of files left out rests on for each (R179).
+          ...(notVerified.length ? { destructionsNotVerified: notVerified } : {}),
           ...(decided.warnings.length ? { warnings: decided.warnings } : {}),
         },
       });

@@ -85,6 +85,7 @@ import { datedFileName, formatModified, newId, withCollisionSuffix, type PolicyR
 import { encryptStream, readKeyId } from "../crypto/format.js";
 import { unwrapKey, unwrapWithRecovery, WrongPassphraseError } from "../crypto/keys.js";
 import { openSealedZip } from "../crypto/random-access.js";
+import { UnsafeFileError } from "../extract/errors.js";
 import { extractArchive, readArchiveEntry, type ZipSource } from "../extract/zip.js";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { shredPath } from "../fs/shred.js";
@@ -96,7 +97,7 @@ import { PolicyDeniedError, ProjectLockedError, ReadOnlyLibraryError } from "../
 import { SimulatedCrash } from "../repo/seams.js";
 import { foldName, namesIn, readMaybe } from "../repo/io.js";
 import type { ProjectKeyFile } from "../repo/projects.js";
-import { AuditChainInvalidError, DestructionRecordError, RestoreError, restoreSeams, type RestoreRequest } from "../repo/restore.js";
+import { AuditChainInvalidError, DestructionRecordError, RestoreError, UnreadableBackupError, restoreSeams, type RestoreRequest } from "../repo/restore.js";
 import { parseProjectJson } from "../repo/state.js";
 import {
   DESTRUCTION_BACKUPS_PENDING_WARNING,
@@ -110,6 +111,7 @@ import {
   onProjectUnlocked,
   lookupPolicyInfo,
   refuseRestore,
+  refuseUnreadableBackup,
   repoClock,
   repoLibrary,
   repoTz,
@@ -123,7 +125,7 @@ import { isDue, projectTimeZone } from "../retention-date.js";
 // neither this module nor retention.ts (which imports this module).
 import { destroyedOnRecord, inheritedOutstanding, type DestroyedOnRecord } from "../restore-record.js";
 
-export { AuditChainInvalidError, DestructionRecordError, RestoreError };
+export { AuditChainInvalidError, DestructionRecordError, RestoreError, UnreadableBackupError };
 
 export const BACKUPS_MANIFEST = "backups-manifest.json";
 export const DEFAULT_KEEP = 10;
@@ -1605,18 +1607,18 @@ async function projectIdIn(repo: Repo, abs: string): Promise<string | undefined>
  * is a refusal). The archive's names were checked already (extractArchive's first pass).
  */
 async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: Pick<RestoreRequest, "destinations" | "backupSha256" | "file">): Promise<RestoreRequest> {
-  const undecryptable = () => new RestoreError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
+  const undecryptable = () => new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
   const z = await openBackup(repo, abs).catch(() => {
     throw undecryptable();
   });
   try {
     const raw = await readArchiveEntry(z.src, "project.json", PROJECT_JSON_MAX);
-    if (!raw) throw new RestoreError("This file is not a project backup (it has no project.json)");
+    if (!raw) throw new UnreadableBackupError("This file is not a project backup (it has no project.json)");
     let project: Project;
     try {
       project = parseProjectJson(JSON.parse(raw.toString("utf8"))).project;
     } catch {
-      throw new RestoreError("The backup's project.json cannot be read");
+      throw new UnreadableBackupError("The backup's project.json cannot be read");
     }
     const rules = await readArchiveEntry(z.src, "governance.yaml");
     return {
@@ -1628,7 +1630,7 @@ async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: 
   } catch (err) {
     if (err instanceof RestoreError) throw err;
     if (z.failure()) throw undecryptable();
-    throw new RestoreError("The backup could not be read; it was not restored");
+    throw new UnreadableBackupError("The backup could not be read; it was not restored");
   } finally {
     await z.close().catch(() => {});
   }
@@ -1675,23 +1677,42 @@ export async function restoreBackup(repo: Repo, path: string, opts: RestoreOptio
   return restoreLocked(repo, path, opts);
 }
 
+/** A refusal of the file itself: it is not a backup this app can read (not a backup, damaged, unsafe, or its own audit log does not verify). */
+const notABackup = (err: unknown): err is Error => err instanceof UnreadableBackupError || err instanceof AuditChainInvalidError || err instanceof UnsafeFileError;
+
 async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Promise<RestoreResult> {
   const lib = repoLibrary(repo);
   if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
   const abs = resolve(path);
+  let backupSha256: string | undefined;
+  try {
+    // Of the whole file: what the restore records, and what a refusal of the file records (R179).
+    backupSha256 = await sha256Of(abs).catch(() => {
+      throw new UnreadableBackupError("This file could not be read; nothing was restored");
+    });
+    return await restoreHashed(repo, abs, backupSha256, opts);
+  } catch (err) {
+    // No refusal is silent (R154, R179): a file that is not a readable backup is recorded in the
+    // library's own audit log by its base name and sha256, with the plain reason. Never its path.
+    if (notABackup(err)) await refuseUnreadableBackup(repo, { file: basename(abs), ...(backupSha256 ? { sha256: backupSha256 } : {}), reason: err.message });
+    throw err;
+  }
+}
+
+async function restoreHashed(repo: Repo, abs: string, backupSha256: string, opts: RestoreOptions): Promise<RestoreResult> {
+  const lib = repoLibrary(repo);
   const sealed = abs.endsWith(".enc");
-  const backupSha256 = await sha256Of(abs);
   // The manifest entry, when the backup is one of this library's.
   const inBackups = resolve(dirname(abs)) === resolve(backupsDir(repo));
   const entry = inBackups ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs)) : undefined;
-  if (entry && entry.sha256 !== backupSha256) throw new RestoreError("This backup was changed after it was made; it was not restored");
+  if (entry && entry.sha256 !== backupSha256) throw new UnreadableBackupError("This backup was changed after it was made; it was not restored");
 
   let source: ZipSource = abs;
   let close: (() => Promise<void>) | undefined;
   let decryptFailure: (() => unknown) | undefined;
   if (sealed) {
     const keyId = await readKeyId(abs).catch(() => {
-      throw new RestoreError("This backup cannot be decrypted: it is damaged, or it is not a backup made by this app");
+      throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it is not a backup made by this app");
     });
     if (!keyFromRing(repo, keyId)) {
       const kf = entry?.keyFile;
@@ -1709,7 +1730,7 @@ async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Pr
       key.fill(0);
     }
     const z = await openSealedZip(abs, (id) => keyFromRing(repo, id)).catch(() => {
-      throw new RestoreError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
+      throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
     });
     source = { reader: z.reader, size: z.size };
     close = z.close;
@@ -1736,7 +1757,7 @@ async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Pr
           const request = await restoreRequestOf(repo, abs, sealed, { destinations, backupSha256, ...(file ? { file } : {}) });
           await authorizeRestore(repo, request);
           try {
-            prior = await destroyedOnRecord(repo);
+            prior = await destroyedOnRecord(repo, { own: request.project.id });
           } catch (err) {
             if (err instanceof DestructionRecordError) await refuseRestore(repo, request, err);
             throw err;
@@ -1747,23 +1768,23 @@ async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Pr
         },
       });
     } catch (err) {
-      if (decryptFailure?.()) throw new RestoreError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
+      if (decryptFailure?.()) throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
       throw err;
     } finally {
       await close?.();
     }
-    if (entries.some((e) => e.refused)) throw new RestoreError("The backup holds two files with the same name; it was not restored");
+    if (entries.some((e) => e.refused)) throw new UnreadableBackupError("The backup holds two files with the same name; it was not restored");
     const headerRaw = await readMaybe(join(staging, "backup.json"));
     let expectedHead: { seq: number; hash: string } | null | undefined;
     if (headerRaw) {
       try {
         expectedHead = (JSON.parse(headerRaw.toString("utf8")) as { auditHead?: { seq: number; hash: string } | null }).auditHead;
       } catch {
-        throw new RestoreError("The backup's description (backup.json) cannot be read");
+        throw new UnreadableBackupError("The backup's description (backup.json) cannot be read");
       }
     }
     // Decided before the first file was written, or nothing was unpacked at all.
-    if (!destinations) throw new RestoreError("The backup could not be read; it was not restored");
+    if (!destinations) throw new UnreadableBackupError("The backup could not be read; it was not restored");
     const date = formatModified(repoClock(repo)(), repoTz(repo)).slice(0, 10);
     await restoreSeams.beforeAdopt?.(staging);
     const { project, notes, leftOut, warnings: inherited } = await adoptRestoredProject(repo, {
@@ -1775,7 +1796,7 @@ async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Pr
       destinations,
       ...(file ? { file } : {}),
       // In the commit turn (it holds the write queue): what was destroyed, as the audit logs say now.
-      destroyed: () => destroyedOnRecord(repo, { inQueue: true, ...(prior ? { prior } : {}) }),
+      destroyed: (own) => destroyedOnRecord(repo, { own, inQueue: true, ...(prior ? { prior } : {}) }),
       // In the commit turn, last before the copy goes live: the backups it inherits as still to be
       // removed are noted, so its warning stands from that moment (R175); taken back if it does not go live.
       beforeLive: async (copy) => {

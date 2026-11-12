@@ -194,6 +194,7 @@ export {
   BackupNotRecordedError,
   DEFAULT_KEEP,
   DestructionRecordError,
+  UnreadableBackupError,
   RestoreError,
   PruneNotRecordedError,
   backupFailure,

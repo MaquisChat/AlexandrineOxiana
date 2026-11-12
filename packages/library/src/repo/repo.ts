@@ -87,6 +87,7 @@ import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutco
 import {
   adoptRestoredProject as adoptRestoredIn,
   authorizeRestoreIn,
+  recordUnreadableBackup,
   refuseRestoreIn,
   type DestructionRecordError,
   type RestoreRequest,
@@ -1356,6 +1357,11 @@ export function authorizeRestore(repo: Repo, r: RestoreRequest): ReturnType<type
 /** Package-internal (restore): audits a restore refused because the record of destructions cannot be read. */
 export function refuseRestore(repo: Repo, r: RestoreRequest, err: DestructionRecordError): Promise<void> {
   return refuseRestoreIn(cores.get(repo)!, r, err);
+}
+
+/** Package-internal (restore, R179): audits, in the library's own log, the refusal of a file that is not a readable backup. */
+export function refuseUnreadableBackup(repo: Repo, f: { file: string; sha256?: string; reason: string }): Promise<void> {
+  return recordUnreadableBackup(cores.get(repo)!, f);
 }
 
 /** Package-internal (restore): the head of the project's audit log as this process holds it. */
