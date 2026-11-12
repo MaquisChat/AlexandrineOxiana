@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// The desktop shell's launch check (Task 37c, R155), on Linux under a virtual display. It starts the
+// The desktop shell's launch check (Task 37c, R155), on Linux under a virtual display and on a Mac
+// (Task 37f) with the app bundle the Mac build made. It starts the
 // built shell (`build:linux` first) the way a person would, with NODE_ENV=test so that the debug
 // build reports on its standard output what this check needs (never the token), and checks:
 //
@@ -17,6 +18,20 @@
 //
 //   pnpm --filter @ao/desktop run launch-check            (node apps/desktop/scripts/launch-check.mjs)
 //
+// On a Mac (Task 37f; no virtual display: GitHub's Mac runners have a logged-in desktop session):
+//
+//   node apps/desktop/scripts/launch-check.mjs --app <the DEBUG .app>       scenarios A-E
+//   node apps/desktop/scripts/launch-check.mjs --release-app <the .app>     scenario R only
+//
+// With --app the shell runs from inside the bundle and finds Node, the service folder and the worker
+// in its Contents/Resources, as a person's copy does (no AO_DESKTOP_* overrides, except scenario D's
+// stand-in service). Scenario R takes the release app (from the mounted disk image), which prints
+// nothing for this check: it waits for the service (Resources/node/node running
+// Resources/library-service/service.mjs) and the worker to appear under the shell, checks that the
+// service listens on the loopback address and refuses a request without the token (HTTP 401), stops
+// the shell with SIGTERM and checks that no helper is left. Processes are read with ps (and lsof)
+// instead of /proc. What the Mac run is expected to show is in apps/desktop/README.md ("Building for macOS").
+//
 // Needs: xvfb-run, dbus-daemon, the built shell (apps/desktop/src-tauri/target/debug), the built
 // service folder (apps/library-service/dist/library-service), Node 22. The worker: AO_DESKTOP_WORKER_BIN
 // if set, else the packaged worker in apps/desktop/sidecars/ if built, else the development worker
@@ -30,7 +45,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const SHELL = join(REPO, "apps", "desktop", "src-tauri", "target", "debug", "alexandrine-oxiana");
+const LINUX_SHELL = join(REPO, "apps", "desktop", "src-tauri", "target", "debug", "alexandrine-oxiana");
+const MAC = process.platform === "darwin";
+let SHELL = LINUX_SHELL;
+/** Whether the shell runs from an app bundle and finds its helpers in its resources (--app on a Mac). */
+let PACKAGED = false;
 const SERVICE_DIR = join(REPO, "apps", "library-service", "dist", "library-service");
 const SHELL_ORIGINS = ["tauri://localhost", "http://tauri.localhost"];
 
@@ -104,19 +123,65 @@ const HELPER_NAMES = new Set([
 ]);
 
 /** Problems with a helper's environment names and command line (a token, or a name off the allow-list). */
-export function helperProblems(who, envNames, cmdline) {
+export function helperProblems(who, envNames, cmdline, platform = process.platform) {
   const out = [];
   for (const n of envNames) {
     if (/TOKEN|PASSPHRASE/i.test(n)) out.push(`${who} has ${n} in its environment`);
+    // macOS: CoreFoundation sets __CF_USER_TEXT_ENCODING inside a process that uses it; the shell does not pass it.
+    else if (platform === "darwin" && n === "__CF_USER_TEXT_ENCODING") continue;
     else if (!HELPER_NAMES.has(n) && !/^(LC_|XDG_)/.test(n)) out.push(`${who} received ${n}, which is not on the allow-list`);
   }
   if (/[0-9a-f]{64}/i.test(cmdline)) out.push(`${who}'s command line carries a token-like value`);
   return out;
 }
 
-// ---------- processes (Linux /proc) ----------
+export function parseArgs(argv) {
+  const out = { app: undefined, releaseApp: undefined };
+  for (let i = 0; i < argv.length; i++) {
+    const [flag, inline] = argv[i].split(/=(.*)/s, 2);
+    const value = () => {
+      const v = inline ?? argv[++i];
+      if (!v) throw new Error(`${flag} needs the path of an app bundle (.app)`);
+      return v;
+    };
+    if (flag === "--") continue;
+    else if (flag === "--app") out.app = value();
+    else if (flag === "--release-app") out.releaseApp = value();
+    else throw new Error(`unknown option ${argv[i]}`);
+  }
+  return out;
+}
+
+/** The shell's program inside an app bundle. */
+export const shellOf = (app) => join(app, "Contents", "MacOS", "alexandrine-oxiana");
+
+/** `ps -o pid=,ppid=,stat=,command=` lines: [{pid, ppid, state (first letter of stat), cmd}]. */
+export function parsePs(text) {
+  return text.split("\n").map((l) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(l)).filter(Boolean).map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), state: m[3][0], cmd: m[4] }));
+}
+
+/**
+ * The names of the variables `ps -E` prints after a process's command line (`withEnv`), given the
+ * command line alone (`cmd`). A value holding " NAME=" would read as one more name: the check then
+ * reports a name too many, never one too few.
+ */
+export function envNamesFromPsE(withEnv, cmd) {
+  const tail = withEnv.startsWith(cmd) ? withEnv.slice(cmd.length) : withEnv;
+  return [...tail.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=/g)].map((m) => m[1]);
+}
+
+/** `lsof -iTCP -sTCP:LISTEN` lines: the addresses a process listens on. */
+export function parseLsofListen(text) {
+  return [...text.matchAll(/TCP (\[[^\]]+\]|[^\s:]+):(\d+) \(LISTEN\)/g)].map((m) => ({ host: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) }));
+}
+
+// ---------- processes (Linux /proc; ps on a Mac) ----------
+
+const ps = (args) => spawnSync("ps", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).stdout ?? "";
+const macTable = () => parsePs(ps(["-axww", "-o", "pid=,ppid=,stat=,command="]));
 
 function procState(pid) {
+  if (MAC) return macTable().find((p) => p.pid === pid)?.state ?? null;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
@@ -141,8 +206,8 @@ function allPids() {
 }
 function descendants(root) {
   const kids = new Map();
-  for (const p of allPids()) {
-    const pp = ppidOf(p);
+  const table = MAC ? macTable() : allPids().map((pid) => ({ pid, ppid: ppidOf(pid) }));
+  for (const { pid: p, ppid: pp } of table) {
     if (!kids.has(pp)) kids.set(pp, []);
     kids.get(pp).push(p);
   }
@@ -163,10 +228,14 @@ const readProc = (pid, f) => {
     return "";
   }
 };
-const envNames = (pid) => readProc(pid, "environ").split("\0").filter(Boolean).map((kv) => kv.slice(0, kv.indexOf("=")));
-const cmdline = (pid) => readProc(pid, "cmdline").split("\0").join(" ");
+const cmdline = (pid) => (MAC ? ps(["-ww", "-o", "command=", "-p", String(pid)]).trim() : readProc(pid, "cmdline").split("\0").join(" "));
+const envNames = (pid) =>
+  MAC ? envNamesFromPsE(ps(["-E", "-ww", "-o", "command=", "-p", String(pid)]).trim(), cmdline(pid)) : readProc(pid, "environ").split("\0").filter(Boolean).map((kv) => kv.slice(0, kv.indexOf("=")));
 /** Running processes whose environment mentions `marker` (the check's temporary folder): any helper of this check. */
 function processesMarkedBy(marker) {
+  if (MAC) {
+    return ps(["-axE", "-ww", "-o", "pid=,command="]).split("\n").filter((l) => l.includes(marker)).map((l) => Number(l.trim().split(/\s/, 1)[0])).filter((p) => p !== process.pid && running(p));
+  }
   return allPids().filter((p) => p !== process.pid && running(p) && readProc(p, "environ").includes(marker));
 }
 
@@ -185,8 +254,8 @@ async function until(what, ms, test) {
 }
 
 /** Starts the shell under xvfb-run, or directly on `env.DISPLAY` when `direct` (a display the check owns). */
-function startShell(env, label, { direct = false } = {}) {
-  const child = direct ? spawn(SHELL, [], { env, stdio: ["pipe", "pipe", "pipe"] }) : spawn("xvfb-run", ["-a", "-s", "-screen 0 1400x900x24", SHELL], { env, stdio: ["pipe", "pipe", "pipe"] });
+function startShell(env, label, { direct = MAC, shell = SHELL } = {}) {
+  const child = direct ? spawn(shell, [], { env, stdio: ["pipe", "pipe", "pipe"] }) : spawn("xvfb-run", ["-a", "-s", "-screen 0 1400x900x24", shell], { env, stdio: ["pipe", "pipe", "pipe"] });
   const lines = [];
   const events = [];
   let log = "";
@@ -230,6 +299,7 @@ function writeProbeFiles(dir) {
 }
 
 function workerBin(root) {
+  if (PACKAGED) return { bin: undefined, kind: "packaged, in the app's resources" };
   if (process.env.AO_DESKTOP_WORKER_BIN) return { bin: process.env.AO_DESKTOP_WORKER_BIN, kind: "given" };
   const sidecars = join(REPO, "apps", "desktop", "sidecars");
   if (existsSync(sidecars)) {
@@ -258,9 +328,9 @@ function shellEnv(dir, extra) {
     XDG_CACHE_HOME: join(dir, "cache"),
     LANG: "C.UTF-8",
     NODE_ENV: "test",
-    AO_DESKTOP_NODE: process.execPath,
-    AO_DESKTOP_SERVICE_DIR: SERVICE_DIR,
-    ...extra,
+    // A packaged app (--app) uses the Node.js and the service folder in its own resources.
+    ...(PACKAGED ? {} : { AO_DESKTOP_NODE: process.execPath, AO_DESKTOP_SERVICE_DIR: SERVICE_DIR }),
+    ...Object.fromEntries(Object.entries(extra).filter(([, v]) => v !== undefined)),
   };
 }
 
@@ -317,16 +387,13 @@ async function assertGone(label, pids, marker, problems, ms = 30_000) {
   }
 }
 
-async function main() {
-  if (process.platform !== "linux") throw new Error("The launch check runs on Linux (under xvfb-run).");
-  for (const [what, p] of [["the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ["the built service folder", join(SERVICE_DIR, "service.mjs")]]) {
-    if (!existsSync(p)) throw new Error(`Missing ${what}.`);
-  }
-  const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
-  const problems = [];
+/** A D-Bus session bus for the run (Linux: the keychain and the web view use it); none on a Mac. */
+function startBus() {
+  if (MAC) return { proc: undefined, address: Promise.resolve(undefined) };
   const dbus = spawn("dbus-daemon", ["--session", "--nofork", "--print-address=1"], { stdio: ["ignore", "pipe", "inherit"] });
-  try {
-    const address = await new Promise((res, rej) => {
+  return {
+    proc: dbus,
+    address: new Promise((res, rej) => {
       let out = "";
       dbus.stdout.on("data", (d) => {
         out += d.toString();
@@ -334,7 +401,81 @@ async function main() {
         if (out.includes("\n")) res(line.trim());
       });
       dbus.once("exit", () => rej(new Error("dbus-daemon did not start")));
+    }),
+  };
+}
+
+/**
+ * R (a Mac, --release-app): the release app as shipped. It prints nothing for this check, so the
+ * check reads the process table: the service and the worker must start from the app's own resources,
+ * the service must listen on the loopback address and refuse a request without its token, and after
+ * SIGTERM to the shell no helper may be left.
+ */
+async function releaseCheck(app, problems) {
+  const shell = shellOf(app);
+  if (!existsSync(shell)) throw new Error(`Missing ${shell}.`);
+  const resources = join(app, "Contents", "Resources");
+  const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
+  const label = "R (the release app)";
+  const env = { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: join(root, "home"), LANG: "en_US.UTF-8", TMPDIR: join(root, "tmp") };
+  mkdirSync(env.HOME, { recursive: true });
+  mkdirSync(env.TMPDIR, { recursive: true });
+  const run = startShell(env, label, { direct: true, shell });
+  try {
+    const found = await until("the service and the worker under the shell", 180_000, async () => {
+      if (run.child.exitCode !== null || run.child.signalCode !== null) throw new Error(`the app exited (${run.child.exitCode ?? run.child.signalCode}) before its helpers started:\n${run.log().slice(-3000)}`);
+      const kids = descendants(run.child.pid).filter(running).map((pid) => ({ pid, cmd: cmdline(pid) }));
+      const svc = kids.find((k) => k.cmd.includes(join(resources, "library-service", "service.mjs")));
+      const worker = kids.find((k) => k.cmd.includes(join(resources, "ao-worker", "ao-worker")));
+      return svc && worker ? { svc, worker, kids } : null;
     });
+    report(`${label}: the service runs the app's own Node.js and service folder`, found.svc.cmd.startsWith(join(resources, "node", "node")), found.svc.cmd.slice(0, 200)) || problems.push("R: service not from the app");
+    report(`${label}: the worker runs from the app's resources, under the service`, true, found.worker.cmd.slice(0, 200));
+    report(`${label}: the service runs with the 512 MB ceiling`, /--max-old-space-size=512/.test(found.svc.cmd)) || problems.push("R: memory ceiling");
+    const envProblems = found.kids.flatMap((k) => helperProblems(k.pid === found.svc.pid ? "the service" : `helper ${k.pid}`, envNames(k.pid), k.cmd));
+    report(`${label}: the helpers got an allow-listed environment and no token outside standard input`, envProblems.length === 0, envProblems.join("; ")) || problems.push(...envProblems);
+    const listen = await until("the service to listen", 60_000, async () => {
+      const l = parseLsofListen(spawnSync("lsof", ["-nP", "-a", "-p", String(found.svc.pid), "-iTCP", "-sTCP:LISTEN"], { encoding: "utf8" }).stdout ?? "");
+      return l.length ? l : null;
+    });
+    report(`${label}: the service listens on the loopback address only`, listen.every((l) => l.host === "127.0.0.1"), listen.map((l) => `${l.host}:${l.port}`).join(", ")) || problems.push("R: not loopback only");
+    const port = listen[0].port;
+    const status = await fetch(`http://127.0.0.1:${port}/libraries`).then((r) => r.status, (e) => `no answer (${e.message})`);
+    report(`${label}: the service answers, and refuses a request without its token`, status === 401, `HTTP ${status}`) || problems.push("R: no token refusal");
+    const helpers = [found.svc.pid, ...descendants(found.svc.pid)].filter(running);
+    process.kill(run.child.pid, "SIGTERM");
+    const { code, signal } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
+    report(`${label}: SIGTERM stops the app`, code === 0, `exit ${code ?? signal}`) || problems.push("R: exit");
+    await assertGone(label, helpers, root, problems);
+  } finally {
+    if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const problems = [];
+  if (MAC) {
+    if (args.releaseApp) {
+      await releaseCheck(resolve(args.releaseApp), problems);
+      return finish(problems);
+    }
+    if (!args.app) throw new Error("On a Mac the launch check runs an app bundle: --app <the debug .app> (scenarios A-E) or --release-app <the .app> (scenario R).");
+    SHELL = shellOf(resolve(args.app));
+    PACKAGED = true;
+  } else if (process.platform !== "linux") {
+    throw new Error("The launch check runs on Linux (under xvfb-run) and on a Mac.");
+  } else if (args.app || args.releaseApp) {
+    throw new Error("--app and --release-app are for a Mac.");
+  }
+  for (const [what, p] of [[MAC ? "the app's program" : "the built shell (pnpm --filter @ao/desktop run build:linux)", SHELL], ...(PACKAGED ? [] : [["the built service folder", join(SERVICE_DIR, "service.mjs")]])]) {
+    if (!existsSync(p)) throw new Error(`Missing ${what}.`);
+  }
+  const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
+  const bus = startBus();
+  try {
+    const address = await bus.address;
     const worker = workerBin(root);
     process.stdout.write(`launch-check: shell ${SHELL}\nlaunch-check: worker: ${worker.kind}\n`);
     const media = writeProbeFiles(join(root, "files"));
@@ -418,14 +559,17 @@ async function main() {
     // E. Opened again during a (deliberately slowed) quit: no second service beside the first;
     //    the first stops its helpers, then starts the app again. On a display the check owns,
     //    because the restarted shell outlives the first process (xvfb-run would end the display).
+    //    On a Mac there is no display to own: the shell runs directly on the desktop session.
     {
       const dir = join(root, "e");
-      const xvfb = spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"], { stdio: ["ignore", "pipe", "ignore"] });
-      const display = await new Promise((res, rej) => {
-        xvfb.stdout.once("data", (d) => res(`:${String(d).trim()}`));
-        xvfb.once("exit", () => rej(new Error("Xvfb did not start")));
-      });
-      const env = { ...shellEnv(dir, { DBUS_SESSION_BUS_ADDRESS: address, AO_DESKTOP_WORKER_BIN: worker.bin, AO_SHELL_TEST_SLOW_STOP_MS: "6000" }), DISPLAY: display };
+      const xvfb = MAC ? undefined : spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"], { stdio: ["ignore", "pipe", "ignore"] });
+      const display = MAC
+        ? undefined
+        : await new Promise((res, rej) => {
+            xvfb.stdout.once("data", (d) => res(`:${String(d).trim()}`));
+            xvfb.once("exit", () => rej(new Error("Xvfb did not start")));
+          });
+      const env = shellEnv(dir, { DBUS_SESSION_BUS_ADDRESS: address, AO_DESKTOP_WORKER_BIN: worker.bin, AO_SHELL_TEST_SLOW_STOP_MS: "6000", DISPLAY: display });
       const run = startShell(env, "E (opened again while closing)", { direct: true });
       const shells = [];
       try {
@@ -461,13 +605,17 @@ async function main() {
       } finally {
         for (const pid of shells) if (running(pid)) killTree(pid);
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
-        xvfb.kill("SIGTERM");
+        xvfb?.kill("SIGTERM");
       }
     }
   } finally {
-    dbus.kill("SIGTERM");
+    bus.proc?.kill("SIGTERM");
     rmSync(root, { recursive: true, force: true });
   }
+  finish(problems);
+}
+
+function finish(problems) {
   if (problems.length) {
     process.stdout.write(`launch-check: FAILED (${problems.length} problem${problems.length === 1 ? "" : "s"})\n`);
     process.exit(1);
