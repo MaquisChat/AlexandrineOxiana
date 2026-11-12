@@ -276,6 +276,33 @@ describe("the port across launches (R171, defect D13)", () => {
     expect(await stop(b), b.err()).toBe(0);
   }, 60_000);
 
+  it("the remembered port and the reopen of the last library (Task 46a) do not hold each other up when either file is missing or unreadable", async () => {
+    // A remembered port, and the last library's record unreadable (a folder in its place).
+    const a = run({ stdin: `${TOKEN}\n` });
+    const first = await ready(a);
+    expect(await stop(a), a.err()).toBe(0);
+    await rm(join(deps.appConfigDir, "last-library.json"), { recursive: true, force: true });
+    await mkdir(join(deps.appConfigDir, "last-library.json"));
+    const b = run({ stdin: `${TOKEN}\n` });
+    expect(await ready(b)).toBe(first);
+    expect((await fetch(`http://127.0.0.1:${first}/libraries`, { headers: auth })).status).toBe(200);
+    expect(await stop(b), b.err()).toBe(0);
+    // The last library remembered at a place that is gone, and the port file unreadable.
+    const lib = join(tmp, "Lib");
+    await (await createLibrary(lib, "Lib", deps)).close();
+    const c = run({ env: baseEnv({ AO_NO_WORKER: "1", AO_LIBRARY: lib }), stdin: `${TOKEN}\n` });
+    await ready(c);
+    expect(await stop(c), c.err()).toBe(0);
+    await rm(lib, { recursive: true, force: true });
+    await rm(portFile(), { force: true });
+    await mkdir(portFile());
+    const d = run({ stdin: `${TOKEN}\n` });
+    const port = await ready(d);
+    const r = await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth });
+    expect(r.status).toBe(200);
+    expect(await stop(d), d.err()).toBe(0);
+  }, 90_000);
+
   it("an explicit AO_SERVICE_PORT is used exactly, and neither read from nor written to the remembered port", async () => {
     const probe = await holdPort(0);
     const explicit = (probe.address() as { port: number }).port;
