@@ -74,7 +74,7 @@ const later = (ms: number) => {
 const onDisk = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [{ path: "/", removable: false, network: false }] });
 const onNetwork = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [{ path: kit.lib.root, removable: false, network: true }] });
 const unknownPlace = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [], mountsKnown: false });
-const NETWORK_REASON = "The project would be restored into the library's folder, which is on a network drive; the rules of the project in this backup do not allow its data there";
+const NETWORK_REASON = "The project would be restored into the library's folder, which is on a network drive. The rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows.";
 
 const RETAIN = `identifiability:
   containsIdentifiable: true
@@ -192,7 +192,7 @@ describe("1. a restore is decided by the policy engine before anything is writte
     const b = await backupProject(kit.repo, p.id);
     const folders = await projectFolders();
     await expect(restore(b.path, { locationEnv: unknownPlace() })).rejects.toMatchObject({
-      reason: "Where the library's folder is stored could not be determined (it may be a network drive), and the rules of the project in this backup do not allow its data there. To restore it, use a library on storage those rules allow.",
+      reason: "Where the library's folder is stored could not be determined (it may be a network drive), and the rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows.",
     });
     await expectNothingRestored(folders, [p.id]);
     expect(await refusalsIn(p.id)).toHaveLength(1);
@@ -316,6 +316,48 @@ describe("1. a restore is decided by the policy engine before anything is writte
     await expectNothingRestored(folders, [p.id]);
   });
 
+  it("R179: a file that is not a readable backup is refused with an entry in the library's audit log: its name, its SHA-256, the plain reason, no path", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Audited Refusals");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    const count = (await eventsOf(p.id)).length;
+    // No project.json; a project.json that cannot be read; not an archive at all; an audit log inside that does not verify.
+    const files = unzipSync(new Uint8Array(await readFile(b.path)));
+    const auditName = Object.keys(files).find((n) => n.startsWith("audit/"))!;
+    const cases: Array<[string, RegExp]> = [
+      [await craft(b, { "project.json": null }, "no project.zip"), /not a project backup/u],
+      [await craft(b, { "project.json": "{ not json" }, "torn project.zip"), /project\.json cannot be read/u],
+      [join(kit.tmp, "holiday photos.zip"), /could not be read|cannot be read/u],
+      [await craft(b, { [auditName]: Buffer.from(files[auditName]!).toString("utf8").replace('"actor":"tester"', '"actor":"mallory"') }, "tampered log.zip"), /audit log does not verify/u],
+    ];
+    await writeFile(cases[2]![0], "these bytes are not an archive");
+    for (const [path, words] of cases) {
+      const err = (await restore(path).catch((e: unknown) => e)) as Error;
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toMatch(words);
+      expect(err.message).not.toContain(kit.tmp);
+      // Asked again the same day: refused again, and listed once (R157).
+      await expect(restore(path)).rejects.toBeInstanceOf(Error);
+      const mine = (await libraryRefusals()).filter((e) => detailsOf(e).file === basename(path));
+      expect(mine).toHaveLength(1);
+      expect(mine[0]!.decision).toEqual({ result: "deny", reason: err.message });
+      expect(mine[0]!.details).toMatchObject({ op: "project.restore", notABackup: true, file: basename(path), backupSha256: sha(await readFile(path)), sha256Covers: "the whole file" });
+      expect(JSON.stringify(mine[0])).not.toContain(kit.tmp);
+    }
+    // A file that is not there at all: a plain refusal, recorded by its name; there is nothing to hash.
+    const missing = (await restore(join(kit.tmp, "never existed.zip")).catch((e: unknown) => e)) as Error;
+    expect(missing).toBeInstanceOf(RestoreError);
+    expect(missing.message).not.toContain(kit.tmp);
+    const [gone] = (await libraryRefusals()).filter((e) => detailsOf(e).file === "never existed.zip");
+    expect(gone!.details).toMatchObject({ op: "project.restore", notABackup: true, sha256Covers: "nothing: the file could not be read" });
+    expect(gone!.details).not.toHaveProperty("backupSha256");
+    await expectNothingRestored(folders, [p.id]);
+    // The project's own log is not where these go: the file is no backup of any project here.
+    expect((await eventsOf(p.id)).length).toBe(count);
+    expect((await kit.repo.libraryAudit()).verify.ok).toBe(true);
+  });
+
   it("a copy of a backup kept elsewhere is restored holding the maintenance lock of the project it is a backup of", async () => {
     const p = await makeProject(kit, OPEN_GOV, false, "Elsewhere Copy");
     await addSource(kit, p, { title: "x" });
@@ -339,7 +381,7 @@ describe("1. a restore is decided by the policy engine before anything is writte
   });
 
   describe("the project the backup was made from is in this library: the rules it has now must allow the restore too", () => {
-    const NOW_REASON = "The project would be restored into the library's folder, which is on this computer's disk; the rules the original project has now do not allow its data there";
+    const NOW_REASON = "The project would be restored into the library's folder, which is on this computer's disk. The rule on where data may live that the original project has now does not allow its data there. Restore the backup into another library on storage that rule allows, or allow this kind of storage in the original project's rules.";
     async function tighten(p: Project, yaml: string): Promise<void> {
       const g = await kit.repo.getGovernance(p.id);
       await kit.repo.setGovernance(p.id, yaml, { baseSha256: g.sha256 });
@@ -391,6 +433,8 @@ describe("1. a restore is decided by the policy engine before anything is writte
       const err = (await restore(b.path).catch((e: unknown) => e)) as PolicyDeniedError;
       expect(err).toBeInstanceOf(PolicyDeniedError);
       expect(err.reason).toMatch(/^Policy could not be evaluated: the rules the original project has now cannot be read/u);
+      // Which rules, and the two ways out (R179).
+      expect(err.reason).toMatch(/Repair that project's rules in the governance editor, or restore this backup into another library\.$/u);
       expect(err.reason).not.toContain(kit.tmp);
       await expectNothingRestored(folders, [p.id]);
       expect(await refusalsIn(p.id)).toHaveLength(1);
@@ -408,6 +452,21 @@ describe("1. a restore is decided by the policy engine before anything is writte
       const err = (await restore(b.path).catch((e: unknown) => e)) as PolicyDeniedError;
       expect(err).toBeInstanceOf(PolicyDeniedError);
       expect(err.reason).toMatch(/the original project has now require encryption at rest/u);
+      expect(err.reason).toMatch(/Restore the backup into another library, or change that rule in the original project's rules\.$/u);
+      await expectNothingRestored(folders, [p.id]);
+    });
+
+    it("the backup's own, older rules exclude the library's present place although the original's rules allow it: refused by the backup's own rule, with the way out", async () => {
+      const p = await makeProject(kit, OPEN_GOV, false, "Older Rules");
+      const b = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
+      // The backup as it would be had it been made while the project's rules allowed removable drives only.
+      const older = await craft(b, { "governance.yaml": `${OPEN_GOV}residency:\n  allowed: [removable]\n` }, "older rules.zip");
+      const folders = await projectFolders();
+      const err = (await restore(older, { locationEnv: onDisk() }).catch((e: unknown) => e)) as PolicyDeniedError;
+      expect(err).toBeInstanceOf(PolicyDeniedError);
+      expect(err.reason).toBe(
+        "The project would be restored into the library's folder, which is on this computer's disk. The rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows.",
+      );
       await expectNothingRestored(folders, [p.id]);
     });
   });
@@ -612,6 +671,9 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     expect(err).toBeInstanceOf(DestructionRecordError);
     expect(err.message).toMatch(/audit log of the project "Origin" does not hold together/u);
     expect(err.message).toMatch(/[Nn]othing was restored/u);
+    // The backup belongs to that project, and the way out is named (R179).
+    expect(err.message).toMatch(/This backup belongs to that project/u);
+    expect(err.message).toMatch(/can be restored into another library/u);
     expect(err.message).not.toContain(kit.tmp);
     expect(spaceAsked).toBe(false);
     await expectNothingRestored(folders, [s.p.id]);
@@ -663,22 +725,96 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     await expectNothingRestored(folders, [s.p.id]);
   });
 
-  it("another project's audit log that does not hold together refuses the restore too, and names that project", async () => {
+  describe("R179: another project's audit log does not hold together (the backup's own project's does)", () => {
+    interface Bystander {
+      s: Scene;
+      z: Project;
+      /** The bystander's destruction of a file with the same bytes as the raw file in the backup. */
+      zr: DestroyResult;
+    }
+    /** Project "Origin" with its backup kept elsewhere (nothing destroyed in it), and an unrelated project that destroyed the same file and whose audit log was then changed outside the app. */
+    async function bystander(): Promise<Bystander> {
+      const z = await makeProject(kit, RETAIN, false, "Bystander");
+      const zRaw = await rawSource(z); // the same bytes as Origin's raw file: another copy of the same recording
+      await addSource(kit, z, { title: "something else" });
+      const s = await scene({ destroy: false });
+      backupSeams.failBackup = true; // the bystander has no backups, and makes none
+      const zr = await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+      backupSeams.failBackup = false;
+      await breakAudit(z, (l) => l.includes('"op":"retention.destroy"'));
+      return { s, z, zr };
+    }
+    const notVerified = async (projectId: string) => (detailsOf((await eventsOf(projectId)).at(-1)!).destructionsNotVerified ?? []) as Array<Record<string, unknown>>;
+
+    it("the restore is not refused; a file the bystander's certificate names as destroyed is left out on that certificate alone, and the notes and the audit entry say so", async () => {
+      const { s, z } = await bystander();
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(files["Kept paper"]!.onDisk).toBe(true);
+      expect(r.leftOut).toHaveLength(1);
+      const said = r.notes.join(" ");
+      expect(said).toMatch(/audit log of the project "Bystander" does not hold together/u);
+      expect(said).toMatch(/certificate files alone/u);
+      expect(said).toMatch(/1 file of this backup/u);
+      expect(said).not.toContain(kit.tmp);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "certificate-files-alone", leftOut: 1 }]);
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
+      // Nothing was refused, so nothing is recorded as refused.
+      expect(await libraryRefusals()).toEqual([]);
+      expect(await refusalsIn(s.p.id)).toEqual([]);
+    });
+
+    it("unverified evidence still excludes: whatever that project's certificate files name is left out, also after they were edited", async () => {
+      const { s, zr } = await bystander();
+      const cert = JSON.parse(await readFile(zr.certificatePath, "utf8")) as { assets: Array<Record<string, unknown>> };
+      await writeFile(zr.certificatePath, `${JSON.stringify({ ...cert, assets: [...cert.assets, { assetId: "someone-else", sha256: s.kept.assets[0]!.sha256 }] }, null, 2)}\n`);
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(files["Kept paper"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(r.notes.join(" ")).toMatch(/2 files of this backup/u);
+    });
+
+    it("with that project's certificate deleted as well: the restore still goes ahead, and says it could not establish that project's destructions at all", async () => {
+      const { s, z, zr } = await bystander();
+      await rm(zr.certificatePath);
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      expect(files["Interview one"]!.onDisk).toBe(true);
+      expect(files["Kept paper"]!.onDisk).toBe(true);
+      expect(r.leftOut).toEqual([]);
+      const said = r.notes.join(" ");
+      expect(said).toMatch(/audit log of the project "Bystander" does not hold together/u);
+      expect(said).toMatch(/could not be established at all/u);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "nothing-could-be-read", leftOut: 0 }]);
+    });
+
+    it("every audit log holds together: nothing of this is said or recorded", async () => {
+      const s = await scene();
+      const r = await restore(s.offline);
+      await expectRawLeftOut(r);
+      expect(r.notes).toHaveLength(1);
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).not.toHaveProperty("destructionsNotVerified");
+    });
+  });
+
+  it("R179: another project's missing certificate, or a certificate there that is not on record, is not mentioned when it has no bearing on this restore", async () => {
+    const z = await makeProject(kit, RETAIN, false, "Elsewhere In The Library");
+    const zRaw = await rawSource(z, "bytes no other project holds");
     const s = await scene();
-    const other = await makeProject(kit, OPEN_GOV, false, "Bystander");
-    await addSource(kit, other, { title: "a" });
-    await addSource(kit, other, { title: "b" });
-    await breakAudit(other, (l) => l.includes('"store"'));
-    const folders = await projectFolders();
-    const before = ids();
-    const err = (await restore(s.offline).catch((e: unknown) => e)) as Error;
-    expect(err).toBeInstanceOf(RestoreError);
-    expect(err.message).toMatch(/audit log of the project "Bystander" does not hold together/u);
-    await expectNothingRestored(folders, before);
-    // The backup's own project is here and its log is intact: the refusal is recorded there.
-    const denied = await refusalsIn(s.p.id);
-    expect(denied).toHaveLength(1);
-    expect(denied[0]!.decision).toEqual({ result: "deny", reason: err.message });
+    backupSeams.failBackup = true;
+    const zr = await destroyRaw(kit.repo, z.id, [zRaw.assets[0]!.id], "tester");
+    backupSeams.failBackup = false;
+    await rm(zr.certificatePath);
+    await writeFile(
+      join(kit.lib.root, kit.repo.getProject(z.id).folder, "retention", "destruction-2026-12-03 1000.json"),
+      `${JSON.stringify({ at: "2026-12-03T10:00:00.000Z", assets: [{ assetId: "nobody", sha256: sha("nothing this backup holds") }] })}\n`,
+    );
+    const r = await restore(s.offline);
+    await expectRawLeftOut(r);
+    // Only what this restore left out, and why.
+    expect(r.notes).toHaveLength(1);
   });
 
   it("a locked project with a recorded destruction does not stop a restore: what it destroyed is in its audit log, readable without its key", async () => {
@@ -731,6 +867,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     expect(err).toBeInstanceOf(RestoreError);
     expect(err.message).toMatch(/project "Origin"/u);
     expect(err.message).toMatch(/cannot tell which files/u);
+    expect(err.message).toMatch(/can be restored into another library/u);
     expect(err.message).not.toContain(kit.tmp);
     await expectNothingRestored(folders, before);
   });
