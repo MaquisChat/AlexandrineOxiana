@@ -1,6 +1,49 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
+
+describe("device-level notices (Task 68)", () => {
+  it("the identity notice: what happened, the lock, and the existing words for a locked library", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "device-identity-renewed" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
+    expect(t).toMatch(/locked by another device/);
+    expect(t).toMatch(/“Read-only \(locked by …\)”/);
+    expect(t).toMatch(/2 minutes/);
+  });
+
+  it("the old-copies notice: what happened, old copies may still be here, the damaged list is kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/list of old library copies awaiting deletion was damaged and was set aside/);
+    expect(t).toMatch(/may still be on this computer/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
+  it("“Got it” is a keyboard-operable button that names the notice it dismisses", async () => {
+    const onDismiss = vi.fn();
+    render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={onDismiss} />);
+    const b = screen.getByRole("button", { name: "Got it" });
+    b.focus();
+    await userEvent.setup().keyboard("{Enter}");
+    expect(onDismiss).toHaveBeenCalledWith("old-copies-list-set-aside");
+  });
+
+  it("bannersFor: one banner per known notice, after the others; none for an unknown kind or none at all", () => {
+    expect(bannersFor({ mode: "read-write", notices: [] })).toEqual([]);
+    expect(
+      bannersFor({
+        mode: "read-only",
+        readOnlyReason: "newer-format",
+        notices: [
+          { kind: "old-copies-list-set-aside", at: "2026-11-12T10:15:30.000Z" },
+          { kind: "unknown-kind" as never, at: "2026-11-12T10:15:30.000Z" },
+        ],
+      }),
+    ).toEqual([{ kind: "read-only-newer-format" }, { kind: "notice", notice: "old-copies-list-set-aside" }]);
+  });
+});
 
 describe("StatusBanner", () => {
   it("read-only, locked by another computer", () => {

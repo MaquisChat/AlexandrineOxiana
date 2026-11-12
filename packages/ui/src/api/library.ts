@@ -7,6 +7,7 @@
  * Citations are always rendered by the service (participant codes and withheld sources are applied
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
+import type { DeviceNotice, DeviceNoticeDismissRequest, DeviceNoticeKind } from "@ao/shared";
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
 
@@ -101,6 +102,8 @@ export interface LibraryState {
   index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];
   projectWarnings?: Record<string, string[]>;
+  /** This computer's own notices (Task 68): kind and time only. */
+  notices?: DeviceNotice[];
 }
 
 export interface ProjectSummary {
@@ -306,6 +309,8 @@ export function libraryApi(client: ApiClient) {
     },
     libraries: {
       list: () => r<LibraryList>("GET", "/libraries"),
+      /** The researcher's "Got it" for a device-level notice (Task 68): POST /settings/notices/dismiss. */
+      dismissNotice: (kind: DeviceNoticeKind) => r<{ notices: DeviceNotice[] }>("POST", "/settings/notices/dismiss", { body: { kind } satisfies DeviceNoticeDismissRequest }),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),
       close: () => r<{ closed: true }>("POST", "/libraries/close"),
