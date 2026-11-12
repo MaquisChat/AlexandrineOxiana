@@ -129,8 +129,11 @@ describe("CaptureQueueRegistry", () => {
     r.startLinks("long", P, [YT, IG], "desktop");
     c.advance(CAPTURE_QUEUE_KEEP_MS - 1);
     expect(r.detail(P, "done")).toBeDefined();
+    expect(r.has("done")).toBe(true);
     c.advance(2);
     expect(r.detail(P, "done")).toBeUndefined();
+    expect(r.has("done")).toBe(false);
+    expect(r.has("long")).toBe(true);
     expect(r.list(P).map((q) => q.queueId)).toEqual(["long"]);
     c.advance(10 * CAPTURE_QUEUE_KEEP_MS);
     expect(r.detail(P, "long")).toBeDefined();

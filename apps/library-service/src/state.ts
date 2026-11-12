@@ -267,6 +267,8 @@ export class ServiceState {
   ): Promise<void> {
     const offset = at.offset ?? 0;
     const total = at.total ?? urls.length;
+    // Bounded as the readable queues are: a finished queue they have forgotten is forgotten here too.
+    for (const [id, q] of this.captures) if (q.finished && !this.captureQueues.has(id)) this.captures.delete(id);
     const info = this.captures.get(queueId) ?? { projectId, done: offset, total, finished: false };
     if (this.session) info.lib = this.session.lib;
     this.captures.set(queueId, info);

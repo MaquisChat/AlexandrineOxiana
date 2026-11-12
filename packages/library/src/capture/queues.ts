@@ -139,6 +139,12 @@ export class CaptureQueueRegistry {
     this.prune();
   }
 
+  /** Whether the queue is still kept (running, or finished and not yet forgotten). */
+  has(queueId: string): boolean {
+    this.prune();
+    return this.entries.has(queueId);
+  }
+
   /** Whether the queue is known and still running. */
   running(queueId: string): boolean {
     const e = this.entries.get(queueId);
