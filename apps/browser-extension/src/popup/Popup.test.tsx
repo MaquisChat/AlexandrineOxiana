@@ -7,7 +7,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createApi, type LocalStorageArea } from "../api.js";
+import { createApi, unreachable, type LocalStorageArea } from "../api.js";
 import { Popup, type PopupBridge } from "./Popup.js";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -131,6 +131,24 @@ function fakeNetFactory(newPort: { status: number; body: unknown } | null) {
 }
 
 describe("the desktop app does not answer on the saved port (R171)", () => {
+  it("names the place of the app's pairing page in Task 65's words, with no brackets inside brackets (re-review M10)", async () => {
+    const net = appClosed();
+    await mount(net);
+    const notice = alerts().join(" ");
+    const message = unreachable(OLD);
+    for (const text of [notice, message]) {
+      // Task 65's words for where the pairing page is (the popup's own hint before pairing).
+      expect(text).toContain("“Browser extension” page, at the top of its library window,");
+      expect(text).not.toMatch(/\([^)]*\(/);
+    }
+  });
+
+  it("says “no library open” once when the app answers without a library (re-review M9)", async () => {
+    const net = fakeNet((port) => (port === OLD ? { status: 503, body: { error: { code: "LIBRARY_OFFLINE", message: "No library is open." } } } : null));
+    await mount(net);
+    expect((host.textContent ?? "").match(/no library is open/gi)).toHaveLength(1);
+  });
+
   it("names the two possible causes and offers “Use a different port” beside “Unpair”", async () => {
     const net = appClosed();
     await mount(net);

@@ -62,7 +62,7 @@ function asPairing(v: unknown): Pairing | undefined {
 
 /** The app does not answer on the saved port: either cause, in plain words (R171). */
 export const unreachable = (port: number) =>
-  `The desktop app is not answering on port ${port}. Either the app is closed (open it and try again), or the app's port changed when it was reopened (its “Browser extension” page (at the top of its library window) shows the port it uses now).`;
+  `The desktop app is not answering on port ${port}. Either the app is closed (open it and try again), or the app's port changed when it was reopened: its “Browser extension” page, at the top of its library window, shows the port it uses now.`;
 
 function projectsOf(r: unknown): ProjectChoice[] | undefined {
   const list = (r as { projects?: unknown } | undefined)?.projects;

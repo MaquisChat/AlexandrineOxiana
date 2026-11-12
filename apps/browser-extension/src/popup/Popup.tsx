@@ -95,8 +95,9 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       setProjects([]);
       setNoLibrary(e instanceof ApiError && e.code === "LIBRARY_OFFLINE");
       // Not answering: said once, with both causes and what to do, in its own notice (R171).
+      // No library open: said once, in the list area (re-review M9).
       if (e instanceof ApiError && e.code === "UNREACHABLE") setUnreachable(true);
-      else setStatus(message(e));
+      else if (!(e instanceof ApiError && e.code === "LIBRARY_OFFLINE")) setStatus(message(e));
       if (!(await bridge.api.getPairing())) setLoad({ state: "unpaired" });
     }
     if (tab !== undefined) setProfile(statusOf(await bridge.send<ProfileStatus>({ type: "profile-status", tabId: tab })));
@@ -256,7 +257,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
         <div role="alert" className="notice">
           <p>The desktop app is not answering on port {load.pairing.port}.</p>
           <p>
-            Either the app is closed: open it, then open this popup again. Or the app's port changed when it was reopened: its “Browser extension” page (at the top of its library window) then shows the new port. Enter that port with “Use a different port”. The pairing stays valid, so there is no need to pair again.
+            Either the app is closed: open it, then open this popup again. Or the app's port changed when it was reopened: its “Browser extension” page, at the top of its library window, then shows the new port. Enter that port with “Use a different port”. The pairing stays valid, so there is no need to pair again.
           </p>
         </div>
       ) : null}
