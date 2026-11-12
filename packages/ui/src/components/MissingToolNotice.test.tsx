@@ -45,6 +45,13 @@ describe("MissingToolNotice", () => {
     expect(screen.getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(PATHS.tools);
   });
 
+  it("after the service's own sentence (a capture outcome's reason) it adds only the link", () => {
+    const reason = "The video downloader is not installed on this computer, so nothing was saved. Install it from the tools dialogue, then capture the link again.";
+    render(<MissingToolNotice from={{ errorCode: "TOOL_NOT_INSTALLED", reason, tool: "video-downloader" }} />);
+    expect(screen.queryByText(/is not installed/)).toBeNull();
+    expect(screen.getByRole("link", { name: "Open the optional tools screen" }).getAttribute("href")).toBe(`${PATHS.tools}?tool=video-downloader`);
+  });
+
   it("shows its children (the usual message) for any other failure", () => {
     render(
       <p>

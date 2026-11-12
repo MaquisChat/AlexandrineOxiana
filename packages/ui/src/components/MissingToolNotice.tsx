@@ -1,10 +1,12 @@
 /**
  * A missing optional tool, said where it is met (Task 48b; R126). The service answers a job whose
  * tool is not installed with `409 { error: { code: "TOOL_NOT_INSTALLED", reason: <tool id> } }`; a
- * capture outcome carries `errorCode: "TOOL_NOT_INSTALLED"` (without the tool id today); a source's
- * viewing copy or OCR job that waits for its tool is recorded failed with that code. Each becomes one
- * plain sentence naming the tool and a link to the optional tools screen. Anything else shows the
- * children (the screen's usual message), so a hook-up is one line.
+ * capture outcome carries `errorCode: "TOOL_NOT_INSTALLED"` with the library's own sentence naming the
+ * tool in `reason` (and `tool`, which the UI's queue state does not keep yet); a source's viewing copy
+ * or OCR job that waits for its tool is recorded failed with that code. Each becomes one plain
+ * sentence naming the tool and a link to the optional tools screen (only the link where the service's
+ * sentence is already shown). Anything else shows the children (the screen's usual message), so a
+ * hook-up is one line.
  *
  * The tool's name comes from this file's fixed words, never from the error (the raw id is not shown).
  */
@@ -73,11 +75,27 @@ export function MissingToolNotice({ from, children, as = "span" }: { from: unkno
   const m = missingToolOf(from);
   if (!m) return <>{children ?? null}</>;
   const Tag = as;
+  // A capture outcome or run carries the library's own sentence naming the tool (shown by the screen):
+  // then only the link is added, so the same thing is not said twice.
+  if (saidByService(from)) {
+    return (
+      <Tag className="ao-tool-missing">
+        <ToolsLink tool={m.tool}>Open the optional tools screen</ToolsLink>
+      </Tag>
+    );
+  }
   return (
     <Tag className="ao-tool-missing">
       {m.tool ? TOOL_SENTENCE[m.tool] : UNNAMED} <ToolsLink tool={m.tool} />.
     </Tag>
   );
+}
+
+/** An outcome (not a service error) whose `reason` or `stopReason` is a sentence, not a tool id. */
+function saidByService(from: unknown): boolean {
+  if (from instanceof ApiClientError || !isObj(from)) return false;
+  const said = (v: unknown) => typeof v === "string" && v.trim() !== "" && !isToolId(v.trim());
+  return said(from.reason) || said(from.stopReason);
 }
 
 interface WaitingJob {

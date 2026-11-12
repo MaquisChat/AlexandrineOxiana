@@ -29,10 +29,12 @@ beforeEach(() => {
 describe("the capture queue", () => {
   it("a link that failed for a missing downloader says so and links to the tools screen", () => {
     let q = linkQueue("q1", [A]);
-    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: A, status: "failed", errorCode: "TOOL_NOT_INSTALLED", reason: "The capture failed." } });
+    // The library's sentence (packages/library/src/capture/errors.ts toolMissingReason) is shown once, then the link.
+    const reason = "The video downloader is not installed on this computer, so nothing was saved. Install it from the tools dialogue, then capture the link again.";
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: A, status: "failed", errorCode: "TOOL_NOT_INSTALLED", reason } });
     render(<CaptureQueue queues={[q]} />);
     const row = screen.getAllByRole("listitem")[0]!;
-    expect(within(row).getByText(/downloader .* is not installed/i)).toBeTruthy();
+    expect(within(row).getAllByText(/is not installed/i)).toHaveLength(1);
     expect(within(row).getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(PATHS.tools);
   });
 
