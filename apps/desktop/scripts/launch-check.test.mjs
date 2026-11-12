@@ -2,7 +2,7 @@
 // the helpers' environments. (The check itself needs a display and the built shell: launch-check.mjs.)
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { EXPECTED_IPC, envNamesFromPsE, helperProblems, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf } from "./launch-check.mjs";
+import { appProcesses, envEvidenceProblems, envNamesFromEnviron, envNamesFromPsE, EXPECTED_IPC, helperProblems, parseArgs, parseLsofListen, parsePs, parseShellLine, probeProblems, shellOf } from "./launch-check.mjs";
 
 const GOOD = {
   origin: "tauri://localhost",
@@ -70,10 +70,52 @@ describe("helperProblems", () => {
 });
 
 describe("helperProblems on a Mac", () => {
-  it("accepts the text-encoding variable CoreFoundation sets inside a process, on macOS only", () => {
-    assert.deepEqual(helperProblems("the service", ["PATH", "__CF_USER_TEXT_ENCODING"], "node", "darwin"), []);
-    assert.equal(helperProblems("the service", ["PATH", "__CF_USER_TEXT_ENCODING"], "node", "linux").length, 1);
-    assert.equal(helperProblems("the service", ["XPC_SERVICE_NAME"], "node", "darwin").length, 1);
+  it("allows no name the shell does not pass, on macOS as on Linux (ps -E shows the environment given at start)", () => {
+    assert.equal(helperProblems("the service", ["PATH", "__CF_USER_TEXT_ENCODING"], "node").length, 1);
+    assert.equal(helperProblems("the service", ["XPC_SERVICE_NAME"], "node").length, 1);
+  });
+});
+
+// Sample outputs. Linux: /proc/<pid>/environ is NUL-separated NAME=value entries (proc(5)); an
+// unreadable file reads as "" here. macOS: `ps -E -ww -o command= -p <pid>` prints the command line
+// followed by the environment; these samples follow ps(1)'s format and were not captured on a Mac.
+const LINUX_ENVIRON = "PATH=/usr/bin:/bin\0HOME=/tmp/x/home\0AO_SERVICE_PORT=0\0AO_CONFIG_DIR=/tmp/x/settings\0LANG=C.UTF-8\0";
+const MAC_CMD = "/Applications/Alexandrine Oxiana.app/Contents/Resources/node/node --max-old-space-size=512 /Applications/Alexandrine Oxiana.app/Contents/Resources/library-service/service.mjs";
+const MAC_PS_E = `${MAC_CMD} PATH=/usr/bin:/bin HOME=/Users/runner AO_SERVICE_PORT=0 AO_CONFIG_DIR=/Users/runner/Library/Application Support/org.alexandrineoxiana.desktop/settings LANG=en_US.UTF-8`;
+
+describe("reading a helper's environment, failing closed", () => {
+  it("reads the names on each system", () => {
+    assert.deepEqual(envNamesFromEnviron(LINUX_ENVIRON), ["PATH", "HOME", "AO_SERVICE_PORT", "AO_CONFIG_DIR", "LANG"]);
+    assert.deepEqual(envNamesFromPsE(MAC_PS_E, MAC_CMD), ["PATH", "HOME", "AO_SERVICE_PORT", "AO_CONFIG_DIR", "LANG"]);
+  });
+  it("says null, not an empty list, when nothing could be read", () => {
+    assert.equal(envNamesFromEnviron(""), null);
+    assert.equal(envNamesFromPsE(MAC_CMD, MAC_CMD), null);
+    assert.equal(envNamesFromPsE("", MAC_CMD), null);
+  });
+  it("reports an environment that could not be read, or lacks what the helper must have, as a failure", () => {
+    const service = ["PATH", "AO_SERVICE_PORT", "AO_CONFIG_DIR"];
+    assert.deepEqual(envEvidenceProblems("the service", envNamesFromEnviron(LINUX_ENVIRON), service), []);
+    assert.deepEqual(envEvidenceProblems("the service", envNamesFromPsE(MAC_PS_E, MAC_CMD), service), []);
+    assert.match(envEvidenceProblems("the service", null, service).join(), /could not check: the service's environment could not be read/);
+    const p = envEvidenceProblems("the worker", ["PATH"], ["AO_WORKER_PORT"]);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /could not check: the worker's environment as read lacks AO_WORKER_PORT/);
+  });
+});
+
+describe("appProcesses", () => {
+  it("finds every process of any copy of the app (its program and the helpers in its resources), and nothing else", () => {
+    const table = parsePs(
+      [
+        "  10     1 S    /Users/runner/work/r/r/apps/desktop/src-tauri/target/debug/bundle/macos/Alexandrine Oxiana.app/Contents/MacOS/alexandrine-oxiana",
+        "  11    10 S    /Users/runner/work/r/r/apps/desktop/src-tauri/target/debug/bundle/macos/Alexandrine Oxiana.app/Contents/Resources/node/node --max-old-space-size=512 x/service.mjs",
+        "  12     1 S    /Volumes/Alexandrine Oxiana/Alexandrine Oxiana.app/Contents/MacOS/alexandrine-oxiana",
+        "  13     1 S    /usr/bin/ssh-agent",
+        "  14     1 S    node apps/desktop/scripts/launch-check.mjs --app /x/Alexandrine Oxiana.app",
+      ].join("\n"),
+    );
+    assert.deepEqual(appProcesses(table).map((p) => p.pid), [10, 11, 12]);
   });
 });
 
@@ -108,7 +150,7 @@ describe("process listing on a Mac (ps)", () => {
       "AO_CONFIG_DIR",
       "__CF_USER_TEXT_ENCODING",
     ]);
-    assert.deepEqual(envNamesFromPsE(cmd, cmd), []);
+    assert.equal(envNamesFromPsE(cmd, cmd), null);
   });
   it("reads the listening ports lsof reports", () => {
     const text = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 202 runner 21u IPv4 0x1 0t0 TCP 127.0.0.1:53817 (LISTEN)\nnode 202 runner 22u IPv6 0x2 0t0 TCP [::1]:53818 (LISTEN)\n";

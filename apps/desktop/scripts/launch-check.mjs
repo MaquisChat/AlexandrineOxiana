@@ -39,7 +39,7 @@
 // ffmpeg, when present, makes the audio and video files the probe attaches; without it those two
 // checks are skipped and say so. Everything it writes is under one temporary folder, removed at the end.
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -123,12 +123,10 @@ const HELPER_NAMES = new Set([
 ]);
 
 /** Problems with a helper's environment names and command line (a token, or a name off the allow-list). */
-export function helperProblems(who, envNames, cmdline, platform = process.platform) {
+export function helperProblems(who, envNames, cmdline) {
   const out = [];
   for (const n of envNames) {
     if (/TOKEN|PASSPHRASE/i.test(n)) out.push(`${who} has ${n} in its environment`);
-    // macOS: CoreFoundation sets __CF_USER_TEXT_ENCODING inside a process that uses it; the shell does not pass it.
-    else if (platform === "darwin" && n === "__CF_USER_TEXT_ENCODING") continue;
     else if (!HELPER_NAMES.has(n) && !/^(LC_|XDG_)/.test(n)) out.push(`${who} received ${n}, which is not on the allow-list`);
   }
   if (/[0-9a-f]{64}/i.test(cmdline)) out.push(`${who}'s command line carries a token-like value`);
@@ -166,8 +164,35 @@ export function parsePs(text) {
  * reports a name too many, never one too few.
  */
 export function envNamesFromPsE(withEnv, cmd) {
+  if (!withEnv) return null;
   const tail = withEnv.startsWith(cmd) ? withEnv.slice(cmd.length) : withEnv;
-  return [...tail.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=/g)].map((m) => m[1]);
+  const names = [...tail.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=/g)].map((m) => m[1]);
+  return names.length ? names : null;
+}
+
+/** The names in a Linux /proc/<pid>/environ (NUL-separated NAME=value), or null when nothing could be read. */
+export function envNamesFromEnviron(text) {
+  const names = text.split("\0").filter(Boolean).map((kv) => kv.slice(0, kv.indexOf("=")));
+  return names.length ? names : null;
+}
+
+/**
+ * Fail closed: an environment that could not be read, or that lacks names the helper is known to
+ * have (so what was read cannot be trusted), is a failure, never a pass.
+ */
+export function envEvidenceProblems(who, names, required) {
+  if (names === null) return [`could not check: ${who}'s environment could not be read`];
+  const missing = required.filter((n) => !names.includes(n));
+  return missing.length ? [`could not check: ${who}'s environment as read lacks ${missing.join(", ")}, which it must have`] : [];
+}
+
+/** The names the service and the worker always have (helper_env.rs; worker-client.ts). */
+export const SERVICE_MUST_HAVE = ["PATH", "AO_SERVICE_PORT", "AO_CONFIG_DIR"];
+export const WORKER_MUST_HAVE = ["AO_WORKER_PORT"];
+
+/** Processes of any copy of the app: its program, and the helpers in its resources. */
+export function appProcesses(table, binary = "alexandrine-oxiana") {
+  return table.filter((p) => p.cmd.includes(`.app/Contents/MacOS/${binary}`) || /\.app\/Contents\/Resources\/(node\/node|ao-worker\/ao-worker)\b/.test(p.cmd));
 }
 
 /** `lsof -iTCP -sTCP:LISTEN` lines: the addresses a process listens on. */
@@ -229,8 +254,46 @@ const readProc = (pid, f) => {
   }
 };
 const cmdline = (pid) => (MAC ? ps(["-ww", "-o", "command=", "-p", String(pid)]).trim() : readProc(pid, "cmdline").split("\0").join(" "));
-const envNames = (pid) =>
-  MAC ? envNamesFromPsE(ps(["-E", "-ww", "-o", "command=", "-p", String(pid)]).trim(), cmdline(pid)) : readProc(pid, "environ").split("\0").filter(Boolean).map((kv) => kv.slice(0, kv.indexOf("=")));
+/** A process's variable names, or null when they could not be read. */
+const envNames = (pid) => (MAC ? envNamesFromPsE(ps(["-E", "-ww", "-o", "command=", "-p", String(pid)]).trim(), cmdline(pid)) : envNamesFromEnviron(readProc(pid, "environ")));
+
+/** The helpers' environment check (R153), with the evidence that it could read them. */
+function helperEnvProblems(svcPid, helpers) {
+  return helpers.flatMap((p) => {
+    const cmd = cmdline(p);
+    const isWorker = p !== svcPid && /ao[-_]worker/.test(cmd);
+    const who = p === svcPid ? "the service" : isWorker ? `the worker (${p})` : `helper ${p}`;
+    const names = envNames(p);
+    return [...envEvidenceProblems(who, names, p === svcPid ? SERVICE_MUST_HAVE : isWorker ? WORKER_MUST_HAVE : []), ...helperProblems(who, names ?? [], cmd)];
+  });
+}
+
+/**
+ * Whether the leftover-process search can see a process by its environment here: a stand-in process
+ * carrying the marker must be found. Without that, "no process is left" would be a pass with
+ * nothing checked.
+ */
+async function leftoverSearchWorks(marker) {
+  const child = spawn("sleep", ["30"], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", AO_LAUNCH_CHECK_MARK: marker }, stdio: "ignore" });
+  try {
+    await sleep(300);
+    return processesMarkedBy(marker).includes(child.pid);
+  } finally {
+    child.kill("SIGKILL");
+  }
+}
+
+/** On a Mac: stops every process of any copy of the app; returns what was found running. */
+function stopAppProcesses() {
+  if (!MAC) return [];
+  const left = appProcesses(macTable()).filter((p) => p.pid !== process.pid);
+  for (const p of left) {
+    try {
+      process.kill(p.pid, "SIGKILL");
+    } catch {}
+  }
+  return left;
+}
 /** Running processes whose environment mentions `marker` (the check's temporary folder): any helper of this check. */
 function processesMarkedBy(marker) {
   if (MAC) {
@@ -417,6 +480,12 @@ async function releaseCheck(app, problems) {
   const resources = join(app, "Contents", "Resources");
   const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
   const label = "R (the release app)";
+  if (!(await leftoverSearchWorks(root))) problems.push(`could not check: the search for leftover processes cannot read environments here (${label})`);
+  const before = stopAppProcesses();
+  if (before.length) {
+    report(`${label}: no copy of the app was running before the check`, false, before.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; "));
+    problems.push("R: the app was already running");
+  }
   const env = { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: join(root, "home"), LANG: "en_US.UTF-8", TMPDIR: join(root, "tmp") };
   mkdirSync(env.HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
@@ -432,7 +501,7 @@ async function releaseCheck(app, problems) {
     report(`${label}: the service runs the app's own Node.js and service folder`, found.svc.cmd.startsWith(join(resources, "node", "node")), found.svc.cmd.slice(0, 200)) || problems.push("R: service not from the app");
     report(`${label}: the worker runs from the app's resources, under the service`, true, found.worker.cmd.slice(0, 200));
     report(`${label}: the service runs with the 512 MB ceiling`, /--max-old-space-size=512/.test(found.svc.cmd)) || problems.push("R: memory ceiling");
-    const envProblems = found.kids.flatMap((k) => helperProblems(k.pid === found.svc.pid ? "the service" : `helper ${k.pid}`, envNames(k.pid), k.cmd));
+    const envProblems = helperEnvProblems(found.svc.pid, found.kids.map((k) => k.pid));
     report(`${label}: the helpers got an allow-listed environment and no token outside standard input`, envProblems.length === 0, envProblems.join("; ")) || problems.push(...envProblems);
     const listen = await until("the service to listen", 60_000, async () => {
       const l = parseLsofListen(spawnSync("lsof", ["-nP", "-a", "-p", String(found.svc.pid), "-iTCP", "-sTCP:LISTEN"], { encoding: "utf8" }).stdout ?? "");
@@ -449,6 +518,8 @@ async function releaseCheck(app, problems) {
     await assertGone(label, helpers, root, problems);
   } finally {
     if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
+    const left = stopAppProcesses();
+    report(`${label}: no process of the app is left at the end`, left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("R: app processes left");
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -458,11 +529,12 @@ async function main() {
   const problems = [];
   if (MAC) {
     if (args.releaseApp) {
-      await releaseCheck(resolve(args.releaseApp), problems);
+      await releaseCheck(realpathSync(args.releaseApp), problems);
       return finish(problems);
     }
     if (!args.app) throw new Error("On a Mac the launch check runs an app bundle: --app <the debug .app> (scenarios A-E) or --release-app <the .app> (scenario R).");
-    SHELL = shellOf(resolve(args.app));
+    // The real path: tauri-utils refuses a program path with a symbolic link in it on macOS.
+    SHELL = shellOf(realpathSync(args.app));
     PACKAGED = true;
   } else if (process.platform !== "linux") {
     throw new Error("The launch check runs on Linux (under xvfb-run) and on a Mac.");
@@ -473,6 +545,15 @@ async function main() {
     if (!existsSync(p)) throw new Error(`Missing ${what}.`);
   }
   const root = mkdtempSync(join(tmpdir(), "ao-launch-check-"));
+  if (!(await leftoverSearchWorks(root))) {
+    report("the search for leftover processes can see a process by its environment", false, "it could not; every 'no process is left' check would be blind");
+    problems.push("could not check: leftover processes");
+  }
+  const before = stopAppProcesses();
+  if (before.length) {
+    report("no copy of the app was running before the check", false, before.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; "));
+    problems.push("the app was already running");
+  }
   const bus = startBus();
   try {
     const address = await bus.address;
@@ -495,7 +576,7 @@ async function main() {
       const run = startShell(env, "A (closed normally)");
       try {
         const { svc, helpers } = await upAndProbed(run, media, problems);
-        const envProblems = helpers.flatMap((p) => helperProblems(p === svc.pid ? "the service" : `helper ${p}`, envNames(p), cmdline(p)));
+        const envProblems = helperEnvProblems(svc.pid, helpers);
         report(`${run.label}: the helpers got an allow-listed environment and no token outside standard input`, envProblems.length === 0, envProblems.join("; ")) || problems.push(...envProblems);
         report(`${run.label}: the service runs with the 512 MB ceiling`, /--max-old-space-size=512/.test(cmdline(svc.pid))) || problems.push("memory ceiling");
         const second = startShell(env, "A (second launch)");
@@ -559,8 +640,12 @@ async function main() {
     // E. Opened again during a (deliberately slowed) quit: no second service beside the first;
     //    the first stops its helpers, then starts the app again. On a display the check owns,
     //    because the restarted shell outlives the first process (xvfb-run would end the display).
-    //    On a Mac there is no display to own: the shell runs directly on the desktop session.
-    {
+    //    Not on a Mac: there the shell relaunches a bundled app through LaunchServices (`open -n`;
+    //    tauri 2.12.5 src/process.rs, restart_macos_app), so the restarted app's output never reaches
+    //    this check and the app would run on outside it.
+    if (MAC) {
+      process.stdout.write("launch-check: skip E (opened again while closing): on macOS the restarted app is started by LaunchServices (open -n), outside this check, so its reports cannot be read\n");
+    } else {
       const dir = join(root, "e");
       const xvfb = MAC ? undefined : spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"], { stdio: ["ignore", "pipe", "ignore"] });
       const display = MAC
@@ -610,6 +695,8 @@ async function main() {
     }
   } finally {
     bus.proc?.kill("SIGTERM");
+    const left = stopAppProcesses();
+    if (MAC) report("no process of the app is left at the end", left.length === 0, left.map((p) => `${p.pid} ${p.cmd.slice(0, 120)}`).join("; ")) || problems.push("app processes left");
     rmSync(root, { recursive: true, force: true });
   }
   finish(problems);
