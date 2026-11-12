@@ -480,12 +480,6 @@ export class WorkerClient {
     return undefined;
   }
 
-  /**
-   * The one writer of job records: appends the job's new state to its project's journal (sealed
-   * in encrypted projects), then updates the cache row. Finished jobs keep no paths or parameters.
-   * Nothing is written in a read-only library. Throws (writing nothing more) when the journal
-   * cannot be appended, e.g. the project was locked meanwhile.
-   */
   /** The job's next state, from its current record (finished jobs keep no paths or parameters). */
   private next(prev: JobRecord, status: JobStatus, error?: string, keepJob = false): JobRecord {
     const { job, error: _previous, ...base } = prev;
@@ -509,6 +503,12 @@ export class WorkerClient {
     return true;
   }
 
+  /**
+   * The one writer of job records: appends the job's new state to its project's journal (sealed
+   * in encrypted projects), then updates the cache row. Finished jobs keep no paths or parameters.
+   * Nothing is written in a read-only library. Throws (writing nothing more) when the journal
+   * cannot be appended, e.g. the project was locked meanwhile.
+   */
   private async transition(id: string, status: JobStatus, error?: string, keepJob = false): Promise<void> {
     const prev = this.records.get(id);
     if (!prev) return;
