@@ -352,3 +352,37 @@ describe("deciding entries that have no batch (Task 67)", () => {
     }
   });
 });
+
+describe("a conflict found by a later check enters the queue (Task 72, D19, R190)", () => {
+  /** An existing source whose stored evidence now disagrees (data a later check added), not yet rechecked and with no entry. */
+  async function existingWithNewEvidence(pid: string): Promise<string> {
+    const at = new Date().toISOString();
+    const sf = await svc.state.session!.repo.createSource(pid, draft("Rivers and Memory"), [], {
+      provenance: provenance(),
+      fieldEvidence: [
+        { field: "/title", value: "Rivers and Memory", source: { kind: "page-dom" }, at },
+        { field: "/title", value: "Rivers and Memories", source: { kind: "platform-json" }, at },
+      ],
+    });
+    return sf.source.id;
+  }
+
+  it("the recheck that finds the conflict queues it: the list row needs review and the queue shows a capture entry naming the field, its cause a later check", async () => {
+    const pid = await newProject();
+    const sid = await existingWithNewEvidence(pid);
+    expect((await queue(pid)).total).toBe(0);
+    expect(await badge(pid, sid)).toBe(false);
+    const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/recheck` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.verification["/title"].status).toBe("conflict");
+    expect(await badge(pid, sid)).toBe(true);
+    const q = await queue(pid);
+    expect(q.total).toBe(1);
+    expect(q.items[0]).toMatchObject({ sourceId: sid, kind: "verification", group: "capture", fields: { "/title": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" }, title: "Rivers and Memory" });
+    // Settled by confirming the field (R176 1): it leaves the queue and the badge clears.
+    const c = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/title", value: { variants: [{ lang: "en", kind: "original", value: "Rivers and Memories" }] } } });
+    expect(c.status, c.body).toBe(200);
+    expect((await queue(pid)).total).toBe(0);
+    expect(await badge(pid, sid)).toBe(false);
+  });
+});
