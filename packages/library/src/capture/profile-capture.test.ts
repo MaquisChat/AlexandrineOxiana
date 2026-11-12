@@ -357,6 +357,29 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(0);
   });
 
+  // Task 63 fix round 1, item 3. EXPECTED TO FAIL until the repository's updateSource can build its
+  // patch from the source it reads inside the governed transaction (Task 34d, repo/sources.ts): the
+  // profile run reads the source's title before its write, so an edit made in between is lost.
+  it.fails("KNOWN DEFECT (fixed by Task 34d): a title edit made while a profile run records an edit is not lost", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    const target = ttId(6);
+    const sid = (await byPost(p.id, target)).source.id;
+    const prof = synthetic();
+    await setProfile({ ...prof, items: prof.items.map((it) => (it.id === target ? { ...it, caption: "Evening dance at the old market (edited)\n#dance" } : it)) });
+    // The researcher adds a translated title while the run is between its read and its write.
+    const add = repo.addOriginalAsset.bind(repo);
+    vi.spyOn(repo, "addOriginalAsset").mockImplementation(async (...args) => {
+      const cur = await repo.getSource(p.id, sid);
+      await repo.updateSource(p.id, sid, { title: { variants: [...cur.source.title.variants, { lang: "de", kind: "translated", value: "Tanz Nummer 6" }] } });
+      return add(...args);
+    });
+    expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(1);
+    const values = (await byPost(p.id, target)).source.title.variants.map((v) => v.value);
+    expect(values).toContain("Evening dance at the old market (edited)");
+    expect(values).toContain("Tanz Nummer 6");
+  });
+
   it("maxItems: 5 stops at 5 and never marks the rest unavailable; a later full run adds the rest", async () => {
     const p = await project();
     const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 5 });
