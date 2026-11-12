@@ -1031,3 +1031,28 @@ def test_the_ytdlp_release_lookups_honour_cancel_too(worker_env, monkeypatch, tm
         assert time.monotonic() - t < 1.5
     finally:
         srv.close()
+
+
+# ---------- fix round 2, N2: a tool job's final state is the worker's ----------
+
+
+def test_an_install_that_completed_before_the_cancel_took_effect_ends_done():
+    from ao_worker.jobs import JobManager
+
+    def finishes_then_sees_cancel(job, ctx):
+        job.cancel_event.set()  # the cancel arrives after the last point where it could stop the install
+        return {"tool": "ffmpeg", "installed": ["ffmpeg"]}
+
+    for honour, expected in ((False, "done"), (True, "cancelled")):
+        m = JobManager({"tool.install": finishes_then_sees_cancel}, max_running=1, cancel_after_return=honour)
+        j = m.submit("tool.install", "ffmpeg", "/x", {})
+        deadline = time.monotonic() + 5
+        while j.status not in ("done", "failed", "cancelled") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert j.status == expected, honour
+        m.shutdown()
+
+
+def test_the_worker_runs_tool_jobs_in_a_lane_that_keeps_a_completed_install(worker):
+    assert worker.server.tool_manager.cancel_after_return is False
+    assert worker.server.manager.cancel_after_return is True

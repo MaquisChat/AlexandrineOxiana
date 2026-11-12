@@ -251,4 +251,4 @@ def make_server(token: str, port: int = 0) -> WorkerServer:
     if not token:
         raise ValueError("a token is required")
     tools.sweep()  # an install interrupted by a crash leaves nothing half-installed
-    return WorkerServer(token, port, JobManager(HANDLERS), JobManager(HANDLERS, max_running=1))
+    return WorkerServer(token, port, JobManager(HANDLERS), JobManager(HANDLERS, max_running=1, cancel_after_return=False))

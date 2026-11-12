@@ -231,22 +231,44 @@ describe("installing a tool", () => {
     await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "cancelled");
   });
 
-  it("a cancelled job is shown as cancelled at once, even while the media helper is still ending it", async () => {
+  it("a cancel the media helper confirms ends the job cancelled; until then it shows the cancel was asked for", async () => {
     const worker = stubWorker({ ignoreAbort: true });
     await start({ worker, autoStartWorker: false });
     const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
     await until(() => worker.runs.length === 1);
     const c = await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
-    expect(c.json.job.status).toBe("cancelled");
-    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
-    expect(((await call({ url: "/tools" })).json as ToolsResponse).jobs.every((j) => j.status !== "running")).toBe(true);
-    // a late success from the helper does not bring it back to life
-    worker.runs[0]!.finish({ installed: ["ffmpeg"] });
-    await new Promise((r) => setTimeout(r, 20));
-    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
-    // and the tool can be asked for again: a new job
+    expect(c.json.job).toMatchObject({ status: "running", cancelRequested: true });
+    expect(worker.runs[0]!.signal?.aborted).toBe(true);
+    worker.runs[0]!.finish(new WorkerJobError("CANCELLED", "the job was cancelled"));
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "cancelled");
     const again = await call({ method: "POST", url: "/tools/ffmpeg/install" });
     expect(again.json.job.jobId).not.toBe(job.jobId);
+  });
+
+  it("an install that completed before the cancel took effect ends installed and says so", async () => {
+    const worker = stubWorker({ ignoreAbort: true });
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
+    worker.runs[0]!.finish({ tool: "ffmpeg", action: "install", installed: ["ffmpeg"] });
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status !== "running");
+    const done = (await call({ url: `/tools/jobs/${job.jobId}` })).json.job as ToolJob;
+    expect(done).toMatchObject({ status: "done", cancelRequested: true, result: { installed: ["ffmpeg"] } });
+  });
+
+  it("a cancel the media helper never confirms ends the job failed, not cancelled", async () => {
+    const worker = stubWorker({ ignoreAbort: true });
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
+    worker.runs[0]!.finish(new WorkerJobError("CANCEL_UNCONFIRMED", "the worker did not confirm"));
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status !== "running");
+    const j = (await call({ url: `/tools/jobs/${job.jobId}` })).json.job as ToolJob;
+    expect(j.status).toBe("failed");
+    expect(j.error?.code).toBe("CANCEL_UNCONFIRMED");
+    expect(j.error?.message).toMatch(/tools list/);
   });
 
   it("a failed install is recorded with the worker's code and a plain message, never a bare 500", async () => {

@@ -111,6 +111,7 @@ export type ToolErrorCode =
   | "TOOL_NOT_MANAGED"
   | "TOOL_UPDATE_FAILED"
   | "WORKER_UNAVAILABLE"
+  | "CANCEL_UNCONFIRMED"
   | "FAILED";
 
 export interface ToolJob {
@@ -122,6 +123,12 @@ export interface ToolJob {
   progress: number;
   startedAt: string;
   finishedAt?: string;
+  /**
+   * A cancel was asked for (fix round 2). The job stays `running` until the worker answers: then
+   * `cancelled` (it stopped, nothing half-installed) or `done` (the install completed before the
+   * cancel could take effect), or `failed` with CANCEL_UNCONFIRMED.
+   */
+  cancelRequested?: boolean;
   error?: { code: ToolErrorCode | string; message: string };
   /** For a finished job: which parts were installed, updated, removed or already in place. */
   result?: { installed?: string[]; updated?: Array<{ component: string; old: string | null; new: string | null }>; removed?: string[]; skipped?: string[] };
