@@ -33,7 +33,7 @@ describe("device-level notices on the library chooser", () => {
     const user = userEvent.setup();
     render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
     const banner = (await screen.findByText(/identity for the app could not be read and had to be renewed/)).closest("[role=status]") as HTMLElement;
-    expect(banner.textContent).toMatch(/Your libraries are not affected/);
+    expect(banner.textContent).toMatch(/Your libraries and what is in them are unchanged/);
     expect(screen.getAllByRole("button", { name: "Got it" })).toHaveLength(1); // the unknown kind is not shown
     await user.dblClick(screen.getByRole("button", { name: "Got it" }));
     await waitFor(() => expect(screen.queryByText(/had to be renewed/)).toBeNull());

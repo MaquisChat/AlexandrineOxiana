@@ -26,19 +26,19 @@ export type BannerVariant =
   | { kind: "notice"; notice: DeviceNoticeKind };
 
 /**
- * The words of each device-level notice (Task 68). A renewed identity does not change how locks are
- * treated: a lock is this program's only with the same identity AND the same running program, and a
- * lock left on this computer by a program no longer running is taken over at once (packages/library
- * lock.ts), so the notice says nothing about locks (review round 1, M2). What changes is the name
- * under which this computer's changes are recorded in the audit logs from now on.
+ * The words of each device-level notice (Task 68). Only what is true (R181 b, d): a renewed identity
+ * leaves the libraries unchanged; only when a new program happens to reuse the old one's process
+ * number can a library stay read-only until its old lock is 2 minutes stale (packages/library
+ * lock.ts); changes from now on are recorded under the new identity. No notice names a screen that
+ * does not exist: there is no watched-folders screen yet, so that notice says only what happened.
  */
 export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
   "device-identity-renewed":
-    "This computer's identity for the app could not be read and had to be renewed. Your libraries are not affected; the changes you make from now on are recorded under this computer's new identity. The damaged identity file is kept beside the app's settings.",
+    "This computer's identity for the app could not be read and had to be renewed. Your libraries and what is in them are unchanged. A library that was open when the app last stopped may show as read-only for up to 2 minutes; open it again after that. The changes you make from now on are recorded under this computer's new identity. The damaged identity file is kept beside the app's settings.",
   "old-copies-list-set-aside":
     "The list of old library copies awaiting deletion was damaged and was set aside. Some old copies of moved libraries may still be on this computer without being offered for deletion here, and a move that had not finished may not be able to finish from here. The damaged list is kept beside the app's settings.",
   "watched-folders-list-set-aside":
-    "This computer's list of watched folders was damaged and was set aside, so watched folders on this computer have stopped. Watched folders must be added again on this computer. The damaged list is kept beside the app's settings.",
+    "This computer's list of watched folders was damaged and was set aside, so some watched folders on this computer may have stopped: files put in those folders are not imported. The damaged list is kept beside the app's settings.",
   "libraries-list-set-aside":
     "This computer's list of libraries was damaged and was set aside. Your libraries themselves are untouched: open each one again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":

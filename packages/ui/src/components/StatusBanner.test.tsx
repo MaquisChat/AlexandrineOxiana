@@ -8,10 +8,11 @@ describe("device-level notices (Task 68)", () => {
     render(<StatusBanner variant={{ kind: "notice", notice: "device-identity-renewed" }} onDismiss={() => undefined} />);
     const t = screen.getByRole("status").textContent ?? "";
     expect(t).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
-    expect(t).toMatch(/Your libraries are not affected/);
+    // R181 b: only what is true.
+    expect(t).toMatch(/Your libraries and what is in them are unchanged/);
+    expect(t).toMatch(/A library that was open when the app last stopped may show as read-only for up to 2 minutes; open it again after that/);
     expect(t).toMatch(/recorded under this computer's new identity/);
     expect(t).toMatch(/kept beside the app's settings/);
-    expect(t).not.toMatch(/locked/i);
   });
 
   it("the old-copies notice: what happened, old copies may still be here, the damaged list is kept", () => {
@@ -29,7 +30,10 @@ describe("device-level notices (Task 68)", () => {
     render(<StatusBanner variant={{ kind: "notice", notice: "watched-folders-list-set-aside" }} onDismiss={() => undefined} />);
     const t = screen.getByRole("status").textContent ?? "";
     expect(t).toMatch(/list of watched folders was damaged and was set aside/);
-    expect(t).toMatch(/must be added again/);
+    // Partial damage is not overstated, and no screen that does not exist is named (R181 d; review Rm3).
+    expect(t).toMatch(/some watched folders on this computer may have stopped/);
+    expect(t).toMatch(/files put in those folders are not imported/);
+    expect(t).not.toMatch(/added again|import settings/);
     expect(t).toMatch(/kept beside the app's settings/);
   });
 
