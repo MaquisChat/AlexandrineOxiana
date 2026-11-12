@@ -487,9 +487,12 @@ async function rebuildManifest(repo: Repo): Promise<BackupManifest> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return m;
     throw new Error(`The Backups folder cannot be read (${(err as NodeJS.ErrnoException).code ?? "error"}), so the app cannot tell which backups exist.`, { cause: err });
   }
-  const unsettled = new Set(Object.values((await readState(dir)).pending).flatMap((op) => (op.kind === "create" && op.file ? [op.file] : [])));
+  const unsettled = Object.values((await readState(dir)).pending).flatMap((op) => (op.kind === "create" && op.file ? [op] : []));
   for (const file of names) {
-    if (unsettled.has(file)) continue;
+    // Left out only while the file under that name is that unsettled backup's own archive: any other
+    // file that carries the name is read like every backup file (it may hold the project's data).
+    const op = unsettled.find((o) => o.file === file);
+    if (op && (await isOurs(join(dir, file), op.tmp ? join(dir, op.tmp) : undefined, op.entry?.sha256).catch(() => false))) continue;
     const e = await readEntry(repo, file);
     if (e) m.backups.push(e);
     else m.unresolved!.push(file);

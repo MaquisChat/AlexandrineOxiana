@@ -302,6 +302,28 @@ describe("D15: the manifest missing at a retry pass, at a prune and at a restore
     expect(existsSync(named)).toBe(false);
     expect(existsSync(manifestPath()) ? (await manifestNow()).backups : []).toEqual([]);
   });
+
+  it("another file that carries an unfinished backup's name is still read and listed: only the unfinished archive itself is left out", async () => {
+    const other = await makeProject(kit, OPEN_GOV, false, "Other");
+    await addSource(kit, other, { title: "theirs" });
+    const theirs = await backupProject(kit.repo, other.id);
+    const theirBytes = await readFile(theirs.path);
+    const p = await makeProject(kit, OPEN_GOV, false, "Unfinished");
+    backupSeams.crashAt = "before-commit";
+    await expect(backupProject(kit.repo, p.id)).rejects.toBeInstanceOf(SimulatedCrash);
+    const named = join(backupsDir(), "Unfinished - backup - modified 2026-11-10 0930.zip");
+    // Outside the app, the name is given to another file: a real backup, of the other project.
+    await rm(named);
+    await writeFile(named, theirBytes);
+    await rm(manifestPath());
+    await forgetMissingBackups(kit.repo, ["Nothing - backup - modified 2026-01-01 0000.zip"]);
+    const listed = (await manifestNow()).backups.map((b) => [b.file, b.projectId, b.sha256]);
+    expect(listed).toContainEqual(["Unfinished - backup - modified 2026-11-10 0930.zip", other.id, theirs.sha256]);
+    // The unfinished backup is settled as never made; the file that took its name is not its to remove.
+    expect(await listBackups(kit.repo, p.id)).toEqual([]);
+    expect((await readFile(named)).equals(theirBytes)).toBe(true);
+    expect((await listBackups(kit.repo, other.id)).map((b) => b.file).sort()).toEqual([nameOf(theirs), "Unfinished - backup - modified 2026-11-10 0930.zip"].sort());
+  });
 });
 
 describe("a backup that takes the name of one removed outside the app", () => {
