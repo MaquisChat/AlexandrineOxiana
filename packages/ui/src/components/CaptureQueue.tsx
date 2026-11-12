@@ -7,7 +7,9 @@
  * Only what the screen saw is claimed (R146): an item whose outcome was missed is "Not known", the
  * counts add up to the total (done + failed + not known + not tried + still to come), a queue whose
  * progress may have been missed says so, and the library's own sentence for a stopped or paused run
- * is shown as it is, with the counts of what was saved.
+ * is shown as it is, with the counts of what was saved. A queue read again from the service (Task 63)
+ * says when the browser extension sent it; a missed outcome stays "Not known" only until the queue
+ * can be read again.
  */
 import { useId } from "react";
 import { itemExplanation, queueCounts, type CaptureQueueState, type ItemState, type ProfileReport } from "../api/capture";
@@ -92,6 +94,7 @@ function QueueView({ q }: { q: CaptureQueueState }) {
           `${plural(q.total ?? q.items.length, "link")}`
         )}
       </h3>
+      {q.startedBy === "extension" && <p>Sent from the browser extension.</p>}
       <label className="ao-capture-queue__progress">
         <span>{q.kind === "profile" ? "Posts captured" : "Links captured"}</span>
         <progress value={q.done} {...(q.total !== undefined ? { max: Math.max(q.total, 1) } : {})} />
@@ -107,8 +110,8 @@ function QueueView({ q }: { q: CaptureQueueState }) {
       <MissingToolNotice from={q} as="p" />
       {q.gap && (
         <p className="ao-capture-queue__note">
-          Progress was missed while the connection to the library service was down. Items marked “Not known” may have been captured: look in the library for the captured sources. This screen cannot
-          re-read a running capture yet.
+          Progress was missed while the connection to the library service was down. Items marked “Not known” are updated as soon as the library service can be reached again; until then, look in the
+          library for the captured sources.
         </p>
       )}
       {r && (r.status !== "failed" || hasCounts(r) || q.items.length > 0) && (
@@ -121,6 +124,9 @@ function QueueView({ q }: { q: CaptureQueueState }) {
           )}
         </>
       )}
+      {q.itemsOmitted ? (
+        <p className="ao-capture-queue__note">{`The library service kept only the first ${n(q.items.length)} posts of this run; ${plural(q.itemsOmitted, "later post")} ${q.itemsOmitted === 1 ? "is" : "are"} counted above but not listed.`}</p>
+      ) : null}
       {q.items.length > 0 && (
         <ol className="ao-capture-queue__items">
           {q.items.map((it, i) => {

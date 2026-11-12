@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COOKIES_ACKNOWLEDGEMENT } from "../api/capture";
+import type { CaptureQueueDetail } from "@ao/shared";
 import { ANON_RULES, errorResponse, mockCapture, P1, P2, server, STRICT_RULES, type CaptureSetup } from "../test/captureService";
 import { Capture, CaptureRoute } from "./Capture";
 
@@ -13,6 +14,20 @@ const YT = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 const IG = "https://www.instagram.com/p/Cabc123/";
 const TT = "https://www.tiktok.com/@someone/video/7234567890";
 const PROFILE = "https://www.instagram.com/someone/";
+
+/** A running links queue of P1 as the service reports it (Task 63). */
+const running = (): CaptureQueueDetail => ({
+  queueId: "q1",
+  projectId: P1,
+  kind: "links",
+  startedBy: "desktop",
+  done: 0,
+  total: 3,
+  finished: false,
+  startedAt: "2026-11-12T10:00:00.000Z",
+  urls: [YT, IG, TT],
+  items: [],
+});
 
 async function setup(o: CaptureSetup = {}, projectId = P1) {
   const m = mockCapture(o);
@@ -135,8 +150,10 @@ describe("Capture screen — links", () => {
     await paste(user, [YT]);
     await user.click(screen.getByRole("button", { name: "Capture links" }));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/capture tools are not available on this computer right now/);
+    expect(alert.textContent).toMatch(/The media helper is not running/);
     expect(alert.textContent).toMatch(/Restart the app/);
+    // Said once (Minor O2).
+    expect(alert.textContent!.match(/queued/g)).toHaveLength(1);
     expect(document.body.textContent).not.toMatch(/setup:py|pnpm|`/);
     // Said once, not three times.
     expect(alert.textContent!.match(/not running|not available/g)?.length ?? 0).toBeLessThanOrEqual(1);
@@ -310,9 +327,123 @@ describe("Capture screen — progress", () => {
     expect(screen.getByText("Finished. Of 2 links: 1 done, 1 failed.")).toBeTruthy();
   });
 
-  it("says that captures started earlier or elsewhere are not shown here", async () => {
+  it("no longer says that captures started earlier or from the extension are not shown (Task 63)", async () => {
     await setup();
-    expect(screen.getByText(/Captures started earlier, or from the browser extension, keep running in the library service but are not shown here/)).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/are not shown here|cannot re-read a running capture/);
+  });
+
+  it("on opening, reads the running and recent captures: one started earlier from the extension is shown with its outcomes", async () => {
+    const { m } = await setup({
+      queues: [
+        { ...running(), queueId: "from-ext", startedBy: "extension", done: 1, items: [{ url: YT, status: "created", sourceId: "s1" }] },
+        { ...running(), queueId: "old", startedAt: "2026-11-12T09:00:00.000Z", urls: [TT], total: 1, done: 1, finished: true, finishedAt: "2026-11-12T09:01:00.000Z", items: [{ url: TT, status: "duplicate" }] },
+      ],
+    });
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(within(queue).getAllByRole("region")).toHaveLength(2));
+    const [newest, older] = within(queue).getAllByRole("region");
+    expect(within(newest!).getByText(/Sent from the browser extension/)).toBeTruthy();
+    expect(within(newest!).getByText("Saved")).toBeTruthy();
+    expect(within(newest!).getByText("Capturing now")).toBeTruthy();
+    expect(within(newest!).getByText("Waiting")).toBeTruthy();
+    expect(within(older!).getByText("Already in the project")).toBeTruthy();
+    expect(queue.textContent).not.toMatch(/Not known/);
+    // One list and one read per queue.
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/captures`)).toHaveLength(1);
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/captures/from-ext`)).toHaveLength(1);
+    // Its events then fill it.
+    await act(async () => m.emit("capture.progress", { queueId: "from-ext", projectId: P1, done: 2, total: 3, finished: false, outcome: { url: IG, status: "created" } }));
+    await waitFor(() => expect(within(newest!).getAllByText("Saved")).toHaveLength(2));
+  });
+
+  it("a missing tool in a capture read again keeps its notice with the link to the Optional tools screen", async () => {
+    await setup({
+      queues: [
+        {
+          ...running(),
+          urls: [YT],
+          total: 1,
+          done: 1,
+          finished: true,
+          items: [{ url: YT, status: "failed", errorCode: "TOOL_NOT_INSTALLED", reason: "The video downloader is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then capture the link again.", tool: "video-downloader" }],
+        },
+      ],
+    });
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(within(queue).getByText(/The video downloader is not installed on this computer/)).toBeTruthy());
+    const link = within(queue).getByRole("link", { name: /Optional tools/ });
+    expect(link.getAttribute("href")).toMatch(/tool=video-downloader/);
+  });
+
+  it("after a reconnect, outcomes missed while the connection was down are read again: no “Not known” is left (Minor O1)", async () => {
+    const { m, user } = await setup();
+    await paste(user, [YT, IG, TT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await act(async () => m.emit("capture.progress", { queueId: "q1", projectId: P1, done: 1, total: 3, finished: false, outcome: { url: YT, status: "created" } }));
+    await waitFor(() => expect(within(queue).getByText("Saved")).toBeTruthy());
+    // While the stream is down, link 2 fails; the service knows.
+    m.setQueues([{ ...running(), queueId: "q1", done: 2, items: [{ url: YT, status: "created" }, { url: IG, status: "failed", errorCode: "LOGIN_REQUIRED" }] }]);
+    await act(async () => m.closeStreams());
+    await waitFor(() => expect(within(queue).getByText("Failed")).toBeTruthy());
+    expect(within(queue).getByText("Capturing now")).toBeTruthy();
+    expect(within(queue).queryByText("Not known")).toBeNull();
+    expect(within(queue).queryByText(/Progress was missed/)).toBeNull();
+    expect(within(queue).getByText("Of 3 links: 1 done, 1 failed, 1 still to come.")).toBeTruthy();
+  });
+
+  it("a read answered after the connection was lost again is dropped; the next one is used", async () => {
+    const { m, user } = await setup({ queuesDelayMs: 150 });
+    await paste(user, [YT, IG]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(m.queueReads()).toBe(1)); // the opening read
+    m.setQueues([{ ...running(), queueId: "q1", urls: [YT, IG], total: 2, done: 1, items: [{ url: YT, status: "created" }] }]);
+    // A reconnect starts a read; the stream drops again before it is answered.
+    await act(async () => m.closeStreams());
+    await waitFor(() => expect(m.streams()).toBe(1));
+    await act(async () => m.closeStreams());
+    await waitFor(() => expect(m.queueReads()).toBe(2));
+    // Answered while the connection was down: not applied.
+    expect(within(queue).queryByText("Saved")).toBeNull();
+    expect(within(queue).getAllByText("Not known").length).toBeGreaterThan(0);
+    // The next connection's read is.
+    await waitFor(() => expect(within(queue).getByText("Saved")).toBeTruthy());
+    await waitFor(() => expect(within(queue).queryByText("Not known")).toBeNull());
+  });
+
+  it("an event of a capture the screen does not know reads that capture once", async () => {
+    const { m } = await setup();
+    m.setQueues([{ ...running(), queueId: "elsewhere", startedBy: "extension", urls: [YT], total: 1 }]);
+    await act(async () => {
+      m.emit("capture.progress", { queueId: "elsewhere", projectId: P1, done: 0, total: 1, finished: false });
+      m.emit("capture.progress", { queueId: "elsewhere", projectId: P1, done: 0, total: 1, finished: false });
+    });
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(within(queue).getByText(/Sent from the browser extension/)).toBeTruthy());
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/captures/elsewhere`)).toHaveLength(1);
+  });
+
+  it("the same link while its capture runs: the service's refusal is said in plain words and the running capture is shown", async () => {
+    const { m, user } = await setup({
+      captureAnswer: () =>
+        errorResponse(
+          409,
+          "CONFLICT",
+          "At least one of these links is already waiting or being captured in this project, in a capture that is still running, so nothing new was queued. Wait until that capture has finished, or leave the link out.",
+          "CAPTURE_RUNNING",
+        ),
+    });
+    await waitFor(() => expect(m.queueReads()).toBe(1));
+    m.setQueues([{ ...running(), queueId: "q0", urls: [YT], total: 1 }]);
+    await paste(user, [YT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/already waiting or being captured in this project/);
+    expect(alert.textContent).not.toMatch(/CAPTURE_RUNNING|Something changed/);
+    const queue = await screen.findByRole("region", { name: "Capture queue" });
+    await waitFor(() => expect(within(queue).getByText("Capturing now")).toBeTruthy());
+    expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(1);
   });
 
   it("reconnects after a gap; a link whose outcome was missed is not known, and the gap is explained", async () => {
@@ -591,10 +722,10 @@ describe("Capture screen — capture tools", () => {
     expect(within(tools).getByText(/Not installed on this computer/)).toBeTruthy();
   });
 
-  it("a failed update as the service sends it today (500) and a helper that is not running are said plainly", async () => {
+  it("an unexpected failure (500) and a helper that is not running are said plainly", async () => {
     const { user } = await setup({
       versionsAnswer: () => errorResponse(503, "WORKER_UNAVAILABLE", "The media helper is not running.", "The media helper is not set up yet. Run `pnpm setup:py` once, then try again."),
-      // apps/library-service: media-worker.ts call() throws a plain Error → toApiError → 500 INTERNAL.
+      // An error the service does not know: 500 INTERNAL with its generic message.
       updateAnswer: () => errorResponse(500, "INTERNAL", "Something went wrong. Nothing was changed by this request unless it says otherwise."),
     });
     const tools = screen.getByRole("region", { name: "Capture tools" });
@@ -606,11 +737,21 @@ describe("Capture screen — capture tools", () => {
     expect(alert.textContent).toMatch(/Something went wrong\. Nothing was changed/);
   });
 
-  it("a failed update with a tool code (once Task 63 sends one) is explained, the code never shown", async () => {
+  it("a failed update with a tool code is explained, the code never shown", async () => {
     const { user } = await setup({ updateAnswer: () => errorResponse(502, "TOOLS_UPDATE_FAILED", "The capture tools could not be updated.", "TOOL_CHECKSUM_MISMATCH") });
     const tools = screen.getByRole("region", { name: "Capture tools" });
     await user.click(within(tools).getByRole("button", { name: "Update capture tools" }));
     expect(await within(tools).findByText(/did not match its published checksum/)).toBeTruthy();
     expect(tools.textContent).not.toMatch(/TOOL_CHECKSUM_MISMATCH/);
+  });
+
+  it("a failed update as the service sends it (502 TOOL_FAILED with the helper's code) is explained (Task 63)", async () => {
+    const { user } = await setup({
+      updateAnswer: () => errorResponse(502, "TOOL_FAILED", "The tool could not be installed or updated. Nothing was left half-installed; try again later.", "TOOL_UPDATE_FAILED"),
+    });
+    const tools = screen.getByRole("region", { name: "Capture tools" });
+    await user.click(within(tools).getByRole("button", { name: "Update capture tools" }));
+    const alert = await within(tools).findByRole("alert");
+    expect(alert.textContent).toBe("The downloader tool could not be updated. Try again later.");
   });
 });
