@@ -381,7 +381,7 @@ async function decide(
   }
   const allowed: Array<{ req: PolicyRequest; d: PolicyDecision }> = [];
   for (const r of Array.isArray(reqs) ? reqs : [reqs]) {
-    const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.tz };
+    const req: PolicyRequest = { ...r, projectId: st.project.id, actor: r.actor ?? core.actor, now: r.now ?? at, tz: r.tz ?? core.zoneOf(st.project) };
     let d = enforceConditions(core, st, cfg ? evaluate(cfg, req) : denyOf(cfgError!));
     const refused = runRefuse(refuse, d, req);
     if (refused) d = denyOf(refused, d.warnings);

@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import type { Asset, Collection, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, DateRule, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -1129,7 +1129,7 @@ export async function pseudonymizesIdentifiable(repo: Repo, projectId: string): 
     projectId,
     actor: core.actor,
     now: core.clock().toISOString(),
-    tz: core.tz,
+    tz: core.zoneOf(core.state(projectId).project),
     store: { identifiable: true, hasLocation: false, legalBasis: "(evaluated for naming only)" },
   });
   if (d.result === "deny") return true;
@@ -1193,7 +1193,7 @@ export async function lookupPolicyInfo(
   const core = cores.get(repo)!;
   const st = core.state(projectId);
   const policy = await projectPolicy(repo, projectId);
-  return { policy, actor: core.actor, ...(core.tz ? { tz: core.tz } : {}), clock: core.clock, sensitive: core.encrypted(st) };
+  return { policy, actor: core.actor, tz: core.zoneOf(st.project), clock: core.clock, sensitive: core.encrypted(st) };
 }
 
 /** Package-internal (Zotero Web import): records the library version a finished import saw (governed, audited). */
@@ -1209,6 +1209,15 @@ export function addWatchedFolderEntry(repo: Repo, projectId: string, options: un
 /** Package-internal (watched folders): removes a watch's record from project.json (governed, audited). */
 export function removeWatchedFolderEntry(repo: Repo, projectId: string, id: string): Promise<void> {
   return removeWatchedFolderRecord(cores.get(repo)!, projectId, id);
+}
+
+/**
+ * Package-internal: the zone a project's date rule is read in (R160 as amended): its time zone
+ * when set, else the computer's for protocol dates and UTC for retention (`dateRuleZone`).
+ */
+export function projectDateZone(repo: Repo, projectId: string, rule: DateRule): string {
+  const core = cores.get(repo)!;
+  return core.zoneOf(core.state(projectId).project, rule);
 }
 
 /** Package-internal: the researcher's time zone the repo names dated files in. */
@@ -1376,7 +1385,7 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
     try {
       const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
       if (!raw) throw new Error("governance.yaml is missing");
-      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "set-aside", projectId, actor: core.actor, now: at, tz: core.tz, setAside: { reason: why } });
+      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "set-aside", projectId, actor: core.actor, now: at, tz: core.zoneOf(st.project), setAside: { reason: why } });
       decision = d.result === "deny" ? { result: "deny", reason: d.reason } : { result: "allow" };
     } catch (e) {
       // Never an error message here: it can name an absolute path (N5).
