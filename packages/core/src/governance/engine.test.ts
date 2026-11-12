@@ -263,6 +263,21 @@ describe("effective policy and failure", () => {
   });
 });
 
+describe("review-withdrawal (Task 67, R176 2): a source reviewed after a consent withdrawal", () => {
+  const rw = (reason: unknown) => req({ action: "review-withdrawal", reviewWithdrawal: { reason: reason as string } });
+  const PROFILES = ["", "profiles: [hipaa]", "profiles: [gdpr]", "profiles: [irb]", "profiles: [dmp]", "profiles: [hipaa, gdpr, irb, dmp]"];
+  it.each(PROFILES)("is allowed with a reason under %j", (yaml) => {
+    expect(evaluate(cfg(yaml), rw("Spoke with P-001: the audio may be kept, not quoted")).result).toBe("allow");
+  });
+  it.each(PROFILES)("is refused without a reason (after trimming) under %j", (yaml) => {
+    for (const r of ["", "   \n\t"]) expect(denyReason(evaluate(cfg(yaml), rw(r)))).toBe("A reason is required to record that this source was reviewed after the withdrawal");
+  });
+  it("is refused when the payload is missing or the reason is not text", () => {
+    expect(evaluate(cfg(), req({ action: "review-withdrawal" })).result).toBe("deny");
+    expect(evaluate(cfg(), rw(42)).result).toBe("deny");
+  });
+});
+
 describe("set-aside (Task 50, R154 d)", () => {
   const sa = (reason: unknown) => req({ action: "set-aside", setAside: { reason: reason as string } });
   const PROFILES = ["", "profiles: [hipaa]", "profiles: [gdpr]", "profiles: [irb]", "profiles: [dmp]", "profiles: [hipaa, gdpr, irb, dmp]"];
