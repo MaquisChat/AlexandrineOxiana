@@ -1,0 +1,5 @@
+{
+  "request": 2,
+  "architectures": "apple-silicon",
+  "note": "Second attempt, 2026-11-12: Apple Silicon. Run 1 built the app and passed every check except the release-app launch check, which wrongly waited for a worker that starts only when a library is opened; the check is corrected."
+}

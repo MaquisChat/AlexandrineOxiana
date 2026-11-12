@@ -369,13 +369,16 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     return lines.slice(start, end < 0 ? undefined : end).filter((l) => l.trim() && !/^\s*#/.test(l));
   };
 
-  it("starts only by hand or on a version tag, never on a branch push, a pull request or a schedule", () => {
+  it("starts only by hand, on a version tag, or on a branch push that changed the build-request file (R168); never on a pull request or a schedule", () => {
     const on = block("on").join("\n");
     assert.match(on, /^ {2}workflow_dispatch:/m);
-    assert.match(on, /^ {2}push:\n {4}tags:\n {6}- "v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+\*"$/m);
+    // The whole push trigger, exactly: version tags; and the named branches ONLY for the one path.
+    assert.match(on, /^ {2}push:\n {4}tags:\n {6}- "v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+\*"\n {4}branches:\n {6}- "claude\/\*\*"\n {6}- main\n {4}paths:\n {6}- apps\/desktop\/mac-build-request\.json$/m);
     const triggers = block("on").map((l) => /^ {2}([a-z_]+):/.exec(l)?.[1]).filter(Boolean);
     assert.deepEqual(triggers, ["workflow_dispatch", "push"]);
-    assert.doesNotMatch(on, /branches|paths/);
+    // A `branches` filter without the `paths` filter would run on every branch push: both or neither.
+    assert.equal(/^ {4}branches:/m.test(on), /^ {4}paths:/m.test(on));
+    assert.equal((on.match(/^ {6}- /gm) ?? []).length, 4, "one tag pattern, two branches, one path; nothing else");
   });
 
   it("reads only, builds on the two runners R133 names, and never overlaps", () => {

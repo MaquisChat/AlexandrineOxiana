@@ -154,18 +154,31 @@ The target triple follows Tauri's sidecar names (`aarch64-apple-darwin`, `x86_64
 
 ## Building for macOS
 
-Two downloads, each built on its own GitHub Mac (R133): **Apple Silicon** on `macos-15` and
-**Intel** on `macos-15-intel`. Both need macOS 15.0 or later. They are signed ad hoc, not with a
-Developer ID (R151), so a Mac asks once before opening them (below).
+One download: **Apple Silicon** (M1 and later), built on a GitHub `macos-15` machine (R133). It needs
+macOS 15.0 or later. It is signed ad hoc, not with a Developer ID (R151), so a Mac asks once before
+opening it (below).
 
-**Not yet run.** The workflow and the build script were written and checked on Linux (Task 37f); the
-first run on a Mac is the first time any of it meets macOS. What could not be checked is listed in
-the Task 37f report under "Unverified until the first Mac run".
+**Apple Silicon only (R169, the owner's decision of 2026-11-12).** The Intel download is not built.
+The Intel runner (`macos-15-intel`), its pins and the worker's Intel pin set stay in the repository,
+unused; one switch, `INTEL_BUILDS` in `scripts/mac-targets.mjs`, turns them back on. While it is off,
+everything below that mentions Intel is refused in plain words and builds nothing.
+
+**First run on a Mac: 2026-11-12** (run 1 of "Desktop (macOS)", Apple Silicon, macOS 15.8, about 15
+minutes without caches). The app and its disk image were built and signed ad hoc; the packaged
+worker's smoke test passed; the launch check A–D passed on the debug app, with the page reaching the
+service and the worker from the origin `tauri://localhost` (requests, events, pictures, audio and
+video). Check R on the release app failed on the check's own mistake: it waited for a worker, which
+the app starts only when a library is opened. What a Mac run cannot show, and the owner's own tests
+must: opening the downloaded app from Finder ("Open Anyway", below), and using it.
 
 ### What the workflow does
 
-`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started from a tag or by
-hand (both below), never on a branch push: Mac minutes are billed at ten times Linux minutes. A
+`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started from a build
+request, a tag or by hand (all below), never on an ordinary branch push: Mac minutes are billed at
+ten times Linux minutes. A **build request** is a commit that changes
+`apps/desktop/mac-build-request.json` on a working branch: raise `"request"` by one and set
+`"architectures"` to `"apple-silicon"` (R168; this is how a build is started from a session that can
+push only its own branch). A
 short first job on Linux decides which downloads to build and refuses a tag that is not a version
 of the app (`scripts/mac-targets.mjs`). For each architecture it:
 
@@ -186,9 +199,10 @@ of the app (`scripts/mac-targets.mjs`). For each architecture it:
 4. checks it on the runner: the packaged worker's smoke test (with Homebrew's ffmpeg and tesseract,
    which the app itself does not ship), the launch check A–D on the debug build of the app (the same
    bundle layout; only a debug build reports what the check reads), and check R on the release app
-   run from the mounted disk image: its service and worker start from the app's own resources, the
-   service listens on 127.0.0.1 and refuses a request without its token, and nothing is left after
-   the app is stopped; and writes the sizes and checksums in the run's summary.
+   run from the mounted disk image: its service starts from the app's own resources, listens on
+   127.0.0.1 and refuses a request without its token, and nothing is left after the app is stopped
+   (no worker is expected in R: the service starts it when a library is opened, which only A–D do);
+   and writes the sizes and checksums in the run's summary.
 
 On a Mac with the same tools, `pnpm --filter @ao/desktop run build:macos` does step 2 by hand;
 `node scripts/build-macos.mjs --dry-run [--arch arm64|x64]` prints the steps on any system.
@@ -217,22 +231,22 @@ starts a build:
 
 | Tag | Builds |
 | --- | --- |
-| `v0.0.0-mac.1` | both downloads |
-| `v0.0.0-arm.1` | Apple Silicon only |
-| `v0.0.0-intel.1` | Intel only |
-| `v0.0.0` | both (a release) |
+| `v0.0.0-arm.1` | Apple Silicon (a test build) |
+| `v0.0.0` | Apple Silicon (a release) |
+| `v0.0.0-mac.1` | refused while Intel is off (with Intel on: both downloads) |
+| `v0.0.0-intel.1` | refused while Intel is off (with Intel on: Intel only) |
 
 The version (`0.0.0` here) must be the app's version, `version` in `src-tauri/tauri.conf.json`;
 otherwise the run stops in its first minute, on Linux, before any Mac time is spent. Only these four
 forms build, exactly as written (lower case, a number at the end and nothing after it): any other
 tag that starts with `v` and a version, such as a mistyped `-arm1`, `-ARM.1` or `-rc.1`, also stops
 there, with a message naming the accepted forms, and builds nothing. The last number
-counts attempts: each new build needs a new tag (`-mac.2`, `-mac.3`, …). Because it spends Mac
+counts attempts: each new build needs a new tag (`-arm.2`, `-arm.3`, …). Because it spends Mac
 minutes, a tag is pushed only at the owner's word (R167). From a checkout of the branch to build:
 
 ```sh
-git tag v0.0.0-mac.1
-git push origin v0.0.0-mac.1
+git tag v0.0.0-arm.1
+git push origin v0.0.0-arm.1
 ```
 
 **With the "Run workflow" button (on the GitHub website).** GitHub shows this button only for a
@@ -244,18 +258,16 @@ the file is on `main`:
 1. Open the repository on github.com and click **Actions** (top of the page).
 2. In the list on the left, click **Desktop (macOS)**.
 3. Click **Run workflow** (on the right, above the list of runs). Under "Use workflow from", choose
-   the branch to build; under "Which downloads to build", choose **both**, **apple-silicon** or
-   **intel**. Click the green **Run workflow** button.
-4. The run appears in the list after a few seconds. A cold run takes roughly an hour per
-   architecture (estimate); the two run side by side.
+   the branch to build; "Which downloads to build" offers **apple-silicon** only. Click the green
+   **Run workflow** button.
+4. The run appears in the list after a few seconds. A cold run takes roughly an hour (estimate).
 
 ### Where the downloads appear
 
 Open the finished run (click its name in the list). At the bottom of its **Summary** page, under
-**Artifacts**, are `alexandrine-oxiana-macos-apple-silicon` and `alexandrine-oxiana-macos-intel`.
-Each downloads as a `.zip` holding the disk image (`.dmg`) and its SHA-256. They are kept for 30
-days. Which one: Apple menu > About This Mac: "Chip: Apple M…" means Apple Silicon, "Processor:
-…Intel…" means Intel.
+**Artifacts**, is `alexandrine-oxiana-macos-apple-silicon`. It downloads as a `.zip` holding the
+disk image (`.dmg`) and its SHA-256, and is kept for 30 days. It runs on a Mac whose Apple menu >
+About This Mac says "Chip: Apple M…"; a Mac that says "Processor: …Intel…" cannot run it (R169).
 
 ### Opening the unsigned app the first time ("Open Anyway", R151)
 
