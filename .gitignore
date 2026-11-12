@@ -32,3 +32,6 @@ packages/core/csl/styles.zip.part
 packages/core/csl/locales/
 packages/core/csl/locales.tmp/
 packages/core/csl/bundle.json
+
+# The browser extension download built by apps/browser-extension/scripts/package.mjs
+apps/browser-extension/dist-zip/
