@@ -10,7 +10,7 @@ import { NotFoundError } from "./errors.js";
 import { decryptBytes, foldName, mimeFor, namesIn, readMaybe } from "./io.js";
 import { runMutation, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import { readFullData, writeProjectData } from "./projects.js";
-import { appendReviewEntry, appendReviewUpdate, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, appendReviewUpdate, queueNewConflicts, readReviewEntries, resolveSettledCaptureEntries, type ReviewEntry, type ReviewInput } from "./review.js";
 import { deleteSourceInTx, fileMode, readSourceFile, writeSourceFile } from "./sources.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
 import { addDeletions, clearDeletions, releaseDeletions, resetDeletions } from "./tombstones.js";
@@ -55,6 +55,8 @@ export function runImportChange<T>(
   core.assertWritable();
   /** Capture entries resolved by this change, because a write gave an existing source a new report (R176 1). */
   const resolved: string[] = [];
+  /** Fields an existing source's new report put newly in conflict, queued by this change (R190 a). */
+  const queued: Array<{ entry: string; fields: string[] }> = [];
   return runMutation(
     core,
     projectId,
@@ -83,7 +85,15 @@ export function runImportChange<T>(
           if (!st.sources.has(parsed.source.id)) tx.onCommit(() => st.sources.set(parsed.source.id, parsed.source.folder));
           // An existing source given a new report (a review decision's fields, a merge, an incremental
           // update): its capture entries are re-examined in this change. A new source has none yet.
-          if (before && !isDeepStrictEqual(before.verification, parsed.verification)) resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
+          if (before && !isDeepStrictEqual(before.verification, parsed.verification)) {
+            // A field newly in conflict is queued first (R190 a), so an entry it extends is not resolved
+            // under it. Only a review decision rewrites an existing source's report here (a run's merges
+            // and updates, and the undo's reverts, leave it as it is); a batch's undo removes that source
+            // and resolves the entry with it ("undone", R176 4).
+            const q = await queueNewConflicts(core, tx, before, parsed);
+            if (q) queued.push(q);
+            resolved.push(...(await resolveSettledCaptureEntries(core, tx, parsed, "recheck")));
+          }
           tx.index((sink) => sink.indexSource(parsed));
         },
         deleteSource: (id, o) => deleteSourceInTx(core, tx, id, o),
@@ -161,7 +171,7 @@ export function runImportChange<T>(
       op: opts.op,
       ...(opts.entity ? { entity: opts.entity } : {}),
       ...(opts.refuse ? { refuse: opts.refuse } : {}),
-      auditDetails: () => (resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}),
+      auditDetails: () => ({ ...(resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}), ...(queued.length ? { reviewQueued: [...queued] } : {}) }),
     },
   );
 }
