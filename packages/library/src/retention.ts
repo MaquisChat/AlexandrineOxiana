@@ -44,7 +44,9 @@
  * The certificate, the amendments and `Backups/backups-state.json` are conveniences, not
  * authorities. `resumeDestruction` (at open, at unlock and hourly) deletes nothing for a
  * destruction whose files disagree with the audit log, keeps the warning and says why; it only
- * records listed backups that are found gone. Destruction holds the project's maintenance lock
+ * records listed backups that are found gone. The audit log is the authority while its chain holds:
+ * nothing is removed on the word of a log that does not verify, and a noted backup that is still in
+ * Backups/ is not dropped from the note on its word either. Destruction holds the project's maintenance lock
  * (R138 a). Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed`
  * (counts and the certificate's sha256), each amendment's `delete` event (op `retention.backups`)
  * and a `retention.backups` report of the same facts.
