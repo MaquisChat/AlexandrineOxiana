@@ -373,6 +373,13 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service and UI tests for each kind of entry; `pnpm e2e -- --app-only --trace off`.
 - Model: Opus.
 
+**Task 68 — Settings writers never write what they did not read (D16) [ledger: R96, R159]**
+- Depends: 66 (it fixed the same shape for the pairings).
+- Files: `apps/library-service/src/routes/fonts.ts`, `routes/appearance.ts`, the app-settings helper they share with the pairings, tests.
+- Accept: a change to the fonts index or to the appearance settings is written only over what was read successfully; when the read fails the change is refused in plain words (no path) and nothing is written; a missing file on a fresh settings folder is still "nothing yet", not a failure; the same check for every other writer of a file in the app's settings folder, each named in the report.
+- Verify: service tests (unreadable, a directory in its place, invalid JSON, truncated, missing) for each writer.
+- Model: Opus (the Task 66 implementer).
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
@@ -460,6 +467,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by the review of Task 37i (for Task 66): D13 (high): the library service takes a new port at every launch, and the browser extension keeps the port typed at pairing and never looks for another, so a paired browser stops working each time the app is reopened ("The desktop app is not answering on port N") until it is unpaired and paired again.
 - Defect found by the review of Task 46b (for Task 67): D14 (high): the review queue screen lists the items of one import batch only. Entries queued by a drag-and-drop attach, by a capture with conflicting fields or by a consent withdrawal cannot be seen or decided anywhere, so their "Needs review" badge cannot be cleared.
 - Defect found by Task 49's fourth round (for Task 50b): D15 (high): a deleted `backups-manifest.json` is read as "no backups", so a destruction lists none, its certificate says "none", and a backup that holds the destroyed file stays.
+- Defect found by Task 66's fix round (for Task 68): D16: when the fonts index or the appearance settings cannot be read at the moment of a change, the change is written over defaults — the other fonts' entries are dropped (their files stay, unlisted), or the other appearance settings are reset.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -493,7 +501,7 @@ Update after every task; commit and push.
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
-| 49 Backups governed | round 5 in re-review | d59a52b (worktree branch) | a pass writes nothing on an unverified chain; a restore copies certificates byte for byte (R175) |
+| 49 Backups governed | approved; taking the working branch, then verification | d59a52b (worktree branch) | R147 met after five rounds (re-scoped at the fourth); reviewed with probes; D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
@@ -513,7 +521,8 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | fix round 1 | c4524b4 (worktree branch) | reviewed with probes: 3 Important (a failed read wipes every pairing; the popup's port check too loose; a stale notice) |
+| 66 A paired browser survives a relaunch (D13) | fix round 1 in re-review | 4e4f35a (worktree branch) | a failed read never wipes the pairings; the popup's port check is strict; the working branch taken |
+| 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
 | 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
