@@ -478,7 +478,7 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | fix round 1 in re-review | e50933c (worktree branch) | a rebuild stopped half-way is rebuilt at the next open; the reopen at start cannot replace a library opened since |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | approved; takes the working branch after Task 51, then verification | e50933c (worktree branch) | reviewed with probes over one fix round (one Critical closed) |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; verification before merge | ae4de75 (worktree branch) | reviewed with probes over one fix round; "Needs review" follows every pending entry (R172); D14 remains for Task 67 |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
