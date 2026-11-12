@@ -10,6 +10,12 @@
  * the screen asks GET /extension/pair/status/:codeId (by the code's non-secret id), one request at a
  * time, and stops asking when the code ends or the screen is left. The countdown uses the service's
  * `validForMs` against this page's own clock only, so the two clocks are never compared.
+ *
+ * The app's port across launches (R171, defect D13): the service listens again on its last port when
+ * it can, but when that port was taken it starts on another, and a browser paired before still holds
+ * the old one. The list answer says the service's port now and, per browser, the port it last reached
+ * the service on; when one differs, the screen says what happened, shows the new port, and tells the
+ * researcher what to do in that browser's popup ("Use a different port"; no new pairing needed).
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { PAIRING_CODE_ID, type PairingCodeStatus } from "@ao/shared";
@@ -87,6 +93,8 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
   const [issueError, setIssueError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [browsers, setBrowsers] = useState<PairedBrowser[] | null>(null);
+  /** The service's port now, as its list answer says it (R171). */
+  const [servicePort, setServicePort] = useState<number | undefined>(undefined);
   const [listError, setListError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<PairedBrowser | null>(null);
   const [revokeBusy, setRevokeBusy] = useState(false);
@@ -132,10 +140,12 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
       const my = ++listSeq.current;
       const ac = signal();
       try {
-        const list = await api.list(ac.signal);
+        const answer = await api.list(ac.signal);
         if (!alive.current || my !== listSeq.current) return undefined;
+        const list = answer.extensions;
         browsersRef.current = list;
         setBrowsers(list);
+        setServicePort(answer.port);
         setListError(null);
         return list;
       } catch (err) {
@@ -345,6 +355,10 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
   }, [focusList]);
 
   const showLabel = code || outcome ? "Show a new code" : "Show a pairing code";
+  // R171: the port now (the service's word first), and the browsers that hold an older one.
+  const currentPort = servicePort ?? port;
+  const oldPort = (b: PairedBrowser) => currentPort !== undefined && b.port !== undefined && b.port !== currentPort;
+  const portMoved = currentPort !== undefined && (browsers ?? []).some(oldPort);
 
   return (
     <main className="ao-screen ao-pairing">
@@ -420,6 +434,21 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
         <h2 id={`${ids}-list`} ref={heading} tabIndex={-1}>
           Paired browsers
         </h2>
+        {/* Always mounted, and its words change only when the port or the set of browsers with an old
+            port changes, so screen readers announce it once (R171). */}
+        <div role="status" aria-label="The app's port changed" className={portMoved ? "ao-warning ao-pairing-moved" : undefined}>
+          {portMoved ? (
+            <>
+              <p>
+                <strong>This app's port changed.</strong> When the app was reopened, the port it used before was taken by another program, so it now uses port{" "}
+                <span className="ao-pairing-port-value">{currentPort}</span>. The browsers marked “Old port” below still use the earlier port, so they cannot capture until they are given the new one.
+              </p>
+              <p>
+                In each of those browsers, open the extension's popup, choose “Use a different port”, type {currentPort} and choose “Check and save”. The pairing stays valid: there is no need to pair again.
+              </p>
+            </>
+          ) : null}
+        </div>
         {listError ? (
           <p role="alert" className="ao-warning">
             {listError}
@@ -447,6 +476,19 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
                   <UserText>{b.origin}</UserText>
                   <br />
                   <span className="ao-hint">Paired {when(b.pairedAt)}</span>
+                  {oldPort(b) ? (
+                    <>
+                      <br />
+                      <span className="ao-pairing-old-port">
+                        Old port: {b.port}. This app now uses port {currentPort}.
+                      </span>
+                    </>
+                  ) : currentPort !== undefined && b.port === undefined ? (
+                    <>
+                      <br />
+                      <span className="ao-hint">Paired before this app kept its port. If this browser says the app is not answering, give it port {currentPort} in its popup (“Use a different port”).</span>
+                    </>
+                  ) : null}
                 </span>
                 <button type="button" className="ao-danger" aria-label={`Revoke ${b.origin}`} onClick={() => { setRevokeError(null); setRevoking(b); }}>
                   Revoke

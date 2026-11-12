@@ -803,3 +803,86 @@ describe("Paired browsers", () => {
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Paired browsers" })));
   });
 });
+
+describe("the app's port changed since a browser was paired (R171, defect D13)", () => {
+  const NOW = 4318;
+  const OLD = 51234;
+  const NOTICE = "The app's port changed";
+  const noticeText = () => screen.queryByRole("status", { name: NOTICE })?.textContent ?? "";
+
+  it("says so in plain words when a paired browser holds an older port: what happened, the new port, what to do in the browser", async () => {
+    const svc = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }, { ...BROWSER_B, port: NOW }] });
+    server.use(...svc.handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    const notice = screen.getByRole("status", { name: NOTICE });
+    const text = notice.textContent ?? "";
+    expect(text).toMatch(/reopened/i);
+    expect(text).toMatch(/another program/i);
+    expect(text).toContain(String(NOW));
+    expect(text).toMatch(/“Use a different port”/);
+    expect(text).toMatch(/“Check and save”/);
+    expect(text).toMatch(/no need to pair again/i);
+    // The current port is easy to read and copy: on its own, in a selectable element.
+    expect(notice.querySelector(".ao-pairing-port-value")?.textContent).toBe(String(NOW));
+    // The browser that holds the old port is marked in the list; the other is not.
+    const rowA = screen.getByText(BROWSER_A.origin).closest("li")!;
+    const rowB = screen.getByText(BROWSER_B.origin).closest("li")!;
+    expect(rowA.textContent).toContain(`Old port: ${OLD}`);
+    expect(rowB.textContent).not.toMatch(/Old port/);
+    // Its origin comes from outside: shown through UserText.
+    expect(within(rowA).getByText(BROWSER_A.origin).getAttribute("dir")).toBe("auto");
+  });
+
+  it("says nothing when every paired browser holds the current port, or none is paired", async () => {
+    server.use(...pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: NOW }] }).handlers);
+    const { unmount } = render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(noticeText()).toBe("");
+    expect(document.body.textContent).not.toMatch(/Old port/);
+    unmount();
+    server.use(...pairingService({ port: NOW }).handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await screen.findByText("No browser is paired yet.");
+    expect(noticeText()).toBe("");
+  });
+
+  it("a browser paired before ports were kept gets a hint on its row, not the notice", async () => {
+    server.use(...pairingService({ port: NOW, pairings: [BROWSER_A] }).handlers);
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(noticeText()).toBe("");
+    const row = screen.getByText(BROWSER_A.origin).closest("li")!;
+    expect(row.textContent).toMatch(new RegExp(`give it port ${NOW}`));
+  });
+
+  it("the notice is announced once: a later read of the same list does not change it; it goes when the old-port browser is revoked", async () => {
+    const svc = pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }, { ...BROWSER_B, port: NOW }] });
+    server.use(...svc.handlers);
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} port={NOW} />);
+    await waitFor(() => expect(noticeText()).not.toBe(""));
+    const first = noticeText();
+    // Revoking the other browser reads the list again: the notice's words do not change (no new announcement).
+    await user.click(screen.getByRole("button", { name: `Revoke ${BROWSER_B.origin}` }));
+    await user.click(screen.getByRole("button", { name: "Revoke pairing" }));
+    await waitFor(() => expect(svc.state.deleted).toEqual([BROWSER_B.id]));
+    await waitFor(() => expect(svc.state.listReads).toBeGreaterThanOrEqual(2));
+    expect(noticeText()).toBe(first);
+    await user.click(screen.getByRole("button", { name: `Revoke ${BROWSER_A.origin}` }));
+    await user.click(screen.getByRole("button", { name: "Revoke pairing" }));
+    await waitFor(() => expect(noticeText()).toBe(""));
+  });
+
+  it("takes the port from the service's answer, and ignores one that is not a port", async () => {
+    // The page was given no port: the service's answer is enough.
+    server.use(...pairingService({ port: NOW, pairings: [{ ...BROWSER_A, port: OLD }] }).handlers);
+    const { unmount } = render(<ExtensionPairing api={makeApi()} />);
+    await waitFor(() => expect(noticeText()).toContain(String(NOW)));
+    unmount();
+    server.use(http.get(url("/extension/pairings"), () => HttpResponse.json({ extensions: [{ ...BROWSER_A, port: OLD }], port: "4318" })));
+    render(<ExtensionPairing api={makeApi()} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(noticeText()).toBe("");
+  });
+});

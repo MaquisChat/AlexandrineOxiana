@@ -6,28 +6,29 @@
  *                                       earlier one; desktop app only)
  *  - GET /extension/pair/status/:codeId → PairingCodeStatus (active, used, expired, invalidated,
  *                                       replaced or none; never the code; the app's own page only)
- *  - GET /extension/pairings          → { extensions: [{ id, origin, pairedAt }] }  (never a token)
+ *  - GET /extension/pairings          → PairedBrowsers { extensions: [{ id, origin, pairedAt, port? }], port? }
+ *                                       (never a token; `port`: the service's port now, and per
+ *                                       browser the port it last reached the service on, R171)
  *  - DELETE /extension/pairings/:pid  → { removed: true }  (404 NOT_FOUND when already gone)
  * The code is a short-lived secret: callers keep it in component state only. Its `codeId` is not.
  */
-import type { PairingCodeIssued, PairingCodeStatus } from "@ao/shared";
+import type { PairedBrowser, PairedBrowsers, PairingCodeIssued, PairingCodeStatus } from "@ao/shared";
 import type { ApiClient } from "./client";
 
 export type PairingCode = PairingCodeIssued;
 export type { PairingCodeStatus };
 
-export interface PairedBrowser {
-  id: string;
-  /** The extension's origin, e.g. chrome-extension://<id>. */
-  origin: string;
-  pairedAt: string;
-}
+export type { PairedBrowser, PairedBrowsers };
+
+/** A port number, or undefined for anything else (the answer is not trusted to have the right shape). */
+const portOf = (v: unknown): number | undefined => (typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 65535 ? v : undefined);
 
 export interface ExtensionApi {
   issueCode(signal?: AbortSignal): Promise<PairingCode>;
   /** What became of the code with this id (Task 46c). */
   codeStatus(codeId: string, signal?: AbortSignal): Promise<PairingCodeStatus>;
-  list(signal?: AbortSignal): Promise<PairedBrowser[]>;
+  /** The paired browsers, and the service's port now when it says it (R171). */
+  list(signal?: AbortSignal): Promise<PairedBrowsers>;
   revoke(id: string, signal?: AbortSignal): Promise<void>;
 }
 
@@ -35,7 +36,15 @@ export function extensionApi(client: ApiClient): ExtensionApi {
   return {
     issueCode: (signal) => client.request<PairingCode>("POST", "/extension/pair", signal ? { signal } : {}),
     codeStatus: (codeId, signal) => client.request<PairingCodeStatus>("GET", `/extension/pair/status/${encodeURIComponent(codeId)}`, signal ? { signal } : {}),
-    list: async (signal) => (await client.request<{ extensions: PairedBrowser[] }>("GET", "/extension/pairings", signal ? { signal } : {})).extensions,
+    list: async (signal) => {
+      const r = await client.request<{ extensions?: unknown; port?: unknown }>("GET", "/extension/pairings", signal ? { signal } : {});
+      const extensions = (Array.isArray(r?.extensions) ? (r.extensions as PairedBrowser[]) : []).map(({ port, ...b }) => {
+        const p = portOf(port);
+        return p !== undefined ? { ...b, port: p } : b;
+      });
+      const port = portOf(r?.port);
+      return { extensions, ...(port !== undefined ? { port } : {}) };
+    },
     revoke: async (id, signal) => {
       await client.request<{ removed: boolean }>("DELETE", `/extension/pairings/${encodeURIComponent(id)}`, signal ? { signal } : {});
     },
