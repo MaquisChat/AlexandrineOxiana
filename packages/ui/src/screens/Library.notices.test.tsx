@@ -26,8 +26,7 @@ describe("device-level notices in the banner area", () => {
     server.use(...libraryHandlers({ state: withNotices([{ kind: "device-identity-renewed", at: AT }, { kind: "old-copies-list-set-aside", at: AT }, { kind: "something-new", at: AT }]) }));
     render(<Library api={testApi()} current={CURRENT_RW as never} />);
     const identity = (await screen.findByText(/identity for the app .* had to be renewed/)).closest("[role=status]")!;
-    expect(identity.textContent).toMatch(/locked by another device/);
-    expect(identity.textContent).toMatch(/Read-only \(locked by/);
+    expect(identity.textContent).toMatch(/Your libraries are not affected/);
     const copies = screen.getByText(/old library copies awaiting deletion was damaged/).closest("[role=status]")!;
     expect(copies.textContent).toMatch(/may still be on this computer/);
     expect(copies.textContent).toMatch(/kept beside the app's settings/);

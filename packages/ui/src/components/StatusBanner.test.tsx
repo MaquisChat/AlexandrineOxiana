@@ -4,13 +4,14 @@ import { describe, expect, it, vi } from "vitest";
 import { StatusBanner, bannersFor, volumeOf, warningText } from "./StatusBanner";
 
 describe("device-level notices (Task 68)", () => {
-  it("the identity notice: what happened, the lock, and the existing words for a locked library", () => {
+  it("the identity notice: what happened, what it changes (not the locks: review round 1, M2), the damaged file kept", () => {
     render(<StatusBanner variant={{ kind: "notice", notice: "device-identity-renewed" }} onDismiss={() => undefined} />);
     const t = screen.getByRole("status").textContent ?? "";
     expect(t).toMatch(/This computer's identity for the app could not be read and had to be renewed/);
-    expect(t).toMatch(/locked by another device/);
-    expect(t).toMatch(/“Read-only \(locked by …\)”/);
-    expect(t).toMatch(/2 minutes/);
+    expect(t).toMatch(/Your libraries are not affected/);
+    expect(t).toMatch(/recorded under this computer's new identity/);
+    expect(t).toMatch(/kept beside the app's settings/);
+    expect(t).not.toMatch(/locked/i);
   });
 
   it("the old-copies notice: what happened, old copies may still be here, the damaged list is kept", () => {

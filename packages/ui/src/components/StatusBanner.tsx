@@ -25,13 +25,15 @@ export type BannerVariant =
   | { kind: "notice"; notice: DeviceNoticeKind };
 
 /**
- * The words of each device-level notice (Task 68). The way a library left locked under the old
- * identity is released is the lock's own: a lock not kept up for 2 minutes is taken over on the next
- * open (packages/library lock.ts STALE_MS); until then the banner above says "Read-only (locked by …)".
+ * The words of each device-level notice (Task 68). A renewed identity does not change how locks are
+ * treated: a lock is this program's only with the same identity AND the same running program, and a
+ * lock left on this computer by a program no longer running is taken over at once (packages/library
+ * lock.ts), so the notice says nothing about locks (review round 1, M2). What changes is the name
+ * under which this computer's changes are recorded in the audit logs from now on.
  */
 export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
   "device-identity-renewed":
-    "This computer's identity for the app could not be read and had to be renewed. A library this computer left locked may show as locked by another device, “Read-only (locked by …)”: once that old lock has not been kept up for 2 minutes, the library opens with changes on again, so close it and open it again then. The damaged identity file is kept beside the app's settings.",
+    "This computer's identity for the app could not be read and had to be renewed. Your libraries are not affected; the changes you make from now on are recorded under this computer's new identity. The damaged identity file is kept beside the app's settings.",
   "old-copies-list-set-aside":
     "The list of old library copies awaiting deletion was damaged and was set aside. Old copies of moved libraries may still be on this computer, but they are no longer offered for deletion here. The damaged list is kept beside the app's settings.",
   "watched-folders-list-set-aside":
