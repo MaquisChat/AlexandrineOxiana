@@ -1671,9 +1671,10 @@ async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: 
  * read from the audit logs (restore-record.ts `destroyedOnRecord`) before anything is unpacked and
  * again in the commit turn. While the audit log of the project the backup belongs to does not
  * verify, the restore is refused (DestructionRecordError, audited the same way; the backup can be
- * restored into another library). Another project's log that does not verify does not stop it: that
- * project's certificate files are then taken as they are, and whatever they name is left out. The
- * answer says what was left out, and why.
+ * restored into another library). Another project's log that does not verify does not stop it, nor
+ * does a folder in `Projects/` that could not be loaded as a project: whatever can still be read of
+ * its audit log and its certificate files is taken as it is, and whatever that names is left out
+ * (unverified evidence excludes, whatever its form). The answer says what was left out, and why.
  *
  * A file that is not a readable backup (no project in it, damaged, unsafe, changed since it was
  * made, its own audit log not verifying) is refused and recorded in the library's audit log by its

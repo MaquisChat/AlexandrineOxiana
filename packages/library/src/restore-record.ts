@@ -5,22 +5,35 @@
  * fold of audit events into destructions, shared with the retry in retention.ts); it imports neither
  * retention.ts nor export/backup.ts, so the restore in backup.ts can use it.
  *
- * Whose audit log must hold together (R179):
+ * Whose audit log must hold together (R179; fix round 1, rulings 2 and 3):
  *   - the log of the project the backup belongs to, when that project is in the library. If it does
  *     not verify, what that project destroyed cannot be known and the restore is refused, in plain
  *     words that name the way out (another library);
- *   - any other project's log that does not verify does not stop a restore. Its certificate files
- *     are then taken as they are on disk: whatever they name as destroyed is left out (unverified
- *     evidence still excludes; it never brings data back), and the restore says, in its notes and
- *     in its audit entry, that for that project the list rests on certificate files alone, or that
- *     nothing of that project's destructions could be established.
+ *   - any other project's log that does not verify does not stop a restore. Unverified evidence
+ *     excludes, whatever its form (it never brings data back): every file a destruction entry that
+ *     can still be read in that log names as destroyed, and every file that project's certificate
+ *     and amendment files, as they are on disk, name as destroyed, is left out. The restore says,
+ *     in its notes and in its audit entry, that the log did not verify and what the exclusion rests
+ *     on, or that nothing of that project's destructions could be established;
+ *   - a folder in `Projects/` that is there but could not be loaded as a project (its project.json
+ *     is missing or cannot be read) counts the same way, and never refuses a restore: it may be the
+ *     very project that is being recovered. The restore says that the folder could not be loaded.
+ *
+ * A locked project (the restore unlocks nothing, I1): its audit log is not sealed, so the files it
+ * destroyed are known by id. Its sealed certificates are not read, which the restore says.
  */
+import * as fsp from "node:fs/promises";
+import { join } from "node:path";
 import type { AuditEvent, Project } from "@ao/core";
 import { auditedDestructions, outstandingOf, parseObject, readPlain, retentionNames, sha256, strings } from "./destruction-record.js";
+import { projectMovedAway } from "./library.js";
+import { AuditStore } from "./repo/audit-store.js";
 import { DESTRUCTION_CERTIFICATE } from "./repo/destroy.js";
 import { ProjectLockedError } from "./repo/errors.js";
-import { auditHeadOf, repoClock, verifiedAuditEvents, verifiedAuditEventsInQueue, type Repo } from "./repo/repo.js";
+import { decryptBytes } from "./repo/io.js";
+import { auditHeadOf, keyFromRing, repoClock, repoLibrary, verifiedAuditEvents, verifiedAuditEventsInQueue, type Repo } from "./repo/repo.js";
 import { DestructionRecordError, type DestroyedRecord, type DestroyedSource } from "./repo/restore.js";
+import { parseProjectJson } from "./repo/state.js";
 
 type Head = { seq: number; hash: string } | null;
 const sameHead = (a: Head, b: Head) => (a?.seq ?? 0) === (b?.seq ?? 0) && (a?.hash ?? "") === (b?.hash ?? "");
@@ -91,13 +104,16 @@ const whyNot = (buf: Buffer | null | "unreadable" | "locked") =>
  * What cannot be read with certainty:
  *   - in the backup's own project (its log does not verify, or an entry names no files and its
  *     certificate does not verify): DestructionRecordError, and nothing is restored;
- *   - in any other project: its certificate files are taken as they are on disk (`certificate-only`).
+ *   - in any other project, and in a folder that could not be loaded as a project: whatever can
+ *     still be read of its audit log and its certificate files is taken as it is (`unverified`).
  *
  * `inQueue`: the caller holds the write queue (the restore's commit turn). `prior`: an earlier
- * reading, reused for each project whose audit log still ends where it did then.
+ * reading, reused for each project whose audit log verified then and still ends where it did
+ * (evidence nothing vouches for is read again each time).
  */
 export async function destroyedOnRecord(repo: Repo, opts: { own?: string; inQueue?: boolean; prior?: DestroyedOnRecord } = {}): Promise<DestroyedOnRecord> {
   const out: DestroyedOnRecord = { sources: [], projects: new Map() };
+  const root = repoLibrary(repo).root;
   for (const p of repo.listProjects()) {
     const head = auditHeadOf(repo, p.id);
     let mine = opts.prior?.projects.get(p.id);
@@ -112,10 +128,78 @@ export async function destroyedOnRecord(repo: Repo, opts: { own?: string; inQueu
           p.id,
           true,
         );
-      } else mine = { head, sources: [await certificatesAlone(repo, p)] };
+      } else {
+        // Never kept for the commit turn: nothing ties what is on disk to the head the process holds.
+        out.sources.push(
+          await unvouched(repo, {
+            what: `The audit log of the project "${p.name}" does not hold together`,
+            ident: { projectId: p.id },
+            projectId: p.id,
+            dir: join(root, ...p.folder.split("/")),
+            read: (name) => retentionFile(repo, p, name),
+          }),
+        );
+        continue;
+      }
     }
     out.projects.set(p.id, mine);
     out.sources.push(...mine.sources);
+  }
+  // A folder that is there but could not be loaded as a project still counts as evidence (fix round
+  // 1, ruling 3). It never refuses a restore: it may be the very project that is being recovered.
+  for (const name of await unloadedFolders(repo)) {
+    const dir = join(root, "Projects", name);
+    out.sources.push(
+      await unvouched(repo, {
+        what: `The project folder "${name}" could not be loaded (its project.json is missing or cannot be read)`,
+        ident: { folder: name, notLoaded: true },
+        projectId: "",
+        dir,
+        read: async (file) => {
+          let raw: Buffer;
+          try {
+            raw = await fsp.readFile(join(dir, "retention", file));
+          } catch (err) {
+            return (err as NodeJS.ErrnoException).code === "ENOENT" ? null : "unreadable";
+          }
+          if (!file.endsWith(".enc")) return raw;
+          // Sealed: readable only with a key that is in this session already (the restore unlocks nothing).
+          return decryptBytes((id) => keyFromRing(repo, id), raw).catch(() => "locked" as const);
+        },
+      }),
+    );
+  }
+  return out;
+}
+
+/**
+ * Folders in `Projects/` that hold a project's remains but could not be loaded as a project: their
+ * project.json is missing or cannot be read. Not hidden folders (a restore or a new project in the
+ * making), not a project moved to another library, not a folder with a readable project.json (a
+ * project, loaded or about to be), and not a folder that holds neither an audit log nor retention
+ * records (nothing of a project is in it, and nothing is said of it).
+ */
+async function unloadedFolders(repo: Repo): Promise<string[]> {
+  const root = repoLibrary(repo).root;
+  const loaded = new Set(repo.listProjects().map((p) => p.folder));
+  const names = await fsp.readdir(join(root, "Projects")).catch(() => [] as string[]);
+  const out: string[] = [];
+  for (const n of names.sort()) {
+    if (n.startsWith(".") || loaded.has(`Projects/${n}`)) continue;
+    const dir = join(root, "Projects", n);
+    if (!(await fsp.lstat(dir).catch(() => null))?.isDirectory()) continue;
+    if (await projectMovedAway(root, n)) continue;
+    const raw = await fsp.readFile(join(dir, "project.json")).catch(() => null);
+    if (raw) {
+      try {
+        parseProjectJson(JSON.parse(raw.toString("utf8")));
+        continue;
+      } catch {
+        // cannot be read: remains
+      }
+    }
+    const holds = async (sub: string) => (await fsp.readdir(join(dir, sub)).catch(() => [] as string[])).length > 0;
+    if ((await holds("audit")) || (await holds("retention"))) out.push(n);
   }
   return out;
 }
@@ -143,7 +227,7 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
   /** Another project's: the restore goes on, on its certificate files as they are, and says so. */
   const unestablished = (which: string, why: string, found: { byId: Map<string, string>; bySha256: Map<string, string> } | undefined, certificate?: string): DestroyedSource => ({
     projectId: p.id,
-    basis: "certificate-only",
+    basis: "unverified",
     byId: found?.byId ?? new Map(),
     bySha256: found?.bySha256 ?? new Map(),
     note: (n) =>
@@ -243,38 +327,92 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
   return out;
 }
 
+/** A record nothing vouches for: whose it is, and how its files are reached. */
+interface Unvouched {
+  /** How the restore's notes begin of it: what is wrong, in plain words. */
+  what: string;
+  /** What the restore's audit entry names it by. */
+  ident: Record<string, unknown>;
+  /** The project's id; empty for a folder that could not be loaded. */
+  projectId: string;
+  /** Its folder (absolute). */
+  dir: string;
+  /** A file of its retention folder. */
+  read: (name: string) => Promise<Buffer | null | "unreadable" | "locked">;
+}
+
 /**
- * A project whose audit log does not verify (never the backup's own): its certificate and amendment
- * files as they are on disk. Whatever they name as destroyed is left out; nothing vouches for them,
- * and nothing says they are complete, which the restore says in its notes and its audit entry.
+ * What can still be read of an audit log nothing vouches for: the files its destruction entries
+ * name as destroyed (by id), and how many such entries there were. An entry that cannot be parsed,
+ * and a log that cannot be read at all, give nothing.
  */
-async function certificatesAlone(repo: Repo, p: Project): Promise<DestroyedSource> {
+async function namedInLog(dir: string, fallbackAt: string): Promise<{ byId: Map<string, string>; entries: number }> {
+  const out = { byId: new Map<string, string>(), entries: 0 };
+  let events: Array<AuditEvent | null>;
+  try {
+    events = await AuditStore.read(dir);
+  } catch {
+    return out;
+  }
+  for (const e of events) {
+    if (!e || typeof e !== "object" || e.action !== "delete") continue;
+    const d = e.details as Record<string, unknown> | null | undefined;
+    if (!d || typeof d !== "object" || d.op !== "retention.destroy" || !Array.isArray(d.destroyedAssets)) continue;
+    const ids = strings(d.destroyedAssets);
+    if (!ids.length) continue;
+    out.entries++;
+    const at = typeof e.at === "string" ? e.at : fallbackAt;
+    for (const id of ids) if (!out.byId.has(id)) out.byId.set(id, at);
+  }
+  return out;
+}
+
+/**
+ * What stands in for the record of a project nothing vouches for (R179; fix round 1, rulings 2 and
+ * 3): a project whose audit log does not verify (never the backup's own), or a folder that could
+ * not be loaded as a project. Unverified evidence excludes, whatever its form:
+ *   - every file a destruction entry that can still be read in its audit log names as destroyed;
+ *   - every file its certificate and amendment files, as they are on disk, name as destroyed.
+ * Nothing vouches for either, and nothing says they are complete: the restore says so, and what the
+ * exclusion rests on, in its notes and in its audit entry. (A garbled or forged log or certificate
+ * can so keep a file out wrongly; the same backup restores into another library.)
+ */
+async function unvouched(repo: Repo, u: Unvouched): Promise<DestroyedSource> {
   const now = repoClock(repo)().toISOString();
-  const byId = new Map<string, string>();
+  const { byId, entries } = await namedInLog(join(u.dir, "audit"), now);
   const bySha256 = new Map<string, string>();
-  let readable = 0;
-  let locked = false;
-  for (const n of await retentionNames(repo, `${p.folder}/retention`)) {
+  let certificates = 0;
+  let sealed = false;
+  for (const n of (await fsp.readdir(join(u.dir, "retention")).catch(() => [] as string[])).sort()) {
     if (!DESTRUCTION_CERTIFICATE.test(n) && !AMENDMENT_FILE.test(n)) continue;
-    const buf = await retentionFile(repo, p, n);
-    if (buf === "locked") locked = true;
+    const buf = await u.read(n);
+    if (buf === "locked") sealed = true;
     const found = Buffer.isBuffer(buf) ? namedIn(buf, now) : undefined;
-    if (!found) continue;
-    readable++;
+    // One that names no file (an amendment lists backups, not files) is no evidence of what was destroyed.
+    if (!found || (!found.byId.size && !found.bySha256.size)) continue;
+    certificates++;
     for (const [k, v] of found.byId) if (!byId.has(k)) byId.set(k, v);
     for (const [k, v] of found.bySha256) if (!bySha256.has(k)) bySha256.set(k, v);
   }
-  const broken = `The audit log of the project "${p.name}" does not hold together`;
+  const basis = entries && certificates ? "unverified-log-and-certificate-files" : entries ? "unverified-log-entries" : certificates ? "certificate-files-alone" : "nothing-could-be-read";
+  const noKey = sealed ? ": they are sealed, and that project is not unlocked" : "";
+  const restsOn =
+    entries && certificates
+      ? "the destruction entries that can still be read in its audit log and its certificate files"
+      : entries
+        ? `the destruction entries that can still be read in its audit log (no certificate file of it could be read${noKey})`
+        : "its certificate files alone (no destruction entry that names files could be read in its audit log)";
+  const cannotVouch = `${u.what}, so the app cannot vouch for what that project destroyed.`;
   return {
-    projectId: p.id,
-    basis: "certificate-only",
+    projectId: u.projectId,
+    basis: "unverified",
     byId,
     bySha256,
     note: (n) =>
-      readable
-        ? `${broken}, so what that project destroyed could not be read from it. What was left out on that project's account rests on its certificate files alone, taken as they are on disk: ${n ? leftOutWords(n, "they name") : "they name no file of this backup, so nothing was left out"}. A destruction those files do not show could not be taken into account.`
-        : `${broken}, and no destruction certificate of that project could be read${locked ? " (the project is locked)" : ""}. What that project destroyed could not be established at all, so nothing was left out on its account.`,
-    audit: (n) => ({ projectId: p.id, basis: readable ? "certificate-files-alone" : "nothing-could-be-read", leftOut: n }),
+      basis === "nothing-could-be-read"
+        ? `${cannotVouch} Neither a destruction entry in its audit log nor a destruction certificate could be read${noKey}, so what it destroyed could not be established at all, and nothing was left out on its account.`
+        : `${cannotVouch} What was left out on its account rests on ${restsOn}, taken as they are on disk: ${n ? leftOutWords(n, "they name") : "they name no file of this backup, so nothing was left out"}. A destruction they do not show could not be taken into account.`,
+    audit: (n) => ({ ...u.ident, basis, leftOut: n }),
   };
 }
 

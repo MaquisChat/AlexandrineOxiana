@@ -24,8 +24,9 @@
  *   never put in the key ring, and the copy is then locked. Files a destruction recorded
  *   in this library destroyed are not brought back (marked destroyed, R92): which files is read in
  *   this turn from the audit logs (R174 d; the caller's reader, `StagedRestore.destroyed`). A
- *   certificate file a verified audit log does not record counts for nothing; the certificate
- *   files of a project whose audit log does not verify still exclude what they name (R179);
+ *   certificate file a verified audit log does not record counts for nothing; what can still be
+ *   read of the log and the certificate files of a project whose audit log does not verify, or
+ *   whose folder could not be loaded, still excludes what it names (R179; fix round 1);
  *   ids of import batches, review entries and pending jobs are new too, and so are the keys of
  *   provenance.fileHashes and its importBatchId (the one exception to R76, restore only);
  *   3b. the copy is anchored (R12) before it goes live, so a crash after the rename is no "missing anchor";
@@ -57,7 +58,7 @@ import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError } from "./errors.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
 import { appendLibraryRefusal } from "./library-audit.js";
-import { loadProjectFolder, parseProjectJson, type Manifest, type RepoCore } from "./state.js";
+import { loadProjectFolder, parseProjectJson, type Manifest, type ProjectState, type RepoCore } from "./state.js";
 import { listSourceIds, readSourceFile } from "./sources.js";
 
 /** The backup's audit log does not verify (or differs from what the backup recorded). Nothing was restored. */
@@ -128,15 +129,17 @@ export interface RestoreRequest {
 
 /** One source of knowledge about files destroyed in this library: a destruction, or what stands in for one. */
 export interface DestroyedSource {
-  /** The project whose record it is. */
+  /** The project whose record it is (empty for a folder that could not be loaded as a project). */
   projectId: string;
   /**
    * `recorded`: a destruction that project's verified audit log records.
-   * `certificate-only`: certificate files taken as they are on disk because the audit log cannot
-   * vouch for them (R179). Unverified evidence still excludes: it errs towards not bringing data back.
+   * `unverified`: what can still be read of an audit log that does not verify, or of the log of a
+   * folder that could not be loaded, and certificate files taken as they are on disk: nothing
+   * vouches for it (R179; fix round 1, rulings 2 and 3). Unverified evidence still excludes,
+   * whatever its form: it errs towards not bringing data back.
    * `unrecorded`: a certificate file a verified audit log does not record. It counts for nothing.
    */
-  basis: "recorded" | "certificate-only" | "unrecorded";
+  basis: "recorded" | "unverified" | "unrecorded";
   /** Asset id (in the project the data was destroyed in) → when it was destroyed. */
   byId: ReadonlyMap<string, string>;
   /** sha256 of a destroyed file → when. */
@@ -286,12 +289,27 @@ export async function decideRestore(core: RepoCore, r: RestoreRequest, at: strin
   return conditions.length ? { result: "allow_with_conditions", conditions, warnings } : { result: "allow", warnings };
 }
 
+/** Whether the project's audit log, read now, verifies and ends at the head this process holds. Caller holds the write queue. */
+async function logHoldsTogether(st: ProjectState): Promise<boolean> {
+  try {
+    const verify = verifyChain((await AuditStore.read(st.audit.dir)) as AuditEvent[]);
+    const head = st.audit.head;
+    return verify.ok && (verify.head?.seq ?? 0) === (head?.seq ?? 0) && (verify.head?.hash ?? "") === (head?.hash ?? "");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Audits a refused restore (never silent, R154): in the log of the project the backup belongs to,
- * when that project is in this library and its log can take it; otherwise in the library's own log
- * (where the same refusal is listed once a day, R157). If neither can be written the refusal still
- * stands and the library warns (`refusal-unrecorded`). The backup is named by its sha256, and by its
- * file name only when it is one of this library's backups: never a path. Caller holds the write queue.
+ * when that project is in this library and its log is intact and takes it; otherwise in the
+ * library's own log (where the same refusal is listed once a day, R157). "Intact" is checked here,
+ * by reading the log (fix round 1, M4): a log changed outside the app while it runs is never
+ * appended to. The library's entry says why the project's log did not take it:
+ * `projectLogNotIntact` (it does not verify), or `projectLogNotWritable` (an interrupted write is
+ * pending, or the append failed). If neither log can be written the refusal still stands and the
+ * library warns (`refusal-unrecorded`). The backup is named by its sha256, and by its file name
+ * only when it is one of this library's backups: never a path. Caller holds the write queue.
  */
 export async function recordRestoreRefusal(
   core: RepoCore,
@@ -303,18 +321,25 @@ export async function recordRestoreRefusal(
   const at = core.clock().toISOString();
   const what = { op: "project.restore", backupSha256: r.backupSha256, ...(r.file ? { file: r.file } : {}), at: stage };
   const st = core.projects.get(r.project.id);
-  if (st && st.recoveryPending !== true && st.auditUnverified !== true && opts.logNotIntact !== st.project.id) {
-    try {
-      await core.auditNow(st, {
-        ...core.auditBase(st, at),
-        action: "restore",
-        entity: { type: "project", id: st.project.id },
-        decision: { result: "deny", reason },
-        details: { ...what, ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) },
-      });
-      return;
-    } catch {
-      // the library's own log takes it
+  /** Why the project's own log does not take the entry (undefined: there is no such project here). */
+  let notTaken: "projectLogNotIntact" | "projectLogNotWritable" | undefined;
+  if (st) {
+    if (st.auditUnverified === true || opts.logNotIntact === st.project.id || !(await logHoldsTogether(st))) notTaken = "projectLogNotIntact";
+    else if (st.recoveryPending === true) notTaken = "projectLogNotWritable";
+    else {
+      try {
+        await core.auditNow(st, {
+          ...core.auditBase(st, at),
+          action: "restore",
+          entity: { type: "project", id: st.project.id },
+          decision: { result: "deny", reason },
+          details: { ...what, ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) },
+        });
+        return;
+      } catch {
+        // the library's own log takes it
+        notTaken = "projectLogNotWritable";
+      }
     }
   }
   try {
@@ -325,7 +350,7 @@ export async function recordRestoreRefusal(
       ...(st ? { projectId: st.project.id } : {}),
       action: "restore",
       decision: { result: "deny", reason },
-      details: { ...what, name: r.project.name, encrypted: r.project.encrypted, ...(st ? { projectLogNotIntact: true } : {}) },
+      details: { ...what, name: r.project.name, encrypted: r.project.encrypted, ...(notTaken ? { [notTaken]: true } : {}) },
     });
   } catch (err) {
     core.integrityWarnings.push({
@@ -585,8 +610,9 @@ export async function adoptRestoredProject(
       // Files destroyed under a retention rule are not brought back (R92, R174 d, R179). Which files
       // is read now, in the commit turn, from this library's record of destructions: an asset a
       // destruction's own audit entry names (by its id), or whose sha256 a certificate the audit log
-      // vouches for lists; and, for a project whose audit log does not verify, whatever its
-      // certificate files name (unverified evidence still excludes). If the backup's own project's
+      // vouches for lists; and, for a project whose audit log does not verify or whose folder could
+      // not be loaded, whatever can still be read of its log and its certificate files names
+      // (unverified evidence still excludes, whatever its form). If the backup's own project's
       // record cannot be read with certainty nothing is restored, and the refusal is audited.
       let record: DestroyedRecord;
       try {
@@ -597,7 +623,7 @@ export async function adoptRestoredProject(
       }
       const notes: string[] = [];
       // A verified record decides first; evidence the audit log cannot vouch for only ever adds to what is left out.
-      const excluding = [...record.sources.filter((x) => x.basis === "recorded"), ...record.sources.filter((x) => x.basis === "certificate-only")];
+      const excluding = [...record.sources.filter((x) => x.basis === "recorded"), ...record.sources.filter((x) => x.basis === "unverified")];
       const leftBy = new Map<DestroyedSource, number>();
       /** What the copy keeps: the ids and sha256 of the stored files that are brought back. */
       const kept = { ids: new Set<string>(), sha256: new Set<string>() };
