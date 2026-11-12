@@ -6,6 +6,7 @@ import { newId, type Annotation, type Provenance, type SourceDraft } from "@ao/c
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
+import { backupProject, restoreBackup } from "../export/backup.js";
 import { createLibrary, type Library } from "../library.js";
 import { ReadOnlyLibraryError, type Repo } from "../repo/index.js";
 import { importChange } from "../repo/repo.js";
@@ -353,6 +354,35 @@ describe("rebuildIndex", () => {
     const res2 = await rebuildIndex(handle, ring, lib);
     expect(res2.lockedProjects).toEqual([]);
     expect(search(handle.db, { text: "identifying" }).items[0]).toMatchObject({ id: sf.source.id, locked: false, title: "Very identifying title" });
+  });
+});
+
+describe("a copy restored with the passphrase while its project is locked (Task 50b, I1)", () => {
+  it("is indexed as any locked project is: from its manifest only, nothing identifying; unlocking it indexes it fully", async () => {
+    const created = await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const pid = created.project.id;
+    await repo.createSource(pid, draft("Very identifying title", { type: "interview" }), files(), {
+      provenance: prov({ identifiable: true, legal: { status: "consented", basis: "consent form" } }),
+    });
+    const b = await backupProject(repo, pid);
+    repo.lockProject(pid);
+    const r = await restoreBackup(repo, b.path, { passphrase: "pw" });
+    expect(repo.indexErrors).toEqual([]);
+    // The restore unlocked nothing: no title of either project can be found.
+    expect(search(handle.db, { text: "identifying" }).total).toBe(0);
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM temp.t_sources").get()).toEqual({ n: 0 });
+    const [sid] = repo.listSourceIds(r.projectId);
+    const rows = search(handle.db, { projectId: r.projectId }).items;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: sid, projectId: r.projectId, type: "interview", title: "", creatorsText: "", issuedYear: "2025", needsReview: false, locked: true });
+    expect(rows[0]!.folder.startsWith(`${r.folder}/`)).toBe(true);
+    expect(handle.db.prepare("SELECT locked FROM projects WHERE id = ?").get(r.projectId)).toEqual({ locked: 1 });
+    // Its change state is recorded as a locked project's is (by its manifest), so the copy alone does not make the index stale.
+    expect((JSON.parse(getMeta(handle.db, "projectStamps")!) as Record<string, { mode: string }>)[r.projectId]!.mode).toBe("manifest");
+
+    await repo.unlockProject(r.projectId, "pw");
+    expect(repo.indexErrors).toEqual([]);
+    expect(search(handle.db, { text: "identifying", projectId: r.projectId }).items[0]).toMatchObject({ id: sid, locked: false, title: "Very identifying title" });
   });
 });
 
