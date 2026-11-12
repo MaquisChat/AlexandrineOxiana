@@ -246,6 +246,16 @@ export class ServiceState {
     return (this.captureRegistry ??= new CaptureQueueRegistry({ now: () => this.opts.now().getTime() }));
   }
 
+  /**
+   * Forgets every trace of `projectId`'s capture queues (the readable records and the progress map),
+   * at once: at its lock, and for an encrypted project when its library closes or moves (R30, R50).
+   * A queue still running stops before its next link (startCaptureQueue).
+   */
+  forgetCaptures(projectId: string): void {
+    this.captureQueues.forgetProject(projectId);
+    for (const [id, q] of this.captures) if (q.projectId === projectId) this.captures.delete(id);
+  }
+
   /** The progress of a capture queue (also after a move). */
   captureQueue(queueId: string): { projectId: string; done: number; total: number; finished: boolean; lib?: object } | undefined {
     return this.captures.get(queueId);
@@ -283,8 +293,12 @@ export class ServiceState {
     return this.startWork("capture", async (ctl) => {
       await at.after?.catch(() => {});
       let outcomes: Awaited<ReturnType<ReturnType<typeof createLinkCapture>["captureUrls"]>>;
+      let locked = () => false;
       try {
         const s = this.requireSession();
+        // A locked project's queue stops before its next link, and nothing more of it is recorded or
+        // published (R30, R142: a capture is not stored for a locked project; it is captured again).
+        locked = () => !s.repo.isUnlocked(projectId);
         const worker = await this.workerClient();
         const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
         outcomes = await capture.captureUrls(
@@ -292,16 +306,23 @@ export class ServiceState {
           urls,
           opts,
           (done, _t, outcome) => {
+            if (locked()) return;
             info.done = offset + done;
             info.finished = info.done === total;
             this.captureQueues.progress(queueId, info.done, total, outcome);
             if (info.finished) this.captureQueues.finish(queueId, {});
             this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished });
           },
-          { shouldStop: () => ctl.stopping },
+          { shouldStop: () => ctl.stopping || locked() },
         );
       } catch (err) {
         fail(err);
+        return;
+      }
+      if (locked()) {
+        info.finished = true;
+        this.forgetCaptures(projectId);
+        this.events.publish("capture.progress", { queueId, projectId, finished: true, error: "ProjectLockedError: the project was locked, so the capture stopped" });
         return;
       }
       if (outcomes.length < urls.length) {
@@ -622,6 +643,8 @@ export class ServiceState {
     const s = this.session;
     if (!s) return;
     this.session = undefined;
+    // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
+    for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.forgetCaptures(p.id);
     this.stopBackupScheduler();
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).

@@ -139,6 +139,15 @@ export class CaptureQueueRegistry {
     this.prune();
   }
 
+  /**
+   * Forgets every queue of `projectId`, running or finished, at once: called when the project is
+   * locked, and for an encrypted project when its library closes (R30, R50). A running queue's later
+   * progress and end are then ignored.
+   */
+  forgetProject(projectId: string): void {
+    for (const e of [...this.entries.values()]) if (e.projectId === projectId) this.entries.delete(e.queueId);
+  }
+
   /** Whether the queue is still kept (running, or finished and not yet forgotten). */
   has(queueId: string): boolean {
     this.prune();

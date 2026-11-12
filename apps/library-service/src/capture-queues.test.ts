@@ -332,3 +332,94 @@ describe("the same address again while its queue runs", () => {
     await svc.state.idle();
   });
 });
+
+describe("a locked project (Task 63 fix round 1: I1, I2; R30, R50, R142)", () => {
+  async function lockedWhileRunning(): Promise<{ pid: string; plain: string; queueId: string; plainQueue: string; worker: ReturnType<typeof gatedWorker>; events: Array<{ type: string; data: any }> }> {
+    const worker = gatedWorker();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const plain = await project("Plain");
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const q = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT, YT2, IG] } });
+    expect(q.status, q.body).toBe(200);
+    const pq = await call({ method: "POST", url: `/projects/${plain}/capture`, body: { urls: ["https://www.youtube.com/watch?v=plain000001"] } });
+    expect(pq.status, pq.body).toBe(200);
+    await until(() => worker.calls.length > 0);
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    return { pid, plain, queueId: q.json.queueId as string, plainQueue: pq.json.queueId as string, worker, events };
+  }
+
+  it("I1: a capture of a locked project answers 423 whatever the address (desktop and extension routes): nothing tells what it is capturing", async () => {
+    const { pid, worker } = await lockedWhileRunning();
+    const ext = await extensionToken();
+    const answers = [];
+    for (const urls of [[YT2], ["https://www.youtube.com/watch?v=other000001"]]) {
+      const ui = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls } });
+      const fromExt = await call({ method: "POST", url: "/capture/browser/links", noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT }, body: { projectId: pid, urls } });
+      answers.push([ui.status, ui.json.error], [fromExt.status, fromExt.json.error]);
+    }
+    for (const a of answers) expect(a).toEqual(answers[0]);
+    expect(answers[0]![0]).toBe(423);
+    expect((answers[0]![1] as { code: string }).code).toBe("PROJECT_LOCKED");
+    const profile = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: PROFILE } });
+    expect(profile.status).toBe(423);
+    worker.release();
+    await svc.state.idle();
+  });
+
+  it("I2: at the lock, the running queue's record is forgotten at once and it stops before its next link; another project's queue is untouched", async () => {
+    const { pid, plain, queueId, plainQueue, worker, events } = await lockedWhileRunning();
+    expect(svc.state.captureQueues.detail(pid, queueId)).toBeUndefined();
+    expect(svc.state.captureQueue(queueId)).toBeUndefined();
+    expect(svc.state.captureQueues.detail(plain, plainQueue)).toBeDefined();
+    worker.release();
+    await svc.state.idle();
+    // The link in progress ended; the others were not tried (R142: nothing more runs for a locked project).
+    const secretCalls = worker.calls.filter((j) => j.input !== "https://www.youtube.com/watch?v=plain000001");
+    expect(secretCalls).toHaveLength(1);
+    expect(svc.state.captureQueues.detail(pid, queueId)).toBeUndefined();
+    expect(svc.state.captureQueue(queueId)).toBeUndefined();
+    // No outcome of the locked project's queue was published after the lock; its end says why.
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
+    expect(mine.filter((e) => e.data.outcome)).toHaveLength(0);
+    expect(mine.at(-1)?.data).toMatchObject({ finished: true });
+    expect(mine.at(-1)?.data.error).toMatch(/^ProjectLockedError/);
+    expect(svc.state.captureQueues.detail(plain, plainQueue)).toMatchObject({ finished: true, done: 1 });
+    // After the unlock the screen reads what the service has: nothing of before.
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+  });
+
+  it("I2: a finished queue of a project is forgotten when the project is locked", async () => {
+    const worker = gatedWorker();
+    worker.release();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const q = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
+    await svc.state.idle();
+    expect(svc.state.captureQueues.detail(pid, q.json.queueId)).toMatchObject({ finished: true });
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    expect(svc.state.captureQueues.detail(pid, q.json.queueId)).toBeUndefined();
+    expect(svc.state.captureQueue(q.json.queueId)).toBeUndefined();
+  });
+
+  it("I2: closing the library forgets an encrypted project's queues (its key goes with it); a plain project's stay readable when it is opened again", async () => {
+    const worker = gatedWorker();
+    worker.release();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const plain = await project("Plain");
+    const a = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
+    const b = await call({ method: "POST", url: `/projects/${plain}/capture`, body: { urls: [YT] } });
+    await svc.state.idle();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    expect(svc.state.captureQueues.detail(pid, a.json.queueId)).toBeUndefined();
+    expect(svc.state.captureQueue(a.json.queueId)).toBeUndefined();
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);
+    expect((await call({ url: `/projects/${plain}/captures/${b.json.queueId as string}` })).json).toMatchObject({ finished: true });
+  });
+});

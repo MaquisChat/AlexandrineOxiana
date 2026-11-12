@@ -115,15 +115,14 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     opts: CaptureOptions,
     extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void; startedBy?: CaptureStartedBy } = {},
   ): Promise<{ queueId: string }> {
-    const running = () => {
-      if (state.captureQueues.runningConflict(projectId, urls)) throw new ApiError(409, "CONFLICT", LINKS_RUNNING, CAPTURE_RUNNING);
-    };
-    running(); // before the capture decision is evaluated and audited
+    // Nothing about the project's captures is said before the lock and the rules have been checked (I1).
+    requireUnlocked(s, projectId);
     await checkCaptureAllowed(s.repo, projectId, urls, extra.methods); // 403 with the reason when denied
     requireAcknowledged(s, projectId, opts);
     await state.workerClient(); // 503 when the media helper cannot run
-    // Again, and recorded with nothing awaited in between, so parallel requests cannot both pass.
-    running();
+    // Checked and recorded with nothing awaited in between, so parallel requests cannot both pass.
+    requireUnlocked(s, projectId);
+    if (state.captureQueues.runningConflict(projectId, urls)) throw new ApiError(409, "CONFLICT", LINKS_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
     // The legal basis is checked per link as it is stored, as for every capture.
@@ -164,7 +163,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const b = bodyOf(req);
-    const url = urlList({ u: [str(b, "url", 2048)] }, "u", 1)[0]!;
+    const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
     const o = optObj(b, "options") ?? {};
     const base = captureOptions(o);
     const since = optStr(o, "since", 10);
@@ -184,15 +183,13 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       ...(optBool(o, "metadataOnly") ? { metadataOnly: true } : {}),
       ...(optBool(o, "includeComments") ? { includeComments: true } : {}),
     };
-    const running = () => {
-      if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
-    };
-    running();
+    requireUnlocked(s, projectId); // nothing about its captures before the lock and the rules (I1)
     await checkCaptureAllowed(s.repo, projectId, [url]);
     requireAcknowledged(s, projectId, opts);
     const worker = await state.workerClient();
-    // Again, and recorded with nothing awaited in between (as for links).
-    running();
+    // Checked and recorded with nothing awaited in between (as for links).
+    requireUnlocked(s, projectId);
+    if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     const queues = state.captureQueues;
     queues.startProfile(queueId, projectId, url, "desktop");
@@ -201,13 +198,21 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     state.startWork("profile-capture", async () => {
       try {
         const report = await capture.captureProfile(projectId, url, opts, (done, total, outcome) => {
+          // Locked meanwhile: nothing more of it is recorded or published (the run ends at its next post).
+          if (!s.repo.isUnlocked(projectId)) return;
           queues.progress(queueId, done, total, outcome);
           state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false });
         });
+        if (!s.repo.isUnlocked(projectId)) {
+          state.forgetCaptures(projectId);
+          state.events.publish("capture.progress", { queueId, projectId, finished: true, error: "ProjectLockedError: the project was locked, so the capture stopped" });
+          return;
+        }
         queues.finish(queueId, { report });
         state.events.publish("capture.progress", { queueId, projectId, finished: true, report });
       } catch (err) {
-        queues.finish(queueId, { error: err });
+        if (!s.repo.isUnlocked(projectId)) state.forgetCaptures(projectId);
+        else queues.finish(queueId, { error: err });
         state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
       }
     });

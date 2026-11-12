@@ -173,6 +173,22 @@ describe("CaptureQueueRegistry", () => {
     expect(r.detail(P, "q1")).toMatchObject({ done: 1, total: 2, urls: [YT, IG] });
   });
 
+  it("forgets every queue of one project at once, running or finished; later progress is ignored (R30, R50)", () => {
+    const r = new CaptureQueueRegistry();
+    r.startLinks("run", P, [YT, IG], "desktop");
+    r.startLinks("fin", P, [TT], "desktop");
+    r.finish("fin", {});
+    r.startLinks("other", Q, [YT], "desktop");
+    r.forgetProject(P);
+    expect(r.list(P)).toEqual([]);
+    expect(r.has("run") || r.has("fin")).toBe(false);
+    r.progress("run", 1, 2, { url: YT, status: "created" });
+    r.finish("run", {});
+    expect(r.has("run")).toBe(false);
+    expect(r.runningConflict(P, [IG])).toBeUndefined();
+    expect(r.detail(Q, "other")).toBeDefined();
+  });
+
   describe("an address still waiting or being captured", () => {
     it("is found in a running links queue of the same project, by its canonical form", () => {
       const r = new CaptureQueueRegistry();
