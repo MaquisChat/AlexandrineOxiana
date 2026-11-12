@@ -9,8 +9,11 @@
  * A source that is removed takes its pending entries with it (resolved in the removal's change).
  */
 
-/** What queued a verification entry (R176 3). */
-export type ReviewCause = { kind: "capture-conflict" } | { kind: "consent-withdrawal"; consentIds: string[] };
+/**
+ * What queued a verification entry (R176 3). A capture-conflict entry written when a later check
+ * added data to an existing source records `foundBy: "later-check"` (R190).
+ */
+export type ReviewCause = { kind: "capture-conflict"; foundBy?: "later-check" } | { kind: "consent-withdrawal"; consentIds: string[] };
 
 /**
  * Where an entry came from, so a person can tell entries apart:

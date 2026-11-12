@@ -32,7 +32,7 @@ import { readFullData, writeProjectData } from "./projects.js";
 import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
-import { appendReviewEntry, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReexaminedBy, type ReviewInput } from "./review.js";
+import { appendReviewEntry, queueNewConflicts, resolveCaptureEntriesAfterEdit, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
@@ -654,6 +654,7 @@ export async function updateSource(
 ): Promise<SourceFile> {
   let resolved: string[] = [];
   let by: ReexaminedBy | undefined;
+  let queued: { entry: string; fields: string[] } | undefined;
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -703,6 +704,9 @@ export async function updateSource(
       tx.record("source", id, cur.source, source);
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
+      // A field the recomputed report newly puts in conflict is queued for review in this change (R190 a),
+      // before the entries are re-examined, so an entry it extends is not resolved under it.
+      if (extra.verification) queued = await queueNewConflicts(core, tx, cur, sf);
       // The source's capture entries are re-examined in this change (R176 1): against the new report
       // when one was computed; after an ordinary edit, against the stored report and the source as edited.
       by = extra.resolveReview ?? (extra.verification ? "recheck" : "edit");
@@ -716,7 +720,7 @@ export async function updateSource(
     {
       op: "source.update",
       entity: { type: "source", id },
-      auditDetails: () => (resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
+      auditDetails: () => ({ ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}), ...(queued ? { reviewQueued: queued } : {}) }),
     },
   );
 }
