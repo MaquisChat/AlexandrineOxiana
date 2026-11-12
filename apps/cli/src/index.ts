@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { deviceNoticesIdle } from "@ao/library";
 import { Command } from "commander";
 import { registerCapture } from "./commands/capture.js";
 import { registerExport } from "./commands/export.js";
@@ -40,6 +41,8 @@ export function buildProgram(): Command {
 }
 
 let shuttingDown = false;
+/** The most a stop waits for a notice being written (Task 68 round 2, Rm6). */
+const NOTICE_WAIT_MS = 2000;
 export const isShuttingDown = (): boolean => shuttingDown;
 
 /** Ctrl+C: stop the worker (which stops its running downloads), close the index, release the library. */
@@ -48,7 +51,12 @@ function installSignalHandlers(): void {
     if (shuttingDown) process.exit(130);
     shuttingDown = true;
     process.stderr.write("\nStopping... closing the library safely.\n");
-    Promise.allSettled(openSessions().map((s) => s.close())).then(() => process.exit(signal === "SIGINT" ? 130 : 143));
+    // A device-level notice being written (Task 68 round 2, Rm6) is waited for too, but never more
+    // than NOTICE_WAIT_MS: Ctrl+C never hangs (a second Ctrl+C exits at once, as before).
+    const noticesOrLimit = Promise.race([deviceNoticesIdle(), new Promise<void>((r) => setTimeout(r, NOTICE_WAIT_MS).unref())]);
+    Promise.allSettled(openSessions().map((s) => s.close()))
+      .then(() => noticesOrLimit)
+      .then(() => process.exit(signal === "SIGINT" ? 130 : 143));
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
@@ -89,11 +97,12 @@ export async function run(argv: string[]): Promise<number> {
 
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
+  // A device-level notice being written (Task 68) is finished before the tool exits.
   run(process.argv).then(
-    (code) => process.exit(code),
+    (code) => deviceNoticesIdle().then(() => process.exit(code)),
     (err: unknown) => {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
-      process.exit(EXIT.failure);
+      void deviceNoticesIdle().then(() => process.exit(EXIT.failure));
     },
   );
 }

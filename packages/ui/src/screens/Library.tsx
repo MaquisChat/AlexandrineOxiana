@@ -20,7 +20,7 @@ import { RecheckProjectButton, useProjectRecheck } from "../components/RecheckPr
 import { SearchBox } from "../components/SearchBox";
 import { SourceTable } from "../components/SourceTable";
 import { PendingWritesDialog } from "../components/PendingWritesDialog";
-import { StatusBanner, bannersFor, volumeOf } from "../components/StatusBanner";
+import { StatusBanner, bannersFor, useNoticeDismiss, volumeOf } from "../components/StatusBanner";
 import { TagList } from "../components/TagList";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
@@ -113,6 +113,20 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** The new-recovery-code dialog is open, for this project. */
   const [recovering, setRecovering] = useState<ProjectSummary | null>(null);
   const recoveryButton = useRef<HTMLButtonElement>(null);
+  // This computer's notices (Task 68): "Got it" asks once per notice; focus stays in the library.
+  const bannersRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
+  const [noticeGone, setNoticeGone] = useState(0);
+  useEffect(() => {
+    if (noticeGone > 0) (bannersRef.current ?? mainRef.current)?.focus();
+  }, [noticeGone]);
+  const { onDismiss: dismissNotice, error: noticeError } = useNoticeDismiss(
+    (kind) => api.libraries.dismissNotice(kind),
+    (kind) => {
+      setState((s) => ({ ...s, notices: (s.notices ?? []).filter((n) => n.kind !== kind) }));
+      setNoticeGone((n) => n + 1);
+    },
+  );
   /** A dialog shows a recovery code not yet confirmed: a library close waits for it. */
   const holdClose = useRef(false);
   /** The library closed while that code was on screen. */
@@ -578,10 +592,20 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         />
       )}
       {banners.length > 0 && (
-        <div className="ao-library__banners">
+        <div className="ao-library__banners" ref={bannersRef} tabIndex={-1} role="region" aria-label="Library status">
           {banners.map((b, i) => (
-            <StatusBanner key={`${b.kind}-${i}`} variant={b} onResolve={() => setResolving({ from: document.activeElement instanceof HTMLElement ? document.activeElement : null })} />
+            <StatusBanner
+              key={b.kind === "notice" ? `notice-${b.notice}` : `${b.kind}-${i}`}
+              variant={b}
+              onResolve={() => setResolving({ from: document.activeElement instanceof HTMLElement ? document.activeElement : null })}
+              onDismiss={dismissNotice}
+            />
           ))}
+          {noticeError && (
+            <p role="alert" className="ao-warning">
+              {noticeError}
+            </p>
+          )}
         </div>
       )}
       {firstUse?.(locked)}
@@ -708,7 +732,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           </>
         )}
       </aside>
-      <main className="ao-library__main">
+      <main className="ao-library__main" ref={mainRef} tabIndex={-1}>
         {error && (
           <p role="alert" className="ao-error">
             {error}

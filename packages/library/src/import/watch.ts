@@ -36,6 +36,7 @@ import * as fsp from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { watch as chokidarWatch, type FSWatcher } from "chokidar";
 import { WatchedFolderOptions, type WatchedFolder, type WatchedFolderOptions as WatchedFolderOptionsT } from "@ao/core";
+import { raiseDeviceNotice } from "../device-notices.js";
 import { writeSmallFileAtomic } from "../fs/atomic.js";
 import { isClosed, type Library } from "../library.js";
 import type { HttpClient } from "../lookup/index.js";
@@ -58,7 +59,7 @@ export const WATCH_REASONS = {
   library: "A watched folder cannot be inside the library or contain it. Choose another folder.",
   locked: "The project is locked; new files are imported when it is unlocked.",
   libraryClosed: "The library was closed or another computer took it over, so the folder is no longer watched.",
-  settingsUnreadable: "The list of watched folders on this computer could not be read; it was set aside and a new one started.",
+  settingsUnreadable: "The list of watched folders on this computer was damaged; it was set aside and a new one started.",
 } as const;
 
 export interface WatchEvent {
@@ -376,33 +377,65 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
 const FILE = "watched-folders.json";
 type Store = Record<string, Record<string, Record<string, string>>>;
 
-/** The store; `corrupt` when a file exists but cannot be read as one (it is then moved aside before any write). */
+/**
+ * The list of watched folders on this computer could not be read (Task 68 fix round 1, I1; R178 a):
+ * nothing was moved or written. The message carries no path.
+ */
+export class WatchedFoldersUnreadableError extends Error {
+  constructor() {
+    super("This computer's list of watched folders could not be read, so it was not changed. Check that the app's settings folder can be read and try again.");
+    this.name = "WatchedFoldersUnreadableError";
+  }
+}
+
+/**
+ * The store, by the registry's rule (Task 68, R178 a): missing is empty; a read error other than
+ * "missing" throws WatchedFoldersUnreadableError (nothing is moved or written on its strength);
+ * `corrupt` only when the CONTENT is damaged (not JSON, the wrong shape, an entry this app cannot
+ * use): the file is then kept aside before any write.
+ */
 async function readStore(appConfigDir: string): Promise<{ store: Store; corrupt: boolean }> {
   const out = Object.create(null) as Store;
+  let text: string;
+  try {
+    text = await fsp.readFile(join(appConfigDir, FILE), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return { store: out, corrupt: false };
+    throw new WatchedFoldersUnreadableError();
+  }
   let raw: unknown;
   try {
-    raw = JSON.parse(await fsp.readFile(join(appConfigDir, FILE), "utf8")) as unknown;
-  } catch (err) {
-    return { store: out, corrupt: (err as NodeJS.ErrnoException)?.code !== "ENOENT" };
+    raw = JSON.parse(text) as unknown;
+  } catch {
+    return { store: out, corrupt: true };
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { store: out, corrupt: true };
+  let dropped = false;
   for (const libId of Object.keys(raw)) {
     const projects = (raw as Record<string, unknown>)[libId];
-    if (!projects || typeof projects !== "object" || Array.isArray(projects)) continue;
+    if (!projects || typeof projects !== "object" || Array.isArray(projects)) {
+      dropped = true;
+      continue;
+    }
     const p = Object.create(null) as Record<string, Record<string, string>>;
     for (const projectId of Object.keys(projects)) {
       const watches = (projects as Record<string, unknown>)[projectId];
-      if (!watches || typeof watches !== "object" || Array.isArray(watches)) continue;
+      if (!watches || typeof watches !== "object" || Array.isArray(watches)) {
+        dropped = true;
+        continue;
+      }
       const w = Object.create(null) as Record<string, string>;
       for (const id of Object.keys(watches)) {
         const d = (watches as Record<string, unknown>)[id];
         if (typeof d === "string" && isAbsolute(d)) w[id] = d;
+        else dropped = true;
       }
       p[projectId] = w;
     }
     out[libId] = p;
   }
-  return { store: out, corrupt: false };
+  // An entry this app cannot use is not dropped in silence: the whole file is kept aside first.
+  return { store: out, corrupt: dropped };
 }
 
 export interface WatchSettingsDeps {
@@ -412,11 +445,24 @@ export interface WatchSettingsDeps {
   onWarning?: (warning: string) => void;
 }
 
-/** Moves an unreadable settings file aside (never deleted) and warns. */
+/**
+ * Keeps a damaged settings file aside as `watched-folders.json.corrupt-<stamp>` (never deleted, never
+ * overwritten: `-n` when that name is taken), warns, and raises the device-level notice (Task 68).
+ * When it cannot be set aside, nothing may be written over it: WatchedFoldersUnreadableError.
+ */
 async function setAside(deps: WatchSettingsDeps): Promise<void> {
-  const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  await fsp.rename(join(deps.lib.appConfigDir, FILE), join(deps.lib.appConfigDir, `watched-folders.unreadable-${stamp}.json`)).catch(() => {});
+  const dir = deps.lib.appConfigDir;
+  const now = new Date();
+  const stamp = now.toISOString().replace(/\.\d+Z$/u, "").replace(/[-:]/gu, "").replace("T", "-");
+  let name = `${FILE}.corrupt-${stamp}`;
+  for (let n = 1; await fsp.lstat(join(dir, name)).then(() => true, () => false); n++) name = `${FILE}.corrupt-${stamp}-${n}`;
+  try {
+    await fsp.rename(join(dir, FILE), join(dir, name));
+  } catch {
+    throw new WatchedFoldersUnreadableError();
+  }
   deps.onWarning?.(WATCH_REASONS.settingsUnreadable);
+  await raiseDeviceNotice(dir, "watched-folders-list-set-aside", now);
 }
 
 let lock: Promise<unknown> = Promise.resolve();
@@ -459,6 +505,8 @@ function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real:
 export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}): Promise<WatchedFolder> {
   const real = await checkedFolder(deps, dir);
   deps.repo.getProject(projectId); // NotFoundError for an unknown project
+  // A list that cannot be read refuses before the project is changed (Task 68, R178 a).
+  await readStore(deps.lib.appConfigDir);
   const wf = await addWatchedFolderEntry(deps.repo, projectId, options);
   await putFolder(deps, projectId, wf.id, real);
   return wf;
@@ -472,6 +520,8 @@ export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string,
 
 /** Removes a watched folder from project.json and from this device's settings. */
 export async function removeWatchedFolder(deps: WatchSettingsDeps, projectId: string, id: string): Promise<void> {
+  // A list that cannot be read refuses before the project is changed (Task 68, R178 a).
+  await readStore(deps.lib.appConfigDir);
   await removeWatchedFolderEntry(deps.repo, projectId, id);
   await updateStore(deps, (s) => {
     const watches = own(own(s, deps.lib.id) ?? {}, projectId);
@@ -482,7 +532,7 @@ export async function removeWatchedFolder(deps: WatchSettingsDeps, projectId: st
 /** The project's watched folders, each with its folder on this computer (`dir` undefined when none was chosen here). */
 export async function listWatchedFolders(deps: WatchSettingsDeps, projectId: string): Promise<Array<WatchedFolder & { dir?: string }>> {
   const { store, corrupt } = await readStore(deps.lib.appConfigDir);
-  if (corrupt) await updateStore(deps, () => {}); // set aside (with the warning) under the lock
+  if (corrupt) await updateStore(deps, () => {}); // set aside (with the warning and the notice) under the lock
   const watches = own(own(store, deps.lib.id) ?? {}, projectId) ?? {};
   return (deps.repo.getProject(projectId).watchedFolders ?? []).map((w) => {
     const dir = own(watches, w.id);

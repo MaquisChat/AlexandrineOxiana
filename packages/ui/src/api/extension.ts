@@ -12,7 +12,8 @@
  *  - DELETE /extension/pairings/:pid  → { removed: true }  (404 NOT_FOUND when already gone)
  * The code is a short-lived secret: callers keep it in component state only. Its `codeId` is not.
  */
-import type { PairedBrowser, PairedBrowsers, PairingCodeIssued, PairingCodeStatus, PairingRemovedResponse } from "@ao/shared";
+import type { PairedBrowser, PairedBrowsers, PairingCodeIssued, PairingCodeStatus, PairingRemovedResponse, SettingsResetRequest, SettingsResetResponse } from "@ao/shared";
+
 import type { ApiClient } from "./client";
 
 export type PairingCode = PairingCodeIssued;
@@ -30,6 +31,11 @@ export interface ExtensionApi {
   /** The paired browsers, and the service's port now when it says it (R171). */
   list(signal?: AbortSignal): Promise<PairedBrowsers>;
   revoke(id: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Sets the unreadable pairings file aside and starts an empty list (Task 68): POST /settings/reset
+   * { file: "extension-pairings", confirm: true }, sent only after the screen's confirmation.
+   */
+  resetList(signal?: AbortSignal): Promise<SettingsResetResponse>;
 }
 
 export function extensionApi(client: ApiClient): ExtensionApi {
@@ -37,16 +43,20 @@ export function extensionApi(client: ApiClient): ExtensionApi {
     issueCode: (signal) => client.request<PairingCode>("POST", "/extension/pair", signal ? { signal } : {}),
     codeStatus: (codeId, signal) => client.request<PairingCodeStatus>("GET", `/extension/pair/status/${encodeURIComponent(codeId)}`, signal ? { signal } : {}),
     list: async (signal) => {
-      const r = await client.request<{ extensions?: unknown; port?: unknown }>("GET", "/extension/pairings", signal ? { signal } : {});
+      const r = await client.request<{ extensions?: unknown; port?: unknown; unreadable?: unknown }>("GET", "/extension/pairings", signal ? { signal } : {});
       const extensions = (Array.isArray(r?.extensions) ? (r.extensions as PairedBrowser[]) : []).map(({ port, ...b }) => {
         const p = portOf(port);
         return p !== undefined ? { ...b, port: p } : b;
       });
       const port = portOf(r?.port);
-      return { extensions, ...(port !== undefined ? { port } : {}) };
+      return { extensions, ...(port !== undefined ? { port } : {}), ...(r?.unreadable === true ? { unreadable: true as const } : {}) };
     },
     revoke: async (id, signal) => {
       await client.request<PairingRemovedResponse>("DELETE", `/extension/pairings/${encodeURIComponent(id)}`, signal ? { signal } : {});
+    },
+    resetList: (signal) => {
+      const body: SettingsResetRequest = { file: "extension-pairings", confirm: true };
+      return client.request<SettingsResetResponse>("POST", "/settings/reset", { body, ...(signal ? { signal } : {}) });
     },
   };
 }

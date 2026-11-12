@@ -4,10 +4,10 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import type { ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
-import { PairingsUnreadableError } from "./auth.js";
-
+import type { ResettableSetting, ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
 import {
+  AppSettingReadableError,
+  AppSettingUnreadableError,
   AcknowledgementRequiredError,
   PendingWriteChoiceError,
   PendingWriteIncompleteError,
@@ -29,6 +29,9 @@ import {
   LockNotWritableError,
   MissingParentError,
   MoveVerificationError,
+  OldCopiesUnreadableError,
+  WatchedFoldersUnreadableError,
+  ApprovedFoldersUnreadableError,
   PathEscapeError,
   ProxyRecordRefusedError,
   RestoreError,
@@ -86,6 +89,14 @@ export const notFound = (what = "That item"): ApiError => new ApiError(404, "NOT
 /** The body of every error answer: the shared declaration (Task 47). */
 export type ErrorBody = ServiceErrorBody;
 
+/** The settings files a refusal can name (Task 68), with how to say them and their `reason`. */
+export const SETTINGS_FILES: Record<string, { reason?: ResettableSetting; what: string; it: string }> = {
+  "extension-pairings.json": { reason: "extension-pairings", what: "The list of paired browsers", it: "it was" },
+  "fonts.json": { reason: "fonts", what: "The list of added fonts", it: "it was" },
+  "appearance.json": { reason: "appearance", what: "The appearance settings", it: "they were" },
+  "notices.json": { what: "The app's list of notices on this computer", it: "it was" },
+};
+
 /** Library error → status, code, plain message. Unknown errors are INTERNAL with a generic message. */
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
@@ -114,8 +125,18 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof ReviewEntryDecidedError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
-  // The app's list of paired browsers could not be read: nothing was changed (Task 66, I1).
-  if (err instanceof PairingsUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
+  // A settings file of this computer that cannot be read: nothing was written over it; `reason`
+  // names it, so the desktop app can offer its reset (Task 66 I1, Task 68).
+  if (err instanceof AppSettingUnreadableError) {
+    const which = SETTINGS_FILES[err.fileName];
+    return new ApiError(503, "UNAVAILABLE", which ? `${which.what} could not be read, so ${which.it} not changed.` : "A settings file of this app could not be read, so it was not changed.", which?.reason);
+  }
+  if (err instanceof AppSettingReadableError) {
+    const which = SETTINGS_FILES[err.fileName];
+    const what = which ? which.what : "That settings file";
+    if (err.missing) return new ApiError(409, "CONFLICT", `${what} ${which?.it === "they were" ? "are" : "is"} not there, so there is nothing to reset.`);
+    return new ApiError(409, "CONFLICT", `${what} can be read, so nothing was reset.`);
+  }
   // A file of the app itself is missing (a damaged installation); its message names what, never where.
   if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");
@@ -134,6 +155,10 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof LinkedContentChangedError) return new ApiError(409, "CONFLICT", "A linked file changed on disk.");
   if (err instanceof ProxyRecordRefusedError) return new ApiError(409, "CONFLICT", "That viewing copy was not recorded.", err.code);
   if (err instanceof SecretStoreUnavailableError) return new ApiError(503, "UNAVAILABLE", "This computer's keyring is not available.");
+  // This computer's list of old library copies could not be read: nothing written (Task 68, ruling 1).
+  if (err instanceof OldCopiesUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
+  if (err instanceof WatchedFoldersUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
+  if (err instanceof ApprovedFoldersUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof MoveVerificationError) return new ApiError(409, "CONFLICT", "The copied library did not verify; the old copy is kept and nothing was switched.");
   if (err instanceof LockNotWritableError) return new ApiError(409, "READ_ONLY", "The library's lock file cannot be written.");
   if (err instanceof GovernanceParseError) return new ApiError(400, "VALIDATION", err.message);

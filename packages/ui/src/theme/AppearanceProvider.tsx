@@ -28,6 +28,11 @@ export interface AppearanceContextValue {
    * screen, and the message stays, until retrySave() saves it (R109).
    */
   saveError?: string;
+  /**
+   * The service's `reason` for the last failure, when it gave one: "appearance" means the settings
+   * file cannot be read, and the screen offers its reset (Task 68).
+   */
+  saveErrorReason?: string;
   /** Sends the changes that failed to save again. */
   retrySave(): Promise<void>;
   /** The researcher's own font files (R100), when the service is connected. */
@@ -75,6 +80,7 @@ export interface AppearanceProviderProps {
 export function AppearanceProvider({ client, initial, children }: AppearanceProviderProps) {
   const [settings, setSettings] = useState<AppearanceSettings>(initial ?? DEFAULT_APPEARANCE);
   const [saveError, setSaveError] = useState<string | undefined>();
+  const [saveErrorReason, setSaveErrorReason] = useState<string | undefined>();
   const systemDark = useMedia("(prefers-color-scheme: dark)");
   const systemReduce = useMedia("(prefers-reduced-motion: reduce)");
   // Set once the user changes something, so a slow initial load never overwrites that change.
@@ -156,10 +162,14 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
           if (q.pending) next = applyPatch(next, q.pending);
           return next;
         });
-        if (!q.failed) setSaveError(undefined);
+        if (!q.failed) {
+          setSaveError(undefined);
+          setSaveErrorReason(undefined);
+        }
       } catch (err) {
         q.failed = mergePatch(q.failed, patchNow);
         setSaveError(`Couldn't save your appearance settings: ${messageOf(err)}`);
+        setSaveErrorReason(err instanceof ApiClientError ? err.reason : undefined);
       }
       for (const w of waiting) w();
     }
@@ -222,8 +232,8 @@ export function AppearanceProvider({ client, initial, children }: AppearanceProv
   const fontError = Object.values(faceErrors)[0];
 
   const value = useMemo<AppearanceContextValue>(
-    () => ({ settings, theme, reducedMotion, accentApplied, update, retrySave, ...(saveError ? { saveError } : {}), ...(fonts ? { fonts } : {}), ...(fontError ? { fontError } : {}) }),
-    [settings, theme, reducedMotion, accentApplied, update, retrySave, saveError, fonts, fontError],
+    () => ({ settings, theme, reducedMotion, accentApplied, update, retrySave, ...(saveError ? { saveError } : {}), ...(saveError && saveErrorReason ? { saveErrorReason } : {}), ...(fonts ? { fonts } : {}), ...(fontError ? { fontError } : {}) }),
+    [settings, theme, reducedMotion, accentApplied, update, retrySave, saveError, saveErrorReason, fonts, fontError],
   );
   return <AppearanceContext.Provider value={value}>{children}</AppearanceContext.Provider>;
 }

@@ -9,7 +9,7 @@
  * whole edited transcript).
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { appConfigDir, deviceDeps, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
+import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
@@ -102,6 +102,8 @@ const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey
 
 export async function createService(opts: ServiceOptions): Promise<LibraryService> {
   const deps = opts.deps ?? deviceDeps(appConfigDir());
+  // A notice raised while this device's identity was read (Task 68) is written before the first state.
+  await deviceNoticesIdle();
   const app = Fastify({
     bodyLimit: BODY_LIMIT,
     // Never echo request bodies or query strings into the log.
@@ -157,6 +159,12 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 
   const fail = (reply: FastifyReply, e: ApiError) => reply.status(e.status).send(errorBody(e, state.roots));
+  /**
+   * No pairing could be read since start, and the file still cannot be read: looked at again on each
+   * such request, so it heals by itself (M5). Pairings already read keep being checked as usual.
+   */
+  const pairingsUnreadable = async () => pairing.notLoaded && (await pairing.checkFile());
+  const PAIRINGS_UNREADABLE = new ApiError(503, "UNAVAILABLE", "This computer's list of paired browsers cannot be read right now. Your browser stays paired; try again in a moment, or open the desktop app's “Browser extension” page.");
 
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
     if (closingNow) return fail(reply, new ApiError(503, "UNAVAILABLE", "The library service is shutting down."));
@@ -186,7 +194,15 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     const path = req.url.split("?")[0] ?? "";
     const preflightOpen = req.method === "OPTIONS" && OPEN_ROUTES.has(`POST ${path}`);
     if (origin !== undefined) {
-      const ok = SHELL_ORIGINS.has(origin) || pairing.isPairedOrigin(origin) || ((OPEN_ROUTES.has(route) || preflightOpen) && isExtensionOrigin(origin));
+      const allowed = () => SHELL_ORIGINS.has(origin) || pairing.isPairedOrigin(origin) || ((OPEN_ROUTES.has(route) || preflightOpen) && isExtensionOrigin(origin));
+      let ok = allowed();
+      // The pairings file cannot be read (Task 68 fix round 1, M5): an extension is told so, never
+      // refused as unpaired, so that it keeps its token; nothing is let through. When the check finds
+      // the file readable again, the origin is judged again on what was just read (round 2, Rm1).
+      if (!ok && isExtensionOrigin(origin) && pairing.notLoaded) {
+        if (await pairingsUnreadable()) return fail(reply, PAIRINGS_UNREADABLE);
+        ok = allowed();
+      }
       if (!ok) return fail(reply, new ApiError(403, "FORBIDDEN", "Requests from this origin are not allowed."));
       reply.header("Access-Control-Allow-Origin", origin).header("Vary", "Origin");
       if (req.method === "OPTIONS") {
@@ -210,6 +226,10 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
       req.caller = "ui";
       return;
     }
+    // While no pairing could be read (the file unreadable since start), EVERY request with a token
+    // other than the desktop app's gets the same 503, never 401 (an extension forgets its token on a
+    // 401): nothing is let through, and nothing tells a known token from an unknown one (M5).
+    if (await pairingsUnreadable()) return fail(reply, PAIRINGS_UNREADABLE);
     const ext = pairing.extensionFor(token);
     if (!ext) return fail(reply, new ApiError(401, "UNAUTHORIZED", "A valid token is needed."));
     // 4. The extension token: its own routes only, from its own origin.
@@ -302,6 +322,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
         await state.shutdown();
         // A browser's port being recorded (R171) finishes its atomic write before the service exits.
         await pairing.idle();
+        // A device-level notice being written (Task 68) is not lost at shutdown.
+        await deviceNoticesIdle();
         await app.close();
       })();
       return closing;

@@ -4,7 +4,9 @@
  * library's integrity warnings and projects' standing warnings. Warning codes are never shown as
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
-import type { IntegrityWarning, LibraryState } from "../api/library";
+import { useRef, useState } from "react";
+import { isDeviceNoticeKind, type DeviceNoticeKind } from "@ao/shared";
+import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
 import "./library.css";
@@ -19,7 +21,29 @@ export type BannerVariant =
   /** The index could not be rebuilt (D8); the service's reason is not shown (it can name files). */
   | { kind: "index-failed" }
   /** `detail` is accepted for the record but never shown (R114 I1). */
-  | { kind: "warning"; warning: string; project: string; detail?: string };
+  | { kind: "warning"; warning: string; project: string; detail?: string }
+  /** This computer's own notice (Task 68, R154, R178): fixed words by kind; goes by "Got it". */
+  | { kind: "notice"; notice: DeviceNoticeKind };
+
+/**
+ * The words of each device-level notice (Task 68). Only what is true (R181 b, d): a renewed identity
+ * leaves the libraries unchanged; only when a new program happens to reuse the old one's process
+ * number can a library stay read-only until its old lock is 2 minutes stale (packages/library
+ * lock.ts); changes from now on are recorded under the new identity. No notice names a screen that
+ * does not exist: there is no watched-folders screen yet, so that notice says only what happened.
+ */
+export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
+  "device-identity-renewed":
+    "This computer's identity for the app could not be read and had to be renewed. Your libraries and what is in them are unchanged. A library that was open when the app last stopped may show as read-only for up to 2 minutes; open it again after that. The changes you make from now on are recorded under this computer's new identity. The damaged identity file is kept beside the app's settings.",
+  "old-copies-list-set-aside":
+    "The list of old library copies awaiting deletion was damaged and was set aside. Some old copies of moved libraries may still be on this computer without being offered for deletion here, and a move that had not finished may not be able to finish from here. The damaged list is kept beside the app's settings.",
+  "watched-folders-list-set-aside":
+    "This computer's list of watched folders was damaged and was set aside, so some watched folders on this computer may have stopped: files put in those folders are not imported. The damaged list is kept beside the app's settings.",
+  "libraries-list-set-aside":
+    "This computer's list of libraries was damaged and was set aside. Your libraries themselves are untouched: open each one again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
+  "approved-folders-list-set-aside":
+    "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
+};
 
 const READ_ONLY_REASONS: Record<string, string> = {
   "not-writable": "this folder cannot be written to",
@@ -40,6 +64,9 @@ const WARNINGS: Record<string, (p: string) => string> = {
   empty: (p) => `The audit log of ${p} is empty although this computer has a record of it. It may have been replaced outside the app.`,
   "anchor-missing": (p) => `The audit log may have been changed outside the app (${p}): this computer has no record to check it against. It is checked from now on.`,
   "anchors-unreadable": () => "This computer's record of the audit logs could not be read, so they could not be checked this time. Nothing in the library was changed.",
+  // For this session only (Task 68 round 2, Rm4): the service could not read this computer's watched folders at open.
+  "watched-folders-unreadable": () =>
+    "This computer's list of watched folders could not be read when this library was opened, so its watched folders are not running now: files put in them are not imported. Open the library again to try again.",
   "rolled-back-incomplete-write": (p) => `An interrupted change in ${p} was undone when the library opened, so nothing half-saved was kept.`,
   "invalid-txn-marker": (p) => `A note left by an interrupted change in ${p} could not be read. It was kept aside and nothing was changed.`,
   "incomplete-write-pending": (p) => `An interrupted change in ${p} could not be finished or undone yet. It is tried again when the library is next opened with write access.`,
@@ -99,6 +126,8 @@ function text(v: BannerVariant): string {
       return "The library's search index could not be rebuilt, so sources and search may be incomplete. Your sources are safe in the library folder.";
     case "warning":
       return warningText(v.warning, v.project);
+    case "notice":
+      return NOTICE_TEXT[v.notice];
   }
 }
 
@@ -110,12 +139,55 @@ const TONE: Record<BannerVariant["kind"], string> = {
   "index-rebuilding": "info",
   "index-failed": "warn",
   warning: "warn",
+  notice: "warn",
 };
+
+/**
+ * The researcher's "Got it" for this computer's notices (Task 68), shared by the library's banner
+ * area and the chooser: one request per notice (a second click while it runs does nothing), then
+ * `onGone(kind)`; a refusal is kept in `error`, in plain words.
+ */
+export function useNoticeDismiss(dismiss: (kind: DeviceNoticeKind) => Promise<unknown>, onGone: (kind: DeviceNoticeKind) => void): { onDismiss: (kind: DeviceNoticeKind) => void; error: string | null } {
+  const [error, setError] = useState<string | null>(null);
+  const running = useRef(new Set<string>());
+  const onDismiss = (kind: DeviceNoticeKind) => {
+    if (running.current.has(kind)) return;
+    running.current.add(kind);
+    setError(null);
+    dismiss(kind).then(
+      () => {
+        running.current.delete(kind);
+        onGone(kind);
+      },
+      (err: unknown) => {
+        running.current.delete(kind);
+        setError(errorText(err, "The notice could not be removed."));
+      },
+    );
+  };
+  return { onDismiss, error };
+}
+
+/** This computer's notices as banners with "Got it", for a page without a library's banners (the chooser). */
+export function DeviceNoticeBanners({ notices, onDismiss, error }: { notices: LibraryState["notices"]; onDismiss: (kind: DeviceNoticeKind) => void; error: string | null }) {
+  const banners = bannersFor({ notices });
+  if (!banners.length && !error) return null;
+  return (
+    <div className="ao-library__banners" role="region" aria-label="Notices">
+      {banners.map((b) => (b.kind === "notice" ? <StatusBanner key={`notice-${b.notice}`} variant={b} onDismiss={onDismiss} /> : null))}
+      {error && (
+        <p role="alert" className="ao-warning">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 /** Warnings about an interrupted change the researcher can resolve by hand (R27). */
 export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable"]);
 
-export function StatusBanner({ variant, onResolve }: { variant: BannerVariant; onResolve?: () => void }) {
+export function StatusBanner({ variant, onResolve, onDismiss }: { variant: BannerVariant; onResolve?: () => void; onDismiss?: (notice: DeviceNoticeKind) => void }) {
   const resolvable = !!onResolve && variant.kind === "warning" && RESOLVABLE_WARNINGS.has(variant.warning);
   // Project names and service details are user text: shown with dir=auto inside the sentence.
   return (
@@ -127,6 +199,14 @@ export function StatusBanner({ variant, onResolve }: { variant: BannerVariant; o
           <a href={PATHS.missingFiles} onClick={inAppLink}>
             Rebuild library from folder
           </a>
+        </>
+      )}
+      {variant.kind === "notice" && onDismiss && (
+        <>
+          {" "}
+          <button type="button" className="ao-small" onClick={() => onDismiss(variant.notice)}>
+            Got it
+          </button>
         </>
       )}
       {resolvable && (
@@ -165,7 +245,7 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index">, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices">>, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;
@@ -184,6 +264,13 @@ export function bannersFor(state: Pick<LibraryState, "mode" | "readOnlyReason" |
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
   for (const [pid, list] of Object.entries(state.projectWarnings ?? {})) {
     for (const w of list) out.push({ kind: "warning", warning: w, project: ctx.projectNames?.[pid] ?? "a project" });
+  }
+  // This computer's own notices (Task 68): known kinds only, once each.
+  const seen = new Set<string>();
+  for (const n of state.notices ?? []) {
+    if (!isDeviceNoticeKind(n?.kind) || seen.has(n.kind)) continue;
+    seen.add(n.kind);
+    out.push({ kind: "notice", notice: n.kind });
   }
   return out;
 }

@@ -394,6 +394,13 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service and interface tests; `pnpm -r typecheck`; UI lints; `pnpm e2e -- --app-only --trace off`. Scenario 10 (Task 34f) asserts the mark once this is merged.
 - Model: Opus.
 
+**Task 70 — A read never mistakes a write in progress for outside tampering (D21) [ledger: R186, R26, R154]**
+- Depends: none. Parallel: 69.
+- Files: `packages/library/src/repo/sources.ts` and its tests; at most a small helper in the write queue's module.
+- Accept: a read that meets a write in progress records no integrity warning and returns a consistent pair; the trash path the same; a real outside change is still reported once, as today; the fast path does not take the write queue.
+- Verify: library and service tests; `pnpm -r typecheck`.
+- Model: Opus.
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
@@ -485,6 +492,8 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by the accuracy review of Task 37k (for Task 69): D17 (medium): a captured post that has disappeared at its source is kept and recorded as no longer available (`availability: unavailable-on-platform`), but no library screen shows it; only the capture queue's one-line count says so. Scenario 10 promises the item is flagged (R183 a).
 - Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests.
 - Defect found by the re-check of Task 37k (not fixed in this build): D19 (medium): a conflict found when a later check adds data to an existing source (a browser-extension capture with the downloader ticked) shows as a "Conflict" badge on the source but writes no review-queue entry, so the source carries no "Needs review" (R172). Entries are written only when a source is created (`packages/library/src/sources.ts`). For after the owner's tests.
+- Defect found by the review of Task 34f (not fixed in this build): D20 (medium): the audit entry of a field confirmation is a generic `source.update` that names no field, and the change log does not hold the verification report; confirming the value already there leaves no trace of which field was confirmed (R176, R149). For after the owner's tests.
+- Defect found by the review of Task 69 (for Task 70): D21 (high): a read of a source that falls between the two files of a write in progress (`readSourceFile` reads outside the write queue; `writeSourceFile` writes the annotations file, then `source.json`) records a false integrity warning, shown as "Some annotations … were changed outside the app" until restart. In the code before Task 69; the source's own view could already meet it.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -506,7 +515,7 @@ Update after every task; commit and push.
 | 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | done | 700b7eb | reviewed with probes over one fix round; D1, D2, D6, D7 closed; none of D1–D8 is open; "Needs review" follows every pending entry (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
-| 47 Shared API types | fix round 1 | e914c27 (worktree branch) | review: no behaviour change; request fields must break both builds too (R184); not on the Mac build's path |
+| 47 Shared API types | fix round 2 (type-level) | 456d33a (worktree branch) | no run-time change confirmed; request fields break both builds (R184); one draft type still to tie to the library's; not on the Mac build's path |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
@@ -516,11 +525,11 @@ Update after every task; commit and push.
 | 62 Transcription as a job | complete | d2c21b5 (merge) | reviewed with probes over one fix round and a final check; verification clean throughout; GitHub's run on the merge to be read before the next merge |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
-| 34f Scenarios 9–11 | in review | 8039125 (worktree branch) | five runs of five in both browsers; found D17; its D17 step turns into a passing check after Task 69 |
+| 34f Scenarios 9–11 | approved; a last small round after Task 69 (the D17 step, six minors) | 8039125 (worktree branch) | five runs of five in both browsers; found D17; its review found D20 |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | approved; verification with 68 running | a4737c1 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); closes D15 when merged |
+| 50b Restore asks the policy engine | approved; up to date; verification after Task 68's | c4a8aa7 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); closes D15 when merged |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -539,10 +548,11 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | approved; verification with 50b running | 391a93f (worktree branch) | reviewed with probes over two fix rounds (R181); five minors to the final review's list |
+| 68 Settings writers never write what they did not read (D16) | complete | c02679b (merge) | reviewed with probes over two fix rounds (R178, R181); D16 closed; five minors on the final review's list |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
-| 69 Show that a captured item is no longer available (D17) | in progress | | dispatched 2026-11-12; on the Mac build's path (R183) |
+| 69 Show that a captured item is no longer available (D17) | fix round 1 | 50e42e6 (worktree branch) | the list is to read `source.json` alone (R186); on the Mac build's path |
+| 70 A read never mistakes a write in progress for tampering (D21) | in progress | | dispatched 2026-11-12; in the Mac build if merged in time |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
