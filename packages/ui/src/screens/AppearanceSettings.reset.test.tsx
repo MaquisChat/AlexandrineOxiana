@@ -185,6 +185,8 @@ describe("the list of added fonts cannot be read (Task 68)", () => {
     expect(dialog.contains(document.activeElement)).toBe(true);
     await user.tab();
     expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(document.activeElement).toBe(within(r).getByRole("button", { name: RESET }));

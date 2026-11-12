@@ -36,7 +36,7 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
   "device-identity-renewed":
     "This computer's identity for the app could not be read and had to be renewed. Your libraries are not affected; the changes you make from now on are recorded under this computer's new identity. The damaged identity file is kept beside the app's settings.",
   "old-copies-list-set-aside":
-    "The list of old library copies awaiting deletion was damaged and was set aside. Old copies of moved libraries may still be on this computer, but they are no longer offered for deletion here. The damaged list is kept beside the app's settings.",
+    "The list of old library copies awaiting deletion was damaged and was set aside. Some old copies of moved libraries may still be on this computer without being offered for deletion here, and a move that had not finished may not be able to finish from here. The damaged list is kept beside the app's settings.",
   "watched-folders-list-set-aside":
     "This computer's list of watched folders was damaged and was set aside, so watched folders on this computer have stopped. Watched folders must be added again on this computer. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":

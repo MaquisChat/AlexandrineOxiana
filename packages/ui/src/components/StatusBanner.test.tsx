@@ -19,6 +19,9 @@ describe("device-level notices (Task 68)", () => {
     const t = screen.getByRole("status").textContent ?? "";
     expect(t).toMatch(/list of old library copies awaiting deletion was damaged and was set aside/);
     expect(t).toMatch(/may still be on this computer/);
+    // Not an overstatement when only part of the list was damaged (review round 1, M6).
+    expect(t).toMatch(/Some old copies/);
+    expect(t).toMatch(/a move that had not finished may not be able to finish from here/);
     expect(t).toMatch(/kept beside the app's settings/);
   });
 

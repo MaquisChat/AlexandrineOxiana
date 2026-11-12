@@ -341,6 +341,15 @@ describe("POST /settings/reset (Task 68)", () => {
     expect(await readFile(cfg("appearance.json"), "utf8")).toBe("garbage{");
   });
 
+  it("a reset of a file that is not there says so truthfully (review round 1, M7)", async () => {
+    await start();
+    const r = await call({ method: "POST", url: "/settings/reset", body: { file: "appearance", confirm: true } });
+    expect(r.status).toBe(409);
+    expect(r.json.error.message).toBe("The appearance settings are not there, so there is nothing to reset.");
+    await writeFile(cfg("fonts.json"), JSON.stringify({ fonts: [] }));
+    expect((await call({ method: "POST", url: "/settings/reset", body: { file: "fonts", confirm: true } })).json.error.message).toBe("The list of added fonts can be read, so nothing was reset.");
+  });
+
   it("an unknown file name or another field is refused", async () => {
     await start();
     expect((await call({ method: "POST", url: "/settings/reset", body: { file: "libraries", confirm: true } })).status).toBe(400);

@@ -150,7 +150,9 @@ export function toApiError(err: unknown): ApiError {
   }
   if (err instanceof AppSettingReadableError) {
     const which = SETTINGS_FILES[err.fileName];
-    return new ApiError(409, "CONFLICT", `${which ? which.what : "That settings file"} can be read, so nothing was reset.`);
+    const what = which ? which.what : "That settings file";
+    if (err.missing) return new ApiError(409, "CONFLICT", `${what} ${which?.it === "they were" ? "are" : "is"} not there, so there is nothing to reset.`);
+    return new ApiError(409, "CONFLICT", `${what} can be read, so nothing was reset.`);
   }
   // A file of the app itself is missing (a damaged installation); its message names what, never where.
   if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);

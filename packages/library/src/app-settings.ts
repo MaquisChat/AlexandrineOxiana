@@ -190,8 +190,12 @@ export class AppSettingUnreadableError extends Error {
 
 /** A reset was asked for a settings file that can be read (or is not there): nothing was set aside. */
 export class AppSettingReadableError extends Error {
-  constructor(readonly fileName: string) {
-    super(`The settings file "${fileName}" can be read, so it was not reset.`);
+  /** `missing`: the file is not there at all (review round 1, M7), rather than readable. */
+  constructor(
+    readonly fileName: string,
+    readonly missing = false,
+  ) {
+    super(missing ? `The settings file "${fileName}" is not there, so there is nothing to reset.` : `The settings file "${fileName}" can be read, so it was not reset.`);
     this.name = "AppSettingReadableError";
   }
 }
@@ -249,8 +253,8 @@ export function setAppSettingAside(dir: string, name: string, check: (v: unknown
   if (!SETTING_NAME.test(name)) throw new TypeError(`not a settings file name: ${name}`);
   return inSettingTurn(dir, name, async () => {
     try {
-      await readAppSettingStrict(dir, name, check);
-      throw new AppSettingReadableError(name); // readable, or missing: nothing to reset
+      const v = await readAppSettingStrict(dir, name, check);
+      throw new AppSettingReadableError(name, v === undefined); // readable, or missing: nothing to reset
     } catch (err) {
       if (!(err instanceof AppSettingUnreadableError)) throw err;
     }
