@@ -496,7 +496,7 @@ Update after every task; commit and push.
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | approved; verification before merge | cc7ea13 (worktree branch) | reviewed with probes over two fix rounds and a final check; `recordEdit` fixed; an ended capture's download is cancelled |
-| 62 Transcription as a job | in progress | | dispatched 2026-11-12 after Task 51 merged; also carries N-5 of Task 51 (a close stops a rerun) |
+| 62 Transcription as a job | in review | f867056 (worktree branch) | built: a job with progress, one per source; flags per segment in a human-edit version; a close stops a rerun |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
