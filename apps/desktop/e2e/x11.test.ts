@@ -42,9 +42,10 @@ describe("the X11 requests", () => {
     expect([...encodeGetInputFocus()]).toEqual([43, 0, 1, 0]);
   });
 
-  it("finds a display's socket", () => {
-    expect(socketPathFor(":42")).toBe("/tmp/.X11-unix/X42");
-    expect(socketPathFor(":7.0")).toBe("/tmp/.X11-unix/X7");
+  it("finds a display's socket: the file in /tmp/.X11-unix when it exists, else the abstract one Xvfb also listens on", () => {
+    expect(socketPathFor(":42", () => true)).toBe("/tmp/.X11-unix/X42");
+    expect(socketPathFor(":7.0", () => true)).toBe("/tmp/.X11-unix/X7");
+    expect(socketPathFor(":42", () => false)).toBe("\0/tmp/.X11-unix/X42");
     expect(() => socketPathFor("host:1")).toThrow(/local display/);
   });
 });

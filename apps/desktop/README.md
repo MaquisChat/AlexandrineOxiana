@@ -67,13 +67,20 @@ and Rust 1.97 with cargo. Then:
 needs the built app) drives the debug build `build:linux` makes through its real window, by
 WebDriver: `tauri-driver` in front of the system's `WebKitWebDriver`. One scenario
 (`e2e/desktop.e2e.ts`): the library chooser; the first-use Optional tools dialog ("Not now"); a
-library and a project; a PDF attached with "Choose files…" through the native GTK file dialog; the
+library at a typed folder and a project; a PDF attached with "Choose files…" through the native GTK file dialog; the
 source listed; the stored copy, the untouched original and the audit entries on disk; the window
-closed as its close button does; no process of the app left. Its results are in `pnpm report` under
+closed as its close button does; no process of the app left; nothing under the real home folder
+created or modified. Its results are in `pnpm report` under
 "The desktop app end to end".
 
 - Each run gets a private Xvfb display and D-Bus session bus, and its home, settings, data and
-  libraries under one temporary folder (`e2e/desktop.ts`). The app runs without its test mode: no
+  libraries under one temporary folder (`e2e/desktop.ts`, `e2e/lifetime.ts`). Every process it
+  starts (Xvfb, the bus and the session services it starts, such as dconf and the portals, the
+  drivers, the app and its helpers, xdotool) gets HOME and the XDG folders there, and each is
+  started in its own process group. The `run` fixture (`e2e/fixtures.ts`) stops all of them,
+  unmounts the document portal and removes the folder however the test ends, a time-out included,
+  and saves the app's output (`e2e/test-results/*/shell-output.txt`) when it did not pass; a last
+  sweep at process exit covers a run that was never torn down. The app runs without its test mode: no
   NODE_ENV, no probe. It starts its own service with its own token, which the test never sees; what
   the service wrote is read from disk.
 - The native file dialog is the real one. WebDriver cannot reach it, so the test finds it on the
@@ -82,8 +89,10 @@ closed as its close button does; no process of the app left. Its results are in 
 - Closing: the test sends the window the window manager's close message (`WM_DELETE_WINDOW`, `e2e/x11.ts`).
   WebDriver's own "close window" is not used, because WebKitWebDriver kills the app's process the
   moment its last window closes.
-- Not covered: a file dropped from another program (an OS drag and drop cannot be made under Xvfb),
-  and the macOS app (there is no WebDriver for the Mac web view).
+- Not covered: the native folder picker ("Choose folder…"): the library is created at a folder typed
+  into the chooser, because the GTK folder chooser completes a typed path with a trailing "/" and
+  Return then opens the folder instead of choosing it; a file dropped from another program (an OS drag
+  and drop cannot be made under Xvfb); and the macOS app (there is no WebDriver for the Mac web view).
 - The WebDriver client is `e2e/webdriver.ts`, a few W3C commands over `fetch`; the published clients
   bring in packages under licences other than MIT, Apache-2.0 and BSD. Playwright (`@playwright/test`
   1.63.0, Apache-2.0) is only the test runner; no browser of its own is started.

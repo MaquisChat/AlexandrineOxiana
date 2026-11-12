@@ -428,8 +428,12 @@ export async function startDesktop(run: RunLifetime): Promise<Desktop> {
     return false;
   };
   const infrastructure = () => [xvfb.pid!, dbus.pid!, ...descendants(dbus.pid!), driver.pid!, ...descendants(driver.pid!)].filter((p) => p !== shell.shellPid && !isUnder(p, shell.shellPid));
+  // A window or session that is gone cannot come back: that ends any wait at once.
   const find = (role: Role, name: string | null, opts: { level?: number; within?: string } = {}) =>
-    session.execute<unknown[]>(FIND_SCRIPT, [role, name, opts.level ?? null, opts.within ? session.element(opts.within) : null]);
+    session.execute<unknown[]>(FIND_SCRIPT, [role, name, opts.level ?? null, opts.within ? session.element(opts.within) : null]).catch((err: unknown) => {
+      if (err instanceof WebDriverError && ["no such window", "invalid session id"].includes(err.code)) throw new Fatal(err.message);
+      throw err;
+    });
   const xEnv = displayEnv(root, { path, display });
   const X = (args: string[]) => run.run("xdotool", args, xEnv);
   /** The visible windows on the private display, with their titles. */

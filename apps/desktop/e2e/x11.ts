@@ -11,6 +11,7 @@
  * window closes (seen here: the shell a zombie within 20 ms, its service left to stop through the
  * end of its standard input), so it would test a crash, not a person closing the app.
  */
+import { existsSync } from "node:fs";
 import { connect } from "node:net";
 
 /** The connection set-up: little-endian ('l'), protocol 11.0, no authorisation (Xvfb on a local socket). */
@@ -58,11 +59,16 @@ export function encodeGetInputFocus(): Buffer {
   return Buffer.from([43, 0, 1, 0]);
 }
 
-/** The Unix socket of a local display (":N" or ":N.S"). */
-export function socketPathFor(display: string): string {
+/**
+ * The Unix socket of a local display (":N" or ":N.S"): the file in /tmp/.X11-unix when it exists,
+ * else the abstract socket of the same name, which an X server on Linux also listens on (and the
+ * only one when it could not create /tmp/.X11-unix, as a non-root Xvfb on a fresh machine).
+ */
+export function socketPathFor(display: string, exists: (p: string) => boolean = existsSync): string {
   const m = /^:(\d+)(\.\d+)?$/.exec(display);
   if (!m) throw new Error(`${display} is not a local display`);
-  return `/tmp/.X11-unix/X${m[1]}`;
+  const path = `/tmp/.X11-unix/X${m[1]}`;
+  return exists(path) ? path : `\0${path}`;
 }
 
 /** Sends `window` the window manager's close message on the X server at `socketPath`. */
