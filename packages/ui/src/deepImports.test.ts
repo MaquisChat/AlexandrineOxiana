@@ -23,16 +23,26 @@ function files(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** The module specifiers of `import … from "x"`, `export … from "x"`, `import("x")` and `import "x"`. */
+/**
+ * The module specifiers of `import … from "x"`, `export … from "x"`, `import("x")` (a comment before
+ * the specifier too), `import "x"`, and `vi.mock("x")` / `vi.doMock("x")`.
+ */
 function specifiers(src: string): string[] {
   const out: string[] = [];
-  const re = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(["'])([^"'\n]+)\1/g;
+  const re = /(?:\bfrom\s*|\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)*|\bimport\s+|\bvi\.(?:do)?[mM]ock\s*\(\s*)(["'])([^"'\n]+)\1/g;
   for (let m = re.exec(src); m; m = re.exec(src)) out.push(m[2]!);
   return out;
 }
 
-/** A specifier that reaches into a workspace package's own files. */
-const isDeepImport = (spec: string): boolean => /^@ao\/[^/]+\/src(?:\/|$)/.test(spec);
+/**
+ * A specifier that reaches into a workspace package's own files: `@ao/<pkg>/src/…`, or a relative
+ * path into another package's `src` (`../../core/src/…`). A file read as text (`?raw`) is not a
+ * module import and is left alone (capture.test.ts reads the library's error sentences that way).
+ */
+const isDeepImport = (spec: string): boolean => !spec.endsWith("?raw") && (/^@ao\/[^/]+\/src(?:\/|$)/.test(spec) || /(?:^|\/)\.\.\/(?:core|library|shared|ui)\/src\//.test(spec));
+
+/** The root of @ao/core: all of it, `node:` modules included, which the interface's bundle must not take. */
+const isCoreRoot = (spec: string): boolean => spec === "@ao/core";
 
 const coreExports = (): string[] => Object.keys((JSON.parse(readFileSync(CORE_PACKAGE, "utf8")) as { exports?: Record<string, unknown> }).exports ?? {});
 
@@ -62,6 +72,15 @@ describe("imports of the workspace packages (Task 47)", () => {
     expect(missing).toEqual([]);
   });
 
+  it("the interface's own code never imports the root of @ao/core (tests may)", () => {
+    const found: string[] = [];
+    for (const f of sources) {
+      if (!f.startsWith(join(ROOT, "src")) || /\.test\.tsx?$/.test(f) || f.includes(`${join("src", "test")}`)) continue;
+      for (const s of specifiers(readFileSync(f, "utf8"))) if (isCoreRoot(s)) found.push(`${relative(ROOT, f)}: ${s}`);
+    }
+    expect(found).toEqual([]);
+  });
+
   it("recognises the forms a deep import can take", () => {
     expect(specifiers(`import { a } from "@ao/core/src/ids";\nexport { b } from '@ao/shared/src/x';\nconst c = await import("@ao/core/src/y");\nimport "@ao/core/src/z";`)).toEqual([
       "@ao/core/src/ids",
@@ -72,5 +91,26 @@ describe("imports of the workspace packages (Task 47)", () => {
     expect(isDeepImport("@ao/core/src/governance/merge")).toBe(true);
     expect(isDeepImport("@ao/core/governance/merge")).toBe(false);
     expect(isDeepImport("@ao/shared")).toBe(false);
+  });
+
+  it("also recognises a commented dynamic import, a mocked module and a relative path into another package's src (review M4)", () => {
+    expect(specifiers(`const c = await import(/* why */ "@ao/core/src/y");\nvi.mock("@ao/core/src/ids", () => ({}));\nvi.doMock('@ao/core/src/w');\nimport * as X from "../../core/src/naming";`)).toEqual([
+      "@ao/core/src/y",
+      "@ao/core/src/ids",
+      "@ao/core/src/w",
+      "../../core/src/naming",
+    ]);
+    expect(isDeepImport("../../core/src/naming")).toBe(true);
+    expect(isDeepImport("../../../library/src/capture/errors")).toBe(true);
+    expect(isDeepImport("../../shared/src/index.ts")).toBe(true);
+    expect(isDeepImport("./api/capture")).toBe(false);
+    expect(isDeepImport("../src/api/capture")).toBe(false);
+    // Read as text (Vite's ?raw), not imported as a module: not a deep import.
+    expect(isDeepImport("../../../library/src/capture/errors.ts?raw")).toBe(false);
+  });
+
+  it("forbids the root of @ao/core in the interface's own code (it would bundle all of core; review M6)", () => {
+    expect(isCoreRoot("@ao/core")).toBe(true);
+    expect(isCoreRoot("@ao/core/ids")).toBe(false);
   });
 });
