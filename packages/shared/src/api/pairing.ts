@@ -11,6 +11,7 @@
  * The status routes are the only UI-token routes that need an Origin header: the desktop app's page
  * always sends one, and a caller without one (a command-line tool) is refused (Task 46c, review M5).
  */
+import type { AnyRouteErrorCode, ErrorCodes } from "./errors.js";
 
 /** The form of a code's id: 16 lowercase hexadecimal characters. */
 export const PAIRING_CODE_ID = /^[0-9a-f]{16}$/;
@@ -84,3 +85,28 @@ export type PairingCodeStatus =
 export type PairingCodeInvalidReason = "wrong-tries" | "not-saved";
 
 export type PairingCodeState = PairingCodeStatus["state"];
+
+/** `DELETE /extension/pairings/:pid` (UI token); 404 NOT_FOUND when that pairing is already gone. */
+export interface PairingRemovedResponse {
+  removed: true;
+}
+
+/**
+ * `POST /extension/pair/confirm`: the browser extension sends the code (from its own origin, no
+ * token). A wrong or spent code is 401 UNAUTHORIZED; too many tries from one origin 429 RATE_LIMITED.
+ */
+export interface PairingConfirmRequest {
+  code: string;
+}
+
+/** The extension's token: a secret, kept by the extension only. */
+export interface PairingConfirmResponse {
+  token: string;
+}
+
+/** Issuing a code (UI token only: 403 FORBIDDEN otherwise) and reading a code's status (also the app's own origin only). */
+export type PairingCodeErrorCode = ErrorCodes<AnyRouteErrorCode | "MOVE_IN_PROGRESS">;
+/** Confirming a code; the list of paired browsers could not be read or saved (503 UNAVAILABLE). */
+export type PairingConfirmErrorCode = ErrorCodes<AnyRouteErrorCode | "MOVE_IN_PROGRESS" | "RATE_LIMITED" | "UNAVAILABLE">;
+/** Listing (GET) and removing (DELETE) paired browsers. */
+export type PairingsErrorCode = ErrorCodes<AnyRouteErrorCode | "MOVE_IN_PROGRESS" | "NOT_FOUND" | "UNAVAILABLE">;

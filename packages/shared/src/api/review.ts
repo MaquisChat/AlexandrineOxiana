@@ -8,6 +8,7 @@
  * - a consent withdrawal's entry by `POST /review/:itemId/reviewed-after-withdrawal`, with a reason.
  * A source that is removed takes its pending entries with it (resolved in the removal's change).
  */
+import type { ErrorCodes, LibraryWriteErrorCode } from "./errors.js";
 
 /** What queued a verification entry (R176 3). */
 export type ReviewCause = { kind: "capture-conflict" } | { kind: "consent-withdrawal"; consentIds: string[] };
@@ -85,3 +86,69 @@ export interface WithdrawalReviewedResponse {
 }
 
 export const WITHDRAWAL_REASON_MAX = 2000;
+
+// ---- deciding import entries (Task 47) ----
+//
+// - `POST /review/:itemId/decide`  ReviewDecideRequest   → ReviewDecideResponse
+// - `POST /review/bulk-edit`       ReviewBulkEditRequest → ReviewBulkEditResponse
+// Both name the project in the body (R97); a project not in the library is 400 VALIDATION.
+
+/** The decisions an import entry takes; any other `decision.action` is 400 VALIDATION. */
+export const REVIEW_DECISION_ACTIONS = ["accept", "accept-candidate", "merge", "skip", "keep-both"] as const;
+export type ReviewDecisionAction = (typeof REVIEW_DECISION_ACTIONS)[number];
+
+/** A text in one or more languages and forms (core's MultiText), as the review form edits a title. */
+export interface MultiTextValue {
+  variants: Array<{ lang: string; kind: "original" | "romanized" | "translated"; value: string }>;
+}
+
+/** What the researcher corrected before accepting an entry (a part of the library's source draft). */
+export interface ReviewDraft {
+  type?: string;
+  title?: MultiTextValue;
+}
+
+export type ReviewEntryDecision =
+  | { action: "accept"; draft?: ReviewDraft }
+  /** `index` into the entry's `candidates`. */
+  | { action: "accept-candidate"; index: number }
+  /** Merge into this existing source. */
+  | { action: "merge"; sourceId: string }
+  | { action: "skip" }
+  | { action: "keep-both" };
+
+export interface ReviewDecideRequest {
+  projectId: string;
+  decision: ReviewEntryDecision;
+}
+
+export interface ReviewDecideResponse {
+  decided: true;
+}
+
+/** What a bulk edit sets on every entry's source. */
+export interface ReviewEntryPatch {
+  type?: string;
+  tagIds?: string[];
+  collectionId?: string;
+}
+
+/** At most 10 000 entries at once. */
+export interface ReviewBulkEditRequest {
+  projectId: string;
+  itemIds: string[];
+  patch: ReviewEntryPatch;
+}
+
+export interface ReviewBulkEditResponse {
+  /** How many entries were named (every one was edited, or the request failed as a whole). */
+  edited: number;
+}
+
+/** `GET /projects/:id/review` (a library open for writing is needed) and a locked project (423). */
+export type ProjectReviewErrorCode = ErrorCodes<LibraryWriteErrorCode | "PROJECT_LOCKED">;
+/**
+ * Deciding, bulk-editing, and "reviewed after the withdrawal": also the project's rules (403
+ * POLICY_DENIED), a locked project (423), an entry already decided (409 CONFLICT).
+ */
+export type ReviewDecideErrorCode = ErrorCodes<LibraryWriteErrorCode | "POLICY_DENIED" | "PROJECT_LOCKED" | "CONFLICT">;
