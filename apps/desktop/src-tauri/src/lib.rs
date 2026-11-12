@@ -18,6 +18,8 @@
 pub mod connection;
 pub mod helper_env;
 pub mod paths;
+#[cfg(debug_assertions)]
+pub mod probe;
 pub mod service;
 pub mod token;
 
@@ -119,6 +121,10 @@ fn launch(app: AppHandle, shell: Arc<Shell>) {
         .devtools(cfg!(debug_assertions));
     if test_mode() {
         builder = builder.on_document_title_changed(|_, title| println!("AO_SHELL_TITLE {title}"));
+        #[cfg(debug_assertions)]
+        if let Some(dir) = std::env::var_os("AO_SHELL_PROBE_DIR") {
+            builder = builder.initialization_script(probe::script(std::path::Path::new(&dir)));
+        }
     }
     match builder.build() {
         Ok(w) => {
