@@ -25,7 +25,9 @@ any worker starts (needs `huggingface_hub`, so run this script with the build ve
 
 Every acceptance check is required: a missing fixture, model or tool FAILS the run, unless it is
 named in `--allow-missing` (model, clip, dng, ffmpeg, tesseract), which turns that absence into a
-reported skip. Exit code 0 when every required check passed. `--report` writes the results as JSON.
+reported skip. gallery-dl is not inside the worker (R152); run 1 checks that captures needing it or
+yt-dlp name the missing tool, and `--gallery-dl-wheel <pinned wheel>` (optional) also runs a
+downloaded gallery-dl on the bundle's Python. Exit code 0 when every required check passed. `--report` writes the results as JSON.
 """
 from __future__ import annotations
 
@@ -54,7 +56,7 @@ DNG_FILE = DOWNLOADED / "canon-eos-5d-mark-iii-14bit.dng"
 CLIP_WORDS = ("curiosity", "beside", "moment")
 TOKEN = "smoke-" + os.urandom(16).hex()
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # our own requests never use a proxy
-ABSENCES = ("model", "clip", "dng", "ffmpeg", "tesseract", "gallery-dl")
+ABSENCES = ("model", "clip", "dng", "ffmpeg", "tesseract")
 
 
 class Results:
@@ -424,6 +426,16 @@ def run_without_tools(res: Results, exe: Path, root: Path, fx: dict) -> None:
         else:
             res.missing(name, "dng", "fixture missing: run `pnpm fetch-fixtures`")
 
+        # gallery-dl is not inside the worker (R152): an image capture names the missing tool, offline.
+        j = w.run("capture.download", "https://www.instagram.com/p/AoSmoke0001/", out / "gdl", {"tool": "gallery-dl"})
+        err = j.get("error") or {}
+        res.check("image capture without the image downloader: TOOL_NOT_INSTALLED naming image-downloader (not a crash)",
+                  j["status"] == "failed" and err.get("code") == "TOOL_NOT_INSTALLED" and err.get("tool") == "image-downloader", err)
+        j = w.run("capture.download", "https://www.youtube.com/watch?v=AoSmoke0001", out / "ytdl", {"tool": "yt-dlp"})
+        err = j.get("error") or {}
+        res.check("video capture without the video downloader: TOOL_NOT_INSTALLED naming video-downloader, nothing downloaded",
+                  j["status"] == "failed" and err.get("code") == "TOOL_NOT_INSTALLED" and err.get("tool") == "video-downloader", err)
+
         j = w.run("pdf.ocr", fx["pdf"], out / "ocr.pdf")
         res.check("OCR without tesseract fails clearly, naming the tool (TOOL_NOT_INSTALLED, ocr)",
                   j["status"] == "failed" and j["error"]["code"] == "TOOL_NOT_INSTALLED" and j["error"].get("tool") == "ocr", j.get("error"))
@@ -555,7 +567,9 @@ def main() -> int:
         res.check("the downloaded gallery-dl finds its extractors and the standard library it needs", r.returncode == 0 and "instagram" in r.stdout.lower(),
                   f"{r.stdout.count(chr(10))} lines" if r.returncode == 0 else r.stderr[-300:])
     else:
-        res.missing(name, "gallery-dl", "pass --gallery-dl-wheel <the pinned gallery_dl-1.32.19-py3-none-any.whl>")
+        # Optional (R152): without a wheel there is nothing of gallery-dl's to run; run 1 checks that a
+        # capture needing it reports it as not installed.
+        res.info["galleryDlWheelCheck"] = "not run (no --gallery-dl-wheel)"
     r = subprocess.run([str(exe), "--version"], capture_output=True, text=True, env={"PATH": os.devnull}, timeout=60)
     res.check("anything else is refused (not a general interpreter)", r.returncode == 2, r.returncode)
 
