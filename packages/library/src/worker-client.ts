@@ -88,6 +88,10 @@ export interface WorkerJob {
 
 /** What a resubmission's `prepare` may add to a job it reruns, and be told how it ended (Task 62). */
 export interface ResumeExtras {
+  /** The input and output worked out again from the library as it is now (e.g. after a move). */
+  input?: string;
+  inputEncrypted?: boolean;
+  output?: string;
   onProgress?: (progress: number) => void;
   signal?: AbortSignal;
   finish?: (result: JobResult) => Promise<void>;
@@ -297,7 +301,7 @@ export class WorkerClient {
    */
   async resumePending(
     projectId?: string,
-    opts: { shouldStop?: () => boolean; signal?: AbortSignal; prepare?: (rec: JobRecord) => ResumeExtras | undefined } = {},
+    opts: { shouldStop?: () => boolean; signal?: AbortSignal; prepare?: (rec: JobRecord) => ResumeExtras | undefined | Promise<ResumeExtras | undefined> } = {},
   ): Promise<Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }>> {
     const library = repoLibrary(this.repo);
     if (library.mode !== "read-write" || this.closed) return [];
@@ -343,10 +347,18 @@ export class WorkerClient {
         });
         continue;
       }
-      const extras = opts.prepare?.(rec) ?? {};
+      let extras: ResumeExtras;
+      try {
+        extras = (await opts.prepare?.(rec)) ?? {};
+      } catch (error) {
+        out.push({ id: rec.id, projectId: rec.projectId, error }); // left pending, as it was
+        continue;
+      }
       const signals = [opts.signal, extras.signal].filter((s): s is AbortSignal => s !== undefined);
       const job: WorkerJob = {
         ...rec.job,
+        ...(extras.input !== undefined ? { input: extras.input, inputEncrypted: extras.inputEncrypted === true } : {}),
+        ...(extras.output !== undefined ? { output: extras.output } : {}),
         ...(extras.onProgress ? { onProgress: extras.onProgress } : {}),
         ...(signals.length ? { signal: signals.length === 1 ? signals[0]! : AbortSignal.any(signals) } : {}),
         ...(extras.finish ? { finish: extras.finish } : {}),

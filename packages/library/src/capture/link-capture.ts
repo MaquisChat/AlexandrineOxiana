@@ -45,6 +45,7 @@ import type { SourceInputFile } from "../repo/sources.js";
 import { DEFAULT_SPEECH_MODEL } from "@ao/shared";
 import { WorkerJobError, WorkerToolError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
 import { AcknowledgementRequiredError, incompleteReason, plainReason, toolMissingReason, transcriptToolMissingNote } from "./errors.js";
+import { storeTranscript } from "../transcript-store.js";
 import { classifyUrl, isCollectionLink, type ClassifiedUrl, type Platform } from "./platforms.js";
 import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport } from "./profile-capture.js";
 import { buildDraft, stripSnapshot, verificationSnapshot, type CaptureTool } from "./snapshot.js";
@@ -371,38 +372,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       params: { model: params.model ?? DEFAULT_SPEECH_MODEL, ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },
       entity: { type: "asset", id: media.id },
     });
-    const meta = r.meta;
-    const model = typeof meta.model === "string" ? meta.model : (params.model ?? "whisper");
-    const langs = Array.isArray(meta.detectedLanguages) ? meta.detectedLanguages.filter((l): l is string => typeof l === "string") : [];
-    const lang = langs.length === 1 ? langs[0]! : langs.length > 1 ? "mul" : "und";
-    const flagged = typeof meta.flaggedCount === "number" ? meta.flaggedCount : undefined;
-    const at = new Date().toISOString();
-    const files: string[] = [];
-    for (const ext of ["vtt", "json"]) {
-      const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
-      if (!file) continue;
-      const asset = await repo.addDerivedAsset(projectId, sf.source.id, {
-        fromPath: file,
-        kind: "transcript",
-        lang,
-        tool: `whisper-${model}`,
-        ext,
-        ...(r.encrypted ? { fromEncrypted: true } : {}),
-        ...(flagged !== undefined ? { metadata: { flaggedSegments: flagged } } : {}),
-        derivation: {
-          parents: [media.id],
-          operation: "transcribe",
-          provider: "faster-whisper",
-          model,
-          ranAt: "local",
-          params: { model, detectedLanguages: langs, ...(params.language ? { language: params.language } : {}) },
-          at,
-          triggeredBy,
-        },
-      });
-      files.push(asset.path);
-    }
-    return { files, flaggedSegments: flagged ?? 0 };
+    return storeTranscript(repo, projectId, sf.source.id, media, r, params, triggeredBy);
   }
 
   async function transcribe(projectId: string, sf: SourceFile, media: Asset, opts: CaptureOptions, work: string): Promise<{ note: string; tool?: string } | undefined> {

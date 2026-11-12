@@ -263,6 +263,8 @@ export {
 export { isMediaMime, isPictureMime, openAssetContent } from "./asset-content.js";
 export type { AssetContent } from "./asset-content.js";
 export { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
+export { TRANSCRIBE_KIND, recordingOf, transcriptionJob, transcriptionRecords, transcriptionRerun } from "./transcription-jobs.js";
+export type { StoredTranscript, TranscriptionParams } from "./transcription-jobs.js";
 export type { SegmentEdit, TranscriptRead, TranscriptSegment, VttCue } from "./transcript-segments.js";
 export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";
