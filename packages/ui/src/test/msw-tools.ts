@@ -10,6 +10,7 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { createClient } from "../api/client";
 import { toolsApi } from "../api/tools";
+import type { FirstUseAnswer } from "../components/FirstUseTools";
 
 export const BASE = "http://127.0.0.1:4319";
 export const TOKEN = "t".repeat(40) + "-task48b";
@@ -265,11 +266,11 @@ export function toolsService(opts: { tools?: ToolInfo[]; jobs?: ToolJob[]; base?
 }
 
 /** A store for the first-use answer that a test can read (the app keeps it in its own settings). */
-export function memoryStore(initial: "not-now" | "chosen" | null = null) {
+export function memoryStore(initial: FirstUseAnswer | null = null) {
   let v = initial;
   return {
     get: () => v,
-    set: (x: "not-now" | "chosen") => {
+    set: (x: FirstUseAnswer) => {
       v = x;
     },
     get value() {
