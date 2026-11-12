@@ -115,10 +115,11 @@ export interface TranscriptionProgressEvent {
   job: TranscriptionJob;
   /** For the jobs indicator: progress in percent (0..100), and whether the job has ended. */
   jobId: string;
+  projectId: string;
   done: number;
   total: 100;
   finished: boolean;
 }
 
-/** The 409 code of a second transcription of a source while one is queued or running. */
+/** The `reason` of the 409 CONFLICT for a second transcription of a source while one is queued, running or pending. */
 export const TRANSCRIPTION_RUNNING = "TRANSCRIPTION_RUNNING";

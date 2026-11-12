@@ -26,6 +26,7 @@
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TranscriptionJob, TranscriptResponse, TranscriptSaveRequest, TranscriptVersionSummary } from "@ao/shared";
+import { TRANSCRIPTION_RUNNING } from "@ao/shared";
 import { ApiClientError } from "../api/client";
 import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, transcriptionJobOf, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
@@ -522,7 +523,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
       accept(r.job);
     } catch (err) {
       if (!mounted.current) return;
-      const running = err instanceof ApiClientError && err.reason === "TRANSCRIPTION_RUNNING";
+      const running = err instanceof ApiClientError && err.reason === TRANSCRIPTION_RUNNING;
       const lost = err instanceof ApiClientError && err.status === 0;
       if (running || lost) {
         // The run already going, or the one this request may have started: shown, never started twice.

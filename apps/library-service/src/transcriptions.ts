@@ -28,7 +28,7 @@ import {
   type TranscriptionParams,
   type WorkerClient,
 } from "@ao/library";
-import { TRANSCRIPTION_RUNNING, type TranscriptionJob } from "@ao/shared";
+import { TRANSCRIPTION_RUNNING, type TranscriptionJob, type TranscriptionProgressEvent } from "@ao/shared";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import type { ServiceState, Session } from "./state.js";
 
@@ -274,6 +274,6 @@ export class Transcriptions {
   }
 }
 
-function event(job: TranscriptionJob, finished: boolean): Record<string, unknown> {
+function event(job: TranscriptionJob, finished: boolean): TranscriptionProgressEvent & Record<string, unknown> {
   return { kind: "transcription", jobId: job.jobId, projectId: job.projectId, job, done: Math.round((job.progress ?? 0) * 100), total: 100, finished };
 }
