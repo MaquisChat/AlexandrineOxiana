@@ -56,7 +56,7 @@ The library opens, showing its name as the page heading. To make your first proj
 
 ### Every time you open the app, at present
 
-At present the app does not reopen your last library by itself. Each time it starts, it shows **Choose a library** with your libraries listed. Click **Open** next to the one you want. This is a known problem (D5 in the test checklist) that is being fixed.
+At present each time the app starts, it shows **Choose a library** with your libraries listed. Click **Open** next to the one you want. This is related to known problem D5 in the test checklist, which is being fixed: the app should show **Library not found** at once for a library that has moved, instead of **Choose a library**.
 
 ## Where the library lives
 
@@ -70,7 +70,7 @@ The library is the folder you chose. It is an ordinary folder: you can see it in
 
 In an encrypted project the files are stored scrambled (their names end in `.enc`) and can be opened only through the app with the passphrase or recovery code. The project's names and structure stay readable.
 
-**Backing up or moving the library.** Because it is an ordinary folder, you can back it up by copying the whole folder to another drive, but only while the app is closed. Do not drag or rename the folder while the app is open. To move the library to another place, use the app's own function: in the library, click **Governance and records**, then **Move library**. It copies the library, checks every file at the new place, switches to it, and deletes the old copy only when you confirm. If you rename or move the folder yourself while the app is closed, the app shows **Library not found** the next time and offers **Locate library…** and **Search for library** to find it again. For an encrypted project, keep a copy of the passphrase or recovery code separate from the backup.
+**Backing up or moving the library.** Because it is an ordinary folder, you can back it up by copying the whole folder to another drive, but only while the app is closed. Do not drag or rename the folder while the app is open. To move the library to another place, use the app's own function: in the library, select a project, click **Governance and records**, then **Move library**. It copies the library, checks every file at the new place, switches to it, and deletes the old copy only when you confirm. If you rename or move the folder yourself while the app is closed, the app shows **Library not found** the next time (at present you first see **Choose a library** and click **Open** next to it, known problem D5) and offers **Locate library…** and **Search for library** to find it again. For an encrypted project, keep a copy of the passphrase or recovery code separate from the backup.
 
 ## Where the app keeps its own settings
 
@@ -91,7 +91,7 @@ Some features need extra programs that are not included with the app, so that it
 
 When you open a library for the first time, a banner appears: "Some features need optional tools that are not included with the app: would you like to choose which to download?" It has two buttons:
 
-- **Choose tools…** opens a dialog titled **Optional tools**. It asks "What will you do?" with four choices: **Work with recordings**, **Save videos from the web**, **Save picture posts from the web**, **Read scanned documents**. The tools that match are offered, with their download size and the web addresses they contact. Nothing downloads until you click the **Download** button.
+- **Choose tools…** opens a dialog titled **Optional tools**. It asks "What will you do?" with four choices: **Work with recordings**, **Save videos from the web**, **Save picture posts from the web**, **Read scanned documents**. The tools that match are offered, with their download size and the web addresses they contact. Nothing downloads until you click the button that starts the download (it reads "Download N tools (size)", or "Download selected tools" while nothing is ticked).
 - **Not now** hides the banner and the app remembers your answer. You can change your mind later: click **Optional tools** at the top of the library screen.
 
 What each tool is for:
@@ -102,31 +102,35 @@ What each tool is for:
 - **Video tools (ffmpeg)**: makes viewing copies of videos, including copies that leave out or blur a recorded location. Without it, media that carries a location stays "proxy pending" and is left out of exports.
 - **Text recognition (OCR)**: makes the text of scanned PDFs searchable. On this Mac build it is shown as not available: no ready-made version exists yet for Macs, and the app uses one already installed on your Mac if there is one.
 
-Each download is checked against its published checksum before it is used. The **Optional tools** screen lets you **Install**, **Update**, **Remove**, or **Cancel** a download in progress.
+Each download is checked against a checksum recorded in the app before it is used (the video downloader, which is always the latest release, is checked against the checksums its authors publish). The **Optional tools** screen lets you **Install**, **Update**, **Remove**, or **Cancel** a download in progress.
 
 ## Pairing the browser extension
 
-The browser extension lets you capture the web page you are looking at into a project. It is not in any browser's store, and it is not part of the Mac download. At present it has to be built from the project's source files and loaded by hand. You need Node 22 and pnpm (see the repository's `README.md`). If you do not have those, ask the person who gave you this guide for a ready-made extension folder.
+The browser extension lets you capture the web page you are looking at into a project. It works in Chrome, Edge and Firefox (version 128 or later), not in Safari. It is not in any browser's store.
 
-**Loading it into the browser.** You need a copy of the project's source files (the repository). In a terminal, in that folder, run `pnpm install` and then `pnpm --filter @ao/browser-extension build`. That makes the folder `apps/browser-extension/dist`.
+**Getting the extension.** The extension is meant to be a download on the same run page as the Mac app: an artifact called `alexandrine-oxiana-browser-extension`, next to `alexandrine-oxiana-macos-apple-silicon` under **Artifacts**.
 
-- **Chrome (or Edge):** open `chrome://extensions`, turn on **Developer mode**, choose **Load unpacked**, and pick the `dist` folder.
-- **Firefox (128 or later):** open `about:debugging`, choose **Load Temporary Add-on**, and pick `dist/manifest.json` (Firefox forgets it when it closes).
+- If that artifact is on the run page you downloaded from, download it and unzip it. Then load the unzipped folder into your browser:
+  - **Chrome (or Edge):** open `chrome://extensions`, turn on **Developer mode**, choose **Load unpacked**, and pick the unzipped folder.
+  - **Firefox:** open `about:debugging`, choose **This Firefox**, then **Load Temporary Add-on**, and pick the file `manifest.json` in the unzipped folder. Firefox forgets it when it closes.
+- If it is not there (the build of 2026-11-12 has no such artifact), the extension cannot be installed without a developer's help. Ask the person who gave you this guide, and leave this section until you have it.
 
-**Letting a project accept browser captures.** A new project does not allow browser capture or the downloader. The extension's popup says "No project allows browser capture." until you allow it. In the app: open the project, click **Governance and records**, then **View governance.yaml**. In the text, add (or change) this line, then click **Save changes**:
+**Known problem D13 (being fixed): pair again after every reopen.** The app takes a new port each time it starts, and the extension keeps the one it was paired with. After you quit and reopen the app, the popup still says it is paired, but every capture fails with "The desktop app is not answering on port N. Is it open?". The way round for now: in the popup click **Unpair**, in the app click **Show a pairing code**, and pair again with the new port and code (steps below). For the test, do scenario 10 of the checklist in one sitting, without quitting the app.
+
+**Known problem D11 (being fixed): letting a project accept browser captures.** A new project does not allow browser capture or the downloader, and the Governance form has no control for it yet. The extension's popup says "No project allows browser capture." until you allow it. The only way for now is a workaround that will go away: in the app, select the project, click **Governance and records**, then **View governance.yaml**, and add this line at the end of the text:
 
 `captureMethods: [manual_upload, zotero_import, refman_import, calibre_import, device_import, browser_capture, downloader]`
 
-If the app says the change needs a reason, give one: it is kept in the audit log.
+Click **Save changes**. The app says "This change loosens the project's rules, so it needs a reason" and opens a dialog **Record a reason** with the fields **Reason** and **Approved by**. Fill them in and click **Record reason**; you should then see **Saved.** The reason is kept in the audit log. A project that is encrypted and locked, or that holds identifiable data, can still refuse a capture; use a plain project.
 
 **Pairing.**
 
 1. In the app's library screen, click **Browser extension**. The page has a section **Pair a browser**.
 2. Click **Show a pairing code**. A code of six digits appears, with "Valid for" a countdown. The code works once, for 5 minutes, and stops after 5 wrong tries. The page also shows the **Port** number.
-3. In your browser, click the extension's icon. Its popup, **Pair with the desktop app**, has two boxes: **Port** and **Pairing code**. (The popup's own hint says "open Settings → Browser extension"; in the app, the place is the **Browser extension** link at the top of the library screen.) Type the port and the six digits, then click **Pair**.
-4. The popup says "Pairing done. Choose a project below." and the app says "The code was used: a browser was paired, and the code can't be used again." The browser is listed under **Paired browsers**.
+3. In your browser, click the extension's icon. Its popup, **Pair with the desktop app**, has two boxes: **Port** and **Pairing code**. (The popup's own hint says "open Settings → Browser extension"; the app has no Settings menu: the place is the **Browser extension** link at the top of the library screen.) Type the port and the six digits, then click **Pair**.
+4. The popup says "Pairing done. Choose a project below." and the app says "The code was used: a browser was paired, and the code can't be used again." The extension is listed under **Paired browsers** by its address, which begins `chrome-extension://` or `moz-extension://`.
 
-To undo a pairing, click **Revoke** next to the browser in **Paired browsers** and confirm with **Revoke pairing**. In the popup, **Unpair** removes it from the browser's side.
+To undo a pairing, click **Revoke** next to the entry in **Paired browsers** and confirm with **Revoke pairing**. In the popup, **Unpair** removes it from the browser's side.
 
 ## Quitting
 
@@ -137,13 +141,13 @@ Close the app's window. The app quits when its window closes, and it also stops 
 To remove the app, drag **Alexandrine Oxiana** from Applications to the Trash. This leaves behind:
 
 - your **library folders**, wherever you made them (your research data: deliberately not touched);
-- the app's own folder, `~/Library/Application Support/org.alexandrineoxiana.desktop` (settings, downloaded tools and speech models). Delete it if you want everything gone. Keep your passphrases and recovery codes: they are what opens an encrypted project.
+- the app's own folder, `~/Library/Application Support/org.alexandrineoxiana.desktop` (settings, downloaded tools and speech models). Delete it if you want everything gone. The app's web view also keeps some data of its own (for example your answer to the optional-tools banner) in a place this guide cannot name, so deleting that folder may not bring the banner back. Keep your passphrases and recovery codes: they are what opens an encrypted project.
 
 ## If something goes wrong
 
 - **macOS will not open the app.** Follow "Opening it the first time" above. If **Open Anyway** is not there, open the app again from Applications and look again.
 - **A small window titled "Alexandrine Oxiana could not start" appears.** The app's helper program did not start. The window gives a reason. Close it, try once more, and if it appears again, send a screenshot of the window.
-- **The library says "Library not found".** The folder is not where it was last seen (for example, an external drive is not connected, or the folder was renamed). Connect the drive, or click **Locate library…** and type the new full path, or **Search for library**.
+- **The library says "Library not found".** (At present you first see **Choose a library**; click **Open** next to the library and then you see it.) The folder is not where it was last seen (for example, an external drive is not connected, or the folder was renamed). Connect the drive, or click **Locate library…** and type the new full path, or **Search for library**.
 - **A banner says "Read-only (locked by …)".** The library is locked by another device. The banner goes on: "Changes are off until the library is closed there."
 - **An optional tool will not download.** Check your internet connection, then click **Try again** on the tool's card. The message names the tool and the reason.
 - **You forgot a passphrase.** Use the recovery code you saved. There is no other way in.
