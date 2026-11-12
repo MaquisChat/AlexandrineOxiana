@@ -485,6 +485,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by the accuracy review of Task 37k (for Task 69): D17 (medium): a captured post that has disappeared at its source is kept and recorded as no longer available (`availability: unavailable-on-platform`), but no library screen shows it; only the capture queue's one-line count says so. Scenario 10 promises the item is flagged (R183 a).
 - Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests.
 - Defect found by the re-check of Task 37k (not fixed in this build): D19 (medium): a conflict found when a later check adds data to an existing source (a browser-extension capture with the downloader ticked) shows as a "Conflict" badge on the source but writes no review-queue entry, so the source carries no "Needs review" (R172). Entries are written only when a source is created (`packages/library/src/sources.ts`). For after the owner's tests.
+- Defect found by the review of Task 34f (not fixed in this build): D20 (medium): the audit entry of a field confirmation is a generic `source.update` that names no field, and the change log does not hold the verification report; confirming the value already there leaves no trace of which field was confirmed (R176, R149). For after the owner's tests.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -516,7 +517,7 @@ Update after every task; commit and push.
 | 62 Transcription as a job | complete | d2c21b5 (merge) | reviewed with probes over one fix round and a final check; verification clean throughout; GitHub's run on the merge to be read before the next merge |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
-| 34f Scenarios 9–11 | in review | 8039125 (worktree branch) | five runs of five in both browsers; found D17; its D17 step turns into a passing check after Task 69 |
+| 34f Scenarios 9–11 | approved; a last small round after Task 69 (the D17 step, six minors) | 8039125 (worktree branch) | five runs of five in both browsers; found D17; its review found D20 |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
