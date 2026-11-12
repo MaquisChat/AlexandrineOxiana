@@ -190,6 +190,21 @@ describe("SourceTable", () => {
     expect(rows[1]!.textContent).toContain("Found in an annotation");
     expect(rows[2]!.textContent).not.toContain("annotation");
   });
+
+  it("says when only part of a source's annotations is searchable, when the index is incomplete, and when search covers titles only (R161)", () => {
+    const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    const { rerender } = render(
+      <SourceTable items={[{ ...base, id: "a", title: "Long one", matchedIn: "annotation", annotationsPartial: true }, { ...base, id: "b", title: "Short one" }]} total={2} onOpen={vi.fn()} />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    expect(rows[1]!.textContent).toContain("Only part of its annotations is searchable");
+    expect(rows[2]!.textContent).not.toContain("part of its annotations");
+    expect(screen.queryByRole("note")).toBeNull();
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete />);
+    expect(screen.getByRole("note").textContent).toMatch(/search index of this library is being brought up to date: the text of annotations is not searchable yet/i);
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} limited />);
+    expect(screen.getByRole("note").textContent).toMatch(/only titles are searched/i);
+  });
 });
 
 describe("JobsIndicator", () => {

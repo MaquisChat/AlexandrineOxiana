@@ -10,7 +10,7 @@
  * dialog (Task 61).
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
+import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
@@ -84,7 +84,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<{ tags: Tag[]; workspaceTags: Tag[] }>({ tags: [], workspaceTags: [] });
   const [filter, setFilter] = useState<{ text: string; collection?: string | undefined; tag?: string | undefined }>({ text: "" });
-  const [sources, setSources] = useState<{ total: number; items: SourceRow[] } | undefined>();
+  const [sources, setSources] = useState<SourcePage | undefined>();
   const [openSource, setOpenSource] = useState<string | undefined>();
   const [outcomes, setOutcomes] = useState<AttachOutcome[] | undefined>();
   /** "Resolve…" (R27) is open; focus goes back to the button that opened it. */
@@ -317,7 +317,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length }, { signal: ac.signal });
       if (stale()) return;
       // A late page is only ever added to the list it continues, never used as a whole list.
-      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
+      setSources((cur) => (cur ? { ...r, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
     } catch (err) {
       if (!stale()) fail(err, "More sources could not be read.", setSourcesError);
     } finally {
@@ -693,7 +693,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               !sourcesError && <p aria-live="polite">Loading sources…</p>
             ) : (
               <>
-                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} />
+                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} />
                 {sources.items.length < sources.total && (
                   <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
                     Load more sources

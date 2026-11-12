@@ -595,32 +595,42 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
     <div className="ao-subsection">
       {zone ? (
         <div className="ao-field">
-          <label htmlFor={`${tzId}-tz`}>Time zone for these dates</label>
+          <label htmlFor={`${tzId}-tz`}>The project's time zone (protocol and retention dates)</label>
           <input
             id={`${tzId}-tz`}
             type="text"
             maxLength={64}
             autoComplete="off"
             spellCheck={false}
-            aria-describedby={`${tzId}-tz-hint`}
+            aria-describedby={tzError ? `${tzId}-tz-hint ${tzId}-tz-error` : `${tzId}-tz-hint`}
+            {...(tzError ? { "aria-invalid": true } : {})}
             value={zone.input}
             onChange={(e) => {
               const input = e.target.value;
               setZone((z) => (z ? { ...z, input } : z));
               setTzSaved(false);
+              setTzError(null);
             }}
           />
           <p id={`${tzId}-tz-hint`} className="ao-hint">
-            A time zone name such as Europe/Berlin or America/New_York. Leave it empty for UTC.
+            A time zone name such as Europe/Berlin or America/New_York. When set, the protocol's dates and the retention date are both read in it. Empty: protocol dates follow this computer's
+            time zone, and the retention date is read in UTC. Changing the time zone moves the moment the retention date takes effect, by up to a day either way.
           </p>
           <button type="button" disabled={tzBusy} onClick={() => void saveZone()}>
             Save time zone
           </button>
           <p role="status" className="ao-hint">
-            {tzSaved ? "Saved. " : ""}Dates are read in {zone.saved ? <UserText>{zone.saved}</UserText> : "UTC"}.
+            {tzSaved ? "Saved. " : ""}
+            {zone.saved ? (
+              <>
+                The project's dates are read in <UserText>{zone.saved}</UserText>.
+              </>
+            ) : (
+              "No time zone is set: protocol dates in this computer's time zone, the retention date in UTC."
+            )}
           </p>
           {tzError ? (
-            <p role="alert" className="ao-warning">
+            <p role="alert" id={`${tzId}-tz-error`} className="ao-warning">
               {tzError}
             </p>
           ) : null}
