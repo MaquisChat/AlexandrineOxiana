@@ -155,6 +155,68 @@ describe("N1: a search of several terms over many annotated sources", () => {
   }, 120_000);
 });
 
+describe("N5: a search of several words in a project of 5,000 annotated sources does not block for long", () => {
+  /*
+   * Budget (fix round 3): two common words under TWO_WORDS_MS, six under SIX_WORDS_MS, on the
+   * service's one thread. Measured on the development machine (a shared multi-core container, load
+   * 1–3); a slower runner has the margin between the measured times (see the log line) and these.
+   */
+  const TWO_WORDS_MS = 300;
+  const SIX_WORDS_MS = 600;
+  let big: IndexDb;
+  let bigDir: string;
+  const P = "0190f0f0-0000-7000-8000-00000000bbbb";
+  const OTHER = "0190f0f0-0000-7000-8000-00000000cccc";
+  const ids: string[] = [];
+  beforeAll(async () => {
+    bigDir = await mkdtemp(join(tmpdir(), "ao-annspeed-"));
+    big = openIndexAt(join(bigDir, "library.sqlite"));
+    const words = ["market", "vendor", "street", "policy", "memory", "kitchen", "harvest", "ledger", "rumour", "ration"];
+    const add = (project: string, s: number) => {
+      const id = newId();
+      const anns = Array.from({ length: 30 }, (_, i) => {
+        let t = `note${s}x${i} `;
+        for (let j = 0; t.length < 1_000; j++) t += `${words[(s + i + j) % words.length]} `;
+        return { id: newId(), sourceId: id, kind: "highlight", anchors: [], quote: t, author: "t", createdAt: NOW } as Annotation;
+      });
+      const sf = sourceFile(anns, id);
+      (sf.source as { projectIds: string[] }).projectIds = [project];
+      (sf.source as { title: unknown }).title = { variants: [{ lang: "en", kind: "original", value: `Source ${s}` }] };
+      indexSource(big, sf);
+      return id;
+    };
+    big.transaction(() => {
+      for (let s = 0; s < 5_000; s++) ids.push(add(P, s));
+      for (let s = 0; s < 1_000; s++) add(OTHER, s);
+    })();
+  }, 600_000);
+  afterAll(async () => {
+    big.close();
+    await rm(bigDir, { recursive: true, force: true });
+  });
+
+  it("two and six common words stay within the budget, with the right answers", () => {
+    const timed = (text: string) => {
+      search(big, { text, projectId: P, limit: 50 }); // warm the page cache like a typing user would
+      const t = performance.now();
+      const r = search(big, { text, projectId: P, limit: 50 });
+      return { ms: performance.now() - t, r };
+    };
+    const two = timed("market vendor");
+    const six = timed("market vendor street policy memory kitchen");
+    const rare = timed("market note4321x7");
+    console.log(`Task 58 N5 search, project of 5,000 annotated sources (ms): two words ${Math.round(two.ms)}, six words ${Math.round(six.ms)}, common+rare ${Math.round(rare.ms)}`);
+    expect(two.r.total).toBe(5_000);
+    expect(six.r.total).toBe(5_000);
+    expect(two.r.items).toHaveLength(50);
+    expect(two.r.items.every((i) => i.matchedIn === "annotation" && i.projectId === P)).toBe(true);
+    expect(rare.r.total).toBe(1);
+    expect(rare.r.items[0]).toMatchObject({ id: ids[4321], matchedIn: "annotation" });
+    expect(two.ms).toBeLessThan(TWO_WORDS_MS);
+    expect(six.ms).toBeLessThan(SIX_WORDS_MS);
+  });
+});
+
 describe("R161 (b): annotation indexing at the R74 cap has a bounded cost", () => {
   for (const cjk of [true, false]) {
     for (const prot of [false, true]) {

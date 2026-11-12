@@ -1106,6 +1106,20 @@ describe("annotation text (Task 58, R74)", () => {
     expect(() => search(handle.db, { text: Array.from({ length: 17 }, (_, i) => `w${i}`).join(" ") })).toThrow(/at most 16 words/);
   });
 
+  it("N6: the bound counts only the searched project's matches", async () => {
+    const busy = await openProject("Busy");
+    for (let i = 0; i < 6; i++) await repo.createSource(busy, draft(`Thing ${i}`), files(), { provenance: prov() });
+    const quiet = await openProject("Quiet");
+    const sf = await repo.createSource(quiet, draft("Thing apart"), files(), { provenance: prov() });
+    await setAnnotations(quiet, sf.source.id, () => [ann(sf.source.id, { body: "uniqueword here" })]);
+    // Six "thing" sources elsewhere do not refuse a search of this project.
+    expect(search(handle.db, { text: "thing uniqueword", projectId: quiet, maxTermMatches: 5 }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // The library-wide search still counts them all.
+    expect(() => search(handle.db, { text: "thing uniqueword", maxTermMatches: 5 })).toThrow(/too many sources/);
+    // A word found nowhere in the project ends the search at once, with nothing.
+    expect(search(handle.db, { text: "thing nowhereword", projectId: quiet, maxTermMatches: 5 }).total).toBe(0);
+  });
+
   it("N1: a locked encrypted project's annotations combine with nothing (R30); unlocked they do", async () => {
     const pid = (await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
     const sf = await repo.createSource(pid, draft("Sealed source"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
