@@ -65,6 +65,7 @@ async function rawSource(p: Project, title = "Interview one"): Promise<SourceFil
 
 type Details = Record<string, unknown> & {
   op?: string;
+  backupsToRemove?: string[];
   certificate?: string;
   certificateSha256?: string;
   amendment?: string;
@@ -782,6 +783,78 @@ describe("an entry leaves the list only when its file is verifiably gone", () =>
     expect(rec.status).toBe("no-longer-present");
     expect((rec.certificate!.backups as { noLongerPresent?: Array<{ file: string }> }).noLongerPresent?.map((e) => e.file)).toEqual([rel(x)]);
     expect((rec.certificate!.backups as { deleted: string[] }).deleted).toEqual([]);
+  });
+
+  describe("M3: a backup listed by two destructions of the project", () => {
+    /** Two raw files in one backup X; each destroyed on its own (10:00 and 10:05). `stuckAt` says at which destructions X could not be removed. */
+    async function two(stuckAt: { first: boolean; second: boolean }): Promise<{ p: Project; x: BackupResult; first: string; second: string }> {
+      const p = await makeProject(kit, RETAIN, false, "Shared");
+      const one = await rawSource(p, "one");
+      const other = await rawSource(p, "two");
+      const x = await backupProject(kit.repo, p.id);
+      kit.clock.now = new Date("2026-12-02T10:00:00.000Z");
+      if (stuckAt.first) shredSeams.failFor = (path) => path.endsWith(nameOf(x));
+      const a = await destroyRaw(kit.repo, p.id, [one.assets[0]!.id], "tester");
+      shredSeams.failFor = undefined;
+      kit.clock.now = new Date("2026-12-02T10:05:00.000Z");
+      if (stuckAt.second) shredSeams.failFor = (path) => path.endsWith(nameOf(x));
+      const b = await destroyRaw(kit.repo, p.id, [other.assets[0]!.id], "tester");
+      shredSeams.failFor = undefined;
+      return { p, x, first: a.certificatePath, second: b.certificatePath };
+    }
+    type Shown = { deleted: string[]; removedAt?: Record<string, string>; removedUnder?: Record<string, string>; noLongerPresent?: unknown[] };
+
+    it("removed in one pass: the first records the removal, and the second records that the app removed it, for the first, at that time; never as found missing", async () => {
+      const { p, x, first, second } = await two({ first: true, second: true });
+      expect((await listDestructions(kit.repo, p.id)).map((d) => d.outstanding)).toEqual([[rel(x)], [rel(x)]]);
+      later(HOUR);
+      const at = kit.clock.now.toISOString();
+      await resumeDestruction(kit.repo, p.id);
+      expect(existsSync(x.path)).toBe(false);
+      const one = await readDestruction(kit.repo, p.id, first);
+      const other = await readDestruction(kit.repo, p.id, second);
+      expect(one).toMatchObject({ status: "deleted", outstanding: [] });
+      expect((one.certificate!.backups as Shown).removedUnder).toBeUndefined();
+      // The second: removed by the app, as the audit log of this project says, under the first certificate.
+      expect(other).toMatchObject({ status: "deleted", outstanding: [] });
+      const shown = other.certificate!.backups as Shown;
+      expect(shown.deleted).toContain(rel(x));
+      expect(shown.removedAt![rel(x)]).toBe(at);
+      expect(shown.removedUnder).toEqual({ [rel(x)]: basename(first) });
+      expect(shown.noLongerPresent ?? []).toEqual([]);
+      // In the audit log and in the amendment beside the certificate, the same.
+      const mine = (await amendmentEvents(p)).filter((e) => detailsOf(e).certificate === basename(second)).at(-1)!;
+      expect(detailsOf(mine)).toMatchObject({ status: "deleted", removed: [rel(x)], noLongerPresent: [], removedUnder: { [rel(x)]: { certificate: basename(first), at } } });
+      expect((other.amendments.at(-1)!.content!.backups as { removed: unknown }).removed).toEqual([{ file: rel(x), at, under: basename(first) }]);
+      // Once for each certificate, and nothing more afterwards.
+      for (const c of [first, second]) {
+        const ev = (await amendmentEvents(p)).filter((e) => detailsOf(e).certificate === basename(c));
+        expect(ev.filter((e) => detailsOf(e).removed?.includes(rel(x)))).toHaveLength(1);
+        expect(ev.filter((e) => detailsOf(e).noLongerPresent?.includes(rel(x)))).toHaveLength(0);
+      }
+      expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+      const count = (await auditEvents(kit, p)).length;
+      later(HOUR);
+      expect(await resumeDestruction(kit.repo, p.id)).toEqual([]);
+      expect((await auditEvents(kit, p)).length).toBe(count);
+      expect(verifyChain(await auditEvents(kit, p)).ok).toBe(true);
+    });
+
+    it("removed at the second destruction itself: the first, on its next pass, records the removal under the second, with the time it happened", async () => {
+      const { p, x, first, second } = await two({ first: true, second: false });
+      expect(existsSync(x.path)).toBe(false);
+      const removedAt = "2026-12-02T10:05:00.000Z";
+      expect((await readDestruction(kit.repo, p.id, second)).status).toBe("deleted");
+      expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
+      later(HOUR);
+      await resumeDestruction(kit.repo, p.id);
+      const one = await readDestruction(kit.repo, p.id, first);
+      expect(one).toMatchObject({ status: "deleted", outstanding: [] });
+      const shown = one.certificate!.backups as Shown;
+      expect(shown.removedAt![rel(x)]).toBe(removedAt);
+      expect(shown.removedUnder).toEqual({ [rel(x)]: basename(second) });
+      expect(await projectWarnings(kit.repo, p.id)).not.toContain(WARNING);
+    });
   });
 
   describe("a backup that could not be read at the destruction (it may hold the destroyed files)", () => {

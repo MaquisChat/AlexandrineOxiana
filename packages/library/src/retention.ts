@@ -146,6 +146,8 @@ interface CertificateBackups {
   deleted: string[];
   /** When the app removed each one in `deleted`. */
   removedAt?: Record<string, string>;
+  /** Those in `deleted` that the app removed for another destruction of this project: the certificate of that destruction. */
+  removedUnder?: Record<string, string>;
   /** Those found missing: not removed by the app; `at` is when it was noticed. */
   noLongerPresent?: Array<{ file: string; at: string }>;
   /** Those that could not be read at the destruction, read since and found to hold none of the destroyed files (kept). */
@@ -399,6 +401,8 @@ interface Audited {
   unreadable: string[];
   /** Listed backup → when the app removed it. */
   removed: Map<string, string>;
+  /** Of those: removed by the app for another destruction of this project → that destruction's certificate (M3). */
+  removedUnder: Map<string, string>;
   /** Listed backup → when it was noticed to be gone. */
   gone: Map<string, string>;
   /** Unreadable backup → when it was read and found to hold none of the destroyed files. */
@@ -424,6 +428,7 @@ const newAudited = (projectId: string, certificate: string, certificateSha256: s
   toRemove,
   unreadable,
   removed: new Map(),
+  removedUnder: new Map(),
   gone: new Map(),
   notHolding: new Map(),
   amendments: [],
@@ -476,7 +481,15 @@ function auditedDestructions(events: Iterable<AuditEvent | null>): { list: Audit
     const a = typeof d.certificateSha256 === "string" ? bySha.get(d.certificateSha256) : undefined;
     if (a && e.action === "delete" && d.op === "retention.backups") {
       const at = typeof d.stepAt === "string" ? d.stepAt : e.at;
-      for (const f of strings(d.removed)) if (listedIn(a, f) && !settledIn(a, f)) a.removed.set(f, at);
+      const under = (d.removedUnder && typeof d.removedUnder === "object" ? d.removedUnder : {}) as Record<string, { certificate?: unknown; at?: unknown } | undefined>;
+      for (const f of strings(d.removed)) {
+        if (!listedIn(a, f) || settledIn(a, f)) continue;
+        // Removed for another destruction of this project: at the time that one's record gives.
+        const u = Object.hasOwn(under, f) ? under[f] : undefined;
+        const elsewhere = typeof u?.certificate === "string" && typeof u.at === "string" ? { certificate: u.certificate, at: u.at } : undefined;
+        a.removed.set(f, elsewhere?.at ?? at);
+        if (elsewhere) a.removedUnder.set(f, elsewhere.certificate);
+      }
       for (const f of strings(d.noLongerPresent)) if (listedIn(a, f) && !settledIn(a, f)) a.gone.set(f, at);
       for (const f of strings(d.notHolding)) if (a.unreadable.includes(f) && !settledIn(a, f)) a.notHolding.set(f, at);
       if (typeof d.amendment === "string" && typeof d.amendmentSha256 === "string") a.amendments.push({ name: d.amendment, sha256: d.amendmentSha256, at: e.at });
@@ -605,6 +618,7 @@ function present(original: Record<string, unknown>, amendments: readonly Destruc
   const own = (original.backups ?? {}) as { containing?: unknown };
   const b: CertificateBackups = { status: statusOf(a), containing: strings(own.containing), deleted: [...a.removed.keys()] };
   if (a.removed.size) b.removedAt = Object.fromEntries(a.removed);
+  if (a.removedUnder.size) b.removedUnder = Object.fromEntries(a.removedUnder);
   if (a.gone.size) b.noLongerPresent = [...a.gone].map(([file, at]) => ({ file, at }));
   if (a.notHolding.size) b.notHolding = [...a.notHolding].map(([file, at]) => ({ file, at }));
   const steps = amendments.filter((am) => am.verified && am.content).map((am) => (am.content!.backups ?? {}) as AmendmentBackups);
@@ -717,6 +731,8 @@ interface SettleOptions {
   mayRecord?: () => Promise<boolean>;
   /** The certificate as written at the destruction (verified), for the ids of the destroyed assets. */
   certificate?: Record<string, unknown>;
+  /** Every destruction the same reading of the audit log records (this one among them). */
+  all?: readonly Audited[];
 }
 
 /**
@@ -772,11 +788,16 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   const notHolding: string[] = [];
   const toDelete: string[] = [];
   const unidentified: string[] = [];
+  /** Missing because the app removed it for another destruction of this project, as the audit log says (M3): file → that record. */
+  const elsewhere = new Map<string, { certificate: string; at: string }>();
   for (const f of left) {
     const s = files.get(fileOf(f));
     if (a.reused.has(f)) gone.push(f);
     else if (!s?.present) {
-      gone.push(f);
+      // (Not a removal from before this destruction: that was an earlier backup of the same name.)
+      const o = (opts.all ?? []).find((x) => x.certificateSha256 !== a.certificateSha256 && x.removed.has(f) && !x.removedUnder.has(f) && x.removed.get(f)! >= a.at);
+      if (o) elsewhere.set(f, { certificate: o.certificate, at: o.removed.get(f)! });
+      else gone.push(f);
       missing.push(f);
     } else if (!act) continue;
     else if (a.toRemove.includes(f)) (inherited && !a.made.has(f) ? unidentified : toDelete).push(f);
@@ -786,7 +807,7 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   }
   // An observing pass has nothing to do unless a listed backup is gone; and it records that only on
   // the word of a log that holds together: otherwise nothing is written, not even to the manifest.
-  if (!act && (!gone.length || (opts.mayRecord !== undefined && !(await opts.mayRecord())))) return undefined;
+  if (!act && ((!gone.length && !elsewhere.size) || (opts.mayRecord !== undefined && !(await opts.mayRecord())))) return undefined;
 
   // A fresh backup first, when it can be made (R90 d), at most once a day on a retry; the listed
   // backups are removed whether or not it could (R138 e).
@@ -833,7 +854,7 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   backupCrashPoint("before-removal-record");
 
   const freshBackupFailed = a.freshBackup || freshMade ? undefined : (freshFailed ?? a.freshBackupFailed);
-  const changed = removed.length > 0 || gone.length > 0 || notHolding.length > 0 || freshMade !== undefined;
+  const changed = removed.length > 0 || gone.length > 0 || elsewhere.size > 0 || notHolding.length > 0 || freshMade !== undefined;
   if (!changed && (!act || !first)) {
     if (!act || !rec) return undefined;
     const noted = rec;
@@ -859,8 +880,12 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   }
 
   // What this pass found, applied to a copy of the list: `a` itself changes only once it is recorded.
-  const next: Audited = { ...a, removed: new Map(a.removed), gone: new Map(a.gone), notHolding: new Map(a.notHolding) };
+  const next: Audited = { ...a, removed: new Map(a.removed), removedUnder: new Map(a.removedUnder), gone: new Map(a.gone), notHolding: new Map(a.notHolding) };
   for (const f of removed) next.removed.set(f, at);
+  for (const [f, e] of elsewhere) {
+    next.removed.set(f, e.at);
+    next.removedUnder.set(f, e.certificate);
+  }
   for (const f of gone) next.gone.set(f, at);
   for (const f of notHolding) next.notHolding.set(f, at);
   if (freshMade) next.freshBackup = freshMade;
@@ -887,7 +912,7 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     number,
     at,
     backups: {
-      removed: removed.map((file) => ({ file, at })),
+      removed: [...removed.map((file) => ({ file, at })), ...[...elsewhere].map(([file, e]) => ({ file, at: e.at, under: e.certificate }))],
       noLongerPresent: gone.map((file) => ({ file, at })),
       ...(notHolding.length ? { notHolding: notHolding.map((file) => ({ file, at })) } : {}),
       notRemoved: failed.map((f) => ({ ...f, at })),
@@ -900,10 +925,12 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     },
   };
   // The same facts in the audit event that reports the amendment (with its sha256): the authority.
+  const removedByApp = [...removed, ...elsewhere.keys()];
   const facts = {
     stepAt: at,
     status,
-    removed,
+    removed: removedByApp,
+    ...(elsewhere.size ? { removedUnder: Object.fromEntries(elsewhere) } : {}),
     noLongerPresent: gone,
     ...(notHolding.length ? { notHolding } : {}),
     notRemoved: outstanding,
@@ -912,7 +939,7 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
   };
   const w = await amendProjectDestruction(repo, projectId, { certificate: a.certificate, certificateSha256: a.certificateSha256, number, content, facts });
   // Recorded: the list is now what the audit log says.
-  Object.assign(a, { removed: next.removed, gone: next.gone, notHolding: next.notHolding });
+  Object.assign(a, { removed: next.removed, removedUnder: next.removedUnder, gone: next.gone, notHolding: next.notHolding });
   if (next.freshBackup) a.freshBackup = next.freshBackup;
   if (next.freshBackupFailed) a.freshBackupFailed = next.freshBackupFailed;
   else delete a.freshBackupFailed;
@@ -942,7 +969,8 @@ async function settleBackups(repo: Repo, hold: MaintenanceHold, projectId: strin
     amendmentSha256: w.sha256,
     status,
     deleted: a.removed.size,
-    removed,
+    removed: removedByApp,
+    ...(elsewhere.size ? { removedUnder: Object.fromEntries(elsewhere) } : {}),
     noLongerPresent: gone,
     ...(notHolding.length ? { notHolding } : {}),
     notRemoved: outstanding,
@@ -1024,10 +1052,11 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
           // Before anything is removed: the whole log, its chain verified, read again.
           const checked = await verifiedAuditEvents(repo, projectId);
           holds = checked.ok;
-          const sure = checked.ok ? auditedDestructions(checked.events).list.find((x) => x.certificateSha256 === a.certificateSha256) : undefined;
+          const all = checked.ok ? auditedDestructions(checked.events).list : [];
+          const sure = all.find((x) => x.certificateSha256 === a.certificateSha256);
           if (sure) {
             a = sure;
-            await settleBackups(repo, hold, projectId, a, { retry: true, ...(disk?.original ? { certificate: disk.original } : {}) });
+            await settleBackups(repo, hold, projectId, a, { retry: true, all, ...(disk?.original ? { certificate: disk.original } : {}) });
             out.push(join(lib.root, ...rel.split("/")));
           } else {
             problem = AUDIT_UNVERIFIED;
@@ -1046,7 +1075,7 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
         // A convenience disagrees: nothing is removed. A listed backup that is gone is still recorded
         // as gone, and the disagreement is said once in the audit log (not at every pass): both only
         // on the word of a log that holds together. Otherwise this pass writes nothing (R174).
-        await settleBackups(repo, hold, projectId, a, { retry: true, observeOnly: true, mayRecord: logHolds });
+        await settleBackups(repo, hold, projectId, a, { retry: true, observeOnly: true, mayRecord: logHolds, all: view.list });
         if (outstandingOf(a).length && scanned.reportedProblem !== problem && (await logHolds())) {
           await appendLibraryEvent(repo, projectId, "retention.backups", {
             certificate: a.certificate,
