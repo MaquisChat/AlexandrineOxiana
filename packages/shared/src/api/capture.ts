@@ -20,7 +20,6 @@
  * Starting a capture of an address that is still waiting or being captured in a running queue of the
  * same project is refused: 409 CONFLICT with reason CAPTURE_RUNNING (R146; Task 63).
  */
-import type { AnyRouteErrorCode, ErrorCodes, LibraryReadErrorCode, LibraryWriteErrorCode } from "./errors.js";
 
 /** How long a finished queue stays readable (1 hour). */
 export const CAPTURE_QUEUE_KEEP_MS = 60 * 60_000;
@@ -178,17 +177,11 @@ export interface CaptureStartedResponse {
   queueId: string;
 }
 
-/**
- * Codes a capture start can answer: the project's rules refuse it (403 POLICY_DENIED with the rule's
- * reason), the project is locked (423), the browser session is not acknowledged (409
- * ACKNOWLEDGEMENT_REQUIRED, reason "cookies"), the media helper cannot run (503 WORKER_UNAVAILABLE),
- * an address is already being captured or an ended capture is still finishing (409 CONFLICT with
- * reason CAPTURE_RUNNING or CAPTURE_STOPPING).
- */
-export type CaptureStartErrorCode = ErrorCodes<LibraryWriteErrorCode | "POLICY_DENIED" | "PROJECT_LOCKED" | "ACKNOWLEDGEMENT_REQUIRED" | "WORKER_UNAVAILABLE" | "CONFLICT">;
-
-/** `GET /projects/:id/captures[/:queueId]`: also a locked project (423). */
-export type CaptureQueueReadErrorCode = ErrorCodes<LibraryReadErrorCode | "PROJECT_LOCKED">;
+// Refusals the start routes name (besides the codes any route can answer): the project's rules
+// (403 POLICY_DENIED with the rule's reason), a locked project (423), the browser session not
+// acknowledged (409 ACKNOWLEDGEMENT_REQUIRED, reason "cookies"), the media helper not running (503
+// WORKER_UNAVAILABLE), an address already being captured or an ended capture still finishing (409
+// CONFLICT, reason CAPTURE_RUNNING or CAPTURE_STOPPING).
 
 /** A profile run's report with its items, as a `capture.progress` event carries it (the library's ProfileCaptureReport). */
 export interface CaptureProfileReport extends CaptureRunReport {
@@ -245,6 +238,3 @@ export interface CaptureToolsUpdateResponse {
   ytDlp: { old: string | null; new: string | null; managed: boolean };
   galleryDl: { version: string | null; pinned: boolean };
 }
-
-/** `GET /tools/versions` and `POST /tools/update`: no library needed. */
-export type CaptureToolsErrorCode = ErrorCodes<AnyRouteErrorCode | "MOVE_IN_PROGRESS" | "WORKER_UNAVAILABLE" | "TOOL_FAILED">;

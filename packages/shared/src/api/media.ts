@@ -9,7 +9,6 @@
  * GET/HEAD range requests. The ticket is a secret (R135 5): never shown, logged, stored or put in
  * the page address; `POST /media-tickets/revoke` ends it when the player closes.
  */
-import type { AnyRouteErrorCode, ErrorCodes, LibraryReadErrorCode } from "./errors.js";
 
 /** The address form of a ticket: `/media/` and 43 base64url characters (256 random bits). */
 export const MEDIA_TICKET_PATH = /^\/media\/[A-Za-z0-9_-]{43}$/;
@@ -51,10 +50,5 @@ export interface MediaTicketRevokeResponse {
   revoked: boolean;
 }
 
-/**
- * `POST …/media-ticket`: the UI token only (403 otherwise), an asset that is not audio or video, a
- * locked project (423), too many tickets live (429 RATE_LIMITED).
- */
-export type MediaTicketErrorCode = ErrorCodes<LibraryReadErrorCode | "MOVE_IN_PROGRESS" | "PROJECT_LOCKED" | "RATE_LIMITED" | "CONFLICT">;
-/** `POST /media-tickets/revoke`: only a malformed address is refused (400). */
-export type MediaTicketRevokeErrorCode = ErrorCodes<AnyRouteErrorCode | "MOVE_IN_PROGRESS">;
+// Refusals a ticket request names: another token than the UI's (403), a locked project (423), too
+// many tickets live (429 RATE_LIMITED).

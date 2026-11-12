@@ -4,7 +4,8 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import type { ServiceErrorCode } from "@ao/shared";
+import type { ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
+
 import { PairingsUnreadableError } from "./auth.js";
 import {
   AcknowledgementRequiredError,
@@ -67,7 +68,6 @@ import {
 /** The codes the service answers with: one list, shared with the interface (@ao/shared api/errors.ts, Task 47). */
 export type ErrorCode = ServiceErrorCode;
 
-
 export class ApiError extends Error {
   override name = "ApiError";
   constructor(
@@ -83,9 +83,8 @@ export class ApiError extends Error {
 export const badRequest = (message: string): ApiError => new ApiError(400, "VALIDATION", message);
 export const notFound = (what = "That item"): ApiError => new ApiError(404, "NOT_FOUND", `${what} was not found.`);
 
-export interface ErrorBody {
-  error: { code: ErrorCode; message: string; reason?: string };
-}
+/** The body of every error answer: the shared declaration (Task 47). */
+export type ErrorBody = ServiceErrorBody;
 
 /** Library error → status, code, plain message. Unknown errors are INTERNAL with a generic message. */
 export function toApiError(err: unknown): ApiError {

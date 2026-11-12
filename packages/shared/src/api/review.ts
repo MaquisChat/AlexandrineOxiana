@@ -8,7 +8,6 @@
  * - a consent withdrawal's entry by `POST /review/:itemId/reviewed-after-withdrawal`, with a reason.
  * A source that is removed takes its pending entries with it (resolved in the removal's change).
  */
-import type { ErrorCodes, LibraryWriteErrorCode } from "./errors.js";
 
 /** What queued a verification entry (R176 3). */
 export type ReviewCause = { kind: "capture-conflict" } | { kind: "consent-withdrawal"; consentIds: string[] };
@@ -102,7 +101,11 @@ export interface MultiTextValue {
   variants: Array<{ lang: string; kind: "original" | "romanized" | "translated"; value: string }>;
 }
 
-/** What the researcher corrected before accepting an entry (a part of the library's source draft). */
+/**
+ * What the researcher corrected before accepting an entry: the part of the library's source draft
+ * (SourceDraft) the review form edits. The route accepts more than this declares: it passes the
+ * whole `draft` to the library, which validates it (review M3).
+ */
 export interface ReviewDraft {
   type?: string;
   title?: MultiTextValue;
@@ -145,10 +148,5 @@ export interface ReviewBulkEditResponse {
   edited: number;
 }
 
-/** `GET /projects/:id/review` (a library open for writing is needed) and a locked project (423). */
-export type ProjectReviewErrorCode = ErrorCodes<LibraryWriteErrorCode | "PROJECT_LOCKED">;
-/**
- * Deciding, bulk-editing, and "reviewed after the withdrawal": also the project's rules (403
- * POLICY_DENIED), a locked project (423), an entry already decided (409 CONFLICT).
- */
-export type ReviewDecideErrorCode = ErrorCodes<LibraryWriteErrorCode | "POLICY_DENIED" | "PROJECT_LOCKED" | "CONFLICT">;
+// Refusals the review routes name: a library open read-only (409 READ_ONLY, the queue too), a locked
+// project (423); deciding: the project's rules (403 POLICY_DENIED), an entry already decided (409 CONFLICT).

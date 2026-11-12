@@ -1,5 +1,4 @@
 /** Transcript versions (Task 34a c) and transcription as a job (Task 62). */
-import type { ErrorCodes, LibraryReadErrorCode, LibraryWriteErrorCode } from "./errors.js";
 import type { SpeechModel } from "./tools.js";
 
 /** What became of a segment of a human edit, compared with the version it was edited from (Task 62). */
@@ -81,11 +80,8 @@ export interface TranscriptSavedResponse {
   derivation?: unknown;
 }
 
-/** `GET …/transcripts` and `GET …/transcripts/:aid`: also a locked project (423). */
-export type TranscriptReadErrorCode = ErrorCodes<LibraryReadErrorCode | "PROJECT_LOCKED">;
-/** `POST …/transcripts`: also the project's rules (403 POLICY_DENIED) and a locked project. */
-export type TranscriptSaveErrorCode = ErrorCodes<LibraryWriteErrorCode | "PROJECT_LOCKED" | "POLICY_DENIED" | "CONFLICT">;
-
+// Refusals the transcript routes name: a locked project (423); saving: the project's rules (403
+// POLICY_DENIED).
 // ---- transcription as a job (Task 62, R99, R142) ----
 
 export type TranscriptionJobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
@@ -155,13 +151,6 @@ export interface TranscribeRequest {
   language?: string;
 }
 
-/**
- * Starting a transcription: a second one of the source (409 CONFLICT, reason
- * TRANSCRIPTION_RUNNING), the media helper not running (503), the speech model not installed (409
- * TOOL_NOT_INSTALLED, reason its tool id), a locked project (423).
- */
-export type TranscribeErrorCode = ErrorCodes<LibraryWriteErrorCode | "CONFLICT" | "WORKER_UNAVAILABLE" | "TOOL_NOT_INSTALLED" | "PROJECT_LOCKED">;
-/** `GET …/transcription`. */
-export type TranscriptionReadErrorCode = ErrorCodes<LibraryReadErrorCode | "PROJECT_LOCKED">;
-/** `POST /projects/:id/transcriptions/:jobId/cancel`. */
-export type TranscriptionCancelErrorCode = ErrorCodes<LibraryWriteErrorCode | "PROJECT_LOCKED">;
+// Refusals starting a transcription names: a second one of the source (409 CONFLICT, reason
+// TRANSCRIPTION_RUNNING), the media helper not running (503), the speech model not installed (409
+// TOOL_NOT_INSTALLED, reason its tool id), a locked project (423).

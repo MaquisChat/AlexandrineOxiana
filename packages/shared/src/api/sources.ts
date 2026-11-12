@@ -1,5 +1,4 @@
 /** Source records as the service sends them to the UI (Task 34a d). */
-import type { ErrorCodes, LibraryWriteErrorCode } from "./errors.js";
 
 export type VerificationStatus = "verified" | "single-source" | "unverified" | "conflict" | "user-confirmed";
 
@@ -101,10 +100,5 @@ export interface JobsRetryResponse {
   retrying: true;
 }
 
-/**
- * Confirming a field and rechecking a source: also the project's rules (403 POLICY_DENIED), a locked
- * project (423), a record that cannot be changed now (409 CONFLICT).
- */
-export type SourceVerifyErrorCode = ErrorCodes<LibraryWriteErrorCode | "POLICY_DENIED" | "PROJECT_LOCKED" | "CONFLICT">;
-/** `POST /projects/:id/recheck` and `POST /jobs/retry` (the work itself runs afterwards). */
-export type BackgroundJobErrorCode = ErrorCodes<LibraryWriteErrorCode>;
+// Refusals confirming a field and rechecking a source name: the project's rules (403 POLICY_DENIED),
+// a locked project (423).
