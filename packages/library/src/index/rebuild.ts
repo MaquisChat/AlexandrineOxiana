@@ -333,7 +333,12 @@ export interface CheckedIndex {
  * taken for the library's content, even after a crash (C1). Staleness is checked separately
  * (`rebuildIndexIfNeeded`), since it reads every project's change log.
  */
-export async function openIndexChecked(root: string, now: () => Date = () => new Date()): Promise<CheckedIndex> {
+export async function openIndexChecked(
+  root: string,
+  now: () => Date = () => new Date(),
+  /** `newLibrary`: the library was just created, so its new, empty index is its whole content (not marked). */
+  opts: { newLibrary?: boolean } = {},
+): Promise<CheckedIndex> {
   const dbPath = join(root, INDEX_FILE);
   const warnings: string[] = [];
   let started: "missing" | "unreadable" | undefined;
@@ -362,7 +367,8 @@ export async function openIndexChecked(root: string, now: () => Date = () => new
     handle = new IndexHandle(root);
     started = "unreadable";
   }
-  if (started) setMeta(handle.db, NEEDS_REBUILD, started);
+  if (started === "unreadable" || (started === "missing" && !opts.newLibrary)) setMeta(handle.db, NEEDS_REBUILD, started);
+  if (started === "missing" && opts.newLibrary) started = undefined;
   const needsRebuild: IndexRebuildNeed | undefined = started ?? (getMeta(handle.db, NEEDS_REBUILD) !== undefined ? "marked" : undefined);
   return { handle, needsRebuild, partial: indexIsPartial(handle.db), warnings };
 }

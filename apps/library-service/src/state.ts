@@ -38,6 +38,7 @@ import {
   forgetLastOpenLibrary,
   lastOpenLibrary,
   listLibraries,
+  indexIsPartial,
   openIndexChecked,
   openLibrary,
   rebuildIndexIfNeeded,
@@ -98,6 +99,8 @@ export interface Session {
   indexStatus?: IndexStatus;
   /** The rebuild running now (stopped when the library closes or moves). */
   indexRebuild?: { ac: AbortController; done: Promise<unknown> };
+  /** While on, index writes record no change stamps: from the open until the staleness check has run (M6). */
+  stampHold: { on: boolean };
 }
 
 /**
@@ -105,9 +108,14 @@ export interface Session {
  * `library.state` and the source list (D8): absent when it is ready.
  */
 export type IndexStatus =
-  | { state: "rebuilding"; done: number; total: number }
+  /**
+   * `partial`: the index was missing or unreadable and no rebuild has completed since, so it holds
+   * only what was written meanwhile: the list is not the library's content (C1); the interface shows
+   * "being rebuilt" (or the failure) in its place, never a short list.
+   */
+  | { state: "rebuilding"; done: number; total: number; partial?: true }
   /** `message`: plain language, paths scrubbed. */
-  | { state: "failed"; message: string }
+  | { state: "failed"; message: string; partial?: true }
   /** A read-only library: nothing may write its index, so sources are listed from the files. */
   | { state: "unavailable"; reason: string };
 
@@ -399,14 +407,22 @@ export class ServiceState {
     let index: IndexHandle | undefined;
     let repo: Repo;
     let needsRebuild = false;
+    let partial = false;
+    // Held until the staleness check has run (a new library has nothing to check).
+    const stampHold = { on: !opts.newLibrary };
     try {
       if (lib.mode === "read-write") {
-        const checked = await openIndexChecked(lib.root, this.opts.now);
+        const checked = await openIndexChecked(lib.root, this.opts.now, opts.newLibrary ? { newLibrary: true } : {});
         index = checked.handle;
         needsRebuild = checked.needsRebuild !== undefined;
+        partial = checked.partial;
         for (const w of checked.warnings) this.opts.log.warn({ warning: w }, "index");
       }
-      repo = await openRepo(lib, ring, { actor: actor(), tz: this.tz, ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }) } : {}) });
+      repo = await openRepo(lib, ring, {
+        actor: actor(),
+        tz: this.tz,
+        ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }, { holdStamps: () => stampHold.on }) } : {}),
+      });
     } catch (err) {
       index?.close();
       await lib.close().catch(() => {});
@@ -424,10 +440,11 @@ export class ServiceState {
       moveTokens: new Map(),
       workerClient: undefined,
       unsubscribe: [],
+      stampHold,
     };
     if (!index) s.indexStatus = { state: "unavailable", reason: lib.readOnlyReason ?? "read-only" };
     // Never shown as an empty library while the index is rebuilt (D8).
-    else if (needsRebuild) s.indexStatus = { state: "rebuilding", done: 0, total: 0 };
+    else if (needsRebuild) s.indexStatus = { state: "rebuilding", done: 0, total: 0, ...(partial ? { partial: true as const } : {}) };
     this.session = s;
     this.notFound = undefined;
     this.activate(s);
@@ -452,19 +469,25 @@ export class ServiceState {
     const ac = new AbortController();
     const rebuild = this.opts.rebuildIndexIfNeeded ?? rebuildIndexIfNeeded;
     const live = () => this.session === s && !ac.signal.aborted;
+    // Whether the live index holds only part of the library (its mark says so until a rebuild completes).
+    const partialOf = (): { partial?: true } => (index.isOpen && indexIsPartial(index.db) ? { partial: true } : {});
     const run = (async () => {
       try {
         const r = await rebuild(index, s.ring, s.lib, {
           force,
           signal: ac.signal,
+          // Decided (and marked when stale): writes may record their stamps again (M6).
+          onChecked: () => {
+            s.stampHold.on = false;
+          },
           onStart: () => {
             if (!live()) return;
-            s.indexStatus = { state: "rebuilding", done: 0, total: 0 };
+            s.indexStatus = { state: "rebuilding", done: 0, total: 0, ...partialOf() };
             this.publishState();
           },
           onProgress: (done, total) => {
             if (!live()) return;
-            s.indexStatus = { state: "rebuilding", done, total };
+            s.indexStatus = { state: "rebuilding", done, total, ...partialOf() };
             this.events.publish("job.progress", { kind: "index", done, total });
           },
         });
@@ -478,7 +501,7 @@ export class ServiceState {
       } catch (err) {
         if (live()) {
           const message = `The library's search index could not be rebuilt (${scrubPaths(err instanceof Error ? err.message : String(err), this.roots)}). Your sources are safe in the library folder; try "Rebuild library from folder" again.`;
-          s.indexStatus = { state: "failed", message };
+          s.indexStatus = { state: "failed", message, ...partialOf() };
           this.events.publish("job.progress", { kind: "index", ok: false, error: message });
           this.publishState();
         }

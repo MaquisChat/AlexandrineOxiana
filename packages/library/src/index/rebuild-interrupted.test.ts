@@ -129,6 +129,14 @@ describe("C1: a missing index carries the mark until a completed rebuild", () =>
     expect(indexIsPartial(again.handle.db)).toBe(false);
   });
 
+  it("a new library's empty index is its whole content: not marked", async () => {
+    await deleteIndex();
+    const c = await openIndexChecked(lib.root, undefined, { newLibrary: true });
+    track(c.handle);
+    expect(c.needsRebuild).toBeUndefined();
+    expect(getMeta(c.handle.db, "needsRebuild")).toBeUndefined();
+  });
+
   const crashPoints: Array<[string, (stop: () => never) => Parameters<typeof rebuildIndexIfNeeded>[3]]> = [
     ["after the first source is written", (stop) => ({ onProgress: (d) => (d === 1 ? stop() : undefined) })],
     ["mid-way", (stop) => ({ onProgress: (d, t) => (t > 0 && d === Math.ceil(t / 2) ? stop() : undefined) })],

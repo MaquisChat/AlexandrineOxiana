@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { IndexHandle, KeyRing, createIndexSink, deviceDeps, getMeta, openLibrary, openRepo, rememberLastOpenLibrary, setMeta, type Deps } from "@ao/library";
+import { IndexHandle, KeyRing, createIndexSink, deviceDeps, getMeta, openLibrary, openRepo, rebuildIndexIfNeeded, rememberLastOpenLibrary, setMeta, type Deps } from "@ao/library";
 // Package-internal: the governed change an import makes (here, to give a source an annotation).
 import { importChange } from "../../../packages/library/src/repo/repo.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
@@ -93,6 +93,29 @@ function collect(until: (e: { type: string; data: any }) => boolean): Promise<Ar
   });
 }
 
+/**
+ * A rebuild held at its start until released (the real one then runs), so a test can act while the
+ * index is being rebuilt. Only the first `holdCalls` calls are held; a held call that is stopped
+ * (the library closes or moves) rejects as the real one would.
+ */
+function heldRebuild(holdCalls = 1) {
+  const waiting: Array<() => void> = [];
+  let calls = 0;
+  let entered!: () => void;
+  const started = new Promise<void>((r) => (entered = r));
+  const seam: typeof rebuildIndexIfNeeded = async (h, ring, lib, opts = {}) => {
+    if (calls++ < holdCalls) {
+      entered();
+      await new Promise<void>((resolve, reject) => {
+        waiting.push(resolve);
+        opts.signal?.addEventListener("abort", () => reject(opts.signal!.reason as Error), { once: true });
+      });
+    }
+    return rebuildIndexIfNeeded(h, ring, lib, opts);
+  };
+  return { seam, started, release: () => waiting.splice(0).forEach((r) => r()) };
+}
+
 beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "ao-open-"));
   deps = { ...deviceDeps(join(tmp, "config")), settleMs: 0 };
@@ -107,6 +130,9 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
   beforeEach(() => start());
 
   it("a missing library.sqlite: the open says the index is rebuilding, progress is sent, then search finds the sources", async () => {
+    const held = heldRebuild();
+    await svc!.close();
+    await start({ rebuildIndexIfNeeded: held.seam });
     const { path, pid } = await libraryWithSources();
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     await deleteIndex(path);
@@ -117,10 +143,13 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
     });
     const opened = await call({ method: "POST", url: "/libraries/open", body: { path } });
     expect(opened.status, opened.body).toBe(200);
-    expect(opened.json.index).toMatchObject({ state: "rebuilding" });
+    expect(opened.json.index).toMatchObject({ state: "rebuilding", partial: true });
     // Until it finishes, the source list says so instead of passing an empty index off as the truth.
+    await held.started;
     const during = await call({ url: `/projects/${pid}/sources` });
-    if (during.json.total === 0) expect(during.json.index).toMatchObject({ state: "rebuilding" });
+    expect(during.json.total).toBe(0);
+    expect(during.json.index).toMatchObject({ state: "rebuilding", partial: true });
+    held.release();
     const seen = await events;
     off();
     await svc!.state.idle();
@@ -175,11 +204,18 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
     ring.clear();
     await lib.close();
 
+    const held = heldRebuild();
+    await svc!.close();
+    await start({ rebuildIndexIfNeeded: held.seam });
     const opened = await call({ method: "POST", url: "/libraries/open", body: { path } });
     expect(opened.status, opened.body).toBe(200);
-    // Until the rebuild has completed, a search answer says the index is rebuilding or incomplete.
+    // Marked: rebuilt at once. The list is whole (only annotations are missing), so it is not partial.
+    expect(opened.json.index).toEqual({ state: "rebuilding", done: 0, total: 0 });
+    // Until the rebuild has completed, a search answer says the index is rebuilding and incomplete.
+    await held.started;
     const during = await call({ url: `/projects/${pid}/sources?text=pangolinannotation` });
-    if (during.json.total === 0) expect(during.json.index?.state === "rebuilding" || during.json.incomplete === true).toBe(true);
+    expect(during.json).toMatchObject({ total: 0, incomplete: true, index: { state: "rebuilding" } });
+    held.release();
     await svc!.state.idle();
     const after = await call({ url: `/projects/${pid}/sources?text=pangolinannotation` });
     expect(after.json.items).toEqual([expect.objectContaining({ id: sid, matchedIn: "annotation" })]);
@@ -269,11 +305,24 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
   });
 
   it("POST /libraries/rebuild-index (\"Rebuild library from folder\") rebuilds and clears a failed state", async () => {
+    // The rebuild at open fails (once); the researcher then asks for one, which runs for real.
+    let failOnce = true;
+    await svc!.close();
+    await start({
+      rebuildIndexIfNeeded: async (...a) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("disk trouble");
+        }
+        return rebuildIndexIfNeeded(...a);
+      },
+    });
     const { path, pid } = await libraryWithSources();
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     await deleteIndex(path);
     expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
     await svc!.state.idle();
+    expect(svc!.state.libraryState().index).toMatchObject({ state: "failed", partial: true });
     const r = await call({ method: "POST", url: "/libraries/rebuild-index" });
     expect(r.status, r.body).toBe(200);
     expect(r.json).toEqual({ indexed: 2, lockedProjects: 0, errors: 0 });
@@ -290,6 +339,111 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
     const again = await openLibrary(path, deps);
     expect(again.mode).toBe("read-write");
     await again.close();
+  });
+});
+
+describe("C1: a rebuild stopped half-way is never taken as complete", () => {
+  /** Opens the library at `path` in a fresh service with the real rebuild; resolves once it is rebuilt. */
+  async function reopenFresh(path: string) {
+    await svc?.close();
+    await start();
+    const opened = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect(opened.status, opened.body).toBe(200);
+    // The half-built index left behind is shown as being rebuilt, never as the library's content.
+    expect(opened.json.index).toMatchObject({ state: "rebuilding", partial: true });
+    await svc!.state.idle();
+    expect(svc!.state.libraryState().index).toBeUndefined();
+  }
+  const attach = async (pid: string, name: string, title: string) => {
+    const r = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await pdf(name, title)] } });
+    expect(r.status, r.body).toBe(200);
+  };
+
+  it("closed during the rebuild, after a write: the next open rebuilds and lists every source on disk", async () => {
+    const held = heldRebuild();
+    await start({ rebuildIndexIfNeeded: held.seam });
+    const { path, pid } = await libraryWithSources();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await deleteIndex(path);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await held.started;
+    await attach(pid, "c.pdf", "Written during the rebuild");
+    // The list holds only what was written since: it says it is partial (the interface shows "being rebuilt").
+    const during = await call({ url: `/projects/${pid}/sources` });
+    expect(during.json).toMatchObject({ total: 1, index: { state: "rebuilding", partial: true } });
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await reopenFresh(path);
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(3);
+  });
+
+  it("a rebuild that throws, after a write: the state says failed and partial; the next open rebuilds every source", async () => {
+    await start({
+      rebuildIndexIfNeeded: async (h, ring, lib, opts = {}) =>
+        rebuildIndexIfNeeded(h, ring, lib, {
+          ...opts,
+          onProgress: (d, t) => {
+            opts.onProgress?.(d, t);
+            if (d === 1) throw new Error("disk trouble");
+          },
+        }),
+    });
+    const { path, pid } = await libraryWithSources();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await deleteIndex(path);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await svc!.state.idle();
+    await attach(pid, "c.pdf", "Written after the failure");
+    const list = await call({ url: `/projects/${pid}/sources` });
+    expect(list.json).toMatchObject({ total: 1, index: { state: "failed", partial: true } });
+    await reopenFresh(path);
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(3);
+  });
+
+  it("moved during the rebuild, after a write: at its new place it is rebuilt and lists every source", async () => {
+    const held = heldRebuild();
+    await start({ rebuildIndexIfNeeded: held.seam });
+    const { path, pid } = await libraryWithSources();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    await deleteIndex(path);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    await held.started;
+    await attach(pid, "c.pdf", "Written during the rebuild");
+    const dest = join(tmp, "Moved", "Lib");
+    await mkdir(dirname(dest), { recursive: true });
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest } });
+    expect(moved.status, moved.body).toBe(200);
+    expect(moved.body).toContain('"done":true');
+    // The move stopped the rebuild; the library opened at its new place is rebuilt (not held now).
+    await svc!.state.idle();
+    expect(svc!.state.libraryState().index).toBeUndefined();
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(3);
+  });
+
+  it("M6: a write made before the staleness check has run does not hide a change made outside the app", async () => {
+    const held = heldRebuild();
+    await start({ rebuildIndexIfNeeded: held.seam });
+    const { path, pid } = await libraryWithSources();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    // Another copy of the app (no index) adds a source: the index is stale.
+    const lib = await openLibrary(path, deps);
+    const ring = new KeyRing();
+    const repo = await openRepo(lib, ring, { actor: "elsewhere", tz: "UTC" });
+    await repo.createSource(
+      pid,
+      { projectIds: [], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "Tide notes" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "ao", version: "0" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    ring.clear();
+    await lib.close();
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).status).toBe(200);
+    // Before the check runs, a write in the same project (it would refresh that project's stamp).
+    await held.started;
+    await attach(pid, "c.pdf", "Written before the check");
+    held.release();
+    await svc!.state.idle();
+    expect((await call({ url: `/projects/${pid}/sources?text=tide` })).json.total).toBe(1);
+    expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(4);
   });
 });
 
