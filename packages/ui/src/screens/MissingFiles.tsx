@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useId, useState } from "react";
 import type { GovernanceApi, IntegrityAnswer, RelinkResult } from "../api/governance";
 import { RebuildIndex } from "../components/RebuildIndex";
+import { PathField } from "../components/PathField";
 import "./GovernanceScreens.css";
 
 const SKIP_REASON: Record<string, string> = {
@@ -108,8 +109,7 @@ export function MissingFiles({ api, isWindows = onWindows() }: { api: Governance
           </p>
           ) : null}
           <div className="ao-field">
-            <label htmlFor={`${ids}-dir`}>Folder to search</label>
-            <input id={`${ids}-dir`} type="text" value={folder} onChange={(e) => setFolder(e.target.value)} />
+            <PathField id={`${ids}-dir`} label="Folder to search" pick="folder" pickerTitle="Choose the folder that holds the missing files" value={folder} onChange={setFolder} />
             <button type="submit" disabled={busy || !folder.trim()}>
               Search and relink
             </button>

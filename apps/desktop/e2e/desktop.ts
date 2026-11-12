@@ -313,7 +313,7 @@ export interface Desktop {
   closeWithCloseButton(): Promise<void>;
 }
 
-export type Role = "button" | "textbox" | "heading" | "dialog" | "navigation" | "region" | "list" | "listitem" | "table" | "checkbox" | "alert";
+export type Role = "button" | "link" | "textbox" | "heading" | "dialog" | "navigation" | "region" | "list" | "listitem" | "table" | "checkbox" | "alert";
 
 /**
  * Finds visible elements by role and accessible name in the page, as a keyboard or screen-reader
@@ -326,6 +326,7 @@ const [role, name, level, within] = arguments;
 const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
 const SEL = {
   button: 'button, [role="button"], input[type="button"], input[type="submit"]',
+  link: 'a[href], [role="link"]',
   textbox: 'input:not([type]), input[type="text"], input[type="search"], textarea, [role="textbox"]',
   heading: level ? 'h' + level : 'h1, h2, h3, h4, h5, h6, [role="heading"]',
   dialog: 'dialog, [role="dialog"], [role="alertdialog"]',
@@ -346,7 +347,7 @@ const nameOf = (el) => {
   if (el.labels && el.labels.length) return norm(Array.from(el.labels).map(text).join(" "));
   if (el.tagName === "TABLE" && el.caption) return text(el.caption);
   if (el.tagName === "INPUT" && (el.type === "button" || el.type === "submit")) return norm(el.value);
-  if (["button", "heading", "listitem", "checkbox"].includes(role)) return text(el);
+  if (["button", "link", "heading", "listitem", "checkbox"].includes(role)) return text(el);
   return "";
 };
 const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && getComputedStyle(el).visibility !== "hidden";
