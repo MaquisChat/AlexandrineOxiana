@@ -41,6 +41,8 @@ export function buildProgram(): Command {
 }
 
 let shuttingDown = false;
+/** The most a stop waits for a notice being written (Task 68 round 2, Rm6). */
+const NOTICE_WAIT_MS = 2000;
 export const isShuttingDown = (): boolean => shuttingDown;
 
 /** Ctrl+C: stop the worker (which stops its running downloads), close the index, release the library. */
@@ -49,7 +51,12 @@ function installSignalHandlers(): void {
     if (shuttingDown) process.exit(130);
     shuttingDown = true;
     process.stderr.write("\nStopping... closing the library safely.\n");
-    Promise.allSettled(openSessions().map((s) => s.close())).then(() => process.exit(signal === "SIGINT" ? 130 : 143));
+    // A device-level notice being written (Task 68 round 2, Rm6) is waited for too, but never more
+    // than NOTICE_WAIT_MS: Ctrl+C never hangs (a second Ctrl+C exits at once, as before).
+    const noticesOrLimit = Promise.race([deviceNoticesIdle(), new Promise<void>((r) => setTimeout(r, NOTICE_WAIT_MS).unref())]);
+    Promise.allSettled(openSessions().map((s) => s.close()))
+      .then(() => noticesOrLimit)
+      .then(() => process.exit(signal === "SIGINT" ? 130 : 143));
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
