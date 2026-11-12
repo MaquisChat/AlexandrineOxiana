@@ -387,6 +387,13 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service tests (unreadable, a directory in its place, invalid JSON, truncated, missing) for each writer.
 - Model: Opus (the Task 66 implementer).
 
+**Task 69 — Show that a captured item is no longer available at its source (D17) [ledger: R183, R113, R145, R43]**
+- Depends: 63. Parallel: 34f, 47.
+- Files: the service's list-row and source views and their declarations; `packages/ui/src/screens/Library.tsx`, the source screen, their tests.
+- Accept: the library's list row and the source's screen say in words (not colour alone, with an accessible name) that the item is no longer available at its source, with the date it was noticed when recorded; an available source shows no mark; a post recorded as having reappeared loses the mark; nothing else is built.
+- Verify: service and interface tests; `pnpm -r typecheck`; UI lints; `pnpm e2e -- --app-only --trace off`. Scenario 10 (Task 34f) asserts the mark once this is merged.
+- Model: Opus.
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
@@ -475,6 +482,8 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by the review of Task 46b (for Task 67): D14 (high): the review queue screen lists the items of one import batch only. Entries queued by a drag-and-drop attach, by a capture with conflicting fields or by a consent withdrawal cannot be seen or decided anywhere, so their "Needs review" badge cannot be cleared. **CLOSED by Task 67 (merge 0d68dcd, 2026-11-12).**
 - Defect found by Task 49's fourth round (for Task 50b): D15 (high): a deleted `backups-manifest.json` is read as "no backups", so a destruction lists none, its certificate says "none", and a backup that holds the destroyed file stays.
 - Defect found by Task 66's fix round (for Task 68): D16: when the fonts index or the appearance settings cannot be read at the moment of a change, the change is written over defaults — the other fonts' entries are dropped (their files stay, unlisted), or the other appearance settings are reset.
+- Defect found by the accuracy review of Task 37k (for Task 69): D17 (medium): a captured post that has disappeared at its source is kept and recorded as no longer available (`availability: unavailable-on-platform`), but no library screen shows it; only the capture queue's one-line count says so. Scenario 10 promises the item is flagged (R183 a).
+- Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -531,7 +540,8 @@ Update after every task; commit and push.
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
 | 68 Settings writers never write what they did not read (D16) | fix round 2 | 034e1f6 (worktree branch) | re-review closed I1 and I2; one Important (the libraries list set aside in silence) and seven Minor remain (R181) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
-| 37k Revise the guide and checklist | written; in accuracy review | e55d0ac (worktree branch) | every "Known problem" line removed as fixed; scenarios 9–11 in full |
+| 37k Revise the guide and checklist | fix round 1 after the accuracy review | e55d0ac (worktree branch) | 4 Important and 11 Minor points; all "Known problem" removals confirmed; D17 and D18 found |
+| 69 Show that a captured item is no longer available (D17) | in progress | | dispatched 2026-11-12; on the Mac build's path (R183) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
