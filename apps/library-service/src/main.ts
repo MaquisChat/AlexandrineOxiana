@@ -10,14 +10,18 @@
  * The access token (the UI token) is written on standard input by whoever starts it, as one line
  * (R98; see startup-token.ts), for example:
  *
- *   printf '%s\n' "$TOKEN" | node --max-old-space-size=512 --import tsx apps/library-service/src/main.ts
+ *   { printf '%s\n' "$TOKEN"; cat; } | node --max-old-space-size=512 --import tsx apps/library-service/src/main.ts
  *
  * It is never taken from the environment or the command line: the service refuses to start if
  * AO_SERVICE_TOKEN is set, if it is given any argument, if standard input is a terminal (a typed
  * token would be echoed: pipe it in), if the token does not arrive within
  * TOKEN_STDIN_TIMEOUT_MS, or if it is not 32–512 characters from `A–Z a–z 0–9 . _ ~ + / = -`. After
- * the one line, standard input is no longer read but stays open (closing it does not stop the
- * service). The token is never printed: not in a log line, an error, or the ready line.
+ * the one line, anything more on standard input is discarded, and the END of standard input means
+ * "shut down cleanly", exactly as SIGTERM does (R155): the launcher keeps its end open while it wants
+ * the service, so a launcher that exits, crashes or is force-quit leaves no stray service. A plain
+ * `printf ... | node ...` therefore stops the service again at once; keep the pipe open, e.g.
+ * `{ printf '%s\n' "$TOKEN"; cat; } | node ...`. The token is never printed: not in a log line, an
+ * error, or the ready line.
  *
  * Environment:
  *   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any free port)
@@ -29,11 +33,11 @@
  * new requests, pauses running imports (left `paused`, resumable), closes the library (releasing
  * its lock), stops watchers and the media worker, and exits 0. If that takes longer than
  * FORCE_EXIT_MS (longer than the worst-case close: an import reaching a safe point, 60 s, plus the
- * rest) it exits 1.
+ * rest) it exits 1. The end of standard input starts the same shutdown.
  */
 import { openLibrary } from "@ao/library";
 import { createService } from "./server.js";
-import { readStartupToken, startupErrorMessage } from "./startup-token.js";
+import { onEndOfInput, readStartupToken, startupErrorMessage } from "./startup-token.js";
 
 /** Exceeds the worst-case graceful close (R99): SUSPEND_TIMEOUT_MS for imports plus closing the rest. */
 export const FORCE_EXIT_MS = 90_000;
@@ -63,6 +67,8 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => stop("SIGTERM"));
   process.on("SIGINT", () => stop("SIGINT"));
+  // R155: the launcher's end of standard input is gone (closed, crashed, force-quit): shut down.
+  onEndOfInput(process.stdin, () => stop("end of standard input"));
 
   if (process.env.AO_LIBRARY) {
     const lib = await openLibrary(process.env.AO_LIBRARY, svc.state.deps, { onLockLost: () => svc.state.publishState() });

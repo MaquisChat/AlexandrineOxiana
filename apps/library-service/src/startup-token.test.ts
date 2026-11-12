@@ -4,7 +4,7 @@
  */
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { readStartupToken, startupErrorMessage, StartupTokenError, TOKEN_STDIN_TIMEOUT_MS } from "./startup-token.js";
+import { onEndOfInput, readStartupToken, startupErrorMessage, StartupTokenError, TOKEN_STDIN_TIMEOUT_MS } from "./startup-token.js";
 
 const TOKEN = "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8._~+/=-";
 const clean = { env: { PATH: "/usr/bin" } as NodeJS.ProcessEnv, argv: ["/usr/bin/node", "/x/main.ts"], execArgv: ["--max-old-space-size=512", "--import", "tsx"] };
@@ -150,6 +150,52 @@ describe("readStartupToken", () => {
     input.write(`${TOKEN}\n`);
     expect(await p).toBe(TOKEN);
     expect(() => input.emit("error", new Error("EPIPE"))).not.toThrow();
+  });
+});
+
+describe("onEndOfInput (R155: end of standard input after the token line means shut down)", () => {
+  it("calls back once when standard input ends after the token line, discarding anything written after it", async () => {
+    const input = source();
+    const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
+    input.write(`${TOKEN}\nextra bytes that are never read as anything`);
+    expect(await p).toBe(TOKEN);
+    let calls = 0;
+    onEndOfInput(input, () => calls++);
+    input.write("more");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(0);
+    input.end();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(1);
+    input.destroy();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(1);
+  });
+
+  it("calls back when standard input had already ended right after the token (a launcher that closes at once)", async () => {
+    const input = source();
+    const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
+    input.end(`${TOKEN}\n`);
+    expect(await p).toBe(TOKEN);
+    let calls = 0;
+    onEndOfInput(input, () => calls++);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(1);
+  });
+
+  it("treats an error or a close of standard input as its end", async () => {
+    for (const how of ["error", "close"] as const) {
+      const input = source();
+      const p = readStartupToken({ ...clean, input, timeoutMs: 1000 });
+      input.write(`${TOKEN}\n`);
+      expect(await p).toBe(TOKEN);
+      let calls = 0;
+      onEndOfInput(input, () => calls++);
+      if (how === "error") input.destroy(new Error("EPIPE"));
+      else input.destroy();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(calls, how).toBe(1);
+    }
   });
 });
 

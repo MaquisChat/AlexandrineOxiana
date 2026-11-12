@@ -1,7 +1,8 @@
 /**
  * Client for the Python media worker (`services/media-worker`, spec 2.1 / 5.2 / 5.3).
  *
- * `startWorker` spawns the worker with a random token and waits for `AO_WORKER_READY port=<n>`.
+ * `startWorker` spawns the worker, writes a random token as one line on its standard input (which stays
+ * open: the worker stops when it closes, R155), and waits for `AO_WORKER_READY port=<n>`.
  * `WorkerClient.submit` runs one job for a project:
  *
  *   1. policy: `process` with `{ op, provider: 'local' }` (transcription, image_proxy, video_proxy,
@@ -487,17 +488,20 @@ export async function startWorker(opts: StartWorkerOptions = {}): Promise<Worker
   const token = randomBytes(32).toString("hex");
   const child = spawn(argv[0]!, argv.slice(1), {
     cwd,
+    // The token travels on standard input only, as one line (R98, R155); the worker refuses one in
+    // its environment or arguments. Standard input then stays open for the worker's whole life: the
+    // worker stops when it closes, so this process exiting, crashing or being killed leaves no worker.
     env: {
       ...workerEnv(process.env),
       ...opts.env,
-      AO_WORKER_TOKEN: token,
       AO_WORKER_PORT: "0",
-      AO_WORKER_EXIT_ON_STDIN_EOF: "1",
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
+  child.stdin!.on("error", () => {}); // the worker gone early: its exit is reported below
+  child.stdin!.write(`${token}\n`);
   const exited = new Promise<void>((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) resolve();
     else child.once("exit", () => resolve());

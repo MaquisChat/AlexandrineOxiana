@@ -5,12 +5,12 @@
  * the same user (/proc/<pid>/environ, /proc/<pid>/cmdline) and the environment is inherited by every
  * child.
  *
- * The launcher writes the token as one line (`<token>\n`) and may keep standard input open. The
- * service reads that one line and then stops reading standard input: its listeners are removed and
- * the stream is paused, but it is NOT closed. Closing it would give the launcher a broken pipe on any
- * later write, and the shell (Task 37c) may want to signal shutdown by closing its end, as it does for
- * the media worker; leaving the stream open but unread keeps that possible without changing anything
- * here. Anything after the first line is never read.
+ * The launcher writes the token as one line (`<token>\n`) and keeps standard input open for as long
+ * as it wants the service to run. `readStartupToken` reads that one line and then stops reading:
+ * its listeners are removed and the stream is paused, but it is NOT closed. The entry point then
+ * hands the stream to `onEndOfInput`: anything after the first line is discarded unread, and the end
+ * of standard input (the launcher closed its end, or crashed, or was force-quit) means "shut down
+ * cleanly" (R155).
  *
  * Refused, with a plain message that never repeats the token or any part of it:
  *  - a token variable (AO_SERVICE_TOKEN, in any letter case) present in the environment, even empty:
@@ -148,6 +148,27 @@ export async function readStartupToken(src: StartupTokenSource): Promise<string>
   const token = await readFirstLine(src.input, src.timeoutMs ?? TOKEN_STDIN_TIMEOUT_MS);
   checkToken(token, src);
   return token;
+}
+
+/**
+ * After the token line: calls `onEnd` once when standard input ends, closes or fails (R155: the
+ * launcher's end of the pipe is gone, so the service shuts down cleanly; a launcher that crashed or
+ * was force-quit leaves no stray service). Anything written after the token line is read and
+ * discarded, never interpreted.
+ */
+export function onEndOfInput(input: Readable, onEnd: () => void): void {
+  let called = false;
+  const once = () => {
+    if (called) return;
+    called = true;
+    onEnd();
+  };
+  input.on("data", () => {});
+  input.once("end", once);
+  input.once("close", once);
+  input.on("error", once);
+  if (input.readableEnded || input.destroyed) queueMicrotask(once);
+  input.resume();
 }
 
 /** The message of a start-up error, with the token (once known) replaced by `[token]` (R96, R98). */
