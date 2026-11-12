@@ -21,10 +21,10 @@ import { statusWords } from "./VerificationBadge";
 
 /**
  * Top-level fields the service's field route accepts (packages/library/src/source-actions.ts
- * CONFIRMABLE_FIELDS); identifiers are accepted one at a time as "/identifiers/<key>" (R149).
+ * CONFIRMABLE_FIELDS); identifiers are accepted only one at a time, as "/identifiers/<key>" (R149).
  */
 const CONFIRMABLE = new Set([
-  "title", "creators", "issued", "identifiers", "container", "publisher", "type", "volume", "issue", "page", "edition",
+  "title", "creators", "issued", "container", "publisher", "type", "volume", "issue", "page", "edition",
   "numberOfPages", "publisherPlace", "collectionTitle", "collectionNumber", "genre", "medium", "number",
 ]);
 const IDENTIFIERS = new Set(CONFIRMABLE_IDENTIFIER_KEYS);

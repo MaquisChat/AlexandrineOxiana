@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import type { FieldReview } from "@ao/shared";
 import { describe, expect, it, vi } from "vitest";
 import { FIELD_CREATORS_UNVERIFIED, FIELD_DOI_CONFIRMED, FIELD_ISSUED_CONFLICT, FIELD_PUBLISHER_SINGLE, FIELD_TITLE_VERIFIED } from "../test/verification";
+import { isConfirmable } from "./FieldEvidencePopover";
 import { FieldCheck, STATUS_WORDS, VerificationBadge } from "./VerificationBadge";
 
 const noop = () => Promise.resolve();
@@ -302,5 +303,11 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     const pop = screen.getByRole("dialog");
     expect(pop.textContent).not.toContain("{");
     expect(pop.textContent).toContain("a value that cannot be shown as text");
+  });
+
+  it("identifiers are confirmable one at a time, never as the whole object (re-review N3, R149)", () => {
+    expect(isConfirmable("/identifiers/doi")).toBe(true);
+    expect(isConfirmable("/identifiers")).toBe(false);
+    expect(isConfirmable("/publisher")).toBe(true);
   });
 });
