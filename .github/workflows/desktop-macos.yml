@@ -1,0 +1,313 @@
+name: Desktop (macOS)
+
+# The two Mac downloads (Task 37f, R133): Apple Silicon built on macos-15, Intel on macos-15-intel,
+# each from its own build (no combined app), minimum macOS 15.0, ad-hoc signed (R151; signing with a
+# Developer ID and notarisation are Task 37g). macOS runner minutes are billed at ten times Linux ones
+# on a private repository, so an ordinary push to a branch never starts this workflow. The only branch
+# push that does is one that CHANGES the build-request file, apps/desktop/mac-build-request.json
+# (R168): `paths` limits branch pushes to that file, and GitHub does not apply `paths` to tag pushes
+# ("Path filters are not evaluated for pushes of tags", docs.github.com, Actions, workflow syntax,
+# on.push.paths).
+#
+# Three ways to start it (R167 a, R168; apps/desktop/README.md, "Building for macOS"):
+#   - a build request: commit a change to apps/desktop/mac-build-request.json on a working branch
+#     (raise "request" by one and name the architectures). This is the way that works from a session
+#     that can push only its own branch.
+#   - a tag pushed from any branch: vX.Y.Z-mac.N (both), vX.Y.Z-arm.N (Apple Silicon), vX.Y.Z-intel.N
+#     (Intel), or a plain vX.Y.Z (both); X.Y.Z must be the app's version (tauri.conf.json). The plan
+#     job checks this on Linux before any Mac minute is spent (apps/desktop/scripts/mac-targets.mjs).
+#   - "Run workflow" on the website, which GitHub offers only once this file is on the default branch.
+#
+# Minutes per architecture, ESTIMATED (nothing has run on a Mac yet; the Linux timings of the same
+# steps, scaled for GitHub's 3-core M1 and 4-core Intel machines):
+#   cold (no caches): Apple Silicon about 55-75 min, Intel about 65-90 min. The largest parts:
+#     installing tauri-cli (8-12), the release shell with LTO (10-15), the debug shell for the launch
+#     check (5-8), the worker's venv and PyInstaller (6-10), Homebrew's ffmpeg and tesseract for the
+#     checks (5-10), the launch check (4-6).
+#   warm (tauri-cli, the Rust build, the worker venv and the Node archive cached): about 30-45 min on
+#     Apple Silicon, 35-55 on Intel (LTO relinks everything; Homebrew's tools are not cached).
+#   Billed: about 10x those minutes. The caches are saved even when a later step fails, so a failed
+#   attempt does not make the next one cold.
+#
+# Third-party actions are pinned by full commit id (R167 b), each with its release in a comment; the
+# ids were read with `git ls-remote --tags https://github.com/<owner>/<action>` (the peeled ^{} id
+# for an annotated tag) on 2026-11-12.
+
+on:
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: Which downloads to build
+        type: choice
+        options: [both, apple-silicon, intel]
+        default: both
+  push:
+    # Version tags, and branch pushes that change the build-request file (see above). Nothing else.
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+    branches:
+      - "claude/**"
+      - main
+    paths:
+      - apps/desktop/mac-build-request.json
+
+permissions:
+  contents: read
+
+# One Mac build at a time across the repository: a second run waits (only the newest waiting run is
+# kept) and a run in progress is never cancelled by another.
+concurrency:
+  group: desktop-macos
+  cancel-in-progress: false
+
+jobs:
+  # Which downloads this run builds, from the choice or the tag; a tag that is not a version, or names
+  # another version than the app's, stops the run here, on Linux.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+          sparse-checkout: apps/desktop
+      - name: The downloads to build
+        id: targets
+        timeout-minutes: 1
+        env:
+          INPUT_ARCHITECTURES: ${{ inputs.architectures }}
+        run: node apps/desktop/scripts/mac-targets.mjs >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    name: ${{ matrix.label }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      PYTHON: python
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      APP_DEBUG: apps/desktop/src-tauri/target/debug/bundle/macos/Alexandrine Oxiana.app
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: The pins (apps/desktop/macos/pins.json) and the machine
+        id: pins
+        timeout-minutes: 1
+        run: |
+          pins=apps/desktop/macos/pins.json
+          echo "node=$(jq -r .node.version "$pins")" >> "$GITHUB_OUTPUT"
+          echo "tauri-cli=$(jq -r .tauriCli "$pins")" >> "$GITHUB_OUTPUT"
+          [ "$(jq -r .minimumSystemVersion "$pins")" = "$MACOSX_DEPLOYMENT_TARGET" ] || { echo "::error::MACOSX_DEPLOYMENT_TARGET differs from pins.json"; exit 1; }
+          echo "os=$(sw_vers -productVersion)" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          machine=$(uname -m); want=${{ matrix.arch }}; [ "$want" = x64 ] && want=x86_64
+          [ "$machine" = "$want" ] || { echo "::error::${{ matrix.runner }} is $machine, expected $want"; exit 1; }
+          echo "macOS $(sw_vers -productVersion) on $machine; runner image ${ImageOS:-?} ${ImageVersion:-?}; Xcode $(xcodebuild -version 2>/dev/null | head -1)"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        timeout-minutes: 5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        timeout-minutes: 5
+        with:
+          # The same release the app ships (build-macos.mjs checks that the service folder was built by it).
+          node-version: ${{ steps.pins.outputs.node }}
+          cache: pnpm
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        timeout-minutes: 5
+        with:
+          python-version: "3.13"
+
+      - name: Rust 1.97
+        timeout-minutes: 5
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          rustc --version
+
+      # Caches: restored here, saved by the "Save …" steps below even when a later step failed
+      # (actions/cache's own post step saves only after a successful job). Each run saves under its own
+      # key (the content key plus the run id and attempt) and restores the newest entry with the
+      # content key as prefix, so a complete run always supersedes a partial cache that a failed run
+      # saved. Old entries are removed by GitHub's own cache limits (least recently used first).
+      - name: Restore the Rust build cache (crates and the shell's target folder, without the bundles)
+        id: rust-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 10
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/desktop/src-tauri/target
+            !apps/desktop/src-tauri/target/*/bundle
+          key: desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/*.json', 'apps/desktop/src-tauri/Info.plist', 'apps/desktop/src-tauri/capabilities/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/*.json', 'apps/desktop/src-tauri/Info.plist', 'apps/desktop/src-tauri/capabilities/**') }}-
+            desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-
+            desktop-macos-rust-1.97.0-${{ matrix.runner }}-
+
+      - name: Restore tauri-cli
+        id: tauri-cli
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 5
+        with:
+          path: ~/.cargo-tools
+          key: tauri-cli-${{ steps.pins.outputs.tauri-cli }}-rust-1.97.0-${{ matrix.runner }}
+      - name: tauri-cli ${{ steps.pins.outputs.tauri-cli }} (pinned; its own lock file)
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
+        timeout-minutes: 25
+        run: cargo install tauri-cli --version "=${{ steps.pins.outputs.tauri-cli }}" --locked --root ~/.cargo-tools
+      - name: Save tauri-cli (straight after installing it)
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 5
+        with:
+          path: ~/.cargo-tools
+          key: ${{ steps.tauri-cli.outputs.cache-primary-key }}
+      - run: echo "$HOME/.cargo-tools/bin" >> "$GITHUB_PATH"
+        timeout-minutes: 1
+
+      - name: Restore the build caches (the pinned Node archive, the worker's build venv)
+        id: build-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 5
+        with:
+          path: |
+            apps/desktop/.build/node/*.tar.gz
+            apps/desktop/.build/venv-*
+          key: desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}-
+
+      - run: pnpm install --frozen-lockfile
+        timeout-minutes: 10
+      - name: CSL styles and locales (the service folder ships them)
+        timeout-minutes: 5
+        run: pnpm fetch-csl
+
+      - name: Build the app and its disk image (build-macos.mjs)
+        id: build
+        timeout-minutes: 90
+        run: node apps/desktop/scripts/build-macos.mjs --debug-app
+
+      # The download is uploaded as soon as it is built, before the cache saves and the checks, so
+      # neither a failed save nor a failed check ever costs it.
+      - name: Upload the disk image and its SHA-256
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        timeout-minutes: 15
+        with:
+          name: alexandrine-oxiana-macos-${{ matrix.label }}
+          path: |
+            apps/desktop/dist-macos/*.dmg
+            apps/desktop/dist-macos/*.dmg.sha256
+          if-no-files-found: error
+          # A disk image is already compressed.
+          compression-level: 0
+          retention-days: 30
+
+      - name: Save the Rust build cache (also after a failed build)
+        if: ${{ !cancelled() && steps.rust-cache.outcome == 'success' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 15
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/desktop/src-tauri/target
+            !apps/desktop/src-tauri/target/*/bundle
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - name: Save the build caches (also after a failed build)
+        if: ${{ !cancelled() && steps.build-cache.outcome == 'success' && hashFiles('apps/desktop/.build/node/*.tar.gz') != '' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 10
+        with:
+          path: |
+            apps/desktop/.build/node/*.tar.gz
+            apps/desktop/.build/venv-*
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+
+      # ---- checks on this machine ----
+
+      - name: Tools the checks hand to the worker (Homebrew; not shipped in the app)
+        timeout-minutes: 20
+        run: brew install ffmpeg tesseract
+      - name: Pinned test fixtures
+        timeout-minutes: 5
+        run: node scripts/fetch-fixtures.mjs
+      - name: Restore the tiny speech model for the worker's smoke test (outside the bundle)
+        id: model-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 5
+        with:
+          path: ~/.cache/ao-worker-smoke-models
+          key: ao-worker-smoke-models-tiny-v1-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ao-worker-smoke-models-tiny-v1-${{ matrix.runner }}-
+      - name: Packaged worker smoke test (manifest, health, HEIC, proxy, transcription, imports)
+        timeout-minutes: 15
+        run: node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke ${{ matrix.arch == 'arm64' && '--constraints none' || '' }}
+      - name: Save the tiny speech model
+        if: ${{ !cancelled() && steps.model-cache.outcome == 'success' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 5
+        with:
+          path: ~/.cache/ao-worker-smoke-models
+          key: ${{ steps.model-cache.outputs.cache-primary-key }}
+
+      - name: Launch check A-D (the debug app bundle; helpers from its own resources; E is Linux-only)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 20
+        run: node apps/desktop/scripts/launch-check.mjs --app "$APP_DEBUG"
+
+      - name: Launch check R (the release app, run from the mounted disk image)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          dmg=$(ls apps/desktop/dist-macos/*.dmg)
+          mnt="$RUNNER_TEMP/ao-dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+          trap 'hdiutil detach "$mnt" -force || true' EXIT
+          ls -la "$mnt"
+          codesign --verify --deep --strict --verbose=2 "$mnt/Alexandrine Oxiana.app"
+          node apps/desktop/scripts/launch-check.mjs --release-app "$mnt/Alexandrine Oxiana.app"
+
+      - name: Sizes and checksums in the run summary
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        run: |
+          {
+            echo "### ${{ matrix.label }} (${{ matrix.runner }}, macOS ${{ steps.pins.outputs.os }})"
+            for f in apps/desktop/dist-macos/*.dmg; do [ -f "$f" ] && echo "- \`$(basename "$f")\`: $(du -h "$f" | cut -f1), sha256 \`$(cut -d' ' -f1 "$f.sha256")\`"; done
+            app="apps/desktop/src-tauri/target/release/bundle/macos/Alexandrine Oxiana.app"
+            [ -d "$app" ] && echo "- the app: $(du -sh "$app" | cut -f1) (worker $(du -sh "$app/Contents/Resources/ao-worker" | cut -f1), service $(du -sh "$app/Contents/Resources/library-service" | cut -f1), Node.js $(du -sh "$app/Contents/Resources/node" | cut -f1))"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload the worker's manifest and smoke results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        timeout-minutes: 5
+        with:
+          name: worker-bundle-report-macos-${{ matrix.label }}
+          path: |
+            apps/desktop/sidecars/*/sidecar-manifest.json
+            apps/desktop/sidecars/*.smoke.json
+          if-no-files-found: ignore

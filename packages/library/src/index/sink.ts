@@ -7,7 +7,7 @@ import { computeStamps, listProjectEntries, newestChangeId, projectKey, stampFor
 import {
   getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
-import { readExtractedText, readSource } from "./load.js";
+import { readExtractedText, readSource, withAnnotations } from "./load.js";
 
 /**
  * (Re)loads an unlocked encrypted project's content into the in-memory TEMP schema: every source
@@ -119,7 +119,10 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     async indexSource(sf, extractedText) {
       const i = await info(sf.source.projectIds[0] ?? "");
       const text = extractedText ?? (ctx ? await readExtractedText(ctx.root, sf, i.k) : undefined);
-      indexSource(handle.db, sf, text, { protected: i.prot });
+      // A source passed without its annotations loaded (source.json lists only their count): they
+      // are read from the folder, as written by the change that just committed.
+      const full = ctx ? await withAnnotations(join(ctx.root, sf.source.folder), sf, i.k) : sf;
+      indexSource(handle.db, full, text, { protected: i.prot });
       await stamp(i);
     },
     async removeSource(id) {

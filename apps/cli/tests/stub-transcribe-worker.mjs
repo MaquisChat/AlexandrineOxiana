@@ -5,8 +5,13 @@
 import { createServer } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 
-const token = process.env.AO_WORKER_TOKEN;
+// The token is the first line of standard input, as the real worker takes it (R155); the stand-in
+// stops when its standard input closes, like the real one.
+const lines = createInterface({ input: process.stdin });
+const token = await new Promise((resolve) => lines.once("line", resolve));
+lines.once("close", () => process.exit(0));
 const jobs = new Map();
 let n = 0;
 

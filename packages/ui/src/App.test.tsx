@@ -14,6 +14,7 @@ const service = { baseUrl: BASE, token: TOKEN };
 const appearance = () => [
   http.get(url("/settings/appearance"), () => HttpResponse.json(DEFAULT_APPEARANCE)),
   http.get(url("/settings/researcher"), () => HttpResponse.json({ name: null })),
+  http.get(url("/tools"), () => HttpResponse.json({ error: { code: "FORBIDDEN", message: "The tools are managed from the desktop app." } }, { status: 403 })),
 ];
 
 function at(path: string) {

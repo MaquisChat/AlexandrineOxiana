@@ -2,17 +2,18 @@
 
 *Updated 2026-11-11 by the next coordinator. The open-task list below is superseded by `docs/PLAN.md`. Corrections made to this file are listed in `docs/PLAN.md` section 12 and in the git history.*
 
-## Current state (kept up to date by the coordinator; last updated 2026-11-11, end of Milestone I)
+## Current state (kept up to date by the coordinator; last updated 2026-11-12 08:10 UTC)
 
 Read this block first; the rest of this file is the 2026-11-11 morning snapshot.
 
 - **Where the work is:** branch `claude/amanuensis-handoff-0x6u5m`, pushed after every completed task. `main` is the owner-approved state (still at `0ad6506`; nothing has been merged to it yet).
-- **What to do next:** `docs/PLAN.md` section 8 is the task table (status and commit per task); section 9 lists what waits for the owner. The tail of `docs/handoff/LEDGER.md` (from "Checkpoint 2026-11-11") is the running record: every dispatch, review result, ruling (R120 onward) and deferred minor.
-- **Done:** Milestone I (Tasks 38–42: build fixed, docs corrected, decisions recorded, every never-reviewed commit reviewed and fixed, CI extended), Task 43 (end-to-end harness), Task 60 (new-project dialog), Task 52 (owner review pages), Task 37e (Mac research, ADR 0014).
-- **Paused on 2026-11-11 at 17:00 UTC by the account's usage limit (resets 19:20 UTC):** Tasks 34a (review), 45 and 49 (fix rounds) and 51 (early). Their unmerged work is saved as patches in `docs/handoff/wip/`; its README says how to restore each. Rulings they need: R135 (34a), R138 (49), R136 and R137 (45), R31 (51).
-- **How tasks run:** each implementer works in its own git worktree under `.claude/worktrees/` on a local branch `worktree-agent-<id>`; the coordinator merges it after review. **Those branches exist only in the coordinator's container until merged.** If a session ends with tasks "in progress" in the PLAN table, that work is lost unless its branch was pushed: check `git branch --list 'worktree-agent-*'` and the ledger's last "dispatched" lines, and re-dispatch what is missing.
-- **Checks to run before trusting the tree:** `pnpm install --frozen-lockfile && pnpm fetch-csl && pnpm setup:py && pnpm -r typecheck && pnpm test` (2,112 tests at `f5d47a3`), `pnpm --filter @ao/ui run build && pnpm e2e -- --trace off` (extension 4, app 14).
-- **CI on GitHub:** one job per push to a working branch; docs-only pushes start no run. On 2026-11-11 GitHub's runners could not resolve the Ubuntu mirrors; the workflow falls back to another mirror. The first green run since the morning was at `27d7c6c`.
+- **What to do next:** `docs/PLAN.md` section 8 is the task table (status and commit per task); section 9 lists what waits for the owner. The tail of `docs/handoff/LEDGER.md` (from "Checkpoint 2026-11-11") is the running record: every dispatch, review result, ruling (R120 onward, now to R155) and deferred minor.
+- **Merged and verified (in order):** Milestone I (Tasks 38–42), 43, 60, 52, 37e, 45, 34a, 44, 34e, 61, 37d, 34c, 34b, 37b, 37a, 50, 48a, 48b, 37c, 58, 37h, 48c, 37j, 37f (the Mac workflow, written but never run).
+- **State at 2026-11-12 08:10 UTC:** at the owner's word the eight tasks stopped by the interruption of 11 November were restarted with fresh agents in their existing worktrees — 49 (fix round 4), 51 (fix round 2), 34d (fix round 1), 46a, 46b, 46c (fix round 1), 63, and the review of 57 — and the first Mac build was requested, Apple Silicon only (R168: a build is started by a commit that changes `apps/desktop/mac-build-request.json`; this session cannot push tags, and the repository's default branch on GitHub is still the old `claude/eager-sagan-ndp8ku`). Not started: 62 (after 51), 50b (after 49), 47 and 34f (after the 46 tasks and the screens), 37i, 53–56, the Intel build, tesseract's own build. Held for the owner: 37g (Apple membership, needed only before release to others, R151), 53 (the two review pages). Open defects D1–D8 are being fixed by 46a and 46b. If an agent is stopped again, a fresh one continues from the task's worktree branch with the hand-over files in the coordinator's working folder (`takeover-common.md` and one file per task) or, failing those, from the task's PLAN section and its last ledger entries.
+- **How tasks run:** each implementer works in its own git worktree under `.claude/worktrees/` on a local branch `worktree-agent-<id>`; an adversarial reviewer probes it; the coordinator merges with `--no-ff` after review, verifies, records the result in the ledger and the PLAN table, and pushes. The standing briefs every implementer and reviewer is given are `docs/handoff/BRIEF-implementer.md` and `docs/handoff/BRIEF-reviewer.md`; each task adds a short brief of its own built from its PLAN section and the rulings it names. **Worktree branches exist only in the coordinator's container until merged.** If a session ends with tasks "in progress" in the PLAN table, that work is lost unless its branch still exists: check `git branch --list 'worktree-agent-*'` and the ledger's last lines for each task, and re-dispatch what is missing.
+- **Checks to run before trusting the tree:** `pnpm install --frozen-lockfile && pnpm fetch-csl && pnpm setup:py && pnpm -r typecheck && pnpm test`, then `pnpm --filter @ao/ui run build && pnpm e2e -- --trace off`. The service is started with its token on standard input (see the commands table below).
+- **Machine limits learned:** this container has four processors. More than about ten agents at once pushes the load past 25 and tests with explicit time limits fail for slowness; verify merges at raised priority (`nice -n -15 …`) and re-run a timing failure alone before believing it. Default test time-outs are hang detectors (R150); explicit limits are never loosened.
+- **CI on GitHub:** one job per push to a working branch; docs-only pushes start no run; a run in progress is allowed to finish and only the newest waiting run is kept. The repository is private, so runners have two processors and a full run takes about 30 minutes; macOS minutes count ten times. Last green run: 186 at `376abcc`.
 
 ## Project and status
 **Alexandrine Oxiana** is a local-first research workbench for social scientists. It combines Zotero-style references, Obsidian-style notes and Scrivener-style writing, with three further features:
@@ -57,7 +58,7 @@ Kept for history only; use `docs/PLAN.md` for what to do next.
 3. **Task 37: desktop shell (Tauri 2), packaging and e2e.**
    - Carry-overs:
      - The service sidecar runs with `--max-old-space-size=512` (R64/R96).
-     - `AO_SERVICE_TOKEN` is passed on stdin, not in the environment (R98).
+     - Done in Task 37b: the service takes its token as one line on standard input and refuses to start if one is in the environment or the arguments (R98). The shell must start it that way; the worker's own token is still passed in its environment and moves to standard input with the shell (Task 37c).
      - Native file and folder pickers and drop paths (FileDrop notes, R113).
      - Worker sidecar via PyInstaller.
      - An e2e test through `scripts/run-e2e.mjs --desktop-only`.
@@ -106,7 +107,7 @@ Kept for history only; use `docs/PLAN.md` for what to do next.
 | Extension e2e | `pnpm e2e -- --extension-only e2e/extension.spec.ts --trace off` |
 | UI build | `pnpm --filter @ao/ui run build` |
 | UI colour/CSS rules | `pnpm --filter @ao/ui run lint:css && pnpm --filter @ao/ui run lint:colours` |
-| Run the service | `pnpm --filter @ao/library-service start` (prints `AO_SERVICE_READY port=<n>`; needs `AO_SERVICE_TOKEN`, ≥32 chars) |
+| Run the service | `pnpm --filter @ao/library-service start` (prints `AO_SERVICE_READY port=<n>`; the access token, at least 32 characters, is written as one line to its standard input, for example `printf '%s\n' "$TOKEN" \| pnpm --filter @ao/library-service start`; it refuses to start if a token is in the environment or the arguments, R98) |
 | CLI | `pnpm ao --help` (see `apps/cli/README.md`) |
 
 ## Start here (next agent)

@@ -245,7 +245,13 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     const token = str(bodyOf(req), "token", 256);
     const m = state.pendingMove();
     if (!m || m.confirmToken !== token) throw new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires after 15 minutes).");
-    const r = await deleteOldCopy(m.oldRoot, token, { deps: state.deps, ...(state.session ? { destRepo: state.session.repo } : {}), tz: state.tz });
+    let r: Awaited<ReturnType<typeof deleteOldCopy>>;
+    try {
+      r = await deleteOldCopy(m.oldRoot, token, { deps: state.deps, ...(state.session ? { destRepo: state.session.repo } : {}), tz: state.tz });
+    } finally {
+      // A mark may have appeared (Task 50): the banner follows.
+      state.publishState();
+    }
     state.forgetMove();
     return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
   });
@@ -305,8 +311,13 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   app.post("/libraries/relink", async (req) => {
     const s = state.requireWritable();
     const searchDir = absPath(bodyOf(req), "searchDir");
-    const r = await relinkMissing(s.lib, searchDir, s.repo, { keyRing: s.ring });
-    return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
+    try {
+      const r = await relinkMissing(s.lib, searchDir, s.repo, { keyRing: s.ring });
+      return { ...r, warnings: r.warnings.map((w) => scrubPaths(w, state.roots)) };
+    } finally {
+      // A mark may have appeared (Task 50): the banner follows.
+      state.publishState();
+    }
   });
 
   app.post("/libraries/rebuild-index", async () => {

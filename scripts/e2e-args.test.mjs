@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { needsSuiteFlag, noResults, parseE2eArgs } from "./e2e-args.mjs";
+import { needsSuiteFlag, noResults, parseE2eArgs, suitesToRun } from "./e2e-args.mjs";
 import { buildReport } from "./test-report.mjs";
 
 test("a suite that wrote no results is reported as a failure, never as nothing", () => {
@@ -27,6 +27,18 @@ test("both flags at once is an error", () => {
   assert.throws(() => parseE2eArgs(["--extension-only", "--desktop-only"]), /one of/);
   assert.throws(() => parseE2eArgs(["--app-only", "--extension-only"]), /one of/);
   assert.throws(() => parseE2eArgs(["--desktop-only", "--", "--app-only"]), /one of/);
+});
+
+const SUITES = [{ name: "extension" }, { name: "app" }, { name: "desktop", onlyWhenAsked: true }];
+
+test("plain `pnpm e2e` runs every suite except the desktop one, which needs the built app", () => {
+  assert.deepEqual(suitesToRun(undefined, SUITES).map((s) => s.name), ["extension", "app"]);
+});
+
+test("each flag runs its own suite only; --desktop-only is how the desktop suite runs", () => {
+  assert.deepEqual(suitesToRun("desktop", SUITES).map((s) => s.name), ["desktop"]);
+  assert.deepEqual(suitesToRun("app", SUITES).map((s) => s.name), ["app"]);
+  assert.deepEqual(suitesToRun("extension", SUITES).map((s) => s.name), ["extension"]);
 });
 
 test("extra arguments without a flag go nowhere by guess: the runner needs a flag", () => {

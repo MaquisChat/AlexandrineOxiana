@@ -11,6 +11,7 @@ import { findSourceBy, indexSource, openIndex } from "./index/db.js";
 import { shredSeams } from "./fs/shred.js";
 import { backupSeams } from "./export/backup.js";
 import { DESTRUCTION_NOTICE, destroyRaw, readDestruction, resumeDestruction, retentionDue } from "./retention.js";
+import { setProjectTimeZone } from "./repo/repo.js";
 
 let kit: Kit;
 beforeEach(async () => {
@@ -53,6 +54,59 @@ async function derived(p: Project, sf: SourceFile, kind: string, ext: string, bo
     derivation: { parents: [sf.assets[0]!.id], operation: kind, provider: "test", ranAt: "local", params: {}, at: kit.clock.now.toISOString(), triggeredBy: "tester" },
   });
 }
+
+describe("project time zone (Task 58, R93)", () => {
+  it("is set through a governed, audited change; the retention date is then read in it; cleared, it is UTC again", async () => {
+    const p = await makeProject(kit, GOV(false));
+    await rawSource(p);
+    const evening = new Date("2026-11-30T20:00:00Z"); // already 1 December at UTC+14
+    expect(kit.repo.getProject(p.id).timeZone).toBeUndefined();
+    expect(await retentionDue(kit.repo, p.id, evening)).toEqual([]);
+
+    const set = await setProjectTimeZone(kit.repo, p.id, "pacific/kiritimati");
+    expect(set.timeZone).toBe("Pacific/Kiritimati");
+    expect(kit.repo.getProject(p.id).timeZone).toBe("Pacific/Kiritimati");
+    expect(JSON.parse(await readFile(abs(`${p.folder}/project.json`), "utf8")).project.timeZone).toBe("Pacific/Kiritimati");
+    expect(await retentionDue(kit.repo, p.id, evening)).toHaveLength(1);
+    const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.time-zone");
+    expect(ev).toHaveLength(1);
+    expect(ev[0]).toMatchObject({ action: "store", decision: { result: "allow" }, entity: { type: "project", id: p.id }, details: { from: null, to: "Pacific/Kiritimati" } });
+
+    // Setting the same zone again changes and records nothing (M2).
+    const events = (await auditEvents(kit, p)).length;
+    await setProjectTimeZone(kit.repo, p.id, "Pacific/Kiritimati");
+    expect((await auditEvents(kit, p)).length).toBe(events);
+
+    // It survives reopening the library.
+    await kit.reopen();
+    expect(kit.repo.getProject(p.id).timeZone).toBe("Pacific/Kiritimati");
+
+    await setProjectTimeZone(kit.repo, p.id, null);
+    expect((await auditEvents(kit, p)).filter((e) => e.details?.op === "project.time-zone").at(-1)?.details).toMatchObject({ from: "Pacific/Kiritimati", to: null });
+    expect(kit.repo.getProject(p.id).timeZone).toBeUndefined();
+    expect(JSON.parse(await readFile(abs(`${p.folder}/project.json`), "utf8")).project).not.toHaveProperty("timeZone");
+    expect(await retentionDue(kit.repo, p.id, evening)).toEqual([]);
+  });
+
+  it("refuses a name that is not a time zone and writes nothing", async () => {
+    const p = await makeProject(kit, GOV(false));
+    const before = await readFile(abs(`${p.folder}/project.json`), "utf8");
+    const events = (await auditEvents(kit, p)).length;
+    for (const bad of ["Mars/Olympus", "+05:00", "", " UTC", "x".repeat(65)]) {
+      await expect(setProjectTimeZone(kit.repo, p.id, bad), bad).rejects.toThrow(/not a time zone/);
+    }
+    await expect(setProjectTimeZone(kit.repo, p.id, 5 as unknown as string)).rejects.toThrow(/not a time zone/);
+    expect(await readFile(abs(`${p.folder}/project.json`), "utf8")).toBe(before);
+    expect((await auditEvents(kit, p)).length).toBe(events);
+  });
+
+  it("an encrypted project keeps its time zone readable while locked (project.json is plaintext)", async () => {
+    const p = await makeProject(kit, GOV(true), true);
+    await setProjectTimeZone(kit.repo, p.id, "Asia/Tokyo");
+    kit.repo.lockProject(p.id);
+    expect(kit.repo.getProject(p.id).timeZone).toBe("Asia/Tokyo");
+  });
+});
 
 describe("retentionDue", () => {
   it("lists the raw originals of identifiable sources once rawDataDestroyAfter has passed", async () => {

@@ -1,8 +1,9 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { AuditEvent } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "./crypto/keys.js";
@@ -289,12 +290,16 @@ describe("startWorker", () => {
     return p;
   }
 
+  // A stand-in worker that takes its token as the real one does: the first line of standard input
+  // (R155). It reports what it saw of the token elsewhere (environment, arguments).
   const READY_STUB = `import { createServer } from "node:http";
-const token = process.env.AO_WORKER_TOKEN;
+import { createInterface } from "node:readline";
+const lines = createInterface({ input: process.stdin });
+const token = await new Promise((resolve) => lines.once("line", resolve));
 const s = createServer((req, res) => {
   if (req.headers.authorization !== "Bearer " + token) { res.writeHead(401); return res.end("{}"); }
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: true, versions: {}, env: { port: process.env.AO_WORKER_PORT, models: process.env.AO_MODELS_DIR, secret: process.env.SOME_APP_SECRET ?? null, hasPath: !!process.env.PATH, proxy: process.env.HTTPS_PROXY ?? null } }));
+  res.end(JSON.stringify({ ok: true, versions: {}, tokenElsewhere: JSON.stringify(process.env).includes(token) || process.argv.join(" ").includes(token), tokenVar: Object.keys(process.env).filter((k) => /WORKER_TOKEN/i.test(k)), env: { port: process.env.AO_WORKER_PORT, models: process.env.AO_MODELS_DIR, secret: process.env.SOME_APP_SECRET ?? null, hasPath: !!process.env.PATH, proxy: process.env.HTTPS_PROXY ?? null } }));
 });
 s.listen(0, "127.0.0.1", () => console.log("AO_WORKER_READY port=" + s.address().port));
 `;
@@ -315,7 +320,8 @@ s.listen(0, "127.0.0.1", () => console.log("AO_WORKER_READY port=" + s.address()
     const res = await fetch(`${w.baseUrl}/health`, { headers: { Authorization: `Bearer ${w.token}` } });
     expect(res.status).toBe(200);
     // only an allowlisted environment reaches the worker
-    expect(await res.json()).toMatchObject({ ok: true, env: { port: "0", models: "/models", secret: null, hasPath: true, proxy: "http://proxy.test:3128" } });
+    // and the token arrived on standard input only (R98, R155): not in the environment or arguments
+    expect(await res.json()).toMatchObject({ ok: true, tokenElsewhere: false, tokenVar: [], env: { port: "0", models: "/models", secret: null, hasPath: true, proxy: "http://proxy.test:3128" } });
     const other = await startWorker({ command: [process.execPath, script] });
     closers.push(() => other.stop());
     expect(other.token).not.toBe(w.token);
@@ -350,4 +356,42 @@ s.listen(0, "127.0.0.1", () => console.log("AO_WORKER_READY port=" + s.address()
     const unauth = await fetch(`${w.baseUrl}/health`);
     expect(unauth.status).toBe(401);
   }, 60_000);
+
+  it.skipIf(!existsSync(venvPython) || process.platform === "win32")(
+    "a parent killed with SIGKILL leaves no worker: the worker stops when its standard input closes (R155)",
+    async () => {
+      const pidFile = join(tmp, "worker.pid");
+      const parent = await stubScript(`import { writeFileSync } from "node:fs";
+import { startWorker } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "worker-client.ts")).href)};
+const w = await startWorker({ env: { AO_MODELS_DIR: ${JSON.stringify(join(tmp, "models"))}, AO_TOOLS_DIR: ${JSON.stringify(join(tmp, "tools"))} } });
+writeFileSync(${JSON.stringify(pidFile)}, String(w.process.pid));
+console.log("PARENT_READY");
+setInterval(() => {}, 1000);
+`);
+      const child = spawn(process.execPath, ["--import", "tsx", parent], { stdio: ["ignore", "pipe", "pipe"] });
+      closers.push(async () => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      });
+      let err = "";
+      child.stderr.on("data", (d: Buffer) => (err += d.toString()));
+      await new Promise<void>((resolve, reject) => {
+        child.stdout.on("data", (d: Buffer) => d.toString().includes("PARENT_READY") && resolve());
+        child.once("exit", (code) => reject(new Error(`parent exited (${code}): ${err}`)));
+      });
+      const pid = Number(await readFile(pidFile, "utf8"));
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      child.kill("SIGKILL");
+      let gone = false;
+      for (let i = 0; i < 150 && !gone; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        try {
+          process.kill(pid, 0);
+        } catch {
+          gone = true;
+        }
+      }
+      expect(gone).toBe(true);
+    },
+    60_000,
+  );
 });

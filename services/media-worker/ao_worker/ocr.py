@@ -1,4 +1,9 @@
-"""pdf.ocr: `ocrmypdf --skip-text --output-type pdf --sidecar <output>.txt` (needs tesseract and ghostscript)."""
+"""pdf.ocr: `ocrmypdf --skip-text --output-type pdf --sidecar <output>.txt`.
+
+Needs tesseract: the app's own copy in the tools folder (its folder put first on the child's PATH,
+TESSDATA_PREFIX set to the app's language data), else the system's; with neither the job fails with
+TOOL_NOT_INSTALLED (tool `ocr`). Ghostscript is not needed (ocrmypdf 17 rasterises with pypdfium2).
+"""
 from __future__ import annotations
 
 import os
@@ -17,7 +22,7 @@ DEFAULTS = {"languages": ["eng"]}
 # ocrmypdf exit codes (ocrmypdf.ExitCode)
 EXIT_CODES = {
     2: ("UNSUPPORTED_INPUT", "the input is not a readable PDF"),
-    3: ("MISSING_DEPENDENCY", "OCR needs tesseract and ghostscript, which were not found"),
+    3: ("MISSING_DEPENDENCY", "a program OCR needs (tesseract) was not found"),
     4: ("OCR_FAILED", "the OCR output was invalid"),
     5: ("OCR_FAILED", "the output file could not be written"),
     6: ("UNSUPPORTED_INPUT", "the PDF already has text"),
@@ -43,6 +48,15 @@ def run(job: Job, ctx: JobContext) -> dict:
     out = Path(job.output)
     if not src.is_file():
         raise JobError("INPUT_NOT_FOUND", "the input file does not exist")
+    from .tools import managed_tessdata, not_installed, which
+
+    tesseract = which("tesseract")
+    if tesseract is None:
+        raise not_installed("ocr")
+    extra_env = {"PATH": os.pathsep.join([os.path.dirname(tesseract), os.environ.get("PATH", "")])}
+    tessdata = managed_tessdata()
+    if tessdata:
+        extra_env["TESSDATA_PREFIX"] = tessdata
     sidecar = Path(str(out) + ".txt")
     out.parent.mkdir(parents=True, exist_ok=True)
     argv = [
@@ -57,7 +71,7 @@ def run(job: Job, ctx: JobContext) -> dict:
     # ocrmypdf's (and tesseract's/ghostscript's) temporary copies of the input go to the job's
     # private workdir (TMPDIR), which is removed when the job ends, cancelled or not.
     with tempfile.TemporaryFile(mode="w+", dir=ctx.workdir) as errf:
-        proc = ctx.popen(argv, stdout=subprocess.DEVNULL, stderr=errf, text=True)
+        proc = ctx.popen(argv, stdout=subprocess.DEVNULL, stderr=errf, text=True, extra_env=extra_env)
         rc = ctx.wait(proc)
         errf.seek(0)
         stderr = errf.read()

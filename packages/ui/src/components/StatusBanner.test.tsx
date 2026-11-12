@@ -34,7 +34,15 @@ describe("StatusBanner", () => {
     ["annotations-unreadable", /annotations in Dissertation could not be read/],
     ["destroy-incomplete", /destruction of raw data in Dissertation did not finish/],
     ["retention-due", /Dissertation has reached its retention date/],
+    ["recovery-code-unshown", /new recovery code for Dissertation was issued, but the app stopped before it could be shown.*New recovery code…/],
     ["anchor-missing", /audit log may have been changed outside the app/],
+    ["audit-unrecorded", /A change to Dissertation is not recorded in its audit log yet.*recorded the next time the library is opened with write access.*audit screen/],
+    ["audit-unrecorded-blocked", /A change to Dissertation is not recorded in its audit log, and it cannot be while that log does not verify or a problem reported for Dissertation is unresolved.*set it aside/],
+    ["attention-unreadable", /An unrecognised item is in the attention folder of Dissertation.*set it aside/],
+    ["audit-waiting", /kept on this computer.*another computer had the library open.*next opens the library with write access/],
+    ["permissions-not-set", /restored to Dissertation could not be made private to you.*tried again.*set it aside/],
+    ["audit-recorded-late", /recorded in the audit log of Dissertation now.*marked as recorded late/],
+    ["refusal-unrecorded", /refused request could not be recorded in the library's audit log. Nothing was changed/],
   ])("warning %s in plain language", (warning, text) => {
     render(<StatusBanner variant={{ kind: "warning", warning, project: "Dissertation" }} />);
     expect(screen.getByRole("status").textContent).toMatch(text);
@@ -64,6 +72,9 @@ describe("StatusBanner", () => {
       "invalid-txn-marker", "incomplete-write-pending", "txn-recovery-skipped-audit-unverifiable", "trimmed-incomplete-audit-line",
       "incomplete-audit-line-pending", "audit-append-failed-at-open", "deleted-records-unreadable", "annotations-unreadable",
       "annotations-hash-mismatch", "destroy-incomplete", "backup-failed", "retention-due", "protocol-manifest-unreadable",
+      "recovery-code-unshown", "recovery-staging-discarded", "recovery-staging-unverifiable",
+      "audit-unrecorded", "permissions-not-set", "audit-recorded-late", "refusal-unrecorded",
+      "audit-unrecorded-blocked", "attention-unreadable", "audit-waiting",
     ];
     const generic = warningText("made-up-kind", "P");
     const seen = new Set<string>();

@@ -317,3 +317,18 @@ describe("effective policy and failure", () => {
     expect(denyReason(evaluate(cfg(), req({ action: "bogus" as never })))).toMatch(/^Policy could not be evaluated/);
   });
 });
+
+describe("set-aside (Task 50, R154 d)", () => {
+  const sa = (reason: unknown) => req({ action: "set-aside", setAside: { reason: reason as string } });
+  const PROFILES = ["", "profiles: [hipaa]", "profiles: [gdpr]", "profiles: [irb]", "profiles: [dmp]", "profiles: [hipaa, gdpr, irb, dmp]"];
+  it.each(PROFILES)("is allowed with a reason under %j", (yaml) => {
+    expect(evaluate(cfg(yaml), sa("The disk lost it")).result).toBe("allow");
+  });
+  it.each(PROFILES)("is refused without a reason (after trimming) under %j", (yaml) => {
+    for (const r of ["", "   \n\t"]) expect(denyReason(evaluate(cfg(yaml), sa(r)))).toBe("A reason is required to set this aside");
+  });
+  it("is refused when the payload is missing or the reason is not text", () => {
+    expect(evaluate(cfg(), req({ action: "set-aside" })).result).toBe("deny");
+    expect(evaluate(cfg(), sa(42)).result).toBe("deny");
+  });
+});

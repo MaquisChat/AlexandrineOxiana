@@ -1,0 +1,9 @@
+/* A missing optional tool (Task 48b). Colours from theme tokens only; focus rings come from base.css. */
+p.ao-tool-missing {
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+}

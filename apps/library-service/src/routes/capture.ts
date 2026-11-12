@@ -23,6 +23,7 @@ import {
   type ProfileCaptureOptions,
   type ProfileContentType,
 } from "@ao/library";
+import { SPEECH_MODELS } from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
@@ -31,7 +32,8 @@ import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray,
 export const BROWSER_CAPTURE_BODY_LIMIT = 32 * 1024 * 1024;
 
 const BROWSERS: BrowserName[] = ["chrome", "firefox", "safari", "edge", "brave"];
-const MODELS = ["large-v3", "medium", "small"];
+// The speech models the app accepts (R158, one definition in @ao/shared).
+const MODELS: readonly string[] = SPEECH_MODELS;
 const TYPES: ProfileContentType[] = ["posts", "reels", "videos", "shorts", "highlights"];
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
