@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Builds the desktop app on Linux (Task 37c), in this order: the library service folder
 // (apps/library-service/dist/library-service); the notices the About screen shows from the helpers'
-// own builds, copied to apps/desktop/generated/notices/ (the service build's THIRD-PARTY-NOTICES.md,
-// and the packaged worker's sidecar-manifest.json when build:sidecars has made one) and the licence
-// lists of the shell's own Rust crates and the interface's npm packages (notices.mjs); the interface
+// own builds, copied to apps/desktop/generated/notices/ (the service build's THIRD-PARTY-NOTICES.md
+// and THIRD-PARTY-LICENCES.txt, and the packaged worker's sidecar-manifest.json and licence texts when
+// build:sidecars has made one) and the licence lists and texts of the shell's own Rust crates, the
+// interface's npm packages and Node.js (notices.mjs; Task 37j); the interface
 // (packages/ui/dist, which reads those notices and is embedded in the shell); and the Tauri shell
 // (apps/desktop/src-tauri/target/<profile>/alexandrine-oxiana). Debug profile by default (what the
 // launch check runs); `--release` builds the release profile instead (no developer tools, no test mode).
@@ -40,10 +41,21 @@ step("the library service folder", "pnpm", ["--filter", "@ao/library-service", "
 const NOTICES = join(REPO, "apps", "desktop", "generated", "notices");
 rmSync(NOTICES, { recursive: true, force: true });
 mkdirSync(NOTICES, { recursive: true });
-copyFileSync(join(REPO, "apps", "library-service", "dist", "library-service", "licences", "THIRD-PARTY-NOTICES.md"), join(NOTICES, "library-service-THIRD-PARTY-NOTICES.md"));
+const serviceLicences = join(REPO, "apps", "library-service", "dist", "library-service", "licences");
+copyFileSync(join(serviceLicences, "THIRD-PARTY-NOTICES.md"), join(NOTICES, "library-service-THIRD-PARTY-NOTICES.md"));
+// The licence texts themselves (Task 37j): the interface loads each only when asked (About screen).
+copyFileSync(join(serviceLicences, "THIRD-PARTY-LICENCES.txt"), join(NOTICES, "library-service-LICENCES.txt"));
 const sidecars = join(REPO, "apps", "desktop", "sidecars");
 const worker = existsSync(sidecars) ? readdirSync(sidecars).map((d) => join(sidecars, d, "sidecar-manifest.json")).find((f) => existsSync(f)) : undefined;
-if (worker) copyFileSync(worker, join(NOTICES, "worker-sidecar-manifest.json"));
+if (worker) {
+  copyFileSync(worker, join(NOTICES, "worker-sidecar-manifest.json"));
+  const texts = join(dirname(worker), "licenses", "THIRD-PARTY-LICENCES.txt");
+  if (!existsSync(texts)) {
+    process.stderr.write("build:linux: the packaged worker has no licenses/THIRD-PARTY-LICENCES.txt; rebuild it (build:sidecars)\n");
+    process.exit(1);
+  }
+  copyFileSync(texts, join(NOTICES, "worker-LICENCES.txt"));
+}
 process.stdout.write(`build:linux: notices: the service's npm packages${worker ? " and the packaged worker's manifest" : " (no packaged worker yet: its manifest is not included)"}\n`);
 
 // The shell's own Rust crates and the interface's npm packages (R159 c); fails on one without a licence.
