@@ -25,7 +25,6 @@ import { existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import type { EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
@@ -33,6 +32,7 @@ import type { IndexDb } from "./index/db.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
 import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
+import { mediaWorkerSourceDir } from "./resources.js";
 
 export type WorkerJobType = "audio.transcribe" | "capture.download" | "image.proxy" | "video.proxy" | "pdf.ocr";
 
@@ -433,7 +433,12 @@ export interface WorkerHandle extends WorkerEndpoint {
   stop(): Promise<void>;
 }
 
-const WORKER_DIR = fileURLToPath(new URL("../../../services/media-worker/", import.meta.url));
+/** The media worker's source folder (its dev venv); none in a built folder, where AO_WORKER_BIN is required. */
+const workerDir = (): string => {
+  const dir = mediaWorkerSourceDir();
+  if (!dir) throw new Error("The media worker is not configured: set AO_WORKER_BIN to the packaged worker.");
+  return dir;
+};
 const READY_RE = /^AO_WORKER_READY port=(\d+)\s*$/;
 
 // The worker (and the tools it runs) get only what they need from the app's environment.
@@ -463,7 +468,7 @@ export function workerEnv(env: NodeJS.ProcessEnv): Record<string, string> {
 }
 
 export function devWorkerPython(): string {
-  return join(WORKER_DIR, ".venv", process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
+  return join(workerDir(), ".venv", process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
 }
 
 export async function startWorker(opts: StartWorkerOptions = {}): Promise<WorkerHandle> {
@@ -476,7 +481,7 @@ export async function startWorker(opts: StartWorkerOptions = {}): Promise<Worker
       const py = opts.python ?? devWorkerPython();
       if (!existsSync(py)) throw new Error(`media worker venv not found (${py}); run \`pnpm setup:py\``);
       argv = [py, "-m", "ao_worker"];
-      cwd = WORKER_DIR;
+      cwd = workerDir();
     }
   }
   const token = randomBytes(32).toString("hex");

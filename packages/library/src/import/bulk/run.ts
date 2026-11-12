@@ -32,7 +32,7 @@
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "../../resources.js";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import {
@@ -112,7 +112,7 @@ import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
 import { capAnnotations, planAnnotations, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
-const VERSION: string = (createRequire(import.meta.url)("../../../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 const TOOL = { name: "bulk-import", version: VERSION };
 
 /** File notes the engine adds when it leaves out one of an item's files (R68 I2; never a path). */
