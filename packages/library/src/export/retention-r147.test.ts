@@ -8,11 +8,12 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { appendFile, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sealEvent, verifyChain, type AuditEvent, type Project, type SourceFile } from "@ao/core";
 import type { LocationEnv } from "../location.js";
 import { shredSeams } from "../fs/shred.js";
+import { newAttentionId, writeAttention, type UnrecordedAudit } from "../repo/attention.js";
 import { projectWarnings } from "../repo/repo.js";
 import { SimulatedCrash, seams } from "../repo/testing.js";
 import { destroyRaw, listDestructions, readDestruction, resumeDestruction } from "../retention.js";
@@ -436,6 +437,66 @@ describe("the certificate and backups-state.json are conveniences; the audit log
     expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
     const recs = await listDestructions(kit.repo, p.id);
     expect(recs.every((r) => /audit log/u.test(r.problem ?? ""))).toBe(true);
+  });
+});
+
+describe("what is recorded late from a mark (Task 50) is never a destruction's list, nor a record of a removal", () => {
+  it("marks left on disk that claim a removal and a destruction of their own: recorded late as what a mark may be, and the retry reads nothing from them", async () => {
+    const { p, x, certificatePath } = await stuck();
+    kit.clock.now = new Date("2026-12-02T10:30:00.000Z");
+    const liveOnly = await backupProject(kit.repo, p.id, { prune: false });
+    const folder = kit.repo.getProject(p.id).folder;
+    const certificate = basename(certificatePath);
+    const certificateSha256 = sha(await readFile(certificatePath));
+    // Written outside the app, in the form of the app's own marks (an action a mark may name), with
+    // the details of the events the retry trusts.
+    const mark = (details: Record<string, unknown>): UnrecordedAudit => ({
+      formatVersion: 1,
+      id: newAttentionId(),
+      kind: "audit-unrecorded",
+      occurredAt: "2026-12-02T10:31:00.000Z",
+      actor: "tester",
+      device: "dev-A",
+      action: "library.relink",
+      details,
+      state: "ready",
+    });
+    // The stuck backup is said to be removed, and to be gone.
+    await writeAttention(kit.lib.root, folder, mark({ op: "retention.backups", certificate, certificateSha256, stepAt: "2026-12-02T10:31:00.000Z", status: "deleted", removed: [rel(x)], noLongerPresent: [rel(x)], notRemoved: [] }));
+    // A destruction of its own, whose list names the backup of live data.
+    await writeAttention(kit.lib.root, folder, mark({ op: "retention.destroy", certificate: "destruction-2026-12-02 1031.json", certificateSha256: sha("forged"), backupsToRemove: [rel(liveOnly)], backupsUnreadable: [] }));
+    const again = await kit.reopen();
+    // Both are in the audit log now, recorded late under the action a mark may name; the chain holds.
+    const late = (await auditEvents(kit, p)).filter((e) => detailsOf(e).recordedLate !== undefined);
+    expect(late.map((e) => e.action)).toEqual(["library.relink", "library.relink"]);
+    expect(late.map((e) => detailsOf(e).op).sort()).toEqual(["retention.backups", "retention.destroy"]);
+    expect(verifyChain(await auditEvents(kit, p)).ok).toBe(true);
+
+    // The retry runs and the removal still fails: nothing was taken from the marks.
+    kit.clock.now = new Date("2026-12-02T11:30:00.000Z");
+    shredSeams.failFor = (path) => path.endsWith(nameOf(x));
+    await resumeDestruction(again, p.id);
+    shredSeams.failFor = undefined;
+    expect(existsSync(x.path)).toBe(true);
+    expect(existsSync(liveOnly.path)).toBe(true);
+    const all = await listDestructions(again, p.id);
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ status: "pending", outstanding: [rel(x)], verified: true });
+    expect(all[0]!.problem).toBeUndefined();
+    expect(await holdingNotRemoved(again, p.id)).toEqual([rel(x)]);
+    expect(await projectWarnings(again, p.id)).toContain(WARNING);
+    // Nothing but the mark itself says the step is finished.
+    expect((await completions(p)).filter((e) => detailsOf(e).recordedLate === undefined)).toEqual([]);
+    expect(await recordedAs(p, rel(x))).toEqual({ removed: 0, gone: 0 });
+
+    // The removal works at last: only the listed backup goes, and it is recorded once, as removed.
+    later(HOUR);
+    await resumeDestruction(again, p.id);
+    expect(existsSync(x.path)).toBe(false);
+    expect(existsSync(liveOnly.path)).toBe(true);
+    expect((await readDestruction(again, p.id, certificatePath)).status).toBe("deleted");
+    expect(await recordedAs(p, rel(x))).toEqual({ removed: 1, gone: 0 });
+    expect(await projectWarnings(again, p.id)).not.toContain(WARNING);
   });
 });
 
