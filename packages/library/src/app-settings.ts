@@ -11,6 +11,7 @@ import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { newId } from "@ao/core";
 import type { Deps } from "./deps.js";
+import { raiseDeviceNotice } from "./device-notices.js";
 import { writeFileAtomic } from "./fs/atomic.js";
 
 /** The app's settings folder: AO_CONFIG_DIR, else the platform's usual place. */
@@ -112,7 +113,11 @@ function deviceIdIn(dir: string, now: () => Date): { id: string; renewed: boolea
  */
 export function deviceDeps(dir: string = appConfigDir(), opts: { now?: () => Date } = {}): Deps & { deviceRenewed?: true } {
   ensurePrivateDir(dir);
-  const device = deviceIdIn(dir, opts.now ?? (() => new Date()));
+  const now = opts.now ?? (() => new Date());
+  const device = deviceIdIn(dir, now);
+  // Never silent (R154, R178): the researcher is told, through a device-level notice; raising it
+  // never throws and never holds up the start (deviceNoticesIdle waits for it where that matters).
+  if (device.renewed) void raiseDeviceNotice(dir, "device-identity-renewed", now());
   return {
     clock: () => new Date(),
     deviceId: device.id,

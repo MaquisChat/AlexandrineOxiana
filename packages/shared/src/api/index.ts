@@ -12,3 +12,4 @@ export * from "./attention.js";
 export * from "./tools.js";
 export * from "./capture.js";
 export * from "./settings-reset.js";
+export * from "./device-notices.js";

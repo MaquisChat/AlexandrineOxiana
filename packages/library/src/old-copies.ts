@@ -14,6 +14,7 @@ import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { Deps } from "./deps.js";
+import { raiseDeviceNotice } from "./device-notices.js";
 import { writeFileAtomic } from "./fs/atomic.js";
 
 export const OLD_COPY_TTL_MS = 24 * 3600_000;
@@ -120,7 +121,11 @@ function changeList<T>(deps: CfgDeps, edit: (records: PendingOldCopy[]) => Promi
     const { records, damaged } = await readList(deps);
     const out = await edit(records);
     if (out.records === null) return out.result; // nothing to change
-    if (damaged) await fsp.rename(key, await corruptName(deps));
+    if (damaged) {
+      await fsp.rename(key, await corruptName(deps));
+      // Never silent (R154, R178): a device-level notice says so (raising never throws).
+      await raiseDeviceNotice(deps.appConfigDir, "old-copies-list-set-aside", deps.clock());
+    }
     await save(deps, out.records);
     return out.result;
   });
