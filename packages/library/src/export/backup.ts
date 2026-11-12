@@ -1552,9 +1552,12 @@ export interface RestoreResult {
   /**
    * Files not brought back because a destruction recorded in this library destroyed them (R174 d):
    * the source and asset (by their ids in the new project, where the asset is marked destroyed) and
-   * when it was destroyed.
+   * when it was destroyed. `unverified`: the file was left out only because records the app cannot
+   * vouch for name it as destroyed (a log that does not verify, a folder that could not be loaded,
+   * a certificate taken as it is); that it was destroyed is not established, and `destroyedAt` is
+   * what those records say (R182 d).
    */
-  leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string }>;
+  leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }>;
 }
 
 export interface RestoreOptions {
@@ -1649,11 +1652,14 @@ async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: 
  * the backup and seals the copy's files, is held by this call alone and never put in the key ring,
  * and is zeroed when the call ends: allowed, refused or failed, every project is as locked or
  * unlocked afterwards as before, and nothing is readable that was not. The copy made that way is
- * locked until it is unlocked itself (audited as `key.unlock`). A locked original does not stand in
- * the way of the decision: its rules and its audit log are not sealed. Only its sealed destruction
- * certificates are not read: the files it destroyed are known by id from its audit log, the
- * restore says that the certificates were not read, and an entry written before the log named the
- * files refuses the restore (unlock the project first, or restore into another library).
+ * locked until it is unlocked itself (audited as `key.unlock`). A locked original whose audit log
+ * records no destruction does not stand in the way: its rules and its audit log are not sealed, and
+ * nothing needs its key. One whose log records a destruction refuses the restore (R182 a): its
+ * destruction certificate is sealed, the backup cannot be checked against it, and a destroyed file
+ * must not come back because a project happened to be locked. The refusal names both ways out:
+ * unlock that project and restore again, or restore into another library. Any other locked
+ * project's sealed certificates are not read: the files it destroyed are known by id from its
+ * audit log, and the restore says that the certificates were not read (R182 b).
  *
  * Governed (Task 50b, R138): before anything is written, the policy engine decides
  * (`action: 'restore'`) on the rules the backup carries, which become the new project's, and on the

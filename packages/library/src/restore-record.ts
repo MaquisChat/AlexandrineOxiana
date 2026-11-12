@@ -19,15 +19,20 @@
  *     is missing or cannot be read) counts the same way, and never refuses a restore: it may be the
  *     very project that is being recovered. The restore says that the folder could not be loaded.
  *
- * A locked project (the restore unlocks nothing, I1): its audit log is not sealed, so the files it
- * destroyed are known by id. Its sealed certificates are not read, which the restore says.
+ * A locked project (the restore unlocks nothing, I1; R182):
+ *   - the backup's own project, with a destruction on record in whatever form: its certificate is
+ *     sealed and the backup cannot be checked against it, so the restore is refused, naming both
+ *     ways out (unlock that project and restore again, or another library). With no destruction on
+ *     record nothing needs the key;
+ *   - any other locked project: its audit log is not sealed, so the files it destroyed are known
+ *     by id. Its sealed certificates are not read, which the restore says.
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditEvent, Project } from "@ao/core";
 import { auditedDestructions, outstandingOf, parseObject, readPlain, retentionNames, sha256, strings } from "./destruction-record.js";
 import { projectMovedAway } from "./library.js";
-import { AuditStore } from "./repo/audit-store.js";
+import { auditSegments } from "./repo/audit-store.js";
 import { DESTRUCTION_CERTIFICATE } from "./repo/destroy.js";
 import { ProjectLockedError } from "./repo/errors.js";
 import { decryptBytes } from "./repo/io.js";
@@ -209,6 +214,19 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
   const out: DestroyedSource[] = [];
   const { list, certificateHashes } = auditedDestructions(events);
   const now = repoClock(repo)().toISOString();
+  // The backup's own project, locked, with a destruction on record in whatever form (R182 a): the
+  // destruction certificate is sealed, the restore unlocks nothing (I1), and so the backup cannot
+  // be checked against it. A destroyed file must not come back because a project happened to be
+  // locked: the restore is refused, in words that name both ways out. With no destruction on
+  // record nothing needs the key, and the restore is decided as for an unlocked project.
+  // The log decides, not the retention folder: a certificate file removed outside the app changes nothing here.
+  const lockedOwn = () =>
+    new DestructionRecordError(
+      `The project "${p.name}" is locked, and its audit log records that raw data was destroyed under a retention rule. This backup belongs to that project. That project's destruction certificates are sealed, so while it is locked the app cannot check the backup against them, and nothing was restored here. Unlock that project and restore the backup again, or restore the backup into another library.`,
+      p.id,
+      false,
+    );
+  if (own && (list.length || certificateHashes.size) && !repo.isUnlocked(p.id)) throw lockedOwn();
   // What each destruction's own audit entry names as destroyed (the first entry for a certificate
   // stands, as in the fold; an entry recorded late from a mark is never one: its action differs).
   const named = new Map<string, string[]>();
@@ -217,10 +235,10 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
     if (e?.action !== "delete" || d.op !== "retention.destroy" || typeof d.certificateSha256 !== "string" || !Array.isArray(d.destroyedAssets)) continue;
     if (!named.has(d.certificateSha256)) named.set(d.certificateSha256, strings(d.destroyedAssets));
   }
-  /** The backup's own project: what it destroyed cannot be told, so nothing is restored here. */
-  const cannotTell = (which: string, why: string, locked: boolean) =>
+  /** The backup's own project, unlocked: what it destroyed cannot be told, so nothing is restored here. */
+  const cannotTell = (which: string, why: string) =>
     new DestructionRecordError(
-      `The audit log of the project "${p.name}" records a destruction of raw data${which} without naming the files that were destroyed, and the certificate ${why}. This backup belongs to that project, and the app cannot tell which files must not be brought back, so nothing was restored here. ${ELSEWHERE}${locked ? " Or unlock that project and try again." : ""}`,
+      `The audit log of the project "${p.name}" records a destruction of raw data${which} without naming the files that were destroyed, and the certificate ${why}. This backup belongs to that project, and the app cannot tell which files must not be brought back, so nothing was restored here. ${ELSEWHERE}`,
       p.id,
       false,
     );
@@ -238,13 +256,15 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
       }`,
     audit: (n) => ({ projectId: p.id, ...(certificate ? { certificate } : {}), basis: found ? "certificate-files-alone" : "nothing-could-be-read", leftOut: n }),
   });
-  /** Destructions whose files are known from the audit log, but whose sealed certificate could not be read: the project is locked. */
+  /** Another project's destructions whose files are known from its audit log, but whose sealed certificate could not be read: it is locked. */
   let sealed = 0;
   for (const a of list) {
     const byId = new Map<string, string>();
     const ids = named.get(a.certificateSha256);
     for (const id of ids ?? []) byId.set(id, a.at);
     const buf = await retentionFile(repo, p, a.certificate);
+    // Locked since the check above (a lock does not wait for a restore): refused all the same.
+    if (own && buf === "locked") throw lockedOwn();
     const verified = Buffer.isBuffer(buf) && sha256(buf) === a.certificateSha256 ? namedIn(buf, a.at) : undefined;
     if (verified) {
       for (const [id, at] of verified.byId) if (!byId.has(id)) byId.set(id, at);
@@ -268,12 +288,13 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
       continue;
     }
     // An entry written before the audit log named the destroyed files, whose certificate does not verify either.
-    if (own) throw cannotTell(` (certificate "${a.certificate}")`, why, buf === "locked");
+    if (own) throw cannotTell(` (certificate "${a.certificate}")`, why);
     out.push(unestablished(` (certificate "${a.certificate}")`, why, Buffer.isBuffer(buf) ? namedIn(buf, now) : undefined, a.certificate));
   }
-  // A locked project (the restore unlocks nothing, I1): its audit log, which is not sealed, names the
-  // destroyed files by id, and that is what was used. Its sealed certificates also list each file's
-  // sha256, which would catch the same file kept under another id; that could not be read, and is said.
+  // Another project that is locked (R182 b; the restore unlocks nothing, I1): its audit log, which is
+  // not sealed, names the destroyed files by id, and that is what was used. Its sealed certificates
+  // also list each file's sha256, which would catch the same file kept under another id; that could
+  // not be read, and is said. (Never the backup's own project: that one is refused above.)
   if (sealed) {
     out.push({
       projectId: p.id,
@@ -304,7 +325,7 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
   }
   if (earliest.size) {
     const why = lockedOne ? "is sealed, and its project is locked" : "is missing, or is not the file the audit log recorded";
-    if (own) throw cannotTell("", why, lockedOne);
+    if (own) throw lockedOne ? lockedOwn() : cannotTell("", why);
     // Whatever certificate files are there still exclude (unverified).
     const all = { byId: new Map<string, string>(), bySha256: new Map<string, string>() };
     for (const l of loose) {
@@ -343,18 +364,28 @@ interface Unvouched {
 
 /**
  * What can still be read of an audit log nothing vouches for: the files its destruction entries
- * name as destroyed (by id), and how many such entries there were. An entry that cannot be parsed,
- * and a log that cannot be read at all, give nothing.
+ * name as destroyed (by id), and how many such entries there were. A line that cannot be parsed,
+ * and a segment that cannot be read at all, give nothing.
+ *
+ * Every line is read, the last one included when it has no final newline (R182 c): the audit store
+ * takes such a line for an incomplete write, which is right for appending and for verifying, but
+ * here a line that parses as an entry is evidence like any other readable entry. Only this reading
+ * differs; the audit store's own is not changed.
  */
 async function namedInLog(dir: string, fallbackAt: string): Promise<{ byId: Map<string, string>; entries: number }> {
   const out = { byId: new Map<string, string>(), entries: 0 };
-  let events: Array<AuditEvent | null>;
-  try {
-    events = await AuditStore.read(dir);
-  } catch {
-    return out;
+  const lines: string[] = [];
+  for (const n of await auditSegments(dir).catch(() => [] as string[])) {
+    lines.push(...(await fsp.readFile(join(dir, n), "utf8").catch(() => "")).split("\n"));
   }
-  for (const e of events) {
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+    let e: AuditEvent | null;
+    try {
+      e = JSON.parse(line) as AuditEvent | null;
+    } catch {
+      continue;
+    }
     if (!e || typeof e !== "object" || e.action !== "delete") continue;
     const d = e.details as Record<string, unknown> | null | undefined;
     if (!d || typeof d !== "object" || d.op !== "retention.destroy" || !Array.isArray(d.destroyedAssets)) continue;

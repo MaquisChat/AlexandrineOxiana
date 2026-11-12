@@ -153,9 +153,10 @@ export interface DestroyedSource {
   /** What the restore's audit entry says of this source, when it is not a verified record. */
   audit?: (leftOut: number) => Record<string, unknown>;
   /**
-   * The project is locked and its destruction certificates are sealed: what it destroyed is known
-   * by id from its audit log, but the certificates' list of sha256 could not be read (the restore
-   * unlocks nothing, I1). Said in the notes, and named in the restore's audit entry.
+   * Another project that is locked, with sealed destruction certificates (R182 b): what it
+   * destroyed is known by id from its audit log, but the certificates' list of sha256 could not be
+   * read (the restore unlocks nothing, I1). Said in the notes, and named in the restore's audit
+   * entry. Never the backup's own project: locked with a destruction on record, it refuses (R182 a).
    */
   sealed?: true;
 }
@@ -493,7 +494,7 @@ const pretty = (text: string) => /\n\s/u.test(text);
 export async function adoptRestoredProject(
   core: RepoCore,
   s: StagedRestore,
-): Promise<{ project: Project; notes: string[]; leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string }>; warnings: string[] }> {
+): Promise<{ project: Project; notes: string[]; leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }>; warnings: string[] }> {
   core.assertWritable();
   return core.serial(async () => {
     core.assertWritable();
@@ -627,8 +628,11 @@ export async function adoptRestoredProject(
       const leftBy = new Map<DestroyedSource, number>();
       /** What the copy keeps: the ids and sha256 of the stored files that are brought back. */
       const kept = { ids: new Set<string>(), sha256: new Set<string>() };
-      /** What was left out, by the ids the backup holds (given as the copy's ids in the answer). */
-      const left: Array<{ sourceId: string; assetId: string; destroyedAt: string }> = [];
+      /**
+       * What was left out, by the ids the backup holds (given as the copy's ids in the answer).
+       * `unverified`: only records the app cannot vouch for name it as destroyed (R182 d).
+       */
+      const left: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }> = [];
       for (const [f, raw] of parsedSources) {
         const sf = raw as { source: { id: string }; assets: Array<{ id: string; path: string; sha256: string; status?: string; destroyedAt?: string; linked?: unknown }> };
         for (const a of sf.assets) {
@@ -643,13 +647,22 @@ export async function adoptRestoredProject(
           if (a.path.startsWith(`${old.folder}/`)) await shredPath(join(staging, ...a.path.slice(old.folder.length + 1).split("/")));
           a.status = "destroyed";
           a.destroyedAt = at;
-          left.push({ sourceId: sf.source.id, assetId: a.id, destroyedAt: at });
+          left.push({ sourceId: sf.source.id, assetId: a.id, destroyedAt: at, ...(by.basis === "unverified" ? { unverified: true as const } : {}) });
           leftBy.set(by, (leftBy.get(by) ?? 0) + 1);
         }
         parsedSources.set(f, sf as unknown as Record<string, unknown>);
       }
-      const skipped = left.length;
+      // Counted and said apart (R182 d): what a verified record says was destroyed, and what was left
+      // out only because records nothing vouches for name it. Nothing is stated as fact on unverified ground.
+      const skipped = left.filter((x) => !x.unverified).length;
+      const onUnverified = left.length - skipped;
       if (skipped) notes.push(`${skipped} ${skipped === 1 ? "file was" : "files were"} destroyed earlier under a retention rule and ${skipped === 1 ? "was" : "were"} not restored.`);
+      if (onUnverified) {
+        const one = onUnverified === 1;
+        notes.push(
+          `${onUnverified} ${one ? "file was" : "files were"} left out because unverified records name ${one ? "it" : "them"} as destroyed; the app cannot confirm that ${one ? "it was" : "they were"} destroyed.`,
+        );
+      }
       // What each source has to say about this restore (nothing, when it has no bearing on it), and
       // what the audit entry records of evidence the audit log could not vouch for.
       const notVerified: Array<Record<string, unknown>> = [];
@@ -766,6 +779,8 @@ export async function adoptRestoredProject(
           restoredFrom: old.id,
           fromAuditHead: verify.head ? { seq: verify.head.seq, hash: verify.head.hash } : null,
           ...(skipped ? { leftOutDestroyed: skipped } : {}),
+          // Left out on records the app cannot vouch for alone: not counted as destroyed (R182 d).
+          ...(onUnverified ? { leftOutUnverified: onUnverified } : {}),
           // Projects whose record of destructions the audit log could not vouch for, and what the
           // list of files left out rests on for each (R179).
           ...(notVerified.length ? { destructionsNotVerified: notVerified } : {}),
@@ -814,7 +829,12 @@ export async function adoptRestoredProject(
       return {
         project: structuredClone(st.project),
         notes,
-        leftOut: left.map((x) => ({ sourceId: ids.get(x.sourceId) ?? x.sourceId, assetId: ids.get(x.assetId) ?? x.assetId, destroyedAt: x.destroyedAt })),
+        leftOut: left.map((x) => ({
+          sourceId: ids.get(x.sourceId) ?? x.sourceId,
+          assetId: ids.get(x.assetId) ?? x.assetId,
+          destroyedAt: x.destroyedAt,
+          ...(x.unverified ? { unverified: true as const } : {}),
+        })),
         warnings: inherited?.warnings ?? [],
       };
     } catch (err) {
