@@ -128,6 +128,9 @@ class Worker:
         t0 = time.monotonic()
         self.proc = subprocess.Popen([str(exe)], cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)
+        # The token as the service passes it: one line on standard input, which stays open (R155).
+        self.proc.stdin.write(TOKEN + "\n")
+        self.proc.stdin.flush()
         self.stderr: list[str] = []
         threading.Thread(target=self._drain, daemon=True).start()
         line = self.proc.stdout.readline()  # the ready line
@@ -350,7 +353,7 @@ def clean_env(root: Path, path: str, models: Path, tools: Path, proxy: str) -> d
     tmp.mkdir(exist_ok=True)
     env = {
         "PATH": path, "HOME": str(home), "TMPDIR": str(tmp), "LANG": "C.UTF-8",
-        "AO_WORKER_TOKEN": TOKEN, "AO_WORKER_PORT": "0", "AO_WORKER_EXIT_ON_STDIN_EOF": "1",
+        "AO_WORKER_PORT": "0",
         "AO_MODELS_DIR": str(models), "AO_TOOLS_DIR": str(tools), "PYTHONUNBUFFERED": "1",
     }
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):

@@ -85,13 +85,28 @@ describe("the access token on standard input (R98)", () => {
     const port = await ready(r);
     expect((await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth })).status).toBe(200);
     expect((await fetch(`http://127.0.0.1:${port}/libraries`, { headers: { authorization: "Bearer not-the-token-0123456789abcdefghijkl" } })).status).toBe(401);
-    // The launcher closing standard input later is not a reason to stop (it is no longer read).
-    r.child.stdin!.end();
+    // Anything written after the token line is not read as anything.
+    r.child.stdin!.write("not a command\n");
     await new Promise((res) => setTimeout(res, 300));
     expect((await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth })).status).toBe(200);
     expect(await stop(r), r.err()).toBe(0);
     expect(r.out()).toMatch(/AO_SERVICE_READY port=\d+\n/);
     expect(r.out()).not.toContain(TOKEN);
+    expect(r.err()).not.toContain(TOKEN);
+  });
+
+  it("shuts down cleanly when its standard input closes after the token line (the launcher is gone, R155)", async () => {
+    const lib = join(tmp, "Lib");
+    await (await createLibrary(lib, "Lib", deps)).close();
+    const r = run({ env: baseEnv({ AO_NO_WORKER: "1", AO_LIBRARY: lib }), stdin: `${TOKEN}\n` });
+    const port = await ready(r);
+    expect((await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth })).status).toBe(200);
+    expect(existsSync(join(lib, ".lock"))).toBe(true);
+    r.child.stdin!.end();
+    const { code } = await r.exit;
+    expect(code, r.err()).toBe(0);
+    // A clean shutdown: the library's lock was released.
+    expect(existsSync(join(lib, ".lock"))).toBe(false);
     expect(r.err()).not.toContain(TOKEN);
   });
 

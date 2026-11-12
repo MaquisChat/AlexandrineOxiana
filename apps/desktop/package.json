@@ -3,9 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "The desktop app (Tauri shell, not built yet) and the build of its helper programs.",
+  "description": "The desktop app: the Tauri shell (src-tauri) and the build of its helper programs.",
   "scripts": {
     "build:sidecars": "node scripts/build-sidecars.mjs",
-    "smoke:sidecars": "node scripts/build-sidecars.mjs --skip-build --smoke"
+    "smoke:sidecars": "node scripts/build-sidecars.mjs --skip-build --smoke",
+    "build:linux": "node scripts/build-linux.mjs",
+    "launch-check": "node scripts/launch-check.mjs",
+    "test": "node --test scripts/launch-check.test.mjs scripts/notices.test.mjs && cargo test --locked --manifest-path src-tauri/Cargo.toml"
   }
 }
