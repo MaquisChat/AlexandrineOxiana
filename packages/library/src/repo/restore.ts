@@ -5,7 +5,8 @@
  *
  *   1. its audit chain must verify (and match the head the backup recorded, when it did);
  *   1b. the policy engine decides, in this turn (R138 c), against the rules that would go live with
- *      the copy (the `governance.yaml` unpacked from the backup) and where the library is
+ *      the copy (the `governance.yaml` unpacked from the backup), the rules the project the backup
+ *      was made from has now when it is in this library, and where the library is
  *      (`decideRestore`): a refusal is audited and nothing is restored. The same decision was made
  *      before anything was unpacked (`authorizeRestoreIn`);
  *   2. everything the library indexes by id gets a fresh id (the project, its sources, assets,
@@ -152,6 +153,8 @@ export interface StagedRestore {
 
 /** Rules that require encryption at rest, for a project that is not encrypted: it would come back unencrypted. */
 export const RESTORE_NEEDS_ENCRYPTION = "The rules of the project in this backup require encryption at rest, but the project in it is not encrypted; it was not restored";
+/** The same, by the rules the project the backup was made from has now. */
+export const RESTORE_NEEDS_ENCRYPTION_NOW = "The rules the original project has now require encryption at rest, but the project in this backup is not encrypted; it was not restored";
 /** A sealed archive whose project is not an encrypted one: unpacking it would write its files unencrypted. */
 export const RESTORE_SEALED_BUT_PLAIN = "This backup is sealed, but the project in it is not an encrypted one, so it would come back unencrypted; it was not restored";
 
@@ -160,34 +163,67 @@ const denyOf = (reason: string, warnings: string[] = []): PolicyDecision => ({ r
 const REASON_MAX = 600;
 
 /**
- * The policy decision for a restore. The rules asked are the backup's own (they become the new
- * project's); the engine checks them against where the library is and gives an `encrypt` condition
- * when they require encryption at rest (`action: 'restore'`). A condition the project in the backup
- * cannot honour is a deny, as for every governed write. Never throws: rules that are missing or
- * cannot be read, and any failure to decide, are a deny (fail closed).
+ * One set of rules asked about a restore: the engine's decision (`action: 'restore'`), with a
+ * condition the project in the backup cannot honour turned into a deny, as for every governed
+ * write. Rules that are missing or cannot be parsed, and any failure to decide, are a deny.
  */
-export function decideRestore(core: RepoCore, r: RestoreRequest, at: string): PolicyDecision {
+function askRules(core: RepoCore, r: RestoreRequest, at: string, yaml: string | null, rules: "backup" | "original", zone: { timeZone?: string | undefined }): PolicyDecision {
   let d: PolicyDecision;
   try {
-    if (r.governanceYaml === null) throw new Error("the backup holds no governance.yaml");
-    d = evaluate(parseGovernance(r.governanceYaml), {
+    if (yaml === null) throw new Error(rules === "backup" ? "the backup holds no governance.yaml" : "its governance.yaml is missing");
+    d = evaluate(parseGovernance(yaml), {
       action: "restore",
       projectId: r.project.id,
       actor: core.actor,
       now: at,
-      tz: core.zoneOf(r.project),
-      restore: { destinations: r.destinations },
+      tz: core.zoneOf(zone),
+      restore: { destinations: r.destinations, rules },
     });
   } catch (e) {
-    // The text comes from a file brought from outside (the backup's rules): scrubbed of paths, and
-    // kept short, before it becomes a recorded reason.
+    // The text may come from a file brought from outside (the backup's rules): scrubbed of paths,
+    // and kept short, before it becomes a recorded reason.
     const why = scrubPaths(e instanceof Error ? e.message : String(e), [core.root]);
-    return denyOf(`Policy could not be evaluated: ${why.length > REASON_MAX ? `${why.slice(0, REASON_MAX)}…` : why}`);
+    const short = why.length > REASON_MAX ? `${why.slice(0, REASON_MAX)}…` : why;
+    return denyOf(`Policy could not be evaluated: ${rules === "original" ? "the rules the original project has now cannot be read: " : ""}${short}`);
   }
-  if (d.result === "deny") return d;
-  if (d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "encrypt") && !r.project.encrypted) return denyOf(RESTORE_NEEDS_ENCRYPTION, d.warnings);
-  if (r.sealed && !r.project.encrypted) return denyOf(RESTORE_SEALED_BUT_PLAIN, d.warnings);
+  if (d.result === "allow_with_conditions" && d.conditions.some((c) => c.type === "encrypt") && !r.project.encrypted) {
+    return denyOf(rules === "backup" ? RESTORE_NEEDS_ENCRYPTION : RESTORE_NEEDS_ENCRYPTION_NOW, d.warnings);
+  }
   return d;
+}
+
+/**
+ * The policy decision for a restore (Task 50b). Two sets of rules are asked, and both must allow it:
+ *   - the rules the backup carries, which become the new project's;
+ *   - the rules the project the backup was made from has now, when that project is in this library
+ *     (read here, so in the commit turn they are the governance then in force, R138 c).
+ * Each is asked the same thing: every kind of storage the library's folder may be on must be
+ * allowed, and rules that require encryption at rest need the project in the backup to be an
+ * encrypted one. A sealed archive whose project is not encrypted is refused as well. Never throws:
+ * rules that are missing or cannot be read, and any failure to decide, are a deny (fail closed).
+ * Caller holds the write queue.
+ */
+export async function decideRestore(core: RepoCore, r: RestoreRequest, at: string): Promise<PolicyDecision> {
+  const own = askRules(core, r, at, r.governanceYaml, "backup", r.project);
+  if (own.result === "deny") return own;
+  if (r.sealed && !r.project.encrypted) return denyOf(RESTORE_SEALED_BUT_PLAIN, own.warnings);
+  const st = core.projects.get(r.project.id);
+  if (!st) return own;
+  let yaml: string | null;
+  try {
+    const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
+    yaml = raw ? raw.toString("utf8") : null;
+  } catch (e) {
+    return denyOf(`Policy could not be evaluated: the rules the original project has now cannot be read: ${scrubPaths(e instanceof Error ? e.message : String(e), [core.root])}`, own.warnings);
+  }
+  const now = askRules(core, r, at, yaml, "original", st.project);
+  const warnings = [...new Set([...own.warnings, ...now.warnings])];
+  if (now.result === "deny") return denyOf(now.reason, warnings);
+  // Both allow: every condition of either stands (only `encrypt` can be given).
+  const conditions = [...(own.result === "allow_with_conditions" ? own.conditions : []), ...(now.result === "allow_with_conditions" ? now.conditions : [])].filter(
+    (c, i, all) => all.findIndex((x) => x.type === c.type) === i,
+  );
+  return conditions.length ? { result: "allow_with_conditions", conditions, warnings } : { result: "allow", warnings };
 }
 
 /**
@@ -248,7 +284,7 @@ export async function authorizeRestoreIn(core: RepoCore, r: RestoreRequest): Pro
   core.assertWritable();
   return core.serial(async () => {
     core.assertWritable();
-    const d = decideRestore(core, r, core.clock().toISOString());
+    const d = await decideRestore(core, r, core.clock().toISOString());
     if (d.result === "deny") {
       await recordRestoreRefusal(core, r, d.reason, "decision", { warnings: d.warnings });
       throw new PolicyDeniedError(d.reason, "restore");
@@ -369,7 +405,8 @@ export async function adoptRestoredProject(
       const wrongProject = auditProjectProblem(events as AuditEvent[], old.id);
       if (wrongProject) throw new AuditChainInvalidError(wrongProject);
 
-      // 1b. The decision again, in this turn (R138 c), against the rules that would go live with the copy.
+      // 1b. The decision again, in this turn (R138 c): against the rules that would go live with the
+      // copy, and the rules the project the backup was made from has at this moment.
       const rules = await readMaybe(join(staging, "governance.yaml"));
       const request: RestoreRequest = {
         project: { id: old.id, name: old.name, encrypted: old.encryption.enabled, ...(old.timeZone ? { timeZone: old.timeZone } : {}) },
@@ -379,7 +416,7 @@ export async function adoptRestoredProject(
         backupSha256: s.backupSha256,
         ...(s.file ? { file: s.file } : {}),
       };
-      const decided = decideRestore(core, request, core.clock().toISOString());
+      const decided = await decideRestore(core, request, core.clock().toISOString());
       if (decided.result === "deny") {
         await recordRestoreRefusal(core, request, decided.reason, "commit", { warnings: decided.warnings });
         throw new PolicyDeniedError(decided.reason, "restore");

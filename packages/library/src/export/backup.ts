@@ -1630,12 +1630,13 @@ async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: 
  * (or the recovery code), checked against the key file the backup manifest kept.
  *
  * Governed (Task 50b, R138): before anything is written, the policy engine decides
- * (`action: 'restore'`) on the rules the backup carries, which become the new project's: every kind
- * of storage the library's folder may be on must be in their `residency.allowed`, and
+ * (`action: 'restore'`) on the rules the backup carries, which become the new project's, and on the
+ * rules the project it was made from has now when that project is in this library; both must allow
+ * it. Every kind of storage the library's folder may be on must be in their `residency.allowed`, and
  * `encryption.atRest: required` gives an `encrypt` condition that a project which is not encrypted
  * cannot honour (refused: nothing comes back unencrypted under such rules). Rules that are missing
  * or cannot be read refuse it too. The decision is made again in the commit turn, under the write
- * queue, against the rules as unpacked; the allow is recorded with its conditions in the copy's
+ * queue, against the rules as unpacked and the original's rules then in force; the allow is recorded with its conditions in the copy's
  * `project.restored` event. A refusal throws PolicyDeniedError and is audited as a `restore` deny:
  * in the log of the project the backup belongs to when it is in this library, else in the library's
  * own log (never a path: the backup's sha256, and its file name when it is one of this library's).

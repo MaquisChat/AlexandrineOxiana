@@ -26,11 +26,13 @@ export interface PolicyRequest {
    */
   backup?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }> };
   /**
-   * A backup restored as a new project of a library (Task 50b). The policy evaluated is the one the
-   * backup carries: it becomes the new project's. `destinations` lists every kind of storage the
-   * library's folder may be on, as for a backup. Each must be allowed.
+   * A backup restored as a new project of a library (Task 50b). `destinations` lists every kind of
+   * storage the library's folder may be on, as for a backup. Each must be allowed. The caller asks
+   * this of the rules the backup carries (they become the new project's; `rules: 'backup'`, the
+   * default) and, when the project the backup was made from is in the library, of the rules that
+   * project has now (`rules: 'original'`). `rules` only chooses the words of a refusal.
    */
-  restore?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }> };
+  restore?: { destinations: Array<{ destination: ResidencyKind; cloudFolderId?: string; uncertain?: boolean }>; rules?: "backup" | "original" };
   sync?: Record<string, never>;
   /** Setting aside a mark that cannot be repaired (Task 50, R154 d): the researcher's reason. */
   setAside?: { reason: string };
@@ -329,22 +331,29 @@ function backup(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): Po
 }
 
 /**
- * A restore (Task 50b): a backup becomes a new project of this library and brings its own rules
- * with it, so those are the rules asked (`p`). The questions are a backup's, the other way round:
- * every kind of storage the library's folder may be on must be allowed by the residency rules, and
- * rules that require encryption at rest give an `encrypt` condition, which a project that is not
- * encrypted cannot honour (the caller refuses it: nothing comes back unencrypted under such rules).
+ * A restore (Task 50b): a backup becomes a new project of this library. The questions are a
+ * backup's, the other way round: every kind of storage the library's folder may be on must be
+ * allowed by the residency rules, and rules that require encryption at rest give an `encrypt`
+ * condition, which a project that is not encrypted cannot honour (the caller refuses it: nothing
+ * comes back unencrypted under such rules). The caller asks this of the rules the backup brings
+ * with it, which become the new project's, and of the rules the project it was made from has now
+ * when that project is in the library; `restore.rules` says which, for the words of a refusal.
  */
 function restore(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const r = need(req.restore, "restore") as { rules?: unknown };
+  const which = r === null || typeof r !== "object" || r.rules === undefined ? "backup" : str(r.rules, "restore.rules");
+  if (which !== "backup" && which !== "original") throw new Error('restore.rules must be "backup" or "original"');
+  const rules = which === "backup" ? "the rules of the project in this backup" : "the rules the original project has now";
+  const list = which === "backup" ? "the approved list of the project in this backup" : "the approved list the original project has now";
   return fullCopy(
     p,
-    need(req.restore, "restore"),
+    r,
     "restore",
     {
       uncertain: (kind) =>
-        `Where the library's folder is stored could not be determined (it may be ${kind}), and the rules of the project in this backup do not allow its data there. To restore it, use a library on storage those rules allow.`,
-      folder: (id) => `The project would be restored into the library's folder, which is in cloud folder ${id}; it is not on the approved list of the project in this backup`,
-      kind: (where) => `The project would be restored into the library's folder, which is ${where}; the rules of the project in this backup do not allow its data there`,
+        `Where the library's folder is stored could not be determined (it may be ${kind}), and ${rules} do not allow its data there. To restore it, use a library on storage those rules allow.`,
+      folder: (id) => `The project would be restored into the library's folder, which is in cloud folder ${id}; it is not on ${list}`,
+      kind: (where) => `The project would be restored into the library's folder, which is ${where}; ${rules} do not allow its data there`,
     },
     warnings,
   );

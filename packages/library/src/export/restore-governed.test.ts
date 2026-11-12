@@ -338,6 +338,80 @@ describe("1. a restore is decided by the policy engine before anything is writte
     expect(ids()).toHaveLength(2);
   });
 
+  describe("the project the backup was made from is in this library: the rules it has now must allow the restore too", () => {
+    const NOW_REASON = "The project would be restored into the library's folder, which is on this computer's disk; the rules the original project has now do not allow its data there";
+    async function tighten(p: Project, yaml: string): Promise<void> {
+      const g = await kit.repo.getGovernance(p.id);
+      await kit.repo.setGovernance(p.id, yaml, { baseSha256: g.sha256 });
+    }
+
+    it("rules tightened after the backup was made (the library's place no longer allowed): refused, the reason says whose rules, audited in that project's log", async () => {
+      const p = await makeProject(kit, OPEN_GOV, false, "Tightened");
+      await addSource(kit, p, { title: "x" });
+      const b = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
+      await tighten(p, `${OPEN_GOV}residency:\n  allowed: [removable]\n`);
+      const folders = await projectFolders();
+      const err = (await restore(b.path, { locationEnv: onDisk() }).catch((e: unknown) => e)) as PolicyDeniedError;
+      expect(err).toBeInstanceOf(PolicyDeniedError);
+      expect(err.reason).toBe(NOW_REASON);
+      await expectNothingRestored(folders, [p.id]);
+      const denied = await refusalsIn(p.id);
+      expect(denied).toHaveLength(1);
+      expect(denied[0]!.decision).toEqual({ result: "deny", reason: NOW_REASON });
+      expect(denied[0]!.details).toMatchObject({ op: "project.restore", at: "decision" });
+    });
+
+    it("rules tightened while the backup was being unpacked: decided again in the commit turn against the governance then in force (R138 c); the refusal is audited and nothing is restored", async () => {
+      const p = await makeProject(kit, OPEN_GOV, false, "Tightened Meanwhile");
+      await addSource(kit, p, { title: "x" });
+      const b = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
+      const folders = await projectFolders();
+      let staged = "";
+      seamsOfRestore.beforeAdopt = async (staging) => {
+        staged = staging;
+        // An ordinary change, which a restore does not hold up.
+        await tighten(p, `${OPEN_GOV}residency:\n  allowed: [removable]\n`);
+      };
+      const err = (await restore(b.path, { locationEnv: onDisk() }).catch((e: unknown) => e)) as PolicyDeniedError;
+      expect(err).toBeInstanceOf(PolicyDeniedError);
+      expect(err.reason).toBe(NOW_REASON);
+      expect(staged).not.toBe("");
+      expect(existsSync(staged)).toBe(false);
+      await expectNothingRestored(folders, [p.id]);
+      const denied = await refusalsIn(p.id);
+      expect(denied).toHaveLength(1);
+      expect(denied[0]!.details).toMatchObject({ op: "project.restore", backupSha256: b.sha256, at: "commit" });
+    });
+
+    it("its rules cannot be read now: refused (fail closed), without a path in the reason", async () => {
+      const p = await makeProject(kit, OPEN_GOV, false, "Unreadable Now");
+      const b = await backupProject(kit.repo, p.id);
+      await writeFile(join(kit.lib.root, p.folder, "governance.yaml"), "identifiability: [unclosed\n  nope: {");
+      const folders = await projectFolders();
+      const err = (await restore(b.path).catch((e: unknown) => e)) as PolicyDeniedError;
+      expect(err).toBeInstanceOf(PolicyDeniedError);
+      expect(err.reason).toMatch(/^Policy could not be evaluated: the rules the original project has now cannot be read/u);
+      expect(err.reason).not.toContain(kit.tmp);
+      await expectNothingRestored(folders, [p.id]);
+      expect(await refusalsIn(p.id)).toHaveLength(1);
+
+      await rm(join(kit.lib.root, p.folder, "governance.yaml"));
+      await expect(restore(b.path)).rejects.toMatchObject({ reason: expect.stringMatching(/^Policy could not be evaluated: the rules the original project has now cannot be read/u) });
+      await expectNothingRestored(folders, [p.id]);
+    });
+
+    it("its rules now require encryption at rest (the file was edited outside the app) and the project in the backup is not encrypted: refused", async () => {
+      const p = await makeProject(kit, OPEN_GOV, false, "Required Now");
+      const b = await backupProject(kit.repo, p.id);
+      await writeFile(join(kit.lib.root, p.folder, "governance.yaml"), OPEN_GOV.replace("atRest: optional", "atRest: required"));
+      const folders = await projectFolders();
+      const err = (await restore(b.path).catch((e: unknown) => e)) as PolicyDeniedError;
+      expect(err).toBeInstanceOf(PolicyDeniedError);
+      expect(err.reason).toMatch(/the original project has now require encryption at rest/u);
+      await expectNothingRestored(folders, [p.id]);
+    });
+  });
+
   it("decided again in the commit turn, against the rules that would go live: a refusal there is audited, and nothing is restored", async () => {
     const p = await makeProject(kit, OPEN_GOV, false, "Changed Meanwhile");
     await addSource(kit, p, { title: "x" });

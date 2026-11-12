@@ -299,6 +299,23 @@ describe("restore (Task 50b): a backup becomes a new project in the library, und
   it("an unknown kind is refused, never allowed", () => {
     expect(evaluate(cfg("encryption: { atRest: optional }"), rs(at("moon"))).result).toBe("deny");
   });
+  it("asked of the rules the original project has now, a refusal says so (`rules: original`); the rule itself is the same", () => {
+    const now = (yaml: string, ...destinations: Dest[]) => evaluate(cfg(yaml), req({ action: "restore", restore: { destinations, rules: "original" } }));
+    expect(denyReason(now("encryption: { atRest: optional }", at("network")))).toBe(
+      "The project would be restored into the library's folder, which is on a network drive; the rules the original project has now do not allow its data there",
+    );
+    expect(denyReason(now(HIPAA_CLOUD, at("cloud_folder", { cloudFolderId: "f2" })))).toBe(
+      "The project would be restored into the library's folder, which is in cloud folder f2; it is not on the approved list the original project has now",
+    );
+    expect(denyReason(now("encryption: { atRest: optional }", at("device", { uncertain: true }), at("network", { uncertain: true })))).toBe(
+      "Where the library's folder is stored could not be determined (it may be a network drive), and the rules the original project has now do not allow its data there. To restore it, use a library on storage those rules allow.",
+    );
+    expect(now("encryption: { atRest: optional }", at("device"))).toEqual({ result: "allow", warnings: [] });
+    expect(conditions(now("", at("device")))).toEqual(ENCRYPT);
+    // `rules: backup` is the default, and anything else cannot be evaluated.
+    expect(evaluate(cfg("encryption: { atRest: optional }"), req({ action: "restore", restore: { destinations: [at("network")], rules: "backup" } }))).toEqual(evaluate(cfg("encryption: { atRest: optional }"), rs(at("network"))));
+    expect(denyReason(evaluate(cfg(), req({ action: "restore", restore: { destinations: [at("device")], rules: "mine" as never } })))).toMatch(/^Policy could not be evaluated/);
+  });
   it("a backup's reasons are unchanged by the shared rule", () => {
     expect(denyReason(evaluate(cfg("encryption: { atRest: optional }"), req({ action: "backup", backup: { destinations: [at("network")] } })))).toBe(
       "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there",
