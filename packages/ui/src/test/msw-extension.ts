@@ -1,11 +1,13 @@
 /**
  * Fixtures for the extension pairing screen (Task 34e): MSW handlers shaped like the service's
- * pairing routes (apps/library-service/src/routes/capture.ts). Own file so no shared fixture changes.
+ * pairing routes (apps/library-service/src/routes/capture.ts), the code-status route (Task 46c)
+ * included. Own file so no shared fixture changes.
  */
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { createClient } from "../api/client";
+import type { PairingCodeIssued, PairingCodeStatus } from "@ao/shared";
 import { extensionApi, type PairedBrowser } from "../api/extension";
 
 export const BASE = "http://127.0.0.1:4318";
@@ -27,16 +29,58 @@ export const BROWSER_B: PairedBrowser = { id: "0918273645aabbcc", origin: "moz-e
 
 export const apiError = (status: number, code: string, message: string) => HttpResponse.json({ error: { code, message } }, { status });
 
-/** Pairings the test can change; `pair` hands out the given codes in turn. */
+/** The id the fixture gives the n-th code it issues (0-based): 16 hex characters, like the service's. */
+export const codeIdOf = (n: number) => `c0de${String(n).padStart(12, "0")}`;
+
+/**
+ * Pairings the test can change; `pair` hands out the given codes in turn. Each code's status is
+ * kept as the service keeps it (a new code replaces an active one; past its time it is expired);
+ * `end` sets what became of a code, `pairWith` pairs a browser with the newest code.
+ */
 export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: number }>; pairings?: PairedBrowser[] } = {}) {
-  const state = { pairings: [...(opts.pairings ?? [])], issued: 0, codes: opts.codes ?? [{ code: "482916" }], deleted: [] as string[] };
+  const state = {
+    pairings: [...(opts.pairings ?? [])],
+    issued: 0,
+    codes: opts.codes ?? [{ code: "482916" }],
+    deleted: [] as string[],
+    /** Per issued code: its expiry (ms) and, once it ended, its final status. */
+    records: [] as Array<{ codeId: string; expires: number; end?: PairingCodeStatus }>,
+    statusReads: [] as string[],
+  };
+  const statusOf = (codeId: string): PairingCodeStatus => {
+    const r = state.records.find((x) => x.codeId === codeId);
+    if (!r) return { state: "none" };
+    if (!r.end && Date.now() > r.expires) r.end = { state: "expired", codeId, expiredAt: new Date(r.expires).toISOString() };
+    return r.end ?? { state: "active", codeId, expiresAt: new Date(r.expires).toISOString(), validForMs: Math.max(0, r.expires - Date.now()) };
+  };
+  const end = (n: number, status: PairingCodeStatus) => {
+    state.records[n]!.end = status;
+  };
+  const pairWith = (b: PairedBrowser) => {
+    const n = state.records.length - 1;
+    const at = new Date().toISOString();
+    state.pairings.push({ ...b, pairedAt: at });
+    end(n, { state: "used", codeId: codeIdOf(n), usedAt: at, browser: { id: b.id, origin: b.origin } });
+  };
   return {
     state,
+    end,
+    pairWith,
     handlers: [
       http.post(url("/extension/pair"), () => {
         const c = state.codes[Math.min(state.issued, state.codes.length - 1)]!;
+        const prev = state.records.at(-1);
+        if (prev && statusOf(prev.codeId).state === "active") prev.end = { state: "replaced", codeId: prev.codeId, replacedAt: new Date().toISOString() };
+        const ttl = c.ttlMs ?? 5 * 60_000;
+        const codeId = codeIdOf(state.issued);
+        state.records.push({ codeId, expires: Date.now() + ttl });
         state.issued++;
-        return HttpResponse.json({ code: c.code, expiresAt: new Date(Date.now() + (c.ttlMs ?? 5 * 60_000)).toISOString() });
+        const body: PairingCodeIssued = { code: c.code, codeId, expiresAt: new Date(Date.now() + ttl).toISOString(), validForMs: ttl };
+        return HttpResponse.json(body);
+      }),
+      http.get(url("/extension/pair/status/:codeId"), ({ params }) => {
+        state.statusReads.push(String(params.codeId));
+        return HttpResponse.json(statusOf(String(params.codeId)));
       }),
       http.get(url("/extension/pairings"), () => HttpResponse.json({ extensions: state.pairings })),
       http.delete(url("/extension/pairings/:pid"), ({ params }) => {
