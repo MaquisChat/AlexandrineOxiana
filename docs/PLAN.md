@@ -359,8 +359,15 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: the script and workflow tests; the zip built here loads in the extension's end-to-end run.
 - Model: Opus.
 
+**Task 66 — A paired browser survives a relaunch (D13) [ledger: R171, R96, R110, R111]**
+- Depends: 46c (the pairing screen and the pairing code), 65 (the popup's wording).
+- Files: `apps/library-service/src/main.ts` and the app settings store, `apps/desktop/src-tauri/src/helper_env.rs` only if the shell must say something new, `apps/browser-extension/src` (popup), `packages/ui/src/screens/ExtensionPairing.tsx`, tests.
+- Accept: the service listens again on the port it used last time when that port is free, and on another free port when it is not; a pairing made before a relaunch works after it without any action when the port is the same; when the port had to change, the pairing screen says so in plain words and the popup lets the researcher enter the new port without pairing again (the token stays valid); the extension still never scans for a port (R110); 127.0.0.1 only, token, Host and Origin checks unchanged (R96).
+- Verify: service tests (the same port after a restart; fallback when it is taken; two services at once); the extension's tests and end-to-end run; the desktop launch check.
+- Model: Opus.
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
-- Depends: 46a, 46b, 34d, 63, 64, 65, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
+- Depends: 46a, 46b, 34d, 63, 64, 65, 66, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
 
 ### Milestone N — Finish Phase 1
@@ -443,6 +450,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect D9 (the first-use question could take focus from a person typing): fixed by Task 48c.
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
 - Defects found by Task 37i while writing the owner's guide (for Task 64): D10 (high): nothing in the interface links to the Capture screen or to the transcript viewer, and the desktop app has no address bar, so neither can be reached. D11 (high): the Governance form has no control for capture methods; a new project allows neither browser capture nor the downloader, and the only way to allow them is to edit the `governance.yaml` text. D12: outside the library chooser and the drop areas, folder and file paths must be typed in full; there is no picker.
+- Defect found by the review of Task 37i (for Task 66): D13 (high): the library service takes a new port at every launch, and the browser extension keeps the port typed at pairing and never looks for another, so a paired browser stops working each time the app is reopened ("The desktop app is not answering on port N") until it is unpaired and paired again.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -493,9 +501,10 @@ Update after every task; commit and push.
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
-| 37i Guide and checklist | in review | 81c7c20 (worktree branch) | first version written against the build of 2026-11-12; it found D10–D12 and that the extension had no download (R170); accuracy review dispatched |
+| 37i Guide and checklist | fix round 1 | 81c7c20 (worktree branch) | first version written against the build of 2026-11-12; it found D10–D12 and that the extension had no download (R170); accuracy review: 5 Important, 16 Minor, and defect D13 (R171) |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | in progress | | dispatched 2026-11-12 |
+| 66 A paired browser survives a relaunch (D13) | not started | | waits for 46c and 65 |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
