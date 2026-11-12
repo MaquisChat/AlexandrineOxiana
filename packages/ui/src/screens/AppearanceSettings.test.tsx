@@ -294,7 +294,7 @@ describe("a typeface from the researcher's own file (R100, Task 57)", () => {
     expect(bytes).toHaveBeenCalledWith(`/settings/fonts/${ID2}`, expect.objectContaining({ maxBytes: expect.any(Number) }));
     expect(typeof FakeFontFace.made[0]!.source).not.toBe("string"); // bytes, never an address
     expect((FakeFontFace.made[0]!.source as ArrayBuffer).byteLength).toBe(4);
-    expect(prop("--font-reading").startsWith("Junicode, serif")).toBe(true);
+    expect(prop("--font-reading").startsWith("'Junicode', serif")).toBe(true); // always quoted (M5)
   });
 
   it("a saved choice is loaded when the app starts, and released when another typeface is chosen", async () => {
