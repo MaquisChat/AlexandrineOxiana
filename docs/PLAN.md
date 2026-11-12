@@ -401,6 +401,15 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: library and service tests; `pnpm -r typecheck`.
 - Model: Opus.
 
+**Task 71 — The extension remembers the downloader choice (D18) [ledger: R189]**
+- Files: `apps/browser-extension/src/popup/**`. Accept: the last choice is stored in the extension's local storage and shown at the next open; ticked by default; the project's rules still decide whether the box is offered. Verify: the extension's unit and end-to-end tests. Model: Opus.
+
+**Task 72 — A conflict found by a later check enters the review queue (D19) [ledger: R190, R172, R176, R177, R26]**
+- Files: `packages/library/src/sources.ts`, the review-entry writer, tests. Accept: a field newly in conflict on an existing source writes or extends one pending review entry in the same crash-safe change; settled by confirmation or a clearing recheck. Verify: library and service tests; the app end-to-end run. Model: Opus.
+
+**Task 73 — The audit says which field was confirmed (D20) [ledger: R191, R149, R176, R177]**
+- Files: the library's confirm path, the audit detail's type, tests. Accept: the entry names the field, that it was a confirmation, and kept or changed; never the value; old entries untouched; the chain verifies. Verify: core, library and service tests; scenario 11. Model: Opus.
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
@@ -553,10 +562,13 @@ Update after every task; commit and push.
 | 37k Revise the guide and checklist | done | cabc4d3 (merge) and the last edit | accuracy-reviewed line by line; scenario 10 quotes the mark of Task 69; it found D17, D18 and D19 |
 | 69 Show that a captured item is no longer available (D17) | complete | 0e12b9e (merge) | reviewed with probes over one fix round (R185, R186); D17 closed |
 | 70 A read never mistakes a write in progress for tampering (D21) | complete | a916b20 (merge) | reviewed with probes (R188); D21 closed; four minors on the final review's list |
+| 71 The extension remembers the downloader choice (D18) | in progress | | dispatched 2026-11-12 (R189) |
+| 72 A later conflict enters the review queue (D19) | in progress | | dispatched 2026-11-12 (R190) |
+| 73 The audit says which field was confirmed (D20) | in progress | | dispatched 2026-11-12 (R191) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | ready for the owner (2026-11-12) | | the build is run 3 of "Desktop (macOS)" (id 43271302338, commit 4a7255b; unsigned, R151), with the browser extension as a second download of the same run; the guide and checklist were sent; known open defects D18, D19, D20 |
+| 55 Owner hands-on tests | the owner reports no errors found (2026-11-12, Mac build 3) | | the build is run 3 of "Desktop (macOS)" (id 43271302338, commit 4a7255b); the owner goes on to the review pages (Task 53) |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
