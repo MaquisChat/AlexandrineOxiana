@@ -510,7 +510,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | in progress | 40fc3df (worktree branch) | built; three questions ruled (R179: both sets of rules decide; one damaged log no longer stops every restore; every refusal audited); then review. No interface offers a restore: a question for the owner |
+| 50b Restore asks the policy engine | in review | 1afd0fb (worktree branch) | built with R179; D15 fixed; the retry logic untouched. No interface offers a restore: a question for the owner |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
