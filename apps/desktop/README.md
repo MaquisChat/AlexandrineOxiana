@@ -58,8 +58,11 @@ and Rust 1.97 with cargo. Then:
   SIGKILL of the shell, and after a service that refuses to start. It needs `xvfb-run` and
   `dbus-daemon`; `ffmpeg` for its audio and video checks. The worker: `AO_DESKTOP_WORKER_BIN`, else
   the packaged worker in `sidecars/`, else the development one (`pnpm setup:py`).
-- `pnpm --filter @ao/desktop test`: the launch check's own tests, the desktop end-to-end harness's
-  unit tests (`e2e/*.test.ts`, Vitest) and the shell's Rust tests.
+- `pnpm --filter @ao/desktop test`: the launch check's own tests, the Mac build's tests that need no
+  Mac (`scripts/build-macos.test.mjs`, `scripts/node-release.test.mjs`), the desktop end-to-end
+  harness's unit tests (`e2e/*.test.ts`, Vitest) and the shell's Rust tests.
+
+The steps the Linux and the Mac builds share are in `scripts/build-common.mjs`.
 
 ## The desktop end-to-end test (Linux)
 
@@ -147,4 +150,103 @@ apps/desktop/src-tauri/target/debug/alexandrine-oxiana
 
 `.build/` (build venvs, PyInstaller's work files) and `sidecars/` (the output) are git-ignored.
 The target triple follows Tauri's sidecar names (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`x86_64-unknown-linux-gnu`). The Mac build workflow (37f) and signing (37g) are other tasks.
+`x86_64-unknown-linux-gnu`). The Mac build is below; signing with a Developer ID is Task 37g.
+
+## Building for macOS
+
+Two downloads, each built on its own GitHub Mac (R133): **Apple Silicon** on `macos-15` and
+**Intel** on `macos-15-intel`. Both need macOS 15.0 or later. They are signed ad hoc, not with a
+Developer ID (R151), so a Mac asks once before opening them (below).
+
+**Not yet run.** The workflow and the build script were written and checked on Linux (Task 37f); the
+first run on a Mac is the first time any of it meets macOS. What could not be checked is listed in
+the Task 37f report under "Unverified until the first Mac run".
+
+### What the workflow does
+
+`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started by hand or when a
+version tag (`v1.2.3`) is pushed, never on a branch push: Mac minutes are billed at ten times Linux
+minutes. For each architecture it:
+
+1. installs the pinned tools: Node.js (the release in `macos/pins.json`), pnpm, Python 3.13,
+   Rust 1.97 and tauri-cli (`pins.json`), with caches keyed on the lock files;
+2. runs `scripts/build-macos.mjs --debug-app`: the pinned Node.js release (downloaded from
+   nodejs.org and checked against the SHA-256 in `pins.json` before use), the library service folder
+   (built by that Node, with darwin native modules), the packaged worker (the Intel one on its own
+   pin set, `services/media-worker/packaging/constraints-macos-x86_64.txt`), the notices and licence
+   texts, the interface, then Tauri's bundler for the `.app`; it copies Node, the service folder and
+   the worker into `Contents/Resources` (`src-tauri/tauri.macos.conf.json`; where
+   `src-tauri/src/paths.rs` looks), signs the app as `macos/signing.json` says (today ad hoc), fails
+   if any program or library in it needs a macOS newer than 15.0, and makes the disk image
+   `dist-macos/Alexandrine-Oxiana-<version>-<apple-silicon|intel>.dmg` with its `.sha256`;
+3. checks it on the runner: the packaged worker's smoke test (with Homebrew's ffmpeg and tesseract,
+   which the app itself does not ship), the launch check A–E on the debug build of the app (the same
+   bundle layout; only a debug build reports what the check reads), and check R on the release app
+   run from the mounted disk image: its service and worker start from the app's own resources, the
+   service listens on 127.0.0.1 and refuses a request without its token, and nothing is left after
+   the app is stopped;
+4. uploads the disk image and its SHA-256 as the run's artefacts, and writes the sizes and checksums
+   in the run's summary.
+
+On a Mac with the same tools, `pnpm --filter @ao/desktop run build:macos` does step 2 by hand;
+`node scripts/build-macos.mjs --dry-run [--arch arm64|x64]` prints the steps on any system.
+
+**Launch check scenarios on a Mac** (`scripts/launch-check.mjs --app <debug .app>`): A (normal close,
+the page reaching the service and the worker, the granted commands, the helpers' environment, the
+second launch), B (SIGTERM), C (SIGKILL: the service sees its standard input close) and D (a service
+that refuses to start) are expected to work as on Linux: they use only the shell's own test output,
+standard input and signals. E (opened again while closing) depends on the single-instance plugin on
+macOS and is the least certain. On a Mac the processes are read with `ps` instead of `/proc`, there
+is no virtual display or D-Bus (the runner has a logged-in desktop session), and the helpers'
+environment is read with `ps -E`.
+
+### Starting it by hand (on the GitHub website)
+
+1. Open the repository on github.com and click **Actions** (top of the page).
+2. In the list on the left, click **Desktop (macOS)**.
+3. Click **Run workflow** (on the right, above the list of runs). Under "Use workflow from", choose
+   the branch to build; under "Which downloads to build", choose **both**, **apple-silicon** or
+   **intel**. Click the green **Run workflow** button.
+4. The run appears in the list after a few seconds. A cold run takes roughly an hour per
+   architecture (estimate); the two run side by side.
+
+### Where the downloads appear
+
+Open the finished run (click its name in the list). At the bottom of its **Summary** page, under
+**Artifacts**, are `alexandrine-oxiana-macos-apple-silicon` and `alexandrine-oxiana-macos-intel`.
+Each downloads as a `.zip` holding the disk image (`.dmg`) and its SHA-256. They are kept for 30
+days. Which one: Apple menu > About This Mac: "Chip: Apple M…" means Apple Silicon, "Processor:
+…Intel…" means Intel.
+
+### Opening the unsigned app the first time ("Open Anyway", R151)
+
+1. Double-click the `.zip`, then the `.dmg`, and drag **Alexandrine Oxiana** onto **Applications**.
+2. Open it from Applications. macOS says it cannot check the app for malicious software. Click
+   **Done** (not "Move to Trash").
+3. Open **System Settings > Privacy & Security** and scroll down to **Security**. Next to the
+   message that Alexandrine Oxiana was blocked, click **Open Anyway**, confirm with your password or
+   Touch ID, then click **Open**.
+
+This is needed once per download. From then on the app opens normally. On macOS 15 the older way
+(Control-click the app, then Open) no longer skips this step.
+
+### For Task 37g (signing and notarisation): written down, not enabled
+
+`macos/signing.json` is the only place to change: `identity` (or the `APPLE_SIGNING_IDENTITY`
+variable from a secret, with the certificate imported into a keychain by the workflow),
+`hardenedRuntime: true`, and an entitlements file per part. With an identity every Mach-O file is
+signed inside out, each with a secure timestamp. The entitlements each part is expected to need
+under the hardened runtime (to be confirmed by trying, not added in advance):
+
+- **the shell** (`app`): none expected; the web view's JavaScript runs in the system's own WebKit
+  processes.
+- **Node.js** (`node`): `com.apple.security.cs.allow-jit` for V8's compiler; possibly
+  `com.apple.security.cs.allow-unsigned-executable-memory`. Not
+  `com.apple.security.cs.disable-library-validation` while every `.node` file is signed with our
+  Team ID, and never `com.apple.security.cs.allow-dyld-environment-variables` (R153).
+- **the worker** (`worker`): none at first; `com.apple.security.cs.allow-unsigned-executable-memory`
+  only if a ctypes or cffi callback fails (ADR 0014).
+
+Apple expects code in `Contents/MacOS`, `Contents/Frameworks` or `Contents/Helpers`, not in
+`Contents/Resources`, where the helpers are today (`src-tauri/src/paths.rs`); if notarisation or the
+signature check refuses that, the helpers move and `paths.rs` with them.
