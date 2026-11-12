@@ -85,6 +85,15 @@ describe("the entries", () => {
       assert.throws(() => entryOrder(bad), /entry/, JSON.stringify(bad));
     }
   });
+  it("refuses control characters, direction marks, and names that differ only by case (a Mac or Windows would unpack them wrongly)", () => {
+    for (const bad of ["a\u0000b", "c\nd", "e\u0085f", "g‮h", "i‏j", "k⁦l"]) {
+      assert.throws(() => entryOrder(["manifest.json", bad]), /entry/, JSON.stringify(bad));
+    }
+    assert.throws(() => entryOrder(["manifest.json", "A.js", "a.js"]), /case/);
+    assert.throws(() => entryOrder(["manifest.json", "Manifest.JSON"]), /case/);
+    // Ordinary non-ASCII names stay allowed.
+    assert.deepEqual(entryOrder(["manifest.json", "ünï/café ☕.txt"]), ["manifest.json", "ünï/café ☕.txt"]);
+  });
 });
 
 describe("listing the built folder", () => {

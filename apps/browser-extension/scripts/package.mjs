@@ -17,7 +17,12 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { crc32 } from "node:zlib";
+import * as zlib from "node:zlib";
+
+// zlib.crc32 arrived in Node 22.2; the repository allows any Node 22, so say so plainly instead of
+// failing at import with a SyntaxError on 22.0 or 22.1.
+if (typeof zlib.crc32 !== "function") throw new Error(`package.mjs needs Node 22.2 or later (zlib.crc32); this is Node ${process.versions.node}`);
+const { crc32 } = zlib;
 
 export const ARCHIVE_BASENAME = "alexandrine-oxiana-browser-extension";
 
@@ -35,15 +40,21 @@ export function sha256Line(hex, name) {
   return `${hex}  ${name}\n`;
 }
 
-/** The entry names in archive order (sorted by their UTF-8 bytes); refuses unsafe or repeated names and a missing top-level manifest.json. */
+/** The entry names in archive order (sorted by their UTF-8 bytes); refuses unsafe, repeated or case-only-different names and a missing top-level manifest.json. */
 export function entryOrder(names) {
   const seen = new Set();
+  const folded = new Map();
   for (const n of names) {
-    if (typeof n !== "string" || n === "" || n.startsWith("/") || n.includes("\\") || n.split("/").some((part) => part === "" || part === "." || part === "..")) {
+    // C0 and C1 controls and the Unicode direction controls (marks, embeddings, overrides, isolates).
+    if (typeof n !== "string" || n === "" || /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(n) || n.startsWith("/") || n.includes("\\") || n.split("/").some((part) => part === "" || part === "." || part === "..")) {
       throw new Error(`not a safe archive entry name: ${JSON.stringify(n)}`);
     }
     if (seen.has(n)) throw new Error(`a repeated archive entry: ${n}`);
     seen.add(n);
+    // macOS and Windows file systems ignore case by default: two such names would overwrite each other.
+    const f = n.toLowerCase();
+    if (folded.has(f)) throw new Error(`two archive entries differ only by case: ${folded.get(f)} and ${n}`);
+    folded.set(f, n);
   }
   if (!seen.has("manifest.json")) throw new Error("the archive must hold manifest.json at its top level");
   return [...names].sort((a, b) => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")));
