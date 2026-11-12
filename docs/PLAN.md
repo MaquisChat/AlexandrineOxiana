@@ -456,7 +456,7 @@ Update after every task; commit and push.
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | in review | 5699dc8 (worktree branch) | built; review restarted 2026-11-12 with a fresh agent, at the owner's word |
+| 57 Import wizard routes | fix round 1 | 5699dc8 (worktree branch) | reviewed with probes: approved, 12 Minor; ten are being fixed, the rest deferred in the ledger |
 | 49 Backups governed | fix round 4 | 857144d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; re-scoped by R147 |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
