@@ -104,8 +104,55 @@ describe("Library screen", () => {
     const items = within(list).getAllByRole("listitem");
     expect(items).toHaveLength(3);
     expect(items[0]!.textContent).toMatch(/a\.pdf.*Added as a new source/);
-    expect(within(items[1]!).getByRole("link", { name: /needs review/i }).getAttribute("href")).toBe("/import/review");
+    // It leads to the project's queue, at that source's entries (Task 67).
+    expect(within(items[1]!).getByRole("link", { name: /needs review/i }).getAttribute("href")).toBe("/import/review?project=p1&source=s10");
     expect(items[2]!.textContent).toMatch(/c\.pdf.*The file could not be read\./);
+  });
+
+  it("links the project's review queue beside its other actions, with the count of waiting entries (Task 67)", async () => {
+    const asked: Array<string | null> = [];
+    server.use(
+      http.get(url("/projects/:id/review"), ({ request }) => {
+        asked.push(new URL(request.url).searchParams.get("limit"));
+        return HttpResponse.json({ items: [], total: 3, offset: 0, limit: 0 });
+      }),
+      ...libraryHandlers(),
+    );
+    renderLibrary();
+    const header = (await screen.findByRole("heading", { level: 1 })).closest("header")!;
+    const link = await within(header).findByRole("link", { name: "Review queue (3 waiting)" });
+    expect(link.getAttribute("href")).toBe("/import/review?project=p1");
+    // Only the count is asked for.
+    expect(asked.every((l) => l === "0")).toBe(true);
+  });
+
+  it("a row's Needs review badge leads to the project's queue at that source (Task 67)", async () => {
+    server.use(...libraryHandlers());
+    renderLibrary();
+    const table = await screen.findByRole("table", { name: "Sources" });
+    const badge = await within(table).findByRole("link", { name: /Needs review/ });
+    expect(badge.getAttribute("href")).toBe("/import/review?project=p1&source=s2");
+    expect(within(table).getAllByRole("link", { name: /Needs review/ })).toHaveLength(1);
+  });
+
+  it("a locked project's queue count is neither asked for nor shown (Task 67)", async () => {
+    const asked: string[] = [];
+    server.use(
+      http.get(url("/projects/:id/review"), ({ params }) => {
+        asked.push(String(params.id));
+        return HttpResponse.json({ items: [], total: 5, offset: 0, limit: 0 });
+      }),
+      ...libraryHandlers(),
+    );
+    const user = userEvent.setup();
+    renderLibrary();
+    const nav = await screen.findByRole("navigation", { name: "Projects" });
+    await screen.findByRole("link", { name: "Review queue (5 waiting)" });
+    await user.click(within(nav).getByRole("button", { name: /Clinic interviews/ }));
+    await screen.findByLabelText("Passphrase or recovery code");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("link", { name: /Review queue/ })).toBeNull();
+    expect(asked).not.toContain("p2");
   });
 
   it("names the device holding the lock: read-only (locked by <hostname>), from the library and its state events", async () => {
