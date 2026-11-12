@@ -4,11 +4,12 @@
  * library's list rows and the source view carry that availability so the interface can show it.
  * The source is marked here the way profile capture marks it (the same repo call and values).
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { newId, type Annotation } from "@ao/core";
 import { deviceDeps, type Deps } from "@ao/library";
 import { createService, type LibraryService } from "./server.js";
 
@@ -59,7 +60,11 @@ async function setup(): Promise<{ pid: string; gone: string; here: string }> {
         pid,
         { projectIds: [pid], type: "social-post", title: { variants: [{ lang: "en", kind: "original", value: title }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
         [],
-        { provenance: { captureMethod: "downloader", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+        {
+          provenance: { captureMethod: "downloader", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+          // Each source has an annotations file, so a list that read it could raise integrity warnings (I1).
+          annotations: (sourceId: string, _a: unknown, actor: string): Annotation[] => [{ id: newId(), sourceId, kind: "note", body: "A note", anchors: [], author: actor, createdAt: new Date().toISOString() }],
+        },
       )
     ).source.id;
   return { pid, gone: await post("Gone post"), here: await post("Present post") };
@@ -100,5 +105,25 @@ describe("availability in the list rows and the source view (Task 69, D17)", () 
     const list = await call({ url: `/projects/${pid}/sources?text=Gone` });
     expect(list.json.items.map((i: { id: string }) => i.id)).toEqual([gone]);
     expect(list.json.items[0].availability).toEqual({ status: "unavailable-on-platform", firstNoticedAt: NOTICED });
+  });
+
+  it("the list reads each row's own record alone (R186): an annotations file caught mid-write raises no 'changed outside the app' warning (I1)", async () => {
+    const { pid, gone, here } = await setup();
+    const repo = svc.state.session!.repo;
+    await repo.updateSource(pid, gone, { availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED } });
+    // The state a reader sees between writeSourceFile's two writes: new annotations next to the
+    // hash still recorded in source.json (and, for the other source, an annotations file gone).
+    const goneFolder = (await repo.getSource(pid, gone)).source.folder;
+    const hereFolder = (await repo.getSource(pid, here)).source.folder;
+    await appendFile(join(tmp, "Lib", goneFolder, "annotations.json"), " ");
+    await rm(join(tmp, "Lib", hereFolder, "annotations.json"));
+    for (let i = 0; i < 3; i++) {
+      const list = await call({ url: `/projects/${pid}/sources` });
+      expect(list.status, list.body).toBe(200);
+      expect(list.json.items.find((r: { id: string }) => r.id === gone).availability).toEqual({ status: "unavailable-on-platform", firstNoticedAt: NOTICED });
+      expect(list.json.items.find((r: { id: string }) => r.id === here).availability).toEqual({ status: "available" });
+    }
+    expect(repo.integrityWarnings).toEqual([]);
+    expect((await call({ url: "/libraries/integrity" })).json.integrityWarnings ?? []).toEqual([]);
   });
 });

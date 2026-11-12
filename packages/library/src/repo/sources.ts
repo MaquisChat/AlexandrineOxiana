@@ -578,6 +578,26 @@ export async function getSource(core: RepoCore, projectId: string, id: string): 
   return readSourceFile(core, st, id);
 }
 
+/**
+ * A source's own record from `source.json(.enc)` ALONE (R186): it does not open the annotations
+ * file, makes no cross-file check and records no integrity warning, so a list may read it for every
+ * row while annotations are being written. For anything that needs the annotations, use getSource.
+ */
+export async function getSourceRecord(core: RepoCore, projectId: string, id: string): Promise<Source> {
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  const folder = sourceFolderOf(st, id);
+  const encrypted = core.encrypted(st);
+  const raw = await readMaybe(core.abs(encrypted ? `${folder}/source.json.enc` : `${folder}/source.json`));
+  if (!raw) throw new NotFoundError("Source", id);
+  let text: string;
+  if (encrypted) {
+    const { key, keyId } = core.key(st);
+    text = (await decryptBytes((k) => (k === keyId ? key : undefined), raw)).toString("utf8");
+  } else text = raw.toString("utf8");
+  return SourceFile.parse(JSON.parse(text)).source;
+}
+
 export function listSourceIds(core: RepoCore, projectId: string): string[] {
   return [...core.state(projectId).sources.keys()];
 }

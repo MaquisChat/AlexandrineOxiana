@@ -5,7 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { BIBLIO_FIELDS, SourceType, evidenceSourceName, type FieldEvidence, type SourceFile } from "@ao/core";
+import { BIBLIO_FIELDS, SourceType, evidenceSourceName, type FieldEvidence, type Source, type SourceFile } from "@ao/core";
 import {
   ASSET_TEXT_MAX_BYTES,
   addTranscriptVersion,
@@ -92,23 +92,25 @@ export interface RowAvailability {
   firstNoticedAt?: string;
 }
 
-const rowAvailability = (sf: SourceFile): RowAvailability => {
-  const a = sf.source.availability;
+const rowAvailability = (src: Source): RowAvailability => {
+  const a = src.availability;
   return { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}) };
 };
 
 /**
- * The availability of each listed source (Task 69, D17), read from its record: the index does not
- * hold it. A locked row, or a record that cannot be read, gets none (the interface then shows nothing).
+ * The availability of each listed source (Task 69, D17), read from its own record: the index does
+ * not hold it. Through the light read of source.json alone (R186), which opens no annotations file
+ * and cannot raise an integrity warning while annotations are being written. A locked row, or a
+ * record that cannot be read, gets none (the interface then shows nothing).
  */
-async function availabilityOf(repo: { getSource(projectId: string, id: string): Promise<SourceFile> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, RowAvailability>> {
+async function availabilityOf(repo: { getSourceRecord(projectId: string, id: string): Promise<Source> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, RowAvailability>> {
   const out = new Map<string, RowAvailability>();
   await Promise.all(
     rows
       .filter((r) => !r.locked)
       .map(async (r) => {
-        const sf = await repo.getSource(projectId, r.id).catch(() => undefined);
-        if (sf) out.set(r.id, rowAvailability(sf));
+        const src = await repo.getSourceRecord(projectId, r.id).catch(() => undefined);
+        if (src) out.set(r.id, rowAvailability(src));
       }),
   );
   return out;
@@ -159,15 +161,15 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     // Its review queue is not read here, so no row claims needsReview (Task 46b M4).
     const items = [];
     for (const id of s.repo.listSourceIds(projectId)) {
-      const sf = await s.repo.getSource(projectId, id).catch(() => undefined);
-      if (!sf) continue;
-      const src = sf.source;
+      // Only the record's own fields are needed: the light read (R186).
+      const src = await s.repo.getSourceRecord(projectId, id).catch(() => undefined);
+      if (!src) continue;
       const title = src.title.variants[0]?.value ?? "";
       if (q.text && !title.toLowerCase().includes(q.text.toLowerCase())) continue;
       if (q.type && src.type !== q.type) continue;
       if (q.collection && !src.collectionIds.includes(q.collection)) continue;
       if (q.tag && !src.tagIds.includes(q.tag)) continue;
-      items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false, availability: rowAvailability(sf) });
+      items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false, availability: rowAvailability(src) });
     }
     // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
     return { total: items.length, items: items.slice(offset, offset + limit), limited: true, ...index };
