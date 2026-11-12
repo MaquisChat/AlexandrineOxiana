@@ -394,6 +394,13 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service and interface tests; `pnpm -r typecheck`; UI lints; `pnpm e2e -- --app-only --trace off`. Scenario 10 (Task 34f) asserts the mark once this is merged.
 - Model: Opus.
 
+**Task 70 — A read never mistakes a write in progress for outside tampering (D21) [ledger: R186, R26, R154]**
+- Depends: none. Parallel: 69.
+- Files: `packages/library/src/repo/sources.ts` and its tests; at most a small helper in the write queue's module.
+- Accept: a read that meets a write in progress records no integrity warning and returns a consistent pair; the trash path the same; a real outside change is still reported once, as today; the fast path does not take the write queue.
+- Verify: library and service tests; `pnpm -r typecheck`.
+- Model: Opus.
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
@@ -486,6 +493,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests.
 - Defect found by the re-check of Task 37k (not fixed in this build): D19 (medium): a conflict found when a later check adds data to an existing source (a browser-extension capture with the downloader ticked) shows as a "Conflict" badge on the source but writes no review-queue entry, so the source carries no "Needs review" (R172). Entries are written only when a source is created (`packages/library/src/sources.ts`). For after the owner's tests.
 - Defect found by the review of Task 34f (not fixed in this build): D20 (medium): the audit entry of a field confirmation is a generic `source.update` that names no field, and the change log does not hold the verification report; confirming the value already there leaves no trace of which field was confirmed (R176, R149). For after the owner's tests.
+- Defect found by the review of Task 69 (for Task 70): D21 (high): a read of a source that falls between the two files of a write in progress (`readSourceFile` reads outside the write queue; `writeSourceFile` writes the annotations file, then `source.json`) records a false integrity warning, shown as "Some annotations … were changed outside the app" until restart. In the code before Task 69; the source's own view could already meet it.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -543,7 +551,8 @@ Update after every task; commit and push.
 | 68 Settings writers never write what they did not read (D16) | approved; verification with 50b running | 391a93f (worktree branch) | reviewed with probes over two fix rounds (R181); five minors to the final review's list |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
-| 69 Show that a captured item is no longer available (D17) | in review | 50e42e6 (worktree branch) | the mark in the list row and on the source's screen; the list reads each row's record (R185); on the Mac build's path |
+| 69 Show that a captured item is no longer available (D17) | fix round 1 | 50e42e6 (worktree branch) | the list is to read `source.json` alone (R186); on the Mac build's path |
+| 70 A read never mistakes a write in progress for tampering (D21) | in progress | | dispatched 2026-11-12; in the Mac build if merged in time |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
