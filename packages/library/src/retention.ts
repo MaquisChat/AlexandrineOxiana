@@ -62,21 +62,35 @@
  * other as no longer present. Within one project, a backup removed for another of its destructions
  * is recorded as removed, under that destruction (`removedUnder`). The copy's warning stands from
  * the restore itself: the list it inherits is noted for it as the last step before it goes live
- * (`inheritedOutstanding`, called by the restore), and its own passes settle it.
+ * (restore-record.ts `inheritedOutstanding`, called by the restore), and its own passes settle it.
  *
- * What a restore must not bring back (R174 d) is read from the same record (`destroyedOnRecord`):
- * the destruction's own audit event names the destroyed assets by id (`destroyedAssets`), and a
- * certificate adds the files' sha256 only while it is the file that event recorded. A restore is
- * refused while a project's audit log does not hold together.
+ * The reading of the record (how audit events fold into destructions; the certificate and amendment
+ * files) lives in destruction-record.ts, moved there unchanged so that a restore can read the same
+ * record without importing this module. What a restore must not bring back (R174 d, R179) is read
+ * from it in restore-record.ts.
  *
  * Destruction holds the project's maintenance lock (R138 a). Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed`
  * (counts and the certificate's sha256), each amendment's `delete` event (op `retention.backups`)
  * and a `retention.backups` report of the same facts.
  */
-import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import { basename, join } from "node:path";
-import { formatModified, type Asset, type AuditEvent, type Project } from "@ao/core";
+import { formatModified, type Asset, type AuditEvent } from "@ao/core";
+import {
+  auditedDestructions,
+  backupRel,
+  fileOf,
+  isBackupRel,
+  listedIn,
+  newAudited,
+  outstandingOf,
+  parseObject,
+  readPlain,
+  retentionNames,
+  sha256,
+  strings,
+  type Audited,
+} from "./destruction-record.js";
 import {
   backupCrashPoint,
   backupFailureReason,
@@ -101,22 +115,17 @@ import {
   type RetentionRetry,
 } from "./export/backup.js";
 import { DESTRUCTION_CERTIFICATE, amendmentNumber } from "./repo/destroy.js";
-import { decryptBytes } from "./repo/io.js";
-import { NotFoundError, ProjectLockedError } from "./repo/errors.js";
-import { DestructionRecordError, type DestroyedRecord } from "./repo/restore.js";
+import { NotFoundError } from "./repo/errors.js";
 import { SimulatedCrash } from "./repo/seams.js";
 import {
   amendProjectDestruction,
   appendLibraryEvent,
   auditEventsMentioning,
-  auditHeadOf,
   destroyProjectAssets,
   lookupPolicyInfo,
-  projectDataKey,
   repoClock,
   repoLibrary,
   verifiedAuditEvents,
-  verifiedAuditEventsInQueue,
   type Repo,
 } from "./repo/repo.js";
 import { toRel } from "./repo/txn.js";
@@ -400,71 +409,6 @@ async function holdingBackups(repo: Repo, projectId: string, ids: ReadonlySet<st
 // ------------------------------------------------------------------------------------------
 // What the audit log says of each destruction (R147)
 
-/** `Backups/<file>`: how certificates, amendments and audit events name a backup. */
-const backupRel = (file: string) => `Backups/${file}`;
-const fileOf = (rel: string) => rel.slice("Backups/".length);
-const isBackupRel = (v: unknown): v is string => typeof v === "string" && /^Backups\/[^/\\]+$/u.test(v);
-const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
-const sha256 = (data: Uint8Array | string) => createHash("sha256").update(data).digest("hex");
-
-/** A destruction as the audit log records it: its fixed list, and what later events say became of each entry. */
-interface Audited {
-  /** The certificate's file name in the project's `retention` folder, and its sha256 as written. */
-  certificate: string;
-  certificateSha256: string;
-  at: string;
-  /**
-   * The project the data was destroyed in: this one, or, in a restored copy, the project the copy
-   * was made from (the destruction is then inherited with the audit log, R175).
-   */
-  projectId: string;
-  /** Listed backup → the sha256 the audit log recorded when that backup was made (none: the log does not record its making). */
-  made: Map<string, string>;
-  /** Decided at the destruction: backups that hold the destroyed files. */
-  toRemove: string[];
-  /** Backups that could not be read then and may hold them. */
-  unreadable: string[];
-  /** Listed backup → when the app removed it. */
-  removed: Map<string, string>;
-  /** Of those: removed by the app for another destruction of this project → that destruction's certificate (M3). */
-  removedUnder: Map<string, string>;
-  /** Listed backup → when it was noticed to be gone. */
-  gone: Map<string, string>;
-  /** Unreadable backup → when it was read and found to hold none of the destroyed files. */
-  notHolding: Map<string, string>;
-  /** Amendments written beside the certificate, oldest first. */
-  amendments: Array<{ name: string; sha256: string; at: string }>;
-  freshBackup?: string;
-  freshBackupFailed?: string;
-  /** When the audit log last heard of this destruction's backups (an amendment, a report or a summary). */
-  lastRecordedAt?: string;
-  /** The disagreement its last report gave, if that is what it was about. */
-  reportedProblem?: string;
-  /** Listed names a later backup was given: the listed file is gone (a name is never given while a file has it, R138 b). */
-  reused: Set<string>;
-}
-
-const newAudited = (projectId: string, certificate: string, certificateSha256: string, at: string, toRemove: string[], unreadable: string[]): Audited => ({
-  certificate,
-  certificateSha256,
-  at,
-  projectId,
-  made: new Map(),
-  toRemove,
-  unreadable,
-  removed: new Map(),
-  removedUnder: new Map(),
-  gone: new Map(),
-  notHolding: new Map(),
-  amendments: [],
-  reused: new Set(),
-});
-
-const listedIn = (a: Audited, f: string) => a.toRemove.includes(f) || a.unreadable.includes(f);
-const settledIn = (a: Audited, f: string) => a.removed.has(f) || a.gone.has(f) || a.notHolding.has(f);
-/** The listed backups not yet verifiably gone (nor found not to hold the files). */
-const outstandingOf = (a: Audited): string[] => [...new Set([...a.toRemove, ...a.unreadable])].filter((f) => !settledIn(a, f));
-
 function statusOf(a: Audited): BackupsStepStatus {
   if (!a.toRemove.length && !a.unreadable.length) return "none";
   const left = outstandingOf(a);
@@ -475,67 +419,6 @@ function statusOf(a: Audited): BackupsStepStatus {
 
 /** Lines of the audit log worth parsing for this: the destruction and backups-step events, and backups made. */
 const NEEDLES = ['"retention.', '"backup.create"'] as const;
-
-/**
- * Folds audit events (in order) into the destructions they record. Only events written in the R147
- * form count: a destruction is its change's `delete` event naming the certificate, its sha256 and
- * the list; an entry leaves the list only by a later `delete` event (op `retention.backups`) for
- * the same certificate. The first record of a file stands: nothing is counted twice.
- */
-function auditedDestructions(events: Iterable<AuditEvent | null>): { list: Audited[]; certificateHashes: Set<string> } {
-  const bySha = new Map<string, Audited>();
-  const list: Audited[] = [];
-  const certificateHashes = new Set<string>();
-  /** Backup → the sha256 recorded when the backup of that name was last made. */
-  const made = new Map<string, string>();
-  for (const e of events) {
-    if (!e || typeof e !== "object") continue;
-    const d = (e.details ?? {}) as Record<string, unknown>;
-    if (e.action === "retention.destroyed" && typeof d.certificateSha256 === "string") certificateHashes.add(d.certificateSha256);
-    if (e.action === "delete" && d.op === "retention.destroy") {
-      if (typeof d.certificate !== "string" || !DESTRUCTION_CERTIFICATE.test(d.certificate) || typeof d.certificateSha256 !== "string") continue;
-      certificateHashes.add(d.certificateSha256);
-      if (bySha.has(d.certificateSha256)) continue;
-      const a = newAudited(e.projectId ?? "", d.certificate, d.certificateSha256, e.at, strings(d.backupsToRemove).filter(isBackupRel), strings(d.backupsUnreadable).filter(isBackupRel));
-      // Which file each listed name stood for at that moment: the backup last made under it.
-      for (const f of a.toRemove) if (made.has(f)) a.made.set(f, made.get(f)!);
-      bySha.set(a.certificateSha256, a);
-      list.push(a);
-      continue;
-    }
-    const a = typeof d.certificateSha256 === "string" ? bySha.get(d.certificateSha256) : undefined;
-    if (a && e.action === "delete" && d.op === "retention.backups") {
-      const at = typeof d.stepAt === "string" ? d.stepAt : e.at;
-      const under = (d.removedUnder && typeof d.removedUnder === "object" ? d.removedUnder : {}) as Record<string, { certificate?: unknown; at?: unknown } | undefined>;
-      for (const f of strings(d.removed)) {
-        if (!listedIn(a, f) || settledIn(a, f)) continue;
-        // Removed for another destruction of this project: at the time that one's record gives.
-        const u = Object.hasOwn(under, f) ? under[f] : undefined;
-        const elsewhere = typeof u?.certificate === "string" && typeof u.at === "string" ? { certificate: u.certificate, at: u.at } : undefined;
-        a.removed.set(f, elsewhere?.at ?? at);
-        if (elsewhere) a.removedUnder.set(f, elsewhere.certificate);
-      }
-      for (const f of strings(d.noLongerPresent)) if (listedIn(a, f) && !settledIn(a, f)) a.gone.set(f, at);
-      for (const f of strings(d.notHolding)) if (a.unreadable.includes(f) && !settledIn(a, f)) a.notHolding.set(f, at);
-      if (typeof d.amendment === "string" && typeof d.amendmentSha256 === "string") a.amendments.push({ name: d.amendment, sha256: d.amendmentSha256, at: e.at });
-      if (typeof d.freshBackup === "string" && isBackupRel(d.freshBackup)) a.freshBackup ??= d.freshBackup;
-      if (a.freshBackup) delete a.freshBackupFailed;
-      else if (typeof d.freshBackupFailed === "string") a.freshBackupFailed = d.freshBackupFailed;
-      a.lastRecordedAt = e.at;
-      delete a.reportedProblem;
-    } else if (a && e.action === "retention.backups") {
-      a.lastRecordedAt = e.at;
-      if (typeof d.problem === "string") a.reportedProblem = d.problem;
-      else delete a.reportedProblem;
-    } else if (e.action === "backup.create" && typeof d.file === "string") {
-      const f = backupRel(d.file);
-      for (const x of list) if (listedIn(x, f) && !settledIn(x, f)) x.reused.add(f);
-      if (typeof d.sha256 === "string") made.set(f, d.sha256);
-      else made.delete(f);
-    }
-  }
-  return { list, certificateHashes };
-}
 
 /** A cheap pass over the audit log for the destructions it records, and whether the log is as this process left it. */
 async function scan(repo: Repo, projectId: string): Promise<{ list: Audited[]; certificateHashes: Set<string>; headMatches: boolean }> {
@@ -558,43 +441,6 @@ const CANNOT_TELL =
 /** Never with the name the note gives: it is text from a file anyone can edit, and may be a path (R96). */
 const STATE_DISAGREES =
   "The app's own note of the backups still to remove (backups-state.json in the Backups folder) names a backup for this destruction that the audit log does not. Nothing was removed for this destruction this time, and the note was corrected from the audit log.";
-
-/** A file in the retention folder as it is (decrypted when sealed): null when it is not there, "unreadable" when it cannot be opened. */
-async function readPlain(repo: Repo, projectId: string, rel: string): Promise<Buffer | null | "unreadable"> {
-  let raw: Buffer;
-  try {
-    raw = await fsp.readFile(join(repoLibrary(repo).root, ...rel.split("/")));
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ENOENT" ? null : "unreadable";
-  }
-  if (!rel.endsWith(".enc")) return raw;
-  // Throws ProjectLockedError while the project is locked: nothing of it can be read then.
-  const k = projectDataKey(repo, projectId);
-  if (!k) return "unreadable";
-  try {
-    return await decryptBytes((id) => (id === k.keyId ? k.key : undefined), raw);
-  } catch {
-    return "unreadable";
-  }
-}
-
-function parseObject(buf: Buffer): Record<string, unknown> | undefined {
-  try {
-    const v: unknown = JSON.parse(buf.toString("utf8"));
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** File names in the project's retention folder (none when it does not exist). */
-async function retentionNames(repo: Repo, dirRel: string): Promise<string[]> {
-  try {
-    return (await fsp.readdir(join(repoLibrary(repo).root, ...dirRel.split("/")))).sort();
-  } catch {
-    return [];
-  }
-}
 
 interface OnDisk {
   /** The certificate file is byte for byte the one the audit log recorded. */
@@ -1168,151 +1014,6 @@ export async function backupsAwaitingRemoval(repo: Repo, projectId: string): Pro
   return Object.keys(notes)
     .sort()
     .map((rel) => ({ certificateFile: rel, backups: notes[rel]!.files, ...(notes[rel]!.problem ? { reason: notes[rel]!.problem } : {}) }));
-}
-
-// ------------------------------------------------------------------------------------------
-// For a restore (Task 50b; R174 d, R175). Readers only: nothing here removes a backup, writes to
-// an audit log or touches the retry above.
-
-type Head = { seq: number; hash: string } | null;
-const sameHead = (a: Head, b: Head) => (a?.seq ?? 0) === (b?.seq ?? 0) && (a?.hash ?? "") === (b?.hash ?? "");
-
-/** What one project's audit log says was destroyed, and the head of the log it was read at. */
-interface ProjectDestroyed {
-  head: Head;
-  byId: Array<[string, string]>;
-  bySha256: Array<[string, string]>;
-  notes: string[];
-}
-
-/**
- * Package-internal (restore): what the destructions recorded in this library say a restore must not
- * bring back, with each project's part kept so the commit turn reads again only what changed since.
- */
-export interface DestroyedOnRecord extends DestroyedRecord {
-  byId: Map<string, string>;
-  bySha256: Map<string, string>;
-  notes: string[];
-  projects: Map<string, ProjectDestroyed>;
-}
-
-const LOG_UNREADABLE_FOR_RESTORE = (name: string) =>
-  `The audit log of the project "${name}" does not hold together: an entry was changed or removed outside the app, or the log is not as the app left it. The app cannot tell from it which files were destroyed under a retention rule, so nothing was restored.`;
-
-/**
- * Package-internal (restore, R174 d): what a restore must not bring back, as the audit logs of this
- * library's projects record it. Every project's log is read in full and its chain verified (the
- * reading the retry makes before it removes anything); a destruction is its change's own audit
- * entry, as `auditedDestructions` reads it. From each recorded destruction:
- *   - the ids of the destroyed assets, which that entry names itself (`destroyedAssets`): known
- *     whatever became of the certificate file (deleted, edited), and without a locked project's key;
- *   - the sha256 of each destroyed file, from the certificate, only when the file on disk is byte
- *     for byte the one the entry recorded (so the same file kept under other ids, in a copy made by
- *     an earlier restore, is left out as well).
- * A certificate file the audit log does not record (added, forged) counts for nothing, and is said.
- * The app does not guess: while a project's audit log does not hold together, or records a
- * destruction without naming its files while the certificate does not verify either, this throws
- * DestructionRecordError (plain words) and nothing is restored.
- * `inQueue`: the caller holds the write queue (the restore's commit turn). `prior`: an earlier
- * reading, reused for each project whose audit log still ends where it did then.
- */
-export async function destroyedOnRecord(repo: Repo, opts: { inQueue?: boolean; prior?: DestroyedOnRecord } = {}): Promise<DestroyedOnRecord> {
-  const out: DestroyedOnRecord = { byId: new Map(), bySha256: new Map(), notes: [], projects: new Map() };
-  for (const p of repo.listProjects()) {
-    let mine = opts.prior?.projects.get(p.id);
-    if (!mine || !sameHead(mine.head, auditHeadOf(repo, p.id))) {
-      const read = opts.inQueue ? await verifiedAuditEventsInQueue(repo, p.id) : await verifiedAuditEvents(repo, p.id);
-      if (!read.ok) throw new DestructionRecordError(LOG_UNREADABLE_FOR_RESTORE(p.name), p.id, true);
-      mine = await destroyedIn(repo, p, read.events);
-    }
-    out.projects.set(p.id, mine);
-    for (const [id, at] of mine.byId) if (!out.byId.has(id)) out.byId.set(id, at);
-    for (const [hash, at] of mine.bySha256) if (!out.bySha256.has(hash)) out.bySha256.set(hash, at);
-    out.notes.push(...mine.notes);
-  }
-  return out;
-}
-
-/** One project's part of `destroyedOnRecord`, from its verified audit events. */
-async function destroyedIn(repo: Repo, p: Project, events: AuditEvent[]): Promise<ProjectDestroyed> {
-  const last = events.at(-1);
-  const out: ProjectDestroyed = { head: last ? { seq: last.seq, hash: last.hash } : null, byId: [], bySha256: [], notes: [] };
-  const { list, certificateHashes } = auditedDestructions(events);
-  const dirRel = `${p.folder}/retention`;
-  const names = await retentionNames(repo, dirRel);
-  const read = async (name: string): Promise<Buffer | null | "unreadable" | "locked"> => {
-    try {
-      return await readPlain(repo, p.id, `${dirRel}/${name}`);
-    } catch (err) {
-      return err instanceof ProjectLockedError ? "locked" : "unreadable";
-    }
-  };
-  /** The assets a verified certificate lists; false when it does not say when. */
-  const take = (buf: Buffer, at?: string): boolean => {
-    const c = parseObject(buf);
-    const when = typeof c?.at === "string" ? c.at : at;
-    if (when === undefined) return false;
-    for (const a of Array.isArray(c?.assets) ? (c.assets as Array<{ assetId?: unknown; sha256?: unknown } | null>) : []) {
-      if (typeof a?.assetId === "string") out.byId.push([a.assetId, when]);
-      if (typeof a?.sha256 === "string") out.bySha256.push([a.sha256, when]);
-    }
-    return true;
-  };
-  // What each destruction's own audit entry names as destroyed (the first entry for a certificate
-  // stands, as in the fold; an entry recorded late from a mark is never one: its action differs).
-  const named = new Map<string, string[]>();
-  for (const e of events) {
-    const d = (e?.details ?? {}) as Record<string, unknown>;
-    if (e?.action !== "delete" || d.op !== "retention.destroy" || typeof d.certificateSha256 !== "string" || !Array.isArray(d.destroyedAssets)) continue;
-    if (!named.has(d.certificateSha256)) named.set(d.certificateSha256, strings(d.destroyedAssets));
-  }
-  const cannotTell = (which: string, why: string, locked: boolean) =>
-    new DestructionRecordError(
-      `The audit log of the project "${p.name}" records a destruction of raw data${which} without naming the files that were destroyed, and the certificate ${why}. The app cannot tell which files must not be brought back, so nothing was restored.${locked ? " Unlock that project and try again." : ""}`,
-      p.id,
-      false,
-    );
-  for (const a of list) {
-    const ids = named.get(a.certificateSha256);
-    for (const id of ids ?? []) out.byId.push([id, a.at]);
-    const buf = await read(a.certificate);
-    if (Buffer.isBuffer(buf) && sha256(buf) === a.certificateSha256 && take(buf, a.at)) continue;
-    const why =
-      buf === null ? "is missing" : buf === "locked" ? "is sealed, and its project is locked" : buf === "unreadable" ? "cannot be read" : "is not the file the audit log recorded: it was changed afterwards";
-    if (!ids) throw cannotTell(` (certificate "${a.certificate}")`, why, buf === "locked");
-    // A locked project is no fault: what it destroyed is known from its audit log all the same.
-    if (buf !== "locked") out.notes.push(`The destruction certificate "${a.certificate}" of the project "${p.name}" ${why}. Which files it destroyed was taken from that project's audit log.`);
-  }
-  // Destructions the log records only by their certificate's sha256 (the earlier form of the entry).
-  const earlier = new Set([...certificateHashes].filter((h) => !list.some((a) => a.certificateSha256 === h)));
-  let lockedOne = false;
-  for (const n of names) {
-    if (!DESTRUCTION_CERTIFICATE.test(n) || list.some((a) => a.certificate === n)) continue;
-    const buf = await read(n);
-    if (Buffer.isBuffer(buf) && earlier.has(sha256(buf)) && take(buf)) {
-      earlier.delete(sha256(buf));
-      continue;
-    }
-    if (buf === "locked") lockedOne = true;
-    else out.notes.push(`A file named like a destruction certificate ("${n}") in the project "${p.name}" is not recorded in that project's audit log. It was not taken into account.`);
-  }
-  if (earlier.size) throw cannotTell("", lockedOne ? "is sealed, and its project is locked" : "is missing, or is not the file the audit log recorded", lockedOne);
-  return out;
-}
-
-/**
- * Package-internal (restore, R175): the backups a restored copy inherits as still to be removed,
- * from the audit events it starts with, keyed by its own certificates (library-relative): what the
- * note behind its `destruction-backups-pending` warning says from the moment it is live. The same
- * list its first retry pass reads from the same log.
- */
-export function inheritedOutstanding(events: Iterable<AuditEvent | null>, folder: string): Record<string, DestructionNote> {
-  const notes: Record<string, DestructionNote> = {};
-  for (const a of auditedDestructions(events).list) {
-    const left = outstandingOf(a);
-    if (left.length) notes[`${folder}/retention/${a.certificate}`] = { files: left };
-  }
-  return notes;
 }
 
 /** `destruction-<YYYY-MM-DD HHmm>` for a time in `tz`. */

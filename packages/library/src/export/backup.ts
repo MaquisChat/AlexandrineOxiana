@@ -119,9 +119,9 @@ import {
   type Repo,
 } from "../repo/repo.js";
 import { isDue, projectTimeZone } from "../retention-date.js";
-// The readers a restore needs live with the destruction's record in retention.ts, which imports this
-// module: the two refer to each other, and neither uses the other while it is being loaded.
-import { destroyedOnRecord, inheritedOutstanding, type DestroyedOnRecord } from "../retention.js";
+// The readers a restore needs: built on the shared reading of the destruction record, and importing
+// neither this module nor retention.ts (which imports this module).
+import { destroyedOnRecord, inheritedOutstanding, type DestroyedOnRecord } from "../restore-record.js";
 
 export { AuditChainInvalidError, DestructionRecordError, RestoreError };
 
