@@ -4,7 +4,7 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import type { ResettableSetting } from "@ao/shared";
+import type { ResettableSetting, ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
 import {
   AppSettingReadableError,
   AppSettingUnreadableError,
@@ -68,26 +68,8 @@ import {
   scrubPaths,
 } from "@ao/library";
 
-export type ErrorCode =
-  | "POLICY_DENIED"
-  | "READ_ONLY"
-  | "LIBRARY_OFFLINE"
-  | "WRONG_PASSPHRASE"
-  | "NOT_FOUND"
-  | "VALIDATION"
-  | "UNAUTHORIZED"
-  | "FORBIDDEN"
-  | "PAYLOAD_TOO_LARGE"
-  | "RATE_LIMITED"
-  | "PROJECT_LOCKED"
-  | "CONFLICT"
-  | "ACKNOWLEDGEMENT_REQUIRED"
-  | "WORKER_UNAVAILABLE"
-  | "UNAVAILABLE"
-  | "MOVE_IN_PROGRESS"
-  | "TOOL_NOT_INSTALLED"
-  | "TOOL_FAILED"
-  | "INTERNAL";
+/** The codes the service answers with: one list, shared with the interface (@ao/shared api/errors.ts, Task 47). */
+export type ErrorCode = ServiceErrorCode;
 
 export class ApiError extends Error {
   override name = "ApiError";
@@ -104,9 +86,8 @@ export class ApiError extends Error {
 export const badRequest = (message: string): ApiError => new ApiError(400, "VALIDATION", message);
 export const notFound = (what = "That item"): ApiError => new ApiError(404, "NOT_FOUND", `${what} was not found.`);
 
-export interface ErrorBody {
-  error: { code: ErrorCode; message: string; reason?: string };
-}
+/** The body of every error answer: the shared declaration (Task 47). */
+export type ErrorBody = ServiceErrorBody;
 
 /** The settings files a refusal can name (Task 68), with how to say them and their `reason`. */
 export const SETTINGS_FILES: Record<string, { reason?: ResettableSetting; what: string; it: string }> = {

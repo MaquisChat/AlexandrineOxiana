@@ -16,26 +16,11 @@
  * Typed methods exist for what the UI uses so far (appearance); later screens add theirs on top of
  * `request()` (Tasks 33+).
  */
-import { isCredentialQueryKey, isMediaTicketPath } from "@ao/shared";
+import { isCredentialQueryKey, isMediaTicketPath, type ServiceErrorCode } from "@ao/shared";
 import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
 
-export type ErrorCode =
-  | "POLICY_DENIED"
-  | "READ_ONLY"
-  | "LIBRARY_OFFLINE"
-  | "WRONG_PASSPHRASE"
-  | "NOT_FOUND"
-  | "VALIDATION"
-  | "UNAUTHORIZED"
-  | "FORBIDDEN"
-  | "PAYLOAD_TOO_LARGE"
-  | "RATE_LIMITED"
-  | "PROJECT_LOCKED"
-  | "CONFLICT"
-  | "ACKNOWLEDGEMENT_REQUIRED"
-  | "WORKER_UNAVAILABLE"
-  | "UNAVAILABLE"
-  | "INTERNAL";
+/** The codes the service answers with: its own list, declared once in @ao/shared (Task 47). */
+export type ErrorCode = ServiceErrorCode;
 
 export interface ServiceError {
   code: ErrorCode | (string & {});

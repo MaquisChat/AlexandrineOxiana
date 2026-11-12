@@ -20,9 +20,20 @@ import {
   transcriptVersions,
   type SourcePatch,
 } from "@ao/library";
-import type { EvidenceOrigin, FieldReview, SourceRecordExtras, TranscriptListResponse, TranscriptResponse } from "@ao/shared";
+import type {
+  EvidenceOrigin,
+  FieldConfirmRequest,
+  FieldReview,
+  ProjectRecheckResponse,
+  RecheckProgressEvent,
+  SourceRecordExtras,
+  TranscriptListResponse,
+  TranscriptResponse,
+  TranscriptSavedResponse,
+  TranscriptSaveRequest,
+} from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
-import { bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
+import { bodyAs, bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
 
 /** Fields a PATCH may change (provenance, folder and ids never). */
 const EDITABLE = new Set<string>(["type", "title", "creators", "container", "publisher", "issued", "accessed", "identifiers", "caseAttributes", "availability", ...BIBLIO_FIELDS]);
@@ -211,17 +222,20 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   // Researcher-set value of one field, recorded as their own evidence (→ user-confirmed when it agrees).
   // `field` is a top-level field or one identifier under the verification report's key ("/identifiers/doi", R149);
   // anything else is refused by the library (InvalidInputError → 400 VALIDATION).
-  app.patch("/projects/:id/sources/:sid/fields", async (req) => {
+  app.patch("/projects/:id/sources/:sid/fields", async (req): Promise<SourceFile & SourceRecordExtras> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
-    const b = bodyOf(req);
+    const b = bodyAs<FieldConfirmRequest>(req);
+    // Read through the request type before the presence check, which would otherwise let any key compile (R184).
+    const value = b.value;
     if (!("value" in b)) throw badRequest('"value" is required.');
-    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value));
+    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), value));
+
   });
 
-  app.post("/projects/:id/sources/:sid/recheck", async (req) => {
+  app.post("/projects/:id/sources/:sid/recheck", async (req): Promise<SourceFile & SourceRecordExtras> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
@@ -230,7 +244,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   });
 
   // Every source of the project, as a background job with progress (`job.progress`, kind "recheck").
-  app.post("/projects/:id/recheck", async (req) => {
+  app.post("/projects/:id/recheck", async (req): Promise<ProjectRecheckResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const jobId = randomUUID();
@@ -253,9 +267,9 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
             tally.failed++;
           }
           done++;
-          state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, finished: false });
+          state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, finished: false } satisfies RecheckProgressEvent);
         }
-        state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, changed: tally.changed, failed: tally.failed, finished: true });
+        state.events.publish("job.progress", { kind: "recheck", jobId, projectId, done, total, changed: tally.changed, failed: tally.failed, finished: true } satisfies RecheckProgressEvent);
       });
     run(0);
     return { jobId, total };
@@ -396,17 +410,18 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     if (!transcriptVersions(sf).some((a) => a.id === aid)) throw notFound("That transcript");
     return readTranscript(s.repo, projectId, sid, aid);
   });
-  app.post("/projects/:id/sources/:sid/transcripts", { bodyLimit: TRANSCRIPT_BODY_LIMIT }, async (req) => {
+  app.post("/projects/:id/sources/:sid/transcripts", { bodyLimit: TRANSCRIPT_BODY_LIMIT }, async (req): Promise<TranscriptSavedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
-    const b = bodyOf(req);
+    const b = bodyAs<TranscriptSaveRequest>(req);
     const format = str(b, "format", 8);
     if (format !== "vtt" && format !== "txt") throw badRequest('"format" must be "vtt" or "txt".');
     const basedOn = optStr(b, "basedOn", 64);
     const lang = optStr(b, "lang", 35);
-    const asset = await addTranscriptVersion(s.repo, projectId, sid, { text: str(b, "text", ASSET_TEXT_MAX_BYTES), format, ...(basedOn ? { basedOn } : {}), ...(lang ? { lang } : {}) });
+    const text = str(b, "text", ASSET_TEXT_MAX_BYTES);
+    const asset = await addTranscriptVersion(s.repo, projectId, sid, { text, format, ...(basedOn ? { basedOn } : {}), ...(lang ? { lang } : {}) });
     return { id: asset.id, path: asset.path, derivation: asset.derivation };
   });
 }

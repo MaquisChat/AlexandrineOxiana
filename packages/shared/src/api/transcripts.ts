@@ -1,4 +1,5 @@
 /** Transcript versions (Task 34a c) and transcription as a job (Task 62). */
+import type { SpeechModel } from "./tools.js";
 
 /** What became of a segment of a human edit, compared with the version it was edited from (Task 62). */
 export type TranscriptSegmentEdit = "unchanged" | "edited" | "added";
@@ -71,6 +72,16 @@ export interface TranscriptSaveRequest {
   lang?: string;
 }
 
+/** What `POST …/transcripts` answers: the stored human-edit version (library-relative path). */
+export interface TranscriptSavedResponse {
+  id: string;
+  path: string;
+  /** How it was made (the library's derivation record: operation "human-edit", what it was based on). */
+  derivation?: unknown;
+}
+
+// Refusals the transcript routes name: a locked project (423); saving: the project's rules (403
+// POLICY_DENIED).
 // ---- transcription as a job (Task 62, R99, R142) ----
 
 export type TranscriptionJobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
@@ -128,3 +139,18 @@ export interface TranscriptionProgressEvent {
 
 /** The `reason` of the 409 CONFLICT for a second transcription of a source while one is queued, running or pending. */
 export const TRANSCRIPTION_RUNNING = "TRANSCRIPTION_RUNNING";
+
+/**
+ * `POST /projects/:id/sources/:sid/transcribe`: both optional. A model outside SPEECH_MODELS, or a
+ * language that is neither "auto" nor a language code, is 400 VALIDATION.
+ */
+export interface TranscribeRequest {
+  /** One of SPEECH_MODELS; DEFAULT_SPEECH_MODEL when left out. */
+  model?: SpeechModel;
+  /** "auto" or a language code ("en", "pt-BR"). */
+  language?: string;
+}
+
+// Refusals starting a transcription names: a second one of the source (409 CONFLICT, reason
+// TRANSCRIPTION_RUNNING), the media helper not running (503), the speech model not installed (409
+// TOOL_NOT_INSTALLED, reason its tool id), a locked project (423).

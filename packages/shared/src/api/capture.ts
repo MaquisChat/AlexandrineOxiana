@@ -46,8 +46,8 @@ export type CaptureStartedBy = "desktop" | "extension";
 /** One link's outcome (the library's CaptureOutcome, carried through unchanged). */
 export interface CaptureItemOutcome {
   url: string;
-  /** created | duplicate | refreshed | incomplete | failed | needs-review */
-  status: string;
+  /** One of CAPTURE_ITEM_STATUSES (a later service may send another). */
+  status: CaptureItemStatus | (string & {});
   sourceId?: string;
   /** The library's own plain sentence. */
   reason?: string;
@@ -105,4 +105,136 @@ export interface CaptureQueueDetail extends CaptureQueueSummary {
 
 export interface CaptureQueueListResponse {
   queues: CaptureQueueSummary[];
+}
+
+// ---- starting a capture (Task 47: one declaration for the service and the interface) ----
+//
+// - `POST /projects/:id/capture`         CaptureLinksRequest   → CaptureStartedResponse
+// - `POST /projects/:id/capture-profile` CaptureProfileRequest → CaptureStartedResponse
+// - `POST /projects/:id/acknowledge`     AcknowledgeRequest    → AcknowledgeResponse
+// - `GET /tools/versions`                → CaptureToolVersionsResponse
+// - `POST /tools/update`                 → CaptureToolsUpdateResponse
+// Outcomes arrive as `capture.progress` events (CaptureProgressEvent) on `GET /events`.
+
+/** Links queued at once (R111: an extension's link list too); more is 400 VALIDATION. */
+export const CAPTURE_LINKS_MAX = 500;
+
+/** The browsers whose signed-in session the downloader can use (`cookiesFromBrowser`). */
+export const CAPTURE_BROWSERS = ["chrome", "firefox", "safari", "edge", "brave"] as const;
+export type CaptureBrowser = (typeof CAPTURE_BROWSERS)[number];
+
+/** The parts of a profile a profile capture can list (`contentTypes`). */
+export const CAPTURE_CONTENT_TYPES = ["posts", "reels", "videos", "shorts", "highlights"] as const;
+export type CaptureContentType = (typeof CAPTURE_CONTENT_TYPES)[number];
+
+/** A captured link's outcome (`CaptureItemOutcome.status`; the library's CaptureStatus). */
+export const CAPTURE_ITEM_STATUSES = ["created", "duplicate", "refreshed", "incomplete", "failed", "needs-review"] as const;
+export type CaptureItemStatus = (typeof CAPTURE_ITEM_STATUSES)[number];
+
+/**
+ * The options of a links capture as the service reads them (routes/capture.ts `captureOptions`);
+ * anything else in `options` is ignored. A browser outside CAPTURE_BROWSERS, or a model outside
+ * SPEECH_MODELS, is 400 VALIDATION.
+ */
+export interface CaptureRequestOptions {
+  /** Use this browser's signed-in session (needs the project's acknowledgement: 409 ACKNOWLEDGEMENT_REQUIRED). */
+  cookiesFromBrowser?: CaptureBrowser;
+  /** Left out: the project's own setting. */
+  transcribe?: boolean;
+  /** One of SPEECH_MODELS (any other is 400 VALIDATION). */
+  transcribeModel?: string;
+  /** For a post already in the project: save a new dated snapshot. */
+  refreshIfExists?: boolean;
+  /** At most 2000 characters; the project's default for social media when left out (R41). */
+  legalBasis?: string;
+}
+
+/** A profile run's options: the links options and these (`since`/`until` are YYYY-MM-DD). */
+export interface ProfileCaptureRequestOptions extends CaptureRequestOptions {
+  since?: string;
+  until?: string;
+  /** A whole number of 1 or more. Setting it turns off removed-item detection (R43). */
+  maxItems?: number;
+  contentTypes?: CaptureContentType[];
+  metadataOnly?: boolean;
+  includeComments?: boolean;
+}
+
+/** `POST /projects/:id/capture`: at most CAPTURE_LINKS_MAX web addresses. */
+export interface CaptureLinksRequest {
+  urls: string[];
+  options?: CaptureRequestOptions;
+}
+
+/** `POST /projects/:id/capture-profile`. */
+export interface CaptureProfileRequest {
+  url: string;
+  options?: ProfileCaptureRequestOptions;
+}
+
+/** Both start routes: the queue whose `capture.progress` events and state (`GET …/captures/:queueId`) follow. */
+export interface CaptureStartedResponse {
+  queueId: string;
+}
+
+// Refusals the start routes name (besides the codes any route can answer): the project's rules
+// (403 POLICY_DENIED with the rule's reason), a locked project (423), the browser session not
+// acknowledged (409 ACKNOWLEDGEMENT_REQUIRED, reason "cookies"), the media helper not running (503
+// WORKER_UNAVAILABLE), an address already being captured or an ended capture still finishing (409
+// CONFLICT, reason CAPTURE_RUNNING or CAPTURE_STOPPING).
+
+/** A profile run's report with its items, as a `capture.progress` event carries it (the library's ProfileCaptureReport). */
+export interface CaptureProfileReport extends CaptureRunReport {
+  items: CaptureItemOutcome[];
+}
+
+/**
+ * A `capture.progress` event of a queue: after each item (`done`, `total`, `outcome`), and at its
+ * end (`finished: true`, with a profile run's `report`, or `error` when the queue stopped as a
+ * whole: the error's kind and message, which are never shown).
+ */
+export interface CaptureQueueProgressEvent {
+  queueId: string;
+  projectId: string;
+  done?: number;
+  total?: number;
+  outcome?: CaptureItemOutcome;
+  finished: boolean;
+  report?: CaptureProfileReport;
+  error?: string;
+}
+
+/** A `capture.progress` event of a page captured by the browser extension (no queue). */
+export interface BrowserCaptureProgressEvent {
+  kind: "browser";
+  projectId: string;
+  sourceId: string;
+  status: string;
+  finished: true;
+}
+
+export type CaptureProgressEvent = CaptureQueueProgressEvent | BrowserCaptureProgressEvent;
+
+/** `POST /projects/:id/acknowledge`: the one-time browser-session acknowledgement (spec 5.1). */
+export interface AcknowledgeRequest {
+  kind: "cookies";
+}
+
+/** The project's acknowledgements after it (e.g. `["cookies"]`). */
+export interface AcknowledgeResponse {
+  acknowledgements: string[];
+}
+
+/** `GET /tools/versions`: each capture tool's version, null when it is not there. */
+export interface CaptureToolVersionsResponse {
+  versions: Record<string, string | null>;
+}
+
+/**
+ * `POST /tools/update` (the downloader). A failure is 502 TOOL_FAILED with the media helper's code
+ * as `reason` (502 INTERNAL for another failure of its job), or 503 WORKER_UNAVAILABLE.
+ */
+export interface CaptureToolsUpdateResponse {
+  ytDlp: { old: string | null; new: string | null; managed: boolean };
+  galleryDl: { version: string | null; pinned: boolean };
 }

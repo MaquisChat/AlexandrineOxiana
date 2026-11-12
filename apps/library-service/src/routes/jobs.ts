@@ -4,8 +4,9 @@
  */
 import type { FastifyInstance } from "fastify";
 import { ocrQueueFor, proxyQueueFor } from "@ao/library";
+import type { JobsRetryRequest, JobsRetryResponse } from "@ao/shared";
 import { badRequest } from "../errors.js";
-import { bodyOf, optStr, queryOf, str, type Ctx } from "./util.js";
+import { bodyAs, optStr, queryOf, str, type Ctx } from "./util.js";
 
 /**
  * The optional tool a failed viewing copy or OCR job is waiting for (Task 48a, R126): a video proxy
@@ -48,9 +49,9 @@ export function registerJobs(app: FastifyInstance, ctx: Ctx): void {
     };
   });
 
-  app.post("/jobs/retry", async (req) => {
+  app.post("/jobs/retry", async (req): Promise<JobsRetryResponse> => {
     const s = state.requireWritable();
-    const b = bodyOf(req);
+    const b = bodyAs<JobsRetryRequest>(req);
     const projectId = str(b, "projectId", 64);
     if (!s.repo.listProjects().some((p) => p.id === projectId)) throw badRequest("That project is not in this library.");
     const sourceId = optStr(b, "sourceId", 64);

@@ -49,3 +49,6 @@ export interface MediaTicketRevokeResponse {
   /** False when it had already ended (or never existed). */
   revoked: boolean;
 }
+
+// Refusals a ticket request names: another token than the UI's (403), a locked project (423), too
+// many tickets live (429 RATE_LIMITED).

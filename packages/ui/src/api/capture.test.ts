@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { COOKIES_ACKNOWLEDGEMENT as CORE_ACK } from "@ao/core/src/capture/acknowledgement";
-import { classifyUrl, isWebAddress as coreIsWebAddress } from "@ao/core/src/capture/platforms";
+import { COOKIES_ACKNOWLEDGEMENT as CORE_ACK } from "@ao/core/capture/acknowledgement";
+import { classifyUrl, isWebAddress as coreIsWebAddress } from "@ao/core/capture/platforms";
 import type { CaptureQueueDetail } from "@ao/shared";
 import errorsSource from "../../../library/src/capture/errors.ts?raw";
 import captureSource from "./capture.ts?raw";

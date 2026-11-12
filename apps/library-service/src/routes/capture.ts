@@ -27,28 +27,72 @@ import {
   checkCaptureAllowed,
   createLinkCapture,
   type BrowserName,
+  type CaptureOutcome,
+  type CaptureStatus,
+  type ProfileCaptureReport,
   type CaptureOptions,
   type ProfileCaptureOptions,
   type ProfileContentType,
 } from "@ao/library";
-import { CAPTURE_RUNNING, CAPTURE_STOPPING, PAIRING_CODE_ID, SPEECH_MODELS, type CaptureStartedBy, type PairedBrowsers, type PairingCodeStatus } from "@ao/shared";
+// Request and answer shapes: one declaration with the interface (@ao/shared, Task 47).
+import {
+  CAPTURE_BROWSERS,
+  CAPTURE_CONTENT_TYPES,
+  CAPTURE_LINKS_MAX,
+  CAPTURE_RUNNING,
+  CAPTURE_STOPPING,
+  PAIRING_CODE_ID,
+  SPEECH_MODELS,
+  type BrowserCaptureProgressEvent,
+  type CaptureBrowser,
+  type CaptureContentType,
+  type CaptureItemOutcome,
+  type CaptureItemStatus,
+  type CaptureProfileReport,
+  type CaptureLinksRequest,
+  type CaptureProfileRequest,
+  type CaptureQueueDetail,
+  type CaptureQueueListResponse,
+  type CaptureQueueProgressEvent,
+  type CaptureRequestOptions,
+  type CaptureStartedBy,
+  type CaptureStartedResponse,
+  type CaptureToolsUpdateResponse,
+  type CaptureToolVersionsResponse,
+  type PairedBrowsers,
+  type PairingCodeIssued,
+  type PairingCodeStatus,
+  type PairingConfirmRequest,
+  type PairingConfirmResponse,
+  type PairingRemovedResponse,
+  type ProfileCaptureRequestOptions,
+} from "@ao/shared";
 import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
 import { registerTranscription } from "./transcription.js";
-import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
+import { bodyAs, bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
 /** Browser capture carries a full-page screenshot and the page's HTML (R96: raised only here). */
 export const BROWSER_CAPTURE_BODY_LIMIT = 32 * 1024 * 1024;
 
-const BROWSERS: BrowserName[] = ["chrome", "firefox", "safari", "edge", "brave"];
+// The library's browsers and profile parts are exactly the shared lists (a change to either fails here).
+true satisfies Same<BrowserName, CaptureBrowser>;
+true satisfies Same<ProfileContentType, CaptureContentType>;
+// A link's outcome and a profile run's report go out as the library makes them: its statuses are the
+// shared list, and they carry exactly the fields the shared types declare (no undeclared field on the wire).
+true satisfies Same<CaptureStatus, CaptureItemStatus>;
+true satisfies Same<keyof CaptureOutcome, keyof CaptureItemOutcome>;
+true satisfies Same<keyof ProfileCaptureReport, keyof CaptureProfileReport>;
+const BROWSERS: readonly BrowserName[] = CAPTURE_BROWSERS;
 // The speech models the app accepts (R158, one definition in @ao/shared).
 const MODELS: readonly string[] = SPEECH_MODELS;
-const TYPES: ProfileContentType[] = ["posts", "reels", "videos", "shorts", "highlights"];
+const TYPES: readonly ProfileContentType[] = CAPTURE_CONTENT_TYPES;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
-function captureOptions(o: Obj | undefined): CaptureOptions {
-  const opts = o ?? {};
+/** The options of a capture, read through their shared request type (an absent `options` is `{}`). */
+function captureOptions(o: BodyOf<CaptureRequestOptions> | undefined): CaptureOptions {
+  const opts = o ?? ({} as BodyOf<CaptureRequestOptions>);
   const browser = optStr(opts, "cookiesFromBrowser", 16);
   if (browser !== undefined && !BROWSERS.includes(browser as BrowserName)) throw badRequest(`"${browser}" is not a supported browser.`);
   const model = optStr(opts, "transcribeModel", 16);
@@ -72,11 +116,11 @@ function requireAcknowledged(s: Session, projectId: string, opts: CaptureOptions
   }
 }
 
-/** Links queued at once (R111: also the extension's link lists). */
-export const MAX_QUEUED_LINKS = 500;
+/** Links queued at once (R111: also the extension's link lists; @ao/shared CAPTURE_LINKS_MAX). */
+export const MAX_QUEUED_LINKS = CAPTURE_LINKS_MAX;
 
 /** A list of web addresses (http or https only, at most 2048 characters each). */
-function urlList(b: Obj, key: string, max: number): string[] {
+function urlList<O extends object>(b: O, key: keyof O & string, max: number): string[] {
   const urls = strArray(b, key, { max, itemMax: MAX_ADDRESS_LENGTH });
   for (const u of urls) if (!isWebAddress(u)) throw badRequest(`"${key}" must be web addresses.`);
   return urls;
@@ -119,7 +163,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     urls: string[],
     opts: CaptureOptions,
     extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void; startedBy?: CaptureStartedBy } = {},
-  ): Promise<{ queueId: string }> {
+  ): Promise<CaptureStartedResponse> {
     // Nothing about the project's captures is said before the lock and the rules have been checked (I1).
     requireUnlocked(s, projectId);
     await checkCaptureAllowed(s.repo, projectId, urls, extra.methods); // 403 with the reason when denied
@@ -159,21 +203,21 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     return live;
   }
 
-  app.post("/projects/:id/capture", async (req) => {
+  app.post("/projects/:id/capture", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
+    const b = bodyAs<CaptureLinksRequest>(req);
     const urls = urlList(b, "urls", MAX_QUEUED_LINKS);
-    const opts = captureOptions(optObj(b, "options"));
+    const opts = captureOptions(optObj(b, "options") as BodyOf<CaptureRequestOptions> | undefined);
     return queueLinks(s, projectId, urls, opts);
   });
 
-  app.post("/projects/:id/capture-profile", async (req) => {
+  app.post("/projects/:id/capture-profile", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
+    const b = bodyAs<CaptureProfileRequest>(req);
     const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
-    const o = optObj(b, "options") ?? {};
+    const o = (optObj(b, "options") ?? {}) as BodyOf<ProfileCaptureRequestOptions>;
     const base = captureOptions(o);
     const since = optStr(o, "since", 10);
     const until = optStr(o, "until", 10);
@@ -217,31 +261,31 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
             // Ended meanwhile (a lock, a close): nothing more of it is recorded or published (I3).
             if (state.captureEnded(queueId)) return;
             queues.progress(queueId, done, total, outcome);
-            state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false });
+            state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false } satisfies CaptureQueueProgressEvent);
           },
           { cancelled: () => state.captureEnded(queueId), signal: state.captureSignal(queueId) },
         );
         if (state.profileRunEnded(queueId)) return; // its end was published when it was ended
         queues.finish(queueId, { report });
-        state.events.publish("capture.progress", { queueId, projectId, finished: true, report });
+        state.events.publish("capture.progress", { queueId, projectId, finished: true, report } satisfies CaptureQueueProgressEvent);
       } catch (err) {
         if (state.profileRunEnded(queueId)) return;
         queues.finish(queueId, { error: err });
-        state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
+        state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) } satisfies CaptureQueueProgressEvent);
       }
     });
     return { queueId };
   });
 
   // ---- a capture's state, read again (Task 63) ----
-  app.get("/projects/:id/captures", async (req) => {
+  app.get("/projects/:id/captures", async (req): Promise<CaptureQueueListResponse> => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
     requireUnlocked(s, projectId);
     return { queues: state.captureQueues.list(projectId) };
   });
 
-  app.get("/projects/:id/captures/:qid", async (req) => {
+  app.get("/projects/:id/captures/:qid", async (req): Promise<CaptureQueueDetail> => {
     const s = state.requireSession();
     const projectId = projectParam(ctx, req);
     requireUnlocked(s, projectId);
@@ -253,25 +297,25 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   // Transcription of a source runs as a job (Task 62): its routes are in transcription.ts.
   registerTranscription(app, ctx);
 
-  app.get("/tools/versions", async () => {
+  app.get("/tools/versions", async (): Promise<CaptureToolVersionsResponse> => {
     const w = await state.ensureWorker();
     return { versions: await w.versions() };
   });
 
-  app.post("/tools/update", async () => {
+  app.post("/tools/update", async (): Promise<CaptureToolsUpdateResponse> => {
     const w = await state.ensureWorker();
     return w.updateTools();
   });
 
   // ---- the browser extension ----
-  app.post("/extension/pair", async (req) => {
+  app.post("/extension/pair", async (req): Promise<PairingCodeIssued> => {
     if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Pairing is started from the desktop app.");
     return pairing.newCode();
   });
 
-  app.post("/extension/pair/confirm", async (req) => {
+  app.post("/extension/pair/confirm", async (req): Promise<PairingConfirmResponse> => {
     if (pairing.rateLimited(req.headers.origin ?? "")) throw new ApiError(429, "RATE_LIMITED", "Too many attempts. Wait a minute, then try again.");
-    const code = bodyOf(req).code;
+    const code = bodyAs<PairingConfirmRequest>(req).code;
     const token = await pairing.confirm(typeof code === "string" ? code : "", req.headers.origin ?? "");
     if (!token) throw new ApiError(401, "UNAUTHORIZED", "That code is not valid. Ask the desktop app for a new one.");
     return { token };
@@ -298,7 +342,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const port = pairing.port;
     return { extensions: pairing.list(), ...(port !== undefined ? { port } : {}), ...(unreadable ? { unreadable: true as const } : {}) };
   });
-  app.delete("/extension/pairings/:pid", async (req) => {
+  app.delete("/extension/pairings/:pid", async (req): Promise<PairingRemovedResponse> => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");
     return { removed: true };
   });
@@ -306,7 +350,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   // The extension's "profile as I scroll" list (R111): the same decision, queue and capture.progress
   // events as /projects/:id/capture, reached with the extension token only (the desktop app uses that
   // route). No browser-session (cookies) option from here; a legal basis may be given.
-  app.post("/capture/browser/links", async (req) => {
+  app.post("/capture/browser/links", async (req): Promise<CaptureStartedResponse> => {
     if (req.caller !== "extension") throw new ApiError(403, "FORBIDDEN", "This is the browser extension's route; the desktop app queues links with /projects/:id/capture.");
     const s = state.requireWritable();
     const b = bodyOf(req);
@@ -364,7 +408,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       },
       linkCapture ? { linkCapture } : {},
     );
-    state.events.publish("capture.progress", { kind: "browser", projectId, sourceId: r.sourceId, status: r.status, finished: true });
+    state.events.publish("capture.progress", { kind: "browser", projectId, sourceId: r.sourceId, status: r.status, finished: true } satisfies BrowserCaptureProgressEvent);
     return r;
   });
 }

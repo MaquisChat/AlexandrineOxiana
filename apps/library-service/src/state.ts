@@ -55,8 +55,9 @@ import {
   rememberLastOpenLibrary,
   type RebuildResult,
 } from "@ao/library";
-import type { CaptureStartedBy, DeviceNotice } from "@ao/shared";
+import type { CaptureQueueProgressEvent, CaptureStartedBy, DeviceNotice } from "@ao/shared";
 import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
+
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
@@ -356,7 +357,7 @@ export class ServiceState {
       if (this.endedCaptures.has(queueId)) return; // ended already (a second lock)
       this.endedCaptures.set(queueId, { projectId, why });
       this.captureAborts.get(queueId)?.abort();
-      this.events.publish("capture.progress", { queueId, projectId, finished: true, error });
+      this.events.publish("capture.progress", { queueId, projectId, finished: true, error } satisfies CaptureQueueProgressEvent);
     };
     for (const [id, q] of this.captures) {
       if (q.projectId !== projectId) continue;
@@ -430,7 +431,7 @@ export class ServiceState {
       info.finished = true;
       this.captureAborts.delete(queueId);
       this.captureQueues.finish(queueId, { error: err });
-      this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) });
+      this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) } satisfies CaptureQueueProgressEvent);
     };
     return this.startWork("capture", async (ctl) => {
       await at.after?.catch(() => {});
@@ -457,7 +458,7 @@ export class ServiceState {
             info.finished = info.done === total;
             this.captureQueues.progress(queueId, info.done, total, outcome);
             if (info.finished) this.captureQueues.finish(queueId, {});
-            this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished });
+            this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished } satisfies CaptureQueueProgressEvent);
           },
           { shouldStop: () => ctl.stopping, cancelled: ended, signal: this.captureSignal(queueId) },
         );

@@ -19,7 +19,7 @@ import {
   VERIFIED_SOURCE,
   withFields,
 } from "../test/verification";
-import { FIELD_LABELS as CORE_FIELD_LABELS } from "@ao/core/src/verify/checks";
+import { FIELD_LABELS as CORE_FIELD_LABELS } from "@ao/core/verify/checks";
 import { FIELD_LABELS, SourceDetail } from "./SourceDetail";
 
 useMockService();

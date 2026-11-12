@@ -564,13 +564,18 @@ export function Capture({ client, projectId }: CaptureProps) {
     return true;
   };
 
-  const baseOptions = (): CaptureOptions => ({
-    ...(useSession ? { cookiesFromBrowser: browser } : {}),
-    ...(transcribe === "yes" ? { transcribe: true } : transcribe === "no" ? { transcribe: false } : {}),
-    ...(transcribe !== "no" && model ? { transcribeModel: model } : {}),
-    ...(refresh ? { refreshIfExists: true } : {}),
-    ...(legalBasis.trim() ? { legalBasis: legalBasis.trim() } : {}),
-  });
+  // Built by assignment to the shared request type, so every key is checked against it (R184):
+  // a key spread in from an untyped object would not be.
+  const baseOptions = (): CaptureOptions => {
+    const o: CaptureOptions = {};
+    if (useSession) o.cookiesFromBrowser = browser;
+    if (transcribe === "yes") o.transcribe = true;
+    else if (transcribe === "no") o.transcribe = false;
+    if (transcribe !== "no" && model) o.transcribeModel = model;
+    if (refresh) o.refreshIfExists = true;
+    if (legalBasis.trim()) o.legalBasis = legalBasis.trim();
+    return o;
+  };
 
   /** A refusal of a start, in plain words; the service asking for the acknowledgement opens it. */
   const refused = (err: unknown, fallbackText: string) => {
@@ -640,15 +645,14 @@ export function Capture({ client, projectId }: CaptureProps) {
       if (maxNumber !== undefined && (!Number.isInteger(maxNumber) || maxNumber < 1)) return setProfileError("The maximum number of items must be a whole number of 1 or more.");
       setProfileError(null);
       if (!checkLegal(comments)) return;
-      const options: ProfileCaptureOptions = {
-        ...baseOptions(),
-        ...(since ? { since } : {}),
-        ...(until ? { until } : {}),
-        ...(maxNumber !== undefined ? { maxItems: maxNumber } : {}),
-        ...(types.length ? { contentTypes: CONTENT_TYPES.map((t) => t.value).filter((t) => types.includes(t)) } : {}),
-        ...(metadataOnly ? { metadataOnly: true } : {}),
-        ...(comments ? { includeComments: true } : {}),
-      };
+      // By assignment to the shared request type, as baseOptions (R184).
+      const options: ProfileCaptureOptions = baseOptions();
+      if (since) options.since = since;
+      if (until) options.until = until;
+      if (maxNumber !== undefined) options.maxItems = maxNumber;
+      if (types.length) options.contentTypes = CONTENT_TYPES.map((t) => t.value).filter((t) => types.includes(t));
+      if (metadataOnly) options.metadataOnly = true;
+      if (comments) options.includeComments = true;
       try {
         const { queueId } = await api.captureProfile(projectId, url, options);
         if (!live.current) return;

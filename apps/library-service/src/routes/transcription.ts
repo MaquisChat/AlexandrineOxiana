@@ -13,12 +13,12 @@
  * before; a job the worker refuses for a missing tool fails with the same code and id.
  */
 import type { FastifyInstance } from "fastify";
-import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, speechToolId, type TranscriptionJobResponse } from "@ao/shared";
+import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, speechToolId, type TranscribeRequest, type TranscriptionJobResponse } from "@ao/shared";
 import { ProjectLockedError, cancelPendingJob, transcriptionRecords } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { busyError, fromRecord } from "../transcriptions.js";
 import type { Session } from "../state.js";
-import { bodyOf, optStr, paramsOf, projectParam, type Ctx } from "./util.js";
+import { bodyAs, optStr, paramsOf, projectParam, type Ctx } from "./util.js";
 
 const MODELS: readonly string[] = SPEECH_MODELS;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -51,7 +51,7 @@ export function registerTranscription(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
     if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
-    const b = bodyOf(req);
+    const b = bodyAs<TranscribeRequest>(req);
     const model = optStr(b, "model", 16);
     if (model !== undefined && !MODELS.includes(model)) throw badRequest(`"${model}" is not a transcription model.`);
     const language = optStr(b, "language", 16);

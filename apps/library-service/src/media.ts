@@ -46,11 +46,13 @@ import {
   PICTURE_MAX_BYTES,
   isMediaTicketPath,
   type MediaTicketResponse,
+  type MediaTicketRevokeRequest,
   type MediaTicketRevokeResponse,
+
 } from "@ao/shared";
 import { SHELL_ORIGINS } from "./auth.js";
 import { ApiError, badRequest, notFound, toApiError } from "./errors.js";
-import { bodyOf, paramsOf, projectParam, str, type Ctx } from "./routes/util.js";
+import { bodyAs, paramsOf, projectParam, str, type Ctx } from "./routes/util.js";
 
 export { PICTURE_MAX_BYTES };
 
@@ -331,7 +333,7 @@ export function registerMedia(app: FastifyInstance, ctx: Ctx & { pictureMaxBytes
 
   app.post("/media-tickets/revoke", async (req): Promise<MediaTicketRevokeResponse> => {
     if (req.caller !== "ui") throw new ApiError(403, "FORBIDDEN", "Only the desktop app can do this.");
-    const path = str(bodyOf(req), "path", 128);
+    const path = str(bodyAs<MediaTicketRevokeRequest>(req), "path", 128);
     if (!isMediaTicketPath(path)) throw badRequest('"path" must be a media address (/media/…).');
     return { revoked: tickets.revoke(path.slice("/media/".length)) };
   });

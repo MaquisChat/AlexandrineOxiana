@@ -90,3 +90,24 @@ export type PairingCodeStatus =
 export type PairingCodeInvalidReason = "wrong-tries" | "not-saved";
 
 export type PairingCodeState = PairingCodeStatus["state"];
+
+/** `DELETE /extension/pairings/:pid` (UI token); 404 NOT_FOUND when that pairing is already gone. */
+export interface PairingRemovedResponse {
+  removed: true;
+}
+
+/**
+ * `POST /extension/pair/confirm`: the browser extension sends the code (from its own origin, no
+ * token). A wrong or spent code is 401 UNAUTHORIZED; too many tries from one origin 429 RATE_LIMITED.
+ */
+export interface PairingConfirmRequest {
+  code: string;
+}
+
+/** The extension's token: a secret, kept by the extension only. */
+export interface PairingConfirmResponse {
+  token: string;
+}
+
+// Refusals the pairing routes name: issuing a code or reading its status from anywhere but the
+// desktop app (403 FORBIDDEN); the list of paired browsers unreadable (503 UNAVAILABLE).

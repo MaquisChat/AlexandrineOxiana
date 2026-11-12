@@ -31,8 +31,8 @@
  */
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { effectivePolicy } from "@ao/core/src/governance/merge";
-import { parseGovernance } from "@ao/core/src/governance/schema";
+import { effectivePolicy } from "@ao/core/governance/merge";
+import { parseGovernance } from "@ao/core/governance/schema";
 import { ApiClientError } from "../api/client";
 import type { Profile } from "../api/governance";
 import { errorText, type LibraryApi, type ProjectSummary } from "../api/library";

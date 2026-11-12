@@ -61,3 +61,44 @@ export interface SourceRecordExtras {
   /** Every field that has a verification or evidence, sorted by field. */
   fields: FieldReview[];
 }
+
+// ---- verification and background work of a source (Task 47) ----
+//
+// - `PATCH /projects/:id/sources/:sid/fields` FieldConfirmRequest → the source record (+ SourceRecordExtras)
+// - `POST /projects/:id/sources/:sid/recheck` (no body)           → the source record (+ SourceRecordExtras)
+// - `POST /projects/:id/recheck` (no body)                        → ProjectRecheckResponse; then
+//   `job.progress` events of kind "recheck" (RecheckProgressEvent, R99)
+// - `POST /jobs/retry` JobsRetryRequest                           → JobsRetryResponse (R84)
+
+/** `POST /projects/:id/recheck`: the job runs in the background. */
+export interface ProjectRecheckResponse {
+  jobId: string;
+  /** Sources to recheck. */
+  total: number;
+}
+
+/** A `job.progress` event of a project recheck: after each source, and once more when finished (with the tallies). */
+export interface RecheckProgressEvent {
+  kind: "recheck";
+  jobId: string;
+  projectId: string;
+  done: number;
+  total: number;
+  finished: boolean;
+  /** On the last event: sources whose record changed, and those that could not be rechecked. */
+  changed?: number;
+  failed?: number;
+}
+
+/** `POST /jobs/retry`: run a project's failed viewing-copy and OCR jobs again (R84), of one source when named. */
+export interface JobsRetryRequest {
+  projectId: string;
+  sourceId?: string;
+}
+
+export interface JobsRetryResponse {
+  retrying: true;
+}
+
+// Refusals confirming a field and rechecking a source name: the project's rules (403 POLICY_DENIED),
+// a locked project (423).

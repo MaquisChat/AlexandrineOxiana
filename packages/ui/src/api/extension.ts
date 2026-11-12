@@ -12,7 +12,8 @@
  *  - DELETE /extension/pairings/:pid  → { removed: true }  (404 NOT_FOUND when already gone)
  * The code is a short-lived secret: callers keep it in component state only. Its `codeId` is not.
  */
-import type { PairedBrowser, PairedBrowsers, PairingCodeIssued, PairingCodeStatus, SettingsResetRequest, SettingsResetResponse } from "@ao/shared";
+import type { PairedBrowser, PairedBrowsers, PairingCodeIssued, PairingCodeStatus, PairingRemovedResponse, SettingsResetRequest, SettingsResetResponse } from "@ao/shared";
+
 import type { ApiClient } from "./client";
 
 export type PairingCode = PairingCodeIssued;
@@ -51,7 +52,7 @@ export function extensionApi(client: ApiClient): ExtensionApi {
       return { extensions, ...(port !== undefined ? { port } : {}), ...(r?.unreadable === true ? { unreadable: true as const } : {}) };
     },
     revoke: async (id, signal) => {
-      await client.request<{ removed: boolean }>("DELETE", `/extension/pairings/${encodeURIComponent(id)}`, signal ? { signal } : {});
+      await client.request<PairingRemovedResponse>("DELETE", `/extension/pairings/${encodeURIComponent(id)}`, signal ? { signal } : {});
     },
     resetList: (signal) => {
       const body: SettingsResetRequest = { file: "extension-pairings", confirm: true };

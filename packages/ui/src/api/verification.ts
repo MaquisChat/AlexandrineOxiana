@@ -5,7 +5,17 @@
  * `GET …/assets/:aid/content`) and routes/jobs.ts (`POST /jobs/retry`); the source record's
  * `fields` are the shared `FieldReview` (packages/shared/src/api/sources.ts).
  */
-import { PICTURE_MAX_BYTES, type FieldReview, type SourceRecordExtras, type VerificationStatus } from "@ao/shared";
+import {
+  PICTURE_MAX_BYTES,
+  type FieldConfirmRequest,
+  type FieldReview,
+  type JobsRetryRequest,
+  type JobsRetryResponse,
+  type ProjectRecheckResponse,
+  type RecheckProgressEvent,
+  type SourceRecordExtras,
+  type VerificationStatus,
+} from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 import type { SourceFile } from "./library";
 
@@ -29,22 +39,10 @@ export type VerifiedSource = SourceFile &
   };
 
 /** `POST /projects/:id/recheck`: the job runs in the background; `job.progress` events (kind "recheck") report it (R99). */
-export interface RecheckJob {
-  jobId: string;
-  total: number;
-}
+export type RecheckJob = ProjectRecheckResponse;
 
-/** The `job.progress` event of a project recheck (routes/sources.ts). */
-export interface RecheckProgress {
-  kind: "recheck";
-  jobId: string;
-  projectId: string;
-  done: number;
-  total: number;
-  finished: boolean;
-  changed?: number;
-  failed?: number;
-}
+/** The `job.progress` event of a project recheck (@ao/shared). */
+export type RecheckProgress = RecheckProgressEvent;
 
 /** Raster pictures the service serves and a browser can show (never SVG: it is a document, R135 1). */
 const SHOWABLE_PICTURES: ReadonlySet<string> = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/apng"]);
@@ -57,11 +55,17 @@ export function verificationApi(client: ApiClient) {
   const r = client.request;
   return {
     /** The researcher's value for one field (recorded as their evidence: "confirmed by you" when it agrees). */
-    confirmField: (pid: string, sid: string, field: string, value: unknown) => r<VerifiedSource>("PATCH", `${src(pid, sid)}/fields`, { body: { field, value } }),
+    confirmField: (pid: string, sid: string, field: string, value: unknown) => {
+      const body: FieldConfirmRequest = { field, value };
+      return r<VerifiedSource>("PATCH", `${src(pid, sid)}/fields`, { body });
+    },
     recheckSource: (pid: string, sid: string) => r<VerifiedSource>("POST", `${src(pid, sid)}/recheck`),
     recheckProject: (pid: string) => r<RecheckJob>("POST", `/projects/${seg(pid)}/recheck`),
     /** Runs a source's failed viewing-proxy and OCR jobs again (R84). */
-    retryJobs: (pid: string, sid: string) => r<{ retrying: true }>("POST", "/jobs/retry", { body: { projectId: pid, sourceId: sid } }),
+    retryJobs: (pid: string, sid: string) => {
+      const body: JobsRetryRequest = { projectId: pid, sourceId: sid };
+      return r<JobsRetryResponse>("POST", "/jobs/retry", { body });
+    },
     /** A stored picture, read with the token and returned as a Blob for a blob: URL (R135 1). */
     picture: async (pid: string, sid: string, aid: string, opts: { signal?: AbortSignal } = {}): Promise<Blob> => {
       // The service refuses a picture larger than this too; the client stops reading past it (R135 1).
