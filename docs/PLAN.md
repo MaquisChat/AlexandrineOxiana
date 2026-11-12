@@ -452,12 +452,12 @@ Update after every task; commit and push.
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48a Tools: worker and service | re-review of fix round 1 | 691a58a (worktree branch) | four Important reported fixed; contract changes additive only |
-| 48b Tools: the dialogue | in review | 9fb7cda (worktree branch) | built on 48a's branch (R156); stale wording on the capture screen to correct |
+| 48a Tools: worker and service | fix round 2 (short) | 691a58a (worktree branch) | round 1 passed re-review; adding hosts and one shared definition of the speech models (R158), and two small fixes, before merge |
+| 48b Tools: the dialogue | fix round 1 | 9fb7cda (worktree branch) | 6 Important: first-use question skipped when a tool exists, three different default models, untrue wording after cancel, stale sentences (R158) |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
 | 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
-| 50 No silent refusals | re-review of fix round 2 | 634bf3e (worktree branch) | four Important reported fixed (R157). The restore item waits for Task 49 |
+| 50 No silent refusals | fix round 3 (short) | 634bf3e (worktree branch) | round 2 passed re-review; one Minor fixed before merge (path scrubbing must not rewrite the researcher's own text). The restore item waits for Task 49 |
 | 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
