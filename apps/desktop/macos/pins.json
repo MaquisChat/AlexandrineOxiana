@@ -1,0 +1,13 @@
+{
+  "_about": "The Mac build's pins, in one place (Task 37f). node: the Node.js release shipped beside the library service (ADR 0013); sha256 is copied from the release's own SHASUMS256.txt and every download is checked against it before it is used (scripts/node-release.mjs). The workflow (.github/workflows/desktop-macos.yml) installs the same version to run the build, so the service folder is built by the Node it ships with. tauriCli: the Tauri bundler (cargo install tauri-cli --version =<this> --locked), the CLI release published together with the tauri crate pinned in src-tauri/Cargo.toml. minimumSystemVersion: the oldest macOS both downloads run on (R133); MACOSX_DEPLOYMENT_TARGET and tauri.macos.conf.json's bundle.macOS.minimumSystemVersion are this value (scripts/build-macos.test.mjs checks).",
+  "node": {
+    "version": "v22.23.4",
+    "source": "https://nodejs.org/dist/v22.23.4/SHASUMS256.txt",
+    "sha256": {
+      "darwin-arm64": "c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428",
+      "darwin-x64": "efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819"
+    }
+  },
+  "tauriCli": "2.12.4",
+  "minimumSystemVersion": "15.0"
+}
