@@ -38,6 +38,15 @@ describe("SourceDetail", () => {
     expect(within(region).getByText("smith-2019.pdf")).toBeTruthy();
   });
 
+  it("the title heading itself takes its direction from the text (D7): an Arabic title's heading is dir=auto, not only its inline text", async () => {
+    const arabic = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, title: { variants: [{ lang: "ar", kind: "original", value: "دراسة ميدانية في القاهرة" }] } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(arabic)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const heading = await screen.findByRole("heading", { level: 2, name: "دراسة ميدانية في القاهرة" });
+    expect(heading.getAttribute("dir")).toBe("auto");
+    expect(heading.getAttribute("lang")).toBe("ar");
+  });
+
   it("edits the title through PATCH, keeping the other title variants", async () => {
     let body: { title?: { variants: Array<{ value: string }> } } = {};
     server.use(

@@ -432,9 +432,9 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
       {src && (
         <>
           <div className="ao-row">
-            <h2>
-              <UserText lang={variants[0]?.lang}>{title || "Untitled"}</UserText>
-            </h2>
+            <UserText as="h2" lang={variants[0]?.lang}>
+              {title || "Untitled"}
+            </UserText>
             {badge("/title")}
           </div>
           {variants.slice(1).map((v, i) => (

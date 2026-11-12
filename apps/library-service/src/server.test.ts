@@ -1934,6 +1934,150 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
   });
 });
 
+describe("Task 46b D2 (R137): a library row's needsReview means an item waits in the import review queue", () => {
+  beforeEach(() => start());
+
+  it("is true while the source's review item is pending and false once it is decided, whatever the fields' verification", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const dir = join(tmp, "in");
+    await fixturePdf("a.pdf", "First Paper on Rivers");
+    await fixturePdf("b.pdf", "Second Paper on Lakes");
+    const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir }, options: {} } })).json;
+    await svc.state.idle();
+    const pending = (await call({ url: `/imports/${batchId}/review` })).json.items as Array<{ id: string; sourceId: string }>;
+    expect(pending.length, "the fixture's items wait for review (no lookups)").toBeGreaterThan(1);
+    const rows = async () => (await call({ url: `/projects/${pid}/sources?limit=100` })).json.items as Array<{ id: string; needsReview: boolean }>;
+    const waiting = new Set(pending.map((p) => p.sourceId));
+    for (const r of await rows()) expect(r.needsReview, r.id).toBe(waiting.has(r.id));
+
+    const [first, ...rest] = pending;
+    const statuses = async (sid: string) => ((await call({ url: `/projects/${pid}/sources/${sid}` })).json as { fields: Array<{ field: string; status: string }> }).fields.map((f) => `${f.field}:${f.status}`);
+    const before = await statuses(first!.sourceId);
+    const decided = await call({ method: "POST", url: `/review/${first!.id}/decide`, body: { projectId: pid, decision: { action: "accept" } } });
+    expect(decided.status, decided.body).toBe(200);
+    const after = await rows();
+    expect(after.find((r) => r.id === first!.sourceId)?.needsReview).toBe(false);
+    for (const p of rest) expect(after.find((r) => r.id === p.sourceId)?.needsReview).toBe(true);
+    // Accepting does not confirm the fields (R137): the source's verification is unchanged.
+    expect(await statuses(first!.sourceId)).toEqual(before);
+
+    // Every other decision clears it too (keep-both here), and a text search reports the same.
+    for (const p of rest) expect((await call({ method: "POST", url: `/review/${p.id}/decide`, body: { projectId: pid, decision: { action: "keep-both" } } })).status).toBe(200);
+    expect((await rows()).every((r) => !r.needsReview)).toBe(true);
+    const found = (await call({ url: `/projects/${pid}/sources?text=Rivers` })).json.items as Array<{ needsReview: boolean }>;
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.every((r) => !r.needsReview)).toBe(true);
+  });
+});
+
+describe("Task 46b fix round 1 (R172): needsReview means the source has a pending entry of any kind in the project's review queue", () => {
+  beforeEach(() => start());
+
+  const rows = async (pid: string) => (await call({ url: `/projects/${pid}/sources?limit=500` })).json.items as Array<{ id: string; needsReview: boolean; locked: boolean }>;
+  const badge = async (pid: string, sid: string) => (await rows(pid)).find((r) => r.id === sid)?.needsReview;
+  /** The project's pending review entries, read from the index (no route lists entries outside a batch). */
+  const pendingEntries = (pid: string) =>
+    svc.state.session!.index!.db.prepare("SELECT id, kind, batch_id AS batchId, source_id AS sourceId FROM review_items WHERE project_id = ? AND status = 'pending'").all(pid) as Array<{
+      id: string;
+      kind: string;
+      batchId: string | null;
+      sourceId: string | null;
+    }>;
+  const decide = (pid: string, itemId: string, decision: Record<string, unknown>) => call({ method: "POST", url: `/review/${itemId}/decide`, body: { projectId: pid, decision } });
+  const importFolder = async (pid: string, titles: string[], folder: string) => {
+    for (const [i, t] of titles.entries()) await fixturePdf(join("..", folder, `p${i}.pdf`), t);
+    const r = await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: join(tmp, folder) }, options: {} } });
+    expect(r.status, r.body).toBe(200);
+    await svc.state.idle();
+    const items = (await call({ url: `/imports/${r.json.batchId}/review` })).json.items as Array<{ id: string; sourceId: string }>;
+    expect(items.length, "every fixture item waits for review (no lookups)").toBe(titles.length);
+    return { batchId: r.json.batchId as string, items };
+  };
+
+  it("a source attached by drag and drop whose outcome is needs-review carries the badge (an import entry with no batch), and deciding it clears it", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    expect(att.status, att.body).toBe(200);
+    const [o] = att.json.items as Array<{ outcome: string; sourceId: string }>;
+    expect(o!.outcome).toBe("needs-review");
+    const [entry] = pendingEntries(pid);
+    expect(entry).toMatchObject({ kind: "import", batchId: null, sourceId: o!.sourceId });
+    expect(await badge(pid, o!.sourceId)).toBe(true);
+    expect((await decide(pid, entry!.id, { action: "accept" })).status).toBe(200);
+    expect(await badge(pid, o!.sourceId)).toBe(false);
+  });
+
+  it("a captured source saved with conflicting fields carries the badge (a verification entry, as link and profile capture queue it)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const repo = svc.state.session!.repo;
+    // createSource's reviewItem is how link-capture.ts and profile-capture.ts queue a capture with conflicts.
+    const sf = await repo.createSource(
+      pid,
+      { projectIds: [pid], type: "webpage", title: { variants: [{ lang: "en", kind: "original", value: "A captured page" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: await fixturePdf("page.pdf"), role: "original", handling: "copy" }],
+      {
+        provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+        reviewItem: { fields: { "/title": "conflict" }, reasons: ["The page and its metadata disagree on the title."] },
+      },
+    );
+    expect(pendingEntries(pid)).toEqual([expect.objectContaining({ kind: "verification", sourceId: sf.source.id })]);
+    expect(await badge(pid, sf.source.id)).toBe(true);
+  });
+
+  it("an import batch item: on while pending, off after each kind of decision (accept, edit and accept, skip, merge, keep-both)", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const { items } = await importFolder(pid, ["Rivers of the North", "Lakes of the South", "Deltas of the East", "Estuaries of the West", "Marshes Everywhere"], "batch");
+    for (const it of items) expect(await badge(pid, it.sourceId), it.sourceId).toBe(true);
+    const [a, b, c, d, e] = items as [(typeof items)[0], (typeof items)[0], (typeof items)[0], (typeof items)[0], (typeof items)[0]];
+    const sf = await svc.state.session!.repo.getSource(pid, b.sourceId);
+    const draft = { ...sf.source, title: { variants: [{ lang: "en", kind: "original", value: "Lakes of the South, edited" }] } };
+    expect((await decide(pid, a.id, { action: "accept" })).status).toBe(200);
+    expect((await decide(pid, b.id, { action: "accept", draft })).status).toBe(200);
+    expect((await decide(pid, c.id, { action: "skip" })).status).toBe(200);
+    expect((await decide(pid, d.id, { action: "merge", sourceId: a.sourceId })).status).toBe(200);
+    const left = await rows(pid);
+    for (const s of [a, b]) expect(left.find((r) => r.id === s.sourceId)?.needsReview, s.sourceId).toBe(false);
+    for (const s of [c, d]) expect(left.find((r) => r.id === s.sourceId), "skipped or merged away: no row").toBeUndefined();
+    expect(left.find((r) => r.id === e.sourceId)?.needsReview).toBe(true);
+    expect((await decide(pid, e.id, { action: "keep-both" })).status).toBe(200);
+    expect((await rows(pid)).every((r) => !r.needsReview)).toBe(true);
+    expect(pendingEntries(pid)).toEqual([]);
+  });
+
+  it("off after the import is undone: no entry of the batch is left pending, and an older source merged into stays as it was", async () => {
+    await openNewLibrary();
+    const pid = await newProject();
+    const kept = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf("kept.pdf", "An Older Attached Paper")] } });
+    const keptId = kept.json.items[0].sourceId as string;
+    const [keptEntry] = pendingEntries(pid);
+    expect((await decide(pid, keptEntry!.id, { action: "accept" })).status).toBe(200);
+    const { batchId, items } = await importFolder(pid, ["Rivers of the North", "Lakes of the South"], "undo");
+    expect((await decide(pid, items[0]!.id, { action: "merge", sourceId: keptId })).status).toBe(200);
+    expect(await badge(pid, items[1]!.sourceId)).toBe(true);
+    const undo = await call({ method: "POST", url: `/imports/${batchId}/undo` });
+    expect(undo.status, undo.body).toBe(200);
+    expect(pendingEntries(pid)).toEqual([]);
+    expect((await rows(pid)).map((r) => [r.id, r.needsReview])).toEqual([[keptId, false]]);
+  });
+
+  it("a locked project's rows do not claim needsReview: its queue cannot be read while locked", async () => {
+    await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, true);
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [await fixturePdf()] } });
+    const sid = att.json.items[0].sourceId as string;
+    expect(await badge(pid, sid)).toBe(true);
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const locked = (await rows(pid)).find((r) => r.id === sid);
+    expect(locked).toMatchObject({ locked: true, needsReview: false });
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    expect(await badge(pid, sid)).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Task 51 fix round 1 (R142 item 3): the worker client follows the live index after a rebuild
 

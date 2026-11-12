@@ -180,6 +180,7 @@ export interface SourceRow {
   creatorsText: string;
   issuedYear?: string;
   folder: string;
+  /** R137, R172: this source has a pending entry of any kind in the project's review queue (nothing else; not field verification). False for a locked row. */
   needsReview: boolean;
   locked: boolean;
   /** A text search found it through the text of its annotations (Task 58). */

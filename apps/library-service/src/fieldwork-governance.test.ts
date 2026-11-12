@@ -282,3 +282,40 @@ describe("researcher name (device setting, R84/R117 carry-over)", () => {
     }
   });
 });
+
+describe("Task 46b fix round 1 (R172): consent withdrawal and the library row's needsReview", () => {
+  const badge = async (sid: string) => ((await call({ url: `/projects/${pid}/sources?limit=500` })).json.items as Array<{ id: string; needsReview: boolean }>).find((r) => r.id === sid)?.needsReview;
+  const pending = (sid: string) =>
+    svc.state.session!.index!.db.prepare("SELECT id, kind FROM review_items WHERE project_id = ? AND source_id = ? AND status = 'pending' ORDER BY kind").all(pid, sid) as Array<{ id: string; kind: string }>;
+  const withdrawFor = async (sourceId: string) => {
+    const p = (await call({ method: "POST", url: `/projects/${pid}/participants`, body: {} })).json;
+    const c = (await call({ method: "POST", url: `/projects/${pid}/consents`, body: { participantId: p.id, scope: "audio", date: "2026-03-14" } })).json;
+    await svc.state.session!.repo.linkSourceToFieldwork(pid, sourceId, { participantIds: [p.id] });
+    const w = await call({ method: "POST", url: `/projects/${pid}/consents/${c.id}/withdraw`, body: { reason: "phoned" } });
+    expect(w.status, w.body).toBe(200);
+    expect(w.json.flaggedSourceIds).toEqual([sourceId]);
+  };
+
+  it("a source flagged by a consent withdrawal carries the badge", async () => {
+    const { sourceId } = await newSource();
+    expect(await badge(sourceId)).toBe(false);
+    await withdrawFor(sourceId);
+    expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
+    expect(await badge(sourceId)).toBe(true);
+  });
+
+  it("a source with two pending entries keeps the badge until both are decided: deciding its import entry leaves the withdrawal's", async () => {
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
+    expect(att.status, att.body).toBe(200);
+    expect(att.json.items[0].outcome).toBe("needs-review");
+    const sourceId = att.json.items[0].sourceId as string;
+    await withdrawFor(sourceId);
+    const two = pending(sourceId);
+    expect(two.map((e) => e.kind)).toEqual(["import", "verification"]);
+    expect(await badge(sourceId)).toBe(true);
+    const d = await call({ method: "POST", url: `/review/${two[0]!.id}/decide`, body: { projectId: pid, decision: { action: "accept" } } });
+    expect(d.status, d.body).toBe(200);
+    expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
+    expect(await badge(sourceId)).toBe(true);
+  });
+});

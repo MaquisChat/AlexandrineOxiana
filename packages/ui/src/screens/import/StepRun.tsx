@@ -17,13 +17,22 @@ export interface StepRunProps {
   projectId: string;
   batchId: string;
   onEnded(state: BatchState, error?: string): void;
+  /** Focus the heading once shown: the researcher arrived on this run from an address (D1, R145). */
+  focusOnArrival?: boolean;
 }
 
 /** Reconnects after the event stream ends before the batch does (then a message and a manual check). */
 const RECONNECTS = 2;
 const RECONNECT_DELAY_MS = 300;
 
-export function StepRun({ client, api, projectId, batchId, onEnded }: StepRunProps) {
+export function StepRun({ client, api, projectId, batchId, onEnded, focusOnArrival = false }: StepRunProps) {
+  const heading = useRef<HTMLHeadingElement>(null);
+  /** Focus the heading once, when the researcher arrived on this run from an address (D1, R145). */
+  const arrival = useRef(focusOnArrival);
+  useEffect(() => {
+    if (arrival.current) heading.current?.focus();
+    arrival.current = false;
+  }, []);
   const [done, setDone] = useState(0);
   const [total, setTotal] = useState<number | undefined>(undefined);
   const [paused, setPaused] = useState(false);
@@ -122,7 +131,7 @@ export function StepRun({ client, api, projectId, batchId, onEnded }: StepRunPro
   };
 
   return (
-    <Section title="Run">
+    <Section title="Run" headingRef={heading}>
       <p>
         The import runs in the background and survives restarts; items are identified as they are imported. You can keep working.
       </p>
