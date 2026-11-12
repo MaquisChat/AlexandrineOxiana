@@ -5,7 +5,7 @@
  * `GET …/assets/:aid/content`) and routes/jobs.ts (`POST /jobs/retry`); the source record's
  * `fields` are the shared `FieldReview` (packages/shared/src/api/sources.ts).
  */
-import type { FieldReview, SourceRecordExtras, VerificationStatus } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type FieldReview, type SourceRecordExtras, type VerificationStatus } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 import type { SourceFile } from "./library";
 
@@ -64,7 +64,8 @@ export function verificationApi(client: ApiClient) {
     retryJobs: (pid: string, sid: string) => r<{ retrying: true }>("POST", "/jobs/retry", { body: { projectId: pid, sourceId: sid } }),
     /** A stored picture, read with the token and returned as a Blob for a blob: URL (R135 1). */
     picture: async (pid: string, sid: string, aid: string, opts: { signal?: AbortSignal } = {}): Promise<Blob> => {
-      const blob = await client.blob(`${src(pid, sid)}/assets/${seg(aid)}/content`, opts);
+      // The service refuses a picture larger than this too; the client stops reading past it (R135 1).
+      const blob = await client.bytes(`${src(pid, sid)}/assets/${seg(aid)}/content`, { maxBytes: PICTURE_MAX_BYTES, ...(opts.signal ? { signal: opts.signal } : {}) });
       if (!isShowablePicture(blob.type)) throw new ApiClientError(200, { code: "VALIDATION", message: "The library service did not send a picture." });
       return blob;
     },

@@ -1,3 +1,4 @@
+import { PICTURE_MAX_BYTES } from "@ao/shared";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { server, serviceError, testApi, testClient, TOKEN, url, useMockService } from "../test/service";
@@ -62,7 +63,7 @@ describe("verification API (Task 34d)", () => {
       }),
     );
     const blob = await verificationApi(testClient()).picture("p1", "s1", "a 1");
-    expect(typeof blob.arrayBuffer).toBe("function"); // a Blob (Node's in this test runner, the page's in a browser)
+    expect(blob).toBeInstanceOf(Blob); // read under the picture limit, so built in chunks with the page's own Blob
     expect(blob.type).toBe("image/jpeg");
     expect(blob.size).toBe(8);
     expect(auth).toBe(`Bearer ${TOKEN}`);
@@ -82,5 +83,26 @@ describe("verification API (Task 34d)", () => {
     await expect(verificationApi(testClient()).picture("p1", "s1", "a1")).rejects.toBeInstanceOf(ApiClientError);
     server.use(http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), () => new HttpResponse("<html></html>", { headers: { "content-type": "text/html" } })));
     await expect(verificationApi(testClient()).picture("p1", "s1", "a1")).rejects.toBeInstanceOf(ApiClientError);
+  });
+
+  it("a picture larger than the service's picture limit is refused while it is read (PAYLOAD_TOO_LARGE), never held whole", async () => {
+    // A body that does not say its length, one chunk past PICTURE_MAX_BYTES.
+    const chunk = new Uint8Array(4 * 1024 * 1024);
+    let sent = 0;
+    server.use(
+      http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), () => {
+        const body = new ReadableStream<Uint8Array>({
+          pull(c) {
+            if (sent > PICTURE_MAX_BYTES) return c.close();
+            sent += chunk.byteLength;
+            c.enqueue(chunk);
+          },
+        });
+        return new HttpResponse(body, { headers: { "content-type": "image/jpeg" } });
+      }),
+    );
+    const err = await verificationApi(testClient()).picture("p1", "s1", "a1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect((err as ApiClientError).code).toBe("PAYLOAD_TOO_LARGE");
   });
 });
