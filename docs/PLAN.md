@@ -469,7 +469,7 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | 7b7a3b4 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; the rebuild on open must honour the index's rebuild marker (R161) |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | in review | ed6a10f (worktree branch) | built; the end-to-end steps for D4, D5 and D8 run as normal tests; the rebuild on open honours the index's rebuild marker (R161) |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | fdbd601 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
 | 46c A pairing code's status | fix round 1 in re-review | 7a7f5e2 (worktree branch) | a code is `used` only once its pairing is written; M1–M6 fixed |
 | 47 Shared API types | not started | | |
