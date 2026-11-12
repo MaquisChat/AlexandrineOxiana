@@ -551,8 +551,8 @@ Update after every task; commit and push.
 | 68 Settings writers never write what they did not read (D16) | merged; one of its tests fails on GitHub (a test fault, skipped here as root) and is being fixed | c02679b (merge) | reviewed with probes over two fix rounds (R178, R181); D16 closed; GitHub's run 201 red until the test fix is pushed (R187) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
-| 69 Show that a captured item is no longer available (D17) | approved; verification with 50b running | d965f8a (worktree branch) | reviewed with probes over one fix round (R185, R186); on the Mac build's path |
-| 70 A read never mistakes a write in progress for tampering (D21) | in review | c17e6b7 (worktree branch) | a mismatch is confirmed in the write queue's turn before any warning; in the Mac build if merged in time |
+| 69 Show that a captured item is no longer available (D17) | approved; verification with 50b and 70 running | d965f8a (worktree branch) | reviewed with probes over one fix round (R185, R186); on the Mac build's path |
+| 70 A read never mistakes a write in progress for tampering (D21) | approved; verification with 50b and 69 running | c17e6b7 (worktree branch) | reviewed with probes (R188); four minors on the final review's list |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
