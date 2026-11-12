@@ -48,6 +48,10 @@ describe("About", () => {
     expect(text).toContain("2.4.63"); // the pinned version
     expect(text).toMatch(/source of citeproc-js is available/i);
     expect(text).toMatch(/no Modifications/);
+    // The notice itself first, as NOTICE.md quotes it.
+    expect(cite.querySelector("blockquote")?.textContent).toBe(
+      "Copyright (c) 2009-2019 Frank Bennett. citeproc-js, <https://github.com/juris-m/citeproc-js>, used under the Common Public Attribution License 1.0.",
+    );
     // The licence texts themselves, one keyboard step away.
     expect(within(cite).getByText("The CPAL-1.0 licence text")).toBeTruthy();
     expect(within(cite).getByText("The CC BY-SA 3.0 licence text")).toBeTruthy();

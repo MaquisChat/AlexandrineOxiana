@@ -102,6 +102,12 @@ const NOT_IN_THIS_BUILD = "This list is added by the desktop build of the app, f
 
 export function About({ notices = BUILT_NOTICES }: { notices?: BuiltNotices }) {
   const notice = fileNamed(CSL, "NOTICE.md");
+  // The notice NOTICE.md quotes for the About screen (its "> " lines), shown first.
+  const quoted = notice
+    ?.split(/\r?\n/)
+    .filter((l) => l.startsWith("> "))
+    .map((l) => l.slice(2))
+    .join(" ");
   const npm = notices.npm !== undefined ? parseNpmNotices(notices.npm) : undefined;
   const worker = notices.worker !== undefined ? parseWorker(notices.worker) : undefined;
   const fonts = Object.entries(FONTS).sort(([a], [b]) => a.localeCompare(b));
@@ -115,6 +121,7 @@ export function About({ notices = BUILT_NOTICES }: { notices?: BuiltNotices }) {
         <h2 id="ao-about-csl" className="ao-pane-title">
           Citation processor and styles
         </h2>
+        {quoted ? <UserText as="blockquote">{quoted}</UserText> : null}
         {notice !== undefined ? (
           <UserText as="div" className="ao-notice">
             {notice}
