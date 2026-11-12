@@ -24,6 +24,7 @@ export const PATHS = {
   missingFiles: "/missing-files",
   transcript: "/transcript",
   capture: "/capture",
+  about: "/about",
 } as const;
 
 /** Where the Bulk Import screens live (R113): the wizard and its review queue. */

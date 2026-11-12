@@ -10,7 +10,7 @@ import { ApiClientError } from "../api/client";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry } from "../api/library";
 import { UserText } from "../components/UserText";
 import { desktopShell } from "../desktopShell";
-import { navigate } from "../navigation";
+import { navigate, PATHS } from "../navigation";
 import "../components/library.css";
 
 export interface LibraryChooserProps {
@@ -154,10 +154,10 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
       </form>
       <p>
         <a
-          href="/about"
+          href={PATHS.about}
           onClick={(e) => {
             e.preventDefault();
-            navigate("/about");
+            navigate(PATHS.about);
           }}
         >
           About and third-party notices
