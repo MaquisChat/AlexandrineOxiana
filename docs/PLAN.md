@@ -465,7 +465,7 @@ Update after every task; commit and push.
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
-| 37c Desktop shell | in review | becdf08 (worktree branch) | built and launched on Linux under a virtual display (R155); one unexplained start-up time-out in six launches, for the reviewer |
+| 37c Desktop shell | fix round 1 | becdf08 (worktree branch) | spec met; 3 Important: the token could reach a look-alike local origin, drop positions on high-density screens, a second launch during a slow quit (R159) |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
