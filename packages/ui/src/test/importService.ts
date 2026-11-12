@@ -91,6 +91,14 @@ export interface ServiceSetup {
   governanceDelayMs?: number;
   /** Source ids whose first request fails (HTTP 500). */
   failSourcesOnce?: string[];
+  /** The Zotero key in the password store (Task 57): stored at the start, or no store at all. */
+  zoteroKey?: { stored?: boolean; noStore?: boolean };
+  /** What GET /import/zotero-data-folders answers (default none). */
+  zoteroFolders?: Array<{ path: string; from: "usual-place" | "zotero-setting" }>;
+  /** Picture bytes by asset id, for GET …/assets/:aid/content; anything else is 400. */
+  pictures?: Record<string, { type: string; bytes: Uint8Array }>;
+  /** Delay (ms) before each picture answer. */
+  pictureDelayMs?: number;
 }
 
 export const server = setupServer();
@@ -117,6 +125,8 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
   let inFlight = 0;
   let peak = 0;
   const failOnce = new Set(o.failSourcesOnce ?? []);
+  let keyStored = !!o.zoteroKey?.stored;
+  const noStore = () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "No secure key store is available on this computer, so the key was not saved." } }, { status: 503 });
 
   // Replaces the previous test's handlers (rather than resetting after each test), so a request a
   // component sends while a test is being torn down still finds a handler.
@@ -178,6 +188,35 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
     http.get(url("/projects/:id/tags"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/tags`);
       return HttpResponse.json({ tags: o.tags ?? [], workspaceTags: o.workspaceTags ?? [] });
+    }),
+    http.get(url("/secrets/zotero-api-key"), async ({ request }) => {
+      await rec(request, "/secrets/zotero-api-key");
+      return o.zoteroKey?.noStore ? noStore() : HttpResponse.json({ stored: keyStored });
+    }),
+    http.put(url("/secrets/zotero-api-key"), async ({ request }) => {
+      await rec(request, "/secrets/zotero-api-key");
+      await wait(20);
+      if (o.zoteroKey?.noStore) return noStore();
+      keyStored = true;
+      return HttpResponse.json({ stored: true });
+    }),
+    http.delete(url("/secrets/zotero-api-key"), async ({ request }) => {
+      await rec(request, "/secrets/zotero-api-key");
+      if (o.zoteroKey?.noStore) return noStore();
+      const removed = keyStored;
+      keyStored = false;
+      return HttpResponse.json({ removed });
+    }),
+    http.get(url("/import/zotero-data-folders"), async ({ request }) => {
+      await rec(request, "/import/zotero-data-folders");
+      return HttpResponse.json({ folders: o.zoteroFolders ?? [] });
+    }),
+    http.get(url("/projects/:id/sources/:sid/assets/:aid/content"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}/assets/${params.aid as string}/content`);
+      await wait(o.pictureDelayMs);
+      const p = o.pictures?.[params.aid as string];
+      if (!p) return HttpResponse.json({ error: { code: "VALIDATION", message: "This file is not a picture." } }, { status: 400 });
+      return new HttpResponse(p.bytes, { headers: { "Content-Type": p.type } });
     }),
     http.get(url("/projects/:id/sources"), async ({ request, params }) => {
       await rec(request, `/projects/${params.id as string}/sources`);

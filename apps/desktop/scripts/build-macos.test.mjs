@@ -369,13 +369,16 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     return lines.slice(start, end < 0 ? undefined : end).filter((l) => l.trim() && !/^\s*#/.test(l));
   };
 
-  it("starts only by hand or on a version tag, never on a branch push, a pull request or a schedule", () => {
+  it("starts only by hand, on a version tag, or on a branch push that changed the build-request file (R168); never on a pull request or a schedule", () => {
     const on = block("on").join("\n");
     assert.match(on, /^ {2}workflow_dispatch:/m);
-    assert.match(on, /^ {2}push:\n {4}tags:\n {6}- "v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+\*"$/m);
+    // The whole push trigger, exactly: version tags; and the named branches ONLY for the one path.
+    assert.match(on, /^ {2}push:\n {4}tags:\n {6}- "v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+\*"\n {4}branches:\n {6}- "claude\/\*\*"\n {6}- main\n {4}paths:\n {6}- apps\/desktop\/mac-build-request\.json$/m);
     const triggers = block("on").map((l) => /^ {2}([a-z_]+):/.exec(l)?.[1]).filter(Boolean);
     assert.deepEqual(triggers, ["workflow_dispatch", "push"]);
-    assert.doesNotMatch(on, /branches|paths/);
+    // A `branches` filter without the `paths` filter would run on every branch push: both or neither.
+    assert.equal(/^ {4}branches:/m.test(on), /^ {4}paths:/m.test(on));
+    assert.equal((on.match(/^ {6}- /gm) ?? []).length, 4, "one tag pattern, two branches, one path; nothing else");
   });
 
   it("reads only, builds on the two runners R133 names, and never overlaps", () => {
@@ -422,6 +425,61 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     assert.doesNotMatch(wf, /always\(\)/);
     assert.doesNotMatch(wf, /uses: actions\/cache@/, "restore and save are separate steps");
     assert.match(wf, /!apps\/desktop\/src-tauri\/target\/\*\/bundle/);
+  });
+
+  describe("the browser extension's download (Task 65)", () => {
+    /** The text of a job under `jobs:`, up to the next job or the end. */
+    const job = (name) => {
+      const lines = wf.split("\n");
+      const jobsAt = lines.indexOf("jobs:");
+      const start = lines.findIndex((l, i) => i > jobsAt && l === `  ${name}:`);
+      assert.ok(jobsAt >= 0 && start > jobsAt, `no job ${name}`);
+      const end = lines.findIndex((l, i) => i > start && (/^ {2}[A-Za-z]/.test(l) || /^[A-Za-z]/.test(l)));
+      return lines.slice(start, end < 0 ? undefined : end).join("\n");
+    };
+    const ext = () => job("extension");
+    const usesOf = (text) => text.split("\n").filter((l) => /^\s*-?\s*uses:/.test(l)).map((l) => l.trim().replace(/^- /, ""));
+
+    it("is its own job on Linux, after plan only, so it neither waits for nor depends on the Mac build", () => {
+      const e = ext();
+      assert.match(e, /^ {4}runs-on: ubuntu-latest$/m);
+      assert.match(e, /^ {4}needs: plan$/m);
+      assert.doesNotMatch(e, /^ {4}if:/m, "no condition on the Mac build's outcome");
+      assert.doesNotMatch(e, /matrix\.|needs\.build|strategy:/);
+      assert.match(e, /^ {4}timeout-minutes: \d+$/m);
+      // The Mac job does not wait for it either.
+      assert.match(job("build"), /^ {4}needs: plan$/m);
+    });
+
+    it("installs from the lock file, runs the packaging script and uploads the zip and its SHA-256 for 30 days", () => {
+      const e = ext();
+      assert.match(e, /run: pnpm install --frozen-lockfile$/m);
+      assert.match(e, /run: pnpm --filter @ao\/browser-extension run package$/m);
+      assert.ok(e.indexOf("run: pnpm install --frozen-lockfile") < e.indexOf("run package"));
+      assert.match(e, /node-version: "?22"?$/m);
+      const upload = e.slice(e.indexOf("uses: actions/upload-artifact"));
+      assert.ok(e.indexOf("uses: actions/upload-artifact") > e.indexOf("run package"), "uploads after packaging");
+      assert.match(upload, /^ {10}name: alexandrine-oxiana-browser-extension$/m);
+      assert.match(upload, /^ {12}apps\/browser-extension\/dist-zip\/\*\.zip$/m);
+      assert.match(upload, /^ {12}apps\/browser-extension\/dist-zip\/\*\.zip\.sha256$/m);
+      assert.match(upload, /^ {10}if-no-files-found: error$/m);
+      assert.match(upload, /^ {10}retention-days: 30$/m);
+      // Its size and checksum in the run's summary.
+      assert.match(e, /dist-zip\/\*\.zip[\s\S]*>> "\$GITHUB_STEP_SUMMARY"/);
+    });
+
+    it("uses no secret and only the actions, at the commit ids, that the Mac build already uses", () => {
+      const e = ext();
+      assert.doesNotMatch(e, /secrets\.|GITHUB_TOKEN|github\.token/);
+      // The workflow's `contents: read` stays the only permission: the job widens nothing.
+      assert.doesNotMatch(e, /^\s+permissions:/m);
+      assert.match(e, /persist-credentials: false/);
+      const rest = wf.replace(e, "");
+      const theirs = new Set(usesOf(rest));
+      const mine = usesOf(e);
+      assert.ok(mine.length >= 4, "checkout, pnpm, Node, upload");
+      for (const u of mine) assert.ok(theirs.has(u), `${u}: a new action or a new version`);
+    });
   });
 
   it("gives every step a time limit", () => {

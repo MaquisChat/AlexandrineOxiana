@@ -162,6 +162,88 @@ describe("createClient", () => {
   });
 });
 
+describe("bytes() — a file's content, with the token in the header (R135 1, Task 57)", () => {
+  it("GETs the path with the Authorization header and gives the body as a Blob of its type", async () => {
+    const f = fakeFetch(() => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const b = await api.bytes("/projects/p/sources/s/assets/a/content");
+    expect(b.type).toBe("image/png");
+    expect([...new Uint8Array(await b.arrayBuffer())]).toEqual([1, 2, 3]);
+    expect(f.calls[0]!.url).toBe(`${BASE}/projects/p/sources/s/assets/a/content`);
+    expect(f.calls[0]!.init.method).toBe("GET");
+    expect(header(f.calls[0]!.init, "authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(f.calls[0]!.url).not.toContain(TOKEN);
+  });
+
+  it("an error answer is the service's error; a bad path is refused before any request", async () => {
+    const f = fakeFetch(() => json({ error: { code: "PROJECT_LOCKED", message: "This project is locked." } }, 423));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x")).rejects.toMatchObject({ status: 423, code: "PROJECT_LOCKED", message: "This project is locked." });
+    expect(() => api.bytes(`/x?t=${TOKEN}`)).toThrow();
+    expect(() => api.bytes(`/x/${TOKEN}`)).toThrow();
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("an answer larger than the limit given is refused", async () => {
+    const f = fakeFetch(() => new Response(new Uint8Array(100), { status: 200, headers: { "content-type": "image/png", "content-length": "100" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
+
+  it("with no Content-Length, it stops reading once the limit is passed and gives up the rest (M11)", async () => {
+    // A body of 4-byte chunks that would go on for 40 000 bytes; nothing says how long it is.
+    let pulls = 0;
+    let cancelled = false;
+    const body = () =>
+      new ReadableStream<Uint8Array>({
+        pull(c) {
+          pulls++;
+          if (pulls > 10_000) c.close();
+          else c.enqueue(new Uint8Array([1, 2, 3, 4]));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+    const f = fakeFetch(() => new Response(body(), { status: 200, headers: { "content-type": "image/png" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    expect(pulls).toBeLessThan(10); // 3 chunks pass 10 bytes; the stream may pull a little ahead
+    expect(cancelled).toBe(true);
+  });
+
+  it("with no Content-Length, a body within the limit is given whole, of its type (M10 d)", async () => {
+    const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5]), new Uint8Array([6, 7, 8, 9, 10])];
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(ch);
+        c.close();
+      },
+    });
+    const f = fakeFetch(() => new Response(stream, { status: 200, headers: { "content-type": "font/woff2" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const b = await api.bytes("/x", { maxBytes: 10 });
+    expect(b.type).toBe("font/woff2");
+    // Read as the interface does where Blob.arrayBuffer is missing (this test DOM's Blob lacks it).
+    const read = await new Promise<ArrayBuffer>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result as ArrayBuffer);
+      r.onerror = () => reject(r.error);
+      r.readAsArrayBuffer(b);
+    });
+    expect([...new Uint8Array(read)]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // One byte more than the limit, sent in small pieces: refused.
+    const over = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of [...chunks, new Uint8Array([11])]) c.enqueue(ch);
+        c.close();
+      },
+    });
+    const g = fakeFetch(() => new Response(over, { status: 200, headers: { "content-type": "font/woff2" } }));
+    await expect(createClient(BASE, TOKEN, { fetch: g.fetch }).bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
+});
+
 describe("mediaUrl() — the address a media element loads (R135)", () => {
   const TICKET = "Ab3_-".repeat(8) + "xyz"; // 43 base64url characters
   const B64_TOKEN = "Q".repeat(40); // a token that could sit inside a ticket-shaped path

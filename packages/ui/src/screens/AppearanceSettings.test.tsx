@@ -3,8 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
-import type { ApiClient } from "../api/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiClientError, type ApiClient } from "../api/client";
 import { DEFAULT_APPEARANCE, type AppearanceSettings } from "../theme/appearance";
 import { AppearanceProvider } from "../theme/AppearanceProvider";
 import { ACCENT_DEBOUNCE_MS, AppearanceSettingsScreen } from "./AppearanceSettings";
@@ -207,5 +207,132 @@ describe("Appearance settings screen", () => {
     const { get } = setup();
     await waitFor(() => expect(get).toHaveBeenCalled());
     await act(async () => {});
+  });
+});
+
+describe("a typeface from the researcher's own file (R100, Task 57)", () => {
+  const ID = "0123456789abcdef0123456789abcdef";
+  const ID2 = "fedcba9876543210fedcba9876543210";
+  const BRILL = { id: ID, name: "Brill", format: "woff2", size: 4, addedAt: "2026-11-11T10:00:00.000Z" };
+
+  class FakeFontFace {
+    static made: FakeFontFace[] = [];
+    status = "unloaded";
+    constructor(
+      readonly family: string,
+      readonly source: ArrayBuffer | string,
+    ) {
+      FakeFontFace.made.push(this);
+    }
+    async load() {
+      if (typeof this.source === "string" || this.source.byteLength === 0) throw new Error("bad font");
+      this.status = "loaded";
+      return this;
+    }
+  }
+  const faces = new Set<FakeFontFace>();
+  beforeEach(() => {
+    FakeFontFace.made = [];
+    faces.clear();
+    vi.stubGlobal("FontFace", FakeFontFace);
+    Object.defineProperty(document, "fonts", { configurable: true, value: { add: (f: FakeFontFace) => faces.add(f), delete: (f: FakeFontFace) => faces.delete(f) } });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete (document as { fonts?: unknown }).fonts;
+  });
+
+  function setupFonts(initial: AppearanceSettings = DEFAULT_APPEARANCE, o: { fonts?: (typeof BRILL)[]; addFails?: string; badBytes?: boolean } = {}) {
+    let cur = structuredClone(initial);
+    let list = [...(o.fonts ?? [])];
+    const put = vi.fn(async (patch: Partial<AppearanceSettings>) => {
+      cur = { ...cur, ...patch, fonts: { ...cur.fonts, ...(patch.fonts ?? {}) } } as AppearanceSettings;
+      return structuredClone(cur);
+    });
+    const get = vi.fn(async () => structuredClone(cur));
+    const request = vi.fn(async (method: string, path: string, opts?: { body?: { path?: string; name?: string } }) => {
+      if (method === "GET" && path === "/settings/fonts") return { fonts: list };
+      if (method === "POST" && path === "/settings/fonts") {
+        await new Promise((r) => setTimeout(r, 20));
+        if (o.addFails) throw new ApiClientError(400, { code: "VALIDATION", message: o.addFails });
+        const f = { ...BRILL, id: ID2, name: opts?.body?.name ?? "Junicode" };
+        list = [...list.filter((x) => x.id !== f.id), f];
+        return f;
+      }
+      if (method === "DELETE" && path.startsWith("/settings/fonts/")) {
+        list = list.filter((x) => `/settings/fonts/${x.id}` !== path);
+        return { removed: true };
+      }
+      throw new Error(`unexpected ${method} ${path}`);
+    });
+    const bytes = vi.fn(async (_path: string) => new Blob([o.badBytes ? new Uint8Array(0) : new Uint8Array([0x77, 0x4f, 0x46, 0x32])], { type: "font/woff2" }));
+    const client = { appearance: { get, put }, request, bytes } as unknown as ApiClient;
+    const utils = render(
+      <AppearanceProvider client={client} initial={initial}>
+        <AppearanceSettingsScreen />
+      </AppearanceProvider>,
+    );
+    return { ...utils, put, get, request, bytes };
+  }
+
+  const withReading = (file: string, family = "Brill"): AppearanceSettings => ({ ...DEFAULT_APPEARANCE, fonts: { ...DEFAULT_APPEARANCE.fonts, reading: { family, source: "user-file", file, generic: "serif" } } });
+
+  it("adds a font file through the service, offers it for each typeface, and loads it from the service's bytes", async () => {
+    const { request, put, bytes } = setupFonts();
+    const user = userEvent.setup();
+    const region = await screen.findByRole("region", { name: "Your own font files" });
+    await user.type(within(region).getByRole("textbox", { name: "Font file path" }), "/Users/me/Fonts/Junicode.woff2");
+    await user.type(within(region).getByRole("textbox", { name: "Name to use (optional)" }), "Junicode");
+    await user.dblClick(within(region).getByRole("button", { name: "Add font file" }));
+    expect(await within(region).findByText("Junicode")).toBeTruthy();
+    expect(request.mock.calls.filter((c) => c[0] === "POST")).toEqual([["POST", "/settings/fonts", { body: { path: "/Users/me/Fonts/Junicode.woff2", name: "Junicode" } }]]);
+    expect((within(region).getByRole("textbox", { name: "Font file path" }) as HTMLInputElement).value).toBe("");
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Reading view typeface" }), "From file: Junicode");
+    expect(put).toHaveBeenLastCalledWith({ fonts: { reading: { family: "Junicode", source: "user-file", file: ID2, generic: "serif" } } });
+    await waitFor(() => expect([...faces].map((f) => f.family)).toEqual(["Junicode"]));
+    expect(bytes).toHaveBeenCalledWith(`/settings/fonts/${ID2}`, expect.objectContaining({ maxBytes: expect.any(Number) }));
+    expect(typeof FakeFontFace.made[0]!.source).not.toBe("string"); // bytes, never an address
+    expect((FakeFontFace.made[0]!.source as ArrayBuffer).byteLength).toBe(4);
+    expect(prop("--font-reading").startsWith("'Junicode', serif")).toBe(true); // always quoted (M5)
+  });
+
+  it("a saved choice is loaded when the app starts, and released when another typeface is chosen", async () => {
+    setupFonts(withReading(ID), { fonts: [BRILL] });
+    await waitFor(() => expect([...faces].map((f) => f.family)).toEqual(["Brill"]));
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Reading view typeface" }), "Sorts Mill Goudy (bundled)");
+    await waitFor(() => expect(faces.size).toBe(0));
+  });
+
+  it("a font that cannot be loaded says so, and the fallback typefaces are used", async () => {
+    setupFonts(withReading(ID), { fonts: [BRILL], badBytes: true });
+    expect(await screen.findByText(/“Brill” could not be loaded/)).toBeTruthy();
+    expect(faces.size).toBe(0);
+  });
+
+  it("refuses a relative path before sending it, and shows the service's refusal in plain words", async () => {
+    const { request } = setupFonts(DEFAULT_APPEARANCE, { addFails: "That is not a font file this app can use." });
+    const user = userEvent.setup();
+    const region = await screen.findByRole("region", { name: "Your own font files" });
+    await user.type(within(region).getByRole("textbox", { name: "Font file path" }), "fonts/x.ttf");
+    await user.click(within(region).getByRole("button", { name: "Add font file" }));
+    expect(within(region).getByRole("alert").textContent).toMatch(/full path/);
+    expect(request.mock.calls.filter((c) => c[0] === "POST")).toEqual([]);
+    await user.clear(within(region).getByRole("textbox", { name: "Font file path" }));
+    await user.type(within(region).getByRole("textbox", { name: "Font file path" }), "/tmp/x.pdf");
+    await user.click(within(region).getByRole("button", { name: "Add font file" }));
+    expect((await within(region).findByRole("alert")).textContent).toMatch(/not a font file this app can use/);
+  });
+
+  it("removes a font file", async () => {
+    const { request } = setupFonts(DEFAULT_APPEARANCE, { fonts: [BRILL] });
+    const user = userEvent.setup();
+    const region = await screen.findByRole("region", { name: "Your own font files" });
+    await within(region).findByText("Brill");
+    await user.click(within(region).getByRole("button", { name: "Remove Brill" }));
+    await waitFor(() => expect(within(region).queryByText("Brill")).toBeNull());
+    expect(request).toHaveBeenCalledWith("DELETE", `/settings/fonts/${ID}`);
+    expect(screen.queryByRole("option", { name: "From file: Brill" })).toBeNull();
   });
 });

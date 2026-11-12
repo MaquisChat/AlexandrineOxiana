@@ -102,6 +102,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const limit = intParam(q.limit, "limit", 1, 500, 50);
     const offset = intParam(q.offset, "offset", 0, 10_000_000, 0);
     if (q.type !== undefined && !SourceType.safeParse(q.type).success) throw badRequest(`"${q.type}" is not a source type.`);
+    // While the index is rebuilt (or cannot be written), the list says so (D8).
+    const index = s.indexStatus ? { index: s.indexStatus } : {};
     if (s.index) {
       const found = search(s.index.db, {
         projectId,
@@ -115,7 +117,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       const waiting = waitingForReview(s.index.db, projectId, found.items.map((i) => i.id));
       // A locked project's queue cannot be read (review/pending.jsonl is encrypted): its rows claim
       // nothing (false, as the index stores for locked rows); they show "Locked" instead.
-      return { ...found, items: found.items.map((i) => ({ ...i, needsReview: !i.locked && waiting.has(i.id) })) };
+      return { ...found, items: found.items.map((i) => ({ ...i, needsReview: !i.locked && waiting.has(i.id) })), ...index };
     }
     // A read-only library has no index we may write: list from the files (titles only when unlocked).
     // Its review queue is not read here, so no row claims needsReview (Task 46b M4).
@@ -132,7 +134,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false });
     }
     // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
-    return { total: items.length, items: items.slice(offset, offset + limit), limited: true };
+    return { total: items.length, items: items.slice(offset, offset + limit), limited: true, ...index };
   });
 
   const record = (sf: SourceFile) => sourceRecord(sf, state.roots);
@@ -169,6 +171,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   });
 
   // Researcher-set value of one field, recorded as their own evidence (→ user-confirmed when it agrees).
+  // `field` is a top-level field or one identifier under the verification report's key ("/identifiers/doi", R149);
+  // anything else is refused by the library (InvalidInputError → 400 VALIDATION).
   app.patch("/projects/:id/sources/:sid/fields", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);

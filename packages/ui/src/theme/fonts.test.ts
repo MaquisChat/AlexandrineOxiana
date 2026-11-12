@@ -66,6 +66,13 @@ describe("font stacks", () => {
     expect(fontStack({ family: "My Thesis Font", source: "user-file", file: "fonts/thesis.otf", generic: "serif" })).toBe(`'My Thesis Font', serif, ${FALLBACKS}`);
   });
 
+  it("a researcher's file family is always quoted, so a name like a keyword or a generic family stays the file's face (M5)", () => {
+    for (const family of ["Brill", "serif", "inherit", "monospace", "system-ui", "Junicode-Regular"]) {
+      const s = fontStack({ family, source: "user-file", file: "0123456789abcdef0123456789abcdef", generic: "serif" });
+      expect(s, family).toBe(`'${family}', serif, ${FALLBACKS}`);
+    }
+  });
+
   it("refuses family names that could escape the font-family value, including control characters", () => {
     for (const bad of ["x; color: red", "a{b}", "<script>", "", "a\\b", "Times\nNew", "x\u0000y", "x\u007fy"]) expect(() => fontStack({ family: bad, source: "system" }), JSON.stringify(bad)).toThrow(/font name/);
     for (const bad of ["Times\nNew", "x\u0000y"]) expect(isUsableFamily(bad)).toBe(false);

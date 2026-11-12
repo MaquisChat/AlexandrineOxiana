@@ -1,0 +1,139 @@
+/* Verification badges, the evidence popover, the source's pictures and its background work (Task 34d). Tokens only. */
+
+.ao-verify-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.ao-verify {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 0.75rem;
+  padding: 0 var(--space-1);
+  margin-inline-start: var(--space-1);
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--chip);
+  color: var(--ink-2);
+}
+
+.ao-verify__glyph {
+  font-weight: 700;
+  min-width: 1ch;
+  text-align: center;
+}
+
+/* Each status differs in outline as well as colour (never colour alone). */
+.ao-verify--verified {
+  background: var(--ok-soft);
+  color: var(--ok-ink);
+  border-color: var(--ok-line);
+}
+
+.ao-verify--single-source {
+  border-style: dashed;
+}
+
+.ao-verify--unverified {
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  border-color: var(--warn-line);
+  border-style: dotted;
+}
+
+.ao-verify--conflict {
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  border-color: var(--deny);
+  border-width: 2px;
+}
+
+.ao-verify--user-confirmed {
+  background: var(--accent-soft);
+  color: var(--accent-soft-ink);
+  border-color: var(--accent);
+  border-style: double;
+  border-width: 3px;
+}
+
+.ao-verify--none {
+  color: var(--muted);
+}
+
+/*
+ * The evidence dialog uses the shared dialog shell (ReasonDialog.tsx), whose classes are styled in
+ * GovernanceScreens.css; the same rules are repeated here so the dialog looks the same on the
+ * library screen, which does not load that file.
+ */
+.ao-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--backdrop);
+}
+
+.ao-dialog {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: var(--space-3) var(--space-4);
+  max-width: 34rem;
+  width: calc(100% - 2rem);
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+}
+
+.ao-evidence__title {
+  margin: 0 0 var(--space-1);
+  font-size: 1.2rem;
+}
+
+.ao-evidence__item {
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ao-evidence__quote {
+  margin: var(--space-1) 0 0;
+  padding-inline-start: var(--space-2);
+  border-inline-start: 3px solid var(--line-strong);
+  color: var(--ink-2);
+}
+
+.ao-evidence__choices {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin: var(--space-2) 0;
+  padding: var(--space-1) var(--space-2);
+}
+
+.ao-evidence__choice {
+  display: block;
+  padding: var(--space-1) 0;
+}
+
+.ao-pictures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.ao-picture {
+  margin: 0;
+}
+
+.ao-picture img {
+  display: block;
+  max-width: 16rem;
+  max-height: 16rem;
+  border: 1px solid var(--line);
+}
+
+.ao-picture figcaption {
+  font-size: 0.8rem;
+  color: var(--ink-2);
+}

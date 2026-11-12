@@ -1,9 +1,11 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { ReviewItem } from "../../api/import";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ImportApi, ReviewItem, SourceFile } from "../../api/import";
 import { http, HttpResponse } from "msw";
 import { BASE as SERVICE, mockService, PSEUDONYMISING_GOVERNANCE, server, type ServiceSetup, B1, P1 } from "../../test/importService";
+import { renderToStaticMarkup } from "react-dom/server";
+import { FilePreview } from "./FilePreview";
 import { ReviewQueue } from "./ReviewQueue";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -374,5 +376,110 @@ describe("Review queue", () => {
     screen.getByRole("button", { name: "Show Second paper" }).focus();
     await user.keyboard("{Enter}");
     await within(screen.getByRole("region", { name: "Imported record" })).findByText("Second paper");
+  });
+});
+
+describe("Review queue: the file under review (Task 57, R135)", () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const pictureSource = (n: number, title: string, assets: unknown[]) => ({ ...source(n, title), assets });
+  let made: string[];
+  let revoked: string[];
+  beforeEach(() => {
+    made = [];
+    revoked = [];
+    let k = 0;
+    URL.createObjectURL = vi.fn((b: Blob) => {
+      expect(b.type).toBe("image/png");
+      const u = `blob:http://localhost/p${++k}`;
+      made.push(u);
+      return u;
+    }) as typeof URL.createObjectURL;
+    URL.revokeObjectURL = vi.fn((u: string) => void revoked.push(u)) as typeof URL.revokeObjectURL;
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  const withPictures = (o: Partial<ServiceSetup> = {}): ServiceSetup => ({
+    ...BASE,
+    sources: {
+      s1: pictureSource(1, "Market photo", [{ id: "a1", role: "original", kind: "image", mime: "image/png", path: "Sources/s1/photo-1.png", bytes: 8 }]),
+      s2: pictureSource(2, "Second paper", [{ id: "a2", role: "original", kind: "pdf", mime: "application/pdf", path: "Sources/s2/paper-2.pdf", bytes: 900 }]),
+      s3: pictureSource(3, "Third photo", [
+        { id: "a3", role: "original", kind: "image", mime: "image/heic", path: "Sources/s3/IMG_3.heic", bytes: 900 },
+        { id: "a3p", role: "derived", kind: "proxy", mime: "image/png", path: "Sources/s3/IMG_3.proxy.png", bytes: 8 },
+      ]),
+    },
+    pictures: { a1: { type: "image/png", bytes: PNG }, a3p: { type: "image/png", bytes: PNG } },
+    ...o,
+  });
+
+  it("shows a picture through a blob: address, fetched with the token in the header", async () => {
+    const { m } = setup(withPictures());
+    const preview = await screen.findByRole("region", { name: "File preview" });
+    const img = (await within(preview).findByRole("img", { name: "Preview of photo-1.png" })) as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe(made[0]);
+    expect(img.getAttribute("src")!.startsWith("blob:")).toBe(true);
+    expect(m.calls.filter((c) => c.path.endsWith("/content")).map((c) => c.path)).toEqual([`/projects/${P1}/sources/s1/assets/a1/content`]);
+  });
+
+  it("a picture that cannot be shown as it is uses its viewing copy; a PDF says plainly there is no preview", async () => {
+    const { m, user } = setup(withPictures());
+    await within(await screen.findByRole("region", { name: "File preview" })).findByRole("img");
+    await user.click(screen.getByRole("button", { name: "Show Second paper" }));
+    const preview = await screen.findByRole("region", { name: "File preview" });
+    expect(await within(preview).findByText(/No preview of this file can be shown here/)).toBeTruthy();
+    expect(within(preview).queryByRole("img")).toBeNull();
+    expect(revoked).toEqual([made[0]]); // the earlier picture's address is released
+    await user.click(screen.getByRole("button", { name: "Show Third photo" }));
+    expect(await within(screen.getByRole("region", { name: "File preview" })).findByRole("img", { name: "Preview of IMG_3.proxy.png" })).toBeTruthy();
+    expect(m.calls.filter((c) => c.path.endsWith("/content")).map((c) => c.path.split("/")[6])).toEqual(["a1", "a3p"]);
+  });
+
+  it("an answer that arrives after another item was chosen is dropped, and nothing outlives the screen", async () => {
+    // The first picture answers only once the test lets it, after another item was chosen.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    let first = true;
+    const { user } = setup(
+      withPictures({
+        extra: [
+          http.get(`${SERVICE}/projects/:id/sources/:sid/assets/:aid/content`, async () => {
+            if (first) {
+              first = false;
+              await gate;
+            }
+            return new HttpResponse(PNG, { headers: { "Content-Type": "image/png" } });
+          }),
+        ],
+      }),
+    );
+    await screen.findByRole("region", { name: "File preview" });
+    await waitFor(() => expect(first).toBe(false));
+    await user.click(screen.getByRole("button", { name: "Show Second paper" }));
+    await within(screen.getByRole("region", { name: "File preview" })).findByText(/No preview of this file can be shown here/);
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("img", { name: /Preview of/ })).toBeNull();
+    expect(made).toEqual([]); // the late answer never became an address
+    await user.click(screen.getByRole("button", { name: "Show Market photo" }));
+    await screen.findByRole("img", { name: "Preview of photo-1.png" });
+    cleanup();
+    expect(revoked).toEqual(made);
+  });
+
+  it("the first render of an item with a picture says it is loading, never \"No preview\" (M9)", () => {
+    // Rendered once, with no effect run: what the browser paints first.
+    const api = { picture: () => new Promise<Blob>(() => {}) } as unknown as ImportApi;
+    const photo = pictureSource(1, "Market photo", [{ id: "a1", role: "original", kind: "image", mime: "image/png", path: "Sources/s1/photo-1.png", bytes: 8 }]) as unknown as SourceFile;
+    const first = renderToStaticMarkup(<FilePreview api={api} projectId={P1} source={photo} />);
+    expect(first).toContain("Loading the picture");
+    expect(first).not.toContain("No preview");
+    const paper = pictureSource(2, "Second paper", [{ id: "a2", role: "original", kind: "pdf", mime: "application/pdf", path: "Sources/s2/paper-2.pdf", bytes: 900 }]) as unknown as SourceFile;
+    expect(renderToStaticMarkup(<FilePreview api={api} projectId={P1} source={paper} />)).toContain("No preview of this file can be shown here");
+  });
+
+  it("a picture that cannot be read says so in plain words", async () => {
+    setup(withPictures({ pictures: {} }));
+    const preview = await screen.findByRole("region", { name: "File preview" });
+    expect(await within(preview).findByText(/The picture could not be shown/)).toBeTruthy();
   });
 });

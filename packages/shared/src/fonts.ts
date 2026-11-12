@@ -78,3 +78,25 @@ export function inferGenericFamily(family: string): GenericFamily | undefined {
   for (const n of names) if (KNOWN_GENERIC[n]) return KNOWN_GENERIC[n];
   return undefined;
 }
+
+/**
+ * Names a typeface from the researcher's own file cannot take (Task 57, R100): a CSS-wide keyword
+ * would make the font-family value invalid, a generic family would resolve to the browser's own face
+ * instead of the file, and a bundled face's name would replace that face across the whole app. The
+ * service refuses them; the interface also quotes a file's family in the stack.
+ */
+export const CSS_WIDE_KEYWORDS = ["inherit", "initial", "unset", "revert", "revert-layer", "default"] as const;
+export const GENERIC_FONT_KEYWORDS = ["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded", "emoji", "math", "fangsong"] as const;
+/** The faces the interface ships (public/fonts, declared in theme/fonts.css). */
+export const BUNDLED_FONT_FAMILIES = ["Sorts Mill Goudy", "Atkinson Hyperlegible", "OpenDyslexic"] as const;
+
+export type ReservedFontName = "css-keyword" | "generic-family" | "bundled-face";
+
+/** Why a name cannot be a file's family name (compared case-insensitively, trimmed), or null when it can. */
+export function reservedFontName(name: string): ReservedFontName | null {
+  const n = name.trim().toLowerCase();
+  if ((CSS_WIDE_KEYWORDS as readonly string[]).includes(n)) return "css-keyword";
+  if ((GENERIC_FONT_KEYWORDS as readonly string[]).includes(n)) return "generic-family";
+  if (BUNDLED_FONT_FAMILIES.some((f) => f.toLowerCase() === n)) return "bundled-face";
+  return null;
+}

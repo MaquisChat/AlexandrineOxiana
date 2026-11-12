@@ -6,16 +6,23 @@ A local-first research workbench for social scientists: capture, transcription, 
 
 Design: `docs/superpowers/specs/2026-11-09-research-workbench-design.md`. Decisions: `docs/adr/`.
 
-## What you can use today
+## For researchers: trying the Mac app
 
-The command-line tool: run `pnpm ao --help` (see `apps/cli/README.md`). The desktop app is not built yet (`apps/desktop` is planned), and the interface in `packages/ui` cannot yet be started together with the service.
+Alexandrine Oxiana is a desktop app that keeps your sources, notes and the rules that govern them (ethics, data protection) in an ordinary folder on your own computer. A pre-release Mac build, for Apple Silicon Macs only (macOS 15 or later), is made by the **Desktop (macOS)** workflow on GitHub: open the repository's **Actions** tab, then **Desktop (macOS)**, then the newest run with a green tick, and download `alexandrine-oxiana-macos-apple-silicon` from **Artifacts**. The build is unsigned, so macOS asks you to allow it once.
+
+- Installing and opening it: `docs/first-run.md`.
+- Testing it by hand: `docs/owner-checklist.md`.
+
+## For developers: what you can use today
+
+The command-line tool: run `pnpm ao --help` (see `apps/cli/README.md`). The desktop app is built by `apps/desktop` (see its `README.md`). The interface (`packages/ui`) and the service (`apps/library-service`) each have a short README of their own.
 
 ## Layout
 
 - `packages/core`, `packages/library`, `packages/shared`, `packages/ui` - shared TypeScript packages (domain model, library engine, small shared rules, user interface)
 - `apps/library-service`, `apps/cli`, `apps/browser-extension` - local service, command-line tool and browser extension
 - `services/media-worker` - Python media worker (transcription, downloads, proxies, OCR)
-- `apps/desktop` - the desktop app: planned, not built yet
+- `apps/desktop` - the desktop app (a Tauri shell around the interface, the service and the media worker)
 - `scripts/` - test report and helpers
 
 ## Requirements

@@ -11,10 +11,11 @@ import { REVIEW_FILE, parseReviewFile, reviewRow, type ReviewItemRow } from "../
 import type { Manifest } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, type Stamps } from "./changes.js";
 import {
-  INDEX_FILE, checkpointTruncate, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta, upsertReviewItem,
-  type IndexDb, type IndexHandle,
+  INDEX_FILE, IndexHandle, checkpointTruncate, deleteMeta, getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, openIndexAt, setMeta, upsertReviewItem,
+  type IndexDb,
 } from "./db.js";
 import { readExtractedText, readSource } from "./load.js";
+import { JOBS_FILE, markLegacyJobs, readJobJournal, upgradeLegacyJobs, upsertJobRow, type JobRecord } from "../job-journal.js";
 import { indexUnlockedProject } from "./sink.js";
 
 export interface RebuildResult {
@@ -31,17 +32,42 @@ export interface RebuildOptions {
   afterClose?: () => void | Promise<void>;
   /** Test seam: replaces the per-project in-memory reload. */
   reloadProject?: typeof indexUnlockedProject;
+  /** Stops the rebuild between sources (e.g. the library is closing); the old database stays in place. */
+  signal?: AbortSignal;
+  /** Test seam (a crash point): runs once the new index is built, just before its mark is cleared. */
+  beforeComplete?: () => void | Promise<void>;
 }
 
 /**
- * Tables that later tasks fill from files of their own (review items, import batches, jobs). Until
- * those files exist the index is their only home, so a rebuild copies their rows over (ADR 0007).
- * Review items now also live in `review/pending.jsonl` (R31): rows read from those files replace
- * carried ones; rows of locked encrypted projects are carried as they were.
+ * Review items live in `review/pending.jsonl` (R31): rows read from those files replace the old
+ * database's rows, which are copied over so that rows of locked encrypted projects (whose files
+ * cannot be read) stay as they were. Jobs are never copied: they are read from each project's job
+ * journal (`jobs/journal.jsonl`). The one exception is the upgrade of a database written before
+ * the journal existed: its job rows of locked encrypted projects, not yet written into their
+ * journals (`upgradeLegacyJobs`), are kept until the project is unlocked.
  */
-const CARRIED_TABLES = ["review_items", "import_batches", "jobs"] as const;
 
 const REBUILD_PREFIX = `${INDEX_FILE}.rebuild-`;
+
+/**
+ * The lasting "rebuild needed" mark (meta key, R161 a). Its value says why:
+ * - "annotations": migration 0002 left an older index without annotation text;
+ * - "missing" / "unreadable": library.sqlite was missing or could not be opened, and a new, empty
+ *   one was started; until a rebuild completes it holds only what was written since (half-built);
+ * - "stale" / "forced": a rebuild was started on an index that did not match the files, or was asked for;
+ * - "rebuilding": only in a new index while it is being built.
+ * Only a completed rebuild clears it; while it is set the index counts as stale.
+ */
+const NEEDS_REBUILD = "needsRebuild";
+
+/** Marks that mean the index holds only part of the library (it was missing or unreadable): never shown as its content. */
+const PARTIAL_MARKS = new Set(["missing", "unreadable", "rebuilding"]);
+
+/** True when the index holds only part of the library: it was started empty and no rebuild has completed since (C1). */
+export function indexIsPartial(db: IndexDb): boolean {
+  const mark = getMeta(db, NEEDS_REBUILD);
+  return mark !== undefined && PARTIAL_MARKS.has(mark);
+}
 
 async function rmIndexFiles(path: string): Promise<void> {
   for (const suffix of ["", "-wal", "-shm", "-journal"]) await fsp.rm(path + suffix, { force: true });
@@ -72,14 +98,36 @@ export async function rebuildIndex(
   const tmp = join(root, `${REBUILD_PREFIX}${newId()}`);
   let nextDb: IndexDb | undefined;
   try {
-    const carried = readCarried(handle.isOpen ? handle.db : undefined);
+    const old = handle.isOpen ? handle.db : undefined;
+    // Job rows from before the journal are written into the journals first (R31 upgrade).
+    const legacy = old ? await upgradeLegacyJobs(old, root, keyRing) : undefined;
+    const carried = readCarried(old);
     nextDb = openIndexAt(tmp);
-    const result = await populate(nextDb, root, keyRing, carried, onProgress);
+    // The new index is marked from its first write (R161 a, Task 46a C1); clearing the mark is the
+    // last change made to it, so only a completed build can ever be taken for the library's content.
+    setMeta(nextDb, NEEDS_REBUILD, "rebuilding");
+    const result = await populate(nextDb, root, keyRing, carried, onProgress, opts.signal);
+    if (legacy) {
+      result.errors.push(...legacy.errors);
+      if (legacy.waiting.length) {
+        for (const r of legacy.waiting) {
+          nextDb.prepare("INSERT OR REPLACE INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+            r.id, r.project_id, r.kind, r.status, r.payload_json, r.created_at,
+          );
+        }
+        markLegacyJobs(nextDb);
+      }
+    }
+    opts.signal?.throwIfAborted();
+    await opts.beforeComplete?.();
+    opts.signal?.throwIfAborted();
+    deleteMeta(nextDb, NEEDS_REBUILD);
     checkpointTruncate(nextDb);
     nextDb.pragma("journal_mode = DELETE"); // one self-contained file
     nextDb.close();
     nextDb = undefined;
     await opts.beforeRename?.();
+    opts.signal?.throwIfAborted();
     if (handle.isOpen) checkpointTruncate(handle.db); // failure here aborts with the old DB intact
     handle.close();
     await opts.afterClose?.();
@@ -142,15 +190,11 @@ async function reloadUnlocked(
 }
 
 function readCarried(old: IndexDb | undefined): Record<string, Array<Record<string, unknown>>> {
-  const out: Record<string, Array<Record<string, unknown>>> = {};
-  for (const t of CARRIED_TABLES) {
-    try {
-      out[t] = old ? (old.prepare(`SELECT * FROM ${t}`).all() as Array<Record<string, unknown>>) : [];
-    } catch {
-      out[t] = []; // unreadable old database: nothing to carry
-    }
+  try {
+    return { review_items: old ? (old.prepare("SELECT * FROM review_items").all() as Array<Record<string, unknown>>) : [] };
+  } catch {
+    return { review_items: [] }; // unreadable old database: nothing to carry
   }
-  return out;
 }
 
 async function populate(
@@ -159,6 +203,7 @@ async function populate(
   keyRing: KeyRing,
   carried: Record<string, Array<Record<string, unknown>>>,
   onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<RebuildResult> {
   const result: RebuildResult = { indexed: 0, lockedProjects: [], errors: [] };
   // Stamps first: a change made while we walk then shows up as stale rather than being missed.
@@ -166,6 +211,7 @@ async function populate(
 
   const jobs: Array<() => Promise<void>> = [];
   const reviewRows: ReviewItemRow[] = [];
+  const jobRecords: JobRecord[] = [];
   for (const e of await listProjectEntries(root)) {
     if (!e.data) {
       result.errors.push({ folder: e.rel, message: e.error ?? "unreadable project" });
@@ -205,6 +251,14 @@ async function populate(
     } catch (err) {
       result.errors.push({ folder: `${e.rel}/${REVIEW_FILE}`, message: err instanceof Error ? err.message : String(err) });
     }
+    // So is its job journal (R31): the jobs table is filled from it alone.
+    try {
+      const journal = await readJobJournal(root, e.rel, project.id, k);
+      jobRecords.push(...journal.records.values());
+      if (journal.unreadable.length) result.errors.push({ folder: `${e.rel}/${JOBS_FILE}`, message: `${journal.unreadable.length} unreadable line(s) skipped` });
+    } catch (err) {
+      result.errors.push({ folder: `${e.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
+    }
     // Plain projects are indexed fully here. An unlocked encrypted project gets manifest-level rows
     // only; its content is loaded into memory after the new file is in place (R30).
     const prot = k !== null;
@@ -237,6 +291,7 @@ async function populate(
   onProgress?.(0, total);
   let done = 0;
   for (const job of jobs) {
+    signal?.throwIfAborted();
     await job();
     onProgress?.(++done, total);
   }
@@ -248,6 +303,7 @@ async function populate(
   }
   // The files win over carried rows: they are the record (rows of locked projects stay as carried).
   for (const r of reviewRows) upsertReviewItem(db, r);
+  for (const r of jobRecords) upsertJobRow(db, r);
   setMeta(db, "projectStamps", JSON.stringify(stamps));
   setMeta(db, "lastChangeId", newestChangeId(stamps) ?? "");
   return result;
@@ -260,7 +316,7 @@ async function populate(
  * a migration's "rebuild needed" mark is set (R161 a): only a completed rebuild clears it.
  */
 export async function isIndexStale(root: string, db: IndexDb, keyRing: KeyRing): Promise<boolean> {
-  if (getMeta(db, "needsRebuild") !== undefined) return true;
+  if (getMeta(db, NEEDS_REBUILD) !== undefined) return true;
   const recorded = getMeta(db, "projectStamps");
   if (recorded === undefined) return true;
   const current = await computeStamps(root, keyRing);
@@ -272,4 +328,127 @@ function sameStamps(a: Stamps, b: Stamps): boolean {
   const kb = Object.keys(b).sort();
   if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
   return ka.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+}
+
+/**
+ * Why a library's index must be rebuilt as soon as it is opened: library.sqlite was missing or
+ * unreadable (a new one was started), or it carries the "rebuild needed" mark (an earlier rebuild did
+ * not complete, or a migration left content out).
+ */
+export type IndexRebuildNeed = "missing" | "unreadable" | "marked";
+
+export interface CheckedIndex {
+  handle: IndexHandle;
+  /** Rebuild at once, whatever the staleness check would say; undefined when only that check decides. */
+  needsRebuild: IndexRebuildNeed | undefined;
+  /** The index holds only part of the library (see indexIsPartial): its list is not the library's content. */
+  partial: boolean;
+  /** Plain-language notes (never a path). */
+  warnings: string[];
+}
+
+/**
+ * Opens a read-write library's index for use (spec 4.3, 9: the files are the record, the index is
+ * rebuildable). A missing library.sqlite is started empty, and an unreadable one is kept aside as
+ * `library.sqlite.corrupt-<time>` and started again; either way the new one is marked at once
+ * ("missing" / "unreadable"), so that what is written into it before a rebuild completes is never
+ * taken for the library's content, even after a crash (C1). Staleness is checked separately
+ * (`rebuildIndexIfNeeded`), since it reads every project's change log.
+ */
+export async function openIndexChecked(
+  root: string,
+  now: () => Date = () => new Date(),
+  /** `newLibrary`: the library was just created, so its new, empty index is its whole content (not marked). */
+  opts: { newLibrary?: boolean } = {},
+): Promise<CheckedIndex> {
+  const dbPath = join(root, INDEX_FILE);
+  const warnings: string[] = [];
+  let started: "missing" | "unreadable" | undefined;
+  try {
+    await fsp.access(dbPath);
+  } catch {
+    started = "missing";
+    // A WAL without its database is no use to the new one.
+    for (const s of ["-wal", "-shm"]) await fsp.rm(dbPath + s, { force: true });
+  }
+  let handle: IndexHandle | undefined;
+  try {
+    handle = new IndexHandle(root);
+    // A file that is not a database can open lazily; read from it to be sure.
+    handle.db.prepare("SELECT COUNT(*) FROM meta").get();
+  } catch {
+    try {
+      handle?.close();
+    } catch {
+      // not open
+    }
+    const stamp = now().toISOString().replace(/[-:.]/g, "");
+    await renameWithRetry(dbPath, `${dbPath}.corrupt-${stamp}`);
+    for (const s of ["-wal", "-shm"]) await fsp.rm(dbPath + s, { force: true });
+    warnings.push("library.sqlite could not be opened; it was kept as library.sqlite.corrupt-<time> and rebuilt");
+    handle = new IndexHandle(root);
+    started = "unreadable";
+  }
+  if (started === "unreadable" || (started === "missing" && !opts.newLibrary)) setMeta(handle.db, NEEDS_REBUILD, started);
+  if (started === "missing" && opts.newLibrary) started = undefined;
+  const needsRebuild: IndexRebuildNeed | undefined = started ?? (getMeta(handle.db, NEEDS_REBUILD) !== undefined ? "marked" : undefined);
+  return { handle, needsRebuild, partial: indexIsPartial(handle.db), warnings };
+}
+
+export interface RebuildIfNeededOptions {
+  /** Rebuild whatever the index says (it was missing, unreadable or marked, or the researcher asked). */
+  force?: boolean;
+  onProgress?: (done: number, total: number) => void;
+  /**
+   * Called once the decision is made: `stale` false (current, nothing done) or true (a rebuild
+   * follows, and the index has been marked). Until then an index sink should hold its stamps (M6).
+   */
+  onChecked?: (stale: boolean) => void;
+  /** Called once, when a rebuild is about to start (not when the index is current). */
+  onStart?: () => void;
+  signal?: AbortSignal;
+  /** Test seams of each pass. */
+  rebuild?: Omit<RebuildOptions, "signal">;
+}
+
+/** Passes a rebuild may take when the library keeps changing under it. */
+const MAX_PASSES = 3;
+
+/**
+ * Rebuilds the index when `force` is set or it no longer matches the files (`isIndexStale`; a check
+ * that fails counts as stale). Before the first pass the live index is marked ("stale" or "forced",
+ * unless it already carries a mark, which is kept): a rebuild that does not complete (a close, a move,
+ * a failure, a crash) leaves the mark, so the next open rebuilds again, and writes made meanwhile
+ * cannot make the index look current (C1). A change written while a pass walked the files makes it
+ * stale again, so it is checked after each pass and rebuilt again (at most three passes). Returns
+ * the last pass's result, or undefined when the index was current. A read-only library cannot
+ * rebuild (ReadOnlyLibraryError). Locked encrypted projects are indexed from their manifests only;
+ * unlocking one completes it (R30).
+ */
+export async function rebuildIndexIfNeeded(
+  handle: IndexHandle,
+  keyRing: KeyRing,
+  library: Pick<Library, "mode" | "readOnlyReason">,
+  opts: RebuildIfNeededOptions = {},
+): Promise<RebuildResult | undefined> {
+  if (library.mode !== "read-write") throw new ReadOnlyLibraryError(library.readOnlyReason);
+  const stale = async () => isIndexStale(handle.root, handle.db, keyRing).catch(() => true);
+  const mark = (why: string) => {
+    if (getMeta(handle.db, NEEDS_REBUILD) === undefined) setMeta(handle.db, NEEDS_REBUILD, why);
+  };
+  if (!opts.force && !(await stale())) {
+    opts.onChecked?.(false);
+    return undefined;
+  }
+  mark(opts.force ? "forced" : "stale");
+  opts.onChecked?.(true);
+  opts.onStart?.();
+  let result: RebuildResult | undefined;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    opts.signal?.throwIfAborted();
+    if (pass > 0) mark("stale"); // changed during the last pass: marked again until this one completes
+    result = await rebuildIndex(handle, keyRing, library, opts.onProgress, { ...opts.rebuild, ...(opts.signal ? { signal: opts.signal } : {}) });
+    if (!(await stale())) break;
+  }
+  return result;
 }

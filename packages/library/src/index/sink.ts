@@ -8,6 +8,7 @@ import {
   getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource, withAnnotations } from "./load.js";
+import { JOBS_FILE, refreshJobRows, upgradeLegacyJobs } from "../job-journal.js";
 
 /**
  * (Re)loads an unlocked encrypted project's content into the in-memory TEMP schema: every source
@@ -53,7 +54,18 @@ export async function indexUnlockedProject(
       out.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
     }
   }
-  if (!still()) purgeProject(db, projectId); // locked during the load: nothing may stay in memory
+  if (!still()) {
+    purgeProject(db, projectId); // locked during the load: nothing may stay in memory
+    return out;
+  }
+  // Job rows (R31): legacy rows of this project are written into its journal now that its key is
+  // here, and the rows are made to match the journal (rows hold no payload: persistent is fine, R30).
+  try {
+    out.errors.push(...(await upgradeLegacyJobs(db, root, keyRing)).errors);
+    await refreshJobRows(() => db, root, entry.rel, projectId, k);
+  } catch (err) {
+    out.errors.push({ folder: `${entry.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
+  }
   return out;
 }
 
@@ -92,7 +104,18 @@ async function readProjectJson(root: string, rel: string): Promise<ProjectJson |
  * incrementally (only the affected project), and index encrypted projects' content in memory only.
  * Without `ctx`, a source of an unknown project is treated as protected (kept in memory only).
  */
-export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRing: KeyRing }): IndexSink {
+export function createIndexSink(
+  handle: IndexHandle,
+  ctx?: { root: string; keyRing: KeyRing },
+  opts: {
+    /**
+     * While true, writes do not record change stamps (M6): set from the open until the staleness
+     * check has run, so a write made before it cannot refresh a project's stamp and hide a change
+     * made outside the app. The written rows are indexed as usual.
+     */
+    holdStamps?: () => boolean;
+  } = {},
+): IndexSink {
   /** Looks up where a project lives and whether it is encrypted (project.json read once per call). */
   async function info(projectId: string) {
     const row = handle.db.prepare("SELECT folder, encrypted FROM projects WHERE id = ?").get(projectId) as
@@ -111,7 +134,7 @@ export function createIndexSink(handle: IndexHandle, ctx?: { root: string; keyRi
     return { prot: data.project.encryption.enabled, rel, data, k: projectKey(data, ctx.keyRing) };
   }
   async function stamp(i: { rel?: string | undefined; data?: ProjectJson | undefined }) {
-    if (!ctx) return;
+    if (!ctx || opts.holdStamps?.()) return;
     if (i.rel && i.data) await recordProjectStamp(handle.db, ctx.root, ctx.keyRing, i.rel, i.data);
     else await recordStamps(handle.db, ctx.root, ctx.keyRing);
   }

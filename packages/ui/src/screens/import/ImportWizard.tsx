@@ -203,8 +203,11 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
     setBusy(true);
     setError(null);
     const approveOutside = approveOutsideOf(approvals);
-    const o = { ...opts, ...(approveOutside ? { approveOutside } : {}) };
     const c = scanned.choice;
+    // "Copy into the library" copies linked files (Zotero's) unless kept as links by choice (R136),
+    // even ones the scan did not see (M2). A device import has no linked files.
+    const copyLinked = c.kind !== "device" && opts.fileHandling === "copy";
+    const o = { ...opts, ...(copyLinked ? { linkedFiles: opts.linkedFiles ?? "copy" } : {}), ...(approveOutside ? { approveOutside } : {}) };
     try {
       const r =
         c.kind === "device"
@@ -285,7 +288,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
       )}
       {step === "options" && (
         <>
-          <StepOptions options={opts} onOptions={setOptions} policy={effectivePolicy} />
+          <StepOptions options={opts} onOptions={setOptions} policy={effectivePolicy} linkedAttachments={scanned?.summary.linkedFiles ?? 0} />
           <ErrorNote error={error} />
           <div className="ao-import__actions">
             <button type="button" onClick={() => setStep("review")} disabled={busy}>

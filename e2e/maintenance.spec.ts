@@ -16,7 +16,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, blockedBy, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test, type AppHarness, type Defect, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { REPO_ROOT } from "./paths.js";
 
 interface Libraries {
@@ -24,7 +24,6 @@ interface Libraries {
   current?: { libraryId: string; name: string; mode: string };
 }
 
-const D5: Defect = { id: "D5", title: "on relaunch the app shows “Library not found” for the library that was open (spec 4.5)" };
 
 /** Every file under `dir`, relative to it ("/"-separated). */
 function filesUnder(dir: string): string[] {
@@ -157,15 +156,9 @@ test("scenario 6: move the library, verify, delete the old copy; rename it outsi
     await page.goto(`${APP_ORIGIN}/`);
   });
 
-  await blockedBy(D5);
-
-  await test.step("the chooser lists the library at its last place; opening it shows “Library not found”", async () => {
-    await page.goto(`${APP_ORIGIN}/`); // D5: start again from the screen the app shows on launch
-    await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
-    const entry = page.getByRole("list", { name: "Libraries" }).getByRole("listitem").filter({ has: page.getByRole("heading", { name: LIBRARY }) });
-    await expect(entry.getByText(dest, { exact: true })).toBeVisible();
-    await entry.getByRole("button", { name: `Open ${LIBRARY}` }).click();
+  await test.step("on relaunch the app shows “Library not found” for the library that was open (spec 4.5)", async () => {
     await expect(page.getByRole("heading", { level: 1, name: `Library not found: ${LIBRARY}` })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toHaveCount(0);
     await expect(page.getByText(`Last seen at ${dest}`)).toBeVisible();
     expect((await app.api<Libraries>("GET", "/libraries")).body.current).toBeUndefined();
   });
@@ -304,15 +297,4 @@ test.describe("scenario 8", () => {
 test("the app's fonts finish loading on the library chooser (no face left in error, document.fonts settles)", async ({ page }) => {
   await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toBeVisible();
   await fontsSettle(page);
-});
-
-// ---------- the steps scenarios 6 and 8 cannot do yet, each on its own (expected to fail while the defect reproduces) ----------
-
-test(`${D5.id}: ${D5.title}`, async ({ page, app }) => {
-  const { libraryPath } = await libraryWithProject(app, page, { library: LIBRARY, project: PROJECT });
-  await app.restart(async () => renameSync(libraryPath, `${libraryPath} (renamed)`));
-  await page.goto(`${APP_ORIGIN}/`);
-  await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
-  expectDefect(D5);
-  await expect(page.getByRole("heading", { level: 1, name: `Library not found: ${LIBRARY}` })).toBeVisible({ timeout: DEFECT_TIMEOUT });
 });
