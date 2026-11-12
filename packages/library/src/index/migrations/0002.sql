@@ -22,6 +22,7 @@ CREATE TABLE annotation_chunks (
   sha256 TEXT NOT NULL,
   PRIMARY KEY (source_id, seq)
 );
+CREATE INDEX annotation_chunks_rowid ON annotation_chunks (fts_rowid);
 ALTER TABLE sources ADD COLUMN annotations_partial INTEGER NOT NULL DEFAULT 0;
 
 -- An index that already holds sources was built without their annotations: it is marked as needing

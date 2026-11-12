@@ -69,49 +69,70 @@ export function search(db: IndexDb, q: SearchQuery): SearchResult {
   //   tier 0: the record alone holds every term (ranked by bm25 with column weights: title, then
   //           creators and container, then body text and bigrams);
   //   tier 1: the record and the annotations together ("found in an annotation"), after them,
-  //           ranked by the sum of each term's best rank.
+  //           ranked by the best rank of the rarest term.
+  // Speed (N5): every per-term look-up is limited to the searched project inside the query; the
+  // candidates are the intersection of the terms' id sets (rarest first, ids only, no ranks), and
+  // ranks are computed for the candidates alone, once, with the count in the same query.
   const recTerms = [...new Set(matchTerms(q.text!))];
   const annTerms = [...new Set(matchTerms(q.text!, "annotation_bigrams"))];
   if (recTerms.length > MAX_QUERY_TERMS) throw new InvalidInputError(`Use at most ${MAX_QUERY_TERMS} words in a search.`);
+  // A matching row's source is found through its rowid (sources.fts_rowid, annotation_chunks), never
+  // by reading the FTS row's own columns, which would read its text.
+  const scope = q.projectId ? " AND x.id IN (SELECT source_id FROM main.source_projects WHERE project_id = ?)" : "";
+  const scopeArgs = q.projectId ? [q.projectId] : [];
+  const FROM = {
+    rec: `source_text JOIN (SELECT id, fts_rowid FROM main.sources) x ON x.fts_rowid = source_text.rowid WHERE source_text MATCH ?`,
+    tRec: `t_source_text JOIN (SELECT id, fts_rowid FROM temp.t_sources) x ON x.fts_rowid = t_source_text.rowid WHERE t_source_text MATCH ?`,
+    ann: `annotation_text JOIN (SELECT source_id AS id, fts_rowid FROM main.annotation_chunks) x ON x.fts_rowid = annotation_text.rowid WHERE annotation_text MATCH ?`,
+    tAnn: `t_annotation_text JOIN (SELECT source_id AS id, fts_rowid FROM temp.t_annotation_chunks) x ON x.fts_rowid = t_annotation_text.rowid WHERE t_annotation_text MATCH ?`,
+  };
+  /** Ids of the sources a term matches in the record or the annotations (both stores), in scope. */
+  const idSet = `SELECT x.id FROM ${FROM.rec}${scope}
+      UNION SELECT x.id FROM ${FROM.tRec}${scope}
+      UNION SELECT x.id FROM ${FROM.ann}${scope}
+      UNION SELECT x.id FROM ${FROM.tAnn}${scope}`;
+  const idSetArgs = (i: number) => [recTerms[i]!, ...scopeArgs, recTerms[i]!, ...scopeArgs, annTerms[i]!, ...scopeArgs, annTerms[i]!, ...scopeArgs];
+  let order = recTerms.map((_, i) => i);
   if (recTerms.length > 1) {
+    // The bound counts the searched project's matches only (N6); it also orders the terms, rarest first.
     const cap = q.maxTermMatches ?? MAX_TERM_MATCHES;
-    recTerms.forEach((t, i) => {
-      if (termMatches(db, t, annTerms[i]!, cap) > cap) {
-        throw new InvalidInputError("This search matches too many sources to combine its words. Use a more specific word, or fewer words.");
-      }
-    });
+    const counts = recTerms.map((t, i) => termMatches(db, [[FROM.rec, t], [FROM.tRec, t], [FROM.ann, annTerms[i]!], [FROM.tAnn, annTerms[i]!]], cap, scope, scopeArgs));
+    if (counts.some((n) => n === 0)) return { total: 0, items: [], ...incomplete(db) }; // a term found nowhere: nothing to combine
+    if (counts.some((n) => n > cap)) {
+      throw new InvalidInputError("This search matches too many sources to combine its words. Use a more specific word, or fewer words.");
+    }
+    order = order.sort((a, b) => counts[a]! - counts[b]!);
   }
+  const rarest = order[0]!;
   const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  const perTerm = recTerms
-    .map(
-      (_, i) => `SELECT ${i} AS t, source_id, bm25(source_text, ${RECORD_WEIGHTS}) AS r FROM source_text WHERE source_text MATCH ?
-        UNION ALL SELECT ${i}, source_id, bm25(t_source_text, ${RECORD_WEIGHTS}) FROM t_source_text WHERE t_source_text MATCH ?
-        UNION ALL SELECT ${i}, source_id, bm25(annotation_text) FROM annotation_text WHERE annotation_text MATCH ?
-        UNION ALL SELECT ${i}, source_id, bm25(t_annotation_text) FROM t_annotation_text WHERE t_annotation_text MATCH ?`,
-    )
-    .join("\n        UNION ALL ");
-  const hits = `
-    WITH rec AS (
+  const sql = `
+    WITH cand AS MATERIALIZED (
+      ${order.map(() => `SELECT id AS source_id FROM (${idSet})`).join("\n      INTERSECT ")}
+    ), rec AS (
       SELECT source_id, MIN(rank) AS rank FROM (
-        SELECT source_id, bm25(source_text, ${RECORD_WEIGHTS}) AS rank FROM source_text WHERE source_text MATCH ?
-        UNION ALL SELECT source_id, bm25(t_source_text, ${RECORD_WEIGHTS}) AS rank FROM t_source_text WHERE t_source_text MATCH ?
+        SELECT x.id AS source_id, bm25(source_text, ${RECORD_WEIGHTS}) AS rank FROM ${FROM.rec} AND x.id IN cand
+        UNION ALL SELECT x.id, bm25(t_source_text, ${RECORD_WEIGHTS}) FROM ${FROM.tRec} AND x.id IN cand
       ) GROUP BY source_id
-    ), th AS (
-        ${perTerm}
-    ), best AS (
-      SELECT t, source_id, MIN(r) AS r FROM th GROUP BY t, source_id
-    ), spread AS (
-      SELECT source_id, SUM(r) AS rank FROM best GROUP BY source_id HAVING COUNT(*) = ${recTerms.length}
+    ), ann AS (
+      SELECT source_id, MIN(rank) AS rank FROM (
+        SELECT x.id AS source_id, bm25(annotation_text) AS rank FROM ${FROM.ann} AND x.id IN cand
+        UNION ALL SELECT x.id, bm25(t_annotation_text) FROM ${FROM.tAnn} AND x.id IN cand
+      ) GROUP BY source_id
     ), hits AS (
       SELECT source_id, 0 AS tier, rank FROM rec
-      UNION ALL SELECT source_id, 1 AS tier, rank FROM spread WHERE source_id NOT IN (SELECT source_id FROM rec)
-    )`;
-  const from = `hits h JOIN v_sources s ON s.id = h.source_id ${w}`;
-  const args = [match, match, ...recTerms.flatMap((t, i) => [t, t, annTerms[i]!, annTerms[i]!]), ...params];
-  const total = (db.prepare(`${hits} SELECT COUNT(*) AS n FROM ${from}`).get(...args) as { n: number }).n;
-  const rows = db
-    .prepare(`${hits} SELECT ${SOURCE_COLUMNS}, h.tier FROM ${from} ORDER BY h.tier, h.rank, s.id LIMIT ? OFFSET ?`)
-    .all(...args, limit, offset) as Array<RawRow & { tier: number }>;
+      UNION ALL SELECT c.source_id, 1 AS tier, COALESCE(a.rank, 0) FROM cand c LEFT JOIN ann a ON a.source_id = c.source_id
+        WHERE c.source_id NOT IN (SELECT source_id FROM rec)
+    )
+    SELECT ${SOURCE_COLUMNS}, h.tier, COUNT(*) OVER () AS total
+    FROM hits h JOIN v_sources s ON s.id = h.source_id ${w}
+    ORDER BY h.tier, h.rank, s.id LIMIT ? OFFSET ?`;
+  const args = [...order.flatMap(idSetArgs), match, match, annTerms[rarest]!, annTerms[rarest]!, ...params];
+  const rows = db.prepare(sql).all(...args, limit, offset) as Array<RawRow & { tier: number; total: number }>;
+  let total = rows[0]?.total;
+  if (total === undefined) {
+    // A page past the end: count without a page.
+    total = offset === 0 ? 0 : (db.prepare(sql.replace(/ORDER BY h\.tier[^]*$/u, "LIMIT 1")).get(...args) as { total: number } | undefined)?.total ?? 0;
+  }
   return { total, items: rows.map((r) => (r.tier === 1 ? { ...toRow(r), matchedIn: "annotation" as const } : toRow(r))), ...incomplete(db) };
 }
 
@@ -120,11 +141,11 @@ export const MAX_QUERY_TERMS = 16;
 /** In a search of several terms, a term may match at most this many rows (records and annotation chunks). */
 export const MAX_TERM_MATCHES = 50_000;
 
-/** How many rows `t` matches in the record tables and `a` in the annotation tables, counting at most `cap` + 1. */
-function termMatches(db: IndexDb, t: string, a: string, cap: number): number {
+/** How many rows a term matches in the four tables (`[from, expression]`), in scope, counting at most `cap` + 1. */
+function termMatches(db: IndexDb, tables: Array<[string, string]>, cap: number, scope: string, scopeArgs: string[]): number {
   let n = 0;
-  for (const [table, expr] of [["source_text", t], ["t_source_text", t], ["annotation_text", a], ["t_annotation_text", a]] as const) {
-    n += (db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${table} WHERE ${table} MATCH ? LIMIT ?)`).get(expr, cap + 1 - n) as { n: number }).n;
+  for (const [from, expr] of tables) {
+    n += (db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${from}${scope} LIMIT ?)`).get(expr, ...scopeArgs, cap + 1 - n) as { n: number }).n;
     if (n > cap) break;
   }
   return n;

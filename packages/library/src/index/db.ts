@@ -163,6 +163,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS temp.t_annotation_text USING fts5(${ANNOTATIO
 CREATE TEMP TABLE IF NOT EXISTS t_annotation_chunks (
   source_id TEXT NOT NULL, seq INTEGER NOT NULL, fts_rowid INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (source_id, seq)
 );
+CREATE INDEX IF NOT EXISTS temp.t_annotation_chunks_rowid ON t_annotation_chunks (fts_rowid);
 
 CREATE TEMP VIEW IF NOT EXISTS v_sources AS
   SELECT s.id, s.project_id, s.type,
