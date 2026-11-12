@@ -11,7 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -746,7 +746,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     }
     const notVerified = async (projectId: string) => (detailsOf((await eventsOf(projectId)).at(-1)!).destructionsNotVerified ?? []) as Array<Record<string, unknown>>;
 
-    it("the restore is not refused; a file the bystander's certificate names as destroyed is left out on that certificate alone, and the notes and the audit entry say so", async () => {
+    it("the restore is not refused; a file the bystander's certificate names as destroyed is left out, and the notes and the audit entry say that the log did not verify and what the exclusion rests on", async () => {
       const { s, z } = await bystander();
       const r = await restore(s.offline);
       const files = await restoredFiles(r.projectId);
@@ -755,10 +755,11 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(r.leftOut).toHaveLength(1);
       const said = r.notes.join(" ");
       expect(said).toMatch(/audit log of the project "Bystander" does not hold together/u);
-      expect(said).toMatch(/certificate files alone/u);
+      // Both kinds of evidence were there to read, and neither is vouched for (fix round 1, ruling 2).
+      expect(said).toMatch(/rests on the destruction entries that can still be read in its audit log and its certificate files/u);
       expect(said).toMatch(/1 file of this backup/u);
       expect(said).not.toContain(kit.tmp);
-      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "certificate-files-alone", leftOut: 1 }]);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "unverified-log-and-certificate-files", leftOut: 1 }]);
       expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
       // Nothing was refused, so nothing is recorded as refused.
       expect(await libraryRefusals()).toEqual([]);
@@ -776,7 +777,7 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(r.notes.join(" ")).toMatch(/2 files of this backup/u);
     });
 
-    it("with that project's certificate deleted as well: the restore still goes ahead, and says it could not establish that project's destructions at all", async () => {
+    it("with that project's certificate deleted as well: the restore goes ahead on the destruction entries that can still be read in its log, which name no file of this backup (the bystander's copy had another id), and says so", async () => {
       const { s, z, zr } = await bystander();
       await rm(zr.certificatePath);
       const r = await restore(s.offline);
@@ -786,8 +787,60 @@ describe("3. what a restore does not bring back is read from the audit log's rec
       expect(r.leftOut).toEqual([]);
       const said = r.notes.join(" ");
       expect(said).toMatch(/audit log of the project "Bystander" does not hold together/u);
+      expect(said).toMatch(/rests on the destruction entries that can still be read in its audit log \(no certificate file of it could be read\)/u);
+      expect(said).toMatch(/they name no file of this backup, so nothing was left out/u);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "unverified-log-entries", leftOut: 0 }]);
+    });
+
+    it("fix round 1, ruling 2: the certificate gone and the log not verifying, but its destruction entry still names the file: the file stays out, and the notes say why", async () => {
+      // The reviewer's probe: the original destroyed the raw file; a copy restored from its fresh backup inherits that entry.
+      const s = await scene();
+      const fresh = abs((s.r.certificate.backups as { freshBackup: string }).freshBackup);
+      const copy = await restore(fresh);
+      const c = kit.repo.getProject(copy.projectId);
+      // Outside the app: the original's folder is removed, the certificate the copy kept is deleted, and the copy's log is changed.
+      await rm(join(kit.lib.root, s.p.folder), { recursive: true, force: true });
+      await rm(join(kit.lib.root, c.folder, "retention", basename(s.r.certificatePath)));
+      await kit.reopen();
+      expect(ids()).toEqual([c.id]);
+      await breakAudit(c, (l) => l.includes('"op":"retention.destroy"'));
+      const r = await restore(s.offline);
+      const files = await restoredFiles(r.projectId);
+      expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(files["Kept paper"]!.onDisk).toBe(true);
+      expect(r.leftOut).toEqual([{ sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z" }]);
+      const said = r.notes.join(" ");
+      expect(said).toMatch(/audit log of the project "Origin \(restored 2026-12-02\)" does not hold together/u);
+      expect(said).toMatch(/cannot vouch for what that project destroyed/u);
+      expect(said).toMatch(/rests on the destruction entries that can still be read in its audit log \(no certificate file of it could be read\)/u);
+      expect(said).toMatch(/1 file of this backup that they name as destroyed was left out/u);
+      expect(said).not.toContain(kit.tmp);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: c.id, basis: "unverified-log-entries", leftOut: 1 }]);
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
+      expect(await libraryRefusals()).toEqual([]);
+    });
+
+    it("fix round 1, ruling 2: a log so damaged that no entry can be read: the restore goes ahead on the certificate files alone; with those gone too it says it could not establish that project's destructions at all", async () => {
+      const { s, z, zr } = await bystander();
+      const dir = join(kit.lib.root, kit.repo.getProject(z.id).folder, "audit");
+      for (const n of await readdir(dir)) await writeFile(join(dir, n), "\u0000\u0001 not a line of the log\n{ nor this\n");
+      const r = await restore(s.offline);
+      expect((await restoredFiles(r.projectId))["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+      expect(r.notes.join(" ")).toMatch(/rests on its certificate files alone \(no destruction entry that names files could be read in its audit log\)/u);
+      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "certificate-files-alone", leftOut: 1 }]);
+
+      await rm(zr.certificatePath);
+      const again = await restore(s.offline);
+      const files = await restoredFiles(again.projectId);
+      expect(files["Interview one"]!.onDisk).toBe(true);
+      expect(files["Kept paper"]!.onDisk).toBe(true);
+      expect(again.leftOut).toEqual([]);
+      const said = again.notes.join(" ");
+      expect(said).toMatch(/audit log of the project "Bystander" does not hold together/u);
+      expect(said).toMatch(/[Nn]either a destruction entry in its audit log nor a destruction certificate could be read/u);
       expect(said).toMatch(/could not be established at all/u);
-      expect(await notVerified(r.projectId)).toEqual([{ projectId: z.id, basis: "nothing-could-be-read", leftOut: 0 }]);
+      expect(await notVerified(again.projectId)).toEqual([{ projectId: z.id, basis: "nothing-could-be-read", leftOut: 0 }]);
+      expect(await libraryRefusals()).toEqual([]);
     });
 
     it("another project's destruction recorded without its files (the earlier form of the entry), its certificate not verifying: not refused; the certificate as found still excludes, and it is said", async () => {
@@ -820,6 +873,63 @@ describe("3. what a restore does not bring back is read from the audit log's rec
 
     it("every audit log holds together: nothing of this is said or recorded", async () => {
       const s = await scene();
+      const r = await restore(s.offline);
+      await expectRawLeftOut(r);
+      expect(r.notes).toHaveLength(1);
+      expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).not.toHaveProperty("destructionsNotVerified");
+    });
+  });
+
+  describe("fix round 1, ruling 3: a project folder that is there but cannot be loaded still counts as evidence", () => {
+    const notVerified = async (projectId: string) => (detailsOf((await eventsOf(projectId)).at(-1)!).destructionsNotVerified ?? []) as Array<Record<string, unknown>>;
+
+    it("project.json removed from the original's folder, its audit log intact: the restore is not refused, the destroyed file stays out, and the notes and the audit entry say the folder could not be loaded", async () => {
+      const s = await scene();
+      await rm(join(kit.lib.root, s.p.folder, "project.json"));
+      await kit.reopen();
+      expect(ids()).toEqual([]);
+      const r = await restore(s.offline);
+      await expectRawLeftOut(r);
+      const said = r.notes.join(" ");
+      expect(said).toMatch(/project folder "Origin" could not be loaded \(its project\.json is missing or cannot be read\)/u);
+      expect(said).toMatch(/cannot vouch for what that project destroyed/u);
+      expect(said).toMatch(/rests on the destruction entries that can still be read in its audit log and its certificate files/u);
+      expect(said).toMatch(/1 file of this backup that they name as destroyed was left out/u);
+      expect(said).not.toContain(kit.tmp);
+      expect(await notVerified(r.projectId)).toEqual([{ folder: "Origin", notLoaded: true, basis: "unverified-log-and-certificate-files", leftOut: 1 }]);
+      // Not refused: such a folder may be the very project that is being recovered.
+      expect(await libraryRefusals()).toEqual([]);
+    });
+
+    it("the folder's audit log cannot be read either: its certificate file still keeps the file out; with that gone too the restore says it could not establish what the folder's project destroyed", async () => {
+      const s = await scene();
+      await rm(join(kit.lib.root, s.p.folder, "project.json"));
+      const dir = join(kit.lib.root, s.p.folder, "audit");
+      for (const n of await readdir(dir)) await writeFile(join(dir, n), "\u0000\u0001 not a line of the log\n{ nor this\n");
+      await kit.reopen();
+      expect(ids()).toEqual([]);
+      const r = await restore(s.offline);
+      await expectRawLeftOut(r);
+      expect(r.notes.join(" ")).toMatch(/project folder "Origin" could not be loaded/u);
+      expect(r.notes.join(" ")).toMatch(/rests on its certificate files alone/u);
+      expect(await notVerified(r.projectId)).toEqual([{ folder: "Origin", notLoaded: true, basis: "certificate-files-alone", leftOut: 1 }]);
+
+      await rm(s.r.certificatePath);
+      const again = await restore(s.offline);
+      const files = await restoredFiles(again.projectId);
+      expect(files["Interview one"]!.onDisk).toBe(true);
+      expect(again.leftOut).toEqual([]);
+      const said = again.notes.join(" ");
+      expect(said).toMatch(/project folder "Origin" could not be loaded/u);
+      expect(said).toMatch(/could not be established at all/u);
+      expect(said).not.toContain(kit.tmp);
+      expect(await notVerified(again.projectId)).toContainEqual({ folder: "Origin", notLoaded: true, basis: "nothing-could-be-read", leftOut: 0 });
+    });
+
+    it("a folder in Projects that holds no audit log and no retention records is not a project's remains: nothing is said of it", async () => {
+      const s = await scene();
+      await mkdir(join(kit.lib.root, "Projects", "Just Some Notes"), { recursive: true });
+      await writeFile(join(kit.lib.root, "Projects", "Just Some Notes", "notes.txt"), "not a project");
       const r = await restore(s.offline);
       await expectRawLeftOut(r);
       expect(r.notes).toHaveLength(1);
