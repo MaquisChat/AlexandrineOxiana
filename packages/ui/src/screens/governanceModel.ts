@@ -274,6 +274,7 @@ export function captureNeeds(cfg: Config, today: string): string[] {
     );
   }
   if (cfg.protocol.requireBeforeCapture && !cfg.protocol.number) out.push("A protocol number in the protocol record below: these rules refuse every capture until there is one.");
+  if (cfg.protocol.platforms.length > 0) out.push("A link from one of the platforms the protocol approves (Platforms, in the protocol record below): links from other platforms are refused.");
   const day = (d: string | null) => (d ? d.slice(0, 10) : null);
   const from = day(cfg.protocol.approvedFrom);
   const until = day(cfg.protocol.expires);

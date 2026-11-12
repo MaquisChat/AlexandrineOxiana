@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
@@ -484,5 +484,141 @@ describe("capture methods (D11)", () => {
     // The other controls are read-only too.
     expect((within(card("Encryption")).getByRole("combobox", { name: "Encryption at rest" }) as HTMLSelectElement).disabled).toBe(true);
     expect(cap.puts).toHaveLength(0);
+  });
+});
+
+describe("a locked project or a read-only library: nothing on the screen offers a change (Task 64 review M1)", () => {
+  const REASONS = ["This project is locked. Unlock it in the library to change its rules.", "This library is open read-only here, so its rules cannot be changed."];
+  it.each(REASONS)("“%s”: approval documents, time zone and destruction are off, the reason is shown once, and no request is sent", async (why) => {
+    const sent: string[] = [];
+    serve();
+    server.use(
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: "2026-01-01", timeZone: "Europe/Oslo", due: [{ sourceId: "s1", title: "Interview", assetIds: ["a1"] }] })),
+      http.post(url(`/projects/${PID}/protocol/documents`), () => {
+        sent.push("documents");
+        return HttpResponse.json({ results: [], documents: [] });
+      }),
+      http.put(url(`/projects/${PID}/time-zone`), () => {
+        sent.push("time-zone");
+        return HttpResponse.json({ timeZone: null });
+      }),
+      http.post(url(`/projects/${PID}/retention/destroy`), () => {
+        sent.push("destroy");
+        return HttpResponse.json({});
+      }),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} readOnlyReason={why} />);
+    await loaded();
+    expect(screen.getAllByText(why)).toHaveLength(1);
+    const reasonId = screen.getByText(why).id;
+    const protocol = card("Protocol record");
+    expect((within(protocol).getByRole("textbox", { name: "Or add a document by its full path" }) as HTMLInputElement).disabled).toBe(true);
+    expect((within(protocol).getByRole("button", { name: "Add" }) as HTMLButtonElement).disabled).toBe(true);
+    const ret = card("Retention and destruction");
+    const tz = (await within(ret).findByRole("textbox", { name: /time zone/ })) as HTMLInputElement;
+    expect(tz.value).toBe("Europe/Oslo");
+    expect(tz.disabled).toBe(true);
+    const saveZone = within(ret).getByRole("button", { name: "Save time zone" }) as HTMLButtonElement;
+    expect(saveZone.disabled).toBe(true);
+    expect(saveZone.getAttribute("aria-describedby")?.split(" ")).toContain(reasonId);
+    // What is due is still listed, but cannot be destroyed.
+    expect(within(ret).getByText("Interview")).toBeTruthy();
+    const destroy = within(ret).getByRole("button", { name: "Destroy raw data" }) as HTMLButtonElement;
+    expect(destroy.disabled).toBe(true);
+    expect(destroy.getAttribute("aria-describedby")?.split(" ")).toContain(reasonId);
+    fireEvent.click(saveZone);
+    fireEvent.click(destroy);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("Save changes: one request per action (Task 64 review M10)", () => {
+  /** A stricter change (no reason asked), and a PUT that waits until released; later PUTs answer 409. */
+  async function ready() {
+    let release!: () => void;
+    const cap: Captured = { puts: [] };
+    serve();
+    server.use(
+      http.put(url(`/projects/${PID}/governance`), async ({ request }) => {
+        cap.puts.push({ body: await request.json(), ifMatch: null });
+        if (cap.puts.length > 1) return HttpResponse.json({ error: { code: "CONFLICT", message: "changed" } }, { status: 409 });
+        await new Promise<void>((r) => (release = r));
+        return HttpResponse.json({ violations: [], loosened: [], sha256: "b".repeat(64) });
+      }),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.click(within(card("Protocol record")).getByRole("checkbox", { name: "A protocol record is required before capture" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    return { cap, user, release: () => release(), save: screen.getByRole("button", { name: "Save changes" }) };
+  }
+
+  it("two clicks send one PUT, and Saved. stays", async () => {
+    const { cap, save, release } = await ready();
+    // Both clicks before React renders again (as a fast double click can land).
+    act(() => {
+      save.click();
+      save.click();
+    });
+    await waitFor(() => expect(cap.puts).toHaveLength(1));
+    release();
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(cap.puts).toHaveLength(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("Enter held on the focused button sends one PUT", async () => {
+    const { cap, save, user, release } = await ready();
+    save.focus();
+    // Key repeats can land before the button is re-rendered as busy: two in one go, then held.
+    act(() => {
+      save.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      save.click();
+      save.click();
+    });
+    await user.keyboard("{Enter>5/}");
+    await waitFor(() => expect(cap.puts).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(cap.puts).toHaveLength(1);
+    release();
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+  });
+});
+
+describe("capture methods, smaller points (Task 64 review)", () => {
+  it("a default legal basis whose reason is cancelled goes back to the saved value (M2)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.type(within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis/ }), "Public task");
+    await user.tab();
+    await user.click(within(screen.getByRole("dialog", { name: "Record a reason" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect((within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis/ }) as HTMLInputElement).value).toBe(""));
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("the reason dialog shows the typed legal basis as the person's own text, with its own direction (M7)", async () => {
+    serve();
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    await user.type(within(card("Capture methods")).getByRole("textbox", { name: /Default legal basis/ }), "مهمة عامة");
+    await user.tab();
+    const dialog = screen.getByRole("dialog", { name: "Record a reason" });
+    expect(within(dialog).getByText("مهمة عامة").getAttribute("dir")).toBe("auto");
+  });
+
+  it("the note names the protocol's platform scope when it has one (M6)", async () => {
+    serve({ yaml: "identifiability:\n  containsIdentifiable: false\n  pseudonymizeFileNames: false\nprotocol:\n  platforms: [youtube]\n" });
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const note = within(card("Capture methods")).getByRole("note", { name: /What a capture from the web also needs/ });
+    expect(note.textContent).toMatch(/platforms the protocol approves/);
+    expect(note.textContent).not.toMatch(/Nothing else/);
   });
 });

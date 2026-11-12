@@ -102,6 +102,8 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rawOpen, setRawOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** Counts cancelled reason dialogs: a field holding the cancelled value is reset from the rules. */
+  const [cancelled, setCancelled] = useState(0);
   const rawId = useId();
 
   const load = useCallback(async () => {
@@ -140,7 +142,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
   const cfg = parsed.cfg;
 
   /** One control changed through the form; `said` names the change in plain words for the reason dialog. */
-  const change = (control: string, value: unknown, said?: string) => {
+  const change = (control: string, value: unknown, said?: ReactNode) => {
     if (!cfg || readOnlyReason) return;
     setStatus(null);
     const profile = belowProfile(cfg, control, value);
@@ -154,7 +156,11 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
       message: needsException
         ? `${PROFILE_LABEL[profile!]} requires ${describe(requiredBy(cfg, control).find((r) => r.profile === profile)?.req.value ?? "a value")} for ${control}. Setting it to ${describe(value)} is recorded as an exception with your reason.`
         : said
-          ? `${said} loosens the project's rules, so it needs a reason.`
+          ? (
+            <>
+              {said} loosens the project&apos;s rules, so it needs a reason.
+            </>
+          )
           : `Setting ${control} to ${describe(value)} loosens the project's rules, so it needs a reason.`,
       apply: (reason: string, by: string) => {
         let next = setIn(text, control, value);
@@ -179,8 +185,11 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
     });
   };
 
+  /** A save in flight: one request per action, however fast the clicks or key repeats (R113). */
+  const saving = useRef(false);
   const save = async (extraReason?: string) => {
-    if (!saved) return;
+    if (!saved || saving.current) return;
+    saving.current = true;
     const all = extraReason ? [...reasons, extraReason] : reasons;
     setBusy(true);
     try {
@@ -199,6 +208,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
         setStatus({ kind: "error", message: err instanceof Error ? err.message : "The rules could not be saved." });
       }
     } finally {
+      saving.current = false;
       setBusy(false);
     }
   };
@@ -305,6 +315,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
             cfg={cfg}
             disabled={off}
             {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})}
+            cancelled={cancelled}
             onChange={change}
             onClearDefault={(path) => {
               setStatus(null);
@@ -325,7 +336,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
             />
             <Required cfg={cfg} control="retention.rawDataDestroyAfter" />
           </div>
-          <Retention api={api} projectId={projectId} />
+          <Retention api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
         </ControlCard>
 
         <ControlCard violations={violations} title="Audit log" controls={["audit"]}>
@@ -370,7 +381,7 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
           <ListInput label="Populations" disabled={off} value={cfg?.protocol.populations ?? []} onCommit={(v) => change("protocol.populations", v)} />
           <ListInput label="Languages" disabled={off} value={cfg?.protocol.languages ?? []} onCommit={(v) => change("protocol.languages", v)} />
           <CheckControl cfg={cfg} disabled={off} onChange={change} control="protocol.requireBeforeCapture" label="A protocol record is required before capture" />
-          <ProtocolDocuments api={api} projectId={projectId} />
+          <ProtocolDocuments api={api} projectId={projectId} {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})} />
         </ControlCard>
 
         <ControlCard violations={violations} title="Data management plan" controls={["dmp"]}>
@@ -413,7 +424,17 @@ export function GovernanceSettings({ api, projectId, readOnlyReason }: Governanc
           <textarea id={`${rawId}-text`} className="ao-code" rows={18} spellCheck={false} readOnly={!!readOnlyReason} value={text} onChange={(e) => typeRaw(e.target.value)} />
         </div>
       ) : null}
-      {pending ? <ReasonDialog message={pending.message} onConfirm={confirmReason} onCancel={() => setPending(null)} /> : null}
+      {pending ? (
+        <ReasonDialog
+          message={pending.message}
+          onConfirm={confirmReason}
+          onCancel={() => {
+            setPending(null);
+            // A field whose change was not recorded goes back to the rules as they are (review M2).
+            setCancelled((n) => n + 1);
+          }}
+        />
+      ) : null}
     </main>
   );
 }
@@ -469,6 +490,7 @@ function CaptureMethods({
   cfg,
   disabled,
   whyId,
+  cancelled,
   onChange,
   onClearDefault,
 }: {
@@ -476,7 +498,9 @@ function CaptureMethods({
   disabled: boolean;
   /** The element saying why the rules cannot be changed now. */
   whyId?: string;
-  onChange: (control: string, value: unknown, said?: string) => void;
+  /** Changes when a reason dialog is cancelled: the default legal basis field is reset from the rules. */
+  cancelled: number;
+  onChange: (control: string, value: unknown, said?: ReactNode) => void;
   onClearDefault: (path: string) => void;
 }) {
   const id = useId();
@@ -516,11 +540,22 @@ function CaptureMethods({
           )}
         </div>
         <CommitInput
+          key={cancelled}
           label="Default legal basis for captures from the web (recorded with each capture that gives none)"
           hint="For example: Public task, GDPR Art. 6(1)(e). Setting or changing it loosens the rules, so it asks for a reason."
           disabled={disabled}
           value={basis}
-          onCommit={(v) => (v ? onChange(basisPath, v, `Setting the default legal basis for captures from the web to “${v}”`) : onClearDefault(basisPath))}
+          onCommit={(v) =>
+            v
+              ? onChange(
+                  basisPath,
+                  v,
+                  <>
+                    Setting the default legal basis for captures from the web to “<UserText>{v}</UserText>”
+                  </>,
+                )
+              : onClearDefault(basisPath)
+          }
         />
       </fieldset>
       <fieldset className="ao-fieldset" aria-describedby={whyId}>
@@ -619,7 +654,8 @@ function ListInput({ label, value, onCommit, disabled }: { label: string; value:
 
 const size = (n: number) => (n < 1024 ? `${n} bytes` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 
-function ProtocolDocuments({ api, projectId }: { api: GovernanceApi; projectId: string }) {
+/** `whyId`: the element saying why nothing may be changed now (a locked project, a read-only library): adding is then off. */
+function ProtocolDocuments({ api, projectId, whyId }: { api: GovernanceApi; projectId: string; whyId?: string }) {
   const [docs, setDocs] = useState<ProtocolDocument[]>([]);
   const [results, setResults] = useState<ProtocolDocumentResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -627,6 +663,7 @@ function ProtocolDocuments({ api, projectId }: { api: GovernanceApi; projectId: 
     api.protocolDocuments(projectId).then((r) => setDocs(r.documents), () => setError("The approval documents could not be listed."));
   }, [api, projectId]);
   const add = async (paths: string[]) => {
+    if (whyId) return;
     try {
       const r = await api.addProtocolDocuments(projectId, paths);
       setDocs(r.documents);
@@ -650,7 +687,7 @@ function ProtocolDocuments({ api, projectId }: { api: GovernanceApi; projectId: 
       ) : (
         <p className="ao-hint">No approval documents yet.</p>
       )}
-      <FileDrop prompt="Drop approval documents here (PDF, Word, OpenDocument, plain text or images, up to 100 MB each; kept in the project's protocol folder)." fieldLabel="Or add a document by its full path" onPaths={(p) => void add(p)} />
+      <FileDrop prompt="Drop approval documents here (PDF, Word, OpenDocument, plain text or images, up to 100 MB each; kept in the project's protocol folder)." fieldLabel="Or add a document by its full path" disabled={!!whyId} onPaths={(p) => void add(p)} />
       {results ? (
         <ul className="ao-list" aria-label="Results of the last drop">
           {results.map((r, i) => (
@@ -670,7 +707,8 @@ function ProtocolDocuments({ api, projectId }: { api: GovernanceApi; projectId: 
   );
 }
 
-function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }) {
+/** `whyId`: as for ProtocolDocuments; the time zone and destruction are then shown but off. */
+function Retention({ api, projectId, whyId }: { api: GovernanceApi; projectId: string; whyId?: string }) {
   const [due, setDue] = useState<RetentionDue | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -703,7 +741,7 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
     );
   }, [api, projectId]);
   const saveZone = async () => {
-    if (!zone || tzSending.current) return; // one request per click, however fast the clicks
+    if (!zone || tzSending.current || whyId) return; // one request per click, however fast the clicks; none while nothing may change
     tzSending.current = true;
     const pid = projectId;
     const wanted = zone.input.trim() || null;
@@ -727,6 +765,7 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
   useEffect(load, [load]);
   const assetIds = due?.due.flatMap((d) => d.assetIds) ?? [];
   const destroy = async () => {
+    if (whyId) return;
     setBusy(true);
     try {
       setCert(await api.destroyRaw(projectId, assetIds));
@@ -750,7 +789,8 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
             maxLength={64}
             autoComplete="off"
             spellCheck={false}
-            aria-describedby={tzError ? `${tzId}-tz-hint ${tzId}-tz-error` : `${tzId}-tz-hint`}
+            disabled={!!whyId}
+            aria-describedby={[`${tzId}-tz-hint`, tzError ? `${tzId}-tz-error` : "", whyId ?? ""].filter(Boolean).join(" ")}
             {...(tzError ? { "aria-invalid": true } : {})}
             value={zone.input}
             onChange={(e) => {
@@ -764,7 +804,7 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
             A time zone name such as Europe/Berlin or America/New_York. When set, the protocol's dates and the retention date are both read in it. Empty: protocol dates follow this computer's
             time zone, and the retention date is read in UTC. Changing the time zone moves the moment the retention date takes effect, by up to a day either way.
           </p>
-          <button type="button" disabled={tzBusy} onClick={() => void saveZone()}>
+          <button type="button" disabled={tzBusy || !!whyId} aria-describedby={whyId} onClick={() => void saveZone()}>
             Save time zone
           </button>
           <p role="status" className="ao-hint">
@@ -798,7 +838,7 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
           ))}
         </ul>
       )}
-      <button type="button" className="ao-danger" disabled={!assetIds.length} onClick={() => setConfirming(true)}>
+      <button type="button" className="ao-danger" disabled={!assetIds.length || !!whyId} aria-describedby={whyId} onClick={() => setConfirming(true)}>
         Destroy raw data
       </button>
       {error ? (
