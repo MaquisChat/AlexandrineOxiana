@@ -2,12 +2,15 @@
  * The desktop app end to end on Linux (Task 37h): the built app (the debug build `build:linux`
  * makes), started by WebDriver (tauri-driver → WebKitWebDriver) on a private virtual display, with
  * its home, settings and data folders and a place for libraries all under one temporary folder
- * (desktop.ts). One scenario, as a person would go through it:
+ * (desktop.ts, lifetime.ts). The `run` fixture (fixtures.ts) stops every process of the run and
+ * removes that folder however the test ends, a time-out included, and saves the app's output when
+ * it did not pass. One scenario, as a person would go through it:
  *
- *   the window shows the library chooser → a library is created → a project is created in the New
+ *   the window shows the library chooser → a library is created at a typed folder → a project is created in the New
  *   project dialog → a PDF is attached with "Choose files…" through the native file dialog → the
  *   library lists the source → what the service persisted is on disk (the stored copy, the original
- *   untouched, the audit entry) → the window is closed → no process of the app is left.
+ *   untouched, the audit entry) → the window is closed → no process of the app is left, and nothing
+ *   under the real home folder was created or modified.
  *
  * What is real and what is stood in for:
  *  - Real: the app's own window and web view (WebKitGTK), its tauri://localhost origin and
@@ -21,16 +24,24 @@
  *  - Stood in for: the person's hand in that dialog. WebDriver cannot reach a native window, so the
  *    test finds it on the display by its title and types the file's path into it with xdotool
  *    (Ctrl+L, the path, Return), as a person may. No test double exists in the shell or the bridge.
- *  - Not covered: a file dropped onto the window from another program (an OS drag and drop cannot be
- *    made under Xvfb; the drop path is covered by the bridge's unit tests), and the macOS app (there
- *    is no WebDriver for the Mac web view; this test catches what Linux and macOS share).
+ *  - Not covered:
+ *    - the native FOLDER picker ("Choose folder…" in the library chooser): the library is created at
+ *      a folder TYPED into the chooser's field, which a person can also do. The GTK folder chooser
+ *      completes a typed path with a trailing "/", and Return then opens that folder instead of
+ *      choosing it; choosing it would need a click on its "Open" button by position, too fragile;
+ *    - a file dropped onto the window from another program (an OS drag and drop cannot be made under
+ *      Xvfb; the drop path is covered by the bridge's unit tests);
+ *    - the macOS app (there is no WebDriver for the Mac web view; this test catches what Linux and
+ *      macOS share).
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, relative } from "node:path";
-import { expect, test } from "@playwright/test";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
-import { cmdline, readAuditLines, running, startDesktop, until, type Desktop } from "./desktop.js";
+import { cmdline, homeChanges, readAuditLines, running, snapshotHome, startDesktop, until, type Desktop } from "./desktop.js";
+import { expect, test } from "./fixtures.js";
+import { parentOf, processEnvProblems } from "./lifetime.js";
 
 const LIBRARY = "Estuary fieldwork";
 const PROJECT = "Tide-line interviews";
@@ -54,21 +65,14 @@ function filesUnder(dir: string): string[] {
 
 const sha256 = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 
-/** A process's parent pid (-1 when it is gone). */
-function parentOf(pid: number): number {
-  try {
-    const s = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return Number(s.slice(s.lastIndexOf(")") + 2).split(" ")[1]);
-  } catch {
-    return -1;
-  }
-}
-
-test("the built Linux app: create a library and a project, attach a file through the native file dialog, close with nothing left running", async ({}, testInfo) => {
+test("the built Linux app: create a library and a project, attach a file through the native file dialog, close with nothing left running", async ({ run }) => {
+  // The real home folder's per-user folders, to show afterwards that the run left them untouched.
+  const realHome = homedir();
+  const homeBefore = snapshotHome(realHome);
   let app: Desktop | undefined;
-  try {
+  {
     await test.step("launch the built app under WebDriver on a private display", async () => {
-      app = await startDesktop();
+      app = await startDesktop(run);
     });
     const d = app!;
     const s = d.session;
@@ -171,6 +175,14 @@ test("the built Linux app: create a library and a project, attach a file through
       expect(created.map((e) => e.action), why).toContain("store");
     });
 
+    await test.step("every process of the run, the session services the bus started included, keeps its home and XDG folders in the run's folder", async () => {
+      const all = d.runProcesses();
+      // At least: Xvfb, the bus, tauri-driver, WebKitWebDriver, the app, its web view processes, the service and the worker.
+      expect(all.length, all.map((p) => cmdline(p)).join("\n")).toBeGreaterThanOrEqual(8);
+      const problems = all.flatMap((p) => processEnvProblems(p, d.root).map((x) => `${p} ${cmdline(p).slice(0, 80)}: ${x}`));
+      expect(problems).toEqual([]);
+    });
+
     await test.step("close the window: the shell stops its helpers and exits, and no process of the app is left", async () => {
       const helpers = d.helpers();
       expect(helpers.length, "the service and the worker run before closing").toBeGreaterThanOrEqual(2);
@@ -195,11 +207,9 @@ test("the built Linux app: create a library and a project, attach a file through
       const left = await until("no process of the app to be left", 30_000, () => d.appProcesses().length === 0).catch(() => d.appProcesses());
       expect(left === true ? [] : (left as number[]).map((p) => `${p} ${cmdline(p)}`)).toEqual([]);
     });
-  } catch (err) {
-    if (app) await testInfo.attach("shell-output", { body: app.log(), contentType: "text/plain" });
-    if (app) writeFileSync(testInfo.outputPath("shell-output.txt"), app.log());
-    throw err;
-  } finally {
-    await app?.dispose();
+
+    await test.step("nothing under the real home folder was created or modified", async () => {
+      expect(homeChanges(homeBefore, snapshotHome(realHome)), `under ${realHome}`).toEqual([]);
+    });
   }
 });

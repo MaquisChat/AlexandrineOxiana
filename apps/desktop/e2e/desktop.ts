@@ -4,9 +4,11 @@
  *
  *   test ──WebDriver──▶ tauri-driver ──▶ WebKitWebDriver ──▶ the app (debug build) in its real web view
  *
- * Per run, under one temporary folder in os.tmpdir() (removed afterwards):
+ * Per run, under the run's temporary folder in os.tmpdir() (lifetime.ts: every process it starts
+ * gets HOME and the XDG per-user folders there, and is stopped however the test ends):
  *  - a private X display (Xvfb, `-displayfd`), so nothing appears on, or types into, a person's own
- *    screen, and a private D-Bus session bus (the shell's single-instance guard and GTK use one);
+ *    screen, and a private D-Bus session bus (the shell's single-instance guard and GTK use one; what
+ *    the bus starts, such as dconf with GTK's file-chooser settings, stays in the run's folder too);
  *  - the app's home, settings, data and cache folders (HOME and XDG_*): the app keeps its settings,
  *    pairings and tools under its data folder there (R159), and a place for the run's libraries;
  *  - tauri-driver on a free port, given exactly that environment (desktopEnv): WebKitWebDriver starts
@@ -24,13 +26,13 @@
  * would type a path into it, then presses Return. Everything from the button to the service is the
  * real app; only the person's key presses are made by the test.
  */
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { elementId, newSession, type Session } from "./webdriver.js";
+import { Fatal, cmdline, descendants, parentOf, processesMarkedBy, running, runEnv, startedByBus, until, type RunLifetime } from "./lifetime.js";
+import { elementId, newSession, WebDriverError, type Session } from "./webdriver.js";
 import { requestWindowClose, socketPathFor } from "./x11.js";
 
 /** The main window's title (tauri.conf.json productName, set by the shell). */
@@ -56,16 +58,15 @@ export interface EnvParts {
   path: string;
 }
 
+/** The environment of Xvfb, the D-Bus session bus (and so what it starts) and xdotool: the run's own folders. */
+export function displayEnv(root: string, p: { path: string; display?: string }): Record<string, string> {
+  return runEnv(root, { PATH: p.path, ...(p.display ? { DISPLAY: p.display } : {}) });
+}
+
 /** The environment tauri-driver (and so WebKitWebDriver and the app) gets: only this, nothing inherited. */
 export function desktopEnv(root: string, p: EnvParts): Record<string, string> {
   return {
-    PATH: p.path,
-    HOME: join(root, "home"),
-    XDG_CONFIG_HOME: join(root, "config"),
-    XDG_DATA_HOME: join(root, "data"),
-    XDG_CACHE_HOME: join(root, "cache"),
-    XDG_RUNTIME_DIR: join(root, "runtime"),
-    LANG: "C.UTF-8",
+    ...runEnv(root, { PATH: p.path }),
     DISPLAY: p.display,
     DBUS_SESSION_BUS_ADDRESS: p.bus,
     // Where the debug shell finds its helpers (paths.rs: debug builds only; a release build uses its resources).
@@ -148,6 +149,64 @@ export function missingPrerequisites(c: PrerequisiteChecks): string[] {
   return out;
 }
 
+/** The per-user folders of the real home that the scenario's check compares before and after a run. */
+export const HOME_WATCHED = [".config", ".local/share", ".local/state", ".cache"];
+/**
+ * Inside those, folders that other programs on a shared machine change while the scenario runs, for
+ * reasons of their own, so a change there says nothing about this run:
+ *  - package managers, toolchains and other tools' caches;
+ *  - caches every GLib, GL or GStreamer program shares: `.cache/dconf` (GLib's dconf client writes it
+ *    whenever XDG_RUNTIME_DIR is unset; seen here changing every few seconds while another task's
+ *    browser tests ran and no desktop run did), `.cache/mesa_shader_cache`, `.cache/gstreamer-1.0`,
+ *    `.cache/fontconfig`. That this run's own processes never write them is shown instead by
+ *    checking each of its processes' HOME and XDG_* (the scenario's "every process" step).
+ * Everything else is compared, including `.config/dconf` (GTK's file-chooser settings), `.config/gtk-3.0`,
+ * `.local/share/recently-used.xbel`, WebKitGTK's folders and the app's own.
+ */
+export const HOME_SKIPPED = new Set([
+  ".cache/pnpm", ".local/share/pnpm", ".cache/pip", ".config/pip", ".cache/uv", ".config/uv", ".local/share/uv", ".cache/deno",
+  ".cache/huggingface", ".cache/claude-cli-nodejs", ".cache/goimports", ".cache/Microsoft", ".cache/ms-playwright", ".config/gcloud",
+  ".config/google-chrome-for-testing", ".cache/ao-worker-smoke-models", ".cache/ao-worker-test-models", ".cache/node", ".cache/typescript",
+  ".cache/dconf", ".cache/mesa_shader_cache", ".cache/gstreamer-1.0", ".cache/fontconfig",
+]);
+
+/** Path (relative to `home`) → modification time, of every file and folder under the watched folders. */
+export function snapshotHome(home: string): Map<string, number> {
+  const out = new Map<string, number>();
+  const walk = (rel: string) => {
+    if (HOME_SKIPPED.has(rel)) return;
+    let st;
+    try {
+      st = lstatSync(join(home, rel));
+    } catch {
+      return;
+    }
+    out.set(rel, st.mtimeMs);
+    if (!st.isDirectory()) return;
+    for (const name of readdirSync(join(home, rel))) walk(`${rel}/${name}`);
+  };
+  for (const w of HOME_WATCHED) walk(w);
+  return out;
+}
+
+/** What was created or modified between two snapshots ("created <path>", "modified <path>"), sorted. */
+export function homeChanges(before: Map<string, number>, after: Map<string, number>): string[] {
+  const out: string[] = [];
+  for (const [p, t] of after) {
+    if (!before.has(p)) out.push(`created ${p}`);
+    else if (before.get(p) !== t && !(after.has(p) && isDirWithOnlyCreatedChildren(p, before, after))) out.push(`modified ${p}`);
+  }
+  return out.sort();
+}
+
+/** A folder whose time changed only because an entry was created in it is reported through that entry. */
+function isDirWithOnlyCreatedChildren(dir: string, before: Map<string, number>, after: Map<string, number>): boolean {
+  const prefix = `${dir}/`;
+  let child = false;
+  for (const p of after.keys()) if (p.startsWith(prefix) && !p.slice(prefix.length).includes("/") && !before.has(p)) child = true;
+  return child;
+}
+
 // ---------- the machine ----------
 
 function onPath(program: string): boolean {
@@ -202,81 +261,12 @@ function freePort(): Promise<number> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Polls `test` until it returns something truthy; fails after `ms` naming `what`. */
-export async function until<T>(what: string, ms: number, test: () => Promise<T | undefined | null | false> | T | undefined | null | false): Promise<T> {
-  const end = Date.now() + ms;
-  let last: unknown;
-  for (;;) {
-    try {
-      const v = await test();
-      if (v) return v;
-      last = undefined;
-    } catch (err) {
-      last = err;
-    }
-    if (Date.now() > end) throw new Error(`timed out after ${Math.round(ms / 1000)} s waiting for ${what}${last instanceof Error ? ` (last: ${last.message})` : ""}`);
-    await sleep(200);
-  }
-}
-
-// ---------- processes (Linux /proc) ----------
-
-function stat(pid: number): string[] | null {
-  try {
-    const s = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return s.slice(s.lastIndexOf(")") + 2).split(" ");
-  } catch {
-    return null;
-  }
-}
-/** Running (a zombie waiting to be reaped counts as gone: it runs nothing). */
-export function running(pid: number): boolean {
-  const s = stat(pid);
-  return s !== null && s[0] !== "Z" && s[0] !== "X";
-}
-const readProc = (pid: number, f: string) => {
-  try {
-    return readFileSync(`/proc/${pid}/${f}`, "latin1");
-  } catch {
-    return "";
-  }
-};
-export const cmdline = (pid: number) => readProc(pid, "cmdline").split("\0").join(" ").trim();
-const allPids = () => readdirSync("/proc").filter((d) => /^\d+$/.test(d)).map(Number);
-export function descendants(root: number): number[] {
-  const kids = new Map<number, number[]>();
-  for (const p of allPids()) {
-    const pp = Number(stat(p)?.[1] ?? -1);
-    if (!kids.has(pp)) kids.set(pp, []);
-    kids.get(pp)!.push(p);
-  }
-  const out: number[] = [];
-  const walk = (p: number) => {
-    for (const k of kids.get(p) ?? []) {
-      out.push(k);
-      walk(k);
-    }
-  };
-  walk(root);
-  return out;
-}
-/** Running processes whose environment mentions `marker` (the run's temporary folder), except `except`. */
-export function processesMarkedBy(marker: string, except: number[]): number[] {
-  return allPids().filter((p) => p !== process.pid && !except.includes(p) && running(p) && readProc(p, "environ").includes(marker));
-}
-function killAll(pids: number[]): void {
-  for (const p of pids) {
-    try {
-      process.kill(p, "SIGKILL");
-    } catch {
-      // gone
-    }
-  }
-}
+export { cmdline, running, until };
 
 // ---------- the run ----------
 
 export interface Desktop {
+  /** The run's folder (lifetime.ts). */
   root: string;
   /** An empty folder for the run's libraries. */
   librariesDir: string;
@@ -293,8 +283,10 @@ export interface Desktop {
   shellLog(): ShellLog;
   /** The service and what it started (the worker), still running. */
   helpers(): number[];
-  /** The processes of this run apart from the drivers (the app, its web view processes, the helpers). */
+  /** The processes of this run apart from the display, the bus and the session services it started, and the drivers: the app, its web view processes, the helpers. */
   appProcesses(): number[];
+  /** Every process of the run now: the display, the bus and what it started, the drivers, the app and its helpers. */
+  runProcesses(): number[];
   /** The one visible element with this role and accessible name (polls; see FIND_SCRIPT). */
   byRole(role: Role, name: string | null, opts?: { level?: number; within?: string; timeoutMs?: number }): Promise<string>;
   /** How many visible elements have this role and name now. */
@@ -305,8 +297,6 @@ export interface Desktop {
   pickInFileDialog(title: string, path: string): Promise<void>;
   /** Closes the main window as its close button does: the window manager's WM_DELETE_WINDOW (x11.ts). */
   closeWithCloseButton(): Promise<void>;
-  /** Stops everything this run started that is still running, and removes the temporary folder. */
-  dispose(): Promise<void>;
 }
 
 export type Role = "button" | "textbox" | "heading" | "dialog" | "navigation" | "region" | "list" | "listitem" | "table" | "checkbox" | "alert";
@@ -350,160 +340,161 @@ const scope = within || document;
 return Array.from(scope.querySelectorAll(SEL[role])).filter((el) => visible(el) && (name === null || nameOf(el) === name));
 `;
 
-/** Starts the app under WebDriver on a private display and bus; see the file comment. */
-export async function startDesktop(): Promise<Desktop> {
+/** Reads the first line a child prints on standard output (its display number, its bus address). */
+function firstLine(child: ReturnType<RunLifetime["spawn"]>, what: string, ms: number): Promise<string> {
+  return new Promise((done, fail) => {
+    let out = "";
+    const timer = setTimeout(() => fail(new Fatal(`${what} did not report within ${ms / 1000} s`)), ms);
+    child.stdout!.on("data", (d: Buffer) => {
+      out += d.toString();
+      if (out.includes("\n")) {
+        clearTimeout(timer);
+        done(out.split("\n")[0]!.trim());
+      }
+    });
+    child.once("error", (e) => {
+      clearTimeout(timer);
+      fail(new Fatal(`${what} could not be started: ${e.message}`));
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      fail(new Fatal(`${what} exited (${code}) before it reported`));
+    });
+  });
+}
+
+/**
+ * Starts the app under WebDriver on a private display and bus, inside `run` (see the file comment).
+ * Every process is started through `run`, so the `run` fixture stops all of them whatever happens.
+ */
+export async function startDesktop(run: RunLifetime): Promise<Desktop> {
   const missing = checkPrerequisites();
   if (missing.length) throw new Error(`The desktop end-to-end test cannot run here:\n- ${missing.join("\n- ")}`);
-  const root = mkdtempSync(join(tmpdir(), "ao-desktop-e2e-"));
-  for (const d of ["home", "config", "data", "cache", "runtime", "libraries", "files"]) mkdirSync(join(root, d), { recursive: true, mode: 0o700 });
-  const children: ChildProcess[] = [];
-  let output = "";
-  const collect = (child: ChildProcess) => {
-    const take = (d: Buffer) => {
-      output += d.toString();
-      if (output.length > 2_000_000) output = output.slice(-1_000_000);
-    };
-    child.stdout?.on("data", take);
-    child.stderr?.on("data", take);
-  };
-  const dispose = async () => {
-    // The drivers, the display and the bus; then anything of this run still running (a failed run's app and helpers).
-    for (const c of [...children].reverse()) if (c.pid && c.exitCode === null && c.signalCode === null) killAll([...descendants(c.pid), c.pid]);
-    await sleep(200);
-    killAll(processesMarkedBy(root, []));
-    rmSync(root, { recursive: true, force: true });
-  };
+  const root = run.root;
+  for (const d of ["libraries", "files"]) mkdirSync(join(root, d), { recursive: true, mode: 0o700 });
+  const path = process.env.PATH ?? "/usr/bin:/bin";
 
-  try {
-    // The private display.
-    const xvfb = spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"], { stdio: ["ignore", "pipe", "ignore"] });
-    children.push(xvfb);
-    const display = await Promise.race([
-      new Promise<string>((done, fail) => {
-        xvfb.stdout!.once("data", (d) => done(`:${String(d).trim()}`));
-        xvfb.once("exit", () => fail(new Error("Xvfb did not start")));
-      }),
-      sleep(30_000).then(() => Promise.reject(new Error("Xvfb did not report its display within 30 s"))),
-    ]);
-    // The private session bus.
-    const dbus = spawn("dbus-daemon", ["--session", "--nofork", "--print-address=1"], { stdio: ["ignore", "pipe", "ignore"] });
-    children.push(dbus);
-    const bus = await Promise.race([
-      new Promise<string>((done, fail) => {
-        let out = "";
-        dbus.stdout!.on("data", (d) => {
-          out += String(d);
-          if (out.includes("\n")) done(out.split("\n")[0]!.trim());
-        });
-        dbus.once("exit", () => fail(new Error("dbus-daemon did not start")));
-      }),
-      sleep(30_000).then(() => Promise.reject(new Error("dbus-daemon did not report its address within 30 s"))),
-    ]);
-    // The worker (the development one through a small start script, as the launch check does).
-    const w = findWorker()!;
-    let workerBin = w.bin;
-    if (w.dev) {
-      workerBin = join(root, "dev-worker.sh");
-      writeFileSync(workerBin, `#!/bin/sh\nexec env -u PWD '${w.dev.replaceAll("'", "'\\''")}' -m ao_worker\n`);
-      chmodSync(workerBin, 0o755);
-    }
-    const env = desktopEnv(root, { display, bus, workerBin, nodeBin: process.execPath, serviceDir: SERVICE_DIR, path: process.env.PATH ?? "/usr/bin:/bin" });
-    const port = await freePort();
-    const nativePort = await freePort();
-    const driver = spawn(findTauriDriver()!, ["--port", String(port), "--native-port", String(nativePort)], { env, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
-    children.push(driver);
-    collect(driver);
-    const base = `http://127.0.0.1:${port}`;
-    // tauri-driver listens shortly after it starts; the session request then starts WebKitWebDriver and the app.
-    const session = await until("tauri-driver to start a session", 90_000, async () => {
-      if (driver.exitCode !== null) throw new Error(`tauri-driver exited (${driver.exitCode})`);
-      try {
-        return await newSession(base, { "tauri:options": { application: SHELL } }, { commandTimeoutMs: 120_000 });
-      } catch (err) {
-        if (err instanceof Error && /ECONNREFUSED|fetch failed/.test(err.message)) return undefined;
-        throw err;
-      }
-    });
-    const failedStart = () => {
-      const f = readShellLog(output).startFailure;
-      if (f) throw new Error(`the app could not start: ${f}`);
-    };
-    const shellPid = await until("the app's process under the drivers", 60_000, () => {
-      failedStart();
-      return descendants(driver.pid!).find((p) => running(p) && cmdline(p).startsWith(SHELL));
-    });
-    const servicePid = await until("the library service under the app", 120_000, () => {
-      failedStart();
-      if (!running(shellPid)) throw new Error("the app exited before its service started");
-      return readShellLog(output).port !== undefined ? descendants(shellPid).find((p) => running(p) && /service\.mjs/.test(cmdline(p))) : undefined;
-    });
-    const shell = { shellPid, servicePid };
-    const drivers = () => [driver.pid!, ...descendants(driver.pid!)].filter((p) => p !== shell.shellPid && !isUnder(p, shell.shellPid));
-    const isUnder = (p: number, ancestor: number) => {
-      for (let q = p, i = 0; q > 1 && i < 64; i++) {
-        if (q === ancestor) return true;
-        q = Number(stat(q)?.[1] ?? 0);
-      }
-      return false;
-    };
-    const find = (role: Role, name: string | null, opts: { level?: number; within?: string } = {}) =>
-      session.execute<unknown[]>(FIND_SCRIPT, [role, name, opts.level ?? null, opts.within ? session.element(opts.within) : null]);
-    const X = (args: string[]) => spawnSync("xdotool", args, { env: { PATH: env.PATH!, DISPLAY: display }, encoding: "utf8", timeout: 20_000 });
-    /** The visible windows on the private display, with their titles. */
-    const windows = () => X(["search", "--onlyvisible", "--name", "."]).stdout.split("\n").filter(Boolean).map((id) => ({ id, name: X(["getwindowname", id]).stdout.trim() }));
-
-    const desktop: Desktop = {
-      root,
-      librariesDir: join(root, "libraries"),
-      filesDir: join(root, "files"),
-      appDataDir: join(root, "data", APP_IDENTIFIER),
-      session,
-      shell,
-      log: () => output,
-      shellLog: () => readShellLog(output),
-      helpers: () => [shell.servicePid, ...descendants(shell.servicePid)].filter(running),
-      appProcesses: () => processesMarkedBy(root, drivers()),
-      async byRole(role, name, opts = {}) {
-        let count = 0;
-        const el = await until(`one ${role}${name === null ? "" : ` named "${name}"`}`, opts.timeoutMs ?? 30_000, async () => {
-          const hits = await find(role, name, opts);
-          count = hits.length;
-          return hits.length === 1 ? hits[0] : undefined;
-        }).catch((err: Error) => {
-          throw new Error(`${err.message}${count > 1 ? ` (found ${count})` : ""}`);
-        });
-        return elementId(el);
-      },
-      async countByRole(role, name, opts = {}) {
-        return (await find(role, name, opts)).length;
-      },
-      async textsByRole(role, opts = {}) {
-        const hits = await find(role, null, opts);
-        return Promise.all(hits.map((h) => session.text(elementId(h))));
-      },
-      async pickInFileDialog(title, path) {
-        const win = await until(`the native file dialog "${title}"`, 30_000, () => windowTitled(windows(), title));
-        // No window manager on the private display: give the dialog the keyboard focus directly.
-        for (const args of [["windowfocus", "--sync", win], ["key", "--clearmodifiers", "ctrl+l"], ["type", "--delay", "25", path]]) {
-          const r = X(args);
-          if (r.status !== 0) throw new Error(`xdotool ${args[0]} failed: ${r.stderr}`);
-          await sleep(300);
-        }
-        const r = X(["key", "--clearmodifiers", "Return"]);
-        if (r.status !== 0) throw new Error(`xdotool key Return failed: ${r.stderr}`);
-        await until(`the native file dialog "${title}" to close`, 30_000, () => windowTitled(windows(), title) === undefined);
-      },
-      async closeWithCloseButton() {
-        const win = windowTitled(windows(), WINDOW_TITLE);
-        if (!win) throw new Error(`no visible window titled "${WINDOW_TITLE}" on the display`);
-        await requestWindowClose(socketPathFor(display), Number(win));
-      },
-      dispose,
-    };
-    return desktop;
-  } catch (err) {
-    const tail = output.slice(-6000);
-    await dispose();
-    throw new Error(`${err instanceof Error ? err.message : String(err)}\n--- the drivers' and the app's output (end) ---\n${tail}`);
+  // The private display and the private session bus, both with the run's own folders.
+  const xvfb = run.spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"], displayEnv(root, { path }), { keepStdout: true });
+  const display = `:${await firstLine(xvfb, "Xvfb", 30_000)}`;
+  const dbus = run.spawn("dbus-daemon", ["--session", "--nofork", "--print-address=1"], displayEnv(root, { path, display }), { keepStdout: true });
+  const bus = await firstLine(dbus, "dbus-daemon", 30_000);
+  // The worker (the development one through a small start script, as the launch check does).
+  const w = findWorker()!;
+  let workerBin = w.bin;
+  if (w.dev) {
+    workerBin = join(root, "dev-worker.sh");
+    writeFileSync(workerBin, `#!/bin/sh\nexec env -u PWD '${w.dev.replaceAll("'", "'\\''")}' -m ao_worker\n`);
+    chmodSync(workerBin, 0o755);
   }
+  const env = desktopEnv(root, { display, bus, workerBin, nodeBin: process.execPath, serviceDir: SERVICE_DIR, path });
+  const port = await freePort();
+  const nativePort = await freePort();
+  const driver = run.spawn(findTauriDriver()!, ["--port", String(port), "--native-port", String(nativePort)], env);
+  const base = `http://127.0.0.1:${port}`;
+  // tauri-driver listens shortly after it starts. Only "not listening yet" is waited out; any other
+  // answer (a refused session, a driver that exited) fails at once with its cause.
+  const session = await until("tauri-driver to start a session", 90_000, async () => {
+    if (driver.exitCode !== null || driver.signalCode !== null) throw new Fatal(`tauri-driver exited (${driver.exitCode ?? driver.signalCode})`);
+    try {
+      return await newSession(base, { "tauri:options": { application: SHELL } }, { commandTimeoutMs: 120_000 });
+    } catch (err) {
+      if (err instanceof Error && !(err instanceof WebDriverError) && /ECONNREFUSED|fetch failed/.test(err.message)) return undefined;
+      throw new Fatal(`the app could not be started through WebDriver: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+  // On every way out of the run: end the WebDriver session, so that WebKitWebDriver ends cleanly
+  // before its process group is stopped (an error here is expected once the app has closed).
+  run.defer(() => session.delete());
+  const failedStart = () => {
+    const f = readShellLog(run.log()).startFailure;
+    if (f) throw new Fatal(`the app could not start: ${f}`);
+  };
+  const shellPid = await until("the app's process under the drivers", 60_000, () => {
+    failedStart();
+    return descendants(driver.pid!).find((p) => running(p) && cmdline(p).startsWith(SHELL));
+  });
+  const servicePid = await until("the library service under the app", 120_000, () => {
+    failedStart();
+    if (!running(shellPid)) throw new Fatal("the app exited before its service started");
+    return readShellLog(run.log()).port !== undefined ? descendants(shellPid).find((p) => running(p) && /service\.mjs/.test(cmdline(p))) : undefined;
+  });
+  const shell = { shellPid, servicePid };
+  const isUnder = (p: number, ancestor: number) => {
+    for (let q = p, i = 0; q > 1 && i < 64; i++) {
+      if (q === ancestor) return true;
+      q = parentOf(q);
+    }
+    return false;
+  };
+  const infrastructure = () => [xvfb.pid!, dbus.pid!, ...descendants(dbus.pid!), driver.pid!, ...descendants(driver.pid!)].filter((p) => p !== shell.shellPid && !isUnder(p, shell.shellPid));
+  const find = (role: Role, name: string | null, opts: { level?: number; within?: string } = {}) =>
+    session.execute<unknown[]>(FIND_SCRIPT, [role, name, opts.level ?? null, opts.within ? session.element(opts.within) : null]);
+  const xEnv = displayEnv(root, { path, display });
+  const X = (args: string[]) => run.run("xdotool", args, xEnv);
+  /** The visible windows on the private display, with their titles. */
+  const windows = () => X(["search", "--onlyvisible", "--name", "."]).stdout.split("\n").filter(Boolean).map((id) => ({ id, name: X(["getwindowname", id]).stdout.trim() }));
+  const xdo = (args: string[]) => {
+    const r = X(args);
+    if (r.status !== 0) throw new Error(`xdotool ${args.join(" ")} failed: ${r.stderr || r.error?.message || `exit ${r.status}`}`);
+    return r.stdout.trim();
+  };
+  /** Fails loudly unless `win` has the keyboard focus (no window manager: focus is set directly). */
+  const focused = async (win: string, title: string) => {
+    xdo(["windowfocus", "--sync", win]);
+    await until(`the keyboard focus on "${title}"`, 5_000, () => {
+      if (windowTitled(windows(), title) !== win) throw new Fatal(`the window "${title}" is gone`);
+      return xdo(["getwindowfocus"]) === win;
+    });
+  };
+
+  return {
+    root,
+    librariesDir: join(root, "libraries"),
+    filesDir: join(root, "files"),
+    appDataDir: join(root, "data", APP_IDENTIFIER),
+    session,
+    shell,
+    log: () => run.log(),
+    shellLog: () => readShellLog(run.log()),
+    helpers: () => [shell.servicePid, ...descendants(shell.servicePid)].filter(running),
+    appProcesses: () => processesMarkedBy(root, infrastructure()).filter((p) => !startedByBus(p)),
+    runProcesses: () => [...new Set([...[xvfb.pid!, dbus.pid!, driver.pid!].flatMap((p) => [p, ...descendants(p)]), ...processesMarkedBy(root, [])])].filter(running),
+    async byRole(role, name, opts = {}) {
+      let count = 0;
+      const el = await until(`one ${role}${name === null ? "" : ` named "${name}"`}`, opts.timeoutMs ?? 30_000, async () => {
+        const hits = await find(role, name, opts);
+        count = hits.length;
+        return hits.length === 1 ? hits[0] : undefined;
+      }).catch((err: Error) => {
+        throw new Error(`${err.message}${count > 1 ? ` (found ${count})` : ""}`);
+      });
+      return elementId(el);
+    },
+    async countByRole(role, name, opts = {}) {
+      return (await find(role, name, opts)).length;
+    },
+    async textsByRole(role, opts = {}) {
+      const hits = await find(role, null, opts);
+      return Promise.all(hits.map((h) => session.text(elementId(h))));
+    },
+    async pickInFileDialog(title, path) {
+      const win = await until(`the native file dialog "${title}"`, 30_000, () => windowTitled(windows(), title));
+      // Each key press goes to the window with the focus: confirm it is the dialog before each part.
+      await focused(win, title);
+      xdo(["key", "--clearmodifiers", "ctrl+l"]);
+      await sleep(200);
+      await focused(win, title);
+      xdo(["type", "--delay", "25", path]);
+      await sleep(200);
+      await focused(win, title);
+      xdo(["key", "--clearmodifiers", "Return"]);
+      await until(`the native file dialog "${title}" to close`, 30_000, () => windowTitled(windows(), title) === undefined);
+    },
+    async closeWithCloseButton() {
+      const win = windowTitled(windows(), WINDOW_TITLE);
+      if (!win) throw new Error(`no visible window titled "${WINDOW_TITLE}" on the display`);
+      await requestWindowClose(socketPathFor(display), Number(win));
+    },
+  };
 }
