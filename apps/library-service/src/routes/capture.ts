@@ -10,7 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { PAIRING_CODE_ID, SPEECH_MODELS, type PairingCodeStatus } from "@ao/shared";
+import { PAIRING_CODE_ID, SPEECH_MODELS, type PairedBrowsers, type PairingCodeStatus } from "@ao/shared";
 import {
   COOKIES_ACKNOWLEDGEMENT,
   captureBrowserPage,
@@ -241,7 +241,11 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   app.get("/extension/pair/status", async (req) => codeStatus(req));
   app.get("/extension/pair/status/:codeId", async (req) => codeStatus(req));
 
-  app.get("/extension/pairings", async () => ({ extensions: pairing.list() }));
+  // With the service's port now, so the app can tell which browsers still hold an older one (R171).
+  app.get("/extension/pairings", async (): Promise<PairedBrowsers> => {
+    const port = pairing.port;
+    return { extensions: pairing.list(), ...(port !== undefined ? { port } : {}) };
+  });
   app.delete("/extension/pairings/:pid", async (req) => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");
     return { removed: true };

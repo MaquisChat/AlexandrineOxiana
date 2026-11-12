@@ -63,7 +63,14 @@ export interface PairedExtension {
   origin: string;
   tokenSha256: string;
   pairedAt: string;
+  /**
+   * The service's port this browser last reached it on: at pairing, then at its latest accepted
+   * request (R171). Absent in pairings saved before ports were kept.
+   */
+  port?: number;
 }
+
+const portOk = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 65535;
 
 interface PairingFile {
   v: 1;
@@ -115,6 +122,8 @@ export class Pairing {
   private readonly maxAttempts: number;
   private readonly perMinute: number;
   private readonly now: () => number;
+  /** The port the service listens on, once it listens (R171). */
+  private currentPort: number | undefined;
 
   constructor(
     private readonly configDir: string,
@@ -128,7 +137,11 @@ export class Pairing {
 
   async load(): Promise<void> {
     const f = await readAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE);
-    this.paired = Array.isArray(f?.extensions) ? f.extensions.filter((e) => typeof e?.tokenSha256 === "string" && typeof e.origin === "string" && isExtensionOrigin(e.origin)) : [];
+    this.paired = Array.isArray(f?.extensions)
+      ? f.extensions
+          .filter((e) => typeof e?.tokenSha256 === "string" && typeof e.origin === "string" && isExtensionOrigin(e.origin))
+          .map(({ port, ...e }) => (portOk(port) ? { ...e, port } : e))
+      : [];
     this.loaded = true;
   }
 
@@ -208,7 +221,7 @@ export class Pairing {
     this.code = undefined;
     const token = randomBytes(32).toString("base64url");
     const at = this.now();
-    const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(at).toISOString() };
+    const entry: PairedExtension = { id: randomBytes(8).toString("hex"), origin, tokenSha256: digest(token).toString("hex"), pairedAt: new Date(at).toISOString(), ...(this.currentPort !== undefined ? { port: this.currentPort } : {}) };
     // Spent now (never usable twice), but "used" only once the pairing is durably written (I1).
     c.record.confirming = true;
     let next: PairingFile;
@@ -239,6 +252,34 @@ export class Pairing {
       if (stored.length === d.length && timingSafeEqual(stored, d)) hit = e;
     }
     return hit;
+  }
+
+  /** The service now listens on `port`: new pairings are made on it (R171). */
+  setPort(port: number): void {
+    this.currentPort = port;
+  }
+
+  /** The port the service listens on, once it does. */
+  get port(): number | undefined {
+    return this.currentPort;
+  }
+
+  /**
+   * The paired browser `id` was just accepted on the service's current port (R171): when that is
+   * not the port its pairing holds, the pairing takes it (in memory at once, then written; at most
+   * once per launch per browser). Rejects when the write fails; the pairing works all the same.
+   */
+  async noteReachedOnCurrentPort(id: string): Promise<void> {
+    const port = this.currentPort;
+    const e = this.paired.find((x) => x.id === id);
+    if (port === undefined || !e || e.port === port) return;
+    e.port = port;
+    const next = await updateAppSetting<PairingFile>(this.configDir, PAIRINGS_FILE, (cur) => ({
+      v: 1,
+      extensions: (Array.isArray(cur?.extensions) ? cur.extensions : []).map((x) => (x.id === id ? { ...x, port } : x)),
+    }));
+    // Another change may have landed meanwhile (an unpair): the file is the truth, the port kept.
+    this.paired = next.extensions.map((x) => (x.id === id ? { ...x, port } : x));
   }
 
   isPairedOrigin(origin: string): boolean {
