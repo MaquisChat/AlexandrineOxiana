@@ -485,7 +485,7 @@ Update after every task; commit and push.
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | approved; one binary reader, then verification before merge | cc2fe64 (worktree branch) | reviewed with probes over two fix rounds (R145, R149); after Task 57 merges its `blob()` uses move onto `bytes()` |
+| 34d Verification badges | approved; verification before merge | 51eaf8d (worktree branch) | reviewed with probes over two fix rounds (R145, R149); the working branch taken; `bytes()` is the one binary reader |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | fix round 2 | 7a59e9a (worktree branch) | I1 and I2 closed; new Important: a queue outlives a lock that is undone before its download ends |
 | 62 Transcription as a job | in progress | | dispatched 2026-11-12 after Task 51 merged; also carries N-5 of Task 51 (a close stops a rerun) |
