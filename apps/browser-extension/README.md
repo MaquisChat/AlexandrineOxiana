@@ -9,13 +9,54 @@ use the downloader, the recheck compares that evidence with the platform's own d
 Works in Chrome/Edge (Manifest V3 service worker) and in Firefox 128 or later (the same `background.js`
 runs as a background script, and the code uses `webextension-polyfill`).
 
+## Installing the extension from the download
+
+You do not need to build anything. Every Mac build of the desktop app also makes the extension.
+
+1. **Download it.** Open the same GitHub Actions run page you downloaded the Mac app from (workflow
+   "Desktop (macOS)"). At the bottom of its **Summary** page, under **Artifacts**, click
+   `alexandrine-oxiana-browser-extension`. It is kept for 30 days, like the Mac download.
+2. **Unzip it.** The download is a `.zip` that holds another `.zip`,
+   `alexandrine-oxiana-browser-extension-<version>.zip`, and a `.sha256` file with its checksum
+   (Safari may already have opened the outer one into a folder). Double-click the inner `.zip`. You get
+   a folder with `manifest.json` and a few other files directly inside it.
+3. **Move that folder to where it can stay**, for example your Documents folder. Do not delete it later
+   and do not leave it in Downloads if you clear that folder.
+
+Then load it in your browser:
+
+- **Chrome or Edge:** type `chrome://extensions` in the address bar (in Edge, `edge://extensions` also
+  works) and press Return. Turn on **Developer mode** (a switch at the top right in Chrome, on the left in
+  Edge). Click **Load unpacked** and pick the unzipped folder (the one with `manifest.json` inside).
+  Keep that folder: the browser loads the extension from it each time it starts, and the extension stops
+  working if the folder is moved or deleted. To update, unzip a newer download and choose **Load
+  unpacked** again, or replace the folder's contents and click the extension's reload button.
+- **Firefox (version 128 or later):** type `about:debugging` in the address bar and press Return. Click
+  **This Firefox**, then **Load Temporary Add-on…**, and pick the `manifest.json` file inside the
+  unzipped folder. Firefox removes the extension when it closes, so you load it again each time you
+  start Firefox.
+- **Safari** is not supported.
+
+Next, pair it with the desktop app (see "Pairing" below). To check the download, compare the
+checksum: in Terminal, `cd` to the folder that holds both files and run
+`shasum -a 256 -c alexandrine-oxiana-browser-extension-*.zip.sha256`; it should say `OK`.
+
 ## Build, load and test
 
 ```sh
 pnpm --filter @ao/browser-extension build      # → apps/browser-extension/dist (unpacked)
+pnpm --filter @ao/browser-extension run package # builds, then dist-zip/alexandrine-oxiana-browser-extension-<version>.zip and its .sha256
 pnpm --filter @ao/browser-extension exec vitest run
+node --test apps/browser-extension/scripts/package.test.mjs  # the packaging script's tests (also in pnpm test:scripts)
 pnpm e2e -- --extension-only e2e/extension.spec.ts --trace off  # builds, then Playwright (headless Chromium)
 ```
+
+`package` writes a reproducible archive: the same built files always give the same SHA-256 (entries
+sorted, stored without compression, one fixed date and file mode; see `scripts/package.mjs`). The Mac
+build's workflow runs it on Linux and uploads the result (`.github/workflows/desktop-macos.yml`, job
+`extension`). To run the end-to-end test against another unpacked folder, such as the unzipped
+download, set `AO_EXTENSION_DIR` to that folder and run
+`pnpm --filter @ao/browser-extension exec playwright test`.
 
 To load the build:
 
@@ -24,7 +65,8 @@ To load the build:
 
 ## Pairing
 
-1. In the desktop app, open Settings → Browser extension. It shows the service's port and a 6-digit code
+1. In the desktop app, with your library open, choose **Browser extension** at the top of the window,
+   then **Show a pairing code**. The page shows the service's port and a 6-digit code
    (`POST /extension/pair`).
 2. In the popup, type the port and the code. The popup posts the code to `POST /extension/pair/confirm`
    and keeps the token it gets back in `storage.local` (never `storage.sync`).
