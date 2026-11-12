@@ -40,6 +40,10 @@ export interface IntegrityWarning {
     | "incomplete-audit-line-pending"
     /** An audit event could not be appended while opening; the project refuses writes until reopened. */
     | "audit-append-failed-at-open"
+    /** Actions whose audit entry (or file permissions) could not be written at the time were recorded on this open (Task 50). */
+    | "audit-recorded-late"
+    /** A refusal with no project to hold it could not be recorded in the library's audit log (Task 50). */
+    | "refusal-unrecorded"
     /** The project's record of sources deleted here could not be read; set aside (R74 I2). */
     | "deleted-records-unreadable"
     /** A source's annotations file is missing or damaged; the source is read without annotations (R77). */

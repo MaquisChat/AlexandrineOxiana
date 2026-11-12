@@ -1,0 +1,4 @@
+# Made by scripts/build-linux.mjs and build-macos.mjs from the helpers' own builds (the About screen reads them)
+/generated/
+# The Mac disk images and their checksums (scripts/build-macos.mjs)
+/dist-macos/

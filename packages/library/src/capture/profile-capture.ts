@@ -68,8 +68,8 @@ import {
   repoTz,
   updateSourceRechecked,
 } from "../repo/repo.js";
-import { WorkerJobError, WorkerUnavailableError } from "../worker-client.js";
-import { AcknowledgementRequiredError, plainReason } from "./errors.js";
+import { WorkerJobError, WorkerToolError, WorkerUnavailableError } from "../worker-client.js";
+import { AcknowledgementRequiredError, plainReason, toolMissingReason } from "./errors.js";
 import type { CaptureCore, CaptureOptions, CaptureOutcome, ItemContext } from "./link-capture.js";
 import { classifyUrl, type ClassifiedUrl, type Platform } from "./platforms.js";
 import { captionOf, profileSnapshot, readEnumeration, type ProfileEntry, type ProfileMeta } from "./profile-snapshot.js";
@@ -112,6 +112,8 @@ export interface ProfileCaptureReport {
   items: CaptureOutcome[];
   errorCode?: string;
   reason?: string;
+  /** The optional tool that was missing (with `TOOL_NOT_INSTALLED`, Task 48a). */
+  tool?: string;
 }
 
 /** A known post: the listing (tab) it was found in, and what to restore if it disappears and returns. */
@@ -320,7 +322,11 @@ export function createProfileCapture(core: CaptureCore) {
         pause();
         return audited(projectId, platform, report);
       }
-      if (r.error) return audited(projectId, platform, failedReport(r.error));
+      if (r.error) {
+        // A missing tool is named, with how to get it (R126).
+        const missing = r.error === "TOOL_NOT_INSTALLED" && r.tool ? { tool: r.tool } : undefined;
+        return audited(projectId, platform, missing ? { ...failedReport(r.error), ...missing, reason: toolMissingReason(missing.tool) } : failedReport(r.error));
+      }
       ({ results, toolVersion } = r);
       break;
     }
@@ -679,7 +685,7 @@ export function createProfileCapture(core: CaptureCore) {
     c: ClassifiedUrl,
     opts: ProfileCaptureOptions,
     tool: CaptureTool,
-  ): Promise<{ results: ListingResult[]; error?: string; toolVersion: string }> {
+  ): Promise<{ results: ListingResult[]; error?: string; tool?: string; toolVersion: string }> {
     const results: ListingResult[] = [];
     let toolVersion = "unknown";
     for (const listing of listingsFor(c, opts.contentTypes)) {
@@ -702,7 +708,7 @@ export function createProfileCapture(core: CaptureCore) {
             },
           });
         } catch (err) {
-          if (err instanceof WorkerJobError) return { results, error: err.code, toolVersion };
+          if (err instanceof WorkerJobError) return { results, error: err.code, ...(err instanceof WorkerToolError ? { tool: err.tool } : {}), toolVersion };
           if (err instanceof WorkerUnavailableError) return { results, error: "WORKER_UNAVAILABLE", toolVersion };
           throw err;
         }

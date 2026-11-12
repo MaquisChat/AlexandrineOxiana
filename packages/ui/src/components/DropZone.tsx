@@ -2,10 +2,14 @@
  * Drop files here to attach them (spec 5.1). The desktop shell supplies OS file paths; the e2e
  * browser build injects them through the same `onPaths` prop. Dropped items are read as
  * `text/uri-list` file URLs or, where the shell sets it, each File's `path`. For keyboard users (and
- * anyone without a pointer) "Attach files…" takes paths typed one per line; the desktop shell's file
- * picker arrives with Task 37.
+ * anyone without a pointer) "Attach files…" takes paths typed one per line.
+ *
+ * Inside the desktop shell (desktopShell.ts) "Choose files…" opens the native file picker, and files
+ * dropped on the area arrive as paths through the shell's drop event; the DOM drop then only stops
+ * the web view from opening the file, so nothing is attached twice.
  */
-import { useId, useState, type DragEvent, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type DragEvent, type FormEvent } from "react";
+import { desktopShell } from "../desktopShell";
 import "./library.css";
 
 /** A file:// URL as a local path ("" for anything else). */
@@ -60,8 +64,47 @@ export function DropZone({ onPaths, disabled = false, disabledReason, target = "
   const [over, setOver] = useState(false);
   const [typing, setTyping] = useState(false);
   const [typed, setTyped] = useState("");
+  const [picking, setPicking] = useState(false);
   const fieldId = useId();
   const hintId = useId();
+  const shell = desktopShell();
+  const zone = useRef<HTMLElement>(null);
+  // The latest props, for the shell's drop events and the picker's answer.
+  const latest = useRef({ onPaths, disabled });
+  latest.current = { onPaths, disabled };
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    const el = zone.current;
+    const undo =
+      shell && el
+        ? shell.dropTarget(el, {
+            onPaths: (paths) => {
+              setOver(false);
+              if (!latest.current.disabled && paths.length) latest.current.onPaths(paths);
+            },
+            onOver: (o) => setOver(o && !latest.current.disabled),
+          })
+        : undefined;
+    return () => {
+      mounted.current = false;
+      undo?.();
+    };
+  }, [shell]);
+
+  const choose = async () => {
+    if (!shell || picking || disabled) return;
+    setPicking(true);
+    try {
+      const paths = await shell.pickFiles(`Attach files to ${target}`, true);
+      if (mounted.current && paths.length && !latest.current.disabled) latest.current.onPaths(paths);
+    } catch {
+      // The picker could not be opened: the typed-path way below stays available.
+    } finally {
+      if (mounted.current) setPicking(false);
+    }
+  };
 
   const onDragOver = (e: DragEvent) => {
     // Always prevented, even while disabled: otherwise the webview would navigate to the dropped file.
@@ -76,7 +119,8 @@ export function DropZone({ onPaths, disabled = false, disabledReason, target = "
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setOver(false);
-    if (disabled || !e.dataTransfer) return;
+    // Inside the shell the drop's paths come through the shell's drop event (above).
+    if (disabled || !e.dataTransfer || shell) return;
     const paths = pathsFromDataTransfer(e.dataTransfer);
     if (paths.length) onPaths(paths);
   };
@@ -91,6 +135,7 @@ export function DropZone({ onPaths, disabled = false, disabledReason, target = "
 
   return (
     <section
+      ref={zone}
       aria-label={`Attach files to ${target}`}
       aria-describedby={hintId}
       aria-disabled={disabled ? "true" : undefined}
@@ -103,6 +148,11 @@ export function DropZone({ onPaths, disabled = false, disabledReason, target = "
       <p id={hintId} className="ao-drop__hint">
         {disabled ? (disabledReason ?? "Attaching files is off.") : "Drop PDFs, EPUBs, images, audio or video here to attach them."}
       </p>
+      {shell && (
+        <button type="button" disabled={disabled || picking} onClick={() => void choose()}>
+          Choose files…
+        </button>
+      )}
       <button type="button" disabled={disabled} aria-expanded={typing} onClick={() => setTyping((t) => !t)}>
         Attach files…
       </button>

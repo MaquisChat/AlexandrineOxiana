@@ -24,3 +24,12 @@ export function noResults(suite, status) {
 export function needsSuiteFlag({ only, args }) {
   return !only && args.length > 0;
 }
+
+/**
+ * The suites a run takes: the one its flag names, or with no flag every suite except those marked
+ * `onlyWhenAsked` (the desktop suite: it needs the built app, `build:linux`, so it runs only with
+ * --desktop-only).
+ */
+export function suitesToRun(only, suites) {
+  return suites.filter((s) => (only ? s.name === only : !s.onlyWhenAsked));
+}

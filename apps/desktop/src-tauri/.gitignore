@@ -1,0 +1,3 @@
+# Build output, and the files tauri-build generates (schemas for editors)
+/target/
+/gen/

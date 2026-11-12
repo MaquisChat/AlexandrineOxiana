@@ -270,4 +270,92 @@ describe("Governance settings", () => {
     expect(cert.textContent).toMatch(/overwritten with zeros/);
     expect(cert.textContent).toMatch(/destruction-2026-11-11 0930\.json/);
   });
+
+  it("the project's time zone (R93, R160): defaults explained, set once per click, refused in plain words tied to the field, cleared", async () => {
+    serve();
+    const sent: any[] = [];
+    let release: (() => void) | undefined;
+    let stored: string | null = null;
+    server.use(
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: "2026-12-01", timeZone: stored, due: [] })),
+      http.put(url(`/projects/${PID}/time-zone`), async ({ request }) => {
+        const body = (await request.json()) as { timeZone: string | null };
+        sent.push(body);
+        if (body.timeZone === "Mars/Olympus") {
+          return HttpResponse.json({ error: { code: "VALIDATION", message: "That is not a time zone name (for example Europe/Berlin or America/New_York)." } }, { status: 400 });
+        }
+        if (body.timeZone === "Asia/Tokyo") await new Promise<void>((r) => (release = r));
+        stored = body.timeZone;
+        return HttpResponse.json({ timeZone: stored });
+      }),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const ret = card("Retention and destruction");
+    const field = (await within(ret).findByRole("textbox", { name: "The project's time zone (protocol and retention dates)" })) as HTMLInputElement;
+    expect(field.value).toBe("");
+    // What applies when it is empty, and what a change does (R160 as amended, M5).
+    expect(ret.textContent).toMatch(/Empty: protocol dates follow this computer's time zone, and the retention date is read in UTC/);
+    expect(ret.textContent).toMatch(/Changing the time zone moves the moment the retention date takes effect, by up to a day/);
+    expect(within(ret).getByRole("status").textContent).toMatch(/protocol dates in this computer's time zone, the retention date in UTC/);
+    const user = userEvent.setup();
+    const save = within(ret).getByRole("button", { name: "Save time zone" }) as HTMLButtonElement;
+
+    await user.type(field, "Mars/Olympus");
+    await user.click(save);
+    const alert = await within(ret).findByRole("alert");
+    expect(alert.textContent).toMatch(/not a time zone name/);
+    // The error belongs to the field (M5).
+    expect(field.getAttribute("aria-invalid")).toBe("true");
+    expect(field.getAttribute("aria-describedby")?.split(" ")).toContain(alert.id);
+
+    await user.clear(field);
+    await user.type(field, "Asia/Tokyo");
+    expect(field.getAttribute("aria-invalid")).toBeNull();
+    // Two clicks in the same tick (before React re-renders the button disabled) send one request (M9).
+    fireEvent.click(save);
+    fireEvent.click(save);
+    await waitFor(() => expect(save.disabled).toBe(true));
+    release?.();
+    await waitFor(() => expect(within(ret).getByRole("status").textContent).toMatch(/Saved/));
+    expect(sent.filter((b) => b.timeZone === "Asia/Tokyo")).toHaveLength(1);
+    expect(field.value).toBe("Asia/Tokyo");
+
+    expect(within(ret).getByRole("status").textContent).toMatch(/Saved\. The project's dates are read in Asia\/Tokyo/);
+
+    await user.clear(field);
+    await user.click(save);
+    await waitFor(() => expect(sent.at(-1)).toEqual({ timeZone: null }));
+    await waitFor(() => expect(within(ret).getByRole("status").textContent).toMatch(/retention date in UTC/));
+  });
+
+  it("drops a time-zone answer that arrives after the project changed (M9)", async () => {
+    const OTHER = "0190f0f0-0000-7000-8000-000000000002";
+    serve();
+    let release: (() => void) | undefined;
+    server.use(
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: null, timeZone: null, due: [] })),
+      http.put(url(`/projects/${PID}/time-zone`), async () => {
+        await new Promise<void>((r) => (release = r));
+        return HttpResponse.json({ timeZone: "Asia/Tokyo" });
+      }),
+      http.get(url(`/projects/${OTHER}/governance`), () => HttpResponse.json({ yaml: YAML, sha256: SHA, violations: [] })),
+      http.get(url(`/projects/${OTHER}/protocol/documents`), () => HttpResponse.json({ documents: [] })),
+      http.get(url(`/projects/${OTHER}/retention`), () => HttpResponse.json({ destroyAfter: null, timeZone: "Europe/Oslo", due: [] })),
+    );
+    const api = makeApi();
+    const { rerender } = render(<GovernanceSettings api={api} projectId={PID} />);
+    await loaded();
+    const user = userEvent.setup();
+    const name = "The project's time zone (protocol and retention dates)";
+    await user.type(await within(card("Retention and destruction")).findByRole("textbox", { name }), "Asia/Tokyo");
+    await user.click(within(card("Retention and destruction")).getByRole("button", { name: "Save time zone" }));
+    await waitFor(() => expect(release).toBeDefined());
+    rerender(<GovernanceSettings api={api} projectId={OTHER} />);
+    await waitFor(() => expect((within(card("Retention and destruction")).getByRole("textbox", { name }) as HTMLInputElement).value).toBe("Europe/Oslo"));
+    release!();
+    await new Promise((r) => setTimeout(r, 50));
+    expect((within(card("Retention and destruction")).getByRole("textbox", { name }) as HTMLInputElement).value).toBe("Europe/Oslo");
+    expect(within(card("Retention and destruction")).getByRole("status").textContent).not.toMatch(/Saved|Tokyo/);
+  });
 });

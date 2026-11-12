@@ -7,12 +7,14 @@ name = "ao-worker"
 version = "0.1.0"
 description = "AlexandrineOxiana media worker: transcription, capture download, proxies, OCR"
 requires-python = ">=3.12"
-# Pinned: the worker ships with the app; gallery-dl updates with app releases (ADR 0009).
+# Pinned: the worker ships with the app. gallery-dl (GPL-2.0-only) is not a dependency any more: the
+# first-use tools dialogue downloads its pinned wheel (ao_worker/toolpins.py, Task 48a, ADR 0009).
 dependencies = [
   "faster-whisper==1.2.1",
   # faster-whisper 1.2.1 calls av.open(metadata_errors=...), removed in PyAV 19.
   "av==18.1.0",
-  "gallery-dl==1.32.19",
+  # gallery-dl's one dependency (Apache-2.0), kept so the downloaded gallery-dl runs on the worker's Python.
+  "requests==2.34.2",
   "pillow==13.0.0",
   "pillow-heif==1.8.1",
   "rawpy==0.28.0",

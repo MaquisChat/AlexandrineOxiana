@@ -1,0 +1,10 @@
+{
+  "_about": "How the Mac build signs the app (scripts/build-macos.mjs; Tauri itself bundles with --no-sign). Today: ad hoc ('-'), no hardened runtime, no entitlements, no timestamp (R151: the owner opens the unsigned build once through System Settings). Ad hoc, only the Mach-O files that carry no valid signature yet are signed (PyInstaller signs the worker's files ad hoc, Node.js comes signed by its publisher, with entitlements that include allow-dyld-environment-variables, disable-library-validation and get-task-allow: acceptable only for the owner's own tests; Task 37g must re-sign Node with ours), then the shell's program, then the app. Task 37g changes this file only: identity (or the APPLE_SIGNING_IDENTITY variable, from a secret), hardenedRuntime true, and an entitlements file per part (paths relative to apps/desktop; the entitlements each part is expected to need are in apps/desktop/README.md, 'Building for macOS'); with an identity every Mach-O file is signed, inside out, with a secure timestamp.",
+  "identity": "-",
+  "hardenedRuntime": false,
+  "entitlements": {
+    "app": null,
+    "node": null,
+    "worker": null
+  }
+}

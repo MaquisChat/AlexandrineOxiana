@@ -46,7 +46,7 @@ describe("Capture screen — links", () => {
     expect(within(rows[0]!).getByText(YT).getAttribute("dir")).toBe("auto");
     await user.click(screen.getByRole("button", { name: "Capture links" }));
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT, IG, TT], options: {} });
+    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT, IG, TT], options: { transcribeModel: "medium" } });
     // Queued: the queue shows them, the box is emptied.
     const queue = await screen.findByRole("region", { name: "Capture queue" });
     expect(within(queue).getAllByRole("listitem")).toHaveLength(3);
@@ -71,7 +71,7 @@ describe("Capture screen — links", () => {
     expect(screen.getByText(/Listed twice: captured once/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Capture links" }));
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT, IG], options: {} });
+    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT, IG], options: { transcribeModel: "medium" } });
   });
 
   it("a link carrying a user name or password is refused with a sentence (review M3)", async () => {
@@ -438,7 +438,7 @@ describe("Capture screen — legal basis (R41)", () => {
     await user.type(field, "Consent (GDPR Art. 6(1)(a))");
     await user.click(screen.getByRole("button", { name: "Capture links" }));
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT], options: { legalBasis: "Consent (GDPR Art. 6(1)(a))" } });
+    expect(m.bodies(`POST /projects/${P1}/capture`)[0]).toEqual({ urls: [YT], options: { transcribeModel: "medium", legalBasis: "Consent (GDPR Art. 6(1)(a))" } });
   });
 
   it("names the project's default when there is one; typing one overrides it", async () => {
@@ -486,7 +486,7 @@ describe("Capture screen — profile", () => {
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
     expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({
       url: PROFILE,
-      options: { since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true },
+      options: { transcribeModel: "medium", since: "2026-01-01", until: "2026-06-30", maxItems: 25, contentTypes: ["reels"], metadataOnly: true },
     });
     const queue = await screen.findByRole("region", { name: "Capture queue" });
     expect(within(queue).getByText(PROFILE)).toBeTruthy();
@@ -537,7 +537,7 @@ describe("Capture screen — profile", () => {
     await user.type(field, "Legitimate interests");
     await user.click(screen.getByRole("button", { name: "Capture profile" }));
     await waitFor(() => expect(m.bodies(`POST /projects/${P1}/capture-profile`)).toHaveLength(1));
-    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: PROFILE, options: { includeComments: true, legalBasis: "Legitimate interests" } });
+    expect(m.bodies(`POST /projects/${P1}/capture-profile`)[0]).toEqual({ url: PROFILE, options: { transcribeModel: "medium", includeComments: true, legalBasis: "Legitimate interests" } });
   });
 
   it("a profile run's posts and summary appear as its events arrive", async () => {
@@ -579,14 +579,15 @@ describe("Capture screen — capture tools", () => {
     expect(within(tools).getByText("1.32.19")).toBeTruthy();
     await user.dblClick(within(tools).getByRole("button", { name: "Update capture tools" }));
     expect(await within(tools).findByText("yt-dlp: 2026.10.01 → 2026.11.01")).toBeTruthy();
-    expect(within(tools).getByText(/gallery-dl 1\.32\.19 comes with the app/)).toBeTruthy();
+    expect(within(tools).getByText(/gallery-dl 1\.32\.19 is the image downloader; it is installed and updated from the Optional tools screen/)).toBeTruthy();
     expect(m.bodies("POST /tools/update")).toHaveLength(1);
   });
 
   it("a missing tool is explained in plain words", async () => {
     await setup({ versions: { yt_dlp: null, gallery_dl: "1.32.19", ffmpeg: null } });
     const tools = screen.getByRole("region", { name: "Capture tools" });
-    expect(await within(tools).findByText(/Not installed yet: it is downloaded the first time a link is captured/)).toBeTruthy();
+    // Nothing downloads by itself (R156): the video downloader is installed from the tools screen.
+    expect(await within(tools).findByText("Not installed. Install it from the Optional tools screen.")).toBeTruthy();
     expect(within(tools).getByText(/Not installed on this computer/)).toBeTruthy();
   });
 

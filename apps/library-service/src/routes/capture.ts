@@ -10,7 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { PAIRING_CODE_ID, type PairingCodeStatus } from "@ao/shared";
+import { PAIRING_CODE_ID, SPEECH_MODELS, type PairingCodeStatus } from "@ao/shared";
 import {
   COOKIES_ACKNOWLEDGEMENT,
   captureBrowserPage,
@@ -33,7 +33,8 @@ import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray,
 export const BROWSER_CAPTURE_BODY_LIMIT = 32 * 1024 * 1024;
 
 const BROWSERS: BrowserName[] = ["chrome", "firefox", "safari", "edge", "brave"];
-const MODELS = ["large-v3", "medium", "small"];
+// The speech models the app accepts (R158, one definition in @ao/shared).
+const MODELS: readonly string[] = SPEECH_MODELS;
 const TYPES: ProfileContentType[] = ["posts", "reels", "videos", "shorts", "highlights"];
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 

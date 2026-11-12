@@ -1,5 +1,5 @@
 /** Retention dates (R92): read in the project's time zone setting, else UTC. */
-import type { Repo } from "./repo/repo.js";
+import { projectDateZone, type Repo } from "./repo/repo.js";
 
 /** The calendar date (YYYY-MM-DD) of `now` in `tz`. */
 function localDate(now: Date, tz?: string): string {
@@ -16,15 +16,8 @@ export function isDue(date: string, now: Date, tz: string): boolean {
   return !Number.isNaN(t) && now.getTime() >= t;
 }
 
-/** The project's time zone setting if it names a real zone, else UTC. */
+/** The zone the project's retention date is read in: its time zone when set, else UTC (R92, R160). */
 export function projectTimeZone(repo: Repo, projectId: string): string {
-  const tz = repo.getProject(projectId).timeZone;
-  if (!tz) return "UTC";
-  try {
-    new Intl.DateTimeFormat("en-CA", { timeZone: tz });
-    return tz;
-  } catch {
-    return "UTC";
-  }
+  return projectDateZone(repo, projectId, "retention");
 }
 

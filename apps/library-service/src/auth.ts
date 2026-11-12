@@ -1,9 +1,10 @@
 /**
  * Who may talk to the service (R96):
  *
- *  - The desktop UI holds the UI token (AO_SERVICE_TOKEN, read once then removed from the
- *    environment), sent as `Authorization: Bearer <token>` and compared in constant time. Tokens
- *    are never accepted in the query string (a request carrying one there is refused).
+ *  - The desktop UI holds the UI token (handed to the service on standard input, never through the
+ *    environment: main.ts, startup-token.ts, R98), sent as `Authorization: Bearer <token>` and
+ *    compared in constant time. Tokens are never accepted in the query string (a request carrying
+ *    one there is refused).
  *  - The browser extension holds its own token, issued by pairing and valid only for
  *    `POST /capture/browser`, `POST /capture/browser/links` and `GET /projects`. Only its SHA-256 is stored, in the device's app
  *    settings (`extension-pairings.json`), with the extension origin recorded at pairing. Its routes
@@ -20,14 +21,6 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { readAppSetting, updateAppSetting } from "@ao/library";
 import { isCredentialQueryKey, type PairingCodeIssued, type PairingCodeStatus } from "@ao/shared";
-
-/** The UI token from the environment, which is then removed from it (child processes never see it). */
-export function readServiceToken(env: NodeJS.ProcessEnv = process.env): string {
-  const t = env.AO_SERVICE_TOKEN;
-  delete env.AO_SERVICE_TOKEN;
-  if (typeof t !== "string" || t.length < 32) throw new Error("AO_SERVICE_TOKEN must be set to a random token of at least 32 characters");
-  return t;
-}
 
 const digest = (s: string) => createHash("sha256").update(s, "utf8").digest();
 
