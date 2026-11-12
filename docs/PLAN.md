@@ -488,7 +488,7 @@ Update after every task; commit and push.
 | 34d Verification badges | approved; one binary reader, then verification before merge | cc2fe64 (worktree branch) | reviewed with probes over two fix rounds (R145, R149); after Task 57 merges its `blob()` uses move onto `bytes()` |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | fix round 2 | 7a59e9a (worktree branch) | I1 and I2 closed; new Important: a queue outlives a lock that is undone before its download ends |
-| 62 Transcription as a job | not started | | found by the Task 34c review |
+| 62 Transcription as a job | in progress | | dispatched 2026-11-12 after Task 51 merged; also carries N-5 of Task 51 (a close stops a rerun) |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
