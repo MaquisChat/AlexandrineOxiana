@@ -1363,3 +1363,67 @@ describe("review round 2 (R82): stores from attach and Bulk Import share the pro
     expect(repo.listSourceIds(p.id)).toHaveLength(1);
   }, 30_000);
 });
+
+describe("Task 72 (R190): an import decision that puts a field newly in conflict queues it; the batch's undo takes it back", () => {
+  const STORE = { action: "store" as const, store: { identifiable: false, hasLocation: false } };
+
+  /**
+   * A batch with one item; its source carries a page's date (2014); the item's import entry offers a
+   * candidate dated 2018. Accepting the candidate puts the date newly in conflict.
+   */
+  async function decidedIntoConflict() {
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(await folderWith("r190", { "a.pdf": await workPdf("r190") })));
+    const [sid] = repo.listSourceIds(p.id);
+    const at = new Date().toISOString();
+    await importChange(repo, p.id, STORE, async (ops) => {
+      const cur = await ops.readSource(sid!);
+      await ops.writeSource(cur, { ...cur, fieldEvidence: [...cur.fieldEvidence, { field: "/issued", value: "2014", source: { kind: "page-dom" }, at }] });
+    }, { op: "test" });
+    const entry = await importChange(repo, p.id, STORE, (ops) =>
+      ops.appendReview({
+        sourceId: sid!,
+        kind: "import",
+        batchId: h.batchId,
+        fields: {},
+        reasons: ["low confidence"],
+        candidates: [{ provider: "openalex", title: WORK_TITLE, creators: [], issued: "2018", type: "article-journal", identifiers: {} }],
+      }),
+      { op: "test" },
+    );
+    await bulk.decideReview(p.id, entry.id, { action: "accept-candidate", index: 0 });
+    expect((await repo.getSource(p.id, sid!)).verification["/issued"]?.status).toBe("conflict");
+    const queued = (await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === sid && e.status === "pending" && e.kind === "verification");
+    return { p, sid: sid!, batchId: h.batchId, queued, entries: async () => (await projectReviewEntries(repo, p.id)).filter((e) => e.sourceId === sid) };
+  }
+
+  it("the decision's own change queues the date, its cause a later check, and its audit event says so", async () => {
+    const { p, queued } = await decidedIntoConflict();
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ fields: { "/issued": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } });
+    const decide = (await auditEvents(p)).filter((e) => (e.details as { op?: string } | undefined)?.op === "review.decide");
+    expect(decide).toHaveLength(1);
+    expect(decide[0]!.details).toMatchObject({ reviewQueued: [{ entry: queued[0]!.id, fields: ["/issued"] }] });
+  });
+
+  it("undoing the batch takes the entry back in the change that removes the source", async () => {
+    const { p, batchId, queued, entries } = await decidedIntoConflict();
+    expect(queued).toHaveLength(1);
+    await bulk.undoBatch(p.id, batchId);
+    expect(await entries()).toEqual(expect.arrayContaining([expect.objectContaining({ id: queued[0]!.id, status: "resolved", decision: "undone" })]));
+    expect((await entries()).filter((e) => e.status === "pending")).toEqual([]);
+  });
+
+  it("an entry the researcher already settled is neither resurrected nor rewritten by the undo", async () => {
+    const { confirmField } = await import("../../source-actions.js");
+    const { p, sid, batchId, queued, entries } = await decidedIntoConflict();
+    expect(queued).toHaveLength(1);
+    await confirmField(repo, p.id, sid, "/issued", "2018");
+    expect((await entries()).find((e) => e.id === queued[0]!.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    const linesBefore = (await readProjectFile(p, "review/pending.jsonl")).split("\n").filter((l) => l.includes(queued[0]!.id)).length;
+    await bulk.undoBatch(p.id, batchId);
+    expect((await entries()).find((e) => e.id === queued[0]!.id)).toMatchObject({ status: "resolved", decision: "confirmed" });
+    expect((await readProjectFile(p, "review/pending.jsonl")).split("\n").filter((l) => l.includes(queued[0]!.id))).toHaveLength(linesBefore);
+  });
+});
