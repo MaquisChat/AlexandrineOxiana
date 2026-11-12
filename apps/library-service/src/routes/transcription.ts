@@ -13,7 +13,7 @@
  * before; a job the worker refuses for a missing tool fails with the same code and id.
  */
 import type { FastifyInstance } from "fastify";
-import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, speechToolId, type TranscriptionJobResponse } from "@ao/shared";
+import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, speechToolId, type TranscribeRequest, type TranscriptionJobResponse } from "@ao/shared";
 import { ProjectLockedError, cancelPendingJob, transcriptionRecords } from "@ao/library";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import { busyError, fromRecord } from "../transcriptions.js";
@@ -52,9 +52,10 @@ export function registerTranscription(app: FastifyInstance, ctx: Ctx): void {
     const sid = paramsOf(req).sid ?? "";
     if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
     const b = bodyOf(req);
-    const model = optStr(b, "model", 16);
+    const model = optStr(b, "model" satisfies keyof TranscribeRequest, 16);
     if (model !== undefined && !MODELS.includes(model)) throw badRequest(`"${model}" is not a transcription model.`);
-    const language = optStr(b, "language", 16);
+    const language = optStr(b, "language" satisfies keyof TranscribeRequest, 16);
+
     if (language !== undefined && language !== "auto" && !/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(language)) throw badRequest(`"${language}" is not a language code.`);
     // One step with the registration: the source is taken before anything is awaited.
     const { token, release } = state.transcriptions.reserve(projectId, sid);

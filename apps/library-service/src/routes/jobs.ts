@@ -4,6 +4,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import { ocrQueueFor, proxyQueueFor } from "@ao/library";
+import type { JobsRetryRequest, JobsRetryResponse } from "@ao/shared";
 import { badRequest } from "../errors.js";
 import { bodyOf, optStr, queryOf, str, type Ctx } from "./util.js";
 
@@ -48,12 +49,13 @@ export function registerJobs(app: FastifyInstance, ctx: Ctx): void {
     };
   });
 
-  app.post("/jobs/retry", async (req) => {
+  app.post("/jobs/retry", async (req): Promise<JobsRetryResponse> => {
     const s = state.requireWritable();
     const b = bodyOf(req);
-    const projectId = str(b, "projectId", 64);
+    const projectId = str(b, "projectId" satisfies keyof JobsRetryRequest, 64);
     if (!s.repo.listProjects().some((p) => p.id === projectId)) throw badRequest("That project is not in this library.");
-    const sourceId = optStr(b, "sourceId", 64);
+    const sourceId = optStr(b, "sourceId" satisfies keyof JobsRetryRequest, 64);
+
     state.startWork("retry", async () => {
       await proxyQueueFor(s.repo).retryFailed(projectId, sourceId);
       await ocrQueueFor(s.repo).retryFailed(projectId, sourceId);
