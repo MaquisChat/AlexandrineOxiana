@@ -172,7 +172,7 @@ describe("GET /projects/:id/review: the project's whole queue (Task 67, R172)", 
     expect(page.items.map((e) => e.id)).toEqual(all.items.slice(1, 3).map((e) => e.id));
     expect(await queue(pid, "?limit=0")).toEqual({ items: [], total: 4, offset: 0, limit: 0 });
     expect(await queue(pid, `?source=${sid}`)).toMatchObject({ total: 1, items: [{ sourceId: sid }] });
-    for (const bad of ["?limit=1001", "?limit=-1", "?offset=x"]) {
+    for (const bad of ["?limit=1001", "?limit=-1", "?offset=x", "?source=..%2F..", "?source=not-an-id"]) {
       const r = await call({ url: `/projects/${pid}/review${bad}` });
       expect(r.status, bad).toBe(400);
       expect(r.json.error.code).toBe("VALIDATION");
@@ -332,5 +332,23 @@ describe("deciding entries that have no batch (Task 67)", () => {
     expect((await queue(pid)).total).toBe(0);
     const rows = svc.state.session!.index!.db.prepare("SELECT status FROM review_items WHERE project_id = ? AND source_id = ?").all(pid, sid) as Array<{ status: string }>;
     expect(rows).toEqual([{ status: "resolved" }]);
+  });
+
+  it("an encrypted project: the reason is not in the audit record, and nothing echoes it while the project is locked (fix round 1, I2)", async () => {
+    const pid = await newProject(true);
+    await flaggedByWithdrawal(pid);
+    const [entry] = (await queue(pid)).items;
+    const reason = "Quokka-5512 asked us to keep only the transcript";
+    const r = await reviewed(pid, entry!.id, reason);
+    expect(r.status, r.body).toBe(200);
+    const audit = await call({ url: `/projects/${pid}/audit?limit=1000` });
+    expect(audit.body).not.toContain("Quokka");
+    const ev = (audit.json.events as Array<{ action: string; details?: Record<string, unknown> }>).find((e) => e.action === "review-withdrawal");
+    expect(ev?.details).toMatchObject({ reviewEntry: entry!.id, reasonGiven: true, reasonSha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(ev?.details?.reason).toBeUndefined();
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    for (const res of [await call({ url: `/projects/${pid}/review` }), await reviewed(pid, entry!.id, "again"), await call({ url: `/projects/${pid}/audit?limit=1000` })]) {
+      expect(res.body).not.toContain("Quokka");
+    }
   });
 });

@@ -4,6 +4,7 @@
  * a source flagged by a consent withdrawal was reviewed (R176 2).
  */
 import type { FastifyInstance } from "fastify";
+import { isId } from "@ao/core";
 import { reviewCauseOf, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "@ao/library";
 import {
   PROJECT_REVIEW_PAGE_MAX,
@@ -62,7 +63,8 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     const q = queryOf(req);
     const offset = intParam(q.offset, "offset", 0, 10_000_000, 0);
     const limit = intParam(q.limit, "limit", 0, PROJECT_REVIEW_PAGE_MAX, 500);
-    const source = q.source ? q.source.slice(0, 64) : undefined;
+    const source = q.source || undefined;
+    if (source !== undefined && !isId(source)) throw badRequest('"source" must be a source id.');
     if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
     const r = await s.bulk.listProjectReview(projectId, { offset, limit, ...(source ? { sourceId: source } : {}) });
     return { items: r.items.map(entryOut), total: r.total, offset, limit };
