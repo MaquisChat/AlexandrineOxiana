@@ -3,6 +3,7 @@
  * transcript viewer and the source screen's viewing-copy state. Own file, so the screens' own test
  * files (edited by other tasks) are untouched.
  */
+import { SPEECH_MODELS } from "@ao/shared";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
@@ -88,7 +89,7 @@ describe("the transcript viewer", () => {
     await screen.findByText("Hello and welcome.");
     const select = screen.getByLabelText("Speech model") as HTMLSelectElement;
     expect(select.value).toBe("medium");
-    expect([...select.options].map((o) => o.value)).toEqual(["large-v3", "medium", "small"]);
+    expect([...select.options].map((o) => o.value)).toEqual([...SPEECH_MODELS]);
     await waitFor(() => expect([...select.options].find((o) => o.value === "medium")!.textContent).toMatch(/not installed/));
     const note = screen.getByText(/speech model “medium” is not installed/i);
     expect(within(note).getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(`${PATHS.tools}?tool=speech-medium`);

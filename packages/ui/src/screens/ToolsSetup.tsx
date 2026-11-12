@@ -37,7 +37,8 @@ const GROUPS: Array<{ id: ToolInfo["group"]; title: string; hint: string }> = [
 
 /** Speed and accuracy of each speech model the app accepts, in plain words. */
 const SPEECH_HINT: Record<string, string> = {
-  small: "Fastest of the models the app uses, and the least accurate.",
+  tiny: "Quickest and least accurate: for trying things out.",
+  small: "Fast, and less accurate than the medium model.",
   medium: "More accurate than the small model, and slower.",
   "large-v3": "Slowest and most accurate: for difficult recordings, on a fast computer.",
 };
@@ -51,7 +52,7 @@ const VERB: Record<ToolAction, { doing: string; done: string }> = {
   remove: { doing: "Removing", done: "removed" },
 };
 
-type Mark = "start" | "half" | "end";
+type Mark = "start" | "half" | "stopping" | "end";
 
 /** A failed request on one tool, and what its Try again repeats (exactly the request that failed). */
 interface RequestError {
@@ -171,8 +172,15 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
             }),
           );
         }
-        // Ended, or no longer known to the service (it restarted): the catalogue says what is installed now.
-        if (got.some((g) => !g.j || g.j.status !== "running")) void load();
+        // Ended, or no longer known to the service (it restarted): the catalogue says what is installed
+        // now, and a stopped job's card waits for it before it says anything.
+        const ended = got.filter((g) => !g.j || g.j.status !== "running");
+        if (ended.length) {
+          const ids = ended.map((g) => g.j?.toolId).filter((x): x is ToolId => !!x);
+          for (const id of ids) setIn(setChecking, id, true);
+          await load();
+          if (alive.current) for (const id of ids) setIn(setChecking, id, false);
+        }
       } finally {
         reading = false;
       }
@@ -210,14 +218,19 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
         m.add("start");
         say = { lead: `${v.doing} `, name: t.name, tail: " started." };
       }
-      if (j.status === "running" && j.progress >= 0.5 && !m.has("half")) {
+      if (j.status === "running" && j.cancelRequested && !m.has("stopping")) {
+        m.add("stopping");
+        say = { lead: "Stopping ", name: t.name, tail: "." };
+      }
+      if (j.status === "running" && !j.cancelRequested && j.progress >= 0.5 && !m.has("half")) {
         m.add("half");
         say = { lead: `${v.doing} `, name: t.name, tail: ": half way." };
       }
       if (j.status !== "running" && !m.has("end")) {
         m.add("end");
         m.add("half");
-        if (j.status === "done") say = { lead: "", name: t.name, tail: ` is ${v.done}.` };
+        if (j.status === "done" && j.cancelRequested) say = { lead: "", name: t.name, tail: ` is ${v.done}: it finished before the stop took effect.` };
+        else if (j.status === "done") say = { lead: "", name: t.name, tail: ` is ${v.done}.` };
         else if (j.status === "cancelled") say = { lead: `${v.doing} `, name: t.name, tail: " was stopped." };
         else say = { lead: `${v.doing} `, name: t.name, tail: " did not finish." };
       }
@@ -293,11 +306,9 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
     try {
       const j = await api.cancel(job.jobId, ac.signal);
       if (!alive.current) return;
+      // The job stays running, with cancelRequested, until the media helper answers (stopped, or
+      // finished first); the poll reads that answer and then the catalogue.
       putJob(j);
-      // What a stop left behind is known only from the catalogue (a part may have arrived first).
-      setIn(setChecking, t.id, true);
-      await load();
-      if (alive.current) setIn(setChecking, t.id, false);
     } catch (err) {
       if (!alive.current) return;
       if (err instanceof ApiClientError && err.code === "NOT_FOUND") {
@@ -408,27 +419,33 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
         {running && job ? (
           <div className="ao-tool__job">
             <label className="ao-tool__progress">
-              <span>
-                {VERB[job.action].doing}… {Math.round(job.progress * 100)}%
-              </span>
+              <span>{job.cancelRequested ? "Stopping…" : `${VERB[job.action].doing}… ${Math.round(job.progress * 100)}%`}</span>
               <progress max={100} value={Math.round(Math.min(1, Math.max(0, job.progress)) * 100)} aria-label={`${VERB[job.action].doing} ${t.name}`} />
             </label>
-            {/* A remove cannot be stopped part-way, so it offers no Cancel. */}
-            {job.action !== "remove" ? (
+            {/* A remove cannot be stopped part-way, and a stop asked for once is not asked again. */}
+            {job.action !== "remove" && !job.cancelRequested ? (
               <button type="button" aria-label={`Cancel ${VERB[job.action].doing.toLowerCase()} ${t.name}`} disabled={busy.has(`${job.jobId}:cancel`)} onClick={() => void cancel(t, job)}>
                 Cancel
               </button>
             ) : null}
           </div>
         ) : null}
-        {job?.status === "cancelled" ? (
+        {job && job.status !== "running" && (job.status === "cancelled" || job.cancelRequested) ? (
           checking.has(t.id) ? (
-            <p>Stopping… reading what is installed now.</p>
-          ) : (
+            <p>Reading what is installed now…</p>
+          ) : job.status === "cancelled" ? (
             <UserText as="p">{`Stopped. ${installedNow(t)}`}</UserText>
-          )
+          ) : job.status === "done" ? (
+            <UserText as="p">{`It finished before the stop took effect. ${installedNow(t)}`}</UserText>
+          ) : null
         ) : null}
-        {failed && !reqError ? (
+        {failed && failed.error?.code === "CANCEL_UNCONFIRMED" && !reqError ? (
+          <div role="alert" className="ao-warning">
+            <UserText as="p">{failed.error.message}</UserText>
+            {checking.has(t.id) ? null : <UserText as="p">{`What is on this computer now: ${installedNow(t)}`}</UserText>}
+          </div>
+        ) : null}
+        {failed && failed.error?.code !== "CANCEL_UNCONFIRMED" && !reqError ? (
           <div role="alert" className="ao-warning">
             <p>
               {VERB[failed.action].doing} did not finish. <UserText>{failed.error?.message ?? "Nothing was left half-installed."}</UserText>

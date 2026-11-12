@@ -12,27 +12,18 @@
 import type { ToolAction, ToolId, ToolInfo, ToolJob, ToolJobResponse, ToolsResponse } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "./client";
 import { errorText } from "./library";
-import { TRANSCRIPTION_MODELS, type TranscriptionModel } from "./transcripts";
+import { DEFAULT_SPEECH_MODEL, isSpeechModel, speechToolId } from "@ao/shared";
 
-/**
- * PLACEHOLDER (R158) — DELETE at the merge that brings `DEFAULT_SPEECH_MODEL` (and the list of
- * accepted models) into `@ao/shared` from Task 48a, and use those instead. The default is "medium"
- * per R158 (SPEC 5.2 names none). The models the app accepts are, until then, TRANSCRIPTION_MODELS
- * (api/transcripts.ts, the service's MODELS); this file adds no list of its own.
- */
-export const PLACEHOLDER_DEFAULT_SPEECH_MODEL: TranscriptionModel = "medium";
+// The speech models the app accepts and the default one are defined once, in @ao/shared (R158).
+export { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, type SpeechModel } from "@ao/shared";
 
-/** The speech models the app accepts (R158), and the default one. */
-export const ACCEPTED_SPEECH_MODELS: readonly TranscriptionModel[] = TRANSCRIPTION_MODELS;
-export const DEFAULT_SPEECH_MODEL: TranscriptionModel = PLACEHOLDER_DEFAULT_SPEECH_MODEL;
-
-/** The tool that holds a speech model (`medium` → `speech-medium`). */
-export const speechTool = (model: string): ToolId => `speech-${model}` as ToolId;
+/** The tool that holds a speech model (`medium` → `speech-medium`); for a name the app does not accept, its id as the catalogue would give it. */
+export const speechTool = (model: string): ToolId => (isSpeechModel(model) ? speechToolId(model) : (`speech-${model}` as ToolId));
 
 /** Whether a feature of the app uses this tool: any tool but a speech model the app does not accept (R158). */
 export function usedByApp(id: string): boolean {
   const size = speechSize(id);
-  return size === undefined || (ACCEPTED_SPEECH_MODELS as readonly string[]).includes(size);
+  return size === undefined || isSpeechModel(size);
 }
 
 /**

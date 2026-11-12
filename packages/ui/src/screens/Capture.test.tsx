@@ -579,7 +579,7 @@ describe("Capture screen — capture tools", () => {
     expect(within(tools).getByText("1.32.19")).toBeTruthy();
     await user.dblClick(within(tools).getByRole("button", { name: "Update capture tools" }));
     expect(await within(tools).findByText("yt-dlp: 2026.10.01 → 2026.11.01")).toBeTruthy();
-    expect(within(tools).getByText(/gallery-dl 1\.32\.19 is the image downloader; it is installed and updated from the optional tools screen/)).toBeTruthy();
+    expect(within(tools).getByText(/gallery-dl 1\.32\.19 is the image downloader; it is installed and updated from the Optional tools screen/)).toBeTruthy();
     expect(m.bodies("POST /tools/update")).toHaveLength(1);
   });
 
@@ -587,7 +587,7 @@ describe("Capture screen — capture tools", () => {
     await setup({ versions: { yt_dlp: null, gallery_dl: "1.32.19", ffmpeg: null } });
     const tools = screen.getByRole("region", { name: "Capture tools" });
     // Nothing downloads by itself (R156): the video downloader is installed from the tools screen.
-    expect(await within(tools).findByText("Not installed. Install it from the optional tools screen.")).toBeTruthy();
+    expect(await within(tools).findByText("Not installed. Install it from the Optional tools screen.")).toBeTruthy();
     expect(within(tools).getByText(/Not installed on this computer/)).toBeTruthy();
   });
 

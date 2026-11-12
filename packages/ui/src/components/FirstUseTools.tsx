@@ -3,9 +3,9 @@
  * no optional tool installed and the question not yet answered, it asks what the researcher will do
  * and offers the matching tools pre-selected, with the total download size and the hosts each
  * download contacts (from the catalogue). Nothing is downloaded until "Download …" is pressed; each
- * chosen tool is then one install job (one request each), and the optional tools screen opens to
+ * chosen tool is then one install job (one request each), and the Optional tools screen opens to
  * show their progress. "Not now" (or Escape) is always there and is remembered, so the dialogue does
- * not come back; the same choices stay on the optional tools screen in the settings. The dialogue
+ * not come back; the same choices stay on the Optional tools screen in the settings. The dialogue
  * never blocks the app: when the catalogue cannot be read (the media helper is not running, or the
  * page is not the desktop app) it does not open at all.
  *
@@ -208,7 +208,7 @@ function FirstUseDialog({ api, tools, onNotNow, onStarted }: { api: ToolsApi; to
       onStarted();
       return;
     }
-    setError(`${failed.join(", ")} could not be started. ${toolsErrorText(firstError, "The library service did not answer.")} Try again, or choose Not now and install later from the optional tools screen.`);
+    setError(`${failed.join(", ")} could not be started. ${toolsErrorText(firstError, "The library service did not answer.")} Try again, or choose Not now and install later from the Optional tools screen.`);
   };
 
   return (

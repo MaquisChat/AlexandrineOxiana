@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/shared";
 import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, useMsw } from "../test/msw-tools";
 import { ToolsSetup } from "./ToolsSetup";
 
@@ -25,7 +26,7 @@ async function shown(svc = toolsService(), props: Partial<Parameters<typeof Tool
 describe("the optional tools screen", () => {
   it("lists every tool the app can use with its purpose, what stops without it, its size and whether it is installed", async () => {
     await shown();
-    for (const t of catalogue().filter((x) => x.id !== "speech-tiny")) {
+    for (const t of catalogue()) {
       const c = card(t.name);
       expect(within(c).getByText(t.purpose)).toBeTruthy();
       expect(within(c).getByText(new RegExp(escape(t.without)))).toBeTruthy();
@@ -35,24 +36,16 @@ describe("the optional tools screen", () => {
     expect(within(card("Speech model: small")).getByRole("button", { name: "Install Speech model: small" })).toBeTruthy();
   });
 
-  it("offers only the speech models the app accepts (R158): no tiny model, which no feature can use", async () => {
+  it("offers exactly the speech models of the shared definition (R158), the default among them", async () => {
     await shown();
-    expect(screen.queryByRole("region", { name: "Speech model: tiny" })).toBeNull();
-    expect(screen.queryByText(/tiny/)).toBeNull();
-  });
-
-  it("a tiny model the app installed earlier can still be removed, but not installed or updated", async () => {
-    const tools = catalogue().map((t) => (t.id === "speech-tiny" ? { ...t, installed: true, usable: true, managed: true, remainingSize: 0 } : t));
-    await shown(toolsService({ tools }));
-    const c = card("Speech model: tiny");
-    expect(within(c).getByText(/no feature of the app uses it/i)).toBeTruthy();
-    expect(within(c).getByRole("button", { name: "Remove Speech model: tiny" })).toBeTruthy();
-    expect(within(c).queryByRole("button", { name: /Install|Update/ })).toBeNull();
+    const offered = screen.getAllByRole("region", { name: /^Speech model: / }).map((r) => r.getAttribute("aria-labelledby") && within(r).getByRole("heading").textContent);
+    expect(offered).toEqual(SPEECH_MODELS.map((m) => `Speech model: ${m}`));
+    expect(within(card(`Speech model: ${DEFAULT_SPEECH_MODEL}`)).getByText(/the app's default/i)).toBeTruthy();
   });
 
   it("gives each speech model a plain hint about speed and accuracy, and names the app's default", async () => {
     await shown();
-    expect(within(card("Speech model: small")).getByText(/fastest.*least accurate/i)).toBeTruthy();
+    expect(within(card("Speech model: tiny")).getByText(/quickest.*least accurate/i)).toBeTruthy();
     expect(within(card("Speech model: medium")).getByText(/the app's default/i)).toBeTruthy();
     expect(within(card("Speech model: large-v3")).getByText(/slowest.*most accurate/i)).toBeTruthy();
   });
@@ -158,6 +151,12 @@ describe("the optional tools screen", () => {
     vd.components = vd.components.map((c) => (c.id === "yt-dlp" ? { ...c, installed: true, usable: true, source: "managed" as const } : c));
     const reads = svc.state.requests.filter((r) => r === "GET /tools").length;
     await user.click(within(card("Video downloader")).getByRole("button", { name: "Cancel installing Video downloader" }));
+    // Until the media helper answers: "Stopping…", announced once, and no second Cancel.
+    await waitFor(() => expect(within(card("Video downloader")).getByText("Stopping…")).toBeTruthy());
+    expect(within(card("Video downloader")).queryByRole("button", { name: /Cancel/ })).toBeNull();
+    const live = screen.getByRole("status", { name: "Tool progress" });
+    await waitFor(() => expect(live.textContent).toBe("Stopping Video downloader."));
+    svc.finish(svc.jobOf("video-downloader")!.jobId, "cancelled");
     await waitFor(() => expect(svc.state.requests.filter((r) => r === "GET /tools").length).toBeGreaterThan(reads));
     const c = card("Video downloader");
     await waitFor(() => expect(within(c).getByText(/Stopped/)).toBeTruthy());
@@ -177,8 +176,36 @@ describe("the optional tools screen", () => {
     await user.click(within(card("Speech model: small")).getByRole("button", { name: "Cancel installing Speech model: small" }));
     const job = svc.jobOf("speech-small")!;
     await waitFor(() => expect(svc.state.requests).toContain(`POST /tools/jobs/${job.jobId}/cancel`));
+    svc.finish(job.jobId, "cancelled");
     await waitFor(() => expect(within(card("Speech model: small")).getByText(/Stopped.*is not installed/)).toBeTruthy());
     expect(within(card("Speech model: small")).queryByRole("progressbar")).toBeNull();
+  });
+
+  it("an install that completed before the stop took effect says it is installed and offers Remove", async () => {
+    const { user, svc } = await shown();
+    await user.click(screen.getByRole("button", { name: "Install Image downloader" }));
+    await screen.findByRole("progressbar", { name: /Installing Image downloader/ });
+    await user.click(within(card("Image downloader")).getByRole("button", { name: "Cancel installing Image downloader" }));
+    await waitFor(() => expect(within(card("Image downloader")).getByText("Stopping…")).toBeTruthy());
+    svc.finish(svc.jobOf("image-downloader")!.jobId, "done");
+    const c = () => card("Image downloader");
+    await waitFor(() => expect(within(c()).getByText(/It finished before the stop took effect\. Image downloader is installed\./)).toBeTruthy());
+    expect(within(c()).getByText("Installed")).toBeTruthy();
+    expect(within(c()).getByRole("button", { name: "Remove Image downloader" })).toBeTruthy();
+    expect(screen.getByRole("status", { name: "Tool progress" }).textContent).toMatch(/finished before the stop took effect/);
+  });
+
+  it("a stop the media helper did not confirm is said plainly, with what the catalogue shows, and nothing is retried", async () => {
+    const { user, svc } = await shown();
+    await user.click(screen.getByRole("button", { name: "Install Speech model: small" }));
+    await screen.findByRole("progressbar", { name: /Installing Speech model: small/ });
+    await user.click(within(card("Speech model: small")).getByRole("button", { name: "Cancel installing Speech model: small" }));
+    svc.finish(svc.jobOf("speech-small")!.jobId, "failed", { code: "CANCEL_UNCONFIRMED", message: "The media helper did not confirm that it stopped. Check the tools list to see whether the tool is installed." });
+    const alert = await within(card("Speech model: small")).findByRole("alert");
+    expect(alert.textContent).toMatch(/did not confirm that it stopped/);
+    await waitFor(() => expect(alert.textContent).toMatch(/Speech model: small is not installed/));
+    expect(within(alert).queryByRole("button")).toBeNull();
+    expect(svc.state.requests.filter((r) => r === "POST /tools/speech-small/install")).toHaveLength(1);
   });
 
   it("a remove offers no Cancel (it cannot be stopped)", async () => {

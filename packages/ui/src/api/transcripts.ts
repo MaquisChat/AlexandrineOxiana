@@ -8,12 +8,13 @@
  * never shown, logged, stored or put in the page address. `revokeTicket()` sends it in the body.
  */
 import type { MediaTicketResponse, MediaTicketRevokeResponse, TranscriptListResponse, TranscriptResponse, TranscriptSaveRequest } from "@ao/shared";
+import { SPEECH_MODELS, type SpeechModel } from "@ao/shared";
 import type { ApiClient } from "./client";
 import type { SourceFile } from "./library";
 
-/** The speech models the service accepts (MODELS in routes/capture.ts). */
-export const TRANSCRIPTION_MODELS = ["large-v3", "medium", "small"] as const;
-export type TranscriptionModel = (typeof TRANSCRIPTION_MODELS)[number];
+/** The speech models the app accepts: the one definition in @ao/shared (R158). */
+export const TRANSCRIPTION_MODELS = SPEECH_MODELS;
+export type TranscriptionModel = SpeechModel;
 
 /** What POST …/transcribe answers (TranscribeSourceResult in packages/library). */
 export interface TranscribeResult {

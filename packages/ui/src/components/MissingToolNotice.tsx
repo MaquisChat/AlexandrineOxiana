@@ -4,7 +4,7 @@
  * capture outcome carries `errorCode: "TOOL_NOT_INSTALLED"` with the library's own sentence naming the
  * tool in `reason` (and `tool`, which the UI's queue state does not keep yet); a source's viewing copy
  * or OCR job that waits for its tool is recorded failed with that code. Each becomes one plain
- * sentence naming the tool and a link to the optional tools screen (only the link where the service's
+ * sentence naming the tool and a link to the Optional tools screen (only the link where the service's
  * sentence is already shown). Anything else shows the children (the screen's usual message), so a
  * hook-up is one line.
  *
@@ -59,7 +59,7 @@ export function missingToolOf(from: unknown): { tool?: ToolId } | undefined {
 export const toolsHref = (tool?: ToolId): string => (tool ? `${PATHS.tools}?tool=${encodeURIComponent(tool)}` : PATHS.tools);
 
 /** The link to the tools screen. */
-export function ToolsLink({ tool, children = "Install it from the optional tools screen" }: { tool?: ToolId | undefined; children?: ReactNode }) {
+export function ToolsLink({ tool, children = "Install it from the Optional tools screen" }: { tool?: ToolId | undefined; children?: ReactNode }) {
   const href = toolsHref(tool);
   return (
     <a href={href} onClick={inAppLink}>
@@ -81,7 +81,7 @@ export function MissingToolNotice({ from, children, as = "span" }: { from: unkno
   if (saidByService(from)) {
     return (
       <Tag className="ao-tool-missing">
-        <ToolsLink tool={m.tool}>Open the optional tools screen</ToolsLink>
+        <ToolsLink tool={m.tool}>Open the Optional tools screen</ToolsLink>
       </Tag>
     );
   }
@@ -120,12 +120,12 @@ export function SourceToolNotice({ file }: { file: unknown }) {
       {video && (
         <p className="ao-tool-missing" role="note">
           This source&apos;s viewing copy, with its location coarsened or removed, has not been made: the video tools (ffmpeg) are not installed. Until it is, the media stays “proxy pending”
-          and is left out of exports. <ToolsLink tool="ffmpeg">Install ffmpeg from the optional tools screen</ToolsLink>.
+          and is left out of exports. <ToolsLink tool="ffmpeg">Install ffmpeg from the Optional tools screen</ToolsLink>.
         </p>
       )}
       {ocr && (
         <p className="ao-tool-missing" role="note">
-          This source&apos;s scanned pages have not been read: text recognition (OCR) is not installed on this computer. <ToolsLink tool="ocr">See the optional tools screen</ToolsLink>.
+          This source&apos;s scanned pages have not been read: text recognition (OCR) is not installed on this computer. <ToolsLink tool="ocr">See the Optional tools screen</ToolsLink>.
         </p>
       )}
     </>

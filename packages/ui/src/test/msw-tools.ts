@@ -223,10 +223,9 @@ export function toolsService(opts: { tools?: ToolInfo[]; jobs?: ToolJob[]; base?
         }
         const j = find(String(params.jobId));
         if (!j) return apiError(404, "NOT_FOUND", "That tool job was not found.");
-        if (j.status === "running") {
-          j.status = "cancelled";
-          j.finishedAt = new Date().toISOString();
-        }
+        // As the service does since 48a fix round 2: the job stays running, with cancelRequested, until
+        // the worker answers (a test then calls finish(..., "cancelled" | "done" | "failed")).
+        if (j.status === "running") j.cancelRequested = true;
         return HttpResponse.json({ job: { ...j } });
       }),
       http.get(url("/tools/jobs/:jobId"), ({ params }) => {

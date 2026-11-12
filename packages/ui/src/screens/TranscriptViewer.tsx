@@ -45,9 +45,10 @@ export interface TranscriptViewerProps {
 }
 
 const MODEL_LABELS: Record<TranscriptionModel, string> = {
-  "large-v3": "large-v3 (most accurate, slowest)",
+  tiny: "tiny (quickest, least accurate)",
+  small: "small (fast)",
   medium: "medium",
-  small: "small (fastest)",
+  "large-v3": "large-v3 (most accurate, slowest)",
 };
 
 const LOCKED = "This project is locked, so its transcript and recording are not shown. Unlock it in the library, then choose Try again.";
@@ -90,7 +91,7 @@ function transcribeError(err: unknown, model: string): string {
   const said = err.message ? ` The service said: “${err.message}”` : "";
   switch (err.reason) {
     case "MODEL_UNAVAILABLE":
-      return `The speech model “${model}” on this computer could not be loaded; it may be damaged. Remove it and install it again from the optional tools screen, or choose another model.${said}`;
+      return `The speech model “${model}” on this computer could not be loaded; it may be damaged. Remove it and install it again from the Optional tools screen, or choose another model.${said}`;
     case "FFMPEG_FAILED":
       return `The sound could not be read from the recording. The file may be damaged or in a form the speech tool cannot read.${said}`;
     case "UNSUPPORTED_INPUT":

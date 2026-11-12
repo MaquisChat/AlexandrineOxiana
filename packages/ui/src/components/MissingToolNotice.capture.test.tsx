@@ -2,6 +2,7 @@
  * The capture screen and the optional tools (Task 48b). Its own file: the capture fixtures have
  * their own mock server (test/captureService.ts).
  */
+import { SPEECH_MODELS } from "@ao/shared";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -40,7 +41,7 @@ describe("the capture screen and the optional tools", () => {
     const view = render(<Capture client={m.client} projectId={P1} />);
     const tools = await screen.findByRole("region", { name: "Capture tools" });
     // yt-dlp and gallery-dl rows: both are first-use downloads (R126, R152).
-    expect(await within(tools).findAllByText(/^Not installed\. Install it from the optional tools screen\.$/)).toHaveLength(2);
+    expect(await within(tools).findAllByText(/^Not installed\. Install it from the Optional tools screen\.$/)).toHaveLength(2);
     expect(tools.textContent).not.toMatch(/downloaded the first time|comes with the app/);
     view.unmount();
   });
@@ -48,7 +49,7 @@ describe("the capture screen and the optional tools", () => {
   it("uses the app's default speech model (R158) and offers only the models the app accepts", async () => {
     const { m, user, view } = await ready();
     expect(model().value).toBe("medium");
-    expect([...model().options].map((o) => o.value)).toEqual(["large-v3", "medium", "small"]);
+    expect([...model().options].map((o) => o.value)).toEqual([...SPEECH_MODELS]);
     await user.click(screen.getByRole("textbox", { name: "Links, one per line" }));
     await user.paste(YT);
     await user.click(screen.getByRole("radio", { name: "Transcribe" }));

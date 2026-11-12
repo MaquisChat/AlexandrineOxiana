@@ -23,6 +23,7 @@
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
+import { SPEECH_MODELS, type SpeechModel } from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
 import { isValidId, seg } from "./import";
 
@@ -45,12 +46,16 @@ export const BROWSERS: ReadonlyArray<{ value: BrowserName; label: string }> = [
   { value: "brave", label: "Brave" },
 ];
 
-/** The transcription models the service accepts (routes/capture.ts MODELS). */
-export const MODELS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: "large-v3", label: "Large (most accurate, slowest)" },
-  { value: "medium", label: "Medium" },
-  { value: "small", label: "Small (fastest)" },
-];
+/** Words for each speech model; the models themselves are the one definition in @ao/shared (R158). */
+const MODEL_WORDS: Record<SpeechModel, string> = {
+  tiny: "Tiny (quickest, least accurate)",
+  small: "Small (fast)",
+  medium: "Medium",
+  "large-v3": "Large (most accurate, slowest)",
+};
+
+/** The transcription models the app accepts, in the shared order, with their words. */
+export const MODELS: ReadonlyArray<{ value: SpeechModel; label: string }> = SPEECH_MODELS.map((value) => ({ value, label: MODEL_WORDS[value] }));
 
 export type ProfileContentType = "posts" | "reels" | "videos" | "shorts" | "highlights";
 export const CONTENT_TYPES: ReadonlyArray<{ value: ProfileContentType; label: string }> = [
@@ -311,7 +316,7 @@ const OUTCOME_TEXT: Record<string, string> = {
   PROJECT_LOCKED: "The project is locked. Unlock it, then try again.",
   CAPTURE_FAILED: "Something went wrong while saving this link. Nothing was saved.",
   // The media helper's own job codes.
-  TOOL_DOWNLOAD_FAILED: "A tool could not be downloaded. Check the internet connection, then install it again from the optional tools screen.",
+  TOOL_DOWNLOAD_FAILED: "A tool could not be downloaded. Check the internet connection, then install it again from the Optional tools screen.",
   TOOL_CHECKSUM_MISMATCH: "The downloader tool that was fetched did not match its published checksum, so it was not installed. Try again later.",
   TOOL_UPDATE_FAILED: "The downloader tool could not be updated. Try again later.",
   TOOL_MISSING: "A tool this capture needs is not installed on this computer. Install it from the Optional tools screen.",
