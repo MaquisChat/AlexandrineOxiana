@@ -38,7 +38,7 @@ describe("StatusBanner", () => {
     ["anchor-missing", /audit log may have been changed outside the app/],
     ["audit-unrecorded", /A change to Dissertation is not recorded in its audit log yet.*recorded the next time the library is opened with write access.*audit screen/],
     ["audit-unrecorded-blocked", /A change to Dissertation is not recorded in its audit log, and it cannot be while that log does not verify or a problem reported for Dissertation is unresolved.*set it aside/],
-    ["attention-unreadable", /A note that something in Dissertation still needs recording could not be read.*set it aside/],
+    ["attention-unreadable", /An unrecognised item is in the attention folder of Dissertation.*set it aside/],
     ["audit-waiting", /kept on this computer.*another computer had the library open.*next opens the library with write access/],
     ["permissions-not-set", /restored to Dissertation could not be made private to you.*tried again.*set it aside/],
     ["audit-recorded-late", /recorded in the audit log of Dissertation now.*marked as recorded late/],

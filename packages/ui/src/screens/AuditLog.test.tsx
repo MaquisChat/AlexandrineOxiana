@@ -176,7 +176,7 @@ describe("Task 50 (R154 b, d): late entries, attention marks, the library's audi
   const marks = [
     { id: "m1", kind: "audit-unrecorded", action: "library.relink", occurredAt: "2026-11-02T08:00:00.000Z", actor: "ana", reason: "EIO", interrupted: true, canSetAside: true },
     { id: "m2", kind: "permissions-not-set", action: "library.relink", occurredAt: "2026-11-03T08:00:00.000Z", actor: "ana", canSetAside: true },
-    { id: "bad.json", kind: "unreadable", canSetAside: true },
+    { id: "u-0123456789abcdef0123456789abcdef", kind: "unrecognised", name: "abc 2.json", canSetAside: true },
     { id: "m4", kind: "waiting", action: "library.reconnect", occurredAt: "2026-11-04T08:00:00.000Z", actor: "ana", canSetAside: false },
   ];
 
@@ -190,7 +190,8 @@ describe("Task 50 (R154 b, d): late entries, attention marks, the library's audi
     expect(items[0]!.textContent).toMatch(/not recorded in the audit log/);
     expect(items[0]!.textContent).toMatch(/library\.relink/);
     expect(items[1]!.textContent).toMatch(/could not be made private/);
-    expect(items[2]!.textContent).toMatch(/could not be read/);
+    expect(items[2]!.textContent).toMatch(/An unrecognised item in the attention folder: abc 2\.json/);
+    expect(within(items[2]!).getByText("abc 2.json").getAttribute("dir")).toBe("auto");
     expect(items[3]!.textContent).toMatch(/kept on this computer/);
     expect(within(items[3]!).queryByRole("button")).toBeNull();
     expect(within(region).getAllByRole("button", { name: /Set aside/ })).toHaveLength(3);
@@ -251,17 +252,17 @@ describe("Task 50 (R154 b, d): late entries, attention marks, the library's audi
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
   });
 
-  it("shows the library's audit log: refused creations by name, repeats, and its integrity check", async () => {
+  it("shows the library's audit log: refused creations by name, set-asides with their mark and reason, and its integrity check", async () => {
     serveAudit(0);
     server.use(
       http.get(url("/libraries/audit"), () =>
         HttpResponse.json({
           events: [
             { seq: 2, at: "2026-11-09T10:00:00.000Z", actor: "ana", device: "dev-A", action: "store", decision: { result: "deny", reason: "Governance requires encryption at rest" }, details: { op: "project.create", name: RTL, encrypted: false } },
-            { seq: 1, at: "2026-11-08T10:00:00.000Z", actor: "ana", device: "dev-A", action: "delete", projectId: PID, decision: { result: "allow" }, details: { op: "attention.set-aside", reason: "Recorded on paper", mark: { kind: "unreadable" } } },
+            { seq: 1, at: "2026-11-08T10:00:00.000Z", actor: "ana", device: "dev-A", action: "set-aside", projectId: PID, decision: { result: "allow" }, details: { op: "attention.set-aside", reason: "Recorded on paper", mark: { kind: "audit-unrecorded", record: { action: "library.relink", occurredAt: "2026-11-02T08:00:00.000Z" } } } },
+            { seq: 0, at: "2026-11-07T10:00:00.000Z", actor: "ana", device: "dev-A", action: "set-aside", projectId: PID, decision: { result: "deny", reason: "A reason is required to set this aside" }, details: { op: "attention.set-aside", reason: "", mark: { kind: "unrecognised", name: "abc 2.json", entry: "file" } } },
           ],
-          total: 2,
-          repeats: { seq: 2, count: 3, lastAt: "2026-11-09T11:00:00.000Z" },
+          total: 3,
         }),
       ),
       http.get(url("/libraries/audit/verify"), () => HttpResponse.json({ ok: true, events: 2, anchored: true, alteredAt: [] })),
@@ -273,10 +274,101 @@ describe("Task 50 (R154 b, d): late entries, attention marks, the library's audi
     const rows = within(table).getAllByRole("row").slice(1);
     expect(rows[0]!.textContent).toMatch(/A project named .*evil.* was asked for/);
     expect(rows[0]!.textContent).toMatch(/Denied: Governance requires encryption at rest/);
-    expect(rows[0]!.textContent).toMatch(/asked 3 more times, last at 2026-11-09T11:00:00.000Z/);
+    expect(rows[0]!.textContent).toMatch(/Further identical refusals that day are not listed/);
     expect(within(rows[0]!).getAllByText((_t, el) => el?.getAttribute("dir") === "auto" && (el.textContent ?? "").includes("evil")).length).toBeGreaterThanOrEqual(1);
-    expect(rows[1]!.textContent).toMatch(/A mark was set aside: Recorded on paper/);
+    expect(rows[1]!.textContent).toMatch(/A mark was set aside/);
+    expect(rows[1]!.textContent).toMatch(/not recorded in the audit log \(library\.relink, 2026-11-02T08:00:00\.000Z\)/);
+    expect(rows[1]!.textContent).toMatch(/Reason: Recorded on paper/);
+    expect(rows[2]!.textContent).toMatch(/Setting a mark aside was asked for/);
+    expect(rows[2]!.textContent).not.toMatch(/A mark was set aside/);
+    expect(rows[2]!.textContent).toMatch(/unrecognised item in the attention folder: abc 2\.json/);
     await user.click(screen.getByRole("button", { name: "Verify the library's audit log" }));
     expect((await screen.findByText(/2 events — hash chain intact/)).textContent).toBeTruthy();
+  });
+});
+
+describe("N3, N8: set-asides in the project's log; stale answers and double clicks", () => {
+  it("N3: a set-aside recorded in the project's log shows which mark, the reason, who and when", async () => {
+    server.use(
+      http.get(url(`/projects/${PID}/audit`), () =>
+        HttpResponse.json({
+          events: [
+            {
+              ...ev(5),
+              at: "2026-11-09T10:00:00.000Z",
+              actor: "ana",
+              action: "set-aside",
+              entity: { type: "project", id: PID },
+              decision: { result: "allow" },
+              details: { op: "attention.set-aside", reason: "Recorded on paper", mark: { kind: "permissions-not-set", record: { action: "library.relink", occurredAt: "2026-11-03T08:00:00.000Z" } } },
+            },
+          ],
+          total: 1,
+        }),
+      ),
+    );
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    const row = within(table).getAllByRole("row")[1]!;
+    expect(row.textContent).toMatch(/2026-11-09T10:00:00.000Z/);
+    expect(row.textContent).toMatch(/ana/);
+    expect(row.textContent).toMatch(/A mark was set aside/);
+    expect(row.textContent).toMatch(/could not be made private \(library\.relink, 2026-11-03T08:00:00\.000Z\)/);
+    expect(row.textContent).toMatch(/Reason: Recorded on paper/);
+  });
+
+  it("N8: the library's verify button sends one request on a double click", async () => {
+    serveAudit(0);
+    let calls = 0;
+    server.use(
+      http.get(url("/libraries/audit/verify"), async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 30));
+        return HttpResponse.json({ ok: true, events: 1, anchored: true, alteredAt: [] });
+      }),
+    );
+    const user = userEvent.setup();
+    render(<AuditLog api={makeApi()} projectId={PID} />);
+    const b = await screen.findByRole("button", { name: "Verify the library's audit log" });
+    await user.dblClick(b);
+    await screen.findByText(/1 event — hash chain intact/);
+    expect(calls).toBe(1);
+  });
+
+  it("N8: a later successful load clears an earlier error in Needs attention", async () => {
+    serveAudit(0);
+    let fail = true;
+    server.use(
+      http.get(url(`/projects/${PID}/attention`), () =>
+        fail ? HttpResponse.json({ error: { code: "INTERNAL", message: "Could not read" } }, { status: 500 }) : HttpResponse.json({ marks: [] }),
+      ),
+    );
+    const { rerender } = render(<AuditLog api={makeApi()} projectId={PID} />);
+    const region = await screen.findByRole("region", { name: "Needs attention" });
+    await within(region).findByRole("alert");
+    fail = false;
+    rerender(<AuditLog api={makeApi()} projectId={PID} />);
+    await within(region).findByText(/Nothing needs attention/);
+    expect(within(region).queryByRole("alert")).toBeNull();
+  });
+
+  it("N8: an answer for an earlier project is dropped", async () => {
+    const P2 = "0190f0f0-0000-7000-8000-000000000003";
+    serveAudit(0);
+    server.use(
+      http.get(url(`/projects/${P2}/audit`), () => HttpResponse.json({ events: [], total: 0 })),
+      http.get(url(`/projects/${PID}/attention`), async () => {
+        await new Promise((r) => setTimeout(r, 80));
+        return HttpResponse.json({ marks: [{ id: "m1", kind: "audit-unrecorded", action: "library.relink", occurredAt: "2026-11-02T08:00:00.000Z", canSetAside: true }] });
+      }),
+      http.get(url(`/projects/${P2}/attention`), () => HttpResponse.json({ marks: [] })),
+    );
+    const api = makeApi();
+    const { rerender } = render(<AuditLog api={api} projectId={PID} />);
+    rerender(<AuditLog api={api} projectId={P2} />);
+    await screen.findByText(/Nothing needs attention/);
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByText(/library\.relink/)).toBeNull();
+    expect(screen.getByText(/Nothing needs attention/)).toBeTruthy();
   });
 });

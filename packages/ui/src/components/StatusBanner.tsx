@@ -62,7 +62,7 @@ const WARNINGS: Record<string, (p: string) => string> = {
   "audit-unrecorded-blocked": (p) =>
     `A change to ${p} is not recorded in its audit log, and it cannot be while that log does not verify or a problem reported for ${p} is unresolved. The change was kept. Review it on the audit screen, where you can set it aside with a reason.`,
   "attention-unreadable": (p) =>
-    `A note that something in ${p} still needs recording could not be read. It is kept. Review it on the audit screen, where you can set it aside with a reason.`,
+    `An unrecognised item is in the attention folder of ${p}. It is kept and never opened. Review it on the audit screen, where you can set it aside with a reason.`,
   "audit-waiting": (p) =>
     `A change to ${p} made here is kept on this computer because another computer had the library open. It is recorded when this computer next opens the library with write access.`,
   "permissions-not-set": (p) =>

@@ -53,6 +53,7 @@ function Verdict({ check }: { check: AuditCheck }) {
  * (Task 61): what an allowed event did, and what a refused one asked for (M-d).
  */
 const PLAIN_OPS: Record<string, { allowed: string; refused: string }> = {
+  "attention.set-aside": { allowed: "A mark was set aside", refused: "Setting a mark aside was asked for" },
   "project.recovery-code": { allowed: "A new recovery code was issued", refused: "A new recovery code was asked for" },
 };
 const PLAIN_ACTIONS: Record<string, string> = {
@@ -117,8 +118,12 @@ function markText(m: AttentionMarkView): ReactNode {
       );
     case "permissions-not-set":
       return <>A file restored{when} could not be made private to you on this disk. This is tried again each time the library opens; if this disk cannot do it, set it aside with a reason.</>;
-    case "unreadable":
-      return <>A note that something in this project still needs recording could not be read. It is kept until you set it aside with a reason.</>;
+    case "unrecognised":
+      return (
+        <>
+          An unrecognised item in the attention folder: <UserText>{m.name ?? ""}</UserText>. It is kept, and never opened, until you set it aside with a reason.
+        </>
+      );
     case "waiting":
       return (
         <>
@@ -160,6 +165,43 @@ function SetAsideDialog({ busy, onConfirm, onCancel }: { busy: boolean; onConfir
   );
 }
 
+/** Which mark a set-aside was about, from its audit record (N3); every text through UserText. */
+function MarkSummary({ mark }: { mark: unknown }) {
+  const m = (mark && typeof mark === "object" ? mark : {}) as { kind?: unknown; name?: unknown; record?: { action?: unknown; occurredAt?: unknown } };
+  const rec = m.record && typeof m.record === "object" ? m.record : undefined;
+  const of = rec ? (
+    <>
+      {" "}
+      (<UserText>{String(rec.action ?? "?")}</UserText>, <UserText>{String(rec.occurredAt ?? "?")}</UserText>)
+    </>
+  ) : null;
+  switch (m.kind) {
+    case "audit-unrecorded":
+      return <>a change not recorded in the audit log{of}</>;
+    case "permissions-not-set":
+      return <>a file that could not be made private{of}</>;
+    case "unrecognised":
+      return (
+        <>
+          an unrecognised item in the attention folder: <UserText>{String(m.name ?? "")}</UserText>
+        </>
+      );
+    default:
+      return <>a mark</>;
+  }
+}
+
+/** For a set-aside event: which mark and the reason (who and when are the row's own columns). */
+function SetAsideDetails({ e }: { e: AuditEvent }) {
+  if (e.details?.op !== "attention.set-aside") return null;
+  return (
+    <>
+      {" "}
+      — <MarkSummary mark={e.details.mark} />. Reason: <UserText>{String(e.details.reason ?? "")}</UserText>
+    </>
+  );
+}
+
 function NeedsAttention({ api, projectId, onChanged }: { api: GovernanceApi; projectId: string; onChanged: () => void }) {
   const ids = useId();
   const [marks, setMarks] = useState<AttentionMarkView[] | null>(null);
@@ -170,15 +212,27 @@ function NeedsAttention({ api, projectId, onChanged }: { api: GovernanceApi; pro
   const heading = useRef<HTMLHeadingElement>(null);
   const alive = useRef(true);
   useEffect(() => () => void (alive.current = false), []);
+  /** The project whose answers are current: an answer for another one is dropped (N8). */
+  const current = useRef(projectId);
+  current.current = projectId;
+  const sending = useRef(false);
 
   const load = useCallback(async () => {
+    const asked = projectId;
     try {
-      const r = await api.attention(projectId);
-      if (alive.current) setMarks(r.marks);
+      const r = await api.attention(asked);
+      if (!alive.current || current.current !== asked) return;
+      setMarks(r.marks);
+      setError(null);
     } catch (err) {
-      if (alive.current) setError(err instanceof Error ? err.message : "What needs attention could not be read.");
+      if (!alive.current || current.current !== asked) return;
+      setError(err instanceof Error ? err.message : "What needs attention could not be read.");
     }
   }, [api, projectId]);
+  useEffect(() => {
+    setMarks(null);
+    setOpen(null);
+  }, [projectId]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -190,21 +244,24 @@ function NeedsAttention({ api, projectId, onChanged }: { api: GovernanceApi; pro
   }, [focusHeading, marks]);
 
   const setAside = async (reason: string) => {
-    if (!open || busy) return;
+    if (!open || sending.current) return;
+    sending.current = true;
+    const asked = projectId;
     setBusy(true);
     try {
-      await api.setAsideMark(projectId, open, reason);
-      if (!alive.current) return;
+      await api.setAsideMark(asked, open, reason);
+      if (!alive.current || current.current !== asked) return;
       setOpen(null);
       setError(null);
       await load();
       setFocusHeading(true);
       onChanged();
     } catch (err) {
-      if (!alive.current) return;
+      if (!alive.current || current.current !== asked) return;
       setOpen(null);
       setError(err instanceof Error ? err.message : "It could not be set aside.");
     } finally {
+      sending.current = false;
       if (alive.current) setBusy(false);
     }
   };
@@ -249,13 +306,15 @@ function LibraryWhat({ e }: { e: AuditEvent }) {
     return (
       <>
         A project named <UserText>{String(d.name ?? "")}</UserText> was asked for
+        {e.decision?.result === "deny" ? ". Further identical refusals that day are not listed." : ""}
       </>
     );
   }
   if (d.op === "attention.set-aside") {
     return (
       <>
-        A mark was set aside: <UserText>{String(d.reason ?? "")}</UserText>
+        {e.decision?.result === "deny" ? PLAIN_OPS["attention.set-aside"]!.refused : PLAIN_OPS["attention.set-aside"]!.allowed}
+        <SetAsideDetails e={e} />
       </>
     );
   }
@@ -270,23 +329,42 @@ function LibraryAudit({ api }: { api: GovernanceApi }) {
   const [check, setCheck] = useState<AuditCheck | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [checking, setChecking] = useState(false);
+  // Refs, not state: a double click fires before the button re-renders as disabled (N8, R113).
+  const loadingRef = useRef(false);
+  const checkingRef = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => () => void (alive.current = false), []);
   const show = async () => {
-    if (loading) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     try {
-      setPage(await api.libraryAudit({ limit: 100 }));
+      const p = await api.libraryAudit({ limit: 100 });
+      if (!alive.current) return;
+      setPage(p);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "The library's audit log could not be read.");
+      if (alive.current) setError(err instanceof Error ? err.message : "The library's audit log could not be read.");
     } finally {
-      setLoading(false);
+      loadingRef.current = false;
+      if (alive.current) setLoading(false);
     }
   };
   const verify = async () => {
+    if (checkingRef.current) return;
+    checkingRef.current = true;
+    setChecking(true);
     try {
-      setCheck(await api.verifyLibraryAudit());
+      const c = await api.verifyLibraryAudit();
+      if (!alive.current) return;
+      setCheck(c);
+      setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "The library's audit log could not be checked.");
+      if (alive.current) setError(err instanceof Error ? err.message : "The library's audit log could not be checked.");
+    } finally {
+      checkingRef.current = false;
+      if (alive.current) setChecking(false);
     }
   };
   return (
@@ -297,7 +375,7 @@ function LibraryAudit({ api }: { api: GovernanceApi }) {
         <button type="button" onClick={() => void show()} disabled={loading}>
           Show the library's audit log
         </button>
-        <button type="button" onClick={() => void verify()}>
+        <button type="button" onClick={() => void verify()} disabled={checking}>
           Verify the library's audit log
         </button>
       </div>
@@ -325,10 +403,7 @@ function LibraryAudit({ api }: { api: GovernanceApi }) {
               {page.events.map((e) => (
                 <tr key={e.seq}>
                   <td>{e.seq}</td>
-                  <td>
-                    {e.at}
-                    {page.repeats && page.repeats.seq === e.seq ? ` (asked ${count(page.repeats.count)} more ${page.repeats.count === 1 ? "time" : "times"}, last at ${page.repeats.lastAt})` : ""}
-                  </td>
+                  <td>{e.at}</td>
                   <td>
                     <UserText>{e.actor}</UserText>
                   </td>
@@ -433,6 +508,7 @@ export function AuditLog({ api, projectId, pageSize = 100 }: { api: GovernanceAp
                   </td>
                   <td>
                     <UserText>{whatOf(e)}</UserText>
+                    <SetAsideDetails e={e} />
                   </td>
                   <td className={e.decision?.result === "deny" ? "ao-deny" : undefined}>
                     <Decision e={e} />
