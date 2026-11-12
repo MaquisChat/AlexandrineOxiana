@@ -100,6 +100,13 @@ export interface ApiClient {
    * Same URL and error rules as request(); the caller turns it into a blob: URL and revokes it.
    */
   blob(path: string, opts?: { signal?: AbortSignal }): Promise<Blob>;
+  /**
+   * A file's content (GET), e.g. a picture for a `blob:` address (R135 1) or a font file (R100):
+   * the token in the Authorization header as always, the body as a Blob of the type the service
+   * sent. An answer larger than `maxBytes` is refused (PAYLOAD_TOO_LARGE). Same path rules as
+   * request(); a bad path throws before anything is sent.
+   */
+  bytes(path: string, opts?: { signal?: AbortSignal; maxBytes?: number }): Promise<Blob>;
 }
 
 /** `onOpen` is called once the service has answered with a stream (its headers arrived), before any line. */
@@ -440,8 +447,64 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
     return `${base}${ticketPath}`;
   }
 
+  function bytes(path: string, o: { signal?: AbortSignal; maxBytes?: number } = {}): Promise<Blob> {
+    const url = urlFor(path); // throws synchronously on a bad path or a credential in the URL
+    const tooLarge = () => new ApiClientError(0, { code: "PAYLOAD_TOO_LARGE", message: "The file is too large to show here." });
+    return (async () => {
+      const init: RequestInit = { method: "GET", headers: { ...auth, Accept: "*/*" } };
+      if (o.signal) init.signal = o.signal;
+      let res: Response;
+      try {
+        res = await doFetch(url, init);
+      } catch (err) {
+        if (o.signal?.aborted) throw err;
+        throw unreachable();
+      }
+      if (!res.ok) throw await errorFrom(res);
+      const declared = Number(res.headers.get("content-length"));
+      if (o.maxBytes !== undefined && Number.isFinite(declared) && declared > o.maxBytes) {
+        res.body?.cancel().catch(() => {});
+        throw tooLarge();
+      }
+      const type = res.headers.get("content-type") ?? "";
+      if (o.maxBytes === undefined || !res.body) {
+        let blob: Blob;
+        try {
+          blob = await res.blob();
+        } catch (err) {
+          if (o.signal?.aborted) throw err;
+          throw unreachable();
+        }
+        if (o.maxBytes !== undefined && blob.size > o.maxBytes) throw tooLarge();
+        return blob;
+      }
+      // With a limit, the body is read in chunks and given up as soon as it passes the limit, so a
+      // body that does not say its length is never held whole first (M11).
+      const reader = res.body.getReader();
+      const parts: Uint8Array[] = [];
+      let total = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > o.maxBytes) {
+            reader.cancel().catch(() => {});
+            throw tooLarge();
+          }
+          parts.push(value);
+        }
+      } catch (err) {
+        if (err instanceof ApiClientError || o.signal?.aborted) throw err;
+        throw unreachable();
+      }
+      return new Blob(parts as BlobPart[], { type });
+    })();
+  }
+
   return {
     request,
+    bytes,
     appearance: {
       get: () => request<AppearanceSettings>("GET", "/settings/appearance"),
       put: (patch) => request<AppearanceSettings>("PUT", "/settings/appearance", { body: patch }),

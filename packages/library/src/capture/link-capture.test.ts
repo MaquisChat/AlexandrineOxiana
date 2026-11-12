@@ -10,6 +10,7 @@ import type { Deps } from "../deps.js";
 import { IndexHandle } from "../index/db.js";
 import { rebuildIndex } from "../index/rebuild.js";
 import { createIndexSink } from "../index/sink.js";
+import { appendJobRecords } from "../job-journal.js";
 import { createLibrary, type Library } from "../library.js";
 import { PolicyDeniedError, type Repo } from "../repo/index.js";
 import { decryptBytes } from "../repo/io.js";
@@ -596,9 +597,12 @@ ${basis ? `consent:\n  defaultLegalBasis:\n    social-media: "${basis}"\n` : ""}
 
   it("I3: capture jobs are never resumed, leftovers are swept, and the work folder is private", async () => {
     const p = await project();
-    // a capture.download job left running by a crash
-    handle.db.prepare("INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES ('j-old', ?, 'capture.download', 'running', ?, ?)")
-      .run(p.id, JSON.stringify({ type: "capture.download", input: YT, output: join(lib.root, ".tmp", "capture-old"), params: {} }), new Date().toISOString());
+    // a capture.download job left running by a crash (its journal record, R31; the row was never written)
+    const at = new Date().toISOString();
+    await appendJobRecords(lib.root, p.folder, null, [
+      { v: 1, id: "j-old", projectId: p.id, kind: "capture.download", status: "running", createdAt: at, updatedAt: at,
+        job: { type: "capture.download", input: YT, output: join(lib.root, ".tmp", "capture-old"), params: {} } },
+    ]);
     const stale = join(lib.root, ".tmp", "capture-old");
     await mkdir(stale, { recursive: true });
     await writeFile(join(stale, "aoTest00001.info.json"), '{"http_headers":{"Cookie":"SID=x"}}');
