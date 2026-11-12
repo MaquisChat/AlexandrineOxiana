@@ -112,7 +112,7 @@ Each download is checked against a checksum recorded in the app before it is use
 
 The browser extension lets you capture the web page you are looking at into a project. It works in Chrome, Edge and Firefox (version 128 or later), not in Safari. It is not in any browser's store.
 
-**Getting the extension.** The extension is a download on the same run page as the Mac app: under **Artifacts**, click `alexandrine-oxiana-browser-extension` (it sits next to `alexandrine-oxiana-macos-apple-silicon`). Like the Mac download, GitHub keeps it for 30 days. A run built before this download was added, such as the one of 2026-11-12, has no such artifact: ask for a new build.
+**Getting the extension.** The extension is a download on the same run page as the Mac app: under **Artifacts**, click `alexandrine-oxiana-browser-extension` (it sits next to `alexandrine-oxiana-macos-apple-silicon`). Like the Mac download, GitHub keeps it for 30 days. The run of the first build was made before this download was added and has no such artifact: use the newest run with a green tick.
 
 1. Download it. It is a `.zip` that holds another `.zip`, `alexandrine-oxiana-browser-extension-<version>.zip`, and a `.sha256` file (Safari may already have opened the outer one into a folder).
 2. Open the inner `.zip` by double-clicking it. You get a folder with `manifest.json` and a few other files directly inside it.
