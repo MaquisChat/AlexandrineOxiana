@@ -503,7 +503,7 @@ Update after every task; commit and push.
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | done | 960aacc | reviewed with probes over two fix rounds and a final check; a locked project's captures are neither probed nor kept; `recordEdit` fixed |
-| 62 Transcription as a job | one fix before the merge | 1d5909a (worktree branch) | reviewed with probes; a late fix could pair one run's file with another's (flagged text shown as clean): ruled, being fixed |
+| 62 Transcription as a job | approved; verification waits for a green GitHub run | 2be8912 (worktree branch) | reviewed with probes over one fix round and a final check; a version's files come from one run |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
@@ -526,10 +526,10 @@ Update after every task; commit and push.
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
-| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved; verification before merge | 3dd8f79 (worktree branch) | reviewed with probes; the three points fixed; the working branch taken |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved and verified; merge waits for a green GitHub run | 3dd8f79 (worktree branch) | reviewed with probes; the desktop scenario's picker step passes |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | in progress | | given to Task 66's implementer 2026-11-12 |
+| 68 Settings writers never write what they did not read (D16) | built; two questions for the controller, then review | 7ec17eb (worktree branch) | one helper: a settings file is written only over what was read; a confirmed reset keeps the damaged file aside |
 | 67 One review queue for the project (D14) | in review | 31edce4 (worktree branch) | built with R176: every kind of entry listed and decidable; verification entries resolved by the library |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
