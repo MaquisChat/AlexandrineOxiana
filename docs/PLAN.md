@@ -526,7 +526,7 @@ Update after every task; commit and push.
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
-| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | in review | ce30b54 (worktree branch) | built: a Capture link and a reachability test; capture methods and a default legal basis in the Governance form; pickers on every typed path |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved; three small points, then verification | ce30b54 (worktree branch) | reviewed with probes: approved, 10 Minor; a locked project's Governance screen must offer no change at all; one request per Save |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | approved; verification before merge | 94816e0 (worktree branch) | reviewed with probes over one fix round; the working branch taken three times as it moved |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
