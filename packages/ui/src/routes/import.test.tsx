@@ -107,7 +107,9 @@ describe("import routes", () => {
     await user.click(await screen.findByRole("button", { name: "Next" }));
     await screen.findByRole("heading", { name: "Options" });
     await user.click(screen.getByRole("button", { name: "Start import" }));
-    expect(await screen.findByRole("heading", { name: "Run" })).toBeTruthy();
+    const run = await screen.findByRole("heading", { name: "Run" });
+    const { waitFor } = await import("@testing-library/react");
+    await waitFor(() => expect(document.activeElement).toBe(run)); // focus is placed on arrival (R145, M2)
     expect(new URLSearchParams(window.location.search).get("batch")).toBe(B1);
     expect(m.bodies(`POST /projects/${P1}/import`)).toHaveLength(1);
     expect(screen.queryByRole("alert")).toBeNull();

@@ -49,9 +49,11 @@ export interface StepReportProps {
   projectId: string;
   batchId: string;
   error?: string;
+  /** Focus the heading once shown: the researcher arrived on this report from an address (D1, R145). */
+  focusOnArrival?: boolean;
 }
 
-export function StepReport({ api, projectId, batchId, error: runError }: StepReportProps) {
+export function StepReport({ api, projectId, batchId, error: runError, focusOnArrival = false }: StepReportProps) {
   const [report, setReport] = useState<ImportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   /** A failed undo: shown inside the dialog while it is open (the page behind it is inert), on the page after. */
@@ -66,6 +68,11 @@ export function StepReport({ api, projectId, batchId, error: runError }: StepRep
   useEffect(() => {
     if (refocus) (undoButton.current ?? heading.current)?.focus();
   }, [refocus]);
+  const arrival = useRef(focusOnArrival);
+  useEffect(() => {
+    if (arrival.current) heading.current?.focus();
+    arrival.current = false;
+  }, []);
 
   useEffect(() => {
     let live = true;

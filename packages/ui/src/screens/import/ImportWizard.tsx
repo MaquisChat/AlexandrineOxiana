@@ -91,6 +91,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
   /** The project of the import being run or reported (the scanned one, or the one in the address). */
   const [runProject, setRunProject] = useState<string>("");
   const [recent, setRecent] = useState<BatchSummary[] | null>(null);
+  /** The import was opened from the address: its step's heading takes focus when shown (R145). */
+  const [arrived, setArrived] = useState(false);
   const [runError, setRunError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -138,6 +140,7 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
         } else {
           setRunProject(initialProject);
           setBatchId(b.batchId);
+          setArrived(true);
           setStep(LIVE.has(b.state) ? "run" : "report");
         }
       })
@@ -294,8 +297,8 @@ export function ImportWizard({ client, projectId: initialProject, batchId: initi
           </div>
         </>
       )}
-      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} />}
-      {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} {...(runError ? { error: runError } : {})} />}
+      {step === "run" && batchId && runProject && <StepRun client={client} api={api} projectId={runProject} batchId={batchId} onEnded={ended} focusOnArrival={arrived} />}
+      {step === "report" && batchId && runProject && <StepReport api={api} projectId={runProject} batchId={batchId} focusOnArrival={arrived} {...(runError ? { error: runError } : {})} />}
     </main>
   );
 }

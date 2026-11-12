@@ -514,6 +514,18 @@ describe("Bulk Import wizard", () => {
       expect(within(steps).getByText("Report and undo").getAttribute("aria-current")).toBe("step");
     });
 
+    it("arriving on an import from the address puts focus on its step's heading (R145): the report's, or the run's", async () => {
+      open(B1, { batches: [batch("finished")] });
+      const report = await screen.findByRole("heading", { name: "Report and undo" });
+      await waitFor(() => expect(document.activeElement).toBe(report));
+    });
+
+    it("arriving on a running import from the address puts focus on the Run heading", async () => {
+      open(B1, { batches: [batch("running")] });
+      const run = await screen.findByRole("heading", { name: "Run" });
+      await waitFor(() => expect(document.activeElement).toBe(run));
+    });
+
     it("opened on a running import, it shows the run", async () => {
       open(B1, { batches: [batch("running")] });
       expect(await screen.findByRole("heading", { name: "Run" })).toBeTruthy();
