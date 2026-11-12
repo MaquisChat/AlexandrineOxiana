@@ -15,6 +15,13 @@ import { FileDrop } from "../components/FileDrop";
 import { ConfirmDialog, ReasonDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import {
+  CAPTURE_LABEL,
+  CAPTURE_METHODS,
+  WEB_CAPTURE_METHODS,
+  WEB_LEGAL_CATEGORY,
+  captureNeeds,
+  removeIn,
+  type CaptureMethod,
   ENCRYPTION_LEVELS,
   LOCATION_LEVELS,
   PROCESSING_LABEL,
@@ -52,7 +59,23 @@ type Status = { kind: "saved" } | { kind: "conflict"; message: string } | { kind
 
 const describe = (v: unknown) => JSON.stringify(v);
 
-export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; projectId: string }) {
+export interface GovernanceSettingsProps {
+  api: GovernanceApi;
+  projectId: string;
+  /**
+   * Why these rules cannot be changed now (a locked project, a read-only library), in plain words;
+   * the rules are then shown but every control is off, with this reason.
+   */
+  readOnlyReason?: string | undefined;
+}
+
+/** Today in this computer's time zone, YYYY-MM-DD (protocol dates are read in it when no project time zone is set). */
+const localToday = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+export function GovernanceSettings({ api, projectId, readOnlyReason }: GovernanceSettingsProps) {
   const [saved, setSaved] = useState<{ yaml: string; sha256: string } | null>(null);
   const [text, setTextNow] = useState("");
   // What the cards show is parsed from `parseText`: at once for form edits, 300 ms after the last
@@ -116,9 +139,9 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
 
   const cfg = parsed.cfg;
 
-  /** One control changed through the form. */
-  const change = (control: string, value: unknown) => {
-    if (!cfg) return;
+  /** One control changed through the form; `said` names the change in plain words for the reason dialog. */
+  const change = (control: string, value: unknown, said?: string) => {
+    if (!cfg || readOnlyReason) return;
     setStatus(null);
     const profile = belowProfile(cfg, control, value);
     const needsException = profile !== null && !hasException(cfg, control, value);
@@ -130,7 +153,9 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
     setPending({
       message: needsException
         ? `${PROFILE_LABEL[profile!]} requires ${describe(requiredBy(cfg, control).find((r) => r.profile === profile)?.req.value ?? "a value")} for ${control}. Setting it to ${describe(value)} is recorded as an exception with your reason.`
-        : `Setting ${control} to ${describe(value)} loosens the project's rules, so it needs a reason.`,
+        : said
+          ? `${said} loosens the project's rules, so it needs a reason.`
+          : `Setting ${control} to ${describe(value)} loosens the project's rules, so it needs a reason.`,
       apply: (reason: string, by: string) => {
         let next = setIn(text, control, value);
         if (needsException) next = addException(next, { control, value, reason, by, at: nowUtc() });
@@ -209,12 +234,17 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
     );
   }
 
-  const off = !cfg;
+  const off = !cfg || !!readOnlyReason;
 
   return (
     <main className="ao-screen">
       <h1>Governance</h1>
       <p className="ao-hint">These rules are checked on every capture, import, change and export in this project. You may make any rule stricter; making one looser asks for a reason, which is kept in the audit log.</p>
+      {readOnlyReason ? (
+        <p id={`${rawId}-why`} className="ao-warning">
+          {readOnlyReason}
+        </p>
+      ) : null}
 
       <fieldset className="ao-fieldset">
         <legend>Compliance profiles</legend>
@@ -261,13 +291,26 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
         </ControlCard>
 
         <ControlCard violations={violations} title="Identifiability" controls={["identifiability.containsIdentifiable", "identifiability.pseudonymizeFileNames"]}>
-          <CheckControl cfg={cfg} onChange={change} control="identifiability.containsIdentifiable" label="This project holds identifiable data" />
-          <CheckControl cfg={cfg} onChange={change} control="identifiability.pseudonymizeFileNames" label="Pseudonymise file and folder names" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="identifiability.containsIdentifiable" label="This project holds identifiable data" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="identifiability.pseudonymizeFileNames" label="Pseudonymise file and folder names" />
         </ControlCard>
 
         <ControlCard violations={violations} title="Consent and provenance" controls={["consent"]}>
-          <CheckControl cfg={cfg} onChange={change} control="consent.requireStatus" label="Every source records its consent status" />
-          <CheckControl cfg={cfg} onChange={change} control="consent.requireLegalBasis" label="Every identifiable source records its legal basis" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="consent.requireStatus" label="Every source records its consent status" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="consent.requireLegalBasis" label="Every identifiable source records its legal basis" />
+        </ControlCard>
+
+        <ControlCard violations={violations} title="Capture methods" controls={["captureMethods", "consent.defaultLegalBasis"]}>
+          <CaptureMethods
+            cfg={cfg}
+            disabled={off}
+            {...(readOnlyReason ? { whyId: `${rawId}-why` } : {})}
+            onChange={change}
+            onClearDefault={(path) => {
+              setStatus(null);
+              setText((t) => removeIn(t, path));
+            }}
+          />
         </ControlCard>
 
         <ControlCard violations={violations} title="Retention and destruction" controls={["retention"]}>
@@ -286,7 +329,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
         </ControlCard>
 
         <ControlCard violations={violations} title="Audit log" controls={["audit"]}>
-          <CheckControl cfg={cfg} onChange={change} control="audit.enabled" label="Keep an append-only, hash-chained audit log" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="audit.enabled" label="Keep an append-only, hash-chained audit log" />
         </ControlCard>
 
         <ControlCard violations={violations} title="Encryption" controls={["encryption"]}>
@@ -315,7 +358,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
             </select>
             <Required cfg={cfg} control="sharing.locationMetadata" />
           </div>
-          <CheckControl cfg={cfg} onChange={change} control="identifiability.deidentifiedExportsOnly" label="Export de-identified copies only" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="identifiability.deidentifiedExportsOnly" label="Export de-identified copies only" />
         </ControlCard>
 
         <ControlCard violations={violations} title="Protocol record" controls={["protocol"]}>
@@ -326,7 +369,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
           <ListInput label="Platforms" disabled={off} value={cfg?.protocol.platforms ?? []} onCommit={(v) => change("protocol.platforms", v)} />
           <ListInput label="Populations" disabled={off} value={cfg?.protocol.populations ?? []} onCommit={(v) => change("protocol.populations", v)} />
           <ListInput label="Languages" disabled={off} value={cfg?.protocol.languages ?? []} onCommit={(v) => change("protocol.languages", v)} />
-          <CheckControl cfg={cfg} onChange={change} control="protocol.requireBeforeCapture" label="A protocol record is required before capture" />
+          <CheckControl cfg={cfg} disabled={off} onChange={change} control="protocol.requireBeforeCapture" label="A protocol record is required before capture" />
           <ProtocolDocuments api={api} projectId={projectId} />
         </ControlCard>
 
@@ -367,7 +410,7 @@ export function GovernanceSettings({ api, projectId }: { api: GovernanceApi; pro
       {rawOpen ? (
         <div id={`${rawId}-raw`} className="ao-raw">
           <label htmlFor={`${rawId}-text`}>governance.yaml</label>
-          <textarea id={`${rawId}-text`} className="ao-code" rows={18} spellCheck={false} value={text} onChange={(e) => typeRaw(e.target.value)} />
+          <textarea id={`${rawId}-text`} className="ao-code" rows={18} spellCheck={false} readOnly={!!readOnlyReason} value={text} onChange={(e) => typeRaw(e.target.value)} />
         </div>
       ) : null}
       {pending ? <ReasonDialog message={pending.message} onConfirm={confirmReason} onCancel={() => setPending(null)} /> : null}
@@ -416,11 +459,116 @@ function ControlCard({ title, controls, children, violations }: { title: string;
   );
 }
 
-function CheckControl({ cfg, control, label, onChange }: { cfg: Config | null; control: string; label: string; onChange: (control: string, value: unknown) => void }) {
+/**
+ * The project's capture methods (D11): every method the rules know, in plain words, written to
+ * `captureMethods` through the same governed change as the other controls. Next to the methods that
+ * capture from the web it says what else a capture needs before it will run (R41), and offers the
+ * default legal basis those captures use when none is given with them.
+ */
+function CaptureMethods({
+  cfg,
+  disabled,
+  whyId,
+  onChange,
+  onClearDefault,
+}: {
+  cfg: Config | null;
+  disabled: boolean;
+  /** The element saying why the rules cannot be changed now. */
+  whyId?: string;
+  onChange: (control: string, value: unknown, said?: string) => void;
+  onClearDefault: (path: string) => void;
+}) {
+  const id = useId();
+  const on = new Set(cfg?.captureMethods ?? []);
+  const needs = cfg ? captureNeeds(cfg, localToday()) : [];
+  const basisPath = `consent.defaultLegalBasis.${WEB_LEGAL_CATEGORY}`;
+  const basis = cfg?.consent.defaultLegalBasis?.[WEB_LEGAL_CATEGORY] ?? "";
+  const toggle = (m: CaptureMethod, checked: boolean) => {
+    if (!cfg) return;
+    const next = CAPTURE_METHODS.filter((x) => (x === m ? checked : on.has(x)));
+    // Methods the rules file names that this version does not know are kept as written.
+    const unknown = cfg.captureMethods.filter((x) => !(CAPTURE_METHODS as readonly string[]).includes(x));
+    onChange("captureMethods", [...next, ...unknown], `${checked ? "Allowing" : "Not allowing"} “${CAPTURE_LABEL[m]}”`);
+  };
+  const box = (m: CaptureMethod, describedBy?: string) => (
+    <label key={m} className="ao-choice">
+      <input type="checkbox" disabled={disabled} checked={on.has(m)} aria-describedby={describedBy} onChange={(e) => toggle(m, e.target.checked)} />
+      {CAPTURE_LABEL[m]}
+    </label>
+  );
+  return (
+    <>
+      <p className="ao-hint">How sources may come into this project. A method that is not ticked is refused, whoever asks: the Capture screen, the browser extension or an import.</p>
+      <fieldset className="ao-fieldset" aria-describedby={whyId}>
+        <legend>How sources may come in from the web</legend>
+        {WEB_CAPTURE_METHODS.map((m) => box(m, `${id}-needs`))}
+        <div id={`${id}-needs`} role="note" aria-labelledby={`${id}-needs-h`} className="ao-hint">
+          <p id={`${id}-needs-h`}>What a capture from the web also needs before it will run:</p>
+          {needs.length ? (
+            <ul className="ao-list">
+              {needs.map((n) => (
+                <li key={n}>{n}</li>
+              ))}
+            </ul>
+          ) : (
+            <p>Nothing else under these rules.</p>
+          )}
+        </div>
+        <CommitInput
+          label="Default legal basis for captures from the web (recorded with each capture that gives none)"
+          hint="For example: Public task, GDPR Art. 6(1)(e). Setting or changing it loosens the rules, so it asks for a reason."
+          disabled={disabled}
+          value={basis}
+          onCommit={(v) => (v ? onChange(basisPath, v, `Setting the default legal basis for captures from the web to “${v}”`) : onClearDefault(basisPath))}
+        />
+      </fieldset>
+      <fieldset className="ao-fieldset" aria-describedby={whyId}>
+        <legend>How sources may come in from files and other programs</legend>
+        {CAPTURE_METHODS.filter((m) => !WEB_CAPTURE_METHODS.includes(m)).map((m) => box(m))}
+      </fieldset>
+    </>
+  );
+}
+
+/** One line of text, committed when the field loses focus or on Enter (a loosening asks for a reason once, not per keystroke). */
+function CommitInput({ label, hint, value, onCommit, disabled }: { label: string; hint: string; value: string; onCommit: (v: string) => void; disabled?: boolean }) {
+  const id = useId();
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => {
+    const next = draft.trim();
+    if (next !== value.trim()) onCommit(next);
+  };
+  return (
+    <div className="ao-field">
+      <label htmlFor={id}>{label}</label>
+      <input
+        id={id}
+        type="text"
+        dir="auto"
+        maxLength={2000}
+        disabled={disabled}
+        aria-describedby={`${id}-hint`}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+      />
+      <p id={`${id}-hint`} className="ao-hint">
+        {hint}
+      </p>
+    </div>
+  );
+}
+
+function CheckControl({ cfg, control, label, onChange, disabled }: { cfg: Config | null; control: string; label: string; onChange: (control: string, value: unknown) => void; disabled?: boolean }) {
   return (
     <div className="ao-field">
       <label className="ao-choice">
-        <input type="checkbox" disabled={!cfg} checked={cfg ? getPath(cfg, control) === true : false} onChange={(e) => onChange(control, e.target.checked)} />
+        <input type="checkbox" disabled={!cfg || disabled} checked={cfg ? getPath(cfg, control) === true : false} onChange={(e) => onChange(control, e.target.checked)} />
         {label}
       </label>
       <Required cfg={cfg} control={control} />
