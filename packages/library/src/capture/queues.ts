@@ -133,7 +133,7 @@ export class CaptureQueueRegistry {
     const e = this.entries.get(queueId);
     if (!e) return;
     e.finished = true;
-    e.finishedAt = this.now();
+    e.finishedAt ??= this.now(); // told twice (the last link, then the run's end): the first time stays
     if (end.error !== undefined) e.error = errorName(end.error);
     if (end.report) e.report = reportOf(end.report);
     this.prune();

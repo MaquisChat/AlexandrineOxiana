@@ -34,9 +34,11 @@ import {
   type WorkerClient,
   type WorkerToolsClient,
   type CaptureOptions,
+  CaptureQueueRegistry,
   createLinkCapture,
   openLibrary,
 } from "@ao/library";
+import type { CaptureStartedBy } from "@ao/shared";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
@@ -238,6 +240,11 @@ export class ServiceState {
 
   /** `lib`: the library the queue's current run belongs to (it changes when a move carries the queue on, 41a N4). */
   private readonly captures = new Map<string, { projectId: string; done: number; total: number; finished: boolean; lib?: object }>();
+  /** Every capture queue and profile run this service started, readable again (Task 63; bounded: queues.ts). */
+  private captureRegistry: CaptureQueueRegistry | undefined;
+  get captureQueues(): CaptureQueueRegistry {
+    return (this.captureRegistry ??= new CaptureQueueRegistry({ now: () => this.opts.now().getTime() }));
+  }
 
   /** The progress of a capture queue (also after a move). */
   captureQueue(queueId: string): { projectId: string; done: number; total: number; finished: boolean; lib?: object } | undefined {
@@ -248,18 +255,27 @@ export class ServiceState {
    * Captures `urls` one at a time in the registry: progress as `capture.progress`; a move stops it
    * between links and it continues with the rest on the moved library (R106 C1). With `after`, the
    * queue waits for that (another queue) to end before its first link (R116). The promise settles
-   * when this run of the queue has ended.
+   * when this run of the queue has ended. The queue is recorded (readable again) at once, before
+   * anything is awaited.
    */
-  startCaptureQueue(queueId: string, projectId: string, urls: string[], opts: CaptureOptions, at: { offset?: number; total?: number; after?: Promise<unknown> } = {}): Promise<void> {
+  startCaptureQueue(
+    queueId: string,
+    projectId: string,
+    urls: string[],
+    opts: CaptureOptions,
+    at: { offset?: number; total?: number; after?: Promise<unknown>; startedBy?: CaptureStartedBy } = {},
+  ): Promise<void> {
     const offset = at.offset ?? 0;
     const total = at.total ?? urls.length;
     const info = this.captures.get(queueId) ?? { projectId, done: offset, total, finished: false };
     if (this.session) info.lib = this.session.lib;
     this.captures.set(queueId, info);
+    this.captureQueues.startLinks(queueId, projectId, urls, at.startedBy ?? "desktop");
     // Every way out but a continuation after a move marks the queue finished (41a I3): an unfinished
     // queue keeps an extension's links slot taken.
     const fail = (err: unknown) => {
       info.finished = true;
+      this.captureQueues.finish(queueId, { error: err });
       this.events.publish("capture.progress", { queueId, projectId, finished: true, error: this.describe(err) });
     };
     return this.startWork("capture", async (ctl) => {
@@ -276,6 +292,8 @@ export class ServiceState {
           (done, _t, outcome) => {
             info.done = offset + done;
             info.finished = info.done === total;
+            this.captureQueues.progress(queueId, info.done, total, outcome);
+            if (info.finished) this.captureQueues.finish(queueId, {});
             this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished });
           },
           { shouldStop: () => ctl.stopping },
@@ -290,6 +308,7 @@ export class ServiceState {
         return () => void this.startCaptureQueue(queueId, projectId, rest, opts, { offset: next, total });
       }
       info.finished = true;
+      this.captureQueues.finish(queueId, {});
       return;
     });
   }

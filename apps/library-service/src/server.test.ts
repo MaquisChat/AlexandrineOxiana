@@ -1622,7 +1622,8 @@ describe("integration: the extension's routes (R111)", () => {
     };
     return p;
   }
-  const yt = (k: string, i: number) => `https://www.youtube.com/watch?v=${(k + String(i).padStart(11, "0")).slice(-11)}`;
+  // Distinct links for distinct keys (Task 63: the same link still running in a project is not queued again).
+  const yt = (k: string, i: number) => `https://www.youtube.com/watch?v=${k}${String(i).padStart(10, "0")}`;
 
   it("R116: the project must allow browser capture as well as the downloader (403 POLICY_DENIED with the reason)", async () => {
     await start({ worker: fakeProvider({ fail: 99 }), pairing: { confirmPerMinute: 100 } });
