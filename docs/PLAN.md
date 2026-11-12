@@ -548,7 +548,7 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | approved; verification with 50b running | 391a93f (worktree branch) | reviewed with probes over two fix rounds (R181); five minors to the final review's list |
+| 68 Settings writers never write what they did not read (D16) | complete | c02679b (merge) | reviewed with probes over two fix rounds (R178, R181); D16 closed; five minors on the final review's list |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
 | 69 Show that a captured item is no longer available (D17) | fix round 1 | 50e42e6 (worktree branch) | the list is to read `source.json` alone (R186); on the Mac build's path |
