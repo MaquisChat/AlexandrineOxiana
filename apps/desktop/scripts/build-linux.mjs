@@ -13,54 +13,25 @@
 //
 // Needs the web view's development libraries (README: "Building on Linux") and Rust 1.97 with cargo.
 // It does not package (no .deb or AppImage) and does not build the media worker (build:sidecars).
-import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+// The steps it shares with the Mac build (build-macos.mjs) are in build-common.mjs.
+import { join } from "node:path";
+import { buildInterface, buildServiceFolder, copyHelperNotices, stepper, TAURI, writeShellNotices } from "./build-common.mjs";
 
-const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const TAURI = join(REPO, "apps", "desktop", "src-tauri");
 const release = process.argv.includes("--release");
-
-function step(what, cmd, args, cwd = REPO) {
-  process.stdout.write(`build:linux: ${what}\n`);
-  const r = spawnSync(cmd, args, { cwd, stdio: "inherit" });
-  if (r.status !== 0) {
-    process.stderr.write(`build:linux: ${what} failed\n`);
-    process.exit(r.status ?? 1);
-  }
-}
+const step = stepper("build:linux");
 
 if (process.platform !== "linux") {
-  process.stderr.write("build:linux builds on Linux; the Mac build is Task 37f.\n");
+  process.stderr.write("build:linux builds on Linux; on a Mac use build:macos.\n");
   process.exit(1);
 }
-step("the library service folder", "pnpm", ["--filter", "@ao/library-service", "run", "build"]);
+buildServiceFolder(step);
 
 // The notices for the About screen, as the helpers' builds made them.
-const NOTICES = join(REPO, "apps", "desktop", "generated", "notices");
-rmSync(NOTICES, { recursive: true, force: true });
-mkdirSync(NOTICES, { recursive: true });
-const serviceLicences = join(REPO, "apps", "library-service", "dist", "library-service", "licences");
-copyFileSync(join(serviceLicences, "THIRD-PARTY-NOTICES.md"), join(NOTICES, "library-service-THIRD-PARTY-NOTICES.md"));
-// The licence texts themselves (Task 37j): the interface loads each only when asked (About screen).
-copyFileSync(join(serviceLicences, "THIRD-PARTY-LICENCES.txt"), join(NOTICES, "library-service-LICENCES.txt"));
-const sidecars = join(REPO, "apps", "desktop", "sidecars");
-const worker = existsSync(sidecars) ? readdirSync(sidecars).map((d) => join(sidecars, d, "sidecar-manifest.json")).find((f) => existsSync(f)) : undefined;
-if (worker) {
-  copyFileSync(worker, join(NOTICES, "worker-sidecar-manifest.json"));
-  const texts = join(dirname(worker), "licenses", "THIRD-PARTY-LICENCES.txt");
-  if (!existsSync(texts)) {
-    process.stderr.write("build:linux: the packaged worker has no licenses/THIRD-PARTY-LICENCES.txt; rebuild it (build:sidecars)\n");
-    process.exit(1);
-  }
-  copyFileSync(texts, join(NOTICES, "worker-LICENCES.txt"));
-}
-process.stdout.write(`build:linux: notices: the service's npm packages${worker ? " and the packaged worker's manifest" : " (no packaged worker yet: its manifest is not included)"}\n`);
+copyHelperNotices("build:linux");
 
 // The shell's own Rust crates and the interface's npm packages (R159 c); fails on one without a licence.
-step("the licence lists of the shell's crates and the interface's packages", process.execPath, [join(REPO, "apps", "desktop", "scripts", "notices.mjs"), NOTICES]);
+writeShellNotices(step);
 
-step("the interface", "pnpm", ["--filter", "@ao/ui", "run", "build"]);
-step(`the shell (${release ? "release" : "debug"})`, "cargo", ["build", "--locked", ...(release ? ["--release"] : [])], TAURI);
+buildInterface(step);
+step(`the shell (${release ? "release" : "debug"})`, "cargo", ["build", "--locked", ...(release ? ["--release"] : [])], { cwd: TAURI });
 process.stdout.write(`build:linux: done: ${join(TAURI, "target", release ? "release" : "debug", "alexandrine-oxiana")}\n`);
