@@ -133,3 +133,41 @@ describe("the extension's api.ts against the real service (R111)", () => {
     expect(sent.filter((s) => s.method === "POST").every((s) => s.origin === EXT)).toBe(true);
   });
 });
+
+describe("a paired browser across a relaunch of the real service (R171, defect D13)", () => {
+  const relaunch = async (onPort: number): Promise<number> => {
+    await svc.close();
+    svc = await createService({ token: TOKEN, deps: { ...deviceDeps(join(tmp, "config")), settleMs: 0 }, logStream: { write: () => true } as unknown as NodeJS.WritableStream, worker: failingWorker(), autoStartWorker: false });
+    port = await svc.listen(onPort);
+    return port;
+  };
+
+  it("on the same port it works with nothing to do; on a new port, the typed port is checked and saved, the token unchanged", async () => {
+    const storage = memoryStorage();
+    const api = createApi({ fetch: chromeLikeFetch([]), storage });
+    const { code } = await ui("POST", "/extension/pair");
+    const first = port;
+    const paired = await api.pair(first, code);
+
+    // Same port (the service listened again on its last port): the pairing works as it is.
+    await relaunch(first);
+    await ui("POST", "/libraries", { path: join(tmp, "Lib"), name: "Lib" });
+    await ui("POST", "/projects", { name: "Profiles", governanceYaml: GOV("manual_upload, browser_capture"), encryption: { enabled: false } });
+    expect((await api.listProjects()).map((p) => p.name)).toEqual(["Profiles"]);
+
+    // Another port (the old one was taken): the old port does not answer; the app's list says the browser holds it.
+    await relaunch(0);
+    expect(port).not.toBe(first);
+    expect(await api.listProjects().catch((e: unknown) => e)).toMatchObject({ code: "UNREACHABLE" });
+    const before = await ui("GET", "/extension/pairings");
+    expect(before.port).toBe(port);
+    expect(before.extensions[0].port).toBe(first);
+
+    // The researcher types the new port: one authorised request, then saved; the token is the same.
+    const r = await api.changePort(String(port));
+    expect(r.pairing).toEqual({ ...paired, port });
+    expect((await api.getPairing())?.token).toBe(paired.token);
+    const after = await ui("GET", "/extension/pairings");
+    expect(after.extensions[0].port).toBe(port);
+  });
+});
