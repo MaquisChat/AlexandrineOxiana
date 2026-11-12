@@ -44,6 +44,9 @@ export async function flagIfWithdrawn(
   const added = [...linkedParticipants(data, after)].filter((id) => !prev.has(id));
   const codes = withdrawnAmong(data, added);
   if (!codes.length) return false;
-  await appendReviewEntry(core, tx, { sourceId, kind: "verification", fields: {}, reasons: [withdrawnReason(codes)] });
+  // The withdrawn consent records it reaches (R176 3), so the entry can say which withdrawal queued it.
+  const reached = new Set(added);
+  const consentIds = data.consents.filter((c) => c.withdrawn && reached.has(c.participantId)).map((c) => c.id);
+  await appendReviewEntry(core, tx, { sourceId, kind: "verification", cause: { kind: "consent-withdrawal", consentIds }, fields: {}, reasons: [withdrawnReason(codes)] });
   return true;
 }

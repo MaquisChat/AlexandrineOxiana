@@ -7,11 +7,18 @@
  */
 import { newId } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
-import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
+import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./errors.js";
+import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import type { ProjectState, RepoCore } from "./state.js";
 
 export const REVIEW_FILE = "review/pending.jsonl";
 const PURPOSE = "ao-review";
+
+/**
+ * What queued a verification entry (R176 3): a capture whose fields conflict, or a consent
+ * withdrawal (the withdrawn consent records it reaches). Import entries need none: their kind says it.
+ */
+export type ReviewCause = { kind: "capture-conflict" } | { kind: "consent-withdrawal"; consentIds: string[] };
 
 export interface ReviewEntry {
   id: string;
@@ -36,9 +43,127 @@ export interface ReviewEntry {
   hints?: string[];
   /** Import items: the import batch that queued it (Bulk Import). */
   batchId?: string;
-  /** Resolved entries: when, and the decision taken (e.g. "accept", "skip", "merge"). */
+  /** Verification entries queued since R176: what queued it (older entries: see reviewCauseOf). */
+  cause?: ReviewCause;
+  /**
+   * Resolved entries: when, and the decision taken: an import decision ("accept", "skip", "merge",
+   * …, "undone"), "confirmed" or "rechecked" (a capture's conflict, R176 1),
+   * "reviewed-after-withdrawal" (R176 2), "source-removed" (R176 4).
+   */
   resolvedAt?: string;
   decision?: string;
+  /** "reviewed-after-withdrawal": the researcher's reason, as typed. */
+  reason?: string;
+}
+
+/**
+ * The cause of a verification entry (R176 3), the one place it is inferred: a recorded cause wins;
+ * an entry queued before causes were recorded is a capture's when it lists fields (captures queue
+ * their conflicting or unverified fields) and a consent withdrawal's when it lists none (withdrawals
+ * queue no fields; which consent is then unknown). Import entries have no cause.
+ */
+export function reviewCauseOf(e: Pick<ReviewEntry, "kind" | "fields" | "cause">): ReviewCause | undefined {
+  if (e.kind !== "verification") return undefined;
+  if (e.cause) return e.cause;
+  return Object.keys(e.fields ?? {}).length > 0 ? { kind: "capture-conflict" } : { kind: "consent-withdrawal", consentIds: [] };
+}
+
+/** A field a capture's entry lists is settled when its verification is none of conflict or unverified (nor missing). */
+const SETTLED = new Set(["verified", "single-source", "user-confirmed"]);
+
+/**
+ * Inside a running mutation that has just written `sf` (a confirm or a recheck, R176 1): every
+ * pending capture-conflict entry of the source none of whose listed fields is left in conflict or
+ * unconfirmed gets its `resolved` line in the same change. Returns the ids resolved.
+ */
+export async function resolveSettledCaptureEntries(
+  core: RepoCore,
+  tx: Tx,
+  sf: { source: { id: string }; verification: Record<string, { status: string }> },
+  by: "confirmation" | "recheck",
+): Promise<string[]> {
+  const done: string[] = [];
+  for (const e of await readReviewEntries(core, tx.state)) {
+    if (e.status !== "pending" || e.sourceId !== sf.source.id || reviewCauseOf(e)?.kind !== "capture-conflict") continue;
+    const fields = Object.keys(e.fields ?? {});
+    if (!fields.every((f) => SETTLED.has(sf.verification[f]?.status ?? ""))) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: by === "confirmation" ? "confirmed" : "rechecked" });
+    done.push(e.id);
+  }
+  return done;
+}
+
+/** Without writing: whether a recheck would resolve any of the source's capture entries (so a recheck that changes no verification still runs). */
+export async function hasSettledCaptureEntries(core: RepoCore, st: ProjectState, sf: { source: { id: string }; verification: Record<string, { status: string }> }): Promise<boolean> {
+  return (await readReviewEntries(core, st)).some(
+    (e) => e.status === "pending" && e.sourceId === sf.source.id && reviewCauseOf(e)?.kind === "capture-conflict" && Object.keys(e.fields ?? {}).every((f) => SETTLED.has(sf.verification[f]?.status ?? "")),
+  );
+}
+
+/** The policy operation and audit op of "Reviewed after the withdrawal" (R176 2). */
+export const WITHDRAWAL_REVIEWED_OP = "review.withdrawal-reviewed";
+const REASON_MAX = 2000;
+
+/**
+ * "Reviewed after the withdrawal" (R176 2): the researcher's explicit decision on an entry a consent
+ * withdrawal queued, with a reason in their own words (stored as typed). Its own policy operation
+ * (`review-withdrawal`, allowed in every profile; the engine refuses a blank reason, and the refusal
+ * is audited); one governed, audited, crash-safe change that writes only the entry's `resolved`
+ * line — nothing else about the source changes. A locked project is refused before anything is read.
+ */
+export async function reviewedAfterWithdrawal(core: RepoCore, projectId: string, entryId: string, reason: string): Promise<ReviewEntry> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  if (typeof reason !== "string") throw new InvalidInputError("Give a reason, in your own words.");
+  if (reason.length > REASON_MAX) throw new InvalidInputError(`Give a reason of up to ${REASON_MAX} characters.`);
+  const find = async (s: ProjectState) => {
+    const e = (await readReviewEntries(core, s)).find((x) => x.id === entryId);
+    if (!e || !e.sourceId) throw new NotFoundError("Review entry", entryId);
+    if (reviewCauseOf(e)?.kind !== "consent-withdrawal") throw new InvalidInputError("This is not an entry flagged by a consent withdrawal.");
+    if (e.status !== "pending") throw new ReviewEntryDecidedError();
+    return e;
+  };
+  const first = await find(st);
+  return runMutation(
+    core,
+    projectId,
+    { action: "review-withdrawal", reviewWithdrawal: { reason } },
+    async (tx) => {
+      // Read again inside the change: of two decisions at once, the second finds it decided.
+      const e = await find(tx.state);
+      const resolved: ReviewEntry = { ...e, status: "resolved", resolvedAt: tx.at, decision: "reviewed-after-withdrawal", reason };
+      await writeReviewLine(core, tx, resolved);
+      return resolved;
+    },
+    { op: WITHDRAWAL_REVIEWED_OP, entity: { type: "source", id: first.sourceId! }, auditDetails: { reviewEntry: entryId, reason } },
+  );
+}
+
+/** The pending entries read once per change (a change that removes many sources reads the queue once). */
+const pendingByTx = new WeakMap<Tx, ReviewEntry[]>();
+
+/**
+ * Inside the change that removes a source (R176 4): its pending entries are resolved
+ * ("source-removed"), except `keep`, an entry the caller resolves itself in this change.
+ */
+export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sourceId: string, opts: { keep?: string } = {}): Promise<string[]> {
+  let pending = pendingByTx.get(tx);
+  if (!pending) {
+    pending = (await readReviewEntries(core, tx.state)).filter((e) => e.status === "pending");
+    pendingByTx.set(tx, pending);
+  }
+  const done: string[] = [];
+  for (const e of pending) {
+    if (e.sourceId !== sourceId || e.id === opts.keep) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: "source-removed" });
+    done.push(e.id);
+  }
+  pendingByTx.set(
+    tx,
+    pending.filter((e) => !done.includes(e.id)),
+  );
+  return done;
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */
@@ -53,6 +178,7 @@ export interface ReviewInput {
   duplicateOf?: { sourceId: string; reason: string };
   hints?: string[];
   batchId?: string;
+  cause?: ReviewCause;
 }
 
 /** A `review_items` row; `payload` is safe for the persistent index (nothing identifying when `encrypted`). */
@@ -108,6 +234,7 @@ export async function appendReviewEntry(
     ...(input.duplicateOf ? { duplicateOf: input.duplicateOf } : {}),
     ...(input.hints?.length ? { hints: input.hints } : {}),
     ...(input.batchId ? { batchId: input.batchId } : {}),
+    ...(input.cause ? { cause: input.cause } : {}),
   };
   await writeReviewLine(core, tx, entry);
   return entry;

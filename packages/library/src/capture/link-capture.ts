@@ -577,6 +577,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
                   Object.entries(report.fields).filter(([, v]) => v.status === "conflict" || v.status === "unverified").map(([k, v]) => [k, v.status]),
                 ),
                 reasons: report.reasons,
+                cause: { kind: "capture-conflict" as const },
               },
             }
           : {}),

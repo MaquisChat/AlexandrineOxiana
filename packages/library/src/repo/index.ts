@@ -12,7 +12,8 @@ export type { CreateProjectInput, ProjectKeyFile } from "./projects.js";
 export type { CreateSourceOptions, SourceInputFile, SourcePatch } from "./sources.js";
 export type { DerivedAssetInput, OriginalAssetInput } from "./assets.js";
 export type { AcknowledgementKind } from "./acknowledge.js";
-export type { ReviewEntry, ReviewInput, ReviewItemRow } from "./review.js";
+export type { ReviewCause, ReviewEntry, ReviewInput, ReviewItemRow } from "./review.js";
+export { reviewCauseOf } from "./review.js";
 export { REVIEW_FILE } from "./review.js";
 export type { ConsentInput, ConsentPatch, ParticipantInput, ParticipantPatch, SessionInput, SessionPatch } from "./fieldwork.js";
 export {
@@ -21,6 +22,7 @@ export {
   KeyFileChangedError,
   DestroyedParentError,
   FieldworkInUseError,
+  ReviewEntryDecidedError,
   MissingParentError,
   ProxyRecordRefusedError,
   ImmutableProvenanceError,

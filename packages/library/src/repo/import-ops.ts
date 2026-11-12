@@ -22,7 +22,7 @@ export interface ImportOps {
   /** Writes the source file (recorded in the change log and indexed after commit). */
   writeSource(before: SourceFile | null, sf: SourceFile): Promise<void>;
   /** Deletes a source (a deletion record is kept for incrementally imported ones, R73; `undo`: none); returns the keys newly recorded. */
-  deleteSource(id: string, opts?: { undo?: boolean }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
+  deleteSource(id: string, opts?: { undo?: boolean; keepReview?: string }): Promise<{ sf: SourceFile; tombstoned: string[] }>;
   /** Clears the deletion records of these Zotero item keys (R73); returns those that were recorded. */
   clearDeletions(zoteroKeys: string[]): Promise<string[]>;
   /** Records these Zotero item keys as deleted here (undo puts back what it cleared, R74 I3); returns those newly recorded. */

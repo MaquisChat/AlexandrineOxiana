@@ -32,7 +32,7 @@ import { readFullData, writeProjectData } from "./projects.js";
 import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
-import { appendReviewEntry, type ReviewInput } from "./review.js";
+import { appendReviewEntry, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
 
@@ -593,8 +593,17 @@ export async function updateSource(
    */
   patchOrBuild: SourcePatch | ((cur: Source) => SourcePatch),
   /** Package-internal: also replace the source file's field evidence and verification (a recheck after a machine change). */
-  extra: { fieldEvidence?: (cur: SourceFile) => FieldEvidence[]; verification?: (next: SourceFile) => Record<string, FieldVerification> } = {},
+  extra: {
+    fieldEvidence?: (cur: SourceFile) => FieldEvidence[];
+    verification?: (next: SourceFile) => Record<string, FieldVerification>;
+    /**
+     * A confirm (R149) or a recheck: the source's capture-conflict review entries left with no listed
+     * field in conflict or unconfirmed are resolved in this same change, and the audit event says so (R176 1).
+     */
+    resolveReview?: "confirmation" | "recheck";
+  } = {},
 ): Promise<SourceFile> {
+  let resolved: string[] = [];
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -642,10 +651,15 @@ export async function updateSource(
       tx.record("source", id, cur.source, source);
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
+      if (extra.resolveReview) resolved = await resolveSettledCaptureEntries(core, tx, sf, extra.resolveReview);
       tx.index((sink) => sink.indexSource(sf));
       return sf;
     },
-    { op: "source.update", entity: { type: "source", id } },
+    {
+      op: "source.update",
+      entity: { type: "source", id },
+      auditDetails: () => (resolved.length ? { reviewResolved: { entries: resolved, by: extra.resolveReview } } : {}),
+    },
   );
 }
 
@@ -664,12 +678,16 @@ export async function editSource(core: RepoCore, tx: Tx, id: string, edit: (s: S
  * Deletes one source inside a running mutation (its folder is trashed; linked originals are not
  * touched). Every path that deletes a source comes through here; a source imported incrementally
  * (Zotero) leaves a deletion record so a later run does not bring it back (R73), except when the
- * deletion is a batch undo (`undo`), which is not the user's.
+ * deletion is a batch undo (`undo`), which is not the user's. The source's pending review entries
+ * are resolved in the same change (R176 4: "source-removed"), except `keepReview`, the entry a
+ * review decision resolves itself. An import undo resolves its removed sources' entries itself, in
+ * one change after the removals (undo.ts step 5, "undone"), rather than re-reading the queue per source.
  */
-export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
+export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean; keepReview?: string } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
   const st = tx.state;
   const cur = await readSourceFile(core, st, id);
   const tombstoned = opts.undo ? [] : await recordDeletion(core, tx, cur);
+  if (!opts.undo) await resolveEntriesOfRemovedSource(core, tx, id, opts.keepReview ? { keep: opts.keepReview } : {});
   await tx.trash(cur.source.folder);
   if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
   for (const a of cur.assets) tx.record("asset", a.id, a, null);
