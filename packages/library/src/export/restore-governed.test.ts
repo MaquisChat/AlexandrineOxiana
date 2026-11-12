@@ -1,0 +1,675 @@
+/**
+ * Task 50b: restoring a backup is a governed operation.
+ *   1. The policy engine decides before anything is written, and again in the commit turn; a
+ *      refusal is audited (in the project's log when the backup's project is in this library, else
+ *      in the library's own log) and said in plain words without paths; any failure to decide refuses.
+ *   3. What a restore does not bring back is read from the destruction record as the audit log gives
+ *      it (R174 d), whatever the certificate files on disk say; while an audit log does not verify,
+ *      the restore is refused rather than guessing.
+ *   4. A restored project that inherits backups still to be removed shows its warning from the
+ *      restore itself (R175).
+ */
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { appendFile, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { strToU8, unzipSync, zipSync } from "fflate";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { sealEvent, verifyChain, type AuditEvent, type Project, type SourceFile } from "@ao/core";
+import { shredSeams } from "../fs/shred.js";
+import type { LocationEnv } from "../location.js";
+import { newAttentionId, writeAttention, type UnrecordedAudit } from "../repo/attention.js";
+import { PolicyDeniedError } from "../repo/errors.js";
+import { encryptBytes } from "../repo/io.js";
+import { projectDataKey, projectWarnings } from "../repo/repo.js";
+import { restoreSeams } from "../repo/restore.js";
+import { backupsAwaitingRemoval, destroyRaw, listDestructions, readDestruction, resumeDestruction, type DestroyResult } from "../retention.js";
+import { BACKUPS_STATE, RestoreError, backupProject, backupSeams, holdingNotRemoved, restoreBackup, type BackupResult, type RestoreResult } from "./backup.js";
+import { OPEN_GOV, PSEUDO_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./test-kit.js";
+
+/** The seams of a restore, as this task leaves them (set and cleared by these tests only). */
+const seamsOfRestore = restoreSeams as { crashAfterRename?: boolean; failBeforeRename?: boolean; beforeAdopt?: (staging: string) => Promise<void> };
+/** A restore's answer, with what this task adds to it. */
+type Restored = RestoreResult & { leftOut?: Array<{ sourceId: string; assetId: string; destroyedAt: string }> };
+const restore = (path: string, opts: { passphrase?: string; locationEnv?: LocationEnv } = {}, repo = kit.repo) =>
+  restoreBackup(repo, path, opts as { passphrase?: string }) as Promise<Restored>;
+
+let kit: Kit;
+beforeEach(async () => {
+  kit = await makeKit("ao-restore-gov-");
+});
+afterEach(async () => {
+  shredSeams.failFor = undefined;
+  backupSeams.failBackup = false;
+  backupSeams.freeBytes = undefined;
+  seamsOfRestore.beforeAdopt = undefined;
+  seamsOfRestore.failBeforeRename = false;
+  seamsOfRestore.crashAfterRename = false;
+  await kit.close();
+});
+
+const HOUR = 3_600_000;
+const WARNING = "destruction-backups-pending";
+const sha = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
+const nameOf = (x: { path: string }) => x.path.slice(x.path.lastIndexOf("/") + 1);
+const rel = (x: { path: string }) => `Backups/${nameOf(x)}`;
+const abs = (libraryRelative: string) => join(kit.lib.root, ...libraryRelative.split("/"));
+const at = (iso: string) => {
+  kit.clock.now = new Date(iso);
+};
+const later = (ms: number) => {
+  kit.clock.now = new Date(kit.clock.now.getTime() + ms);
+};
+/** Where the library is, as the location classifier would see it. */
+const onDisk = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [{ path: "/", removable: false, network: false }] });
+const onNetwork = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [{ path: kit.lib.root, removable: false, network: true }] });
+const unknownPlace = (): LocationEnv => ({ homeDir: kit.tmp, platform: "linux", mounts: [], mountsKnown: false });
+const NETWORK_REASON = "The project would be restored into the library's folder, which is on a network drive; the rules of the project in this backup do not allow its data there";
+
+const RETAIN = `identifiability:
+  containsIdentifiable: true
+  pseudonymizeFileNames: false
+  deidentifiedExportsOnly: true
+encryption:
+  atRest: optional
+consent:
+  requireLegalBasis: false
+retention:
+  rawDataDestroyAfter: 2026-12-01
+captureMethods: [manual_upload]
+`;
+
+type Details = Record<string, unknown> & { op?: string; problem?: string; destroyedAssets?: string[] };
+const detailsOf = (e: AuditEvent) => (e.details ?? {}) as Details;
+const eventsOf = (projectId: string) => auditEvents(kit, kit.repo.getProject(projectId));
+/** Refused restores in a project's own audit log. */
+const refusalsIn = async (projectId: string) => (await eventsOf(projectId)).filter((e) => e.action === "restore");
+/** Refused restores in the library's own audit log. */
+const libraryRefusals = async (k: Kit = kit) => (await k.repo.libraryAudit()).events.filter((e) => e.action === "restore");
+/** The folders in Projects/ (a restore in progress would show as `.creating-<id>`). */
+const projectFolders = async () => (await readdir(join(kit.lib.root, "Projects")).catch(() => [] as string[])).sort();
+const ids = () => kit.repo.listProjects().map((p) => p.id).sort();
+
+/** Asserts that a refused restore left nothing behind: no project, no staging folder. */
+async function expectNothingRestored(foldersBefore: string[], idsBefore: string[]): Promise<void> {
+  expect(await projectFolders()).toEqual(foldersBefore);
+  expect(ids()).toEqual(idsBefore);
+}
+
+/** A copy of a backup with some of its files replaced (or removed, with `null`), kept outside the library. */
+async function craft(b: { path: string }, changes: Record<string, string | null>, name = "crafted.zip"): Promise<string> {
+  const files = unzipSync(new Uint8Array(await readFile(b.path)));
+  for (const [n, text] of Object.entries(changes)) {
+    if (text === null) delete files[n];
+    else files[n] = strToU8(text);
+  }
+  const out = join(kit.tmp, name);
+  await writeFile(out, zipSync(files));
+  return out;
+}
+
+async function rawSource(p: Project, bytes = "RAW interview audio bytes"): Promise<SourceFile> {
+  const f = await scratchFile(kit, "interview.mp3", bytes);
+  return addSource(kit, p, { type: "interview", title: "Interview one", identifiable: true, files: [{ path: f, role: "original", handling: "copy" }] });
+}
+async function keptSource(p: Project): Promise<SourceFile> {
+  const f = await scratchFile(kit, "paper.pdf", "%PDF-1.4 a paper that is kept");
+  return addSource(kit, p, { title: "Kept paper", files: [{ path: f, role: "original", handling: "copy" }] });
+}
+
+/** The restored project's sources by title, and whether each one's original came back. */
+async function restoredFiles(projectId: string): Promise<Record<string, { status: string | undefined; onDisk: boolean; assetId: string; sourceId: string }>> {
+  const out: Record<string, { status: string | undefined; onDisk: boolean; assetId: string; sourceId: string }> = {};
+  for (const id of kit.repo.listSourceIds(projectId)) {
+    const sf = await kit.repo.getSource(projectId, id);
+    const a = sf.assets[0]!;
+    out[sf.source.title.variants[0]!.value] = { status: a.status, onDisk: existsSync(abs(a.path)), assetId: a.id, sourceId: id };
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------
+describe("1. a restore is decided by the policy engine before anything is written", () => {
+  it("an allowed restore: the new project's log records the decision with the restore, with its conditions", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Open");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    const r = await restore(b.path, { locationEnv: onDisk() });
+    const last = (await eventsOf(r.projectId)).at(-1)!;
+    expect(last).toMatchObject({ action: "project.restored", projectId: r.projectId, decision: { result: "allow" } });
+    expect(last.details).toMatchObject({ op: "project.restore", backupSha256: b.sha256, restoredFrom: p.id });
+    expect(verifyChain(await eventsOf(r.projectId)).ok).toBe(true);
+    expect(await refusalsIn(p.id)).toEqual([]);
+
+    const e = await makeProject(kit, PSEUDO_GOV, true, "Sealed");
+    await addSource(kit, e, { title: "y" });
+    const sealed = await backupProject(kit.repo, e.id);
+    const r2 = await restore(sealed.path, { locationEnv: onDisk() });
+    const last2 = (await eventsOf(r2.projectId)).at(-1)!;
+    expect(last2.action).toBe("project.restored");
+    expect(last2.decision).toEqual({ result: "allow_with_conditions", conditions: [{ type: "encrypt" }] });
+    expect(kit.repo.getProject(r2.projectId).encryption.enabled).toBe(true);
+  });
+
+  it("a library on storage the backup's rules exclude: refused before anything is written, in plain words, and audited in the project's log", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Net");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    const before = ids();
+    let spaceAsked = false;
+    backupSeams.freeBytes = async () => {
+      spaceAsked = true; // asked right before the first file would be written
+      return Number.MAX_SAFE_INTEGER;
+    };
+    const err = (await restore(b.path, { locationEnv: onNetwork() }).catch((e: unknown) => e)) as PolicyDeniedError;
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(err.reason).toBe(NETWORK_REASON);
+    expect(spaceAsked).toBe(false);
+    await expectNothingRestored(folders, before);
+    const denied = await refusalsIn(p.id);
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.decision).toEqual({ result: "deny", reason: NETWORK_REASON });
+    expect(denied[0]!.details).toMatchObject({ op: "project.restore", backupSha256: b.sha256, file: nameOf(b), at: "decision" });
+    expect(denied[0]!.entity).toEqual({ type: "project", id: p.id });
+    expect(JSON.stringify(denied[0])).not.toContain(kit.tmp);
+    expect(await libraryRefusals()).toEqual([]);
+    expect(verifyChain(await eventsOf(p.id)).ok).toBe(true);
+  });
+
+  it("where the library is cannot be determined: refused when it may be storage the rules exclude (fail closed)", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Unknown");
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    await expect(restore(b.path, { locationEnv: unknownPlace() })).rejects.toMatchObject({
+      reason: "Where the library's folder is stored could not be determined (it may be a network drive), and the rules of the project in this backup do not allow its data there. To restore it, use a library on storage those rules allow.",
+    });
+    await expectNothingRestored(folders, [p.id]);
+    expect(await refusalsIn(p.id)).toHaveLength(1);
+  });
+
+  it("rules in the backup that require encryption at rest, for a project that is not encrypted: nothing comes back unencrypted", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Plain");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    const copy = await craft(b, { "governance.yaml": OPEN_GOV.replace("atRest: optional", "atRest: required") });
+    const folders = await projectFolders();
+    const err = (await restore(copy).catch((e: unknown) => e)) as PolicyDeniedError;
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(err.reason).toMatch(/require encryption at rest/u);
+    expect(err.reason).toMatch(/not encrypted/u);
+    await expectNothingRestored(folders, [p.id]);
+    const denied = await refusalsIn(p.id);
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.decision).toEqual({ result: "deny", reason: err.reason });
+    // A file from elsewhere: its sha256 is recorded, never its name or where it was.
+    expect(denied[0]!.details).toMatchObject({ op: "project.restore", backupSha256: sha(await readFile(copy)) });
+    expect(JSON.stringify(denied[0])).not.toContain("crafted");
+  });
+
+  it("a sealed backup whose project is not an encrypted one would come back unencrypted: refused", async () => {
+    const plain = await makeProject(kit, OPEN_GOV, false, "Plain Inside");
+    await addSource(kit, plain, { title: "x" });
+    const b = await backupProject(kit.repo, plain.id);
+    const e = await makeProject(kit, PSEUDO_GOV, true, "Key Owner");
+    const k = projectDataKey(kit.repo, e.id)!;
+    const sealed = join(kit.tmp, "sealed by hand.zip.enc");
+    await writeFile(sealed, await encryptBytes(k.key, k.keyId, await readFile(b.path)));
+    const folders = await projectFolders();
+    const before = ids();
+    const err = (await restore(sealed).catch((x: unknown) => x)) as PolicyDeniedError;
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(err.reason).toMatch(/sealed/u);
+    await expectNothingRestored(folders, before);
+    expect(await refusalsIn(plain.id)).toHaveLength(1);
+  });
+
+  it("rules that cannot be read (no governance.yaml in the backup, or one that is not YAML): refused, the reason without a path", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "No Rules");
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    for (const [n, text] of [["none.zip", null], ["bad.zip", "identifiability: [unclosed\n  nope: {"]] as const) {
+      const copy = await craft(b, { "governance.yaml": text }, n);
+      const err = (await restore(copy).catch((e: unknown) => e)) as PolicyDeniedError;
+      expect(err).toBeInstanceOf(PolicyDeniedError);
+      expect(err.reason).toMatch(/^Policy could not be evaluated/u);
+      expect(err.reason).not.toContain(kit.tmp);
+      await expectNothingRestored(folders, [p.id]);
+    }
+    const denied = await refusalsIn(p.id);
+    expect(denied).toHaveLength(2);
+    for (const d of denied) expect(d.decision?.result).toBe("deny");
+  });
+
+  it("a backup of a project that is not in this library: a refusal is recorded in the library's own audit log, once a day for the same refusal; an allowed one restores", async () => {
+    const other = await makeKit("ao-restore-other-");
+    try {
+      const theirs = await makeProject(other, OPEN_GOV, false, "Elsewhere");
+      await addSource(other, theirs, { title: "from another library" });
+      const b = await backupProject(other.repo, theirs.id);
+      const folders = await projectFolders();
+      for (let n = 0; n < 2; n++) {
+        const err = (await restore(b.path, { locationEnv: onNetwork() }).catch((e: unknown) => e)) as PolicyDeniedError;
+        expect(err).toBeInstanceOf(PolicyDeniedError);
+        expect(err.reason).toBe(NETWORK_REASON);
+      }
+      await expectNothingRestored(folders, []);
+      const denied = await libraryRefusals();
+      expect(denied).toHaveLength(1);
+      expect(denied[0]!.decision).toEqual({ result: "deny", reason: NETWORK_REASON });
+      expect(denied[0]!.details).toMatchObject({ op: "project.restore", name: "Elsewhere", encrypted: false, backupSha256: b.sha256 });
+      expect(JSON.stringify(denied[0])).not.toContain(other.tmp);
+      expect(JSON.stringify(denied[0])).not.toContain(kit.tmp);
+      expect((await kit.repo.libraryAudit()).verify.ok).toBe(true);
+      // Nothing was written to the library the backup came from.
+      expect(await libraryRefusals(other)).toEqual([]);
+
+      const r = await restore(b.path, { locationEnv: onDisk() });
+      expect(kit.repo.getProject(r.projectId).name).toBe("Elsewhere (restored 2026-11-10)");
+      expect((await eventsOf(r.projectId)).at(-1)).toMatchObject({ action: "project.restored", decision: { result: "allow" } });
+    } finally {
+      await other.close();
+    }
+  });
+
+  it("decided again in the commit turn, against the rules that would go live: a refusal there is audited, and nothing is restored", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Changed Meanwhile");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    const folders = await projectFolders();
+    let staged = "";
+    seamsOfRestore.beforeAdopt = async (staging) => {
+      // Between unpacking and the commit: the rules that would go live now require encryption.
+      staged = staging;
+      await writeFile(join(staging, "governance.yaml"), OPEN_GOV.replace("atRest: optional", "atRest: required"));
+    };
+    const err = (await restore(b.path).catch((e: unknown) => e)) as PolicyDeniedError;
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(err.reason).toMatch(/require encryption at rest/u);
+    expect(staged).not.toBe("");
+    expect(existsSync(staged)).toBe(false);
+    await expectNothingRestored(folders, [p.id]);
+    const denied = await refusalsIn(p.id);
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.decision).toEqual({ result: "deny", reason: err.reason });
+    expect(denied[0]!.details).toMatchObject({ op: "project.restore", backupSha256: b.sha256, at: "commit" });
+  });
+});
+
+// ------------------------------------------------------------------------------------------
+interface Scene {
+  p: Project;
+  raw: SourceFile;
+  kept: SourceFile;
+  /** The backup made before the destruction, as a copy kept outside the library. */
+  offline: string;
+  r: DestroyResult;
+}
+
+/** A project with a raw file and a paper, backed up at 09:59; a copy of that backup is kept elsewhere; with `destroy`, the raw file is destroyed at 10:00. */
+async function scene(opts: { destroy?: boolean; name?: string } = {}): Promise<Scene> {
+  const p = await makeProject(kit, RETAIN, false, opts.name ?? "Origin");
+  const raw = await rawSource(p);
+  const kept = await keptSource(p);
+  at("2026-12-02T09:59:00.000Z");
+  const b = await backupProject(kit.repo, p.id);
+  const offline = join(kit.tmp, `${opts.name ?? "Origin"} offline copy.zip`);
+  await writeFile(offline, await readFile(b.path));
+  at("2026-12-02T10:00:00.000Z");
+  const r = opts.destroy === false ? (undefined as unknown as DestroyResult) : await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+  return { p, raw, kept, offline, r };
+}
+
+/** The raw file was left out and marked destroyed; the paper came back. */
+async function expectRawLeftOut(r: Restored): Promise<void> {
+  const files = await restoredFiles(r.projectId);
+  expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+  expect(files["Kept paper"]!.onDisk).toBe(true);
+  expect(files["Kept paper"]!.status).not.toBe("destroyed");
+  expect(r.notes.join(" ")).toMatch(/1 file was destroyed earlier under a retention rule and was not restored/u);
+  expect(r.leftOut).toEqual([{ sourceId: files["Interview one"]!.sourceId, assetId: files["Interview one"]!.assetId, destroyedAt: "2026-12-02T10:00:00.000Z" }]);
+  expect(detailsOf((await eventsOf(r.projectId)).at(-1)!)).toMatchObject({ op: "project.restore", leftOutDestroyed: 1 });
+}
+
+/** Rewrites the project's audit log on disk with `edit` applied to each entry and the chain made whole again (one segment). */
+async function rewriteAudit(p: Project, edit: (e: AuditEvent) => void): Promise<void> {
+  const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
+  const names = (await readdir(dir)).sort();
+  expect(names).toHaveLength(1);
+  const events = (await readFile(join(dir, names[0]!), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as AuditEvent);
+  let prev: { seq: number; hash: string } | null = null;
+  const lines = events.map((e) => {
+    edit(e);
+    const { seq: _s, hash: _h, prevHash: _p, ...rest } = e;
+    const sealed = sealEvent(rest, prev);
+    prev = { seq: sealed.seq, hash: sealed.hash };
+    return JSON.stringify(sealed);
+  });
+  await writeFile(join(dir, names[0]!), `${lines.join("\n")}\n`);
+}
+
+/** Changes one entry of the project's audit log on disk (not the last): the chain no longer verifies. Returns how to put it back. */
+async function breakAudit(p: Project, pick: (line: string) => boolean): Promise<() => Promise<void>> {
+  const dir = join(kit.lib.root, kit.repo.getProject(p.id).folder, "audit");
+  const segment = join(dir, (await readdir(dir)).sort().at(-1)!);
+  const lines = (await readFile(segment, "utf8")).split("\n");
+  const i = lines.findIndex(pick);
+  expect(i).toBeGreaterThan(-1);
+  expect(i).toBeLessThan(lines.filter((l) => l.trim()).length - 1);
+  const original = lines[i]!;
+  const e = JSON.parse(original) as { details: Record<string, unknown> };
+  e.details = { ...e.details, changedOutside: true };
+  lines[i] = JSON.stringify(e);
+  await writeFile(segment, lines.join("\n"));
+  expect(verifyChain(await auditEvents(kit, p)).ok).toBe(false);
+  return async () => {
+    const now = (await readFile(segment, "utf8")).split("\n");
+    now[i] = original;
+    await writeFile(segment, now.join("\n"));
+  };
+}
+
+describe("3. what a restore does not bring back is read from the audit log's record of destructions", () => {
+  it("a backup made before a destruction: the destroyed file does not come back, and the restore says what it left out and why", async () => {
+    const s = await scene();
+    // What the destruction's own audit entry says was destroyed.
+    const commit = (await eventsOf(s.p.id)).find((e) => e.action === "delete" && detailsOf(e).op === "retention.destroy")!;
+    expect(detailsOf(commit).destroyedAssets).toEqual([s.raw.assets[0]!.id]);
+    const r = await restore(s.offline);
+    await expectRawLeftOut(r);
+    expect(r.notes).toHaveLength(1);
+  });
+
+  it("the same with the certificate file deleted: the file still does not come back", async () => {
+    const s = await scene();
+    await rm(s.r.certificatePath);
+    const r = await restore(s.offline);
+    await expectRawLeftOut(r);
+    // It says where the knowledge came from, without a path.
+    expect(r.notes.join(" ")).toMatch(/certificate/u);
+    expect(r.notes.join(" ")).toMatch(/audit log/u);
+    expect(r.notes.join(" ")).not.toContain(kit.tmp);
+  });
+
+  it("the same with the certificate edited to name nothing, or to name the kept file in place of the destroyed one", async () => {
+    const s = await scene();
+    const cert = JSON.parse(await readFile(s.r.certificatePath, "utf8")) as { assets: Array<Record<string, unknown>> };
+    await writeFile(s.r.certificatePath, `${JSON.stringify({ ...cert, assets: [] }, null, 2)}\n`);
+    await expectRawLeftOut(await restore(s.offline));
+    await writeFile(
+      s.r.certificatePath,
+      `${JSON.stringify({ ...cert, assets: [{ ...cert.assets[0], assetId: s.kept.assets[0]!.id, sha256: s.kept.assets[0]!.sha256 }] }, null, 2)}\n`,
+    );
+    await expectRawLeftOut(await restore(s.offline));
+  });
+
+  it("a forged extra certificate that names a file never destroyed: that file comes back, and the restore says the certificate was not taken into account", async () => {
+    const s = await scene();
+    const forged = join(kit.lib.root, kit.repo.getProject(s.p.id).folder, "retention", "destruction-2026-12-03 1000.json");
+    await writeFile(
+      forged,
+      `${JSON.stringify({ formatVersion: 1, kind: "destruction-certificate", projectId: s.p.id, at: "2026-12-03T10:00:00.000Z", assets: [{ assetId: s.kept.assets[0]!.id, sha256: s.kept.assets[0]!.sha256 }] }, null, 2)}\n`,
+    );
+    const r = await restore(s.offline);
+    await expectRawLeftOut(r);
+    expect(r.notes.join(" ")).toMatch(/destruction-2026-12-03 1000\.json/u);
+    expect(r.notes.join(" ")).toMatch(/not recorded/u);
+    expect(r.notes.join(" ")).not.toContain(kit.tmp);
+  });
+
+  it("a destruction in a project restored from the same data is honoured by what its certificate says (the same file under other ids)", async () => {
+    const s = await scene({ destroy: false });
+    const copy = await restore(s.offline);
+    const mine = await restoredFiles(copy.projectId);
+    expect(mine["Interview one"]!.onDisk).toBe(true);
+    await destroyRaw(kit.repo, copy.projectId, [mine["Interview one"]!.assetId], "tester");
+    const again = await restore(s.offline);
+    const files = await restoredFiles(again.projectId);
+    expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+    expect(files["Kept paper"]!.onDisk).toBe(true);
+  });
+
+  it("a destruction recorded between unpacking and the commit is seen in the commit turn", async () => {
+    const s = await scene({ destroy: false });
+    const copy = await restore(s.offline);
+    const mine = await restoredFiles(copy.projectId);
+    seamsOfRestore.beforeAdopt = async () => {
+      seamsOfRestore.beforeAdopt = undefined;
+      // In the copy made earlier (its own maintenance lock): the same file, destroyed now.
+      await destroyRaw(kit.repo, copy.projectId, [mine["Interview one"]!.assetId], "tester");
+    };
+    const again = await restore(s.offline);
+    const files = await restoredFiles(again.projectId);
+    expect(files["Interview one"]).toMatchObject({ status: "destroyed", onDisk: false });
+    expect(files["Kept paper"]!.onDisk).toBe(true);
+  });
+
+  it("an audit log that does not hold together: the restore is refused in plain words, nothing is written, and the refusal is recorded in the library's log", async () => {
+    const s = await scene();
+    await breakAudit(s.p, (l) => l.includes('"op":"retention.destroy"'));
+    const folders = await projectFolders();
+    const count = (await eventsOf(s.p.id)).length;
+    let spaceAsked = false;
+    backupSeams.freeBytes = async () => {
+      spaceAsked = true;
+      return Number.MAX_SAFE_INTEGER;
+    };
+    const err = (await restore(s.offline).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(RestoreError);
+    expect(err.message).toMatch(/audit log of the project "Origin" does not hold together/u);
+    expect(err.message).toMatch(/[Nn]othing was restored/u);
+    expect(err.message).not.toContain(kit.tmp);
+    expect(spaceAsked).toBe(false);
+    await expectNothingRestored(folders, [s.p.id]);
+    // Never into the log that does not hold together.
+    expect((await eventsOf(s.p.id)).length).toBe(count);
+    const denied = await libraryRefusals();
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.decision).toEqual({ result: "deny", reason: err.message });
+    expect(denied[0]!.details).toMatchObject({ op: "project.restore", name: "Origin", backupSha256: sha(await readFile(s.offline)) });
+
+    // The same after a restart (the open reports the log, and the restore still does not guess).
+    await kit.reopen();
+    await expect(restore(s.offline)).rejects.toBeInstanceOf(RestoreError);
+    await expectNothingRestored(folders, [s.p.id]);
+  });
+
+  it("the log holds again: the restore goes ahead and leaves the destroyed file out", async () => {
+    const s = await scene();
+    const putBack = await breakAudit(s.p, (l) => l.includes('"op":"retention.destroy"'));
+    await expect(restore(s.offline)).rejects.toBeInstanceOf(RestoreError);
+    await putBack();
+    await expectRawLeftOut(await restore(s.offline));
+  });
+
+  it("an entry added to a project's audit log outside the app while it runs: refused (the log is not as the app left it), whatever the entry says", async () => {
+    const s = await scene({ destroy: false });
+    const dir = join(kit.lib.root, kit.repo.getProject(s.p.id).folder, "audit");
+    const events = await eventsOf(s.p.id);
+    const head = events.at(-1)!;
+    // Correctly chained, naming the kept paper as destroyed.
+    const forged = sealEvent(
+      {
+        at: "2026-12-02T10:30:00.000Z",
+        actor: "tester",
+        device: "dev-A",
+        projectId: s.p.id,
+        action: "delete",
+        entity: { type: "project", id: s.p.id },
+        decision: { result: "allow" },
+        details: { op: "retention.destroy", certificate: "destruction-2026-12-02 1030.json", certificateSha256: sha("forged"), backupsToRemove: [], backupsUnreadable: [], destroyedAssets: [s.kept.assets[0]!.id] },
+      },
+      { seq: head.seq, hash: head.hash },
+    );
+    await appendFile(join(dir, (await readdir(dir)).sort().at(-1)!), `${JSON.stringify(forged)}\n`);
+    const folders = await projectFolders();
+    const err = (await restore(s.offline).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(RestoreError);
+    expect(err.message).toMatch(/audit log of the project "Origin"/u);
+    await expectNothingRestored(folders, [s.p.id]);
+  });
+
+  it("another project's audit log that does not hold together refuses the restore too, and names that project", async () => {
+    const s = await scene();
+    const other = await makeProject(kit, OPEN_GOV, false, "Bystander");
+    await addSource(kit, other, { title: "a" });
+    await addSource(kit, other, { title: "b" });
+    await breakAudit(other, (l) => l.includes('"store"'));
+    const folders = await projectFolders();
+    const before = ids();
+    const err = (await restore(s.offline).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(RestoreError);
+    expect(err.message).toMatch(/audit log of the project "Bystander" does not hold together/u);
+    await expectNothingRestored(folders, before);
+    // The backup's own project is here and its log is intact: the refusal is recorded there.
+    const denied = await refusalsIn(s.p.id);
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.decision).toEqual({ result: "deny", reason: err.message });
+  });
+
+  it("a locked project with a recorded destruction does not stop a restore: what it destroyed is in its audit log, readable without its key", async () => {
+    const q = await makeProject(kit, RETAIN.replace("atRest: optional", "atRest: required"), true, "Locked One");
+    const qRaw = await rawSource(q, "raw bytes of the locked project");
+    const s = await scene();
+    await destroyRaw(kit.repo, q.id, [qRaw.assets[0]!.id], "tester");
+    kit.repo.lockProject(q.id);
+    const r = await restore(s.offline);
+    await expectRawLeftOut(r);
+  });
+
+  it("what a mark recorded late says (Task 50) is never read as a destruction", async () => {
+    const s = await scene({ destroy: false });
+    const mark: UnrecordedAudit = {
+      formatVersion: 1,
+      id: newAttentionId(),
+      kind: "audit-unrecorded",
+      occurredAt: "2026-12-02T10:31:00.000Z",
+      actor: "tester",
+      device: "dev-A",
+      action: "library.relink",
+      details: { op: "retention.destroy", certificate: "destruction-2026-12-02 1031.json", certificateSha256: sha("forged"), backupsToRemove: [], backupsUnreadable: [], destroyedAssets: [s.raw.assets[0]!.id, s.kept.assets[0]!.id] },
+      state: "ready",
+    };
+    await writeAttention(kit.lib.root, kit.repo.getProject(s.p.id).folder, mark);
+    await kit.reopen();
+    const late = (await eventsOf(s.p.id)).filter((e) => detailsOf(e).recordedLate !== undefined);
+    expect(late.map((e) => [e.action, detailsOf(e).op])).toEqual([["library.relink", "retention.destroy"]]);
+    const r = await restore(s.offline);
+    const files = await restoredFiles(r.projectId);
+    expect(files["Interview one"]!.onDisk).toBe(true);
+    expect(files["Kept paper"]!.onDisk).toBe(true);
+    expect(r.leftOut ?? []).toEqual([]);
+  });
+
+  it("a destruction the audit log records without saying which files (an earlier form of the entry): read from its certificate while that verifies; refused when it does not", async () => {
+    const s = await scene();
+    await rewriteAudit(s.p, (e) => {
+      if (e.action === "delete" && detailsOf(e).op === "retention.destroy") delete (e.details as Details).destroyedAssets;
+    });
+    await kit.reopen();
+    expect(verifyChain(await eventsOf(s.p.id)).ok).toBe(true);
+    await expectRawLeftOut(await restore(s.offline));
+
+    await rm(s.r.certificatePath);
+    const folders = await projectFolders();
+    const before = ids();
+    const err = (await restore(s.offline).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(RestoreError);
+    expect(err.message).toMatch(/project "Origin"/u);
+    expect(err.message).toMatch(/cannot tell which files/u);
+    expect(err.message).not.toContain(kit.tmp);
+    await expectNothingRestored(folders, before);
+  });
+});
+
+// ------------------------------------------------------------------------------------------
+interface Destroyed {
+  p: Project;
+  x: BackupResult;
+  r: DestroyResult;
+  /** The backup the destruction made itself: its audit log has the destruction, with X still on its list. */
+  fresh: string;
+  certificateName: string;
+}
+
+/** A project whose one raw file was destroyed on 2026-12-02 at 10:00; with `stuck`, the backup holding it could not be removed. */
+async function destroyed(opts: { stuck: boolean }): Promise<Destroyed> {
+  const p = await makeProject(kit, RETAIN, false, "Origin");
+  const sf = await rawSource(p);
+  at("2026-12-02T09:59:00.000Z");
+  const x = await backupProject(kit.repo, p.id);
+  at("2026-12-02T10:00:00.000Z");
+  if (opts.stuck) shredSeams.failFor = (path) => path.endsWith(nameOf(x));
+  const r = await destroyRaw(kit.repo, p.id, [sf.assets[0]!.id], "tester");
+  shredSeams.failFor = undefined;
+  const fresh = (r.certificate.backups as { freshBackup?: string }).freshBackup;
+  expect(fresh).toBeDefined();
+  return { p, x, r, fresh: abs(fresh!), certificateName: basename(r.certificatePath) };
+}
+
+describe("4. a restored project's warning about inherited backups stands from the restore", () => {
+  it("a list inherited with a backup still on it: the warning, the note behind it and the restore's own answer say so at once; nothing is recorded yet, and the first pass settles it as before", async () => {
+    const d = await destroyed({ stuck: true });
+    const r = await restore(d.fresh);
+    const copy = r.projectId;
+    expect(r.warnings).toContain(WARNING);
+    expect(await projectWarnings(kit.repo, copy)).toContain(WARNING);
+    expect(await holdingNotRemoved(kit.repo, copy)).toEqual([rel(d.x)]);
+    expect(await backupsAwaitingRemoval(kit.repo, copy)).toEqual([{ certificateFile: `${kit.repo.getProject(copy).folder}/retention/${d.certificateName}`, backups: [rel(d.x)] }]);
+    // The restore recorded nothing about the step: it is the copy's passes that settle it.
+    expect((await eventsOf(copy)).at(-1)!.action).toBe("project.restored");
+    expect(await listDestructions(kit.repo, copy)).toMatchObject([{ status: "pending", outstanding: [rel(d.x)], verified: true, amendments: [] }]);
+    expect(existsSync(d.x.path)).toBe(true);
+    // The original's own warning is its own.
+    expect(await holdingNotRemoved(kit.repo, d.p.id)).toEqual([rel(d.x)]);
+
+    later(HOUR);
+    await resumeDestruction(kit.repo, copy);
+    expect(existsSync(d.x.path)).toBe(false);
+    expect(await readDestruction(kit.repo, copy, d.certificateName)).toMatchObject({ status: "deleted", outstanding: [] });
+    expect(await projectWarnings(kit.repo, copy)).not.toContain(WARNING);
+    // The note the restore wrote was the audit log's own list: no pass found it to disagree.
+    expect((await eventsOf(copy)).map((e) => detailsOf(e).problem).filter((x) => x !== undefined)).toEqual([]);
+  });
+
+  it("a list inherited whose backup the original has since removed: the warning stands from the restore until the copy's first pass records the backup as no longer present", async () => {
+    const d = await destroyed({ stuck: false });
+    expect(existsSync(d.x.path)).toBe(false);
+    const r = await restore(d.fresh);
+    expect(r.warnings).toContain(WARNING);
+    expect(await projectWarnings(kit.repo, r.projectId)).toContain(WARNING);
+    later(HOUR);
+    await resumeDestruction(kit.repo, r.projectId);
+    expect(await readDestruction(kit.repo, r.projectId, d.certificateName)).toMatchObject({ status: "no-longer-present", outstanding: [] });
+    expect(await projectWarnings(kit.repo, r.projectId)).not.toContain(WARNING);
+  });
+
+  it("nothing inherited as outstanding: no warning", async () => {
+    const d = await destroyed({ stuck: false });
+    later(24 * HOUR);
+    const afterwards = await backupProject(kit.repo, d.p.id, { prune: false });
+    const r = await restore(afterwards.path);
+    expect(r.warnings).not.toContain(WARNING);
+    expect(await projectWarnings(kit.repo, r.projectId)).not.toContain(WARNING);
+    expect(await holdingNotRemoved(kit.repo, r.projectId)).toEqual([]);
+  });
+
+  it("a restore that fails at its last step takes the note back; one that dies right after the copy went live has left it standing", async () => {
+    const d = await destroyed({ stuck: true });
+    const noted = async () => Object.keys((JSON.parse(await readFile(join(kit.lib.root, "Backups", BACKUPS_STATE), "utf8")) as { undestroyed: Record<string, unknown> }).undestroyed).sort();
+    seamsOfRestore.failBeforeRename = true;
+    await expect(restore(d.fresh)).rejects.toThrow(/simulated/u);
+    seamsOfRestore.failBeforeRename = false;
+    expect(ids()).toEqual([d.p.id]);
+    expect(await noted()).toEqual([d.p.id]);
+
+    seamsOfRestore.crashAfterRename = true;
+    await expect(restore(d.fresh)).rejects.toThrow(/simulated/u);
+    seamsOfRestore.crashAfterRename = false;
+    await kit.reopen();
+    const copy = ids().find((id) => id !== d.p.id)!;
+    expect(copy).toBeDefined();
+    expect(await projectWarnings(kit.repo, copy)).toContain(WARNING);
+    expect(await holdingNotRemoved(kit.repo, copy)).toEqual([rel(d.x)]);
+  });
+});
