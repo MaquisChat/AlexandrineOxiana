@@ -103,6 +103,7 @@ def worker(worker_env, caplog):
         yield client
     finally:
         server.manager.shutdown()
+        server.tool_manager.shutdown()
         server.shutdown()
         server.server_close()
 

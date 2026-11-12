@@ -315,6 +315,7 @@ const OUTCOME_TEXT: Record<string, string> = {
   TOOL_CHECKSUM_MISMATCH: "The downloader tool that was fetched did not match its published checksum, so it was not installed. Try again later.",
   TOOL_UPDATE_FAILED: "The downloader tool could not be updated. Try again later.",
   TOOL_MISSING: "A tool this capture needs is not installed on this computer.",
+  TOOL_NOT_INSTALLED: "A tool this capture needs is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then capture the link again.",
   MISSING_DEPENDENCY: "A tool this capture needs is not installed on this computer.",
   MODEL_UNAVAILABLE: "The transcription model could not be loaded or downloaded. Check the internet connection, or choose another model.",
   FFMPEG_FAILED: "The video could not be converted. The file may be damaged.",

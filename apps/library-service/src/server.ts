@@ -27,6 +27,7 @@ import { isMediaRoute, mediaRequestRefusal, registerMedia } from "./media.js";
 import { registerProjects } from "./routes/projects.js";
 import { registerReview } from "./routes/review.js";
 import { registerSources } from "./routes/sources.js";
+import { registerTools } from "./routes/tools.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -253,6 +254,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerCitations(app, ctx);
   registerAppearance(app, ctx);
   registerJobs(app, ctx);
+  registerTools(app, ctx);
   registerMedia(app, ctx);
 
   let closing: Promise<void> | undefined;

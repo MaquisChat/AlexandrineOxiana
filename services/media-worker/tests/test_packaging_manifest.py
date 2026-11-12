@@ -127,13 +127,13 @@ def test_gpl_statements_are_reported_as_gpl(tmp_path):
     assert manifest.copyleft("GPL-2.0-only") == "yes"
 
     m = {
-        "packages": [{"name": "gallery_dl", "version": "1.32.19", "licence": "GPL-2.0-only", "copyleft": "yes"},
+        "packages": [{"name": "some_gpl_pkg", "version": "1.0", "licence": "GPL-2.0-only", "copyleft": "yes"},
                      {"name": "pillow_heif", "version": "1.8.1", "licence": "BSD-3-Clause", "copyleft": "no",
                       "binaryWheelStatement": "GPLv2, due to base library licenses.", "copyleftIncludingNativeLibraries": "yes"}],
         "nativeLibraries": [{"library": "libx265-4883ecb5.so.217", "carriedBy": "pillow_heif", **x265}],
     }
     lines = "\n".join(manifest.review_lines(m))
-    assert "gallery_dl 1.32.19: GPL-2.0-only (yes)" in lines
+    assert "some_gpl_pkg 1.0: GPL-2.0-only (yes)" in lines
     assert "pillow_heif with its native libraries: yes" in lines
     assert "libx265-4883ecb5.so.217 (pillow_heif): GPLv2" in lines
 
@@ -142,3 +142,21 @@ def test_gpl_statements_are_reported_as_gpl(tmp_path):
                                             ("LGPL version 3 or later", "weak"), ("MPL-2.0", "weak"), ("something", "unclear")])
 def test_copyleft_classes(value, expected):
     assert manifest.copyleft(value) == expected
+
+
+# ---------- gallery-dl is not inside the worker (R152) ----------
+
+
+def test_gallery_dl_in_the_bundle_is_a_problem(tmp_path):
+    b = make_bundle(tmp_path, dists=["gallery_dl", "requests"])
+    problems = manifest.check_complete(b, {"packages": [{"name": "gallery_dl"}, {"name": "requests"}], "nativeLibraries": []})
+    assert any("gallery-dl" in p and "R152" in p for p in problems), problems
+
+
+def test_the_worker_does_not_depend_on_gallery_dl():
+    import tomllib
+
+    deps = tomllib.loads((PACKAGING.parent / "pyproject.toml").read_text())["project"]["dependencies"]
+    names = [manifest.canonical(d.split("=")[0].split("<")[0].split(">")[0].strip()) for d in deps]
+    assert "gallery-dl" not in names
+    assert "requests" in names  # what the downloaded gallery-dl needs from the worker's Python

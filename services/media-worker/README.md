@@ -10,8 +10,11 @@ The Node client is `packages/library/src/worker-client.ts` (`startWorker`, `Work
 
 ## Setup
 
-Needs Python 3.12+ and, on the system, `ffmpeg`/`ffprobe` (proxies, audio decoding),
-`tesseract` and `ghostscript` (OCR).
+Needs Python 3.12+. The optional tools (ffmpeg/ffprobe for video proxies, tesseract for OCR,
+yt-dlp with deno and gallery-dl for capture, the speech models) are installed by the first-use
+tools dialogue (`GET /tools`, below) or found on the system's PATH; in development and CI they
+come from the system (`tesseract-ocr ghostscript ffmpeg` from apt). Audio decoding for
+transcription uses the bundled PyAV, not ffmpeg.
 
 ```sh
 pnpm setup:py          # creates services/media-worker/.venv and installs the worker + test deps
@@ -40,8 +43,8 @@ AO_WORKER_TOKEN=<random, ≥16 chars> AO_WORKER_PORT=0 .venv/bin/python -m ao_wo
 | --- | --- |
 | `AO_WORKER_TOKEN` | required; every request needs `Authorization: Bearer <token>` |
 | `AO_WORKER_PORT` | port on 127.0.0.1 (`0` = any free port; the chosen one is printed) |
-| `AO_MODELS_DIR` | faster-whisper model cache (Hugging Face cache layout). A model already there is loaded with no network contact; an absent one is downloaded on first use, and if that fails the job fails with `MODEL_UNAVAILABLE` ("not installed and could not be downloaded") |
-| `AO_TOOLS_DIR` | managed standalone yt-dlp binary (ADR 0009) |
+| `AO_MODELS_DIR` | faster-whisper models (Hugging Face cache layout), installed by `POST /tools/speech-<size>/install`. A model there is loaded with no network contact; an absent one fails the job with `TOOL_NOT_INSTALLED` (tool `speech-<size>`) and is never downloaded on the fly |
+| `AO_TOOLS_DIR` | the optional tools the worker installs: `yt-dlp` (ADR 0009), `deno/`, `ffmpeg/`, `gallery-dl/`, `tessdata/` |
 | `AO_YTDLP_BIN` / `AO_GALLERYDL_BIN` | use this executable instead |
 | `AO_WORKER_EXIT_ON_STDIN_EOF=1` | exit when stdin closes (set by `startWorker`, so the worker dies with the app) |
 | `AO_WORKER_LOG_LEVEL` | default `INFO`; logs go to stderr |
@@ -64,9 +67,14 @@ is `401 UNAUTHORIZED`, an invalid request `400 INVALID_REQUEST`.
 - `POST /jobs` `{ type, input, output, params }` → `202 { id }`. `input` is an absolute path (a URL for `capture.download`), `output` an absolute path.
 - `GET /jobs/{id}` → `{ id, type, status: queued|running|done|failed|cancelled, progress: 0..1, result?: { output, meta }, error? }`. A finished job is forgotten once this has returned its terminal state (or 10 minutes after it ended); later requests get 404.
 - `POST /jobs/{id}/cancel` → `202` with the job. A queued job is cancelled at once; a running job's child processes are killed as a process group (SIGTERM, SIGKILL after 3 s).
-- `POST /tools/update` → `{ ytDlp: { old, new, managed }, galleryDl: { version, pinned: true } }`. Runs `yt-dlp --update-to stable` on the managed binary only; a binary from `AO_YTDLP_BIN` or PATH is reported, not touched.
+- `POST /tools/update` → `{ ytDlp: { old, new, managed }, galleryDl: { version, pinned: true } }`. Runs `yt-dlp --update-to stable` on the managed binary only; a binary from `AO_YTDLP_BIN` or PATH is reported, not touched. Failure: `502 { error: { code: TOOL_UPDATE_FAILED | TOOL_DOWNLOAD_FAILED | TOOL_CHECKSUM_MISMATCH, message, tool } }`.
+- `GET /tools` → `{ platform, tools: [{ id, group, name, purpose, without, version, downloadSize, remainingSize, sizeApproximate, installed, usable, managed, updateAvailable, available, unavailableReason?, notice?, components: [...] }] }`: the optional tools (`speech-tiny|small|medium|large-v3`, `video-downloader` = yt-dlp + deno, `image-downloader` = gallery-dl, `ffmpeg`, `ocr` = tesseract + English data). Quick local checks only; no network.
+- `POST /tools/{id}/install|update|remove` → `202 { id }`: a job (`tool.install` …) polled and cancelled like any other. Pins, verification and the atomic install are described in `ao_worker/tools.py` and ADR 0009. Its result: `{ tool, action, installed, updated, skipped }` or `{ tool, action, removed }`; its error carries `tool`.
 
-At most 2 jobs run at once; more are queued. A transcription counts as one job and uses every CPU core.
+A job whose optional tool is missing fails with `TOOL_NOT_INSTALLED` and `error.tool` naming it
+(`video-downloader`, `image-downloader`, `ffmpeg`, `ocr`, `speech-<size>`).
+
+At most 2 jobs run at once; more are queued. A transcription counts as one job and uses every CPU core. Tool installs (`tool.*`) run in a lane of their own, one at a time, so a large download never holds up the media jobs. Every tool download has a stall limit (no byte for 30 s), a deadline scaled to its size, and ends within about a second of a cancel.
 
 ### Job types
 
@@ -128,11 +136,20 @@ PyInstaller is a build-time dependency only (the `packaging` extra). The spec, t
 point and the smoke test are in `packaging/`; the spec says, for each hidden import and data
 file, what broke without it.
 
-**Inside:** the worker, its Python dependencies and gallery-dl. **Not inside** (R126): ffmpeg,
-ffprobe, tesseract, ghostscript, yt-dlp and the speech models. The packaged worker finds them the
-same way as from source: ffmpeg, ffprobe and tesseract on `PATH` (the shell puts the tools
-folder's `bin` first on `PATH`), yt-dlp through `AO_YTDLP_BIN` or `AO_TOOLS_DIR`, models in
-`AO_MODELS_DIR`. It starts and answers `/health` with none of them present.
+**Inside:** the worker and its Python dependencies (with `requests`, which the downloaded gallery-dl
+uses). **Not inside** (R126, Task 48a): ffmpeg, ffprobe, tesseract, ghostscript, yt-dlp, deno,
+gallery-dl (GPL-2.0-only) and the speech models. The packaged worker finds them the same way as
+from source: the copies it installed in `AO_TOOLS_DIR` / `AO_MODELS_DIR` first, else ffmpeg,
+ffprobe, tesseract and deno on `PATH`, yt-dlp through `AO_YTDLP_BIN`. It starts and answers
+`/health` and `/tools` with none of them present. The downloaded gallery-dl runs as
+`ao-worker -m gallery_dl` with `AO_GALLERYDL_LIB` naming its folder; the smoke test checks that
+with `--gallery-dl-wheel <the pinned wheel>`.
+
+**Live check (R133, opt-in, never in CI):**
+`.venv/bin/python scripts/live_check.py --network` installs the video downloader into a
+temporary folder as the tools dialogue does and reads one public video's metadata with the real
+yt-dlp and the arguments a capture uses (`--js-runtimes deno:<path>` included). Exit 0 passed,
+1 drift or failure, 3 inconclusive (the site refused this computer).
 
 **How the shell starts it:** exactly like the source worker, with the executable as the whole
 command: `AO_WORKER_BIN=<folder>/ao-worker` for `startWorker`, which passes `AO_WORKER_TOKEN`,

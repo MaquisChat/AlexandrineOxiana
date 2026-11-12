@@ -227,6 +227,8 @@ def check_complete(bundle: Path, manifest: dict) -> list[str]:
     listed = {canonical(p["name"]) for p in manifest.get("packages", [])}
     present = bundled_dist_names(internal)
     problems += [f"package {n} is in the bundle but not in the manifest" for n in sorted(present - listed)]
+    # gallery-dl is GPL-2.0-only and not shipped inside the worker (R152): a first-use download.
+    problems += [f"package {n} must not be inside the worker (R152: gallery-dl is a first-use download)" for n in sorted((present | listed) & {"gallery-dl"})]
     problems += [f"package {n} is in the manifest but not in the bundle" for n in sorted(listed - present)]
     listed_libs = {x["path"] for x in manifest.get("nativeLibraries", [])}
     present_libs = {str(p.relative_to(bundle)) for p in native_library_files(internal)}

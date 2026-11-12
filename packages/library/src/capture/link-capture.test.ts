@@ -15,7 +15,7 @@ import { PolicyDeniedError, type Repo } from "../repo/index.js";
 import { decryptBytes } from "../repo/io.js";
 import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient, devWorkerPython, startWorker } from "../worker-client.js";
-import { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, plainReason } from "./errors.js";
+import { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, plainReason, toolMissingReason } from "./errors.js";
 import { createLinkCapture, type LinkCapture } from "./link-capture.js";
 import { classifyUrl } from "./platforms.js";
 import { stripSnapshot } from "./snapshot.js";
@@ -758,5 +758,74 @@ describe("R116: one per-platform lane per library", () => {
     await Promise.all([a.captureUrls(p.id, urls("A"), { transcribe: false }), b.captureUrls(p.id, urls("B"), { transcribe: false })]);
     expect(downloads).toBe(8);
     expect(overlaps).toEqual([]);
+  });
+});
+
+describe("a missing tool (Task 48a, R126)", () => {
+  async function withMissing(...missing: string[]): Promise<LinkCapture> {
+    const w = await startToolWorker({ missing });
+    closers.push(() => w.close());
+    return createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w, index: { db: handle.db }, pollMs: 5 }), index: handle });
+  }
+
+  it("a video link without the video downloader names it and says how to get it; nothing is saved", async () => {
+    const p = await project();
+    const out = await (await withMissing("video-downloader")).captureUrl(p.id, YT, { transcribe: false });
+    expect(out).toEqual({ url: YT, status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader", reason: toolMissingReason("video-downloader") });
+    expect(out.reason).toMatch(/video downloader is not installed/i);
+    expect(out.reason).toMatch(/the Optional tools screen/);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a photo post without the image downloader names it", async () => {
+    const p = await project();
+    const out = await (await withMissing("image-downloader")).captureUrl(p.id, IG, { transcribe: false });
+    expect(out).toMatchObject({ status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "image-downloader" });
+    expect(out.reason).toMatch(/image downloader is not installed/i);
+  });
+
+  it("a capture whose speech model is missing saves the source and names the model in its note", async () => {
+    const p = await project();
+    const out = await (await withMissing("speech-small")).captureUrl(p.id, YT, { transcribe: true, transcribeModel: "small" });
+    expect(out.status).toBe("created");
+    expect(out.tool).toBe("speech-small");
+    expect(out.reason).toMatch(/small speech model is not installed/i);
+    expect(out.reason).toMatch(/the Optional tools screen/);
+  });
+
+  it("the plain reason for the code is no longer the generic one, and names no path or address", () => {
+    expect(plainReason("TOOL_NOT_INSTALLED")).not.toBe(plainReason("SOMETHING_ELSE"));
+    expect(plainReason("TOOL_NOT_INSTALLED")).toMatch(/the Optional tools screen/);
+    for (const t of ["video-downloader", "image-downloader", "speech-tiny", "speech-large-v3", "ffmpeg", "ocr", "unknown-thing"]) {
+      expect(toolMissingReason(t)).toMatch(/not installed/);
+      expect(toolMissingReason(t)).not.toMatch(/:\/\/|[\\/]home/);
+    }
+    expect(toolMissingReason("speech-large-v3")).toMatch(/large-v3 speech model/);
+  });
+});
+
+describe("the default speech model (R158)", () => {
+  it("a capture that transcribes without naming a model asks for the shared default", async () => {
+    const { DEFAULT_SPEECH_MODEL } = await import("@ao/shared");
+    const p = await project();
+    const out = await capture.captureUrl(p.id, YT, { transcribe: true });
+    expect(out.status).toBe("created");
+    const job = worker.submitted.find((j) => j.type === "audio.transcribe");
+    expect(job?.params.model).toBe(DEFAULT_SPEECH_MODEL);
+    expect(DEFAULT_SPEECH_MODEL).toBe("medium");
+  });
+});
+
+describe("the speech model names in sentences (R158)", () => {
+  it("every shared speech model is named, and nothing else is taken for one", async () => {
+    const { SPEECH_MODELS } = await import("@ao/shared");
+    for (const m of SPEECH_MODELS) expect(toolMissingReason(`speech-${m}`)).toMatch(new RegExp(`^The ${m} speech model is not installed`));
+    expect(toolMissingReason("speech-huge")).toMatch(/^A tool this needs/);
+  });
+
+  it("the sentences carry no list of model names of their own", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("./errors.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/large-v3|\btiny\b/);
   });
 });
