@@ -441,15 +441,39 @@ export function createClient(baseUrl: string, token: string, opts: ClientOptions
         res.body?.cancel().catch(() => {});
         throw tooLarge();
       }
-      let blob: Blob;
+      const type = res.headers.get("content-type") ?? "";
+      if (o.maxBytes === undefined || !res.body) {
+        let blob: Blob;
+        try {
+          blob = await res.blob();
+        } catch (err) {
+          if (o.signal?.aborted) throw err;
+          throw unreachable();
+        }
+        if (o.maxBytes !== undefined && blob.size > o.maxBytes) throw tooLarge();
+        return blob;
+      }
+      // With a limit, the body is read in chunks and given up as soon as it passes the limit, so a
+      // body that does not say its length is never held whole first (M11).
+      const reader = res.body.getReader();
+      const parts: Uint8Array[] = [];
+      let total = 0;
       try {
-        blob = await res.blob();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > o.maxBytes) {
+            reader.cancel().catch(() => {});
+            throw tooLarge();
+          }
+          parts.push(value);
+        }
       } catch (err) {
-        if (o.signal?.aborted) throw err;
+        if (err instanceof ApiClientError || o.signal?.aborted) throw err;
         throw unreachable();
       }
-      if (o.maxBytes !== undefined && blob.size > o.maxBytes) throw tooLarge();
-      return blob;
+      return new Blob(parts as BlobPart[], { type });
     })();
   }
 

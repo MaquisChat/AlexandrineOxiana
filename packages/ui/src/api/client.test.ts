@@ -189,6 +189,59 @@ describe("bytes() — a file's content, with the token in the header (R135 1, Ta
     const api = createClient(BASE, TOKEN, { fetch: f.fetch });
     await expect(api.bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
   });
+
+  it("with no Content-Length, it stops reading once the limit is passed and gives up the rest (M11)", async () => {
+    // A body of 4-byte chunks that would go on for 40 000 bytes; nothing says how long it is.
+    let pulls = 0;
+    let cancelled = false;
+    const body = () =>
+      new ReadableStream<Uint8Array>({
+        pull(c) {
+          pulls++;
+          if (pulls > 10_000) c.close();
+          else c.enqueue(new Uint8Array([1, 2, 3, 4]));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+    const f = fakeFetch(() => new Response(body(), { status: 200, headers: { "content-type": "image/png" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    await expect(api.bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    expect(pulls).toBeLessThan(10); // 3 chunks pass 10 bytes; the stream may pull a little ahead
+    expect(cancelled).toBe(true);
+  });
+
+  it("with no Content-Length, a body within the limit is given whole, of its type (M10 d)", async () => {
+    const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5]), new Uint8Array([6, 7, 8, 9, 10])];
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(ch);
+        c.close();
+      },
+    });
+    const f = fakeFetch(() => new Response(stream, { status: 200, headers: { "content-type": "font/woff2" } }));
+    const api = createClient(BASE, TOKEN, { fetch: f.fetch });
+    const b = await api.bytes("/x", { maxBytes: 10 });
+    expect(b.type).toBe("font/woff2");
+    // Read as the interface does where Blob.arrayBuffer is missing (this test DOM's Blob lacks it).
+    const read = await new Promise<ArrayBuffer>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result as ArrayBuffer);
+      r.onerror = () => reject(r.error);
+      r.readAsArrayBuffer(b);
+    });
+    expect([...new Uint8Array(read)]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // One byte more than the limit, sent in small pieces: refused.
+    const over = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of [...chunks, new Uint8Array([11])]) c.enqueue(ch);
+        c.close();
+      },
+    });
+    const g = fakeFetch(() => new Response(over, { status: 200, headers: { "content-type": "font/woff2" } }));
+    await expect(createClient(BASE, TOKEN, { fetch: g.fetch }).bytes("/x", { maxBytes: 10 })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
 });
 
 describe("mediaUrl() — the address a media element loads (R135)", () => {
