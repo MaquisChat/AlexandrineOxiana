@@ -11,12 +11,14 @@
  * for a port itself (R110).
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { ApiError, type Api, type Pairing } from "../api.js";
+import { ApiError, type Api, type LocalStorageArea, type Pairing } from "../api.js";
 import type { PendingByProject } from "../pending.js";
 import type { BackgroundRequest, CaptureReply, ProfileStatus, ProjectChoice } from "../types.js";
 
 export interface PopupBridge {
   api: Api;
+  /** storage.local, for the researcher's own popup choices (R189); never storage.sync. */
+  prefs: Pick<LocalStorageArea, "get" | "set">;
   /** The tab the popup was opened on. */
   activeTabId(): Promise<number | undefined>;
   send<T>(msg: BackgroundRequest): Promise<T>;
@@ -30,6 +32,21 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** A reply that is not a profile status (no answer, or an error) means nothing is running. */
 const statusOf = (r: ProfileStatus | null | undefined): ProfileStatus => (r && typeof r.active === "boolean" && typeof r.count === "number" ? r : { active: false, count: 0 });
 
+/**
+ * The researcher's last choice for "Also download media with the downloader" (R189, defect D18),
+ * kept in storage.local under its own key. Anything but a stored boolean, or a read that fails,
+ * means ticked, as before. The project's rules still decide whether the box is offered at all.
+ */
+const ALSO_DOWNLOAD = "alsoDownload";
+async function readAlsoDownload(prefs: PopupBridge["prefs"]): Promise<boolean> {
+  try {
+    const v = (await prefs.get(ALSO_DOWNLOAD))?.[ALSO_DOWNLOAD];
+    return typeof v === "boolean" ? v : true;
+  } catch {
+    return true;
+  }
+}
+
 export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
   const [port, setPort] = useState("");
@@ -37,6 +54,8 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [projects, setProjects] = useState<ProjectChoice[] | undefined>();
   const [projectId, setProjectId] = useState("");
   const [alsoDownload, setAlsoDownload] = useState(true);
+  /** The researcher changed the box in this opening: a stored value read late must not undo it. */
+  const alsoDownloadChanged = useRef(false);
   const [tabId, setTabId] = useState<number | undefined>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
@@ -68,6 +87,27 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       checkAbort.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    let current = true;
+    void readAlsoDownload(bridge.prefs).then((v) => {
+      if (current && !alsoDownloadChanged.current) setAlsoDownload(v);
+    });
+    return () => {
+      current = false;
+    };
+  }, [bridge]);
+
+  function chooseAlsoDownload(v: boolean) {
+    alsoDownloadChanged.current = true;
+    setAlsoDownload(v);
+    // Remembered for the next opening; if it cannot be stored, the box still holds for this one.
+    try {
+      void bridge.prefs.set({ [ALSO_DOWNLOAD]: v }).catch(() => undefined);
+    } catch {
+      /* no storage: nothing to remember */
+    }
+  }
 
   useEffect(() => {
     if (portOpen) portInput.current?.focus();
@@ -323,7 +363,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
             </select>
           </label>
           <label className="check">
-            <input type="checkbox" checked={alsoDownload && downloaderAllowed} disabled={!downloaderAllowed || busy} onChange={(e) => setAlsoDownload(e.target.checked)} />
+            <input type="checkbox" checked={alsoDownload && downloaderAllowed} disabled={!downloaderAllowed || busy} onChange={(e) => chooseAlsoDownload(e.target.checked)} />
             Also download media with the downloader
           </label>
           {!downloaderAllowed && <p className="hint">This project's rules do not allow the downloader, so media downloads and profile capture are off.</p>}
