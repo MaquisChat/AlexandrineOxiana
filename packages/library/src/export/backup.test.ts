@@ -235,6 +235,11 @@ describe("restoreBackup", () => {
     await expect(restoreBackup(kit.repo, r.path)).rejects.toThrow(/passphrase|locked/i);
     const restored = await restoreBackup(kit.repo, r.path, { passphrase: PASS });
     const [sid] = kit.repo.listSourceIds(restored.projectId);
+    // The passphrase read the backup and nothing else (Task 50b, I1): the restore unlocked nothing,
+    // so the copy is locked, like the project it was made from, until it is unlocked itself.
+    expect(kit.repo.isUnlocked(p.id)).toBe(false);
+    expect(kit.repo.isUnlocked(restored.projectId)).toBe(false);
+    await kit.repo.unlockProject(restored.projectId, PASS);
     expect((await kit.repo.getSource(restored.projectId, sid!)).source.title.variants[0]!.value).toBe("inside");
   });
 });

@@ -1336,11 +1336,6 @@ export function keyFromRing(repo: Repo, keyId: string): Uint8Array | undefined {
   return cores.get(repo)!.keyRing.get(keyId);
 }
 
-/** Package-internal (restore with a passphrase): puts a project key in the repo's key ring. */
-export function addKeyToRing(repo: Repo, keyId: string, key: Uint8Array): void {
-  cores.get(repo)!.keyRing.add(keyId, key);
-}
-
 /** Package-internal (restore, R90 b): makes an unpacked backup a new project of the library. */
 export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<typeof adoptRestoredIn> {
   return adoptRestoredIn(cores.get(repo)!, s);

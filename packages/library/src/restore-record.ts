@@ -154,6 +154,8 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
       }`,
     audit: (n) => ({ projectId: p.id, ...(certificate ? { certificate } : {}), basis: found ? "certificate-files-alone" : "nothing-could-be-read", leftOut: n }),
   });
+  /** Destructions whose files are known from the audit log, but whose sealed certificate could not be read: the project is locked. */
+  let sealed = 0;
   for (const a of list) {
     const byId = new Map<string, string>();
     const ids = named.get(a.certificateSha256);
@@ -168,7 +170,8 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
     const why = whyNot(buf);
     if (ids) {
       // The files are known from the audit log all the same; said only when this restore left one of them out
-      // (a locked project is no fault, and is not said at all).
+      // (a locked project is no fault: what could not be read of it is said once, below).
+      if (buf === "locked") sealed++;
       out.push({
         projectId: p.id,
         basis: "recorded",
@@ -183,6 +186,20 @@ async function recorded(repo: Repo, p: Project, events: AuditEvent[], own: boole
     // An entry written before the audit log named the destroyed files, whose certificate does not verify either.
     if (own) throw cannotTell(` (certificate "${a.certificate}")`, why, buf === "locked");
     out.push(unestablished(` (certificate "${a.certificate}")`, why, Buffer.isBuffer(buf) ? namedIn(buf, now) : undefined, a.certificate));
+  }
+  // A locked project (the restore unlocks nothing, I1): its audit log, which is not sealed, names the
+  // destroyed files by id, and that is what was used. Its sealed certificates also list each file's
+  // sha256, which would catch the same file kept under another id; that could not be read, and is said.
+  if (sealed) {
+    out.push({
+      projectId: p.id,
+      basis: "recorded",
+      byId: new Map(),
+      bySha256: new Map(),
+      sealed: true,
+      note: () =>
+        `The project "${p.name}" is locked, and ${sealed === 1 ? "its destruction certificate is sealed, so it was" : "its destruction certificates are sealed, so they were"} not read. The files that project destroyed were recognised by the ids its audit log names; the same file kept under another id in this backup could not be recognised. To be sure, unlock that project and restore the backup again.`,
+    });
   }
   // Certificate-named files the fold does not tie to a destruction of its own: one the log records only by its
   // sha256 (the earliest form, a `retention.destroyed` event alone), or one the log does not record at all.

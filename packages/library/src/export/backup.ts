@@ -64,7 +64,9 @@
  * archive declares, writes runs of zeros as holes, reads a sealed backup in place
  * (crypto/random-access.ts: decrypted chunk by chunk, never written out as a zip), verifies its
  * audit chain, and makes it a NEW project (repo/restore.ts). A restored encrypted project keeps the
- * key (and key id) of the project it was made from: unlocking either unlocks both. A restore is
+ * key (and key id) of the project it was made from: unlocking either unlocks both. The restore
+ * itself unlocks nothing (I1): a passphrase given to it reads the backup, and no key stays in the
+ * session, so the copy is then locked like the project it was made from. A restore is
  * governed (Task 50b): the policy engine decides before anything is unpacked and again in the commit
  * turn, a refusal is audited, files a recorded destruction destroyed are left out by what the audit
  * logs say, and a copy that inherits backups still to be removed has its warning from the moment it
@@ -101,7 +103,6 @@ import { AuditChainInvalidError, DestructionRecordError, RestoreError, Unreadabl
 import { parseProjectJson } from "../repo/state.js";
 import {
   DESTRUCTION_BACKUPS_PENDING_WARNING,
-  addKeyToRing,
   adoptRestoredProject,
   appendLibraryEvent,
   authorizeProcessing,
@@ -1572,10 +1573,13 @@ async function freeBytes(dir: string): Promise<number> {
 /** A backup's project.json is read whole to decide on it; larger than this it is not a backup the app made. */
 const PROJECT_JSON_MAX = 256 * 1024 * 1024;
 
+/** How a restore finds the key a sealed backup needs: from the key ring, or the one derived for this restore alone. */
+type KeyOf = (keyId: string) => Uint8Array | undefined;
+
 /** A backup file opened for reading single entries: as it is, or through the project key when sealed. */
-async function openBackup(repo: Repo, abs: string): Promise<{ src: ZipSource; failure: () => unknown; close: () => Promise<void> }> {
+async function openBackup(repo: Repo, abs: string, keyOf: KeyOf = (id) => keyFromRing(repo, id)): Promise<{ src: ZipSource; failure: () => unknown; close: () => Promise<void> }> {
   if (!abs.endsWith(".enc")) return { src: abs, failure: () => undefined, close: async () => {} };
-  const z = await openSealedZip(abs, (id) => keyFromRing(repo, id));
+  const z = await openSealedZip(abs, keyOf);
   return { src: { reader: z.reader, size: z.size }, failure: z.failure, close: z.close };
 }
 
@@ -1606,9 +1610,9 @@ async function projectIdIn(repo: Repo, abs: string): Promise<string | undefined>
  * unpacked: the project it holds and the rules it carries (`governance.yaml`; none: the decision
  * is a refusal). The archive's names were checked already (extractArchive's first pass).
  */
-async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: Pick<RestoreRequest, "destinations" | "backupSha256" | "file">): Promise<RestoreRequest> {
+async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: Pick<RestoreRequest, "destinations" | "backupSha256" | "file">, keyOf: KeyOf): Promise<RestoreRequest> {
   const undecryptable = () => new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
-  const z = await openBackup(repo, abs).catch(() => {
+  const z = await openBackup(repo, abs, keyOf).catch(() => {
     throw undecryptable();
   });
   try {
@@ -1640,6 +1644,16 @@ async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: 
  * Restores a backup made by backupProject as a NEW project of this library (never over an existing
  * one). A sealed backup needs the project's key: the project unlocked in this app, or `passphrase`
  * (or the recovery code), checked against the key file the backup manifest kept.
+ *
+ * A restore never changes any project's lock state (I1). The key derived from `passphrase` reads
+ * the backup and seals the copy's files, is held by this call alone and never put in the key ring,
+ * and is zeroed when the call ends: allowed, refused or failed, every project is as locked or
+ * unlocked afterwards as before, and nothing is readable that was not. The copy made that way is
+ * locked until it is unlocked itself (audited as `key.unlock`). A locked original does not stand in
+ * the way of the decision: its rules and its audit log are not sealed. Only its sealed destruction
+ * certificates are not read: the files it destroyed are known by id from its audit log, the
+ * restore says that the certificates were not read, and an entry written before the log named the
+ * files refuses the restore (unlock the project first, or restore into another library).
  *
  * Governed (Task 50b, R138): before anything is written, the policy engine decides
  * (`action: 'restore'`) on the rules the backup carries, which become the new project's, and on the
@@ -1707,36 +1721,62 @@ async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Pr
 }
 
 async function restoreHashed(repo: Repo, abs: string, backupSha256: string, opts: RestoreOptions): Promise<RestoreResult> {
-  const lib = repoLibrary(repo);
   const sealed = abs.endsWith(".enc");
   // The manifest entry, when the backup is one of this library's.
   const inBackups = resolve(dirname(abs)) === resolve(backupsDir(repo));
   const entry = inBackups ? (await withManifest(repo, async (m) => m)).backups.find((b) => b.file === basename(abs)) : undefined;
   if (entry && entry.sha256 !== backupSha256) throw new UnreadableBackupError("This backup was changed after it was made; it was not restored");
 
+  /**
+   * The key derived from the passphrase, for this restore alone (I1): it reads the backup and seals
+   * the copy's files, and is never put in the key ring. So the restore unlocks nothing: the project
+   * the backup was made from, and every other project, is as locked afterwards as before, whether
+   * the restore is allowed, refused or fails; and the copy is locked until it is unlocked itself
+   * (which is audited, as every unlock is). Zeroed when the restore ends.
+   */
+  let derived: { keyId: string; key: Uint8Array } | undefined;
+  const keyOf: KeyOf = (id) => (derived && id === derived.keyId ? derived.key : keyFromRing(repo, id));
+  try {
+    if (sealed) {
+      const keyId = await readKeyId(abs).catch(() => {
+        throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it is not a backup made by this app");
+      });
+      if (!keyFromRing(repo, keyId)) {
+        const kf = entry?.keyFile;
+        if (!opts.passphrase || !kf || kf.keyId !== keyId) throw new RestoreError("This backup is encrypted: unlock its project, or give the project's passphrase");
+        let key: Uint8Array;
+        try {
+          key = await unwrapKey(kf.passphrase, opts.passphrase);
+        } catch (err) {
+          if (!(err instanceof WrongPassphraseError)) throw err;
+          key = await unwrapWithRecovery(kf.recovery, opts.passphrase).catch(() => {
+            throw new RestoreError("The passphrase does not open this backup");
+          });
+        }
+        derived = { keyId, key };
+      }
+    }
+    return await restoreOpened(repo, abs, backupSha256, opts, { sealed, inBackups, keyOf, ...(derived ? { key: derived } : {}) });
+  } finally {
+    derived?.key.fill(0);
+  }
+}
+
+/** The restore itself, once the key a sealed backup needs is at hand (`keyOf`). */
+async function restoreOpened(
+  repo: Repo,
+  abs: string,
+  backupSha256: string,
+  opts: RestoreOptions,
+  how: { sealed: boolean; inBackups: boolean; keyOf: KeyOf; key?: { keyId: string; key: Uint8Array } },
+): Promise<RestoreResult> {
+  const lib = repoLibrary(repo);
+  const { sealed, inBackups, keyOf } = how;
   let source: ZipSource = abs;
   let close: (() => Promise<void>) | undefined;
   let decryptFailure: (() => unknown) | undefined;
   if (sealed) {
-    const keyId = await readKeyId(abs).catch(() => {
-      throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it is not a backup made by this app");
-    });
-    if (!keyFromRing(repo, keyId)) {
-      const kf = entry?.keyFile;
-      if (!opts.passphrase || !kf || kf.keyId !== keyId) throw new RestoreError("This backup is encrypted: unlock its project, or give the project's passphrase");
-      let key: Uint8Array;
-      try {
-        key = await unwrapKey(kf.passphrase, opts.passphrase);
-      } catch (err) {
-        if (!(err instanceof WrongPassphraseError)) throw err;
-        key = await unwrapWithRecovery(kf.recovery, opts.passphrase).catch(() => {
-          throw new RestoreError("The passphrase does not open this backup");
-        });
-      }
-      addKeyToRing(repo, keyId, key);
-      key.fill(0);
-    }
-    const z = await openSealedZip(abs, (id) => keyFromRing(repo, id)).catch(() => {
+    const z = await openSealedZip(abs, keyOf).catch(() => {
       throw new UnreadableBackupError("This backup cannot be decrypted: it is damaged, or it was sealed with another key");
     });
     source = { reader: z.reader, size: z.size };
@@ -1761,7 +1801,7 @@ async function restoreHashed(repo: Repo, abs: string, backupSha256: string, opts
           // destroyed in this library must be readable with certainty. A refusal of either is
           // audited and thrown from here: nothing is unpacked.
           destinations = await backupDestinations(projectsDir, opts.locationEnv ?? (await defaultLocationEnv()));
-          const request = await restoreRequestOf(repo, abs, sealed, { destinations, backupSha256, ...(file ? { file } : {}) });
+          const request = await restoreRequestOf(repo, abs, sealed, { destinations, backupSha256, ...(file ? { file } : {}) }, keyOf);
           await authorizeRestore(repo, request);
           try {
             prior = await destroyedOnRecord(repo, { own: request.project.id });
@@ -1802,6 +1842,8 @@ async function restoreHashed(repo: Repo, abs: string, backupSha256: string, opts
       sealed,
       destinations,
       ...(file ? { file } : {}),
+      // The key derived for this restore alone, when the project's own is not in the key ring.
+      ...(how.key ? { key: how.key } : {}),
       // In the commit turn (it holds the write queue): what was destroyed, as the audit logs say now.
       destroyed: (own) => destroyedOnRecord(repo, { own, inQueue: true, ...(prior ? { prior } : {}) }),
       // In the commit turn, last before the copy goes live: the backups it inherits as still to be

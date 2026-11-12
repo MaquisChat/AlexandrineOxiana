@@ -19,7 +19,9 @@
  *      are evidence and are copied byte for byte (R147): the copy's audit log vouches for them;
  *   3. a `project.restored` event naming the backup's sha256 is appended to the copy's audit log;
  *   An encrypted copy keeps the data key, and key id, of the project it was made from (the
- *   backup is sealed with it): unlocking either project unlocks both. Files a destruction recorded
+ *   backup is sealed with it): unlocking either project unlocks both. The restore itself unlocks
+ *   nothing (I1): a key derived from a passphrase comes in as `StagedRestore.key`, is used here and
+ *   never put in the key ring, and the copy is then locked. Files a destruction recorded
  *   in this library destroyed are not brought back (marked destroyed, R92): which files is read in
  *   this turn from the audit logs (R174 d; the caller's reader, `StagedRestore.destroyed`). A
  *   certificate file a verified audit log does not record counts for nothing; the certificate
@@ -147,6 +149,12 @@ export interface DestroyedSource {
   note?: (files: number) => string | undefined;
   /** What the restore's audit entry says of this source, when it is not a verified record. */
   audit?: (leftOut: number) => Record<string, unknown>;
+  /**
+   * The project is locked and its destruction certificates are sealed: what it destroyed is known
+   * by id from its audit log, but the certificates' list of sha256 could not be read (the restore
+   * unlocks nothing, I1). Said in the notes, and named in the restore's audit entry.
+   */
+  sealed?: true;
 }
 
 /** What the destructions on record in this library say a restore must not bring back (R174 d, R179). */
@@ -169,6 +177,12 @@ export interface StagedRestore {
   destinations: RestoreDestinations;
   /** The backup's file name, when it is one of this library's backups. */
   file?: string;
+  /**
+   * The project key derived from a passphrase for this restore alone (I1): used here to read and
+   * seal the copy's files, and never put in the key ring. Absent: the key ring holds the key (the
+   * project is unlocked), or the project is not encrypted.
+   */
+  key?: { keyId: string; key: Uint8Array };
   /**
    * What the destructions on record say must not come back, read in the commit turn (it must not
    * take the write queue), given the id of the project the backup belongs to. Throws
@@ -502,9 +516,10 @@ export async function adoptRestoredProject(
         throw new PolicyDeniedError(decided.reason, "restore");
       }
 
-      // The key, for an encrypted project (the caller made sure it is in the key ring).
+      // The key, for an encrypted project: the one derived for this restore alone, else the key
+      // ring's (the project is unlocked). The restore puts no key in the ring (I1).
       const keyId = old.encryption.enabled ? old.encryption.keyId : undefined;
-      const key = keyId ? core.keyRing.get(keyId) : undefined;
+      const key = keyId ? (s.key && s.key.keyId === keyId ? s.key.key : core.keyRing.get(keyId)) : undefined;
       if (old.encryption.enabled && (!keyId || !key)) throw new RestoreError("The project's key is needed to restore this backup: unlock the project or give its passphrase");
       const getKey = (id: string) => (id === keyId ? key : undefined);
       const readText = async (abs: string): Promise<string> => {
@@ -621,6 +636,7 @@ export async function adoptRestoredProject(
         if (note) notes.push(note);
         if (src.audit) notVerified.push(src.audit(files));
       }
+      const sealedIn = [...new Set(record.sources.filter((x) => x.sealed).map((x) => x.projectId))];
 
       const projectsDir = join(core.root, "Projects");
       const taken = await namesIn(projectsDir);
@@ -727,6 +743,8 @@ export async function adoptRestoredProject(
           // Projects whose record of destructions the audit log could not vouch for, and what the
           // list of files left out rests on for each (R179).
           ...(notVerified.length ? { destructionsNotVerified: notVerified } : {}),
+          // Locked projects whose sealed certificates were not read: their destroyed files were known by id only.
+          ...(sealedIn.length ? { destructionCertificatesSealed: sealedIn } : {}),
           ...(decided.warnings.length ? { warnings: decided.warnings } : {}),
         },
       });
@@ -756,8 +774,14 @@ export async function adoptRestoredProject(
       core.projects.set(st.project.id, st);
       await core.updateAnchor(st, at);
       try {
-        await core.index.indexProject(st.project);
-        for (const id of listSourceIds(core, st.project.id)) await core.index.indexSource(await readSourceFile(core, st, id));
+        if (!core.encrypted(st) || core.keyRing.has(st.project.encryption.keyId ?? "")) {
+          await core.index.indexProject(st.project);
+          for (const id of listSourceIds(core, st.project.id)) await core.index.indexSource(await readSourceFile(core, st, id));
+        } else if (core.index.indexLockedProject) {
+          // Restored with a key derived for the restore alone: the copy is locked, and the index
+          // holds of it what it holds of any locked project (its manifest, R30).
+          await core.index.indexLockedProject(st.project, st.manifest.sources);
+        } else await core.index.indexProject(st.project);
       } catch (error) {
         core.indexErrors.push({ op: "project.restored", error });
       }

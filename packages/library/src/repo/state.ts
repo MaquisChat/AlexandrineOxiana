@@ -27,6 +27,12 @@ export interface IndexSink {
   removeSource(id: string): void | Promise<void>;
   indexProject(p: Project): void | Promise<void>;
   /**
+   * A locked encrypted project that is new to the index (a copy restored with a key that was not
+   * kept): the project and, from its manifest alone, its sources (R30: type and year, no titles, no
+   * text). Optional; absent means `indexProject` is called instead.
+   */
+  indexLockedProject?(p: Project, sources: ManifestEntry[]): void | Promise<void>;
+  /**
    * Called synchronously when an encrypted project is locked: drop everything held for it beyond
    * manifest-level fields (R30). Optional; absent means nothing to drop.
    */
