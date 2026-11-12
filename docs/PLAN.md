@@ -539,7 +539,7 @@ Update after every task; commit and push.
 | 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; the Intel question is closed (not built, R169); one owner confirmation pending (minimum macOS 15) |
-| 37f Mac builds in CI | done | 81276bf | run 2 green on a Mac (2026-11-12, 12 min): the app, its disk image, the worker smoke test, launch check A–D on the debug app and R on the release app from the disk image; Apple Silicon only (R169); builds are started by a build request (R168); written and paper-reviewed in 2ed4788 |
+| 37f Mac builds in CI | done | 81276bf | run 2 green on a Mac (2026-11-12, 12 min): the app, its disk image, the worker smoke test, launch check A–D on the debug app and R on the release app from the disk image; Apple Silicon only (R169); builds are started by a build request (R168); written and paper-reviewed in 2ed4788; run 3 green (2026-11-12, 10 min, commit 4a7255b): the build for the owner's hands-on tests |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
@@ -556,7 +556,7 @@ Update after every task; commit and push.
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | waits for the checklist (37i) and the defect fixes (46a, 46b) | | a Mac build exists (run 2 of "Desktop (macOS)", unsigned, R151) and the owner may try it at once; it still has the open defects D1–D8, so the checklist run is best done on the build made after 46a and 46b merge |
+| 55 Owner hands-on tests | ready for the owner (2026-11-12) | | the build is run 3 of "Desktop (macOS)" (id 43271302338, commit 4a7255b; unsigned, R151), with the browser extension as a second download of the same run; the guide and checklist were sent; known open defects D18, D19, D20 |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
