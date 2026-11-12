@@ -1,6 +1,7 @@
 /**
  * Typed methods for the capture screen (Task 34b, R113), built on the client's `request()`, and the
- * pure pieces the screen and its queue use. Routes (apps/library-service/src/routes/):
+ * pure pieces the screen and its queue use. Routes (apps/library-service/src/routes/); their request
+ * and answer shapes are declared once, in @ao/shared (api/capture.ts, Task 47):
  *
  *   POST /projects/:id/capture           { urls, options? } → { queueId }  (capture.ts)
  *   POST /projects/:id/capture-profile   { url, options? }  → { queueId }  (capture.ts)
@@ -33,7 +34,33 @@ import { parseGovernance } from "@ao/core/governance/schema";
 // The one classifier and the one acknowledgement text (Task 63, R146): only these modules, no copy.
 import { classifyUrl, isWebAddress, type LinkKind, type Platform } from "@ao/core/capture/platforms";
 import { COOKIES_ACKNOWLEDGEMENT } from "@ao/core/capture/acknowledgement";
-import { SPEECH_MODELS, type CaptureQueueDetail, type CaptureQueueListResponse, type CaptureQueueSummary, type CaptureStartedBy, type SpeechModel } from "@ao/shared";
+// Request and answer shapes: one declaration with the service (@ao/shared, Task 47).
+import {
+  CAPTURE_BROWSERS,
+  CAPTURE_CONTENT_TYPES,
+  CAPTURE_LINKS_MAX,
+  SPEECH_MODELS,
+  type AcknowledgeRequest,
+  type AcknowledgeResponse,
+  type CaptureBrowser,
+  type CaptureContentType,
+  type CaptureItemOutcome,
+  type CaptureItemStatus,
+  type CaptureLinksRequest,
+  type CaptureProfileReport,
+  type CaptureProfileRequest,
+  type CaptureQueueDetail,
+  type CaptureQueueListResponse,
+  type CaptureQueueProgressEvent,
+  type CaptureQueueSummary,
+  type CaptureRequestOptions,
+  type CaptureStartedBy,
+  type CaptureStartedResponse,
+  type CaptureToolsUpdateResponse,
+  type CaptureToolVersionsResponse,
+  type ProfileCaptureRequestOptions,
+  type SpeechModel,
+} from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
 import { isValidId, seg } from "./import";
 
@@ -44,14 +71,10 @@ export type { LinkKind, Platform };
 // ---------------------------------------------------------------------------------------------
 // Shapes
 
-export type BrowserName = "chrome" | "firefox" | "safari" | "edge" | "brave";
-export const BROWSERS: ReadonlyArray<{ value: BrowserName; label: string }> = [
-  { value: "chrome", label: "Chrome" },
-  { value: "firefox", label: "Firefox" },
-  { value: "safari", label: "Safari" },
-  { value: "edge", label: "Edge" },
-  { value: "brave", label: "Brave" },
-];
+export type BrowserName = CaptureBrowser;
+const BROWSER_WORDS: Record<BrowserName, string> = { chrome: "Chrome", firefox: "Firefox", safari: "Safari", edge: "Edge", brave: "Brave" };
+/** The browsers the service accepts (the shared list, in its order), with their names. */
+export const BROWSERS: ReadonlyArray<{ value: BrowserName; label: string }> = CAPTURE_BROWSERS.map((value) => ({ value, label: BROWSER_WORDS[value] }));
 
 /** Words for each speech model; the models themselves are the one definition in @ao/shared (R158). */
 const MODEL_WORDS: Record<SpeechModel, string> = {
@@ -64,75 +87,21 @@ const MODEL_WORDS: Record<SpeechModel, string> = {
 /** The transcription models the app accepts, in the shared order, with their words. */
 export const MODELS: ReadonlyArray<{ value: SpeechModel; label: string }> = SPEECH_MODELS.map((value) => ({ value, label: MODEL_WORDS[value] }));
 
-export type ProfileContentType = "posts" | "reels" | "videos" | "shorts" | "highlights";
-export const CONTENT_TYPES: ReadonlyArray<{ value: ProfileContentType; label: string }> = [
-  { value: "posts", label: "Posts" },
-  { value: "reels", label: "Reels" },
-  { value: "videos", label: "Videos" },
-  { value: "shorts", label: "Shorts" },
-  { value: "highlights", label: "Story highlights" },
-];
+export type ProfileContentType = CaptureContentType;
+const CONTENT_TYPE_WORDS: Record<ProfileContentType, string> = { posts: "Posts", reels: "Reels", videos: "Videos", shorts: "Shorts", highlights: "Story highlights" };
+/** The parts of a profile the service can list (the shared list, in its order), with their names. */
+export const CONTENT_TYPES: ReadonlyArray<{ value: ProfileContentType; label: string }> = CAPTURE_CONTENT_TYPES.map((value) => ({ value, label: CONTENT_TYPE_WORDS[value] }));
 
-/** CaptureOptions as the service reads them (routes/capture.ts captureOptions). */
-export interface CaptureOptions {
-  cookiesFromBrowser?: BrowserName;
-  /** Left out: the project's own setting. */
-  transcribe?: boolean;
-  transcribeModel?: string;
-  refreshIfExists?: boolean;
-  legalBasis?: string;
-}
-
-export interface ProfileCaptureOptions extends CaptureOptions {
-  since?: string;
-  until?: string;
-  maxItems?: number;
-  contentTypes?: ProfileContentType[];
-  metadataOnly?: boolean;
-  includeComments?: boolean;
-}
-
-export type CaptureStatus = "created" | "duplicate" | "refreshed" | "incomplete" | "failed" | "needs-review";
-
-/** CaptureOutcome (packages/library/src/capture/link-capture.ts). */
-export interface CaptureOutcome {
-  url: string;
-  status: CaptureStatus | (string & {});
-  sourceId?: string;
-  reason?: string;
-  errorCode?: string;
-  /** The optional tool that was missing (a ToolId), with TOOL_NOT_INSTALLED. */
-  tool?: string;
-}
-
-/** ProfileCaptureReport (packages/library/src/capture/profile-capture.ts). */
-export interface ProfileReport {
-  status: "completed" | "paused-rate-limited" | "failed" | (string & {});
-  profileSourceId?: string;
-  listComplete: boolean;
-  created: number;
-  duplicates: number;
-  incomplete: number;
-  failed: number;
-  newlyUnavailable: number;
-  reappeared: number;
-  edited: number;
-  items: CaptureOutcome[];
-  errorCode?: string;
-  reason?: string;
-  tool?: string;
-}
-
-export interface CaptureProgress {
-  queueId: string;
-  projectId: string;
-  done?: number;
-  total?: number;
-  outcome?: CaptureOutcome;
-  finished: boolean;
-  report?: ProfileReport;
-  error?: string;
-}
+/** The options as the service reads them (@ao/shared). */
+export type CaptureOptions = CaptureRequestOptions;
+export type ProfileCaptureOptions = ProfileCaptureRequestOptions;
+export type CaptureStatus = CaptureItemStatus;
+/** One link's outcome (the library's CaptureOutcome, carried through by the service). */
+export type CaptureOutcome = CaptureItemOutcome;
+/** A profile run's report with its items (the library's ProfileCaptureReport). */
+export type ProfileReport = CaptureProfileReport;
+/** A queue's `capture.progress` event. */
+export type CaptureProgress = CaptureQueueProgressEvent;
 
 export interface CaptureProject {
   id: string;
@@ -141,10 +110,7 @@ export interface CaptureProject {
   acknowledgements?: string[];
 }
 
-export interface ToolsUpdate {
-  ytDlp: { old: string | null; new: string | null; managed: boolean };
-  galleryDl: { version: string | null; pinned: boolean };
-}
+export type ToolsUpdate = CaptureToolsUpdateResponse;
 
 /** What the project's rules mean for a capture (R41). */
 export interface CapturePolicy {
@@ -182,8 +148,8 @@ export function capturePolicyFromYaml(yaml: string): CapturePolicy {
 // ---------------------------------------------------------------------------------------------
 // Links
 
-/** Links queued at once (routes/capture.ts MAX_QUEUED_LINKS). */
-export const MAX_LINKS = 500;
+/** Links queued at once (the service refuses more). */
+export const MAX_LINKS = CAPTURE_LINKS_MAX;
 
 /** One link per line, trimmed; blank lines left out. */
 export function parseLinks(text: string): string[] {
@@ -614,17 +580,26 @@ export function captureApi(client: ApiClient) {
     projects: async () => (await r<{ projects: CaptureProject[] }>("GET", "/projects")).projects,
     policy: async (projectId: string): Promise<CapturePolicy> => capturePolicyFromYaml((await r<{ yaml: string }>("GET", `/projects/${pid(projectId)}/governance`)).yaml),
     /** Queues links for the downloader; outcomes arrive as `capture.progress` events. */
-    capture: (projectId: string, urls: string[], options: CaptureOptions) => r<{ queueId: string }>("POST", `/projects/${pid(projectId)}/capture`, { body: { urls, options } }),
+    capture: (projectId: string, urls: string[], options: CaptureOptions) => {
+      const body: CaptureLinksRequest = { urls, options };
+      return r<CaptureStartedResponse>("POST", `/projects/${pid(projectId)}/capture`, { body });
+    },
     /** A whole profile, channel or playlist with its options. */
-    captureProfile: (projectId: string, url: string, options: ProfileCaptureOptions) =>
-      r<{ queueId: string }>("POST", `/projects/${pid(projectId)}/capture-profile`, { body: { url, options } }),
+    captureProfile: (projectId: string, url: string, options: ProfileCaptureOptions) => {
+      const body: CaptureProfileRequest = { url, options };
+      return r<CaptureStartedResponse>("POST", `/projects/${pid(projectId)}/capture-profile`, { body });
+    },
     /** Records the one-time browser-session acknowledgement (audited by the service). */
-    acknowledge: async (projectId: string) => (await r<{ acknowledgements: string[] }>("POST", `/projects/${pid(projectId)}/acknowledge`, { body: { kind: "cookies" } })).acknowledgements,
+    acknowledge: async (projectId: string) => {
+      const body: AcknowledgeRequest = { kind: "cookies" };
+      return (await r<AcknowledgeResponse>("POST", `/projects/${pid(projectId)}/acknowledge`, { body })).acknowledgements;
+    },
     /** The project's running and recent capture queues (summaries; Task 63). */
     queues: async (projectId: string): Promise<CaptureQueueSummary[]> => (await r<CaptureQueueListResponse>("GET", `/projects/${pid(projectId)}/captures`)).queues,
     /** One queue with its items' outcomes. */
     queue: (projectId: string, queueId: string) => r<CaptureQueueDetail>("GET", `/projects/${pid(projectId)}/captures/${encodeURIComponent(queueId)}`),
-    toolVersions: async () => (await r<{ versions: Record<string, string | null> }>("GET", "/tools/versions")).versions,
+    toolVersions: async () => (await r<CaptureToolVersionsResponse>("GET", "/tools/versions")).versions,
+
     updateTools: () => r<ToolsUpdate>("POST", "/tools/update"),
   };
 }

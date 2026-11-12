@@ -11,7 +11,7 @@
 import { effectivePolicy } from "@ao/core/governance/merge";
 import { parseGovernance } from "@ao/core/governance/schema";
 import { isId } from "@ao/core/ids";
-import { PICTURE_MAX_BYTES, type ProjectReviewPage, type ReviewCause, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type MultiTextValue, type ProjectReviewPage, type ReviewBulkEditRequest, type ReviewBulkEditResponse, type ReviewCause, type ReviewDecideRequest, type ReviewDecideResponse, type ReviewEntryDecision, type ReviewEntryPatch, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
 
 export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
@@ -170,18 +170,9 @@ export interface ReviewItem {
   cause?: ReviewCause;
 }
 
-export type ReviewDecision =
-  | { action: "accept"; draft?: { type?: string; title?: MultiText } }
-  | { action: "accept-candidate"; index: number }
-  | { action: "merge"; sourceId: string }
-  | { action: "skip" }
-  | { action: "keep-both" };
-
-export interface ReviewPatch {
-  type?: string;
-  tagIds?: string[];
-  collectionId?: string;
-}
+/** A decision on an import entry, and a bulk edit's changes (@ao/shared). */
+export type ReviewDecision = ReviewEntryDecision;
+export type ReviewPatch = ReviewEntryPatch;
 
 export interface Creator {
   family?: string;
@@ -190,9 +181,7 @@ export interface Creator {
   role?: string;
 }
 
-export interface MultiText {
-  variants: Array<{ lang: string; kind: "original" | "romanized" | "translated"; value: string }>;
-}
+export type MultiText = MultiTextValue;
 
 /** The parts of source.json (GET /projects/:id/sources/:sid) the review preview shows. */
 export interface SourceFile {
@@ -344,7 +333,8 @@ export function importApi(client: ApiClient) {
     /** Review routes take the project in the body (R97). */
     decide: (projectId: string, itemId: string, decision: ReviewDecision) => {
       pid(projectId);
-      return r<{ decided: boolean }>("POST", `/review/${seg(itemId)}/decide`, { body: { projectId, decision } });
+      const body: ReviewDecideRequest = { projectId, decision };
+      return r<ReviewDecideResponse>("POST", `/review/${seg(itemId)}/decide`, { body });
     },
     /** "Reviewed after the withdrawal" (R176 2): the reason is required and sent exactly as typed. */
     reviewedAfterWithdrawal: (projectId: string, itemId: string, reason: string) => {
@@ -354,7 +344,9 @@ export function importApi(client: ApiClient) {
     },
     bulkEdit: (projectId: string, itemIds: string[], patch: ReviewPatch) => {
       pid(projectId);
-      return r<{ edited: number }>("POST", "/review/bulk-edit", { body: { projectId, itemIds, patch } });
+      const body: ReviewBulkEditRequest = { projectId, itemIds, patch };
+      return r<ReviewBulkEditResponse>("POST", "/review/bulk-edit", { body });
+
     },
 
     source: (projectId: string, sourceId: string) => r<SourceFile>("GET", `/projects/${pid(projectId)}/sources/${seg(sourceId)}`),

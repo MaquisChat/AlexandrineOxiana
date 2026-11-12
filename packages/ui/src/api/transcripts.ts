@@ -9,11 +9,14 @@
  */
 import type {
   MediaTicketResponse,
+  MediaTicketRevokeRequest,
   MediaTicketRevokeResponse,
+  TranscribeRequest,
   TranscriptionJob,
   TranscriptionJobResponse,
   TranscriptListResponse,
   TranscriptResponse,
+  TranscriptSavedResponse,
   TranscriptSaveRequest,
 } from "@ao/shared";
 import { SPEECH_MODELS, type SpeechModel } from "@ao/shared";
@@ -24,12 +27,8 @@ import type { SourceFile } from "./library";
 export const TRANSCRIPTION_MODELS = SPEECH_MODELS;
 export type TranscriptionModel = SpeechModel;
 
-/** What POST …/transcripts answers for a saved edit. */
-export interface SavedTranscript {
-  id: string;
-  path: string;
-  derivation?: unknown;
-}
+/** What POST …/transcripts answers for a saved edit (@ao/shared). */
+export type SavedTranscript = TranscriptSavedResponse;
 
 const seg = (s: string) => encodeURIComponent(s);
 const src = (pid: string, sid: string) => `/projects/${seg(pid)}/sources/${seg(sid)}`;
@@ -55,7 +54,10 @@ export function transcriptApi(client: ApiClient) {
     /** Stores a person's edit as a new version; the version it came from is kept. */
     save: (pid: string, sid: string, body: TranscriptSaveRequest) => r<SavedTranscript>("POST", `${src(pid, sid)}/transcripts`, { body }),
     /** Starts speech recognition again: answers at once with the job (its progress arrives as events). */
-    transcribe: (pid: string, sid: string, opts: { model?: TranscriptionModel }) => r<TranscriptionJobResponse>("POST", `${src(pid, sid)}/transcribe`, { body: opts }),
+    transcribe: (pid: string, sid: string, opts: { model?: TranscriptionModel }) => {
+      const body: TranscribeRequest = opts;
+      return r<TranscriptionJobResponse>("POST", `${src(pid, sid)}/transcribe`, { body });
+    },
     /** The source's newest transcription job (null: none recorded). */
     transcription: (pid: string, sid: string) => r<TranscriptionJobResponse>("GET", `${src(pid, sid)}/transcription`),
     /** Asks a transcription to stop. */
@@ -64,7 +66,11 @@ export function transcriptApi(client: ApiClient) {
     events: (opts: { signal?: AbortSignal; onOpen?: () => void }) => client.events(opts),
     /** A media ticket for one audio or video asset (R135). The answer's `path` is a secret. */
     ticket: (pid: string, sid: string, aid: string) => r<MediaTicketResponse>("POST", `${src(pid, sid)}/assets/${seg(aid)}/media-ticket`),
-    revokeTicket: (path: string) => r<MediaTicketRevokeResponse>("POST", "/media-tickets/revoke", { body: { path } }),
+    revokeTicket: (path: string) => {
+      const body: MediaTicketRevokeRequest = { path };
+      return r<MediaTicketRevokeResponse>("POST", "/media-tickets/revoke", { body });
+    },
+
     /** The address the media element loads (client.mediaUrl: the exact ticket form only). */
     mediaUrl: (ticketPath: string) => client.mediaUrl(ticketPath),
   };
