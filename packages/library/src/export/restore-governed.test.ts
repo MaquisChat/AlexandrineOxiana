@@ -569,6 +569,19 @@ describe("3. what a restore does not bring back is read from the audit log's rec
     expect(files["Kept paper"]!.onDisk).toBe(true);
   });
 
+  it("the original is gone from the library: a copy that inherited its audit log still keeps the destroyed file out of an older backup of the original, with the copy's certificate deleted too", async () => {
+    const s = await scene();
+    const fresh = abs((s.r.certificate.backups as { freshBackup: string }).freshBackup);
+    const copy = await restore(fresh);
+    // Outside the app the original's folder is removed, and so is the certificate the copy kept.
+    await rm(join(kit.lib.root, s.p.folder), { recursive: true, force: true });
+    await rm(join(kit.lib.root, kit.repo.getProject(copy.projectId).folder, "retention", basename(s.r.certificatePath)));
+    await kit.reopen();
+    expect(ids()).toEqual([copy.projectId]);
+    // The copy's log holds the original's destruction entry, which names the destroyed asset by the id the old backup holds.
+    await expectRawLeftOut(await restore(s.offline));
+  });
+
   it("a destruction recorded between unpacking and the commit is seen in the commit turn", async () => {
     const s = await scene({ destroy: false });
     const copy = await restore(s.offline);
