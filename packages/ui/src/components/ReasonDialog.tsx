@@ -43,7 +43,7 @@ export function useTrap(onCancel: () => void, busy = false) {
 }
 
 /** Renders on <body>; every other child of <body> is inert while the dialog is open. */
-function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; children: ReactNode }) {
+export function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; children: ReactNode }) {
   const { ref, onKeyDown } = useTrap(onCancel, busy);
   const [host] = useState(() => document.createElement("div"));
   // A layout effect: the host must be in the document before useTrap's effect moves focus into the dialog.

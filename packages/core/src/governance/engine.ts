@@ -2,7 +2,7 @@ import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
 import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
-export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move";
+export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "set-aside";
 
 export interface PolicyRequest {
   action: PolicyAction;
@@ -19,6 +19,8 @@ export interface PolicyRequest {
   move?: { destination: ResidencyKind; cloudFolderId?: string };
   export?: { identifiable: boolean; hasLocation: boolean };
   sync?: Record<string, never>;
+  /** Setting aside a mark that cannot be repaired (Task 50, R154 d): the researcher's reason. */
+  setAside?: { reason: string };
 }
 
 export type Condition =
@@ -209,6 +211,17 @@ function exportData(p: GovernanceConfig, req: PolicyRequest, warnings: string[])
   return withConditions(conditions, warnings);
 }
 
+/**
+ * Setting aside a mark that cannot be repaired (R154 d): allowed in every profile, but only with a
+ * reason that is not empty once trimmed, so the decision and its audit record have substance.
+ */
+function setAside(req: PolicyRequest, warnings: string[]): PolicyDecision {
+  const s = need(req.setAside, "setAside");
+  str(s.reason, "setAside.reason");
+  if (s.reason.trim() === "") return deny("A reason is required to set this aside", warnings);
+  return allow(warnings);
+}
+
 function move(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): PolicyDecision {
   const { destination, cloudFolderId } = need(req.move, "move");
   str(destination, "move.destination");
@@ -250,6 +263,8 @@ function run(cfg: GovernanceConfig, req: PolicyRequest): PolicyDecision {
       return move(policy, req, warnings);
     case "sync":
       return deny("Sync is not enabled in this version", warnings);
+    case "set-aside":
+      return setAside(req, warnings);
     case "delete":
     case "view":
     case "share":

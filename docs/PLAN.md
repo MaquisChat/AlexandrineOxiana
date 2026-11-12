@@ -441,30 +441,31 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c A pairing code's status | fix round 1 | f889a93 (worktree branch) | spec met, access rules unchanged; one Important: a code is marked used before the pairing is written |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | stopped | 7b7a3b4 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | stopped | fdbd601 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
+| 46c A pairing code's status | fix round 1, stopped | 1ec85b5 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. One Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
+| 34d Verification badges | fix round 1, stopped | db0030d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. 5 Important; identifiers become confirmable (R149) |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | in progress | | implementer dispatched |
+| 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48a Tools: worker and service | in progress | | implementer dispatched; gallery-dl becomes a first-use download (R152) |
-| 48b Tools: the dialogue | not started | | after 48a |
+| 48a Tools: worker and service | fix round 2 (short) | 691a58a (worktree branch) | round 1 passed re-review; adding hosts and one shared definition of the speech models (R158), and two small fixes, before merge |
+| 48b Tools: the dialogue | fix round 1 | 9fb7cda (worktree branch) | 6 Important: first-use question skipped when a tool exists, three different default models, untrue wording after cancel, stale sentences (R158) |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | in progress | | implementer dispatched |
-| 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
-| 50 No silent refusals | fix round 1 | 31553d4 (worktree branch) | 5 Important (R154): the new library-level record must be protected and shown; a repair must not obey a file on disk; marks can be set aside with a reason; nothing written under another device's lock. Larger than planned. The restore item waits for Task 49 |
-| 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
+| 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
+| 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
+| 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
+| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
+| 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
-| 37c Desktop shell | in progress | | implementer dispatched; the shell starts the service, the service starts the worker (R155) |
+| 37c Desktop shell | fix round 1 | becdf08 (worktree branch) | spec met; 3 Important: the token could reach a look-alike local origin, drop positions on high-density screens, a second launch during a slow quit (R159) |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
