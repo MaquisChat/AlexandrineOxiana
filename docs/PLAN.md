@@ -459,6 +459,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defects found by Task 37i while writing the owner's guide (for Task 64): D10 (high): nothing in the interface links to the Capture screen or to the transcript viewer, and the desktop app has no address bar, so neither can be reached. D11 (high): the Governance form has no control for capture methods; a new project allows neither browser capture nor the downloader, and the only way to allow them is to edit the `governance.yaml` text. D12: outside the library chooser and the drop areas, folder and file paths must be typed in full; there is no picker.
 - Defect found by the review of Task 37i (for Task 66): D13 (high): the library service takes a new port at every launch, and the browser extension keeps the port typed at pairing and never looks for another, so a paired browser stops working each time the app is reopened ("The desktop app is not answering on port N") until it is unpaired and paired again.
 - Defect found by the review of Task 46b (for Task 67): D14 (high): the review queue screen lists the items of one import batch only. Entries queued by a drag-and-drop attach, by a capture with conflicting fields or by a consent withdrawal cannot be seen or decided anywhere, so their "Needs review" badge cannot be cleared.
+- Defect found by Task 49's fourth round (for Task 50b): D15 (high): a deleted `backups-manifest.json` is read as "no backups", so a destruction lists none, its certificate says "none", and a backup that holds the destroyed file stays.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -492,9 +493,9 @@ Update after every task; commit and push.
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | approved; verification before merge | 4587f98 (worktree branch) | reviewed with probes over one fix round; 2 new Minor deferred |
-| 49 Backups governed | fix round 4 | 857144d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; re-scoped by R147 |
+| 49 Backups governed | fix round 4 in review | 6bdcab6 (worktree branch) | R147 built: the list is decided once and kept in the audit log; the certificate is never rewritten; a fresh reviewer |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
+| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
 | 51 Job records in files | approved; verification before merge | 82fbf40 (worktree branch) | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
