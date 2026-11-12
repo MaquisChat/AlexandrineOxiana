@@ -1,7 +1,6 @@
 /** Small request helpers shared by the routes: typed reading of JSON bodies, params and query. */
 import type { FastifyRequest } from "fastify";
-import type { ServiceErrorCode } from "@ao/shared";
-import { badRequest, notFound, type ErrorCode } from "../errors.js";
+import { badRequest, notFound } from "../errors.js";
 import type { RouteContext } from "../server.js";
 
 export type Ctx = RouteContext;
@@ -12,9 +11,6 @@ export type Obj = Record<string, unknown>;
  * library type and its declaration in @ao/shared must stay one and the same (Task 47).
  */
 export type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
-
-// The codes the service answers with are exactly those @ao/shared declares for the interface (Task 47).
-true satisfies Same<ErrorCode, ServiceErrorCode>;
 
 /** The JSON body as an object (an absent body is `{}`). */
 export function bodyOf(req: FastifyRequest): Obj {

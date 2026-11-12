@@ -4,6 +4,7 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
+import type { ServiceErrorCode } from "@ao/shared";
 import { PairingsUnreadableError } from "./auth.js";
 import {
   AcknowledgementRequiredError,
@@ -63,26 +64,9 @@ import {
   scrubPaths,
 } from "@ao/library";
 
-export type ErrorCode =
-  | "POLICY_DENIED"
-  | "READ_ONLY"
-  | "LIBRARY_OFFLINE"
-  | "WRONG_PASSPHRASE"
-  | "NOT_FOUND"
-  | "VALIDATION"
-  | "UNAUTHORIZED"
-  | "FORBIDDEN"
-  | "PAYLOAD_TOO_LARGE"
-  | "RATE_LIMITED"
-  | "PROJECT_LOCKED"
-  | "CONFLICT"
-  | "ACKNOWLEDGEMENT_REQUIRED"
-  | "WORKER_UNAVAILABLE"
-  | "UNAVAILABLE"
-  | "MOVE_IN_PROGRESS"
-  | "TOOL_NOT_INSTALLED"
-  | "TOOL_FAILED"
-  | "INTERNAL";
+/** The codes the service answers with: one list, shared with the interface (@ao/shared api/errors.ts, Task 47). */
+export type ErrorCode = ServiceErrorCode;
+
 
 export class ApiError extends Error {
   override name = "ApiError";
