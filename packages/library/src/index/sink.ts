@@ -8,6 +8,7 @@ import {
   getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource, withAnnotations } from "./load.js";
+import { JOBS_FILE, refreshJobRows, upgradeLegacyJobs } from "../job-journal.js";
 
 /**
  * (Re)loads an unlocked encrypted project's content into the in-memory TEMP schema: every source
@@ -53,7 +54,18 @@ export async function indexUnlockedProject(
       out.errors.push({ folder, message: err instanceof Error ? err.message : String(err) });
     }
   }
-  if (!still()) purgeProject(db, projectId); // locked during the load: nothing may stay in memory
+  if (!still()) {
+    purgeProject(db, projectId); // locked during the load: nothing may stay in memory
+    return out;
+  }
+  // Job rows (R31): legacy rows of this project are written into its journal now that its key is
+  // here, and the rows are made to match the journal (rows hold no payload: persistent is fine, R30).
+  try {
+    out.errors.push(...(await upgradeLegacyJobs(db, root, keyRing)).errors);
+    await refreshJobRows(() => db, root, entry.rel, projectId, k);
+  } catch (err) {
+    out.errors.push({ folder: `${entry.rel}/${JOBS_FILE}`, message: err instanceof Error ? err.message : String(err) });
+  }
   return out;
 }
 

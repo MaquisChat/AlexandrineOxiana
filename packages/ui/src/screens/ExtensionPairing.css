@@ -61,3 +61,9 @@
   font-size: 1.5rem;
   color: var(--ink);
 }
+
+/* The popup's field names ("Port", "Pairing code") beside what is typed into them (review M8). */
+.ao-pairing-label {
+  font-weight: 600;
+  margin: 0;
+}

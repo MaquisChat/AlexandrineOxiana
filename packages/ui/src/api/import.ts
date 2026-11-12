@@ -4,14 +4,17 @@
  * fieldwork,sources}.ts and the library types they return (ScanSummary, ImportReport, ReviewEntry,
  * UndoResult).
  *
- * The service has no secrets route (yet): the Zotero Web API key cannot be stored from the UI. It is
- * set with `ao secrets set zotero-api-key` (Task 26 CLI) and read by the service from the OS keyring.
+ * The Zotero Web API key is stored through the service in the system password store and is never
+ * sent back (R78, Task 57): the UI can only ask whether one is stored, store one, or remove it.
  */
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
 import { isId } from "@ao/core/src/ids";
+import { PICTURE_MAX_BYTES, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
+
+export type { ZoteroDataFolder };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -201,7 +204,12 @@ export interface SourceFile {
     tagIds: string[];
     provenance?: { identification?: { method: string; confidence: number }; importBatchId?: string };
   };
-  assets: Array<{ id: string; fileName?: string; mediaType?: string; role?: string; linked?: unknown }>;
+  /**
+   * The source's files as the record has them (@ao/core Asset): `mime` is the recorded type, `path`
+   * library-relative, `status: "destroyed"` for a file destroyed under retention. `fileName` and
+   * `mediaType` are older names some answers may carry.
+   */
+  assets: Array<{ id: string; role?: string; kind?: string; mime?: string; path?: string; bytes?: number; status?: string; fileName?: string; mediaType?: string; linked?: unknown }>;
   fieldEvidence: Array<{ field: string; value?: unknown; source: { kind: string } }>;
 }
 
@@ -339,6 +347,21 @@ export function importApi(client: ApiClient) {
       const t = await r<{ tags: Tag[]; workspaceTags?: Tag[] }>("GET", `/projects/${pid(projectId)}/tags`);
       return [...t.tags, ...(t.workspaceTags ?? []).map((w) => ({ ...w, scope: "workspace" }))];
     },
+    // ---- before an import (Task 57) ----
+    /** Whether a Zotero Web key is in the system password store; the key itself is never sent back (R78). */
+    zoteroKeyStored: async () => (await r<SecretStatusResponse>("GET", "/secrets/zotero-api-key")).stored,
+    /** Stores the key in the system password store (in the body, never in an address). */
+    storeZoteroKey: async (apiKey: string) => {
+      const body: SecretPutRequest = { apiKey };
+      return (await r<SecretStatusResponse>("PUT", "/secrets/zotero-api-key", { body })).stored;
+    },
+    removeZoteroKey: async () => (await r<SecretDeleteResponse>("DELETE", "/secrets/zotero-api-key")).removed,
+    /** Folders on this computer that look like a Zotero data folder. */
+    zoteroDataFolders: async () => (await r<ZoteroDataFoldersResponse>("GET", "/import/zotero-data-folders")).folders,
+    /** A picture of a source, for a `blob:` address (R135 1): the token stays in the header. */
+    picture: (projectId: string, sourceId: string, assetId: string, signal?: AbortSignal) =>
+      client.bytes(`/projects/${pid(projectId)}/sources/${seg(sourceId)}/assets/${seg(assetId)}/content`, { maxBytes: PICTURE_MAX_BYTES, ...(signal ? { signal } : {}) }),
+
     participants: async (projectId: string) => (await r<{ participants: Participant[] }>("GET", `/projects/${pid(projectId)}/participants`)).participants,
     sessions: async (projectId: string) => (await r<{ sessions: FieldSession[] }>("GET", `/projects/${pid(projectId)}/sessions`)).sessions,
   };
