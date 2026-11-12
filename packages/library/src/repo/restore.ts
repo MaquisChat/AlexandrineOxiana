@@ -21,8 +21,9 @@
  *   An encrypted copy keeps the data key, and key id, of the project it was made from (the
  *   backup is sealed with it): unlocking either project unlocks both. Files a destruction recorded
  *   in this library destroyed are not brought back (marked destroyed, R92): which files is read in
- *   this turn from the audit logs (R174 d; the caller's reader, `StagedRestore.destroyed`), never
- *   from a certificate file the audit log does not vouch for;
+ *   this turn from the audit logs (R174 d; the caller's reader, `StagedRestore.destroyed`). A
+ *   certificate file a verified audit log does not record counts for nothing; the certificate
+ *   files of a project whose audit log does not verify still exclude what they name (R179);
  *   ids of import batches, review entries and pending jobs are new too, and so are the keys of
  *   provenance.fileHashes and its importBatchId (the one exception to R76, restore only);
  *   3b. the copy is anchored (R12) before it goes live, so a crash after the rename is no "missing anchor";

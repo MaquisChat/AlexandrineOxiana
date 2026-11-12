@@ -3,6 +3,7 @@
  * desktop UI (its token and origin only), with no absolute paths, and the interface is told when a
  * mark or refusal appears.
  */
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -250,5 +251,25 @@ describe("a refused restore (Task 50b): recorded where the audit screen reads, a
     expect(page.json.events[0]).toMatchObject({ action: "restore", decision: { result: "deny", reason: api.message }, details: { op: "project.restore", name: "Study" } });
     expect(page.body).not.toContain(tmp);
     expect((await call({ url: "/libraries/audit/verify" })).json).toMatchObject({ ok: true });
+    // The way out is named (R179).
+    expect(api.message).toMatch(/can be restored into another library/);
+  });
+
+  it("R179: a file that is not a readable backup: 400 with the plain message, and the library's audit log names the file and its SHA-256, without a path", async () => {
+    await projectWithBackup();
+    const stray = join(tmp, "holiday photos.zip");
+    await writeFile(stray, "these bytes are not an archive");
+    const err = await restoreBackup(svc.state.requireSession().repo, stray).catch((e: unknown) => e);
+    const api = toApiError(err);
+    expect(api.status).toBe(400);
+    expect(`${api.message} ${api.reason ?? ""}`).not.toContain(tmp);
+    const page = await call({ url: "/libraries/audit?limit=10" });
+    expect(page.status, page.body).toBe(200);
+    expect(page.json.events[0]).toMatchObject({
+      action: "restore",
+      decision: { result: "deny" },
+      details: { op: "project.restore", notABackup: true, file: "holiday photos.zip", backupSha256: createHash("sha256").update("these bytes are not an archive").digest("hex"), sha256Covers: "the whole file" },
+    });
+    expect(page.body).not.toContain(tmp);
   });
 });

@@ -1653,10 +1653,17 @@ async function restoreRequestOf(repo: Repo, abs: string, sealed: boolean, rest: 
  * in the log of the project the backup belongs to when it is in this library, else in the library's
  * own log (never a path: the backup's sha256, and its file name when it is one of this library's).
  *
- * What is not brought back (R174 d): files a destruction recorded in this library destroyed, read
- * from the audit logs (retention.ts `destroyedOnRecord`) before anything is unpacked and again in
- * the commit turn. While that record cannot be read with certainty the restore is refused
- * (DestructionRecordError, audited the same way). The answer says what was left out, and why.
+ * What is not brought back (R174 d, R179): files a destruction recorded in this library destroyed,
+ * read from the audit logs (restore-record.ts `destroyedOnRecord`) before anything is unpacked and
+ * again in the commit turn. While the audit log of the project the backup belongs to does not
+ * verify, the restore is refused (DestructionRecordError, audited the same way; the backup can be
+ * restored into another library). Another project's log that does not verify does not stop it: that
+ * project's certificate files are then taken as they are, and whatever they name is left out. The
+ * answer says what was left out, and why.
+ *
+ * A file that is not a readable backup (no project in it, damaged, unsafe, changed since it was
+ * made, its own audit log not verifying) is refused and recorded in the library's audit log by its
+ * base name and the sha256 of the whole file (R179).
  *
  * A copy that inherits backups a destruction still lists for removal has its
  * `destruction-backups-pending` warning from the moment it is live (R175): the note behind it is
