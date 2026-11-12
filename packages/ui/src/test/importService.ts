@@ -99,6 +99,16 @@ export interface ServiceSetup {
   pictures?: Record<string, { type: string; bytes: Uint8Array }>;
   /** Delay (ms) before each picture answer. */
   pictureDelayMs?: number;
+  /** The project's whole review queue (GET /projects/:id/review, Task 67), by project id; a decision removes its entry. */
+  projectReview?: Record<string, ReviewItem[]>;
+  /** Delay (ms) before each page of the project's queue. */
+  projectReviewDelayMs?: number;
+  /** Projects that answer PROJECT_LOCKED until POST /projects/:id/unlock. */
+  locked?: string[];
+  /** Decisions answered PROJECT_LOCKED (the project was locked meanwhile). */
+  decideLocked?: boolean;
+  /** What PATCH /projects/:id/sources/:sid/fields answers, by source id (the record after the confirm). */
+  confirmed?: Record<string, unknown>;
 }
 
 export const server = setupServer();
@@ -126,6 +136,9 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
   let peak = 0;
   const failOnce = new Set(o.failSourcesOnce ?? []);
   let keyStored = !!o.zoteroKey?.stored;
+  const queues = new Map(Object.entries(o.projectReview ?? {}).map(([k, v]) => [k, [...v]]));
+  const locked = new Set(o.locked ?? []);
+  const lockedAnswer = () => HttpResponse.json({ error: { code: "PROJECT_LOCKED", message: "This project is locked. Its passphrase is needed." } }, { status: 423 });
   const noStore = () => HttpResponse.json({ error: { code: "UNAVAILABLE", message: "No secure key store is available on this computer, so the key was not saved." } }, { status: 503 });
 
   // Replaces the previous test's handlers (rather than resetting after each test), so a request a
@@ -241,8 +254,38 @@ export function mockService(o: ServiceSetup = {}): ServiceMock {
       return HttpResponse.json({ edited: b.itemIds.length });
     }),
     http.post(url("/review/:itemId/decide"), async ({ request, params }) => {
-      await rec(request, `/review/${params.itemId as string}/decide`);
+      const b = (await rec(request, `/review/${params.itemId as string}/decide`)) as { projectId?: string };
+      if (o.decideLocked || (b?.projectId && locked.has(b.projectId))) return lockedAnswer();
+      const q = b?.projectId ? queues.get(b.projectId) : undefined;
+      if (q) {
+        const at = q.findIndex((e) => e.id === params.itemId);
+        if (at >= 0 && q[at]!.kind !== "import") return HttpResponse.json({ error: { code: "VALIDATION", message: "This review entry is not an import item; it is reviewed with the source's verification." } }, { status: 400 });
+        if (at >= 0) q.splice(at, 1);
+      }
       return HttpResponse.json({ decided: true });
+    }),
+    http.get(url("/projects/:id/review"), async ({ request, params }) => {
+      const id = params.id as string;
+      await rec(request, `/projects/${id}/review`);
+      await wait(o.projectReviewDelayMs);
+      if (locked.has(id)) return lockedAnswer();
+      const sp = new URL(request.url).searchParams;
+      const offset = Number(sp.get("offset") ?? 0);
+      const limit = Number(sp.get("limit") ?? 500);
+      const source = sp.get("source");
+      const all = (queues.get(id) ?? []).filter((e) => !source || e.sourceId === source);
+      return HttpResponse.json({ items: all.slice(offset, offset + limit), total: all.length, offset, limit });
+    }),
+    http.post(url("/projects/:id/unlock"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/unlock`);
+      locked.delete(params.id as string);
+      return HttpResponse.json({ unlocked: true });
+    }),
+    http.patch(url("/projects/:id/sources/:sid/fields"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/sources/${params.sid as string}/fields`);
+      if (locked.has(params.id as string)) return lockedAnswer();
+      const after = o.confirmed?.[params.sid as string];
+      return after ? HttpResponse.json(after) : HttpResponse.json({ error: { code: "VALIDATION", message: "That field cannot be set here." } }, { status: 400 });
     }),
     http.get(url("/events"), async ({ request }) => {
       await rec(request, "/events");

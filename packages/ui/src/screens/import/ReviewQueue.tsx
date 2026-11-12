@@ -16,6 +16,15 @@
  * SOURCE_POOL requests at a time, the shown item first (R115 I4). The records loaded are kept in a
  * small store outside React state that each row reads for itself, so an answer re-renders only the
  * rows it changes, not the whole queue (a queue of thousands would otherwise be rebuilt per answer).
+ *
+ * Without a batch it is the project's whole queue (Task 67, R172): every pending entry of every kind,
+ * read a page at a time, grouped so a person can tell them apart — by import, "Added by hand" (drag
+ * and drop), "From captures", "After a consent withdrawal" — and, opened from a library row's badge,
+ * only that source's entries. Each entry is decided by the library's own decision for its kind: an
+ * import entry (with or without a batch) as in a batch's queue; a capture's conflicting field by
+ * choosing a value through the source screen's own badge and confirm (FieldCheck, R149). A locked
+ * project's entries are neither listed nor decided, and nothing about them is shown; answers for
+ * another project, after a lock or after the screen closed are dropped.
  */
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ApiClient } from "../../api/client";
@@ -27,15 +36,21 @@ import {
   type Creator,
   type ImportPolicy,
   type ReviewDecision,
+  type ReviewGroup,
   type ReviewItem,
   type ReviewPatch,
   type SourceFile,
   type SourceListItem,
   type Tag,
 } from "../../api/import";
+import { isProjectLocked, libraryApi } from "../../api/library";
+import { verificationApi, type FieldReview } from "../../api/verification";
 import { CodeSwatch } from "../../components/CodeSwatch";
 import { UserText } from "../../components/UserText";
-import { inAppLink } from "../../navigation";
+import { FieldCheck } from "../../components/VerificationBadge";
+import { inAppLink, PATHS } from "../../navigation";
+import { FIELD_LABELS } from "../SourceDetail";
+import { UnlockProject } from "../UnlockProject";
 import { assetName, FilePreview } from "./FilePreview";
 import { count, ErrorNote, errorText, fmt, reportHref, Section, SOURCE_TYPES, typeLabel } from "./shared";
 import "./import.css";
@@ -89,11 +104,19 @@ function useRecord(store: RecordStore, sid: string | undefined): SourceFile | un
 export interface ReviewQueueProps {
   client: ApiClient;
   projectId: string;
-  batchId: string;
+  /** One import's items; without it, the project's whole queue (Task 67). */
+  batchId?: string;
+  /** The project's queue, only this source's entries (opened from a library row's badge). */
+  sourceId?: string;
+  /** Entries per page of the project's queue (tests shorten it). */
+  pageSize?: number;
 }
 
 /** Source requests in flight at once (R115 I4). */
 export const SOURCE_POOL = 6;
+
+/** Entries per page when the project's whole queue is read. */
+export const PROJECT_PAGE = 500;
 
 /** What the batch made from folder names (R64): the collections and tags it reports it created (R118). */
 function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
@@ -101,24 +124,78 @@ function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
   return batch.created.collectionIds.includes(id) || batch.created.tagIds.includes(id);
 }
 
-export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
+/** The group an entry is listed under in the project's queue. */
+const groupOf = (i: ReviewItem): ReviewGroup => i.group ?? (i.kind === "import" ? (i.batchId ? "import" : "attach") : Object.keys(i.fields).length ? "capture" : "withdrawal");
+
+const GROUP_TITLES: Record<Exclude<ReviewGroup, "import">, string> = {
+  attach: "Added by hand",
+  capture: "From captures",
+  withdrawal: "After a consent withdrawal",
+};
+
+const DATE = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
+
+function importTitle(batchId: string | undefined, batches: BatchSummary[]): string {
+  const b = batches.find((x) => x.batchId === batchId);
+  if (!b) return "An import";
+  const when = Number.isNaN(Date.parse(b.startedAt)) ? "" : `, ${DATE.format(new Date(b.startedAt))}`;
+  return `Import ${fmt(b.number)} — ${b.kind}${when}`;
+}
+
+interface Group {
+  key: string;
+  title: string;
+  items: Array<{ item: ReviewItem; n: number }>;
+}
+
+/** The project's entries in groups: each import (in the order first seen), then by hand, captures, withdrawals. */
+function groupsOf(items: ReviewItem[], batches: BatchSummary[]): Group[] {
+  const imports = new Map<string, Group>();
+  const rest: Record<Exclude<ReviewGroup, "import">, Group> = {
+    attach: { key: "attach", title: GROUP_TITLES.attach, items: [] },
+    capture: { key: "capture", title: GROUP_TITLES.capture, items: [] },
+    withdrawal: { key: "withdrawal", title: GROUP_TITLES.withdrawal, items: [] },
+  };
+  items.forEach((item, at) => {
+    const g = groupOf(item);
+    if (g === "import") {
+      const key = `import:${item.batchId ?? ""}`;
+      let grp = imports.get(key);
+      if (!grp) imports.set(key, (grp = { key, title: importTitle(item.batchId, batches), items: [] }));
+      grp.items.push({ item, n: at + 1 });
+    } else rest[g].items.push({ item, n: at + 1 });
+  });
+  return [...imports.values(), rest.attach, rest.capture, rest.withdrawal].filter((g) => g.items.length > 0);
+}
+
+export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = PROJECT_PAGE }: ReviewQueueProps) {
   const api = useMemo(() => importApi(client), [client]);
+  const projectWide = !batchId;
   const [items, setItems] = useState<ReviewItem[] | null>(null);
-  const [store] = useState(recordStore);
+  const [store, setStore] = useState(recordStore);
   const [failed, setFailed] = useState<ReadonlySet<string>>(new Set());
   /** Read by each answer: clearing a failure that is not there would re-render the whole queue. */
   const failedRef = useRef(failed);
   failedRef.current = failed;
   const [policy, setPolicy] = useState<ImportPolicy | null>(null);
-  const [batch, setBatch] = useState<BatchSummary | undefined>(undefined);
+  const [batches, setBatches] = useState<BatchSummary[]>([]);
+  const batch = batchId ? batches.find((b) => b.batchId === batchId) : undefined;
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [focusId, setFocusId] = useState<{ id: string | null } | null>(null);
+  /** The project's queue is locked (PROJECT_LOCKED): nothing of it is shown until it is unlocked here. */
+  const [locked, setLocked] = useState(false);
+  const [projectName, setProjectName] = useState("This project");
+  /** Moved on by an unlock: the queue is read again. */
+  const [readKey, setReadKey] = useState(0);
+  /** Moved on by another project, a lock and unmounting: answers of an older generation are dropped. */
+  const gen = useRef(0);
   const showButtons = useRef(new Map<string, HTMLButtonElement>());
   const title = useRef<HTMLHeadingElement>(null);
 
@@ -175,26 +252,59 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
     [pump],
   );
 
+  /** The project was locked: everything read from it is forgotten, and the unlock form shown. */
+  const forget = useCallback(() => {
+    gen.current++;
+    pool.current.live = false;
+    arrived.current = new Map();
+    setItems(null);
+    setCurrent(null);
+    setSelected([]);
+    setStatus("");
+    setError(null);
+    setStore(recordStore());
+    setLocked(true);
+  }, []);
+
   useEffect(() => {
+    if (locked) return;
+    const g = ++gen.current;
     const p = { queue: [] as string[], active: 0, live: true, asked: new Set<string>() };
     pool.current = p;
     let live = true;
+    const ok = () => live && g === gen.current;
     setError(null);
-    api.review(batchId).then(
+    setItems(null);
+    /** Every page of the project's queue, oldest first; a page for an older generation stops the read. */
+    const readAll = async (): Promise<ReviewItem[]> => {
+      const out: ReviewItem[] = [];
+      for (let offset = 0; ok(); ) {
+        const page = await api.projectReview(projectId, { offset, limit: pageSize, ...(sourceId ? { source: sourceId } : {}) });
+        out.push(...page.items);
+        offset += page.items.length;
+        if (page.items.length === 0 || offset >= page.total) break;
+      }
+      return out;
+    };
+    (batchId ? api.review(batchId) : readAll()).then(
       (list) => {
-        if (!live) return;
+        if (!ok()) return;
         setItems(list);
         setCurrent(list[0]?.id ?? null);
         // Titles come with the items; only items sent without one need their record for the list.
         p.queue = list.flatMap((i) => (i.sourceId && !i.title ? [i.sourceId] : []));
         pump();
       },
-      (e: unknown) => live && setError(errorText(e)),
+      (e: unknown) => {
+        if (!ok()) return;
+        if (isProjectLocked(e)) forget();
+        else setError(errorText(e));
+      },
     );
-    api.policy(projectId).then((x) => live && setPolicy(x), () => live && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
-    api.collections(projectId).then((c) => live && setCollections(c), () => {});
-    api.tags(projectId).then((t) => live && setTags(t), () => {});
-    api.batches(projectId).then((b) => live && setBatch(b.find((x) => x.batchId === batchId)), () => {});
+    api.policy(projectId).then((x) => ok() && setPolicy(x), () => ok() && setPolicy({ pseudonymizeNames: true, encryptionRequired: true }));
+    api.collections(projectId).then((c) => ok() && setCollections(c), () => {});
+    api.tags(projectId).then((t) => ok() && setTags(t), () => {});
+    api.batches(projectId).then((b) => ok() && setBatches(b), () => {});
     return () => {
       live = false;
       p.live = false;
@@ -202,7 +312,19 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
       flushTimer.current = null;
       arrived.current = new Map();
     };
-  }, [api, projectId, batchId, pump]);
+  }, [api, projectId, batchId, sourceId, pageSize, pump, locked, readKey, forget]);
+  // Unmounting moves the generation on: a decision answered after the screen closed changes nothing.
+  useEffect(() => () => void gen.current++, []);
+
+  // The project's name, for the unlock form.
+  useEffect(() => {
+    if (!locked) return;
+    let live = true;
+    api.projects().then((list) => live && setProjectName(list.find((x) => x.id === projectId)?.name ?? "This project"), () => {});
+    return () => {
+      live = false;
+    };
+  }, [api, locked, projectId]);
 
   // The item shown is loaded (its full record, for the preview) before the rest of the queue.
   const currentItem = items?.find((i) => i.id === current);
@@ -238,10 +360,15 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
   const selectedSet = useMemo(() => new Set(selected), [selected]);
 
   const decide = async (item: ReviewItem, decision: ReviewDecision, done: string) => {
+    // One request per decision, however often it is pressed.
+    if (busyRef.current) return;
+    busyRef.current = true;
+    const g = gen.current;
     setBusy(true);
     setError(null);
     try {
       await api.decide(projectId, item.id, decision);
+      if (g !== gen.current) return;
       const list = items ?? [];
       const at = list.findIndex((x) => x.id === item.id);
       const rest = list.filter((x) => x.id !== item.id);
@@ -252,14 +379,40 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
       setStatus(`${done}: ${titleFor(item, at + 1)}`);
       setFocusId({ id: next });
     } catch (e) {
-      setError(errorText(e));
+      if (g !== gen.current) return;
+      if (isProjectLocked(e)) forget();
+      else setError(errorText(e));
     } finally {
-      setBusy(false);
+      busyRef.current = false;
+      if (g === gen.current) setBusy(false);
+    }
+  };
+
+  /** A capture's field confirmed through the source screen's confirm (R149): the record it answers replaces the one shown. */
+  const verification = useMemo(() => verificationApi(client), [client]);
+  const confirmField = async (item: ReviewItem, field: string, value: unknown) => {
+    const g = gen.current;
+    const sid = item.sourceId;
+    if (!sid) return;
+    try {
+      const after = await verification.confirmField(projectId, sid, field, value);
+      if (g !== gen.current) return;
+      store.set([[sid, after as unknown as SourceFile]]);
+      setStatus(`Confirmed: ${FIELD_LABELS[field] ?? field}`);
+    } catch (e) {
+      if (g !== gen.current) return;
+      if (isProjectLocked(e)) {
+        forget();
+        return;
+      }
+      throw new Error(errorText(e));
     }
   };
 
   const bulk = async (patch: ReviewPatch, done: string) => {
-    if (!selected.length) return;
+    if (!selected.length || busyRef.current) return;
+    busyRef.current = true;
+    const g = gen.current;
     setBusy(true);
     setError(null);
     const chosen = items?.filter((i) => selected.includes(i.id)) ?? [];
@@ -269,6 +422,7 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
         chosen.map((i) => i.id),
         patch,
       );
+      if (g !== gen.current) return;
       setStatus(`${done} ${count(r.edited, "item")}.`);
       // The service applied the patch; the loaded records are updated in place (no refetch).
       const sids = new Set(chosen.flatMap((i) => (i.sourceId ? [i.sourceId] : [])));
@@ -284,68 +438,114 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
       }
       store.set(edited);
     } catch (e) {
-      setError(errorText(e));
+      if (g !== gen.current) return;
+      if (isProjectLocked(e)) forget();
+      else setError(errorText(e));
     } finally {
-      setBusy(false);
+      busyRef.current = false;
+      if (g === gen.current) setBusy(false);
     }
   };
 
   const item = currentItem;
   const flagging = policy?.pseudonymizeNames === true;
+  /** Only import entries can be edited together (the library's bulk edit takes import items). */
+  const selectable = useMemo(() => (items ?? []).filter((i) => i.kind === "import"), [items]);
+  const libApi = useMemo(() => libraryApi(client), [client]);
+  const itemBatch = (i: ReviewItem) => (batchId ? batch : batches.find((b) => b.batchId === i.batchId));
+
+  const row = (i: ReviewItem, n: number) => (
+    <Row
+      key={i.id}
+      id={i.id}
+      sourceId={i.sourceId}
+      n={n}
+      store={store}
+      fallbackTitle={i.title || `item ${fmt(n)}`}
+      reason={i.reasons[0] ?? ""}
+      current={i.id === current}
+      selectable={i.kind === "import"}
+      selected={selectedSet.has(i.id)}
+      broken={!!i.sourceId && failed.has(i.sourceId)}
+      onToggle={toggle}
+      onShow={setCurrent}
+      onRetry={retry}
+      showRef={showRef}
+    />
+  );
 
   return (
     <main className="ao-import ao-review" aria-labelledby="ao-review-title">
       <h1 id="ao-review-title" ref={title} tabIndex={-1}>
         Review queue
       </h1>
-      <p>
-        <a href={reportHref(projectId, batchId)} onClick={inAppLink}>
-          Back to the import's report and undo
-        </a>
-      </p>
+      {batchId ? (
+        <p>
+          <a href={reportHref(projectId, batchId)} onClick={inAppLink}>
+            Back to the import's report and undo
+          </a>
+        </p>
+      ) : sourceId ? (
+        <p>
+          <a href={projectQueueHref(projectId)} onClick={inAppLink}>
+            Show every entry waiting in this project
+          </a>
+        </p>
+      ) : null}
       <ErrorNote error={error} />
       <p className="ao-visually-hidden" role="status">
         {status}
       </p>
-      {items === null && !error && <p role="status">Loading…</p>}
-      {items !== null && items.length === 0 && <p>Nothing is waiting for review in this import.</p>}
-      {items !== null && items.length > 0 && (
+      {locked && (
+        <UnlockProject
+          api={libApi}
+          project={{ id: projectId, name: projectName }}
+          onUnlocked={() => {
+            setLocked(false);
+            setReadKey((k) => k + 1);
+          }}
+        />
+      )}
+      {!locked && items === null && !error && <p role="status">Loading…</p>}
+      {!locked && items !== null && items.length === 0 && (
+        <p>{batchId ? "Nothing is waiting for review in this import." : sourceId ? "Nothing is waiting for review for this source." : "Nothing is waiting for review in this project."}</p>
+      )}
+      {!locked && items !== null && items.length > 0 && (
         <div className="ao-review__layout">
           <div className="ao-review__list-col">
+            {projectWide && <p>{items.length === 1 ? "1 entry is waiting" : `${fmt(items.length)} entries are waiting`} in this project{sourceId ? " for this source" : ""}.</p>}
             <BulkBar count={selected.length} collections={collections} tags={tags} busy={busy} onBulk={(p, d) => void bulk(p, d)} />
-            <label className="ao-import__choice">
-              <input
-                type="checkbox"
-                checked={selected.length === items.length}
-                ref={(el) => {
-                  if (el) el.indeterminate = selected.length > 0 && selected.length < items.length;
-                }}
-                onChange={(e) => setSelected(e.target.checked ? items.map((i) => i.id) : [])}
-              />
-              <span>Select all</span>
-            </label>
-            <ul className="ao-review__list" aria-label={`Items waiting for review (${fmt(items.length)})`}>
-              {items.map((i, at) => (
-                <Row
-                  key={i.id}
-                  id={i.id}
-                  sourceId={i.sourceId}
-                  n={at + 1}
-                  store={store}
-                  fallbackTitle={i.title || `item ${fmt(at + 1)}`}
-                  reason={i.reasons[0] ?? ""}
-                  current={i.id === current}
-                  selected={selectedSet.has(i.id)}
-                  broken={!!i.sourceId && failed.has(i.sourceId)}
-                  onToggle={toggle}
-                  onShow={setCurrent}
-                  onRetry={retry}
-                  showRef={showRef}
+            {selectable.length > 0 && (
+              <label className="ao-import__choice">
+                <input
+                  type="checkbox"
+                  checked={selected.length === selectable.length}
+                  ref={(el) => {
+                    if (el) el.indeterminate = selected.length > 0 && selected.length < selectable.length;
+                  }}
+                  onChange={(e) => setSelected(e.target.checked ? selectable.map((i) => i.id) : [])}
                 />
-              ))}
-            </ul>
+                <span>{projectWide && selectable.length < items.length ? "Select every import item" : "Select all"}</span>
+              </label>
+            )}
+            {projectWide ? (
+              groupsOf(items, batches).map((g) => (
+                <section key={g.key} className="ao-review__group" aria-labelledby={`ao-review-g-${g.key}`}>
+                  <h2 id={`ao-review-g-${g.key}`} className="ao-review__group-title">
+                    {g.title}
+                  </h2>
+                  <ul className="ao-review__list" aria-label={`${g.title} (${fmt(g.items.length)})`}>
+                    {g.items.map(({ item: i, n }) => row(i, n))}
+                  </ul>
+                </section>
+              ))
+            ) : (
+              <ul className="ao-review__list" aria-label={`Items waiting for review (${fmt(items.length)})`}>
+                {items.map((i, at) => row(i, at + 1))}
+              </ul>
+            )}
           </div>
-          {item && (
+          {item && item.kind === "import" && (
             <ItemPanel
               key={item.id}
               api={api}
@@ -357,14 +557,121 @@ export function ReviewQueue({ client, projectId, batchId }: ReviewQueueProps) {
               collections={collections}
               tags={tags}
               flagTitle={flagging && titleFromFileName(item, shownSource)}
-              flagFolderNames={flagging ? (id: string) => madeByBatch(id, batch) : () => false}
+              flagFolderNames={flagging ? (id: string) => madeByBatch(id, itemBatch(item)) : () => false}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
+            />
+          )}
+          {item && item.kind !== "import" && (
+            <VerificationPanel
+              key={item.id}
+              item={item}
+              source={shownSource}
+              loadFailed={!!item.sourceId && failed.has(item.sourceId)}
+              onRetry={() => item.sourceId && retry(item.sourceId)}
+              onConfirm={(field, value) => confirmField(item, field, value)}
             />
           )}
         </div>
       )}
     </main>
+  );
+}
+
+/** The project's whole queue (Task 67). */
+export const projectQueueHref = (projectId: string, sourceId?: string): string =>
+  `${PATHS.reviewQueue}?project=${encodeURIComponent(projectId)}${sourceId ? `&source=${encodeURIComponent(sourceId)}` : ""}`;
+
+/** The value a JSON pointer names in the source ("/identifiers/doi"). */
+function valueAt(src: Record<string, unknown>, pointer: string): unknown {
+  let cur: unknown = src;
+  for (const part of pointer.split("/").slice(1)) {
+    if (!cur || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[part.replace(/~1/g, "/").replace(/~0/g, "~")];
+  }
+  return cur;
+}
+
+interface VerificationPanelProps {
+  item: ReviewItem;
+  source: SourceFile | undefined;
+  loadFailed: boolean;
+  onRetry(): void;
+  onConfirm(field: string, value: unknown): Promise<void>;
+}
+
+/**
+ * A verification entry: a capture saved with fields to check (each field's badge and its evidence
+ * dialog, the source screen's own confirm, R149), or a source flagged after a consent withdrawal.
+ */
+function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm }: VerificationPanelProps) {
+  const s = source?.source;
+  const reviews = new Map<string, FieldReview>(((source as { fields?: FieldReview[] } | undefined)?.fields ?? []).map((r) => [r.field, r]));
+  const pointers = Object.keys(item.fields);
+  const withdrawal = groupOf(item) === "withdrawal";
+  return (
+    <div className="ao-review__panel">
+      <Section title={withdrawal ? "Flagged source" : "Captured source"} level={2} className="ao-review__record">
+        {!source && !loadFailed && <p role="status">Loading…</p>}
+        {!source && loadFailed && (
+          <div className="ao-import__error" role="alert">
+            <p>This source's record could not be loaded.</p>
+            <button type="button" onClick={onRetry}>
+              Retry
+            </button>
+          </div>
+        )}
+        {source && s && (
+          <>
+            <UserText as="p" className="ao-review__title">
+              {titleOf(source) || "Untitled"}
+            </UserText>
+            <dl className="ao-review__fields">
+              <dt>Type</dt>
+              <dd>{typeLabel(s.type)}</dd>
+              {s.creators.length > 0 && (
+                <>
+                  <dt>Creators</dt>
+                  <dd>
+                    <UserText>{creatorsText(s.creators)}</UserText>
+                  </dd>
+                </>
+              )}
+            </dl>
+          </>
+        )}
+        <Section title="Why it needs review" level={3}>
+          <ul>
+            {item.reasons.map((r, i) => (
+              <li key={`${i}:${r}`}>
+                <UserText>{r}</UserText>
+              </li>
+            ))}
+          </ul>
+        </Section>
+        {pointers.length > 0 && source && (
+          <Section title="Fields to check" level={3}>
+            <p className="ao-import__hint">Choose the right value for each field: open its badge to see the evidence and confirm a value.</p>
+            <ul className="ao-review__plain-list">
+              {pointers.map((pointer) => {
+                const label = FIELD_LABELS[pointer] ?? pointer.replace(/^\//, "").replace(/\//g, " ");
+                const review: FieldReview = reviews.get(pointer) ?? { field: pointer, status: (item.fields[pointer] ?? "none") as FieldReview["status"], checks: [], evidence: [] };
+                return (
+                  <li key={pointer}>
+                    <span>{label} </span>
+                    <FieldCheck review={review} label={label} value={valueAt(source.source as unknown as Record<string, unknown>, pointer)} readOnly={false} onConfirm={onConfirm} />
+                  </li>
+                );
+              })}
+            </ul>
+            {pointers.every((p) => reviews.get(p)?.status === "user-confirmed") && (
+              <p className="ao-import__hint">Every field here is confirmed. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>
+            )}
+          </Section>
+        )}
+        {withdrawal && <p className="ao-import__hint">Nothing has been deleted. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>}
+      </Section>
+    </div>
   );
 }
 
@@ -377,6 +684,8 @@ interface RowProps {
   fallbackTitle: string;
   reason: string;
   current: boolean;
+  /** Import entries can be selected for a bulk edit; verification entries cannot. */
+  selectable: boolean;
   selected: boolean;
   broken: boolean;
   onToggle(id: string, on: boolean): void;
@@ -386,14 +695,14 @@ interface RowProps {
 }
 
 /** One queue row; re-renders only when its own props or its own record change (queues can hold thousands). */
-const Row = memo(function Row({ id, sourceId, n, store, fallbackTitle, reason, current, selected, broken, onToggle, onShow, onRetry, showRef }: RowProps) {
+const Row = memo(function Row({ id, sourceId, n, store, fallbackTitle, reason, current, selectable, selected, broken, onToggle, onShow, onRetry, showRef }: RowProps) {
   const t = titleOf(useRecord(store, sourceId)) || fallbackTitle;
   return (
     <li className={current ? "ao-review__row ao-review__row--current" : "ao-review__row"}>
-      <input type="checkbox" aria-label={`Select ${t}`} checked={selected} onChange={(e) => onToggle(id, e.target.checked)} />
+      {selectable ? <input type="checkbox" aria-label={`Select ${t}`} checked={selected} onChange={(e) => onToggle(id, e.target.checked)} /> : <span className="ao-review__no-select" aria-hidden="true" />}
       <button type="button" className="ao-review__show" aria-label={`Show ${t}`} aria-pressed={current} ref={(el) => showRef(id, el)} onClick={() => onShow(id)}>
         <UserText className="ao-review__row-title">{t}</UserText>
-        <span className="ao-import__hint">{broken ? "Could not be loaded." : reason}</span>
+        {broken ? <span className="ao-import__hint">Could not be loaded.</span> : <UserText className="ao-import__hint">{reason}</UserText>}
       </button>
       {broken && sourceId && (
         <button type="button" aria-label={`Retry loading item ${fmt(n)}`} onClick={() => onRetry(sourceId)}>

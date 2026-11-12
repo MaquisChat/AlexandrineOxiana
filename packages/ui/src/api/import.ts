@@ -11,10 +11,10 @@
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
 import { isId } from "@ao/core/src/ids";
-import { PICTURE_MAX_BYTES, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type ProjectReviewPage, type ReviewGroup, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
 
-export type { ZoteroDataFolder };
+export type { ProjectReviewPage, ReviewGroup, ZoteroDataFolder };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -164,6 +164,8 @@ export interface ReviewItem {
   batchId?: string;
   /** The source's current title, sent with the item (R118); the source itself is fetched only when it is missing. */
   title?: string;
+  /** In the project's whole queue (Task 67): where the entry came from. */
+  group?: ReviewGroup;
 }
 
 export type ReviewDecision =
@@ -327,6 +329,13 @@ export function importApi(client: ApiClient) {
     undo: (batchId: string) => r<UndoResult>("POST", `/imports/${bid(batchId)}/undo`),
     report: (batchId: string) => r<ImportReport>("GET", `/imports/${bid(batchId)}/report`),
     review: async (batchId: string) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`)).items,
+    /** One page of the project's whole review queue (Task 67, R172): every pending entry of every kind, oldest first. */
+    projectReview: async (projectId: string, q: { offset?: number; limit?: number; source?: string } = {}) => {
+      const page = await r<ProjectReviewPage>("GET", `/projects/${pid(projectId)}/review`, {
+        query: { ...(q.offset ? { offset: q.offset } : {}), ...(q.limit !== undefined ? { limit: q.limit } : {}), ...(q.source ? { source: q.source } : {}) },
+      });
+      return { ...page, items: page.items as unknown as ReviewItem[] };
+    },
 
     /** Review routes take the project in the body (R97). */
     decide: (projectId: string, itemId: string, decision: ReviewDecision) => {

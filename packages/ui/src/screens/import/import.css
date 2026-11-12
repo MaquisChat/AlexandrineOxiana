@@ -346,6 +346,22 @@ span.ao-import__hint {
   margin-top: var(--space-2);
 }
 
+/* A verification entry has no checkbox: the space keeps its title in line with the others. */
+.ao-review__no-select {
+  flex: 0 0 auto;
+  width: 1em;
+}
+
+/* The project's queue (Task 67): one heading per group. */
+.ao-review__group + .ao-review__group {
+  margin-top: var(--space-3);
+}
+
+.ao-review__group-title {
+  font-size: 1rem;
+  margin: var(--space-2) 0 var(--space-1);
+}
+
 .ao-review__row--current {
   background: var(--accent-soft2);
 }
