@@ -453,7 +453,7 @@ Update after every task; commit and push.
 | 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
-| 48b Tools: the dialogue | fix round 2 (short) | cc605f7 (worktree branch) | round 1 confirmed; one Important left: the statement of which hosts a download contacts must be complete |
+| 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
 | 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
