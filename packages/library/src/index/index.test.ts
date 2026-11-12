@@ -870,8 +870,8 @@ describe("annotation text (Task 58, R74)", () => {
     const rec = search(handle.db, { text: "plain" });
     expect(ids(rec)).toEqual([sf.source.id, other.source.id].sort());
     for (const i of rec.items) expect(i).not.toHaveProperty("matchedIn");
-    // A source is found when its record, or its annotations, hold every term (they are indexed apart).
-    expect(search(handle.db, { text: "plain quibbleclaim" }).total).toBe(0);
+    // The terms may be spread over the record and the annotations (N1).
+    expect(search(handle.db, { text: "plain quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
     expect(search(handle.db, { text: "xylophonic quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
     // Filters still apply.
     expect(search(handle.db, { text: "xylophonic", types: ["book"] }).total).toBe(0);

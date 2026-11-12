@@ -33,6 +33,16 @@ export function hasCjk(text: string): boolean {
  * remains (the caller then runs a filter-only query).
  */
 export function buildMatchQuery(text: string, bigramColumn: "cjk_bigrams" | "annotation_bigrams" = "cjk_bigrams"): string | undefined {
+  const parts = matchTerms(text, bigramColumn);
+  return parts.length > 0 ? parts.join(" AND ") : undefined;
+}
+
+/**
+ * The MATCH expression of each term of `text` (see buildMatchQuery): a Latin word as a prefix, a
+ * CJK run as one phrase of bigrams. A query is matched term by term across a source's record and
+ * its annotations (N1).
+ */
+export function matchTerms(text: string, bigramColumn: "cjk_bigrams" | "annotation_bigrams" = "cjk_bigrams"): string[] {
   const parts: string[] = [];
   const cjk = bigramColumn;
   for (const m of text.matchAll(CJK_RUN)) {
@@ -46,7 +56,7 @@ export function buildMatchQuery(text: string, bigramColumn: "cjk_bigrams" | "ann
   }
   const rest = text.replace(CJK_RUN, " ");
   for (const m of rest.matchAll(WORD)) if (/[\p{L}\p{N}]/u.test(m[0])) parts.push(`"${m[0]}"*`); // lone marks are dropped
-  return parts.length > 0 ? parts.join(" AND ") : undefined;
+  return parts;
 }
 
 /** Per source, at most this much annotation text (UTF-8) is indexed (R161 b). */
@@ -56,10 +66,10 @@ export const ANNOTATION_CHUNK_BYTES = 64 * 1024;
 /** At most this many annotations of a source are indexed (R74 I4's count cap). */
 export const MAX_INDEXED_ANNOTATIONS = 10_000;
 
-/** The longest prefix of `s` of at most `room` UTF-8 bytes that does not split a character; linear in `room`. */
-function cutUtf8(s: string, room: number): [string, string] {
+/** The end of the longest run of `s` from `start` of at most `room` UTF-8 bytes that does not split a character; linear in `room`. */
+function endUtf8(s: string, start: number, room: number): number {
   let bytes = 0;
-  let i = 0;
+  let i = start;
   while (i < s.length) {
     const c = s.charCodeAt(i);
     const pair = c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00;
@@ -68,62 +78,93 @@ function cutUtf8(s: string, room: number): [string, string] {
     bytes += n;
     i += pair ? 2 : 1;
   }
-  return [s.slice(0, i), s.slice(i)];
+  return i;
 }
 
+/** The start of the longest run of `s` ending at `end` of at most `room` UTF-8 bytes that does not split a character. */
+function tailStart(s: string, end: number, room: number): number {
+  let bytes = 0;
+  let i = end;
+  while (i > 0) {
+    const c = s.charCodeAt(i - 1);
+    const pair = (c & 0xfc00) === 0xdc00 && i >= 2 && (s.charCodeAt(i - 2) & 0xfc00) === 0xd800;
+    const n = pair ? 4 : c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+    if (bytes + n > room) break;
+    bytes += n;
+    i -= pair ? 2 : 1;
+  }
+  return i;
+}
+
+/** Bytes a split annotation's next part repeats from the end of the part before (N1): a phrase across the split is still found. */
+export const ANNOTATION_CHUNK_OVERLAP = 1024;
+
 /**
- * The indexed text of a source's annotations (Task 58, R74, R161 b): each annotation's quoted text,
- * then its comment, one per line, in the order the source file keeps them (so a write and a
- * rebuild give the same rows), cut into chunks of at most `chunkBytes` (whole annotations where
- * they fit; a longer one is split, never inside a character). At most `maxBytes` in all and
- * `maxCount` annotations; `partial` is true when any annotation text was left out.
+ * The indexed text of a source's annotations (Task 58, R74, R161 b): each annotation (its quoted
+ * text, then its comment, on separate lines), in the order the source file keeps them (so a write
+ * and a rebuild give the same rows), packed into chunks of at most `chunkBytes`. An annotation
+ * that fits a chunk is never split across two (N1); a longer one is split, never inside a
+ * character, each part starting with the last `overlap` bytes of the part before, so a phrase
+ * shorter than that is found across the split. At most `maxBytes` stored in all and `maxCount`
+ * annotations; `partial` is true when any annotation text was left out.
  */
 export function annotationChunks(
   list: ReadonlyArray<{ quote?: string | undefined; body?: string | undefined }>,
   maxBytes = ANNOTATION_INDEX_BYTES,
   chunkBytes = ANNOTATION_CHUNK_BYTES,
   maxCount = MAX_INDEXED_ANNOTATIONS,
+  overlap = ANNOTATION_CHUNK_OVERLAP,
 ): { chunks: string[]; partial: boolean } {
   const chunks: string[] = [];
   let cur: string[] = [];
   let curBytes = 0;
   let total = 0;
-  let partial = false;
   const flush = () => {
     if (cur.length) chunks.push(cur.join("\n"));
     cur = [];
     curBytes = 0;
   };
-  let n = 0;
-  outer: for (const a of list) {
-    if (n >= maxCount) {
-      partial = list.slice(maxCount).some((x) => x.quote || x.body);
-      break;
+  const done = (partial: boolean) => {
+    flush();
+    return { chunks, partial };
+  };
+  for (let n = 0; n < list.length; n++) {
+    if (n >= maxCount) return done(list.slice(maxCount).some((x) => x.quote || x.body));
+    const a = list[n]!;
+    const unit = [a.quote, a.body].filter((t): t is string => !!t).join("\n");
+    if (!unit) continue;
+    const bytes = Buffer.byteLength(unit);
+    const sep = cur.length ? 1 : 0;
+    if (curBytes + sep + bytes <= chunkBytes) {
+      // It fits the current chunk.
+      if (total + sep + bytes > maxBytes) return done(true);
+      cur.push(unit);
+      curBytes += sep + bytes;
+      total += sep + bytes;
+      continue;
     }
-    n++;
-    for (const t of [a.quote, a.body]) {
-      let rest = t ?? "";
-      while (rest) {
-        const sep = cur.length ? 1 : 0;
-        const roomTotal = maxBytes - total - sep;
-        const roomChunk = chunkBytes - curBytes - sep;
-        const [piece, remainder] = cutUtf8(rest, Math.min(roomTotal, roomChunk));
-        if (!piece) {
-          if (cur.length && roomChunk < roomTotal) {
-            flush(); // the chunk is full: go on in the next one
-            continue;
-          }
-          partial = true; // the total is reached
-          break outer;
-        }
-        const b = Buffer.byteLength(piece) + sep;
-        cur.push(piece);
-        curBytes += b;
-        total += b;
-        rest = remainder;
-      }
+    flush();
+    if (bytes <= chunkBytes) {
+      // It fits a chunk of its own.
+      if (total + bytes > maxBytes) return done(true);
+      cur.push(unit);
+      curBytes = bytes;
+      total += bytes;
+      continue;
+    }
+    // Longer than a chunk: split, with overlap (by offsets into the text, never copying the rest).
+    let start = 0;
+    let prevEnd = 0;
+    for (;;) {
+      const end = endUtf8(unit, start, Math.min(chunkBytes, maxBytes - total));
+      if (end <= prevEnd) return done(true); // no room for anything new
+      const piece = unit.slice(start, end);
+      chunks.push(piece);
+      total += Buffer.byteLength(piece);
+      if (end >= unit.length) break;
+      prevEnd = end;
+      start = tailStart(unit, end, Math.min(overlap, chunkBytes - 4));
     }
   }
-  flush();
-  return { chunks, partial };
+  return done(false);
 }
