@@ -85,7 +85,7 @@ file is not there.
   new dependency without a licence, or without a text the builds can find, stops the build instead
   of shipping silently. That is not the same as every notice their licences may require: what a
   package bundles without shipping texts for it is a named gap (below).
-- The interface grows by the size of the texts (about 1.1 MB before the service's and the worker's
+- The interface grows by the size of the texts (about 0.7 MB for the crates, the interface and Node.js; the service's and the worker's
   files, which add about 0.4 MB and 1.1 MB), all in chunks that load only on request.
 - Some things are visible but not solved here, and are listed for the owner's licence review (Task
   56): native libraries the worker's PyInstaller build takes from the build machine whose licence
