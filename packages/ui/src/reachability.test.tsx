@@ -115,6 +115,19 @@ describe("every screen can be reached by clicking (D10)", () => {
     for (const r of ROUTES) expect(ALL_PATHS.some((p) => r.matches(p)), String(r.matches)).toBe(true);
   });
 
+  it("the project's whole review queue, and one source's entries in it, are reached by clicking from the library (Task 67)", async () => {
+    const state = { opened: true };
+    server.use(...serviceFor(state));
+    render(<App service={{ baseUrl: BASE, token: TOKEN }} />);
+    await screen.findByRole("navigation", { name: "Projects" });
+    await screen.findByRole("link", { name: /^Review queue/ });
+    await settle();
+    const hrefs = inAppHrefs();
+    // The header link (with the count) and a row's "Needs review" badge (that source's entries).
+    expect(hrefs).toContain("/import/review?project=p1");
+    expect(hrefs).toContain("/import/review?project=p1&source=s2");
+  });
+
   it("starting at the library chooser, following links reaches every path in the route table", async () => {
     const state = { opened: false };
     server.use(...serviceFor(state));

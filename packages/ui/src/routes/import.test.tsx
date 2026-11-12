@@ -35,6 +35,37 @@ describe("import routes", () => {
     expect(await screen.findByRole("option", { name: /Import 7/ })).toBeTruthy();
   });
 
+  it("/import/review naming a project and no import shows the project's whole queue (Task 67)", async () => {
+    const m = mockService({ projectReview: { [P1]: [] } });
+    render(<>{importRoute({ pathname: "/import/review", search: `?project=${P1}` }, m.client)}</>);
+    expect(await screen.findByRole("heading", { name: "Review queue" })).toBeTruthy();
+    expect(await screen.findByText("Nothing is waiting for review in this project.")).toBeTruthy();
+    expect(m.calls.filter((c) => c.path === `/projects/${P1}/review`)).toHaveLength(1);
+    expect(m.calls.filter((c) => c.path.startsWith("/imports/"))).toHaveLength(0);
+  });
+
+  it("/import/review naming a project and a source shows that source's entries (Task 67)", async () => {
+    const sid = "019a7000-0000-7000-8000-0000000000c1";
+    const m = mockService({ projectReview: { [P1]: [{ id: "r1", projectId: P1, sourceId: sid, kind: "import", group: "attach", status: "pending", createdAt: "2026-11-11T10:00:00.000Z", fields: {}, reasons: ["Check it."], title: "Dropped file" }] } });
+    render(<>{importRoute({ pathname: "/import/review", search: `?project=${P1}&source=${sid}` }, m.client)}</>);
+    expect(await screen.findByRole("button", { name: "Show Dropped file" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Show every entry waiting in this project" })).toBeTruthy();
+  });
+
+  it("/import/review refuses a source id that is not valid, without calling the service with it", async () => {
+    const m = mockService();
+    render(<>{importRoute({ pathname: "/import/review", search: `?project=${P1}&source=..` }, m.client)}</>);
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringMatching(/not a valid/i));
+    expect(m.calls.filter((c) => c.path.includes("/review"))).toHaveLength(0);
+  });
+
+  it("/import/review's picker links to the project's whole queue (Task 67)", async () => {
+    const m = mockService();
+    render(<>{importRoute({ pathname: "/import/review", search: "" }, m.client)}</>);
+    const link = await screen.findByRole("link", { name: "Every entry waiting in this project" });
+    expect(link.getAttribute("href")).toBe(`/import/review?project=${P1}`);
+  });
+
   it.each([
     ["?project=..&batch=" + "B1"],
     ["?project=" + "P1" + "&batch=.."],

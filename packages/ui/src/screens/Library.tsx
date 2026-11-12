@@ -35,6 +35,9 @@ export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
 const governanceHref = (projectId: string) => `${PATHS.governance}?project=${encodeURIComponent(projectId)}`;
 const importHref = (projectId: string) => `${PATHS.importWizard}?project=${encodeURIComponent(projectId)}`;
 const captureHref = (projectId: string) => `${PATHS.capture}?project=${encodeURIComponent(projectId)}`;
+/** The project's whole review queue (Task 67), or that source's entries in it. */
+export const reviewQueueHref = (projectId: string, sourceId?: string) =>
+  `${REVIEW_QUEUE_PATH}?project=${encodeURIComponent(projectId)}${sourceId ? `&source=${encodeURIComponent(sourceId)}` : ""}`;
 
 export interface LibraryProps {
   api: LibraryApi;
@@ -328,6 +331,22 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, projectId, locked, filter, reload]);
 
+  // ---- how many entries wait in the project's review queue (Task 67): read with the list, never for a locked project ----
+  const [waiting, setWaiting] = useState<{ projectId: string; total: number } | undefined>();
+  useEffect(() => {
+    setWaiting(undefined);
+    if (!projectId || locked) return;
+    const ac = new AbortController();
+    api.reviewQueue
+      .count(projectId, { signal: ac.signal })
+      .then((total) => {
+        if (!ac.signal.aborted) setWaiting({ projectId, total });
+      })
+      // Without the count (a read-only library, a lock meanwhile) the link is not offered; the list says why.
+      .catch(() => {});
+    return () => ac.abort();
+  }, [api, projectId, locked, reload]);
+
   // ---- the index (D8): when a rebuild ends, the sources are read again ----
   const indexState = state.index?.state;
   const wasRebuilding = useRef(indexState === "rebuilding");
@@ -492,6 +511,12 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           {!locked && !readOnly && project && (
             <a href={captureHref(project.id)} onClick={(e) => follow(e, captureHref(project.id))}>
               Capture from the web
+            </a>
+          )}
+          {/* What the ways in left for the researcher to decide (Task 67): after Import and Capture. */}
+          {project && !locked && waiting?.projectId === project.id && (
+            <a href={reviewQueueHref(project.id)} onClick={(e) => follow(e, reviewQueueHref(project.id))}>
+              {waiting.total > 0 ? `Review queue (${waiting.total} waiting)` : "Review queue"}
             </a>
           )}
           {project && (
@@ -717,7 +742,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                     {o.outcome === "needs-review" && (
                       <>
                         {" "}
-                        <a href={REVIEW_QUEUE_PATH} onClick={(e) => follow(e, REVIEW_QUEUE_PATH)}>
+                        <a href={reviewQueueHref(project.id, o.sourceId)} onClick={(e) => follow(e, reviewQueueHref(project.id, o.sourceId))}>
                           needs review
                         </a>
                       </>
@@ -762,7 +787,17 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               </p>
             ) : (
               <>
-                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} rebuilding={!!index && index.done < index.total} />
+                <SourceTable
+                  items={sources.items}
+                  total={sources.total}
+                  onOpen={setOpenSource}
+                  selectedId={openSource}
+                  incomplete={sources.incomplete}
+                  limited={sources.limited}
+                  rebuilding={!!index && index.done < index.total}
+                  reviewHref={readOnly ? undefined : (sid) => reviewQueueHref(project.id, sid)}
+                  onFollow={follow}
+                />
                 {sources.items.length < sources.total && (
                   <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
                     Load more sources

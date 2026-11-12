@@ -2,7 +2,7 @@
 import type { ImportOptionsInput } from "@ao/core";
 import type { ReviewEntry } from "../../repo/review.js";
 import { batchReport, type ImportReport } from "./report.js";
-import { bulkEditReview, decideReview, listReview, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "./review.js";
+import { bulkEditReview, decideReview, listProjectReview, listReview, type ListedReviewEntry, type ProjectReviewQuery, type ReviewDecision, type ReviewPatch } from "./review.js";
 import {
   dryRun,
   listBatches,
@@ -25,6 +25,8 @@ export interface BulkImport {
   resumeBatch(projectId: string, batchId: string, adapter?: ImportSourceAdapter): Promise<BatchHandle>;
   listBatches(projectId: string): Promise<BatchSummary[]>;
   listReview(projectId: string, batchId: string): Promise<ListedReviewEntry[]>;
+  /** The project's whole review queue: every pending entry of every kind, with or without a batch (R172). */
+  listProjectReview(projectId: string, query?: ProjectReviewQuery): Promise<{ total: number; items: ListedReviewEntry[] }>;
   decideReview(projectId: string, itemId: string, decision: ReviewDecision): Promise<void>;
   bulkEditReview(projectId: string, itemIds: string[], patch: ReviewPatch): Promise<void>;
   batchReport(projectId: string, batchId: string): Promise<ImportReport>;
@@ -41,6 +43,7 @@ export function createBulkImport(deps: BulkImportDeps): BulkImport {
     resumeBatch: (p, b, a) => resumeBatch(deps, p, b, a),
     listBatches: (p) => listBatches(repo, p),
     listReview: (p, b) => listReview(repo, p, b),
+    listProjectReview: (p, q) => listProjectReview(repo, p, q),
     decideReview: (p, i, d) => decideReview(repo, p, i, d),
     bulkEditReview: (p, i, x) => bulkEditReview(repo, p, i, x),
     batchReport: (p, b) => batchReport(repo, p, b),
@@ -52,7 +55,7 @@ export function createBulkImport(deps: BulkImportDeps): BulkImport {
 export { BatchRefusedError, REASONS as BULK_REASONS } from "./run.js";
 export type { BatchHandle, BatchProgress, BatchRefusalKind, BatchResult, BatchSummary, BulkImportDeps, ScanSummary, BatchCounts } from "./run.js";
 export type { ImportReport } from "./report.js";
-export type { ReviewDecision, ReviewPatch } from "./review.js";
+export type { ListedReviewEntry, ProjectReviewQuery, ReviewDecision, ReviewPatch } from "./review.js";
 export type { UndoKept, UndoResult } from "./undo.js";
 export { adapterFor, folderAdapter, zipAdapter } from "./scan.js";
 export type { ImportSourceAdapter, ScanContext, ScanFile, ScanItem } from "./scan.js";

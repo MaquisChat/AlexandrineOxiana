@@ -507,6 +507,52 @@ describe("review queue", () => {
     const ops = (await auditEvents(p)).map((e) => e.details?.op);
     expect(ops).toEqual(expect.arrayContaining(["review.decide", "review.bulk-edit"]));
   });
+
+  it("listProjectReview (Task 67, R172): every pending entry of the project, of every kind, oldest first, paged, with titles; decided entries and entries of removed sources are left out", async () => {
+    const p = await project();
+    const other = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const batchItems = await bulk.listReview(p.id, h.batchId);
+    expect(batchItems.length).toBeGreaterThanOrEqual(3);
+    // Entries with no batch, as a drag-and-drop attach (import) and a capture or a consent withdrawal (verification) queue them.
+    const attached = await repo.createSource(p.id, plainDraft("Attached by hand"), [], { provenance: plainProvenance(), reviewItem: { kind: "import", fields: {}, reasons: ["Check it."] } });
+    const captured = await repo.createSource(p.id, plainDraft("A captured page"), [], { provenance: plainProvenance(), reviewItem: { fields: { "/title": "conflict" }, reasons: ["The title disagrees."] } });
+    const flagged = await repo.createSource(p.id, plainDraft("An interview"), [], { provenance: plainProvenance(), reviewItem: { kind: "verification", fields: {}, reasons: ["Consent was withdrawn."] } });
+    await repo.createSource(other.id, plainDraft("Another project's"), [], { provenance: plainProvenance(), reviewItem: { kind: "import", fields: {}, reasons: ["x"] } });
+    // One batch item decided, one whose source is gone.
+    await bulk.decideReview(p.id, batchItems[0]!.id, { action: "keep-both" });
+    await repo.deleteSource(p.id, batchItems[1]!.sourceId!);
+
+    const all = await bulk.listProjectReview(p.id);
+    const expected = batchItems.length - 2 + 3;
+    expect(all.total).toBe(expected);
+    expect(all.items).toHaveLength(expected);
+    expect(all.items.every((e) => e.status === "pending" && e.projectId === p.id)).toBe(true);
+    const ids = all.items.map((e) => e.id);
+    expect(ids).not.toContain(batchItems[0]!.id);
+    expect(ids).not.toContain(batchItems[1]!.id);
+    const bySource = new Map(all.items.map((e) => [e.sourceId, e]));
+    expect(bySource.get(attached.source.id)).toMatchObject({ kind: "import", title: "Attached by hand" });
+    expect(bySource.get(attached.source.id)!.batchId).toBeUndefined();
+    expect(bySource.get(captured.source.id)).toMatchObject({ kind: "verification", fields: { "/title": "conflict" }, title: "A captured page" });
+    expect(bySource.get(flagged.source.id)).toMatchObject({ kind: "verification", fields: {}, title: "An interview" });
+    const times = all.items.map((e) => e.createdAt);
+    expect([...times].sort()).toEqual(times);
+
+    const page = await bulk.listProjectReview(p.id, { offset: 1, limit: 2 });
+    expect(page.total).toBe(expected);
+    expect(page.items.map((e) => e.id)).toEqual(ids.slice(1, 3));
+    const one = await bulk.listProjectReview(p.id, { sourceId: captured.source.id });
+    expect(one).toMatchObject({ total: 1, items: [{ sourceId: captured.source.id }] });
+    expect((await bulk.listProjectReview(p.id, { limit: 0 })).items).toEqual([]);
+  });
+
+  it("listProjectReview refuses a locked project", async () => {
+    const p = await project(ENC_GOV, true);
+    await repo.createSource(p.id, plainDraft("Sealed"), [], { provenance: plainProvenance(), reviewItem: { kind: "import", fields: {}, reasons: ["x"] } });
+    repo.lockProject(p.id);
+    await expect(bulk.listProjectReview(p.id)).rejects.toThrow(/locked/i);
+  });
 });
 
 describe("undoBatch", () => {
@@ -815,6 +861,38 @@ processing:
     expect(result.counts.failed).toBe(1);
     const report = await bulk.batchReport(p.id, h.batchId);
     expect(report.failures).toEqual([{ item: "IMG_0001.tif", reason: "Location data requires encryption or locationMetadata: keep" }]);
+  });
+});
+
+describe("undo and the review queue (Task 67 fix round 1, M1; coordinator's ruling 3)", () => {
+  it("each source's removal resolves its pending entries in the same change: a crash between two removals leaves no pending entry of a source that is gone", async () => {
+    const { SimulatedCrash, seams } = await import("../../repo/testing.js");
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const items = await bulk.listReview(p.id, h.batchId);
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    // One batch-created source is also flagged by a consent withdrawal (an entry outside the batch).
+    const part = await repo.createParticipant(p.id, {});
+    const c = await repo.createConsent(p.id, { participantId: part.id, scope: "audio", date: "2026-03-14" });
+    for (const it of items) await repo.linkSourceToFieldwork(p.id, it.sourceId!, { participantIds: [part.id] });
+    await repo.withdrawConsent(p.id, c.id, {});
+    // Crash right after the first removal commits (before its marker is deleted).
+    seams.crashAt = "before-marker-delete";
+    await expect(bulk.undoBatch(p.id, h.batchId)).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.crashAt = undefined;
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    handle = new IndexHandle(lib.root);
+    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+    const present = new Set(repo.listSourceIds(p.id));
+    const gone = items.map((i) => i.sourceId!).filter((sid) => !present.has(sid));
+    expect(gone.length).toBe(1);
+    const entries = await projectReviewEntries(repo, p.id);
+    const ofGone = entries.filter((e) => gone.includes(e.sourceId!));
+    expect(ofGone.length).toBeGreaterThanOrEqual(2); // its batch item and its withdrawal flag
+    expect(ofGone.map((e) => [e.status, e.decision])).toEqual(ofGone.map(() => ["resolved", "undone"]));
   });
 });
 
