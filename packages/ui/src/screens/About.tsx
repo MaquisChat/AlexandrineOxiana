@@ -223,15 +223,8 @@ function LicenceTextsPart({ label, load }: { label: string; load: () => Promise<
     };
   }, []);
 
-  const toggle = () => {
+  const fetchTexts = () => {
     if (loading.current) return; // a second click while loading sends nothing more
-    // Open: hide it, unless loading failed; then the click tries again at once.
-    if (open && state.status !== "failed") {
-      setOpen(false);
-      return;
-    }
-    setOpen(true);
-    if (state.status === "done") return;
     loading.current = true;
     setState({ status: "loading" });
     load().then(
@@ -246,6 +239,17 @@ function LicenceTextsPart({ label, load }: { label: string; load: () => Promise<
     );
   };
 
+  // Shows or hides the texts; showing loads them the first time, and again after a failure.
+  const toggle = () => {
+    if (loading.current) return;
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (state.status !== "done") fetchTexts();
+  };
+
   return (
     <div>
       <button type="button" aria-expanded={open} aria-controls={id} onClick={toggle}>
@@ -253,7 +257,14 @@ function LicenceTextsPart({ label, load }: { label: string; load: () => Promise<
       </button>
       <div id={id} hidden={!open}>
         {state.status === "loading" ? <p role="status">Loading the licence texts…</p> : null}
-        {state.status === "failed" ? <p role="alert">These licence texts could not be loaded. Try again.</p> : null}
+        {state.status === "failed" ? (
+          <div role="alert">
+            <p>These licence texts could not be loaded.</p>
+            <button type="button" onClick={fetchTexts}>
+              Try again
+            </button>
+          </div>
+        ) : null}
         {state.status === "done" ? (
           <UserText as="div" className="ao-notice">
             {state.text}

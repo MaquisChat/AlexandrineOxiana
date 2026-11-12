@@ -176,15 +176,27 @@ describe("full licence texts (Task 37j)", () => {
   it("a text that cannot be loaded is said so in plain words, and can be tried again", async () => {
     const user = userEvent.setup();
     let calls = 0;
-    const load = () => (++calls === 1 ? Promise.reject(new Error("chunk failed /assets/x.js")) : Promise.resolve("MIT terms"));
+    const load = () => (++calls <= 2 ? Promise.reject(new Error("chunk failed /assets/x.js")) : Promise.resolve("MIT terms"));
     render(<About notices={{}} licenceTexts={{ "interface-npm": load }} />);
     const button = screen.getByRole("button", { name: "Show the licence texts of the interface's npm packages" });
     await user.click(button);
-    expect(await screen.findByText("These licence texts could not be loaded. Try again.")).toBeTruthy();
+    expect(await screen.findByText("These licence texts could not be loaded.")).toBeTruthy();
     expect(document.body.textContent).not.toContain("/assets/x.js");
-    await user.click(button); // one click tries again (review M7)
-    expect(await screen.findByText("MIT terms")).toBeTruthy();
+    // The section can still be closed (review N5) ...
+    await user.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(calls).toBe(1);
+    // ... and opened again, which tries again; it fails again here.
+    await user.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
     expect(calls).toBe(2);
+    expect(await screen.findByText("These licence texts could not be loaded.")).toBeTruthy();
+    // A "Try again" button in the message retries, by keyboard too (review M7).
+    const retry = screen.getByRole("button", { name: "Try again" });
+    retry.focus();
+    await user.keyboard("{Enter}");
+    expect(await screen.findByText("MIT terms")).toBeTruthy();
+    expect(calls).toBe(3);
     expect(button.getAttribute("aria-expanded")).toBe("true");
   });
 
