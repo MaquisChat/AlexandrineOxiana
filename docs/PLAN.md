@@ -505,7 +505,7 @@ Update after every task; commit and push.
 | 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | done | 700b7eb | reviewed with probes over one fix round; D1, D2, D6, D7 closed; none of D1–D8 is open; "Needs review" follows every pending entry (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
-| 47 Shared API types | built; a small declarations-only round, then review | 98e0d2e (worktree branch) | seven disagreements found between service and interface, none a behaviour defect |
+| 47 Shared API types | in review | e914c27 (worktree branch) | seven disagreements found between service and interface, none a behaviour defect; not on the Mac build's path |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
@@ -519,7 +519,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | fix round 2 (small) | dd66211 (worktree branch) | round 1 approved on re-review; R182: a locked original with a destruction on record refuses the restore; three minor fixes; closes D15 when merged |
+| 50b Restore asks the policy engine | fix round 2 in re-review | a4737c1 (worktree branch) | R182 built (a locked original with a destruction on record refuses); verification follows Task 68's; closes D15 when merged |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -538,9 +538,9 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | fix round 2 | 034e1f6 (worktree branch) | re-review closed I1 and I2; one Important (the libraries list set aside in silence) and seven Minor remain (R181) |
+| 68 Settings writers never write what they did not read (D16) | fix round 2 in re-review; verification running | 391a93f (worktree branch) | RI1 and seven minors addressed (R181); watched folders have no interface in this phase (recorded) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
-| 37k Revise the guide and checklist | fix round 1 after the accuracy review | e55d0ac (worktree branch) | 4 Important and 11 Minor points; all "Known problem" removals confirmed; D17 and D18 found |
+| 37k Revise the guide and checklist | fix round 1 in re-check | 4d76ae2 (worktree branch) | 15 findings reported fixed; D17 and D18 lines in until Task 69 lands |
 | 69 Show that a captured item is no longer available (D17) | in progress | | dispatched 2026-11-12; on the Mac build's path (R183) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
