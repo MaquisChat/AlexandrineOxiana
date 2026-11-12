@@ -520,7 +520,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | approved; verification with 68 running | a4737c1 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); closes D15 when merged |
+| 50b Restore asks the policy engine | approved; up to date; verification after Task 68's | c4a8aa7 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); closes D15 when merged |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -542,7 +542,7 @@ Update after every task; commit and push.
 | 68 Settings writers never write what they did not read (D16) | approved; verification with 50b running | 391a93f (worktree branch) | reviewed with probes over two fix rounds (R181); five minors to the final review's list |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
-| 69 Show that a captured item is no longer available (D17) | in progress | | dispatched 2026-11-12; on the Mac build's path (R183) |
+| 69 Show that a captured item is no longer available (D17) | in review | 50e42e6 (worktree branch) | the mark in the list row and on the source's screen; the list reads each row's record (R185); on the Mac build's path |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
