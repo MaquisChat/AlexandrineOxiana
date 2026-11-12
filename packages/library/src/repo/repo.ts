@@ -84,7 +84,15 @@ import { isStaleWorkDir } from "../tmp-registry.js";
 import { InvalidInputError, NotFoundError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
-import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
+import {
+  adoptRestoredProject as adoptRestoredIn,
+  authorizeRestoreIn,
+  recordUnreadableBackup,
+  refuseRestoreIn,
+  type DestructionRecordError,
+  type RestoreRequest,
+  type StagedRestore,
+} from "./restore.js";
 import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
@@ -1338,14 +1346,33 @@ export function keyFromRing(repo: Repo, keyId: string): Uint8Array | undefined {
   return cores.get(repo)!.keyRing.get(keyId);
 }
 
-/** Package-internal (restore with a passphrase): puts a project key in the repo's key ring. */
-export function addKeyToRing(repo: Repo, keyId: string, key: Uint8Array): void {
-  cores.get(repo)!.keyRing.add(keyId, key);
-}
-
 /** Package-internal (restore, R90 b): makes an unpacked backup a new project of the library. */
 export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<typeof adoptRestoredIn> {
   return adoptRestoredIn(cores.get(repo)!, s);
+}
+
+/**
+ * Package-internal (restore, Task 50b): the policy decision for a restore, made before anything of
+ * the backup is unpacked. A deny is audited and thrown as PolicyDeniedError.
+ */
+export function authorizeRestore(repo: Repo, r: RestoreRequest): ReturnType<typeof authorizeRestoreIn> {
+  return authorizeRestoreIn(cores.get(repo)!, r);
+}
+
+/** Package-internal (restore): audits a restore refused because the record of destructions cannot be read. */
+export function refuseRestore(repo: Repo, r: RestoreRequest, err: DestructionRecordError): Promise<void> {
+  return refuseRestoreIn(cores.get(repo)!, r, err);
+}
+
+/** Package-internal (restore, R179): audits, in the library's own log, the refusal of a file that is not a readable backup. */
+export function refuseUnreadableBackup(repo: Repo, f: { file: string; sha256?: string; reason: string }): Promise<void> {
+  return recordUnreadableBackup(cores.get(repo)!, f);
+}
+
+/** Package-internal (restore): the head of the project's audit log as this process holds it. */
+export function auditHeadOf(repo: Repo, projectId: string): { seq: number; hash: string } | null {
+  const head = cores.get(repo)!.state(projectId).audit.head;
+  return head ? { seq: head.seq, hash: head.hash } : null;
 }
 
 /** Package-internal (retention, R90 d): the governed destruction change. */
@@ -1398,6 +1425,17 @@ export async function verifiedAuditEvents(repo: Repo, projectId: string): Promis
     if (!r.verify.ok || !endsAt(r.verify.head, head)) return { ok: false as const };
     return { ok: true as const, events: r.events };
   });
+}
+
+/**
+ * Package-internal (restore, in its commit turn): `verifiedAuditEvents` for a caller that already
+ * holds the write queue, where nothing is appended meanwhile. Never call it outside the queue.
+ */
+export async function verifiedAuditEventsInQueue(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+  const st = cores.get(repo)!.state(projectId);
+  const events = (await AuditStore.read(st.audit.dir)) as AuditEvent[];
+  const verify = verifyChain(events);
+  return verify.ok && endsAt(verify.head, st.audit.head) ? { ok: true, events } : { ok: false };
 }
 
 const endsAt = (last: { seq: number; hash: string } | null, head: { seq: number; hash: string } | null): boolean =>

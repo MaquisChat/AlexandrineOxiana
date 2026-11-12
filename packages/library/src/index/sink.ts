@@ -5,7 +5,7 @@ import type { KeyRing } from "../crypto/keys.js";
 import type { IndexSink, ProjectJson } from "../repo/state.js";
 import { computeStamps, listProjectEntries, newestChangeId, projectKey, stampFor, type Stamps } from "./changes.js";
 import {
-  getMeta, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
+  getMeta, indexLockedSource, indexProject, indexProjectEntities, indexSource, purgeProject, removeSource, setMeta, upsertReviewItem, type IndexDb, type IndexHandle,
 } from "./db.js";
 import { readExtractedText, readSource, withAnnotations } from "./load.js";
 import { JOBS_FILE, refreshJobRows, upgradeLegacyJobs } from "../job-journal.js";
@@ -155,6 +155,13 @@ export function createIndexSink(
     },
     async indexProject(p) {
       indexProject(handle.db, p);
+      if (ctx) await stamp(await info(p.id));
+    },
+    async indexLockedProject(p, sources) {
+      indexProject(handle.db, p, true);
+      for (const m of sources) {
+        indexLockedSource(handle.db, { id: m.id, projectId: p.id, type: m.type, folder: m.folder, ...(m.issuedYear ? { issuedYear: m.issuedYear } : {}) });
+      }
       if (ctx) await stamp(await info(p.id));
     },
     purgeProject(projectId) {

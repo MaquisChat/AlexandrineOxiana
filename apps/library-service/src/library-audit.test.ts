@@ -3,12 +3,14 @@
  * desktop UI (its token and origin only), with no absolute paths, and the interface is told when a
  * mark or refusal appears.
  */
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { acquireLock, deviceDeps, type Deps } from "@ao/library";
+import { acquireLock, deviceDeps, restoreBackup, type Deps } from "@ao/library";
+import { toApiError } from "./errors.js";
 import { createService, type LibraryService } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -200,4 +202,74 @@ describe("N1 (R154 e): nothing is written into a library another device holds, o
     const outbox = await readdir(join(tmp, "config", "attention-outbox"));
     expect(outbox).toHaveLength(1);
   }, 60_000);
+});
+
+describe("a refused restore (Task 50b): recorded where the audit screen reads, and answered in plain words", () => {
+  // The service has no restore route: a restore is a library call. What reaches the interface is the
+  // library's error through the service's error mapper, and the audit entries the audit routes serve.
+  async function projectWithBackup(): Promise<{ pid: string; backup: string }> {
+    const created = await call({ method: "POST", url: "/projects", body: { name: "Study", governanceYaml: OPEN_GOV, encryption: { enabled: false } } });
+    expect(created.status, created.body).toBe(200);
+    const pid = created.json.project.id as string;
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    return { pid, backup: join(tmp, "Lib", "Backups", b.json.backup.file as string) };
+  }
+
+  it("refused by the policy engine: 403 with the reason, and the project's audit log has the refusal, without a path", async () => {
+    const { pid, backup } = await projectWithBackup();
+    // The project's rules cannot be read any more (the file was damaged outside the app).
+    await writeFile(join(tmp, "Lib", "Projects", "Study", "governance.yaml"), "identifiability: [unclosed\n  nope: {");
+    const err = await restoreBackup(svc.state.requireSession().repo, backup).catch((e: unknown) => e);
+    const api = toApiError(err);
+    expect([api.status, api.code]).toEqual([403, "POLICY_DENIED"]);
+    expect(api.reason).toMatch(/^Policy could not be evaluated/);
+    expect(`${api.message} ${api.reason}`).not.toContain(tmp);
+    const page = await call({ url: `/projects/${pid}/audit?limit=5` });
+    expect(page.status, page.body).toBe(200);
+    const denied = (page.json.events as Array<{ action: string; decision?: { result: string; reason?: string }; details?: Record<string, unknown> }>).filter((e) => e.action === "restore");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]).toMatchObject({ decision: { result: "deny", reason: api.reason }, details: { op: "project.restore" } });
+    expect(page.body).not.toContain(tmp);
+  });
+
+  it("refused because a project's audit log does not hold together: 400 with the plain message, and the library's audit log has the refusal, without a path", async () => {
+    const { backup } = await projectWithBackup();
+    const dir = join(tmp, "Lib", "Projects", "Study", "audit");
+    const segment = join(dir, (await readdir(dir)).sort()[0]!);
+    const lines = (await readFile(segment, "utf8")).split("\n");
+    const first = JSON.parse(lines[0]!) as { actor: string };
+    lines[0] = JSON.stringify({ ...first, actor: "someone else" });
+    await writeFile(segment, lines.join("\n"));
+    const err = await restoreBackup(svc.state.requireSession().repo, backup).catch((e: unknown) => e);
+    const api = toApiError(err);
+    expect([api.status, api.code]).toEqual([400, "VALIDATION"]);
+    expect(api.message).toMatch(/audit log of the project "Study" does not hold together/);
+    expect(api.message).not.toContain(tmp);
+    const page = await call({ url: "/libraries/audit?limit=10" });
+    expect(page.status, page.body).toBe(200);
+    expect(page.json.events[0]).toMatchObject({ action: "restore", decision: { result: "deny", reason: api.message }, details: { op: "project.restore", name: "Study" } });
+    expect(page.body).not.toContain(tmp);
+    expect((await call({ url: "/libraries/audit/verify" })).json).toMatchObject({ ok: true });
+    // The way out is named (R179).
+    expect(api.message).toMatch(/can be restored into another library/);
+  });
+
+  it("R179: a file that is not a readable backup: 400 with the plain message, and the library's audit log names the file and its SHA-256, without a path", async () => {
+    await projectWithBackup();
+    const stray = join(tmp, "holiday photos.zip");
+    await writeFile(stray, "these bytes are not an archive");
+    const err = await restoreBackup(svc.state.requireSession().repo, stray).catch((e: unknown) => e);
+    const api = toApiError(err);
+    expect(api.status).toBe(400);
+    expect(`${api.message} ${api.reason ?? ""}`).not.toContain(tmp);
+    const page = await call({ url: "/libraries/audit?limit=10" });
+    expect(page.status, page.body).toBe(200);
+    expect(page.json.events[0]).toMatchObject({
+      action: "restore",
+      decision: { result: "deny" },
+      details: { op: "project.restore", notABackup: true, file: "holiday photos.zip", backupSha256: createHash("sha256").update("these bytes are not an archive").digest("hex"), sha256Covers: "the whole file" },
+    });
+    expect(page.body).not.toContain(tmp);
+  });
 });
