@@ -82,10 +82,11 @@ describe("transcripts as segments (Task 34a c)", () => {
     expect(list.versions[0]).toMatchObject({ id: saved.json.id, origin: "human-edit", format: "vtt", tool: "researcher" });
     expect(list.versions[0]!.path.startsWith("/")).toBe(false);
     const t = (await call({ url: `/projects/${pid}/sources/${sid}/transcripts/${saved.json.id}` })).json as TranscriptResponse;
-    expect(t).toMatchObject({ id: saved.json.id, text: vtt, format: "vtt", origin: "human-edit", timed: true });
+    expect(t).toMatchObject({ id: saved.json.id, text: vtt, format: "vtt", origin: "human-edit", timed: true, flagsStored: true });
+    // Task 62: saved without a base, every segment is the person's own (not checked).
     expect(t.segments).toEqual([
-      { start: 0, end: 1.5, lang: "pt", text: "Olá", flags: null },
-      { start: 1.5, end: 3, lang: "pt", text: "Tudo bem?", flags: null },
+      { start: 0, end: 1.5, lang: "pt", text: "Olá", flags: null, edit: "added" },
+      { start: 1.5, end: 3, lang: "pt", text: "Tudo bem?", flags: null, edit: "added" },
     ]);
     const txt = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcripts`, body: { text: "Olá. Tudo bem?", format: "txt" } });
     expect((await call({ url: `/projects/${pid}/sources/${sid}/transcripts/${txt.json.id}` })).json).toMatchObject({ timed: false, segments: [], text: "Olá. Tudo bem?" });

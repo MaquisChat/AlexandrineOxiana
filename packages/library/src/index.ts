@@ -110,6 +110,7 @@ export {
   JOB_OPS,
   JobInterruptedError,
   WorkerClient,
+  cancelPendingJob,
   WorkerJobError,
   WorkerToolError,
   WorkerToolsClient,

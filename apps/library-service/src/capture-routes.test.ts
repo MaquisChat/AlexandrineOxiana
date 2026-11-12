@@ -47,7 +47,9 @@ function stubWorker(): WorkerProvider & { calls: WorkerJob[]; updates: number } 
             ];
             await writeFile(join(job.output, "segments.json"), JSON.stringify(segments));
             await writeFile(join(job.output, "transcript.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the market.\n\nNOTE flags: outside-speech, stock-phrase\n\n00:00:02.000 --> 00:00:04.000\nThanks for watching!\n");
-            return { id: "t1", type: job.type, output: job.output, files: [join(job.output, "transcript.vtt"), join(job.output, "segments.json")], meta: { model: (job.params?.model as string | undefined) ?? "small", detectedLanguages: ["en"], flaggedCount: 1 }, encrypted: false };
+            const result: JobResult = { id: "t1", type: job.type, output: job.output, files: [join(job.output, "transcript.vtt"), join(job.output, "segments.json")], meta: { model: (job.params?.model as string | undefined) ?? "small", detectedLanguages: ["en"], flaggedCount: 1 }, encrypted: false };
+            await job.finish?.(result); // as the real client does before the job is recorded done (Task 62)
+            return result;
           }
           throw new WorkerJobError("TOOL_FAILED", "the tool failed");
         },
@@ -220,7 +222,9 @@ describe("POST /projects/:id/sources/:sid/transcribe", () => {
     }
     expect((await call({ method: "POST", url: `/projects/${pid}/sources/01ZZZZZZZZZZZZZZZZZZZZZZZZ/transcribe`, body: {} })).status).toBe(404);
     const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: { model: "small", language: "en" } });
-    expect(r.status, r.body).toBe(200);
+    expect(r.status, r.body).toBe(202); // Task 62: a job, answered at once
+    await svc.state.idle();
+    expect((await call({ url: `/projects/${pid}/sources/${sid}/transcription` })).json.job).toMatchObject({ jobId: r.json.job.jobId, status: "done" });
     const job = worker.calls.find((c) => c.type === "audio.transcribe")!;
     expect(job.params).toMatchObject({ model: "small", language: "en" });
     const list = (await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse;

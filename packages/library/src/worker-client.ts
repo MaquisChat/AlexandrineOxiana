@@ -273,12 +273,8 @@ export class WorkerClient {
    * one through its signal instead).
    */
   async cancelPending(projectId: string, id: string): Promise<boolean> {
-    const library = repoLibrary(this.repo);
-    if (library.mode !== "read-write" || this.closed || claimed.has(id)) return false;
-    const key = projectDataKey(this.repo, projectId);
-    const rec = (await readJobJournal(library.root, this.repo.getProject(projectId).folder, projectId, key)).records.get(id);
-    if (!rec || !isPending(rec)) return false;
-    return this.claim(rec, { ...this.next(rec, "cancelled", "CANCELLED"), attempt: randomUUID() }, key);
+    if (this.closed) return false;
+    return this.write(() => cancelPendingJob(this.repo, projectId, id, this.index));
   }
 
   /**
@@ -680,6 +676,27 @@ export class WorkerClient {
       }
     }
   }
+}
+
+/**
+ * WorkerClient.cancelPending without a client (the media worker need not be running): records a
+ * pending job of the project as cancelled (`CANCELLED`, its job dropped), claimed in the journal's
+ * turn so that a resubmission and the cancel cannot both win. False when it is not pending, is
+ * unknown, is running in this process, or the library is read-only.
+ */
+export async function cancelPendingJob(repo: Repo, projectId: string, id: string, index?: { readonly db: IndexDb }): Promise<boolean> {
+  const library = repoLibrary(repo);
+  if (library.mode !== "read-write" || claimed.has(id)) return false;
+  const key = projectDataKey(repo, projectId);
+  const folder = repo.getProject(projectId).folder;
+  const rec = (await readJobJournal(library.root, folder, projectId, key)).records.get(id);
+  if (!rec || !isPending(rec)) return false;
+  const { job: _job, error: _error, ...base } = rec;
+  const next: JobRecord = { ...base, status: "cancelled", updatedAt: new Date().toISOString(), error: "CANCELLED", attempt: randomUUID() };
+  if (!(await claimJobRecord(library.root, folder, key, rec, next))) return false;
+  const db = index?.db;
+  if (db?.open) upsertJobRow(db, next);
+  return true;
 }
 
 async function privateDir(path: string): Promise<void> {

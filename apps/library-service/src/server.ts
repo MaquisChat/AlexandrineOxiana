@@ -52,6 +52,8 @@ export interface ServiceOptions {
   suspendTimeoutMs?: number;
   /** Opens a library (test seam). */
   openLibrary?: typeof openLibrary;
+  /** How long a close waits for registered work before abandoning what can be (test seam; Task 62). */
+  closeGraceMs?: number;
   /** Runs right before a move starts copying (test seam). */
   beforeExecuteMove?: () => Promise<void>;
   /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
@@ -129,6 +131,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.watchStabilityMs !== undefined ? { watchStabilityMs: opts.watchStabilityMs } : {}),
     ...(opts.suspendTimeoutMs !== undefined ? { suspendTimeoutMs: opts.suspendTimeoutMs } : {}),
     ...(opts.openLibrary ? { openLibrary: opts.openLibrary } : {}),
+    ...(opts.closeGraceMs !== undefined ? { closeGraceMs: opts.closeGraceMs } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);

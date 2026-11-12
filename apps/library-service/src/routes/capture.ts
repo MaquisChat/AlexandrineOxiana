@@ -27,6 +27,7 @@ import {
 import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
+import { registerTranscription } from "./transcription.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
 
 /** Browser capture carries a full-page screenshot and the page's HTML (R96: raised only here). */
@@ -189,20 +190,8 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     return { queueId };
   });
 
-  app.post("/projects/:id/sources/:sid/transcribe", async (req) => {
-    const s = state.requireWritable();
-    const projectId = projectParam(ctx, req);
-    const sid = paramsOf(req).sid ?? "";
-    if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
-    const b = bodyOf(req);
-    const model = optStr(b, "model", 16);
-    if (model !== undefined && !MODELS.includes(model)) throw badRequest(`"${model}" is not a transcription model.`);
-    const language = optStr(b, "language", 16);
-    if (language !== undefined && language !== "auto" && !/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(language)) throw badRequest(`"${language}" is not a language code.`);
-    const worker = await state.workerClient();
-    const r = await createLinkCapture({ repo: s.repo, worker, index: s.index }).transcribeSource(projectId, sid, { ...(model ? { model } : {}), ...(language ? { language } : {}) });
-    return r;
-  });
+  // Transcription of a source runs as a job (Task 62): its routes are in transcription.ts.
+  registerTranscription(app, ctx);
 
   app.get("/tools/versions", async () => {
     const w = await state.ensureWorker();
