@@ -46,12 +46,17 @@ export function isUsableFamily(family: string): boolean {
   return isUsableFontFamily(family);
 }
 
+/** One family name as CSS, always quoted (a keyword or generic family then names a face, not the keyword). */
+function quotedFamily(name: string): string {
+  return `'${name.trim().replace(/'/g, "\\'")}'`;
+}
+
 /** One family name as CSS: kept if already quoted or a plain identifier, quoted otherwise. */
 function cssFamily(name: string): string {
   const n = name.trim();
   if (/^'[^']*'$|^"[^"]*"$/.test(n)) return n;
   if (/^-?[A-Za-z_][A-Za-z0-9_-]*$/.test(n)) return n;
-  return `'${n.replace(/'/g, "\\'")}'`;
+  return quotedFamily(n);
 }
 
 const splitFamilies = splitFontFamilies;
@@ -71,6 +76,9 @@ export function genericOf(choice: FontChoice): GenericFamily {
 export function fontStack(choice: FontChoice): string {
   if (!isUsableFamily(choice.family)) throw new Error(`"${choice.family}" is not a font name.`);
   const generic = genericOf(choice);
+  // A researcher's own file is one family registered under exactly this name (Task 57 M5): quoted,
+  // so "serif" or "inherit" names the file's face and never the keyword.
+  if (choice.source === "user-file") return [quotedFamily(choice.family), generic, FALLBACKS_BY_GENERIC[generic]].join(", ");
   const isList = splitFamilies(choice.family).length > 1 || /^['"]/.test(choice.family.trim());
   const families = isList ? splitFamilies(choice.family).map(cssFamily) : [cssFamily(choice.family)];
   while (families.length > 1 && TRAILING_GENERICS.has(families[families.length - 1]!) && families[families.length - 1] !== "ui-monospace") families.pop();

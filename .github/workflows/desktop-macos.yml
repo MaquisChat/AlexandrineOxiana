@@ -1,17 +1,24 @@
 name: Desktop (macOS)
 
-# The two Mac downloads (Task 37f, R133): Apple Silicon built on macos-15, Intel on macos-15-intel,
-# each from its own build (no combined app), minimum macOS 15.0, ad-hoc signed (R151; signing with a
-# Developer ID and notarisation are Task 37g). macOS runner minutes are billed at ten times Linux ones
-# on a private repository, so this workflow NEVER runs on a push to a branch. A `push` trigger with
-# only `tags` does not fire for branch pushes: "If you define only tags/tags-ignore or only
-# branches/branches-ignore, the workflow won't run for events affecting the undefined Git ref"
-# (docs.github.com, Actions, workflow syntax, on.push.<branches|tags>).
+# The Mac download (Task 37f, R133): APPLE SILICON ONLY, by the owner's decision (R169), built on
+# macos-15. The Intel download (macos-15-intel, its own build, no combined app) is switched off in
+# apps/desktop/scripts/mac-targets.mjs (INTEL_BUILDS): nothing below starts an Intel job, and what is
+# written here about Intel applies only if the owner reverses that. Minimum macOS 15.0, ad-hoc signed
+# (R151; signing with a Developer ID and notarisation are Task 37g). macOS runner minutes are billed at ten times Linux ones
+# on a private repository, so an ordinary push to a branch never starts this workflow. The only branch
+# push that does is one that CHANGES the build-request file, apps/desktop/mac-build-request.json
+# (R168): `paths` limits branch pushes to that file, and GitHub does not apply `paths` to tag pushes
+# ("Path filters are not evaluated for pushes of tags", docs.github.com, Actions, workflow syntax,
+# on.push.paths).
 #
-# Two ways to start it (R167 a; apps/desktop/README.md, "Building for macOS"):
-#   - a tag pushed from any branch: vX.Y.Z-mac.N (both), vX.Y.Z-arm.N (Apple Silicon), vX.Y.Z-intel.N
-#     (Intel), or a plain vX.Y.Z (both); X.Y.Z must be the app's version (tauri.conf.json). The plan
-#     job checks this on Linux before any Mac minute is spent (apps/desktop/scripts/mac-targets.mjs).
+# Three ways to start it (R167 a, R168; apps/desktop/README.md, "Building for macOS"):
+#   - a build request: commit a change to apps/desktop/mac-build-request.json on a working branch
+#     (raise "request" by one and name the architectures). This is the way that works from a session
+#     that can push only its own branch.
+#   - a tag pushed from any branch: vX.Y.Z-arm.N, or a plain vX.Y.Z for a release (both Apple Silicon;
+#     -mac.N and -intel.N are refused while Intel is off); X.Y.Z must be the app's version
+#     (tauri.conf.json). The plan job checks this on Linux before any Mac minute is spent
+#     (apps/desktop/scripts/mac-targets.mjs).
 #   - "Run workflow" on the website, which GitHub offers only once this file is on the default branch.
 #
 # Minutes per architecture, ESTIMATED (nothing has run on a Mac yet; the Linux timings of the same
@@ -25,6 +32,9 @@ name: Desktop (macOS)
 #   Billed: about 10x those minutes. The caches are saved even when a later step fails, so a failed
 #   attempt does not make the next one cold.
 #
+# Every run that passes plan also builds the browser extension on Linux (job `extension`, Task 65),
+# independent of the Mac job, and uploads it beside the Mac download (a few Linux minutes).
+#
 # Third-party actions are pinned by full commit id (R167 b), each with its release in a comment; the
 # ids were read with `git ls-remote --tags https://github.com/<owner>/<action>` (the peeled ^{} id
 # for an annotated tag) on 2026-11-12.
@@ -35,12 +45,17 @@ on:
       architectures:
         description: Which downloads to build
         type: choice
-        options: [both, apple-silicon, intel]
-        default: both
+        options: [apple-silicon]
+        default: apple-silicon
   push:
-    # Version tags only. No `branches` here: see above.
+    # Version tags, and branch pushes that change the build-request file (see above). Nothing else.
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
+    branches:
+      - "claude/**"
+      - main
+    paths:
+      - apps/desktop/mac-build-request.json
 
 permissions:
   contents: read
@@ -302,3 +317,49 @@ jobs:
             apps/desktop/sidecars/*/sidecar-manifest.json
             apps/desktop/sidecars/*.smoke.json
           if-no-files-found: ignore
+
+  # The browser extension's download (Task 65, R170 d), built on Linux beside the Mac one: its own job
+  # after plan, so it neither waits for the Mac build nor fails with it, and a failure here does not
+  # touch the Mac build. A zip of the built extension (manifest.json at its top level) and its
+  # SHA-256, from apps/browser-extension/scripts/package.mjs; how to load it is in
+  # apps/browser-extension/README.md, "Installing the extension from the download".
+  extension:
+    needs: plan
+    name: Browser extension (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        timeout-minutes: 5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        timeout-minutes: 5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        timeout-minutes: 10
+      - name: Build and zip the extension (package.mjs)
+        timeout-minutes: 5
+        run: pnpm --filter @ao/browser-extension run package
+      - name: Upload the extension and its SHA-256
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        timeout-minutes: 5
+        with:
+          name: alexandrine-oxiana-browser-extension
+          path: |
+            apps/browser-extension/dist-zip/*.zip
+            apps/browser-extension/dist-zip/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Size and checksum in the run summary
+        if: ${{ !cancelled() }}
+        timeout-minutes: 1
+        run: |
+          {
+            echo "### Browser extension (Chrome, Edge, Firefox 128 or later)"
+            for f in apps/browser-extension/dist-zip/*.zip; do [ -f "$f" ] && echo "- \`$(basename "$f")\`: $(du -h "$f" | cut -f1), sha256 \`$(cut -d' ' -f1 "$f.sha256")\`"; done
+          } >> "$GITHUB_STEP_SUMMARY" || true

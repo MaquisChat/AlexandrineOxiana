@@ -19,7 +19,7 @@
  * silently drop them; the screen shows the running queue, so nothing is lost by saying so.
  */
 import { randomUUID } from "node:crypto";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 // The address classifier and the acknowledgement: one definition, shared with the interface (R146).
 import { COOKIES_ACKNOWLEDGEMENT, MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "@ao/core";
 import {
@@ -31,7 +31,8 @@ import {
   type ProfileCaptureOptions,
   type ProfileContentType,
 } from "@ao/library";
-import { CAPTURE_RUNNING, SPEECH_MODELS, type CaptureStartedBy } from "@ao/shared";
+import { CAPTURE_RUNNING, PAIRING_CODE_ID, SPEECH_MODELS, type CaptureStartedBy, type PairingCodeStatus } from "@ao/shared";
+import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
 import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj } from "./util.js";
@@ -274,6 +275,19 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     if (!token) throw new ApiError(401, "UNAUTHORIZED", "That code is not valid. Ask the desktop app for a new one.");
     return { token };
   });
+
+  // What became of a code (Task 46c): never the code itself; the UI token from the desktop app's own
+  // page only. The extension token never reaches here (not one of its routes, server.ts), and a paired
+  // extension's origin, which the service otherwise lets through, is refused too.
+  const codeStatus = (req: FastifyRequest): PairingCodeStatus => {
+    const origin = req.headers.origin;
+    if (req.caller !== "ui" || origin === undefined || !SHELL_ORIGINS.has(origin)) throw new ApiError(403, "FORBIDDEN", "A pairing code's status is shown in the desktop app only.");
+    const codeId = paramsOf(req).codeId;
+    if (codeId !== undefined && !PAIRING_CODE_ID.test(codeId)) throw badRequest("That is not a pairing code's id.");
+    return pairing.status(codeId);
+  };
+  app.get("/extension/pair/status", async (req) => codeStatus(req));
+  app.get("/extension/pair/status/:codeId", async (req) => codeStatus(req));
 
   app.get("/extension/pairings", async () => ({ extensions: pairing.list() }));
   app.delete("/extension/pairings/:pid", async (req) => {

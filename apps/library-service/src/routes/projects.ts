@@ -149,8 +149,8 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const id = projectParam(ctx, req);
     const secret = str(bodyOf(req), "secret", 1024);
     await limit.guard(id, () => s.repo.unlockProject(id, secret));
-    // Work that waited for the key: viewing proxies and OCR of this project, and its daily backup (R99 I7).
-    state.resumeProject(s, id);
+    // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
+    state.resumeProject(s, id, { workerJobs: true });
     state.startWork("backup", async () => {
       await state.runScheduledBackups(id);
     });

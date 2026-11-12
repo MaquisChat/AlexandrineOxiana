@@ -25,7 +25,7 @@ Checks run on 2026-11-11: type-check passes (7 packages); `pnpm test` 2,053 pass
 Task 40 enters these in the ledger as rulings R120 onward.
 
 1. **Scope.** Plan Phase 1 in detail; outline Phases 2–6.
-2. **Platforms.** macOS first: Apple Silicon and Intel. Windows later. The owner will create an Apple Developer account.
+2. **Platforms.** macOS first: Apple Silicon only (the owner, 2026-11-12, R169; Intel Macs were in the plan until then and are not built). Windows later. The owner will create an Apple Developer account.
 3. **Branches.** `main` exists (created at `0ad6506`) and is the approved state. Work happens on a working branch and reaches `main` only with the owner's approval.
 4. **Citation engine licence.** citeproc-js is used under **CPAL-1.0**. The project's own licence is not chosen yet; AGPL-3.0 is the likely later choice and must stay possible. No project `LICENSE` file is added until the owner decides. (Closes the open half of R87.)
 5. **Citation review.** The owner will review the five citation styles from a prepared page.
@@ -54,7 +54,7 @@ Task 40 enters these in the ledger as rulings R120 onward.
 | J | The app runs end to end | A real service, real worker and the built UI pass end-to-end scenarios 1–8 in Chromium and WebKit, in CI. |
 | K | Task 34 | Capture, transcript, verification and pairing screens work against the real service; scenarios 9–11 pass; the first-use tools dialogue works. |
 | L | Governance and durability gaps closed | Backups and refused actions are decided by policy and audited; no audit failure is silent; job records survive loss of the index (R31). |
-| M | macOS desktop app | The test suites pass on a Mac. Signed, notarised downloads for Apple Silicon and Intel are built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
+| M | macOS desktop app | The test suites pass on a Mac. A signed, notarised download for Apple Silicon (Intel dropped by the owner, R169) is built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
 | N | Phase 1 finished | Owner reviews done and applied; final whole-branch review clean; merged to `main`. |
 
 Order: I, then J. K and L can run alongside J once Task 43 is in. M starts after J (37a, 37b, 37d, 37e and 59 can start earlier; 59 should start early because it is the first time anything runs on a Mac). N is last.
@@ -320,7 +320,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 **Task 37f — Mac builds in CI [ledger: R133; ADR 0014]**
 - Depends: 37c, 37d, 37e, 48, 59.
 - Files: `.github/workflows/desktop-macos.yml`, `apps/desktop/src-tauri/tauri.conf.json`.
-- Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered.
+- Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered. (Amended 2026-11-12, R168 and R169: a build can also be started by a build-request file; only Apple Silicon is built, by the owner's decision, and the Intel side stays in the repository switched off.)
 - Verify: a green workflow run with two downloadable artefacts.
 - Model: Opus.
 
@@ -344,6 +344,38 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Accept: how to install, first run, where the library lives, how to pair the browser extension. A checklist the owner can follow on their Mac, one line per check, covering the eleven scenarios.
 - Verify: controller walks the Linux build through the checklist.
 - Model: Sonnet.
+
+**Task 64 — What the owner's guide found missing in the interface (D10, D11, D12) [ledger: R170, R41, R113, R145]**
+- Depends: 46b, 34d, 63 (they change the same screens). Found by Task 37i: the desktop app has no address bar, so a screen without a link cannot be reached.
+- Files: `packages/ui/src/screens/Library.tsx`, the source screen, `components/TranscriptLink.tsx`, the Governance form, the import wizard and the other screens with a typed path, the one bridge module for native pickers, tests; `e2e/` only to turn the new expected-failure tests into normal ones.
+- Accept: (D10) the Capture screen is reached from a project by a visible, keyboard-reachable link, and a source that has a transcript links to the transcript viewer; (D11) the Governance form has a control for the project's capture methods, including browser capture and the downloader, saved through the same governed, audited change as the form's other fields, so that no researcher needs to edit `governance.yaml` text to capture; (D12) every field where a folder or file path is typed offers the native picker when the shell is present and stays a typed field when it is not. The extension popup's and the Capture screen's wording name the place a person can actually find.
+- Verify: UI tests; `pnpm e2e -- --app-only --trace off`; the desktop scenario once.
+- Model: Opus.
+
+**Task 65 — The browser extension as a download [ledger: R170, R110, R167]**
+- Depends: 37f. Found by Task 37i: the extension could only be built from source with Node and pnpm.
+- Files: `.github/workflows/desktop-macos.yml`, `apps/browser-extension/scripts/`, `apps/browser-extension/README.md`, `apps/desktop/scripts/build-macos.test.mjs` (the workflow's tests), `docs/first-run.md`.
+- Accept: every Mac build run also builds the extension on Linux and uploads it, zipped with its SHA-256, as an artifact beside the Mac download; the guide says how to load it in Chrome or Edge and in Firefox; no new permission, host or store listing.
+- Verify: the script and workflow tests; the zip built here loads in the extension's end-to-end run.
+- Model: Opus.
+
+**Task 66 — A paired browser survives a relaunch (D13) [ledger: R171, R96, R110, R111]**
+- Depends: 46c (the pairing screen and the pairing code), 65 (the popup's wording).
+- Files: `apps/library-service/src/main.ts` and the app settings store, `apps/desktop/src-tauri/src/helper_env.rs` only if the shell must say something new, `apps/browser-extension/src` (popup), `packages/ui/src/screens/ExtensionPairing.tsx`, tests.
+- Accept: the service listens again on the port it used last time when that port is free, and on another free port when it is not; a pairing made before a relaunch works after it without any action when the port is the same; when the port had to change, the pairing screen says so in plain words and the popup lets the researcher enter the new port without pairing again (the token stays valid); the extension still never scans for a port (R110); 127.0.0.1 only, token, Host and Origin checks unchanged (R96).
+- Verify: service tests (the same port after a restart; fallback when it is taken; two services at once); the extension's tests and end-to-end run; the desktop launch check.
+- Model: Opus.
+
+**Task 67 — One review queue for the project (D14) [ledger: R172, R137, R149, R113, R145]**
+- Depends: 46b (the queue screen and the badge), 34d (confirming a field's value).
+- Files: `apps/library-service/src/routes/` (a project-wide read of the queue; decisions on entries without a batch), `packages/shared/src/api/`, `packages/ui/src/screens/import/ReviewQueue.tsx` and the route that opens it, the library row's badge link, tests; `e2e/` for scenario 11's queue step.
+- Accept: one view lists every pending entry of the project's review queue: import batch items (grouped by import), items queued by a drag-and-drop attach, and verification items from captures and consent withdrawals, each with what it is and why it waits; each can be decided there (an import item as today; a verification conflict by choosing a value, through the same governed, audited confirm as the source screen's badge), and a decision clears the entry and, when it was the source's last, the row's "Needs review" badge without a reload; the badge and the attach outcome link to this view; a locked project's entries are not shown or decided.
+- Verify: service and UI tests for each kind of entry; `pnpm e2e -- --app-only --trace off`.
+- Model: Opus.
+
+**Task 37k — Revise the guide and checklist for the build the owner will test**
+- Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
+- Model: Sonnet, then an accuracy review.
 
 ### Milestone N — Finish Phase 1
 
@@ -374,7 +406,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 ## 6. Risks
 
 1. **The Mac app cannot be run here.** Everything Mac-specific is first seen working on GitHub's machines or the owner's Mac. Mitigation: WebKit in the browser scenarios (the Mac app's web view is WebKit), a smoke test on the Mac build machines, the owner's checklist.
-2. **Packaging the worker for Intel Macs.** Confirmed by Task 37e: four libraries publish no Intel-Mac build at the current versions, so the Intel download runs on a second, older set (R133). More libraries may follow, and GitHub may retire its Intel machines.
+2. **Packaging the worker for Intel Macs.** No longer a risk: the owner decided on 2026-11-12 that the app is built for Apple Silicon only (R169). For the record, Task 37e confirmed that four libraries publish no Intel-Mac build at the current versions, so an Intel download would run on a second, older set (R133).
 3. **Tools on a Mac without a package manager.** tesseract has no official Mac download and is built and signed in our own CI; ghostscript turned out not to be needed. Tools the app downloads may be blocked by the Mac's security check unless signed (the video downloader is not signed by its authors): unverified, to be tested on the owner's Mac.
 4. **Signing the helper programs.** Apple's rules for programs inside an app are strict; expect more than one attempt at 37g.
 5. **Mac build minutes** on GitHub cost more than Linux ones on a private repository. The Mac workflow runs only by hand or on a tag.
@@ -424,6 +456,10 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
 - Defect D9 (the first-use question could take focus from a person typing): fixed by Task 48c.
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
+- Defects found by Task 37i while writing the owner's guide (for Task 64): D10 (high): nothing in the interface links to the Capture screen or to the transcript viewer, and the desktop app has no address bar, so neither can be reached. D11 (high): the Governance form has no control for capture methods; a new project allows neither browser capture nor the downloader, and the only way to allow them is to edit the `governance.yaml` text. D12: outside the library chooser and the drop areas, folder and file paths must be typed in full; there is no picker.
+- Defect found by the review of Task 37i (for Task 66): D13 (high): the library service takes a new port at every launch, and the browser extension keeps the port typed at pairing and never looks for another, so a paired browser stops working each time the app is reopened ("The desktop app is not answering on port N") until it is unpaired and paired again.
+- Defect found by the review of Task 46b (for Task 67): D14 (high): the review queue screen lists the items of one import batch only. Entries queued by a drag-and-drop attach, by a capture with conflicting fields or by a consent withdrawal cannot be seen or decided anywhere, so their "Needs review" badge cannot be cleared.
+- Defect found by Task 49's fourth round (for Task 50b): D15 (high): a deleted `backups-manifest.json` is read as "no backups", so a destruction lists none, its certificate says "none", and a backup that holds the destroyed file stays.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -442,25 +478,25 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | stopped | 7b7a3b4 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | stopped | fdbd601 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
-| 46c A pairing code's status | fix round 1, stopped | 1ec85b5 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. One Important: a code is marked used before the pairing is written |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | approved; takes the working branch after Task 51, then verification | e50933c (worktree branch) | reviewed with probes over one fix round (one Critical closed) |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; verification before merge | ae4de75 (worktree branch) | reviewed with probes over one fix round; "Needs review" follows every pending entry (R172); D14 remains for Task 67 |
+| 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 1, stopped | db0030d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. 5 Important; identifiers become confirmable (R149) |
+| 34d Verification badges | approved; one binary reader, then verification before merge | cc2fe64 (worktree branch) | reviewed with probes over two fix rounds (R145, R149); after Task 57 merges its `blob()` uses move onto `bytes()` |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
+| 63 Capture state readable; one classifier | fix round 2 | 7a59e9a (worktree branch) | I1 and I2 closed; new Important: a queue outlives a lock that is undone before its download ends |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
-| 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
+| 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
+| 49 Backups governed | fix round 5 | 6bdcab6 (worktree branch) | round 4 reviewed against R147: sound for deletion; 2 Important for what is written (a restore rewrites certificates; a pass writes on an unverified chain); R175 |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
-| 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
+| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
+| 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
@@ -468,17 +504,22 @@ Update after every task; commit and push.
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
 | 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
-| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
-| 37f Mac builds in CI | written and merged; NOT yet run | 2ed4788 | the build script and workflow passed two paper reviews and every Linux check; the first Mac run (the task's real acceptance) waits for the owner's word: roughly 550–750 billed minutes for Apple Silicon only, 1,200–1,650 for both (estimates) |
+| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; the Intel question is closed (not built, R169); one owner confirmation pending (minimum macOS 15) |
+| 37f Mac builds in CI | done | 81276bf | run 2 green on a Mac (2026-11-12, 12 min): the app, its disk image, the worker smoke test, launch check A–D on the debug app and R on the release app from the disk image; Apple Silicon only (R169); builds are started by a build request (R168); written and paper-reviewed in 2ed4788 |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
-| 37i Guide and checklist | not started | | |
+| 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
+| 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
+| 66 A paired browser survives a relaunch (D13) | in progress | | dispatched 2026-11-12 after Task 46c merged |
+| 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
+| 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | blocked | | needs the first Mac build (Task 37f); a signed build is not required for the owner's own tests (R151) |
+| 55 Owner hands-on tests | waits for the checklist (37i) and the defect fixes (46a, 46b) | | a Mac build exists (run 2 of "Desktop (macOS)", unsigned, R151) and the owner may try it at once; it still has the open defects D1–D8, so the checklist run is best done on the build made after 46a and 46b merge |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
@@ -487,7 +528,7 @@ Update after every task; commit and push.
 2. Decided 2026-11-11: no second backup folder in Phase 1. Until sync is designed, a backup lives beside the data it protects, so it does not survive losing the drive; copying the library folder to another drive by hand is the safeguard meanwhile.
 3. Approve merges to `main` at milestone boundaries.
 4. Create the Apple Developer account; later, add its signing credentials as GitHub secrets (Task 37g gives the steps).
-5. Confirm two things from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia, which leaves out Intel MacBook Airs from 2018–19 and most Macs older than 2018; and the Intel download is kept although it must use older versions of four libraries (older cameras' RAW files only, two months behind on OCR fixes, an older cryptography library) and depends on GitHub keeping its Intel machines.
+5. Confirm one thing from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia. (The second question, whether to keep an Intel download, is answered: the owner decided on 2026-11-12 that the app is built for Apple Silicon only, R169.)
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
 8. Choose the project's own licence before anything is published (Task 56). Facts that bear on it, found by Task 37d: the packaged worker contains a GPL-2.0-only program (gallery-dl) and GPL video-codec libraries inside two of its Python packages, besides LGPL and MPL parts. What may be shipped together, and under which licence, is a question for the owner and, ideally, a lawyer; the plan's default until then is to move gallery-dl out of the bundle into the first-use downloads, like the video downloader.

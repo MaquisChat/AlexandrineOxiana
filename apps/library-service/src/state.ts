@@ -32,6 +32,7 @@ import {
   type Repo,
   type ToolsUpdate,
   type WorkerClient,
+  type WorkerEndpoint,
   type WorkerToolsClient,
   type CaptureOptions,
   CaptureQueueRegistry,
@@ -58,13 +59,21 @@ export interface WorkerProvider {
   start(): Promise<ServiceWorker>;
 }
 
+/**
+ * The worker client of an open library. It is given the index handle itself, not its current
+ * connection, so that job rows reach the live database after a rebuild swaps it.
+ */
+export function workerClientFor(Client: typeof WorkerClient, worker: WorkerEndpoint, repo: Repo, index?: IndexHandle): WorkerClient {
+  return new Client({ repo, worker, pollMs: 200, ...(index ? { index } : {}) });
+}
+
 /** The default worker: `AO_WORKER_BIN`, or the venv made by `pnpm setup:py`. */
 export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerProvider => ({
   async start() {
     const mw = await startMediaWorker(onLog ? { onLog } : {});
     const { WorkerClient } = await import("@ao/library");
     return {
-      clientFor: (repo, index) => new WorkerClient({ repo, worker: mw.handle, pollMs: 200, ...(index ? { index: { db: index.db } } : {}) }),
+      clientFor: (repo, index) => workerClientFor(WorkerClient, mw.handle, repo, index),
       versions: () => mw.versions(),
       updateTools: () => mw.updateTools(),
       tools: mw.tools,
@@ -710,17 +719,34 @@ export class ServiceState {
     ocrQueueFor(s.repo).setWorker(client);
     // During a move nothing is resumed: the library open after it resumes (R106 C1).
     if (s.lib.mode !== "read-write" || this.moving) return;
-    this.startWork("worker-resume", async () => {
-      await client.resumePending();
-    });
+    this.resumeWorkerJobs(s);
     for (const p of s.repo.listProjects()) if (s.repo.isUnlocked(p.id)) this.resumeProject(s, p.id);
   }
 
-  /** Resumes a project's pending viewing proxies and OCR (at open / worker ready / unlock). */
-  resumeProject(s: Session, projectId: string): void {
+  /**
+   * Resubmits the worker jobs left pending (all projects at launch; one project at its unlock,
+   * including jobs a lock cancelled before they started, R142), as registered work (R106 C1): a
+   * move or close waits for it, it stops between jobs when asked and continues on the library open
+   * afterwards, and nothing starts during a move. The journal claim keeps each rerun to one run.
+   */
+  resumeWorkerJobs(s: Session, projectId?: string): void {
+    const client = s.workerClient;
+    if (!client || s.lib.mode !== "read-write" || this.moving) return;
+    void this.startWork("worker-resume", async (ctl) => {
+      await client.resumePending(projectId, { shouldStop: () => ctl.stopping });
+      if (ctl.stopping) return (next: Session) => this.resumeWorkerJobs(next, projectId);
+    });
+  }
+
+  /**
+   * Resumes a project's pending viewing proxies and OCR (at open / worker ready / unlock); at an
+   * unlock (`workerJobs`) also its pending worker jobs.
+   */
+  resumeProject(s: Session, projectId: string, opts: { workerJobs?: boolean } = {}): void {
     if (!s.workerClient || s.lib.mode !== "read-write" || this.moving) return;
     this.track(proxyQueueFor(s.repo).resumePending(projectId), "resuming viewing proxies");
     this.track(ocrQueueFor(s.repo).resumePending(projectId), "resuming OCR");
+    if (opts.workerJobs) this.resumeWorkerJobs(s, projectId);
   }
 
   // ---- state for the UI ----------------------------------------------------------------
