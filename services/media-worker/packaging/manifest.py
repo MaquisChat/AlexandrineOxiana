@@ -14,7 +14,11 @@ Python by build-sidecars.mjs, after PyInstaller:
    nothing in the bundle states it. Nothing is inferred from a library's name.
 3. `licenses/` next to the executable: every bundled package's licence files, the build Python's
    licence, the GNU licence texts (GPL-2.0, GPL-3.0, LGPL-2.1, LGPL-3.0) the stated licences refer
-   to, and `README.txt`, a table of the native libraries.
+   to, and `README.txt`, a table of the native libraries. And `THIRD-PARTY-LICENCES.txt`: all of
+   these texts in one readable file, each once with every copyright line of its copies; a package
+   whose wheel ships no licence text gets the standard text of its licence (the repository's
+   licences/standard, also copied to `packages/<name>/STANDARD-TEXT-<id>.txt`) and is named in it.
+   A package with neither stops the build (licence_texts.py, Task 37j).
 
 `copyleft` is "yes", "weak", "runtime-exception", "choice" (the text offers a copyleft and a
 non-copyleft option), "no" or "unknown": a pointer for a human review, not a legal judgement.
@@ -35,6 +39,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import licence_texts  # noqa: E402
 from dists import canonical, runtime_dists  # noqa: E402
 
 STRONG = re.compile(r"\b(A?GPL|GNU (Affero )?General Public|GPLv[23])", re.I)
@@ -271,7 +276,24 @@ def native_libraries(bundle: Path, dists: dict[str, Dist]) -> list[dict]:
     return out
 
 
+def licence_entries(dists: dict[str, Dist]) -> list[dict]:
+    """Each bundled package for licence_texts.collect: its declared licence, its wheel's licence
+    files (path inside the dist-info, text) and the licence its wheel's SBOM states, if any."""
+    out = []
+    for d in sorted(dists.values(), key=lambda d: canonical(d.dist.metadata["Name"])):
+        files = [(str(f.relative_to(d.info_dir)), f.read_text(encoding="utf-8", errors="replace")) for f in d.licence_files()]
+        out.append({"name": d.dist.metadata["Name"], "version": d.dist.version, "licence": d.licence, "files": files,
+                    "sbom_licence": licence_texts.sbom_licence(d.info_dir, d.name)})
+    return out
+
+
 def write_licence_folder(bundle: Path, dists: dict[str, Dist], libs: list[dict]) -> Path:
+    """Writes licenses/ (see the module's docstring), and in it THIRD-PARTY-LICENCES.txt: every text
+    in one file, each once (Task 37j). Stops the build (SystemExit) when a package has neither a text
+    nor a licence with a standard text."""
+    entries = licence_entries(dists)
+    result = licence_texts.collect(entries, licence_texts.load_standard())
+    licence_texts.fail_on(result.problems)
     folder = bundle / "licenses"
     shutil.rmtree(folder, ignore_errors=True)
     (folder / "gnu").mkdir(parents=True)
@@ -282,10 +304,31 @@ def write_licence_folder(bundle: Path, dists: dict[str, Dist], libs: list[dict])
             dest = folder / "packages" / d.dist.metadata["Name"] / f.relative_to(d.info_dir)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(f, dest)
+    for n in result.no_text:  # a package without a text of its own: the standard text(s) used, beside the others
+        for x in n["ids"]:
+            dest = folder / "packages" / n["name"] / f"STANDARD-TEXT-{x}.txt"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(licence_texts.STANDARD_DIR / f"{x}.txt", dest)
     py_licence = Path(sysconfig.get_paths()["stdlib"]) / "LICENSE.txt"
     if py_licence.is_file():
         (folder / "python").mkdir()
         shutil.copyfile(py_licence, folder / "python" / "LICENSE.txt")
+    table = [
+        "library | carried by | licence as stated | copyleft | stated by",
+        "--- | --- | --- | --- | ---",
+        *[f"{x['library']} | {x['carriedBy']} | {x['licence']} | {x['copyleft']} | {x['statedBy']}" for x in libs],
+    ]
+    appendix = [(f"The licence of the Python the worker runs on ({platform.python_version()})", py_licence.read_text(encoding="utf-8"))] if py_licence.is_file() else []
+    appendix += [(f"GNU {t.removesuffix('.txt')} (referred to by the native libraries' statements)", (HERE / "licenses" / t).read_text(encoding="utf-8")) for t in GNU_TEXTS]
+    (folder / "THIRD-PARTY-LICENCES.txt").write_text(licence_texts.render(
+        "The media helper's Python packages: licence texts",
+        "The Python packages inside the packaged media worker, and the licence and notice files each package's wheel ships "
+        "(they also cover the native libraries a wheel vendors, where the wheel says so). Then the licence of Python "
+        "itself and the GNU licence texts the native libraries' statements refer to.",
+        entries, result,
+        preamble=["Native libraries in the bundle, with their licence as the bundle itself states it (facts only, not a legal assessment):",
+                  "\n".join(table)],
+        appendix=appendix), encoding="utf-8")
     lines = [
         "Native libraries in this folder's bundle, with their licence as the bundle itself states it.",
         "Written by services/media-worker/packaging/manifest.py; facts only, not a legal assessment.",

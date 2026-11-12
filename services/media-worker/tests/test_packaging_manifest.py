@@ -160,3 +160,48 @@ def test_the_worker_does_not_depend_on_gallery_dl():
     names = [manifest.canonical(d.split("=")[0].split("<")[0].split(">")[0].strip()) for d in deps]
     assert "gallery-dl" not in names
     assert "requests" in names  # what the downloaded gallery-dl needs from the worker's Python
+
+
+# ---------- the licence texts (Task 37j) ----------
+
+
+class FakeDist(FakeCarrier):
+    def __init__(self, info_dir: Path, name: str, licence: str):
+        super().__init__(info_dir, name=name, licence=licence)
+        self.dist = type("D", (), {"metadata": {"Name": name}, "version": "1.0"})()
+
+
+def test_licence_entries_read_each_wheels_files_and_its_sbom(tmp_path):
+    with_text = tmp_path / "rich-1.0.dist-info"
+    (with_text / "licenses").mkdir(parents=True)
+    (with_text / "licenses" / "LICENSE").write_text("Copyright (c) 2020 Will\n\nterms\n")
+    tok = tmp_path / "tokenizers-1.0.dist-info"
+    (tok / "sboms").mkdir(parents=True)
+    (tok / "sboms" / "x.cyclonedx.json").write_text('{"components": [{"name": "tokenizers", "licenses": [{"expression": "Apache-2.0"}]}]}')
+    tok_dist = FakeDist(tok, "tokenizers", "Apache Software License")
+    tok_dist.licence_files = lambda: []  # its sbom is not a licence file
+    rich, tokenizers = manifest.licence_entries({"rich": FakeDist(with_text, "rich", "MIT"), "tokenizers": tok_dist})
+    assert rich["files"] == [("licenses/LICENSE", "Copyright (c) 2020 Will\n\nterms\n")]
+    assert tokenizers["files"] == [] and tokenizers["sbom_licence"] == "Apache-2.0"
+
+
+def test_the_licence_folder_fails_the_build_for_a_package_with_neither_text_nor_known_licence(tmp_path):
+    info = tmp_path / "odd-1.0.dist-info"
+    info.mkdir()
+    bundle = make_bundle(tmp_path / "bundle")
+    with pytest.raises(SystemExit):
+        manifest.write_licence_folder(bundle, {"odd": FakeDist(info, "odd", "Apache Software License")}, [])
+
+
+def test_the_licence_folder_has_one_file_with_every_text(tmp_path):
+    info = tmp_path / "ctranslate2-1.0.dist-info"
+    info.mkdir()
+    rich = tmp_path / "rich-1.0.dist-info"
+    (rich / "licenses").mkdir(parents=True)
+    (rich / "licenses" / "LICENSE").write_text("Copyright (c) 2020 Will\n\nrich terms\n")
+    bundle = make_bundle(tmp_path / "bundle")
+    folder = manifest.write_licence_folder(bundle, {"ctranslate2": FakeDist(info, "ctranslate2", "MIT"), "rich": FakeDist(rich, "rich", "MIT")}, [])
+    text = (folder / "THIRD-PARTY-LICENCES.txt").read_text()
+    assert "ctranslate2 1.0: MIT - the standard text of MIT" in text
+    assert "rich terms" in text and "Copyright (c) 2020 Will" in text
+    assert "GNU LESSER GENERAL PUBLIC LICENSE" in text  # the GNU texts the native libraries' statements refer to
