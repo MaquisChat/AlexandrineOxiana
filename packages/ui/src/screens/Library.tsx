@@ -51,8 +51,11 @@ export interface LibraryProps {
   projectFromAddress?: string | undefined;
   /** The selected project changed (the route keeps it in the address). */
   onProjectSelected?: (id: string) => void;
-  /** The first-use tools question and its quiet line (Task 48c), shown under the banners. */
-  firstUse?: ReactNode;
+  /**
+   * The first-use tools question's banner (Task 48c, R164), shown under the status banners; `hidden`
+   * while a locked project's unlock screen is shown (it stays mounted, so it is not asked anew).
+   */
+  firstUse?: (hidden: boolean) => ReactNode;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -511,7 +514,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           ))}
         </div>
       )}
-      {firstUse}
+      {firstUse?.(locked)}
       <aside className="ao-library__side">
         {projects === undefined ? (
           <p aria-live="polite">Loading projects…</p>

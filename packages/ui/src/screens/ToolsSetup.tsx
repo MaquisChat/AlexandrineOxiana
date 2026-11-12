@@ -23,6 +23,7 @@ import type { ToolAction, ToolId, ToolInfo, ToolJob } from "@ao/shared";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechSize, toolsApi, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
+import { recordToolsScreenSeen, type FirstUseMemory } from "../components/FirstUseTools";
 import { UserText } from "../components/UserText";
 import type { AppLocation } from "../navigation";
 import "./GovernanceScreens.css";
@@ -74,8 +75,10 @@ function installedNow(t: ToolInfo): string {
 }
 
 /** The route's wrapper: one api object per client; `?tool=<id>` brings that tool into view. */
-export function ToolsSetupRoute({ client, loc }: { client: ApiClient; loc: AppLocation }) {
+export function ToolsSetupRoute({ client, loc, memory }: { client: ApiClient; loc: AppLocation; memory?: FirstUseMemory }) {
   const api = useMemo(() => toolsApi(client), [client]);
+  // Reaching this screen, by whatever route, answers the first-use question (R163, R164).
+  useEffect(() => recordToolsScreenSeen(memory), [memory]);
   const focusTool = new URLSearchParams(loc.search).get("tool") ?? undefined;
   return <ToolsSetup api={api} {...(focusTool ? { focusTool } : {})} />;
 }
