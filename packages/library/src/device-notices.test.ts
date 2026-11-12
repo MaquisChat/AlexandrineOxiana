@@ -19,6 +19,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  await deviceNoticesIdle();
   await rm(dir, { recursive: true, force: true });
 });
 const cfg = (n: string) => join(dir, n);

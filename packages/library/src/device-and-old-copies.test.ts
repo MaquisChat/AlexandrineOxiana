@@ -32,6 +32,7 @@ vi.mock("node:fs/promises", async (orig) => {
 });
 
 import { DeviceIdUnreadableError, deviceDeps } from "./app-settings.js";
+import { deviceNoticesIdle } from "./device-notices.js";
 import { OldCopiesUnreadableError, addPendingOldCopy, listPendingOldCopies, markPendingComplete, removePendingOldCopy } from "./old-copies.js";
 
 let dir: string;
@@ -41,6 +42,8 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   io.failRead = undefined;
+  // A notice raised by a set-aside is written before the folder goes (no race with the removal).
+  await deviceNoticesIdle();
   await rm(dir, { recursive: true, force: true });
 });
 
