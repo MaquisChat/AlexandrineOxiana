@@ -7,6 +7,18 @@ import { ocrQueueFor, proxyQueueFor } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optStr, queryOf, str, type Ctx } from "./util.js";
 
+/**
+ * The optional tool a failed viewing copy or OCR job is waiting for (Task 48a, R126): a video proxy
+ * needs ffmpeg, OCR needs `ocr`. Such media stays "proxy pending" (R83, R90 c) and is retried when
+ * the tool is installed.
+ */
+export function failureTool(type: string, code: string): string | undefined {
+  if (code !== "TOOL_NOT_INSTALLED") return undefined;
+  if (type === "video.proxy") return "ffmpeg";
+  if (type === "ocr") return "ocr";
+  return undefined;
+}
+
 export function registerJobs(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
@@ -19,8 +31,14 @@ export function registerJobs(app: FastifyInstance, ctx: Ctx): void {
     const ocrFailures = [];
     for (const id of ids) {
       if (!s.repo.isUnlocked(id)) continue;
-      proxyFailures.push(...(await proxyQueueFor(s.repo).failures(id)));
-      ocrFailures.push(...(await ocrQueueFor(s.repo).failures(id)));
+      for (const f of await proxyQueueFor(s.repo).failures(id)) {
+        const tool = failureTool(f.type, f.code);
+        proxyFailures.push(tool ? { ...f, tool } : f);
+      }
+      for (const f of await ocrQueueFor(s.repo).failures(id)) {
+        const tool = failureTool("ocr", f.code);
+        ocrFailures.push(tool ? { ...f, tool } : f);
+      }
     }
     return {
       workerReady: !!s.workerClient,

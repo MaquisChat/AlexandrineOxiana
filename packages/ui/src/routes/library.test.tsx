@@ -1,12 +1,14 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LIBRARIES, libraryHandlers, server, serviceError, testClient, url, useMockService } from "../test/service";
 import { navigate } from "../navigation";
 import { LibraryRoutes, isLibraryPath } from "./library";
 
 useMockService();
+// The open library asks for the tools catalogue (the first-use question, Task 48c); outside the desktop app it is refused.
+beforeEach(() => server.use(http.get(url("/tools"), () => serviceError(403, "FORBIDDEN", "The tools are managed from the desktop app."))));
 afterEach(() => window.history.replaceState(null, "", "/"));
 
 describe("library routes", () => {

@@ -372,6 +372,33 @@ researcher to use the Apple Silicon download.
 - Our own ffmpeg and tesseract are signed and notarised as zips in the tools workflow.
 - Expect more than one attempt, as the plan already says.
 
+### Established in Task 37f (2026-11-12; on Linux, before any Mac run)
+
+- **The page's plain-http calls to 127.0.0.1 need an App Transport Security setting.** Apple's
+  documentation of `NSAllowsLocalNetworking`: "In iOS 17, iPadOS 17, and macOS 14, ATS no longer
+  allows connections to IP addresses by default"; the key enables "access to unqualified domains,
+  .local domains, and IP addresses" [S40]. The app sets only that key (`src-tauri/Info.plist`,
+  merged by tauri-cli on macOS); not `NSAllowsArbitraryLoads`. Not verified: whether WKWebView also
+  treats a `fetch` from the `tauri://localhost` page to `http://127.0.0.1` as mixed content. WebKit
+  landed "Allow WKWebView embedders to load mixed content from localhost" in April 2024 [S41], but a
+  request to stop treating loopback addresses as mixed content in general is still open [S42]. The
+  first Mac run's launch check (scenario A, the in-page probe) answers it; if it is blocked, the fix
+  must not loosen the content-security policy or the capabilities (stop and rule).
+- **The minimum-macOS check** reads `LC_BUILD_VERSION` (or `LC_VERSION_MIN_MACOSX`) from every Mach-O
+  file in the app directly (`apps/desktop/scripts/build-macos.mjs`, tested on Linux), instead of
+  `vtool`/`otool`. Node.js v22.23.4's `darwin-arm64` binary states 11.0.
+- **Tauri's bundler** is tauri-cli 2.12.4 (published with tauri 2.12.5; it uses tauri-bundler 2.10.4
+  and tauri-macos-sign 2.4.3, whose sources were read for this task). The disk image is made with
+  `hdiutil create` directly, not with the bundler's `bundle_dmg.sh` (which drives Finder through
+  AppleScript; it skips that step when `CI` is set).
+- **Minutes.** Estimated, not measured: a cold run about 55–75 minutes on Apple Silicon and 65–90 on
+  Intel; warm about 30–45 each; billed at 10× [S33].
+- **tesseract** (R133) is still to be built in our CI: a separate, rarely run workflow per
+  architecture building leptonica (and libpng, libjpeg-turbo, libtiff, zlib, libwebp/openjpeg as
+  chosen) and tesseract 5.5.x from pinned, checksummed source archives with
+  `MACOSX_DEPLOYMENT_TARGET=15.0`, relocatable (`@loader_path` install names), signed, and published
+  with its source archives and licence texts; then a catalogue entry in the tools dialogue.
+
 ## Sources (all checked 2026-11-11 unless stated)
 
 - [S1] https://ffmpeg.martin-riedl.de/ and its `/download/macos/{arm64,amd64}/…_9.0.2/` files
@@ -428,3 +455,6 @@ researcher to use the Apple Silicon download.
 - better-sqlite3 prebuilds:
   `https://github.com/WiseLibs/better-sqlite3/releases/download/v12.11.1/better-sqlite3-v12.11.1-node-v{127,137}-darwin-{arm64,x64}.tar.gz`
   (HTTP 200)
+- [S40] https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsallowslocalnetworking (read 2026-11-12)
+- [S41] https://bugs.webkit.org/show_bug.cgi?id=272461 (RESOLVED FIXED, 2024-04-18; read 2026-11-12)
+- [S42] https://bugs.webkit.org/show_bug.cgi?id=171934 (status NEW; read 2026-11-12, via the page of S41)

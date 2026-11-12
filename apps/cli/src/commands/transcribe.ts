@@ -1,3 +1,4 @@
+import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/library";
 import type { Command } from "commander";
 import { NoMediaError, PolicyDeniedError, WorkerJobError, WorkerUnavailableError, createLinkCapture } from "@ao/library";
 import { EXIT, ExitError } from "../errors.js";
@@ -11,7 +12,7 @@ export function registerTranscribe(program: Command): void {
     .description("Make a transcript of a video or audio source already in a project")
     .argument("<source>", "the source's id, its short code (the four characters in [brackets] in its folder name) or its folder name")
     .requiredOption("--project <name>", "the project")
-    .option("--model <name>", "transcription model: large-v3, medium or small")
+    .option("--model <name>", `transcription model: ${SPEECH_MODELS.join(", ")} (default ${DEFAULT_SPEECH_MODEL})`)
     .option("--language <code>", "spoken language: auto (default) or a code such as en")
     .action(async (ref: string, _o: unknown, cmd: Command) => {
       await withProject(cmd, true, async (s, project, out, o) => {

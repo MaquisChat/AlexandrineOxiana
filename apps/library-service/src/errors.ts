@@ -18,6 +18,7 @@ import {
   FieldworkInUseError,
   GovernanceConflictError,
   InvalidInputError,
+  KeyFileChangedError,
   KeyNotAvailableError,
   LinkedContentChangedError,
   LockNotWritableError,
@@ -50,7 +51,9 @@ import {
   ProjectLockedError,
   ReadOnlyLibraryError,
   RecoveryPendingError,
+  ResourceMissingError,
   WorkerJobError,
+  WorkerToolError,
   WorkerUnavailableError,
   WrongLibraryError,
   WrongPassphraseError,
@@ -74,6 +77,8 @@ export type ErrorCode =
   | "WORKER_UNAVAILABLE"
   | "UNAVAILABLE"
   | "MOVE_IN_PROGRESS"
+  | "TOOL_NOT_INSTALLED"
+  | "TOOL_FAILED"
   | "INTERNAL";
 
 export class ApiError extends Error {
@@ -118,9 +123,12 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof GovernanceLooseningError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof GovernanceConflictError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof InvalidInputError) return new ApiError(400, "VALIDATION", err.message);
+  if (err instanceof KeyFileChangedError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
+  // A file of the app itself is missing (a damaged installation); its message names what, never where.
+  if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");
   if (err instanceof ParticipantCodeMissingError) return new ApiError(409, "CONFLICT", "A participant in these sources has no participant code yet, so they cannot be cited.");
   if (err instanceof ExportDestinationError) return new ApiError(400, "VALIDATION", err.message);
@@ -155,6 +163,10 @@ export function toApiError(err: unknown): ApiError {
   }
   if (err instanceof InvalidConfirmTokenError) return new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires).");
   if (err instanceof WorkerUnavailableError) return new ApiError(503, "WORKER_UNAVAILABLE", "The media helper is not running.", err.message);
+  // An optional tool (Task 48a, R126): a missing one is named (reason = its tool id) so the interface
+  // can offer the Optional tools screen; a failed install or update keeps the worker's code (reason).
+  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return new ApiError(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer. The Optional tools screen shows how to get it.", err.tool);
+  if (err instanceof WorkerJobError && err.code.startsWith("TOOL_")) return new ApiError(502, "TOOL_FAILED", "The tool could not be installed or updated. Nothing was left half-installed; try again later.", err.code);
   if (err instanceof WorkerJobError) return new ApiError(502, "INTERNAL", "The media helper could not finish the job.", err.code);
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   if (code === "ENOENT" || code === "ENOTDIR") return new ApiError(404, "NOT_FOUND", "That file or folder could not be found.");

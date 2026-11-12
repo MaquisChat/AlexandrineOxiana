@@ -3,11 +3,14 @@
  * found" for a library that is not where it was. App.tsx's route table (R118) shows this on "/" and
  * "/library"; links use the shared navigate() (navigation.tsx). The selected project is kept in the
  * address (`?project=<id>`, replacing the history entry), so every way back into the library (Back to
- * library, the browser's Back, a link) returns to that project (41b2 I1).
+ * library, the browser's Back, a link) returns to that project (41b2 I1). The first-use tools
+ * question is placed on the open library's screen only, never over the chooser (Task 48c, D9).
  */
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../api/client";
 import { libraryApi, type CurrentLibrary, type LibraryEntry } from "../api/library";
+import { toolsApi } from "../api/tools";
+import { FirstUseTools } from "../components/FirstUseTools";
 import { navigate, normalisePath, PATHS, projectInQuery, type AppLocation } from "../navigation";
 import { Library } from "../screens/Library";
 import { LibraryChooser } from "../screens/LibraryChooser";
@@ -33,6 +36,7 @@ const withProject = (loc: AppLocation, projectId?: string) => {
 
 function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   const api = useMemo(() => libraryApi(client), [client]);
+  const tools = useMemo(() => toolsApi(client), [client]);
   const [view, setView] = useState<View>({ kind: "loading" });
   const [known, setKnown] = useState<LibraryEntry[]>([]);
 
@@ -85,6 +89,7 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
           current={view.current}
           {...(view.path ? { libraryPath: view.path } : {})}
           navigate={navigate}
+          firstUse={(hidden) => <FirstUseTools api={tools} hidden={hidden} />}
           projectFromAddress={projectInQuery(loc.search)}
           onProjectSelected={(id) => {
             // Only while the library is the screen shown: never rewrite another screen's address.

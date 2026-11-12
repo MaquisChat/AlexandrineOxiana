@@ -109,6 +109,17 @@ export class TornFileError extends Error {
   }
 }
 
+/**
+ * The project's key file changed between reading it and writing (another new recovery code was issued
+ * at the same time): nothing was written by this request (services answer 409 CONFLICT).
+ */
+export class KeyFileChangedError extends Error {
+  override name = "KeyFileChangedError";
+  constructor() {
+    super("Another new recovery code was issued for this project at the same time, so this request changed nothing. Use the code that was shown, or ask for a new one again");
+  }
+}
+
 /** A project, source, collection, tag, participant or session id does not exist. */
 export class NotFoundError extends Error {
   override name = "NotFoundError";

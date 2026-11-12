@@ -32,7 +32,7 @@
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "../../resources.js";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import {
@@ -74,6 +74,8 @@ import {
   projectPolicyOrDefault,
   repoLibrary,
   type Repo,
+  projectDateZone,
+  repoClock,
 } from "../../repo/repo.js";
 import { activeTemp } from "../../tmp-registry.js";
 import { acceptedType } from "../attach.js";
@@ -113,7 +115,7 @@ import { PATTERN_BUDGET_MS, PatternWatchdog } from "./patterns.js";
 import { adapterFor, type ImportSourceAdapter, type ScanItem } from "./scan.js";
 import { capAnnotations, planAnnotations, planUpdate, toAnnotation, uniqueKey, type AnnotationPlan } from "./update.js";
 
-const VERSION: string = (createRequire(import.meta.url)("../../../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 const TOOL = { name: "bulk-import", version: VERSION };
 
 /** File notes the engine adds when it leaves out one of an item's files (R68 I2; never a path). */
@@ -1791,7 +1793,8 @@ async function dryRunPolicy(repo: Repo, projectId: string, kind: ImportBatch["so
   if (!policy) throw new BatchRefusedError("This project's governance settings could not be read, so nothing may be imported.", true);
   const method = CAPTURE_METHOD[kind];
   const { identifiable, legalBasis } = await storeInputs(repo, projectId, legalCategory(method));
-  const base = { projectId, actor: "dry-run", now: new Date().toISOString().replace(/\.\d{3}Z$/u, "Z") };
+  // The zone and clock the real run's governed writes use (R160 as amended: they always agree).
+  const base = { projectId, actor: "dry-run", now: repoClock(repo)().toISOString().replace(/\.\d{3}Z$/u, "Z"), tz: projectDateZone(repo, projectId, "protocol") };
   for (const req of [
     { ...base, action: "capture" as const, capture: { method } },
     { ...base, action: "store" as const, store: { identifiable, hasLocation: false, ...(legalBasis ? { legalBasis } : {}) } },

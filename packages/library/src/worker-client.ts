@@ -1,7 +1,8 @@
 /**
  * Client for the Python media worker (`services/media-worker`, spec 2.1 / 5.2 / 5.3).
  *
- * `startWorker` spawns the worker with a random token and waits for `AO_WORKER_READY port=<n>`.
+ * `startWorker` spawns the worker, writes a random token as one line on its standard input (which stays
+ * open: the worker stops when it closes, R155), and waits for `AO_WORKER_READY port=<n>`.
  * `WorkerClient.submit` runs one job for a project:
  *
  *   1. policy: `process` with `{ op, provider: 'local' }` (transcription, image_proxy, video_proxy,
@@ -25,7 +26,6 @@ import { existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import type { EntityType, PolicyDecision, ProcessingOp } from "@ao/core";
 import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
@@ -33,6 +33,7 @@ import type { IndexDb } from "./index/db.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
 import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
+import { mediaWorkerSourceDir } from "./resources.js";
 
 export type WorkerJobType = "audio.transcribe" | "capture.download" | "image.proxy" | "video.proxy" | "pdf.ocr";
 
@@ -95,6 +96,28 @@ export class WorkerUnavailableError extends Error {
   override name = "WorkerUnavailableError";
 }
 
+/**
+ * A worker failure about one of the optional tools (Task 48a, R126), naming it by its catalogue id
+ * (`ffmpeg`, `ocr`, `speech-small`, `video-downloader` ...): TOOL_NOT_INSTALLED on an ordinary job
+ * whose tool is missing, or a failed install, update or removal. Still a WorkerJobError.
+ */
+export class WorkerToolError extends WorkerJobError {
+  override name = "WorkerToolError";
+  constructor(
+    code: string,
+    message: string,
+    readonly tool: string,
+    detail?: string,
+  ) {
+    super(code, message, detail);
+  }
+}
+
+/** The error for a worker `{ code, message, detail?, tool? }`. */
+function workerError(e: { code: string; message: string; detail?: string | undefined; tool?: string | undefined }): WorkerJobError {
+  return typeof e.tool === "string" && e.tool ? new WorkerToolError(e.code, e.message, e.tool, e.detail) : new WorkerJobError(e.code, e.message, e.detail);
+}
+
 export interface WorkerEndpoint {
   baseUrl: string;
   token: string;
@@ -123,7 +146,7 @@ interface WorkerJobState {
   status: "queued" | "running" | "done" | "failed" | "cancelled";
   progress?: number;
   result?: { output: string; meta?: Record<string, unknown> };
-  error?: { code: string; message: string; detail?: string };
+  error?: { code: string; message: string; detail?: string; tool?: string };
 }
 
 const TERMINAL = new Set(["done", "failed", "cancelled"]);
@@ -240,8 +263,7 @@ export class WorkerClient {
 
       if (state.status === "cancelled") throw new WorkerJobError("CANCELLED", "the job was cancelled");
       if (state.status === "failed") {
-        const e = state.error ?? { code: "FAILED", message: "the job failed" };
-        throw new WorkerJobError(e.code, e.message, e.detail);
+        throw workerError(state.error ?? { code: "FAILED", message: "the job failed" });
       }
       const files = await publish(outDir, finalBase, dataKey);
       const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
@@ -412,6 +434,111 @@ function rewritePaths(value: unknown, from: string, to: string): unknown {
   return value;
 }
 
+// ---------- the optional tools (Task 48a, R126) ----------
+
+export type ToolAction = "install" | "update" | "remove";
+
+const TOOL_ID = /^[a-z0-9-]{1,64}$/;
+
+async function workerRequest<T>(worker: WorkerEndpoint, method: "GET" | "POST", path: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(worker.baseUrl + path, {
+      method,
+      headers: { Authorization: `Bearer ${worker.token}`, ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
+      ...(method === "POST" ? { body: "{}" } : {}),
+    });
+  } catch (err) {
+    throw new WorkerUnavailableError(`the media worker is not reachable (${err instanceof Error ? err.message : String(err)})`);
+  }
+  const text = await res.text();
+  let json: unknown;
+  try {
+    json = text ? JSON.parse(text) : undefined;
+  } catch {
+    json = undefined;
+  }
+  if (res.status === 401) throw new WorkerUnavailableError("the media worker rejected the token (was it restarted?)");
+  if (!res.ok) {
+    const e = (json as { error?: { code?: string; message?: string; detail?: string; tool?: string } } | undefined)?.error;
+    throw workerError({ code: e?.code ?? `HTTP_${res.status}`, message: e?.message ?? `the media worker answered ${res.status}`, detail: e?.detail, tool: e?.tool });
+  }
+  return json as T;
+}
+
+/**
+ * The worker's optional tools, not bound to any library: the catalogue (`GET /tools`), and
+ * installing, updating and removing a tool as a worker job (`POST /tools/<id>/<action>`, then
+ * `GET /jobs/<id>` until it ends) with progress and cancel. Downloads go to the tools and models
+ * folders the worker was started with, never into a library.
+ */
+export class WorkerToolsClient {
+  private readonly pollMs: number;
+  private readonly cancelGraceMs: number;
+
+  /**
+   * `cancelGraceMs`: how long the worker may take to confirm a cancel (default 2 min) before the job
+   * is given up on as CANCEL_UNCONFIRMED (not CANCELLED: only the worker says it stopped).
+   */
+  constructor(
+    private readonly worker: WorkerEndpoint,
+    opts: { pollMs?: number; cancelGraceMs?: number } = {},
+  ) {
+    this.pollMs = opts.pollMs ?? 500;
+    this.cancelGraceMs = opts.cancelGraceMs ?? 120_000;
+  }
+
+  /** `GET /tools`: every optional tool with its purpose, size, version and whether it is installed. */
+  catalogue<T = unknown>(): Promise<T> {
+    return workerRequest<T>(this.worker, "GET", "/tools");
+  }
+
+  /** `POST /tools/update` (ADR 0009: yt-dlp updates itself in place). Failures keep the worker's code. */
+  updateCaptureTools<T = unknown>(): Promise<T> {
+    return workerRequest<T>(this.worker, "POST", "/tools/update");
+  }
+
+  /** Runs one install, update or removal to its end; the result is the worker job's result. */
+  async run(action: ToolAction, toolId: string, opts: { onProgress?: (progress: number) => void; signal?: AbortSignal } = {}): Promise<Record<string, unknown>> {
+    if (!TOOL_ID.test(toolId)) throw new WorkerJobError("UNKNOWN_TOOL", "there is no such tool");
+    if (opts.signal?.aborted) throw new WorkerJobError("CANCELLED", "the job was cancelled");
+    const { id } = await workerRequest<{ id: string }>(this.worker, "POST", `/tools/${toolId}/${action}`);
+    const jobPath = `/jobs/${encodeURIComponent(id)}`;
+    let cancelSent = 0;
+    let last = -1;
+    let failures = 0;
+    for (;;) {
+      if (opts.signal?.aborted && !cancelSent) {
+        cancelSent = Date.now();
+        await workerRequest(this.worker, "POST", `${jobPath}/cancel`).catch(() => {});
+      }
+      // A job the worker does not end after a cancel is not waited for for ever.
+      if (cancelSent && Date.now() - cancelSent > this.cancelGraceMs) throw new WorkerJobError("CANCEL_UNCONFIRMED", "the media worker did not confirm that the job stopped");
+      await new Promise((r) => setTimeout(r, this.pollMs));
+      let state: WorkerJobState;
+      try {
+        state = await workerRequest<WorkerJobState>(this.worker, "GET", jobPath);
+        failures = 0;
+      } catch (err) {
+        if (!(err instanceof WorkerUnavailableError) || ++failures > POLL_RETRIES) throw err;
+        await new Promise((r) => setTimeout(r, this.pollMs * 2 ** failures));
+        continue;
+      }
+      if (typeof state.progress === "number" && state.progress !== last && state.status === "running") {
+        last = state.progress;
+        try {
+          opts.onProgress?.(state.progress);
+        } catch {
+          // a progress callback must not break the job
+        }
+      }
+      if (state.status === "done") return (state.result ?? {}) as unknown as Record<string, unknown>;
+      if (state.status === "cancelled") throw new WorkerJobError("CANCELLED", "the job was cancelled");
+      if (state.status === "failed") throw workerError(state.error ?? { code: "FAILED", message: "the job failed" });
+    }
+  }
+}
+
 // ---------- starting the worker ----------
 
 export interface StartWorkerOptions {
@@ -433,7 +560,12 @@ export interface WorkerHandle extends WorkerEndpoint {
   stop(): Promise<void>;
 }
 
-const WORKER_DIR = fileURLToPath(new URL("../../../services/media-worker/", import.meta.url));
+/** The media worker's source folder (its dev venv); none in a built folder, where AO_WORKER_BIN is required. */
+const workerDir = (): string => {
+  const dir = mediaWorkerSourceDir();
+  if (!dir) throw new Error("The media worker is not configured: set AO_WORKER_BIN to the packaged worker.");
+  return dir;
+};
 const READY_RE = /^AO_WORKER_READY port=(\d+)\s*$/;
 
 // The worker (and the tools it runs) get only what they need from the app's environment.
@@ -447,7 +579,9 @@ const WORKER_ENV_NAMES = new Set([
 ]);
 const WORKER_ENV_PREFIXES = ["LC_", "XDG_", "AO_"];
 // Secrets of the app that the worker (and the tools it runs) must never see.
-const WORKER_ENV_DENY = new Set(["AO_WORKER_TOKEN", "AO_PASSPHRASE"]);
+// AO_SERVICE_TOKEN: the library service refuses to start with it set (it takes its token on standard
+// input, R98), so it cannot be here; denied anyway, in case another host process ever sets it.
+const WORKER_ENV_DENY = new Set(["AO_WORKER_TOKEN", "AO_PASSPHRASE", "AO_SERVICE_TOKEN"]);
 
 /** The allowlisted subset of `env` passed to the worker (names compared case-insensitively). */
 export function workerEnv(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -461,7 +595,7 @@ export function workerEnv(env: NodeJS.ProcessEnv): Record<string, string> {
 }
 
 export function devWorkerPython(): string {
-  return join(WORKER_DIR, ".venv", process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
+  return join(workerDir(), ".venv", process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
 }
 
 export async function startWorker(opts: StartWorkerOptions = {}): Promise<WorkerHandle> {
@@ -474,23 +608,26 @@ export async function startWorker(opts: StartWorkerOptions = {}): Promise<Worker
       const py = opts.python ?? devWorkerPython();
       if (!existsSync(py)) throw new Error(`media worker venv not found (${py}); run \`pnpm setup:py\``);
       argv = [py, "-m", "ao_worker"];
-      cwd = WORKER_DIR;
+      cwd = workerDir();
     }
   }
   const token = randomBytes(32).toString("hex");
   const child = spawn(argv[0]!, argv.slice(1), {
     cwd,
+    // The token travels on standard input only, as one line (R98, R155); the worker refuses one in
+    // its environment or arguments. Standard input then stays open for the worker's whole life: the
+    // worker stops when it closes, so this process exiting, crashing or being killed leaves no worker.
     env: {
       ...workerEnv(process.env),
       ...opts.env,
-      AO_WORKER_TOKEN: token,
       AO_WORKER_PORT: "0",
-      AO_WORKER_EXIT_ON_STDIN_EOF: "1",
       PYTHONUNBUFFERED: "1",
     },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
+  child.stdin!.on("error", () => {}); // the worker gone early: its exit is reported below
+  child.stdin!.write(`${token}\n`);
   const exited = new Promise<void>((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) resolve();
     else child.once("exit", () => resolve());

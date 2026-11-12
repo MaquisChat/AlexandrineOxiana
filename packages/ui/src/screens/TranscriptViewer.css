@@ -1,0 +1,116 @@
+/* Task 34c: the transcript viewer. Tokens only (R105, R113). */
+.ao-tx {
+  max-width: 64rem;
+}
+
+.ao-tx__media {
+  display: block;
+  width: 100%;
+  max-height: 50vh;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.ao-tx__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+
+.ao-tx__toolbar select {
+  max-width: 100%;
+}
+
+.ao-tx__note {
+  border-left: 4px solid var(--line-strong);
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface);
+}
+
+.ao-tx__segments {
+  position: relative;
+  list-style: none;
+  padding: 0;
+  margin: var(--space-3) 0;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.ao-tx__seg {
+  border: 1px solid var(--line-soft);
+  border-left: 4px solid transparent;
+  border-radius: 4px;
+  padding: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+
+.ao-tx__seg--flagged {
+  border-left-color: var(--warn-line);
+  background: var(--warn-soft);
+}
+
+.ao-tx__seg--current {
+  border-color: var(--accent);
+  border-left-color: var(--accent);
+  border-left-width: 6px;
+}
+
+.ao-tx__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ao-tx__time {
+  font-variant-numeric: tabular-nums;
+}
+
+.ao-tx__now,
+.ao-tx__edited {
+  font-size: 0.85rem;
+  font-weight: 600;
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  padding: 0 var(--space-2);
+}
+
+.ao-tx__now {
+  color: var(--accent-ink);
+}
+
+.ao-tx__text,
+.ao-tx__wholetext {
+  margin: var(--space-1) 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ao-tx__editor textarea,
+.ao-tx__whole textarea {
+  display: block;
+  width: 100%;
+  margin: var(--space-1) 0;
+}
+
+.ao-tx__flags {
+  margin: var(--space-1) 0 0;
+  color: var(--warn-ink);
+}
+
+.ao-tx__progress progress {
+  width: 100%;
+}
+
+.ao-tx__again {
+  margin-top: var(--space-4);
+}
+
+.ao-tx__unchecked {
+  margin: var(--space-1) 0 0;
+  font-weight: 600;
+  color: var(--violet-ink);
+}

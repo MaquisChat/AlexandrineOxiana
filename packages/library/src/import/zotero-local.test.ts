@@ -14,6 +14,8 @@ import type { Deps } from "../deps.js";
 import { shutdownExtractors } from "../extract/index.js";
 import { IndexHandle } from "../index/db.js";
 import { createIndexSink } from "../index/sink.js";
+import { rebuildIndex } from "../index/rebuild.js";
+import { search } from "../index/search.js";
 import { createLibrary, type Library } from "../library.js";
 import { HttpClient } from "../lookup/index.js";
 import type { Repo } from "../repo/repo.js";
@@ -1108,6 +1110,108 @@ processing:
     await bulk.undoBatch(p.id, h.batchId);
     expect(byZoteroKey(await sources(p), "AAAA1111").annotations.find((x) => x.externalKey === "zotero:NOTE0001")?.body).toContain("Reading notes");
   });
+
+  // ---- Task 58: the text of imported annotations is searchable (R74) ----
+  const find = (p: Project, text: string) => search(handle.db, { projectId: p.id, text });
+
+  it("Task 58: a search finds a source by its imported annotations' text, comment and notes; a re-import's change and each undo follow", async () => {
+    const p = await project();
+    const bulk = bulkImport();
+    const first = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    await first.done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    const viaAnnotation = [expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })];
+    expect(find(p, "claim").items).toEqual(viaAnnotation); // ANNO0001's comment
+    expect(find(p, "check the numbers").items).toEqual(viaAnnotation); // ANNO0002's comment
+    expect(find(p, "dataset").items).toEqual(viaAnnotation); // the child note
+    expect(find(p, "informal").items.find((i) => i.id === a.source.id)).not.toHaveProperty("matchedIn"); // in the title too
+
+    // Zotero's comment changes; the re-import updates the annotation and the index.
+    zoteroEdit((db) => {
+      db.prepare("UPDATE itemAnnotations SET comment = 'key assertion' WHERE itemID = 9").run();
+      bumpItem(db, 9, "2024-07-02 08:00:00");
+    });
+    const second = await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve());
+    expect((await second.done).counts.updated).toBe(1);
+    expect(find(p, "assertion").items).toEqual(viaAnnotation);
+    expect(find(p, "claim").total).toBe(0);
+
+    // Undo the update: the comment, and the index, are as before.
+    await bulk.undoBatch(p.id, second.batchId);
+    expect(find(p, "claim").items).toEqual(viaAnnotation);
+    expect(find(p, "assertion").total).toBe(0);
+    // Undo the import: nothing of it is found.
+    await bulk.undoBatch(p.id, first.batchId);
+    expect(find(p, "claim").total).toBe(0);
+    expect(find(p, "dataset").total).toBe(0);
+  });
+
+  it("Task 58: an encrypted project's imported annotations are searchable while it is unlocked only", async () => {
+    const p = await project(true);
+    await (await bulkImport().startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    expect(find(p, "numbers").items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    repo.lockProject(p.id);
+    expect(find(p, "numbers").total).toBe(0);
+    expect(handle.db.prepare("SELECT COUNT(*) AS n FROM main.source_text WHERE project_id = ?").get(p.id)).toEqual({ n: 0 });
+    await repo.unlockProject(p.id, "pw");
+    expect(find(p, "numbers").items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+  });
+
+  it("Task 58: a source holding the cap's worth of annotations (10,000, ~16 MB of text) imports, edits, rebuilds and searches in reasonable time; its first 2 MB are searchable", async () => {
+    const filler = (i: number, n: number) => {
+      const words = ["market", "vendor", "street", "policy", "memory", "kitchen", "harvest", "ledger", "rumour", "ration"];
+      let s = "";
+      for (let j = 0; s.length < n; j++) s += `${words[(i + j) % 10]}${(i * 31 + j) % 9973} `;
+      return s.slice(0, n);
+    };
+    zoteroEdit((db) => {
+      const item = db.prepare("INSERT INTO items (itemID, itemTypeID, libraryID, key, version, dateAdded, dateModified, clientDateModified) VALUES (?, 1, 1, ?, 1, '2024-05-03 09:00:00', '2024-05-03 09:00:00', '2024-05-03 09:00:00')");
+      const ann = db.prepare("INSERT INTO itemAnnotations (itemID, parentItemID, type, authorName, text, comment, color, pageLabel, sortIndex, position, isExternal) VALUES (?, 7, 1, '', ?, ?, '#ffd400', '1', '00000|000000|00000', ?, 0)");
+      db.transaction(() => {
+        for (let i = 0; i < 9_998; i++) {
+          item.run(1000 + i, `H${String(i).padStart(7, "0")}`);
+          ann.run(1000 + i, `okapi${i} ${filler(i, 780)}`, `comment${i} ${filler(i + 1, 780)}`, JSON.stringify({ pageIndex: 0, rects: [[1, 2, 3, 4]] }));
+        }
+      })();
+    });
+    const p = await project();
+    const bulk = bulkImport();
+    const times: Record<string, number> = {};
+    let t = performance.now();
+    await (await bulk.startBatch(p.id, zoteroLocalAdapter(dataDir), approve())).done;
+    times.import = performance.now() - t;
+    const a = byZoteroKey(await sources(p), "AAAA1111");
+    expect(a.annotations).toHaveLength(10_000);
+    const chars = a.annotations.reduce((n, x) => n + (x.quote?.length ?? 0) + (x.body?.length ?? 0), 0);
+    expect(chars).toBeGreaterThan(15_000_000);
+    t = performance.now();
+    const hit = find(p, "okapi1000 comment1000");
+    times.search = performance.now() - t;
+    // The first 2 MB are searchable (R161 b), and the source says only part of them is.
+    expect(hit.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation", annotationsPartial: true })]);
+    expect(find(p, "okapi9997").total).toBe(0);
+    t = performance.now();
+    await repo.updateSource(p.id, a.source.id, { title: { variants: [{ lang: "en", kind: "original", value: "Renamed" }] } });
+    times.edit = performance.now() - t;
+    expect(find(p, "okapi1000").total).toBe(1);
+    const row = () =>
+      handle.db
+        .prepare("SELECT c.seq, c.sha256, a.annotations, a.annotation_bigrams FROM main.annotation_chunks c JOIN main.annotation_text a ON a.rowid = c.fts_rowid WHERE c.source_id = ? ORDER BY c.seq")
+        .all(a.source.id);
+    const before = row();
+    t = performance.now();
+    await rebuildIndex(handle, ring, lib);
+    times.rebuild = performance.now() - t;
+    expect(row()).toEqual(before);
+    expect(find(p, "okapi0 comment0").items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(find(p, "renamed").items).toEqual([expect.objectContaining({ id: a.source.id })]);
+    console.log(`Task 58 cap test (ms): ${JSON.stringify(Object.fromEntries(Object.entries(times).map(([k, v]) => [k, Math.round(v)])))}`);
+    // Generous ceilings for a loaded shared machine; the times are reported above.
+    expect(times.edit).toBeLessThan(15_000);
+    expect(times.rebuild).toBeLessThan(30_000);
+    expect(times.search).toBeLessThan(5_000);
+  }, 300_000);
 
   it("R74 M3: undo keeps an annotation the user edited after the update added it, and says so", async () => {
     const p = await project();

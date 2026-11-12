@@ -17,4 +17,4 @@ export { createIndexSink, indexUnlockedProject, recordStamps } from "./sink.js";
 export { rebuildIndex, isIndexStale, openIndexChecked, rebuildIndexIfNeeded } from "./rebuild.js";
 export type { CheckedIndex, IndexRebuildNeed, RebuildIfNeededOptions, RebuildOptions, RebuildResult } from "./rebuild.js";
 export { search } from "./search.js";
-export type { SearchQuery } from "./search.js";
+export type { SearchQuery, SearchResult } from "./search.js";

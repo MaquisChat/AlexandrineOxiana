@@ -99,7 +99,8 @@ describe("New project dialog: the answer is lost (R134 I1)", () => {
     expect(found.textContent).toMatch(/recovery code could not be shown/i);
     expect(found.textContent).toMatch(/cannot be shown again/i);
     expect(found.textContent).toMatch(/opens with the passphrase you just chose/i);
-    expect(found.textContent).toMatch(/planned/i);
+    expect(found.textContent).toMatch(/New recovery code…/);
+    expect(found.textContent).not.toMatch(/planned/i);
     expect(within(found).queryByRole("button", { name: /recovery code/i })).toBeNull();
     expect(within(found).queryByRole("button", { name: "Create project" })).toBeNull();
     expect(svc.posted).toHaveLength(1);
@@ -256,6 +257,7 @@ describe("New project dialog: the recovery code cannot be left unsaved (R134 I2)
         http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, current: CURRENT_RW })),
         http.get(url("/settings/appearance"), () => HttpResponse.json(DEFAULT_APPEARANCE)),
         http.get(url("/settings/researcher"), () => HttpResponse.json({ name: null })),
+        http.get(url("/tools"), () => HttpResponse.json({ error: { code: "FORBIDDEN", message: "The tools are managed from the desktop app." } }, { status: 403 })),
         ...libraryHandlers(),
       );
       return render(<App service={{ baseUrl: BASE, token: TOKEN }} />);

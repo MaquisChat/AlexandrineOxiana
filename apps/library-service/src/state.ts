@@ -32,6 +32,7 @@ import {
   type Repo,
   type ToolsUpdate,
   type WorkerClient,
+  type WorkerToolsClient,
   type CaptureOptions,
   createLinkCapture,
   forgetLastOpenLibrary,
@@ -53,6 +54,8 @@ export interface ServiceWorker {
   clientFor(repo: Repo, index?: IndexHandle): WorkerClient;
   versions(): Promise<Record<string, string | null>>;
   updateTools(): Promise<ToolsUpdate>;
+  /** The optional tools (Task 48a): absent in a worker that cannot install them. */
+  tools?: WorkerToolsClient;
   stop(): Promise<void>;
 }
 
@@ -69,6 +72,7 @@ export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerPro
       clientFor: (repo, index) => new WorkerClient({ repo, worker: mw.handle, pollMs: 200, ...(index ? { index: { db: index.db } } : {}) }),
       versions: () => mw.versions(),
       updateTools: () => mw.updateTools(),
+      tools: mw.tools,
       stop: () => mw.stop(),
     };
   },
