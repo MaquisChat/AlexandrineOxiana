@@ -7,23 +7,31 @@
  *
  * The `capture` decision is evaluated before anything is queued, so a capture the project's rules
  * deny answers 403 POLICY_DENIED with the reason at once (the deny is audited).
+ *
+ * A capture's state can be read again (Task 63, R146; shapes in @ao/shared api/capture.ts):
+ * `GET /projects/:id/captures` lists the project's running and recent queues, and
+ * `GET /projects/:id/captures/:queueId` returns one with its items. The desktop app only (UI token,
+ * shell origin): a paired extension's token does not reach them (R116 keeps its scope to its own
+ * capture routes and the project list). A locked project is refused (423). An address still waiting
+ * or being captured in a running queue of the same project is not queued again: 409 CONFLICT with
+ * reason CAPTURE_RUNNING. Refused rather than joined: the new request's options (browser session,
+ * legal basis, refresh, transcription) could differ from the running queue's, and joining would
+ * silently drop them; the screen shows the running queue, so nothing is lost by saying so.
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { PAIRING_CODE_ID, SPEECH_MODELS, type PairingCodeStatus } from "@ao/shared";
+// The address classifier and the acknowledgement: one definition, shared with the interface (R146).
+import { COOKIES_ACKNOWLEDGEMENT, MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "@ao/core";
 import {
-  COOKIES_ACKNOWLEDGEMENT,
   captureBrowserPage,
   checkCaptureAllowed,
-  classifyUrl,
   createLinkCapture,
-  isCollectionLink,
-  isPostLink,
   type BrowserName,
   type CaptureOptions,
   type ProfileCaptureOptions,
   type ProfileContentType,
 } from "@ao/library";
+import { CAPTURE_RUNNING, CAPTURE_STOPPING, PAIRING_CODE_ID, SPEECH_MODELS, type CaptureStartedBy, type PairedBrowsers, type PairingCodeStatus } from "@ao/shared";
 import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
@@ -68,19 +76,9 @@ export const MAX_QUEUED_LINKS = 500;
 
 /** A list of web addresses (http or https only, at most 2048 characters each). */
 function urlList(b: Obj, key: string, max: number): string[] {
-  const urls = strArray(b, key, { max, itemMax: 2048 });
+  const urls = strArray(b, key, { max, itemMax: MAX_ADDRESS_LENGTH });
   for (const u of urls) if (!isWebAddress(u)) throw badRequest(`"${key}" must be web addresses.`);
   return urls;
-}
-
-function isWebAddress(u: string): boolean {
-  if (!/^https?:\/\//i.test(u)) return false;
-  try {
-    const p = new URL(u);
-    return (p.protocol === "http:" || p.protocol === "https:") && p.hostname.length > 0;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -98,6 +96,18 @@ function postLinksOnly(urls: string[]): void {
 /** Links queues one extension may have at once (R116): one running and one waiting. */
 export const LINK_QUEUES_PER_EXTENSION = 2;
 
+const LINKS_RUNNING =
+  "At least one of these links is already waiting or being captured in this project, in a capture that is still running, so nothing new was queued. Wait until that capture has finished, or leave the link out.";
+/** While an ended capture still finishes: what ended it, in plain words (N6). */
+const stopping = (why: "lock" | "close"): string =>
+  `A capture of this project that was stopped when ${why === "lock" ? "the project was locked" : "the library was closed or moved"} is still finishing its current download, so nothing new was queued. Try again in a moment.`;
+const PROFILE_RUNNING = "This profile, channel or playlist is already being captured in this project, so nothing new was started. Wait until that capture has finished.";
+
+/** A locked project's queues are not shown (423), as its sources are not. */
+function requireUnlocked(s: Session, projectId: string): void {
+  if (!s.repo.isUnlocked(projectId)) throw new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
+}
+
 export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   const { state, pairing } = ctx;
 
@@ -107,15 +117,24 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     projectId: string,
     urls: string[],
     opts: CaptureOptions,
-    extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void } = {},
+    extra: { methods?: Parameters<typeof checkCaptureAllowed>[3]; after?: Promise<unknown>; onQueued?: (queueId: string, done: Promise<void>) => void; startedBy?: CaptureStartedBy } = {},
   ): Promise<{ queueId: string }> {
+    // Nothing about the project's captures is said before the lock and the rules have been checked (I1).
+    requireUnlocked(s, projectId);
     await checkCaptureAllowed(s.repo, projectId, urls, extra.methods); // 403 with the reason when denied
     requireAcknowledged(s, projectId, opts);
     await state.workerClient(); // 503 when the media helper cannot run
+    // Checked and recorded with nothing awaited in between, so parallel requests cannot both pass.
+    requireUnlocked(s, projectId);
+    // An ended capture's download still occupies the worker: its addresses are forgotten, so the
+    // whole project waits until it has returned (I3).
+    const ending = state.captureStopping(projectId);
+    if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
+    if (state.captureQueues.runningConflict(projectId, urls)) throw new ApiError(409, "CONFLICT", LINKS_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
     // The legal basis is checked per link as it is stored, as for every capture.
-    const done = state.startCaptureQueue(queueId, projectId, urls, opts, extra.after ? { after: extra.after } : {});
+    const done = state.startCaptureQueue(queueId, projectId, urls, opts, { ...(extra.after ? { after: extra.after } : {}), startedBy: extra.startedBy ?? "desktop" });
     extra.onQueued?.(queueId, done);
     return { queueId };
   }
@@ -152,7 +171,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
     const b = bodyOf(req);
-    const url = urlList({ u: [str(b, "url", 2048)] }, "u", 1)[0]!;
+    const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
     const o = optObj(b, "options") ?? {};
     const base = captureOptions(o);
     const since = optStr(o, "since", 10);
@@ -172,21 +191,62 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       ...(optBool(o, "metadataOnly") ? { metadataOnly: true } : {}),
       ...(optBool(o, "includeComments") ? { includeComments: true } : {}),
     };
+    requireUnlocked(s, projectId); // nothing about its captures before the lock and the rules (I1)
     await checkCaptureAllowed(s.repo, projectId, [url]);
     requireAcknowledged(s, projectId, opts);
     const worker = await state.workerClient();
+    // Checked and recorded with nothing awaited in between (as for links).
+    requireUnlocked(s, projectId);
+    const ending = state.captureStopping(projectId);
+    if (ending) throw new ApiError(409, "CONFLICT", stopping(ending), CAPTURE_STOPPING);
+    if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
+    const queues = state.captureQueues;
+    queues.startProfile(queueId, projectId, url, "desktop");
+    state.profileRunStarted(queueId, projectId);
     const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
     // A profile run cannot stop part-way here: a move waits for it to finish (drained, R106).
     state.startWork("profile-capture", async () => {
       try {
-        const report = await capture.captureProfile(projectId, url, opts, (done, total, outcome) => state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false }));
+        const report = await capture.captureProfile(
+          projectId,
+          url,
+          opts,
+          (done, total, outcome) => {
+            // Ended meanwhile (a lock, a close): nothing more of it is recorded or published (I3).
+            if (state.captureEnded(queueId)) return;
+            queues.progress(queueId, done, total, outcome);
+            state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false });
+          },
+          { cancelled: () => state.captureEnded(queueId), signal: state.captureSignal(queueId) },
+        );
+        if (state.profileRunEnded(queueId)) return; // its end was published when it was ended
+        queues.finish(queueId, { report });
         state.events.publish("capture.progress", { queueId, projectId, finished: true, report });
       } catch (err) {
+        if (state.profileRunEnded(queueId)) return;
+        queues.finish(queueId, { error: err });
         state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
       }
     });
     return { queueId };
+  });
+
+  // ---- a capture's state, read again (Task 63) ----
+  app.get("/projects/:id/captures", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    requireUnlocked(s, projectId);
+    return { queues: state.captureQueues.list(projectId) };
+  });
+
+  app.get("/projects/:id/captures/:qid", async (req) => {
+    const s = state.requireSession();
+    const projectId = projectParam(ctx, req);
+    requireUnlocked(s, projectId);
+    const q = state.captureQueues.detail(projectId, paramsOf(req).qid ?? "");
+    if (!q) throw notFound("That capture");
+    return q;
   });
 
   app.post("/projects/:id/sources/:sid/transcribe", async (req) => {
@@ -241,7 +301,11 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   app.get("/extension/pair/status", async (req) => codeStatus(req));
   app.get("/extension/pair/status/:codeId", async (req) => codeStatus(req));
 
-  app.get("/extension/pairings", async () => ({ extensions: pairing.list() }));
+  // With the service's port now, so the app can tell which browsers still hold an older one (R171).
+  app.get("/extension/pairings", async (): Promise<PairedBrowsers> => {
+    const port = pairing.port;
+    return { extensions: pairing.list(), ...(port !== undefined ? { port } : {}) };
+  });
   app.delete("/extension/pairings/:pid", async (req) => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");
     return { removed: true };
@@ -273,6 +337,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       return await queueLinks(s, projectId, urls, { transcribe: "project-default", ...(legalBasis ? { legalBasis } : {}) }, {
         // A link list is both browser capture and the downloader: the project must allow both (R116).
         methods: ["browser_capture", "downloader"],
+        startedBy: "extension",
         ...(after ? { after } : {}),
         onQueued: (queueId, done) => {
           slot.queueId = queueId;

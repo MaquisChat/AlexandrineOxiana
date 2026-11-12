@@ -4,12 +4,14 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
+import { PairingsUnreadableError } from "./auth.js";
 import {
   AcknowledgementRequiredError,
   PendingWriteChoiceError,
   PendingWriteIncompleteError,
   AnchorsUnreadableError,
   AuditChainInvalidError,
+  BackupNotRecordedError,
   DecryptionError,
   DestroyedParentError,
   EncryptionFormatError,
@@ -127,12 +129,15 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
+  // The app's list of paired browsers could not be read: nothing was changed (Task 66, I1).
+  if (err instanceof PairingsUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
   // A file of the app itself is missing (a damaged installation); its message names what, never where.
   if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");
   if (err instanceof ParticipantCodeMissingError) return new ApiError(409, "CONFLICT", "A participant in these sources has no participant code yet, so they cannot be cited.");
   if (err instanceof ExportDestinationError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof ExportFailedError) return new ApiError(500, "INTERNAL", "The export could not be finished; nothing was left half-written.");
+  if (err instanceof BackupNotRecordedError) return new ApiError(500, "INTERNAL", err.message);
   if (err instanceof DestroyedParentError || err instanceof MissingParentError) return new ApiError(409, "CONFLICT", "The file this would be made from is no longer there.");
   if (err instanceof KeyNotAvailableError) return new ApiError(423, "PROJECT_LOCKED", "This project is locked. Its passphrase is needed.");
   if (err instanceof DecryptionError || err instanceof EncryptionFormatError) return new ApiError(409, "CONFLICT", "An encrypted file could not be read (damaged, or made with another key).");
