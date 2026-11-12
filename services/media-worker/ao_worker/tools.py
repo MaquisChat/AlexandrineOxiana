@@ -98,7 +98,7 @@ def not_installed(tool_id: str) -> JobError:
         d = downloads_for(c) if c.kind != "ytdlp" else ()
         if isinstance(d, Unavailable) and not component_status(c).installed:
             return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed, and it cannot be downloaded for this computer yet. {d.reason}", tool=tool_id)
-    return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed. Install it from the tools dialogue.", tool=tool_id)
+    return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed. Install it from the Optional tools screen.", tool=tool_id)
 
 
 def _err(code: str, message: str, detail: str | None = None) -> JobError:

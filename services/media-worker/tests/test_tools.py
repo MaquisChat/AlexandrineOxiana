@@ -847,9 +847,9 @@ def test_a_missing_tool_that_cannot_be_installed_here_says_why(worker_env, monke
     monkeypatch.setenv("PATH", str(FAKE_BIN))
     e = tools.not_installed("ocr")
     assert e.code == "TOOL_NOT_INSTALLED" and e.tool == "ocr"
-    assert "tools dialogue" not in e.message
+    assert "Optional tools screen" not in e.message
     assert "tesseract" in e.message
-    assert "tools dialogue" in tools.not_installed("ffmpeg").message
+    assert "Install it from the Optional tools screen." in tools.not_installed("ffmpeg").message
 
 
 def test_an_existing_file_is_never_deleted_by_a_failed_download(worker_env, files, tmp_path):

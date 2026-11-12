@@ -373,6 +373,7 @@ describe("speech models (R158)", () => {
       const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model } });
       expect(r.status, model).toBe(409);
       expect(r.json.error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: `speech-${model}` });
+      expect(r.json.error.message).toMatch(/The Optional tools screen/);
     }
     expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model: "huge" } })).status).toBe(400);
   });

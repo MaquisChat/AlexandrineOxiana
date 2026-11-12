@@ -42,7 +42,7 @@ const REASONS: Record<string, string> = {
   POLICY_CHANGED_RUN: "This project's rules changed during the capture. Posts saved before the change are kept; nothing else was saved.",
   RATE_LIMITED_PAUSED: "The platform is limiting requests, so the profile capture was paused. Run it again later; it continues where it stopped.",
   INVALID_OPTIONS: "Some profile capture options are not valid. Check the dates (YYYY-MM-DD) and the maximum number of items.",
-  TOOL_NOT_INSTALLED: "A tool this needs is not installed on this computer, so nothing was saved. Install it from the tools dialogue, then try again.",
+  TOOL_NOT_INSTALLED: "A tool this needs is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then try again.",
 };
 
 /** What each optional tool (Task 48a catalogue id) is called in a sentence. */
@@ -58,13 +58,13 @@ function toolName(tool: string | undefined): string {
 
 /** The plain sentence for a capture that stopped because its optional tool is missing (R126). */
 export function toolMissingReason(tool: string | undefined): string {
-  return `${toolName(tool)} is not installed on this computer, so nothing was saved. Install it from the tools dialogue, then capture the link again.`;
+  return `${toolName(tool)} is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then capture the link again.`;
 }
 
 /** The note on a source saved without its transcript because the speech model is missing. */
 export function transcriptToolMissingNote(tool: string | undefined): string {
   const name = toolName(tool);
-  return `The source was saved, but the transcript could not be made: ${name.charAt(0).toLowerCase()}${name.slice(1)} is not installed on this computer. Install it from the tools dialogue, then transcribe the source.`;
+  return `The source was saved, but the transcript could not be made: ${name.charAt(0).toLowerCase()}${name.slice(1)} is not installed on this computer. Install it from the Optional tools screen, then transcribe the source.`;
 }
 const FALLBACK = "Something went wrong while saving this link. Nothing was saved.";
 

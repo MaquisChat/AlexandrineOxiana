@@ -72,7 +72,7 @@ def model_path(name: str) -> str:
         log.warning("the %s speech model on disk is unusable (%s); not downloading", name, type(e).__name__)
         raise JobError(
             "MODEL_UNAVAILABLE",
-            f"the {name} model on disk is incomplete or damaged; install it again from the tools dialogue"
+            f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen"
             if damaged else f"the {name} model on disk could not be read",
             type(e).__name__,
             tool=f"speech-{name}",
@@ -80,7 +80,7 @@ def model_path(name: str) -> str:
     if not (Path(path) / "model.bin").is_file():
         log.warning("the %s speech model on disk has no model.bin; not downloading", name)
         raise JobError("MODEL_UNAVAILABLE",
-                       f"the {name} model on disk is incomplete or damaged; install it again from the tools dialogue",
+                       f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen",
                        tool=f"speech-{name}")
     return path
 
