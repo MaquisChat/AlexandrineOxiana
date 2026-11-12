@@ -29,17 +29,27 @@ export async function storeTranscript(
   r: JobResult,
   params: TranscriptionParams,
   triggeredBy: string,
+  /**
+   * The worker job this run is (Task 62, R1-1): recorded in each file's derivation, so that a rerun
+   * of the same job (a lock interrupted its store step) stores only the files the first try did not,
+   * with the same time, and the run stays one version.
+   */
+  jobId?: string,
 ): Promise<StoredTranscript> {
   const meta = r.meta;
   const model = typeof meta.model === "string" ? meta.model : (params.model ?? "whisper");
   const langs = Array.isArray(meta.detectedLanguages) ? meta.detectedLanguages.filter((l): l is string => typeof l === "string") : [];
   const lang = langs.length === 1 ? langs[0]! : langs.length > 1 ? "mul" : "und";
   const flagged = typeof meta.flaggedCount === "number" ? meta.flaggedCount : undefined;
-  const at = new Date().toISOString();
-  const files: string[] = [];
+  const already = jobId
+    ? (await repo.getSource(projectId, sourceId)).assets.filter((a) => a.kind === "transcript" && a.status !== "destroyed" && a.derivation?.params.jobId === jobId)
+    : [];
+  const at = already[0]?.derivation?.at ?? new Date().toISOString();
+  const files: string[] = already.map((a) => a.path);
   for (const ext of ["vtt", "json"]) {
     const file = r.files.find((f) => basename(f) === (ext === "vtt" ? "transcript.vtt" : "segments.json"));
     if (!file) continue;
+    if (already.some((a) => (a.mime === "application/json") === (ext === "json"))) continue; // stored by the first try
     const asset = await repo.addDerivedAsset(projectId, sourceId, {
       fromPath: file,
       kind: "transcript",
@@ -54,7 +64,7 @@ export async function storeTranscript(
         provider: "faster-whisper",
         model,
         ranAt: "local",
-        params: { model, detectedLanguages: langs, ...(params.language ? { language: params.language } : {}) },
+        params: { model, detectedLanguages: langs, ...(params.language ? { language: params.language } : {}), ...(jobId ? { jobId } : {}) },
         at,
         triggeredBy,
       },
