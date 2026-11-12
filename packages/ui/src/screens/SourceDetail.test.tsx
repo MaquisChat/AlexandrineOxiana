@@ -26,6 +26,12 @@ useMockService();
 
 const handlers = () => [http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(SOURCE_FILE)), http.get(url("/styles"), () => HttpResponse.json(STYLES))];
 
+// Task 69 (M2): the date is shown in the researcher's own time zone, so the expected day comes from
+// the machine's zone (getDate, not the formatter under test). Mid-November keeps month and year the
+// same in every zone, so the test checks the local day and the wording wherever it runs.
+const NOTICED_AT = "2026-11-15T12:00:00.000Z";
+const NOTICED_TEXT = `No longer available at its source, noticed on Nov ${new Date(NOTICED_AT).getDate()}, 2026`;
+
 describe("SourceDetail", () => {
   it("shows the source's details and files, with user text marked dir=auto", async () => {
     server.use(...handlers());
@@ -36,6 +42,23 @@ describe("SourceDetail", () => {
     expect(within(region).getByText("Smith, Jane")).toBeTruthy();
     expect(within(region).getByText("10.1000/xyz")).toBeTruthy();
     expect(within(region).getByText("smith-2019.pdf")).toBeTruthy();
+  });
+
+  it("says in words that the source is no longer available at its source, with the date noticed; nothing while it is available (Task 69, D17)", async () => {
+    const gone = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "unavailable-on-platform", firstNoticedAt: NOTICED_AT } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(gone)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    const { unmount } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const mark = await within(region).findByRole("note", { name: NOTICED_TEXT });
+    expect(mark.textContent).toBe(NOTICED_TEXT);
+    unmount();
+
+    const here = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "available" } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(here)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region2 = await screen.findByRole("region", { name: "Source details" });
+    await within(region2).findByRole("heading", { name: "Ethnography at Work" });
+    expect(within(region2).queryByText(/no longer available/i)).toBeNull();
   });
 
   it("the title heading itself takes its direction from the text (D7): an Arabic title's heading is dir=auto, not only its inline text", async () => {

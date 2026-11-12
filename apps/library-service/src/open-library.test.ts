@@ -247,6 +247,11 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
 
   it("a read-only library cannot write an index: it says so, and lists its sources from the files", async () => {
     const { path, pid } = await libraryWithSources();
+    // Task 69 (M3): one source marked gone from its platform, as profile capture marks it.
+    const before = (await call({ url: `/projects/${pid}/sources` })).json.items as Array<{ id: string }>;
+    const gone = before[0]!.id;
+    const noticed = "2026-11-03T09:15:00.000Z";
+    await svc!.state.session!.repo.updateSource(pid, gone, { availability: { status: "unavailable-on-platform", firstNoticedAt: noticed } });
     expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
     await deleteIndex(path);
     const now = new Date().toISOString();
@@ -255,6 +260,11 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
     expect(opened.json).toMatchObject({ mode: "read-only", index: { state: "unavailable", reason: "locked-by-other-device" } });
     const list = await call({ url: `/projects/${pid}/sources` });
     expect(list.json.total).toBe(2);
+    expect(list.json.limited).toBe(true);
+    // Each row read from the files carries its availability (Task 69).
+    for (const row of list.json.items as Array<{ id: string; availability: unknown }>) {
+      expect(row.availability).toEqual(row.id === gone ? { status: "unavailable-on-platform", firstNoticedAt: noticed } : { status: "available" });
+    }
     expect(list.json.index).toEqual({ state: "unavailable", reason: "locked-by-other-device" });
     expect(svc!.state.libraryState().index).toEqual({ state: "unavailable", reason: "locked-by-other-device" });
     // Nothing was written into the library by the open.

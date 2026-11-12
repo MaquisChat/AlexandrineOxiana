@@ -115,6 +115,12 @@
   border-color: var(--warn-line);
 }
 
+/* Task 69: no longer available at its source (the words carry it; the dashed border only echoes them). */
+.ao-badge--gone {
+  border-style: dashed;
+  color: var(--ink);
+}
+
 .ao-chip {
   border-radius: 999px;
 }

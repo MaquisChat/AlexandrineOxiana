@@ -3,10 +3,12 @@
  * source waits for review. Titles and creators are source text (dir=auto). A locked project's
  * sources have no title until it is unlocked. A text search that found a source only through its
  * annotations says so ("Found in an annotation", Task 58). "Needs review" leads to the project's
- * review queue at that source's entries (Task 67) when the screen gives the way there.
+ * review queue at that source's entries (Task 67) when the screen gives the way there. A source a
+ * later capture found gone from its platform says so (Task 69, AvailabilityMark).
  */
 import type { MouseEvent } from "react";
 import type { SourceRow } from "../api/library";
+import { AvailabilityMark, availabilityText } from "./AvailabilityMark";
 import { UserText } from "./UserText";
 import "./library.css";
 
@@ -98,6 +100,12 @@ export function SourceTable({ items, total, onOpen, selectedId, incomplete, limi
                   ) : (
                     <span className="ao-badge ao-badge--review">Needs review</span>
                   ))}
+                {!s.locked && availabilityText(s.availability) && (
+                  <>
+                    {/* A word break before it, so its words never run on from the badge before (M4). */}{" "}
+                    <AvailabilityMark availability={s.availability} />
+                  </>
+                )}
                 {s.matchedIn === "annotation" && <span className="ao-muted"> Found in an annotation</span>}
                 {s.annotationsPartial && <span className="ao-muted"> (Only part of its annotations is searchable)</span>}
               </td>
