@@ -11,9 +11,9 @@ import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, ty
 import { PolicyDeniedError } from "./repo/errors.js";
 import { NoMediaError } from "./capture/link-capture.js";
 import { transcriptVersions } from "./source-actions.js";
-import { readTranscript } from "./transcript-segments.js";
+import { parseVtt, readTranscript } from "./transcript-segments.js";
 import { transcriptionJob, transcriptionRecords, transcriptionRerun } from "./transcription-jobs.js";
-import { WorkerClient, WorkerUnavailableError } from "./worker-client.js";
+import { JobInterruptedError, WorkerClient, WorkerUnavailableError } from "./worker-client.js";
 import { stubWorker, type StubJob } from "./worker-testing.js";
 
 let kit: Kit;
@@ -125,6 +125,55 @@ describe("transcription as a job", () => {
     const broken = { ...kit.repo, getSource: async () => { throw new Error("disk read failed"); } } as unknown as typeof kit.repo;
     await expect(transcriptionRerun(broken, rec)).rejects.toThrow(/disk read failed/);
   });
+
+  for (const how of ["lock", "crash"] as const) {
+    it(`F-1: a ${how} between the two store writes, and a rerun whose words differ: every version's files come from one run`, async () => {
+      const p = await makeProject(kit, OPEN_GOV, true);
+      const sf = await audioSource(p);
+      const repo = kit.repo;
+      let runs = 0;
+      const differing = async (job: StubJob) => {
+        const first = ++runs === 1;
+        await mkdir(job.body.output, { recursive: true });
+        const text = first ? "First try words." : "Rerun different words.";
+        await writeFile(join(job.body.output, "segments.json"), JSON.stringify([{ start: 0, end: 2, text, lang: "en", flags: first ? ["outside-speech"] : [] }]));
+        await writeFile(join(job.body.output, "transcript.vtt"), `WEBVTT\n\n${first ? "NOTE flags: outside-speech\n\n" : ""}00:00:00.000 --> 00:00:02.000\n${text}\n`);
+        return { status: "done", result: { output: job.body.output, meta: { model: "small", detectedLanguages: ["en"], flaggedCount: first ? 1 : 0 } } };
+      };
+      const original = repo.addDerivedAsset.bind(repo);
+      let calls = 0;
+      repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
+        if (++calls === 2) {
+          if (how === "lock") repo.lockProject(p.id);
+          else throw new JobInterruptedError(); // the process stops here: the journal still says running
+        }
+        return original(...args);
+      }) as typeof original;
+      const job = await transcriptionJob(repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
+      await expect((await client(differing)).submit(p.id, job)).rejects.toThrow();
+      repo.addDerivedAsset = original;
+      if (how === "lock") await repo.unlockProject(p.id, "correct horse battery staple");
+      const out = await (await client(differing)).resumePending(p.id, { prepare: (rec) => transcriptionRerun(repo, rec) });
+      expect(out.map((x) => x.error)).toEqual([undefined]);
+      const versions = transcriptVersions(await repo.getSource(p.id, sf.source.id));
+      const runsByTime = new Map<string, typeof versions>();
+      for (const v of versions) runsByTime.set(v.derivation!.at, [...(runsByTime.get(v.derivation!.at) ?? []), v]);
+      for (const files of runsByTime.values()) {
+        const texts = new Set<string>();
+        for (const f of files) {
+          const t = await readTranscript(repo, p.id, sf.source.id, f.id);
+          texts.add(t.segments.map((s) => s.text).join("|"));
+          // The count the list shows is what the viewer shows for that file.
+          expect(t.segments.filter((s) => s.flags && s.flags.length > 0).length).toBe(f.metadata?.flaggedSegments);
+          // The stored WebVTT itself holds the same words as what is shown.
+          if (f.mime === "text/vtt") expect(parseVtt(t.text).map((c) => c.text).join("|")).toBe(t.segments.map((s) => s.text).join("|"));
+        }
+        expect(texts.size).toBe(1); // never two runs' words in one version
+      }
+      // The rerun's complete pair is a version of its own.
+      expect([...runsByTime.values()].some((files) => files.length === 2)).toBe(true);
+    });
+  }
 
   it("a rerun reads the recording from the library as it is now, not from the path recorded", async () => {
     const p = await makeProject(kit);
