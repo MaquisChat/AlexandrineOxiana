@@ -303,6 +303,43 @@ describe("tauriArgs and dmgArgs", () => {
   });
 });
 
+describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
+  const wf = readFileSync(join(DESKTOP, "..", "..", ".github", "workflows", "desktop-macos.yml"), "utf8");
+  /** The lines of a top-level key's block. */
+  const block = (key) => {
+    const lines = wf.split("\n");
+    const start = lines.findIndex((l) => l === `${key}:` || l.startsWith(`${key}: `));
+    assert.ok(start >= 0, `no top-level ${key}`);
+    const end = lines.findIndex((l, i) => i > start && /^[A-Za-z]/.test(l));
+    return lines.slice(start, end < 0 ? undefined : end).filter((l) => l.trim() && !/^\s*#/.test(l));
+  };
+
+  it("starts only by hand or on a version tag, never on a branch push, a pull request or a schedule", () => {
+    const on = block("on").join("\n");
+    assert.match(on, /^ {2}workflow_dispatch:/m);
+    assert.match(on, /^ {2}push:\n {4}tags:\n {6}- "v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+\*"$/m);
+    const triggers = block("on").map((l) => /^ {2}([a-z_]+):/.exec(l)?.[1]).filter(Boolean);
+    assert.deepEqual(triggers, ["workflow_dispatch", "push"]);
+    assert.doesNotMatch(on, /branches|paths/);
+  });
+
+  it("reads only, builds on the two runners R133 names, and never overlaps", () => {
+    assert.deepEqual(block("permissions").slice(1), ["  contents: read"]);
+    assert.match(wf, /"runner":"macos-15","arch":"arm64"/);
+    assert.match(wf, /"runner":"macos-15-intel","arch":"x64"/);
+    assert.match(block("concurrency").join("\n"), /cancel-in-progress: false/);
+    assert.doesNotMatch(wf, /secrets\./);
+    assert.match(wf, new RegExp(`MACOSX_DEPLOYMENT_TARGET: "${PINS.minimumSystemVersion.replace(".", "\\.")}"`));
+  });
+
+  it("gives every step a time limit", () => {
+    const steps = wf.split("\n").filter((l) => /^ {6}- (uses|name|run):/.test(l)).length;
+    const limits = wf.split("\n").filter((l) => /^ {8}timeout-minutes: \d+$/.test(l)).length;
+    assert.ok(steps > 10);
+    assert.equal(limits, steps);
+  });
+});
+
 describe("plan (--dry-run)", () => {
   it("lists the steps in order for each architecture", () => {
     for (const arch of ["arm64", "x64"]) {
