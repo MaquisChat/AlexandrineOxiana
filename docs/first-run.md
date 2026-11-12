@@ -127,12 +127,12 @@ Optional check of the download: the run's **Summary** page lists the extension's
 
 **Letting a project accept browser captures.** A new project does not allow browser capture. In the app, select the project, click **Governance and records**, and find the card **Capture methods**. Tick **Browser capture: pages and posts saved with the browser extension**. The app says that allowing it "loosens the project's rules, so it needs a reason" and opens a dialog **Record a reason** with the fields **Reason** and **Approved by**. Fill them in and click **Record reason**, then click **Save changes**; you should see **Saved.** The reason is kept in the audit log. Until a project allows it, the extension's popup says "No project allows browser capture. Allow it in a project's rules in the desktop app." A project that is encrypted and locked, or that holds identifiable data, can still refuse a capture (the card says what else a capture needs); use a plain project to try it.
 
-**Pairing.** You pair a browser once.
+**Pairing.** You pair a browser once. The "port" is a number the app uses to talk to the browser on this computer; the app shows it and the popup asks for it.
 
 1. In the app's library screen, click **Browser extension**. The page has a section **Pair a browser**.
 2. Click **Show a pairing code**. A code of six digits appears, with "Valid for" a countdown. The code works once, for 5 minutes, and stops after 5 wrong tries. The page also shows the **Port** number.
 3. In your browser, click the extension's icon. Its popup, **Pair with the desktop app**, says to choose "Browser extension" at the top of the app's window and then "Show a pairing code", and has two boxes: **Port** and **Pairing code**. Type the port and the six digits, then click **Pair**.
-4. The popup says "Pairing done. Choose a project below." and the app says "The code was used: a browser was paired, and the code can't be used again." The extension is listed under **Paired browsers** by its address, which begins `chrome-extension://` or `moz-extension://`.
+4. The popup says "Pairing done. Choose a project below." and the app says "The code was used:", then the extension's address, then "was paired, and the code can't be used again." The extension is listed under **Paired browsers** by its address, which begins `chrome-extension://` or `moz-extension://`.
 
 To undo a pairing, click **Revoke** next to the entry in **Paired browsers** and confirm with **Revoke pairing**. In the popup, **Unpair** removes it from the browser's side.
 
@@ -156,7 +156,7 @@ To remove the app, drag **Alexandrine Oxiana** from Applications to the Trash. T
 
 - **macOS will not open the app.** Follow "Opening it the first time" above. If **Open Anyway** is not there, open the app again from Applications and look again.
 - **A small window titled "Alexandrine Oxiana could not start" appears.** The app's helper program did not start. The window gives a reason. Close it, try once more, and if it appears again, send a screenshot of the window.
-- **The library says "Library not found".** The folder is not where it was last seen (for example, an external drive is not connected, or the folder was renamed). Connect the drive, or click **Locate library…** and type the new full path, or **Search for library**.
+- **The library says "Library not found".** The folder is not where it was last seen (for example, an external drive is not connected, or the folder was renamed). Connect the drive, or click **Locate library…**, then **Choose folder…** and pick the folder (or type its full path), then **Reconnect**, or click **Search for library**.
 - **A banner says "Read-only (locked by …)".** The library is locked by another device. The banner goes on: "Changes are off until the library is closed there."
 - **An optional tool will not download.** Check your internet connection, then click **Try again** on the tool's card. The message names the tool and the reason.
 - **The extension's popup says "The desktop app is not answering on port N."** Either the app is closed (open it, then open the popup again), or its port changed: see "After you quit and reopen the app" above.
