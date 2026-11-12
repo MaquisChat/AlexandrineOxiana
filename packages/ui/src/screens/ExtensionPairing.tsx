@@ -83,8 +83,15 @@ export function ExtensionPairingRoute({ client, port }: { client: ApiClient; por
   return <ExtensionPairing api={api} {...(port !== undefined ? { port } : {})} />;
 }
 
-/** `port` is the service's port (not a secret; the extension's popup asks for it). The token never reaches this screen. */
-export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionApi; pollMs?: number; port?: number }) {
+/** While the "port changed" notice is shown, the list is read again this often, at most LIST_POLLS_MAX times (I3). */
+const LIST_POLL_MS = 5000;
+const LIST_POLLS_MAX = 120;
+
+/**
+ * `port` is the service's port (not a secret; the extension's popup asks for it). The token never reaches this screen.
+ * `listPollMs` and `listPollMax` set the quiet re-reading of the list while the "port changed" notice is shown (tests shorten them).
+ */
+export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_POLL_MS, listPollMax = LIST_POLLS_MAX }: { api: ExtensionApi; pollMs?: number; port?: number; listPollMs?: number; listPollMax?: number }) {
   const ids = useId();
   const [code, setCode] = useState<ShownCode | null>(null);
   const [remaining, setRemaining] = useState(0);
@@ -285,6 +292,38 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
     };
   }, [usedBrowser, pollMs, refresh]);
 
+  // While a browser is shown with an old port, the list is read again quietly (fix round 1, I3): the
+  // notice goes by itself once that browser has reached the app on the current port. One read at a
+  // time, at most `listPollMax` reads; it stops when no notice is left and when the screen is left;
+  // `refresh` drops an answer older than a newer read. The live region's words change only when the
+  // port or the set of browsers with an old port changes, so a read announces nothing.
+  // R171: the port now (the service's word first), and the browsers that hold an older one.
+  const currentPort = servicePort ?? port;
+  const oldPort = (b: PairedBrowser) => currentPort !== undefined && b.port !== undefined && b.port !== currentPort;
+  const portMoved = currentPort !== undefined && (browsers ?? []).some(oldPort);
+  useEffect(() => {
+    if (!portMoved) return;
+    let stopped = false;
+    let reading = false;
+    let reads = 0;
+    const t = setInterval(() => {
+      if (stopped || reading) return;
+      if (reads >= listPollMax) {
+        clearInterval(t);
+        return;
+      }
+      reads++;
+      reading = true;
+      void refresh(true).finally(() => {
+        reading = false;
+      });
+    }, listPollMs);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
+  }, [portMoved, listPollMs, listPollMax, refresh]);
+
   const issue = async () => {
     if (issuingNow.current) return;
     issuingNow.current = true;
@@ -355,10 +394,6 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
   }, [focusList]);
 
   const showLabel = code || outcome ? "Show a new code" : "Show a pairing code";
-  // R171: the port now (the service's word first), and the browsers that hold an older one.
-  const currentPort = servicePort ?? port;
-  const oldPort = (b: PairedBrowser) => currentPort !== undefined && b.port !== undefined && b.port !== currentPort;
-  const portMoved = currentPort !== undefined && (browsers ?? []).some(oldPort);
 
   return (
     <main className="ao-screen ao-pairing">
@@ -440,7 +475,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port }: { api: ExtensionA
           {portMoved ? (
             <>
               <p>
-                <strong>This app's port changed.</strong> When the app was reopened, the port it used before was taken by another program, so it now uses port{" "}
+                <strong>This app's port changed.</strong> When the app was last opened, it could not use its earlier port again (most often because another program had taken it), so it now uses port{" "}
                 <span className="ao-pairing-port-value">{currentPort}</span>. The browsers marked “Old port” below still use the earlier port, so they cannot capture until they are given the new one.
               </p>
               <p>
