@@ -471,6 +471,8 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     it("uses no secret and only the actions, at the commit ids, that the Mac build already uses", () => {
       const e = ext();
       assert.doesNotMatch(e, /secrets\.|GITHUB_TOKEN|github\.token/);
+      // The workflow's `contents: read` stays the only permission: the job widens nothing.
+      assert.doesNotMatch(e, /^\s+permissions:/m);
       assert.match(e, /persist-credentials: false/);
       const rest = wf.replace(e, "");
       const theirs = new Set(usesOf(rest));

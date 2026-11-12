@@ -32,6 +32,9 @@ name: Desktop (macOS)
 #   Billed: about 10x those minutes. The caches are saved even when a later step fails, so a failed
 #   attempt does not make the next one cold.
 #
+# Every run that passes plan also builds the browser extension on Linux (job `extension`, Task 65),
+# independent of the Mac job, and uploads it beside the Mac download (a few Linux minutes).
+#
 # Third-party actions are pinned by full commit id (R167 b), each with its release in a comment; the
 # ids were read with `git ls-remote --tags https://github.com/<owner>/<action>` (the peeled ^{} id
 # for an annotated tag) on 2026-11-12.
