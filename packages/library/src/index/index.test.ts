@@ -903,9 +903,11 @@ describe("annotation text (Task 58, R74)", () => {
     await setAnnotations(pid, a.source.id, () => [ann(a.source.id, { quote: "ocelot", body: "家庭料理" }), ann(a.source.id, { kind: "note", body: "marmot" })]);
     await setAnnotations(pid, b.source.id, () => [ann(b.source.id, { quote: "ocelot again" })]);
     await setAnnotations(pid, b.source.id, () => []);
-    const queries = [{ text: "ocelot" }, { text: "marmot" }, { text: "料理" }, { text: "beta" }, {}];
+    const queries = [{ text: "ocelot" }, { text: "marmot" }, { text: "料理" }, { text: "beta" }, {}, { text: "smith marmot" }, { text: "alpha ocelot 料理" }];
     const before = { rows: annRows(), results: queries.map((q) => search(handle.db, q)) };
     expect(before.results[0]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(before.results[5]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    expect(before.results[6]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
     await rebuildIndex(handle, ring, lib);
     expect({ rows: annRows(), results: queries.map((q) => search(handle.db, q)) }).toEqual(before);
   });
@@ -1006,6 +1008,16 @@ describe("annotation text (Task 58, R74)", () => {
     expect(search(handle.db, { text: "tamarind", limit: 1, offset: 2 }).items.map((i) => i.id)).toEqual([viaAnn.source.id]);
   });
 
+  it("N2: the column weights put a title match above a short body that names the word", async () => {
+    const pid = await openProject();
+    // The title source also has a long body; without weights its length makes it lose (probe W2).
+    const byTitle = await repo.createSource(pid, draft("Okra history"), files(), { provenance: prov() });
+    indexSource(handle.db, await repo.getSource(pid, byTitle.source.id), Array.from({ length: 3_000 }, (_, i) => `word${i}`).join(" "));
+    const byBody = await repo.createSource(pid, draft("Market ledgers"), files(), { provenance: prov() });
+    indexSource(handle.db, await repo.getSource(pid, byBody.source.id), "a short note on okra and its sellers");
+    expect(search(handle.db, { text: "okra" }).items.map((i) => i.id)).toEqual([byTitle.source.id, byBody.source.id]);
+  });
+
   it("R161 (b): at most 2 MB of annotation text is indexed, in document order and bounded chunks; the source says it is partly searchable", async () => {
     const pid = await openProject();
     const sf = await repo.createSource(pid, draft("Heavily annotated"), files(), { provenance: prov() });
@@ -1024,19 +1036,83 @@ describe("annotation text (Task 58, R74)", () => {
     expect(search(handle.db, { text: "firstword0" }).items[0]).not.toHaveProperty("annotationsPartial");
   });
 
-  it("chunks annotation text by whole annotations, splits a long one without breaking a character, and caps the count (M3)", () => {
-    const { chunks, partial } = annotationChunks([{ quote: "a", body: "b" }, { body: "c" }, { quote: "" }], 100, 10);
+  it("chunks annotation text by whole annotations, splits only a longer one, with overlap, never inside a character, and caps the count (M3)", () => {
+    const { chunks, partial } = annotationChunks([{ quote: "a", body: "b" }, { body: "c" }, { quote: "" }], 100, 10, 10_000, 4);
     expect([...chunks]).toEqual(["a\nb\nc"]);
     expect(partial).toBe(false);
-    const long = annotationChunks([{ body: "😀".repeat(20) }], 1_000, 10);
+    // An annotation that fits a chunk of its own is never split across two (N1).
+    expect(annotationChunks([{ body: "a".repeat(6) }, { body: "b".repeat(6) }], 100, 10, 10_000, 4).chunks).toEqual(["aaaaaa", "bbbbbb"]);
+    // A longer one is split; each part repeats the end of the one before (at most `overlap` bytes).
+    const long = annotationChunks([{ body: "😀".repeat(20) }], 1_000, 10, 10_000, 4);
     const parts = [...long.chunks];
-    for (const p of parts) {
+    let joined = parts[0]!;
+    for (const [i, p] of parts.entries()) {
       expect(Buffer.byteLength(p)).toBeLessThanOrEqual(10);
       expect(p).not.toMatch(/[\uD800-\uDBFF]$/u);
+      if (i === 0) continue;
+      expect(p.startsWith("😀")).toBe(true); // the previous part's last character (4 bytes)
+      joined += p.slice("😀".length);
     }
-    expect(parts.join("")).toBe("😀".repeat(20));
+    expect(joined).toBe("😀".repeat(20));
     const many = annotationChunks(Array.from({ length: 10_005 }, () => ({ body: "w" })), 1_000_000, 1_000);
     expect([...many.chunks].join("\n").split("\n")).toHaveLength(10_000);
     expect(many.partial).toBe(true);
+  });
+
+  // ---- N1: the terms of a query may be spread over the record and the annotations ----
+
+  it("N1: a query matches a source whose record and annotations together hold every term", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Feeding the city", { creators: [{ family: "Bourdieu", given: "Pierre", role: "author" }] }), files(), { provenance: prov() });
+    const other = await repo.createSource(pid, draft("Habitus elsewhere"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "the habitus of vendors" }), ann(sf.source.id, { body: "fieldwork diary" })]);
+    // Author (record) plus a word of an annotation.
+    expect(search(handle.db, { text: "bourdieu habitus" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // Two words in two different annotations.
+    expect(search(handle.db, { text: "vendors diary" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // A record match still ranks first and carries no annotation mark.
+    const both = search(handle.db, { text: "habitus" });
+    expect(both.items.map((i) => i.id)).toEqual([other.source.id, sf.source.id]);
+    expect(both.items[0]).not.toHaveProperty("matchedIn");
+    // A term found nowhere still finds nothing.
+    expect(search(handle.db, { text: "bourdieu nowhereword" }).total).toBe(0);
+  });
+
+  it("N1: a pair of words is found whichever side of a chunk boundary each falls on, and a phrase across a split annotation is found", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Chunked"), files(), { provenance: prov() });
+    const filler = (n: number) => Array.from({ length: n }, (_, i) => ann(sf.source.id, { body: `filler${i} ${"y".repeat(990)}` }));
+    // alphaword in the first annotation, omegaword about 100 KB later: two chunks.
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { body: "alphaword" }), ...filler(100), ann(sf.source.id, { body: "omegaword" })]);
+    const seqs = (word: string) =>
+      (handle.db.prepare("SELECT c.seq FROM main.annotation_chunks c JOIN main.annotation_text a ON a.rowid = c.fts_rowid WHERE a.annotation_text MATCH ? AND c.source_id = ?").all(`"${word}"`, sf.source.id) as Array<{ seq: number }>).map((r) => r.seq);
+    expect(seqs("alphaword")).not.toEqual(seqs("omegaword"));
+    expect(search(handle.db, { text: "alphaword omegaword" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // The same pair in one chunk.
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { body: "alphaword" }), ann(sf.source.id, { body: "omegaword" })]);
+    expect(search(handle.db, { text: "alphaword omegaword" }).total).toBe(1);
+    // One annotation longer than a chunk, with a CJK phrase across the split.
+    const head = "z ".repeat((ANNOTATION_CHUNK_BYTES - 6) / 2);
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { body: `${head}家庭料理の記憶 ${"w ".repeat(1000)}` })]);
+    expect(search(handle.db, { text: "家庭料理の記憶" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+  });
+
+  it("N1: a query whose words match too much, or with too many words, is refused in plain words", async () => {
+    const pid = await openProject();
+    for (let i = 0; i < 6; i++) await repo.createSource(pid, draft(`Common word ${i}`), files(), { provenance: prov() });
+    // A bound set very low for the test: each word may match at most 5 rows.
+    expect(() => search(handle.db, { text: "common word", maxTermMatches: 5 })).toThrow(/matches too many sources to combine its words.*more specific/i);
+    expect(search(handle.db, { text: "common word" }).total).toBe(6);
+    expect(() => search(handle.db, { text: Array.from({ length: 17 }, (_, i) => `w${i}`).join(" ") })).toThrow(/at most 16 words/);
+  });
+
+  it("N1: a locked encrypted project's annotations combine with nothing (R30); unlocked they do", async () => {
+    const pid = (await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const sf = await repo.createSource(pid, draft("Sealed source"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "qwombatquote" }), ann(sf.source.id, { body: "qcapybara" })], true);
+    expect(search(handle.db, { text: "smith qwombatquote qcapybara" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    repo.lockProject(pid);
+    expect(search(handle.db, { text: "smith qwombatquote" }).total).toBe(0);
+    expect(search(handle.db, { text: "qwombatquote qcapybara" }).total).toBe(0);
   });
 });
