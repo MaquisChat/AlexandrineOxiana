@@ -268,15 +268,15 @@ describe("restore (Task 50b): a backup becomes a new project in the library, und
     ["defaults (encryption required), on this computer", "", [at("device")], "allow_with_conditions", ENCRYPT],
     ["encryption optional", "encryption: { atRest: optional }", [at("device")], "allow", undefined],
     ["encryption off, on a removable drive", "encryption: { atRest: off }", [at("removable")], "allow", undefined],
-    ["a library on a network drive (not allowed by default)", "encryption: { atRest: optional }", [at("network")], "deny", "The project would be restored into the library's folder, which is on a network drive; the rules of the project in this backup do not allow its data there"],
-    ["IRB, in a cloud-synced folder the rules do not allow", "profiles: [irb]", [at("cloud_folder", { cloudFolderId: "dropbox" })], "deny", "The project would be restored into the library's folder, which is in a cloud-synced folder; the rules of the project in this backup do not allow its data there"],
+    ["a library on a network drive (not allowed by default)", "encryption: { atRest: optional }", [at("network")], "deny", "The project would be restored into the library's folder, which is on a network drive. The rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows."],
+    ["IRB, in a cloud-synced folder the rules do not allow", "profiles: [irb]", [at("cloud_folder", { cloudFolderId: "dropbox" })], "deny", "The project would be restored into the library's folder, which is in a cloud-synced folder. The rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows."],
     ["GDPR, any cloud folder allowed (no approved list)", "profiles: [gdpr]\nencryption: { atRest: optional }\nresidency: { allowed: [device, cloud_folder] }", [at("cloud_folder", { cloudFolderId: "icloud" })], "allow", undefined],
     ["HIPAA, encryption off in the file: required anyway", "profiles: [hipaa]\nencryption: { atRest: off }\nsharing: { locationMetadata: strip }", [at("device")], "allow_with_conditions", ENCRYPT],
     ["HIPAA, approved cloud folder", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f1" })], "allow_with_conditions", ENCRYPT],
-    ["HIPAA, cloud folder not on the approved list", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f2" })], "deny", "The project would be restored into the library's folder, which is in cloud folder f2; it is not on the approved list of the project in this backup"],
-    ["HIPAA, public cloud never", "profiles: [hipaa]\nresidency: { allowed: [device, cloud] }", [at("cloud")], "deny", "The project would be restored into the library's folder, which is on a cloud service; the rules of the project in this backup do not allow its data there"],
-    ["typed path and real path: every one must be allowed", "encryption: { atRest: optional }", [at("device"), at("network")], "deny", "The project would be restored into the library's folder, which is on a network drive; the rules of the project in this backup do not allow its data there"],
-    ["a kind that could not be determined is refused when it may be one the rules exclude", "encryption: { atRest: optional }", [at("device", { uncertain: true }), at("removable", { uncertain: true }), at("network", { uncertain: true })], "deny", "Where the library's folder is stored could not be determined (it may be a network drive), and the rules of the project in this backup do not allow its data there. To restore it, use a library on storage those rules allow."],
+    ["HIPAA, cloud folder not on the approved list", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f2" })], "deny", "The project would be restored into the library's folder, which is in cloud folder f2. That folder is not on the approved list in this backup's own rules. Restore the backup into another library, on storage those rules allow."],
+    ["HIPAA, public cloud never", "profiles: [hipaa]\nresidency: { allowed: [device, cloud] }", [at("cloud")], "deny", "The project would be restored into the library's folder, which is on a cloud service. The rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows."],
+    ["typed path and real path: every one must be allowed", "encryption: { atRest: optional }", [at("device"), at("network")], "deny", "The project would be restored into the library's folder, which is on a network drive. The rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows."],
+    ["a kind that could not be determined is refused when it may be one the rules exclude", "encryption: { atRest: optional }", [at("device", { uncertain: true }), at("removable", { uncertain: true }), at("network", { uncertain: true })], "deny", "Where the library's folder is stored could not be determined (it may be a network drive), and the rule on where data may live in this backup's own rules does not allow its data there. Restore the backup into another library, on storage that rule allows."],
   ];
   it.each(table)("%s", (_case, yaml, dests, result, detail) => {
     const d = evaluate(cfg(yaml), rs(...dests));
@@ -302,13 +302,13 @@ describe("restore (Task 50b): a backup becomes a new project in the library, und
   it("asked of the rules the original project has now, a refusal says so (`rules: original`); the rule itself is the same", () => {
     const now = (yaml: string, ...destinations: Dest[]) => evaluate(cfg(yaml), req({ action: "restore", restore: { destinations, rules: "original" } }));
     expect(denyReason(now("encryption: { atRest: optional }", at("network")))).toBe(
-      "The project would be restored into the library's folder, which is on a network drive; the rules the original project has now do not allow its data there",
+      "The project would be restored into the library's folder, which is on a network drive. The rule on where data may live that the original project has now does not allow its data there. Restore the backup into another library on storage that rule allows, or allow this kind of storage in the original project's rules.",
     );
     expect(denyReason(now(HIPAA_CLOUD, at("cloud_folder", { cloudFolderId: "f2" })))).toBe(
-      "The project would be restored into the library's folder, which is in cloud folder f2; it is not on the approved list the original project has now",
+      "The project would be restored into the library's folder, which is in cloud folder f2. That folder is not on the approved list the original project has now. Restore the backup into another library, or add the folder to the original project's approved list.",
     );
     expect(denyReason(now("encryption: { atRest: optional }", at("device", { uncertain: true }), at("network", { uncertain: true })))).toBe(
-      "Where the library's folder is stored could not be determined (it may be a network drive), and the rules the original project has now do not allow its data there. To restore it, use a library on storage those rules allow.",
+      "Where the library's folder is stored could not be determined (it may be a network drive), and the rule on where data may live that the original project has now does not allow its data there. Restore the backup into another library on storage that rule allows, or allow that kind of storage in the original project's rules.",
     );
     expect(now("encryption: { atRest: optional }", at("device"))).toEqual({ result: "allow", warnings: [] });
     expect(conditions(now("", at("device")))).toEqual(ENCRYPT);

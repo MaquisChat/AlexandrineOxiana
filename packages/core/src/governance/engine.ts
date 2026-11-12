@@ -343,17 +343,26 @@ function restore(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): P
   const r = need(req.restore, "restore") as { rules?: unknown };
   const which = r === null || typeof r !== "object" || r.rules === undefined ? "backup" : str(r.rules, "restore.rules");
   if (which !== "backup" && which !== "original") throw new Error('restore.rules must be "backup" or "original"');
-  const rules = which === "backup" ? "the rules of the project in this backup" : "the rules the original project has now";
-  const list = which === "backup" ? "the approved list of the project in this backup" : "the approved list the original project has now";
+  // A refusal says which rule refuses and what the researcher can do about it (R179). A backup's
+  // own rules cannot be changed, so the way out is another library; the original's can be.
+  const own = which === "backup";
+  const rule = own ? "the rule on where data may live in this backup's own rules" : "the rule on where data may live that the original project has now";
+  const elsewhere = own ? "Restore the backup into another library, on storage that rule allows." : "Restore the backup into another library on storage that rule allows";
   return fullCopy(
     p,
     r,
     "restore",
     {
       uncertain: (kind) =>
-        `Where the library's folder is stored could not be determined (it may be ${kind}), and ${rules} do not allow its data there. To restore it, use a library on storage those rules allow.`,
-      folder: (id) => `The project would be restored into the library's folder, which is in cloud folder ${id}; it is not on ${list}`,
-      kind: (where) => `The project would be restored into the library's folder, which is ${where}; ${rules} do not allow its data there`,
+        `Where the library's folder is stored could not be determined (it may be ${kind}), and ${rule} does not allow its data there. ${own ? elsewhere : `${elsewhere}, or allow that kind of storage in the original project's rules.`}`,
+      folder: (id) =>
+        `The project would be restored into the library's folder, which is in cloud folder ${id}. That folder is not on ${
+          own
+            ? "the approved list in this backup's own rules. Restore the backup into another library, on storage those rules allow."
+            : "the approved list the original project has now. Restore the backup into another library, or add the folder to the original project's approved list."
+        }`,
+      kind: (where) =>
+        `The project would be restored into the library's folder, which is ${where}. ${rule.charAt(0).toUpperCase()}${rule.slice(1)} does not allow its data there. ${own ? elsewhere : `${elsewhere}, or allow this kind of storage in the original project's rules.`}`,
     },
     warnings,
   );
