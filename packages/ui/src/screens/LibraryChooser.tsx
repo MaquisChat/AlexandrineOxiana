@@ -10,6 +10,7 @@ import { ApiClientError } from "../api/client";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry } from "../api/library";
 import { UserText } from "../components/UserText";
 import { desktopShell } from "../desktopShell";
+import { navigate } from "../navigation";
 import "../components/library.css";
 
 export interface LibraryChooserProps {
@@ -151,6 +152,17 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
           Create a new library in that folder
         </button>
       </form>
+      <p>
+        <a
+          href="/about"
+          onClick={(e) => {
+            e.preventDefault();
+            navigate("/about");
+          }}
+        >
+          About and third-party notices
+        </a>
+      </p>
     </main>
   );
 }

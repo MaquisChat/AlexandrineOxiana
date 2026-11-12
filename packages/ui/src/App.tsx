@@ -13,6 +13,7 @@ import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
 import { isTranscriptPath, TranscriptRoute } from "./routes/transcript";
+import { About } from "./screens/About";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import { CaptureRoute } from "./screens/Capture";
 import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
@@ -38,6 +39,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isTranscriptPath, render: (loc, client) => <TranscriptRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
+  { matches: (p) => p === "/about", render: () => <About />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
     render: (_loc, client) => (
