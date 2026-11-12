@@ -1,7 +1,8 @@
 /**
  * The sources of the current view: title (opens the source), creators, year, type, and whether the
  * source waits for review. Titles and creators are source text (dir=auto). A locked project's
- * sources have no title until it is unlocked.
+ * sources have no title until it is unlocked. A text search that found a source only through its
+ * annotations says so ("Found in an annotation", Task 58).
  */
 import type { SourceRow } from "../api/library";
 import { UserText } from "./UserText";
@@ -64,6 +65,7 @@ export function SourceTable({ items, total, onOpen, selectedId }: SourceTablePro
                   </button>
                 )}
                 {s.needsReview && <span className="ao-badge ao-badge--review">Needs review</span>}
+                {s.matchedIn === "annotation" && <span className="ao-muted"> Found in an annotation</span>}
               </td>
               <td>
                 <UserText>{s.creatorsText}</UserText>

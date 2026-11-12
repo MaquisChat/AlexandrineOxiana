@@ -270,4 +270,51 @@ describe("Governance settings", () => {
     expect(cert.textContent).toMatch(/overwritten with zeros/);
     expect(cert.textContent).toMatch(/destruction-2026-11-11 0930\.json/);
   });
+
+  it("retention dates are read in the project's time zone (R93): shown, set once per click, refused in plain words, cleared to UTC", async () => {
+    serve();
+    const sent: any[] = [];
+    let release: (() => void) | undefined;
+    let stored: string | null = null;
+    server.use(
+      http.get(url(`/projects/${PID}/retention`), () => HttpResponse.json({ destroyAfter: "2026-12-01", timeZone: stored, due: [] })),
+      http.put(url(`/projects/${PID}/time-zone`), async ({ request }) => {
+        const body = (await request.json()) as { timeZone: string | null };
+        sent.push(body);
+        if (body.timeZone === "Mars/Olympus") {
+          return HttpResponse.json({ error: { code: "VALIDATION", message: "That is not a time zone name (for example Europe/Berlin or America/New_York)." } }, { status: 400 });
+        }
+        if (body.timeZone === "Asia/Tokyo") await new Promise<void>((r) => (release = r));
+        stored = body.timeZone;
+        return HttpResponse.json({ timeZone: stored });
+      }),
+    );
+    render(<GovernanceSettings api={makeApi()} projectId={PID} />);
+    await loaded();
+    const ret = card("Retention and destruction");
+    const field = (await within(ret).findByRole("textbox", { name: "Time zone for these dates" })) as HTMLInputElement;
+    expect(field.value).toBe("");
+    expect(ret.textContent).toMatch(/UTC/);
+    const user = userEvent.setup();
+    const save = within(ret).getByRole("button", { name: "Save time zone" }) as HTMLButtonElement;
+
+    await user.type(field, "Mars/Olympus");
+    await user.click(save);
+    expect((await within(ret).findByRole("alert")).textContent).toMatch(/not a time zone name/);
+
+    await user.clear(field);
+    await user.type(field, "Asia/Tokyo");
+    await user.click(save);
+    await user.click(save); // a double click sends one request
+    expect(save.disabled).toBe(true);
+    release?.();
+    await waitFor(() => expect(within(ret).getByRole("status").textContent).toMatch(/Saved/));
+    expect(sent.filter((b) => b.timeZone === "Asia/Tokyo")).toHaveLength(1);
+    expect(field.value).toBe("Asia/Tokyo");
+
+    await user.clear(field);
+    await user.click(save);
+    await waitFor(() => expect(sent.at(-1)).toEqual({ timeZone: null }));
+    await waitFor(() => expect(within(ret).getByRole("status").textContent).toMatch(/UTC/));
+  });
 });

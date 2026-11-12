@@ -173,6 +173,23 @@ describe("SourceTable", () => {
     render(<SourceTable items={[{ id: "x", projectId: "p2", type: "book", title: "", creatorsText: "", folder: "f", needsReview: false, locked: true }]} total={1} onOpen={vi.fn()} />);
     expect(screen.getByText("Locked source")).toBeTruthy();
   });
+
+  it("says in words when a source was found through its annotations (Task 58)", () => {
+    const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    render(
+      <SourceTable
+        items={[
+          { ...base, id: "a", title: "Found by annotation", matchedIn: "annotation" },
+          { ...base, id: "b", title: "Found by title" },
+        ]}
+        total={2}
+        onOpen={vi.fn()}
+      />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    expect(rows[1]!.textContent).toContain("Found in an annotation");
+    expect(rows[2]!.textContent).not.toContain("annotation");
+  });
 });
 
 describe("JobsIndicator", () => {

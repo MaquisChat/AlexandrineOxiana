@@ -157,6 +157,8 @@ export interface SourceRow {
   folder: string;
   needsReview: boolean;
   locked: boolean;
+  /** A text search found it through the text of its annotations (Task 58). */
+  matchedIn?: "annotation";
 }
 
 export interface SourceQuery {

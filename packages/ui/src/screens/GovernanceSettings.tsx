@@ -529,9 +529,53 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
   const [busy, setBusy] = useState(false);
   const [cert, setCert] = useState<{ certificate: DestructionCertificate; certificateFile: string } | null>(null);
   const certId = useId();
+  const tzId = useId();
+  // The project's time zone (R93): the retention date is read in it; null is UTC.
+  const [zone, setZone] = useState<{ saved: string | null; input: string } | null>(null);
+  const [tzBusy, setTzBusy] = useState(false);
+  const [tzSaved, setTzSaved] = useState(false);
+  const [tzError, setTzError] = useState<string | null>(null);
+  const tzSending = useRef(false);
+  const current = useRef({ projectId, live: true });
+  current.current.projectId = projectId;
+  useEffect(() => {
+    current.current.live = true;
+    return () => {
+      current.current.live = false;
+    };
+  }, []);
   const load = useCallback(() => {
-    api.retention(projectId).then(setDue, (err: unknown) => setError(err instanceof Error ? err.message : "What is due could not be listed."));
+    api.retention(projectId).then(
+      (r) => {
+        if (!current.current.live || current.current.projectId !== projectId) return;
+        setDue(r);
+        setZone({ saved: r.timeZone ?? null, input: r.timeZone ?? "" });
+      },
+      (err: unknown) => setError(err instanceof Error ? err.message : "What is due could not be listed."),
+    );
   }, [api, projectId]);
+  const saveZone = async () => {
+    if (!zone || tzSending.current) return; // one request per click, however fast the clicks
+    tzSending.current = true;
+    const pid = projectId;
+    const wanted = zone.input.trim() || null;
+    setTzBusy(true);
+    setTzSaved(false);
+    setTzError(null);
+    try {
+      const r = await api.setTimeZone(pid, wanted);
+      if (!current.current.live || current.current.projectId !== pid) return; // a stale answer
+      setZone({ saved: r.timeZone, input: r.timeZone ?? "" });
+      setTzSaved(true);
+      load();
+    } catch (err) {
+      if (!current.current.live || current.current.projectId !== pid) return;
+      setTzError(err instanceof Error ? err.message : "The time zone could not be saved.");
+    } finally {
+      tzSending.current = false;
+      if (current.current.live) setTzBusy(false);
+    }
+  };
   useEffect(load, [load]);
   const assetIds = due?.due.flatMap((d) => d.assetIds) ?? [];
   const destroy = async () => {
@@ -549,6 +593,39 @@ function Retention({ api, projectId }: { api: GovernanceApi; projectId: string }
   };
   return (
     <div className="ao-subsection">
+      {zone ? (
+        <div className="ao-field">
+          <label htmlFor={`${tzId}-tz`}>Time zone for these dates</label>
+          <input
+            id={`${tzId}-tz`}
+            type="text"
+            maxLength={64}
+            autoComplete="off"
+            spellCheck={false}
+            aria-describedby={`${tzId}-tz-hint`}
+            value={zone.input}
+            onChange={(e) => {
+              const input = e.target.value;
+              setZone((z) => (z ? { ...z, input } : z));
+              setTzSaved(false);
+            }}
+          />
+          <p id={`${tzId}-tz-hint`} className="ao-hint">
+            A time zone name such as Europe/Berlin or America/New_York. Leave it empty for UTC.
+          </p>
+          <button type="button" disabled={tzBusy} onClick={() => void saveZone()}>
+            Save time zone
+          </button>
+          <p role="status" className="ao-hint">
+            {tzSaved ? "Saved. " : ""}Dates are read in {zone.saved ? <UserText>{zone.saved}</UserText> : "UTC"}.
+          </p>
+          {tzError ? (
+            <p role="alert" className="ao-warning">
+              {tzError}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
       <h3>Due for destruction</h3>
       {due === null ? (
         <p role="status">Checking…</p>
