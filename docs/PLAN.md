@@ -512,7 +512,7 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | approved; verification before merge | 01a66d3 (worktree branch) | reviewed with probes, then one fix round (the update instructions) reviewed by the controller |
-| 66 A paired browser survives a relaunch (D13) | not started | | waits for 46c and 65 |
+| 66 A paired browser survives a relaunch (D13) | in progress | | dispatched 2026-11-12 after Task 46c merged |
 | 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
