@@ -345,6 +345,24 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: controller walks the Linux build through the checklist.
 - Model: Sonnet.
 
+**Task 64 — What the owner's guide found missing in the interface (D10, D11, D12) [ledger: R170, R41, R113, R145]**
+- Depends: 46b, 34d, 63 (they change the same screens). Found by Task 37i: the desktop app has no address bar, so a screen without a link cannot be reached.
+- Files: `packages/ui/src/screens/Library.tsx`, the source screen, `components/TranscriptLink.tsx`, the Governance form, the import wizard and the other screens with a typed path, the one bridge module for native pickers, tests; `e2e/` only to turn the new expected-failure tests into normal ones.
+- Accept: (D10) the Capture screen is reached from a project by a visible, keyboard-reachable link, and a source that has a transcript links to the transcript viewer; (D11) the Governance form has a control for the project's capture methods, including browser capture and the downloader, saved through the same governed, audited change as the form's other fields, so that no researcher needs to edit `governance.yaml` text to capture; (D12) every field where a folder or file path is typed offers the native picker when the shell is present and stays a typed field when it is not. The extension popup's and the Capture screen's wording name the place a person can actually find.
+- Verify: UI tests; `pnpm e2e -- --app-only --trace off`; the desktop scenario once.
+- Model: Opus.
+
+**Task 65 — The browser extension as a download [ledger: R170, R110, R167]**
+- Depends: 37f. Found by Task 37i: the extension could only be built from source with Node and pnpm.
+- Files: `.github/workflows/desktop-macos.yml`, `apps/browser-extension/scripts/`, `apps/browser-extension/README.md`, `apps/desktop/scripts/build-macos.test.mjs` (the workflow's tests), `docs/first-run.md`.
+- Accept: every Mac build run also builds the extension on Linux and uploads it, zipped with its SHA-256, as an artifact beside the Mac download; the guide says how to load it in Chrome or Edge and in Firefox; no new permission, host or store listing.
+- Verify: the script and workflow tests; the zip built here loads in the extension's end-to-end run.
+- Model: Opus.
+
+**Task 37k — Revise the guide and checklist for the build the owner will test**
+- Depends: 46a, 46b, 34d, 63, 64, 65, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
+- Model: Sonnet, then an accuracy review.
+
 ### Milestone N — Finish Phase 1
 
 **Task 52 — Review pages for the owner**
@@ -424,6 +442,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
 - Defect D9 (the first-use question could take focus from a person typing): fixed by Task 48c.
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
+- Defects found by Task 37i while writing the owner's guide (for Task 64): D10 (high): nothing in the interface links to the Capture screen or to the transcript viewer, and the desktop app has no address bar, so neither can be reached. D11 (high): the Governance form has no control for capture methods; a new project allows neither browser capture nor the downloader, and the only way to allow them is to edit the `governance.yaml` text. D12: outside the library chooser and the drop areas, folder and file paths must be typed in full; there is no picker.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -474,7 +493,10 @@ Update after every task; commit and push.
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
-| 37i Guide and checklist | in progress | | dispatched 2026-11-12 once the Mac build was green |
+| 37i Guide and checklist | in review | 81c7c20 (worktree branch) | first version written against the build of 2026-11-12; it found D10–D12 and that the extension had no download (R170); accuracy review dispatched |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
+| 65 The browser extension as a download | in progress | | dispatched 2026-11-12 |
+| 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
