@@ -35,3 +35,4 @@ export {
   TornFileError,
 } from "./errors.js";
 export type { PendingWrite, PendingWriteChoice } from "./pending-writes.js";
+export type { AttentionMark } from "./attention.js";

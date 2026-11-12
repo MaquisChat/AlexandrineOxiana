@@ -61,6 +61,9 @@ class Component:
     write: tuple[tuple[str, str], ...] = ()
     # Download size shown when it is not pinned (yt-dlp: the latest release's size is not known ahead).
     approx_size: int = 0
+    # Hosts contacted by a program's own updater rather than by the worker's downloads (named in the
+    # catalogue's `hosts`, R158; not enforced by the worker, which does not make those requests).
+    update_hosts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,8 @@ DENO = Component(
 YTDLP = Component(
     id="yt-dlp", name="Video downloader (yt-dlp)", version="latest", licence="Unlicense; the standalone build is GPL-3.0-or-later",
     kind="ytdlp", root="tools", folder="yt-dlp", hosts=GITHUB_HOSTS, approx_size=38_000_000,
+    # `yt-dlp --update-to stable` asks GitHub's API for the release, then fetches from the hosts above.
+    update_hosts=("api.github.com",),
 )
 
 # ---------- ffmpeg + ffprobe (Martin Riedl's 9.0.2 release builds, GPL; ADR 0014 until our own build exists) ----------

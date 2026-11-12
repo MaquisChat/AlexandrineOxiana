@@ -929,7 +929,7 @@ def test_every_installable_component_names_the_hosts_it_contacts(worker_env, mon
         for c in t["components"]:
             assert isinstance(c["hosts"], list), c["id"]
             for h in c["hosts"]:
-                assert re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", h), (c["id"], h)
+                assert re.fullmatch(r"(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", h), (c["id"], h)
             if c["available"]:
                 assert c["hosts"], c["id"]
     comps = {c["id"]: c for t in cat["tools"] for c in t["components"]}
@@ -1056,3 +1056,61 @@ def test_an_install_that_completed_before_the_cancel_took_effect_ends_done():
 def test_the_worker_runs_tool_jobs_in_a_lane_that_keeps_a_completed_install(worker):
     assert worker.server.tool_manager.cancel_after_return is False
     assert worker.server.manager.cancel_after_return is True
+
+
+# ---------- fix round 3, N5: `hosts` is the allow-list the code enforces ----------
+
+
+def _covered(host: str, entries: list[str]) -> bool:
+    for e in entries:
+        if e.startswith("*."):
+            if host.endswith(e[1:]) and len(host) > len(e) - 1:
+                return True
+        elif host == e:
+            return True
+    return False
+
+
+def _enforced(c) -> tuple[str, ...]:
+    """The hosts the download code accepts for `c` (pinned addresses and redirects)."""
+    if c.kind == "ytdlp":
+        from ao_worker import download
+
+        return download.YTDLP_HOSTS
+    return c.hosts
+
+
+def test_hosts_cover_every_host_the_download_code_accepts_and_nothing_broader(worker_env, monkeypatch):
+    monkeypatch.setenv("PATH", str(FAKE_BIN))
+    from urllib.parse import urlsplit
+
+    comps = {c["id"]: c for t in tools.catalogue()["tools"] for c in t["components"]}
+    for cid, comp in toolpins.COMPONENTS.items():
+        entries = comps[cid]["hosts"]
+        d = tools.downloads_for(comp) if comp.kind != "ytdlp" else ()
+        if isinstance(d, Unavailable):
+            assert entries == [], cid
+            continue
+        enforced = _enforced(comp)
+        # everything the code accepts is named: exact hosts, and any host under an allowed suffix
+        for rule in enforced:
+            sample = "files-1" + rule if rule.startswith(".") else rule
+            assert _covered(sample, entries), (cid, rule, entries)
+        for x in d:
+            assert _covered(urlsplit(x.url).hostname, entries), (cid, x.url)
+        # nothing broader than the code accepts, apart from the hosts an update contacts
+        for e in entries:
+            if e in comp.update_hosts:
+                continue
+            if e.startswith("*."):
+                assert e[1:] in enforced, (cid, e)  # exactly one of the code's suffix rules
+            else:
+                assert fetch.host_allowed(e, enforced), (cid, e)
+    assert "*.hf.co" in comps["model-medium"]["hosts"] and "huggingface.co" in comps["model-medium"]["hosts"]
+    assert "api.github.com" in comps["yt-dlp"]["hosts"]
+
+
+def test_the_ytdlp_download_enforces_the_catalogues_hosts():
+    from ao_worker import download
+
+    assert download.YTDLP_HOSTS == toolpins.COMPONENTS["yt-dlp"].hosts

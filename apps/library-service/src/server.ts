@@ -15,6 +15,7 @@ import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
 import { registerAppearance } from "./routes/appearance.js";
 import { registerAudit } from "./routes/audit.js";
+import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
 import { registerCitations } from "./routes/citations.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
@@ -248,6 +249,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerReview(app, ctx);
   registerGovernance(app, ctx);
   registerAudit(app, ctx);
+  registerLibraryAudit(app, ctx);
   registerFieldwork(app, ctx);
   registerCitations(app, ctx);
   registerAppearance(app, ctx);

@@ -815,3 +815,17 @@ describe("the default speech model (R158)", () => {
     expect(DEFAULT_SPEECH_MODEL).toBe("medium");
   });
 });
+
+describe("the speech model names in sentences (R158)", () => {
+  it("every shared speech model is named, and nothing else is taken for one", async () => {
+    const { SPEECH_MODELS } = await import("@ao/shared");
+    for (const m of SPEECH_MODELS) expect(toolMissingReason(`speech-${m}`)).toMatch(new RegExp(`^The ${m} speech model is not installed`));
+    expect(toolMissingReason("speech-huge")).toMatch(/^A tool this needs/);
+  });
+
+  it("the sentences carry no list of model names of their own", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("./errors.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/large-v3|\btiny\b/);
+  });
+});

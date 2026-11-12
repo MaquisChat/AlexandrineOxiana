@@ -26,6 +26,7 @@ import {
   type WrappedKey,
 } from "../crypto/keys.js";
 import { AuditStore } from "./audit-store.js";
+import { appendLibraryRefusal } from "./library-audit.js";
 import { appendChanges } from "./changelog-store.js";
 import { GovernanceViolationError, InvalidInputError, KeyFileChangedError, PolicyDeniedError, RecoveryPendingError } from "./errors.js";
 import { decryptBytes, foldName, namesIn, readMaybe, sealLine } from "./io.js";
@@ -50,6 +51,31 @@ export interface ProjectKeyFile {
 const KEY_FILE_MODE = 0o600;
 
 /**
+ * Records a refused project creation in the library's audit log (Task 50): who, what (the name
+ * asked for, whether encrypted) and the rule's reason; never the passphrase. If it cannot be
+ * written the refusal still stands, and the library warns (`refusal-unrecorded`, library-wide).
+ * Repeats of the latest entry on the same day are counted, not appended (R154 a).
+ */
+async function recordCreateRefusal(core: RepoCore, at: string, name: string, encrypted: boolean, reason: string): Promise<void> {
+  try {
+    await appendLibraryRefusal(core, {
+      at,
+      actor: core.actor,
+      device: core.device,
+      action: "store",
+      decision: { result: "deny", reason },
+      details: { op: "project.create", name, encrypted },
+    });
+  } catch (err) {
+    core.integrityWarnings.push({
+      projectId: "*",
+      kind: "refusal-unrecorded",
+      detail: `a refused project creation could not be recorded in the library's audit log (${err instanceof Error ? err.name : "Error"})`,
+    });
+  }
+}
+
+/**
  * Creates `Projects/<name>/` with project.json, governance.yaml (verbatim),
  * keys/project-key.json (encrypted projects), audit/0001.jsonl and
  * changes/<YYYY-MM>.jsonl. Everything is written into a hidden staging folder
@@ -66,22 +92,29 @@ export async function createProject(
     const cfg = parseGovernance(input.governanceYaml);
     const { policy } = effectivePolicy(cfg);
     const enc = input.encryption;
+    const now = core.clock();
+    const at = now.toISOString();
+    // A refusal has no project log to go to: it is recorded in the library's audit log (Task 50).
+    const refuse = async (err: GovernanceViolationError | PolicyDeniedError): Promise<never> => {
+      await recordCreateRefusal(core, at, input.name, enc.enabled === true, err.message);
+      throw err;
+    };
     if (!enc.enabled) {
       if (policy.identifiability.containsIdentifiable && policy.identifiability.pseudonymizeFileNames) {
-        throw new GovernanceViolationError(
-          "This project contains identifiable data and pseudonymizes file names; the pseudonym map must be stored encrypted, so enable encryption for this project",
+        await refuse(
+          new GovernanceViolationError(
+            "This project contains identifiable data and pseudonymizes file names; the pseudonym map must be stored encrypted, so enable encryption for this project",
+          ),
         );
       }
       if (policy.encryption.atRest === "required") {
-        throw new GovernanceViolationError("Governance requires encryption at rest; enable encryption for this project");
+        await refuse(new GovernanceViolationError("Governance requires encryption at rest; enable encryption for this project"));
       }
     } else if (typeof enc.passphrase !== "string" || enc.passphrase === "") {
       throw new TypeError("an encrypted project needs a passphrase");
     }
 
     const id = newId();
-    const now = core.clock();
-    const at = now.toISOString();
     const decision = evaluate(cfg, {
       action: "store",
       projectId: id,
@@ -90,8 +123,7 @@ export async function createProject(
       tz: core.tz,
       store: { identifiable: false, hasLocation: false },
     });
-    // Not audited: the project and its audit log do not exist yet, and nothing has been written.
-    if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "store");
+    if (decision.result === "deny") await refuse(new PolicyDeniedError(decision.reason, "store"));
 
     const projectsDir = join(core.root, "Projects");
     await fsp.mkdir(projectsDir, { recursive: true });
