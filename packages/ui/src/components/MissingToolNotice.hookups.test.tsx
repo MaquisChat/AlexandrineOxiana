@@ -83,7 +83,7 @@ describe("the transcript viewer", () => {
     const svc = transcriptService();
     const tools = catalogue().map((t) => (t.id === "speech-small" ? { ...t, installed: true, usable: true, managed: true, remainingSize: 0 } : t));
     const cat = toolsService({ base: BASE, tools });
-    server.use(...svc.handlers, ...cat.handlers);
+    server.use(...cat.handlers, ...svc.handlers); // the catalogue first: the transcript fixture refuses /tools
     const view = render(<TranscriptViewer api={transcriptApi(testClient())} tools={toolsApi(testClient())} projectId="p1" sourceId="s1" />);
     await screen.findByText("Hello and welcome.");
     const select = screen.getByLabelText("Speech model") as HTMLSelectElement;

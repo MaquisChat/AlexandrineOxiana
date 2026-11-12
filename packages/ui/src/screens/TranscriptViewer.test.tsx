@@ -732,7 +732,7 @@ describe("TranscriptViewer — transcribe again", () => {
     const user = userEvent.setup();
     await user.selectOptions(screen.getByLabelText("Speech model"), "large-v3");
     await user.click(screen.getByRole("button", { name: "Re-transcribe" }));
-    const alert = await screen.findByText(/speech model “large-v3” is not installed/);
+    const alert = await screen.findByText(/speech model “large-v3” on this computer could not be loaded; it may be damaged\. Remove it and install it again from the optional tools screen/);
     expect(alert.textContent).toMatch(/The media helper could not finish the job\./);
     expect(alert.textContent).not.toMatch(/MODEL_UNAVAILABLE|\{/);
   });

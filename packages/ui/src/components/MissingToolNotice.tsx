@@ -11,8 +11,9 @@
  * The tool's name comes from this file's fixed words, never from the error (the raw id is not shown).
  */
 import { isToolId, type ToolId } from "@ao/shared";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ApiClientError } from "../api/client";
+import { speechSize, speechTool, type ToolsApi } from "../api/tools";
 import { inAppLink, PATHS } from "../navigation";
 import "./MissingToolNotice.css";
 
@@ -25,13 +26,13 @@ const TOOL_SENTENCE: Record<ToolId, string> = {
   "speech-medium": "The speech model “medium” is not installed on this computer, so nothing was transcribed with it.",
   "speech-large-v3": "The speech model “large-v3” is not installed on this computer, so nothing was transcribed with it.",
   "video-downloader": "The video downloader is not installed on this computer, so videos cannot be saved from the web.",
-  "image-downloader": "The picture-post downloader is not installed on this computer, so picture posts cannot be saved from the web.",
+  "image-downloader": "The image downloader is not installed on this computer, so photo posts cannot be saved from the web.",
   ffmpeg:
-    "ffmpeg, the video conversion tool, is not installed on this computer. Until it is, viewing copies of videos are not made, and media that carries a location stays “proxy pending” and is left out of exports.",
+    "The video tools (ffmpeg) are not installed on this computer. Until they are, videos get no viewing copies, and media that carries a location stays “proxy pending” and is left out of exports.",
   ocr: "Text recognition (OCR) is not installed on this computer, so scanned pages are not read.",
 };
 
-const UNNAMED = "A downloader this link needs (the video downloader or the picture-post downloader) is not installed on this computer, so nothing was saved.";
+const UNNAMED = "A tool this needs is not installed on this computer.";
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -118,7 +119,7 @@ export function SourceToolNotice({ file }: { file: unknown }) {
     <>
       {video && (
         <p className="ao-tool-missing" role="note">
-          This source&apos;s viewing copy, with its location coarsened or removed, has not been made: ffmpeg, the video conversion tool, is not installed. Until it is, the media stays “proxy pending”
+          This source&apos;s viewing copy, with its location coarsened or removed, has not been made: the video tools (ffmpeg) are not installed. Until it is, the media stays “proxy pending”
           and is left out of exports. <ToolsLink tool="ffmpeg">Install ffmpeg from the optional tools screen</ToolsLink>.
         </p>
       )}
@@ -128,5 +129,51 @@ export function SourceToolNotice({ file }: { file: unknown }) {
         </p>
       )}
     </>
+  );
+}
+
+/**
+ * Which speech models are installed (by model name), from the catalogue; undefined while it is not
+ * known (no tools api, the catalogue cannot be read, or it has not answered yet). Read once.
+ */
+export function useSpeechModels(api: ToolsApi | undefined): Partial<Record<string, boolean>> | undefined {
+  const [installed, setInstalled] = useState<Partial<Record<string, boolean>> | undefined>();
+  useEffect(() => {
+    if (!api) return;
+    let live = true;
+    const ac = new AbortController();
+    api.catalogue(ac.signal).then(
+      (r) => {
+        if (!live || !Array.isArray(r.tools)) return;
+        const out: Partial<Record<string, boolean>> = {};
+        for (const t of r.tools) {
+          const size = speechSize(t.id);
+          if (size) out[size] = t.installed && t.usable;
+        }
+        setInstalled(out);
+      },
+      () => {
+        // Not known (a plain browser, or the media helper is not running): models are offered as they are.
+      },
+    );
+    return () => {
+      live = false;
+      ac.abort();
+    };
+  }, [api]);
+  return installed;
+}
+
+/** An option's words: "(not installed)" added when the catalogue says so. */
+export const modelOptionLabel = (label: string, model: string, installed: Partial<Record<string, boolean>> | undefined): string =>
+  installed?.[model] === false ? `${label} (not installed)` : label;
+
+/** A chosen speech model that is not installed: said before anything is started, with the link. */
+export function SpeechModelNotice({ model, installed }: { model: string; installed: Partial<Record<string, boolean>> | undefined }) {
+  if (installed?.[model] !== false) return null;
+  return (
+    <p className="ao-tool-missing">
+      The speech model “{model}” is not installed on this computer. <ToolsLink tool={speechTool(model)} />.
+    </p>
   );
 }
