@@ -14,6 +14,7 @@
  * point (the innermost one) and gives it the paths; a drop anywhere else is ignored. The Tauri
  * modules are loaded only inside the shell, on first use.
  */
+import { PhysicalPosition } from "@tauri-apps/api/dpi"; // plain value classes: no IPC, safe outside the shell
 
 export interface DropHandlers {
   /** Paths dropped on this target. */
@@ -37,6 +38,21 @@ type DragDropPayload =
   | { type: "drop"; paths: string[]; position: { x: number; y: number } }
   | { type: "leave" };
 
+/**
+ * A drop event's position as the page's CSS pixels. Tauri types it as a PhysicalPosition but passes
+ * on what the web view reports, unscaled (tauri-runtime-wry 2.12.3 lib.rs, `with_drag_drop_handler`):
+ * wry 0.57.2 reports macOS drops in points (wkwebview/drag_drop.rs, `draggingLocation`) and Linux
+ * drops in GTK logical pixels (webkitgtk/drag_drop.rs, `drag-motion`/`drag-drop`), which are the
+ * page's CSS pixels already; only Windows (webview2/drag_drop.rs, `ScreenToClient`) reports physical
+ * pixels. The app's origin tells them apart: `tauri:` on macOS and Linux, `http://tauri.localhost`
+ * on Windows. Physical pixels are converted with Tauri's own `toLogical`.
+ */
+export function dropPointToCss(pos: { x: number; y: number }, page: { protocol: string; scaleFactor: number }): { x: number; y: number } {
+  const physical = pos instanceof PhysicalPosition ? pos : new PhysicalPosition(pos.x, pos.y);
+  const logical = physical.toLogical(page.protocol === "tauri:" ? 1 : page.scaleFactor);
+  return { x: logical.x, y: logical.y };
+}
+
 /** Whether the page runs inside the desktop shell (Tauri sets `isTauri` before any app code). */
 export function inDesktopShell(): boolean {
   return (globalThis as { isTauri?: unknown }).isTauri === true;
@@ -50,8 +66,8 @@ function createShell(): DesktopShell {
   let listening: Promise<unknown> | undefined;
 
   const targetAt = (pos: { x: number; y: number }): HTMLElement | undefined => {
-    const ratio = window.devicePixelRatio || 1;
-    let el: Element | null = document.elementFromPoint(pos.x / ratio, pos.y / ratio);
+    const at = dropPointToCss(pos, { protocol: window.location.protocol, scaleFactor: window.devicePixelRatio || 1 });
+    let el: Element | null = document.elementFromPoint(at.x, at.y);
     while (el) {
       if (el instanceof HTMLElement && targets.has(el)) return el;
       el = el.parentElement;

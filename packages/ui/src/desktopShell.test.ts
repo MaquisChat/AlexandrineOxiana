@@ -32,6 +32,26 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("dropPointToCss: where a drop lands in the page (Tauri 2.12.5 / wry 0.57.2 sources)", () => {
+  // wry reports macOS drops in points (NSDraggingInfo) and Linux drops in GTK logical pixels, both
+  // already the page's CSS pixels; only Windows (WebView2, the http://tauri.localhost origin) reports
+  // physical client pixels. Tauri passes them all on unscaled, typed as a PhysicalPosition.
+  it("macOS and Linux (tauri: pages): the position is used as it is, at scale 1 and at scale 2", async () => {
+    const { dropPointToCss } = await load();
+    const { PhysicalPosition } = await import("@tauri-apps/api/dpi");
+    for (const scale of [1, 2]) expect(dropPointToCss(new PhysicalPosition(300, 500), { protocol: "tauri:", scaleFactor: scale })).toEqual({ x: 300, y: 500 });
+  });
+
+  it("Windows (http://tauri.localhost): physical pixels converted with Tauri's toLogical, at scale 1 and at scale 2", async () => {
+    const { dropPointToCss } = await load();
+    const { PhysicalPosition } = await import("@tauri-apps/api/dpi");
+    expect(dropPointToCss(new PhysicalPosition(300, 500), { protocol: "http:", scaleFactor: 1 })).toEqual({ x: 300, y: 500 });
+    expect(dropPointToCss(new PhysicalPosition(300, 500), { protocol: "http:", scaleFactor: 2 })).toEqual({ x: 150, y: 250 });
+    // A plain {x, y} (as the event's JSON carries it) is read the same way.
+    expect(dropPointToCss({ x: 300, y: 500 }, { protocol: "http:", scaleFactor: 2 })).toEqual({ x: 150, y: 250 });
+  });
+});
+
 describe("desktopShell", () => {
   it("is absent outside the shell, and loads no Tauri module", async () => {
     const m = await load();
@@ -64,7 +84,7 @@ describe("desktopShell", () => {
     expect(await shell.pickFiles("x", true)).toEqual([]);
   });
 
-  it("gives dropped paths to the innermost drop target under the pointer (physical pixels), and to nothing else", async () => {
+  it("gives dropped paths to the innermost drop target under the pointer, and to nothing else (jsdom is an http: page: physical pixels)", async () => {
     g.isTauri = true;
     vi.stubGlobal("devicePixelRatio", 2);
     const outer = document.createElement("section");
