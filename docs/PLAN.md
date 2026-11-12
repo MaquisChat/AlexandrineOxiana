@@ -530,7 +530,7 @@ Update after every task; commit and push.
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | approved; verification before merge | 94816e0 (worktree branch) | reviewed with probes over one fix round; the working branch taken three times as it moved |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
-| 67 One review queue for the project (D14) | in progress | | dispatched 2026-11-12 after Task 46b merged |
+| 67 One review queue for the project (D14) | in progress | d65ffcb (worktree branch) | the view and import decisions are built; the library had no way to resolve a verification entry: ruled (R176) and being built before review |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
