@@ -14,7 +14,9 @@ import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
 import type { Repo } from "../repo/index.js";
 import { openTestRepo } from "../repo/testing.js";
-import { INDEX_FILE, IndexHandle, createIndexSink, getMeta, indexIsPartial, isIndexStale, openIndexChecked, rebuildIndex, rebuildIndexIfNeeded, search } from "./index.js";
+import { appendJobRecords, readJobJournal } from "../job-journal.js";
+import { listProjectEntries } from "./changes.js";
+import { INDEX_FILE, IndexHandle, createIndexSink, getMeta, indexIsPartial, setMeta, isIndexStale, openIndexChecked, rebuildIndex, rebuildIndexIfNeeded, search } from "./index.js";
 
 const NOW = "2026-11-12T10:00:00.000Z";
 const OPEN_GOV = `identifiability:
@@ -242,3 +244,38 @@ describe("C1: a stale index interrupted while rebuilding stays stale", () => {
     ]);
   });
 });
+
+describe("C1 with the job records (Task 51): a stopped rebuild leaves the mark; the job cache is rebuilt at the next open", () => {
+  const jobIds = (h: IndexHandle) => (h.db.prepare("SELECT id FROM jobs ORDER BY id").all() as Array<{ id: string }>).map((r) => r.id);
+  const projectRel = async () => (await listProjectEntries(lib.root)).find((e) => e.data?.project.id === pid)!.rel;
+
+  it("a rebuild stopped half-way keeps the mark, and the next open rebuilds the jobs table from the journal", async () => {
+    await appendJobRecords(lib.root, await projectRel(), null, [{ v: 1, id: "job-1", projectId: pid, kind: "pdf.ocr", status: "done", createdAt: NOW, updatedAt: NOW }]);
+    await deleteIndex();
+    const c = await openIndexChecked(lib.root);
+    track(c.handle);
+    await expect(rebuildIndexIfNeeded(c.handle, ring, lib, { force: true, onProgress: (d) => (d === 1 ? (() => { throw new Error("power cut"); })() : undefined) })).rejects.toThrow("power cut");
+    expect(getMeta(c.handle.db, "needsRebuild")).toBe("missing");
+    expect(jobIds(c.handle)).toEqual([]); // the half-built index never replaced the live one
+    c.handle.close();
+    const h = await openAndRebuild();
+    expect(jobIds(h)).toEqual(["job-1"]);
+    expect(getMeta(h.db, "needsRebuild")).toBeUndefined();
+  });
+
+  it("the legacy job upgrade, then a stop: the rows are in the journal, the mark stays, and the next open puts them in the cache", async () => {
+    const h0 = track(new IndexHandle(lib.root));
+    h0.db.prepare("INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)").run("legacy-1", pid, "pdf.ocr", "done", "{}", NOW);
+    setMeta(h0.db, "jobsLegacy", "1");
+    // The upgrade runs at the start of the rebuild; the stop comes just before the mark is cleared.
+    await expect(rebuildIndexIfNeeded(h0, ring, lib, { force: true, rebuild: { beforeComplete: () => Promise.reject(new Error("power cut")) } })).rejects.toThrow("power cut");
+    expect(getMeta(h0.db, "needsRebuild")).toBe("forced");
+    expect((await readJobJournal(lib.root, await projectRel(), pid, null)).records.has("legacy-1")).toBe(true);
+    h0.close();
+    const h = await openAndRebuild();
+    expect(jobIds(h)).toEqual(["legacy-1"]);
+    expect(getMeta(h.db, "needsRebuild")).toBeUndefined();
+    expect(getMeta(h.db, "jobsLegacy")).toBeUndefined();
+  });
+});
+
