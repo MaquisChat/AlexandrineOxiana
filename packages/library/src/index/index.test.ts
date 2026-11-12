@@ -1,12 +1,14 @@
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { newId, type Provenance, type SourceDraft } from "@ao/core";
+import Database from "better-sqlite3";
+import { newId, type Annotation, type Provenance, type SourceDraft } from "@ao/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, type Library } from "../library.js";
 import { ReadOnlyLibraryError, type Repo } from "../repo/index.js";
+import { importChange } from "../repo/repo.js";
 import { openTestRepo } from "../repo/testing.js";
 import {
   INDEX_FILE,
@@ -24,7 +26,7 @@ import { changeLogReads, newestProjectChangeId } from "./changes.js";
 import { indexProjectEntities, openIndexAt, purgeProject } from "./db.js";
 import { indexUnlockedProject } from "./sink.js";
 import { stripVtt } from "./load.js";
-import { buildMatchQuery, cjkBigrams } from "./text.js";
+import { annotationText, buildMatchQuery, cjkBigrams } from "./text.js";
 
 const NOW = "2026-11-09T14:30:00.000Z";
 const OPEN_GOV = `identifiability:
@@ -127,9 +129,9 @@ afterEach(async () => {
 
 
 describe("schema", () => {
-  it("uses WAL, records schemaVersion 1 and creates the required tables", () => {
+  it("uses WAL, records the latest schemaVersion and creates the required tables", () => {
     expect(handle.db.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
     const names = (handle.db.prepare("SELECT name FROM sqlite_master").all() as Array<{ name: string }>).map((r) => r.name);
     for (const t of [
       "projects", "sources", "assets", "collections", "tags", "source_collections", "source_tags", "participants",
@@ -137,7 +139,7 @@ describe("schema", () => {
     ]) expect(names).toContain(t);
     // reopening does not re-run migrations
     handle.reopen();
-    expect(getMeta(handle.db, "schemaVersion")).toBe("1");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
   });
 });
 
@@ -232,7 +234,7 @@ describe("search", () => {
     expect(search(handle.db, { text: "料記" }).total).toBe(0); // not adjacent
     expect(search(handle.db, { text: "料理 english" }).total).toBe(0);
     expect(cjkBigrams("家庭料理の記憶 abc")).toBe("家庭 庭料 料理 理の の記 記憶 憶");
-    expect(buildMatchQuery("料理")).toBe('cjk_bigrams : "料理"');
+    expect(buildMatchQuery("料理")).toBe('{cjk_bigrams annotation_bigrams} : "料理"');
   });
 });
 
@@ -815,5 +817,150 @@ describe("change-log stamp, read incrementally (R62)", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+// ---- Task 58: the text of annotations is searchable (R74) ----
+
+describe("annotation text (Task 58, R74)", () => {
+  const ann = (sourceId: string, over: Partial<Annotation> = {}): Annotation => ({
+    id: newId(),
+    sourceId,
+    kind: "highlight",
+    anchors: [],
+    author: "tester",
+    createdAt: NOW,
+    ...over,
+  });
+  /** Replaces a source's annotations through one governed change (as an import or the reader would). */
+  const setAnnotations = (pid: string, sid: string, make: (cur: Annotation[]) => Annotation[], identifiable = false) =>
+    importChange(
+      repo,
+      pid,
+      { action: "store", store: { identifiable, hasLocation: false, ...(identifiable ? { legalBasis: SECRET_GOV_LEGAL.basis } : {}) } },
+      async (ops) => {
+        const cur = await ops.readSource(sid);
+        await ops.writeSource(cur, { ...cur, annotations: make(cur.annotations) });
+      },
+      { op: "test.annotations" },
+    );
+  const annRows = () =>
+    handle.db.prepare("SELECT source_id, annotations, annotation_bigrams FROM main.source_text ORDER BY source_id").all();
+
+  it("finds a source by an annotation's quoted text or comment and says the match is in an annotation", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Plain title"), files(), { provenance: prov() });
+    const other = await repo.createSource(pid, draft("Another plain one"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [
+      ann(sf.source.id, { quote: "informal xylophonic markets", body: "quibbleclaim comment" }),
+      ann(sf.source.id, { kind: "note", body: "家庭料理の記憶 in a note" }),
+    ]);
+    const hit = search(handle.db, { text: "xylophonic" });
+    expect(hit.items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(hit.total).toBe(1);
+    expect(search(handle.db, { text: "quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(search(handle.db, { text: "料理" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // A match in the record itself carries no annotation mark.
+    const rec = search(handle.db, { text: "plain" });
+    expect(ids(rec)).toEqual([sf.source.id, other.source.id].sort());
+    for (const i of rec.items) expect(i).not.toHaveProperty("matchedIn");
+    // Terms may be split between the record and an annotation.
+    expect(search(handle.db, { text: "plain quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // Filters still apply.
+    expect(search(handle.db, { text: "xylophonic", types: ["book"] }).total).toBe(0);
+    expect(search(handle.db, { text: "xylophonic", projectId: await openProject("Other") }).total).toBe(0);
+  });
+
+  it("an edit that changes or removes an annotation updates the index; an unrelated edit keeps it; deletion removes it", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Plain title"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "firstzebra" }), ann(sf.source.id, { body: "secondyak" })]);
+    expect(search(handle.db, { text: "firstzebra" }).total).toBe(1);
+    await setAnnotations(pid, sf.source.id, (cur) => cur.map((a) => (a.quote === "firstzebra" ? { ...a, quote: "thirdgnu" } : a)));
+    expect(search(handle.db, { text: "firstzebra" }).total).toBe(0);
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(1);
+    await repo.updateSource(pid, sf.source.id, { title: { variants: [{ lang: "en", kind: "original", value: "Renamed" }] } });
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(1);
+    expect(search(handle.db, { text: "secondyak" }).total).toBe(1);
+    await setAnnotations(pid, sf.source.id, (cur) => cur.filter((a) => a.body !== "secondyak"));
+    expect(search(handle.db, { text: "secondyak" }).total).toBe(0);
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(1);
+    await repo.deleteSource(pid, sf.source.id);
+    expect(search(handle.db, { text: "thirdgnu" }).total).toBe(0);
+  });
+
+  it("a rebuild from the files gives the same index as the incremental writes", async () => {
+    const pid = await openProject();
+    const a = await repo.createSource(pid, draft("Alpha"), files(), { provenance: prov() });
+    const b = await repo.createSource(pid, draft("Beta"), files(), { provenance: prov() });
+    await setAnnotations(pid, a.source.id, () => [ann(a.source.id, { quote: "ocelot", body: "家庭料理" }), ann(a.source.id, { kind: "note", body: "marmot" })]);
+    await setAnnotations(pid, b.source.id, () => [ann(b.source.id, { quote: "ocelot again" })]);
+    await setAnnotations(pid, b.source.id, () => []);
+    const queries = [{ text: "ocelot" }, { text: "marmot alpha" }, { text: "料理" }, { text: "beta" }, {}];
+    const before = { rows: annRows(), results: queries.map((q) => search(handle.db, q)) };
+    expect(before.results[0]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
+    await rebuildIndex(handle, ring, lib);
+    expect({ rows: annRows(), results: queries.map((q) => search(handle.db, q)) }).toEqual(before);
+  });
+
+  it("an encrypted project's annotation text is in memory only, gone on lock, back on unlock and after a rebuild", async () => {
+    const pid = (await repo.createProject({ name: "Secret", governanceYaml: STRICT_GOV, encryption: { enabled: true, passphrase: "pw" } })).project.id;
+    const sf = await repo.createSource(pid, draft("Sealed source"), files(), { provenance: prov({ identifiable: true, legal: SECRET_GOV_LEGAL }) });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "Qwombatquote", body: "Qcapybaracomment 秘密の注釈" })], true);
+    expect(search(handle.db, { text: "qwombatquote" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(search(handle.db, { text: "qcapybaracomment" }).total).toBe(1);
+    const secrets = ["Qwombatquote", "Qcapybaracomment", "秘密", "密の"];
+    const inFile = async () => {
+      handle.db.pragma("wal_checkpoint(TRUNCATE)");
+      const raw = (await rawIndexBytes()).split(sf.source.folder).join("<folder>");
+      // UTF-8 bytes of the CJK secrets, read as latin1 like the rest
+      return secrets.filter((x) => raw.includes(Buffer.from(x, "utf8").toString("latin1")));
+    };
+    expect(await inFile()).toEqual([]);
+    repo.lockProject(pid);
+    expect(search(handle.db, { text: "qwombatquote" }).total).toBe(0);
+    expect(search(handle.db, { text: "秘密" }).total).toBe(0);
+    expect(await inFile()).toEqual([]);
+    await repo.unlockProject(pid, "pw");
+    expect(search(handle.db, { text: "qwombatquote" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "qcapybaracomment" }).total).toBe(1);
+    expect(search(handle.db, { text: "秘密" }).total).toBe(1);
+    expect(await inFile()).toEqual([]);
+    repo.lockProject(pid);
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "qwombatquote" }).total).toBe(0);
+    expect(await inFile()).toEqual([]);
+  });
+
+  it("an index made before annotations were indexed is migrated in place and marked for a rebuild", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Old index title"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "pangolinquote" })]);
+    handle.close();
+    for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
+    // A version-1 index, as an existing library has it.
+    const old = new Database(join(lib.root, INDEX_FILE));
+    old.exec(await readFile(new URL("./migrations/0001.sql", import.meta.url), "utf8"));
+    old.prepare("INSERT INTO meta (key, value) VALUES ('schemaVersion', '1'), ('projectStamps', '{}')").run();
+    old.prepare("INSERT INTO sources (id, fts_rowid, project_id, type, title, folder) VALUES (?, 1, ?, 'article-journal', 'Old index title', 'f')").run(sf.source.id, pid);
+    old.prepare("INSERT INTO source_projects VALUES (?, ?)").run(sf.source.id, pid);
+    old.prepare("INSERT INTO source_text (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams) VALUES (1, ?, ?, 'Old index title', '', '', 'kept text', '')").run(sf.source.id, pid);
+    old.close();
+    handle.reopen();
+    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
+    expect(search(handle.db, { text: "kept" }).items.map((i) => i.id)).toEqual([sf.source.id]);
+    expect(getMeta(handle.db, "projectStamps")).toBeUndefined();
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    expect(search(handle.db, { text: "pangolinquote" }).total).toBe(0);
+    await rebuildIndex(handle, ring, lib);
+    expect(search(handle.db, { text: "pangolinquote" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+  });
+
+  it("indexes at most the per-source cap of annotation text, in a fixed order", () => {
+    const big = "w".repeat(1024);
+    const list = Array.from({ length: 20 }, () => ({ quote: big, body: big }));
+    expect(annotationText(list, 10 * 1024).length).toBeLessThanOrEqual(10 * 1024);
+    expect(annotationText([{ quote: "a", body: "b" }, { body: "c" }, { quote: "" }], 100)).toBe("a\nb\nc");
   });
 });
