@@ -142,14 +142,22 @@ def managed_ytdlp_path() -> Path:
     return tools_dir() / ("yt-dlp.exe" if sys.platform == "win32" else "yt-dlp")
 
 
-def _fetch(url: str) -> bytes:
-    """A small file (the checksum list), with the same redirect rules as every tool download."""
-    req = urllib.request.Request(url, headers={"User-Agent": fetch.USER_AGENT})
-    with fetch.opener(YTDLP_HOSTS).open(req, timeout=120) as r:
-        data = r.read(SUMS_MAX_BYTES + 1)
-    if len(data) > SUMS_MAX_BYTES:
-        raise ToolError("TOOL_DOWNLOAD_FAILED", "the yt-dlp checksum list is larger than expected")
-    return data
+def _fetch(url: str, cancelled=None) -> bytes:
+    """A small file (the checksum list), downloaded like every tool file: the same redirect rules,
+    connect and header limits, stall limit, deadline and cancel."""
+    fd, tmp = tempfile.mkstemp(prefix=".yt-dlp.sums.", dir=tools_dir() if tools_dir().is_dir() else None)
+    os.close(fd)
+    os.unlink(tmp)  # fetch.download creates it itself (and only ever deletes what it created)
+    try:
+        try:
+            fetch.download(url, Path(tmp), sha256=None, size=None, hosts=YTDLP_HOSTS, max_bytes=SUMS_MAX_BYTES, cancelled=cancelled)
+        except fetch.ToolInstallError as e:
+            if e.code == "TOOL_CHECKSUM_MISMATCH":
+                raise ToolError("TOOL_DOWNLOAD_FAILED", "the yt-dlp checksum list is larger than expected") from e
+            raise
+        return Path(tmp).read_bytes()
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -157,14 +165,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _latest_tag() -> str:
+def _latest_tag(cancelled=None) -> str:
     """The latest release tag, from the redirect of `releases/latest/download/SHA2-256SUMS`
     (→ `…/releases/download/<tag>/SHA2-256SUMS`)."""
     req = urllib.request.Request(YTDLP_RELEASES + "latest/download/SHA2-256SUMS", method="HEAD", headers={"User-Agent": fetch.USER_AGENT})
     location = ""
     try:
-        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60):
-            pass
+        r, _ = fetch.open_watched(lambda s: urllib.request.build_opener(_NoRedirect, *fetch.watched_handlers(s)), req, cancelled)
+        r.close()
     except urllib.error.HTTPError as e:
         if e.code in (301, 302, 303, 307, 308):
             location = e.headers.get("Location", "")
@@ -182,9 +190,9 @@ def _download_ytdlp(dest: Path, progress=None, cancelled=None) -> None:
     asset = ytdlp_asset_name()
     try:
         # One tag for both files, so a release published in between cannot mix checksums and binary.
-        tag = _latest_tag()
+        tag = _latest_tag(cancelled)
         base = f"{YTDLP_RELEASES}download/{tag}/"
-        sums = _fetch(base + "SHA2-256SUMS").decode("utf-8", "replace")
+        sums = _fetch(base + "SHA2-256SUMS", cancelled).decode("utf-8", "replace")
     except (ToolError, JobCancelled):
         raise
     except JobError as e:

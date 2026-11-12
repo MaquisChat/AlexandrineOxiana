@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import http.client
 import logging
 import os
 import socket
@@ -28,8 +29,11 @@ log = logging.getLogger("ao_worker.fetch")
 
 USER_AGENT = "ao-worker"
 CHUNK = 1 << 16
-# Connecting and reading the response headers.
-TIMEOUT_SEC = 30
+# Connecting: each socket operation while connecting (and the TLS handshake) may take this long.
+CONNECT_SEC = 15
+# Connecting and reading the response headers, redirects included, must end within this; a cancel
+# is honoured meanwhile (within about WATCH_SEC).
+HEADER_SEC = 30.0
 MAX_REDIRECTS = 5
 # A body that sends no byte for this long is given up on (a hung host must not hold a job slot).
 STALL_SEC = 30.0
@@ -50,8 +54,8 @@ class _Watchdog:
     """Ends a blocked read when the job is cancelled, the host stalls or the deadline passes, by
     shutting the connection's socket down (the read then returns or raises at once)."""
 
-    def __init__(self, resp, cancelled: Callable[[], bool] | None, deadline: float):
-        self.resp = resp
+    def __init__(self, sockets: "Sockets", cancelled: Callable[[], bool] | None, deadline: float):
+        self.sockets = sockets
         self.cancelled = cancelled
         self.deadline = time.monotonic() + deadline
         self.last = time.monotonic()
@@ -77,12 +81,7 @@ class _Watchdog:
                 return
 
     def _shut(self) -> None:
-        sock = getattr(getattr(getattr(self.resp, "fp", None), "raw", None), "_sock", None)
-        try:
-            if sock is not None:
-                sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        self.sockets.kill()
 
     def stop(self) -> None:
         self._stop.set()
@@ -141,9 +140,109 @@ class _Redirects(urllib.request.HTTPRedirectHandler):
         return out
 
 
-def opener(hosts: tuple[str, ...]) -> urllib.request.OpenerDirector:
+class Sockets:
+    """The sockets an opener connects (redirects open new ones), so a watchdog can end a blocked
+    connect, header read or body read by shutting them down."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._socks: list = []
+        self.abandoned = False
+
+    def add(self, sock) -> None:
+        with self._lock:
+            self._socks.append(sock)
+            dead = self.abandoned
+        if dead:
+            _shutdown(sock)
+
+    def kill(self) -> None:
+        with self._lock:
+            self.abandoned = True
+            socks = list(self._socks)
+        for s in socks:
+            _shutdown(s)
+
+
+def _shutdown(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _watched(base, sockets: Sockets):
+    class Conn(base):  # type: ignore[valid-type, misc]
+        def connect(self):
+            super().connect()
+            sockets.add(self.sock)
+
+    return Conn
+
+
+class _WatchedHTTP(urllib.request.HTTPHandler):
+    def __init__(self, sockets: Sockets):
+        super().__init__()
+        self._sockets = sockets
+
+    def http_open(self, req):
+        return self.do_open(_watched(http.client.HTTPConnection, self._sockets), req)
+
+
+class _WatchedHTTPS(urllib.request.HTTPSHandler):
+    def __init__(self, sockets: Sockets):
+        super().__init__()  # the default context: certificates and host names verified
+        self._sockets = sockets
+
+    def https_open(self, req):
+        return self.do_open(_watched(http.client.HTTPSConnection, self._sockets), req, context=self._context)
+
+
+def watched_handlers(sockets: Sockets) -> list:
+    return [_WatchedHTTP(sockets), _WatchedHTTPS(sockets)]
+
+
+def opener(hosts: tuple[str, ...], sockets: Sockets | None = None) -> urllib.request.OpenerDirector:
     """An opener with no cookie jar and no credentials handler, following redirects only to `hosts`."""
-    return urllib.request.build_opener(_Redirects(hosts))
+    return urllib.request.build_opener(_Redirects(hosts), *watched_handlers(sockets or Sockets()))
+
+
+def open_watched(build: Callable[[Sockets], urllib.request.OpenerDirector], req, cancelled: Callable[[], bool] | None = None):
+    """Opens `req` (connect, request, response headers, redirects) in a helper thread, so that a
+    cancel or HEADER_SEC ends the wait whatever the host does: its sockets are shut down and the
+    helper thread ends on its own. Returns (response, sockets); raises what opening raised,
+    JobCancelled, or TOOL_DOWNLOAD_FAILED when the host did not answer in time."""
+    sockets = Sockets()
+    op = build(sockets)
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            r = op.open(req, timeout=CONNECT_SEC)
+        except BaseException as e:  # noqa: BLE001 - handed to the caller
+            box["err"] = e
+            return
+        if sockets.abandoned:
+            r.close()
+        else:
+            box["resp"] = r
+
+    th = threading.Thread(target=run, name="download-open", daemon=True)
+    th.start()
+    end = time.monotonic() + HEADER_SEC
+    while True:
+        th.join(WATCH_SEC)
+        if not th.is_alive():
+            break
+        if cancelled and cancelled():
+            sockets.kill()
+            raise JobCancelled()
+        if time.monotonic() > end:
+            sockets.kill()
+            raise ToolInstallError("TOOL_DOWNLOAD_FAILED", "the download failed: the server did not answer in time")
+    if "err" in box:
+        raise box["err"]
+    return box["resp"], sockets
 
 
 def _open_for_write(path: Path):
@@ -180,8 +279,8 @@ def download(
     watch: _Watchdog | None = None
     try:
         try:
-            resp = opener(hosts).open(req, timeout=TIMEOUT_SEC)
-        except ToolInstallError:
+            resp, sockets = open_watched(lambda s: opener(hosts, s), req, cancelled)
+        except (ToolInstallError, JobCancelled):
             raise
         except urllib.error.HTTPError as e:
             raise ToolInstallError("TOOL_DOWNLOAD_FAILED", f"the download failed (the server answered {e.code})") from e
@@ -193,7 +292,7 @@ def download(
                 created = True
             except OSError as e:
                 raise _write_error(e) from e
-            watch = _Watchdog(resp, cancelled, deadline_for(limit))
+            watch = _Watchdog(sockets, cancelled, deadline_for(limit))
             with f:
                 while True:
                     if cancelled and cancelled():

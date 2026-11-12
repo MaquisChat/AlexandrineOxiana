@@ -22,7 +22,8 @@ log = logging.getLogger("ao_worker.transcribe")
 MODELS = ("large-v3", "medium", "small", "tiny")
 COMPUTE_TYPES = ("int8", "float16")
 DEFAULTS = {
-    "model": "medium", "language": "auto",  # DEFAULT_SPEECH_MODEL in packages/shared (R158) "multilingual": True, "vad": True, "computeType": "int8",
+    # model: DEFAULT_SPEECH_MODEL in packages/shared (R158; tests/test_tools.py checks).
+    "model": "medium", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
     "wordTimestamps": True,
 }
 SAMPLE_RATE = 16000

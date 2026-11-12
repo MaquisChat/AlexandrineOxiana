@@ -944,3 +944,90 @@ def test_a_hosts_list_follows_the_pins(worker_env, files, monkeypatch):
     monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files))
     comps = {c["id"]: c for t in tools.catalogue()["tools"] for c in t["components"]}
     assert comps["ffmpeg"]["hosts"] == ["127.0.0.1"]
+
+
+# ---------- fix round 2, N1: a host that never finishes its headers ----------
+
+
+class SlowHeaders:
+    """Accepts connections and sends a status line, then one header byte every `every` seconds."""
+
+    def __init__(self, every: float = 0.1, total: float = 8.0):
+        import socket as _s
+
+        self.sock = _s.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.every, self.total = every, total
+        self.accepted = 0
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            threading.Thread(target=self._drip, args=(conn,), daemon=True).start()
+
+    def _drip(self, conn):
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\r\n")
+            end = time.monotonic() + self.total
+            while time.monotonic() < end:
+                conn.sendall(b"X")
+                time.sleep(self.every)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def test_a_cancel_while_the_headers_drip_is_honoured_within_about_a_second(worker_env, tmp_path):
+    srv = SlowHeaders()
+    try:
+        flag = {"cancel": False}
+        threading.Timer(0.5, lambda: flag.__setitem__("cancel", True)).start()
+        t = time.monotonic()
+        with pytest.raises(tools.JobCancelled):
+            fetch.download(f"http://127.0.0.1:{srv.port}/x", tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",),
+                           max_bytes=100, cancelled=lambda: flag["cancel"])
+        assert time.monotonic() - t < 1.5
+        assert not (tmp_path / "f").exists()
+    finally:
+        srv.close()
+
+
+def test_headers_that_never_finish_are_given_up_on(worker_env, tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch, "HEADER_SEC", 0.5)
+    srv = SlowHeaders()
+    try:
+        t = time.monotonic()
+        with pytest.raises(fetch.ToolInstallError) as e:
+            fetch.download(f"http://127.0.0.1:{srv.port}/x", tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=100)
+        assert e.value.code == "TOOL_DOWNLOAD_FAILED" and "answer" in e.value.message
+        assert time.monotonic() - t < 1.5
+    finally:
+        srv.close()
+
+
+def test_the_ytdlp_release_lookups_honour_cancel_too(worker_env, monkeypatch, tmp_path):
+    from ao_worker import download
+
+    srv = SlowHeaders()
+    try:
+        monkeypatch.setattr(download, "YTDLP_RELEASES", f"http://127.0.0.1:{srv.port}/releases/")
+        monkeypatch.setattr(download, "YTDLP_HOSTS", ("127.0.0.1",))
+        flag = {"cancel": False}
+        threading.Timer(0.5, lambda: flag.__setitem__("cancel", True)).start()
+        t = time.monotonic()
+        with pytest.raises(tools.JobCancelled):
+            download.install_ytdlp(cancelled=lambda: flag["cancel"])
+        assert time.monotonic() - t < 1.5
+    finally:
+        srv.close()
