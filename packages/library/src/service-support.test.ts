@@ -16,7 +16,8 @@ import { GovernanceConflictError, GovernanceLooseningError } from "./repo/govern
 import { InvalidInputError, NotFoundError, PolicyDeniedError } from "./repo/errors.js";
 import { captureBrowserPage, stripHtmlSnapshot } from "./capture/browser-capture.js";
 import { tinyPng } from "../../../tests/fixtures/generate.mjs";
-import { addTranscriptVersion, checkCaptureAllowed, confirmField, readAssetText, transcriptVersions } from "./source-actions.js";
+import { checkCaptureAllowed, confirmField, readAssetText, transcriptVersions } from "./source-actions.js";
+import { addTranscriptVersion } from "./transcript-segments.js";
 import { WorkerJobError, type JobResult, type WorkerClient, type WorkerJob } from "./worker-client.js";
 
 let kit: Kit;
@@ -184,7 +185,7 @@ describe("source actions", () => {
     const b = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "WEBVTT\n\n00:00.000 --> 00:01.000\nHello there\n", format: "vtt", basedOn: a.id });
     const versions = transcriptVersions(await kit.repo.getSource(p.id, sf.source.id));
     expect(versions.map((v) => v.id)).toEqual([a.id, b.id]);
-    expect(b.derivation?.params).toEqual({ basedOn: a.id });
+    expect(b.derivation?.params).toEqual({ basedOn: a.id, segmentFlags: 1 }); // Task 62: the WebVTT carries each segment's marks
     expect(await readAssetText(kit.repo, p.id, sf.source.id, b.id)).toContain("Hello there");
     await expect(addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "no header", format: "vtt" })).rejects.toThrow(/WEBVTT/);
   });

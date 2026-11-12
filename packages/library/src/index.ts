@@ -251,7 +251,6 @@ export {
 export {
   ASSET_TEXT_MAX_BYTES,
   CONFIRMABLE_FIELDS,
-  addTranscriptVersion,
   checkCaptureAllowed,
   confirmField,
   readAssetText,
@@ -259,8 +258,8 @@ export {
 } from "./source-actions.js";
 export { isMediaMime, isPictureMime, openAssetContent } from "./asset-content.js";
 export type { AssetContent } from "./asset-content.js";
-export { parseVtt, readTranscript } from "./transcript-segments.js";
-export type { TranscriptRead, TranscriptSegment, VttCue } from "./transcript-segments.js";
+export { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
+export type { SegmentEdit, TranscriptRead, TranscriptSegment, VttCue } from "./transcript-segments.js";
 export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";
 export { BROWSER_CAPTURE_LIMITS, HtmlSnapshotRefusedError, captureBrowserPage, htmlStripStats } from "./capture/browser-capture.js";

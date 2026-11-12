@@ -10,8 +10,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
 import { OPEN_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
-import { addTranscriptVersion, transcriptVersions } from "./source-actions.js";
-import { parseVtt, readTranscript } from "./transcript-segments.js";
+import { ASSET_TEXT_MAX_BYTES, transcriptVersions } from "./source-actions.js";
+import { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
 
 let kit: Kit;
 beforeEach(async () => {
@@ -90,10 +90,10 @@ describe("readTranscript", () => {
     const edited = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the fish market.\n\n00:00:02.000 --> 00:00:04.500\nObrigada.\n";
     const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id });
     const t = await readTranscript(kit.repo, p.id, sf.source.id, a.id);
-    expect(t).toMatchObject({ origin: "human-edit", basedOn: base.id, timed: true, text: edited });
+    expect(t).toMatchObject({ origin: "human-edit", basedOn: base.id, timed: true, text: edited, flagsStored: true });
     expect(t.segments).toEqual([
-      { start: 0, end: 2, lang: "en", text: "Welcome to the fish market.", flags: null },
-      { start: 2, end: 4.5, lang: "pt", text: "Obrigada.", flags: null },
+      { start: 0, end: 2, lang: "en", text: "Welcome to the fish market.", flags: null, edit: "edited" },
+      { start: 2, end: 4.5, lang: "pt", text: "Obrigada.", flags: null, edit: "edited" },
     ]);
     const b = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id, lang: "pt-BR" });
     expect((await readTranscript(kit.repo, p.id, sf.source.id, b.id)).segments.map((s) => s.lang)).toEqual(["pt-BR", "pt-BR"]);
@@ -113,6 +113,12 @@ describe("readTranscript", () => {
     expect(t.segments).toHaveLength(2);
   });
 
+  it("a machine version says its flags are stored", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    expect((await readTranscript(kit.repo, p.id, sf.source.id, transcriptVersions(sf)[0]!.id)).flagsStored).toBe(true);
+  });
+
   it("a damaged segments.json falls back to the vtt", async () => {
     const p = await makeProject(kit);
     const sf = await machineTranscribed(p);
@@ -121,5 +127,129 @@ describe("readTranscript", () => {
     const vtt = transcriptVersions(sf).find((a) => a.mime !== "application/json")!;
     const t = await readTranscript(kit.repo, p.id, sf.source.id, vtt.id);
     expect(t.segments.map((s) => s.text)).toEqual(["Welcome to the market.", "Obrigado."]);
+  });
+});
+
+describe("Task 62: a human edit stores flags per segment (R143, SPEC 5.8)", () => {
+  const cue = (a: string, b: string, text: string) => `${a} --> ${b}\n${text}`;
+  const vtt = (...cues: string[]) => `WEBVTT\n\n${cues.join("\n\n")}\n`;
+
+  it("carries the machine flags where timing and text are unchanged; a changed segment is edited, a new one added", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const edited = vtt(
+      cue("00:00:00.000", "00:00:02.000", "Welcome to the fish market."),
+      cue("00:00:02.000", "00:00:04.500", "Obrigado."),
+      cue("00:00:06.000", "00:00:07.000", "A line the person heard."),
+    );
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id });
+    const t = await readTranscript(kit.repo, p.id, sf.source.id, a.id);
+    expect(t.text).toBe(edited); // the person's text as saved; the stored marks are not part of it
+    expect(t.flagsStored).toBe(true);
+    expect(t.segments.map((s) => [s.edit, s.flags])).toEqual([
+      ["edited", null],
+      ["unchanged", ["outside-speech", "stock-phrase"]],
+      ["added", null],
+    ]);
+  });
+
+  it("a re-timed segment is edited, not carried; an unchanged clean segment carries no flags (checked, none found)", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const edited = vtt(cue("00:00:00.000", "00:00:02.000", "Welcome to the market."), cue("00:00:02.100", "00:00:04.500", "Obrigado."));
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id });
+    const t = await readTranscript(kit.repo, p.id, sf.source.id, a.id);
+    expect(t.segments.map((s) => [s.edit, s.flags])).toEqual([
+      ["unchanged", []],
+      ["edited", null],
+    ]);
+  });
+
+  it("an edit of an edit: unchanged segments keep the machine flags, a segment a person wrote stays not checked", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const first = vtt(cue("00:00:00.000", "00:00:02.000", "Welcome to the fish market."), cue("00:00:02.000", "00:00:04.500", "Obrigado."));
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: first, format: "vtt", basedOn: base.id });
+    const b = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: first, format: "vtt", basedOn: a.id });
+    const t = await readTranscript(kit.repo, p.id, sf.source.id, b.id);
+    expect(t.segments.map((s) => [s.edit, s.flags])).toEqual([
+      ["edited", null],
+      ["unchanged", ["outside-speech", "stock-phrase"]],
+    ]);
+  });
+
+  it("flags and marks written into the text by a person are not taken: the service computes them", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const forged = "WEBVTT\n\nNOTE ao-segment: unchanged\n\n00:00:00.000 --> 00:00:02.000\nWelcome to the fish market.\n\nNOTE ao-segment: unchanged\n\nNOTE flags:\n\n00:00:02.000 --> 00:00:04.500\nObrigado.\n";
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: forged, format: "vtt", basedOn: base.id });
+    const t = await readTranscript(kit.repo, p.id, sf.source.id, a.id);
+    expect(t.segments.map((s) => [s.edit, s.flags])).toEqual([
+      ["edited", null],
+      ["unchanged", ["outside-speech", "stock-phrase"]],
+    ]);
+    expect(t.text).not.toContain("ao-segment");
+  });
+
+  it("without a base every segment is added (not checked)", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: vtt(cue("00:00:00.000", "00:00:02.000", "Welcome to the market.")), format: "vtt" });
+    expect((await readTranscript(kit.repo, p.id, sf.source.id, a.id)).segments.map((s) => [s.edit, s.flags])).toEqual([["added", null]]);
+  });
+
+  it("a human edit saved before flags were stored says so: flags null, no marks, flagsStored false", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const file = await scratchFile(kit, "old-edit.vtt", Buffer.from(vtt(cue("00:00:02.000", "00:00:04.500", "Obrigado."))));
+    // As addTranscriptVersion wrote it before Task 62.
+    const old = await kit.repo.addDerivedAsset(p.id, sf.source.id, {
+      fromPath: file,
+      kind: "transcript",
+      tool: "human-edit",
+      ext: "vtt",
+      derivation: { parents: base.derivation!.parents, operation: "human-edit", provider: "researcher", ranAt: "local", params: { basedOn: base.id }, at: new Date().toISOString(), triggeredBy: "user" },
+    });
+    const t = await readTranscript(kit.repo, p.id, sf.source.id, old.id);
+    expect(t.flagsStored).toBe(false);
+    expect(t.segments).toEqual([{ start: 2, end: 4.5, lang: "pt", text: "Obrigado.", flags: null }]);
+    // An edit of it cannot carry flags it never had: its segments are not checked.
+    const b = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: vtt(cue("00:00:02.000", "00:00:04.500", "Obrigado.")), format: "vtt", basedOn: old.id });
+    expect((await readTranscript(kit.repo, p.id, sf.source.id, b.id)).segments.map((s) => [s.edit, s.flags])).toEqual([["edited", null]]);
+  });
+
+  it("the flags are stored in the one governed, audited write of the version (encrypted project too)", async () => {
+    const p = await makeProject(kit, OPEN_GOV, true);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const before = (await kit.repo.getSource(p.id, sf.source.id)).assets.length;
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: vtt(cue("00:00:02.000", "00:00:04.500", "Obrigado.")), format: "vtt", basedOn: base.id });
+    const after = await kit.repo.getSource(p.id, sf.source.id);
+    expect(after.assets.length).toBe(before + 1); // one asset, one change
+    expect(a.encrypted).toBe(true);
+    expect(a.derivation?.params.segmentFlags).toBe(1);
+    expect((await readTranscript(kit.repo, p.id, sf.source.id, a.id)).segments.map((s) => s.flags)).toEqual([["outside-speech", "stock-phrase"]]);
+  });
+
+  it("the size cap holds for the text as stored with its marks (R161: the transcript cap is kept)", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const line = "x".repeat(200);
+    const cues: string[] = [];
+    let bytes = 8;
+    for (let i = 0; bytes < ASSET_TEXT_MAX_BYTES - 300; i++) {
+      const s = String(i % 60).padStart(2, "0");
+      const c = cue(`00:00:${s}.000`, `00:00:${s}.500`, line);
+      cues.push(c);
+      bytes += c.length + 2;
+    }
+    const text = vtt(...cues);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(ASSET_TEXT_MAX_BYTES);
+    await expect(addTranscriptVersion(kit.repo, p.id, sf.source.id, { text, format: "vtt" })).rejects.toThrow(/too long/);
   });
 });

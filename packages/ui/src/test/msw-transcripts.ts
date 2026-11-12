@@ -41,7 +41,7 @@ export const humanVersion = (id: string, at = "2026-11-02T09:00:00.000Z"): Trans
   format: "vtt",
 });
 
-export const machineTranscript = (id = "v1", segments = SEGMENTS): TranscriptResponse => ({ id, text: "WEBVTT\n", format: "vtt", origin: "machine", timed: true, segments });
+export const machineTranscript = (id = "v1", segments = SEGMENTS): TranscriptResponse => ({ id, text: "WEBVTT\n", format: "vtt", origin: "machine", timed: true, flagsStored: true, segments });
 
 export const humanTranscript = (id: string, segments = SEGMENTS): TranscriptResponse => ({
   id,
@@ -50,6 +50,7 @@ export const humanTranscript = (id: string, segments = SEGMENTS): TranscriptResp
   origin: "human-edit",
   basedOn: "v1",
   timed: true,
+  flagsStored: false,
   segments: segments.map((s) => ({ ...s, flags: null })),
 });
 
