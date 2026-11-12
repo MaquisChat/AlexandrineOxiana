@@ -157,6 +157,8 @@ export type {
   BulkImportDeps,
   ImportReport,
   ImportSourceAdapter,
+  ListedReviewEntry,
+  ProjectReviewQuery,
   ReviewDecision,
   ReviewPatch,
   ScanContext,
