@@ -100,7 +100,7 @@ R94 (Task 29, line 226): sealed backups resolved on unlock, rename-safe matching
 R95 (schedule, line 227): OWNER DECISION: parallel worktrees; order T30 → {31,32} → {33,35,36} → T34 → T37.
 R96 (Task 30, line 230): service security: 127.0.0.1, constant-time token, Host check, Origin only shell/paired extension, no query tokens; carry-overs. [OPEN] --max-old-space-size for Task 37 sidecar.
 R97 (Task 30, line 231): route deviations accepted; fieldwork update/withdraw for Task 36 (done).
-R98 (Task 30, line 232): loosening detection; exact credential query-key filter; [OPEN] AO_SERVICE_TOKEN on stdin in Task 37; /proc mkdir spin deferred.
+R98 (Task 30, line 232): loosening detection; exact credential query-key filter; the service token on standard input: done in Task 37b (the worker's token follows in Task 37c); /proc mkdir spin deferred.
 R99 (Task 30, line 233): governance PUT with base hash/409; batch registry; shutdown pauses; move quiesce; backupIfDue on open/unlock; browser capture stripping.
 R100 (Task 32, line 235): mockup tokens, fonts pinned/OFL; [OPEN] user-file fonts loaded via service/desktop (Tasks 33/37); no tokens in URLs.
 R101 (Task 30/33/34, line 236): parse5 stripping; [OPEN] binding for Task 34: archived HTML only in sandboxed frame, never in app webview.

@@ -26,6 +26,18 @@ describe("library API (R113: typed methods on request())", () => {
     ]);
   });
 
+  it("asks for a new recovery code with POST /projects/:id/recovery-code { passphrase }; the code comes back once", async () => {
+    const seen: Array<{ path: string; body: unknown }> = [];
+    server.use(
+      http.post(url("/projects/:id/recovery-code"), async ({ request }) => {
+        seen.push({ path: new URL(request.url).pathname, body: await request.json() });
+        return HttpResponse.json({ recoveryCode: "CODE" });
+      }),
+    );
+    expect(await testApi().projects.newRecoveryCode("p 1", { passphrase: "pw" })).toEqual({ recoveryCode: "CODE" });
+    expect(seen).toEqual([{ path: "/projects/p%201/recovery-code", body: { passphrase: "pw" } }]);
+  });
+
   it("searches sources with text, collection and tag as query values", async () => {
     let seen: URL | undefined;
     server.use(

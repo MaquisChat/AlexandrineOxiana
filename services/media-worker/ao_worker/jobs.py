@@ -24,6 +24,8 @@ MAX_RUNNING = 2
 KILL_GRACE_SEC = 3.0
 
 JOB_TYPES = ("audio.transcribe", "capture.download", "image.proxy", "video.proxy", "pdf.ocr")
+# Installing, updating and removing an optional tool (tools.py); started by POST /tools/<id>/<action>, not /jobs.
+TOOL_JOB_TYPES = ("tool.install", "tool.update", "tool.remove")
 TERMINAL = ("done", "failed", "cancelled")
 # A finished job is forgotten once its terminal state was fetched, or this long after it ended.
 RETAIN_FINISHED_SEC = 600.0
@@ -52,11 +54,17 @@ def child_env(tmpdir: str | None = None) -> dict[str, str]:
 class JobError(Exception):
     """A job failure with a stable code. `message` and `detail` must not contain user file paths or full URLs."""
 
-    def __init__(self, code: str, message: str, detail: str | None = None):
+    def __init__(self, code: str, message: str, detail: str | None = None, tool: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.detail = detail
+        # The optional tool (tools.py catalogue id) the failure is about, e.g. TOOL_NOT_INSTALLED.
+        self.tool = tool
+
+    def to_json(self) -> dict:
+        return {"code": self.code, "message": self.message, **({"detail": self.detail} if self.detail else {}),
+                **({"tool": self.tool} if self.tool else {})}
 
 
 class JobCancelled(Exception):
@@ -192,7 +200,11 @@ Handler = Callable[[Job, JobContext], dict]
 
 
 class JobManager:
-    def __init__(self, handlers: dict[str, Handler], max_running: int = MAX_RUNNING):
+    def __init__(self, handlers: dict[str, Handler], max_running: int = MAX_RUNNING, cancel_after_return: bool = True):
+        # cancel_after_return: a job whose handler finished although a cancel was asked for is still
+        # recorded as cancelled (media jobs: their output is discarded). False for tool installs: an
+        # install that completed is installed, whatever arrived after its last cancel check.
+        self.cancel_after_return = cancel_after_return
         self.handlers = handlers
         self.max_running = max_running
         self.jobs: dict[str, Job] = {}
@@ -273,7 +285,7 @@ class JobManager:
         status, result, error = "failed", None, None
         try:
             result = self.handlers[job.type](job, ctx)
-            if job.cancel_event.is_set():
+            if job.cancel_event.is_set() and self.cancel_after_return:
                 raise JobCancelled()
             status = "done"
             log.info("job %s done", job.id)
@@ -284,7 +296,7 @@ class JobManager:
             if job.cancel_event.is_set():
                 status = "cancelled"
             else:
-                error = {"code": e.code, "message": e.message, **({"detail": e.detail} if e.detail else {})}
+                error = e.to_json()
                 log.warning("job %s failed code=%s", job.id, e.code)
         except Exception as e:  # noqa: BLE001 - any handler bug is a failed job, never a crashed worker
             if job.cancel_event.is_set():

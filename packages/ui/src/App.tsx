@@ -12,8 +12,12 @@ import { BackToLibrary, normalisePath, PATHS, projectInQuery, useDropGuard, useL
 import { GovernanceRoutes, isGovernancePath } from "./routes/governance";
 import { importRoute, isImportPath } from "./routes/import";
 import { isLibraryPath, LibraryRoutes } from "./routes/library";
+import { isTranscriptPath, TranscriptRoute } from "./routes/transcript";
+import { About } from "./screens/About";
 import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
+import { CaptureRoute } from "./screens/Capture";
 import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
+import { ToolsSetupRoute } from "./screens/ToolsSetup";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
@@ -33,7 +37,11 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: isLibraryPath, render: (loc, client) => <LibraryRoutes client={client} loc={loc} />, back: false },
   { matches: isImportPath, render: (loc, client) => importRoute(loc, client), back: true },
   { matches: isGovernancePath, render: (loc, client) => <GovernanceRoutes client={client} loc={loc} />, back: true },
+  { matches: isTranscriptPath, render: (loc, client) => <TranscriptRoute client={client} loc={loc} />, back: true },
+  { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
+  { matches: (p) => p === PATHS.tools, render: (loc, client) => <ToolsSetupRoute client={client} loc={loc} />, back: true },
+  { matches: (p) => p === "/about", render: () => <About />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
     render: (_loc, client) => (
@@ -76,5 +84,9 @@ export function App({ service }: { service?: ServiceConnection }) {
   const client: ApiClient | undefined = useMemo(() => (service ? createClient(service.baseUrl, service.token) : undefined), [service]);
   const loc = useLocation();
   useDropGuard();
-  return <AppearanceProvider {...(client ? { client } : {})}>{client ? routeFor(loc, client, servicePort(service)) : <AppearanceSettingsScreen />}</AppearanceProvider>;
+  return (
+    <AppearanceProvider {...(client ? { client } : {})}>
+      {client ? routeFor(loc, client, servicePort(service)) : <AppearanceSettingsScreen />}
+    </AppearanceProvider>
+  );
 }

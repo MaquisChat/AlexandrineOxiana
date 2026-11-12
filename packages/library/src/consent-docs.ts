@@ -15,7 +15,7 @@
  * left unlinked.
  */
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "./resources.js";
 import { basename } from "node:path";
 import { fileTypeFromFile } from "file-type";
 import type { ConsentRecord, SourceFile } from "@ao/core";
@@ -29,7 +29,7 @@ import { InvalidInputError, NotFoundError } from "./repo/errors.js";
 import { DETACHED_FORM, DETACH_FIRST } from "./repo/fieldwork.js";
 import { createSourceRefusing, onProjectOpened, setConsentDocumentAsset, type Repo } from "./repo/repo.js";
 
-const VERSION: string = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 
 /** Largest consent form accepted (bytes). */
 export const CONSENT_FORM_MAX_BYTES = 100 * 1024 * 1024;

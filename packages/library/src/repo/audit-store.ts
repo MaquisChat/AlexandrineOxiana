@@ -40,6 +40,10 @@ export interface IntegrityWarning {
     | "incomplete-audit-line-pending"
     /** An audit event could not be appended while opening; the project refuses writes until reopened. */
     | "audit-append-failed-at-open"
+    /** Actions whose audit entry (or file permissions) could not be written at the time were recorded on this open (Task 50). */
+    | "audit-recorded-late"
+    /** A refusal with no project to hold it could not be recorded in the library's audit log (Task 50). */
+    | "refusal-unrecorded"
     /** The project's record of sources deleted here could not be read; set aside (R74 I2). */
     | "deleted-records-unreadable"
     /** A source's annotations file is missing or damaged; the source is read without annotations (R77). */
@@ -47,7 +51,11 @@ export interface IntegrityWarning {
     /** A source's annotations file does not match its recorded hash; read as it is (R77). */
     | "annotations-hash-mismatch"
     /** Files destroyed under the retention rule could not be overwritten yet; retried on each open (R94). */
-    | "destroy-incomplete";
+    | "destroy-incomplete"
+    /** A staged recovery-code key file that is not the committed one was removed, not activated (R148). */
+    | "recovery-staging-discarded"
+    /** A staged recovery-code key file was left in place, not activated: the audit log does not verify (R148). */
+    | "recovery-staging-unverifiable";
   detail: string;
   /** Library-relative file, for the two incomplete-line kinds. */
   file?: string;

@@ -14,6 +14,7 @@ export const PATHS = {
   libraryAlias: "/library",
   appearance: "/settings/appearance",
   extension: "/settings/extension",
+  tools: "/settings/tools",
   importWizard: "/import",
   reviewQueue: "/import/review",
   governance: "/governance",
@@ -21,6 +22,8 @@ export const PATHS = {
   fieldwork: "/fieldwork",
   moveLibrary: "/move-library",
   missingFiles: "/missing-files",
+  transcript: "/transcript",
+  capture: "/capture",
 } as const;
 
 /** Where the Bulk Import screens live (R113): the wizard and its review queue. */

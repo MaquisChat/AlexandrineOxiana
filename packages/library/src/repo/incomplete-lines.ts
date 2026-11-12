@@ -36,17 +36,16 @@ const CHANGE_LOG = /^\d{4}-\d{2}\.jsonl$/;
 
 /**
  * `folder` is library-relative: a project folder (`Projects/<name>`), or ""
- * for the library root (workspace change log only). Files reached through a
+ * for the library root (the workspace change log and the library's audit log). Files reached through a
  * symbolic link are never read or changed.
  */
 export async function scanIncompleteLines(root: string, folder: string, trim: boolean): Promise<IncompleteLine[]> {
   const base = folder ? join(root, ...folder.split("/")) : root;
   const rel = (...parts: string[]) => [...(folder ? [folder] : []), ...parts].join("/");
   const files: Array<{ abs: string; file: string }> = [];
-  if (folder) {
-    const last = (await auditSegments(join(base, "audit")).catch(() => [])).at(-1);
-    if (last) files.push({ abs: join(base, "audit", last), file: rel("audit", last) });
-  }
+  // A project's audit log, or at the library root the library's own (refusals with no project, Task 50).
+  const last = (await auditSegments(join(base, "audit")).catch(() => [])).at(-1);
+  if (last) files.push({ abs: join(base, "audit", last), file: rel("audit", last) });
   const logs = await fsp.readdir(join(base, "changes")).catch(() => [] as string[]);
   for (const n of logs.filter((x) => CHANGE_LOG.test(x)).sort()) files.push({ abs: join(base, "changes", n), file: rel("changes", n) });
   if (folder && (await fsp.stat(join(base, "review", "pending.jsonl")).catch(() => null))?.isFile()) {

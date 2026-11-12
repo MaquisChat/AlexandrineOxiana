@@ -7,13 +7,12 @@ import logging
 import os
 import platform
 import re
-import subprocess
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata
 
-from . import download, image_proxy, ocr, transcribe, video_proxy
-from .jobs import JOB_TYPES, JobError, JobManager
+from . import download, image_proxy, ocr, tools, transcribe, video_proxy
+from .jobs import JOB_TYPES, TOOL_JOB_TYPES, JobError, JobManager
 from .location import LOCATION_MODES
 
 log = logging.getLogger("ao_worker.app")
@@ -21,6 +20,7 @@ log = logging.getLogger("ao_worker.app")
 MAX_BODY = 1 << 20
 _JOB_PATH = re.compile(r"^/jobs/([A-Za-z0-9-]{1,64})$")
 _CANCEL_PATH = re.compile(r"^/jobs/([A-Za-z0-9-]{1,64})/cancel$")
+_TOOL_PATH = re.compile(r"^/tools/([a-z0-9-]{1,64})/(install|update|remove)$")
 
 HANDLERS = {
     "audio.transcribe": transcribe.run,
@@ -28,6 +28,7 @@ HANDLERS = {
     "image.proxy": image_proxy.run,
     "video.proxy": video_proxy.run,
     "pdf.ocr": ocr.run,
+    **{t: tools.run for t in TOOL_JOB_TYPES},
 }
 
 
@@ -44,17 +45,6 @@ def _pkg(name: str) -> str | None:
 
 @lru_cache(maxsize=1)
 def _static_versions() -> dict:
-    def first_line(argv, pattern=None):
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        line = ((r.stdout or r.stderr).strip().splitlines() or [""])[0]
-        if pattern:
-            m = re.search(pattern, line)
-            return m.group(1) if m else None
-        return line.strip() or None
-
     return {
         "python": platform.python_version(),
         "faster_whisper": _pkg("faster-whisper"),
@@ -62,13 +52,26 @@ def _static_versions() -> dict:
         "pillow_heif": _pkg("pillow-heif"),
         "rawpy": _pkg("rawpy"),
         "ocrmypdf": _pkg("ocrmypdf"),
-        "ffmpeg": first_line(["ffmpeg", "-version"], r"ffmpeg version (\S+)"),
-        "tesseract": first_line(["tesseract", "--version"], r"tesseract v?(\S+)"),
     }
 
 
+def _program_version(name: str, flag: str, pattern: str) -> str | None:
+    """ffmpeg / tesseract as the jobs find them (the tools folder first); cached until the file changes."""
+    path = tools.which(name)
+    if path is None:
+        return None
+    m = re.search(pattern, tools.run_version([path, flag]) or "")
+    return m.group(1) if m else None
+
+
 def versions() -> dict:
-    return {**_static_versions(), "yt_dlp": download.ytdlp_version(), "gallery_dl": download.gallerydl_version()}
+    return {
+        **_static_versions(),
+        "ffmpeg": _program_version("ffmpeg", "-version", r"ffmpeg version (\S+)"),
+        "tesseract": _program_version("tesseract", "--version", r"tesseract v?(\S+)"),
+        "yt_dlp": download.ytdlp_version(),
+        "gallery_dl": download.gallerydl_version(),
+    }
 
 
 # ---------- validation ----------
@@ -141,9 +144,12 @@ class WorkerServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, token: str, port: int, manager: JobManager):
+    def __init__(self, token: str, port: int, manager: JobManager, tool_manager: JobManager | None = None):
         self.token = token.encode()
         self.manager = manager
+        # Tool installs run in their own lane: a large download never holds up captures, proxies,
+        # transcriptions or OCR (one install at a time; jobs ids are shared by GET/cancel).
+        self.tool_manager = tool_manager or manager
         super().__init__(("127.0.0.1", port), Handler)
 
 
@@ -206,18 +212,26 @@ class Handler(BaseHTTPRequestHandler):
                 type_, input_, output, params = validate_job(body)
                 job = self.server.manager.submit(type_, input_, output, params)
                 return self._send(202, {"id": job.id})
+            if method == "GET" and path == "/tools":
+                return self._send(200, tools.catalogue())
+            m = _TOOL_PATH.match(path)
+            if method == "POST" and m:
+                if m.group(1) not in tools.toolpins.TOOLS:
+                    return self._error(404, "UNKNOWN_TOOL", "there is no such tool")
+                job = self.server.tool_manager.submit(f"tool.{m.group(2)}", m.group(1), str(tools.tools_dir()), {})
+                return self._send(202, {"id": job.id})
             if method == "POST" and path == "/tools/update":
                 try:
                     return self._send(200, download.update_tools())
                 except JobError as e:
-                    return self._send(502, {"error": {"code": e.code, "message": e.message, **({"detail": e.detail} if e.detail else {})}})
+                    return self._send(502, {"error": e.to_json()})
             m = _JOB_PATH.match(path)
             if method == "GET" and m:
-                job = self.server.manager.get(m.group(1))
+                job = self.server.manager.get(m.group(1)) or self.server.tool_manager.get(m.group(1))
                 return self._send(200, job.to_json()) if job else self._error(404, "NOT_FOUND", "no such job")
             m = _CANCEL_PATH.match(path)
             if method == "POST" and m:
-                job = self.server.manager.cancel(m.group(1))
+                job = self.server.manager.cancel(m.group(1)) or self.server.tool_manager.cancel(m.group(1))
                 return self._send(202, job.to_json()) if job else self._error(404, "NOT_FOUND", "no such job")
             return self._error(404, "NOT_FOUND", "no such endpoint")
         except BadRequest as e:
@@ -236,4 +250,5 @@ class Handler(BaseHTTPRequestHandler):
 def make_server(token: str, port: int = 0) -> WorkerServer:
     if not token:
         raise ValueError("a token is required")
-    return WorkerServer(token, port, JobManager(HANDLERS))
+    tools.sweep()  # an install interrupted by a crash leaves nothing half-installed
+    return WorkerServer(token, port, JobManager(HANDLERS), JobManager(HANDLERS, max_running=1, cancel_after_return=False))

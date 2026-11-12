@@ -8,7 +8,9 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "start": "node --max-old-space-size=512 --import tsx src/main.ts"
+    "start": "node --max-old-space-size=512 --import tsx src/main.ts",
+    "build": "node scripts/build.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "@ao/core": "workspace:*",
@@ -16,5 +18,8 @@
     "@ao/shared": "workspace:*",
     "fastify": "5.12.7",
     "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

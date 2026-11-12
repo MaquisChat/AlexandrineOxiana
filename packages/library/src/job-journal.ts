@@ -18,7 +18,7 @@
  * job (needed to resubmit it) is read from the journal.
  *
  * Libraries made before the journal existed have job rows only: `upgradeLegacyJobs` writes each
- * such row into its project's journal once (migration 0002 marks a database that had rows).
+ * such row into its project's journal once (migration 0003 marks a database that had rows).
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
@@ -32,7 +32,7 @@ import { appendDurable, assertContained, decryptBytes, incompleteTail, openLine,
 export const JOBS_FILE = "jobs/journal.jsonl";
 const PURPOSE = "ao-jobs";
 const FILE_MODE = 0o600;
-/** Meta key set (by migration 0002) while job rows written before the journal existed await `upgradeLegacyJobs`. */
+/** Meta key set (by migration 0003) while job rows written before the journal existed await `upgradeLegacyJobs`. */
 export const LEGACY_JOBS_META = "jobsLegacy";
 
 export type WorkerJobType = "audio.transcribe" | "capture.download" | "image.proxy" | "video.proxy" | "pdf.ocr";

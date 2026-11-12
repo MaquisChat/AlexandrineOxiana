@@ -43,7 +43,7 @@ export function useTrap(onCancel: () => void, busy = false) {
 }
 
 /** Renders on <body>; every other child of <body> is inert while the dialog is open. */
-function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; children: ReactNode }) {
+export function DialogShell({ labelledBy, describedBy, onCancel, busy, className, children }: { labelledBy: string; describedBy?: string; onCancel: () => void; busy?: boolean; className?: string; children: ReactNode }) {
   const { ref, onKeyDown } = useTrap(onCancel, busy);
   const [host] = useState(() => document.createElement("div"));
   // A layout effect: the host must be in the document before useTrap's effect moves focus into the dialog.
@@ -58,7 +58,7 @@ function DialogShell({ labelledBy, describedBy, onCancel, busy, children }: { la
   }, [host]);
   return createPortal(
     <div className="ao-dialog-backdrop">
-      <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={labelledBy} aria-describedby={describedBy} aria-busy={busy || undefined} className="ao-dialog" onKeyDown={onKeyDown}>
+      <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={labelledBy} aria-describedby={describedBy} aria-busy={busy || undefined} className={className ? `ao-dialog ${className}` : "ao-dialog"} onKeyDown={onKeyDown}>
         {children}
       </div>
     </div>,

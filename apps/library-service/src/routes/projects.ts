@@ -1,12 +1,13 @@
 /**
  * Projects: list (also for the browser extension: names and whether browser capture is allowed),
  * create, unlock (pending proxies / OCR resume and watched folders rescan), lock (sensitive lookups
- * purged from the shared HttpClient, R96), backup settings and the one-time acknowledgements.
+ * purged from the shared HttpClient, R96), a new recovery code (Task 61), backup settings and the
+ * one-time acknowledgements.
  */
 import type { FastifyInstance } from "fastify";
 import { effectivePolicy, parseGovernance, type Project } from "@ao/core";
-import { setBackupSettings, type Repo } from "@ao/library";
-import { badRequest } from "../errors.js";
+import { InvalidRecoveryCodeError, WrongPassphraseError, setBackupSettings, type Repo } from "@ao/library";
+import { ApiError, badRequest } from "../errors.js";
 import { bodyOf, optBool, optObj, projectParam, str, strArray, type Ctx } from "./util.js";
 
 async function captureMethods(repo: Repo, projectId: string): Promise<string[]> {
@@ -39,8 +40,71 @@ async function projectView(repo: Repo, p: Project) {
   };
 }
 
+/** Wrong passphrases allowed per project within the window before further tries are refused. */
+const MAX_WRONG_PASSPHRASES = 5;
+const WRONG_PASSPHRASE_WINDOW_MS = 60_000;
+
+/**
+ * A modest limit on guessing a project's passphrase (or recovery code) through the service (R141):
+ * every attempt is counted BEFORE it is verified, and a project's attempts are verified one at a time
+ * (across unlock and the new-recovery-code request), so parallel requests cannot get past it and
+ * cannot start a burst of key derivations. After 5 counted wrong attempts within a minute the project
+ * answers 429, even to the right passphrase, until the oldest is a minute old. A correct passphrase
+ * clears the count; a request refused for another reason (locked, read-only, …) is not counted. In
+ * memory only.
+ */
+class WrongPassphraseLimit {
+  private readonly attempts = new Map<string, number[]>();
+  /** The last attempt queued per project: the next one waits for it. */
+  private readonly turns = new Map<string, Promise<void>>();
+  constructor(private readonly now: () => number) {}
+
+  private recent(projectId: string): number[] {
+    const cutoff = this.now() - WRONG_PASSPHRASE_WINDOW_MS;
+    const list = (this.attempts.get(projectId) ?? []).filter((t) => t > cutoff);
+    if (list.length) this.attempts.set(projectId, list);
+    else this.attempts.delete(projectId);
+    return list;
+  }
+
+  /** Runs `fn` in the project's turn unless it is limited; the attempt is counted first and kept only if the passphrase was wrong. */
+  async guard<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.turns.get(projectId) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => mine);
+    this.turns.set(projectId, tail);
+    await prev;
+    try {
+      const list = this.recent(projectId);
+      if (list.length >= MAX_WRONG_PASSPHRASES) {
+        throw new ApiError(429, "RATE_LIMITED", "Too many wrong passphrases for this project. For a minute even the right passphrase is refused: wait a minute, then try again.");
+      }
+      const at = this.now();
+      this.attempts.set(projectId, [...list, at]);
+      try {
+        const r = await fn();
+        this.attempts.delete(projectId);
+        return r;
+      } catch (err) {
+        if (!(err instanceof WrongPassphraseError || err instanceof InvalidRecoveryCodeError)) {
+          // Not a guess: take this attempt back.
+          const cur = this.attempts.get(projectId);
+          const i = cur?.lastIndexOf(at) ?? -1;
+          if (cur && i >= 0) cur.splice(i, 1);
+        }
+        throw err;
+      }
+    } finally {
+      release();
+      if (this.turns.get(projectId) === tail) this.turns.delete(projectId);
+    }
+  }
+}
+
 export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
+  const limit = new WrongPassphraseLimit(() => state.opts.now().getTime());
 
   app.get("/projects", async (req) => {
     const s = state.requireSession();
@@ -52,7 +116,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     return { projects: await Promise.all(projects.map((p) => projectView(s.repo, p))) };
   });
 
-  app.post("/projects", async (req) => {
+  app.post("/projects", async (req, reply) => {
     const s = state.requireWritable();
     const b = bodyOf(req);
     const name = str(b, "name", 200);
@@ -62,14 +126,21 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const enabled = optBool(enc, "enabled") ?? false;
     const passphrase = enabled ? str(enc, "passphrase", 1024) : undefined;
     const targetLanguages = strArray(b, "targetLanguages", { optional: true, max: 20, itemMax: 35 });
-    const { project, recoveryCode } = await s.repo.createProject({
-      name,
-      governanceYaml,
-      encryption: enabled ? { enabled, passphrase: passphrase! } : { enabled: false },
-      ...(targetLanguages.length ? { targetLanguages } : {}),
-    });
-    state.publishState();
-    // The recovery code is shown once, here; it is never logged or stored.
+    let created: Awaited<ReturnType<typeof s.repo.createProject>>;
+    try {
+      created = await s.repo.createProject({
+        name,
+        governanceYaml,
+        encryption: enabled ? { enabled, passphrase: passphrase! } : { enabled: false },
+        ...(targetLanguages.length ? { targetLanguages } : {}),
+      });
+    } finally {
+      // Refused or not, the interface is told: a refusal is now in the library's audit log (Task 50).
+      state.publishState();
+    }
+    const { project, recoveryCode } = created;
+    // The recovery code is shown once, here; it is never logged or stored (nor cached).
+    reply.header("Cache-Control", "no-store");
     return { project: await projectView(s.repo, project), ...(recoveryCode ? { recoveryCode } : {}) };
   });
 
@@ -77,7 +148,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const s = state.requireSession();
     const id = projectParam(ctx, req);
     const secret = str(bodyOf(req), "secret", 1024);
-    await s.repo.unlockProject(id, secret);
+    await limit.guard(id, () => s.repo.unlockProject(id, secret));
     // Work that waited for the key: viewing proxies, OCR and worker jobs of this project (R142), and its daily backup (R99 I7).
     state.resumeProject(s, id, { workerJobs: true });
     state.startWork("backup", async () => {
@@ -97,6 +168,17 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     s.http.purgeSensitive();
     state.publishState();
     return { unlocked: false };
+  });
+
+  // A new recovery code (Task 61, R134 c): the passphrase again, the new code once in the response.
+  // Neither is logged (the logger redacts both names and never logs bodies) nor audited.
+  app.post("/projects/:id/recovery-code", async (req, reply) => {
+    const s = state.requireWritable();
+    const id = projectParam(ctx, req);
+    const passphrase = str(bodyOf(req), "passphrase", 1024);
+    const { recoveryCode } = await limit.guard(id, () => s.repo.issueRecoveryCode(id, passphrase));
+    reply.header("Cache-Control", "no-store");
+    return { recoveryCode };
   });
 
   app.put("/projects/:id/backup-settings", async (req) => {

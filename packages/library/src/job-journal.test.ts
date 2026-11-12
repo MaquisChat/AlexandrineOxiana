@@ -304,7 +304,7 @@ describe("job journal", () => {
 });
 
 describe("upgrade of a library made before the journal", () => {
-  /** Turns the database back into a schema-1 one holding job rows (as an older version wrote them). */
+  /** Turns the database back into a schema-2 one (before the journal) holding job rows (as an older version wrote them). */
   async function legacyIndex(rows: Array<[string, string, string, string, string]>): Promise<void> {
     const db = handle.db;
     db.exec("CREATE TABLE IF NOT EXISTS import_batches (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, number INTEGER NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, payload_json TEXT NOT NULL)");
@@ -312,17 +312,17 @@ describe("upgrade of a library made before the journal", () => {
     for (const [id, pid, kind, status, payload] of rows) {
       db.prepare("INSERT INTO jobs (id, project_id, kind, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(id, pid, kind, status, payload, `2026-01-01T00:00:0${rows.findIndex((r) => r[0] === id)}.000Z`);
     }
-    setMeta(db, "schemaVersion", "1");
-    handle.reopen(); // migration 0002 runs
+    setMeta(db, "schemaVersion", "2");
+    handle.reopen(); // migration 0003 runs
   }
 
-  it("migration 0002 drops import_batches and marks existing job rows; a new database is not marked", async () => {
-    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
+  it("migration 0003 drops import_batches and marks existing job rows; a new database is not marked", async () => {
+    expect(getMeta(handle.db, "schemaVersion")).toBe("3");
     const tables = () => (handle.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name);
     expect(tables()).not.toContain("import_batches");
     expect(getMeta(handle.db, "jobsLegacy")).toBeUndefined();
     await legacyIndex([["old", "p", "pdf.ocr", "done", "{}"]]);
-    expect(getMeta(handle.db, "schemaVersion")).toBe("2");
+    expect(getMeta(handle.db, "schemaVersion")).toBe("3");
     expect(tables()).not.toContain("import_batches");
     expect(getMeta(handle.db, "jobsLegacy")).toBe("1");
   });
