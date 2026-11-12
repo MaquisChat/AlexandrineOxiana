@@ -16,7 +16,10 @@
  *  - on teardown stops the service with SIGTERM (its graceful shutdown stops the worker), checks it
  *    exited cleanly, and fails the test if any process it started is still running;
  *  - `app.restart()` does the same mid-test and starts a new service on the same settings folder (a
- *    relaunch of the app), with a new port and token that the page is handed on its next load.
+ *    relaunch of the app), with a new port and token that the page is handed on its next load;
+ *  - with `test.use({ fakeControl: true })`, `app.fakes` tells the fake downloaders what to answer
+ *    (a synthetic profile, a held download) and speech recognition is a fake inside the real worker
+ *    (FakeControl).
  *
  * Per test, `page`: the built UI (packages/ui/dist) under the desktop shell's own origin,
  * http://tauri.localhost, answered from disk by Playwright (pushState paths fall back to index.html),
