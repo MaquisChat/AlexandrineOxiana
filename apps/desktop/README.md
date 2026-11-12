@@ -269,6 +269,12 @@ Open the finished run (click its name in the list). At the bottom of its **Summa
 disk image (`.dmg`) and its SHA-256, and is kept for 30 days. It runs on a Mac whose Apple menu >
 About This Mac says "Chip: Apple M…"; a Mac that says "Processor: …Intel…" cannot run it (R169).
 
+The same list has `alexandrine-oxiana-browser-extension`: the browser extension for Chrome, Edge and
+Firefox 128 or later, built on Linux by the run's `extension` job (Task 65), also kept for 30 days.
+It holds `alexandrine-oxiana-browser-extension-<version>.zip` and its SHA-256, and the run's summary
+gives both. The job does not wait for the Mac build and does not fail with it. How to load it:
+`apps/browser-extension/README.md`, "Installing the extension from the download".
+
 ### Opening the unsigned app the first time ("Open Anyway", R151)
 
 1. Open the downloaded `.zip` (Safari may already have unpacked it into a folder), then the `.dmg`,

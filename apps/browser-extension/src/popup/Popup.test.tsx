@@ -279,3 +279,27 @@ describe("the desktop app does not answer on the saved port (R171)", () => {
     expect(storage.data.pairing).toMatchObject({ port: OLD });
   });
 });
+
+// Task 65: where the pairing screen is found.
+const unpaired: PopupBridge = {
+  api: { getPairing: async () => null } as unknown as PopupBridge["api"],
+  activeTabId: async () => undefined,
+  send: async () => undefined as never,
+  pendingLinks: async () => ({}),
+  copy: async () => undefined,
+};
+
+describe("the popup before pairing", () => {
+  it("sends the researcher to the place the desktop app really has: “Browser extension” at the top of the library window", async () => {
+    root = createRoot(host);
+    await act(async () => root!.render(<Popup bridge={unpaired} />));
+    expect(host.querySelector("h1")?.textContent).toBe("Pair with the desktop app");
+    const hint = host.querySelector(".hint")?.textContent ?? "";
+    // The link's exact text in the library header (packages/ui/src/screens/Library.tsx) and the
+    // pairing page's button (packages/ui/src/screens/ExtensionPairing.tsx).
+    expect(hint).toContain("“Browser extension”");
+    expect(hint).toContain("“Show a pairing code”");
+    expect(hint).toMatch(/port number and a 6-digit code/);
+    expect(hint).not.toMatch(/Settings/);
+  });
+});

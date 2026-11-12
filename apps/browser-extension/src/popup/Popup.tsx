@@ -207,7 +207,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
     return (
       <main className="popup">
         <h1>Pair with the desktop app</h1>
-        <p className="hint">In Alexandrine Oxiana, open Settings → Browser extension. It shows a port number and a 6-digit code.</p>
+        <p className="hint">In Alexandrine Oxiana, with your library open, choose “Browser extension” at the top of the window, then “Show a pairing code”. It shows a port number and a 6-digit code.</p>
         <form onSubmit={(e) => void pair(e)}>
           <label>
             Port
