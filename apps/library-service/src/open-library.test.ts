@@ -372,18 +372,24 @@ describe("D5: the library open when the service last ran is reopened at start", 
     expect(libs.json.current).toMatchObject({ name: "Lib" });
   });
 
-  it("the entry point reopens the last library at start", async () => {
-    await start();
-    await libraryWithSources();
-    await svc!.close();
-    svc = undefined;
+  /** Starts the entry point as a launcher does (R98, R155): the token on standard input, kept open. */
+  async function runEntry(configDir: string): Promise<{ port: number; stop: () => Promise<void> }> {
     const entry = fileURLToPath(new URL("./main.ts", import.meta.url));
-    const env: Record<string, string | undefined> = { ...process.env, AO_SERVICE_TOKEN: TOKEN, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: deps.appConfigDir, AO_NO_WORKER: "1" };
+    const env: Record<string, string | undefined> = { ...process.env, AO_SERVICE_PORT: "0", AO_CONFIG_DIR: configDir, AO_NO_WORKER: "1" };
     delete env.AO_LIBRARY;
-    const child = spawn(process.execPath, ["--import", "tsx", entry], { cwd: fileURLToPath(new URL("../", import.meta.url)), env, stdio: ["ignore", "pipe", "pipe"] });
+    delete env.AO_SERVICE_TOKEN;
+    const child = spawn(process.execPath, ["--import", "tsx", entry], { cwd: fileURLToPath(new URL("../", import.meta.url)), env, stdio: ["pipe", "pipe", "pipe"] });
+    child.stdin!.on("error", () => {});
+    child.stdin!.write(`${TOKEN}\n`);
     let out = "";
     let err = "";
     child.stderr!.on("data", (d: Buffer) => (err += d.toString()));
+    const exited = new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    // The end of standard input shuts the service down cleanly (R155).
+    const stop = async () => {
+      child.stdin!.end();
+      await exited;
+    };
     try {
       const port = await new Promise<number>((resolve, reject) => {
         child.stdout!.on("data", (d: Buffer) => {
@@ -391,15 +397,41 @@ describe("D5: the library open when the service last ran is reopened at start", 
           const m = /AO_SERVICE_READY port=(\d+)/.exec(out);
           if (m) resolve(Number(m[1]));
         });
-        child.on("exit", () => reject(new Error(`exited early: ${err}`)));
+        void exited.then(() => reject(new Error(`exited early: ${err}`)));
       });
-      const r = await fetch(`http://127.0.0.1:${port}/libraries`, { headers: auth });
+      return { port, stop };
+    } catch (e) {
+      child.kill("SIGKILL");
+      throw e;
+    }
+  }
+
+  it("the entry point reopens the last library at start, from the settings folder it is given (R159), and only from there", async () => {
+    await start();
+    const { path } = await libraryWithSources();
+    await svc!.close();
+    svc = undefined;
+    // Started as the shell starts it: the settings folder the shell chose (AO_CONFIG_DIR).
+    const a = await runEntry(deps.appConfigDir);
+    try {
+      const r = await fetch(`http://127.0.0.1:${a.port}/libraries`, { headers: auth });
       expect(((await r.json()) as { current?: { name: string } }).current?.name).toBe("Lib");
     } finally {
-      await new Promise<void>((resolve) => {
-        child.on("exit", () => resolve());
-        child.kill("SIGTERM");
-      });
+      await a.stop();
     }
+    // Another settings folder knows of no library: the chooser, nothing reopened.
+    const b = await runEntry(join(tmp, "other-settings"));
+    try {
+      const r = await fetch(`http://127.0.0.1:${b.port}/libraries`, { headers: auth });
+      const j = (await r.json()) as { current?: unknown; notFound?: unknown; libraries: unknown[] };
+      expect(j.current).toBeUndefined();
+      expect(j.notFound).toBeUndefined();
+      expect(j.libraries).toEqual([]);
+    } finally {
+      await b.stop();
+    }
+    // What is remembered is kept in the settings folder, never in the library.
+    expect(existsSync(join(deps.appConfigDir, "last-library.json"))).toBe(true);
+    expect(existsSync(join(path, "last-library.json"))).toBe(false);
   }, 60_000);
 });
