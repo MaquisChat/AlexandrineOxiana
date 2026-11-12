@@ -15,6 +15,9 @@ export async function setTimeZone(core: RepoCore, projectId: string, tz: string 
   core.assertWritable();
   const zone = tz === null ? null : typeof tz === "string" ? timeZoneName(tz) : undefined;
   if (zone === undefined) throw new InvalidInputError("That is not a time zone name (for example Europe/Berlin or America/New_York).");
+  const from = core.state(projectId).project.timeZone ?? null;
+  // Nothing changes: nothing is written or audited.
+  if (from === zone) return structuredClone(core.state(projectId).project);
   return runMutation(
     core,
     projectId,
@@ -31,6 +34,7 @@ export async function setTimeZone(core: RepoCore, projectId: string, tz: string 
       });
       return structuredClone(data.project);
     },
-    { op: "project.time-zone", entity: { type: "project", id: projectId } },
+    // The zone names are no more sensitive than project.json, which holds them in plaintext.
+    { op: "project.time-zone", entity: { type: "project", id: projectId }, auditDetails: { from, to: zone } },
   );
 }

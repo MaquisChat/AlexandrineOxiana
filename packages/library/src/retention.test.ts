@@ -70,13 +70,19 @@ describe("project time zone (Task 58, R93)", () => {
     expect(await retentionDue(kit.repo, p.id, evening)).toHaveLength(1);
     const ev = (await auditEvents(kit, p)).filter((e) => e.details?.op === "project.time-zone");
     expect(ev).toHaveLength(1);
-    expect(ev[0]).toMatchObject({ action: "store", decision: { result: "allow" }, entity: { type: "project", id: p.id } });
+    expect(ev[0]).toMatchObject({ action: "store", decision: { result: "allow" }, entity: { type: "project", id: p.id }, details: { from: null, to: "Pacific/Kiritimati" } });
+
+    // Setting the same zone again changes and records nothing (M2).
+    const events = (await auditEvents(kit, p)).length;
+    await setProjectTimeZone(kit.repo, p.id, "Pacific/Kiritimati");
+    expect((await auditEvents(kit, p)).length).toBe(events);
 
     // It survives reopening the library.
     await kit.reopen();
     expect(kit.repo.getProject(p.id).timeZone).toBe("Pacific/Kiritimati");
 
     await setProjectTimeZone(kit.repo, p.id, null);
+    expect((await auditEvents(kit, p)).filter((e) => e.details?.op === "project.time-zone").at(-1)?.details).toMatchObject({ from: "Pacific/Kiritimati", to: null });
     expect(kit.repo.getProject(p.id).timeZone).toBeUndefined();
     expect(JSON.parse(await readFile(abs(`${p.folder}/project.json`), "utf8")).project).not.toHaveProperty("timeZone");
     expect(await retentionDue(kit.repo, p.id, evening)).toEqual([]);
