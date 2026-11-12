@@ -132,24 +132,26 @@ describe("crateLicenceTexts", () => {
   const root = mkdtempSync(join(tmpdir(), "ao-crates-"));
   const crate = (name, license, files, extra = {}) => pkg(name, "1.0.0", license, { manifest_path: crateDir(root, name, files), ...extra });
 
-  it("takes each crate's own licence files, both of a dual-licensed crate, and its license-file", () => {
-    const text = crateLicenceTexts(
+  it("ships each crate's own licence files whole, both of a dual-licensed crate, and its license-file; MIT texts differing in the copyright line are both shipped (R165)", () => {
+    const { text, sources } = crateLicenceTexts(
       [
         crate("withtext", "MIT", { LICENSE: "MIT License\n\nCopyright (c) 2020 Ann\n\nterms A\n" }),
-        crate("two", "MIT OR Apache-2.0", { "LICENSE-MIT": "MIT License\n\nCopyright (c) 2021 Bob\n\nterms A\n", "LICENSE-APACHE": "Apache License\nterms B\n" }),
+        crate("two", "MIT OR Apache-2.0", { "LICENSE-MIT": "MIT License\n\nCopyright (c) 2021 Bob\n\nterms A\n", "LICENSE-APACHE": "Apache License\n\n   (c) You must retain all notices; and\n" }),
+        crate("same", "MIT", { "LICENSE.txt": "MIT License\r\n\r\nCopyright (c) 2020 Ann   \r\n\r\nterms A\r\n" }),
         crate("own", null, { "legal/TERMS.txt": "Own terms\n" }, { license_file: "legal/TERMS.txt" }),
       ],
       STANDARD,
     );
-    // Crates in name order; the one MIT text once, with both copyright lines.
-    assert.match(text, /Used by: two 1\.0\.0 \(LICENSE-MIT\), withtext 1\.0\.0 \(LICENSE\)/);
-    assert.match(text, /Copyright \(c\) 2021 Bob\n {2}Copyright \(c\) 2020 Ann\n\nMIT License\n\nterms A/);
-    assert.match(text, /Used by: two 1\.0\.0 \(LICENSE-APACHE\)\n\nApache License\nterms B/);
-    assert.match(text, /Used by: own 1\.0\.0 \(legal\/TERMS\.txt\)\n\nOwn terms/);
+    assert.match(text, /Applies to: same 1\.0\.0 \(LICENSE\.txt\), withtext 1\.0\.0 \(LICENSE\)\n\nMIT License\n\nCopyright \(c\) 2020 Ann\n\nterms A\n/);
+    assert.match(text, /Applies to: two 1\.0\.0 \(LICENSE-MIT\)\n\nMIT License\n\nCopyright \(c\) 2021 Bob\n\nterms A\n/);
+    assert.match(text, /Applies to: two 1\.0\.0 \(LICENSE-APACHE\)\n\nApache License\n\n {3}\(c\) You must retain all notices; and\n/);
+    assert.match(text, /Applies to: own 1\.0\.0 \(legal\/TERMS\.txt\)\n\nOwn terms/);
+    assert.equal(sources.length, 5);
+    assert.ok(sources.every((s) => s.path.startsWith(root)));
   });
 
   it("uses the standard text for a crate that ships none, names it, and says where an MPL-2.0 crate's source is", () => {
-    const text = crateLicenceTexts([crate("selectors", "MPL-2.0", {}, { repository: "https://github.com/servo/stylo" })], STANDARD);
+    const { text } = crateLicenceTexts([crate("selectors", "MPL-2.0", {}, { repository: "https://github.com/servo/stylo" })], STANDARD);
     assert.match(text, /No licence text shipped by the package \(1\)[\s\S]*selectors 1\.0\.0: MPL-2\.0 - the standard text of MPL-2\.0/);
     assert.match(text, /source: https:\/\/github\.com\/servo\/stylo \(version 1\.0\.0; also https:\/\/crates\.io\/crates\/selectors\/1\.0\.0\)/);
     assert.match(text, /standard MPL text/);
@@ -181,9 +183,26 @@ describe("npmLicenceTexts", () => {
   const read = (p) => PKGS[p.split(/[\\/]/).pop()];
 
   it("takes each package's own licence file; an SPDX tag file is not a text, so the standard one is used and named", () => {
-    const text = npmLicenceTexts(LIST, read, STANDARD);
-    assert.match(text, /Used by: react 19\.3\.1 \(LICENSE\)/);
+    const { text } = npmLicenceTexts(LIST, read, STANDARD);
+    assert.match(text, /Applies to: react 19\.3\.1 \(LICENSE\)/);
     assert.match(text, /@tauri-apps\/plugin-dialog 2\.8\.4: MIT - the standard text of MIT/);
+  });
+
+  it("reads a `SEE LICENSE IN` file, ships an SBOM's component list, and names an MPL package's source", () => {
+    const list = [
+      {
+        dependencies: {
+          seefile: { version: "1.0.0", path: dir("seefile", { "TERMS.md": "Our own terms\n" }) },
+          bin: { version: "2.0.0", path: dir("bin", { LICENSE: "MIT\n", "sbom.cdx.json": JSON.stringify({ metadata: { component: { name: "bin" } }, components: [{ name: "skia", version: "m130" }, { name: "cssparser", version: "0.29.6", licenses: [{ expression: "MPL-2.0" }] }] }) }) },
+          mpl: { version: "3.0.0", path: dir("mpl", { LICENSE: "Mozilla Public License Version 2.0\n" }) },
+        },
+      },
+    ];
+    const P = { seefile: { license: "SEE LICENSE IN TERMS.md" }, bin: { license: "MIT" }, mpl: { license: "MPL-2.0", repository: { url: "https://example.org/mpl.git" } } };
+    const { text } = npmLicenceTexts(list, (p) => P[p.split(/[\\/]/).pop()], STANDARD);
+    assert.match(text, /Applies to: seefile 1\.0\.0 \(TERMS\.md\)\n\nOur own terms/);
+    assert.match(text, /bin 2\.0\.0 \(sbom\.cdx\.json, 2 components\):\n {4}cssparser 0\.29\.6: MPL-2\.0\n {4}skia m130: no licence stated/);
+    assert.match(text, /mpl 3\.0\.0 {2}MPL-2\.0\n {4}source: https:\/\/example\.org\/mpl\.git \(version 3\.0\.0; also https:\/\/www\.npmjs\.com\/package\/mpl\/v\/3\.0\.0\)/);
   });
 
   it("fails on a package with no licence", () => {

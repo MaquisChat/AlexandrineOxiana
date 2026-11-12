@@ -13,23 +13,27 @@
 // Either list fails the build when a shipped crate or package states no licence.
 //
 // And the licence texts that must travel with them (Task 37j, ADR 0015), one readable file per part,
-// each text once with every copyright line of its copies (licence-texts.mjs):
-//  - shell-crates-LICENCES.txt: each crate's own LICENSE*/COPYING*/NOTICE*/COPYRIGHT* files from its
-//    source in the cargo registry (and its Cargo.toml license-file);
-//  - interface-npm-LICENCES.txt: each production npm package's own licence files;
+// every licence and notice file shipped whole, each distinct file once (R165; scripts/notices/licence-texts.mjs):
+//  - shell-crates-LICENCES.txt: each crate's own licence and notice files (LICENSE*, COPYING*,
+//    NOTICE*, COPYRIGHT*, third-party lists, a root licenses/ folder) from its source in the cargo
+//    registry, and its Cargo.toml license-file;
+//  - interface-npm-LICENCES.txt: each production npm package's own licence and notice files, and
+//    the components its own SBOM lists;
 //  - node-LICENCES.txt: the LICENSE of the Node.js release shipped beside the service (ADR 0013),
 //    which also carries the licences of what Node bundles (V8, OpenSSL, ICU, libuv, ...). It is the
 //    release of the Node that runs this script, unless --node <program> names another: the service
 //    folder must run with the Node that built it.
 // A package that ships no text gets the standard text of its identifier (licences/standard) and is
 // named in its file's "no licence text shipped by the package" section; one with neither fails the build.
+// Each file is checked to contain every source file whole before it is written, and the list of
+// source files is written to <out-dir>/../licence-sources/<part>.json for scripts/notices/check-verbatim.mjs.
 //
 //   node apps/desktop/scripts/notices.mjs <out-dir> [--node <node program>]
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { collectLicenceTexts, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts } from "./licence-texts.mjs";
+import { collectLicenceTexts, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const TAURI = join(REPO, "apps", "desktop", "src-tauri");
@@ -90,13 +94,28 @@ const fail = (part, problems) => {
   throw new Error(`licence texts of ${part}:\n  ${problems.join("\n  ")}`);
 };
 
+/** Renders, checks that every source file is in the result whole (R165), and returns { text, sources }. */
+function finish(part, packages, dirOf, standard, render) {
+  const result = collectLicenceTexts(packages, standard);
+  if (result.problems.length) fail(part, result.problems);
+  const text = renderLicenceTexts({ packages, result, ...render });
+  const sources = sourceList(packages, dirOf, result);
+  const missing = verifyVerbatim(
+    text,
+    sources.map((s) => ({ label: s.label, text: s.standard ? standard.get(s.standard) : readFileSync(s.path, "utf8") })),
+  );
+  if (missing.length) fail(part, missing.map((m) => `${m} is not in the notices file whole`));
+  return { text, sources };
+}
+
 /** The licence texts of the shell's crates (from each crate's own source folder), as one file. Throws on a problem. */
 export function crateLicenceTexts(crates, standard = loadStandardTexts()) {
+  const dirs = new Map();
   const packages = [...crates].sort(byName).map((c) => {
     const dir = dirname(c.manifest_path);
     const names = licenceFilesIn(dir);
     if (c.license_file && !names.includes(c.license_file)) names.push(c.license_file);
-    return {
+    const entry = {
       name: c.name,
       version: c.version,
       licence: c.license ?? "",
@@ -104,37 +123,49 @@ export function crateLicenceTexts(crates, standard = loadStandardTexts()) {
       files: readLicenceFiles(dir, names),
       ...(licenceIds(c.license).includes("MPL-2.0") ? { source: crateSource(c) } : {}),
     };
+    dirs.set(entry, dir);
+    return entry;
   });
-  const result = collectLicenceTexts(packages, standard);
-  if (result.problems.length) fail("the shell's Rust crates", result.problems);
-  return renderLicenceTexts({
+  return finish("the shell's Rust crates", packages, (p) => dirs.get(p), standard, {
     title: "The app's Rust crates: licence texts",
-    intro: "The Rust crates compiled into the app's program, and the licence and notice files each crate ships in its source. Crates under the Mozilla Public License 2.0 name where their source is.",
-    packages,
-    result,
+    intro: "The Rust crates compiled into the app's program, and the licence and notice files each crate ships in its source, each shown whole. Crates under the Mozilla Public License 2.0 name where their source is.",
   });
 }
 
 /** The licence texts of the interface's npm packages (from each package's folder), as one file. Throws on a problem. */
 export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts()) {
+  const dirs = new Map();
   const packages = npmPackages(list, readPackage).map(({ name, version, licence, path, pkg }) => {
     const repo = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
-    return {
+    const see = seeLicenceIn(licence);
+    const names = licenceFilesIn(path);
+    if (see && existsSync(join(path, see)) && !names.includes(see)) names.push(see);
+    const components = sbomIn(path);
+    const entry = {
       name,
       version,
       licence,
-      files: readLicenceFiles(path),
-      ...(licenceIds(licence).includes("MPL-2.0") ? { source: `${repo ?? "(no repository stated)"} (version ${version}; also https://www.npmjs.com/package/${name}/v/${version})` } : {}),
+      ...(see ? { licenceFile: see } : {}),
+      files: readLicenceFiles(path, names),
+      ...(components ? { components } : {}),
+      ...(licenceIds(licence).includes("MPL-2.0") ? { source: npmSource(name, version, repo) } : {}),
     };
+    dirs.set(entry, path);
+    return entry;
   });
-  const result = collectLicenceTexts(packages, standard);
-  if (result.problems.length) fail("the interface's npm packages", result.problems);
-  return renderLicenceTexts({
+  return finish("the interface's npm packages", packages, (p) => dirs.get(p), standard, {
     title: "The interface's npm packages: licence texts",
-    intro: "The production npm packages the app's interface is built from, and the licence and notice files each package ships.",
-    packages,
-    result,
+    intro: "The production npm packages the app's interface is built from, and the licence and notice files each package ships, each shown whole.",
   });
+}
+
+/** Where an MPL-2.0 npm package's source is: its repository and its npm page. */
+export const npmSource = (name, version, repo) => `${repo ?? "(no repository stated)"} (version ${version}; also https://www.npmjs.com/package/${name}/v/${version})`;
+
+/** The LICENSE file of the Node.js release `exe` belongs to, or undefined. */
+export function nodeLicenceFile(exe) {
+  const candidates = [join(dirname(exe), "LICENSE"), join(dirname(dirname(exe)), "LICENSE")];
+  return candidates.find((f) => existsSync(f) && /^Node\.js is licensed/.test(readFileSync(f, "utf8")));
 }
 
 /**
@@ -143,9 +174,8 @@ export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts(
  * node.exe (Windows). It covers Node.js and the libraries it bundles. Throws if it is not there.
  */
 export function nodeLicenceText(exe, version) {
-  const candidates = [join(dirname(exe), "LICENSE"), join(dirname(dirname(exe)), "LICENSE")];
-  const file = candidates.find((f) => existsSync(f) && /^Node\.js is licensed/.test(readFileSync(f, "utf8")));
-  if (!file) throw new Error(`there is no LICENSE file of Node.js beside ${exe} (looked for ${candidates.join(" and ")}); ship the release folder's LICENSE with the program`);
+  const file = nodeLicenceFile(exe);
+  if (!file) throw new Error(`there is no LICENSE file of Node.js beside ${exe} (looked in ${dirname(exe)} and ${dirname(dirname(exe))}); ship the release folder's LICENSE with the program`);
   return `Node.js ${version}\n\nThe app runs its library service with this Node.js release, shipped beside it. What follows is the\nrelease's own LICENSE file, unchanged: the licence of Node.js and of the libraries it bundles\n(V8, OpenSSL, ICU, libuv and others).\n\n${readFileSync(file, "utf8")}`;
 }
 
@@ -188,15 +218,25 @@ export function writeNotices(outDir, nodeExe = process.execPath) {
   const shipped = shippedCrates(metadata);
   const crates = crateNotices(shipped);
   writeFileSync(join(outDir, "shell-crates.json"), JSON.stringify(crates, null, 1) + "\n");
-  writeFileSync(join(outDir, "shell-crates-LICENCES.txt"), crateLicenceTexts(shipped, standard));
+  // The source files each notices file was made from: for scripts/notices/check-verbatim.mjs, beside
+  // the notices folder (not in it: the interface embeds that folder's files).
+  const sourcesDir = join(dirname(outDir), "licence-sources");
+  mkdirSync(sourcesDir, { recursive: true });
+  const write = (part, { text, sources }) => {
+    writeFileSync(join(outDir, `${part}-LICENCES.txt`), text);
+    writeFileSync(join(sourcesDir, `${part}.json`), JSON.stringify(sources, null, 1) + "\n");
+    return text;
+  };
+  const cratesText = write("shell-crates", crateLicenceTexts(shipped, standard));
   const list = JSON.parse(execFileSync("pnpm", ["--filter", "@ao/ui", "list", "--prod", "--depth", "Infinity", "--json"], { cwd: REPO, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
   const readPackage = (p) => JSON.parse(readFileSync(join(p, "package.json"), "utf8"));
   const npm = npmNotices(list, readPackage);
   writeFileSync(join(outDir, "interface-npm.json"), JSON.stringify(npm, null, 1) + "\n");
-  writeFileSync(join(outDir, "interface-npm-LICENCES.txt"), npmLicenceTexts(list, readPackage, standard));
+  const npmText = write("interface-npm", npmLicenceTexts(list, readPackage, standard));
   const nodeVersion = execFileSync(nodeExe, ["--version"], { encoding: "utf8" }).trim();
-  writeFileSync(join(outDir, "node-LICENCES.txt"), nodeLicenceText(nodeExe, nodeVersion));
-  return { crates: crates.length, mpl: crates.filter((c) => c.source).length, npm: npm.length, node: nodeVersion };
+  write("node", { text: nodeLicenceText(nodeExe, nodeVersion), sources: [{ label: `Node.js ${nodeVersion} LICENSE`, path: nodeLicenceFile(nodeExe) }] });
+  const distinct = (t) => Number(/\((\d+) distinct\)/.exec(t)?.[1] ?? 0);
+  return { crates: crates.length, mpl: crates.filter((c) => c.source).length, npm: npm.length, node: nodeVersion, cratesDistinct: distinct(cratesText), npmDistinct: distinct(npmText) };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
@@ -206,7 +246,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     const nodeExe = at >= 0 ? argv.splice(at, 2)[1] : process.execPath;
     if (!nodeExe) throw new Error("--node needs the Node.js program the app ships");
     const r = writeNotices(resolve(argv[0] ?? join(REPO, "apps", "desktop", "generated", "notices")), resolve(nodeExe));
-    process.stdout.write(`notices: ${r.crates} Rust crates (${r.mpl} under MPL-2.0), ${r.npm} npm packages of the interface, Node.js ${r.node}; with their licence texts\n`);
+    process.stdout.write(`notices: ${r.crates} Rust crates (${r.mpl} under MPL-2.0), ${r.npm} npm packages of the interface, Node.js ${r.node}; licence texts: ${r.cratesDistinct} distinct files for the crates, ${r.npmDistinct} for the interface\n`);
   } catch (err) {
     process.stderr.write(`notices: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(1);
