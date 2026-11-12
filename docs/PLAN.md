@@ -503,7 +503,7 @@ Update after every task; commit and push.
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | done | 960aacc | reviewed with probes over two fix rounds and a final check; a locked project's captures are neither probed nor kept; `recordEdit` fixed |
-| 62 Transcription as a job | fix round 1 | f867056 (worktree branch) | reviewed with probes: 3 Important (a forbidden transcription not refused at the start; a lock during a run loses it; a refused rerun blocks the source for good) |
+| 62 Transcription as a job | fix round 1 in re-review | 34f0ef4 (worktree branch) | refused at the start; a lock keeps the run; a refused rerun ends; the working branch taken (five files resolved) |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
