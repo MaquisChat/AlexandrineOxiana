@@ -245,7 +245,8 @@ function withManifest<T>(repo: Repo, fn: (m: BackupManifest) => Promise<T>): Pro
     const m = await loadManifest(repo);
     const before = JSON.stringify(m);
     const out = await fn(m);
-    if (JSON.stringify(m) !== before) await writeManifest(dir, m);
+    // (Never into a library this computer does not hold for writing: its readers change nothing.)
+    if (JSON.stringify(m) !== before && repoLibrary(repo).mode === "read-write") await writeManifest(dir, m);
     return out;
   });
   manifestLocks.set(
@@ -266,15 +267,18 @@ const writeManifest = async (dir: string, m: BackupManifest) => {
  * from a file that is merely absent. Everything that decides from the manifest reads it through
  * here (a destruction's list, a retry pass, a prune, a restore's choice of backup), so the rebuild
  * always comes first. Only a Backups folder that holds no backup file gives an empty manifest.
+ * In a library this computer does not hold for writing, the rebuilt list is used and nothing is
+ * written or moved (R154 e): the computer that holds the library rebuilds the file itself.
  */
 async function loadManifest(repo: Repo): Promise<BackupManifest> {
   const dir = backupsDir(repo);
+  const mayWrite = repoLibrary(repo).mode === "read-write";
   const raw = await readMaybe(join(dir, BACKUPS_MANIFEST));
   if (!raw) {
     const rebuilt = await rebuildManifest(repo);
     // Nothing to list: nothing is written (a library that never made a backup keeps no manifest).
     if (!rebuilt.backups.length && !rebuilt.unresolved?.length) return { formatVersion: 1, backups: [] };
-    await writeManifest(dir, rebuilt);
+    if (mayWrite) await writeManifest(dir, rebuilt);
     return rebuilt;
   }
   let m: BackupManifest;
@@ -287,9 +291,9 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
       ...(Array.isArray(parsed.unresolved) ? { unresolved: parsed.unresolved.filter((x) => typeof x === "string") } : {}),
     };
   } catch {
-    await fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {});
+    if (mayWrite) await fsp.rename(join(dir, BACKUPS_MANIFEST), join(dir, `${BACKUPS_MANIFEST}.unreadable-${Date.now()}`)).catch(() => {});
     const rebuilt = await rebuildManifest(repo);
-    await writeManifest(dir, rebuilt);
+    if (mayWrite) await writeManifest(dir, rebuilt);
     return rebuilt;
   }
   // Files a rebuild could not read are tried again every time (R94): e.g. a sealed backup whose
@@ -312,7 +316,7 @@ async function loadManifest(repo: Repo): Promise<BackupManifest> {
     if (moved) {
       if (still.length) m.unresolved = still;
       else delete m.unresolved;
-      await writeManifest(dir, m);
+      if (mayWrite) await writeManifest(dir, m);
     }
   }
   return m;
@@ -1246,6 +1250,9 @@ export function pruneBackupsHeld(repo: Repo, hold: MaintenanceHold, projectId: s
 
 async function pruneLocked(repo: Repo, projectId: string, keep: number): Promise<string[]> {
   const dir = backupsDir(repo);
+  // Never in a library this computer does not hold for writing (R154 e): nothing is removed or noted.
+  const lib = repoLibrary(repo);
+  if (lib.mode !== "read-write") throw new ReadOnlyLibraryError(lib.readOnlyReason);
   await settlePending(repo);
   const pruneId = newId();
   activeOps.add(pruneId);

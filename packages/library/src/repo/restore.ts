@@ -407,7 +407,8 @@ export async function adoptRestoredProject(
 
       // 1b. The decision again, in this turn (R138 c): against the rules that would go live with the
       // copy, and the rules the project the backup was made from has at this moment.
-      const rules = await readMaybe(join(staging, "governance.yaml"));
+      // (Anything there that cannot be read as a file counts as no rules: refused.)
+      const rules = await readMaybe(join(staging, "governance.yaml")).catch(() => null);
       const request: RestoreRequest = {
         project: { id: old.id, name: old.name, encrypted: old.encryption.enabled, ...(old.timeZone ? { timeZone: old.timeZone } : {}) },
         governanceYaml: rules ? rules.toString("utf8") : null,
