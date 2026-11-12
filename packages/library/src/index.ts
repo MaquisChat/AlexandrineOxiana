@@ -48,6 +48,7 @@ export { HEARTBEAT_MS, STALE_MS, LockNotWritableError, acquireLock, readLock, re
 export type { LockInfo } from "./lock.js";
 export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, parseWindowsDrives } from "./location.js";
 export type { Location, LocationEnv, MountInfo } from "./location.js";
+export { OldCopiesUnreadableError } from "./old-copies.js";
 export {
   InvalidConfirmTokenError,
   MOVED_MARKER,
@@ -251,6 +252,7 @@ export {
   readAppSettingStrict,
   updateAppSettingStrict,
   setAppSettingAside,
+  DeviceIdUnreadableError,
   AppSettingUnreadableError,
   AppSettingReadableError,
   researcherName,

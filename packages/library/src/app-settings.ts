@@ -5,7 +5,7 @@
  * absolute paths out of messages shown to people or returned by the service.
  */
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
@@ -33,13 +33,61 @@ export function ensurePrivateDir(dir: string): void {
   }
 }
 
-function deviceIdIn(dir: string): string {
+/**
+ * This computer's identity could not be read (Task 68, ruling 2): the file is there but cannot be
+ * opened or read (no permission, a folder in its place, a passing I/O error). Nothing was written:
+ * the identity is never replaced over a file that merely could not be read, since it says which
+ * device holds a library's lock. The message carries no path.
+ */
+export class DeviceIdUnreadableError extends Error {
+  constructor() {
+    super("This computer's identity for the app (its device file in the app's settings folder) could not be read, so it was not replaced. Check that the app's settings folder can be read, then start the app again.");
+    this.name = "DeviceIdUnreadableError";
+  }
+}
+
+/** `<base>.corrupt-<YYYYMMDD-HHMMSS>` beside it, with `-n` when that name is taken (nothing kept before is overwritten). */
+function corruptNameFor(dir: string, base: string, now: Date): string {
+  const stamp = now.toISOString().replace(/\.\d+Z$/, "").replace(/[-:]/g, "").replace("T", "-");
+  for (let n = 0; ; n++) {
+    const name = n === 0 ? `${base}.corrupt-${stamp}` : `${base}.corrupt-${stamp}-${n}`;
+    try {
+      lstatSync(join(dir, name));
+    } catch {
+      return name;
+    }
+  }
+}
+
+/**
+ * This device's id (Task 68, ruling 2): missing (a fresh settings folder) makes a new one; a file
+ * that cannot be read refuses (DeviceIdUnreadableError) and writes nothing; damaged content (not
+ * JSON, truncated, the wrong shape) is kept aside as `device.json.corrupt-<stamp>` and a new id is
+ * made. Returns whether the identity was renewed over a damaged file.
+ */
+function deviceIdIn(dir: string, now: () => Date): { id: string; renewed: boolean } {
   const file = join(dir, "device.json");
+  let raw: string | undefined;
   try {
-    const v = JSON.parse(readFileSync(file, "utf8")) as { deviceId?: unknown };
-    if (typeof v.deviceId === "string" && v.deviceId) return v.deviceId;
-  } catch {
-    // first run
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw new DeviceIdUnreadableError();
+  }
+  let renewed = false;
+  if (raw !== undefined) {
+    try {
+      const v = JSON.parse(raw) as { deviceId?: unknown } | null;
+      if (typeof v?.deviceId === "string" && v.deviceId) return { id: v.deviceId, renewed: false };
+    } catch {
+      // damaged: kept aside below
+    }
+    // Damaged content: kept aside, never overwritten; if it cannot be set aside, nothing is replaced.
+    try {
+      renameSync(file, join(dir, corruptNameFor(dir, "device.json", now())));
+    } catch {
+      throw new DeviceIdUnreadableError();
+    }
+    renewed = true;
   }
   let id: string;
   try {
@@ -53,15 +101,22 @@ function deviceIdIn(dir: string): string {
   } catch {
     // an unwritable config folder: the id is just not remembered
   }
-  return id;
+  return { id, renewed };
 }
 
-/** This device's Deps (clock, device id, lock liveness) with `dir` as the app settings folder. */
-export function deviceDeps(dir: string = appConfigDir()): Deps {
+/**
+ * This device's Deps (clock, device id, lock liveness) with `dir` as the app settings folder.
+ * Throws DeviceIdUnreadableError when this device's identity file is there but cannot be read
+ * (Task 68, ruling 2). `deviceRenewed` is true when a damaged identity file was kept aside and a new
+ * identity made.
+ */
+export function deviceDeps(dir: string = appConfigDir(), opts: { now?: () => Date } = {}): Deps & { deviceRenewed?: true } {
   ensurePrivateDir(dir);
+  const device = deviceIdIn(dir, opts.now ?? (() => new Date()));
   return {
     clock: () => new Date(),
-    deviceId: deviceIdIn(dir),
+    deviceId: device.id,
+    ...(device.renewed ? { deviceRenewed: true as const } : {}),
     hostname: hostname(),
     pid: process.pid,
     isPidAlive: (pid) => {

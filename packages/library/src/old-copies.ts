@@ -4,6 +4,11 @@
  * the registry), so the offer survives an app restart:
  * `<appConfigDir>/pending-old-copies.json` plus, per record, the list of
  * verified file hashes in `<appConfigDir>/old-copies/<id>.json`.
+ *
+ * The list follows the registry's rule (Task 68, ruling 1): missing is "none yet"; a read error
+ * other than "missing" refuses (OldCopiesUnreadableError) and nothing is written; damaged content is
+ * kept aside as `pending-old-copies.json.corrupt-<stamp>` by the next change, which starts a fresh
+ * list (reading never moves anything: a damaged list reads as empty). Changes run one at a time.
  */
 import { randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -42,12 +47,59 @@ export interface VerifiedHashes {
 type CfgDeps = Pick<Deps, "appConfigDir" | "clock">;
 const listFile = (d: CfgDeps) => join(d.appConfigDir, "pending-old-copies.json");
 
-async function load(deps: CfgDeps): Promise<PendingOldCopy[]> {
+/**
+ * The list of old library copies could not be read (Task 68, ruling 1): nothing was written. The
+ * old copies themselves are untouched. The message carries no path.
+ */
+export class OldCopiesUnreadableError extends Error {
+  /** `during: "move"`: a library move needed the list and was stopped before anything was switched. */
+  constructor(readonly during?: "move") {
+    super(
+      during === "move"
+        ? "The move was stopped before anything was switched: this computer's list of old library copies awaiting deletion could not be read. The library is still where it was and nothing was deleted; the copy made at the new place is not used, and no old copy is listed for deletion. Check that the app's settings folder can be read and try again."
+        : "This computer's list of old library copies awaiting deletion could not be read, so it was not changed. Old copies stay where they are; check that the app's settings folder can be read and try again.",
+    );
+    this.name = "OldCopiesUnreadableError";
+  }
+}
+
+const usable = (r: unknown): r is PendingOldCopy => typeof (r as PendingOldCopy | null)?.id === "string" && typeof (r as PendingOldCopy).oldRoot === "string";
+
+/** The records, and whether anything in the file was unusable (`damaged`). Throws on a read error other than "missing". */
+async function readList(deps: CfgDeps): Promise<{ records: PendingOldCopy[]; damaged: boolean }> {
+  let raw: string;
   try {
-    const v = JSON.parse(await fsp.readFile(listFile(deps), "utf8")) as { records?: unknown };
-    return Array.isArray(v.records) ? (v.records as PendingOldCopy[]).filter((r) => typeof r?.id === "string" && typeof r.oldRoot === "string") : [];
+    raw = await fsp.readFile(listFile(deps), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { records: [], damaged: false };
+    throw new OldCopiesUnreadableError();
+  }
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
   } catch {
-    return [];
+    return { records: [], damaged: true };
+  }
+  const list = (v as { records?: unknown } | null)?.records;
+  if (!Array.isArray(list)) return { records: [], damaged: true };
+  const records = list.filter(usable);
+  return { records, damaged: records.length !== list.length };
+}
+
+async function load(deps: CfgDeps): Promise<PendingOldCopy[]> {
+  return (await readList(deps)).records;
+}
+
+/** `pending-old-copies.json.corrupt-<stamp>`, with `-n` when taken (nothing kept before is overwritten). */
+async function corruptName(deps: CfgDeps): Promise<string> {
+  const stamp = deps.clock().toISOString().replace(/\.\d+Z$/, "").replace(/[-:]/g, "").replace("T", "-");
+  for (let n = 0; ; n++) {
+    const name = `${listFile(deps)}.corrupt-${stamp}${n === 0 ? "" : `-${n}`}`;
+    try {
+      await fsp.lstat(name);
+    } catch {
+      return name;
+    }
   }
 }
 
@@ -56,21 +108,46 @@ async function save(deps: CfgDeps, records: PendingOldCopy[]): Promise<void> {
   await writeFileAtomic(listFile(deps), JSON.stringify({ formatVersion: 1, records }, null, 2), { mode: 0o600 });
 }
 
+const turns = new Map<string, Promise<unknown>>();
+
+/**
+ * A change of the list, in its turn: read (a read error refuses, nothing written), keep a damaged
+ * file aside before anything is written over it, then write what `edit` returns.
+ */
+function changeList<T>(deps: CfgDeps, edit: (records: PendingOldCopy[]) => Promise<{ records: PendingOldCopy[] | null; result: T }>): Promise<T> {
+  const key = listFile(deps);
+  const run = (turns.get(key) ?? Promise.resolve()).then(async () => {
+    const { records, damaged } = await readList(deps);
+    const out = await edit(records);
+    if (out.records === null) return out.result; // nothing to change
+    if (damaged) await fsp.rename(key, await corruptName(deps));
+    await save(deps, out.records);
+    return out.result;
+  });
+  turns.set(
+    key,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
 /** Records a pending old copy (complete: false) with its verified hashes. */
 export async function addPendingOldCopy(
   deps: CfgDeps,
   rec: Omit<PendingOldCopy, "id" | "verifiedHashesFile" | "createdAt" | "complete">,
   hashes: VerifiedHashes,
 ): Promise<PendingOldCopy> {
-  const id = randomBytes(12).toString("hex");
-  const dir = join(deps.appConfigDir, "old-copies");
-  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") await fsp.chmod(dir, 0o700);
-  const verifiedHashesFile = join(dir, `${id}.json`);
-  await writeFileAtomic(verifiedHashesFile, JSON.stringify(hashes), { mode: 0o600 });
-  const full: PendingOldCopy = { ...rec, id, verifiedHashesFile, createdAt: deps.clock().toISOString(), complete: false };
-  await save(deps, [...(await load(deps)), full]);
-  return full;
+  // The list is read first: a list that cannot be read refuses before any hash list is written.
+  return changeList(deps, async (records) => {
+    const id = randomBytes(12).toString("hex");
+    const dir = join(deps.appConfigDir, "old-copies");
+    await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") await fsp.chmod(dir, 0o700);
+    const verifiedHashesFile = join(dir, `${id}.json`);
+    await writeFileAtomic(verifiedHashesFile, JSON.stringify(hashes), { mode: 0o600 });
+    const full: PendingOldCopy = { ...rec, id, verifiedHashesFile, createdAt: deps.clock().toISOString(), complete: false };
+    return { records: [...records, full], result: full };
+  });
 }
 
 /**
@@ -98,19 +175,20 @@ export async function getPendingOldCopy(deps: CfgDeps, id: string): Promise<Pend
 }
 
 export async function markPendingComplete(deps: CfgDeps, id: string): Promise<void> {
-  const all = await load(deps);
-  const r = all.find((x) => x.id === id);
-  if (!r || r.complete) return;
-  r.complete = true;
-  await save(deps, all);
+  return changeList(deps, async (all) => {
+    const r = all.find((x) => x.id === id);
+    if (!r || r.complete) return { records: null, result: undefined };
+    r.complete = true;
+    return { records: all, result: undefined };
+  });
 }
 
 export async function removePendingOldCopy(deps: CfgDeps, id: string): Promise<void> {
-  const all = await load(deps);
-  const r = all.find((x) => x.id === id);
-  if (!r) return;
-  await save(deps, all.filter((x) => x.id !== id));
-  await fsp.rm(r.verifiedHashesFile, { force: true });
+  const r = await changeList(deps, async (all) => {
+    const found = all.find((x) => x.id === id);
+    return found ? { records: all.filter((x) => x.id !== id), result: found } : { records: null, result: undefined };
+  });
+  if (r) await fsp.rm(r.verifiedHashesFile, { force: true });
 }
 
 export async function readVerifiedHashes(rec: PendingOldCopy): Promise<VerifiedHashes> {
