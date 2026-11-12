@@ -3,7 +3,7 @@
  * settings file that stays unreadable (Task 66's M8): the fonts index, the appearance settings and
  * the pairings, through the service's routes.
  */
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -120,9 +120,22 @@ describe("the fonts index (D16)", () => {
   it.skipIf(asRoot)("an index it has no permission to read: refused, nothing written", async () => {
     await start();
     await addFont("Alpha");
-    await chmod(cfg("fonts.json"), 0o000);
+    // Everything is looked at BEFORE the file is made unreadable: the test never reads it while it is.
     const before = await snapshot();
-    expect((await addFont("Gamma")).status).toBe(503);
+    const st0 = await stat(cfg("fonts.json"));
+    await chmod(cfg("fonts.json"), 0o000);
+    try {
+      const stLocked = await stat(cfg("fonts.json"));
+      const add = await addFont("Gamma");
+      expect(add.status).toBe(503);
+      expect(add.json.error).toMatchObject({ code: "UNAVAILABLE", reason: "fonts" });
+      // While it is unreadable: same size, same mode, same modification time (nothing written over it).
+      const st1 = await stat(cfg("fonts.json"));
+      expect([st1.size, st1.mode, st1.mtimeMs, st1.ino]).toEqual([stLocked.size, stLocked.mode, stLocked.mtimeMs, stLocked.ino]);
+    } finally {
+      await chmod(cfg("fonts.json"), st0.mode & 0o777);
+    }
+    // Readable again: byte-identical, and no other file in the settings folder appeared or changed.
     expect(await snapshot()).toEqual(before);
   });
 
