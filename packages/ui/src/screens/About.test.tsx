@@ -209,7 +209,7 @@ describe("full licence texts (Task 37j)", () => {
     for (const text of Object.values(BUILT_NOTICES)) expect(text).not.toMatch(/^=== Text 1 of/m);
     // What the bundler sees: the texts' glob is lazy, and the eager glob takes only the lists.
     const source = ABOUT_SOURCE;
-    const globs = [...source.matchAll(/import\.meta\.glob\(\s*"([^"]*generated\/notices[^"]*)"\s*,\s*\{([^}]*)\}/g)].map((m) => ({ pattern: m[1], options: m[2] }));
+    const globs = [...source.matchAll(/import\.meta\.glob\(\s*"([^"]*generated\/notices[^"]*)"\s*,\s*\{([^}]*)\}/g)].map((m) => ({ pattern: m[1] ?? "", options: m[2] ?? "" }));
     const texts = globs.filter((g) => g.pattern.includes("LICENCES"));
     expect(texts).toHaveLength(1);
     expect(texts[0]!.options).not.toMatch(/eager/);
