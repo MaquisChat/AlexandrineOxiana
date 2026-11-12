@@ -27,6 +27,9 @@ import {
   checkCaptureAllowed,
   createLinkCapture,
   type BrowserName,
+  type CaptureOutcome,
+  type CaptureStatus,
+  type ProfileCaptureReport,
   type CaptureOptions,
   type ProfileCaptureOptions,
   type ProfileContentType,
@@ -43,6 +46,9 @@ import {
   type BrowserCaptureProgressEvent,
   type CaptureBrowser,
   type CaptureContentType,
+  type CaptureItemOutcome,
+  type CaptureItemStatus,
+  type CaptureProfileReport,
   type CaptureLinksRequest,
   type CaptureProfileRequest,
   type CaptureQueueDetail,
@@ -65,7 +71,7 @@ import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
 import { registerTranscription } from "./transcription.js";
-import { bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type Ctx, type Obj, type Same } from "./util.js";
+import { bodyAs, bodyOf, optBool, optObj, optStr, paramsOf, projectParam, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
 /** Browser capture carries a full-page screenshot and the page's HTML (R96: raised only here). */
 export const BROWSER_CAPTURE_BODY_LIMIT = 32 * 1024 * 1024;
@@ -73,21 +79,27 @@ export const BROWSER_CAPTURE_BODY_LIMIT = 32 * 1024 * 1024;
 // The library's browsers and profile parts are exactly the shared lists (a change to either fails here).
 true satisfies Same<BrowserName, CaptureBrowser>;
 true satisfies Same<ProfileContentType, CaptureContentType>;
+// A link's outcome and a profile run's report go out as the library makes them: its statuses are the
+// shared list, and they carry exactly the fields the shared types declare (no undeclared field on the wire).
+true satisfies Same<CaptureStatus, CaptureItemStatus>;
+true satisfies Same<keyof CaptureOutcome, keyof CaptureItemOutcome>;
+true satisfies Same<keyof ProfileCaptureReport, keyof CaptureProfileReport>;
 const BROWSERS: readonly BrowserName[] = CAPTURE_BROWSERS;
 // The speech models the app accepts (R158, one definition in @ao/shared).
 const MODELS: readonly string[] = SPEECH_MODELS;
 const TYPES: readonly ProfileContentType[] = CAPTURE_CONTENT_TYPES;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
-function captureOptions(o: Obj | undefined): CaptureOptions {
-  const opts = o ?? {};
-  const browser = optStr(opts, "cookiesFromBrowser" satisfies keyof CaptureRequestOptions, 16);
+/** The options of a capture, read through their shared request type (an absent `options` is `{}`). */
+function captureOptions(o: BodyOf<CaptureRequestOptions> | undefined): CaptureOptions {
+  const opts = o ?? ({} as BodyOf<CaptureRequestOptions>);
+  const browser = optStr(opts, "cookiesFromBrowser", 16);
   if (browser !== undefined && !BROWSERS.includes(browser as BrowserName)) throw badRequest(`"${browser}" is not a supported browser.`);
-  const model = optStr(opts, "transcribeModel" satisfies keyof CaptureRequestOptions, 16);
+  const model = optStr(opts, "transcribeModel", 16);
   if (model !== undefined && !MODELS.includes(model)) throw badRequest(`"${model}" is not a transcription model.`);
-  const transcribe = opts.transcribe === undefined ? "project-default" : optBool(opts, "transcribe" satisfies keyof CaptureRequestOptions)!;
-  const refresh = optBool(opts, "refreshIfExists" satisfies keyof CaptureRequestOptions);
-  const legalBasis = optStr(opts, "legalBasis" satisfies keyof CaptureRequestOptions, 2000);
+  const transcribe = opts.transcribe === undefined ? "project-default" : optBool(opts, "transcribe")!;
+  const refresh = optBool(opts, "refreshIfExists");
+  const legalBasis = optStr(opts, "legalBasis", 2000);
   return {
     transcribe,
     ...(browser ? { cookiesFromBrowser: browser as BrowserName } : {}),
@@ -108,7 +120,7 @@ function requireAcknowledged(s: Session, projectId: string, opts: CaptureOptions
 export const MAX_QUEUED_LINKS = CAPTURE_LINKS_MAX;
 
 /** A list of web addresses (http or https only, at most 2048 characters each). */
-function urlList(b: Obj, key: string, max: number): string[] {
+function urlList<O extends object>(b: O, key: keyof O & string, max: number): string[] {
   const urls = strArray(b, key, { max, itemMax: MAX_ADDRESS_LENGTH });
   for (const u of urls) if (!isWebAddress(u)) throw badRequest(`"${key}" must be web addresses.`);
   return urls;
@@ -194,25 +206,25 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
   app.post("/projects/:id/capture", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
-    const urls = urlList(b, "urls" satisfies keyof CaptureLinksRequest, MAX_QUEUED_LINKS);
-    const opts = captureOptions(optObj(b, "options" satisfies keyof CaptureLinksRequest));
+    const b = bodyAs<CaptureLinksRequest>(req);
+    const urls = urlList(b, "urls", MAX_QUEUED_LINKS);
+    const opts = captureOptions(optObj(b, "options") as BodyOf<CaptureRequestOptions> | undefined);
     return queueLinks(s, projectId, urls, opts);
   });
 
   app.post("/projects/:id/capture-profile", async (req): Promise<CaptureStartedResponse> => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
-    const b = bodyOf(req);
-    const url = urlList({ u: [str(b, "url" satisfies keyof CaptureProfileRequest, MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
-    const o = optObj(b, "options" satisfies keyof CaptureProfileRequest) ?? {};
+    const b = bodyAs<CaptureProfileRequest>(req);
+    const url = urlList({ u: [str(b, "url", MAX_ADDRESS_LENGTH)] }, "u", 1)[0]!;
+    const o = (optObj(b, "options") ?? {}) as BodyOf<ProfileCaptureRequestOptions>;
     const base = captureOptions(o);
-    const since = optStr(o, "since" satisfies keyof ProfileCaptureRequestOptions, 10);
-    const until = optStr(o, "until" satisfies keyof ProfileCaptureRequestOptions, 10);
+    const since = optStr(o, "since", 10);
+    const until = optStr(o, "until", 10);
     if ((since && !DAY.test(since)) || (until && !DAY.test(until))) throw badRequest("since and until are dates written YYYY-MM-DD.");
     const maxItems = o.maxItems === undefined ? undefined : Number(o.maxItems);
     if (maxItems !== undefined && (!Number.isInteger(maxItems) || maxItems < 1)) throw badRequest('"maxItems" must be a whole number of 1 or more.');
-    const contentTypes = o.contentTypes === undefined ? undefined : strArray(o, "contentTypes" satisfies keyof ProfileCaptureRequestOptions, { max: 5 });
+    const contentTypes = o.contentTypes === undefined ? undefined : strArray(o, "contentTypes", { max: 5 });
     if (contentTypes?.some((t) => !TYPES.includes(t as ProfileContentType))) throw badRequest(`"contentTypes" are: ${TYPES.join(", ")}.`);
     const opts: ProfileCaptureOptions = {
       ...base,
@@ -221,8 +233,8 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       ...(until ? { until } : {}),
       ...(maxItems ? { maxItems } : {}),
       ...(contentTypes ? { contentTypes: contentTypes as ProfileContentType[] } : {}),
-      ...(optBool(o, "metadataOnly" satisfies keyof ProfileCaptureRequestOptions) ? { metadataOnly: true } : {}),
-      ...(optBool(o, "includeComments" satisfies keyof ProfileCaptureRequestOptions) ? { includeComments: true } : {}),
+      ...(optBool(o, "metadataOnly") ? { metadataOnly: true } : {}),
+      ...(optBool(o, "includeComments") ? { includeComments: true } : {}),
     };
     requireUnlocked(s, projectId); // nothing about its captures before the lock and the rules (I1)
     await checkCaptureAllowed(s.repo, projectId, [url]);
@@ -303,7 +315,7 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
 
   app.post("/extension/pair/confirm", async (req): Promise<PairingConfirmResponse> => {
     if (pairing.rateLimited(req.headers.origin ?? "")) throw new ApiError(429, "RATE_LIMITED", "Too many attempts. Wait a minute, then try again.");
-    const code = bodyOf(req)["code" satisfies keyof PairingConfirmRequest];
+    const code = bodyAs<PairingConfirmRequest>(req).code;
     const token = await pairing.confirm(typeof code === "string" ? code : "", req.headers.origin ?? "");
     if (!token) throw new ApiError(401, "UNAUTHORIZED", "That code is not valid. Ask the desktop app for a new one.");
     return { token };
@@ -394,7 +406,6 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
       linkCapture ? { linkCapture } : {},
     );
     state.events.publish("capture.progress", { kind: "browser", projectId, sourceId: r.sourceId, status: r.status, finished: true } satisfies BrowserCaptureProgressEvent);
-
     return r;
   });
 }

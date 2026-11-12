@@ -10,7 +10,7 @@ import { basename } from "node:path";
 import { InvalidRecoveryCodeError, WrongPassphraseError, backupProject, setBackupSettings, type Repo } from "@ao/library";
 import type { AcknowledgeRequest, AcknowledgeResponse } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
-import { bodyOf, optBool, optObj, projectParam, str, strArray, type Ctx } from "./util.js";
+import { bodyAs, bodyOf, optBool, optObj, projectParam, str, strArray, type Ctx } from "./util.js";
 
 async function captureMethods(repo: Repo, projectId: string): Promise<string[]> {
   try {
@@ -216,8 +216,7 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
   app.post("/projects/:id/acknowledge", async (req): Promise<AcknowledgeResponse> => {
     const s = state.requireWritable();
     const id = projectParam(ctx, req);
-    const kind = str(bodyOf(req), "kind" satisfies keyof AcknowledgeRequest, 32);
-
+    const kind = str(bodyAs<AcknowledgeRequest>(req), "kind", 32);
     if (kind !== "cookies") throw badRequest('"kind" must be "cookies".');
     const p = await s.repo.acknowledge(id, kind);
     return { acknowledgements: Object.keys(p.captureAcknowledgements ?? {}) };

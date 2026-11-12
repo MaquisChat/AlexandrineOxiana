@@ -12,6 +12,14 @@ export type Obj = Record<string, unknown>;
  */
 export type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
+/**
+ * A request body seen through its shared request type (@ao/shared, Task 47, R184): every key the type
+ * declares can be read, and its value is still unchecked (`unknown`, validated by the reader as
+ * before). Reading a key the type does not declare (a field renamed in @ao/shared) does not compile.
+ * A type only: the body is the same object.
+ */
+export type BodyOf<T> = { [K in keyof T]-?: unknown };
+
 /** The JSON body as an object (an absent body is `{}`). */
 export function bodyOf(req: FastifyRequest): Obj {
   const b = req.body;
@@ -20,26 +28,35 @@ export function bodyOf(req: FastifyRequest): Obj {
   return b as Obj;
 }
 
-export function str(o: Obj, key: string, max = 4096): string {
-  const v = o[key];
+/** `bodyOf`, seen through the route's shared request type. */
+export function bodyAs<T>(req: FastifyRequest): BodyOf<T> {
+  return bodyOf(req) as BodyOf<T>;
+}
+
+// The readers below take the key as one of `o`'s keys: any text for a plain object, and only a
+// declared key for a body seen through its request type (BodyOf).
+
+export function str<O extends object = Obj>(o: O, key: keyof O & string, max = 4096): string {
+  const v = (o as Obj)[key];
   if (typeof v !== "string" || v.length === 0) throw badRequest(`"${key}" is required (text).`);
   if (v.length > max) throw badRequest(`"${key}" is too long.`);
   return v;
 }
 
-export function optStr(o: Obj, key: string, max = 4096): string | undefined {
-  return o[key] === undefined || o[key] === null ? undefined : str(o, key, max);
+export function optStr<O extends object = Obj>(o: O, key: keyof O & string, max = 4096): string | undefined {
+  const v = (o as Obj)[key];
+  return v === undefined || v === null ? undefined : str(o, key, max);
 }
 
-export function optBool(o: Obj, key: string): boolean | undefined {
-  const v = o[key];
+export function optBool<O extends object = Obj>(o: O, key: keyof O & string): boolean | undefined {
+  const v = (o as Obj)[key];
   if (v === undefined) return undefined;
   if (typeof v !== "boolean") throw badRequest(`"${key}" must be true or false.`);
   return v;
 }
 
-export function strArray(o: Obj, key: string, opts: { max?: number; itemMax?: number; optional?: boolean } = {}): string[] {
-  const v = o[key];
+export function strArray<O extends object = Obj>(o: O, key: keyof O & string, opts: { max?: number; itemMax?: number; optional?: boolean } = {}): string[] {
+  const v = (o as Obj)[key];
   if (v === undefined && opts.optional) return [];
   if (!Array.isArray(v) || v.some((x) => typeof x !== "string" || x.length === 0 || x.length > (opts.itemMax ?? 4096))) {
     throw badRequest(`"${key}" must be a list of text values.`);
@@ -48,8 +65,9 @@ export function strArray(o: Obj, key: string, opts: { max?: number; itemMax?: nu
   return v as string[];
 }
 
-export function optObj(o: Obj, key: string): Obj | undefined {
-  const v = o[key];
+export function optObj<O extends object = Obj>(o: O, key: keyof O & string): Obj | undefined {
+  const v = (o as Obj)[key];
+
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "object" || Array.isArray(v)) throw badRequest(`"${key}" must be an object.`);
   return v as Obj;

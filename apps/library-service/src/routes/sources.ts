@@ -33,7 +33,7 @@ import type {
   TranscriptSaveRequest,
 } from "@ao/shared";
 import { ApiError, badRequest, notFound } from "../errors.js";
-import { bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
+import { bodyAs, bodyOf, intParam, optStr, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Obj } from "./util.js";
 
 /** Fields a PATCH may change (provenance, folder and ids never). */
 const EDITABLE = new Set<string>(["type", "title", "creators", "container", "publisher", "issued", "accessed", "identifiers", "caseAttributes", "availability", ...BIBLIO_FIELDS]);
@@ -189,9 +189,9 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
-    const b = bodyOf(req);
-    if (!(("value" satisfies keyof FieldConfirmRequest) in b)) throw badRequest('"value" is required.');
-    return record(await confirmField(s.repo, projectId, sid, str(b, "field" satisfies keyof FieldConfirmRequest, 64), b.value));
+    const b = bodyAs<FieldConfirmRequest>(req);
+    if (!("value" in b)) throw badRequest('"value" is required.');
+    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value));
   });
 
   app.post("/projects/:id/sources/:sid/recheck", async (req): Promise<SourceFile & SourceRecordExtras> => {
@@ -374,14 +374,13 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
-    const b = bodyOf(req);
-    const format = str(b, "format" satisfies keyof TranscriptSaveRequest, 8);
+    const b = bodyAs<TranscriptSaveRequest>(req);
+    const format = str(b, "format", 8);
     if (format !== "vtt" && format !== "txt") throw badRequest('"format" must be "vtt" or "txt".');
-    const basedOn = optStr(b, "basedOn" satisfies keyof TranscriptSaveRequest, 64);
-    const lang = optStr(b, "lang" satisfies keyof TranscriptSaveRequest, 35);
-    const text = str(b, "text" satisfies keyof TranscriptSaveRequest, ASSET_TEXT_MAX_BYTES);
+    const basedOn = optStr(b, "basedOn", 64);
+    const lang = optStr(b, "lang", 35);
+    const text = str(b, "text", ASSET_TEXT_MAX_BYTES);
     const asset = await addTranscriptVersion(s.repo, projectId, sid, { text, format, ...(basedOn ? { basedOn } : {}), ...(lang ? { lang } : {}) });
-
     return { id: asset.id, path: asset.path, derivation: asset.derivation };
   });
 }

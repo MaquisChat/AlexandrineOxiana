@@ -18,11 +18,13 @@ import {
   type ReviewDecideRequest,
   type ReviewDecideResponse,
   type ReviewDecisionAction,
+  type ReviewEntryDecision,
+  type ReviewEntryPatch,
   type WithdrawalReviewedRequest,
   type WithdrawalReviewedResponse,
 } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
-import { bodyOf, intParam, optObj, paramsOf, projectParam, queryOf, str, strArray, type Ctx, type Same } from "./util.js";
+import { bodyAs, intParam, optObj, paramsOf, projectParam, queryOf, str, strArray, type BodyOf, type Ctx, type Same } from "./util.js";
 
 /** What the queue sends of an entry (only pending entries are listed). */
 function entryOut(e: ListedReviewEntry): ProjectReviewEntry {
@@ -51,12 +53,17 @@ function entryOut(e: ListedReviewEntry): ProjectReviewEntry {
 
 // The library's decisions are exactly the shared list (a change to either fails here).
 true satisfies Same<ReviewDecision["action"], ReviewDecisionAction>;
+// Every decision but `accept` is the same on both sides; `accept`'s draft and the patch's `type` are
+// narrower in the library (SourceDraft, SourceType), which validates them (F4): the rest is tied here.
+true satisfies Same<Exclude<ReviewDecision, { action: "accept" }>, Exclude<ReviewEntryDecision, { action: "accept" }>>;
+true satisfies Same<Omit<ReviewPatch, "type">, Omit<ReviewEntryPatch, "type">>;
+true satisfies Same<keyof ReviewPatch, keyof ReviewEntryPatch>;
 const ACTIONS: ReadonlySet<string> = new Set(REVIEW_DECISION_ACTIONS);
 
 /** The project of a review item: named in the body (review ids are per project). */
-function projectOf(ctx: Ctx, b: Record<string, unknown>): string {
+function projectOf(ctx: Ctx, b: BodyOf<ReviewDecideRequest | ReviewBulkEditRequest | WithdrawalReviewedRequest>): string {
   const s = ctx.state.requireWritable();
-  const projectId = str(b, "projectId" satisfies keyof (ReviewDecideRequest | ReviewBulkEditRequest | WithdrawalReviewedRequest), 64);
+  const projectId = str(b, "projectId", 64);
   if (!s.repo.listProjects().some((p) => p.id === projectId)) throw badRequest("That project is not in this library.");
   return projectId;
 }
@@ -81,9 +88,9 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
 
   app.post("/review/:itemId/decide", async (req): Promise<ReviewDecideResponse> => {
     const s = state.requireWritable();
-    const b = bodyOf(req);
+    const b = bodyAs<ReviewDecideRequest>(req);
     const projectId = projectOf(ctx, b);
-    const decision = optObj(b, "decision" satisfies keyof ReviewDecideRequest);
+    const decision = optObj(b, "decision") as BodyOf<ReviewEntryDecision> | undefined;
     if (!decision || typeof decision.action !== "string" || !ACTIONS.has(decision.action)) {
       throw badRequest(`"decision.action" must be one of: ${[...ACTIONS].join(", ")}.`);
     }
@@ -97,7 +104,7 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
   // anything is read; a second decision on the same entry is a conflict.
   app.post("/review/:itemId/reviewed-after-withdrawal", async (req): Promise<WithdrawalReviewedResponse> => {
     const s = state.requireWritable();
-    const b = bodyOf(req);
+    const b = bodyAs<WithdrawalReviewedRequest>(req);
     const projectId = projectOf(ctx, b);
     if (typeof b.reason !== "string") throw badRequest('"reason" is required: say, in your own words, what you decided after the withdrawal.');
     if (b.reason.length > WITHDRAWAL_REASON_MAX) throw badRequest(`"reason" is too long (at most ${WITHDRAWAL_REASON_MAX} characters).`);
@@ -108,11 +115,10 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
 
   app.post("/review/bulk-edit", async (req): Promise<ReviewBulkEditResponse> => {
     const s = state.requireWritable();
-    const b = bodyOf(req);
+    const b = bodyAs<ReviewBulkEditRequest>(req);
     const projectId = projectOf(ctx, b);
-    const itemIds = strArray(b, "itemIds" satisfies keyof ReviewBulkEditRequest, { max: 10_000, itemMax: 64 });
-    const patch = optObj(b, "patch" satisfies keyof ReviewBulkEditRequest);
-
+    const itemIds = strArray(b, "itemIds", { max: 10_000, itemMax: 64 });
+    const patch = optObj(b, "patch");
     if (!patch) throw badRequest('"patch" is required.');
     await s.bulk.bulkEditReview(projectId, itemIds, patch as ReviewPatch);
     return { edited: itemIds.length };

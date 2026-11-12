@@ -448,7 +448,6 @@ export class ServiceState {
             this.captureQueues.progress(queueId, info.done, total, outcome);
             if (info.finished) this.captureQueues.finish(queueId, {});
             this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished } satisfies CaptureQueueProgressEvent);
-
           },
           { shouldStop: () => ctl.stopping, cancelled: ended, signal: this.captureSignal(queueId) },
         );
