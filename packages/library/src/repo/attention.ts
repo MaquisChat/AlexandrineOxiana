@@ -34,11 +34,11 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AuditEvent } from "@ao/core";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { absPath, assertContained, readMaybe } from "./io.js";
-import { isClosed, type Library } from "../library.js";
+import { isClosed, projectMovedAway, type Library } from "../library.js";
 import { readLock } from "../lock.js";
 import { appendLibraryAudit, readLibraryAudit } from "./library-audit.js";
 import { SimulatedCrash } from "./seams.js";
@@ -171,7 +171,10 @@ export interface UnrecognisedItem {
   name: string;
   entry: "file" | "folder" | "link" | "other";
   bytes?: number;
+  /** `attention` itself is not a folder. */
   self?: true;
+  /** `attention-set-aside` is not a real folder (a link, a file): reported here, never followed (R1). */
+  aside?: true;
 }
 
 const entryOf = (s: import("node:fs").Stats): UnrecognisedItem["entry"] =>
@@ -180,6 +183,16 @@ export const unrecognisedId = (name: string, self = false) => `u-${createHash("s
 
 /** The project's well-formed records, and every other item in its attention folder (kept, never acted on). */
 export async function readAttention(root: string, projectRel: string): Promise<{ records: AttentionRecord[]; unrecognised: UnrecognisedItem[] }> {
+  const r = await readAttentionFolder(root, projectRel);
+  // A set-aside area that is not a real folder is shown at the project level (R1), never followed.
+  const aside = await fsp.lstat(absPath(root, `${projectRel}/${SET_ASIDE_DIR}`)).catch(() => null);
+  if (aside && !aside.isDirectory()) {
+    r.unrecognised.push({ id: `u-${createHash("sha256").update("\u0000aside", "utf8").digest("hex").slice(0, 32)}`, name: SET_ASIDE_DIR, entry: entryOf(aside), ...(aside.isFile() ? { bytes: aside.size } : {}), aside: true });
+  }
+  return r;
+}
+
+async function readAttentionFolder(root: string, projectRel: string): Promise<{ records: AttentionRecord[]; unrecognised: UnrecognisedItem[] }> {
   const dir = dirOf(root, projectRel);
   const top = await fsp.lstat(dir).catch(() => null);
   if (!top) return { records: [], unrecognised: [] };
@@ -534,17 +547,24 @@ export async function markForSetAside(
   const rec = records.find((r) => r.id === id);
   const u = rec ? undefined : unrecognised.find((x) => x.id === id);
   if (!rec && !u) return null;
-  const src = rec ? join(attDir, `${rec.id}.json`) : u!.self ? attDir : join(attDir, u!.name);
+  const src = rec ? join(attDir, `${rec.id}.json`) : u!.self ? attDir : u!.aside ? join(projectDir, SET_ASIDE_DIR) : join(attDir, u!.name);
   const summary: Record<string, unknown> = rec
     ? { kind: rec.kind, record: rec }
     : { kind: "unrecognised", name: u!.name, entry: u!.entry, ...(u!.bytes !== undefined ? { bytes: u!.bytes } : {}) };
   return {
     summary,
     remove: async () => {
-      const asideDir = join(projectDir, SET_ASIDE_DIR);
+      // The first set-aside area that is absent or a real folder (one that is a link is never used, R1).
+      let asideDir = join(projectDir, SET_ASIDE_DIR);
+      for (let i = 1; ; i++) {
+        const st = await fsp.lstat(asideDir).catch(() => null);
+        if (!st || (st.isDirectory() && !st.isSymbolicLink())) break;
+        if (i > 20) throw new Error("no usable set-aside folder in this project");
+        asideDir = join(projectDir, `${SET_ASIDE_DIR}-${i}`);
+      }
       const dest = join(asideDir, `${core.clock().toISOString().replace(/[:.]/g, "-")}-${id}`);
-      // Containment of the folders only: the item itself may be a link, which is moved, not followed.
-      await assertContained(projectDir, join(attDir, ".probe"));
+      // Containment of the folders only: the item itself may be a link, which is moved (renamed), not followed.
+      await assertContained(projectDir, join(dirname(src), ".probe"));
       await assertContained(projectDir, dest);
       await fsp.mkdir(asideDir, { recursive: true, mode: 0o700 });
       await assertContained(projectDir, dest);
@@ -562,6 +582,9 @@ export async function settleOrphanOutbox(core: RepoCore): Promise<void> {
   const entries = (await readOutbox(core.library.appConfigDir, core.library.id)).filter((e) => !core.projects.has(e.projectId));
   if (entries.length === 0) return;
   const folders = await projectFolders(core.root);
+  // A project folder whose project.json cannot be read now (a sync placeholder, a drive coming back)
+  // may be the entry's project: then nothing is taken for deleted, and entries wait (R3).
+  if (await someFolderUnidentified(core.root, folders.size)) return;
   const orphans = entries.filter((e) => !folders.has(e.projectId));
   if (orphans.length === 0) return;
   const recorded = new Set((await readLibraryAudit(core.root)).events.map((e) => e.details?.attentionId).filter((x): x is string => typeof x === "string"));
@@ -587,4 +610,23 @@ export async function settleOrphanOutbox(core: RepoCore): Promise<void> {
     }
     await removeOutbox(core.library.appConfigDir, core.library.id, rec.id);
   }
+}
+
+/** Whether `Projects/` holds a folder (not hidden, not moved away) that no readable project.json identifies. */
+async function someFolderUnidentified(root: string, identified: number): Promise<boolean> {
+  let names: string[] = [];
+  try {
+    names = await fsp.readdir(join(root, "Projects"));
+  } catch {
+    return false;
+  }
+  let folders = 0;
+  for (const n of names) {
+    if (n.startsWith(".")) continue;
+    const st = await fsp.lstat(join(root, "Projects", n)).catch(() => null);
+    if (!st?.isDirectory()) continue;
+    if (await projectMovedAway(root, n)) continue;
+    folders++;
+  }
+  return folders > identified;
 }

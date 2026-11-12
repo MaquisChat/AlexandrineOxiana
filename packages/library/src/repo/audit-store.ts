@@ -9,7 +9,6 @@ import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { sealEvent, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
 import { renameWithRetry, writeFileAtomic, writeSmallFileAtomic } from "../fs/atomic.js";
-import { scrubPaths } from "../app-settings.js";
 import { SimulatedCrash, seams } from "./seams.js";
 import { appendDurable, assertContained, readMaybe, stripUndefined, undoAppend, type AppendUndo } from "./io.js";
 
@@ -76,22 +75,6 @@ export async function auditSegments(dir: string): Promise<string[]> {
   return names.sort((a, b) => Number(SEGMENT.exec(a)![1]) - Number(SEGMENT.exec(b)![1]));
 }
 
-function scrubDeep(v: unknown): unknown {
-  if (typeof v === "string") return scrubPaths(v);
-  if (Array.isArray(v)) return v.map(scrubDeep);
-  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, scrubDeep(x)]));
-  return v;
-}
-
-/** The event's reason and details with absolute paths replaced by `<path>`. */
-function scrubInput(input: AuditInput): AuditInput {
-  return {
-    ...input,
-    ...(input.decision ? { decision: { ...input.decision, ...(typeof input.decision.reason === "string" ? { reason: scrubPaths(input.decision.reason) } : {}) } } : {}),
-    ...(input.details ? { details: scrubDeep(input.details) as Record<string, unknown> } : {}),
-  };
-}
-
 export class AuditStore {
   constructor(
     public dir: string,
@@ -147,8 +130,7 @@ export class AuditStore {
     input: AuditInput,
     onPlan?: (u: AppendUndo) => Promise<void>,
   ): Promise<{ event: AuditEvent; undo: () => Promise<void> }> {
-    // No absolute path is ever stored in a log (N5): error text that reached a reason or a detail is scrubbed.
-    const event = sealEvent(stripUndefined(scrubInput(input)), this.head);
+    const event = sealEvent(stripUndefined(input), this.head);
     if (seams.failAuditAppendFor !== undefined && seams.failAuditAppendFor === input.projectId) {
       throw new Error("simulated audit append failure");
     }

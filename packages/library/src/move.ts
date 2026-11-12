@@ -20,6 +20,7 @@ import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
+import { scrubPaths } from "./app-settings.js";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { copyFileAtomic, writeFileAtomic } from "./fs/atomic.js";
@@ -484,7 +485,8 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
         decision ??= d;
       }
     } catch (e) {
-      decision = denyOf(`Policy could not be evaluated: ${msg(e)}`);
+      // Error text is scrubbed of absolute paths where it is captured: it may be recorded (Task 50 N5).
+      decision = denyOf(`Policy could not be evaluated: ${scrubPaths(msg(e), [lib.root])}`);
     }
     perProject.push({ projectId: p.id, name: p.name, folder: p.folder, decision: decision ?? denyOf("Policy could not be evaluated") });
   }

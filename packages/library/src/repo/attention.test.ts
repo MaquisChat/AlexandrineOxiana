@@ -480,6 +480,21 @@ describe("N2, N10: anything in the attention folder that is not a well-formed ma
 });
 
 describe("N9: outbox leftovers", () => {
+  it("R3: a project whose project.json is briefly unreadable is not taken for deleted; its event reaches its own log later", async () => {
+    const rec = unrecorded();
+    await writeOutbox(join(tmp, "config"), lib.id, pid, rec);
+    const pj = join(lib.root, folder, "project.json");
+    const body = await readFile(pj);
+    await rm(pj);
+    let r = await reopen();
+    expect((await r.libraryAudit()).events.some((e) => e.details?.attentionId === rec.id)).toBe(false);
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toHaveLength(1);
+    await writeFile(pj, body);
+    r = await reopen();
+    expect((await events()).filter((e) => e.details?.attentionId === rec.id)).toHaveLength(1);
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
+  });
+
   it("an entry for a project that no longer exists is recorded in the library's log, then removed (never lost)", async () => {
     const rec = unrecorded();
     await writeOutbox(join(tmp, "config"), lib.id, "0190f0f0-0000-7000-8000-00000000dead", rec);
@@ -489,5 +504,37 @@ describe("N9: outbox leftovers", () => {
     expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
     r = await reopen();
     expect((await r.libraryAudit()).events.filter((e) => e.details?.attentionId === rec.id)).toHaveLength(1);
+  });
+});
+
+describe("R1: links where the attention folders should be are never followed and can be set aside", () => {
+  it("an attention that is a link to a folder outside the project is listed and set aside as a link", async () => {
+    const outside = join(tmp, "outside-dir");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "keep.txt"), "keep");
+    await symlink(outside, join(lib.root, folder, "attention"));
+    const marks = await repo.attentionMarks(pid);
+    expect(marks).toEqual([{ id: expect.stringMatching(/^u-/), kind: "unrecognised", name: "attention", canSetAside: true }]);
+    await repo.setAsideMark(pid, marks[0]!.id, "a stray link");
+    expect(await repo.attentionMarks(pid)).toEqual([]);
+    expect(await readdir(outside)).toEqual(["keep.txt"]);
+    const aside = await readdir(join(lib.root, folder, "attention-set-aside"));
+    expect((await lstat(join(lib.root, folder, "attention-set-aside", aside[0]!))).isSymbolicLink()).toBe(true);
+  });
+
+  it("a set-aside folder that is a link is listed; marks go to another real folder; the link can itself be set aside", async () => {
+    const outside = join(tmp, "outside-aside");
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(lib.root, folder, "attention-set-aside"));
+    const rec = unrecorded();
+    await writeAttention(lib.root, folder, rec);
+    const marks = await repo.attentionMarks(pid);
+    const link = marks.find((m) => m.kind === "unrecognised")!;
+    expect(link).toMatchObject({ name: "attention-set-aside", canSetAside: true });
+    await repo.setAsideMark(pid, rec.id, "recorded on paper");
+    expect(await readdir(outside)).toEqual([]);
+    await repo.setAsideMark(pid, link.id, "a stray link");
+    expect(await repo.attentionMarks(pid)).toEqual([]);
+    expect(await readdir(outside)).toEqual([]);
   });
 });
