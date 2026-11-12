@@ -5,12 +5,16 @@
  * Everything that changes the library goes through `@ao/library`.
  */
 import { userInfo } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import {
   HttpClient,
   IndexHandle,
   KeyRing,
   WorkerUnavailableError,
+  backupFailure,
   backupIfDue,
+  backupsAwaitingRemoval,
+  resumeDestruction,
   createBulkImport,
   createIndexSink,
   disposeOcrQueue,
@@ -22,6 +26,8 @@ import {
   scrubPaths,
   startMediaWorker,
   startWatchedFolders,
+  type BackupFailure,
+  type PendingRemoval,
   type BatchHandle,
   type BulkImport,
   type Deps,
@@ -441,6 +447,8 @@ export class ServiceState {
       repo = await openRepo(lib, ring, {
         actor: actor(),
         tz: this.tz,
+        // The service's clock (Task 49): the destruction retry's back-off and the audit log use the same time.
+        clock: this.opts.now,
         ...(index ? { index: createIndexSink(index, { root: lib.root, keyRing: ring }, { holdStamps: () => stampHold.on }) } : {}),
       });
     } catch (err) {
@@ -982,10 +990,17 @@ export class ServiceState {
       ...(s.indexStatus ? { index: s.indexStatus } : {}),
       integrityWarnings: this.integrityWarnings(s, names),
       projectWarnings: this.cachedProjectWarnings,
+      // Why a project shows `backup-failed` (R125: a refusal gives the engine's reason), path-scrubbed.
+      backupFailures: this.cachedBackupFailures,
+      // What stands behind `destruction-backups-pending` (R147): which backups still wait to be
+      // removed after a destruction, and why the app does not remove them by itself when it does not.
+      destructionBackupsPending: this.cachedPendingRemovals,
     };
   }
 
   private cachedProjectWarnings: Record<string, string[]> = {};
+  private cachedBackupFailures: Record<string, BackupFailure> = {};
+  private cachedPendingRemovals: Record<string, PendingRemoval[]> = {};
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
     return s.repo.integrityWarnings.map((w) => ({
@@ -999,9 +1014,25 @@ export class ServiceState {
   /** The projects' standing warnings (backup failed, deletion records unreadable), by project id. */
   async projectWarnings(s: Session): Promise<Record<string, string[]>> {
     const out: Record<string, string[]> = {};
-    for (const p of s.repo.listProjects()) out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
+    const failures: Record<string, BackupFailure> = {};
+    const waiting: Record<string, PendingRemoval[]> = {};
+    for (const p of s.repo.listProjects()) {
+      out[p.id] = await projectWarnings(s.repo, p.id).catch(() => []);
+      const f = out[p.id]!.includes("backup-failed") ? await backupFailure(s.repo, p.id).catch(() => undefined) : undefined;
+      if (f) failures[p.id] = { ...f, reason: scrubPaths(f.reason, this.roots) };
+      const w = out[p.id]!.includes("destruction-backups-pending") ? await this.pendingRemovals(s, p.id) : [];
+      if (w.length) waiting[p.id] = w;
+    }
     this.cachedProjectWarnings = out;
+    this.cachedBackupFailures = failures;
+    this.cachedPendingRemovals = waiting;
     return out;
+  }
+
+  /** Which backups still wait to be removed after a destruction in the project, and why (R147), as the interface is told: path-scrubbed. */
+  private async pendingRemovals(s: Session, projectId: string): Promise<PendingRemoval[]> {
+    const w = await backupsAwaitingRemoval(s.repo, projectId).catch((): PendingRemoval[] => []);
+    return w.map((x) => (x.reason ? { ...x, reason: scrubPaths(x.reason, this.roots) } : x));
   }
 
   /** Recomputes the project warnings, then sends `library.state`. */
@@ -1009,6 +1040,8 @@ export class ServiceState {
     const s = this.session;
     if (!s) {
       this.cachedProjectWarnings = {};
+      this.cachedBackupFailures = {};
+      this.cachedPendingRemovals = {};
       this.events.publish("library.state", this.libraryState());
       return;
     }
@@ -1027,8 +1060,22 @@ export class ServiceState {
     const s = this.session;
     if (!s || s.lib.mode !== "read-write" || this.moving || this.shuttingDown) return [];
     const out: BackupRun[] = [];
+    let retried = false;
     for (const p of s.repo.listProjects()) {
       if (onlyProjectId && p.id !== onlyProjectId) continue;
+      // A destruction whose backups could not all be removed is retried on every pass (R138 e, N1):
+      // at open, at unlock and hourly, until the audit log records every listed backup as gone
+      // (R147). Never for a locked project: nothing of it can be read or recorded.
+      if (s.repo.isUnlocked(p.id)) {
+        const worked = await resumeDestruction(s.repo, p.id).catch((err: unknown) => {
+          this.opts.log.warn({ err: this.describe(err) }, "resuming a destruction failed");
+          return ["failed"];
+        });
+        // A pass that only observes (the files and the audit log disagree) tries nothing, yet may
+        // change what stands behind the warning: the interface is told whenever that is no longer
+        // what it was last told.
+        if (worked.length || !isDeepStrictEqual(await this.pendingRemovals(s, p.id), this.cachedPendingRemovals[p.id] ?? [])) retried = true;
+      }
       if (p.backups?.automatic === false) continue;
       try {
         const r = await backupIfDue(s.repo, p.id, this.opts.now());
@@ -1040,7 +1087,7 @@ export class ServiceState {
         this.events.publish("job.progress", { kind: "backup", projectId: p.id, ok: false, error: this.describe(err) });
       }
     }
-    if (out.length) this.publishState();
+    if (out.length || retried) this.publishState();
     return out;
   }
 

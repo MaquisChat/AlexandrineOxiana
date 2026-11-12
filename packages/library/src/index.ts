@@ -187,9 +187,13 @@ export {
   AuditChainInvalidError,
   BACKUPS_MANIFEST,
   BACKUPS_STATE,
+  BACKUP_INTERRUPTED,
   BACKUP_LIMITS,
+  BackupNotRecordedError,
   DEFAULT_KEEP,
   RestoreError,
+  PruneNotRecordedError,
+  backupFailure,
   backupIfDue,
   backupProject,
   listBackups,
@@ -197,11 +201,11 @@ export {
   restoreBackup,
   setBackupSettings,
 } from "./export/backup.js";
-export type { BackupEntry, BackupResult, RestoreResult } from "./export/backup.js";
+export type { BackupEntry, BackupFailure, BackupOptions, BackupResult, RestoreResult } from "./export/backup.js";
 export { ExportDestinationError, ExportFailedError, escapeMarkdown, exportProjectOpenFormats } from "./export/project-export.js";
 export type { ProjectExportResult } from "./export/project-export.js";
-export { DESTRUCTION_NOTICE, destroyRaw, resumeDestruction, retentionDue } from "./retention.js";
-export type { DestroyOptions, DueItem } from "./retention.js";
+export { DESTRUCTION_NOTICE, backupsAwaitingRemoval, destroyRaw, listDestructions, readDestruction, resumeDestruction, retentionDue } from "./retention.js";
+export type { BackupsStepStatus, DestroyOptions, DestroyResult, DestructionAmendment, DestructionRecord, DueItem, PendingRemoval } from "./retention.js";
 export { addProtocolDocuments, listProtocolDocuments } from "./protocol-docs.js";
 export type { ProtocolDocument, ProtocolDocumentResult } from "./protocol-docs.js";
 export { attachConsentDocument, reconcileConsentDocuments, CONSENT_FORM_MAX_BYTES } from "./consent-docs.js";

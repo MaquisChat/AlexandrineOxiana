@@ -1,12 +1,13 @@
 /**
  * Projects: list (also for the browser extension: names and whether browser capture is allowed),
  * create, unlock (pending proxies / OCR resume and watched folders rescan), lock (sensitive lookups
- * purged from the shared HttpClient, R96), a new recovery code (Task 61), backup settings and the
- * one-time acknowledgements.
+ * purged from the shared HttpClient, R96), a new recovery code (Task 61), backup settings, a backup
+ * now (governed, R125) and the one-time acknowledgements.
  */
 import type { FastifyInstance } from "fastify";
 import { effectivePolicy, parseGovernance, type Project } from "@ao/core";
-import { InvalidRecoveryCodeError, WrongPassphraseError, setBackupSettings, type Repo } from "@ao/library";
+import { basename } from "node:path";
+import { InvalidRecoveryCodeError, WrongPassphraseError, backupProject, setBackupSettings, type Repo } from "@ao/library";
 import { ApiError, badRequest } from "../errors.js";
 import { bodyOf, optBool, optObj, projectParam, str, strArray, type Ctx } from "./util.js";
 
@@ -190,6 +191,19 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     if (keep !== undefined && (!Number.isInteger(keep) || keep < 1 || keep > 1000)) throw badRequest('"keep" must be a whole number from 1 to 1000.');
     const p = await setBackupSettings(s.repo, id, { ...(automatic !== undefined ? { automatic } : {}), ...(keep !== undefined ? { keep } : {}) });
     return { backups: p.backups ?? {} };
+  });
+
+  // A backup now (R125): governed and audited by the library; a refusal is 403 POLICY_DENIED with
+  // the engine's reason. The answer names the file in the library's Backups folder, never a path.
+  app.post("/projects/:id/backups", async (req) => {
+    const s = state.requireWritable();
+    const id = projectParam(ctx, req);
+    try {
+      const r = await backupProject(s.repo, id);
+      return { backup: { file: basename(r.path), sha256: r.sha256, bytes: r.bytes, pruned: r.pruned, warnings: r.warnings } };
+    } finally {
+      state.publishState(); // `backup-failed` set or cleared
+    }
   });
 
   app.post("/projects/:id/acknowledge", async (req) => {
