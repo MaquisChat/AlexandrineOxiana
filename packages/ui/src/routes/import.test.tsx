@@ -1,4 +1,7 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useLocation } from "../navigation";
+import type { ApiClient } from "../api/client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { mockService, server, B1, B7, P1 } from "../test/importService";
 import { importRoute, IMPORT_PATHS } from "./import";
@@ -85,6 +88,30 @@ describe("import routes", () => {
     fireEvent.change(pick, { target: { value: B7 } });
     const link = await screen.findByRole("link", { name: "Back to the import's report and undo" });
     expect(link.getAttribute("href")).toBe(`/import?project=${P1}&batch=${B7}`);
+  });
+
+  it("Start import, through the route as App renders it: the address names the import, and the wizard opened on it shows the run (D1; a deliberate remount, M1)", async () => {
+    window.history.replaceState(null, "", `/import?project=${P1}`);
+    const m = mockService({ batches: [{ batchId: B1, number: 4, kind: "folder", state: "running", startedAt: "2026-11-11T10:00:00.000Z", counts: { created: 0, merged: 0, skipped: 0, failed: 0, needsReview: 0 } }] });
+    function Routed({ client }: { client: ApiClient }) {
+      return <>{importRoute(useLocation(), client)}</>;
+    }
+    const user = userEvent.setup();
+    render(<Routed client={m.client} />);
+    await screen.findByRole("option", { name: "Thesis" });
+    await user.click(screen.getByRole("radio", { name: "Folder" }));
+    await user.type(screen.getByRole("textbox", { name: "Folder path" }), "/data/papers");
+    await user.click(screen.getByRole("button", { name: "Scan" }));
+    await screen.findByRole("heading", { name: "Scan results" });
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await user.click(await screen.findByRole("button", { name: "Next" }));
+    await screen.findByRole("heading", { name: "Options" });
+    await user.click(screen.getByRole("button", { name: "Start import" }));
+    expect(await screen.findByRole("heading", { name: "Run" })).toBeTruthy();
+    expect(new URLSearchParams(window.location.search).get("batch")).toBe(B1);
+    expect(m.bodies(`POST /projects/${P1}/import`)).toHaveLength(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+    window.history.replaceState(null, "", "/");
   });
 
   it("other paths are not import routes", () => {
