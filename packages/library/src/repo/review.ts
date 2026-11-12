@@ -6,7 +6,7 @@
  * is a cache of this file; for encrypted projects it holds only field names and statuses.
  */
 import { createHash } from "node:crypto";
-import { newId } from "@ao/core";
+import { REQUIRED_FIELDS, newId } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./errors.js";
 import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
@@ -99,6 +99,50 @@ export async function resolveSettledCaptureEntries(core: RepoCore, tx: Tx, sf: R
   for (const e of await readReviewEntries(core, tx.state)) {
     if (!settledBy(e, sf)) continue;
     await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: DECISION[by] });
+    done.push(e.id);
+  }
+  return done;
+}
+
+/** The value a JSON pointer names ("/identifiers/doi"). */
+function valueAt(root: unknown, pointer: string): unknown {
+  let cur: unknown = root;
+  for (const part of pointer.split("/").slice(1)) {
+    if (!cur || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[part.replace(/~1/g, "/").replace(/~0/g, "~")];
+  }
+  return cur;
+}
+
+const blank = (v: unknown): boolean => v === undefined || v === null || (typeof v === "string" && v.trim() === "") || (Array.isArray(v) && v.length === 0);
+
+type Edited = { source: { id: string; type: string } & Record<string, unknown>; verification: Record<string, { status: string }> };
+
+/**
+ * After an ordinary edit (fix round 2, coordinator's ruling on I3): the edit NEVER rewrites the
+ * stored report; it only re-examines the source's pending capture entries, in its own change. A
+ * listed field counts as settled when
+ *  - it is no longer a field of the source as edited: the edit emptied it (it had a value and now
+ *    has none), or the type changed and the field has no value and is not one of the new type's
+ *    fields (`REQUIRED_FIELDS[type]`, the verification's own list of a type's fields); or
+ *  - the STORED report does not have it, or has it neither in conflict nor unverified.
+ * A listed field still there and still in conflict or unverified in the stored report keeps the entry pending.
+ */
+export async function resolveCaptureEntriesAfterEdit(core: RepoCore, tx: Tx, before: Edited, after: Edited): Promise<string[]> {
+  const typeChanged = before.source.type !== after.source.type;
+  const fieldsOfType = new Set(REQUIRED_FIELDS[after.source.type as keyof typeof REQUIRED_FIELDS] ?? REQUIRED_FIELDS.other);
+  const gone = (f: string) => {
+    const now = valueAt(after.source, f);
+    if (!blank(now)) return false;
+    if (!blank(valueAt(before.source, f))) return true; // the edit emptied it
+    return typeChanged && !fieldsOfType.has(f);
+  };
+  const done: string[] = [];
+  for (const e of await readReviewEntries(core, tx.state)) {
+    if (e.status !== "pending" || e.sourceId !== after.source.id || reviewCauseOf(e)?.kind !== "capture-conflict") continue;
+    const open = Object.keys(e.fields ?? {}).some((f) => UNSETTLED.has(after.verification[f]?.status ?? "") && !gone(f));
+    if (open) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: DECISION.edit });
     done.push(e.id);
   }
   return done;

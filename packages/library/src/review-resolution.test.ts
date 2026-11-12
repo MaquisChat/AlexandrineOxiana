@@ -285,11 +285,13 @@ describe("fix round 1, I1: a listed field that has left the report is settled (c
     return sf.source.id;
   }
 
-  it("the probe end to end: the type is corrected to a web page; that edit recomputes the report, the post id leaves it, and the entry is resolved in the edit's own change", async () => {
+  it("the probe end to end: the type is corrected to a web page; the post id is no longer a field of the source, so the entry is resolved in the edit's own change, and the stored report is untouched (fix round 2)", async () => {
     const sid = await videoWithUnverifiedPostId();
     const [entry] = await entriesOf(sid);
+    const before = await kit.repo.getSource(p.id, sid);
     const after = await kit.repo.updateSource(p.id, sid, { type: "webpage" });
-    expect(after.verification["/identifiers/platformPostId"]).toBeUndefined();
+    expect(JSON.stringify(after.verification)).toBe(JSON.stringify(before.verification));
+    expect(after.fieldEvidence).toEqual(before.fieldEvidence);
     expect((await entriesOf(sid))[0]).toMatchObject({ status: "resolved", decision: "edited" });
     expect((await auditEvents(kit, p)).at(-1)).toMatchObject({ details: { op: "source.update", reviewResolved: { entries: [entry!.id], by: "edit" } } });
   });
@@ -308,21 +310,56 @@ describe("fix round 1, I1: a listed field that has left the report is settled (c
     expect((await entriesOf(sf.source.id))[0]).toMatchObject({ status: "resolved", decision: "rechecked" });
   });
 
-  it("an edit that removes a listed field recomputes the report and resolves the entry when the field leaves it; an edit that leaves the report alone resolves nothing", async () => {
+  it("an edit that empties a listed conflicting field resolves the entry, without touching the stored report (fix round 2)", async () => {
     const at = kit.clock.now.toISOString();
     const sf = await kit.repo.createSource(p.id, draft("A page", { publisher: "Unknown press" }), [], {
       provenance: provenance(),
-      // The publisher was reported unverified; no evidence for it is stored, so once it is removed the report no longer has it.
-      fieldEvidence: [{ field: "/title", value: "A page", source: { kind: "page-dom" }, at }],
-      verification: { "/publisher": { status: "unverified", checks: [], reason: "Only from the file name." } },
-      reviewItem: { fields: { "/publisher": "unverified" }, reasons: ["?"], cause: { kind: "capture-conflict" } },
+      fieldEvidence: [{ field: "/title", value: "A page", source: { kind: "page-dom" }, at }, { field: "/publisher", value: "Other press", source: { kind: "page-dom" }, at }],
+      verification: { "/publisher": { status: "conflict", checks: ["sources-agree"], reason: "Two publishers." } },
+      reviewItem: { fields: { "/publisher": "conflict" }, reasons: ["?"], cause: { kind: "capture-conflict" } },
     });
     const sid = sf.source.id;
     await kit.repo.setMembership(p.id, sid, { tagIds: [] });
     expect((await entriesOf(sid))[0]).toMatchObject({ status: "pending" });
+    const before = await kit.repo.getSource(p.id, sid);
     const after = await kit.repo.updateSource(p.id, sid, { publisher: undefined });
-    expect(["unverified", "conflict"]).not.toContain(after.verification["/publisher"]?.status);
+    expect(after.verification).toEqual(before.verification);
     expect((await entriesOf(sid))[0]).toMatchObject({ status: "resolved", decision: "edited" });
+  });
+
+  it("an edit to an unrelated field leaves a pending entry pending, and a still-unsettled field keeps it open (fix round 2)", async () => {
+    const sid = await capturedWithConflicts({ "/issued": "conflict" });
+    await kit.repo.updateSource(p.id, sid, { volume: "3" });
+    await kit.repo.updateSource(p.id, sid, { volume: undefined });
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "pending" });
+  });
+
+  it("the re-review's probe: removing a field, or a source's last tag, never rewrites the stored report, a status or the evidence; the audit event describes only the edit (I3)", async () => {
+    const at = kit.clock.now.toISOString();
+    const verified = (current: unknown): FieldVerification => ({ status: "verified", checks: ["lookup-agrees"], current });
+    const sf = await kit.repo.createSource(p.id, draft("Rivers and Memory", { type: "article-journal", issued: "2019", volume: "3" }), [], {
+      provenance: provenance(),
+      fieldEvidence: [{ field: "/title", value: "Rivers and Memory", source: { kind: "lookup", provider: "crossref" }, at }],
+      verification: { "/title": verified("Rivers and Memory"), "/issued": verified("2019"), "/container": { status: "unverified", checks: [], reason: "Missing." } },
+      reviewItem: { fields: { "/container": "unverified" }, reasons: ["The journal is unknown."], cause: { kind: "capture-conflict" } },
+    });
+    const sid = sf.source.id;
+    const tag = await kit.repo.createTag(p.id, "to read");
+    await kit.repo.updateSource(p.id, sid, { tagIds: [tag.id] });
+    const stored = async () => {
+      const s = await kit.repo.getSource(p.id, sid);
+      return { verification: JSON.stringify(s.verification), evidence: JSON.stringify(s.fieldEvidence) };
+    };
+    const before = await stored();
+    for (const patch of [{ volume: undefined }, { tagIds: [] as string[] }]) {
+      const n = (await auditEvents(kit, p)).length;
+      await kit.repo.updateSource(p.id, sid, patch);
+      expect(await stored()).toEqual(before);
+      const added = (await auditEvents(kit, p)).slice(n);
+      expect(added).toHaveLength(1);
+      expect(added[0]!.details).not.toHaveProperty("reviewResolved");
+    }
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "pending" });
   });
 
   it("an import decision that rewrites a captured source's report re-examines its capture entries in the decision's change", async () => {
