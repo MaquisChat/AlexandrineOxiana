@@ -363,7 +363,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Model: Opus. Likely more than one session: split by package.
 
 **Task 55 — Owner's hands-on tests**
-- Depends: 37g, 37i.
+- Depends: 37f, 37i (the unsigned build is enough for the owner's own Mac, R151; 37g is needed before release to others).
 - Accept: the Mac checklist; a real Zotero account download (storage hosts unverified, R79); the Mac password store; the extension in Firefox; a live capture of one real YouTube and one real Instagram address.
 - Who: the owner, with the controller fixing what turns up.
 
@@ -422,6 +422,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
+- Defect D9 (the first-use question could take focus from a person typing): fixed by Task 48c.
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
@@ -441,39 +442,43 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c A pairing code's status | fix round 1 | f889a93 (worktree branch) | spec met, access rules unchanged; one Important: a code is marked used before the pairing is written |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | stopped | 7b7a3b4 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | stopped | fdbd601 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
+| 46c A pairing code's status | fix round 1, stopped | 1ec85b5 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. One Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
+| 34d Verification badges | fix round 1, stopped | db0030d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. 5 Important; identifiers become confirmable (R149) |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
+| 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48 Tools dialogue | not started | | |
+| 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
+| 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | in progress | | implementer dispatched |
-| 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
-| 50 No silent refusals | not started | | |
-| 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
+| 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
+| 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
+| 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
+| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
+| 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
-| 58 Ledger loose ends | not started | | |
+| 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
-| 37a Service bundle | in progress | | implementer dispatched (ahead of Task 46: little overlap, and it heads the longest remaining chain) |
-| 37b Token on standard input | fix round 1 (short) | 0175e11 (worktree branch) | code sound under probes; two small clean-ups; HANDOFF.md to be corrected at merge |
-| 37c Desktop shell | not started | | |
+| 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
+| 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
+| 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
-| 37f Mac builds in CI | not started | | |
-| 37g Signing | blocked | | needs Apple Developer credentials |
-| 37h Desktop end-to-end | not started | | |
+| 37f Mac builds in CI | written and merged; NOT yet run | 2ed4788 | the build script and workflow passed two paper reviews and every Linux check; the first Mac run (the task's real acceptance) waits for the owner's word: roughly 550–750 billed minutes for Apple Silicon only, 1,200–1,650 for both (estimates) |
+| 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
+| 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
+| 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
+| 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | blocked | | needs signed Mac build |
+| 55 Owner hands-on tests | blocked | | needs the first Mac build (Task 37f); a signed build is not required for the owner's own tests (R151) |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner

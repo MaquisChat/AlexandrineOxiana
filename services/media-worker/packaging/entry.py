@@ -4,7 +4,9 @@ With no arguments it is `python -m ao_worker` (same environment variables, same 
 token handling). The worker starts some tools as `sys.executable -m <module>`; in the packaged
 build `sys.executable` is this program, so it also accepts:
 
-- `ao-worker -m ocrmypdf ...` and `ao-worker -m gallery_dl ...` (only these two modules), and
+- `ao-worker -m ocrmypdf ...` and `ao-worker -m gallery_dl ...` (only these two modules); gallery-dl
+  is not inside the bundle (GPL-2.0-only): it is the copy the tools dialogue downloaded, found in the
+  folder `AO_GALLERYDL_LIB` names (download.py sets it), and runs on this bundle's Python, and
 - `ao-worker --self-check`, which imports every native library in the bundle and prints their
   versions as JSON (used by the smoke test; touches no file and no network).
 
@@ -30,7 +32,7 @@ def self_check() -> int:
         "ctranslate2": "ctranslate2", "onnxruntime": "onnxruntime", "tokenizers": "tokenizers",
         "av": "av", "numpy": "numpy", "PIL": "pillow", "pillow_heif": "pillow-heif", "rawpy": "rawpy",
         "pikepdf": "pikepdf", "pypdfium2": "pypdfium2", "lxml.etree": "lxml", "cryptography.hazmat.bindings._rust": "cryptography",
-        "ocrmypdf": "ocrmypdf", "faster_whisper": "faster-whisper", "gallery_dl": "gallery-dl", "uharfbuzz": "uharfbuzz",
+        "ocrmypdf": "ocrmypdf", "faster_whisper": "faster-whisper", "requests": "requests", "uharfbuzz": "uharfbuzz",
     }
     for mod, dist in modules.items():
         try:
@@ -58,8 +60,12 @@ def main() -> int:
     if args == ["--self-check"]:
         return self_check()
     if len(args) >= 2 and args[0] == "-m" and args[1] in CHILD_MODULES:
+        import os
         import runpy
 
+        lib = os.environ.get("AO_GALLERYDL_LIB")
+        if args[1] == "gallery_dl" and lib:
+            sys.path.insert(0, lib)
         sys.argv = [sys.executable, *args[2:]]
         try:
             runpy.run_module(args[1], run_name="__main__", alter_sys=True)

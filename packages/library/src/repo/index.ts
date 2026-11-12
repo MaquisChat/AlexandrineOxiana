@@ -1,4 +1,4 @@
-export { Repo, openRepo, projectWarnings, BACKUP_FAILED_WARNING } from "./repo.js";
+export { Repo, openRepo, projectWarnings, setProjectTimeZone, BACKUP_FAILED_WARNING } from "./repo.js";
 export { RECOVERY_CODE_UNSHOWN_WARNING } from "./projects.js";
 export { GOVERNANCE_MAX_BYTES, GovernanceConflictError, GovernanceLooseningError, UNREADABLE_GOVERNANCE } from "./governance-edit.js";
 export type { GovernanceEditResult } from "./governance-edit.js";
@@ -35,3 +35,4 @@ export {
   TornFileError,
 } from "./errors.js";
 export type { PendingWrite, PendingWriteChoice } from "./pending-writes.js";
+export type { AttentionMark } from "./attention.js";

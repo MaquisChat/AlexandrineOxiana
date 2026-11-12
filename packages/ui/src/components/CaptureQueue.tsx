@@ -11,6 +11,7 @@
  */
 import { useId } from "react";
 import { itemExplanation, queueCounts, type CaptureQueueState, type ItemState, type ProfileReport } from "../api/capture";
+import { MissingToolNotice } from "./MissingToolNotice";
 import { UserText } from "./UserText";
 import "./CaptureQueue.css";
 
@@ -103,6 +104,7 @@ function QueueView({ q }: { q: CaptureQueueState }) {
           {q.error && <p>{q.error}</p>}
         </div>
       )}
+      <MissingToolNotice from={q} as="p" />
       {q.gap && (
         <p className="ao-capture-queue__note">
           Progress was missed while the connection to the library service was down. Items marked “Not known” may have been captured: look in the library for the captured sources. This screen cannot
@@ -133,6 +135,7 @@ function QueueView({ q }: { q: CaptureQueueState }) {
                     {why.service}
                   </UserText>
                 )}
+                <MissingToolNotice from={it} as="p" />
               </li>
             );
           })}

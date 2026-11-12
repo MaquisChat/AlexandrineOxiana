@@ -173,6 +173,44 @@ describe("SourceTable", () => {
     render(<SourceTable items={[{ id: "x", projectId: "p2", type: "book", title: "", creatorsText: "", folder: "f", needsReview: false, locked: true }]} total={1} onOpen={vi.fn()} />);
     expect(screen.getByText("Locked source")).toBeTruthy();
   });
+
+  it("says in words when a source was found through its annotations (Task 58)", () => {
+    const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    render(
+      <SourceTable
+        items={[
+          { ...base, id: "a", title: "Found by annotation", matchedIn: "annotation" },
+          { ...base, id: "b", title: "Found by title" },
+        ]}
+        total={2}
+        onOpen={vi.fn()}
+      />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    expect(rows[1]!.textContent).toContain("Found in an annotation");
+    expect(rows[2]!.textContent).not.toContain("annotation");
+  });
+
+  it("says when only part of a source's annotations is searchable, when the index is incomplete, and when search covers titles only (R161)", () => {
+    const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    const { rerender } = render(
+      <SourceTable items={[{ ...base, id: "a", title: "Long one", matchedIn: "annotation", annotationsPartial: true }, { ...base, id: "b", title: "Short one" }]} total={2} onOpen={vi.fn()} />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    expect(rows[1]!.textContent).toContain("Only part of its annotations is searchable");
+    expect(rows[2]!.textContent).not.toContain("part of its annotations");
+    expect(screen.queryByRole("note")).toBeNull();
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete />);
+    // N3: a state and its remedy, not a rebuild that is not running.
+    const note = screen.getByRole("note").textContent;
+    expect(note).toMatch(/Annotations are not searchable yet: this library's search index needs rebuilding/);
+    expect(note).toMatch(/rebuild-index/);
+    expect(note).not.toMatch(/being/);
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} incomplete rebuilding />);
+    expect(screen.getByRole("note").textContent).toMatch(/The search index is being rebuilt: annotations become searchable when it finishes/);
+    rerender(<SourceTable items={[]} total={0} onOpen={vi.fn()} limited />);
+    expect(screen.getByRole("note").textContent).toMatch(/only titles are searched/i);
+  });
 });
 
 describe("JobsIndicator", () => {

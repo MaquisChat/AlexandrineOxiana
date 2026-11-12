@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { recheckSourceFile, type FieldEvidence, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
 import { InvalidInputError } from "../repo/errors.js";
 import { addCapturedOriginal, projectPolicy, repoLibrary, updateSourceRechecked, type Repo } from "../repo/repo.js";
+import { htmlStripWorkerUrl } from "../resources.js";
 import { activeTemp } from "../tmp-registry.js";
 import { classifyUrl } from "./platforms.js";
 import { stripSnapshot } from "./snapshot.js";
@@ -236,7 +237,6 @@ export const HTML_STRIP_MAX_WAITING = 8;
 export const HTML_STRIP_RETRY_AFTER_TIMEOUT_MS = 10 * 60_000;
 /** Test seam: the time budget in force (HTML_STRIP_TIMEOUT_MS). */
 export const htmlStripTuning = { timeoutMs: HTML_STRIP_TIMEOUT_MS };
-const STRIP_WORKER = new URL("./html-strip-worker.mjs", import.meta.url);
 
 /** The page's HTML was not stored (too large or deep, or markup that does not settle); the screenshot still is. */
 export class HtmlSnapshotRefusedError extends InvalidInputError {
@@ -274,7 +274,7 @@ async function slot(): Promise<() => void> {
 function runWorker(html: string, hash: string): Promise<string> {
   return new Promise((resolve, reject) => {
     started++;
-    const worker = new Worker(STRIP_WORKER, { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
+    const worker = new Worker(htmlStripWorkerUrl(), { workerData: { html }, resourceLimits: { maxOldGenerationSizeMb: HTML_STRIP_HEAP_MB } });
     let settled = false;
     const finish = (fn: () => void) => {
       if (settled) return;

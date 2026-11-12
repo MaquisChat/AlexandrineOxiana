@@ -7,6 +7,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { errorText, isProjectLocked, type Creator, type LibraryApi, type SourceFile, type SourcePatch } from "../api/library";
 import { CitePanel } from "../components/CitePanel";
+import { SourceToolNotice } from "../components/MissingToolNotice";
 import { typeLabel } from "../components/SourceTable";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
@@ -215,6 +216,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
               ))}
             </ul>
           )}
+          <SourceToolNotice file={file} />
           <CitePanel api={api} projectId={projectId} sourceIds={[sourceId]} />
         </>
       )}

@@ -86,6 +86,8 @@ export function transcriptService(opts: { versions?: TranscriptVersionSummary[];
   };
   let n = 0;
   const handlers = [
+    // The optional tools' catalogue (Task 48b), asked for by the transcript route: refused as in a plain browser.
+    http.get(url("/tools"), () => HttpResponse.json({ error: { code: "FORBIDDEN", message: "The tools are managed from the desktop app." } }, { status: 403 })),
     http.get(url("/projects/:id/sources/:sid"), ({ params }) => HttpResponse.json(sourceFile(String(params.sid), params.sid === "s1" ? "Interview with a baker" : "Second interview", opts.media ?? "video"))),
     http.get(url("/projects/:id/sources/:sid/transcripts"), () => HttpResponse.json({ versions: state.versions })),
     http.get(url("/projects/:id/sources/:sid/transcripts/:aid"), ({ params }) => {

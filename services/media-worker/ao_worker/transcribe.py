@@ -1,7 +1,8 @@
 """audio.transcribe: faster-whisper with VAD, per-segment language and hallucination flags.
 
-Output (in the `output` dir): `transcript.vtt` and `segments.json` (see README). Models are cached
-in `AO_MODELS_DIR` and downloaded on first use. A transcription uses every CPU core.
+Output (in the `output` dir): `transcript.vtt` and `segments.json` (see README). Models live in
+`AO_MODELS_DIR`, installed by the first-use tools dialogue (tools.py); a missing one fails the job with
+TOOL_NOT_INSTALLED. A transcription uses every CPU core.
 """
 from __future__ import annotations
 
@@ -16,10 +17,13 @@ from .jobs import Job, JobContext, JobError
 
 log = logging.getLogger("ao_worker.transcribe")
 
+# The speech models the app accepts: the same list as SPEECH_MODELS in packages/shared (R158;
+# tests/test_tools.py fails when they differ).
 MODELS = ("large-v3", "medium", "small", "tiny")
 COMPUTE_TYPES = ("int8", "float16")
 DEFAULTS = {
-    "model": "large-v3", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
+    # model: DEFAULT_SPEECH_MODEL in packages/shared (R158; tests/test_tools.py checks).
+    "model": "medium", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
     "wordTimestamps": True,
 }
 SAMPLE_RATE = 16000
@@ -47,38 +51,37 @@ def models_dir() -> Path:
 
 def model_path(name: str) -> str:
     """The model's folder in `models_dir()`. A model already on disk is used with no network contact
-    at all; only an absent one is downloaded (from Hugging Face, into `models_dir()`)."""
+    at all (R144). An absent model is never downloaded here: the job fails with TOOL_NOT_INSTALLED
+    naming the tool (`speech-<name>`), which the first-use tools dialogue installs (tools.py)."""
     from faster_whisper.utils import _MODELS, download_model
+
+    from .tools import not_installed
 
     folder = models_dir()
     cache = str(folder)
     # Hugging Face cache layout: <models dir>/models--<owner>--<repo>/snapshots/<revision>/
     repo = folder / ("models--" + _MODELS[name].replace("/", "--"))
     absent = (not folder.exists() or folder.is_dir()) and not os.path.lexists(repo)
-    if not absent:
-        try:
-            path = download_model(name, cache_dir=cache, local_files_only=True)
-        except Exception as e:  # noqa: BLE001 - reported, never answered with a download
-            damaged = type(e).__name__ == "IncompleteSnapshotError"
-            log.warning("the %s speech model on disk is unusable (%s); not downloading", name, type(e).__name__)
-            raise JobError(
-                "MODEL_UNAVAILABLE",
-                f"the {name} model on disk is incomplete or damaged; remove it from the models folder to install it again"
-                if damaged else f"the {name} model on disk could not be read",
-                type(e).__name__,
-            ) from e
-        if not (Path(path) / "model.bin").is_file():
-            log.warning("the %s speech model on disk has no model.bin; not downloading", name)
-            raise JobError("MODEL_UNAVAILABLE",
-                           f"the {name} model on disk is incomplete or damaged; remove it from the models folder to install it again")
-        return path
-    log.info("the %s speech model is not on disk; downloading it", name)
+    if absent:
+        log.info("the %s speech model is not installed", name)
+        raise not_installed(f"speech-{name}")
     try:
-        path = download_model(name, cache_dir=cache)
-    except Exception as e:  # noqa: BLE001 - httpx errors (proxy refusal, reset) are not OSError
-        log.warning("downloading the %s speech model failed with %s", name, type(e).__name__)
-        raise JobError("MODEL_UNAVAILABLE", f"the {name} model is not installed and could not be downloaded", type(e).__name__) from e
-    log.info("downloaded the %s speech model", name)
+        path = download_model(name, cache_dir=cache, local_files_only=True)
+    except Exception as e:  # noqa: BLE001 - reported, never answered with a download
+        damaged = type(e).__name__ == "IncompleteSnapshotError"
+        log.warning("the %s speech model on disk is unusable (%s); not downloading", name, type(e).__name__)
+        raise JobError(
+            "MODEL_UNAVAILABLE",
+            f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen"
+            if damaged else f"the {name} model on disk could not be read",
+            type(e).__name__,
+            tool=f"speech-{name}",
+        ) from e
+    if not (Path(path) / "model.bin").is_file():
+        log.warning("the %s speech model on disk has no model.bin; not downloading", name)
+        raise JobError("MODEL_UNAVAILABLE",
+                       f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen",
+                       tool=f"speech-{name}")
     return path
 
 
