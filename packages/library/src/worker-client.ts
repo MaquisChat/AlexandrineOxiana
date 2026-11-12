@@ -473,12 +473,15 @@ async function workerRequest<T>(worker: WorkerEndpoint, method: "GET" | "POST", 
  */
 export class WorkerToolsClient {
   private readonly pollMs: number;
+  private readonly cancelGraceMs: number;
 
+  /** `cancelGraceMs`: how long a cancelled job may take to end in the worker before it is given up on (default 10 s). */
   constructor(
     private readonly worker: WorkerEndpoint,
-    opts: { pollMs?: number } = {},
+    opts: { pollMs?: number; cancelGraceMs?: number } = {},
   ) {
     this.pollMs = opts.pollMs ?? 500;
+    this.cancelGraceMs = opts.cancelGraceMs ?? 10_000;
   }
 
   /** `GET /tools`: every optional tool with its purpose, size, version and whether it is installed. */
@@ -497,14 +500,16 @@ export class WorkerToolsClient {
     if (opts.signal?.aborted) throw new WorkerJobError("CANCELLED", "the job was cancelled");
     const { id } = await workerRequest<{ id: string }>(this.worker, "POST", `/tools/${toolId}/${action}`);
     const jobPath = `/jobs/${encodeURIComponent(id)}`;
-    let cancelSent = false;
+    let cancelSent = 0;
     let last = -1;
     let failures = 0;
     for (;;) {
       if (opts.signal?.aborted && !cancelSent) {
-        cancelSent = true;
+        cancelSent = Date.now();
         await workerRequest(this.worker, "POST", `${jobPath}/cancel`).catch(() => {});
       }
+      // A job the worker does not end after a cancel is not waited for for ever.
+      if (cancelSent && Date.now() - cancelSent > this.cancelGraceMs) throw new WorkerJobError("CANCELLED", "the job was cancelled");
       await new Promise((r) => setTimeout(r, this.pollMs));
       let state: WorkerJobState;
       try {

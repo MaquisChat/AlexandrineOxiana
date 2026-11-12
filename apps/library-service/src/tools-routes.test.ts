@@ -38,7 +38,7 @@ interface Run {
 }
 
 /** A stand-in worker whose tool jobs the test finishes by hand. */
-function stubWorker(over: { transcribeError?: Error } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
+function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
   const runs: Run[] = [];
   const p: WorkerProvider & { runs: Run[]; updateError?: Error } = {
     runs,
@@ -55,7 +55,7 @@ function stubWorker(over: { transcribeError?: Error } = {}): WorkerProvider & { 
               progress: (n) => opts.onProgress?.(n),
               finish: (x) => (x instanceof Error ? reject(x) : resolve(x)),
             };
-            opts.signal?.addEventListener("abort", () => reject(new WorkerJobError("CANCELLED", "the job was cancelled")));
+            if (!over.ignoreAbort) opts.signal?.addEventListener("abort", () => reject(new WorkerJobError("CANCELLED", "the job was cancelled")));
             runs.push(r);
           }),
       } as unknown as WorkerToolsClient;
@@ -224,6 +224,24 @@ describe("installing a tool", () => {
     expect(c.status).toBe(200);
     expect(worker.runs[0]!.signal?.aborted).toBe(true);
     await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "cancelled");
+  });
+
+  it("a cancelled job is shown as cancelled at once, even while the media helper is still ending it", async () => {
+    const worker = stubWorker({ ignoreAbort: true });
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    const c = await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
+    expect(c.json.job.status).toBe("cancelled");
+    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
+    expect(((await call({ url: "/tools" })).json as ToolsResponse).jobs.every((j) => j.status !== "running")).toBe(true);
+    // a late success from the helper does not bring it back to life
+    worker.runs[0]!.finish({ installed: ["ffmpeg"] });
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
+    // and the tool can be asked for again: a new job
+    const again = await call({ method: "POST", url: "/tools/ffmpeg/install" });
+    expect(again.json.job.jobId).not.toBe(job.jobId);
   });
 
   it("a failed install is recorded with the worker's code and a plain message, never a bare 500", async () => {
