@@ -850,7 +850,7 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(12);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const progressed = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
@@ -870,10 +870,11 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     await openNewLibrary();
     const pid = await newProject(OPEN_GOV.replace("atRest: optional", "atRest: required"), true);
     const dir = await pdfFolder(10);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const progressed = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     await call({ method: "POST", url: `/projects/${pid}/lock` });
+    svc.state.session!.batches.get(batchId)!.handle.resume(); // the held batch meets the lock at its next write
     await svc.state.idle();
     await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
     expect(["failed", "paused", "interrupted"]).toContain(await batchState(pid, batchId));
@@ -887,7 +888,7 @@ describe("review round 1: batches (R99 I3, I4)", () => {
     const path = await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(15);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const progressed = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     await svc.close();
@@ -908,7 +909,7 @@ describe("review round 1: library move during an import (R99 I5)", () => {
     const oldPath = await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(60);
-    const progressed = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 5);
+    const progressed = holdBatch((d) => d.done >= 5);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await progressed;
     const dest = join(tmp, "Moved");
@@ -1657,10 +1658,12 @@ describe("review round 3: move and background work (R106)", () => {
     const pid = await newProject();
     const dirA = await pdfFolder(20, "ma");
     const dirB = await pdfFolder(20, "mb");
-    const pa = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const pa = holdBatch((d) => d.done >= 2);
     const a = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirA } } })).json.batchId;
     await pa;
+    const pb = holdBatch((d) => d.batchId !== a);
     const b = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dirB } } })).json.batchId;
+    await pb;
     const ha = svc.state.session!.batches.get(a)!.handle;
     const realA = ha.suspend.bind(ha);
     ha.suspend = () => new Promise((r) => setTimeout(r, 300)).then(realA); // lands late
@@ -1677,12 +1680,13 @@ describe("review round 3: move and background work (R106)", () => {
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20, "undo");
-    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 1);
+    const p = holdBatch((d) => d.done >= 1);
     const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
     await p;
     const r = await call({ method: "POST", url: `/imports/${id}/undo` });
     expect(r.status).toBe(409);
     expect(r.json.error.code).toBe("CONFLICT");
+    svc.state.session!.batches.get(id)!.handle.resume(); // let the held batch run to its end
     await svc.state.idle();
   });
 
@@ -1711,7 +1715,7 @@ describe("review round 3: move and background work (R106)", () => {
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20, "fo");
-    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const p = holdBatch((d) => d.done >= 2);
     const id = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json.batchId;
     await p;
     const r = await call({ method: "POST", url: "/libraries/move", body: { dest } });
@@ -1846,7 +1850,7 @@ describe("review round 4: stopped work, in-flight changes, refusals, resumes (R1
     await openNewLibrary();
     const pid = await newProject();
     const dir = await pdfFolder(20, "rs");
-    const p = nextEvent((e) => e.type === "import.progress" && e.data.state === "running" && e.data.done >= 2);
+    const p = holdBatch((d) => d.done >= 2);
     const { batchId } = (await call({ method: "POST", url: `/projects/${pid}/import`, body: { adapter: { kind: "folder", path: dir } } })).json;
     await p;
     expect((await call({ method: "POST", url: `/imports/${batchId}/cancel` })).status).toBe(200);
