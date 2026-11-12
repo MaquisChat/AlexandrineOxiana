@@ -12,6 +12,8 @@
  *
  * The port is not a secret: it still needs the token, and the Host and Origin checks stand (R96).
  */
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
 import { readAppSetting, updateAppSetting } from "@ao/library";
 
 export const PORT_SETTING = "service-port.json";
@@ -26,15 +28,24 @@ export function usablePort(v: unknown): number | undefined {
   return typeof v === "number" && Number.isInteger(v) && v >= 1024 && v <= 65535 ? v : undefined;
 }
 
-/** The remembered port, or undefined when none is remembered or the value is not usable. */
+/** The file is a few bytes; anything larger is not ours and is not read (review M4). */
+const PORT_FILE_MAX_BYTES = 1024;
+
+/**
+ * The remembered port, or undefined when none is remembered or the value is not usable: only a
+ * small regular file (not a link) holding `{ v: 1, port }` counts (review M4).
+ */
 export async function rememberedPort(configDir: string): Promise<number | undefined> {
   let f: unknown;
   try {
+    const st = await lstat(join(configDir, PORT_SETTING));
+    if (!st.isFile() || st.size > PORT_FILE_MAX_BYTES) return undefined;
     f = await readAppSetting<unknown>(configDir, PORT_SETTING);
   } catch {
     return undefined;
   }
-  return typeof f === "object" && f !== null ? usablePort((f as { port?: unknown }).port) : undefined;
+  if (typeof f !== "object" || f === null || (f as { v?: unknown }).v !== 1) return undefined;
+  return usablePort((f as { port?: unknown }).port);
 }
 
 export async function rememberPort(configDir: string, port: number): Promise<void> {

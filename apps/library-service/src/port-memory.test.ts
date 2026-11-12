@@ -2,7 +2,7 @@
  * The service listens again on the port it used last time (R171, defect D13): remembered in the
  * app's settings folder, only when it is asked for any port.
  */
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -82,8 +82,14 @@ describe("listenOnRememberedPort (any port asked for)", () => {
     expect(third).toBe(second);
   });
 
-  it("ignores a remembered value that is not a usable port (text, 0, 70000, a privileged port, broken JSON)", async () => {
-    for (const raw of [`{"v":1,"port":"4318"}`, `{"v":1,"port":0}`, `{"v":1,"port":70000}`, `{"v":1,"port":80}`, `not json`, `[]`, `null`]) {
+  it("ignores a remembered port held through a symbolic link (review M4)", async () => {
+    await writeFile(join(tmp, "elsewhere.json"), JSON.stringify({ v: 1, port: 40000 }));
+    await symlink(join(tmp, "elsewhere.json"), join(tmp, PORT_SETTING));
+    expect(await rememberedPort(tmp)).toBeUndefined();
+  });
+
+  it("ignores a remembered value that is not a usable port (text, 0, 70000, a privileged port, broken JSON, another version, an oversized file)", async () => {
+    for (const raw of [`{"v":1,"port":"4318"}`, `{"v":1,"port":0}`, `{"v":1,"port":70000}`, `{"v":1,"port":80}`, `not json`, `[]`, `null`, `{"v":2,"port":40000}`, `{"port":40000}`, `{"v":1,"port":40000,"pad":"${"x".repeat(5000)}"}`]) {
       await writeFile(join(tmp, PORT_SETTING), raw);
       const tried: number[] = [];
       const base = listener();
