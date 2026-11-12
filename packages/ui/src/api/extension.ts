@@ -47,7 +47,6 @@ export function extensionApi(client: ApiClient): ExtensionApi {
     },
     revoke: async (id, signal) => {
       await client.request<PairingRemovedResponse>("DELETE", `/extension/pairings/${encodeURIComponent(id)}`, signal ? { signal } : {});
-
     },
   };
 }

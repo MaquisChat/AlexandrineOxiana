@@ -368,7 +368,6 @@ export function libraryApi(client: ApiClient) {
     reviewQueue: {
       count: async (pid: string, opts: { signal?: AbortSignal } = {}) =>
         (await r<Pick<ProjectReviewPage, "total">>("GET", `${proj(pid)}/review`, { query: { limit: 0 }, ...(opts.signal ? { signal: opts.signal } : {}) })).total,
-
     },
     /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
     verification: verificationApi(client),

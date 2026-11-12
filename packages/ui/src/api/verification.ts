@@ -66,7 +66,6 @@ export function verificationApi(client: ApiClient) {
       const body: JobsRetryRequest = { projectId: pid, sourceId: sid };
       return r<JobsRetryResponse>("POST", "/jobs/retry", { body });
     },
-
     /** A stored picture, read with the token and returned as a Blob for a blob: URL (R135 1). */
     picture: async (pid: string, sid: string, aid: string, opts: { signal?: AbortSignal } = {}): Promise<Blob> => {
       // The service refuses a picture larger than this too; the client stops reading past it (R135 1).

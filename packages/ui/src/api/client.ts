@@ -22,7 +22,6 @@ import type { AppearancePatch, AppearanceSettings } from "../theme/appearance";
 /** The codes the service answers with: its own list, declared once in @ao/shared (Task 47). */
 export type ErrorCode = ServiceErrorCode;
 
-
 export interface ServiceError {
   code: ErrorCode | (string & {});
   message: string;

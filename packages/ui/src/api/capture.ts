@@ -599,7 +599,6 @@ export function captureApi(client: ApiClient) {
     /** One queue with its items' outcomes. */
     queue: (projectId: string, queueId: string) => r<CaptureQueueDetail>("GET", `/projects/${pid(projectId)}/captures/${encodeURIComponent(queueId)}`),
     toolVersions: async () => (await r<CaptureToolVersionsResponse>("GET", "/tools/versions")).versions,
-
     updateTools: () => r<ToolsUpdate>("POST", "/tools/update"),
   };
 }

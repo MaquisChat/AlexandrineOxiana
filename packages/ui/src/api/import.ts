@@ -346,7 +346,6 @@ export function importApi(client: ApiClient) {
       pid(projectId);
       const body: ReviewBulkEditRequest = { projectId, itemIds, patch };
       return r<ReviewBulkEditResponse>("POST", "/review/bulk-edit", { body });
-
     },
 
     source: (projectId: string, sourceId: string) => r<SourceFile>("GET", `/projects/${pid(projectId)}/sources/${seg(sourceId)}`),

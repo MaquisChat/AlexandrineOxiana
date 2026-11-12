@@ -54,10 +54,7 @@ export function transcriptApi(client: ApiClient) {
     /** Stores a person's edit as a new version; the version it came from is kept. */
     save: (pid: string, sid: string, body: TranscriptSaveRequest) => r<SavedTranscript>("POST", `${src(pid, sid)}/transcripts`, { body }),
     /** Starts speech recognition again: answers at once with the job (its progress arrives as events). */
-    transcribe: (pid: string, sid: string, opts: { model?: TranscriptionModel }) => {
-      const body: TranscribeRequest = opts;
-      return r<TranscriptionJobResponse>("POST", `${src(pid, sid)}/transcribe`, { body });
-    },
+    transcribe: (pid: string, sid: string, body: TranscribeRequest) => r<TranscriptionJobResponse>("POST", `${src(pid, sid)}/transcribe`, { body }),
     /** The source's newest transcription job (null: none recorded). */
     transcription: (pid: string, sid: string) => r<TranscriptionJobResponse>("GET", `${src(pid, sid)}/transcription`),
     /** Asks a transcription to stop. */
@@ -70,7 +67,6 @@ export function transcriptApi(client: ApiClient) {
       const body: MediaTicketRevokeRequest = { path };
       return r<MediaTicketRevokeResponse>("POST", "/media-tickets/revoke", { body });
     },
-
     /** The address the media element loads (client.mediaUrl: the exact ticket form only). */
     mediaUrl: (ticketPath: string) => client.mediaUrl(ticketPath),
   };
