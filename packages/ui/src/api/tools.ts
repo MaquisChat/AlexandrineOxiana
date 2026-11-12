@@ -59,15 +59,19 @@ export function toolsApi(client: ApiClient): ToolsApi {
 
 const HOST = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 
+/** A host entry of the catalogue: a host name, or `*.<domain>` (any server under that domain). */
+const isHostEntry = (h: string): boolean => h.length <= 255 && (HOST.test(h) || (h.startsWith("*.") && HOST.test(h.slice(2))));
+
 /**
- * The hosts a tool's download contacts, from the catalogue: each part's `hosts` (and the tool's own,
- * if given). Only plain host names are kept. Empty when the catalogue does not list them.
+ * The hosts a tool's download contacts, from the catalogue (R158): every entry of each part's
+ * `hosts` (and the tool's own, if given), host names and `*.<domain>` patterns alike — none is
+ * dropped. `missingOnly`: only the parts still to be downloaded. Empty when the catalogue lists none.
  */
 export function hostsOf(tool: ToolInfo, opts: { missingOnly?: boolean } = {}): string[] {
   const out = new Set<string>();
   const add = (v: unknown) => {
     if (!Array.isArray(v)) return;
-    for (const h of v) if (typeof h === "string" && h.length <= 253 && HOST.test(h)) out.add(h);
+    for (const h of v) if (typeof h === "string" && isHostEntry(h.toLowerCase())) out.add(h.toLowerCase());
   };
   add((tool as { hosts?: unknown }).hosts);
   for (const c of tool.components ?? []) {
@@ -77,6 +81,15 @@ export function hostsOf(tool: ToolInfo, opts: { missingOnly?: boolean } = {}): s
   }
   return [...out];
 }
+
+/** One host entry in plain words: a host name as it is; `*.hf.co` as "any server under hf.co". */
+export const hostWords = (h: string): string => (h.startsWith("*.") ? `any server under ${h.slice(2)}` : h);
+
+/** A host list in plain words, every entry named. */
+export const describeHosts = (hosts: readonly string[]): string => hosts.map(hostWords).join(", ");
+
+/** What is said for a tool whose catalogue entry names no hosts. */
+export const PUBLISHER_SERVERS = "its publisher's servers (the catalogue does not name them)";
 
 /** "484 MB", "1.5 GB", "about 78 MB" (decimal units, as download sizes are given). */
 export function formatSize(bytes: number, approximate = false): string {

@@ -92,9 +92,14 @@ export function MissingToolNotice({ from, children, as = "span" }: { from: unkno
   );
 }
 
-/** An outcome (not a service error) whose `reason` or `stopReason` is a sentence, not a tool id. */
+/**
+ * An outcome (not a service error): the capture screen always shows a sentence for its code (the
+ * library's `reason`, or the interface's own words when there is none), so only the link is added
+ * (N4). Also a run whose `reason` or `stopReason` is a sentence, not a tool id.
+ */
 function saidByService(from: unknown): boolean {
   if (from instanceof ApiClientError || !isObj(from)) return false;
+  if (typeof from.errorCode === "string") return true;
   const said = (v: unknown) => typeof v === "string" && v.trim() !== "" && !isToolId(v.trim());
   return said(from.reason) || said(from.stopReason);
 }

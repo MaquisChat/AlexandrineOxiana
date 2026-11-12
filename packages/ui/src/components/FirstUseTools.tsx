@@ -15,7 +15,7 @@
  */
 import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
-import { DEFAULT_SPEECH_MODEL, formatSize, hostsOf, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
+import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { navigate, normalisePath, PATHS } from "../navigation";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
@@ -269,12 +269,18 @@ function FirstUseDialog({ api, tools, onNotNow, onStarted }: { api: ToolsApi; to
       ) : null}
       {offered.length > 0 ? <p>Total download: {sizeText}</p> : null}
       <p className="ao-hint">
-        {hosts.length > 0 ? (
+        {/* Every entry is named; "only" is claimed only when every ticked tool lists its hosts (N1). */}
+        {ticked.length > 0 && ticked.every((t) => hostsOf(t, { missingOnly: true }).length > 0) ? (
           <>
-            Downloading contacts only these addresses: <UserText>{hosts.join(", ")}</UserText>.{" "}
+            Downloading contacts only these addresses: <UserText>{describeHosts(hosts)}</UserText>.{" "}
+          </>
+        ) : ticked.some((t) => hostsOf(t, { missingOnly: true }).length > 0) ? (
+          <>
+            Downloading contacts these servers:{" "}
+            <UserText>{ticked.map((t) => `${t.name}: ${hostsOf(t, { missingOnly: true }).length > 0 ? describeHosts(hostsOf(t, { missingOnly: true })) : PUBLISHER_SERVERS}`).join("; ")}</UserText>.{" "}
           </>
         ) : (
-          "Downloading contacts only each tool's publisher. "
+          `Downloading contacts each tool's publisher's servers (the catalogue does not name them). `
         )}
         Nothing about your projects or about you is sent.
       </p>

@@ -22,7 +22,7 @@
 import type { ToolAction, ToolId, ToolInfo, ToolJob } from "@ao/shared";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
-import { DEFAULT_SPEECH_MODEL, formatSize, hostsOf, remainingOf, speechSize, toolsApi, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
+import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechSize, toolsApi, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { UserText } from "../components/UserText";
 import type { AppLocation } from "../navigation";
 import "./GovernanceScreens.css";
@@ -333,7 +333,8 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
   const groups = GROUPS.map((g) => ({ ...g, tools: listed.filter((t) => t.group === g.id) }));
   const others = listed.filter((t) => !GROUPS.some((g) => g.id === t.group));
   if (others.length) groups.push({ id: "documents", title: "Other tools", hint: "", tools: others });
-  const anyHosts = listed.some((t) => hostsOf(t).length > 0);
+  // "At the addresses listed" only when every tool that can be downloaded lists its hosts (N1).
+  const allListed = listed.filter((t) => t.available || t.installed).every((t) => hostsOf(t).length > 0);
 
   const card = (t: ToolInfo) => {
     const hid = `${ids}-${t.id}`;
@@ -405,10 +406,10 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
           {t.installed ? "Download size: " : remaining > 0 && remaining < t.downloadSize ? `Still to download (of ${formatSize(t.downloadSize, t.sizeApproximate)}): ` : "Download size: "}
           {formatSize(t.installed ? t.downloadSize : remaining || t.downloadSize, t.sizeApproximate)}
         </p>
-        {hosts.length > 0 ? (
-          <p className="ao-hint">
-            Downloads from: <UserText>{hosts.join(", ")}</UserText>
-          </p>
+        {t.available || t.installed ? (
+          <UserText as="p" className="ao-hint">
+            {`Downloads from: ${hosts.length > 0 ? describeHosts(hosts) : `${PUBLISHER_SERVERS}.`}`}
+          </UserText>
         ) : null}
         {t.notice ? (
           <UserText as="p" className="ao-hint">
@@ -445,7 +446,16 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
             {checking.has(t.id) ? null : <UserText as="p">{`What is on this computer now: ${installedNow(t)}`}</UserText>}
           </div>
         ) : null}
-        {failed && failed.error?.code !== "CANCEL_UNCONFIRMED" && !reqError ? (
+        {failed && failed.cancelRequested && failed.error?.code !== "CANCEL_UNCONFIRMED" ? (
+          // The media helper ended the job (it stopped, say) after a stop was asked for: the stop is
+          // acknowledged, with what the catalogue shows; nothing is offered to start again (N2).
+          checking.has(t.id) ? (
+            <p>Reading what is installed now…</p>
+          ) : (
+            <UserText as="p">{`The stop was asked for, and the job ended without finishing. ${installedNow(t)}`}</UserText>
+          )
+        ) : null}
+        {failed && !failed.cancelRequested && failed.error?.code !== "CANCEL_UNCONFIRMED" && !reqError ? (
           <div role="alert" className="ao-warning">
             <p>
               {VERB[failed.action].doing} did not finish. <UserText>{failed.error?.message ?? "Nothing was left half-installed."}</UserText>
@@ -495,7 +505,7 @@ export function ToolsSetup({ api, pollMs = 1000, focusTool }: { api: ToolsApi; p
       <h1>Optional tools</h1>
       <p>The app does not include these tools, so that its own download stays small. Install only the ones you need; you can remove them again here.</p>
       <p>
-        Each download contacts only the tool's publisher{anyHosts ? ", at the addresses listed with the tool," : ""} and sends nothing about your projects or about you. Each file is checked against its
+        Each download contacts only the tool's publisher{allListed ? ", at the addresses listed with the tool," : ""} and sends nothing about your projects or about you. Each file is checked against its
         published checksum before it is used.
       </p>
       <p role="status" aria-label="Tool progress" className="ao-visually-hidden">
