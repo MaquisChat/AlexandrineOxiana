@@ -4,6 +4,7 @@
  */
 import { useId, type ReactNode, type Ref } from "react";
 import { ApiClientError } from "../../api/client";
+import { IMPORT_PATHS } from "../../navigation";
 
 const NUMBER = new Intl.NumberFormat("en");
 
@@ -12,6 +13,31 @@ export const fmt = (n: number): string => NUMBER.format(n);
 
 /** "1 source" / "1,284 sources". */
 export const count = (n: number, one: string, many = `${one}s`): string => `${fmt(n)} ${n === 1 ? one : many}`;
+
+/**
+ * The address of an import's report and undo (D1): the wizard, opened on that import. It works for
+ * as long as the service keeps the import's record (GET /projects/:id/imports, /imports/:id/report);
+ * the report itself offers Undo unless the import was undone.
+ */
+export const reportHref = (projectId: string, batchId: string): string =>
+  `${IMPORT_PATHS.wizard}?project=${encodeURIComponent(projectId)}&batch=${encodeURIComponent(batchId)}`;
+
+/** A batch's state in a few plain words, as the list of imports shows it. */
+export function batchStateText(state: string): string {
+  switch (state) {
+    case "running":
+    case "paused":
+    case "interrupted":
+    case "cancelled":
+    case "undone":
+    case "finished":
+      return state;
+    case "failed":
+      return "stopped with an error";
+    default:
+      return "state unknown";
+  }
+}
 
 /** What the service accepts as an absolute path (routes/import.ts). */
 export const isAbsolutePath = (p: string): boolean => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);

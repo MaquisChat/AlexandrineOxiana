@@ -5,6 +5,7 @@
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
 import type { IntegrityWarning, LibraryState } from "../api/library";
+import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
 import "./library.css";
 
@@ -13,7 +14,10 @@ export type BannerVariant =
   | { kind: "read-only-newer-format" }
   | { kind: "read-only"; reason?: string }
   | { kind: "offline"; volume: string }
+  /** `total` 0: the rebuild has started but not counted the sources yet. */
   | { kind: "index-rebuilding"; done: number; total: number }
+  /** The index could not be rebuilt (D8); the service's reason is not shown (it can name files). */
+  | { kind: "index-failed" }
   /** `detail` is accepted for the record but never shown (R114 I1). */
   | { kind: "warning"; warning: string; project: string; detail?: string };
 
@@ -90,7 +94,9 @@ function text(v: BannerVariant): string {
     case "offline":
       return `Offline — reconnecting when ${v.volume} returns. Nothing can be changed until then; nothing is lost.`;
     case "index-rebuilding":
-      return `Index rebuilding ${v.done}/${v.total}. Search results may be incomplete until it finishes.`;
+      return v.total > 0 ? `Index rebuilding ${v.done}/${v.total}. Search results may be incomplete until it finishes.` : "Index rebuilding. Search results may be incomplete until it finishes.";
+    case "index-failed":
+      return "The library's search index could not be rebuilt, so sources and search may be incomplete. Your sources are safe in the library folder.";
     case "warning":
       return warningText(v.warning, v.project);
   }
@@ -102,6 +108,7 @@ const TONE: Record<BannerVariant["kind"], string> = {
   "read-only": "warn",
   offline: "warn",
   "index-rebuilding": "info",
+  "index-failed": "warn",
   warning: "warn",
 };
 
@@ -114,6 +121,14 @@ export function StatusBanner({ variant, onResolve }: { variant: BannerVariant; o
   return (
     <div role="status" className={`ao-banner ao-banner--${TONE[variant.kind]}`}>
       <UserText>{text(variant)}</UserText>
+      {variant.kind === "index-failed" && (
+        <>
+          {" "}
+          <a href={PATHS.missingFiles} onClick={inAppLink}>
+            Rebuild library from folder
+          </a>
+        </>
+      )}
       {resolvable && (
         <>
           {" "}
@@ -150,7 +165,7 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings">, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index">, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;
@@ -159,7 +174,13 @@ export function bannersFor(state: Pick<LibraryState, "mode" | "readOnlyReason" |
     else if (r === "offline") out.push({ kind: "offline", volume: ctx.volume ?? "the library's drive" });
     else out.push(r ? { kind: "read-only", reason: r } : { kind: "read-only" });
   }
-  if (ctx.index && ctx.index.done < ctx.index.total) out.push({ kind: "index-rebuilding", ...ctx.index });
+  // The library's state says a rebuild runs (D8) even before progress arrives; progress events say how far.
+  const idx = state.index;
+  if (idx?.state === "rebuilding") {
+    const p = ctx.index && ctx.index.done < ctx.index.total ? ctx.index : { done: idx.done, total: idx.total };
+    out.push({ kind: "index-rebuilding", ...p });
+  } else if (idx?.state === "failed") out.push({ kind: "index-failed" });
+  else if (ctx.index && ctx.index.done < ctx.index.total) out.push({ kind: "index-rebuilding", ...ctx.index });
   for (const w of state.integrityWarnings ?? ([] as IntegrityWarning[])) out.push({ kind: "warning", warning: w.kind, project: w.project, detail: w.detail });
   for (const [pid, list] of Object.entries(state.projectWarnings ?? {})) {
     for (const w of list) out.push({ kind: "warning", warning: w, project: ctx.projectNames?.[pid] ?? "a project" });

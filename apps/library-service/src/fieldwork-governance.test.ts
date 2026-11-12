@@ -207,6 +207,35 @@ describe("retention (spec 6.3(5))", () => {
     expect((await call({ url: `/projects/${pid}/retention` })).json.due).toEqual([]);
   });
 
+  it("R147: the certificate is shown as written, with its amendments and the resulting status, at the destruction and afterwards", async () => {
+    const { assetId } = await newSource();
+    const b = await call({ method: "POST", url: `/projects/${pid}/backups` });
+    expect(b.status, b.body).toBe(200);
+    const held = `Backups/${b.json.backup.file as string}`;
+    const r = await call({ method: "POST", url: `/projects/${pid}/retention/destroy`, body: { assetIds: [assetId], confirm: true } });
+    expect(r.status, r.body).toBe(200);
+    // As written at the destruction (and never rewritten): the backup that held the file, still to be removed.
+    expect(r.json.original.backups).toEqual({ status: "pending", containing: [held], deleted: [] });
+    // What happened then is an amendment beside it; the certificate is presented with the result.
+    expect(r.json.status).toBe("deleted");
+    expect(r.json.certificate.backups).toMatchObject({ status: "deleted", containing: [held], deleted: [held] });
+    expect(r.json.amendments).toEqual([
+      {
+        file: expect.stringMatching(/^Projects\/.+\/retention\/destruction-.+\.amendment-1\.json$/),
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        verified: true,
+        content: expect.objectContaining({ kind: "destruction-certificate-amendment", number: 1 }),
+      },
+    ]);
+    expect(JSON.parse(await readFile(join(tmp, "Lib", r.json.certificateFile), "utf8"))).toEqual(r.json.original);
+    const list = await call({ url: `/projects/${pid}/retention/certificates` });
+    expect(list.status, list.body).toBe(200);
+    expect(list.json.certificates).toEqual([
+      { certificateFile: r.json.certificateFile, certificateSha256: expect.stringMatching(/^[0-9a-f]{64}$/), verified: true, original: r.json.original, certificate: r.json.certificate, amendments: r.json.amendments, status: "deleted", outstanding: [] },
+    ]);
+    expect(list.body).not.toContain(tmp);
+  });
+
   it("the project's time zone (R93): GET retention shows it (null: UTC); PUT /time-zone sets a real zone or clears it", async () => {
     expect((await call({ url: `/projects/${pid}/retention` })).json.timeZone).toBeNull();
     const r = await call({ method: "PUT", url: `/projects/${pid}/time-zone`, body: { timeZone: "asia/tokyo" } });
@@ -280,5 +309,42 @@ describe("researcher name (device setting, R84/R117 carry-over)", () => {
       const r = await call({ method: "POST", url: `/projects/${devPid}/device-import`, body: { dir, options: { researcherName } } });
       expect(r.status, JSON.stringify(researcherName)).toBe(400);
     }
+  });
+});
+
+describe("Task 46b fix round 1 (R172): consent withdrawal and the library row's needsReview", () => {
+  const badge = async (sid: string) => ((await call({ url: `/projects/${pid}/sources?limit=500` })).json.items as Array<{ id: string; needsReview: boolean }>).find((r) => r.id === sid)?.needsReview;
+  const pending = (sid: string) =>
+    svc.state.session!.index!.db.prepare("SELECT id, kind FROM review_items WHERE project_id = ? AND source_id = ? AND status = 'pending' ORDER BY kind").all(pid, sid) as Array<{ id: string; kind: string }>;
+  const withdrawFor = async (sourceId: string) => {
+    const p = (await call({ method: "POST", url: `/projects/${pid}/participants`, body: {} })).json;
+    const c = (await call({ method: "POST", url: `/projects/${pid}/consents`, body: { participantId: p.id, scope: "audio", date: "2026-03-14" } })).json;
+    await svc.state.session!.repo.linkSourceToFieldwork(pid, sourceId, { participantIds: [p.id] });
+    const w = await call({ method: "POST", url: `/projects/${pid}/consents/${c.id}/withdraw`, body: { reason: "phoned" } });
+    expect(w.status, w.body).toBe(200);
+    expect(w.json.flaggedSourceIds).toEqual([sourceId]);
+  };
+
+  it("a source flagged by a consent withdrawal carries the badge", async () => {
+    const { sourceId } = await newSource();
+    expect(await badge(sourceId)).toBe(false);
+    await withdrawFor(sourceId);
+    expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
+    expect(await badge(sourceId)).toBe(true);
+  });
+
+  it("a source with two pending entries keeps the badge until both are decided: deciding its import entry leaves the withdrawal's", async () => {
+    const att = await call({ method: "POST", url: `/projects/${pid}/attach`, body: { paths: [pdf] } });
+    expect(att.status, att.body).toBe(200);
+    expect(att.json.items[0].outcome).toBe("needs-review");
+    const sourceId = att.json.items[0].sourceId as string;
+    await withdrawFor(sourceId);
+    const two = pending(sourceId);
+    expect(two.map((e) => e.kind)).toEqual(["import", "verification"]);
+    expect(await badge(sourceId)).toBe(true);
+    const d = await call({ method: "POST", url: `/review/${two[0]!.id}/decide`, body: { projectId: pid, decision: { action: "accept" } } });
+    expect(d.status, d.body).toBe(200);
+    expect(pending(sourceId).map((e) => e.kind)).toEqual(["verification"]);
+    expect(await badge(sourceId)).toBe(true);
   });
 });

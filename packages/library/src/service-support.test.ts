@@ -179,6 +179,78 @@ describe("source actions", () => {
     await expect(confirmField(kit.repo, p.id, sf.source.id, "/provenance", {})).rejects.toThrow(/not a field/);
   });
 
+  it("confirmField confirms an identifier under the verification report's own key (R149), as one governed, audited change", async () => {
+    const sf = await addSource(kit, p, { title: "A study", issued: "2001" });
+    const before = (await auditEvents(kit, p)).length;
+    const next = await confirmField(kit.repo, p.id, sf.source.id, "/identifiers/doi", "10.1000/xyz");
+    expect(next.source.identifiers.doi).toBe("10.1000/xyz");
+    expect(next.source.title.variants[0]?.value).toBe("A study");
+    expect(next.fieldEvidence.filter((e) => e.field === "/identifiers/doi" && e.source.kind === "user").map((e) => e.value)).toEqual(["10.1000/xyz"]);
+    expect(next.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    const events = await auditEvents(kit, p);
+    expect(events.length).toBeGreaterThan(before);
+    expect(events.at(-1)?.details?.op).toBe("source.update");
+    // Another identifier keeps the first; a second confirm replaces the researcher's earlier evidence for that key only.
+    const again = await confirmField(kit.repo, p.id, sf.source.id, "/identifiers/url", "https://example.org/a");
+    expect(again.source.identifiers).toMatchObject({ doi: "10.1000/xyz", url: "https://example.org/a" });
+    expect(again.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    // ISBN is a list in the record: a single typed ISBN is recorded as a list of one.
+    const isbn = await confirmField(kit.repo, p.id, sf.source.id, "/identifiers/isbn", "9780306406157");
+    expect(isbn.source.identifiers.isbn).toEqual(["9780306406157"]);
+    expect(isbn.fieldEvidence.find((e) => e.field === "/identifiers/isbn" && e.source.kind === "user")?.value).toEqual(["9780306406157"]);
+  });
+
+  it("two identifier confirms at once both land, each audited (re-review N2: no lost update)", async () => {
+    const sf = await addSource(kit, p, { title: "A study", issued: "2001" });
+    const before = (await auditEvents(kit, p)).filter((e) => e.details?.op === "source.update").length;
+    const [a, b] = await Promise.all([
+      confirmField(kit.repo, p.id, sf.source.id, "/identifiers/doi", "10.1/a"),
+      confirmField(kit.repo, p.id, sf.source.id, "/identifiers/url", "https://e.org/b"),
+    ]);
+    expect(a.source.identifiers.doi).toBe("10.1/a");
+    expect(b.source.identifiers.url).toBe("https://e.org/b");
+    const stored = await kit.repo.getSource(p.id, sf.source.id);
+    expect(stored.source.identifiers).toMatchObject({ doi: "10.1/a", url: "https://e.org/b" });
+    expect(stored.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    expect(stored.verification["/identifiers/url"]?.status).toBe("user-confirmed");
+    const updates = (await auditEvents(kit, p)).filter((e) => e.details?.op === "source.update").length;
+    expect(updates - before).toBe(2);
+  });
+
+  it("an identifier confirm at once with an ordinary field confirm: both land (re-review N2)", async () => {
+    const sf = await addSource(kit, p, { title: "A study", issued: "2001" });
+    await Promise.all([
+      confirmField(kit.repo, p.id, sf.source.id, "/identifiers/doi", "10.1/a"),
+      confirmField(kit.repo, p.id, sf.source.id, "/publisher", "Polity"),
+    ]);
+    const stored = await kit.repo.getSource(p.id, sf.source.id);
+    expect(stored.source.identifiers.doi).toBe("10.1/a");
+    expect(stored.source.publisher).toBe("Polity");
+    expect(stored.verification["/identifiers/doi"]?.status).toBe("user-confirmed");
+    expect(stored.verification["/publisher"]?.status).toBe("user-confirmed");
+  });
+
+  it("the whole identifiers object cannot be confirmed at once; only one identifier at a time (re-review N3, R149)", async () => {
+    const sf = await addSource(kit, p, { title: "A study" });
+    await expect(confirmField(kit.repo, p.id, sf.source.id, "/identifiers", { doi: "10.1/a" })).rejects.toBeInstanceOf(InvalidInputError);
+  });
+
+  it("confirmField refuses an unknown identifier, a deeper path, and a value of the wrong kind (InvalidInputError, nothing written)", async () => {
+    const sf = await addSource(kit, p, { title: "A study" });
+    const before = (await kit.repo.getSource(p.id, sf.source.id)).source.modifiedAt;
+    for (const [field, value] of [
+      ["/identifiers/platform", "youtube"],
+      ["/identifiers/nonsense", "x"],
+      ["/identifiers/doi/x", "x"],
+      ["/identifiers/doi", 42],
+      ["/identifiers/doi", ""],
+      ["/identifiers/isbn", [1, 2]],
+    ] as const) {
+      await expect(confirmField(kit.repo, p.id, sf.source.id, field, value)).rejects.toBeInstanceOf(InvalidInputError);
+    }
+    expect((await kit.repo.getSource(p.id, sf.source.id)).source.modifiedAt).toBe(before);
+  });
+
   it("addTranscriptVersion stores a human-edited version next to the machine one", async () => {
     const sf = await addSource(kit, p, { title: "Interview" });
     const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: "WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n", format: "vtt" });

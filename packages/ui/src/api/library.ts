@@ -8,6 +8,7 @@
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
+import { verificationApi } from "./verification";
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -20,6 +21,17 @@ export interface LibraryEntry {
 
 export type ReadOnlyReason = "locked-by-other-device" | "newer-format" | "offline" | "not-writable" | "moved" | "move-incomplete";
 
+/**
+ * The open library's search index when it is not ready (IndexStatus in the service's state.ts, D8):
+ * being rebuilt from the files, failed to rebuild, or not writable (a read-only library). Absent when
+ * the index is ready.
+ */
+export type IndexStatus =
+  /** `partial`: the index holds only part of the library until the rebuild completes (C1): no list is shown. */
+  | { state: "rebuilding"; done: number; total: number; partial?: true }
+  | { state: "failed"; message: string; partial?: true }
+  | { state: "unavailable"; reason: string };
+
 /** The library the service has open (libraryView in routes/libraries.ts). */
 export interface CurrentLibrary {
   libraryId: string;
@@ -28,6 +40,18 @@ export interface CurrentLibrary {
   readOnlyReason?: ReadOnlyReason | (string & {});
   /** With "locked-by-other-device": the name of the device holding the library (R118; never a user name). */
   lockedBy?: string;
+  /** The index when it is not ready (D8). */
+  index?: IndexStatus;
+}
+
+/** GET /libraries. */
+export interface LibraryList {
+  libraries: LibraryEntry[];
+  current?: CurrentLibrary;
+  /** The library open when the app last ran, which could not be reopened at start (D5). */
+  notFound?: { libraryId: string; name: string };
+  /** The library open when the app last ran, still being opened by the service (I1). */
+  reopening?: { libraryId: string; name: string };
 }
 
 export interface ReconnectResult extends CurrentLibrary {
@@ -74,6 +98,7 @@ export interface LibraryState {
   mode?: CurrentLibrary["mode"];
   readOnlyReason?: CurrentLibrary["readOnlyReason"];
   lockedBy?: CurrentLibrary["lockedBy"];
+  index?: IndexStatus;
   integrityWarnings?: IntegrityWarning[];
   projectWarnings?: Record<string, string[]>;
 }
@@ -155,6 +180,7 @@ export interface SourceRow {
   creatorsText: string;
   issuedYear?: string;
   folder: string;
+  /** R137, R172: this source has a pending entry of any kind in the project's review queue (nothing else; not field verification). False for a locked row. */
   needsReview: boolean;
   locked: boolean;
   /** A text search found it through the text of its annotations (Task 58). */
@@ -171,6 +197,8 @@ export interface SourcePage {
   incomplete?: true;
   /** A read-only library: only titles were searched. */
   limited?: true;
+  /** The index is being rebuilt, could not be rebuilt, or cannot be written (D8). */
+  index?: IndexStatus;
 }
 
 export interface SourceQuery {
@@ -277,7 +305,7 @@ export function libraryApi(client: ApiClient) {
       resolve: (txn: string, choice: PendingWriteChoice) => r<{ txn: string; choice: PendingWriteChoice; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/resolve`, { body: { choice } }),
     },
     libraries: {
-      list: () => r<{ libraries: LibraryEntry[]; current?: CurrentLibrary }>("GET", "/libraries"),
+      list: () => r<LibraryList>("GET", "/libraries"),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),
       close: () => r<{ closed: true }>("POST", "/libraries/close"),
@@ -335,6 +363,8 @@ export function libraryApi(client: ApiClient) {
       attach: async (pid: string, paths: string[], toSourceId?: string) =>
         (await r<{ items: AttachOutcome[] }>("POST", `${proj(pid)}/attach`, { body: { paths, ...(toSourceId ? { toSourceId } : {}) } })).items,
     },
+    /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
+    verification: verificationApi(client),
     citations: {
       styles: async (q?: string, opts: { signal?: AbortSignal } = {}) =>
         (await r<{ styles: StyleEntry[] }>("GET", "/styles", { query: { q: q || undefined }, ...(opts.signal ? { signal: opts.signal } : {}) })).styles,

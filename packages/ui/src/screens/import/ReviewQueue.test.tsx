@@ -289,7 +289,9 @@ describe("Review queue", () => {
     const review = Array.from({ length: n }, (_, i) => item(i + 1));
     const sources = Object.fromEntries(review.map((r, i) => [r.sourceId!, source(i + 1, `Paper ${i + 1}`)]));
     const { m, user } = setup({ review, sources, sourceDelayMs: 1 });
-    const accept = await screen.findByRole("button", { name: "Accept" });
+    // Found inside its group: a query by role and name over the whole page computes the name of every
+    // one of the list's 4,000 controls, again on each change of the DOM while titles arrive.
+    const accept = within(await screen.findByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" });
     await waitFor(() => expect((accept as HTMLButtonElement).disabled).toBe(false));
     const sourceCalls = () => m.calls.filter((c) => c.method === "GET" && /\/sources\/s\d+$/.test(c.path));
     expect(sourceCalls()[0]!.path).toMatch(/\/sources\/s1$/);

@@ -2,7 +2,7 @@
  * A missing optional tool, said where it is met (Task 48b; R126). The service answers a job whose
  * tool is not installed with `409 { error: { code: "TOOL_NOT_INSTALLED", reason: <tool id> } }`; a
  * capture outcome carries `errorCode: "TOOL_NOT_INSTALLED"` with the library's own sentence naming the
- * tool in `reason` (and `tool`, which the UI's queue state does not keep yet); a source's viewing copy
+ * tool in `reason` (and `tool`, which the capture queue's items and runs keep); a source's viewing copy
  * or OCR job that waits for its tool is recorded failed with that code. Each becomes one plain
  * sentence naming the tool and a link to the Optional tools screen (only the link where the service's
  * sentence is already shown). Anything else shows the children (the screen's usual message), so a
@@ -39,7 +39,7 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object
 /**
  * Whether `from` says an optional tool is missing, and which (when it says). Reads an ApiClientError
  * (`reason` = the tool id), a capture outcome or queue (`errorCode`, and `tool` once the service
- * sends one) or an error body (`code`, `reason`). Undefined for anything else.
+ * sends it) or an error body (`code`, `reason`). Undefined for anything else.
  */
 export function missingToolOf(from: unknown): { tool?: ToolId } | undefined {
   let code: unknown;

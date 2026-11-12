@@ -10,7 +10,13 @@
  *     interrupted changes (orphans: no transaction can restore them);
  *   - writes the destruction certificate `retention/destruction-<YYYY-MM-DD HHmm>.json` (0600;
  *     `.json.enc`, sealed with the project key, in an encrypted project).
+ * The change's own audit event (the commit point) names the certificate, its sha256 and the
+ * backups that hold the destroyed files (R147): which backups must go is decided once, here, and
+ * recorded where it cannot be edited quietly. The certificate is never rewritten afterwards: later
+ * facts are amendment files beside it (`amendDestruction`), each written in a governed change whose
+ * audit event carries the amendment's sha256 and what it reports.
  */
+import { createHash } from "node:crypto";
 import type { Asset, SourceFile } from "@ao/core";
 import { withCollisionSuffix } from "@ao/core";
 import { shredPath } from "../fs/shred.js";
@@ -23,6 +29,29 @@ import { foldName, namesIn } from "./io.js";
 import { runMutation } from "./mutate.js";
 import { readSourceFile, writeSourceFile } from "./sources.js";
 import type { RepoCore } from "./state.js";
+
+/** A destruction certificate's file name (in the project's `retention` folder). */
+export const DESTRUCTION_CERTIFICATE = /^destruction-\d{4}-\d{2}-\d{2} \d{4}(?: \(\d+\))?\.json(?:\.enc)?$/u;
+
+/** A certificate or an amendment as written to its file (also the text its sha256 is taken of, sealed or not). */
+export const certificateText = (c: Record<string, unknown>) => `${JSON.stringify(c, null, 2)}\n`;
+
+const sha256Of = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** `<certificate without .json[.enc]>.amendment-<n>.json[.enc]`: an amendment's file name, beside its certificate. */
+export function amendmentName(certificate: string, n: number): string {
+  const enc = certificate.endsWith(".enc");
+  const stem = certificate.replace(/\.json(?:\.enc)?$/u, "");
+  return `${stem}.amendment-${n}.json${enc ? ".enc" : ""}`;
+}
+
+/** The number of an amendment file of `certificate` (undefined: not one). */
+export function amendmentNumber(certificate: string, name: string): number | undefined {
+  const stem = certificate.replace(/\.json(?:\.enc)?$/u, "");
+  if (!name.startsWith(`${stem}.amendment-`)) return undefined;
+  const m = /^(\d+)\.json(?:\.enc)?$/u.exec(name.slice(stem.length + ".amendment-".length));
+  return m ? Number(m[1]) : undefined;
+}
 
 export interface DestroyPlanItem {
   sourceId: string;
@@ -39,6 +68,12 @@ export interface DestroyInput {
   /** The certificate's content, given the destroyed assets as recorded (before marking). */
   certificate: (destroyed: Array<{ asset: Asset; sourceId: string }>, at: string) => Record<string, unknown>;
   /**
+   * The backups (library-relative, `Backups/<file>`) decided now to hold the destroyed files
+   * (`toRemove`), and those that could not be read and may hold them (`unreadable`): recorded in the
+   * change's audit event (R147).
+   */
+  backups: { toRemove: string[]; unreadable: string[] };
+  /**
    * Destroy only what is due (R117): checked inside the change against the rules as they are then
    * — the retention date has passed in `tz` at `now`, and each of `originals` is an original of an
    * identifiable source. Otherwise nothing is destroyed (InvalidInputError).
@@ -50,10 +85,12 @@ export async function destroyAssets(
   core: RepoCore,
   projectId: string,
   input: DestroyInput,
-): Promise<{ certificateRel: string; certificate: Record<string, unknown>; destroyed: Asset[] }> {
+): Promise<{ certificateRel: string; certificate: Record<string, unknown>; certificateSha256: string; at: string; destroyed: Asset[] }> {
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
+  /** What the commit event says of the certificate and the backups (known once the certificate is written). */
+  let recorded: Record<string, unknown> = {};
   return runMutation(
     core,
     projectId,
@@ -93,10 +130,59 @@ export async function destroyAssets(
       const name = withCollisionSuffix(`${input.certificateStem(tx.now)}.json${tx.encrypted ? ".enc" : ""}`, (n) => taken.has(foldName(n)));
       const certificate = input.certificate(destroyed, tx.at);
       const rel = `${dir}/${name}`;
-      await tx.writeFile(rel, `${JSON.stringify(certificate, null, 2)}\n`, tx.encrypted ? { encrypt: true } : { mode: 0o600 });
-      return { certificateRel: rel, certificate, destroyed: destroyed.map((d) => d.asset) };
+      const text = certificateText(certificate);
+      const certificateSha256 = sha256Of(text);
+      await tx.writeFile(rel, text, tx.encrypted ? { encrypt: true } : { mode: 0o600 });
+      recorded = { certificate: name, certificateSha256, backupsToRemove: [...input.backups.toRemove], backupsUnreadable: [...input.backups.unreadable] };
+      return { certificateRel: rel, certificate, certificateSha256, at: tx.at, destroyed: destroyed.map((d) => d.asset) };
     },
-    { op: "retention.destroy", entity: { type: "project", id: projectId } },
+    { op: "retention.destroy", entity: { type: "project", id: projectId }, auditDetails: () => recorded },
+  );
+}
+
+export interface AmendInput {
+  /** The certificate's file name in the project's `retention` folder, and its sha256 as recorded at the destruction. */
+  certificate: string;
+  certificateSha256: string;
+  /** 1 for the first amendment of the certificate, and so on. */
+  number: number;
+  /** The amendment's content. */
+  content: Record<string, unknown>;
+  /** What the change's audit event says besides the certificate and the amendment's name and sha256. */
+  facts: Record<string, unknown>;
+}
+
+/**
+ * Writes an amendment beside a destruction certificate (R147): a new file, never over an existing
+ * one, in one governed change (`delete`, op `retention.backups`; R26 write-ahead marker). The
+ * change's audit event carries the amendment's name and sha256 and `facts`: the file and its record
+ * in the audit log exist together or not at all.
+ */
+export async function amendDestruction(core: RepoCore, projectId: string, input: AmendInput): Promise<{ amendmentRel: string; name: string; sha256: string }> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  if (!DESTRUCTION_CERTIFICATE.test(input.certificate)) throw new InvalidInputError("Not the name of a destruction certificate");
+  const name = amendmentName(input.certificate, input.number);
+  const rel = `${st.rel}/retention/${name}`;
+  const text = certificateText(input.content);
+  const sha256 = sha256Of(text);
+  return runMutation(
+    core,
+    projectId,
+    { action: "delete" },
+    async (tx) => {
+      // Never rewritten, never replaced: a file already under this name is not the app's own record.
+      if (await tx.exists(rel)) throw new InvalidInputError("A file with this amendment's name already exists; nothing was written over it");
+      await tx.mkdir(`${st.rel}/retention`);
+      await tx.writeFile(rel, text, name.endsWith(".enc") ? { encrypt: true } : { mode: 0o600 });
+      return { amendmentRel: rel, name, sha256 };
+    },
+    {
+      op: "retention.backups",
+      entity: { type: "project", id: projectId },
+      auditDetails: { certificate: input.certificate, certificateSha256: input.certificateSha256, amendment: name, amendmentSha256: sha256, ...input.facts },
+    },
   );
 }
 

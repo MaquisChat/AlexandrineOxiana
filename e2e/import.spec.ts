@@ -18,7 +18,7 @@ import { createRequire } from "node:module";
 import { join, relative, resolve, sep } from "node:path";
 import { buildPdf } from "../tests/fixtures/generate.mjs";
 import { buildZoteroFixture } from "../packages/library/tests/fixtures/zotero/build-fixture.mjs";
-import { APP_ORIGIN, blockedBy, decryptStoredFile, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test, type AppHarness, type Defect, type Page } from "./fixtures.js";
+import { APP_ORIGIN, decryptStoredFile, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR, REPO_ROOT } from "./paths.js";
 
 // ---------- shared ----------
@@ -96,9 +96,6 @@ const ZOTERO_TITLES = ["Feeding the City: Informal Markets in Lagos", "Markets a
 const REVIEWED = "Street Vendors in Accra";
 const REVIEWED_AS = "Street Vendors in Accra, 2018–2020";
 
-const D1: Defect = { id: "D1", title: "back from the review queue to the import's report and its Undo" };
-const D2: Defect = { id: "D2", title: "after a decision in the review queue, the library row no longer carries “Needs review” (R137)" };
-const D4: Defect = { id: "D4", title: "with “Copy into the library”, an approved Zotero linked file is copied in, and the report gives the files copied and the files left as links (R136)" };
 
 /** A library and project, the Zotero fixture data folder, and readers of what the service holds. */
 async function zoteroSetUp(app: AppHarness, page: Page) {
@@ -187,7 +184,17 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect(await z.linkedPdfAsset()).toBeDefined();
   });
 
-  await blockedBy(D4);
+  await test.step("with “Copy into the library”, the approved Zotero linked file is copied in; the report gives the files copied and the files left as links (R136)", async () => {
+    const report = page.getByRole("region", { name: "Report and undo" });
+    await expect(reportRow(page, "Files copied into the library")).toHaveAccessibleName(/^Files copied into the library \d+$/);
+    await expect(reportRow(page, "Files left as links")).toHaveAccessibleName("Files left as links 0");
+    await expect(report).toBeVisible();
+    const pdf = (await z.linkedPdfAsset())!;
+    expect(pdf.linked, JSON.stringify(pdf)).toBeUndefined();
+    const stored = join(z.libraryPath, ...pdf.path.split("/"));
+    expect(resolve(stored).startsWith(resolve(z.libraryPath) + sep), `${pdf.path} is inside the library`).toBe(true);
+    expect(readFileSync(stored).equals(readFileSync(z.linkedPdfPath))).toBe(true);
+  });
 
   await test.step("collections are recreated: Urban, and Food inside it, each holding its items", async () => {
     const cs = await collections();
@@ -219,10 +226,20 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     expect((await listed()).items.map((i) => i.title)).toContain(REVIEWED_AS);
   });
 
-  await blockedBy(D1);
+  await test.step("back from the review queue to the import's report and its Undo (D1): by the queue's link and by the browser's Back", async () => {
+    await page.getByRole("link", { name: "Back to the import's report and undo" }).click();
+    await expect(page.getByRole("heading", { level: 2, name: "Report and undo" })).toBeVisible();
+    await expect(page.getByText("Import 1. The import finished.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Undo import" })).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { level: 1, name: "Review queue" })).toBeVisible();
+    await page.goBack(); // the wizard's own entry names the import once it starts
+    await expect(page.getByRole("heading", { level: 2, name: "Report and undo" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Undo import" })).toBeVisible();
+  });
 
   await test.step("the library shows the imported sources and the recreated collections", async () => {
-    await page.goto(`${APP_ORIGIN}/?project=${projectId}`); // D1: the way back is to the library
+    await page.getByRole("link", { name: "Back to library" }).click();
     await expect(page.getByRole("heading", { level: 1, name: "Urban food library" })).toBeVisible();
     const tree = page.getByRole("tree", { name: "Collections" });
     await expect(tree.getByRole("treeitem", { name: "Urban" })).toHaveAttribute("aria-level", "1");
@@ -237,13 +254,26 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     await expect(page.getByText("5 sources", { exact: true })).toBeVisible();
   });
 
-  await blockedBy(D2);
+  await test.step("the accepted source no longer carries “Needs review”, the others neither (D2, R137: only an item waiting in the queue)", async () => {
+    const table = page.getByRole("table", { name: "Sources" });
+    const row = table.getByRole("row").filter({ has: page.getByRole("button", { name: REVIEWED_AS, exact: true }) });
+    await expect(row).toHaveCount(1);
+    await expect(row.getByText("Needs review")).toHaveCount(0);
+    await expect(table.getByText("Needs review")).toHaveCount(0);
+    expect((await listed()).items.filter((i) => i.needsReview)).toEqual([]);
+  });
 
-  await test.step("undo the first import (through the service: D1 leaves no way to its Undo in the UI)", async () => {
+  await test.step("undo the first import from its report, reached again from the import screen's recent imports (D1)", async () => {
+    await page.getByRole("link", { name: "Import", exact: true }).click();
+    await expect(page.getByRole("heading", { level: 1, name: "Bulk import" })).toBeVisible();
+    await page.getByRole("region", { name: "Recent imports" }).getByRole("link", { name: /^Import 1 — .*\(finished\)$/ }).click();
+    await expect(page.getByText("Import 1. The import finished.")).toBeVisible();
+    await page.getByRole("button", { name: "Undo import" }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Remove 5 imported sources?" });
+    await dialog.getByRole("button", { name: "Undo import" }).click();
+    await expect(page.getByRole("status").filter({ hasText: "Removed 5 sources" })).toBeVisible();
     const [b] = await batches();
-    const r = await app.api<{ removedSources: number }>("POST", `/imports/${b!.batchId}/undo`);
-    expect(r.status, JSON.stringify(r.body)).toBe(200);
-    expect(r.body.removedSources).toBe(5);
+    expect(b).toMatchObject({ number: 1, state: "undone" });
     expect((await listed()).total).toBe(0);
     expect(await collections()).toEqual([]);
   });
@@ -293,49 +323,16 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
   });
 });
 
-// ---------- the steps scenario 3 cannot do yet, each on its own (expected to fail while the defect reproduces) ----------
-
-test(`${D1.id}: ${D1.title}`, async ({ page, app }) => {
+// D2 (fixed in Task 46b), with a plain Accept rather than the scenario's edit, and back to the library without a reload.
+test("a plain Accept in the review queue clears the library row's “Needs review” (R137), seen without reloading the page", async ({ page, app }) => {
   const z = await zoteroSetUp(app, page);
   await importZotero(page, z.dataDir);
   await acceptTheReviewItem(page);
-  expectDefect(D1);
-  // Fixed means a way back from the queue: a link to the import's report, or the browser's Back.
-  const toReport = page.getByRole("link", { name: /report/i });
-  if (await toReport.count()) await toReport.first().click();
-  else await page.goBack();
-  await expect(page.getByRole("heading", { level: 2, name: "Report and undo" })).toBeVisible({ timeout: DEFECT_TIMEOUT });
-  await expect(page.getByRole("button", { name: "Undo import" })).toBeVisible({ timeout: DEFECT_TIMEOUT });
-});
-
-test(`${D2.id}: ${D2.title}`, async ({ page, app }) => {
-  const z = await zoteroSetUp(app, page);
-  await importZotero(page, z.dataDir);
-  await acceptTheReviewItem(page);
-  await page.goto(`${APP_ORIGIN}/?project=${z.projectId}`);
+  await page.getByRole("link", { name: "Back to library" }).click();
   const row = page.getByRole("table", { name: "Sources" }).getByRole("row").filter({ has: page.getByRole("button", { name: REVIEWED, exact: true }) });
   await expect(row).toHaveCount(1);
-  expectDefect(D2);
   // R137: the badge means "an item waits in the review queue"; nothing is asserted about field-level verification.
-  await expect(row.getByText("Needs review")).toHaveCount(0, { timeout: DEFECT_TIMEOUT });
-});
-
-test(`${D4.id}: ${D4.title}`, async ({ page, app }) => {
-  const z = await zoteroSetUp(app, page);
-  // The wizard's defaults: "Copy into the library", and Zotero's linked files not kept where they are.
-  await importZotero(page, z.dataDir);
-  await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 4");
-  expectDefect(D4);
-  // R136: the report states how many files were copied and how many remain links.
-  const report = page.getByRole("region", { name: "Report and undo" });
-  await expect(report).toContainText(/\d[\d,]*\D{0,60}\bcopied\b|\bcopied\b\D{0,60}\d/i, { timeout: DEFECT_TIMEOUT });
-  await expect(report).toContainText(/\d[\d,]*\D{0,60}\blinks?\b|\blinks?\b\D{0,60}\d/i, { timeout: DEFECT_TIMEOUT });
-  // R136: the linked file's bytes are inside the library and the source has no linked file.
-  const pdf = (await z.linkedPdfAsset())!;
-  expect(pdf.linked, JSON.stringify(pdf)).toBeUndefined();
-  const stored = join(z.libraryPath, ...pdf.path.split("/"));
-  expect(resolve(stored).startsWith(resolve(z.libraryPath) + sep), `${pdf.path} is inside the library`).toBe(true);
-  expect(readFileSync(stored).equals(readFileSync(z.linkedPdfPath))).toBe(true);
+  await expect(row.getByText("Needs review")).toHaveCount(0);
 });
 
 // ---------- scenario 4 ----------
@@ -407,25 +404,7 @@ function keysOf(v: unknown): string[] {
   return [];
 }
 
-const D3: Defect = { id: "D3", title: "the source screen displays the proxy (the picture, not only its file name)" };
-
-/** A Live Photo imported through the wizard into an encrypted project that coarsens locations; resolves once both proxies exist. */
-async function importLivePhoto(app: AppHarness, page: Page): Promise<{ projectId: string }> {
-  const phone = join(app.root, "sources", "PHONE");
-  await buildLivePhoto(phone);
-  const { projectId } = await libraryWithProject(app, page, { library: "Field library", project: "Harbour walk", governanceYaml: COARSEN_RULES, passphrase: PASSPHRASE });
-  await openWizard(page, "Camera or phone folder", "Camera or phone folder", phone);
-  await scanAndRun(page);
-  await expect(reportRow(page, "Created")).toHaveAccessibleName("Created 1");
-  const list = (await app.api<SourceList>("GET", `/projects/${projectId}/sources`)).body;
-  const sid = list.items[0]!.id;
-  await expect
-    .poll(async () => (await app.api<StoredSource>("GET", `/projects/${projectId}/sources/${sid}`)).body.assets.filter((a) => a.role === "derived").length, { timeout: 60_000 })
-    .toBe(2);
-  return { projectId };
-}
-
-test("scenario 4: device import of a Live Photo — one source, its proxy, the location coarsened", async ({ page, app }) => {
+test("scenario 4: device import of a Live Photo — one source, its proxy, the location coarsened", async ({ page, app, browserName }) => {
   const phone = join(app.root, "sources", "PHONE");
   const plain = join(app.root, "plain");
   let projectId = "";
@@ -487,7 +466,17 @@ test("scenario 4: device import of a Live Photo — one source, its proxy, the l
     await expect(files.getByRole("listitem").filter({ hasText: /proxy · .* · encrypted/ })).toHaveCount(2);
   });
 
-  await blockedBy(D3);
+  await test.step("the source screen shows the viewing copy as a picture (formerly defect D3), read by authenticated fetch as a blob", async () => {
+    const detail = page.getByRole("region", { name: "Source details" });
+    // The JPEG viewing copy only: the HEIC original is not a picture a browser shows, and the videos are not pictures.
+    await expect(detail.getByRole("img")).toHaveCount(1);
+    await expect(detail.getByRole("img")).toHaveAttribute("src", /^blob:/);
+    // Decoded, not a broken image: it has a size of its own. Not checked in WebKit: there, under this
+    // harness (the app's origin answered by Playwright's route), no blob: picture decodes at all, not
+    // even a known-good JPEG made in the page itself, while Chromium decodes the same bytes (Task 34d report).
+    if (browserName !== "webkit") await expect.poll(() => detail.getByRole("img").evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+    else test.info().annotations.push({ type: "note", description: "blob: pictures do not decode in WebKit under the route-served app origin; decoding checked in Chromium only" });
+  });
 
   await test.step("what the service stored carries no exact location: the record has none, and every stored file is encrypted", async () => {
     const record = JSON.stringify(stored);
@@ -531,16 +520,4 @@ test("scenario 4: device import of a Live Photo — one source, its proxy, the l
     }
     expect(readFileSync(join(libraryPath, ...stored!.assets.find((a) => a.role === "original" && a.kind === "image")!.path.split("/"))).subarray(0, 5).toString("latin1")).toBe("AOENC");
   });
-});
-
-// ---------- the step scenario 4 cannot do yet, on its own (expected to fail while the defect reproduces) ----------
-
-test(`${D3.id}: ${D3.title}`, async ({ page, app }) => {
-  await importLivePhoto(app, page);
-  await page.getByRole("link", { name: "Back to library" }).click();
-  await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: "2026-03-14 iPhone 15 Pro - IMG_0001" }).click();
-  const detail = page.getByRole("region", { name: "Source details" });
-  await expect(detail.getByRole("listitem").filter({ hasText: /proxy · .* · encrypted/ })).toHaveCount(2);
-  expectDefect(D3);
-  await expect(detail.getByRole("img")).toHaveCount(1, { timeout: DEFECT_TIMEOUT });
 });

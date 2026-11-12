@@ -44,7 +44,7 @@ import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import type { SourceInputFile } from "../repo/sources.js";
 import { DEFAULT_SPEECH_MODEL } from "@ao/shared";
 import { WorkerJobError, WorkerToolError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
-import { AcknowledgementRequiredError, incompleteReason, plainReason, toolMissingReason, transcriptToolMissingNote } from "./errors.js";
+import { AcknowledgementRequiredError, CaptureCancelledError, incompleteReason, plainReason, toolMissingReason, transcriptToolMissingNote } from "./errors.js";
 import { storeTranscript } from "../transcript-store.js";
 import { classifyUrl, isCollectionLink, type ClassifiedUrl, type Platform } from "./platforms.js";
 import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport } from "./profile-capture.js";
@@ -99,6 +99,23 @@ export interface ItemContext {
   /** Also download the post's comments (stored as a separate `platform-comments` original). */
   includeComments: boolean;
   metadataOnly: boolean;
+  /** The run was ended from outside (Task 63 I3): a download that comes back then is discarded. */
+  cancelled?: () => boolean;
+  /** Aborted when the run is ended: the worker job in flight is asked to stop (N5). */
+  signal?: AbortSignal;
+}
+
+/** How a queue or a run is ended from outside (Task 63 I3): asked between links and before every store. */
+export interface CaptureControl {
+  /** Stopped between links (a library move, R106): the rest is for the caller to run again. */
+  shouldStop?: () => boolean;
+  /** Ended for good (a lock, a close): a download that comes back is discarded, nothing more is stored. */
+  cancelled?: () => boolean;
+  /**
+   * Aborted when the capture is ended: the worker job in flight is asked to stop (the worker client
+   * sends the worker's cancel), so an ended capture frees the worker promptly (N5).
+   */
+  signal?: AbortSignal;
 }
 
 /** The shared machinery of link and profile capture (package-internal). */
@@ -115,7 +132,7 @@ export interface CaptureCore {
   writeJson(work: string, name: string, data: unknown, projectId: string, encrypted: boolean): Promise<string>;
   makeWork(): Promise<{ work: string; done: () => Promise<void> }>;
   /** One post's full platform metadata (metadata-only download), stripped; undefined when it cannot be read. */
-  fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<Record<string, unknown> | undefined>;
+  fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, signal?: AbortSignal): Promise<Record<string, unknown> | undefined>;
   captureItem(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item: ItemContext): Promise<CaptureOutcome>;
 }
 
@@ -146,6 +163,8 @@ export interface LinkCapture {
     profileUrl: string,
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
+    /** Ended from outside: CaptureCancelledError at the next check, nothing more stored. */
+    control?: Pick<CaptureControl, "cancelled" | "signal">,
   ): Promise<ProfileCaptureReport>;
   /** One link at a time, in order; `onProgress(done, total, outcome)` after each. */
   captureUrls(
@@ -153,8 +172,12 @@ export interface LinkCapture {
     urls: string[],
     opts: CaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
-    /** `shouldStop` is asked before each link; when true the queue stops there (the outcomes so far are returned). */
-    control?: { shouldStop?: () => boolean },
+    /**
+     * `shouldStop` and `cancelled` are asked before each link; when true the queue stops there (the
+     * outcomes so far are returned). `cancelled` is also asked when a download comes back and before
+     * anything is stored: the link is then CANCELLED and nothing of it is stored.
+     */
+    control?: CaptureControl,
   ): Promise<CaptureOutcome[]>;
 }
 
@@ -319,12 +342,13 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return path;
   }
 
-  async function download(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, work: string, metadataOnly: boolean, comments = false): Promise<JobResult> {
+  async function download(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, work: string, metadataOnly: boolean, comments = false, signal?: AbortSignal): Promise<JobResult> {
     const tool = toolFor(c);
     return worker.submit(projectId, {
       type: "capture.download",
       input: c.canonicalUrl,
       output: work,
+      ...(signal ? { signal } : {}),
       params: {
         tool,
         ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
@@ -407,8 +431,10 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     }
   }
 
-  async function captureOne(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item?: ItemContext): Promise<CaptureOutcome> {
+  async function captureOne(projectId: string, url: string, c: ClassifiedUrl, opts: CaptureOptions, item?: ItemContext, control?: CaptureControl): Promise<CaptureOutcome> {
     const platform = c.platform;
+    /** Ended from outside (a lock, a close): checked when the download comes back and before each store. */
+    const cancelled = () => !!(control?.cancelled?.() || item?.cancelled?.());
     const cookies = !!opts.cookiesFromBrowser;
     let identifiable: boolean;
     let legalBasis: string | undefined;
@@ -452,12 +478,14 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       // 5. Download. The raw tool output (info JSON with request headers) stays in this folder.
       let result: JobResult;
       try {
-        result = await download(projectId, c, opts, work, !!existing || !!item?.metadataOnly, !existing && !!item?.includeComments);
+        result = await download(projectId, c, opts, work, !!existing || !!item?.metadataOnly, !existing && !!item?.includeComments, control?.signal ?? item?.signal);
       } catch (err) {
         if (err instanceof WorkerJobError) return workerFailed(url, err);
         if (err instanceof WorkerUnavailableError) return failed(url, "WORKER_UNAVAILABLE");
         throw err;
       }
+      // Ended while it downloaded: the result is discarded (the work folder goes in `done`).
+      if (cancelled()) return failed(url, "CANCELLED");
       const meta = result.meta;
       const files = (Array.isArray(meta.files) ? meta.files : []).filter((f): f is string => typeof f === "string");
       const infoFiles = (Array.isArray(meta.infoJson) ? meta.infoJson : []).filter((f): f is string => typeof f === "string").sort();
@@ -477,6 +505,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
         if (!opts.refreshIfExists) return { url, status: "duplicate", sourceId: existing };
         if (!raw) return failed(url, partialCode ?? "NOTHING_SAVED");
         if (!(await stillAllowed(projectId, platform))) return failed(url, "POLICY_CHANGED");
+        if (cancelled()) return failed(url, "CANCELLED");
         await refresh(projectId, existing, stored, work, result.encrypted);
         return { url, status: "refreshed", sourceId: existing };
       }
@@ -535,6 +564,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       if (item) draft.collectionIds = [...item.collectionIds];
       // Immediately before storing: the rules may have changed during the download (R42).
       if (!(await stillAllowed(projectId, platform))) return failed(url, "POLICY_CHANGED");
+      if (cancelled()) return failed(url, "CANCELLED");
       const sf = await createSourcePreAuthorized(repo, projectId, draft, inputs, {
         provenance,
         fieldEvidence: evidence,
@@ -584,7 +614,8 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       if (captionsFailed) notes.push("The source was saved, but some captions could not be stored.");
       let missingTool: string | undefined;
       const wantTranscript = opts.transcribe === "project-default" ? repo.getProject(projectId).automation?.transcribeNewMedia === true : opts.transcribe;
-      if (wantTranscript && firstMedia) {
+      // Ended after the source was stored (before the end): no transcript is made for it now.
+      if (wantTranscript && firstMedia && !cancelled()) {
         const t = await transcribe(projectId, sf, firstMedia, opts, work);
         if (t) notes.push(t.note);
         if (t?.tool) missingTool = t.tool;
@@ -599,12 +630,12 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     }
   }
 
-  async function fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions): Promise<Record<string, unknown> | undefined> {
+  async function fetchMetadata(projectId: string, c: ClassifiedUrl, opts: CaptureOptions, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
     const { work, done } = await makeWork();
     try {
       let r: JobResult;
       try {
-        r = await download(projectId, c, opts, work, true);
+        r = await download(projectId, c, opts, work, true, false, signal);
       } catch (err) {
         if (err instanceof WorkerJobError || err instanceof WorkerUnavailableError) return undefined;
         throw err;
@@ -633,16 +664,21 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
   };
   const profiles = createProfileCapture(core);
 
-  async function captureUrl(projectId: string, url: string, opts: CaptureOptions): Promise<CaptureOutcome> {
+  async function captureUrl(projectId: string, url: string, opts: CaptureOptions, control?: CaptureControl): Promise<CaptureOutcome> {
     // The browser session needs the one-time acknowledgement, whatever the link is.
     if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(url);
     if (isCollectionLink(c)) {
       if (deps.captureProfile) return deps.captureProfile(projectId, url, opts);
-      return profiles.outcomeOf(url, await profiles.captureProfile(projectId, url, opts));
+      try {
+        return profiles.outcomeOf(url, await profiles.captureProfile(projectId, url, opts, undefined, control));
+      } catch (err) {
+        if (err instanceof CaptureCancelledError) return failed(url, "CANCELLED");
+        throw err;
+      }
     }
     if (c.platform === "other") return failed(url, "UNSUPPORTED_URL");
-    return inLane(c.platform, () => captureOne(projectId, url, c, opts));
+    return inLane(c.platform, () => captureOne(projectId, url, c, opts, undefined, control));
   }
 
   async function captureUrls(
@@ -650,17 +686,17 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     urls: string[],
     opts: CaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
-    control: { shouldStop?: () => boolean } = {},
+    control: CaptureControl = {},
   ): Promise<CaptureOutcome[]> {
     // Ask once, before the queue starts.
     if (opts.cookiesFromBrowser && !acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const out: CaptureOutcome[] = [];
     for (const url of urls) {
       // Stopped between links (a library move, R106): the rest is for the caller to run again.
-      if (control.shouldStop?.()) break;
+      if (control.shouldStop?.() || control.cancelled?.()) break;
       let o: CaptureOutcome;
       try {
-        o = await captureUrl(projectId, url, opts);
+        o = await captureUrl(projectId, url, opts, control);
       } catch (err) {
         if (err instanceof AcknowledgementRequiredError) throw err;
         if (err instanceof PolicyDeniedError) o = failed(url, "POLICY_DENIED", err.reason);
@@ -677,5 +713,5 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return out;
   }
 
-  return { captureUrl, captureUrls, captureProfile: profiles.captureProfile, transcribeSource };
+  return { captureUrl: (projectId, url, opts) => captureUrl(projectId, url, opts), captureUrls, captureProfile: profiles.captureProfile, transcribeSource };
 }

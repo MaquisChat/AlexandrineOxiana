@@ -22,6 +22,8 @@ export interface ImportReport {
   startedAt: string;
   finishedAt?: string;
   counts: { items: number; created: number; needsReview: number; duplicates: number; merged: number; updated: number; unchanged: number; deletedHere: number; failed: number };
+  /** Files this import stored: copied into the library, and left as links where they were (R136). Always given. */
+  files: { copied: number; linked: number };
   failures: Array<{ item: string; reason: string }>;
   /** Items imported without some of their linked files (e.g. "attached file not found"); never a path (R66). */
   fileNotes: Array<{ item: string; note: string }>;
@@ -84,6 +86,8 @@ function markdown(r: ImportReport): string {
     ...(r.counts.updated || r.counts.unchanged ? [`- Updated from a newer version: ${r.counts.updated}`, `- Unchanged since the last import: ${r.counts.unchanged}`] : []),
     ...(r.counts.deletedHere ? [`- Deleted here — not re-imported: ${r.counts.deletedHere}`] : []),
     `- Failed: ${r.counts.failed}`,
+    `- Files copied into the library: ${r.files.copied}`,
+    `- Files left as links: ${r.files.linked}`,
     "",
   ];
   if (r.failures.length) {
@@ -130,6 +134,16 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
   const notesByKey = new Map<string, string[]>();
   for (const e of journal) if (e.notes?.length && !notesByKey.has(e.key)) notesByKey.set(e.key, e.notes);
   const c = countOutcomes(latest.values());
+  // Files stored, by item (its first line that stored any); an item that failed or was skipped in review keeps none.
+  const filesByKey = new Map<string, { copied: number; linked: number }>();
+  for (const e of journal) if (e.files && !filesByKey.has(e.key)) filesByKey.set(e.key, e.files);
+  const files = { copied: 0, linked: 0 };
+  for (const [key, f] of filesByKey) {
+    const last = latest.get(key)?.outcome;
+    if (last === "failed" || last === "skipped") continue;
+    files.copied += f.copied;
+    files.linked += f.linked;
+  }
   const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.batchId === batchId && e.status === "pending");
   const report: ImportReport = {
     batchId,
@@ -139,6 +153,7 @@ export async function batchReport(repo: Repo, projectId: string, batchId: string
     startedAt: rec.startedAt,
     ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
     counts: c,
+    files,
     failures: [...latest.values()].filter((e) => e.outcome === "failed").map((e) => ({ item: reportLabel(e.key, rec.secret), reason: e.reason ?? "The item could not be imported." })),
     fileNotes: [...notesByKey].flatMap(([key, notes]) => notes.map((note) => ({ item: reportLabel(key, rec.secret), note }))),
     pendingReview: pending.map((e) => ({ reviewId: e.id, ...(e.sourceId ? { sourceId: e.sourceId } : {}), reasons: e.reasons })),

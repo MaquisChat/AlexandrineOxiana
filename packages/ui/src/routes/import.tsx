@@ -1,5 +1,6 @@
 /**
- * Bulk Import routes (Task 35, R113): `/import` is the wizard, `/import/review` the review queue
+ * Bulk Import routes (Task 35, R113): `/import` is the wizard (`?project=<id>`; with `&batch=<id>`
+ * it opens that import's run or report, D1), `/import/review` the review queue
  * (`?project=<id>&batch=<id>`, else a picker). App.tsx's route table (R118) renders what
  * `importRoute` returns for these paths; null means the path is not an import route.
  */
@@ -23,7 +24,15 @@ export function importRoute(loc: RouteLocation, client: ApiClient): ReactElement
   if (path === IMPORT_PATHS.wizard) {
     // An id from the address is used only when it is a valid id (R115 I3); otherwise it is ignored.
     const project = q.get("project");
-    return <ImportWizard key={key} client={client} {...(isValidId(project) ? { projectId: project } : {})} />;
+    const batch = q.get("batch");
+    return (
+      <ImportWizard
+        key={key}
+        client={client}
+        {...(isValidId(project) ? { projectId: project } : {})}
+        {...(isValidId(project) && isValidId(batch) ? { batchId: batch } : {})}
+      />
+    );
   }
   if (path === IMPORT_PATHS.review) {
     const project = q.get("project");

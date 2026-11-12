@@ -373,6 +373,20 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service and UI tests for each kind of entry; `pnpm e2e -- --app-only --trace off`.
 - Model: Opus.
 
+**Task 50b — Restore asks the policy engine; a missing backups manifest is rebuilt (D15) [ledger: R174, R175, R147, R138, R125, R92, R154]**
+- Depends: 49. Split from Task 50; widened by R174 after Task 49's fourth round.
+- Files: `packages/library/src/repo/restore.ts`, `packages/library/src/export/backup.ts` and `retention.ts` (the manifest loader and the destruction's list-building only), `packages/core` (the policy engine, only if restore needs an operation it does not have), `apps/library-service/src` (the restore route's answer), `docs/governance/README.md`, `docs/adr/0005-governance-checkpoint.md`, tests.
+- Accept: restoring a backup is evaluated by the policy engine before anything is written, fails closed, and a refusal is audited and said in plain words; a missing `backups-manifest.json` beside existing backup files is rebuilt like a damaged one before any decision that depends on it, and if it cannot be rebuilt every backup of the project is listed as needing a look and the warning is raised, never "none"; restore decides what not to bring back from the destruction record as the audit log gives it, not from certificate files alone; a restored project's warning about inherited backups stands from the restore itself; nothing Task 49's reviews established regresses (the event counts, R147's six requirements, R175).
+- Verify: `pnpm --filter @ao/library exec vitest run src/export src/repo` and the retention and restore files; service tests; `pnpm -r typecheck`.
+- Model: the most capable tier (this module took five rounds in Task 49).
+
+**Task 68 — Settings writers never write what they did not read (D16) [ledger: R96, R159]**
+- Depends: 66 (it fixed the same shape for the pairings).
+- Files: `apps/library-service/src/routes/fonts.ts`, `routes/appearance.ts`, the app-settings helper they share with the pairings, tests.
+- Accept: a change to the fonts index or to the appearance settings is written only over what was read successfully; when the read fails the change is refused in plain words (no path) and nothing is written; a missing file on a fresh settings folder is still "nothing yet", not a failure; the same check for every other writer of a file in the app's settings folder, each named in the report. A settings file that stays unreadable (the pairings, the fonts index, the appearance settings) has a way out the researcher can find: an explicit, confirmed reset of that one file, said in plain words with what will be lost (Task 66's M8).
+- Verify: service tests (unreadable, a directory in its place, invalid JSON, truncated, missing) for each writer.
+- Model: Opus (the Task 66 implementer).
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
 - Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
@@ -460,6 +474,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by the review of Task 37i (for Task 66): D13 (high): the library service takes a new port at every launch, and the browser extension keeps the port typed at pairing and never looks for another, so a paired browser stops working each time the app is reopened ("The desktop app is not answering on port N") until it is unpaired and paired again.
 - Defect found by the review of Task 46b (for Task 67): D14 (high): the review queue screen lists the items of one import batch only. Entries queued by a drag-and-drop attach, by a capture with conflicting fields or by a consent withdrawal cannot be seen or decided anywhere, so their "Needs review" badge cannot be cleared.
 - Defect found by Task 49's fourth round (for Task 50b): D15 (high): a deleted `backups-manifest.json` is read as "no backups", so a destruction lists none, its certificate says "none", and a backup that holds the destroyed file stays.
+- Defect found by Task 66's fix round (for Task 68): D16: when the fonts index or the appearance settings cannot be read at the moment of a change, the change is written over defaults — the other fonts' entries are dropped (their files stay, unlisted), or the other appearance settings are reset.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -478,24 +493,24 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | approved; takes the working branch after Task 51, then verification | e50933c (worktree branch) | reviewed with probes over one fix round (one Critical closed) |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; verification before merge | ae4de75 (worktree branch) | reviewed with probes over one fix round; "Needs review" follows every pending entry (R172); D14 remains for Task 67 |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | done | 700b7eb | reviewed with probes over one fix round; D1, D2, D6, D7 closed; none of D1–D8 is open; "Needs review" follows every pending entry (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | approved; one binary reader, then verification before merge | cc2fe64 (worktree branch) | reviewed with probes over two fix rounds (R145, R149); after Task 57 merges its `blob()` uses move onto `bytes()` |
+| 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | fix round 2 | 7a59e9a (worktree branch) | I1 and I2 closed; new Important: a queue outlives a lock that is undone before its download ends |
-| 62 Transcription as a job | not started | | found by the Task 34c review |
+| 63 Capture state readable; one classifier | done | 960aacc | reviewed with probes over two fix rounds and a final check; a locked project's captures are neither probed nor kept; `recordEdit` fixed |
+| 62 Transcription as a job | fix round 1 | f867056 (worktree branch) | reviewed with probes: 3 Important (a forbidden transcription not refused at the start; a lock during a run loses it; a refused rerun blocks the source for good) |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
-| 49 Backups governed | fix round 5 | 6bdcab6 (worktree branch) | round 4 reviewed against R147: sound for deletion; 2 Important for what is written (a restore rewrites certificates; a pass writes on an unverified chain); R175 |
+| 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
+| 50b Restore asks the policy engine | in progress | | dispatched 2026-11-12 after Task 49 merged; also D15 (a missing backups manifest), restore reading destructions through the audit log, and a restored project's warning from the restore (R174) |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -511,10 +526,11 @@ Update after every task; commit and push.
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
-| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | in progress | | dispatched 2026-11-12 after Task 46b merged; the transcript half of D10 was closed by Task 34d |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | in progress | | dispatched 2026-11-12 after Task 46c merged |
-| 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
+| 66 A paired browser survives a relaunch (D13) | approved; verification before merge | 94816e0 (worktree branch) | reviewed with probes over one fix round; the working branch taken three times as it moved |
+| 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
+| 67 One review queue for the project (D14) | in progress | | dispatched 2026-11-12 after Task 46b merged |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |

@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import type { Asset, Collection, DateRule, ConsentRecord, GovernanceConfig, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -46,7 +46,7 @@ import {
 } from "./fieldwork.js";
 import { scanIncompleteLines, type IncompleteLine } from "./incomplete-lines.js";
 import { foldName, readMaybe } from "./io.js";
-import { authorizeOnly, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
+import { authorizeOnly, decide, runMutation, type InternalMutateOptions, type MutateOptions, type MutateRequest, type RefuseHook, type Tx } from "./mutate.js";
 import {
   RECOVERY_CODE_UNSHOWN_WARNING,
   completeRecoveryActivation,
@@ -85,7 +85,7 @@ import { InvalidInputError, NotFoundError, PolicyDeniedError, RecoveryPendingErr
 import { completeRecordedResolves, pendingWrites, resolvePendingWrite, type PendingWrite, type PendingWriteChoice } from "./pending-writes.js";
 import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutcome } from "./txn.js";
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
-import { destroyAssets, type DestroyInput } from "./destroy.js";
+import { amendDestruction, destroyAssets, type AmendInput, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
 import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
@@ -1092,9 +1092,23 @@ export async function deletedRecordsTrouble(repo: Repo, projectId: string): Prom
 export const BACKUP_FAILED_WARNING = "backup-failed";
 
 /**
+ * Persisted in `Backups/backups-state.json` (`pending`) when old backups were removed but their
+ * `backup.prune` audit event could not be written yet (R125, R82); cleared once it is recorded.
+ */
+export const BACKUP_AUDIT_PENDING_WARNING = "backup-audit-pending";
+
+/**
+ * Noted in `Backups/backups-state.json` (`undestroyed`) while a backup listed at a destruction under
+ * the retention rule is not yet verifiably gone (R138 e, N1, R147). The note is rewritten from the
+ * audit log at every retry pass, and cleared once every listed backup is recorded as removed or as
+ * no longer present.
+ */
+export const DESTRUCTION_BACKUPS_PENDING_WARNING = "destruction-backups-pending";
+
+/**
  * The project's standing warnings (persisted ones: 'deleted-records-unreadable', R74 I2;
- * 'backup-failed', R92; 'recovery-code-unshown', R141 b; 'audit-unrecorded' and
- * 'permissions-not-set', Task 50).
+ * 'backup-failed', R92; 'backup-audit-pending', R125; 'destruction-backups-pending', R147;
+ * 'recovery-code-unshown', R141 b; 'audit-unrecorded' and 'permissions-not-set', Task 50).
  */
 export async function projectWarnings(repo: Repo, projectId: string): Promise<string[]> {
   const core = cores.get(repo)!;
@@ -1107,8 +1121,16 @@ export async function projectWarnings(repo: Repo, projectId: string): Promise<st
   if ((await readOutbox(core.library.appConfigDir, core.library.id)).some((e) => e.projectId === projectId)) out.push(AUDIT_WAITING_WARNING);
   try {
     const raw = await readMaybe(join(core.root, "Backups", "backups-state.json"));
-    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown> }) : undefined;
+    const m = raw ? (JSON.parse(raw.toString("utf8")) as { failures?: Record<string, unknown>; pending?: Record<string, unknown>; undestroyed?: Record<string, unknown> }) : undefined;
     if (m?.failures && Object.hasOwn(m.failures, projectId)) out.push(BACKUP_FAILED_WARNING);
+    const stuck = m?.undestroyed && typeof m.undestroyed === "object" && Object.hasOwn(m.undestroyed, projectId) ? m.undestroyed[projectId] : undefined;
+    // Per destruction certificate (R2-I2): the warning stands while any of them has a backup left.
+    const lists = Array.isArray(stuck) ? [stuck] : stuck && typeof stuck === "object" ? Object.values(stuck as Record<string, unknown>) : [];
+    if (lists.some((l) => Array.isArray(l) && l.length > 0)) out.push(DESTRUCTION_BACKUPS_PENDING_WARNING);
+    const pending = m?.pending && typeof m.pending === "object" ? Object.values(m.pending) : [];
+    if (pending.some((op) => (op as { kind?: unknown; projectId?: unknown; auditFailed?: unknown } | null)?.kind === "prune" && (op as { projectId?: unknown }).projectId === projectId && (op as { auditFailed?: unknown }).auditFailed === true)) {
+      out.push(BACKUP_AUDIT_PENDING_WARNING);
+    }
   } catch {
     // an unreadable manifest is handled (and rebuilt) by the backups module
   }
@@ -1161,7 +1183,7 @@ export function updateSourceRechecked(
   repo: Repo,
   projectId: string,
   id: string,
-  patch: SourcePatch,
+  patch: Parameters<typeof updateSource>[3],
   extra: Parameters<typeof updateSource>[4],
 ): Promise<SourceFile> {
   return updateSource(cores.get(repo)!, projectId, id, patch, extra);
@@ -1256,6 +1278,13 @@ export interface ProjectQueueContext {
   at(): string;
   /** Appends one audit event about the project (decision allow), anchored. */
   audit(action: string, details: Record<string, unknown>): Promise<void>;
+  /**
+   * Evaluates a request in this turn, against the governance in force now (a backup's commit
+   * point, R138 c): a deny is audited and thrown as PolicyDeniedError, as in any governed write.
+   */
+  decide(req: MutateRequest, opts: { op: string; entity?: { type: EntityType; id: string }; unaudited?: boolean }): Promise<PolicyDecision>;
+  /** Appends one audit event about the project with the given decision (e.g. a deny with what it refused), anchored. */
+  record(action: string, decision: { result: "allow" } | { result: "deny"; reason: string }, details: Record<string, unknown>): Promise<void>;
 }
 
 /**
@@ -1282,6 +1311,14 @@ export function withProjectQueue<T>(repo: Repo, projectId: string, fn: (ctx: Pro
         const at = core.clock().toISOString();
         await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision: { result: "allow" }, details });
       },
+      decide: async (req, o) => {
+        const [first] = await decide(core, st, req, core.clock().toISOString(), o.op, o.entity, undefined, o.unaudited === true);
+        return first!.d;
+      },
+      record: async (action, decision, details) => {
+        const at = core.clock().toISOString();
+        await core.auditNow(st, { ...core.auditBase(st, at), action, entity: { type: "project", id: projectId }, decision, details });
+      },
     });
   });
 }
@@ -1305,6 +1342,56 @@ export function adoptRestoredProject(repo: Repo, s: StagedRestore): ReturnType<t
 export function destroyProjectAssets(repo: Repo, projectId: string, input: DestroyInput): ReturnType<typeof destroyAssets> {
   return destroyAssets(cores.get(repo)!, projectId, input);
 }
+
+/** Package-internal (retention, R147): the governed change that writes an amendment beside a destruction certificate. */
+export function amendProjectDestruction(repo: Repo, projectId: string, input: AmendInput): ReturnType<typeof amendDestruction> {
+  return amendDestruction(cores.get(repo)!, projectId, input);
+}
+
+/**
+ * Package-internal (retention, R147): the project's audit events whose line contains one of
+ * `needles`. `headMatches`: the log on disk ends at the head this process holds (the one checked
+ * against the anchor at open, moved on only by this process's own appends); false means the log
+ * changed outside the app since. The log is read outside the write queue (it can be long, and this
+ * runs hourly for every project); only the comparison with the head runs in the queue. If the two do
+ * not match, an entry may have been appended while the log was read: it is read once more, in the
+ * queue, where nothing is appended meanwhile.
+ */
+export async function auditEventsMentioning(repo: Repo, projectId: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; headMatches: boolean }> {
+  const core = cores.get(repo)!;
+  const first = await AuditStore.readMatching(core.state(projectId).audit.dir, needles);
+  return core.serial(async () => {
+    const st = core.state(projectId);
+    if (endsAt(first.last, st.audit.head)) return { events: first.events, headMatches: true };
+    const { events, last } = await AuditStore.readMatching(st.audit.dir, needles);
+    return { events, headMatches: endsAt(last, st.audit.head) };
+  });
+}
+
+/**
+ * Package-internal (retention, R147): every audit event of the project, only when its chain of
+ * hashes verifies and it ends at the head this process holds; otherwise `ok: false` (the log is not
+ * what the app wrote, so nothing may be removed on its word). Read and verified outside the write
+ * queue, the head compared in it; a reading that does not pass is made once more in the queue, so an
+ * entry appended meanwhile is never taken for a change made outside the app.
+ */
+export async function verifiedAuditEvents(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+  const core = cores.get(repo)!;
+  const read = async () => {
+    const events = (await AuditStore.read(core.state(projectId).audit.dir)) as AuditEvent[];
+    return { events, verify: verifyChain(events) };
+  };
+  let r = await read();
+  return core.serial(async () => {
+    const head = core.state(projectId).audit.head;
+    if (!r.verify.ok || !endsAt(r.verify.head, head)) r = await read();
+    if (!r.verify.ok || !endsAt(r.verify.head, head)) return { ok: false as const };
+    return { ok: true as const, events: r.events };
+  });
+}
+
+const endsAt = (last: { seq: number; hash: string } | null, head: { seq: number; hash: string } | null): boolean =>
+  (last?.seq ?? 0) === (head?.seq ?? 0) && (last?.hash ?? "") === (head?.hash ?? "");
 
 /** Sets a project's backup settings (daily automatic backup, how many to keep); governed and audited. */
 export function setProjectBackupSettings(repo: Repo, projectId: string, settings: BackupSettings): Promise<Project> {

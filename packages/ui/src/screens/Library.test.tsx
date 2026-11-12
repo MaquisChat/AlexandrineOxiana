@@ -29,6 +29,13 @@ describe("Library screen", () => {
     expect(clinic.textContent).toMatch(/Locked/);
   });
 
+  it("the library's name heading takes its direction from the text itself (D7)", async () => {
+    server.use(...libraryHandlers());
+    renderLibrary({ ...CURRENT_RW, name: "مكتبة الأطروحة" });
+    const heading = await screen.findByRole("heading", { level: 1, name: "مكتبة الأطروحة" });
+    expect(heading.getAttribute("dir")).toBe("auto");
+  });
+
   it("shows nested collections, tags and the project's sources", async () => {
     server.use(...libraryHandlers());
     renderLibrary();
@@ -181,6 +188,103 @@ describe("Library screen", () => {
     server.use(...libraryHandlers({ events: [{ type: "job.progress", data: { kind: "transcription", jobId: "j1", done: 40, total: 100, finished: false } }] }));
     renderLibrary();
     expect(await screen.findByText(/Transcribing recordings 40\/100/)).toBeTruthy();
+  });
+
+  it("D8: while the index is rebuilt, the source list says so instead of showing an empty library, and fills in when it is ready", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0 };
+    let calls = 0;
+    server.use(
+      http.get(url("/projects/:id/sources"), () => {
+        calls++;
+        return HttpResponse.json(calls === 1 ? { total: 0, items: [], index: rebuilding } : SOURCES);
+      }),
+      ...libraryHandlers({
+        current: { ...CURRENT_RW, index: rebuilding },
+        state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} },
+        events: [
+          { type: "job.progress", data: { kind: "index", done: 1, total: 4 } },
+          { type: "library.state", data: { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} } },
+        ],
+      }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText(/The library's search index is being rebuilt from its files/)).toBeTruthy();
+    expect(screen.queryByText(/No sources/)).toBeNull();
+    // Once it is ready the sources are read again.
+    expect(await screen.findByText("Ethnography at Work", {}, { timeout: 5000 })).toBeTruthy();
+    expect(screen.queryByText(/being rebuilt from its files/)).toBeNull();
+  });
+
+  it("D8: the rebuilding banner shows from the library's state, before any progress arrives", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0 };
+    server.use(...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }));
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect((await screen.findByText(/^Index rebuilding\./)).closest("[role=status]")).toBeTruthy();
+  });
+
+  it("D8: an index that could not be rebuilt says so plainly and points to “Rebuild library from folder”", async () => {
+    const failed = { state: "failed", message: "The library's search index could not be rebuilt (disk trouble)." };
+    server.use(...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }));
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    const banner = (await screen.findByText(/search index could not be rebuilt/)).closest("[role=status]") as HTMLElement;
+    expect(banner).toBeTruthy();
+    expect(banner.textContent).toMatch(/Your sources are safe in the library folder/);
+    expect(banner.textContent).not.toMatch(/disk trouble/);
+    expect(within(banner).getByRole("link", { name: "Rebuild library from folder" }).getAttribute("href")).toBe("/missing-files");
+  });
+
+  it("D8: when the index could not be rebuilt and lists nothing, the list says so instead of “no sources”", async () => {
+    const failed = { state: "failed", message: "x" };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ total: 0, items: [], index: failed })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    expect(await screen.findByText(/The sources cannot be listed: the library's search index could not be rebuilt/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a partial index being rebuilt is never shown as a short list: “being rebuilt” in its place", async () => {
+    const rebuilding = { state: "rebuilding", done: 0, total: 0, partial: true };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, total: 1, items: SOURCES.items.slice(0, 1), index: rebuilding })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText(/The library's search index is being rebuilt from its files/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a partial index whose rebuild failed is never shown as a short list: the failure in its place", async () => {
+    const failed = { state: "failed", message: "x", partial: true };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, total: 1, items: SOURCES.items.slice(0, 1), index: failed })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: failed }, state: { open: true, ...CURRENT_RW, index: failed, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: failed });
+    expect(await screen.findByText(/The sources cannot be listed: the library's search index could not be rebuilt/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Sources" })).toBeNull();
+  });
+
+  it("C1: a whole index being rebuilt (not partial) keeps its list shown", async () => {
+    const rebuilding = { state: "rebuilding", done: 1, total: 4 };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, index: rebuilding })),
+      ...libraryHandlers({ current: { ...CURRENT_RW, index: rebuilding }, state: { open: true, ...CURRENT_RW, index: rebuilding, integrityWarnings: [], projectWarnings: {} } }),
+    );
+    renderLibrary({ ...CURRENT_RW, index: rebuilding });
+    expect(await screen.findByText("Ethnography at Work")).toBeTruthy();
+  });
+
+  it("D8: a read-only library says its index cannot be built here and search looks at titles only", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "locked-by-other-device", lockedBy: "field-laptop", index: { state: "unavailable", reason: "locked-by-other-device" } };
+    server.use(
+      http.get(url("/projects/:id/sources"), () => HttpResponse.json({ ...SOURCES, index: { state: "unavailable", reason: "locked-by-other-device" } })),
+      ...libraryHandlers({ current: ro }),
+    );
+    renderLibrary(ro);
+    expect(await screen.findByText("Ethnography at Work")).toBeTruthy();
+    expect(screen.getByText(/open read-only, so its search index cannot be built here.*titles only/)).toBeTruthy();
   });
 
   it("a locked encrypted project shows UnlockProject; a wrong passphrase says nothing was changed", async () => {

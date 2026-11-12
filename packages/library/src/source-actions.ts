@@ -31,12 +31,14 @@ export async function checkCaptureAllowed(repo: Repo, projectId: string, urls: s
   }
 }
 
-/** Source fields a person may set through confirmField (top-level bibliographic fields). */
+/**
+ * Source fields a person may set through confirmField (top-level bibliographic fields). The
+ * identifiers are not here: they are confirmed one at a time as `/identifiers/<key>` (R149).
+ */
 export const CONFIRMABLE_FIELDS: ReadonlySet<string> = new Set([
   "title",
   "creators",
   "issued",
-  "identifiers",
   "container",
   "publisher",
   "type",
@@ -59,12 +61,49 @@ export const CONFIRMABLE_FIELDS: ReadonlySet<string> = new Set([
  * value agrees). Throws TypeError for a field that cannot be set this way or an invalid value.
  */
 export async function confirmField(repo: Repo, projectId: string, sourceId: string, field: string, value: unknown): Promise<SourceFile> {
+  const ident = /^\/?identifiers\/(.+)$/.exec(field);
+  if (ident) return confirmIdentifier(repo, projectId, sourceId, ident[1]!, value);
   const name = field.replace(/^\//, "");
   if (!CONFIRMABLE_FIELDS.has(name)) throw new InvalidInputError(`"${field}" is not a field that can be set here`);
   const at = new Date().toISOString();
   const pointer = `/${name}`;
   return updateSourceRechecked(repo, projectId, sourceId, { [name]: value } as Partial<Omit<Source, "id">>, {
     fieldEvidence: (cur) => [...cur.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
+    verification: (next) => recheckSourceFile(next, {}).verification,
+  });
+}
+
+/**
+ * Identifiers a person may confirm one at a time (R149), named as the verification report names
+ * them: `/identifiers/<key>`. `platform` is a classification, not an identifier, and is not here.
+ */
+export const CONFIRMABLE_IDENTIFIERS: ReadonlySet<string> = new Set(["doi", "isbn", "issn", "url", "platformPostId", "arxiv"]);
+const IDENTIFIER_MAX = 2048;
+
+const identifierText = (v: unknown): v is string => typeof v === "string" && v.trim() !== "" && v.length <= IDENTIFIER_MAX;
+
+/**
+ * One identifier set by the researcher and recorded as their evidence at `/identifiers/<key>`, the
+ * pointer the verification report uses, so the badge can become user-confirmed (R149). The other
+ * identifiers are kept. ISBN is a list in the record: a single ISBN is recorded as a list of one.
+ */
+async function confirmIdentifier(repo: Repo, projectId: string, sourceId: string, key: string, raw: unknown): Promise<SourceFile> {
+  if (!CONFIRMABLE_IDENTIFIERS.has(key)) throw new InvalidInputError(`"/identifiers/${key}" is not a field that can be set here`);
+  let value: string | string[];
+  if (key === "isbn") {
+    const list = typeof raw === "string" ? [raw] : raw;
+    if (!Array.isArray(list) || list.length === 0 || list.length > 50 || !list.every(identifierText)) throw new InvalidInputError("an ISBN must be text (or a list of them)");
+    value = list.map((x) => x.trim());
+  } else {
+    if (!identifierText(raw)) throw new InvalidInputError(`the ${key} must be text of at most ${IDENTIFIER_MAX} characters`);
+    value = raw.trim();
+  }
+  const pointer = `/identifiers/${key}`;
+  const at = new Date().toISOString();
+  // The other identifiers are taken from the source as read inside the governed change, so two
+  // confirms at once both land (re-review N2: no lost update).
+  return updateSourceRechecked(repo, projectId, sourceId, (cur) => ({ identifiers: { ...cur.identifiers, [key]: value } }), {
+    fieldEvidence: (c) => [...c.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
     verification: (next) => recheckSourceFile(next, {}).verification,
   });
 }

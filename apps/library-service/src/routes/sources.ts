@@ -71,6 +71,21 @@ export function sourceRecord(sf: SourceFile, roots: Iterable<string>): SourceFil
   };
 }
 
+/**
+ * Of `ids`, the sources with at least one pending entry in the project's review queue, of any kind
+ * and whether or not it belongs to an import batch (R172, refining R137: that, and nothing else, is
+ * what a library row's "Needs review" means; field verification is shown on the source screen).
+ * Read from the index's `review_items`, the cache of `review/pending.jsonl` that every queued entry,
+ * every decision and every undo updates; it holds only ids, kinds and statuses for encrypted projects.
+ */
+function waitingForReview(db: { prepare(sql: string): { all(...p: unknown[]): unknown[] } }, projectId: string, ids: string[]): Set<string> {
+  if (!ids.length) return new Set();
+  const rows = db
+    .prepare(`SELECT DISTINCT source_id FROM review_items WHERE project_id = ? AND status = 'pending' AND source_id IN (${ids.map(() => "?").join(",")})`)
+    .all(projectId, ...ids) as Array<{ source_id: string }>;
+  return new Set(rows.map((r) => r.source_id));
+}
+
 async function sourceOf(ctx: Ctx, projectId: string, sid: string): Promise<SourceFile> {
   const s = ctx.state.requireSession();
   if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
@@ -87,8 +102,10 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const limit = intParam(q.limit, "limit", 1, 500, 50);
     const offset = intParam(q.offset, "offset", 0, 10_000_000, 0);
     if (q.type !== undefined && !SourceType.safeParse(q.type).success) throw badRequest(`"${q.type}" is not a source type.`);
+    // While the index is rebuilt (or cannot be written), the list says so (D8).
+    const index = s.indexStatus ? { index: s.indexStatus } : {};
     if (s.index) {
-      return search(s.index.db, {
+      const found = search(s.index.db, {
         projectId,
         ...(q.text ? { text: q.text.slice(0, 500) } : {}),
         ...(q.type ? { types: [q.type as SourceType] } : {}),
@@ -97,8 +114,13 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
         limit,
         offset,
       });
+      const waiting = waitingForReview(s.index.db, projectId, found.items.map((i) => i.id));
+      // A locked project's queue cannot be read (review/pending.jsonl is encrypted): its rows claim
+      // nothing (false, as the index stores for locked rows); they show "Locked" instead.
+      return { ...found, items: found.items.map((i) => ({ ...i, needsReview: !i.locked && waiting.has(i.id) })), ...index };
     }
     // A read-only library has no index we may write: list from the files (titles only when unlocked).
+    // Its review queue is not read here, so no row claims needsReview (Task 46b M4).
     const items = [];
     for (const id of s.repo.listSourceIds(projectId)) {
       const sf = await s.repo.getSource(projectId, id).catch(() => undefined);
@@ -112,7 +134,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false });
     }
     // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
-    return { total: items.length, items: items.slice(offset, offset + limit), limited: true };
+    return { total: items.length, items: items.slice(offset, offset + limit), limited: true, ...index };
   });
 
   const record = (sf: SourceFile) => sourceRecord(sf, state.roots);
@@ -149,6 +171,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   });
 
   // Researcher-set value of one field, recorded as their own evidence (→ user-confirmed when it agrees).
+  // `field` is a top-level field or one identifier under the verification report's key ("/identifiers/doi", R149);
+  // anything else is refused by the library (InvalidInputError → 400 VALIDATION).
   app.patch("/projects/:id/sources/:sid/fields", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
