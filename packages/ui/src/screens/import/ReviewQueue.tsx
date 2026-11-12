@@ -26,7 +26,7 @@
  * project's entries are neither listed nor decided, and nothing about them is shown; answers for
  * another project, after a lock or after the screen closed are dropped.
  */
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { ApiClient } from "../../api/client";
 import {
   importApi,
@@ -560,6 +560,7 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
               flagFolderNames={flagging ? (id: string) => madeByBatch(id, itemBatch(item)) : () => false}
               busy={busy}
               onDecide={(d, done) => void decide(item, d, done)}
+              onConfirm={(field, value) => confirmField(item, field, value)}
             />
           )}
           {item && item.kind !== "import" && (
@@ -592,6 +593,33 @@ function valueAt(src: Record<string, unknown>, pointer: string): unknown {
   return cur;
 }
 
+/**
+ * The fields of an entry that need checking, each with its verification badge and evidence dialog:
+ * the source screen's own FieldCheck and confirm (R149), never a second implementation.
+ */
+function FieldsToCheck({ item, source, pointers, onConfirm, children }: { item: ReviewItem; source: SourceFile; pointers: string[]; onConfirm(field: string, value: unknown): Promise<void>; children?: (allConfirmed: boolean) => ReactNode }) {
+  if (!pointers.length) return null;
+  const reviews = new Map<string, FieldReview>(((source as { fields?: FieldReview[] }).fields ?? []).map((r) => [r.field, r]));
+  return (
+    <Section title="Fields to check" level={3}>
+      <p className="ao-import__hint">Choose the right value for each field: open its badge to see the evidence and confirm a value.</p>
+      <ul className="ao-review__plain-list">
+        {pointers.map((pointer) => {
+          const label = FIELD_LABELS[pointer] ?? pointer.replace(/^\//, "").replace(/\//g, " ");
+          const review: FieldReview = reviews.get(pointer) ?? { field: pointer, status: (item.fields[pointer] ?? "none") as FieldReview["status"], checks: [], evidence: [] };
+          return (
+            <li key={pointer}>
+              <span>{label} </span>
+              <FieldCheck review={review} label={label} value={valueAt(source.source as unknown as Record<string, unknown>, pointer)} readOnly={false} onConfirm={onConfirm} />
+            </li>
+          );
+        })}
+      </ul>
+      {children?.(pointers.every((p) => reviews.get(p)?.status === "user-confirmed"))}
+    </Section>
+  );
+}
+
 interface VerificationPanelProps {
   item: ReviewItem;
   source: SourceFile | undefined;
@@ -606,8 +634,6 @@ interface VerificationPanelProps {
  */
 function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm }: VerificationPanelProps) {
   const s = source?.source;
-  const reviews = new Map<string, FieldReview>(((source as { fields?: FieldReview[] } | undefined)?.fields ?? []).map((r) => [r.field, r]));
-  const pointers = Object.keys(item.fields);
   const withdrawal = groupOf(item) === "withdrawal";
   return (
     <div className="ao-review__panel">
@@ -649,25 +675,12 @@ function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm }: Ver
             ))}
           </ul>
         </Section>
-        {pointers.length > 0 && source && (
-          <Section title="Fields to check" level={3}>
-            <p className="ao-import__hint">Choose the right value for each field: open its badge to see the evidence and confirm a value.</p>
-            <ul className="ao-review__plain-list">
-              {pointers.map((pointer) => {
-                const label = FIELD_LABELS[pointer] ?? pointer.replace(/^\//, "").replace(/\//g, " ");
-                const review: FieldReview = reviews.get(pointer) ?? { field: pointer, status: (item.fields[pointer] ?? "none") as FieldReview["status"], checks: [], evidence: [] };
-                return (
-                  <li key={pointer}>
-                    <span>{label} </span>
-                    <FieldCheck review={review} label={label} value={valueAt(source.source as unknown as Record<string, unknown>, pointer)} readOnly={false} onConfirm={onConfirm} />
-                  </li>
-                );
-              })}
-            </ul>
-            {pointers.every((p) => reviews.get(p)?.status === "user-confirmed") && (
-              <p className="ao-import__hint">Every field here is confirmed. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>
-            )}
-          </Section>
+        {source && (
+          <FieldsToCheck item={item} source={source} pointers={Object.keys(item.fields)} onConfirm={onConfirm}>
+            {(allConfirmed) =>
+              allConfirmed && <p className="ao-import__hint">Every field here is confirmed. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>
+            }
+          </FieldsToCheck>
         )}
         {withdrawal && <p className="ao-import__hint">Nothing has been deleted. There is no decision for this kind of entry in the review queue yet, so it stays here.</p>}
       </Section>
@@ -788,9 +801,11 @@ interface ItemPanelProps {
   flagFolderNames(id: string): boolean;
   busy: boolean;
   onDecide(d: ReviewDecision, done: string): void;
+  /** A conflicting field's value chosen through the source screen's confirm (R149). */
+  onConfirm(field: string, value: unknown): Promise<void>;
 }
 
-function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collections, tags, flagTitle, flagFolderNames, busy, onDecide }: ItemPanelProps) {
+function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collections, tags, flagTitle, flagFolderNames, busy, onDecide, onConfirm }: ItemPanelProps) {
   const [mode, setMode] = useState<"view" | "edit" | "merge">("view");
   const s = source?.source;
   const title = titleOf(source);
@@ -902,6 +917,7 @@ function ItemPanel({ api, projectId, item, source, loadFailed, onRetry, collecti
                 </p>
               )}
               <FilePreview api={api} projectId={projectId} source={source} />
+              <FieldsToCheck item={item} source={source} pointers={Object.keys(item.fields).filter((p) => item.fields[p] === "conflict")} onConfirm={onConfirm} />
             </>
           )}
           <Section title="Why it needs review" level={3}>

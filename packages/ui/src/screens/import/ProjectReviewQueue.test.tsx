@@ -133,6 +133,20 @@ describe("the project's whole review queue (Task 67)", () => {
     expect(m.calls.filter((c) => c.path.startsWith("/review/"))).toHaveLength(0);
   });
 
+  it("an import entry with a conflicting field shows its badge too, confirmed through the same confirm, and is then decided as an import item", async () => {
+    const s6 = { ...record(6, "Entry 3", [titleReview("conflict")]), source: { ...record(6).source, title: { variants: [{ lang: "en", kind: "original", value: "Entry 3" }] } } };
+    const after = { ...record(6, "Entry three, revised", [titleReview("user-confirmed")]) };
+    const { m, user } = setup({ ...BASE, projectReview: { [P1]: [entry(6, "attach", { fields: { "/title": "conflict" } })] }, sources: { s6 }, confirmed: { s6: after } });
+    await user.click(await screen.findByRole("button", { name: "Title: Conflict" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("radio", { name: /Entry three, revised/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
+    expect(await screen.findByRole("button", { name: "Title: Confirmed by you" })).toBeTruthy();
+    expect(m.bodies(`PATCH /projects/${P1}/sources/s6/fields`)).toHaveLength(1);
+    await user.click(within(screen.getByRole("group", { name: "Decide this item" })).getByRole("button", { name: "Accept" }));
+    await waitFor(() => expect(m.bodies("POST /review/r6/decide")).toHaveLength(1));
+  });
+
   it("an entry after a consent withdrawal shows why it waits, in the participant's words of the record", async () => {
     const { user } = setup();
     await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
