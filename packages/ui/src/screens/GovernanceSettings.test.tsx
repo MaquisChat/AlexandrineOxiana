@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { makeApi, server, url, useMsw } from "../test/msw-governance";
-import { CAPTURE_METHODS } from "@ao/core/src/governance/schema";
+import { CAPTURE_METHODS } from "@ao/core/governance/schema";
 import { GovernanceSettings } from "./GovernanceSettings";
 import { CAPTURE_LABEL, DEFAULTS } from "./governanceModel";
 

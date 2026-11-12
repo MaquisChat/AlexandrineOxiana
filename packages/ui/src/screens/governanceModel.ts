@@ -5,7 +5,7 @@
  * edits to the YAML text that keep its comments.
  */
 import { isMap, parseDocument, type Document } from "yaml";
-import { CAPTURE_METHODS } from "@ao/core/src/governance/schema";
+import { CAPTURE_METHODS } from "@ao/core/governance/schema";
 import type { Profile } from "../api/governance";
 
 export const PROFILES: Array<{ id: Profile; label: string }> = [

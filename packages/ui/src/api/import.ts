@@ -8,9 +8,9 @@
  * sent back (R78, Task 57): the UI can only ask whether one is stored, store one, or remove it.
  */
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
-import { effectivePolicy } from "@ao/core/src/governance/merge";
-import { parseGovernance } from "@ao/core/src/governance/schema";
-import { isId } from "@ao/core/src/ids";
+import { effectivePolicy } from "@ao/core/governance/merge";
+import { parseGovernance } from "@ao/core/governance/schema";
+import { isId } from "@ao/core/ids";
 import { PICTURE_MAX_BYTES, type ProjectReviewPage, type ReviewCause, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
 

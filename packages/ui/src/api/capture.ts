@@ -28,11 +28,11 @@
  * down are replaced by the truth.
  */
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
-import { effectivePolicy } from "@ao/core/src/governance/merge";
-import { parseGovernance } from "@ao/core/src/governance/schema";
+import { effectivePolicy } from "@ao/core/governance/merge";
+import { parseGovernance } from "@ao/core/governance/schema";
 // The one classifier and the one acknowledgement text (Task 63, R146): only these modules, no copy.
-import { classifyUrl, isWebAddress, type LinkKind, type Platform } from "@ao/core/src/capture/platforms";
-import { COOKIES_ACKNOWLEDGEMENT } from "@ao/core/src/capture/acknowledgement";
+import { classifyUrl, isWebAddress, type LinkKind, type Platform } from "@ao/core/capture/platforms";
+import { COOKIES_ACKNOWLEDGEMENT } from "@ao/core/capture/acknowledgement";
 import { SPEECH_MODELS, type CaptureQueueDetail, type CaptureQueueListResponse, type CaptureQueueSummary, type CaptureStartedBy, type SpeechModel } from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
 import { isValidId, seg } from "./import";
