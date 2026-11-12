@@ -11,6 +11,7 @@ import type { CurrentLibrary, FoundLibrary, LibraryApi, LibraryEntry } from "../
 import { volumeOf } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
+import { PathField } from "../components/PathField";
 
 export interface LibraryNotFoundProps {
   api: Pick<LibraryApi, "libraries">;
@@ -173,8 +174,7 @@ export function LibraryNotFound({ api, library, onOpened, onOpenDifferent, waitI
 
       {mode === "locate" && (
         <form className="ao-inline-form" onSubmit={submitLocate}>
-          <label htmlFor={`${id}-path`}>Library folder</label>
-          <input id={`${id}-path`} dir="auto" value={path} onChange={(e) => setPath(e.target.value)} />
+          <PathField id={`${id}-path`} label="Library folder" pick="folder" pickerTitle="Choose the library's folder" value={path} onChange={setPath} inputProps={{ dir: "auto" }} />
           <button type="submit" disabled={busy}>
             Reconnect
           </button>

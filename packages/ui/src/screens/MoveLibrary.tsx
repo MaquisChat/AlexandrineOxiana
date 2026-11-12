@@ -17,6 +17,7 @@ import { isStreamCutOff, normaliseRoot, type GovernanceApi, type MovePlan, type 
 import { ConfirmDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import "./GovernanceScreens.css";
+import { PathField } from "../components/PathField";
 
 type Stage = "pick" | "plan" | "moving" | "verified" | "failed" | "deleted";
 
@@ -171,8 +172,16 @@ export function MoveLibrary({ api, pollMs = 2000, maxPolls = 900 }: { api: Gover
           void check();
         }}
       >
-        <label htmlFor={`${ids}-dest`}>Destination folder</label>
-        <input id={`${ids}-dest`} type="text" value={dest} disabled={stage === "moving" || stage === "verified"} onChange={(e) => setDest(e.target.value)} placeholder="/Volumes/Drive/Library" />
+        <PathField
+          id={`${ids}-dest`}
+          label="Destination folder"
+          pick="folder"
+          pickerTitle="Choose where to move the library"
+          value={dest}
+          disabled={stage === "moving" || stage === "verified"}
+          onChange={setDest}
+          placeholder="/Volumes/Drive/Library"
+        />
         <button type="submit" disabled={!dest.trim() || stage === "moving" || stage === "verified"}>
           Check destination
         </button>

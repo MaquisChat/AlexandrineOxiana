@@ -6,8 +6,12 @@ import { useEffect, useId, useRef, useState, type FormEvent, type ReactElement }
 import { isZoteroApiKeyShape } from "@ao/shared";
 import { ApiClientError } from "../../api/client";
 import type { FieldSession, ImportAdapter, ImportApi, Participant, ProjectInfo, ZoteroDataFolder } from "../../api/import";
+import { PathField } from "../../components/PathField";
 import { UserText } from "../../components/UserText";
 import { ErrorNote, errorText, isAbsolutePath, PATH_HINT, Section } from "./shared";
+
+/** Makes a path field (label, value, setter, placeholder, what the picker chooses, the picker's title). */
+type PathFieldMaker = (label: string, value: string, set: (v: string) => void, placeholder: string, pick?: "folder" | "file", pickerTitle?: string) => ReactElement;
 
 export type RefFormat = "bibtex" | "ris" | "csl-json" | "zotero-rdf";
 
@@ -77,11 +81,9 @@ export interface StepSourceProps {
 
 export function StepSource({ api, projects, projectId, onProject, choice, onChoice, busy, error, onScan, onNext }: StepSourceProps) {
   const [invalid, setInvalid] = useState<string | null>(null);
-  const pathProps = (label: string, value: string, set: (v: string) => void, placeholder: string) => (
-    <label className="ao-import__field">
-      <span>{label}</span>
-      <input type="text" value={value} placeholder={placeholder} spellCheck={false} onChange={(e) => set(e.target.value)} />
-    </label>
+  // A path field with the native picker beside it inside the desktop shell (D12).
+  const pathProps: PathFieldMaker = (label, value, set, placeholder, pick = "folder", pickerTitle = `Choose the ${label.toLowerCase()}`) => (
+    <PathField className="ao-import__field" label={label} value={value} onChange={set} placeholder={placeholder} pick={pick} pickerTitle={pickerTitle} />
   );
 
   const pick = (kind: Kind) => {
@@ -132,6 +134,8 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
             choice.path,
             (path) => onChoice({ ...choice, path }),
             choice.kind === "zip" ? "/Users/me/Downloads/papers.zip" : "/Users/me/Documents/Papers",
+            choice.kind === "zip" ? "file" : "folder",
+            choice.kind === "folder" ? "Choose the folder to import" : choice.kind === "zip" ? "Choose the ZIP file to import" : "Choose the Calibre library folder",
           )}
         {choice.kind === "reference" && (
           <>
@@ -145,7 +149,7 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
                 ))}
               </select>
             </label>
-            {pathProps("File path", choice.path, (path) => onChoice({ ...choice, path }), "/Users/me/Documents/library.bib")}
+            {pathProps("File path", choice.path, (path) => onChoice({ ...choice, path }), "/Users/me/Documents/library.bib", "file", "Choose the reference file")}
           </>
         )}
         {choice.kind === "zotero-local" && (
@@ -210,7 +214,7 @@ function DeviceFields({
   projectId: string;
   choice: Extract<SourceChoice, { kind: "device" }>;
   onChoice(c: SourceChoice): void;
-  field: (label: string, value: string, set: (v: string) => void, placeholder: string) => ReactElement;
+  field: PathFieldMaker;
 }) {
   const hintId = useId();
   const [sessions, setSessions] = useState<FieldSession[]>([]);

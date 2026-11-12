@@ -2,14 +2,14 @@
  * Choose a library (spec 4.5 "Multiple libraries"): the registered libraries with where each was
  * last seen, opened at its last known place; one that is not there goes to "Library not found".
  * A library can also be opened, or created, at a typed folder; inside the desktop shell a native
- * folder picker fills that field too (desktopShell.ts). A chosen folder is only put in the field:
+ * folder picker fills that field too (PathField). A chosen folder is only put in the field:
  * it reaches the service when Open or Create is used, and the service decides.
  */
-import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
 import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry } from "../api/library";
+import { PathField } from "../components/PathField";
 import { UserText } from "../components/UserText";
-import { desktopShell } from "../desktopShell";
 import { navigate, PATHS } from "../navigation";
 import "../components/library.css";
 
@@ -28,32 +28,7 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
   const [busy, setBusy] = useState(false);
   const [path, setPath] = useState("");
   const [name, setName] = useState("");
-  const [picking, setPicking] = useState(false);
   const id = useId();
-  const shell = desktopShell();
-  const mounted = useRef(true);
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
-
-  const chooseFolder = async () => {
-    if (!shell || picking) return;
-    setPicking(true);
-    try {
-      const chosen = await shell.pickFolder("Choose the library folder");
-      if (mounted.current && chosen) {
-        setPath(chosen);
-        setError(undefined);
-      }
-    } catch {
-      if (mounted.current) setError("The folder picker could not be opened. Type the folder's full path instead.");
-    } finally {
-      if (mounted.current) setPicking(false);
-    }
-  };
 
   useEffect(() => {
     let live = true;
@@ -134,13 +109,19 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
       )}
       <h2 className="ao-pane-title">Another library</h2>
       <form className="ao-inline-form" onSubmit={(e) => void openTyped(e, false)}>
-        <label htmlFor={`${id}-path`}>Library folder</label>
-        <input id={`${id}-path`} dir="auto" value={path} onChange={(e) => setPath(e.target.value)} />
-        {shell && (
-          <button type="button" disabled={busy || picking} onClick={() => void chooseFolder()}>
-            Choose folder…
-          </button>
-        )}
+        <PathField
+          id={`${id}-path`}
+          label="Library folder"
+          pick="folder"
+          pickerTitle="Choose the library folder"
+          value={path}
+          disabled={busy}
+          onChange={(p) => {
+            setPath(p);
+            setError(undefined);
+          }}
+          inputProps={{ dir: "auto" }}
+        />
         <button type="submit" disabled={busy}>
           Open library
         </button>

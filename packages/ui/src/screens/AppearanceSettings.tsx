@@ -16,6 +16,7 @@ import { useAppearance } from "../theme/AppearanceProvider";
 import { FONT_PRESETS, genericOf, isUsableFamily, type FontChoice } from "../theme/fonts";
 import { THEMES } from "../theme/themes";
 import "./AppearanceSettings.css";
+import { PathField } from "../components/PathField";
 
 const SLOT_LABELS: Record<FontSlot, string> = {
   interface: "Interface",
@@ -191,10 +192,7 @@ function UserFontFiles({ fonts, list, onList }: { fonts: FontsApi; list: UserFon
         </ul>
       )}
       <form className="ao-font-file-form" onSubmit={add}>
-        <div className="ao-field">
-          <label htmlFor={`${id}-path`}>Font file path</label>
-          <input id={`${id}-path`} type="text" spellCheck={false} placeholder="/Users/me/Fonts/Junicode.woff2" value={path} onChange={(e) => setPath(e.target.value)} />
-        </div>
+        <PathField id={`${id}-path`} className="ao-field" label="Font file path" pick="file" pickerTitle="Choose a font file" placeholder="/Users/me/Fonts/Junicode.woff2" value={path} onChange={setPath} />
         <div className="ao-field">
           <label htmlFor={`${id}-name`}>Name to use (optional)</label>
           <input id={`${id}-name`} type="text" value={name} onChange={(e) => setName(e.target.value)} />
