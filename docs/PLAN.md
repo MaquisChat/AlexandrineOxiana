@@ -528,7 +528,7 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | in progress | | dispatched 2026-11-12 after Task 46b merged; the transcript half of D10 was closed by Task 34d |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | approved; taking the working branch once more, then verification | 69121dc (worktree branch) | reviewed with probes over one fix round |
+| 66 A paired browser survives a relaunch (D13) | approved; verification before merge | 94816e0 (worktree branch) | reviewed with probes over one fix round; the working branch taken three times as it moved |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
 | 67 One review queue for the project (D14) | in progress | | dispatched 2026-11-12 after Task 46b merged |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
