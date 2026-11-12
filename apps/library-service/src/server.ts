@@ -52,6 +52,8 @@ export interface ServiceOptions {
   suspendTimeoutMs?: number;
   /** Opens a library (test seam). */
   openLibrary?: typeof openLibrary;
+  /** How long a close waits for registered work before abandoning what can be (test seam; Task 62). */
+  closeGraceMs?: number;
   /** Rebuilds the index when needed (test seam). */
   rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
   /** Test seam (a fake clock) for GET /libraries' wait at start. */
@@ -133,6 +135,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.watchStabilityMs !== undefined ? { watchStabilityMs: opts.watchStabilityMs } : {}),
     ...(opts.suspendTimeoutMs !== undefined ? { suspendTimeoutMs: opts.suspendTimeoutMs } : {}),
     ...(opts.openLibrary ? { openLibrary: opts.openLibrary } : {}),
+    ...(opts.closeGraceMs !== undefined ? { closeGraceMs: opts.closeGraceMs } : {}),
     ...(opts.rebuildIndexIfNeeded ? { rebuildIndexIfNeeded: opts.rebuildIndexIfNeeded } : {}),
     ...(opts.startupTimer ? { startupTimer: opts.startupTimer } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },

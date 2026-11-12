@@ -33,15 +33,15 @@ import { decryptStream, encryptStream } from "./crypto/format.js";
 import { copyFileAtomic, renameWithRetry } from "./fs/atomic.js";
 import type { IndexDb } from "./index/db.js";
 import {
-  LOCKED_CODE, UNFINISHED, appendJobRecords, assertNoSecrets, claimJobRecord, compactJobJournal, errorCode, isPending, refreshJobRows, upgradeLegacyJobs,
-  upsertJobRow, type JobRecord, type JobStatus, type ProjectKey, type StoredJob, type WorkerJobType,
+  LOCKED_CODE, UNFINISHED, appendJobRecords, appendNewJobRecord, assertNoSecrets, claimJobRecord, compactJobJournal, errorCode, isPending, readJobJournal,
+  refreshJobRows, upgradeLegacyJobs, upsertJobRow, type JobAbout, type JobRecord, type JobStatus, type ProjectKey, type StoredJob, type WorkerJobType,
 } from "./job-journal.js";
-import { ProjectLockedError } from "./repo/errors.js";
+import { PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 import { mediaWorkerSourceDir } from "./resources.js";
 
-export type { WorkerJobType } from "./job-journal.js";
+export type { JobAbout, JobRecord, WorkerJobType } from "./job-journal.js";
 
 /** The processing op each job type is evaluated as (null: the caller passed a `capture` decision). */
 export const JOB_OPS: Record<WorkerJobType, ProcessingOp | null> = {
@@ -68,9 +68,60 @@ export interface WorkerJob {
   entity?: { type: EntityType; id: string };
   /** Called with 0..1 whenever the worker reports progress. */
   onProgress?: (progress: number) => void;
-  /** Aborting cancels the job (the worker kills its child processes). */
+  /**
+   * Aborting cancels the job (the worker kills its child processes); it is recorded cancelled.
+   * Aborting with a JobInterruptedError as the reason stops it the same way but leaves it pending
+   * (no final line): it runs again at the next resubmission (a close, a shutdown; Task 62).
+   */
   signal?: AbortSignal;
+  /** The job's id (a UUID the caller chose, Task 62); refused when the journal already has it. Default: a new one. */
+  id?: string;
+  /** What the job is for (recorded on every line of it, Task 62). */
+  about?: JobAbout;
+  /**
+   * Runs once the outputs are in place and before the job is recorded done (Task 62): e.g. storing
+   * them in the library. When it throws, the job is recorded failed and the error is thrown. A crash
+   * during it leaves the job running in the journal, so it runs once more at the next launch.
+   */
+  finish?: (result: JobResult) => Promise<void>;
 }
+
+/** What a resubmission's `prepare` may add to a job it reruns, and be told how it ended (Task 62). */
+export interface ResumeExtras {
+  /** The input and output worked out again from the library as it is now (e.g. after a move). */
+  input?: string;
+  inputEncrypted?: boolean;
+  output?: string;
+  onProgress?: (progress: number) => void;
+  signal?: AbortSignal;
+  finish?: (result: JobResult) => Promise<void>;
+  /** After the rerun: `claimed` false when another resubmission took the job first (nothing ran). */
+  onEnd?: (outcome: { claimed: boolean; result?: JobResult; error?: unknown }) => void;
+}
+
+/**
+ * The reason to abort a job's signal with to stop it without recording an outcome: the job stays
+ * pending and runs again at the next resubmission (Task 62: a close or shutdown, R142's rerun).
+ */
+export class JobInterruptedError extends Error {
+  override name = "JobInterruptedError";
+  constructor() {
+    super("the job was interrupted; it runs again when the library is next opened");
+  }
+}
+
+/** Tells a rerun's `onEnd` how it ended (its own failure must not break the resubmission). */
+function tell(extras: ResumeExtras, outcome: Parameters<NonNullable<ResumeExtras["onEnd"]>>[0]): void {
+  try {
+    extras.onEnd?.(outcome);
+  } catch {
+    // the caller's bookkeeping
+  }
+}
+
+const isInterrupt = (signal: AbortSignal | undefined): boolean => !!signal?.aborted && signal.reason instanceof JobInterruptedError;
+const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CLOSED = "the library was closed; the job runs again when it is next opened";
 
 export interface JobResult {
   /** The client's job id (the `jobs` row). */
@@ -182,8 +233,48 @@ export class WorkerClient {
     return this.keys.size;
   }
 
+  /** Closed (Task 62): nothing more is written to any journal, nothing more is stored. */
+  private closed = false;
+  /** Journal writes and `finish` steps in progress (`close` waits for them). */
+  private readonly writing = new Set<Promise<unknown>>();
+
+  /** Runs one write unless the client is closed (then WorkerUnavailableError: the job stays pending). */
+  private async write<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.closed) throw new WorkerUnavailableError(CLOSED);
+    const p = fn();
+    this.writing.add(p);
+    try {
+      return await p;
+    } finally {
+      this.writing.delete(p);
+    }
+  }
+
+  /**
+   * Closes the client before its library's lock is released (Task 62, N-5): from now on it appends
+   * no journal line, stores nothing and starts nothing; resolves once the writes in progress have
+   * ended. A job still running then gets no final line: it stays pending and runs again at the
+   * next launch. Stop running jobs first (abort with JobInterruptedError) so the worker stops too.
+   */
+  async close(): Promise<void> {
+    this.closed = true;
+    while (this.writing.size) await Promise.allSettled([...this.writing]);
+  }
+
   submit(projectId: string, job: WorkerJob): Promise<JobResult> {
-    return this.run(randomUUID(), projectId, job);
+    if (job.id !== undefined && !JOB_ID.test(job.id)) return Promise.reject(new TypeError("a worker job's id must be a UUID"));
+    return this.run(job.id ?? randomUUID(), projectId, job, undefined, job.id !== undefined);
+  }
+
+  /**
+   * Records a pending job (queued, running in no process, or cancelled by a lock) as cancelled, so
+   * it is never run again (Task 62). Claimed like a rerun, so a resubmission and a cancel cannot
+   * both win. False when the job is not pending, unknown, or running in this process (stop that
+   * one through its signal instead).
+   */
+  async cancelPending(projectId: string, id: string): Promise<boolean> {
+    if (this.closed) return false;
+    return this.write(() => cancelPendingJob(this.repo, projectId, id, this.index));
   }
 
   /**
@@ -200,16 +291,19 @@ export class WorkerClient {
    * Each rerun is claimed in the journal first (`claimJobRecord`): of overlapping resubmissions
    * exactly one runs a given pending record; the others skip it. `shouldStop` is asked before each
    * job (a move or close stops resubmission between jobs; calling this again later continues).
+   * `signal` is given to each rerun: aborted with JobInterruptedError, it stops the job in hand,
+   * which stays pending, and no further job starts (Task 62, N-5). `prepare` may add progress, a
+   * signal and a finish step to a rerun (e.g. storing a transcript) and is told how it ended.
    */
   async resumePending(
     projectId?: string,
-    opts: { shouldStop?: () => boolean } = {},
+    opts: { shouldStop?: () => boolean; signal?: AbortSignal; prepare?: (rec: JobRecord) => ResumeExtras | undefined | Promise<ResumeExtras | undefined> } = {},
   ): Promise<Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }>> {
     const library = repoLibrary(this.repo);
-    if (library.mode !== "read-write") return [];
+    if (library.mode !== "read-write" || this.closed) return [];
     await this.removeStaleTemp();
     const db = this.db();
-    if (db) await upgradeLegacyJobs(db, library.root, { get: (keyId: string) => this.keyById(keyId) }).catch(() => undefined);
+    if (db) await this.write(() => upgradeLegacyJobs(db, library.root, { get: (keyId: string) => this.keyById(keyId) })).catch(() => undefined);
     const out: Array<{ id: string; projectId: string; result?: JobResult; error?: unknown }> = [];
     const todo: JobRecord[] = [];
     for (const p of this.repo.listProjects()) {
@@ -224,8 +318,8 @@ export class WorkerClient {
         continue;
       }
       try {
-        await compactJobJournal(library.root, p.folder, p.id, key);
-        const journal = await refreshJobRows(() => this.db(), library.root, p.folder, p.id, key);
+        await this.write(() => compactJobJournal(library.root, p.folder, p.id, key));
+        const journal = await this.write(() => refreshJobRows(() => this.db(), library.root, p.folder, p.id, key));
         for (const r of journal.records.values()) if (isPending(r)) todo.push(r);
       } catch (error) {
         out.push({ id: "", projectId: p.id, error });
@@ -233,7 +327,7 @@ export class WorkerClient {
     }
     todo.sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt)));
     for (const rec of todo) {
-      if (opts.shouldStop?.()) break;
+      if (opts.shouldStop?.() || opts.signal?.aborted || this.closed) break;
       if (claimed.has(rec.id)) continue; // running in this process now
       if (rec.kind === "capture.download" || !rec.job) {
         // Never resumed: a capture's caller (and the capture decision it made) is gone, and its
@@ -249,11 +343,30 @@ export class WorkerClient {
         });
         continue;
       }
+      let extras: ResumeExtras;
       try {
-        out.push({ id: rec.id, projectId: rec.projectId, result: await this.run(rec.id, rec.projectId, rec.job, rec) });
+        extras = (await opts.prepare?.(rec)) ?? {};
       } catch (error) {
-        if (error instanceof NotClaimed) continue;
-        out.push({ id: rec.id, projectId: rec.projectId, error });
+        out.push({ id: rec.id, projectId: rec.projectId, error }); // left pending, as it was
+        continue;
+      }
+      const signals = [opts.signal, extras.signal].filter((s): s is AbortSignal => s !== undefined);
+      const job: WorkerJob = {
+        ...rec.job,
+        ...(extras.input !== undefined ? { input: extras.input, inputEncrypted: extras.inputEncrypted === true } : {}),
+        ...(extras.output !== undefined ? { output: extras.output } : {}),
+        ...(extras.onProgress ? { onProgress: extras.onProgress } : {}),
+        ...(signals.length ? { signal: signals.length === 1 ? signals[0]! : AbortSignal.any(signals) } : {}),
+        ...(extras.finish ? { finish: extras.finish } : {}),
+      };
+      try {
+        const result = await this.run(rec.id, rec.projectId, job, rec);
+        tell(extras, { claimed: true, result });
+        out.push({ id: rec.id, projectId: rec.projectId, result });
+      } catch (error) {
+        const took = !(error instanceof NotClaimed);
+        tell(extras, { claimed: took, error });
+        if (took) out.push({ id: rec.id, projectId: rec.projectId, error });
       }
     }
     return out;
@@ -261,28 +374,39 @@ export class WorkerClient {
 
   // ---- internals ----
 
-  private async run(id: string, projectId: string, job: WorkerJob, resumed?: JobRecord): Promise<JobResult> {
+  private async run(id: string, projectId: string, job: WorkerJob, resumed?: JobRecord, chosenId = false): Promise<JobResult> {
+    if (this.closed) throw new WorkerUnavailableError(CLOSED);
     if (claimed.has(id)) throw new WorkerJobError("ALREADY_RUNNING", "the job is already running");
     claimed.add(id);
     try {
-      return await this.runClaimed(id, projectId, job, resumed);
+      return await this.runClaimed(id, projectId, job, resumed, chosenId);
     } finally {
       claimed.delete(id);
     }
   }
 
-  private async runClaimed(id: string, projectId: string, job: WorkerJob, resumed?: JobRecord): Promise<JobResult> {
-    const op = JOB_OPS[job.type];
-    if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
-    assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
+  private async runClaimed(id: string, projectId: string, job: WorkerJob, resumed: JobRecord | undefined, chosenId: boolean): Promise<JobResult> {
     let decision: PolicyDecision | undefined;
-    if (op !== null) {
-      decision = await authorizeProcessing(
-        this.repo,
-        projectId,
-        { action: "process", process: { op, provider: "local" } },
-        { op: `worker.${job.type}`, entity: job.entity },
-      );
+    try {
+      const op = JOB_OPS[job.type];
+      if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
+      assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
+      if (op !== null) {
+        decision = await authorizeProcessing(
+          this.repo,
+          projectId,
+          { action: "process", process: { op, provider: "local" } },
+          { op: `worker.${job.type}`, entity: job.entity },
+        );
+      }
+    } catch (err) {
+      // Task 62 (I3): a rerun refused for good (the rules, a job that can never run) ends with that
+      // reason, claimed once in the journal, so no later launch evaluates (and audits) it again.
+      if (resumed && (err instanceof PolicyDeniedError || err instanceof TypeError)) {
+        const code = err instanceof PolicyDeniedError ? "POLICY_DENIED" : "UNRECOVERABLE";
+        await this.claim(resumed, { ...this.next(resumed, "failed", code), attempt: randomUUID() }).catch(() => false);
+      }
+      throw err;
     }
     const live = projectDataKey(this.repo, projectId); // throws ProjectLockedError when locked
     // R142: the job keeps its own copy of the key from here to its end (a lock zeroes the ring's),
@@ -301,13 +425,17 @@ export class WorkerClient {
       ...(job.entity ? { entity: job.entity } : {}),
     };
     const now = new Date().toISOString();
-    this.records.set(id, resumed ?? { v: 1, id, projectId, kind: stored.type, status: "queued", createdAt: now, updatedAt: now, job: stored });
+    const first: JobRecord = { v: 1, id, projectId, kind: stored.type, status: "queued", createdAt: now, updatedAt: now, job: stored, ...(job.about ? { about: job.about } : {}) };
+    this.records.set(id, resumed ?? first);
     try {
       if (resumed) {
         // A rerun: claimed in the journal, once (R142); a second resubmission finds the claim.
         const next: JobRecord = { ...this.next(resumed, "queued"), attempt: randomUUID() };
         if (!(await this.claim(resumed, next, dataKey))) throw new NotClaimed();
         this.records.set(id, next);
+      } else if (chosenId) {
+        // An id the caller chose is used once: never a second job under the same record.
+        if (!(await this.appendFirst(first, dataKey))) throw new WorkerJobError("ALREADY_RUNNING", "a job with this id is already recorded");
       } else {
         await this.transition(id, "queued");
       }
@@ -342,7 +470,7 @@ export class WorkerClient {
       const workerOutput = isDir ? outDir : join(outDir, basename(job.output));
       const finalBase = isDir ? job.output : dirname(job.output);
 
-      if (job.signal?.aborted) throw new WorkerJobError("CANCELLED", "the job was cancelled");
+      if (job.signal?.aborted) throw isInterrupt(job.signal) ? (job.signal.reason as JobInterruptedError) : new WorkerJobError("CANCELLED", "the job was cancelled");
       if (lockedNow()) await this.cancelForLock(id, projectId);
       const { id: workerId } = await this.request<{ id: string }>("POST", "/jobs", {
         type: job.type,
@@ -363,17 +491,38 @@ export class WorkerClient {
       }
       const state = await this.poll(workerId, job);
 
-      if (state.status === "cancelled") throw new WorkerJobError("CANCELLED", "the job was cancelled");
+      if (state.status === "cancelled") throw isInterrupt(job.signal) ? (job.signal!.reason as JobInterruptedError) : new WorkerJobError("CANCELLED", "the job was cancelled");
       if (state.status === "failed") {
         throw workerError(state.error ?? { code: "FAILED", message: "the job failed" });
       }
-      const files = await publish(outDir, finalBase, dataKey);
-      const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
-      await this.transition(id, "done");
-      return { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
+      // R142 (Task 62, I2): a job whose finish step stores into the library cannot finish on a
+      // project locked by now: nothing is published or stored, it is recorded cancelled-locked (its
+      // job kept) and runs once at the next unlock. A job without one finishes with its captured key.
+      if (job.finish && lockedNow()) await this.cancelForLock(id, projectId);
+      // Publishing, the finish step and the `done` line are one guarded write (M8, M9): a closed
+      // client starts none of them (the job stays pending), and `close()` waits for all of them.
+      return await this.write(async () => {
+        const files = await publish(outDir, finalBase, dataKey);
+        const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
+        const result: JobResult = { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
+        if (job.finish) {
+          try {
+            await job.finish(result);
+          } catch (err) {
+            if (err instanceof ProjectLockedError || lockedNow()) {
+              await this.transition(id, "cancelled", LOCKED_CODE, true, false);
+              throw new ProjectLockedError(projectId);
+            }
+            throw err;
+          }
+        }
+        await this.transition(id, "done", undefined, false, false);
+        return result;
+      });
     } catch (err) {
       const recorded = this.records.get(id)?.status;
-      if (!(err instanceof WorkerUnavailableError) && recorded !== undefined && UNFINISHED.has(recorded)) {
+      // Not recorded: a worker that went away, an interrupt or a close leave the job pending.
+      if (!(err instanceof WorkerUnavailableError) && !(err instanceof JobInterruptedError) && recorded !== undefined && UNFINISHED.has(recorded)) {
         const cancelled = err instanceof WorkerJobError && err.code === "CANCELLED";
         // A failure to record the outcome leaves the job pending (resubmitted later): the job's own error is the useful one.
         await this.transition(id, cancelled ? "cancelled" : "failed", errorCode(err instanceof WorkerJobError ? err.code : undefined)).catch(() => {});
@@ -497,10 +646,24 @@ export class WorkerClient {
     const library = repoLibrary(this.repo);
     if (library.mode !== "read-write") return false;
     const k = key !== undefined ? key : projectDataKey(this.repo, expected.projectId);
-    if (!(await claimJobRecord(library.root, this.repo.getProject(expected.projectId).folder, k, expected, next))) return false;
-    const db = this.db();
-    if (db) upsertJobRow(db, next);
-    return true;
+    return this.write(async () => {
+      if (!(await claimJobRecord(library.root, this.repo.getProject(expected.projectId).folder, k, expected, next))) return false;
+      const db = this.db();
+      if (db) upsertJobRow(db, next);
+      return true;
+    });
+  }
+
+  /** The first record of a job whose id the caller chose: appended only if the id is new. */
+  private async appendFirst(rec: JobRecord, key: ProjectKey): Promise<boolean> {
+    const library = repoLibrary(this.repo);
+    if (library.mode !== "read-write") return true; // a read-only library records nothing
+    return this.write(async () => {
+      if (!(await appendNewJobRecord(library.root, this.repo.getProject(rec.projectId).folder, key, rec))) return false;
+      const db = this.db();
+      if (db) upsertJobRow(db, rec);
+      return true;
+    });
   }
 
   /**
@@ -509,7 +672,7 @@ export class WorkerClient {
    * Nothing is written in a read-only library. Throws (writing nothing more) when the journal
    * cannot be appended, e.g. the project was locked meanwhile.
    */
-  private async transition(id: string, status: JobStatus, error?: string, keepJob = false): Promise<void> {
+  private async transition(id: string, status: JobStatus, error?: string, keepJob = false, guarded = true): Promise<void> {
     const prev = this.records.get(id);
     if (!prev) return;
     const library = repoLibrary(this.repo);
@@ -517,10 +680,14 @@ export class WorkerClient {
     const rec = this.next(prev, status, error, keepJob);
     // The job's captured key (R142), else the project's (ProjectLockedError while locked).
     const key = this.keys.get(id) ?? projectDataKey(this.repo, prev.projectId);
-    await appendJobRecords(library.root, this.repo.getProject(prev.projectId).folder, key, [rec]);
-    this.records.set(id, rec);
-    const db = this.db();
-    if (db) upsertJobRow(db, rec);
+    const append = async () => {
+      await appendJobRecords(library.root, this.repo.getProject(prev.projectId).folder, key, [rec]);
+      this.records.set(id, rec);
+      const db = this.db();
+      if (db) upsertJobRow(db, rec);
+    };
+    // Unguarded only from inside a guarded write (the step it ends is already tracked).
+    await (guarded ? this.write(append) : append());
   }
 
   private async removeStaleTemp(): Promise<void> {
@@ -537,6 +704,27 @@ export class WorkerClient {
       }
     }
   }
+}
+
+/**
+ * WorkerClient.cancelPending without a client (the media worker need not be running): records a
+ * pending job of the project as cancelled (`CANCELLED`, its job dropped), claimed in the journal's
+ * turn so that a resubmission and the cancel cannot both win. False when it is not pending, is
+ * unknown, is running in this process, or the library is read-only.
+ */
+export async function cancelPendingJob(repo: Repo, projectId: string, id: string, index?: { readonly db: IndexDb }): Promise<boolean> {
+  const library = repoLibrary(repo);
+  if (library.mode !== "read-write" || claimed.has(id)) return false;
+  const key = projectDataKey(repo, projectId);
+  const folder = repo.getProject(projectId).folder;
+  const rec = (await readJobJournal(library.root, folder, projectId, key)).records.get(id);
+  if (!rec || !isPending(rec)) return false;
+  const { job: _job, error: _error, ...base } = rec;
+  const next: JobRecord = { ...base, status: "cancelled", updatedAt: new Date().toISOString(), error: "CANCELLED", attempt: randomUUID() };
+  if (!(await claimJobRecord(library.root, folder, key, rec, next))) return false;
+  const db = index?.db;
+  if (db?.open) upsertJobRow(db, next);
+  return true;
 }
 
 async function privateDir(path: string): Promise<void> {

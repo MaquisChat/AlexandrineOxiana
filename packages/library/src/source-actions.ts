@@ -6,19 +6,14 @@
  *    audited and thrown as PolicyDeniedError; an allow is not audited — each capture audits its own).
  *  - confirmField: the researcher sets a field's value; recorded as `user` field evidence and the
  *    verification recomputed in the same change, so an agreeing value becomes `user-confirmed`.
- *  - addTranscriptVersion: a human-edited transcript stored as a new derived version (never
- *    replacing the machine one).
  *  - readAssetText: the text of a derived text asset (transcript, OCR), decrypted when needed.
  */
-import { randomUUID } from "node:crypto";
-import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 import { recheckSourceFile, type Asset, type Provenance, type Source, type SourceFile } from "@ao/core";
 import { classifyUrl } from "./capture/platforms.js";
 import { decryptBytes, readMaybe } from "./repo/io.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, updateSourceRechecked, type Repo } from "./repo/repo.js";
 import { InvalidInputError, NotFoundError } from "./repo/errors.js";
-import { activeTemp } from "./tmp-registry.js";
 
 /**
  * Evaluates (and on deny, audits and throws) the `capture` decision for each platform the links are on,
@@ -137,61 +132,4 @@ export function transcriptVersions(sf: SourceFile): Asset[] {
   return sf.assets
     .filter((a) => a.role === "derived" && a.kind === "transcript" && a.status !== "destroyed")
     .sort((a, b) => (a.derivation?.at ?? "").localeCompare(b.derivation?.at ?? ""));
-}
-
-/**
- * Stores a human-edited transcript as a new version (derived asset, tool `human-edit`) next to the
- * versions it was edited from; `basedOn` is the version edited (its parents are inherited, so the
- * new version derives from the same media).
- */
-export async function addTranscriptVersion(
-  repo: Repo,
-  projectId: string,
-  sourceId: string,
-  input: { text: string; format: "vtt" | "txt"; basedOn?: string; lang?: string },
-): Promise<Asset> {
-  if (typeof input.text !== "string" || input.text.length === 0) throw new InvalidInputError("the transcript text is empty");
-  if (Buffer.byteLength(input.text, "utf8") > ASSET_TEXT_MAX_BYTES) throw new InvalidInputError("the transcript is too long");
-  if (input.format !== "vtt" && input.format !== "txt") throw new InvalidInputError('format must be "vtt" or "txt"');
-  if (input.format === "vtt" && !/^﻿?WEBVTT/.test(input.text)) throw new InvalidInputError("a WebVTT transcript must start with WEBVTT");
-  const sf = await repo.getSource(projectId, sourceId);
-  let parents: string[];
-  if (input.basedOn) {
-    const base = transcriptVersions(sf).find((a) => a.id === input.basedOn);
-    if (!base) throw new NotFoundError("Transcript", input.basedOn);
-    parents = base.derivation?.parents?.length ? [...base.derivation.parents] : [base.id];
-  } else {
-    const media = sf.assets.find((a) => a.role === "original" && a.status !== "destroyed" && (a.mime.startsWith("audio/") || a.mime.startsWith("video/")));
-    parents = media ? [media.id] : [];
-  }
-  const root = repoLibrary(repo).root;
-  const name = `worker-edit-${randomUUID()}`;
-  const work = join(root, ".tmp", name);
-  activeTemp.add(name);
-  try {
-    await fsp.mkdir(work, { recursive: true, mode: 0o700 });
-    const file = join(work, `transcript.${input.format}`);
-    await fsp.writeFile(file, input.text, { mode: 0o600 });
-    return await repo.addDerivedAsset(projectId, sourceId, {
-      fromPath: file,
-      kind: "transcript",
-      ...(input.lang ? { lang: input.lang } : {}),
-      tool: "human-edit",
-      ext: input.format,
-      derivation: {
-        parents,
-        operation: "human-edit",
-        provider: "researcher",
-        ranAt: "local",
-        // The language is recorded here too (the file name alone carries it otherwise), so a
-        // reader of the version's segments knows it (transcript-segments.ts).
-        params: { ...(input.basedOn ? { basedOn: input.basedOn } : {}), ...(input.lang ? { lang: input.lang } : {}) },
-        at: new Date().toISOString(),
-        triggeredBy: "user",
-      },
-    });
-  } finally {
-    await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
-    activeTemp.delete(name);
-  }
 }

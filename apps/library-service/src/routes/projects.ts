@@ -169,7 +169,10 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     // nor what it was capturing: its running captures end now, for good (Task 63 I3). A project that
     // is not encrypted has nothing to lock, and its captures run on.
     s.http.purgeSensitive();
-    if (s.repo.getProject(id).encryption.enabled) state.endCaptures(id, "lock");
+    if (s.repo.getProject(id).encryption.enabled) {
+      state.endCaptures(id, "lock");
+      state.transcriptions.forgetProject(id); // what it was transcribing too (Task 62 R1-2); its journal keeps the run
+    }
     state.publishState();
     return { unlocked: false };
   });
