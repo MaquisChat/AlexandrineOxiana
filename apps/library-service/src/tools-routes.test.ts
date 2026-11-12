@@ -371,9 +371,16 @@ describe("speech models (R158)", () => {
     );
     for (const model of SPEECH_MODELS) {
       const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model } });
-      expect(r.status, model).toBe(409);
-      expect(r.json.error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: `speech-${model}` });
-      expect(r.json.error.message).toMatch(/The Optional tools screen/);
+      // Task 62: refused at the start when the tools list says so; else the job fails with the same answer.
+      let error = r.json.error as { code: string; reason?: string; message: string } | undefined;
+      if (r.status === 202) {
+        await svc.state.idle();
+        const job = (await call({ url: `/projects/${pid}/sources/${sf.source.id}/transcription` })).json.job;
+        expect(job.status, model).toBe("failed");
+        error = job.error;
+      } else expect(r.status, model).toBe(409);
+      expect(error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: `speech-${model}` });
+      expect(error!.message).toMatch(/The Optional tools screen/);
     }
     expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model: "huge" } })).status).toBe(400);
   });

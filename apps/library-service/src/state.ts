@@ -41,6 +41,7 @@ import {
   type WorkerEndpoint,
   type WorkerToolsClient,
   type CaptureOptions,
+  JobInterruptedError,
   CaptureQueueRegistry,
   createLinkCapture,
   forgetLastOpenLibrary,
@@ -57,6 +58,7 @@ import type { CaptureStartedBy } from "@ao/shared";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
+import { Transcriptions } from "./transcriptions.js";
 
 /** A running media worker, shared by every library the service opens. */
 export interface ServiceWorker {
@@ -149,6 +151,8 @@ export interface StateOptions {
   suspendTimeoutMs?: number;
   /** Opens a library (test seam; default the library's openLibrary). */
   openLibrary?: typeof openLibrary;
+  /** How long a close waits for registered work before abandoning what can be (test seam; default CLOSE_GRACE_MS). */
+  closeGraceMs?: number;
   /** Rebuilds the index when needed (test seam; default the library's rebuildIndexIfNeeded). */
   rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
   /** Test seam (a fake clock): starts the timer of GET /libraries' wait at start; returns its cancel. */
@@ -172,7 +176,18 @@ export const SUSPEND_TIMEOUT_MS = 60_000;
 /** Lets registered background work stop between its items (R106). */
 export interface WorkControl {
   stopping: boolean;
+  /**
+   * Set by work that can be abandoned part-way (Task 62, N-5): a close or shutdown calls it for
+   * what is still running when its grace period ends; the work stops at once, writes nothing more
+   * and leaves its job pending, to run again at the next open.
+   */
+  interrupt?: () => void;
 }
+
+/** How long a close waits for registered work before abandoning what can be (default; Task 62). */
+export const CLOSE_GRACE_MS = 30_000;
+/** Work a close or shutdown asks to stop between its items, and abandons after the grace period (N-5). */
+const STOPPED_AT_CLOSE: ReadonlySet<string> = new Set(["worker-resume", "transcription"]);
 
 export interface BackupRun {
   projectId: string;
@@ -194,6 +209,8 @@ export class ServiceState {
   readonly events = new EventBus();
   /** Media tickets (R135): memory only; all end when the library closes or moves, or the service stops. */
   readonly media = new MediaTickets(() => this.opts.now().getTime());
+  /** Transcriptions as jobs (Task 62): live state over the projects' job journals. */
+  readonly transcriptions = new Transcriptions(this);
   private worker: ServiceWorker | undefined;
   private workerStarting: Promise<ServiceWorker> | undefined;
   private readonly tasks = new Set<Promise<unknown>>();
@@ -989,6 +1006,12 @@ export class ServiceState {
     // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
     for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
     this.stopBackupScheduler();
+    // N-5: the rerun of interrupted jobs starts no further job, and a transcription is asked to stop
+    // too; what is still running when the grace period ends is abandoned below.
+    const stoppable = [...this.work.values()].filter((w) => STOPPED_AT_CLOSE.has(w.kind));
+    for (const w of stoppable) w.ctl.stopping = true;
+    // A live transcription is resumable: abandoned at once rather than after the grace period (M7).
+    for (const w of stoppable) if (w.kind === "transcription") w.ctl.interrupt?.();
     await this.stopIndexRebuild(s);
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
@@ -1005,7 +1028,14 @@ export class ServiceState {
     for (const u of s.unsubscribe) u();
     await disposeProxyQueue(s.repo).catch(() => {});
     await disposeOcrQueue(s.repo).catch(() => {});
-    await withTimeout(Promise.allSettled([...this.tasks]), 30_000).catch(() => {});
+    await withTimeout(Promise.allSettled([...this.tasks]), this.opts.closeGraceMs ?? CLOSE_GRACE_MS).catch(() => {});
+    // Abandoned now (they stay pending in their journals and run again at the next open) ...
+    const left = [...this.work.values()].filter((w) => STOPPED_AT_CLOSE.has(w.kind));
+    for (const w of left) w.ctl.interrupt?.();
+    await withTimeout(Promise.allSettled(left.map((w) => w.done)), 5_000).catch(() => {});
+    // ... and whatever has not ended writes nothing more: no journal line after the lock is released.
+    await s.workerClient?.close?.().catch(() => {});
+    this.transcriptions.forget(s.lib);
     try {
       s.index?.close();
     } catch {
@@ -1068,7 +1098,15 @@ export class ServiceState {
     const client = s.workerClient;
     if (!client || s.lib.mode !== "read-write" || this.moving) return;
     void this.startWork("worker-resume", async (ctl) => {
-      await client.resumePending(projectId, { shouldStop: () => ctl.stopping });
+      // A close abandons the job in hand once its grace period ends (N-5): it stays pending.
+      const ac = new AbortController();
+      ctl.interrupt = () => ac.abort(new JobInterruptedError());
+      await client.resumePending(projectId, {
+        shouldStop: () => ctl.stopping,
+        signal: ac.signal,
+        // A pending transcription runs again with its finish step and is followed like a new one (Task 62).
+        prepare: (rec) => this.transcriptions.rerun(s, rec),
+      });
       if (ctl.stopping) return (next: Session) => this.resumeWorkerJobs(next, projectId);
     });
   }

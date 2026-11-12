@@ -108,7 +108,9 @@ export * from "./index/index.js";
 
 export {
   JOB_OPS,
+  JobInterruptedError,
   WorkerClient,
+  cancelPendingJob,
   WorkerJobError,
   WorkerToolError,
   WorkerToolsClient,
@@ -117,7 +119,10 @@ export {
   startWorker,
 } from "./worker-client.js";
 export type {
+  JobAbout,
+  JobRecord,
   JobResult,
+  ResumeExtras,
   StartWorkerOptions,
   ToolAction,
   WorkerClientOptions,
@@ -260,7 +265,6 @@ export {
   ASSET_TEXT_MAX_BYTES,
   CONFIRMABLE_FIELDS,
   CONFIRMABLE_IDENTIFIERS,
-  addTranscriptVersion,
   checkCaptureAllowed,
   confirmField,
   readAssetText,
@@ -268,8 +272,10 @@ export {
 } from "./source-actions.js";
 export { isMediaMime, isPictureMime, openAssetContent } from "./asset-content.js";
 export type { AssetContent } from "./asset-content.js";
-export { parseVtt, readTranscript } from "./transcript-segments.js";
-export type { TranscriptRead, TranscriptSegment, VttCue } from "./transcript-segments.js";
+export { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
+export { TRANSCRIBE_KIND, recordingOf, transcriptionJob, transcriptionRecords, transcriptionRerun } from "./transcription-jobs.js";
+export type { StoredTranscript, TranscriptionParams } from "./transcription-jobs.js";
+export type { SegmentEdit, TranscriptRead, TranscriptSegment, VttCue } from "./transcript-segments.js";
 export { OCR_ATTEMPTS, OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 export type { OcrFailure, OcrQueueOptions, OcrResult } from "./import/ocr.js";
 export { BROWSER_CAPTURE_LIMITS, HtmlSnapshotRefusedError, captureBrowserPage, htmlStripStats } from "./capture/browser-capture.js";

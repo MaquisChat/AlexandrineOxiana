@@ -10,11 +10,13 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { openIndex, type IndexDb } from "./index/db.js";
 import { createLibrary, type Library } from "./library.js";
-import { PolicyDeniedError, type Repo } from "./repo/index.js";
+import { PolicyDeniedError, ProjectLockedError, type Repo } from "./repo/index.js";
 import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { projectDataKey } from "./repo/repo.js";
 import { openTestRepo } from "./repo/testing.js";
-import { WorkerJobError, WorkerUnavailableError, WorkerClient, startWorker, type WorkerHandle } from "./worker-client.js";
+import { randomUUID } from "node:crypto";
+import { journalPath, type JobRecord } from "./job-journal.js";
+import { JobInterruptedError, WorkerJobError, WorkerUnavailableError, WorkerClient, startWorker, type WorkerHandle, type WorkerJob } from "./worker-client.js";
 import { stubWorker as sharedStubWorker } from "./worker-testing.js";
 
 const FAST = 2 ** 10;
@@ -394,4 +396,245 @@ setInterval(() => {}, 1000);
     },
     60_000,
   );
+});
+
+describe("Task 62: jobs the service follows (an id, what it is about, finish, interrupt, close, cancel)", () => {
+  const okSubmit = async (job: { body: { output: string } }) => {
+    await mkdir(dirname(job.body.output), { recursive: true });
+    await writeFile(job.body.output, "jpeg");
+    return { status: "done", result: { output: job.body.output, meta: {} } };
+  };
+  async function setup() {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: OPEN_GOV, encryption: { enabled: false } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    const lines = async () =>
+      (await readFile(journalPath(lib.root, project.folder), "utf8").catch(() => ""))
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as JobRecord);
+    const bytes = () => readFile(journalPath(lib.root, project.folder)).catch(() => Buffer.alloc(0));
+    return { project, input, output: join(tmp, "out", "a.jpg"), lines, bytes };
+  }
+  /** A job left pending: submitted while the worker was unreachable. */
+  async function pendingJob(projectId: string, input: string, output: string, extra: Partial<WorkerJob> = {}): Promise<string> {
+    const down = await stubWorker(() => ({ status: "done" }));
+    await closers.pop()!();
+    const id = randomUUID();
+    await expect(new WorkerClient({ repo, worker: down, index: { db }, pollMs: 5 }).submit(projectId, { id, type: "image.proxy", input, output, params: {}, ...extra })).rejects.toBeInstanceOf(WorkerUnavailableError);
+    return id;
+  }
+
+  it("a job submitted with its own id is recorded under it, and what it is about is kept on every line, finished too", async () => {
+    const { project, input, output, lines } = await setup();
+    const client = new WorkerClient({ repo, worker: await stubWorker(okSubmit), index: { db }, pollMs: 5 });
+    const id = randomUUID();
+    const r = await client.submit(project.id, { id, type: "image.proxy", input, output, params: {}, about: { sourceId: "019a7000-0000-7000-8000-000000000001", model: "small" } });
+    expect(r.id).toBe(id);
+    const recs = await lines();
+    expect(recs.map((x) => [x.id, x.status])).toEqual([
+      [id, "queued"],
+      [id, "running"],
+      [id, "done"],
+    ]);
+    for (const x of recs) expect(x.about).toEqual({ sourceId: "019a7000-0000-7000-8000-000000000001", model: "small" });
+    await expect(client.submit(project.id, { id: "../x", type: "image.proxy", input, output, params: {} })).rejects.toBeInstanceOf(TypeError);
+    await expect(client.submit(project.id, { id, type: "image.proxy", input, output, params: {} })).rejects.toThrow(/already/);
+  });
+
+  it("finish runs once the outputs are in place and before the job is recorded done; a failing finish records it failed", async () => {
+    const { project, input, output, lines } = await setup();
+    const client = new WorkerClient({ repo, worker: await stubWorker(okSubmit), index: { db }, pollMs: 5 });
+    let seen: unknown;
+    await client.submit(project.id, {
+      type: "image.proxy",
+      input,
+      output,
+      params: {},
+      finish: async (r) => {
+        seen = { file: existsSync(output), status: (await lines()).filter((x) => x.id === r.id).at(-1)!.status };
+      },
+    });
+    expect(seen).toEqual({ file: true, status: "running" });
+    const err = await client.submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "b.jpg"), params: {}, finish: async () => { throw new Error("disk full"); } }).catch((e: unknown) => e);
+    expect((err as Error).message).toBe("disk full");
+    expect((await lines()).at(-1)).toMatchObject({ status: "failed", error: "FAILED" });
+  });
+
+  it("an interrupt leaves the job pending (cancelled in the worker, no final line); the next resubmission runs it once", async () => {
+    const { project, input, output, lines } = await setup();
+    const slow = await stubWorker(okSubmit, { pollsUntilDone: 100_000 });
+    const ac = new AbortController();
+    const err = await new WorkerClient({ repo, worker: slow, index: { db }, pollMs: 5 })
+      .submit(project.id, { type: "image.proxy", input, output, params: {}, signal: ac.signal, onProgress: () => ac.abort(new JobInterruptedError()) })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JobInterruptedError);
+    expect(slow.requests).toContain("POST /jobs/j1/cancel");
+    expect((await lines()).map((x) => x.status)).toEqual(["queued", "running"]);
+    const ok = await stubWorker(okSubmit);
+    const resumed = await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending();
+    expect(resumed.map((x) => x.error)).toEqual([undefined]);
+    expect(ok.jobs.size).toBe(1);
+    expect(await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending()).toEqual([]);
+  });
+
+  it("close(): nothing is written to the journal after it returns, and the job in hand stays pending", async () => {
+    const { project, input, output, lines, bytes } = await setup();
+    const slow = await stubWorker(okSubmit, { pollsUntilDone: 100_000 });
+    const client = new WorkerClient({ repo, worker: slow, index: { db }, pollMs: 5 });
+    let finished = false;
+    const p = client.submit(project.id, { type: "image.proxy", input, output, params: {}, finish: async () => { finished = true; } }).catch((e: unknown) => e);
+    while ((await lines()).length < 2) await new Promise((r) => setTimeout(r, 5));
+    await client.close();
+    const after = await bytes();
+    slow.jobs.get("j1")!.polls = 100_000; // the worker finishes now
+    expect(await p).toBeInstanceOf(WorkerUnavailableError);
+    expect(finished).toBe(false); // nothing is stored for a closed library
+    expect((await bytes()).equals(after)).toBe(true);
+    expect((await lines()).at(-1)!.status).toBe("running");
+    await expect(client.submit(project.id, { type: "image.proxy", input, output, params: {} })).rejects.toBeInstanceOf(WorkerUnavailableError);
+    expect(await client.resumePending()).toEqual([]);
+    expect((await bytes()).equals(after)).toBe(true);
+    const ok = await stubWorker(okSubmit);
+    expect((await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending()).map((x) => x.error)).toEqual([undefined]);
+  });
+
+  it("cancelPending records a pending job cancelled, so it is never run again; anything else is left alone", async () => {
+    const { project, input, output, lines } = await setup();
+    const id = await pendingJob(project.id, input, output);
+    const ok = await stubWorker(okSubmit);
+    const client = new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 });
+    expect(await client.cancelPending(project.id, id)).toBe(true);
+    expect((await lines()).at(-1)).toMatchObject({ id, status: "cancelled", error: "CANCELLED" });
+    expect((await lines()).at(-1)!.job).toBeUndefined();
+    expect(await client.cancelPending(project.id, id)).toBe(false);
+    expect(await client.cancelPending(project.id, randomUUID())).toBe(false);
+    expect(await client.resumePending()).toEqual([]);
+    expect(ok.jobs.size).toBe(0);
+    expect(jobRows().map((r) => r.status)).toEqual(["cancelled"]);
+  });
+
+  it("resumePending: prepare gives each rerun its progress, signal and finish, and onEnd says how it ended", async () => {
+    const { project, input, output } = await setup();
+    const id = await pendingJob(project.id, input, output, { about: { sourceId: "019a7000-0000-7000-8000-000000000002" } });
+    const ok = await stubWorker(okSubmit);
+    const seen: string[] = [];
+    const out = await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending(undefined, {
+      prepare: (rec) => {
+        seen.push(`prepare ${rec.id} ${rec.about?.sourceId}`);
+        return {
+          onProgress: () => seen.push("progress"),
+          finish: async (r) => void seen.push(`finish ${r.id}`),
+          onEnd: (o) => seen.push(`end ${o.claimed} ${o.result ? "result" : "error"}`),
+        };
+      },
+    });
+    expect(out.map((x) => x.id)).toEqual([id]);
+    expect(seen[0]).toBe(`prepare ${id} 019a7000-0000-7000-8000-000000000002`);
+    expect(seen).toContain(`finish ${id}`);
+    expect(seen.at(-1)).toBe("end true result");
+  });
+
+  it("fix 1 I3: a rerun the rules refuse ends for good, recorded and audited once; later resubmissions leave it alone", async () => {
+    const { project, input, output, lines } = await setup();
+    const id = await pendingJob(project.id, input, output);
+    const gov = await repo.getGovernance(project.id);
+    await repo.setGovernance(project.id, `${OPEN_GOV}processing:\n  image_proxy: []\n`, { baseSha256: gov.sha256 });
+    const ok = await stubWorker(okSubmit);
+    for (let i = 0; i < 3; i++) {
+      const out = await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending();
+      if (i === 0) expect(out.map((x) => x.error)).toEqual([expect.any(PolicyDeniedError)]);
+      else expect(out).toEqual([]);
+    }
+    expect(ok.jobs.size).toBe(0);
+    expect((await lines()).at(-1)).toMatchObject({ id, status: "failed", error: "POLICY_DENIED" });
+    const denies = (await auditEvents(project.folder)).filter((e) => e.decision?.result === "deny");
+    expect(denies).toHaveLength(1);
+  });
+
+  it("fix 1 I2: a lock while the worker runs: nothing is published or stored, the job is cancelled-locked and runs once at the unlock", async () => {
+    const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    const worker = await stubWorker(okSubmit);
+    let finished = 0;
+    const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 })
+      .submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "e.jpg"), params: {}, finish: async () => void finished++, onProgress: () => repo.lockProject(project.id) })
+      .catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    expect(finished).toBe(0);
+    expect(existsSync(join(tmp, "out", "e.jpg"))).toBe(false);
+    expect(jobRows().map((r) => r.status)).toEqual(["cancelled"]);
+    await repo.unlockProject(project.id, "pw");
+    const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 5 });
+    const out = await client.resumePending(project.id, { prepare: () => ({ finish: async () => void finished++ }) });
+    expect(out.map((x) => x.error)).toEqual([undefined]);
+    expect(finished).toBe(1);
+    expect(worker.jobs.size).toBe(2);
+    expect(await client.resumePending(project.id)).toEqual([]);
+  });
+
+  it("fix 1 I2: a lock during the finish step (the store refused): cancelled-locked, run once at the unlock", async () => {
+    const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    const worker = await stubWorker(okSubmit);
+    const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 })
+      .submit(project.id, {
+        type: "image.proxy",
+        input,
+        output: join(tmp, "out", "f.jpg"),
+        params: {},
+        finish: async () => {
+          repo.lockProject(project.id);
+          throw new ProjectLockedError(project.id); // what a governed write says on a locked project
+        },
+      })
+      .catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    expect(jobRows().map((r) => r.status)).toEqual(["cancelled"]);
+    await repo.unlockProject(project.id, "pw");
+    let stored = 0;
+    const out = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 }).resumePending(project.id, { prepare: () => ({ finish: async () => void stored++ }) });
+    expect(out.map((x) => x.error)).toEqual([undefined]);
+    expect(stored).toBe(1);
+    expect(jobRows().map((r) => r.status)).toEqual(["done"]);
+  });
+
+  it("fix 1 M8/M9: a close during the finish step waits for it, and its done line is written", async () => {
+    const { project, input, output, lines } = await setup();
+    const client = new WorkerClient({ repo, worker: await stubWorker(okSubmit), index: { db }, pollMs: 5 });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let inFinish = false;
+    const p = client.submit(project.id, { type: "image.proxy", input, output, params: {}, finish: async () => { inFinish = true; await gate; } });
+    while (!inFinish) await new Promise((r) => setTimeout(r, 5));
+    let closed = false;
+    const c = client.close().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(closed).toBe(false);
+    release();
+    await c;
+    await p;
+    expect((await lines()).at(-1)!.status).toBe("done");
+  });
+
+  it("resumePending with a signal: an interrupt stops the job in hand (left pending) and starts no other", async () => {
+    const { project, input, lines } = await setup();
+    const ids = [];
+    for (let i = 0; i < 3; i++) ids.push(await pendingJob(project.id, input, join(tmp, "out", `${i}.jpg`)));
+    const slow = await stubWorker(okSubmit, { pollsUntilDone: 100_000 });
+    const ac = new AbortController();
+    const out = await new WorkerClient({ repo, worker: slow, index: { db }, pollMs: 5 }).resumePending(undefined, {
+      signal: ac.signal,
+      prepare: () => ({ onProgress: () => ac.abort(new JobInterruptedError()) }),
+    });
+    expect(slow.jobs.size).toBe(1);
+    expect(out.map((x) => x.error)).toEqual([expect.any(JobInterruptedError)]);
+    const newest = new Map((await lines()).map((x) => [x.id, x.status]));
+    expect(ids.map((x) => newest.get(x))).toEqual(["running", "queued", "queued"]); // the first left running (pending), the rest untouched
+    const ok = await stubWorker(okSubmit);
+    expect((await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending()).map((x) => x.error)).toEqual([undefined, undefined, undefined]);
+    expect(ok.jobs.size).toBe(3);
+  });
 });
