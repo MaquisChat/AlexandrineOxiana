@@ -10,3 +10,5 @@ export const SERVICE_DIR = fileURLToPath(new URL("../apps/library-service/", imp
 export const FAKE_TOOLS = fileURLToPath(new URL("../packages/library/tests/fixtures/fake-tools", import.meta.url));
 /** Recorded metadata answers (answers.json) replayed by the service under NODE_ENV=test. */
 export const LOOKUP_FIXTURES = fileURLToPath(new URL("../packages/library/tests/fixtures/lookup", import.meta.url));
+/** A fake faster-whisper and the worker wrapper that puts it first on the worker's PYTHONPATH (fixtures.ts `fakeControl`). */
+export const FAKE_SPEECH = fileURLToPath(new URL("../packages/library/tests/fixtures/fake-speech", import.meta.url));
