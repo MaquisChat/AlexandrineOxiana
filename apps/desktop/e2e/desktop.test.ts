@@ -2,7 +2,7 @@
 // real home folder or of this process's settings), finding the native file dialog among the
 // display's windows, reading the audit log, and the plain list of what is missing to run at all.
 import { describe, expect, it } from "vitest";
-import { desktopEnv, dialogWindow, missingPrerequisites, readAuditLines, readShellLog } from "./desktop.js";
+import { desktopEnv, windowTitled, missingPrerequisites, readAuditLines, readShellLog } from "./desktop.js";
 
 describe("desktopEnv", () => {
   const env = desktopEnv("/tmp/ao-desktop-e2e-x", { display: ":42", bus: "unix:path=/tmp/bus", workerBin: "/tmp/w", nodeBin: "/usr/bin/node", serviceDir: "/svc", path: "/usr/bin:/bin" });
@@ -41,18 +41,18 @@ describe("readShellLog", () => {
   });
 });
 
-describe("dialogWindow", () => {
+describe("windowTitled", () => {
   const windows = [
     { id: "1", name: "alexandrine-oxiana" },
     { id: "2", name: "Alexandrine Oxiana" },
     { id: "3", name: "Attach files to Tide-line interviews" },
   ];
   it("finds the native dialog by its exact title", () => {
-    expect(dialogWindow(windows, "Attach files to Tide-line interviews")).toBe("3");
+    expect(windowTitled(windows, "Attach files to Tide-line interviews")).toBe("3");
   });
   it("is undefined while no window has that title (the app's own windows never match)", () => {
-    expect(dialogWindow(windows.slice(0, 2), "Attach files to Tide-line interviews")).toBeUndefined();
-    expect(dialogWindow(windows, "Attach files to Tide-line")).toBeUndefined();
+    expect(windowTitled(windows.slice(0, 2), "Attach files to Tide-line interviews")).toBeUndefined();
+    expect(windowTitled(windows, "Attach files to Tide-line")).toBeUndefined();
   });
 });
 

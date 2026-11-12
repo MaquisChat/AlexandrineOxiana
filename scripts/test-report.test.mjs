@@ -136,3 +136,21 @@ test("the desktop spec file (*.e2e.ts, kept out of Vitest's way) counts as a spe
   const md = buildReport({ playwrightDesktop: run }, { listSpecFiles: () => ["/repo/apps/desktop/e2e/desktop.e2e.ts", "/repo/apps/desktop/e2e/other.e2e.ts"] });
   assert.match(md, /✗ The desktop app end to end: other\.e2e\.ts contains no tests/);
 });
+
+test("files the project's testMatch leaves out (the desktop suite's Vitest unit tests beside it) are not spec files of that run", () => {
+  const run = desktopRun([pwSpec("works", ["expected"], "desktop.e2e.ts")], {
+    config: { rootDir: "/repo/apps/desktop/e2e", projects: [{ name: "desktop", testDir: "/repo/apps/desktop/e2e", testMatch: ["*.e2e.ts"] }], argv: ["node", "cli.js", "test", "-c", "e2e/playwright.config.ts"] },
+  });
+  const files = () => ["/repo/apps/desktop/e2e/desktop.e2e.ts", "/repo/apps/desktop/e2e/webdriver.test.ts", "/repo/apps/desktop/e2e/sub/other.e2e.ts"];
+  const md = buildReport({ playwrightDesktop: run }, { listSpecFiles: files });
+  assert.doesNotMatch(md, /webdriver\.test\.ts/);
+  assert.match(md, /✗ The desktop app end to end: other\.e2e\.ts contains no tests/);
+  assert.match(md, /1 of 2 checks passed/);
+});
+
+test("a testMatch this report cannot read (Playwright's default extended glob) falls back to the usual spec-file names", () => {
+  const run = desktopRun([pwSpec("works", ["expected"], "desktop.e2e.ts")], {
+    config: { rootDir: "/r", projects: [{ name: "p", testDir: "/r", testMatch: ["**/*.@(spec|test).?(c|m)[jt]s?(x)"] }], argv: ["node", "cli.js", "test"] },
+  });
+  assert.match(buildReport({ playwrightDesktop: run }, { listSpecFiles: () => ["/r/desktop.e2e.ts", "/r/a.test.ts"] }), /✗ The desktop app end to end: a\.test\.ts contains no tests/);
+});

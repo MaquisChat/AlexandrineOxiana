@@ -75,8 +75,8 @@ export function desktopEnv(root: string, p: EnvParts): Record<string, string> {
   };
 }
 
-/** The id of the window titled exactly `title` (the native dialog), or undefined. */
-export function dialogWindow(windows: Array<{ id: string; name: string }>, title: string): string | undefined {
+/** The id of the window titled exactly `title` (the native dialog, the main window), or undefined. */
+export function windowTitled(windows: Array<{ id: string; name: string }>, title: string): string | undefined {
   return windows.find((w) => w.name === title)?.id;
 }
 
@@ -449,6 +449,8 @@ export async function startDesktop(): Promise<Desktop> {
     const find = (role: Role, name: string | null, opts: { level?: number; within?: string } = {}) =>
       session.execute<unknown[]>(FIND_SCRIPT, [role, name, opts.level ?? null, opts.within ? session.element(opts.within) : null]);
     const X = (args: string[]) => spawnSync("xdotool", args, { env: { PATH: env.PATH!, DISPLAY: display }, encoding: "utf8", timeout: 20_000 });
+    /** The visible windows on the private display, with their titles. */
+    const windows = () => X(["search", "--onlyvisible", "--name", "."]).stdout.split("\n").filter(Boolean).map((id) => ({ id, name: X(["getwindowname", id]).stdout.trim() }));
 
     const desktop: Desktop = {
       root,
@@ -480,10 +482,7 @@ export async function startDesktop(): Promise<Desktop> {
         return Promise.all(hits.map((h) => session.text(elementId(h))));
       },
       async pickInFileDialog(title, path) {
-        const win = await until(`the native file dialog "${title}"`, 30_000, () => {
-          const ids = X(["search", "--onlyvisible", "--name", "."]).stdout.split("\n").filter(Boolean);
-          return dialogWindow(ids.map((id) => ({ id, name: X(["getwindowname", id]).stdout.trim() })), title);
-        });
+        const win = await until(`the native file dialog "${title}"`, 30_000, () => windowTitled(windows(), title));
         // No window manager on the private display: give the dialog the keyboard focus directly.
         for (const args of [["windowfocus", "--sync", win], ["key", "--clearmodifiers", "ctrl+l"], ["type", "--delay", "25", path]]) {
           const r = X(args);
@@ -492,11 +491,10 @@ export async function startDesktop(): Promise<Desktop> {
         }
         const r = X(["key", "--clearmodifiers", "Return"]);
         if (r.status !== 0) throw new Error(`xdotool key Return failed: ${r.stderr}`);
-        await until(`the native file dialog "${title}" to close`, 30_000, () => !X(["search", "--onlyvisible", "--name", "."]).stdout.split("\n").filter(Boolean).some((id) => X(["getwindowname", id]).stdout.trim() === title));
+        await until(`the native file dialog "${title}" to close`, 30_000, () => windowTitled(windows(), title) === undefined);
       },
       async closeWithCloseButton() {
-        const ids = X(["search", "--onlyvisible", "--name", "."]).stdout.split("\n").filter(Boolean);
-        const win = dialogWindow(ids.map((id) => ({ id, name: X(["getwindowname", id]).stdout.trim() })), WINDOW_TITLE);
+        const win = windowTitled(windows(), WINDOW_TITLE);
         if (!win) throw new Error(`no visible window titled "${WINDOW_TITLE}" on the display`);
         await requestWindowClose(socketPathFor(display), Number(win));
       },

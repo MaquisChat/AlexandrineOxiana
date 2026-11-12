@@ -101,6 +101,19 @@ export function isSpecFile(name) {
   return /\.(spec|test|e2e)\.[cm]?[jt]sx?$/.test(name);
 }
 
+/**
+ * A test of a file's name against a project's `testMatch` as Playwright's JSON report records it,
+ * when every pattern is a plain name glob ("*.e2e.ts", "**\/*.spec.ts": letters, digits, ".", "-",
+ * "_" and "*"); undefined otherwise (Playwright's default extended glob, a regular expression), and
+ * the usual spec-file names (isSpecFile) apply.
+ */
+function testMatcher(testMatch) {
+  const patterns = Array.isArray(testMatch) ? testMatch : testMatch === undefined ? [] : [testMatch];
+  if (!patterns.length || !patterns.every((p) => typeof p === "string" && /^(\*\*\/)?[\w.*-]+$/.test(p))) return undefined;
+  const res = patterns.map((p) => new RegExp(`^${p.replace(/^\*\*\//, "").replace(/[.+?^${}()|[\]\\-]/g, "\\$&").replace(/\*/g, "[^/]*")}$`));
+  return (name) => res.some((re) => re.test(name));
+}
+
 /** Spec files under `dir` (isSpecFile). */
 function specFilesOnDisk(dir) {
   const out = [];
@@ -144,8 +157,16 @@ function fromPlaywright(json, area, listSpecFiles = specFilesOnDisk) {
   const cfg = json.config;
   if (cfg?.rootDir && Array.isArray(cfg.argv) && unfiltered(cfg.argv)) {
     const reported = new Set((json.suites ?? []).map((s) => s.file).filter(Boolean));
-    const dirs = [...new Set((cfg.projects ?? []).map((p) => p.testDir).filter(Boolean))];
-    const files = [...new Set(dirs.flatMap((d) => listSpecFiles(d)))].map((f) => relative(cfg.rootDir, f).split(sep).join("/"));
+    const files = [
+      ...new Set(
+        (cfg.projects ?? [])
+          .filter((p) => p.testDir)
+          .flatMap((p) => {
+            const match = testMatcher(p.testMatch);
+            return listSpecFiles(p.testDir).filter((f) => !match || match(basename(f)));
+          }),
+      ),
+    ].map((f) => relative(cfg.rootDir, f).split(sep).join("/"));
     for (const f of files.sort()) if (!reported.has(f)) out.push({ area: areaOf(f), name: `${basename(f)} contains no tests`, passed: false });
   }
   for (const e of json.errors ?? []) {
