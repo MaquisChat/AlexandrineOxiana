@@ -185,6 +185,9 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
         // "No library open" passes only as the app's own answer to this authorised request: 503 with
         // the service's error shape and that code (fix round 1, I2). Any other status fails.
         if (code === "LIBRARY_OFFLINE" && e instanceof ApiError && e.status === 503 && e.serviceShaped) projects = null;
+        // Any other 503 in the service's own shape is the app speaking (e.g. its list of paired
+        // browsers cannot be read right now): its own words, and the port kept (Task 68, Rm5).
+        else if (e instanceof ApiError && e.status === 503 && e.serviceShaped) throw new ApiError(e.code, `${e.message} ${kept}`, 503);
         else if (code === "UNREACHABLE") throw new ApiError("UNREACHABLE", `Nothing answered on port ${port}. Check the number on the desktop app's “Browser extension” page, and that the app is open. ${kept}`);
         else if (e instanceof ApiError && (e.status === 401 || e.status === 403))
           throw new ApiError("NOT_ACCEPTED", `The program on port ${port} did not accept this browser's pairing. Check the number on the desktop app's “Browser extension” page. If this browser was revoked there, unpair and pair again. ${kept}`, e.status);
