@@ -118,7 +118,8 @@ export interface ToolsState {
 }
 
 /** The service's tool routes over a catalogue the test can change. */
-export function toolsService(opts: { tools?: ToolInfo[]; jobs?: ToolJob[] } = {}) {
+export function toolsService(opts: { tools?: ToolInfo[]; jobs?: ToolJob[]; base?: string } = {}) {
+  const url = (path: string) => `${opts.base ?? BASE}${path}`;
   const state: ToolsState = { tools: opts.tools ?? catalogue(), jobs: [...(opts.jobs ?? [])], requests: [], seq: 0 };
   const latest = (id: string) => [...state.jobs].reverse().find((j) => j.toolId === id);
   const withJobs = () => state.tools.map((t) => (latest(t.id) ? { ...t, job: { ...latest(t.id)! } } : t));
