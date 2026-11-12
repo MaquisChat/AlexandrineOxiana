@@ -251,6 +251,7 @@ export {
 export {
   ASSET_TEXT_MAX_BYTES,
   CONFIRMABLE_FIELDS,
+  CONFIRMABLE_IDENTIFIERS,
   addTranscriptVersion,
   checkCaptureAllowed,
   confirmField,

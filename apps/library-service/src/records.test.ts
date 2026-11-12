@@ -9,8 +9,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { deviceDeps, type Deps } from "@ao/library";
-import type { FieldReview, SourceRecordExtras, TranscriptListResponse, TranscriptResponse } from "@ao/shared";
+import { CONFIRMABLE_IDENTIFIERS, deviceDeps, type Deps } from "@ao/library";
+import { CONFIRMABLE_IDENTIFIER_KEYS, type FieldConfirmRequest, type FieldReview, type SourceRecordExtras, type TranscriptListResponse, type TranscriptResponse } from "@ao/shared";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService } from "./server.js";
 
@@ -150,5 +150,47 @@ describe("evidence and verification on source records (Task 34a d)", () => {
       expect(r.body).not.toContain(tmp);
       expect(r.json.assets[0].linked).toEqual({ libraryRelativePath: sf.assets[0]!.linked!.libraryRelativePath });
     }
+  });
+});
+
+describe("confirming an identifier through the field route (R149)", () => {
+  async function source(pid: string) {
+    const repo = svc.state.session!.repo;
+    return repo.createSource(
+      pid,
+      { projectIds: [pid], type: "article-journal", title: { variants: [{ lang: "en", kind: "original", value: "A study" }] }, creators: [], identifiers: { doi: "10.1/old" }, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+  }
+
+  it("PATCH …/fields with the badge's own key (/identifiers/doi) sets it and the record's field review says user-confirmed", async () => {
+    const pid = await project();
+    const sid = (await source(pid)).source.id;
+    const body: FieldConfirmRequest = { field: "/identifiers/doi", value: "10.1/new" };
+    const r = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json.source.identifiers.doi).toBe("10.1/new");
+    const doi = (r.json as SourceRecordExtras).fields.find((f) => f.field === "/identifiers/doi");
+    expect(doi?.status).toBe("user-confirmed");
+    expect(doi?.evidence.some((e) => e.from.kind === "user" && e.value === "10.1/new")).toBe(true);
+  });
+
+  it("an unknown field or identifier is refused with a plain 400, and nothing changes", async () => {
+    const pid = await project();
+    const sid = (await source(pid)).source.id;
+    for (const field of ["/identifiers/platform", "/identifiers/whatever", "/identifiers/doi/extra", "/provenance", "/nonsense"]) {
+      const r = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field, value: "x" } });
+      expect(r.status, field).toBe(400);
+      expect(r.json.error.code).toBe("VALIDATION");
+      expect(r.json.error.message).toMatch(/not a field that can be set here/);
+    }
+    const r = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/identifiers/doi", value: 7 } });
+    expect(r.status).toBe(400);
+    expect((await call({ url: `/projects/${pid}/sources/${sid}` })).json.source.identifiers.doi).toBe("10.1/old");
+  });
+
+  it("the shared list of confirmable identifiers is the library's", () => {
+    expect([...CONFIRMABLE_IDENTIFIER_KEYS].sort()).toEqual([...CONFIRMABLE_IDENTIFIERS].sort());
   });
 });

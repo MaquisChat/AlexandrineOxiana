@@ -38,6 +38,21 @@ export interface FieldReview {
 }
 
 /**
+ * `PATCH /projects/:id/sources/:sid/fields`: the researcher's value for one field, recorded as their
+ * own evidence (the field becomes "user-confirmed" when it agrees). `field` is a top-level field
+ * ("/title", "/issued" …) or one identifier under the verification report's own key
+ * ("/identifiers/doi", R149), so a FieldReview's `field` can be posted back unchanged. Anything else
+ * is refused (400 VALIDATION). An ISBN may be one string or a list.
+ */
+export interface FieldConfirmRequest {
+  field: string;
+  value: unknown;
+}
+
+/** The identifiers that can be confirmed one at a time (`/identifiers/<key>`, R149); the library's CONFIRMABLE_IDENTIFIERS. */
+export const CONFIRMABLE_IDENTIFIER_KEYS: readonly string[] = ["doi", "isbn", "issn", "url", "platformPostId", "arxiv"];
+
+/**
  * Added to every source record the service sends (`GET`/`PATCH /projects/:id/sources/:sid`,
  * `PATCH …/fields`, `POST …/recheck`), next to the stored record's own keys. In those records a
  * linked file's absolute path is left out (R132): `assets[].linked` keeps only `libraryRelativePath`.

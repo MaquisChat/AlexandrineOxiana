@@ -152,6 +152,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
   });
 
   // Researcher-set value of one field, recorded as their own evidence (→ user-confirmed when it agrees).
+  // `field` is a top-level field or one identifier under the verification report's key ("/identifiers/doi", R149);
+  // anything else is refused by the library (InvalidInputError → 400 VALIDATION).
   app.patch("/projects/:id/sources/:sid/fields", async (req) => {
     const s = state.requireWritable();
     const projectId = projectParam(ctx, req);
