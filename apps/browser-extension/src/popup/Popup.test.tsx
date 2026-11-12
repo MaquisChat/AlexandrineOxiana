@@ -8,6 +8,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApi, unreachable, type LocalStorageArea } from "../api.js";
+import type { BackgroundRequest } from "../types.js";
 import { Popup, type PopupBridge } from "./Popup.js";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -83,12 +84,16 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 10; i++) await act(async () => void (await new Promise((r) => setTimeout(r, 0))));
 }
 
-async function mount(net: ReturnType<typeof fakeNet>, storage = memoryStorage()) {
+async function mount(net: ReturnType<typeof fakeNet>, storage = memoryStorage(), opts: { sent?: BackgroundRequest[]; prefs?: PopupBridge["prefs"] } = {}) {
   if (!("pairing" in storage.data)) storage.data.pairing = { port: OLD, token: TOKEN, pairedAt: "2026-11-01T10:00:00.000Z" };
   const bridge: PopupBridge = {
     api: createApi({ fetch: net.fn, storage }),
+    prefs: opts.prefs ?? storage,
     activeTabId: async () => 7,
-    send: async <T,>() => ({ active: false, count: 0 }) as T,
+    send: async <T,>(msg: BackgroundRequest) => {
+      opts.sent?.push(msg);
+      return { active: false, count: 0 } as T;
+    },
     pendingLinks: async () => ({}),
     copy: async () => {},
   };
@@ -315,6 +320,7 @@ describe("the desktop app does not answer on the saved port (R171)", () => {
 // Task 65: where the pairing screen is found.
 const unpaired: PopupBridge = {
   api: { getPairing: async () => null } as unknown as PopupBridge["api"],
+  prefs: memoryStorage(),
   activeTabId: async () => undefined,
   send: async () => undefined as never,
   pendingLinks: async () => ({}),
@@ -333,5 +339,156 @@ describe("the popup before pairing", () => {
     expect(hint).toContain("“Show a pairing code”");
     expect(hint).toMatch(/port number and a 6-digit code/);
     expect(hint).not.toMatch(/Settings/);
+  });
+});
+
+// Task 71, defect D18 (R189): the popup remembers the last choice for "Also download media with the
+// downloader" in storage.local, per browser profile; the project's rules still decide.
+describe("the popup remembers the downloader choice (R189, D18)", () => {
+  const BOTH = { projects: [...PROJECTS.projects, { id: "p2", name: "Pages only", captureMethods: ["browser_capture"] }] };
+  const answers = (body: unknown = PROJECTS) => fakeNet((port) => (port === OLD ? { status: 200, body } : null));
+  const box = () => inputLabelled(/also download media with the downloader/i);
+  const captures = (sent: BackgroundRequest[]) => sent.filter((m) => m.type === "capture-page");
+  async function reopen(storage: ReturnType<typeof memoryStorage>, sent: BackgroundRequest[] = []) {
+    act(() => root?.unmount());
+    root = undefined;
+    host.replaceChildren();
+    await mount(answers(), storage, { sent });
+  }
+  async function choose(projectId: string) {
+    const select = host.querySelector("select")!;
+    await act(async () => {
+      select.value = projectId;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+
+  it("is ticked with nothing stored, and a capture then asks for the downloader", async () => {
+    const sent: BackgroundRequest[] = [];
+    const storage = await mount(answers(), memoryStorage(), { sent });
+    expect(box()!.checked).toBe(true);
+    expect(box()!.disabled).toBe(false);
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p1", alsoDownload: true }]);
+    // Opening the popup stores nothing; only the researcher's own change does.
+    expect(storage.data).not.toHaveProperty("alsoDownload");
+  });
+
+  it("an untick is stored in storage.local and shown at the next open; the capture sends what is shown", async () => {
+    const storage = await mount(answers());
+    await click(box());
+    expect(box()!.checked).toBe(false);
+    expect(storage.data.alsoDownload).toBe(false);
+    const sent: BackgroundRequest[] = [];
+    await reopen(storage, sent);
+    expect(box()!.checked).toBe(false);
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p1", alsoDownload: false }]);
+    // The token is where it was: the choice sits beside it, under its own key.
+    expect(storage.data.pairing).toMatchObject({ port: OLD, token: TOKEN });
+  });
+
+  it("a tick is stored likewise and shown at the next open", async () => {
+    const storage = memoryStorage();
+    storage.data.alsoDownload = false;
+    await mount(answers(), storage);
+    expect(box()!.checked).toBe(false);
+    await click(box());
+    expect(storage.data.alsoDownload).toBe(true);
+    const sent: BackgroundRequest[] = [];
+    await reopen(storage, sent);
+    expect(box()!.checked).toBe(true);
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p1", alsoDownload: true }]);
+  });
+
+  it("a project whose rules do not allow the downloader offers no choice and sends no downloader request, whatever is stored", async () => {
+    const storage = memoryStorage();
+    storage.data.alsoDownload = true;
+    const sent: BackgroundRequest[] = [];
+    await mount(answers(BOTH), storage, { sent });
+    await choose("p2");
+    expect(box()!.checked).toBe(false);
+    expect(box()!.disabled).toBe(true);
+    expect(host.textContent).toContain("This project's rules do not allow the downloader");
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p2", alsoDownload: false }]);
+    // Nothing the project's rules settle is written back as the researcher's choice.
+    expect(storage.data.alsoDownload).toBe(true);
+    // Back on the project that allows it, the stored choice is shown again.
+    await choose("p1");
+    expect(box()!.checked).toBe(true);
+  });
+
+  it("a project that does not allow the downloader still sends none when “unticked” is stored", async () => {
+    const storage = memoryStorage();
+    storage.data.alsoDownload = false;
+    const sent: BackgroundRequest[] = [];
+    await mount(answers(BOTH), storage, { sent });
+    await choose("p2");
+    expect(box()!.disabled).toBe(true);
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p2", alsoDownload: false }]);
+    expect(storage.data.alsoDownload).toBe(false);
+  });
+
+  it.each([["false"], ["true"], [0], [1], [null], [{}], [[false]]])("an odd stored value (%j) falls back to ticked", async (odd) => {
+    const storage = memoryStorage();
+    storage.data.alsoDownload = odd;
+    await mount(answers(), storage);
+    expect(box()!.checked).toBe(true);
+  });
+
+  it("a storage read that fails falls back to ticked and breaks nothing", async () => {
+    const storage = memoryStorage();
+    const prefs = { ...storage, get: async () => Promise.reject(new Error("storage is unavailable")) };
+    const sent: BackgroundRequest[] = [];
+    await mount(answers(), storage, { sent, prefs });
+    expect(host.textContent).toContain("Estuary");
+    expect(box()!.checked).toBe(true);
+    expect(status()).toBe("");
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p1", alsoDownload: true }]);
+  });
+
+  it("a read that throws before it returns a promise also falls back to ticked", async () => {
+    const storage = memoryStorage();
+    const prefs = {
+      ...storage,
+      get: () => {
+        throw new Error("no storage here");
+      },
+    };
+    await mount(answers(), storage, { prefs });
+    expect(host.textContent).toContain("Estuary");
+    expect(box()!.checked).toBe(true);
+  });
+
+  it("a storage write that fails still changes the box for this time, and says nothing alarming", async () => {
+    const storage = memoryStorage();
+    const prefs = { ...storage, set: async () => Promise.reject(new Error("quota")) };
+    const sent: BackgroundRequest[] = [];
+    await mount(answers(), storage, { sent, prefs });
+    await click(box());
+    await settle();
+    expect(box()!.checked).toBe(false);
+    expect(status()).toBe("");
+    await click(button("Capture this page"));
+    expect(captures(sent)).toEqual([{ type: "capture-page", tabId: 7, projectId: "p1", alsoDownload: false }]);
+  });
+
+  it("a stored value read late does not undo a change the researcher already made", async () => {
+    const storage = memoryStorage();
+    storage.data.alsoDownload = true;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const prefs = { ...storage, get: async (key: string) => (await gate, storage.get(key)) };
+    await mount(answers(), storage, { prefs });
+    await click(box());
+    expect(box()!.checked).toBe(false);
+    release();
+    await settle();
+    expect(box()!.checked).toBe(false);
+    expect(storage.data.alsoDownload).toBe(false);
   });
 });
