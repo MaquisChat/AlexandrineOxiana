@@ -39,7 +39,7 @@ interface Run {
 }
 
 /** A stand-in worker whose tool jobs the test finishes by hand. */
-function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
+function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean; missingModels?: boolean } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
   const runs: Run[] = [];
   const p: WorkerProvider & { runs: Run[]; updateError?: Error } = {
     runs,
@@ -61,7 +61,11 @@ function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean } = {
           }),
       } as unknown as WorkerToolsClient;
       const client = {
-        async submit(_pid: string, _job: WorkerJob): Promise<JobResult> {
+        async submit(_pid: string, job: WorkerJob): Promise<JobResult> {
+          if (over.missingModels && job.type === "audio.transcribe") {
+            const m = String(job.params?.model);
+            throw new WorkerToolError("TOOL_NOT_INSTALLED", `Speech model: ${m} is not installed.`, `speech-${m}`);
+          }
           throw over.transcribeError ?? new WorkerJobError("TOOL_FAILED", "no");
         },
         async resumePending() {
@@ -227,22 +231,44 @@ describe("installing a tool", () => {
     await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "cancelled");
   });
 
-  it("a cancelled job is shown as cancelled at once, even while the media helper is still ending it", async () => {
+  it("a cancel the media helper confirms ends the job cancelled; until then it shows the cancel was asked for", async () => {
     const worker = stubWorker({ ignoreAbort: true });
     await start({ worker, autoStartWorker: false });
     const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
     await until(() => worker.runs.length === 1);
     const c = await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
-    expect(c.json.job.status).toBe("cancelled");
-    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
-    expect(((await call({ url: "/tools" })).json as ToolsResponse).jobs.every((j) => j.status !== "running")).toBe(true);
-    // a late success from the helper does not bring it back to life
-    worker.runs[0]!.finish({ installed: ["ffmpeg"] });
-    await new Promise((r) => setTimeout(r, 20));
-    expect((await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status).toBe("cancelled");
-    // and the tool can be asked for again: a new job
+    expect(c.json.job).toMatchObject({ status: "running", cancelRequested: true });
+    expect(worker.runs[0]!.signal?.aborted).toBe(true);
+    worker.runs[0]!.finish(new WorkerJobError("CANCELLED", "the job was cancelled"));
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status === "cancelled");
     const again = await call({ method: "POST", url: "/tools/ffmpeg/install" });
     expect(again.json.job.jobId).not.toBe(job.jobId);
+  });
+
+  it("an install that completed before the cancel took effect ends installed and says so", async () => {
+    const worker = stubWorker({ ignoreAbort: true });
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
+    worker.runs[0]!.finish({ tool: "ffmpeg", action: "install", installed: ["ffmpeg"] });
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status !== "running");
+    const done = (await call({ url: `/tools/jobs/${job.jobId}` })).json.job as ToolJob;
+    expect(done).toMatchObject({ status: "done", cancelRequested: true, result: { installed: ["ffmpeg"] } });
+  });
+
+  it("a cancel the media helper never confirms ends the job failed, not cancelled", async () => {
+    const worker = stubWorker({ ignoreAbort: true });
+    await start({ worker, autoStartWorker: false });
+    const job = (await call({ method: "POST", url: "/tools/ffmpeg/install" })).json.job as ToolJob;
+    await until(() => worker.runs.length === 1);
+    await call({ method: "POST", url: `/tools/jobs/${job.jobId}/cancel` });
+    worker.runs[0]!.finish(new WorkerJobError("CANCEL_UNCONFIRMED", "the worker did not confirm"));
+    await until(async () => (await call({ url: `/tools/jobs/${job.jobId}` })).json.job.status !== "running");
+    const j = (await call({ url: `/tools/jobs/${job.jobId}` })).json.job as ToolJob;
+    expect(j.status).toBe("failed");
+    expect(j.error?.code).toBe("CANCEL_UNCONFIRMED");
+    expect(j.error?.message).toMatch(/tools list/);
   });
 
   it("a failed install is recorded with the worker's code and a plain message, never a bare 500", async () => {
@@ -324,5 +350,31 @@ describe("GET /jobs names the missing tool of a failed viewing copy or OCR job",
     expect(failureTool("ocr", "TOOL_NOT_INSTALLED")).toBe("ocr");
     expect(failureTool("video.proxy", "FFMPEG_FAILED")).toBeUndefined();
     expect(failureTool("image.proxy", "TOOL_NOT_INSTALLED")).toBeUndefined();
+  });
+});
+
+describe("speech models (R158)", () => {
+  it("a transcription accepts exactly the shared models, and a missing one is named by its tool id", async () => {
+    const { SPEECH_MODELS } = await import("@ao/shared");
+    await start({ worker: stubWorker({ missingModels: true }), autoStartWorker: false });
+    expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Lib"), name: "Lib" } })).status).toBe(200);
+    const p = await call({ method: "POST", url: "/projects", body: { name: "S", governanceYaml: "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\n", encryption: { enabled: false } } });
+    const pid = p.json.project.id as string;
+    const dir = join(tmp, "in");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "talk.mp3"), Buffer.alloc(64, 1));
+    const sf = await svc.state.session!.repo.createSource(
+      pid,
+      { projectIds: [pid], type: "audio", title: { variants: [{ lang: "en", kind: "original", value: "Talk" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: join(dir, "talk.mp3"), role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    for (const model of SPEECH_MODELS) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model } });
+      expect(r.status, model).toBe(409);
+      expect(r.json.error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: `speech-${model}` });
+      expect(r.json.error.message).toMatch(/The Optional tools screen/);
+    }
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model: "huge" } })).status).toBe(400);
   });
 });

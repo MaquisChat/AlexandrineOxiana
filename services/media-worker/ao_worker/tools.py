@@ -98,7 +98,7 @@ def not_installed(tool_id: str) -> JobError:
         d = downloads_for(c) if c.kind != "ytdlp" else ()
         if isinstance(d, Unavailable) and not component_status(c).installed:
             return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed, and it cannot be downloaded for this computer yet. {d.reason}", tool=tool_id)
-    return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed. Install it from the tools dialogue.", tool=tool_id)
+    return JobError("TOOL_NOT_INSTALLED", f"{name} is not installed. Install it from the Optional tools screen.", tool=tool_id)
 
 
 def _err(code: str, message: str, detail: str | None = None) -> JobError:
@@ -318,6 +318,26 @@ def _download_size(c: Component) -> tuple[int, bool]:
     return sum(x.size for x in d), False
 
 
+def hosts_of(c: Component) -> list[str]:
+    """The host names a component's download contacts (R158), derived from its pins, never typed
+    again: the pinned addresses' hosts and the exact hosts a redirect may lead to; for yt-dlp the
+    release host (its checksum file comes from there too) and the hosts its files are served from.
+    Only bare host names (a `.suffix` redirect allowance is not one host). Nothing for a part that
+    cannot be downloaded for this computer."""
+    from urllib.parse import urlsplit
+
+    if c.kind == "ytdlp":
+        from .download import YTDLP_HOSTS, YTDLP_RELEASES
+
+        found = [urlsplit(YTDLP_RELEASES).hostname or "", *YTDLP_HOSTS]
+    else:
+        d = downloads_for(c)
+        if isinstance(d, Unavailable):
+            return []
+        found = [urlsplit(x.url).hostname or "" for x in d] + list(c.hosts)
+    return list(dict.fromkeys(h.lower() for h in found if h and not h.startswith(".")))
+
+
 def catalogue() -> dict:
     """GET /tools: every optional tool, with what it is for, what stops working without it, its size,
     version and whether it is installed and usable. Runs only quick local checks; no network."""
@@ -346,6 +366,7 @@ def catalogue() -> dict:
                 "installedVersion": st.version, "outdated": st.outdated,
                 "available": available, **({"unavailableReason": d.reason} if not available else {}),  # type: ignore[union-attr]
                 "downloadSize": s, "sizeApproximate": a,
+                "hosts": hosts_of(c),
             })
         installed = all(p["installed"] for p in parts)
         usable = installed and all(p["usable"] for p in parts)

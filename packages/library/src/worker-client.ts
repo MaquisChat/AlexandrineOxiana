@@ -475,13 +475,16 @@ export class WorkerToolsClient {
   private readonly pollMs: number;
   private readonly cancelGraceMs: number;
 
-  /** `cancelGraceMs`: how long a cancelled job may take to end in the worker before it is given up on (default 10 s). */
+  /**
+   * `cancelGraceMs`: how long the worker may take to confirm a cancel (default 2 min) before the job
+   * is given up on as CANCEL_UNCONFIRMED (not CANCELLED: only the worker says it stopped).
+   */
   constructor(
     private readonly worker: WorkerEndpoint,
     opts: { pollMs?: number; cancelGraceMs?: number } = {},
   ) {
     this.pollMs = opts.pollMs ?? 500;
-    this.cancelGraceMs = opts.cancelGraceMs ?? 10_000;
+    this.cancelGraceMs = opts.cancelGraceMs ?? 120_000;
   }
 
   /** `GET /tools`: every optional tool with its purpose, size, version and whether it is installed. */
@@ -509,7 +512,7 @@ export class WorkerToolsClient {
         await workerRequest(this.worker, "POST", `${jobPath}/cancel`).catch(() => {});
       }
       // A job the worker does not end after a cancel is not waited for for ever.
-      if (cancelSent && Date.now() - cancelSent > this.cancelGraceMs) throw new WorkerJobError("CANCELLED", "the job was cancelled");
+      if (cancelSent && Date.now() - cancelSent > this.cancelGraceMs) throw new WorkerJobError("CANCEL_UNCONFIRMED", "the media worker did not confirm that the job stopped");
       await new Promise((r) => setTimeout(r, this.pollMs));
       let state: WorkerJobState;
       try {

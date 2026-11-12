@@ -108,15 +108,26 @@ describe("WorkerToolsClient", () => {
     expect(f.requests.some((r) => r.method === "POST" && r.url === "/jobs/w1/cancel")).toBe(true);
   });
 
-  it("a worker that does not end a cancelled job is given up on after the grace period", async () => {
+  it("a worker that does not confirm a cancel is given up on after the grace period, as unconfirmed", async () => {
     const f = await started({ final: { status: "done", result: {} }, polls: 100000, ignoreCancel: true });
     const ac = new AbortController();
     const t = Date.now();
     const p = new WorkerToolsClient(f, { pollMs: 5, cancelGraceMs: 100 }).run("install", "ffmpeg", { signal: ac.signal });
     setTimeout(() => ac.abort(), 20);
     const err = await p.catch((e: unknown) => e);
-    expect((err as WorkerJobError).code).toBe("CANCELLED");
+    expect((err as WorkerJobError).code).toBe("CANCEL_UNCONFIRMED");
     expect(Date.now() - t).toBeLessThan(2000);
+  });
+
+  it("an install that completes although a cancel was asked for returns its result", async () => {
+    const f = await started({ final: { status: "done", result: { tool: "ffmpeg", installed: ["ffmpeg"] } }, polls: 4, ignoreCancel: true });
+    const ac = new AbortController();
+    ac.abort();
+    const p = new WorkerToolsClient(f, { pollMs: 5 }).run("install", "ffmpeg", { signal: ac.signal });
+    await expect(p).rejects.toMatchObject({ code: "CANCELLED" }); // aborted before it was even sent
+    const ac2 = new AbortController();
+    const r = await new WorkerToolsClient(f, { pollMs: 5 }).run("install", "ffmpeg", { signal: ac2.signal, onProgress: () => ac2.abort() });
+    expect(r).toMatchObject({ installed: ["ffmpeg"] });
   });
 
   it("an unknown tool is the worker's 404 code, not a crash", async () => {

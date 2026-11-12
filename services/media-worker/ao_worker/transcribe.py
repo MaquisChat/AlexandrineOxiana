@@ -17,10 +17,13 @@ from .jobs import Job, JobContext, JobError
 
 log = logging.getLogger("ao_worker.transcribe")
 
+# The speech models the app accepts: the same list as SPEECH_MODELS in packages/shared (R158;
+# tests/test_tools.py fails when they differ).
 MODELS = ("large-v3", "medium", "small", "tiny")
 COMPUTE_TYPES = ("int8", "float16")
 DEFAULTS = {
-    "model": "large-v3", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
+    # model: DEFAULT_SPEECH_MODEL in packages/shared (R158; tests/test_tools.py checks).
+    "model": "medium", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
     "wordTimestamps": True,
 }
 SAMPLE_RATE = 16000
@@ -69,7 +72,7 @@ def model_path(name: str) -> str:
         log.warning("the %s speech model on disk is unusable (%s); not downloading", name, type(e).__name__)
         raise JobError(
             "MODEL_UNAVAILABLE",
-            f"the {name} model on disk is incomplete or damaged; install it again from the tools dialogue"
+            f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen"
             if damaged else f"the {name} model on disk could not be read",
             type(e).__name__,
             tool=f"speech-{name}",
@@ -77,7 +80,7 @@ def model_path(name: str) -> str:
     if not (Path(path) / "model.bin").is_file():
         log.warning("the %s speech model on disk has no model.bin; not downloading", name)
         raise JobError("MODEL_UNAVAILABLE",
-                       f"the {name} model on disk is incomplete or damaged; install it again from the tools dialogue",
+                       f"the {name} model on disk is incomplete or damaged; install it again from the Optional tools screen",
                        tool=f"speech-{name}")
     return path
 

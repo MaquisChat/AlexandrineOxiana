@@ -29,6 +29,7 @@ const MESSAGES: Record<string, string> = {
   TOOL_NOT_MANAGED: "This tool was not installed by the app (it belongs to this computer), so it was left alone.",
   TOOL_UPDATE_FAILED: "The tool could not be updated. Try again later.",
   WORKER_UNAVAILABLE: "The media helper stopped before the job finished. Nothing was left half-installed; try again.",
+  CANCEL_UNCONFIRMED: "The media helper did not confirm that it stopped. Check the tools list to see whether the tool is installed.",
 };
 const FALLBACK = "The tool job did not finish. Nothing was left half-installed; try again.";
 
@@ -112,15 +113,15 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
       })
       .then(
         (result) => {
-          if (job.status !== "running") return; // cancelled meanwhile: the catalogue tells what is installed
+          // The worker's answer is final, also after a cancel: an install that completed is installed.
           job.status = "done";
           job.progress = 1;
           job.result = pick(result);
           if (action !== "remove") retryWaitingWork(toolId);
         },
         (err: unknown) => {
-          if (job.status !== "running") return;
-          if ((err instanceof WorkerJobError && err.code === "CANCELLED") || entry.ac.signal.aborted) {
+          // Cancelled only when the worker says it stopped (nothing half-installed).
+          if (err instanceof WorkerJobError && err.code === "CANCELLED") {
             job.status = "cancelled";
             return;
           }
@@ -181,12 +182,11 @@ export function registerTools(app: FastifyInstance, ctx: Ctx): void {
     requireShell(req);
     const e = jobs.get(paramsOf(req).jobId ?? "");
     if (!e) throw notFound("That tool job");
-    if (e.job.status === "running") {
-      // Shown as cancelled at once (R: never "running" after a cancel); the worker ends the download
-      // within about a second, and a late answer from it is ignored.
+    if (e.job.status === "running" && !e.job.cancelRequested) {
+      // The job's final state is the worker's (R: cancelled only when it confirms it stopped). The
+      // worker ends a download within about a second; an install past its last cancel check completes.
       e.ac.abort();
-      e.job.status = "cancelled";
-      e.job.finishedAt = new Date().toISOString();
+      e.job.cancelRequested = true;
       publish(e.job);
     }
     return { job: { ...e.job } };

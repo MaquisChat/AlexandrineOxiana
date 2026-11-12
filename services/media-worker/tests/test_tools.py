@@ -847,9 +847,9 @@ def test_a_missing_tool_that_cannot_be_installed_here_says_why(worker_env, monke
     monkeypatch.setenv("PATH", str(FAKE_BIN))
     e = tools.not_installed("ocr")
     assert e.code == "TOOL_NOT_INSTALLED" and e.tool == "ocr"
-    assert "tools dialogue" not in e.message
+    assert "Optional tools screen" not in e.message
     assert "tesseract" in e.message
-    assert "tools dialogue" in tools.not_installed("ffmpeg").message
+    assert "Install it from the Optional tools screen." in tools.not_installed("ffmpeg").message
 
 
 def test_an_existing_file_is_never_deleted_by_a_failed_download(worker_env, files, tmp_path):
@@ -894,3 +894,165 @@ def test_tool_jobs_do_not_take_the_media_jobs_slots(worker, worker_env, files, m
     assert all(worker.request("GET", f"/jobs/{j}")[1]["status"] in ("running", "queued") for j in started)
     for jid in started:
         worker.request("POST", f"/jobs/{jid}/cancel")
+
+
+# ---------- fix round 2: hosts and one definition of the speech models (R158) ----------
+
+REPO = Path(__file__).resolve().parents[3]
+SHARED_TOOLS_TS = REPO / "packages" / "shared" / "src" / "api" / "tools.ts"
+
+
+def shared_speech_models() -> tuple[list[str], str]:
+    """SPEECH_MODELS and DEFAULT_SPEECH_MODEL as packages/shared declares them (the one definition)."""
+    text = SHARED_TOOLS_TS.read_text(encoding="utf-8")
+    m = re.search(r"export const SPEECH_MODELS = \[([^\]]*)\] as const", text)
+    d = re.search(r'export const DEFAULT_SPEECH_MODEL: SpeechModel = "([^"]+)"', text)
+    assert m and d, "SPEECH_MODELS / DEFAULT_SPEECH_MODEL not found in packages/shared"
+    return re.findall(r'"([^"]+)"', m.group(1)), d.group(1)
+
+
+def test_the_worker_accepts_and_offers_exactly_the_shared_speech_models():
+    from ao_worker import transcribe
+
+    models, default = shared_speech_models()
+    assert sorted(transcribe.MODELS) == sorted(models)
+    assert sorted(toolpins.MODEL_PINS) == sorted(models)
+    offered = sorted(t.id for t in toolpins.TOOLS.values() if t.group == "speech")
+    assert offered == sorted(f"speech-{m}" for m in models)
+    assert transcribe.DEFAULTS["model"] == default == "medium"
+
+
+def test_every_installable_component_names_the_hosts_it_contacts(worker_env, monkeypatch):
+    monkeypatch.setenv("PATH", str(FAKE_BIN))
+    cat = tools.catalogue()
+    for t in cat["tools"]:
+        for c in t["components"]:
+            assert isinstance(c["hosts"], list), c["id"]
+            for h in c["hosts"]:
+                assert re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", h), (c["id"], h)
+            if c["available"]:
+                assert c["hosts"], c["id"]
+    comps = {c["id"]: c for t in cat["tools"] for c in t["components"]}
+    assert "huggingface.co" in comps["model-medium"]["hosts"]
+    assert "github.com" in comps["yt-dlp"]["hosts"]
+    assert comps["deno"]["hosts"] == ["dl.deno.land"]
+    assert comps["ffmpeg"]["hosts"] == ["ffmpeg.martin-riedl.de"]
+    assert comps["tesseract"]["hosts"] == []  # nothing to download on any platform yet
+
+
+def test_a_hosts_list_follows_the_pins(worker_env, files, monkeypatch):
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files))
+    comps = {c["id"]: c for t in tools.catalogue()["tools"] for c in t["components"]}
+    assert comps["ffmpeg"]["hosts"] == ["127.0.0.1"]
+
+
+# ---------- fix round 2, N1: a host that never finishes its headers ----------
+
+
+class SlowHeaders:
+    """Accepts connections and sends a status line, then one header byte every `every` seconds."""
+
+    def __init__(self, every: float = 0.1, total: float = 8.0):
+        import socket as _s
+
+        self.sock = _s.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.every, self.total = every, total
+        self.accepted = 0
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            threading.Thread(target=self._drip, args=(conn,), daemon=True).start()
+
+    def _drip(self, conn):
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\r\n")
+            end = time.monotonic() + self.total
+            while time.monotonic() < end:
+                conn.sendall(b"X")
+                time.sleep(self.every)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def test_a_cancel_while_the_headers_drip_is_honoured_within_about_a_second(worker_env, tmp_path):
+    srv = SlowHeaders()
+    try:
+        flag = {"cancel": False}
+        threading.Timer(0.5, lambda: flag.__setitem__("cancel", True)).start()
+        t = time.monotonic()
+        with pytest.raises(tools.JobCancelled):
+            fetch.download(f"http://127.0.0.1:{srv.port}/x", tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",),
+                           max_bytes=100, cancelled=lambda: flag["cancel"])
+        assert time.monotonic() - t < 1.5
+        assert not (tmp_path / "f").exists()
+    finally:
+        srv.close()
+
+
+def test_headers_that_never_finish_are_given_up_on(worker_env, tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch, "HEADER_SEC", 0.5)
+    srv = SlowHeaders()
+    try:
+        t = time.monotonic()
+        with pytest.raises(fetch.ToolInstallError) as e:
+            fetch.download(f"http://127.0.0.1:{srv.port}/x", tmp_path / "f", sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=100)
+        assert e.value.code == "TOOL_DOWNLOAD_FAILED" and "answer" in e.value.message
+        assert time.monotonic() - t < 1.5
+    finally:
+        srv.close()
+
+
+def test_the_ytdlp_release_lookups_honour_cancel_too(worker_env, monkeypatch, tmp_path):
+    from ao_worker import download
+
+    srv = SlowHeaders()
+    try:
+        monkeypatch.setattr(download, "YTDLP_RELEASES", f"http://127.0.0.1:{srv.port}/releases/")
+        monkeypatch.setattr(download, "YTDLP_HOSTS", ("127.0.0.1",))
+        flag = {"cancel": False}
+        threading.Timer(0.5, lambda: flag.__setitem__("cancel", True)).start()
+        t = time.monotonic()
+        with pytest.raises(tools.JobCancelled):
+            download.install_ytdlp(cancelled=lambda: flag["cancel"])
+        assert time.monotonic() - t < 1.5
+    finally:
+        srv.close()
+
+
+# ---------- fix round 2, N2: a tool job's final state is the worker's ----------
+
+
+def test_an_install_that_completed_before_the_cancel_took_effect_ends_done():
+    from ao_worker.jobs import JobManager
+
+    def finishes_then_sees_cancel(job, ctx):
+        job.cancel_event.set()  # the cancel arrives after the last point where it could stop the install
+        return {"tool": "ffmpeg", "installed": ["ffmpeg"]}
+
+    for honour, expected in ((False, "done"), (True, "cancelled")):
+        m = JobManager({"tool.install": finishes_then_sees_cancel}, max_running=1, cancel_after_return=honour)
+        j = m.submit("tool.install", "ffmpeg", "/x", {})
+        deadline = time.monotonic() + 5
+        while j.status not in ("done", "failed", "cancelled") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert j.status == expected, honour
+        m.shutdown()
+
+
+def test_the_worker_runs_tool_jobs_in_a_lane_that_keeps_a_completed_install(worker):
+    assert worker.server.tool_manager.cancel_after_return is False
+    assert worker.server.manager.cancel_after_return is True

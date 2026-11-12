@@ -164,8 +164,8 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof InvalidConfirmTokenError) return new ApiError(400, "VALIDATION", "That confirmation is not valid (it is single use and expires).");
   if (err instanceof WorkerUnavailableError) return new ApiError(503, "WORKER_UNAVAILABLE", "The media helper is not running.", err.message);
   // An optional tool (Task 48a, R126): a missing one is named (reason = its tool id) so the interface
-  // can offer the tools dialogue; a failed install or update keeps the worker's code (reason).
-  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return new ApiError(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer. The tools dialogue shows how to get it.", err.tool);
+  // can offer the Optional tools screen; a failed install or update keeps the worker's code (reason).
+  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return new ApiError(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer. The Optional tools screen shows how to get it.", err.tool);
   if (err instanceof WorkerJobError && err.code.startsWith("TOOL_")) return new ApiError(502, "TOOL_FAILED", "The tool could not be installed or updated. Nothing was left half-installed; try again later.", err.code);
   if (err instanceof WorkerJobError) return new ApiError(502, "INTERNAL", "The media helper could not finish the job.", err.code);
   const code = (err as NodeJS.ErrnoException | undefined)?.code;

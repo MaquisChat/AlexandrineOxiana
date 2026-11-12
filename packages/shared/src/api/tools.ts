@@ -21,8 +21,22 @@ export function isToolId(v: string): v is ToolId {
   return (TOOL_IDS as readonly string[]).includes(v);
 }
 
+/**
+ * The speech models the app accepts (R158): the one definition used by the worker's catalogue
+ * (checked by services/media-worker/tests/test_tools.py), the service's validation, the capture
+ * code, the transcript viewer and the tools dialogue. Nothing else can be installed or asked for.
+ */
+export const SPEECH_MODELS = ["tiny", "small", "medium", "large-v3"] as const;
+export type SpeechModel = (typeof SPEECH_MODELS)[number];
+/** The model used when none is named (R158: SPEC 5.2 names none; the transcript viewer's default). */
+export const DEFAULT_SPEECH_MODEL: SpeechModel = "medium";
+
+export function isSpeechModel(v: string): v is SpeechModel {
+  return (SPEECH_MODELS as readonly string[]).includes(v);
+}
+
 /** The speech model tool for a transcription model name (`small` → `speech-small`). */
-export function speechToolId(model: "tiny" | "small" | "medium" | "large-v3"): ToolId {
+export function speechToolId(model: SpeechModel): ToolId {
   return `speech-${model}`;
 }
 
@@ -50,6 +64,12 @@ export interface ToolComponent {
   unavailableReason?: string;
   downloadSize: number;
   sizeApproximate: boolean;
+  /**
+   * The host names its download contacts (R158), derived from its pins: the pinned addresses' hosts
+   * and the exact hosts a redirect may lead to; for yt-dlp the release host and its file hosts.
+   * Absent in answers from before Task 48a fix round 2.
+   */
+  hosts?: string[];
 }
 
 export interface ToolInfo {
@@ -91,6 +111,7 @@ export type ToolErrorCode =
   | "TOOL_NOT_MANAGED"
   | "TOOL_UPDATE_FAILED"
   | "WORKER_UNAVAILABLE"
+  | "CANCEL_UNCONFIRMED"
   | "FAILED";
 
 export interface ToolJob {
@@ -102,6 +123,12 @@ export interface ToolJob {
   progress: number;
   startedAt: string;
   finishedAt?: string;
+  /**
+   * A cancel was asked for (fix round 2). The job stays `running` until the worker answers: then
+   * `cancelled` (it stopped, nothing half-installed) or `done` (the install completed before the
+   * cancel could take effect), or `failed` with CANCEL_UNCONFIRMED.
+   */
+  cancelRequested?: boolean;
   error?: { code: ToolErrorCode | string; message: string };
   /** For a finished job: which parts were installed, updated, removed or already in place. */
   result?: { installed?: string[]; updated?: Array<{ component: string; old: string | null; new: string | null }>; removed?: string[]; skipped?: string[] };
