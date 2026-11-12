@@ -11,7 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -280,6 +280,44 @@ describe("1. a restore is decided by the policy engine before anything is writte
     } finally {
       await other.close();
     }
+  });
+
+  it("fix round 1 (M4): a refusal by policy is never appended to a project log that no longer verifies: it goes to the library's log, which says so", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Changed Outside");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    await addSource(kit, p, { title: "y" });
+    // Changed outside the app while it runs: the open found nothing wrong with this log.
+    await breakAudit(p, (l) => l.includes('"action":"backup.create"'));
+    const count = (await eventsOf(p.id)).length;
+    const folders = await projectFolders();
+    const err = (await restore(b.path, { locationEnv: onNetwork() }).catch((e: unknown) => e)) as PolicyDeniedError;
+    expect(err).toBeInstanceOf(PolicyDeniedError);
+    expect(err.reason).toBe(NETWORK_REASON);
+    await expectNothingRestored(folders, [p.id]);
+    expect((await eventsOf(p.id)).length).toBe(count);
+    const denied = await libraryRefusals();
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.decision).toEqual({ result: "deny", reason: NETWORK_REASON });
+    expect(denied[0]!.details).toMatchObject({ op: "project.restore", name: "Changed Outside", backupSha256: b.sha256, at: "decision", projectLogNotIntact: true });
+  });
+
+  it("fix round 1 (M4): a refusal the project's log cannot take for another reason goes to the library's log too, and is not said to be a log that does not hold together", async () => {
+    const p = await makeProject(kit, OPEN_GOV, false, "Not Writable");
+    await addSource(kit, p, { title: "x" });
+    const b = await backupProject(kit.repo, p.id);
+    // The audit folder now lies outside the project folder, behind a link: read as before, but never written through.
+    const dir = join(kit.lib.root, p.folder, "audit");
+    const outside = join(kit.tmp, "audit kept elsewhere");
+    await rename(dir, outside);
+    await symlink(outside, dir);
+    const count = (await eventsOf(p.id)).length;
+    await expect(restore(b.path, { locationEnv: onNetwork() })).rejects.toBeInstanceOf(PolicyDeniedError);
+    expect((await eventsOf(p.id)).length).toBe(count);
+    const denied = await libraryRefusals();
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.details).toMatchObject({ op: "project.restore", name: "Not Writable", projectLogNotWritable: true });
+    expect(denied[0]!.details).not.toHaveProperty("projectLogNotIntact");
   });
 
   it("a refusal that neither audit log can take still refuses, and the library warns", async () => {
@@ -1095,9 +1133,14 @@ describe("4. a restored project's warning about inherited backups stands from th
     seamsOfRestore.crashAfterRename = true;
     await expect(restore(d.fresh)).rejects.toThrow(/simulated/u);
     seamsOfRestore.crashAfterRename = false;
+    // As the restore itself left it on disk, before anything is opened again (a pass at the next
+    // open could set the note anew, which would prove nothing about the restore; fix round 1, M8).
+    const left = await noted();
+    expect(left).toHaveLength(2);
     await kit.reopen();
     const copy = ids().find((id) => id !== d.p.id)!;
     expect(copy).toBeDefined();
+    expect(left).toEqual([d.p.id, copy].sort());
     expect(await projectWarnings(kit.repo, copy)).toContain(WARNING);
     expect(await holdingNotRemoved(kit.repo, copy)).toEqual([rel(d.x)]);
   });
