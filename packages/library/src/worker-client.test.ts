@@ -10,7 +10,7 @@ import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
 import { openIndex, type IndexDb } from "./index/db.js";
 import { createLibrary, type Library } from "./library.js";
-import { PolicyDeniedError, type Repo } from "./repo/index.js";
+import { PolicyDeniedError, ProjectLockedError, type Repo } from "./repo/index.js";
 import { decryptBytes, encryptBytes } from "./repo/io.js";
 import { projectDataKey } from "./repo/repo.js";
 import { openTestRepo } from "./repo/testing.js";
@@ -533,6 +533,90 @@ describe("Task 62: jobs the service follows (an id, what it is about, finish, in
     expect(seen[0]).toBe(`prepare ${id} 019a7000-0000-7000-8000-000000000002`);
     expect(seen).toContain(`finish ${id}`);
     expect(seen.at(-1)).toBe("end true result");
+  });
+
+  it("fix 1 I3: a rerun the rules refuse ends for good, recorded and audited once; later resubmissions leave it alone", async () => {
+    const { project, input, output, lines } = await setup();
+    const id = await pendingJob(project.id, input, output);
+    const gov = await repo.getGovernance(project.id);
+    await repo.setGovernance(project.id, `${OPEN_GOV}processing:\n  image_proxy: []\n`, { baseSha256: gov.sha256 });
+    const ok = await stubWorker(okSubmit);
+    for (let i = 0; i < 3; i++) {
+      const out = await new WorkerClient({ repo, worker: ok, index: { db }, pollMs: 5 }).resumePending();
+      if (i === 0) expect(out.map((x) => x.error)).toEqual([expect.any(PolicyDeniedError)]);
+      else expect(out).toEqual([]);
+    }
+    expect(ok.jobs.size).toBe(0);
+    expect((await lines()).at(-1)).toMatchObject({ id, status: "failed", error: "POLICY_DENIED" });
+    const denies = (await auditEvents(project.folder)).filter((e) => e.decision?.result === "deny");
+    expect(denies).toHaveLength(1);
+  });
+
+  it("fix 1 I2: a lock while the worker runs: nothing is published or stored, the job is cancelled-locked and runs once at the unlock", async () => {
+    const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    const worker = await stubWorker(okSubmit);
+    let finished = 0;
+    const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 })
+      .submit(project.id, { type: "image.proxy", input, output: join(tmp, "out", "e.jpg"), params: {}, finish: async () => void finished++, onProgress: () => repo.lockProject(project.id) })
+      .catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    expect(finished).toBe(0);
+    expect(existsSync(join(tmp, "out", "e.jpg"))).toBe(false);
+    expect(jobRows().map((r) => r.status)).toEqual(["cancelled"]);
+    await repo.unlockProject(project.id, "pw");
+    const client = new WorkerClient({ repo, worker, index: { db }, pollMs: 5 });
+    const out = await client.resumePending(project.id, { prepare: () => ({ finish: async () => void finished++ }) });
+    expect(out.map((x) => x.error)).toEqual([undefined]);
+    expect(finished).toBe(1);
+    expect(worker.jobs.size).toBe(2);
+    expect(await client.resumePending(project.id)).toEqual([]);
+  });
+
+  it("fix 1 I2: a lock during the finish step (the store refused): cancelled-locked, run once at the unlock", async () => {
+    const { project } = await repo.createProject({ name: "E", governanceYaml: OPEN_GOV, encryption: { enabled: true, passphrase: "pw" } });
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    const worker = await stubWorker(okSubmit);
+    const err = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 })
+      .submit(project.id, {
+        type: "image.proxy",
+        input,
+        output: join(tmp, "out", "f.jpg"),
+        params: {},
+        finish: async () => {
+          repo.lockProject(project.id);
+          throw new ProjectLockedError(project.id); // what a governed write says on a locked project
+        },
+      })
+      .catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    expect(jobRows().map((r) => r.status)).toEqual(["cancelled"]);
+    await repo.unlockProject(project.id, "pw");
+    let stored = 0;
+    const out = await new WorkerClient({ repo, worker, index: { db }, pollMs: 5 }).resumePending(project.id, { prepare: () => ({ finish: async () => void stored++ }) });
+    expect(out.map((x) => x.error)).toEqual([undefined]);
+    expect(stored).toBe(1);
+    expect(jobRows().map((r) => r.status)).toEqual(["done"]);
+  });
+
+  it("fix 1 M8/M9: a close during the finish step waits for it, and its done line is written", async () => {
+    const { project, input, output, lines } = await setup();
+    const client = new WorkerClient({ repo, worker: await stubWorker(okSubmit), index: { db }, pollMs: 5 });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let inFinish = false;
+    const p = client.submit(project.id, { type: "image.proxy", input, output, params: {}, finish: async () => { inFinish = true; await gate; } });
+    while (!inFinish) await new Promise((r) => setTimeout(r, 5));
+    let closed = false;
+    const c = client.close().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(closed).toBe(false);
+    release();
+    await c;
+    await p;
+    expect((await lines()).at(-1)!.status).toBe("done");
   });
 
   it("resumePending with a signal: an interrupt stops the job in hand (left pending) and starts no other", async () => {

@@ -7,7 +7,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project } from "@ao/core";
-import { OPEN_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
+import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
+import { PolicyDeniedError } from "./repo/errors.js";
 import { NoMediaError } from "./capture/link-capture.js";
 import { transcriptVersions } from "./source-actions.js";
 import { readTranscript } from "./transcript-segments.js";
@@ -94,6 +95,35 @@ describe("transcription as a job", () => {
     expect(versions.every((v) => v.encrypted)).toBe(true);
     expect((await transcriptionRecords(kit.repo, p.id, sf.source.id)).map((x) => x.status)).toEqual(["done"]);
     expect(await c.resumePending(undefined, { prepare: (rec) => transcriptionRerun(kit.repo, rec) })).toEqual([]);
+  });
+
+  it("fix 1 I1: a transcription the rules forbid is refused when the job is built: audited once, nothing recorded", async () => {
+    const p = await makeProject(kit, `${OPEN_GOV}processing:\n  transcription: []\n`);
+    const sf = await audioSource(p);
+    const before = (await auditEvents(kit, p)).length;
+    await expect(transcriptionJob(kit.repo, p.id, sf.source.id, {}, { id: randomUUID() })).rejects.toBeInstanceOf(PolicyDeniedError);
+    const events = (await auditEvents(kit, p)).slice(before);
+    expect(events.filter((e) => e.decision?.result === "deny")).toHaveLength(1);
+    expect(await transcriptionRecords(kit.repo, p.id, sf.source.id)).toEqual([]);
+    // Allowed: no audit entry for the check itself (each run audits its own decision).
+    const q = await makeProject(kit);
+    const sq = await audioSource(q);
+    const n = (await auditEvents(kit, q)).length;
+    await transcriptionJob(kit.repo, q.id, sq.source.id, {}, { id: randomUUID() });
+    expect((await auditEvents(kit, q)).length).toBe(n);
+  });
+
+  it("fix 1 M12: a rerun whose source cannot be read for another reason is left pending, not cancelled", async () => {
+    const p = await makeProject(kit);
+    const sf = await audioSource(p);
+    const rec = {
+      v: 1 as const, id: randomUUID(), projectId: p.id, kind: "audio.transcribe", status: "queued" as const,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), about: { sourceId: sf.source.id },
+      job: { type: "audio.transcribe" as const, input: "x", output: "y", params: {}, entity: { type: "asset" as const, id: sf.assets[0]!.id } },
+    };
+    expect(await transcriptionRerun(kit.repo, { ...rec, about: { sourceId: randomUUID() } })).toBeUndefined(); // gone: cancelled by the caller
+    const broken = { ...kit.repo, getSource: async () => { throw new Error("disk read failed"); } } as unknown as typeof kit.repo;
+    await expect(transcriptionRerun(broken, rec)).rejects.toThrow(/disk read failed/);
   });
 
   it("a rerun reads the recording from the library as it is now, not from the path recorded", async () => {

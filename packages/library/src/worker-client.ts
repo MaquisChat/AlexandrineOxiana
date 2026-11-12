@@ -36,7 +36,7 @@ import {
   LOCKED_CODE, UNFINISHED, appendJobRecords, appendNewJobRecord, assertNoSecrets, claimJobRecord, compactJobJournal, errorCode, isPending, readJobJournal,
   refreshJobRows, upgradeLegacyJobs, upsertJobRow, type JobAbout, type JobRecord, type JobStatus, type ProjectKey, type StoredJob, type WorkerJobType,
 } from "./job-journal.js";
-import { ProjectLockedError } from "./repo/errors.js";
+import { PolicyDeniedError, ProjectLockedError } from "./repo/errors.js";
 import { activeTemp, isStaleWorkDir } from "./tmp-registry.js";
 import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 import { mediaWorkerSourceDir } from "./resources.js";
@@ -386,17 +386,27 @@ export class WorkerClient {
   }
 
   private async runClaimed(id: string, projectId: string, job: WorkerJob, resumed: JobRecord | undefined, chosenId: boolean): Promise<JobResult> {
-    const op = JOB_OPS[job.type];
-    if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
-    assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
     let decision: PolicyDecision | undefined;
-    if (op !== null) {
-      decision = await authorizeProcessing(
-        this.repo,
-        projectId,
-        { action: "process", process: { op, provider: "local" } },
-        { op: `worker.${job.type}`, entity: job.entity },
-      );
+    try {
+      const op = JOB_OPS[job.type];
+      if (op === undefined) throw new TypeError(`unknown worker job type "${String(job.type)}"`);
+      assertNoSecrets(job.params ?? {}); // job records are kept in files: never a secret (R31)
+      if (op !== null) {
+        decision = await authorizeProcessing(
+          this.repo,
+          projectId,
+          { action: "process", process: { op, provider: "local" } },
+          { op: `worker.${job.type}`, entity: job.entity },
+        );
+      }
+    } catch (err) {
+      // Task 62 (I3): a rerun refused for good (the rules, a job that can never run) ends with that
+      // reason, claimed once in the journal, so no later launch evaluates (and audits) it again.
+      if (resumed && (err instanceof PolicyDeniedError || err instanceof TypeError)) {
+        const code = err instanceof PolicyDeniedError ? "POLICY_DENIED" : "UNRECOVERABLE";
+        await this.claim(resumed, { ...this.next(resumed, "failed", code), attempt: randomUUID() }).catch(() => false);
+      }
+      throw err;
     }
     const live = projectDataKey(this.repo, projectId); // throws ProjectLockedError when locked
     // R142: the job keeps its own copy of the key from here to its end (a lock zeroes the ring's),
@@ -485,14 +495,30 @@ export class WorkerClient {
       if (state.status === "failed") {
         throw workerError(state.error ?? { code: "FAILED", message: "the job failed" });
       }
-      // A closed client stores nothing (its library's lock may be gone): the job stays pending.
-      if (this.closed) throw new WorkerUnavailableError(CLOSED);
-      const files = await publish(outDir, finalBase, dataKey);
-      const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
-      const result: JobResult = { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
-      if (job.finish) await this.write(() => job.finish!(result));
-      await this.transition(id, "done");
-      return result;
+      // R142 (Task 62, I2): a job whose finish step stores into the library cannot finish on a
+      // project locked by now: nothing is published or stored, it is recorded cancelled-locked (its
+      // job kept) and runs once at the next unlock. A job without one finishes with its captured key.
+      if (job.finish && lockedNow()) await this.cancelForLock(id, projectId);
+      // Publishing, the finish step and the `done` line are one guarded write (M8, M9): a closed
+      // client starts none of them (the job stays pending), and `close()` waits for all of them.
+      return await this.write(async () => {
+        const files = await publish(outDir, finalBase, dataKey);
+        const meta = rewritePaths(state.result?.meta ?? {}, outDir, finalBase) as Record<string, unknown>;
+        const result: JobResult = { id, type: job.type, output: job.output, files, meta, encrypted: dataKey !== null };
+        if (job.finish) {
+          try {
+            await job.finish(result);
+          } catch (err) {
+            if (err instanceof ProjectLockedError || lockedNow()) {
+              await this.transition(id, "cancelled", LOCKED_CODE, true, false);
+              throw new ProjectLockedError(projectId);
+            }
+            throw err;
+          }
+        }
+        await this.transition(id, "done", undefined, false, false);
+        return result;
+      });
     } catch (err) {
       const recorded = this.records.get(id)?.status;
       // Not recorded: a worker that went away, an interrupt or a close leave the job pending.
@@ -646,7 +672,7 @@ export class WorkerClient {
    * Nothing is written in a read-only library. Throws (writing nothing more) when the journal
    * cannot be appended, e.g. the project was locked meanwhile.
    */
-  private async transition(id: string, status: JobStatus, error?: string, keepJob = false): Promise<void> {
+  private async transition(id: string, status: JobStatus, error?: string, keepJob = false, guarded = true): Promise<void> {
     const prev = this.records.get(id);
     if (!prev) return;
     const library = repoLibrary(this.repo);
@@ -654,12 +680,14 @@ export class WorkerClient {
     const rec = this.next(prev, status, error, keepJob);
     // The job's captured key (R142), else the project's (ProjectLockedError while locked).
     const key = this.keys.get(id) ?? projectDataKey(this.repo, prev.projectId);
-    await this.write(async () => {
+    const append = async () => {
       await appendJobRecords(library.root, this.repo.getProject(prev.projectId).folder, key, [rec]);
       this.records.set(id, rec);
       const db = this.db();
       if (db) upsertJobRow(db, rec);
-    });
+    };
+    // Unguarded only from inside a guarded write (the step it ends is already tracked).
+    await (guarded ? this.write(append) : append());
   }
 
   private async removeStaleTemp(): Promise<void> {

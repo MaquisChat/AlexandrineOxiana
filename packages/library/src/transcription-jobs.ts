@@ -17,7 +17,8 @@ import type { Asset, SourceFile } from "@ao/core";
 import { DEFAULT_SPEECH_MODEL } from "@ao/shared";
 import { NoMediaError } from "./capture/link-capture.js";
 import { readJobJournal, type JobRecord } from "./job-journal.js";
-import { projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
+import { NotFoundError } from "./repo/errors.js";
+import { authorizeProcessing, projectDataKey, repoLibrary, type Repo } from "./repo/repo.js";
 import { storeTranscript, type StoredTranscript, type TranscriptionParams } from "./transcript-store.js";
 import type { ResumeExtras, WorkerJob } from "./worker-client.js";
 
@@ -52,6 +53,10 @@ export async function transcriptionJob(
   const sf = await repo.getSource(projectId, sourceId);
   const media = recordingOf(sf);
   if (!media) throw new NoMediaError(sourceId);
+  // Refused at the start (fix 1, I1): the same decision the run makes, so a forbidden transcription
+  // is never recorded as a job. A deny is audited and thrown (PolicyDeniedError); an allow is not
+  // audited here (the run audits its own decision). Checked again when the job runs.
+  await authorizeProcessing(repo, projectId, { action: "process", process: { op: "transcription", provider: "local" } }, { op: `worker.${TRANSCRIBE_KIND}`, entity: { type: "asset", id: media.id } });
   const p = workerParams(params);
   const triggeredBy = opts.triggeredBy ?? "user";
   return {
@@ -78,7 +83,12 @@ export async function transcriptionJob(
 export async function transcriptionRerun(repo: Repo, rec: JobRecord, onStored?: (s: StoredTranscript) => void): Promise<ResumeExtras | undefined> {
   if (rec.kind !== TRANSCRIBE_KIND || !rec.about?.sourceId || !rec.job) return undefined;
   const sourceId = rec.about.sourceId;
-  const sf = await repo.getSource(rec.projectId, sourceId).catch(() => undefined);
+  // Only a source that is really gone ends the rerun (the caller cancels it); any other failure to
+  // read it is thrown, and the record stays pending for the next resubmission (M12).
+  const sf = await repo.getSource(rec.projectId, sourceId).catch((err: unknown) => {
+    if (err instanceof NotFoundError) return undefined;
+    throw err;
+  });
   const mediaId = rec.job.entity?.type === "asset" ? rec.job.entity.id : undefined;
   const media = sf?.assets.find((a) => a.id === mediaId && a.status !== "destroyed") ?? (sf ? recordingOf(sf) : undefined);
   if (!sf || !media) return undefined;
