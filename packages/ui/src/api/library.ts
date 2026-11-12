@@ -192,6 +192,18 @@ export interface SourceRow {
   matchedIn?: "annotation";
   /** Only part of its annotations' text is searchable (R161 b). */
   annotationsPartial?: true;
+  /** The record's availability (Task 69); absent for a locked row or a record that could not be read. */
+  availability?: SourceAvailability;
+}
+
+/**
+ * A source's availability as the library records it (@ao/core Availability): "available",
+ * "incomplete" (only part of it was saved), "unavailable-on-platform" (a later capture found it
+ * gone from its platform); `firstNoticedAt` (ISO time) when recorded. Other values may come later.
+ */
+export interface SourceAvailability {
+  status: string;
+  firstNoticedAt?: string;
 }
 
 /** A page of sources (GET /projects/:id/sources). */
@@ -259,6 +271,7 @@ export interface SourceFile {
     collectionIds: string[];
     tagIds: string[];
     folder: string;
+    availability?: SourceAvailability;
     [k: string]: unknown;
   };
   assets: Asset[];

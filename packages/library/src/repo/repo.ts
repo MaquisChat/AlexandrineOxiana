@@ -3,7 +3,7 @@ import * as fsp from "node:fs/promises";
 import { basename, join, posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_GOVERNANCE, effectivePolicy, evaluate, parseGovernance, recheckSourceFile, verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import type { Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
+import type { Asset, Collection, DateRule, ConsentRecord, EntityType, GovernanceConfig, PolicyDecision, Participant, PendingOcr, PendingProxy, Project, Provenance, Session, Source, SourceDraft, SourceFile, Tag, VerifyContext, WatchedFolder } from "@ao/core";
 import type { KeyRing } from "../crypto/keys.js";
 import type { Library } from "../library.js";
 import { acknowledge, type AcknowledgementKind } from "./acknowledge.js";
@@ -64,6 +64,7 @@ import {
   createSources,
   deleteSource,
   getSource,
+  getSourceRecord,
   listSourceIds,
   relinkLinkedAsset as relinkLinkedAssetIn,
   updateSource,
@@ -235,6 +236,10 @@ export class Repo {
   }
   getSource(projectId: string, id: string): Promise<SourceFile> {
     return getSource(this.core, projectId, id);
+  }
+  /** The source's own record (source.json alone; no annotations, no integrity check: R186). */
+  getSourceRecord(projectId: string, id: string): Promise<Source> {
+    return getSourceRecord(this.core, projectId, id);
   }
   listSourceIds(projectId: string): string[] {
     return listSourceIds(this.core, projectId);
