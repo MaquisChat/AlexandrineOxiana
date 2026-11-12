@@ -1,3 +1,4 @@
+import { SPEECH_MODELS } from "@ao/library";
 import type { Command } from "commander";
 import { COOKIES_ACKNOWLEDGEMENT, type BrowserName, type CaptureOutcome } from "@ao/library";
 import type { Project, SourceFile } from "@ao/core";
@@ -69,7 +70,8 @@ export async function withProject<T>(
   return withSession(cmd, write, async (s, out, opts) => body(s, await openProject(s, opts.project as string | undefined), out, opts));
 }
 
-const MODELS = ["large-v3", "medium", "small"];
+// The speech models the app accepts (R158, one definition in @ao/shared).
+const MODELS: readonly string[] = SPEECH_MODELS;
 
 /** `--model`: one of the transcription models, or undefined. */
 export function parseModel(v: unknown): string | undefined {

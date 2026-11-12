@@ -17,7 +17,9 @@ export type CrashPoint =
   /** The active key file replaced, the staged one not yet removed. */
   | "recovery-mid-activate"
   /** Activation finished, before the code is returned. */
-  | "recovery-after-activate";
+  | "recovery-after-activate"
+  /** Task 50: an audit append failed after the action, before the project is marked as needing attention. */
+  | "before-attention-mark";
 
 export const seams: {
   crashAt?: CrashPoint;

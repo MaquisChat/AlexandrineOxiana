@@ -1,0 +1,38 @@
+[package]
+name = "ao-desktop"
+version = "0.0.0"
+description = "Alexandrine Oxiana: the desktop shell (starts the library service, shows the interface)"
+edition = "2021"
+publish = false
+license = "UNLICENSED"
+
+[lib]
+name = "ao_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alexandrine-oxiana"
+path = "src/main.rs"
+
+# Every version is pinned exactly (CLAUDE.md); Cargo.lock is committed.
+[build-dependencies]
+tauri-build = { version = "=2.7.4", default-features = false, features = [] }
+
+[dependencies]
+# custom-protocol: the interface is always the built one embedded in the program (packages/ui/dist),
+# never a development server.
+tauri = { version = "=2.12.5", default-features = false, features = ["custom-protocol", "wry", "x11", "compression", "common-controls-v6"] }
+tauri-plugin-dialog = { version = "=2.8.4" }
+tauri-plugin-single-instance = { version = "=2.5.5" }
+serde_json = { version = "=1.0.154" }
+getrandom = { version = "=0.3.4" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "=0.2.177" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -2,7 +2,7 @@
 # PyInstaller spec: the media worker as one folder, `ao-worker/ao-worker` plus `ao-worker/_internal/`.
 # Built by `node apps/desktop/scripts/build-sidecars.mjs` inside its build venv; one build per
 # platform and architecture (no universal2, ADR 0014). Not inside: ffmpeg, tesseract, ghostscript,
-# yt-dlp and the speech models (R126); the worker finds them through PATH, AO_TOOLS_DIR,
+# yt-dlp, gallery-dl and the speech models (R126, Task 48a); the worker finds them through PATH, AO_TOOLS_DIR,
 # AO_YTDLP_BIN and AO_MODELS_DIR exactly as when run from source.
 #
 # Everything below that PyInstaller did not find by itself was found by building and running
@@ -41,6 +41,15 @@ datas += collect_data_files("ao_worker")
 # (PDF/A). The same as ocrmypdf 17.14's own hook, which the Intel pin set's 17.12.1 does not have.
 datas += collect_data_files("ocrmypdf", excludes=["_pyinstaller"]) + collect_data_files("pikepdf")
 
+# The standard-library modules gallery-dl 1.32.19 imports (see the gallery-dl note below).
+GALLERY_DL_STDLIB = [
+    "_string", "argparse", "array", "atexit", "binascii", "collections", "ctypes", "datetime", "email.utils",
+    "errno", "functools", "getpass", "hashlib", "hmac", "html", "html.parser", "http.cookiejar", "itertools", "json",
+    "logging", "math", "mimetypes", "netrc", "operator", "pickle", "platform", "queue", "random", "re", "shlex",
+    "shutil", "signal", "socket", "sqlite3", "ssl", "string", "struct", "subprocess", "tempfile", "threading",
+    "time", "tomllib", "unicodedata", "urllib.parse", "warnings", "webbrowser", "xml.etree.ElementTree", "zipfile",
+]
+
 hiddenimports = [
     # ocrmypdf runs as `sys.executable -m ocrmypdf` (ocr.py), so nothing imports it. Without it:
     # "ModuleNotFoundError: No module named 'ocrmypdf'".
@@ -50,13 +59,13 @@ hiddenimports = [
     # Intel pin set's 17.12.1 has none. Without these (17.12.1 build): "No module named
     # ocrmypdf.__main__" and "No module named 'pypdfium2'".
     *collect_submodules("ocrmypdf", filter=lambda name: not name.startswith("ocrmypdf._pyinstaller")),
-    # gallery-dl runs as `sys.executable -m gallery_dl` (download.py). Without these:
-    # "No module named gallery_dl.__main__; 'gallery_dl' is a package and cannot be directly executed".
-    "gallery_dl",
-    "gallery_dl.__main__",
-    # gallery-dl imports its extractors by name at run time. Without them: `--list-extractors` and
-    # any URL failed with "ModuleNotFoundError: No module named 'gallery_dl.extractor.2ch'".
-    *collect_submodules("gallery_dl"),
+    # gallery-dl is NOT bundled (GPL-2.0-only, Task 48a): the tools dialogue downloads the pinned
+    # wheel, and the worker runs it as `ao-worker -m gallery_dl` with AO_GALLERYDL_LIB (entry.py).
+    # It then needs, from this bundle, its one dependency and the standard-library modules it
+    # imports (listed from gallery-dl 1.32.19's sources; nothing in the worker imports them all).
+    # Not yet confirmed by a packaged build: the smoke test's `--gallery-dl-wheel` check does that.
+    *collect_submodules("requests"),
+    *GALLERY_DL_STDLIB,
 ]
 
 a = Analysis(

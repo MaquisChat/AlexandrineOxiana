@@ -19,9 +19,9 @@
  * deterministic: citeproc itself failed); the library process is never affected.
  */
 import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 import type { CitationFormat, CslItem } from "@ao/core";
+import { citeprocRequireFrom, sandboxWorkerUrl } from "../resources.js";
 
 export interface SandboxConfig {
   maxWorkers: number;
@@ -60,9 +60,6 @@ export interface SandboxRequest {
   /** For citations: citeproc's cite items (citeprocCitationItems). */
   cites?: Array<{ id: string; locator?: string; label?: string }>;
 }
-
-const citeprocFrom = createRequire(import.meta.url).resolve("@ao/core/package.json");
-const WORKER_URL = new URL("./sandbox-worker.mjs", import.meta.url);
 
 interface Reply {
   ok: boolean;
@@ -133,8 +130,8 @@ class SandboxPool {
   }
 
   private spawn(key: string, styleXml: string, heap: number): Slot {
-    const worker = new Worker(WORKER_URL, {
-      workerData: { citeprocFrom, styleXml },
+    const worker = new Worker(sandboxWorkerUrl(), {
+      workerData: { citeprocFrom: citeprocRequireFrom(), styleXml },
       resourceLimits: { maxOldGenerationSizeMb: heap, maxYoungGenerationSizeMb: Math.min(32, Math.max(1, Math.floor(heap / 4))), stackSizeMb: 4 },
       stdout: true,
       stderr: true,

@@ -8,7 +8,7 @@ from conftest import SPEECH_CLIP, need_download
 pytestmark = pytest.mark.slow
 
 
-def test_transcribes_speech_clip(worker, tmp_path):
+def test_transcribes_speech_clip(worker, tmp_path, tiny_on_disk):
     clip = need_download(SPEECH_CLIP)
     out = tmp_path / "t"
     job = worker.run("audio.transcribe", str(clip), str(out), {"model": "tiny", "language": "auto"}, timeout=600)
@@ -51,16 +51,18 @@ def test_model_on_disk_loads_without_any_network_contact(worker, tmp_path, tiny_
     assert no_network.attempts == []
 
 
-def test_missing_model_without_network_is_a_clear_error(worker, worker_env, tmp_path, monkeypatch, no_network):
+def test_missing_model_is_named_and_never_downloaded(worker, worker_env, tmp_path, monkeypatch, no_network):
+    """Task 48 replaces R144's automatic first download: an absent model fails the job, naming the tool."""
     from ao_worker import transcribe
 
     transcribe._model_cache.clear()
     monkeypatch.setenv("AO_MODELS_DIR", str(tmp_path / "no-models"))
     job = worker.run("audio.transcribe", str(need_download(SPEECH_CLIP)), str(tmp_path / "t"), {"model": "tiny", "language": "en"}, timeout=120)
     assert job["status"] == "failed", job
-    assert job["error"]["code"] == "MODEL_UNAVAILABLE"
-    assert "not installed" in job["error"]["message"] and "could not be downloaded" in job["error"]["message"]
-    assert no_network.attempts, "the absent model should have been downloaded (and the attempt refused)"
+    assert job["error"]["code"] == "TOOL_NOT_INSTALLED"
+    assert job["error"]["tool"] == "speech-tiny"
+    assert "not installed" in job["error"]["message"]
+    assert no_network.attempts == []
 
 
 def _damaged_copy(tiny_path: str, dest) -> None:
@@ -107,7 +109,7 @@ def test_unreadable_models_folder_is_reported_and_not_downloaded(worker_env, tmp
     assert nn.attempts == []
 
 
-def test_absent_model_is_the_only_case_that_downloads(worker_env, tmp_path, monkeypatch):
+def test_absent_model_is_never_downloaded(worker_env, tmp_path, monkeypatch):
     from conftest import NoNetwork
 
     from ao_worker import transcribe
@@ -117,11 +119,11 @@ def test_absent_model_is_the_only_case_that_downloads(worker_env, tmp_path, monk
     nn = NoNetwork(monkeypatch)
     with pytest.raises(JobError) as e:
         transcribe.model_path("tiny")
-    assert "not installed and could not be downloaded" in e.value.message
-    assert nn.attempts, "an absent model is downloaded (and the attempt refused here)"
+    assert e.value.code == "TOOL_NOT_INSTALLED" and e.value.tool == "speech-tiny"
+    assert nn.attempts == []
 
 
-def test_silence_yields_no_unflagged_segments(worker, tmp_path):
+def test_silence_yields_no_unflagged_segments(worker, tmp_path, tiny_on_disk):
     silence = tmp_path / "silence.wav"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "10", str(silence)], check=True)
     out = tmp_path / "t"

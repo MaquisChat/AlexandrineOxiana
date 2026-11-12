@@ -42,6 +42,8 @@ export interface CaptureSetup {
   updateAnswer?: () => Response | undefined;
   updateDelayMs?: number;
   extra?: RequestHandler[];
+  /** The optional tools' catalogue (GET /tools, Task 48b); left out: refused as in a plain browser (403). */
+  tools?: unknown[];
 }
 
 export interface CaptureMock {
@@ -109,6 +111,9 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       profiles++;
       return o.profileAnswer?.(profiles) ?? HttpResponse.json({ queueId: `qp${profiles}` });
     }),
+    http.get(url("/tools"), () =>
+      o.tools ? HttpResponse.json({ platform: "linux-x64", tools: o.tools, jobs: [] }) : errorResponse(403, "FORBIDDEN", "The tools are managed from the desktop app."),
+    ),
     http.get(url("/tools/versions"), async ({ request }) => {
       await rec(request, "/tools/versions");
       return o.versionsAnswer?.() ?? HttpResponse.json({ versions: o.versions ?? { yt_dlp: "2026.10.01", gallery_dl: "1.32.19", ffmpeg: "7.1", faster_whisper: "1.2.0", python: "3.13.1" } });

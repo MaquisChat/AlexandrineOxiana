@@ -9,8 +9,8 @@
  * other selection. "New recovery code…" (an unlocked encrypted project) opens the new-recovery-code
  * dialog (Task 61).
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
@@ -52,6 +52,11 @@ export interface LibraryProps {
   projectFromAddress?: string | undefined;
   /** The selected project changed (the route keeps it in the address). */
   onProjectSelected?: (id: string) => void;
+  /**
+   * The first-use tools question's banner (Task 48c, R164), shown under the status banners; `hidden`
+   * while a locked project's unlock screen is shown (it stays mounted, so it is not asked anew).
+   */
+  firstUse?: (hidden: boolean) => ReactNode;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -70,7 +75,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -85,7 +90,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<{ tags: Tag[]; workspaceTags: Tag[] }>({ tags: [], workspaceTags: [] });
   const [filter, setFilter] = useState<{ text: string; collection?: string | undefined; tag?: string | undefined }>({ text: "" });
-  const [sources, setSources] = useState<{ total: number; items: SourceRow[] } | undefined>();
+  const [sources, setSources] = useState<SourcePage | undefined>();
   const [openSource, setOpenSource] = useState<string | undefined>();
   const [outcomes, setOutcomes] = useState<AttachOutcome[] | undefined>();
   /** "Resolve…" (R27) is open; focus goes back to the button that opened it. */
@@ -207,7 +212,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             if (typeof d.done !== "number" || typeof d.total !== "number") continue;
             // A project recheck shows its own progress by its button (announced at start and end only, R113).
             if (d.kind === "recheck") recheckEvent.current(e.data);
-            else if (d.kind === "index") setIndex({ done: d.done, total: d.total });
+            else if (d.kind === "index") {
+              setIndex({ done: d.done, total: d.total });
+              // A finished rebuild: read the sources again, so a "needs rebuilding" note goes at once (N3).
+              if (d.done >= d.total) refresh();
+            }
             else {
               const key = `${d.kind ?? "job"}:${d.jobId ?? ""}`;
               const finished = d.finished === true || d.done >= d.total;
@@ -332,7 +341,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length }, { signal: ac.signal });
       if (stale()) return;
       // A late page is only ever added to the list it continues, never used as a whole list.
-      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
+      setSources((cur) => (cur ? { ...r, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
     } catch (err) {
       if (!stale()) fail(err, "More sources could not be read.", setSourcesError);
     } finally {
@@ -467,6 +476,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.extension} onClick={(e) => follow(e, PATHS.extension)}>
             Browser extension
           </a>
+          <a href={PATHS.tools} onClick={(e) => follow(e, PATHS.tools)}>
+            Optional tools
+          </a>
+          <a href="/about" onClick={(e) => follow(e, "/about")}>About and third-party notices</a>
           {onSwitchLibrary && (
             <button type="button" onClick={onSwitchLibrary}>
               Switch library
@@ -517,6 +530,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           ))}
         </div>
       )}
+      {firstUse?.(locked)}
       <aside className="ao-library__side">
         {projects === undefined ? (
           <p aria-live="polite">Loading projects…</p>
@@ -705,7 +719,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               !sourcesError && <p aria-live="polite">Loading sources…</p>
             ) : (
               <>
-                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} />
+                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} rebuilding={!!index && index.done < index.total} />
                 {sources.items.length < sources.total && (
                   <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
                     Load more sources

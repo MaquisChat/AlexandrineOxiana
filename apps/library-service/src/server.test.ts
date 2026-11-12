@@ -17,6 +17,8 @@ import {
   WorkerJobError,
   createLibrary,
   deviceDeps,
+  indexSource,
+  setMeta,
   listBackups,
   openLibrary,
   openRepo,
@@ -184,6 +186,20 @@ describe("libraries, projects, sources", () => {
     expect(found.json.items.map((i: { id: string }) => i.id)).toContain(sid);
     const none = await call({ url: `/projects/${pid}/sources?text=zzzunfindable` });
     expect(none.json.total).toBe(0);
+    // Task 58: a match in an annotation, and an index awaiting a rebuild, reach the interface.
+    const idx = svc.state.session!.index!.db;
+    const sf = await svc.state.session!.repo.getSource(pid, sid);
+    indexSource(idx, { ...sf, annotations: [{ id: sid, sourceId: sid, kind: "note", anchors: [], body: "quokkaannotation", author: "t", createdAt: new Date().toISOString() }] });
+    const viaAnn = await call({ url: `/projects/${pid}/sources?text=quokkaannotation` });
+    expect(viaAnn.json.items).toEqual([expect.objectContaining({ id: sid, matchedIn: "annotation" })]);
+    expect(viaAnn.json).not.toHaveProperty("incomplete");
+    setMeta(idx, "needsRebuild", "annotations");
+    expect((await call({ url: `/projects/${pid}/sources` })).json.incomplete).toBe(true);
+    idx.prepare("DELETE FROM meta WHERE key = 'needsRebuild'").run();
+    // A query with too many words is refused in plain words (N1).
+    const many = await call({ url: `/projects/${pid}/sources?text=${encodeURIComponent(Array.from({ length: 17 }, (_, i) => `w${i}`).join(" "))}` });
+    expect(many.status).toBe(400);
+    expect(many.json.error).toMatchObject({ code: "VALIDATION", message: "Use at most 16 words in a search." });
     const one = await call({ url: `/projects/${pid}/sources/${sid}` });
     expect(one.json.source.id).toBe(sid);
     expect((await call({ url: `/projects/${pid}/sources/01ZZZZZZZZZZZZZZZZZZZZZZZZ` })).status).toBe(404);
@@ -974,6 +990,14 @@ describe("review round 1: smaller route fixes (R99 minors)", () => {
     expect(toApiError(new lib.ExportDestinationError("x")).status).toBe(400);
     expect(toApiError(new lib.RestoreError("x")).status).toBe(400);
   });
+
+  it("a file missing from the installation is 503 UNAVAILABLE with its plain message (not INTERNAL, not the user's fault)", async () => {
+    const { toApiError } = await import("./errors.js");
+    const lib = await import("@ao/library");
+    const t = toApiError(new lib.ResourceMissingError("the web page cleaner"));
+    expect([t.status, t.code]).toEqual([503, "UNAVAILABLE"]);
+    expect(t.message).toMatch(/web page cleaner is missing from the installation/);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1758,6 +1782,19 @@ describe("screens integration (R118): lock holder", () => {
       expect(body).not.toContain("4242");
       expect(body).not.toContain("ana");
     }
+  });
+
+  it("Task 58 M6: a read-only library's source list says its search is limited to titles", async () => {
+    const path = await openNewLibrary();
+    const pid = await newProject();
+    expect((await call({ url: `/projects/${pid}/sources?text=anything` })).json).not.toHaveProperty("limited");
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    const now = new Date().toISOString();
+    await writeFile(join(path, ".lock"), JSON.stringify({ deviceId: "dev-other", hostname: "field-laptop", pid: 4242, openedAt: now, heartbeatAt: now, user: "ana" }));
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path } })).json.mode).toBe("read-only");
+    const r = await call({ url: `/projects/${pid}/sources?text=anything` });
+    expect(r.status, r.body).toBe(200);
+    expect(r.json).toMatchObject({ total: 0, items: [], limited: true });
   });
 
   it("(c) a writable library sends no lockedBy", async () => {

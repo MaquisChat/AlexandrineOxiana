@@ -15,6 +15,7 @@ import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
 import { registerAppearance } from "./routes/appearance.js";
 import { registerAudit } from "./routes/audit.js";
+import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
 import { registerCitations } from "./routes/citations.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
@@ -26,6 +27,7 @@ import { isMediaRoute, mediaRequestRefusal, registerMedia } from "./media.js";
 import { registerProjects } from "./routes/projects.js";
 import { registerReview } from "./routes/review.js";
 import { registerSources } from "./routes/sources.js";
+import { registerTools } from "./routes/tools.js";
 
 export type { ServiceWorker, WorkerProvider } from "./state.js";
 
@@ -247,10 +249,12 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerReview(app, ctx);
   registerGovernance(app, ctx);
   registerAudit(app, ctx);
+  registerLibraryAudit(app, ctx);
   registerFieldwork(app, ctx);
   registerCitations(app, ctx);
   registerAppearance(app, ctx);
   registerJobs(app, ctx);
+  registerTools(app, ctx);
   registerMedia(app, ctx);
 
   let closing: Promise<void> | undefined;

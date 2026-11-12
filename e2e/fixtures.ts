@@ -457,6 +457,21 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     };
     await handOver();
     app.onRestart(handOver);
+    // The first-use "Optional tools" question (Tasks 48b, 48c) is a banner on the open library. These
+    // scenarios are about other things, so the harness records it as answered "Not now", exactly as
+    // the app records that answer (FirstUseTools.tsx), before any app code runs. An answer already
+    // there is left alone, so a scenario about the question itself can set its own state first.
+    await context.addInitScript(
+      ({ origin }) => {
+        if (window !== window.top || window.location.origin !== origin) return;
+        try {
+          if (window.localStorage.getItem("ao.firstUseTools") === null) window.localStorage.setItem("ao.firstUseTools", "not-now");
+        } catch {
+          // storage unavailable: the app treats that as unanswered
+        }
+      },
+      { origin: APP_ORIGIN },
+    );
     await page.goto(`${APP_ORIGIN}/`);
     await use(page);
   },

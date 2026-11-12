@@ -25,6 +25,8 @@ import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
 import { isPlayableRecording } from "../components/TranscriptLink";
+import { MissingToolNotice, modelOptionLabel, SpeechModelNotice, useSpeechModels } from "../components/MissingToolNotice";
+import { DEFAULT_SPEECH_MODEL, type ToolsApi } from "../api/tools";
 import { UserText } from "../components/UserText";
 import { blockNavigation } from "../navigation";
 import { setTranscriptionRun, subscribeTranscriptionRuns, transcriptionRun } from "./transcriptionRuns";
@@ -38,12 +40,15 @@ export interface TranscriptViewerProps {
   sourceId: string;
   /** The service said the project is locked. */
   onLocked?: () => void;
+  /** The optional tools (Task 48b): which speech models are installed. Left out: not known. */
+  tools?: ToolsApi;
 }
 
 const MODEL_LABELS: Record<TranscriptionModel, string> = {
-  "large-v3": "large-v3 (most accurate, slowest)",
+  tiny: "tiny (quickest, least accurate)",
+  small: "small (fast)",
   medium: "medium",
-  small: "small (fastest)",
+  "large-v3": "large-v3 (most accurate, slowest)",
 };
 
 const LOCKED = "This project is locked, so its transcript and recording are not shown. Unlock it in the library, then choose Try again.";
@@ -86,9 +91,9 @@ function transcribeError(err: unknown, model: string): string {
   const said = err.message ? ` The service said: “${err.message}”` : "";
   switch (err.reason) {
     case "MODEL_UNAVAILABLE":
-      return `The speech model “${model}” is not installed and could not be downloaded. Connect to the internet and try again, or choose a model that is already installed.${said}`;
+      return `The speech model “${model}” on this computer could not be loaded; it may be damaged. Remove it and install it again from the Optional tools screen, or choose another model.${said}`;
     case "FFMPEG_FAILED":
-      return `The sound could not be read from the recording: the audio tool (ffmpeg) is missing or failed.${said}`;
+      return `The sound could not be read from the recording. The file may be damaged or in a form the speech tool cannot read.${said}`;
     case "UNSUPPORTED_INPUT":
       return `The recording has no sound the speech tool can read.${said}`;
     case "INPUT_NOT_FOUND":
@@ -123,7 +128,8 @@ export function TranscriptViewer(props: TranscriptViewerProps) {
   return <Viewer key={`${props.projectId}\u0000${props.sourceId}`} {...props} />;
 }
 
-function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
+function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerProps) {
+  const installedModels = useSpeechModels(tools);
   const id = useId();
   const key = `${projectId}\u0000${sourceId}`;
   const keyRef = useRef(key);
@@ -153,8 +159,9 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
   const [saveError, setSaveError] = useState<string | undefined>();
   const [notice, setNotice] = useState<string | undefined>();
   const [refused, setRefused] = useState(false);
-  const [model, setModel] = useState<TranscriptionModel>("medium");
+  const [model, setModel] = useState<TranscriptionModel>(DEFAULT_SPEECH_MODEL);
   const [transcribeFailure, setTranscribeFailure] = useState<string | undefined>();
+  const [failedWith, setFailedWith] = useState<unknown>(); // the error behind transcribeFailure (Task 48b)
   /** This source's re-transcription in this session (it outlives the screen; R143). */
   const run = useSyncExternalStore(subscribeTranscriptionRuns, () => transcriptionRun(key));
 
@@ -431,6 +438,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       void loadVersions({ paths: r.files });
     } else if (!sawLocked(run.error)) {
       setTranscribeFailure(transcribeError(run.error, run.model));
+      setFailedWith(run.error);
     }
   }, [run, key, loadVersions, sawLocked]);
 
@@ -736,14 +744,15 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
                 <select id={`${id}-model`} value={model} disabled={busy} onChange={(e) => setModel(e.target.value as TranscriptionModel)}>
                   {TRANSCRIPTION_MODELS.map((m) => (
                     <option key={m} value={m}>
-                      {MODEL_LABELS[m]}
+                      {modelOptionLabel(MODEL_LABELS[m], m, installedModels)}
                     </option>
                   ))}
                 </select>
-                <button type="button" onClick={transcribe} disabled={busy} aria-describedby={busy ? `${id}-run` : undefined}>
+                <button type="button" onClick={transcribe} disabled={busy || installedModels?.[model] === false} aria-describedby={busy ? `${id}-run` : undefined}>
                   Re-transcribe
                 </button>
               </div>
+              <SpeechModelNotice model={model} installed={installedModels} />
               <div id={`${id}-run`} role="status" className="ao-tx__progress">
                 {run?.state === "running" && (
                   <>
@@ -762,7 +771,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
               )}
               {transcribeFailure && (
                 <p role="alert" className="ao-error">
-                  {transcribeFailure}
+                  <MissingToolNotice from={failedWith}>{transcribeFailure}</MissingToolNotice>
                 </p>
               )}
             </>

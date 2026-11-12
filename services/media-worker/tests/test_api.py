@@ -132,41 +132,161 @@ def test_logs_strip_url_queries_and_user_paths(worker, tmp_path, caplog):
     assert "firefox" not in text and "cookies" not in text.lower()
 
 
-def test_python_m_ao_worker_prints_ready_and_binds_localhost(worker_env):
-    env = {**os.environ, "AO_WORKER_TOKEN": TOKEN, "AO_WORKER_PORT": "0"}
-    p = subprocess.Popen([sys.executable, "-m", "ao_worker"], cwd=Path(__file__).parents[1], env=env, stdout=subprocess.PIPE, text=True)
+WORKER_DIR = Path(__file__).parents[1]
+# A token as the service makes them (64 hex characters); conftest's TOKEN is for the in-process worker.
+STDIN_TOKEN = "0123456789abcdef" * 4
+
+
+def _env(**extra: str) -> dict:
+    """The test's environment without any worker token variable, plus `extra`."""
+    env = {k: v for k, v in os.environ.items() if k.upper() != "AO_WORKER_TOKEN"}
+    env.update(AO_WORKER_PORT="0", PYTHONUNBUFFERED="1", **extra)
+    return env
+
+
+def _start(args=(), env=None, stdin=subprocess.PIPE, write: str | None = STDIN_TOKEN + "\n"):
+    """`python -m ao_worker` as the library service starts it: the token as one line on stdin, which stays open."""
+    p = subprocess.Popen([sys.executable, "-m", "ao_worker", *args], cwd=WORKER_DIR, env=env or _env(), stdin=stdin,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if write is not None and p.stdin:
+        p.stdin.write(write)
+        p.stdin.flush()
+    return p
+
+
+def _stop(p) -> None:
+    if p.poll() is None:
+        p.kill()
+        p.wait(10)
+
+
+def _refused(p, timeout=30) -> tuple[int, str, str]:
+    try:
+        out, err = p.communicate(timeout=timeout)
+    finally:
+        _stop(p)
+    return p.returncode, out, err
+
+
+def test_python_m_ao_worker_reads_its_token_on_stdin_prints_ready_and_binds_localhost(worker_env):
+    p = _start()
     try:
         line = p.stdout.readline()
         m = re.fullmatch(r"AO_WORKER_READY port=(\d+)\n", line)
         assert m, line
-        status, body = Client(f"http://127.0.0.1:{m.group(1)}").request("GET", "/health")
+        client = Client(f"http://127.0.0.1:{m.group(1)}", token=STDIN_TOKEN)
+        status, body = client.request("GET", "/health")
         assert status == 200 and body["ok"] is True
+        status, _ = client.request("GET", "/health", token="0" * 64)
+        assert status == 401
+        if sys.platform.startswith("linux"):
+            environ = Path(f"/proc/{p.pid}/environ").read_bytes()
+            cmdline = Path(f"/proc/{p.pid}/cmdline").read_bytes()
+            assert STDIN_TOKEN.encode() not in environ and STDIN_TOKEN.encode() not in cmdline
+    finally:
+        p.terminate()
+        p.wait(10)
+    assert STDIN_TOKEN not in p.stdout.read() + p.stderr.read()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_its_own_stdin_is_not_handed_to_the_tools_it_runs(worker_env):
+    # The life line stays with the worker: what it starts (version probes, jobs) gets /dev/null.
+    p = _start()
+    try:
+        assert p.stdout.readline().startswith("AO_WORKER_READY port=")
+        assert os.readlink(f"/proc/{p.pid}/fd/0") == "/dev/null"
     finally:
         p.terminate()
         p.wait(10)
 
 
+def test_exits_cleanly_when_its_stdin_closes(worker_env):
+    # R155: the service's end of the pipe is gone (closed, crashed, killed): the worker stops.
+    p = _start()
+    try:
+        assert p.stdout.readline().startswith("AO_WORKER_READY port=")
+        time.sleep(0.3)
+        p.stdin.close()
+        assert p.wait(15) == 0, p.stderr.read()[-500:]
+    finally:
+        _stop(p)
+
+
 def test_sigterm_exits_cleanly_while_watching_stdin(worker_env):
     # As startWorker runs it: stdin is a pipe that stays open, and the app stops it with SIGTERM.
-    env = {**os.environ, "AO_WORKER_TOKEN": TOKEN, "AO_WORKER_PORT": "0", "AO_WORKER_EXIT_ON_STDIN_EOF": "1"}
-    p = subprocess.Popen([sys.executable, "-m", "ao_worker"], cwd=Path(__file__).parents[1], env=env,
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = _start()
     try:
         assert p.stdout.readline().startswith("AO_WORKER_READY port=")
         time.sleep(0.3)  # the stdin watcher is blocked in its read
         p.terminate()
         assert p.wait(15) == 0, p.stderr.read()[-500:]
     finally:
-        if p.poll() is None:
-            p.kill()
-            p.wait(10)
+        _stop(p)
 
 
-def test_refuses_to_start_without_token(worker_env):
-    env = {k: v for k, v in os.environ.items() if k != "AO_WORKER_TOKEN"}
-    p = subprocess.run([sys.executable, "-m", "ao_worker"], cwd=Path(__file__).parents[1], env=env, capture_output=True, text=True, timeout=30)
-    assert p.returncode != 0
-    assert "AO_WORKER_TOKEN" in p.stderr
+@pytest.mark.parametrize("name", ["AO_WORKER_TOKEN", "ao_worker_token"])
+def test_refuses_a_token_in_its_environment_even_with_one_on_stdin(worker_env, name):
+    code, out, err = _refused(_start(env=_env(**{name: STDIN_TOKEN})))
+    assert code != 0
+    assert "AO_WORKER_READY" not in out
+    assert "environment" in err and STDIN_TOKEN not in err
+
+
+def test_refuses_command_line_arguments(worker_env):
+    code, out, err = _refused(_start(args=["--token", STDIN_TOKEN]))
+    assert code != 0 and "AO_WORKER_READY" not in out
+    assert "argument" in err and STDIN_TOKEN not in err
+
+
+def test_refuses_the_tokens_value_in_another_variable(worker_env):
+    code, out, err = _refused(_start(env=_env(SOMETHING_ELSE=f"x{STDIN_TOKEN}x")))
+    assert code != 0 and "AO_WORKER_READY" not in out
+    assert "environment" in err and STDIN_TOKEN not in err
+
+
+@pytest.mark.parametrize("bad", ["short-token", STDIN_TOKEN + " with spaces"])
+def test_refuses_a_malformed_token_without_printing_it(worker_env, bad):
+    code, out, err = _refused(_start(write=bad + "\n"))
+    assert code != 0 and "AO_WORKER_READY" not in out
+    assert "not a valid access token" in err and bad not in err
+
+
+def test_refuses_at_once_when_stdin_is_closed_or_not_connected(worker_env):
+    t0 = time.monotonic()
+    code, out, err = _refused(_start(stdin=subprocess.DEVNULL, write=None))
+    assert code != 0 and "AO_WORKER_READY" not in out
+    assert "standard input closed before an access token arrived" in err.lower()
+    assert time.monotonic() - t0 < 10
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pseudo-terminals are POSIX")
+def test_refuses_a_terminal_on_stdin(worker_env):
+    import pty
+
+    master, slave = pty.openpty()
+    try:
+        code, out, err = _refused(_start(stdin=slave, write=None))
+    finally:
+        os.close(master)
+        os.close(slave)
+    assert code != 0 and "AO_WORKER_READY" not in out
+    assert "terminal" in err
+
+
+def test_refuses_when_no_token_arrives_in_time(worker_env):
+    t0 = time.monotonic()
+    p = _start(write=None)  # stdin stays open and silent (communicate() would close it)
+    try:
+        code = p.wait(timeout=60)
+        elapsed = time.monotonic() - t0
+        out, err = p.stdout.read(), p.stderr.read()
+    finally:
+        p.stdin.close()
+        _stop(p)
+    assert code != 0 and "AO_WORKER_READY" not in out
+    assert "no access token arrived on standard input within" in err.lower()
+    assert 10 <= elapsed < 50
 
 
 def test_tools_update_updates_managed_yt_dlp(worker, worker_env, monkeypatch):

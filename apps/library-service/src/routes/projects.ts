@@ -126,13 +126,19 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     const enabled = optBool(enc, "enabled") ?? false;
     const passphrase = enabled ? str(enc, "passphrase", 1024) : undefined;
     const targetLanguages = strArray(b, "targetLanguages", { optional: true, max: 20, itemMax: 35 });
-    const { project, recoveryCode } = await s.repo.createProject({
-      name,
-      governanceYaml,
-      encryption: enabled ? { enabled, passphrase: passphrase! } : { enabled: false },
-      ...(targetLanguages.length ? { targetLanguages } : {}),
-    });
-    state.publishState();
+    let created: Awaited<ReturnType<typeof s.repo.createProject>>;
+    try {
+      created = await s.repo.createProject({
+        name,
+        governanceYaml,
+        encryption: enabled ? { enabled, passphrase: passphrase! } : { enabled: false },
+        ...(targetLanguages.length ? { targetLanguages } : {}),
+      });
+    } finally {
+      // Refused or not, the interface is told: a refusal is now in the library's audit log (Task 50).
+      state.publishState();
+    }
+    const { project, recoveryCode } = created;
     // The recovery code is shown once, here; it is never logged or stored (nor cached).
     reply.header("Cache-Control", "no-store");
     return { project: await projectView(s.repo, project), ...(recoveryCode ? { recoveryCode } : {}) };

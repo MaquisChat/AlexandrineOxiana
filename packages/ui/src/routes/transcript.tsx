@@ -5,6 +5,7 @@
  */
 import { useMemo } from "react";
 import type { ApiClient } from "../api/client";
+import { toolsApi } from "../api/tools";
 import { transcriptApi } from "../api/transcripts";
 import { normalisePath, PATHS, type AppLocation } from "../navigation";
 import { TranscriptViewer } from "../screens/TranscriptViewer";
@@ -13,6 +14,7 @@ export const isTranscriptPath = (path: string): boolean => normalisePath(path) =
 
 export function TranscriptRoute({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   const api = useMemo(() => transcriptApi(client), [client]);
+  const tools = useMemo(() => toolsApi(client), [client]);
   const q = new URLSearchParams(loc.search);
   const projectId = q.get("project") ?? "";
   const sourceId = q.get("source") ?? "";
@@ -24,5 +26,5 @@ export function TranscriptRoute({ client, loc }: { client: ApiClient; loc: AppLo
       </main>
     );
   }
-  return <TranscriptViewer api={api} projectId={projectId} sourceId={sourceId} />;
+  return <TranscriptViewer api={api} tools={tools} projectId={projectId} sourceId={sourceId} />;
 }

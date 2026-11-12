@@ -17,6 +17,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEven
 import { errorText, isProjectLocked, type Asset, type Creator, type LibraryApi, type SourcePatch } from "../api/library";
 import { isShowablePicture, type FieldReview, type PendingJob, type VerifiedSource } from "../api/verification";
 import { CitePanel } from "../components/CitePanel";
+import { SourceToolNotice } from "../components/MissingToolNotice";
 import { typeLabel } from "../components/SourceTable";
 import { TranscriptLink } from "../components/TranscriptLink";
 import { UserText } from "../components/UserText";
@@ -577,6 +578,7 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
               ))}
             </ul>
           )}
+          <SourceToolNotice file={file} />
           <CitePanel api={api} projectId={projectId} sourceIds={[sourceId]} />
         </>
       )}

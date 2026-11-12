@@ -42,8 +42,9 @@ import { decryptBytes, encryptBytes } from "../repo/io.js";
 import { authorizeProcessing, createSourcePreAuthorized, projectDataKey, projectPolicy, projectStampNow, repoLibrary, type Repo } from "../repo/repo.js";
 import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import type { SourceInputFile } from "../repo/sources.js";
-import { WorkerJobError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
-import { AcknowledgementRequiredError, incompleteReason, plainReason } from "./errors.js";
+import { DEFAULT_SPEECH_MODEL } from "@ao/shared";
+import { WorkerJobError, WorkerToolError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
+import { AcknowledgementRequiredError, incompleteReason, plainReason, toolMissingReason, transcriptToolMissingNote } from "./errors.js";
 import { classifyUrl, isCollectionLink, type ClassifiedUrl, type Platform } from "./platforms.js";
 import { createProfileCapture, type ProfileCaptureOptions, type ProfileCaptureReport } from "./profile-capture.js";
 import { buildDraft, stripSnapshot, verificationSnapshot, type CaptureTool } from "./snapshot.js";
@@ -72,6 +73,8 @@ export interface CaptureOutcome {
   sourceId?: string;
   reason?: string;
   errorCode?: string;
+  /** The optional tool that was missing (Task 48a catalogue id), with `TOOL_NOT_INSTALLED` or a transcript note. */
+  tool?: string;
 }
 
 export interface LinkCaptureDeps {
@@ -182,6 +185,12 @@ const COMMENTS_UNSUPPORTED_NOTE = "Comments cannot be saved for this kind of pos
 
 function failed(url: string, code: string, reason = plainReason(code)): CaptureOutcome {
   return { url, status: "failed", errorCode: code, reason };
+}
+
+/** A worker failure as an outcome; a missing tool is named, with how to get it (R126). */
+function workerFailed(url: string, err: WorkerJobError): CaptureOutcome {
+  if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return { ...failed(url, err.code, toolMissingReason(err.tool)), tool: err.tool };
+  return failed(url, err.code);
 }
 
 /** One set of per-platform lanes per open library (repo), whichever queue or capture uses it (R116). */
@@ -358,7 +367,8 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       input: join(root, ...media.path.split("/")),
       inputEncrypted: media.encrypted,
       output: join(work, "transcript"),
-      params: { ...(params.model ? { model: params.model } : {}), ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },
+      // The shared default (R158) when none is named, never the worker's own.
+      params: { model: params.model ?? DEFAULT_SPEECH_MODEL, ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },
       entity: { type: "asset", id: media.id },
     });
     const meta = r.meta;
@@ -395,14 +405,16 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
     return { files, flaggedSegments: flagged ?? 0 };
   }
 
-  async function transcribe(projectId: string, sf: SourceFile, media: Asset, opts: CaptureOptions, work: string): Promise<string | undefined> {
+  async function transcribe(projectId: string, sf: SourceFile, media: Asset, opts: CaptureOptions, work: string): Promise<{ note: string; tool?: string } | undefined> {
     try {
       await runTranscription(projectId, sf, media, { model: opts.transcribeModel }, work, "capture");
     } catch (err) {
-      if (err instanceof PolicyDeniedError) return "The source was saved, but this project does not allow transcription.";
-      if (err instanceof WorkerUnavailableError) return "The source was saved, but the transcript could not be made because the media helper is not running.";
-      if (err instanceof WorkerJobError) return "The source was saved, but the transcript could not be made.";
-      return "The source was saved, but the transcript could not be stored.";
+      if (err instanceof PolicyDeniedError) return { note: "The source was saved, but this project does not allow transcription." };
+      if (err instanceof WorkerUnavailableError) return { note: "The source was saved, but the transcript could not be made because the media helper is not running." };
+      // The speech model is missing (R126): named, with how to get it.
+      if (err instanceof WorkerToolError && err.code === "TOOL_NOT_INSTALLED") return { note: transcriptToolMissingNote(err.tool), tool: err.tool };
+      if (err instanceof WorkerJobError) return { note: "The source was saved, but the transcript could not be made." };
+      return { note: "The source was saved, but the transcript could not be stored." };
     }
     return undefined;
   }
@@ -472,7 +484,7 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       try {
         result = await download(projectId, c, opts, work, !!existing || !!item?.metadataOnly, !existing && !!item?.includeComments);
       } catch (err) {
-        if (err instanceof WorkerJobError) return failed(url, err.code);
+        if (err instanceof WorkerJobError) return workerFailed(url, err);
         if (err instanceof WorkerUnavailableError) return failed(url, "WORKER_UNAVAILABLE");
         throw err;
       }
@@ -600,13 +612,15 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
         }
       }
       if (captionsFailed) notes.push("The source was saved, but some captions could not be stored.");
+      let missingTool: string | undefined;
       const wantTranscript = opts.transcribe === "project-default" ? repo.getProject(projectId).automation?.transcribeNewMedia === true : opts.transcribe;
       if (wantTranscript && firstMedia) {
-        const note = await transcribe(projectId, sf, firstMedia, opts, work);
-        if (note) notes.push(note);
+        const t = await transcribe(projectId, sf, firstMedia, opts, work);
+        if (t) notes.push(t.note);
+        if (t?.tool) missingTool = t.tool;
       }
 
-      const base = { url, sourceId: sf.source.id };
+      const base = { url, sourceId: sf.source.id, ...(missingTool ? { tool: missingTool } : {}) };
       if (incomplete) return { ...base, status: "incomplete", errorCode: incomplete, reason: [incompleteReason(incomplete), ...notes].join(" ") };
       if (needsReview) return { ...base, status: "needs-review", reason: [REVIEW_NOTE, ...notes].join(" ") };
       return { ...base, status: "created", ...(notes.length ? { reason: notes.join(" ") } : {}) };
