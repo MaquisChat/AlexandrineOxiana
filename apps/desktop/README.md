@@ -223,7 +223,10 @@ starts a build:
 | `v0.0.0` | both (a release) |
 
 The version (`0.0.0` here) must be the app's version, `version` in `src-tauri/tauri.conf.json`;
-otherwise the run stops in its first minute, on Linux, before any Mac time is spent. The last number
+otherwise the run stops in its first minute, on Linux, before any Mac time is spent. Only these four
+forms build, exactly as written (lower case, a number at the end and nothing after it): any other
+tag that starts with `v` and a version, such as a mistyped `-arm1`, `-ARM.1` or `-rc.1`, also stops
+there, with a message naming the accepted forms, and builds nothing. The last number
 counts attempts: each new build needs a new tag (`-mac.2`, `-mac.3`, …). Because it spends Mac
 minutes, a tag is pushed only at the owner's word (R167). From a checkout of the branch to build:
 

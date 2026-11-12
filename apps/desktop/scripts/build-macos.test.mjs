@@ -397,15 +397,29 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
   it("uploads the download straight after the build, before any check can fail", () => {
     const at = (s) => wf.indexOf(s);
     assert.ok(at("name: Upload the disk image") > at("id: build"));
+    // Directly after the build: before the cache saves (a failed save must not skip it) and the checks.
+    assert.ok(at("name: Upload the disk image") < at("name: Save the Rust build cache"));
     assert.ok(at("name: Upload the disk image") < at("name: Tools the checks hand to the worker"));
-    assert.doesNotMatch(wf.slice(at("name: Upload the disk image"), at("name: Tools the checks")), /\n\s+if:/);
+    const between = wf.slice(at("run: node apps/desktop/scripts/build-macos.mjs"), at("name: Upload the disk image"));
+    assert.doesNotMatch(between, /\n {6}- (uses|name|run):/, "no step between the build and the upload");
+    assert.match(wf.slice(at("name: Upload the disk image"), at("uses: actions/upload-artifact")), /if: \$\{\{ !cancelled\(\) && steps\.build\.outcome == 'success' \}\}/);
   });
 
   it("saves the caches even when a later step failed", () => {
     for (const name of ["Save the Rust build cache", "Save the build caches"]) {
       const block = wf.slice(wf.indexOf(`name: ${name}`), wf.indexOf("uses:", wf.indexOf(`name: ${name}`)));
-      assert.match(block, /if: always\(\)/, name);
+      assert.match(block, /if: \$\{\{ !cancelled\(\)/, name);
+      assert.doesNotMatch(block, /cache-hit/, `${name}: no exact hit can skip it`);
     }
+    // Each run saves under its own key and restores the newest by prefix, so a complete run supersedes a partial cache.
+    const restores = wf.split("uses: actions/cache/restore@").slice(1).map((b) => b.slice(0, b.indexOf("\n      - ")));
+    assert.equal(restores.length, 4);
+    for (const r of restores.filter((x) => !x.includes(".cargo-tools"))) {
+      assert.match(r, /key: .*-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}\n/);
+      assert.match(r, /restore-keys: \|\n/);
+    }
+    // After a cancellation nothing more runs on the Mac (no always()).
+    assert.doesNotMatch(wf, /always\(\)/);
     assert.doesNotMatch(wf, /uses: actions\/cache@/, "restore and save are separate steps");
     assert.match(wf, /!apps\/desktop\/src-tauri\/target\/\*\/bundle/);
   });

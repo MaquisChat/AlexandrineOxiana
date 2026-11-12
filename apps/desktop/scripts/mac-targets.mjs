@@ -6,7 +6,8 @@
 //     vX.Y.Z-mac.N     both downloads
 //     vX.Y.Z-arm.N     Apple Silicon only
 //     vX.Y.Z-intel.N   Intel only
-//     vX.Y.Z, or vX.Y.Z-<any other pre-release>: both
+//     vX.Y.Z           both (a release)
+//   Any other tag (a mistyped -arm1, -ARM.1, -rc.1, ...) builds nothing.
 //   X.Y.Z must be the app's version (src-tauri/tauri.conf.json), so a mistyped tag fails here, in a
 //   minute on Linux, instead of spending Mac minutes, and the disk image carries the tag's version.
 //
@@ -33,11 +34,12 @@ export function macTargets({ event, input, ref = "", version }) {
   if (event !== "push") throw new Error(`a Mac build starts only by hand or from a tag, not on ${event}`);
   if (!ref.startsWith("refs/tags/")) throw new Error(`a Mac build starts only from a tag, not from ${ref}`);
   const tag = ref.slice("refs/tags/".length);
-  const m = /^v(\d+\.\d+\.\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(tag);
-  if (!m || (m[2] && /^(mac|arm|intel)$/.test(m[2]))) throw new Error(`${tag} is not a version tag (vX.Y.Z, vX.Y.Z-mac.N, vX.Y.Z-arm.N or vX.Y.Z-intel.N)`);
+  // Only the exact documented forms build; anything else (a mistyped -arm1, -ARM.1, -arm.1.2, -rc.1)
+  // stops here rather than falling back to building both, the costliest run.
+  const m = /^v(\d+\.\d+\.\d+)(?:-(mac|arm|intel)\.(\d+))?$/.exec(tag);
+  if (!m) throw new Error(`${tag} is not a version tag; the accepted forms: vX.Y.Z, vX.Y.Z-mac.N, vX.Y.Z-arm.N, vX.Y.Z-intel.N (N a number)`);
   if (m[1] !== version) throw new Error(`the tag ${tag} names version ${m[1]}, but the app's version (tauri.conf.json) is ${version}`);
-  const kind = /^(mac|arm|intel)\.\d+$/.exec(m[2] ?? "")?.[1];
-  return kind === "arm" ? [RUNNERS.arm64] : kind === "intel" ? [RUNNERS.x64] : BOTH;
+  return m[2] === "arm" ? [RUNNERS.arm64] : m[2] === "intel" ? [RUNNERS.x64] : BOTH;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

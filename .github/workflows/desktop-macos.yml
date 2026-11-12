@@ -131,7 +131,10 @@ jobs:
           rustc --version
 
       # Caches: restored here, saved by the "Save …" steps below even when a later step failed
-      # (actions/cache's own post step saves only after a successful job).
+      # (actions/cache's own post step saves only after a successful job). Each run saves under its own
+      # key (the content key plus the run id and attempt) and restores the newest entry with the
+      # content key as prefix, so a complete run always supersedes a partial cache that a failed run
+      # saved. Old entries are removed by GitHub's own cache limits (least recently used first).
       - name: Restore the Rust build cache (crates and the shell's target folder, without the bundles)
         id: rust-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -143,8 +146,9 @@ jobs:
             ~/.cargo/git/db
             apps/desktop/src-tauri/target
             !apps/desktop/src-tauri/target/*/bundle
-          key: desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/*.json', 'apps/desktop/src-tauri/Info.plist', 'apps/desktop/src-tauri/capabilities/**') }}
+          key: desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/*.json', 'apps/desktop/src-tauri/Info.plist', 'apps/desktop/src-tauri/capabilities/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/*.json', 'apps/desktop/src-tauri/Info.plist', 'apps/desktop/src-tauri/capabilities/**') }}-
             desktop-macos-rust-1.97.0-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-
             desktop-macos-rust-1.97.0-${{ matrix.runner }}-
 
@@ -177,7 +181,9 @@ jobs:
           path: |
             apps/desktop/.build/node/*.tar.gz
             apps/desktop/.build/venv-*
-          key: desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}
+          key: desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            desktop-macos-build-${{ matrix.runner }}-${{ steps.pins.outputs.image }}-py3.13-${{ hashFiles('apps/desktop/macos/pins.json', 'services/media-worker/pyproject.toml', 'services/media-worker/packaging/constraints-macos-x86_64.txt') }}-
 
       - run: pnpm install --frozen-lockfile
         timeout-minutes: 10
@@ -190,30 +196,10 @@ jobs:
         timeout-minutes: 90
         run: node apps/desktop/scripts/build-macos.mjs --debug-app
 
-      - name: Save the Rust build cache (also after a failed build)
-        if: always() && steps.rust-cache.outputs.cache-hit != 'true' && steps.rust-cache.outcome == 'success'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        timeout-minutes: 15
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            apps/desktop/src-tauri/target
-            !apps/desktop/src-tauri/target/*/bundle
-          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
-      - name: Save the build caches (also after a failed build)
-        if: always() && steps.build-cache.outputs.cache-hit != 'true' && steps.build-cache.outcome == 'success' && hashFiles('apps/desktop/.build/node/*.tar.gz') != ''
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        timeout-minutes: 10
-        with:
-          path: |
-            apps/desktop/.build/node/*.tar.gz
-            apps/desktop/.build/venv-*
-          key: ${{ steps.build-cache.outputs.cache-primary-key }}
-
-      # The download is uploaded as soon as it is built, so a check that fails below never costs it.
+      # The download is uploaded as soon as it is built, before the cache saves and the checks, so
+      # neither a failed save nor a failed check ever costs it.
       - name: Upload the disk image and its SHA-256
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         timeout-minutes: 15
         with:
@@ -225,6 +211,29 @@ jobs:
           # A disk image is already compressed.
           compression-level: 0
           retention-days: 30
+
+      - name: Save the Rust build cache (also after a failed build)
+        if: ${{ !cancelled() && steps.rust-cache.outcome == 'success' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 15
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/desktop/src-tauri/target
+            !apps/desktop/src-tauri/target/*/bundle
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - name: Save the build caches (also after a failed build)
+        if: ${{ !cancelled() && steps.build-cache.outcome == 'success' && hashFiles('apps/desktop/.build/node/*.tar.gz') != '' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        timeout-minutes: 10
+        with:
+          path: |
+            apps/desktop/.build/node/*.tar.gz
+            apps/desktop/.build/venv-*
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
 
       # ---- checks on this machine ----
 
@@ -240,12 +249,14 @@ jobs:
         timeout-minutes: 5
         with:
           path: ~/.cache/ao-worker-smoke-models
-          key: ao-worker-smoke-models-tiny-v1-${{ matrix.runner }}
+          key: ao-worker-smoke-models-tiny-v1-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ao-worker-smoke-models-tiny-v1-${{ matrix.runner }}-
       - name: Packaged worker smoke test (manifest, health, HEIC, proxy, transcription, imports)
         timeout-minutes: 15
         run: node apps/desktop/scripts/build-sidecars.mjs --skip-build --smoke ${{ matrix.arch == 'arm64' && '--constraints none' || '' }}
       - name: Save the tiny speech model
-        if: always() && steps.model-cache.outputs.cache-hit != 'true' && steps.model-cache.outcome == 'success'
+        if: ${{ !cancelled() && steps.model-cache.outcome == 'success' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         timeout-minutes: 5
         with:
@@ -253,12 +264,12 @@ jobs:
           key: ${{ steps.model-cache.outputs.cache-primary-key }}
 
       - name: Launch check A-D (the debug app bundle; helpers from its own resources; E is Linux-only)
-        if: always() && steps.build.outcome == 'success'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 20
         run: node apps/desktop/scripts/launch-check.mjs --app "$APP_DEBUG"
 
       - name: Launch check R (the release app, run from the mounted disk image)
-        if: always() && steps.build.outcome == 'success'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           dmg=$(ls apps/desktop/dist-macos/*.dmg)
@@ -271,7 +282,7 @@ jobs:
           node apps/desktop/scripts/launch-check.mjs --release-app "$mnt/Alexandrine Oxiana.app"
 
       - name: Sizes and checksums in the run summary
-        if: always()
+        if: ${{ !cancelled() }}
         timeout-minutes: 2
         run: |
           {
@@ -282,7 +293,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload the worker's manifest and smoke results
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         timeout-minutes: 5
         with:
