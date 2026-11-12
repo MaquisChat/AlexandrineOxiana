@@ -478,7 +478,7 @@ Update after every task; commit and push.
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | fix round 1 | ed6a10f (worktree branch) | reviewed with probes: 1 Critical (a rebuild stopped half-way is taken as complete), 2 Important (the reopen at start can replace a library opened since; missing tests) |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | fix round 1 | e6c2bc5 (worktree branch) | reviewed with probes: approved but for what "Needs review" follows, now ruled (R172) |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | fix round 1 in re-review | ae4de75 (worktree branch) | "Needs review" follows every pending entry of the review queue (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
