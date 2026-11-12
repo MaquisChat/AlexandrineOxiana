@@ -131,32 +131,8 @@ def test_prefers_env_then_path_and_never_downloads(worker_env, monkeypatch, tmp_
     assert called == []
 
 
-def test_managed_download_verifies_sha256(worker_env, monkeypatch):
-    """The managed binary is checked against SHA2-256SUMS; a mismatch is refused (no network: fetch is stubbed)."""
-    payload = b"#!/bin/sh\necho 2026.11.01\n"
-    sums = "0" * 64 + "  " + download.ytdlp_asset_name() + "\n"
-    fetched = []
-
-    def fetch(url):
-        fetched.append(url)
-        return sums.encode() if url.endswith("SHA2-256SUMS") else payload
-
-    monkeypatch.setattr(download, "_latest_tag", lambda: "2026.11.01")
-    monkeypatch.setattr(download, "_fetch", fetch)
-    dest = worker_env["tools"] / "yt-dlp"
-    with pytest.raises(download.ToolError) as e:
-        download._download_ytdlp(dest)
-    assert e.value.code == "TOOL_CHECKSUM_MISMATCH"
-    assert not dest.exists()
-
-    import hashlib
-
-    sums = hashlib.sha256(payload).hexdigest() + "  " + download.ytdlp_asset_name() + "\n"
-    download._download_ytdlp(dest)
-    # both files come from the same pinned tag, not from "latest"
-    assert all("/download/2026.11.01/" in u for u in fetched) and len(fetched) == 4
-    assert dest.read_bytes() == payload
-    assert os.access(dest, os.X_OK)
+# The managed yt-dlp download (latest tag, SHA2-256SUMS, refused on mismatch) is tested against a
+# local file server in test_tools.py (test_video_downloader_installs_..., test_ytdlp_not_matching_...).
 
 
 def test_gallerydl_dates_are_inclusive_and_validated():

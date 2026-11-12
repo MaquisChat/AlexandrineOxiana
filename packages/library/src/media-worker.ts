@@ -5,7 +5,7 @@
  */
 import type { IndexHandle } from "./index/db.js";
 import type { Repo } from "./repo/repo.js";
-import { WorkerClient, WorkerUnavailableError, startWorker, type WorkerHandle } from "./worker-client.js";
+import { WorkerClient, WorkerToolsClient, WorkerUnavailableError, startWorker, type WorkerHandle } from "./worker-client.js";
 
 export interface ToolsUpdate {
   ytDlp: { old: string | null; new: string | null; managed: boolean };
@@ -18,8 +18,10 @@ export interface MediaWorker {
   readonly client: WorkerClient;
   /** `GET /health`: the tools' versions. */
   versions(): Promise<Record<string, string | null>>;
-  /** `POST /tools/update` (yt-dlp). */
+  /** `POST /tools/update` (yt-dlp). A failure is a WorkerJobError with the worker's code (WorkerToolError naming the tool). */
   updateTools(): Promise<ToolsUpdate>;
+  /** The optional tools (Task 48a): catalogue, install / update / remove as worker jobs. */
+  readonly tools: WorkerToolsClient;
   stop(): Promise<void>;
 }
 
@@ -46,6 +48,7 @@ export async function startMediaWorker(opts: { repo?: Repo | undefined; index?: 
   }
   const { repo, index } = opts;
   let client: WorkerClient | undefined;
+  const tools = new WorkerToolsClient(handle, { pollMs: opts.pollMs ?? 200 });
   return {
     handle,
     get client() {
@@ -54,7 +57,8 @@ export async function startMediaWorker(opts: { repo?: Repo | undefined; index?: 
       return client;
     },
     versions: async () => (await call<{ versions: Record<string, string | null> }>(handle, "GET", "/health")).versions,
-    updateTools: () => call<ToolsUpdate>(handle, "POST", "/tools/update"),
+    updateTools: () => tools.updateCaptureTools<ToolsUpdate>(),
+    tools,
     stop: () => handle.stop(),
   };
 }
