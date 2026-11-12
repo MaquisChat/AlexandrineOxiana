@@ -136,19 +136,23 @@ the media worker itself, as it always has.
   the three into the bundle's resources is the Mac build's step (Task 37f).
 - **The start.** `node --max-old-space-size=512 <folder>/service.mjs`, working directory the folder,
   in its own process group, with `env_clear()` and then only: `PATH` (the tools folder's `bin`
-  first; empty entries dropped), `HOME`, `USER`, `LOGNAME`, `TMPDIR`/`TEMP`/`TMP`, `LANG`,
+  first; only absolute entries kept), `HOME`, `USER`, `LOGNAME`, `TMPDIR`/`TEMP`/`TMP`, `LANG`,
   `LANGUAGE`, `LC_*`, `TZ`, `XDG_*`, `DBUS_SESSION_BUS_ADDRESS` (the keychain on Linux), the proxy
   variables in both letter cases, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `TESSDATA_PREFIX`, and the
-  shell's own settings `AO_SERVICE_PORT=0`, `AO_TOOLS_DIR` and `AO_MODELS_DIR` (in the app's data
-  folder) and `AO_WORKER_BIN` (or `AO_NO_WORKER=1`). Never `NODE_OPTIONS`, `NODE_PATH`,
+  shell's own settings `AO_SERVICE_PORT=0`, `AO_CONFIG_DIR`, `AO_TOOLS_DIR` and `AO_MODELS_DIR`
+  (`settings/`, `tools/` and `models/` in the shell's app data folder, so the app settings, pairings,
+  the outbox and the tools are all in one place, R159) and `AO_WORKER_BIN` (or `AO_NO_WORKER=1`). Never `NODE_OPTIONS`, `NODE_PATH`,
   `NAPI_RS_NATIVE_LIBRARY_PATH` or any token or passphrase variable (`src/helper_env.rs`, each name
-  with its reason). Not passed: `AO_CONFIG_DIR` and `AO_LIBRARY` (the service's defaults apply).
+  with its reason). Not passed: `AO_LIBRARY`. Without the shell (CLI, tests, the end-to-end harness)
+  the service's default settings folder is unchanged.
 - **The token.** 32 bytes from the operating system's random source, as 64 hexadecimal characters,
   new on every launch, written as one line on the service's standard input, and otherwise only in
   the page's initialization script; never on disk, in a log or on a command line.
 - **Ready.** The shell waits up to 60 s for `AO_SERVICE_READY port=<n>`; otherwise it stops the
   service and shows an error window with the service's own plain sentence (or a plain one of its
-  own) and exits non-zero. No app window is opened before the service is ready.
+  own, any path in it replaced) and exits non-zero: when the window is closed, or by itself after
+  10 minutes unanswered; the failure is on standard error at once. No app window is opened before
+  the service is ready.
 - **Standard input is the life line (R155 rule 3).** The service keeps reading its standard input
   after the token line and treats its end as "shut down cleanly", exactly like SIGTERM; it writes
   the worker's own token on the worker's standard input the same way, and the worker does the same.
@@ -157,7 +161,10 @@ the media worker itself, as it always has.
 - **Closing.** When the last window closes (or on SIGTERM, SIGINT, SIGHUP) the shell closes the
   service's standard input and waits until no process of the service's process group is left (on
   Linux it is the "child subreaper", so the orphaned worker is reaped by it), for up to 95 s, which
-  is more than the service's own forced exit (90 s); then it kills the group.
+  is more than the service's own forced exit (90 s); then it kills the group. The exit is held back
+  until then, so the single-instance lock (released when the event loop ends) stays held while the
+  helpers stop: a second launch during closing starts no second service; the first instance notes
+  it and starts the app again once its helpers are gone.
 
 ## Consequences
 

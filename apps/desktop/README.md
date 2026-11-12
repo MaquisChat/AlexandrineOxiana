@@ -25,6 +25,18 @@ service, and the environment it gives it, are in `docs/adr/0013-desktop-shell.md
 
 The interface talks to the shell only through `packages/ui/src/desktopShell.ts`.
 
+**The app identifier** `org.alexandrineoxiana.desktop` is defined in one place, `identifier` in
+`src-tauri/tauri.conf.json` (JSON takes no comments, so the note is here). It decides the app's data
+folder (on a Mac `~/Library/Application Support/org.alexandrineoxiana.desktop`), under which the
+shell has the service keep everything (R159): `settings/` (AO_CONFIG_DIR: app settings, pairings,
+the outbox), `tools/` and `models/`; and it names the single-instance lock. It is kept for now and
+must be confirmed by the owner before the first release: changing it later moves every user's
+settings. Without the shell (CLI, tests, the end-to-end harness) the service's own default folder
+is unchanged.
+
+Closing holds the single-instance lock until the service and the worker are gone; a second launch
+during that time is noted by the first instance, which starts the app again once they are gone.
+
 ## Building on Linux
 
 The web view's development libraries (Ubuntu 24.04):
