@@ -164,6 +164,11 @@ export function collectLicenceTexts(packages, standard) {
   return { groups: [...groups.values()], noText, problems };
 }
 
+/** Said at the top of every notices file (review N1): exactly what normaliseText changes. */
+export const NORMALISATION_NOTE = 'How the texts below were normalised: a leading byte-order mark was removed, CR and CRLF line endings were converted to LF, trailing spaces and tabs were removed from each line, and trailing blank lines and the final newline were trimmed. Nothing else in any text was changed.';
+/** The plain statement of a known gap (R165, review N4); the same words as licence_texts.py. */
+export const KNOWN_GAP_NOTE = "Known gaps: each package below bundles these components, as far as its own SBOM states. No licence texts for these components are shipped, other than any among the package's own files below.";
+
 const heading = (text, ch) => `${text}\n${ch.repeat(Math.min(text.length, 100))}`;
 
 /**
@@ -172,7 +177,7 @@ const heading = (text, ch) => `${text}\n${ch.repeat(Math.min(text.length, 100))}
  * once, whole, under the list of packages it applies to.
  */
 export function renderLicenceTexts({ title, intro, packages, result, preamble = [] }) {
-  const out = [heading(title, "="), "", intro, ""];
+  const out = [heading(title, "="), "", intro, "", NORMALISATION_NOTE, ""];
   for (const block of preamble) out.push(block, "");
   out.push(heading(`Packages (${packages.length})`, "-"));
   for (const p of packages) {
@@ -189,8 +194,8 @@ export function renderLicenceTexts({ title, intro, packages, result, preamble = 
   }
   const withComponents = packages.filter((p) => p.components);
   if (withComponents.length) {
-    out.push("", heading("Components listed by a package's own SBOM", "-"));
-    out.push("The package's program contains these components, as its own SBOM states them. The package ships no other texts for them than those shown for it below.");
+    out.push("", heading("Components bundled by a package, as its own SBOM lists them", "-"));
+    out.push(KNOWN_GAP_NOTE);
     for (const p of withComponents) {
       out.push(`  ${p.name} ${p.version} (${p.components.file}, ${p.components.list.length} components):`);
       for (const c of p.components.list) out.push(`    ${c}`);

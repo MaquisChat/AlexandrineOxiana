@@ -54,7 +54,10 @@ The rules, the same in the JavaScript (`scripts/notices/licence-texts.mjs`) and 
 4. **Only whole identical files are merged (R165).** Two files are the same only if they are equal
    after normalising line endings and trailing whitespace. Each distinct file is shipped once, in
    full, under a heading naming every package (and file) it applies to; two MIT texts that differ
-   only in their copyright line are two files.
+   only in their copyright line are two files. The shipped text is the normalised one: a leading
+   byte-order mark removed, CR and CRLF line endings converted to LF, trailing spaces and tabs
+   removed from each line, trailing blank lines and the final newline trimmed; nothing else. Each
+   notices file says so at its top.
 5. **Only what ships.** For the shell: the normal-dependency closure for the build's target, without
    build and dev dependencies and without proc-macro crates or what only they need (they run inside
    the compiler). MPL-2.0 parts name where their source is (crates: repository and crates.io; npm:

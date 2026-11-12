@@ -33,7 +33,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync,
 import { createRequire, isBuiltin } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectLicenceTexts, isLicenceText, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
+import { KNOWN_GAP_NOTE, collectLicenceTexts, isLicenceText, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SERVICE = resolve(HERE, "..");
@@ -546,8 +546,8 @@ function writeLicences(out) {
   } else lines.push("None.");
   const withComponents = collected.filter((p) => p.components);
   if (withComponents.length) {
-    lines.push("", "## Components listed by a package's own SBOM", "");
-    lines.push("The program in these packages contains further components, as the package's own SBOM states them; the package ships no other licence texts for them. The full lists are in `THIRD-PARTY-LICENCES.txt` and the SBOM beside the package's licence.", "");
+    lines.push("", "## Components bundled by a package, as its own SBOM lists them", "");
+    lines.push(`${KNOWN_GAP_NOTE} The full lists are in \`THIRD-PARTY-LICENCES.txt\` and the SBOM beside the package's licence.`, "");
     for (const p of withComponents) lines.push(`- ${p.name} ${p.version}: ${p.components.list.length} components (${p.components.file})`);
   }
   lines.push("");

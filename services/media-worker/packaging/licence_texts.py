@@ -190,9 +190,18 @@ def collect(packages: list[dict], standard: dict[str, str]) -> Result:
             add(standard[x], f"{pid} (standard text of {x})")
         s = "s" if len(ids) > 1 else ""
         only = f"; ships only: {', '.join(n for n, _ in p['files'])}" if p["files"] else ""
+        if p.get("components"):
+            c = p["components"]
+            only += f"; its SBOM ({c['file']}) lists {len(c['list'])} components whose licence texts it does not ship"
         no_text.append({"name": p["name"], "version": p["version"], "licence": p.get("licence") or "", "ids": ids,
                         "used": f"the standard text{s} of {', '.join(ids)} (licences/standard{note}){only}"})
     return Result(list(groups.values()), no_text, problems)
+
+
+# Said at the top of every notices file (review N1): exactly what normalise() changes.
+NORMALISATION_NOTE = 'How the texts below were normalised: a leading byte-order mark was removed, CR and CRLF line endings were converted to LF, trailing spaces and tabs were removed from each line, and trailing blank lines and the final newline were trimmed. Nothing else in any text was changed.'
+# The plain statement of a known gap (R165, review N4); the same words as licence-texts.mjs.
+KNOWN_GAP_NOTE = "Known gaps: each package below bundles these components, as far as its own SBOM states. No licence texts for these components are shipped, other than any among the package's own files below."
 
 
 def _heading(text: str, ch: str) -> str:
@@ -203,7 +212,7 @@ def render(title: str, intro: str, packages: list[dict], result: Result, preambl
     """One readable file: the packages (MPL ones with their source), the ones without a licence text of
     their own, what their SBOMs list, then each distinct file once, whole, under the packages it applies
     to, then `appendix` [(title, text)] unchanged."""
-    out = [_heading(title, "="), "", intro, ""]
+    out = [_heading(title, "="), "", intro, "", NORMALISATION_NOTE, ""]
     for block in preamble:
         out += [block, ""]
     out.append(_heading(f"Packages ({len(packages)})", "-"))
@@ -221,9 +230,7 @@ def render(title: str, intro: str, packages: list[dict], result: Result, preambl
         out.append("None: every package above ships its own licence text.")
     with_components = [p for p in packages if p.get("components")]
     if with_components:
-        out += ["", _heading("Components listed by a package's own SBOM", "-"),
-                "The package's program contains these components, as its wheel's own SBOM states them. "
-                "The texts for them are only those the package ships, shown below."]
+        out += ["", _heading("Components bundled by a package, as its own SBOM lists them", "-"), KNOWN_GAP_NOTE]
         for p in with_components:
             c = p["components"]
             out.append(f"  {p['name']} {p['version']} ({c['file']}, {len(c['list'])} components):")

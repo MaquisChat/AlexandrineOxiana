@@ -206,7 +206,13 @@ describe("renderLicenceTexts and verifyVerbatim", () => {
     assert.match(out, /=== Text 1 of 5 ===\nApplies to: a 1\.0\.0 \(LICENSE\)\n\n4\. Redistribution\./);
     assert.match(out, /m 2\.0\.0 {2}MPL-2\.0\n {4}source: https:\/\/example\.org\/m/);
     assert.match(out, /No licence text shipped by the package \(1\)[\s\S]*n 4\.0\.0: MIT - the standard text of MIT \(licences\/standard\); its SBOM \(sbom\.cdx\.json\) lists 2 components whose licence texts it does not ship/);
-    assert.match(out, /Components listed by a package's own SBOM[\s\S]*n 4\.0\.0 \(sbom\.cdx\.json, 2 components\)[\s\S]*cssparser 0\.29\.6 MPL-2\.0/);
+    assert.match(out, /Components bundled by a package, as its own SBOM lists them[\s\S]*n 4\.0\.0 \(sbom\.cdx\.json, 2 components\)[\s\S]*cssparser 0\.29\.6 MPL-2\.0/);
+    // Review N4: a known gap, plainly.
+    assert.ok(out.includes("Components bundled by a package, as its own SBOM lists them\n"));
+    assert.ok(out.includes("Known gaps: each package below bundles these components, as far as its own SBOM states. No licence texts for these components are shipped, other than any among the package's own files below."));
+    // Review N1: at the top, exactly what was normalised, and that nothing else was changed.
+    const top = out.slice(0, out.indexOf("Packages ("));
+    assert.ok(top.includes('How the texts below were normalised: a leading byte-order mark was removed, CR and CRLF line endings were converted to LF, trailing spaces and tabs were removed from each line, and trailing blank lines and the final newline were trimmed. Nothing else in any text was changed.'));
   });
 
   it("verifyVerbatim names a source that is not in the output whole", () => {

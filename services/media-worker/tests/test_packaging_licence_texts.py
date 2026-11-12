@@ -121,6 +121,12 @@ def test_render_ships_every_file_verbatim_and_names_packages_sources_and_compone
     assert "m 1.0  MPL-2.0\n    source: https://example.org/m (version 1.0)" in out
     assert "No licence text shipped by the package (1)" in out and "n 1.0: Apache-2.0" in out
     assert "n 1.0 (sboms/x.json, 1 components):\n    x 1: MIT" in out
+    # Review N4: the same plain wording as the other generators, and the gap on the package's "no text" line.
+    assert "Components bundled by a package, as its own SBOM lists them\n" in out
+    assert "Known gaps: each package below bundles these components, as far as its own SBOM states. No licence texts for these components are shipped, other than any among the package's own files below." in out
+    assert "n 1.0: Apache-2.0 - the standard text of Apache-2.0 (licences/standard); its SBOM (sboms/x.json) lists 1 components whose licence texts it does not ship" in out
+    # Review N1: what was normalised, at the top.
+    assert 'How the texts below were normalised: a leading byte-order mark was removed, CR and CRLF line endings were converted to LF, trailing spaces and tabs were removed from each line, and trailing blank lines and the final newline were trimmed. Nothing else in any text was changed.' in out[:out.index("Packages (")]
     assert "PSF terms" in out
 
 
