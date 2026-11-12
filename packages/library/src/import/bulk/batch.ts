@@ -67,6 +67,15 @@ export interface JournalEntry {
   tombstoned?: string[];
   /** Annotations of the item left out over the per-source limit (R74 I4). */
   annotationsDropped?: number;
+  /** The files this line stored: copied into the library, or left as links (R136; for the report). */
+  files?: { copied: number; linked: number };
+}
+
+/** A journal line's `files`, from whether each stored file is a link; undefined when none was stored. */
+export function fileCounts(isLink: boolean[]): JournalEntry["files"] {
+  if (!isLink.length) return undefined;
+  const linked = isLink.filter(Boolean).length;
+  return { copied: isLink.length - linked, linked };
 }
 
 export interface GovernanceNote {

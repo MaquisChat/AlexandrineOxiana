@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename } from "node:fs/promises";
+import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { writeFileAtomic } from "./fs/atomic.js";
 import type { Deps } from "./deps.js";
@@ -127,4 +127,33 @@ export async function forgetLibrary(libraryId: string, deps: RegDeps): Promise<v
   const entries = await loadForUpdate(deps);
   const rest = entries.filter((e) => e.libraryId !== libraryId);
   if (rest.length !== entries.length) await save(deps, rest);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The library open when the app last ran (spec 4.5: reopened at start, D5)
+
+const lastFile = (d: Pick<Deps, "appConfigDir">) => join(d.appConfigDir, "last-library.json");
+
+/**
+ * Remembers which library is open, so the app reopens it at its next start. Only the library's id
+ * is kept, in the app settings folder (never in the library); where it is comes from the registry.
+ */
+export async function rememberLastOpenLibrary(libraryId: string, deps: Pick<Deps, "appConfigDir">): Promise<void> {
+  await mkdir(deps.appConfigDir, { recursive: true });
+  await writeFileAtomic(lastFile(deps), JSON.stringify({ libraryId }));
+}
+
+/** The id of the library open when the app last ran, or undefined (none, or the file is unusable). */
+export async function lastOpenLibrary(deps: Pick<Deps, "appConfigDir">): Promise<string | undefined> {
+  try {
+    const v = JSON.parse(await readFile(lastFile(deps), "utf8")) as { libraryId?: unknown };
+    return typeof v.libraryId === "string" && v.libraryId ? v.libraryId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The researcher closed the library: the next start shows the chooser. */
+export async function forgetLastOpenLibrary(deps: Pick<Deps, "appConfigDir">): Promise<void> {
+  await rm(lastFile(deps), { force: true });
 }

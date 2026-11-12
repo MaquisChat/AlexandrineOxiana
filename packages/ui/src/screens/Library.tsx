@@ -10,7 +10,7 @@
  * dialog (Task 61).
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourcePage, Tag } from "../api/library";
+import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, IndexStatus, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
@@ -79,6 +79,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
     ...(current.lockedBy ? { lockedBy: current.lockedBy } : {}),
+    ...(current.index ? { index: current.index } : {}),
   });
   const [index, setIndex] = useState<{ done: number; total: number } | undefined>();
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -190,8 +191,8 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               else closedRef.current?.();
               continue;
             }
-            // Each event is the whole state: a reason or lock holder it no longer names is gone.
-            setState(({ readOnlyReason: _r, lockedBy: _l, ...s }) => ({ ...s, ...d }));
+            // Each event is the whole state: a reason, lock holder or index state it no longer names is gone.
+            setState(({ readOnlyReason: _r, lockedBy: _l, index: _i, ...s }) => ({ ...s, ...d }));
             setStateSeq((n) => n + 1);
           }
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
@@ -310,6 +311,29 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
     return () => ac.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, projectId, locked, filter, reload]);
+
+  // ---- the index (D8): when a rebuild ends, the sources are read again ----
+  const indexState = state.index?.state;
+  const wasRebuilding = useRef(indexState === "rebuilding");
+  useEffect(() => {
+    const before = wasRebuilding.current;
+    wasRebuilding.current = indexState === "rebuilding";
+    if (before && indexState !== "rebuilding") {
+      setIndex(undefined);
+      refresh();
+    }
+  }, [indexState, refresh]);
+  // A list read while the index was being rebuilt is read again shortly (its end may have been missed).
+  const listRebuilding = sources?.index?.state === "rebuilding";
+  // A partial index (missing or unreadable, no rebuild completed since) holds only what was written
+  // meanwhile: its list is never shown as the library's content (C1).
+  const listIndex = sources?.index ?? state.index;
+  const listPartial = !!listIndex && "partial" in listIndex && listIndex.partial === true;
+  useEffect(() => {
+    if (!listRebuilding) return;
+    const t = setTimeout(refresh, 2000);
+    return () => clearTimeout(t);
+  }, [listRebuilding, sources, refresh]);
 
   const query = () => ({ text: filter.text, ...(filter.collection ? { collection: filter.collection } : {}), ...(filter.tag ? { tag: filter.tag } : {}) });
 
@@ -699,8 +723,22 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                 {sourcesError}
               </p>
             )}
+            {(sources?.index ?? state.index)?.state === "unavailable" && (
+              <p className="ao-muted">This library is open read-only, so its search index cannot be built here: sources are listed from the library's files, and search looks at titles only.</p>
+            )}
             {sources === undefined ? (
               !sourcesError && <p aria-live="polite">Loading sources…</p>
+            ) : (sources.total === 0 || listPartial) && (listRebuilding || indexState === "rebuilding") ? (
+              // An index being rebuilt is never passed off as an empty library (D8).
+              <p role="status">The library's search index is being rebuilt from its files. The sources appear here as soon as it has finished; nothing in the library has been lost.</p>
+            ) : (sources.total === 0 || listPartial) && listIndex?.state === "failed" ? (
+              <p role="status">
+                The sources cannot be listed: the library's search index could not be rebuilt. Your sources are safe in the library folder;{" "}
+                <a href={PATHS.missingFiles} onClick={(e) => follow(e, PATHS.missingFiles)}>
+                  rebuild the library from its folder
+                </a>{" "}
+                to list them again.
+              </p>
             ) : (
               <>
                 <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} rebuilding={!!index && index.done < index.total} />

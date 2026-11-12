@@ -100,7 +100,7 @@ export type {
   RelinkSkipReason,
   WatchOptions,
 } from "./reconnect.js";
-export { addKnownPath, forgetLibrary, listLibraries, recordLocation, registerLibrary } from "./registry.js";
+export { addKnownPath, forgetLastOpenLibrary, forgetLibrary, lastOpenLibrary, listLibraries, recordLocation, registerLibrary, rememberLastOpenLibrary } from "./registry.js";
 export type { RegistryEntry } from "./registry.js";
 
 export * from "./repo/index.js";

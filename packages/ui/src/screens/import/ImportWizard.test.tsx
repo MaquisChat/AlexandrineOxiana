@@ -8,6 +8,8 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterAll(() => server.close());
 
 const DEFAULT_OPTIONS = { fileHandling: "copy", structure: "collections", duplicates: "merge", ocr: true, transcribe: false };
+/** What a Bulk Import start sends by default: "Copy into the library" also copies linked files (R136, M2). */
+const START_OPTIONS = { ...DEFAULT_OPTIONS, linkedFiles: "copy" };
 
 function setup(o: ServiceSetup = {}) {
   const m = mockService(o);
@@ -70,7 +72,7 @@ describe("Bulk Import wizard", () => {
     expect((screen.getByRole("checkbox", { name: "OCR scanned PDFs" }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole("checkbox", { name: "Transcribe audio and video" }) as HTMLInputElement).checked).toBe(false);
     await runToReport(m, user);
-    expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/data/papers" }, options: DEFAULT_OPTIONS }]);
+    expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/data/papers" }, options: START_OPTIONS }]);
     expect(m.bodies(`GET /imports/${B1}/report`)).toHaveLength(1);
     expect(screen.getByText("1,280")).toBeTruthy();
   });
@@ -190,7 +192,7 @@ describe("Bulk Import wizard", () => {
         {
           adapter: { kind: "folder", path: "/data/papers" },
           options: {
-            ...DEFAULT_OPTIONS,
+            ...START_OPTIONS,
             approveOutside: { folders: ["/home/u/Zotero/linked"], files: ["/mnt/archive/lee.pdf"], rememberFolders: ["/home/u/Zotero/linked"] },
           },
         },
@@ -230,7 +232,7 @@ describe("Bulk Import wizard", () => {
       expect(screen.getByText(/not approved.*imported without the file/i)).toBeTruthy();
       await toOptions(user);
       await runToReport(m, user);
-      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual(DEFAULT_OPTIONS);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual(START_OPTIONS);
     });
   });
 
@@ -422,7 +424,7 @@ describe("Bulk Import wizard", () => {
       expect((screen.getByRole("checkbox", { name: "Approve this folder and its subfolders" }) as HTMLInputElement).checked).toBe(false);
       await toOptions(user);
       await runToReport(m, user);
-      expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/b" }, options: DEFAULT_OPTIONS }]);
+      expect(m.bodies(`POST /projects/${P1}/import`)).toEqual([{ adapter: { kind: "folder", path: "/b" }, options: START_OPTIONS }]);
     });
 
     it("going back without an edit keeps the scan", async () => {
@@ -567,6 +569,64 @@ describe("Bulk Import wizard", () => {
     it("names updated sources apart from merged ones", async () => {
       await openUndo({ report: { ...REPORT, counts: { ...REPORT.counts, updated: 2 } } });
       expect(within(screen.getByRole("alertdialog")).getByText("Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?")).toBeTruthy();
+    });
+  });
+
+  describe("Zotero's linked files with “Copy into the library” (R136, D4)", () => {
+    const linked: ServiceSetup = { summary: { ...SUMMARY, linkedFiles: 2 } };
+
+    it("copies them by default: the choice to keep them as links is separate, shown only when the scan found some", async () => {
+      const { m, user } = setup(linked);
+      await scanFolder(user);
+      await toOptions(user);
+      const keep = screen.getByRole("checkbox", { name: "Keep the 2 files Zotero links to where they are, as links" }) as HTMLInputElement;
+      expect(keep.checked).toBe(false);
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: object }).options).toEqual(START_OPTIONS);
+    });
+
+    it("keeping them as links is an explicit choice, with the warning", async () => {
+      const { m, user } = setup(linked);
+      await scanFolder(user);
+      await toOptions(user);
+      await user.click(screen.getByRole("checkbox", { name: "Keep the 2 files Zotero links to where they are, as links" }));
+      expect(screen.getByText(/outside encryption and retention control/)).toBeTruthy();
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: { linkedFiles: string } }).options.linkedFiles).toBe("link");
+    });
+
+    it("is never offered where the project's rules require encryption", async () => {
+      const { m, user } = setup({ ...linked, governance: "encryption:\n  atRest: required\n" });
+      await scanFolder(user);
+      await toOptions(user);
+      expect(screen.queryByRole("checkbox", { name: /where they are, as links/ })).toBeNull();
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: { linkedFiles: string } }).options.linkedFiles).toBe("copy");
+    });
+
+    it("is not shown when the scan found no linked files", async () => {
+      const { user } = setup();
+      await scanFolder(user);
+      await toOptions(user);
+      expect(screen.queryByRole("checkbox", { name: /where they are, as links/ })).toBeNull();
+    });
+
+    it("M2: “Copy into the library” always asks for linked files to be copied, even when the scan found none (a link added since is copied too)", async () => {
+      const { m, user } = setup();
+      await scanFolder(user);
+      await toOptions(user);
+      await runToReport(m, user);
+      expect((m.bodies(`POST /projects/${P1}/import`)[0] as { options: { linkedFiles?: string } }).options.linkedFiles).toBe("copy");
+    });
+
+    it("the report gives the number of files copied and the number left as links", async () => {
+      const { m, user } = setup({ ...linked, report: { ...REPORT, files: { copied: 1290, linked: 0 } } });
+      await scanFolder(user);
+      await toOptions(user);
+      await runToReport(m, user);
+      const table = await screen.findByRole("table", { name: "Items by outcome" });
+      expect(within(table).getByRole("row", { name: "Files copied into the library 1,290" })).toBeTruthy();
+      expect(within(table).getByRole("row", { name: "Files left as links 0" })).toBeTruthy();
     });
   });
 });

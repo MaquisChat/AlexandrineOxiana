@@ -14,9 +14,9 @@
  *     service started again on the same library: the index is rebuilt, search finds a source by a
  *     word of its title, and nothing on disk was lost.
  *
- * Elements are found by role and accessible name. Steps the product cannot do yet are
- * `blockedBy(<defect>)` (fixtures.ts), each also run as its own expected-failure test at the end of
- * this file, and described in the Task 44 report.
+ * Elements are found by role and accessible name. Steps the product could not do were
+ * `blockedBy(<defect>)` (fixtures.ts); the one found here, D8 (Task 44 report), is fixed (Task 46a),
+ * and scenario 7 now also checks that the relaunched app reopens the library by itself (D5).
  *
  * The recovery code and the passphrase are secrets: kept in variables, never logged, never in a
  * test or step title, never attached to the report.
@@ -24,7 +24,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { buildDoiPdf, buildPdf } from "../tests/fixtures/generate.mjs";
-import { APP_ORIGIN, blockedBy, DEFECT_TIMEOUT, expect, expectDefect, libraryWithProject, test, type AppHarness, type Defect, type Page } from "./fixtures.js";
+import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 
 // ---------- shared ----------
 
@@ -428,21 +428,12 @@ async function relaunchWithoutIndex(app: AppHarness, libraryPath: string): Promi
   return before;
 }
 
-/**
- * After a relaunch: the library open again. Today the relaunched app shows the chooser (the service
- * does not reopen the last library; the same cause as D5), so it is opened from there; once the app
- * reopens it by itself, this goes straight on.
- */
-async function openFromChooser(page: Page, name: string): Promise<void> {
+/** After a relaunch: the app reopens the library that was open (D5 fixed), never the chooser. */
+async function reopenedAfterRelaunch(page: Page, name: string): Promise<void> {
   await page.goto(`${APP_ORIGIN}/`);
-  const chooser = page.getByRole("heading", { level: 1, name: "Choose a library" });
-  const library = page.getByRole("heading", { level: 1, name });
-  await expect(chooser.or(library)).toBeVisible();
-  if (await chooser.isVisible()) await page.getByRole("button", { name: `Open ${name}` }).click();
-  await expect(library).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Choose a library" })).toHaveCount(0);
 }
-
-const D8: Defect = { id: "D8", title: "opening a library whose library.sqlite was deleted rebuilds the index from the files, so its sources are listed and found by search (spec 4.3, 9)" };
 
 test("scenario 7: delete library.sqlite while the service is stopped, start it again: the index is rebuilt, search works, nothing on disk is lost", async ({ page, app }) => {
   let libraryPath = "";
@@ -459,8 +450,8 @@ test("scenario 7: delete library.sqlite while the service is stopped, start it a
     expect(before.size).toBeGreaterThan(0);
   });
 
-  await test.step("open the library again from the chooser", async () => {
-    await openFromChooser(page, S7_LIBRARY);
+  await test.step("the relaunched app goes straight to the library", async () => {
+    await reopenedAfterRelaunch(page, S7_LIBRARY);
     expect(existsSync(join(libraryPath, "library.sqlite")), "a new index file").toBe(true);
   });
 
@@ -468,17 +459,7 @@ test("scenario 7: delete library.sqlite while the service is stopped, start it a
     expect(lostOrChanged(libraryPath, before)).toEqual([]);
   });
 
-  await blockedBy(D8);
-
-  await test.step("D8: the index rebuilt through the service instead (POST /libraries/rebuild-index; the app has no control for it)", async () => {
-    const rebuilt = await app.api<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index");
-    expect(rebuilt.status, JSON.stringify(rebuilt.body)).toBe(200);
-    expect(rebuilt.body).toMatchObject({ indexed: 3, errors: 0 });
-    await page.reload();
-    await expect(page.getByRole("heading", { level: 1, name: S7_LIBRARY })).toBeVisible();
-  });
-
-  await test.step("the index is rebuilt: the project's three sources are listed again", async () => {
+  await test.step("the index is rebuilt from the files in the background: the project's three sources are listed again", async () => {
     await page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: S7_PROJECT }).click();
     const table = page.getByRole("table", { name: "Sources" });
     for (const t of S7_TITLES) await expect(table.getByRole("button", { name: t, exact: true })).toBeVisible();
@@ -496,17 +477,3 @@ test("scenario 7: delete library.sqlite while the service is stopped, start it a
   });
 });
 
-// ---------- the steps the scenarios cannot do yet, each on its own (expected to fail while the defect reproduces) ----------
-
-test(`${D8.id}: ${D8.title}`, async ({ page, app }) => {
-  const { libraryPath, projectId } = await threeSources(app, page);
-  await relaunchWithoutIndex(app, libraryPath);
-  await openFromChooser(page, S7_LIBRARY);
-  expectDefect(D8);
-  expect((await app.api<SourceList>("GET", `/projects/${projectId}/sources`)).body.total, "the three sources listed after the reopen").toBe(3);
-  const found = (await app.api<SourceList>("GET", `/projects/${projectId}/sources?text=ledger`)).body;
-  expect(found.items.map((i) => i.title)).toEqual(["Harbour ledger of 1932"]);
-  await page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: S7_PROJECT }).click();
-  await page.getByRole("searchbox", { name: "Search sources" }).fill("ledger");
-  await expect(page.getByRole("table", { name: "Sources" }).getByRole("button", { name: "Harbour ledger of 1932", exact: true })).toBeVisible({ timeout: DEFECT_TIMEOUT });
-});

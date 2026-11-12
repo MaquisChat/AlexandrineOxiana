@@ -9,8 +9,11 @@ import {
   LibraryNotWritableError,
   NotALibraryError,
   createLibrary,
+  forgetLastOpenLibrary,
   forgetLibrary,
+  lastOpenLibrary,
   listLibraries,
+  rememberLastOpenLibrary,
   openLibrary,
   recordLocation,
   registerLibrary,
@@ -288,6 +291,26 @@ describe("registry", () => {
     expect((await listLibraries(deps)).map((l) => l.libraryId).sort()).toEqual(["L1", "L2"]);
     await forgetLibrary("L1", deps);
     expect((await listLibraries(deps)).map((l) => l.libraryId)).toEqual(["L2"]);
+  });
+
+  it("D5: remembers the last open library by id only, in the app settings folder; forgets it on request", async () => {
+    const deps = mkDeps();
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+    await rememberLastOpenLibrary("L1", deps);
+    expect(await lastOpenLibrary(deps)).toBe("L1");
+    await rememberLastOpenLibrary("L2", deps);
+    expect(await lastOpenLibrary(deps)).toBe("L2");
+    // Only the id: where the library is comes from the registry, nothing about it from the library.
+    const raw = await readFile(join(deps.appConfigDir, "last-library.json"), "utf8");
+    expect(JSON.parse(raw)).toEqual({ libraryId: "L2" });
+    await forgetLastOpenLibrary(deps);
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+    await forgetLastOpenLibrary(deps); // nothing to forget: no error
+    // A damaged file means nothing to reopen, never an error.
+    await writeFile(join(deps.appConfigDir, "last-library.json"), "{ torn");
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
+    await writeFile(join(deps.appConfigDir, "last-library.json"), JSON.stringify({ libraryId: 7 }));
+    expect(await lastOpenLibrary(deps)).toBeUndefined();
   });
 
   it("create/open record the library in the registry", async () => {
