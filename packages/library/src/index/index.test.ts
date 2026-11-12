@@ -26,7 +26,7 @@ import { changeLogReads, newestProjectChangeId } from "./changes.js";
 import { indexProjectEntities, openIndexAt, purgeProject } from "./db.js";
 import { indexUnlockedProject } from "./sink.js";
 import { stripVtt } from "./load.js";
-import { annotationText, buildMatchQuery, cjkBigrams } from "./text.js";
+import { ANNOTATION_CHUNK_BYTES, ANNOTATION_INDEX_BYTES, annotationChunks, buildMatchQuery, cjkBigrams } from "./text.js";
 
 const NOW = "2026-11-09T14:30:00.000Z";
 const OPEN_GOV = `identifiability:
@@ -234,7 +234,7 @@ describe("search", () => {
     expect(search(handle.db, { text: "料記" }).total).toBe(0); // not adjacent
     expect(search(handle.db, { text: "料理 english" }).total).toBe(0);
     expect(cjkBigrams("家庭料理の記憶 abc")).toBe("家庭 庭料 料理 理の の記 記憶 憶");
-    expect(buildMatchQuery("料理")).toBe('{cjk_bigrams annotation_bigrams} : "料理"');
+    expect(buildMatchQuery("料理")).toBe('cjk_bigrams : "料理"');
   });
 });
 
@@ -845,7 +845,13 @@ describe("annotation text (Task 58, R74)", () => {
       { op: "test.annotations" },
     );
   const annRows = () =>
-    handle.db.prepare("SELECT source_id, annotations, annotation_bigrams FROM main.source_text ORDER BY source_id").all();
+    handle.db
+      .prepare(
+        `SELECT c.source_id, c.seq, c.sha256, a.project_id, a.annotations, a.annotation_bigrams, s.annotations_partial
+         FROM main.annotation_chunks c JOIN main.annotation_text a ON a.rowid = c.fts_rowid JOIN main.sources s ON s.id = c.source_id
+         ORDER BY c.source_id, c.seq`,
+      )
+      .all();
 
   it("finds a source by an annotation's quoted text or comment and says the match is in an annotation", async () => {
     const pid = await openProject();
@@ -864,8 +870,9 @@ describe("annotation text (Task 58, R74)", () => {
     const rec = search(handle.db, { text: "plain" });
     expect(ids(rec)).toEqual([sf.source.id, other.source.id].sort());
     for (const i of rec.items) expect(i).not.toHaveProperty("matchedIn");
-    // Terms may be split between the record and an annotation.
-    expect(search(handle.db, { text: "plain quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    // A source is found when its record, or its annotations, hold every term (they are indexed apart).
+    expect(search(handle.db, { text: "plain quibbleclaim" }).total).toBe(0);
+    expect(search(handle.db, { text: "xylophonic quibbleclaim" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
     // Filters still apply.
     expect(search(handle.db, { text: "xylophonic", types: ["book"] }).total).toBe(0);
     expect(search(handle.db, { text: "xylophonic", projectId: await openProject("Other") }).total).toBe(0);
@@ -896,7 +903,7 @@ describe("annotation text (Task 58, R74)", () => {
     await setAnnotations(pid, a.source.id, () => [ann(a.source.id, { quote: "ocelot", body: "家庭料理" }), ann(a.source.id, { kind: "note", body: "marmot" })]);
     await setAnnotations(pid, b.source.id, () => [ann(b.source.id, { quote: "ocelot again" })]);
     await setAnnotations(pid, b.source.id, () => []);
-    const queries = [{ text: "ocelot" }, { text: "marmot alpha" }, { text: "料理" }, { text: "beta" }, {}];
+    const queries = [{ text: "ocelot" }, { text: "marmot" }, { text: "料理" }, { text: "beta" }, {}];
     const before = { rows: annRows(), results: queries.map((q) => search(handle.db, q)) };
     expect(before.results[0]!.items).toEqual([expect.objectContaining({ id: a.source.id, matchedIn: "annotation" })]);
     await rebuildIndex(handle, ring, lib);
@@ -933,13 +940,10 @@ describe("annotation text (Task 58, R74)", () => {
     expect(await inFile()).toEqual([]);
   });
 
-  it("an index made before annotations were indexed is migrated in place and marked for a rebuild", async () => {
-    const pid = await openProject();
-    const sf = await repo.createSource(pid, draft("Old index title"), files(), { provenance: prov() });
-    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "pangolinquote" })]);
+  /** Replaces the index with a version-1 one holding `sf`'s record (as an existing library has it). */
+  async function oldIndex(sf: { source: { id: string } }, pid: string): Promise<void> {
     handle.close();
     for (const s of ["", "-wal", "-shm"]) await rm(join(lib.root, INDEX_FILE + s), { force: true });
-    // A version-1 index, as an existing library has it.
     const old = new Database(join(lib.root, INDEX_FILE));
     old.exec(await readFile(new URL("./migrations/0001.sql", import.meta.url), "utf8"));
     old.prepare("INSERT INTO meta (key, value) VALUES ('schemaVersion', '1'), ('projectStamps', '{}')").run();
@@ -947,20 +951,92 @@ describe("annotation text (Task 58, R74)", () => {
     old.prepare("INSERT INTO source_projects VALUES (?, ?)").run(sf.source.id, pid);
     old.prepare("INSERT INTO source_text (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams) VALUES (1, ?, ?, 'Old index title', '', '', 'kept text', '')").run(sf.source.id, pid);
     old.close();
+  }
+
+  it("R161 (a): a migrated index stays marked incomplete through writes and reopening until a completed rebuild", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Old index title"), files(), { provenance: prov() });
+    await setAnnotations(pid, sf.source.id, () => [ann(sf.source.id, { quote: "pangolinquote" })]);
+    await oldIndex(sf, pid);
     handle.reopen();
     expect(getMeta(handle.db, "schemaVersion")).toBe("2");
-    expect(search(handle.db, { text: "kept" }).items.map((i) => i.id)).toEqual([sf.source.id]);
-    expect(getMeta(handle.db, "projectStamps")).toBeUndefined();
+    // The old rows still answer, and the answer says the index is incomplete.
+    const kept = search(handle.db, { text: "kept" });
+    expect(kept.items.map((i) => i.id)).toEqual([sf.source.id]);
+    expect(kept.incomplete).toBe(true);
+    expect(search(handle.db, {}).incomplete).toBe(true);
     expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
-    expect(search(handle.db, { text: "pangolinquote" }).total).toBe(0);
+    // An ordinary write in another project records fresh stamps: still stale, still incomplete.
+    const other = await openProject("Other");
+    await repo.createSource(other, draft("Fresh write"), files(), { provenance: prov() });
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    handle.reopen();
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    expect(search(handle.db, { text: "pangolinquote" })).toMatchObject({ total: 0, incomplete: true });
+    // A rebuild that crashes before it completes leaves the marker.
+    await expect(rebuildIndex(handle, ring, lib, undefined, { beforeRename: () => Promise.reject(new Error("power cut")) })).rejects.toThrow("power cut");
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(true);
+    expect(search(handle.db, {}).incomplete).toBe(true);
+    // A completed rebuild clears it.
     await rebuildIndex(handle, ring, lib);
-    expect(search(handle.db, { text: "pangolinquote" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(await isIndexStale(lib.root, handle.db, ring)).toBe(false);
+    const found = search(handle.db, { text: "pangolinquote" });
+    expect(found.items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation" })]);
+    expect(found).not.toHaveProperty("incomplete");
   });
 
-  it("indexes at most the per-source cap of annotation text, in a fixed order", () => {
-    const big = "w".repeat(1024);
-    const list = Array.from({ length: 20 }, () => ({ quote: big, body: big }));
-    expect(annotationText(list, 10 * 1024).length).toBeLessThanOrEqual(10 * 1024);
-    expect(annotationText([{ quote: "a", body: "b" }, { body: "c" }, { quote: "" }], 100)).toBe("a\nb\nc");
+  it("R161 (a): a new index is not marked; a migrated empty one is not either", async () => {
+    expect(search(handle.db, {})).not.toHaveProperty("incomplete");
+    expect(getMeta(handle.db, "needsRebuild")).toBeUndefined();
+  });
+
+  it("I3: a title match ranks above a body-text match, which ranks above an annotation-only match", async () => {
+    const pid = await openProject();
+    const viaAnn = await repo.createSource(pid, draft("Spice notes"), files(), { provenance: prov() });
+    await setAnnotations(pid, viaAnn.source.id, () => [ann(viaAnn.source.id, { body: "a short note on tamarind" })]);
+    const byTitle = await repo.createSource(pid, draft("Tamarind trade"), files(), { provenance: prov() });
+    const filler = Array.from({ length: 5_000 }, (_, i) => `word${i}`).join(" ");
+    await setAnnotations(pid, byTitle.source.id, () => [ann(byTitle.source.id, { body: filler })]);
+    const byBody = await repo.createSource(pid, draft("Market ledgers"), files(), { provenance: prov() });
+    indexSource(handle.db, await repo.getSource(pid, byBody.source.id), `${filler} tamarind`);
+    const r = search(handle.db, { text: "tamarind" });
+    expect(r.items.map((i) => i.id)).toEqual([byTitle.source.id, byBody.source.id, viaAnn.source.id]);
+    expect(r.items.map((i) => i.matchedIn ?? null)).toEqual([null, null, "annotation"]);
+    expect(r.total).toBe(3);
+    expect(search(handle.db, { text: "tamarind", limit: 1, offset: 2 }).items.map((i) => i.id)).toEqual([viaAnn.source.id]);
+  });
+
+  it("R161 (b): at most 2 MB of annotation text is indexed, in document order and bounded chunks; the source says it is partly searchable", async () => {
+    const pid = await openProject();
+    const sf = await repo.createSource(pid, draft("Heavily annotated"), files(), { provenance: prov() });
+    // 3,000 annotations of 1,000 characters: 3 MB, over the 2 MB cap.
+    await setAnnotations(pid, sf.source.id, () => Array.from({ length: 3_000 }, (_, i) => ann(sf.source.id, { quote: `firstword${i} ${"x".repeat(980)}` })));
+    expect(search(handle.db, { text: "firstword0" }).items).toEqual([expect.objectContaining({ id: sf.source.id, matchedIn: "annotation", annotationsPartial: true })]);
+    expect(search(handle.db, { text: "firstword1500" }).total).toBe(1);
+    expect(search(handle.db, { text: "firstword2999" }).total).toBe(0); // past the cap
+    const rows = annRows() as Array<{ annotations: string }>;
+    const bytes = rows.reduce((n, r) => n + Buffer.byteLength(r.annotations), 0);
+    expect(bytes).toBeLessThanOrEqual(ANNOTATION_INDEX_BYTES);
+    expect(bytes).toBeGreaterThan(ANNOTATION_INDEX_BYTES - 2_000);
+    for (const r of rows) expect(Buffer.byteLength(r.annotations)).toBeLessThanOrEqual(ANNOTATION_CHUNK_BYTES);
+    // A source within the cap is not marked.
+    await setAnnotations(pid, sf.source.id, (cur) => cur.slice(0, 10));
+    expect(search(handle.db, { text: "firstword0" }).items[0]).not.toHaveProperty("annotationsPartial");
+  });
+
+  it("chunks annotation text by whole annotations, splits a long one without breaking a character, and caps the count (M3)", () => {
+    const { chunks, partial } = annotationChunks([{ quote: "a", body: "b" }, { body: "c" }, { quote: "" }], 100, 10);
+    expect([...chunks]).toEqual(["a\nb\nc"]);
+    expect(partial).toBe(false);
+    const long = annotationChunks([{ body: "😀".repeat(20) }], 1_000, 10);
+    const parts = [...long.chunks];
+    for (const p of parts) {
+      expect(Buffer.byteLength(p)).toBeLessThanOrEqual(10);
+      expect(p).not.toMatch(/[\uD800-\uDBFF]$/u);
+    }
+    expect(parts.join("")).toBe("😀".repeat(20));
+    const many = annotationChunks(Array.from({ length: 10_005 }, () => ({ body: "w" })), 1_000_000, 1_000);
+    expect([...many.chunks].join("\n").split("\n")).toHaveLength(10_000);
+    expect(many.partial).toBe(true);
   });
 });
