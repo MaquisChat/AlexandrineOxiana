@@ -469,8 +469,8 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | in review | ed6a10f (worktree branch) | built; the end-to-end steps for D4, D5 and D8 run as normal tests; the rebuild on open honours the index's rebuild marker (R161) |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | fdbd601 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | fix round 1 | ed6a10f (worktree branch) | reviewed with probes: 1 Critical (a rebuild stopped half-way is taken as complete), 2 Important (the reopen at start can replace a library opened since; missing tests) |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | in review | e6c2bc5 (worktree branch) | built; D1, D2, D6 and D7 run as normal end-to-end tests in both browsers |
 | 46c A pairing code's status | fix round 1 in re-review | 7a7f5e2 (worktree branch) | a code is `used` only once its pairing is written; M1–M6 fixed |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
@@ -503,7 +503,7 @@ Update after every task; commit and push.
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
-| 65 The browser extension as a download | in progress | | dispatched 2026-11-12 |
+| 65 The browser extension as a download | in review | 463b568 (worktree branch) | built: a reproducible zip and a Linux job in the Mac workflow; no Mac build started |
 | 66 A paired browser survives a relaunch (D13) | not started | | waits for 46c and 65 |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
