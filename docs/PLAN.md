@@ -441,24 +441,24 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c A pairing code's status | fix round 1 | f889a93 (worktree branch) | spec met, access rules unchanged; one Important: a code is marked used before the pairing is written |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | stopped | 7b7a3b4 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | stopped | fdbd601 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
+| 46c A pairing code's status | fix round 1, stopped | 1ec85b5 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. One Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 1 | 140a402 (worktree branch) | spec met; 5 Important; identifiers become confirmable (R149), done in this fix round with its service change |
+| 34d Verification badges | fix round 1, stopped | db0030d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. 5 Important; identifiers become confirmable (R149) |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | in progress | | implementer dispatched |
+| 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48a Tools: worker and service | fix round 1 | afa7bd5 (worktree branch) | download protections held under probes; 4 Important: a missing tool is not named in capture outcomes, the worker-bundle CI job, a slow download cannot be cancelled, four untested protections |
 | 48b Tools: the dialogue | in progress | | implementer dispatched, building on 48a's branch (R156) |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | in progress | | implementer dispatched |
-| 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
+| 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
+| 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
 | 50 No silent refusals | re-review of fix round 1 | 51624b6 (worktree branch) | R154 a–e reported done; the restore item waits for Task 49 |
-| 51 Job records in files | fix round 2 | b802afd (worktree branch) | round 1 confirmed except "rerun once": two Important in the rerun at unlock |
+| 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
