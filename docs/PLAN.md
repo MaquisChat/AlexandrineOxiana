@@ -422,6 +422,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
+- Defect D9 (found by Task 37h in the real window): the first-use question opens over the library chooser and can take focus from a person who is typing; ask only once a library is open and the app is idle (a follow-up to Task 48b).
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
@@ -461,7 +462,7 @@ Update after every task; commit and push.
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
 | 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
-| 58 Ledger loose ends | in review | 28e8368 (worktree branch) | built: annotation text searchable (index schema 2); a setter for the project time zone (R160) |
+| 58 Ledger loose ends | re-review of fix round 3 | 466c35e (worktree branch) | search speed reported fixed (two words under 100 ms at 5,000 annotated sources) |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
@@ -470,7 +471,7 @@ Update after every task; commit and push.
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
-| 37h Desktop end-to-end | in progress | | implementer dispatched |
+| 37h Desktop end-to-end | fix round 1 | 205ec11 (worktree branch) | spec met; 2 Important: a hung run cleaned nothing up; the run wrote to the real home folder |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
