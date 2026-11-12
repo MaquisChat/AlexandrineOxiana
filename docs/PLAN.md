@@ -529,7 +529,7 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | fix round 1 | d2fd1cc (worktree branch) | reviewed with probes: 2 Important (a missed writer, the watched folders; the command-line tool renews the device id unseen); three points ruled |
+| 68 Settings writers never write what they did not read (D16) | fix round 1 in re-review | 034e1f6 (worktree branch) | two more writers under the rule (watched folders, approved import folders); notices on the chooser; an unreadable pairings file no longer unpairs browsers; the working branch taken |
 | 67 One review queue for the project (D14) | approved; verification before merge | abd9353 (worktree branch) | reviewed with probes over two fix rounds (R176, R177); the working branch taken |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
