@@ -473,6 +473,63 @@ describe("fix round 1", () => {
     expect(await versions()).toBe(2); // stored exactly once
   });
 
+  it("R1-2: a lock removes everything the registry holds of the project; the run is rerun once at the unlock from the journal; another project's run goes on", async () => {
+    const { pid, sid, versions, unlock } = await encryptedRun();
+    // A second, unencrypted project with its own run.
+    const other = await call({ method: "POST", url: "/projects", body: { name: "Other", governanceYaml: GOV, encryption: { enabled: false } } });
+    const pid2 = other.json.project.id as string;
+    const sid2 = await audioSource(pid2);
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    expect((await call({ method: "POST", url: `/projects/${pid2}/sources/${sid2}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 2);
+    const held = () => JSON.stringify([...((svc!.state.transcriptions as unknown as { live: Map<string, unknown> }).live.values())]);
+    expect(held()).toContain(sid);
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    expect(held()).not.toContain(pid);
+    expect(held()).not.toContain(sid);
+    expect(held()).toContain(sid2); // the other project's run is still followed
+    worker!.release();
+    await until(() => svc!.state.workKinds().length === 0);
+    expect(held()).not.toContain(pid); // its end added nothing back
+    expect((await stateOf(pid2, sid2))?.status).toBe("done");
+    await unlock();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(await versions()).toBe(2);
+    expect(worker!.runs.filter((r) => r.type === "audio.transcribe")).toHaveLength(3); // pid twice (cancelled-locked, rerun), pid2 once
+  });
+
+  it("R1-3: Stop on a run waiting for the unlock that this service still holds cancels it in the journal", async () => {
+    const { pid, sid } = await encryptedRun();
+    worker!.instant = true;
+    const repo = svc!.state.session!.repo;
+    worker!.onPost = () => repo.lockProject(pid); // locked by the repository itself, not the lock route
+    const { jobId } = (await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).json.job as TranscriptionJob;
+    await until(() => svc!.state.workKinds().length === 0);
+    await repo.unlockProject(pid, PASS); // no rerun: not the unlock route
+    expect((await stateOf(pid, sid))?.error?.code).toBe("PROJECT_LOCKED");
+    const c = await call({ method: "POST", url: `/projects/${pid}/transcriptions/${jobId}/cancel` });
+    expect(c.status, c.body).toBe(200);
+    expect(c.json.job).toMatchObject({ status: "cancelled", error: { code: "CANCELLED" } });
+    expect(await stateOf(pid, sid)).toMatchObject({ status: "cancelled", error: { code: "CANCELLED" } });
+  });
+
+  it("R1-2: a move forgets every entry of the library; the state is read again from the journal", async () => {
+    worker = await stubWorker();
+    worker.instant = true;
+    await start({ worker: provider(worker), autoStartWorker: false });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    const held = () => (svc!.state.transcriptions as unknown as { live: Map<string, unknown> }).live.size;
+    expect(held()).toBe(1);
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    expect(held()).toBe(0);
+    expect((await stateOf(pid, sid))?.status).toBe("done"); // from the journal
+  });
+
   it("M7: a close during a live transcription does not wait out the grace period", async () => {
     worker = await stubWorker();
     await start({ worker: provider(worker!), autoStartWorker: false });

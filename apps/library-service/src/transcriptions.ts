@@ -55,6 +55,8 @@ interface Live {
   unlocked: () => boolean;
   ac: AbortController;
   percent: number;
+  /** Removed from the registry (its project was locked): what the run does next is not followed here. */
+  forgotten?: boolean;
 }
 
 /** The state recorded in the journal, for a job this run of the service does not hold. */
@@ -206,7 +208,30 @@ export class Transcriptions {
 
   /** Forgets everything held for a library that was closed (its jobs stay in its journal). */
   forget(lib: object): void {
-    for (const [id, l] of this.live) if (l.lib === lib) this.live.delete(id);
+    this.drop((l) => l.lib === lib);
+  }
+
+  /**
+   * Forgets everything held for a project at its lock (R1-2; R30, R50): what a locked project was
+   * doing does not stay in memory. A run the lock interrupts is remembered by the project's journal
+   * (R142: cancelled-locked), rerun once at the unlock and followed again from there; until then GET
+   * reads the journal. Another project's entries are untouched.
+   */
+  forgetProject(projectId: string): void {
+    this.drop((l) => l.job.projectId === projectId);
+  }
+
+  /** Forgets one job this run holds (its state is then read from the journal). */
+  forgetJob(jobId: string): void {
+    this.drop((l) => l.job.jobId === jobId);
+  }
+
+  private drop(which: (l: Live) => boolean): void {
+    for (const [id, l] of this.live) {
+      if (!which(l)) continue;
+      l.forgotten = true;
+      this.live.delete(id);
+    }
     for (const [key, v] of this.bySource) if (typeof v === "symbol" || !this.live.has(v)) this.bySource.delete(key);
   }
 
@@ -228,6 +253,7 @@ export class Transcriptions {
   }
 
   private progress(l: Live, p: number): void {
+    if (l.forgotten) return;
     if (!this.active(l) || l.ac.signal.aborted) return;
     const percent = Math.max(0, Math.min(100, Math.floor(p * 100)));
     const changed = l.job.status !== "running" || percent > l.percent;
@@ -240,6 +266,7 @@ export class Transcriptions {
   }
 
   private stored(l: Live, st: StoredTranscript): void {
+    if (l.forgotten) return;
     l.job.result = { files: [...st.files], flaggedSegments: st.flaggedSegments };
   }
 
@@ -251,6 +278,7 @@ export class Transcriptions {
   }
 
   private failed(l: Live, err: unknown): void {
+    if (l.forgotten) return;
     if (err instanceof JobInterruptedError || err instanceof WorkerUnavailableError) {
       // Left pending in the journal (an interrupt, a close, the media helper gone): it runs again
       // at the next open or when the media helper is back; this run no longer holds it.
@@ -275,6 +303,7 @@ export class Transcriptions {
   }
 
   private end(l: Live): void {
+    if (l.forgotten) return;
     l.job.updatedAt = new Date().toISOString();
     const key = this.key(l.job.projectId, l.job.sourceId);
     if (this.bySource.get(key) === l.job.jobId) this.bySource.delete(key);
