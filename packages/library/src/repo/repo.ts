@@ -87,6 +87,7 @@ import { isOrphanBackup, pendingMarkers, recoverTransactions, type RecoveryOutco
 import { adoptRestoredProject as adoptRestoredIn, type StagedRestore } from "./restore.js";
 import { destroyAssets, type DestroyInput } from "./destroy.js";
 import { setBackupSettings as setBackupSettingsIn, type BackupSettings } from "./backup-settings.js";
+import { setTimeZone as setTimeZoneIn } from "./time-zone.js";
 import { readGovernance, setGovernance as setGovernanceIn, type GovernanceEditResult } from "./governance-edit.js";
 import {
   AUDIT_WAITING_WARNING,
@@ -1299,6 +1300,14 @@ export function destroyProjectAssets(repo: Repo, projectId: string, input: Destr
 /** Sets a project's backup settings (daily automatic backup, how many to keep); governed and audited. */
 export function setProjectBackupSettings(repo: Repo, projectId: string, settings: BackupSettings): Promise<Project> {
   return setBackupSettingsIn(cores.get(repo)!, projectId, settings);
+}
+
+/**
+ * Sets (a real IANA zone name) or clears (null) the project's time zone, in which its calendar
+ * rules such as the retention date are read (R92, R93); governed and audited. Absent: UTC.
+ */
+export function setProjectTimeZone(repo: Repo, projectId: string, tz: string | null): Promise<Project> {
+  return setTimeZoneIn(cores.get(repo)!, projectId, tz);
 }
 
 /** Package-internal (citations, exports): the project's pseudonym map (handle or name → code); empty unless encrypted. */
