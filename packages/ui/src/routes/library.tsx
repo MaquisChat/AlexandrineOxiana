@@ -6,20 +6,28 @@
  * library, the browser's Back, a link) returns to that project (41b2 I1). The first-use tools
  * question is placed on the open library's screen only, never over the chooser (Task 48c, D9).
  */
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../api/client";
-import { libraryApi, type CurrentLibrary, type LibraryEntry } from "../api/library";
+import { libraryApi, type CurrentLibrary, type LibraryEntry, type LibraryList } from "../api/library";
 import { toolsApi } from "../api/tools";
 import { FirstUseTools } from "../components/FirstUseTools";
+import { UserText } from "../components/UserText";
 import { navigate, normalisePath, PATHS, projectInQuery, type AppLocation } from "../navigation";
 import { Library } from "../screens/Library";
 import { LibraryChooser } from "../screens/LibraryChooser";
 import { LibraryNotFound } from "../screens/LibraryNotFound";
 
 export const LIBRARY_PATHS = [PATHS.library, PATHS.libraryAlias] as const;
+
+/** How often the screen checks again while the last library is still being opened (I1). */
+const REOPEN_CHECK_MS = 2_000;
 export const isLibraryPath = (path: string): boolean => (LIBRARY_PATHS as readonly string[]).includes(normalisePath(path));
 
-type View = { kind: "loading" } | { kind: "chooser" } | { kind: "not-found"; library: LibraryEntry } | { kind: "library"; current: CurrentLibrary; path?: string | undefined };
+type View =
+  | { kind: "loading" }
+  /** `reopening`: the library open last time is still being opened by the service (I1); the chooser stays usable. */
+  | { kind: "chooser"; reopening?: { libraryId: string; name: string } }
+  | { kind: "not-found"; library: LibraryEntry } | { kind: "library"; current: CurrentLibrary; path?: string | undefined };
 
 export function LibraryRoutes({ client, loc }: { client: ApiClient; loc?: AppLocation }) {
   return <LibraryFlow client={client} loc={loc ?? { pathname: window.location.pathname, search: window.location.search }} />;
@@ -40,6 +48,19 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
   const [view, setView] = useState<View>({ kind: "loading" });
   const [known, setKnown] = useState<LibraryEntry[]>([]);
 
+  /** The view an answer of GET /libraries calls for. */
+  const viewOf = useCallback((r: LibraryList): View => {
+    // The library open when the app last ran: reopened by the service, still being opened, or not found there (D5, I1).
+    const missing = r.notFound ? r.libraries.find((l) => l.libraryId === r.notFound?.libraryId) : undefined;
+    return r.current
+      ? { kind: "library", current: r.current, path: r.libraries.find((l) => l.libraryId === r.current?.libraryId)?.lastKnownPaths[0] }
+      : r.reopening
+        ? { kind: "chooser", reopening: r.reopening }
+        : missing
+          ? { kind: "not-found", library: missing }
+          : { kind: "chooser" };
+  }, []);
+
   useEffect(() => {
     let live = true;
     api.libraries
@@ -47,21 +68,36 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
       .then((r) => {
         if (!live) return;
         setKnown(r.libraries);
-        // The library open when the app last ran: reopened by the service, or not found there (D5).
-        const missing = r.notFound ? r.libraries.find((l) => l.libraryId === r.notFound?.libraryId) : undefined;
-        setView(
-          r.current
-            ? { kind: "library", current: r.current, path: r.libraries.find((l) => l.libraryId === r.current?.libraryId)?.lastKnownPaths[0] }
-            : missing
-              ? { kind: "not-found", library: missing }
-              : { kind: "chooser" },
-        );
+        setView(viewOf(r));
       })
       .catch(() => live && setView({ kind: "chooser" }));
     return () => {
       live = false;
     };
-  }, [api]);
+  }, [api, viewOf]);
+
+  // While the last library is still being opened, check again every 2 s (I1). An answer that comes
+  // after the researcher chose something else (the view changed, or the screen went away) is dropped.
+  const reopeningId = view.kind === "chooser" ? view.reopening?.libraryId : undefined;
+  useEffect(() => {
+    if (!reopeningId) return;
+    let live = true;
+    const timer = setTimeout(() => {
+      api.libraries
+        .list()
+        .then((r) => {
+          if (!live) return;
+          setKnown(r.libraries);
+          setView((v) => (v.kind === "chooser" && v.reopening?.libraryId === reopeningId ? viewOf(r) : v));
+        })
+        // Not answered: keep checking (a new view object re-arms this effect).
+        .catch(() => live && setView((v) => (v.kind === "chooser" && v.reopening ? { ...v } : v)));
+    }, REOPEN_CHECK_MS);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [api, viewOf, reopeningId, view]);
 
   const opened = (current: CurrentLibrary) => setView({ kind: "library", current, path: known.find((l) => l.libraryId === current.libraryId)?.lastKnownPaths[0] });
   const chooser = () => {
@@ -78,7 +114,17 @@ function LibraryFlow({ client, loc }: { client: ApiClient; loc: AppLocation }) {
         </p>
       );
     case "chooser":
-      return <LibraryChooser api={api} onOpened={opened} onNotFound={(library) => setView({ kind: "not-found", library })} />;
+      return (
+        <>
+          {view.reopening && (
+            <p className="ao-page" role="status">
+              Still opening <UserText>{view.reopening.name}</UserText>, the library that was open last time. Its folder is taking a while to answer (a network or external drive can be slow);
+              it opens here as soon as it is ready. You can choose another library meanwhile.
+            </p>
+          )}
+          <LibraryChooser api={api} onOpened={opened} onNotFound={(library) => setView({ kind: "not-found", library })} />
+        </>
+      );
     case "not-found":
       return <LibraryNotFound api={api} library={view.library} onOpened={opened} onOpenDifferent={chooser} />;
     case "library":

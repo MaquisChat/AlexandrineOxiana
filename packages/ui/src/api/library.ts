@@ -43,6 +43,16 @@ export interface CurrentLibrary {
   index?: IndexStatus;
 }
 
+/** GET /libraries. */
+export interface LibraryList {
+  libraries: LibraryEntry[];
+  current?: CurrentLibrary;
+  /** The library open when the app last ran, which could not be reopened at start (D5). */
+  notFound?: { libraryId: string; name: string };
+  /** The library open when the app last ran, still being opened by the service (I1). */
+  reopening?: { libraryId: string; name: string };
+}
+
 export interface ReconnectResult extends CurrentLibrary {
   integrity: unknown;
   rebuilt: boolean;
@@ -293,8 +303,7 @@ export function libraryApi(client: ApiClient) {
       resolve: (txn: string, choice: PendingWriteChoice) => r<{ txn: string; choice: PendingWriteChoice; projectId: string }>("POST", `/libraries/pending-writes/${seg(txn)}/resolve`, { body: { choice } }),
     },
     libraries: {
-      /** `notFound`: the library open when the app last ran, which could not be reopened at start (D5). */
-      list: () => r<{ libraries: LibraryEntry[]; current?: CurrentLibrary; notFound?: { libraryId: string; name: string } }>("GET", "/libraries"),
+      list: () => r<LibraryList>("GET", "/libraries"),
       open: (path: string) => r<CurrentLibrary>("POST", "/libraries/open", { body: { path } }),
       create: (path: string, name: string) => r<CurrentLibrary>("POST", "/libraries", { body: { path, name } }),
       close: () => r<{ closed: true }>("POST", "/libraries/close"),
