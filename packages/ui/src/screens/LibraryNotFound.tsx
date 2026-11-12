@@ -10,8 +10,8 @@ import { errorText } from "../api/library";
 import type { CurrentLibrary, FoundLibrary, LibraryApi, LibraryEntry } from "../api/library";
 import { volumeOf } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
-import "../components/library.css";
 import { PathField } from "../components/PathField";
+import "../components/library.css";
 
 export interface LibraryNotFoundProps {
   api: Pick<LibraryApi, "libraries">;

@@ -55,7 +55,11 @@ describe("path fields outside the import wizard, in the desktop shell (D12)", ()
     const user = userEvent.setup();
     render(<MoveLibrary api={makeApi()} />);
     await user.click(screen.getByRole("button", { name: "Choose folder…" }));
-    expect(shell.pickFolder).toHaveBeenCalledWith("Choose where to move the library");
+    expect(shell.pickFolder).toHaveBeenCalledWith("Choose an empty folder for the library");
+    // Beside the field: the folder must be new or empty, and how to make one in the dialog.
+    const field = screen.getByRole("textbox", { name: "Destination folder" });
+    const hint = screen.getByText("The folder must be new or empty. In the dialog you can make one with New Folder.");
+    expect(field.getAttribute("aria-describedby")?.split(" ")).toContain(hint.id);
     await waitFor(() => expect((screen.getByRole("textbox", { name: "Destination folder" }) as HTMLInputElement).value).toBe("/Volumes/Field SSD/Library"));
     expect(body).toBeUndefined();
     await user.click(screen.getByRole("button", { name: "Check destination" }));

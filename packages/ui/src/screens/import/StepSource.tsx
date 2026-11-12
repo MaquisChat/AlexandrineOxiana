@@ -11,7 +11,7 @@ import { UserText } from "../../components/UserText";
 import { ErrorNote, errorText, isAbsolutePath, PATH_HINT, Section } from "./shared";
 
 /** Makes a path field (label, value, setter, placeholder, what the picker chooses, the picker's title). */
-type PathFieldMaker = (label: string, value: string, set: (v: string) => void, placeholder: string, pick?: "folder" | "file", pickerTitle?: string) => ReactElement;
+type PathFieldMaker = (label: string, value: string, set: (v: string) => void, placeholder: string, pick: "folder" | "file", pickerTitle: string) => ReactElement;
 
 export type RefFormat = "bibtex" | "ris" | "csl-json" | "zotero-rdf";
 
@@ -82,7 +82,7 @@ export interface StepSourceProps {
 export function StepSource({ api, projects, projectId, onProject, choice, onChoice, busy, error, onScan, onNext }: StepSourceProps) {
   const [invalid, setInvalid] = useState<string | null>(null);
   // A path field with the native picker beside it inside the desktop shell (D12).
-  const pathProps: PathFieldMaker = (label, value, set, placeholder, pick = "folder", pickerTitle = `Choose the ${label.toLowerCase()}`) => (
+  const pathProps: PathFieldMaker = (label, value, set, placeholder, pick, pickerTitle) => (
     <PathField className="ao-import__field" label={label} value={value} onChange={set} placeholder={placeholder} pick={pick} pickerTitle={pickerTitle} />
   );
 
@@ -154,7 +154,7 @@ export function StepSource({ api, projects, projectId, onProject, choice, onChoi
         )}
         {choice.kind === "zotero-local" && (
           <>
-            {pathProps("Zotero data folder", choice.dataDir, (dataDir) => onChoice({ ...choice, dataDir }), "/Users/me/Zotero")}
+            {pathProps("Zotero data folder", choice.dataDir, (dataDir) => onChoice({ ...choice, dataDir }), "/Users/me/Zotero", "folder", "Choose the Zotero data folder")}
             <p className="ao-import__hint">
               Zotero keeps it in <code>~/Zotero</code> on macOS and Linux and in <code>%USERPROFILE%\Zotero</code> on Windows, unless you moved it (Zotero: Settings, Advanced, Files and Folders).
             </p>
@@ -247,7 +247,7 @@ function DeviceFields({
 
   return (
     <>
-      {field("Camera or phone folder", choice.dir, (dir) => onChoice({ ...choice, dir }), "/Volumes/PHONE/DCIM")}
+      {field("Camera or phone folder", choice.dir, (dir) => onChoice({ ...choice, dir }), "/Volumes/PHONE/DCIM", "folder", "Choose the camera or phone folder")}
       <label className="ao-import__field">
         <span>Fieldwork session</span>
         <select value={choice.sessionId} onChange={(e) => pickSession(e.target.value)}>

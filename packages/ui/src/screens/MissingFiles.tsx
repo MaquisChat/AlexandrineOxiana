@@ -8,8 +8,8 @@
 import { useCallback, useEffect, useId, useState } from "react";
 import type { GovernanceApi, IntegrityAnswer, RelinkResult } from "../api/governance";
 import { RebuildIndex } from "../components/RebuildIndex";
-import "./GovernanceScreens.css";
 import { PathField } from "../components/PathField";
+import "./GovernanceScreens.css";
 
 const SKIP_REASON: Record<string, string> = {
   "project-locked": "its project is locked; unlock it, then search again",

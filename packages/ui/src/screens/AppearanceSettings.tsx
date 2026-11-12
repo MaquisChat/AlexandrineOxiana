@@ -15,8 +15,8 @@ import { ACCENT_TOO_LOW, FONT_SLOTS, LINE_SPACINGS, TEXT_SCALES, checkAccent, ty
 import { useAppearance } from "../theme/AppearanceProvider";
 import { FONT_PRESETS, genericOf, isUsableFamily, type FontChoice } from "../theme/fonts";
 import { THEMES } from "../theme/themes";
-import "./AppearanceSettings.css";
 import { PathField } from "../components/PathField";
+import "./AppearanceSettings.css";
 
 const SLOT_LABELS: Record<FontSlot, string> = {
   interface: "Interface",

@@ -27,6 +27,16 @@ const CASES = [
   { source: "Calibre library", field: "Calibre library folder", pick: "folder", chosen: "/Users/r/Calibre Library", adapter: { kind: "calibre", path: "/Users/r/Calibre Library" } },
 ] as const;
 
+/** Each picker's title names what to choose; proper nouns keep their capitals (review M4). */
+const TITLES: Record<string, string> = {
+  Folder: "Choose the folder to import",
+  "ZIP archive": "Choose the ZIP file to import",
+  "Zotero library": "Choose the Zotero data folder",
+  "Reference file": "Choose the reference file",
+  "Calibre library": "Choose the Calibre library folder",
+  "Camera or phone folder": "Choose the camera or phone folder",
+};
+
 describe("the import wizard's path fields in the desktop shell (D12)", () => {
   it.each(CASES)("$source: the picker fills “$field”, and Scan sends that path", async ({ source, field, pick, chosen, adapter }) => {
     const shell = (fake.shell = fakeShell());
@@ -40,7 +50,8 @@ describe("the import wizard's path fields in the desktop shell (D12)", () => {
     await user.click(screen.getByRole("button", { name: pick === "folder" ? "Choose folder…" : "Choose file…" }));
     const box = screen.getByRole("textbox", { name: field }) as HTMLInputElement;
     await waitFor(() => expect(box.value).toBe(chosen));
-    if (pick === "file") expect(shell.pickFiles).toHaveBeenCalledWith(expect.any(String), false);
+    if (pick === "file") expect(shell.pickFiles).toHaveBeenCalledWith(TITLES[source], false);
+    else expect(shell.pickFolder).toHaveBeenCalledWith(TITLES[source]);
     // Nothing is sent until Scan.
     expect(m.calls.filter((c) => c.path.endsWith("/import/dry-run"))).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Scan" }));
@@ -58,6 +69,7 @@ describe("the import wizard's path fields in the desktop shell (D12)", () => {
     await user.click(screen.getByRole("radio", { name: "Camera or phone folder" }));
     await user.click(screen.getByRole("button", { name: "Choose folder…" }));
     await waitFor(() => expect((screen.getByRole("textbox", { name: "Camera or phone folder" }) as HTMLInputElement).value).toBe("/Volumes/PHONE/DCIM"));
+    expect(shell.pickFolder).toHaveBeenCalledWith(TITLES["Camera or phone folder"]);
   });
 
   it("outside the shell there is no picker button; the path is typed", async () => {
