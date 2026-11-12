@@ -65,22 +65,24 @@ function absPath(o: Record<string, unknown>, key: string): string {
   return p;
 }
 
-/** How long GET /libraries waits for the reopen at start (D5). */
-const STARTUP_WAIT_MS = 30_000;
-
 export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   app.get("/libraries", async () => {
-    // At start the last open library is being reopened (D5): answer once that has ended (or after
-    // 30 s, e.g. a network drive that does not answer: then as things stand).
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([state.startup, new Promise<void>((r) => (timer = setTimeout(r, STARTUP_WAIT_MS)))]);
-    clearTimeout(timer);
+    // At start the last open library is being reopened (D5): the first answers wait once for that
+    // attempt, at most 30 s (a network drive that does not answer); later ones answer at once and,
+    // while it still runs, name it as `reopening` (I1).
+    await state.waitForStartup();
     const known = await listLibraries(state.deps).catch(() => []);
     return {
       libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })),
-      ...(state.session ? { current: libraryView(ctx) } : state.notFound ? { notFound: state.notFound } : {}),
+      ...(state.session
+        ? { current: libraryView(ctx) }
+        : state.reopening
+          ? { reopening: state.reopening }
+          : state.notFound
+            ? { notFound: state.notFound }
+            : {}),
     };
   });
 

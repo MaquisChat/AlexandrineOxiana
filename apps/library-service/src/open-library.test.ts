@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { IndexHandle, KeyRing, createIndexSink, deviceDeps, getMeta, openLibrary, openRepo, rebuildIndexIfNeeded, rememberLastOpenLibrary, setMeta, type Deps } from "@ao/library";
+import { IndexHandle, KeyRing, createIndexSink, deviceDeps, getMeta, openLibrary, openRepo, rebuildIndexIfNeeded, type Library, rememberLastOpenLibrary, setMeta, type Deps } from "@ao/library";
 // Package-internal: the governed change an import makes (here, to give a source an annotation).
 import { importChange } from "../../../packages/library/src/repo/repo.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
@@ -444,6 +444,118 @@ describe("C1: a rebuild stopped half-way is never taken as complete", () => {
     await svc!.state.idle();
     expect((await call({ url: `/projects/${pid}/sources?text=tide` })).json.total).toBe(1);
     expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(4);
+  });
+});
+
+describe("I1: the reopen at start is one tracked attempt", () => {
+  /** Two known libraries, A (open last, so remembered) and B; the service is stopped. */
+  async function twoLibraries(): Promise<{ a: string; b: string }> {
+    await start();
+    const b = join(tmp, "LibB");
+    expect((await call({ method: "POST", url: "/libraries", body: { path: b, name: "LibB" } })).status).toBe(200);
+    const a = join(tmp, "LibA");
+    expect((await call({ method: "POST", url: "/libraries", body: { path: a, name: "LibA" } })).status).toBe(200);
+    await svc!.close();
+    svc = undefined;
+    return { a, b };
+  }
+  /** An openLibrary whose opens of `slowRoot` wait until released (or forever). */
+  function slowOpen(slowRoot: string) {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const seam: typeof openLibrary = async (root, d, o) => {
+      if (root === slowRoot) await gate;
+      return openLibrary(root, d, o);
+    };
+    return { seam, release };
+  }
+  /** A fake clock for the wait at start: records each timer, fired by the test. */
+  function fakeTimers() {
+    const timers: Array<{ ms: number; fire: () => void; cleared: boolean }> = [];
+    const setTimer = (fn: () => void, ms: number) => {
+      const t = { ms, fire: fn, cleared: false };
+      timers.push(t);
+      return () => void (t.cleared = true);
+    };
+    return { timers, setTimer };
+  }
+
+  it("a library opened by the researcher meanwhile stays open; the late reopen is closed and its lock released", async () => {
+    const { a, b } = await twoLibraries();
+    const slow = slowOpen(a);
+    await start({ openLibrary: slow.seam });
+    const reopening = svc!.state.reopenLast();
+    const opened = await call({ method: "POST", url: "/libraries/open", body: { path: b } });
+    expect(opened.status, opened.body).toBe(200);
+    expect(opened.json.name).toBe("LibB");
+    slow.release();
+    await reopening;
+    const libs = await call({ url: "/libraries" });
+    expect(libs.json.current).toMatchObject({ name: "LibB" });
+    expect(libs.json.reopening).toBeUndefined();
+    // A's lock is free: it opens read-write elsewhere.
+    const again: Library = await openLibrary(a, deps);
+    try {
+      expect(again.mode).toBe("read-write");
+    } finally {
+      await again.close();
+    }
+  });
+
+  it("a library created or closed meanwhile also wins over the late reopen", async () => {
+    const { a } = await twoLibraries();
+    const slow = slowOpen(a);
+    await start({ openLibrary: slow.seam });
+    const reopening = svc!.state.reopenLast();
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    slow.release();
+    await reopening;
+    expect((await call({ url: "/libraries" })).json.current).toBeUndefined();
+  });
+
+  it("a reopen that never settles: GET /libraries waits once, for 30 s on the clock, then every answer is prompt and says the last library is still being opened", async () => {
+    const { a } = await twoLibraries();
+    const slow = slowOpen(a); // never released
+    const clock = fakeTimers();
+    await start({ openLibrary: slow.seam, startupTimer: clock.setTimer });
+    void svc!.state.reopenLast();
+    let firstDone = false;
+    const first = call({ url: "/libraries" }).then((r) => ((firstDone = true), r));
+    // Waiting, on one 30-second timer.
+    await new Promise((r) => setTimeout(r, 200));
+    expect(firstDone).toBe(false);
+    expect(clock.timers.map((t) => t.ms)).toEqual([30_000]);
+    // A second request while the first waits shares the same wait (no new timer).
+    const second = call({ url: "/libraries" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(clock.timers).toHaveLength(1);
+    clock.timers[0]!.fire();
+    for (const r of await Promise.all([first, second])) {
+      expect(r.status).toBe(200);
+      expect(r.json.current).toBeUndefined();
+      expect(r.json.reopening).toEqual({ libraryId: expect.any(String), name: "LibA" });
+    }
+    // From now on, answers are at once (no timer, no wait).
+    const t0 = Date.now();
+    const third = await call({ url: "/libraries" });
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(third.json.reopening).toMatchObject({ name: "LibA" });
+    expect(clock.timers).toHaveLength(1);
+    // The chooser stays usable: opening another library supersedes the attempt.
+    expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "LibC"), name: "LibC" } })).status).toBe(200);
+    expect((await call({ url: "/libraries" })).json.reopening).toBeUndefined();
+  });
+
+  it("a reopen that settles before the deadline: the wait ends then, and its timer is cleared", async () => {
+    await twoLibraries();
+    const clock = fakeTimers();
+    await start({ startupTimer: clock.setTimer });
+    const reopening = svc!.state.reopenLast();
+    const libs = await call({ url: "/libraries" });
+    await reopening;
+    expect(libs.json.current).toMatchObject({ name: "LibA" });
+    expect(clock.timers).toHaveLength(1);
+    expect(clock.timers[0]!.cleared).toBe(true);
   });
 });
 

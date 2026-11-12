@@ -134,7 +134,12 @@ export interface StateOptions {
   openLibrary?: typeof openLibrary;
   /** Rebuilds the index when needed (test seam; default the library's rebuildIndexIfNeeded). */
   rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
+  /** Test seam (a fake clock): starts the timer of GET /libraries' wait at start; returns its cancel. */
+  startupTimer?: (fire: () => void, ms: number) => () => void;
 }
+
+/** How long GET /libraries waits, once, for the reopen at start (D5, I1). */
+export const STARTUP_WAIT_MS = 30_000;
 
 /** A finished move whose old copy may still be deleted: its single-use token, for 15 minutes (R99). */
 export interface PendingMove {
@@ -395,7 +400,13 @@ export class ServiceState {
    * (D5). A read-write library's index is checked: missing or unreadable, it is rebuilt from the
    * files in the background, as is a stale one (D8); `newLibrary` skips that (nothing to index).
    */
-  async adopt(lib: Library, opts: { newLibrary?: boolean } = {}): Promise<Session> {
+  async adopt(lib: Library, opts: { newLibrary?: boolean; stillWanted?: () => boolean } = {}): Promise<Session> {
+    const unwanted = async (): Promise<never> => {
+      // The reopen at start was superseded (I1): released at once, never replacing the open library.
+      await lib.close().catch(() => {});
+      throw new Error("superseded");
+    };
+    if (opts.stillWanted && !opts.stillWanted()) return unwanted();
     if (this.shuttingDown) {
       // Opened while the service was stopping: released at once, never adopted (R101 M7).
       await lib.close().catch(() => {});
@@ -445,6 +456,10 @@ export class ServiceState {
     if (!index) s.indexStatus = { state: "unavailable", reason: lib.readOnlyReason ?? "read-only" };
     // Never shown as an empty library while the index is rebuilt (D8).
     else if (needsRebuild) s.indexStatus = { state: "rebuilding", done: 0, total: 0, ...(partial ? { partial: true as const } : {}) };
+    if (opts.stillWanted && !opts.stillWanted()) {
+      index?.close();
+      return unwanted();
+    }
     this.session = s;
     this.notFound = undefined;
     this.activate(s);
@@ -537,40 +552,94 @@ export class ServiceState {
     await r.done;
   }
 
-  // ---- the library open when the service last ran (D5) ----------------------------------
+  // ---- the library open when the service last ran (D5, I1) -------------------------------
 
   /** The remembered library could not be opened at start: named for the "Library not found" screen. */
   notFound: { libraryId: string; name: string } | undefined;
-  /** Settles when the reopen at start has ended (GET /libraries waits for it). */
+  /** The remembered library is still being opened (the attempt at start has not ended): named for the interface. */
+  reopening: { libraryId: string; name: string } | undefined;
+  /** Settles when the reopen at start has ended. */
   startup: Promise<void> = Promise.resolve();
+  /** The one attempt at start; `superseded` once the researcher opens, creates or closes a library. */
+  private reopenAttempt: { superseded: boolean } | undefined;
+  /** GET /libraries' one wait for the attempt (shared by every request that comes during it). */
+  private startupWait: Promise<void> | undefined;
 
   /**
-   * At start: reopens the library open when the service last ran, at its last known place. A
-   * folder that is gone, unreadable or holds another library leaves it closed and named in
-   * `notFound`. Never throws.
+   * At start: reopens the library open when the service last ran, at its last known place, as one
+   * tracked attempt (I1). While it runs, `reopening` names it. A folder that is gone, unreadable or
+   * holds another library leaves it closed and named in `notFound`. Once the attempt is superseded
+   * (the researcher opened, created or closed a library: `supersedeReopen`) or the service is
+   * stopping, its late result is dropped: what it opened is closed again and its lock released, and
+   * it never replaces the library open now. Never throws.
    */
   reopenLast(): Promise<void> {
+    const attempt = { superseded: false };
+    this.reopenAttempt = attempt;
+    this.startupWait = undefined; // a new attempt: GET /libraries may wait for it once
+    const dropped = () => attempt.superseded || this.shuttingDown;
     this.startup = (async () => {
-      const id = await lastOpenLibrary(this.deps);
-      if (!id || this.session) return;
-      const entry = (await listLibraries(this.deps).catch(() => [])).find((e) => e.libraryId === id);
-      if (!entry) return; // not known any more: the chooser
-      const at = entry.lastKnownPaths[0];
       try {
-        if (!at) throw new Error("no known location");
-        const lib = await this.openLibrary(at);
-        if (lib.id !== id) {
-          await lib.close().catch(() => {});
-          throw new Error("another library is at the remembered place");
+        const id = await lastOpenLibrary(this.deps);
+        if (!id || this.session || dropped()) return;
+        const entry = (await listLibraries(this.deps).catch(() => [])).find((e) => e.libraryId === id);
+        if (!entry || dropped()) return; // not known any more: the chooser
+        this.reopening = { libraryId: entry.libraryId, name: entry.name };
+        const at = entry.lastKnownPaths[0];
+        try {
+          if (!at) throw new Error("no known location");
+          const lib = await this.openLibrary(at);
+          if (dropped()) {
+            await lib.close().catch(() => {});
+            return;
+          }
+          if (lib.id !== id) {
+            await lib.close().catch(() => {});
+            throw new Error("another library is at the remembered place");
+          }
+          this.roots.add(lib.root);
+          await this.adopt(lib, { stillWanted: () => !dropped() });
+        } catch (err) {
+          if (dropped()) return; // superseded meanwhile: nothing to report
+          this.notFound = { libraryId: entry.libraryId, name: entry.name };
+          this.opts.log.warn({ err: this.describe(err) }, "the last open library could not be reopened");
         }
-        this.roots.add(lib.root);
-        await this.adopt(lib);
-      } catch (err) {
-        this.notFound = { libraryId: entry.libraryId, name: entry.name };
-        this.opts.log.warn({ err: this.describe(err) }, "the last open library could not be reopened");
+      } finally {
+        if (this.reopenAttempt === attempt) {
+          this.reopenAttempt = undefined;
+          this.reopening = undefined;
+        }
       }
     })().catch((err: unknown) => this.opts.log.warn({ err: this.describe(err) }, "reopening the last library"));
     return this.startup;
+  }
+
+  /** The researcher chose (opened, created or closed a library): the reopen at start no longer applies (I1). */
+  supersedeReopen(): void {
+    if (!this.reopenAttempt) return;
+    this.reopenAttempt.superseded = true;
+    this.reopenAttempt = undefined;
+    this.reopening = undefined;
+  }
+
+  /**
+   * For GET /libraries: waits for the reopen at start, once and for at most STARTUP_WAIT_MS (a network
+   * drive that does not answer). Requests during that wait share it; afterwards it resolves at once,
+   * and the answer names the library still being opened (`reopening`).
+   */
+  waitForStartup(): Promise<void> {
+    if (!this.startupWait) {
+      const setTimer =
+        this.opts.startupTimer ??
+        ((fire: () => void, ms: number) => {
+          const t = setTimeout(fire, ms);
+          return () => clearTimeout(t);
+        });
+      let cancel = () => {};
+      const deadline = new Promise<void>((r) => (cancel = setTimer(r, STARTUP_WAIT_MS)));
+      this.startupWait = Promise.race([this.startup, deadline]).finally(() => cancel());
+    }
+    return this.startupWait;
   }
 
   /** The researcher closed the library: the next start shows the chooser (D5). */
@@ -780,7 +849,12 @@ export class ServiceState {
   }
 
   /** Closes the open library: running batches cancelled, watches stopped, queues disposed of, lock released. */
+  /**
+   * Closes the open library. Every request that opens, creates, reconnects or closes a library calls
+   * this first, so it is also where the reopen at start is superseded (I1).
+   */
   async closeLibrary(): Promise<void> {
+    this.supersedeReopen();
     // Media tickets end with the library (R135 2), and so do their streams.
     this.media.revokeAll();
     const s = this.session;

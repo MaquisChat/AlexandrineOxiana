@@ -54,6 +54,8 @@ export interface ServiceOptions {
   openLibrary?: typeof openLibrary;
   /** Rebuilds the index when needed (test seam). */
   rebuildIndexIfNeeded?: typeof rebuildIndexIfNeeded;
+  /** Test seam (a fake clock) for GET /libraries' wait at start. */
+  startupTimer?: (fire: () => void, ms: number) => () => void;
   /** Runs right before a move starts copying (test seam). */
   beforeExecuteMove?: () => Promise<void>;
   /** Test seam: how long a watched folder's new file must stay unchanged (default the library's). */
@@ -132,6 +134,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     ...(opts.suspendTimeoutMs !== undefined ? { suspendTimeoutMs: opts.suspendTimeoutMs } : {}),
     ...(opts.openLibrary ? { openLibrary: opts.openLibrary } : {}),
     ...(opts.rebuildIndexIfNeeded ? { rebuildIndexIfNeeded: opts.rebuildIndexIfNeeded } : {}),
+    ...(opts.startupTimer ? { startupTimer: opts.startupTimer } : {}),
     log: { info: (o, m) => app.log.info(o, m), warn: (o, m) => app.log.warn(o, m) },
   });
   const pairing = new Pairing(deps.appConfigDir, opts.pairing);
