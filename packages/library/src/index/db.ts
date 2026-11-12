@@ -13,12 +13,12 @@ import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { primary, type ConsentRecord, type Collection, type Participant, type Project, type Session, type SourceFile, type SourceType, type Tag } from "@ao/core";
 import type { ReviewItemRow } from "../repo/review.js";
+import { migrationsUrl } from "../resources.js";
 import { cjkBigrams } from "./text.js";
 
 export type IndexDb = Database.Database;
 
 export const INDEX_FILE = "library.sqlite";
-const MIGRATIONS_DIR = new URL("./migrations/", import.meta.url);
 
 export interface SourceRow {
   id: string;
@@ -86,7 +86,7 @@ export function checkpointTruncate(db: IndexDb): void {
 }
 
 function migrationFiles(): Array<{ version: number; file: string }> {
-  return readdirSync(MIGRATIONS_DIR)
+  return readdirSync(migrationsUrl())
     .filter((f) => /^\d{4}\.sql$/.test(f))
     .sort()
     .map((f) => ({ version: Number(f.slice(0, 4)), file: f }));
@@ -98,7 +98,7 @@ function migrate(db: IndexDb): void {
   const current = hasMeta ? Number(getMeta(db, "schemaVersion") ?? 0) : 0;
   for (const m of migrationFiles()) {
     if (m.version <= current) continue;
-    const sql = readFileSync(new URL(m.file, MIGRATIONS_DIR), "utf8");
+    const sql = readFileSync(new URL(m.file, migrationsUrl()), "utf8");
     db.transaction(() => {
       db.exec(sql);
       setMeta(db, "schemaVersion", String(m.version));

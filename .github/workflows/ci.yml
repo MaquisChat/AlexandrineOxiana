@@ -63,6 +63,12 @@ jobs:
       - run: pnpm -r typecheck
       - name: Build the UI package
         run: pnpm --filter @ao/ui run build
+      # The library service as the desktop app ships it (Task 37a, ADR 0013): build the self-contained
+      # folder, copy it outside the checkout, start it with plain node and run the smoke sequence.
+      - name: Library service folder (build, then smoke-run it outside the repository)
+        if: runner.os == 'Linux' && matrix.python == '3.13'
+        timeout-minutes: 10
+        run: pnpm --filter @ao/library-service run smoke
       - name: UI style rules (CSS lint and colour scan)
         run: |
           pnpm --filter @ao/ui run lint:css

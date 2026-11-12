@@ -20,13 +20,13 @@
  */
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "../resources.js";
 import { join } from "node:path";
 import { request, type Dispatcher } from "undici";
 import { writeFileAtomic } from "../fs/atomic.js";
 import { recordedLookupsFromEnv, type RecordedLookups } from "./recorded.js";
 
-const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 const PROJECT_URL = "https://github.com/maquiscatta-sys/AlexandrineOxiana";
 export const USER_AGENT = `AlexandrineOxiana/${VERSION} (+${PROJECT_URL})`;
 

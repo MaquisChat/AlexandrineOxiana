@@ -126,6 +126,7 @@ export type {
   WorkerJob,
   WorkerJobType,
 } from "./worker-client.js";
+export { ResourceMissingError } from "./resources.js";
 
 export { classifyUrl, isCollectionLink, isPostLink } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
