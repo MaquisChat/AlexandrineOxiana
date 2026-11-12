@@ -422,7 +422,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
-- Defect D9 (found by Task 37h in the real window): the first-use question opens over the library chooser and can take focus from a person who is typing; ask only once a library is open and the app is idle (a follow-up to Task 48b).
+- Defect D9 (the first-use question could take focus from a person typing): fixed by Task 48c.
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
@@ -473,7 +473,7 @@ Update after every task; commit and push.
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | fix round 1 | 2de3963 (worktree branch) | 1 Critical: a text-merging step altered licence texts; texts now ship verbatim (R165) |
-| 48c First-use question never interrupts (D9) | re-review of fix round 1 | a803970 (worktree branch) | rebuilt as a banner (R164); pre-merge verification with a rebuilt desktop app running |
+| 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
