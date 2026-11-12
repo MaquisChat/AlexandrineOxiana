@@ -461,7 +461,7 @@ Update after every task; commit and push.
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
 | 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
-| 58 Ledger loose ends | not started | | |
+| 58 Ledger loose ends | in progress | | implementer dispatched (annotation text searchable; project time zone) |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
