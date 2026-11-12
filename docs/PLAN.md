@@ -484,7 +484,7 @@ Update after every task; commit and push.
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 2 in re-review | cc2fe64 (worktree branch) | two confirms at once both land; focus follows the confirmed field's badge |
+| 34d Verification badges | approved; one binary reader, then verification before merge | cc2fe64 (worktree branch) | reviewed with probes over two fix rounds (R145, R149); after Task 57 merges its `blob()` uses move onto `bytes()` |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | in review | e76247e (worktree branch) | built; a second capture of a running address is refused, not joined (ruled) |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
