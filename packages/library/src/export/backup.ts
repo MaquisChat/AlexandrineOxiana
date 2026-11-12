@@ -1728,9 +1728,10 @@ async function restoreLocked(repo: Repo, path: string, opts: RestoreOptions): Pr
       entries = await extractArchive(source, staging, BACKUP_LIMITS, undefined, {
         sparse: true,
         beforeWrite: async (declared) => {
-          // Nothing is written yet. The policy engine decides, on the backup's own rules and where
-          // the library is; and what was destroyed in this library must be readable with certainty.
-          // A refusal of either is audited and thrown from here: nothing is unpacked.
+          // Nothing is written yet. The policy engine decides, on the backup's own rules, the rules
+          // its project has now if it is in this library, and where the library is; and what was
+          // destroyed in this library must be readable with certainty. A refusal of either is
+          // audited and thrown from here: nothing is unpacked.
           destinations = await backupDestinations(projectsDir, opts.locationEnv ?? (await defaultLocationEnv()));
           const request = await restoreRequestOf(repo, abs, sealed, { destinations, backupSha256, ...(file ? { file } : {}) });
           await authorizeRestore(repo, request);
