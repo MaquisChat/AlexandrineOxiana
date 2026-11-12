@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { COOKIES_ACKNOWLEDGEMENT as CORE_ACK } from "@ao/core/src/capture/acknowledgement";
+import { classifyUrl, isWebAddress as coreIsWebAddress } from "@ao/core/src/capture/platforms";
+import type { CaptureQueueDetail } from "@ao/shared";
+import errorsSource from "../../../library/src/capture/errors.ts?raw";
+import captureSource from "./capture.ts?raw";
 import {
   applyProgress,
+  COOKIES_ACKNOWLEDGEMENT,
+  KNOWN_OUTCOME_CODES,
+  mergeRead,
+  queueFromDetail,
   capturePolicyFromYaml,
   captureProgress,
   isWebAddress,
@@ -243,5 +252,125 @@ describe("capture: progress events", () => {
     expect(q.finished).toBe(true);
     expect(q.error).toMatch(/legal basis/);
     expect(q.errorCode).toBe("LEGAL_BASIS_REQUIRED");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 63: one classifier and one acknowledgement text; a queue's state read again
+
+describe("capture: one definition of the classifier and the acknowledgement (Task 63, R146)", () => {
+  it("the acknowledgement is the one in @ao/core, not a copy", () => {
+    expect(COOKIES_ACKNOWLEDGEMENT).toBe(CORE_ACK);
+  });
+
+  it("the preview classifies with @ao/core's classifyUrl; the interface keeps no copy of its own", () => {
+    for (const u of ["https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://www.instagram.com/some-one/", "https://vm.tiktok.com/ZMabc/", "https://www.youtube.com./watch?v=dQw4w9WgXcQ"]) {
+      const c = classifyUrl(u);
+      expect({ platform: previewLink(u).platform, kind: previewLink(u).kind }).toEqual({ platform: c.platform, kind: c.kind });
+    }
+    expect(isWebAddress).toBe(coreIsWebAddress);
+    expect(captureSource).not.toMatch(/IG_RESERVED|YT_ID|function classify\(/);
+    expect(captureSource).not.toMatch(/"Using your browser's signed-in session/);
+  });
+
+  it("has a sentence for every reason code in the library's own table", () => {
+    const table = /const REASONS[^{]*\{([\s\S]*?)\n\};/.exec(errorsSource)?.[1] ?? "";
+    const codes = [...table.matchAll(/^\s*([A-Z][A-Z0-9_]+):/gm)].map((m) => m[1]!);
+    expect(codes.length).toBeGreaterThan(10);
+    for (const code of codes) expect(KNOWN_OUTCOME_CODES, code).toContain(code);
+  });
+});
+
+const YT = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+const IG = "https://www.instagram.com/p/Cabc123/";
+const TT = "https://www.tiktok.com/@someone/video/7234567890";
+
+function detail(over: Partial<CaptureQueueDetail> = {}): CaptureQueueDetail {
+  return { queueId: "q1", projectId: P, kind: "links", startedBy: "desktop", done: 0, total: 3, finished: false, startedAt: "2026-11-12T10:00:00.000Z", urls: [YT, IG, TT], items: [], ...over };
+}
+
+describe("capture: a queue read again from the service (Task 63)", () => {
+  it("a running links queue: outcomes so far, the next link being captured, the rest waiting; nothing is 'not known'", () => {
+    const q = queueFromDetail(detail({ done: 1, items: [{ url: YT, status: "created", sourceId: "s1" }] }));
+    expect(q.items.map((i) => i.state)).toEqual(["created", "capturing", "waiting"]);
+    expect(q.gap).toBeFalsy();
+    expect(q.startedAt).toBe("2026-11-12T10:00:00.000Z");
+    expect(addsUp(q)).toMatchObject({ done: 1, pending: 2, unknown: 0 });
+  });
+
+  it("a finished links queue that stopped: the links it did not reach were not tried, and why it stopped is said", () => {
+    const q = queueFromDetail(detail({ done: 1, finished: true, error: "WorkerUnavailableError", items: [{ url: YT, status: "created" }] }));
+    expect(q.items.map((i) => i.state)).toEqual(["created", "not-captured", "not-captured"]);
+    expect(q.error).toMatch(/media helper is not running/);
+    expect(q.finished).toBe(true);
+  });
+
+  it("carries a missing tool's code, sentence and id through unchanged", () => {
+    const why = "The video downloader is not installed on this computer, so nothing was saved. Install it from the Optional tools screen, then capture the link again.";
+    const q = queueFromDetail(detail({ done: 1, items: [{ url: YT, status: "failed", errorCode: "TOOL_NOT_INSTALLED", reason: why, tool: "video-downloader" }] }));
+    expect(q.items[0]).toEqual({ url: YT, state: "failed", errorCode: "TOOL_NOT_INSTALLED", reason: why, tool: "video-downloader" });
+    // From events too.
+    const e = applyProgress(linkQueue("q1", [YT]), { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: YT, status: "failed", errorCode: "TOOL_NOT_INSTALLED", reason: why, tool: "video-downloader" } });
+    expect(e.items[0]!.tool).toBe("video-downloader");
+  });
+
+  it("a profile run: its address, its posts, its report with the library's stop sentence and the missing tool", () => {
+    const q = queueFromDetail(
+      detail({
+        kind: "profile",
+        url: "https://www.instagram.com/someone/",
+        urls: undefined,
+        total: 2,
+        done: 1,
+        finished: true,
+        items: [{ url: IG, status: "created" }],
+        report: { ...REPORT, status: "failed", created: 1, errorCode: "TOOL_NOT_INSTALLED", reason: "The image downloader is not installed on this computer, so nothing was saved.", tool: "image-downloader" },
+      }),
+    );
+    expect(q.kind).toBe("profile");
+    expect(q.url).toBe("https://www.instagram.com/someone/");
+    expect(q.items).toEqual([{ url: IG, state: "created" }]);
+    expect(q.stopReason).toMatch(/image downloader is not installed/);
+    expect(q.errorCode).toBe("TOOL_NOT_INSTALLED");
+    expect(q.tool).toBe("image-downloader");
+    expect(q.report?.items).toEqual([{ url: IG, status: "created" }]);
+  });
+
+  it("a queue started from the browser extension says so", () => {
+    expect(queueFromDetail(detail({ startedBy: "extension" })).startedBy).toBe("extension");
+  });
+
+  it("after a gap, the read replaces 'not known' by the truth (Minor O1): links not reached are waiting again, the gap is over", () => {
+    let local = applyProgress(linkQueue("q1", [YT, IG, TT]), { queueId: "q1", projectId: P, done: 1, total: 3, finished: false, outcome: { url: YT, status: "created" } });
+    local = markGap(local);
+    expect(local.items.map((i) => i.state)).toEqual(["created", "unknown", "unknown"]);
+    const merged = mergeRead(local, queueFromDetail(detail({ done: 2, items: [{ url: YT, status: "created" }, { url: IG, status: "failed", errorCode: "LOGIN_REQUIRED" }] })));
+    expect(merged.items.map((i) => i.state)).toEqual(["created", "failed", "capturing"]);
+    expect(merged.gap).toBe(false);
+    expect(addsUp(merged)).toMatchObject({ done: 1, failed: 1, pending: 1, unknown: 0 });
+  });
+
+  it("an event newer than the read is kept: neither source goes backwards", () => {
+    // The screen saw link 3 finish after the read was answered.
+    let local = linkQueue("q1", [YT, IG, TT]);
+    for (const [done, url] of [[1, YT], [2, IG], [3, TT]] as const) local = applyProgress(local, { queueId: "q1", projectId: P, done, total: 3, finished: done === 3, outcome: { url, status: "created" } });
+    const merged = mergeRead(local, queueFromDetail(detail({ done: 1, items: [{ url: YT, status: "created" }] })));
+    expect(merged.items.map((i) => i.state)).toEqual(["created", "created", "created"]);
+    expect(merged.done).toBe(3);
+    expect(merged.finished).toBe(true);
+  });
+
+  it("a queue the screen did not know is taken as read", () => {
+    const read = queueFromDetail(detail());
+    expect(mergeRead(undefined, read)).toBe(read);
+  });
+});
+
+describe("capture: a queue ended by a close or a move (Task 63 fix round 2, N2)", () => {
+  it("says the library was closed or moved, not that the project was locked", () => {
+    const t = queueErrorText("LibraryClosedError: the library was closed or moved, so the capture stopped");
+    expect(t).toMatch(/library was closed or moved/);
+    expect(t).not.toMatch(/locked/);
+    expect(queueErrorText("ProjectLockedError: x")).toMatch(/locked/);
   });
 });

@@ -123,7 +123,26 @@ describe("CaptureQueue", () => {
     q = markGap(q);
     render(<CaptureQueue queues={[q]} />);
     expect(screen.getByText(/Progress was missed while the connection to the library service was down/)).toBeTruthy();
-    expect(screen.getByText(/cannot re-read a running capture yet/)).toBeTruthy();
+    // Task 63: the screen reads the queue again once it can.
+    expect(screen.getByText(/updated as soon as the library service can be reached again/)).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/cannot re-read/);
+  });
+
+  it("a queue sent from the browser extension says so (Task 63)", () => {
+    render(<CaptureQueue queues={[{ ...linkQueue("q1", [A]), startedBy: "extension" }]} />);
+    expect(screen.getByText("Sent from the browser extension.")).toBeTruthy();
+  });
+
+  it("a long profile run whose later posts the service did not keep says so (Task 63)", () => {
+    const q = { ...profileQueue("qp", "https://www.instagram.com/someone/"), items: [{ url: A, state: "created" }], done: 3, total: 3, itemsOmitted: 2 };
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByText(/kept only the first 1 posts of this run; 2 later posts are counted above but not listed/)).toBeTruthy();
+  });
+
+  it("a profile run stopped by a missing tool links to the Optional tools screen for that tool (Task 63 carries the tool id)", () => {
+    const q = { ...profileQueue("qp", "https://www.instagram.com/someone/"), finished: true, errorCode: "TOOL_NOT_INSTALLED", tool: "image-downloader", stopReason: "The image downloader is not installed on this computer, so nothing was saved." };
+    render(<CaptureQueue queues={[q]} />);
+    expect(screen.getByRole("link", { name: /Optional tools/ }).getAttribute("href")).toMatch(/tool=image-downloader/);
   });
 
   it("the reviewer's profile scenario: posts saved, then stopped by a rules change — the library's sentence and the counts, together", () => {

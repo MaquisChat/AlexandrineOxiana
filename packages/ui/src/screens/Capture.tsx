@@ -7,12 +7,20 @@
  * with the library's exact text); the queue (CaptureQueue) filled from `capture.progress` events; and
  * "Update capture tools" with old → new versions.
  *
+ * The queue is read again from the service (Task 63) on opening and after every reconnect, and a
+ * capture the screen does not know is read when its first event arrives, so captures started
+ * earlier or from the browser extension are shown, and outcomes missed while the connection was
+ * down are replaced by the truth.
+ *
  * Stale answers are dropped: the screen is keyed by its project, every answer and event is checked
- * against `live` (unmount) and events of other projects are never applied. A capture is started
- * once however often its button is pressed (a synchronous guard, then the button is disabled).
+ * against `live` (unmount), a read is used only if the connection it was asked on is still the
+ * current one (and only the latest read), and events of other projects are never applied. A capture
+ * is started once however often its button is pressed (a synchronous guard, then the button is
+ * disabled).
  */
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "../api/client";
 import {
   applyProgress,
@@ -26,11 +34,13 @@ import {
   linkQueue,
   markGap,
   MAX_LINKS,
+  mergeRead,
   MODELS,
   outcomeText,
   parseLinks,
   previewLink,
   profileQueue,
+  queueFromDetail,
   type BrowserName,
   type CaptureOptions,
   type CapturePolicy,
@@ -77,7 +87,11 @@ function hasCredentials(u: string): boolean {
  */
 function plainError(err: unknown, fallback: string): string {
   if (!(err instanceof ApiClientError)) return fallback;
-  if (err.code === "WORKER_UNAVAILABLE") return `${fallback} The capture tools are not available on this computer right now, so nothing was queued. Restart the app and try again.`;
+  if (err.code === "WORKER_UNAVAILABLE") return `${fallback} The media helper is not running. Restart the app and try again.`;
+  // The same link (or profile) is still being captured: the service's own sentence, and where to look.
+  if (err.code === "CONFLICT" && err.reason === CAPTURE_RUNNING) return `${err.message} The running capture is shown in the capture queue below.`;
+  // An ended capture still finishing its download (a lock): the service's own sentence, as it is.
+  if (err.code === "CONFLICT" && err.reason === CAPTURE_STOPPING) return err.message;
   if (err.code === "POLICY_DENIED") return errorText(err, fallback);
   return errorText(new ApiClientError(err.status, { code: err.code, message: err.message }), fallback);
 }
@@ -154,10 +168,10 @@ const TOOL_LABELS: Array<{ keys: string[]; label: string; missing: string }> = [
 ];
 
 /**
- * Plain words for a failed tools call. Today a failed update reaches the UI as 500 INTERNAL with the
- * service's generic message (media-worker.ts throws a plain Error): `lead` plus that message. A tool
- * code in `reason` (Task 63 is to send one) is explained, never shown. The reason of a 503 (the
- * helper's start-up message, which can name commands or paths) is never shown.
+ * Plain words for a failed tools call. A failed update is 502 TOOL_FAILED with the helper's code in
+ * `reason` (for example TOOL_UPDATE_FAILED), which is explained, never shown; any other failure is
+ * `lead` plus the service's message. The reason of a 503 (the helper's start-up message, which can
+ * name commands or paths) is never shown.
  */
 function toolsErrorText(err: unknown, lead: string): string {
   if (!(err instanceof ApiClientError)) return lead;
@@ -328,8 +342,18 @@ export function Capture({ client, projectId }: CaptureProps) {
   const [formError, setFormError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [queues, setQueues] = useState<CaptureQueueState[]>([]);
+  const queuesNow = useRef(queues);
+  queuesNow.current = queues;
+  /** Queues in the list (started here, or read from the service). */
   const known = useRef(new Set<string>());
+  /** Queues this screen started (a refusal of theirs may open the legal-basis field). */
+  const startedHere = useRef(new Set<string>());
   const early = useRef<CaptureProgress[]>([]);
+  /** The connection's generation: changes at every open and every loss, so a read asked on another connection is dropped. */
+  const conn = useRef(0);
+  const readSeq = useRef(0);
+  /** Queues already looked up after an event of theirs (each once), with the connection they were read on. */
+  const looked = useRef(new Map<string, number>());
   const [ack, setAck] = useState<{ from: "checkbox" | "service" } | null>(null);
   const [ackBusy, setAckBusy] = useState(false);
   const [ackError, setAckError] = useState<string | null>(null);
@@ -369,18 +393,97 @@ export function Capture({ client, projectId }: CaptureProps) {
     if (e.outcome?.errorCode === "LEGAL_BASIS_REQUIRED" || e.report?.errorCode === "LEGAL_BASIS_REQUIRED") setLegalRefused(true);
   };
 
-  const onProgress = useCallback((e: CaptureProgress) => {
-    if (!known.current.has(e.queueId)) {
-      early.current.push(e);
-      if (early.current.length > EARLY_EVENTS) early.current.splice(0, early.current.length - EARLY_EVENTS);
-      return;
-    }
-    noteRefusal(e);
-    setQueues((qs) => qs.map((q) => applyProgress(q, e)));
-  }, []);
-
   /** False while the event stream is down: events published then are missed (R146). */
   const connected = useRef(false);
+
+  /**
+   * Queues as the service reports them, merged with what the screen saw (Task 63); the events that
+   * arrived for them before they were known are applied on top. Shown oldest first in the state
+   * (the queue view shows the newest first).
+   */
+  const adopt = useCallback((reads: CaptureQueueState[]) => {
+    if (!reads.length) return;
+    const ids = new Set(reads.map((r) => r.queueId));
+    const pending = early.current.filter((e) => ids.has(e.queueId));
+    early.current = early.current.filter((e) => !ids.has(e.queueId));
+    for (const id of ids) known.current.add(id);
+    setQueues((qs) => {
+      const byId = new Map(qs.map((q) => [q.queueId, q]));
+      for (const r of reads) byId.set(r.queueId, pending.filter((e) => e.queueId === r.queueId).reduce(applyProgress, mergeRead(byId.get(r.queueId), r)));
+      return [...byId.values()].sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? ""));
+    });
+  }, []);
+
+  /** Whether a read asked on connection `gen` (and read number `seq`) may still be used. */
+  const current = (gen: number, seq?: number) => live.current && connected.current && gen === conn.current && (seq === undefined || seq === readSeq.current);
+
+  /**
+   * Reads the project's running and recent queues (on opening, after a reconnect, after a
+   * CAPTURE_RUNNING refusal), and any queue shown with missed progress that the list leaves out; one
+   * the service no longer knows is marked so (review M2). A queue already read after an event on this
+   * connection is not read again (review M8).
+   */
+  const readQueues = useCallback(async () => {
+    const gen = conn.current;
+    const seq = ++readSeq.current;
+    try {
+      const list = await api.queues(projectId);
+      if (!current(gen, seq)) return;
+      const listed = new Set(list.map((q) => q.queueId));
+      const missed = queuesNow.current.filter((q) => q.gap && !listed.has(q.queueId)).map((q) => q.queueId);
+      const ids = [...listed, ...missed].filter((id) => looked.current.get(id) !== gen);
+      const gone: string[] = [];
+      const details = await Promise.all(
+        ids.map((id) =>
+          api.queue(projectId, id).catch((err: unknown) => {
+            // Forgotten by the service (restarted, or finished long ago): left out, and said so if shown.
+            if (err instanceof ApiClientError && err.code === "NOT_FOUND") {
+              gone.push(id);
+              return undefined;
+            }
+            throw err;
+          }),
+        ),
+      );
+      if (!current(gen, seq)) return;
+      adopt(details.filter((d) => d !== undefined).map(queueFromDetail));
+      if (gone.length) setQueues((qs) => qs.map((q) => (q.gap && gone.includes(q.queueId) ? { ...q, forgotten: true } : q)));
+    } catch {
+      // Not readable now: what was seen stays, with its gap note; the next reconnect reads again.
+    }
+  }, [api, projectId, adopt]);
+
+  /** A capture the screen does not know (started elsewhere, or its start's answer still on its way): read once. */
+  const readOne = useCallback(
+    (queueId: string) => {
+      if (looked.current.has(queueId)) return;
+      const gen = conn.current;
+      looked.current.set(queueId, gen);
+      api.queue(projectId, queueId).then(
+        (d) => {
+          if (current(gen)) adopt([queueFromDetail(d)]);
+        },
+        () => {
+          // Not readable (another library's, or forgotten): its events stay unshown.
+        },
+      );
+    },
+    [api, projectId, adopt],
+  );
+
+  const onProgress = useCallback(
+    (e: CaptureProgress) => {
+      if (!known.current.has(e.queueId)) {
+        early.current.push(e);
+        if (early.current.length > EARLY_EVENTS) early.current.splice(0, early.current.length - EARLY_EVENTS);
+        readOne(e.queueId);
+        return;
+      }
+      if (startedHere.current.has(e.queueId)) noteRefusal(e);
+      setQueues((qs) => qs.map((q) => applyProgress(q, e)));
+    },
+    [readOne],
+  );
 
   // capture.progress events of this project, for as long as the screen is shown.
   useEffect(() => {
@@ -392,8 +495,11 @@ export function Capture({ client, projectId }: CaptureProps) {
         try {
           const onOpen = () => {
             connected.current = true;
+            conn.current++;
             tries = 0; // a working connection starts the count again (review M4)
             if (live.current) setLost(false);
+            // Read the queues now: with the stream open, nothing published from here on is missed.
+            void readQueues();
           };
           for await (const ev of client.events({ signal: ctl.signal, onOpen })) {
             if (stop) return;
@@ -406,6 +512,7 @@ export function Capture({ client, projectId }: CaptureProps) {
         if (stop || ctl.signal.aborted) return;
         // The stream ended: whatever is published until it is back is missed by every running queue.
         connected.current = false;
+        conn.current++;
         if (live.current) setQueues((qs) => qs.map(markGap));
         if (tries >= RECONNECTS) {
           if (live.current) setLost(true);
@@ -418,12 +525,20 @@ export function Capture({ client, projectId }: CaptureProps) {
     return () => {
       stop = true;
       connected.current = false;
+      conn.current++;
       ctl.abort();
     };
-  }, [client, projectId, onProgress, attempt]);
+  }, [client, projectId, onProgress, readQueues, attempt]);
 
   /** A queue the service has started: its early events are applied now. */
   const addQueue = (q: CaptureQueueState) => {
+    startedHere.current.add(q.queueId);
+    if (known.current.has(q.queueId)) {
+      // Already read from the service (an event of it came before this answer): not added twice.
+      const seen = queuesNow.current.find((x) => x.queueId === q.queueId);
+      if (seen?.items.some((i) => i.errorCode === "LEGAL_BASIS_REQUIRED") || seen?.errorCode === "LEGAL_BASIS_REQUIRED") setLegalRefused(true);
+      return;
+    }
     known.current.add(q.queueId);
     const mine = early.current.filter((e) => e.queueId === q.queueId);
     early.current = early.current.filter((e) => e.queueId !== q.queueId);
@@ -466,6 +581,8 @@ export function Capture({ client, projectId }: CaptureProps) {
       return;
     }
     setFormError(plainError(err, fallbackText));
+    // The same link is still being captured: make sure that capture is in the list.
+    if (err instanceof ApiClientError && err.code === "CONFLICT" && err.reason === CAPTURE_RUNNING) void readQueues();
   };
 
   const start = async (run: () => Promise<void>) => {
@@ -863,8 +980,7 @@ export function Capture({ client, projectId }: CaptureProps) {
       {notice && <p role="status">{notice}</p>}
 
       <p className="ao-capture__hint">
-        Captures started earlier, or from the browser extension, keep running in the library service but are not shown here: this screen shows only the captures it starts, and cannot re-read a
-        running capture yet. Look for their sources in the library.
+        Captures started earlier or from the browser extension are shown here too, for as long as the library service runs; a finished capture stays listed for up to an hour.
       </p>
       <CaptureQueue queues={queues} />
 
