@@ -167,6 +167,8 @@ export function registerFonts(app: FastifyInstance, ctx: Ctx): void {
       }
       ensurePrivateDir(join(dir, "fonts"));
       const file = fontPath(dir, { id, format });
+      // A kept copy already there (an unlisted one after a reset) is never deleted by this add (M3).
+      const wasThere = await lstat(file).then(() => true, () => false);
       await writeFileAtomic(file, data, { mode: 0o600 });
       const finalName = kept;
       const entry: UserFont = { id, name: finalName, format, size: data.length, addedAt: new Date().toISOString() };
@@ -180,7 +182,7 @@ export function registerFonts(app: FastifyInstance, ctx: Ctx): void {
         });
       } catch (err) {
         // The index became unreadable since it was read: no file is left behind without its entry.
-        if (!prev) await unlink(file).catch(() => undefined);
+        if (!prev && !wasThere) await unlink(file).catch(() => undefined);
         throw err;
       }
       return next.fonts.find((f): f is UserFont => validEntry(f) && f.id === id)!;
