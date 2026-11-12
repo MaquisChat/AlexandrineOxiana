@@ -894,3 +894,53 @@ def test_tool_jobs_do_not_take_the_media_jobs_slots(worker, worker_env, files, m
     assert all(worker.request("GET", f"/jobs/{j}")[1]["status"] in ("running", "queued") for j in started)
     for jid in started:
         worker.request("POST", f"/jobs/{jid}/cancel")
+
+
+# ---------- fix round 2: hosts and one definition of the speech models (R158) ----------
+
+REPO = Path(__file__).resolve().parents[3]
+SHARED_TOOLS_TS = REPO / "packages" / "shared" / "src" / "api" / "tools.ts"
+
+
+def shared_speech_models() -> tuple[list[str], str]:
+    """SPEECH_MODELS and DEFAULT_SPEECH_MODEL as packages/shared declares them (the one definition)."""
+    text = SHARED_TOOLS_TS.read_text(encoding="utf-8")
+    m = re.search(r"export const SPEECH_MODELS = \[([^\]]*)\] as const", text)
+    d = re.search(r'export const DEFAULT_SPEECH_MODEL: SpeechModel = "([^"]+)"', text)
+    assert m and d, "SPEECH_MODELS / DEFAULT_SPEECH_MODEL not found in packages/shared"
+    return re.findall(r'"([^"]+)"', m.group(1)), d.group(1)
+
+
+def test_the_worker_accepts_and_offers_exactly_the_shared_speech_models():
+    from ao_worker import transcribe
+
+    models, default = shared_speech_models()
+    assert sorted(transcribe.MODELS) == sorted(models)
+    assert sorted(toolpins.MODEL_PINS) == sorted(models)
+    offered = sorted(t.id for t in toolpins.TOOLS.values() if t.group == "speech")
+    assert offered == sorted(f"speech-{m}" for m in models)
+    assert transcribe.DEFAULTS["model"] == default == "medium"
+
+
+def test_every_installable_component_names_the_hosts_it_contacts(worker_env, monkeypatch):
+    monkeypatch.setenv("PATH", str(FAKE_BIN))
+    cat = tools.catalogue()
+    for t in cat["tools"]:
+        for c in t["components"]:
+            assert isinstance(c["hosts"], list), c["id"]
+            for h in c["hosts"]:
+                assert re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", h), (c["id"], h)
+            if c["available"]:
+                assert c["hosts"], c["id"]
+    comps = {c["id"]: c for t in cat["tools"] for c in t["components"]}
+    assert "huggingface.co" in comps["model-medium"]["hosts"]
+    assert "github.com" in comps["yt-dlp"]["hosts"]
+    assert comps["deno"]["hosts"] == ["dl.deno.land"]
+    assert comps["ffmpeg"]["hosts"] == ["ffmpeg.martin-riedl.de"]
+    assert comps["tesseract"]["hosts"] == []  # nothing to download on any platform yet
+
+
+def test_a_hosts_list_follows_the_pins(worker_env, files, monkeypatch):
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files))
+    comps = {c["id"]: c for t in tools.catalogue()["tools"] for c in t["components"]}
+    assert comps["ffmpeg"]["hosts"] == ["127.0.0.1"]

@@ -135,6 +135,9 @@ importers:
       '@ao/core':
         specifier: workspace:*
         version: link:../core
+      '@ao/shared':
+        specifier: workspace:*
+        version: link:../shared
       '@napi-rs/keyring':
         specifier: 2.1.2
         version: 2.1.2

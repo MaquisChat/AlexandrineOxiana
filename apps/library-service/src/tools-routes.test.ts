@@ -39,7 +39,7 @@ interface Run {
 }
 
 /** A stand-in worker whose tool jobs the test finishes by hand. */
-function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
+function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean; missingModels?: boolean } = {}): WorkerProvider & { runs: Run[]; updateError?: Error } {
   const runs: Run[] = [];
   const p: WorkerProvider & { runs: Run[]; updateError?: Error } = {
     runs,
@@ -61,7 +61,11 @@ function stubWorker(over: { transcribeError?: Error; ignoreAbort?: boolean } = {
           }),
       } as unknown as WorkerToolsClient;
       const client = {
-        async submit(_pid: string, _job: WorkerJob): Promise<JobResult> {
+        async submit(_pid: string, job: WorkerJob): Promise<JobResult> {
+          if (over.missingModels && job.type === "audio.transcribe") {
+            const m = String(job.params?.model);
+            throw new WorkerToolError("TOOL_NOT_INSTALLED", `Speech model: ${m} is not installed.`, `speech-${m}`);
+          }
           throw over.transcribeError ?? new WorkerJobError("TOOL_FAILED", "no");
         },
         async resumePending() {
@@ -324,5 +328,30 @@ describe("GET /jobs names the missing tool of a failed viewing copy or OCR job",
     expect(failureTool("ocr", "TOOL_NOT_INSTALLED")).toBe("ocr");
     expect(failureTool("video.proxy", "FFMPEG_FAILED")).toBeUndefined();
     expect(failureTool("image.proxy", "TOOL_NOT_INSTALLED")).toBeUndefined();
+  });
+});
+
+describe("speech models (R158)", () => {
+  it("a transcription accepts exactly the shared models, and a missing one is named by its tool id", async () => {
+    const { SPEECH_MODELS } = await import("@ao/shared");
+    await start({ worker: stubWorker({ missingModels: true }), autoStartWorker: false });
+    expect((await call({ method: "POST", url: "/libraries", body: { path: join(tmp, "Lib"), name: "Lib" } })).status).toBe(200);
+    const p = await call({ method: "POST", url: "/projects", body: { name: "S", governanceYaml: "identifiability:\n  containsIdentifiable: false\nencryption:\n  atRest: optional\n", encryption: { enabled: false } } });
+    const pid = p.json.project.id as string;
+    const dir = join(tmp, "in");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "talk.mp3"), Buffer.alloc(64, 1));
+    const sf = await svc.state.session!.repo.createSource(
+      pid,
+      { projectIds: [pid], type: "audio", title: { variants: [{ lang: "en", kind: "original", value: "Talk" }] }, creators: [], identifiers: {}, caseAttributes: {}, availability: { status: "available" }, collectionIds: [], tagIds: [], participantIds: [] },
+      [{ path: join(dir, "talk.mp3"), role: "original", handling: "copy" }],
+      { provenance: { captureMethod: "manual_upload", capturedAt: new Date().toISOString(), tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false } },
+    );
+    for (const model of SPEECH_MODELS) {
+      const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model } });
+      expect(r.status, model).toBe(409);
+      expect(r.json.error).toMatchObject({ code: "TOOL_NOT_INSTALLED", reason: `speech-${model}` });
+    }
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sf.source.id}/transcribe`, body: { model: "huge" } })).status).toBe(400);
   });
 });

@@ -21,8 +21,22 @@ export function isToolId(v: string): v is ToolId {
   return (TOOL_IDS as readonly string[]).includes(v);
 }
 
+/**
+ * The speech models the app accepts (R158): the one definition used by the worker's catalogue
+ * (checked by services/media-worker/tests/test_tools.py), the service's validation, the capture
+ * code, the transcript viewer and the tools dialogue. Nothing else can be installed or asked for.
+ */
+export const SPEECH_MODELS = ["tiny", "small", "medium", "large-v3"] as const;
+export type SpeechModel = (typeof SPEECH_MODELS)[number];
+/** The model used when none is named (R158: SPEC 5.2 names none; the transcript viewer's default). */
+export const DEFAULT_SPEECH_MODEL: SpeechModel = "medium";
+
+export function isSpeechModel(v: string): v is SpeechModel {
+  return (SPEECH_MODELS as readonly string[]).includes(v);
+}
+
 /** The speech model tool for a transcription model name (`small` → `speech-small`). */
-export function speechToolId(model: "tiny" | "small" | "medium" | "large-v3"): ToolId {
+export function speechToolId(model: SpeechModel): ToolId {
   return `speech-${model}`;
 }
 
@@ -50,6 +64,12 @@ export interface ToolComponent {
   unavailableReason?: string;
   downloadSize: number;
   sizeApproximate: boolean;
+  /**
+   * The host names its download contacts (R158), derived from its pins: the pinned addresses' hosts
+   * and the exact hosts a redirect may lead to; for yt-dlp the release host and its file hosts.
+   * Absent in answers from before Task 48a fix round 2.
+   */
+  hosts?: string[];
 }
 
 export interface ToolInfo {

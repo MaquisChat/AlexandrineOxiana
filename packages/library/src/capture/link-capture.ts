@@ -42,6 +42,7 @@ import { decryptBytes, encryptBytes } from "../repo/io.js";
 import { authorizeProcessing, createSourcePreAuthorized, projectDataKey, projectPolicy, projectStampNow, repoLibrary, type Repo } from "../repo/repo.js";
 import { PolicyDeniedError, ProjectLockedError } from "../repo/errors.js";
 import type { SourceInputFile } from "../repo/sources.js";
+import { DEFAULT_SPEECH_MODEL } from "@ao/shared";
 import { WorkerJobError, WorkerToolError, WorkerUnavailableError, type JobResult, type WorkerClient } from "../worker-client.js";
 import { AcknowledgementRequiredError, incompleteReason, plainReason, toolMissingReason, transcriptToolMissingNote } from "./errors.js";
 import { classifyUrl, isCollectionLink, type ClassifiedUrl, type Platform } from "./platforms.js";
@@ -366,7 +367,8 @@ export function createLinkCapture(deps: LinkCaptureDeps): LinkCapture {
       input: join(root, ...media.path.split("/")),
       inputEncrypted: media.encrypted,
       output: join(work, "transcript"),
-      params: { ...(params.model ? { model: params.model } : {}), ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },
+      // The shared default (R158) when none is named, never the worker's own.
+      params: { model: params.model ?? DEFAULT_SPEECH_MODEL, ...(params.language && params.language !== "auto" ? { language: params.language } : {}) },
       entity: { type: "asset", id: media.id },
     });
     const meta = r.meta;

@@ -17,10 +17,12 @@ from .jobs import Job, JobContext, JobError
 
 log = logging.getLogger("ao_worker.transcribe")
 
+# The speech models the app accepts: the same list as SPEECH_MODELS in packages/shared (R158;
+# tests/test_tools.py fails when they differ).
 MODELS = ("large-v3", "medium", "small", "tiny")
 COMPUTE_TYPES = ("int8", "float16")
 DEFAULTS = {
-    "model": "large-v3", "language": "auto", "multilingual": True, "vad": True, "computeType": "int8",
+    "model": "medium", "language": "auto",  # DEFAULT_SPEECH_MODEL in packages/shared (R158) "multilingual": True, "vad": True, "computeType": "int8",
     "wordTimestamps": True,
 }
 SAMPLE_RATE = 16000

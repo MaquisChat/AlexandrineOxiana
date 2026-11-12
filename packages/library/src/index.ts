@@ -268,3 +268,6 @@ export type { BrowserCaptureInput, BrowserCaptureResult, ExtractedPage } from ".
 export { startMediaWorker } from "./media-worker.js";
 export type { MediaWorker, ToolsUpdate } from "./media-worker.js";
 export { LinkedContentChangedError } from "./repo/sources.js";
+
+// The speech models the app accepts and its default (R158), for the apps that do not import @ao/shared.
+export { DEFAULT_SPEECH_MODEL, SPEECH_MODELS, isSpeechModel, type SpeechModel } from "@ao/shared";

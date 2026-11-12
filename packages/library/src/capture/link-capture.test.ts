@@ -803,3 +803,15 @@ describe("a missing tool (Task 48a, R126)", () => {
     expect(toolMissingReason("speech-large-v3")).toMatch(/large-v3 speech model/);
   });
 });
+
+describe("the default speech model (R158)", () => {
+  it("a capture that transcribes without naming a model asks for the shared default", async () => {
+    const { DEFAULT_SPEECH_MODEL } = await import("@ao/shared");
+    const p = await project();
+    const out = await capture.captureUrl(p.id, YT, { transcribe: true });
+    expect(out.status).toBe("created");
+    const job = worker.submitted.find((j) => j.type === "audio.transcribe");
+    expect(job?.params.model).toBe(DEFAULT_SPEECH_MODEL);
+    expect(DEFAULT_SPEECH_MODEL).toBe("medium");
+  });
+});
