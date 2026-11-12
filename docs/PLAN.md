@@ -529,8 +529,8 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved and verified; merge waits for a green GitHub run | 3dd8f79 (worktree branch) | reviewed with probes; the desktop scenario's picker step passes |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | built; two questions for the controller, then review | 7ec17eb (worktree branch) | one helper: a settings file is written only over what was read; a confirmed reset keeps the damaged file aside |
-| 67 One review queue for the project (D14) | in review | 31edce4 (worktree branch) | built with R176: every kind of entry listed and decidable; verification entries resolved by the library |
+| 68 Settings writers never write what they did not read (D16) | in progress | 7ec17eb (worktree branch) | the helper and the three resets are built; two more files ruled (R178: the list of old copies, the device id), then review |
+| 67 One review queue for the project (D14) | fix round 1 | 31edce4 (worktree branch) | reviewed with probes: 2 Important (an entry can stay pending for ever; a withdrawal reason audited in plain text in an encrypted project); R177 |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
