@@ -49,9 +49,17 @@ const COPYRIGHT_LINE = /^\s*(?:copyright\b(?=.*(?:\(c\)|©|\b(?:1[89]|20)\d\d\b|
 export function splitCopyright(text) {
   const copyrights = [];
   const rest = [];
+  const blank = (l) => l !== undefined && !l.trim();
+  let afterRemoved = false;
   for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
-    if (COPYRIGHT_LINE.test(line)) copyrights.push(line.trim());
-    else rest.push(line);
+    if (COPYRIGHT_LINE.test(line)) {
+      copyrights.push(line.trim());
+      afterRemoved = true;
+    } else {
+      // The blank lines on both sides of removed copyright lines become one; the text is otherwise unchanged.
+      if (!(afterRemoved && blank(line) && blank(rest.at(-1)))) rest.push(line);
+      afterRemoved = false;
+    }
   }
   return { copyrights, body: rest.join("\n").replace(/^\s*\n/, "").replace(/\s+$/, "") };
 }
