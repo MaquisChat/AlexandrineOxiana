@@ -546,8 +546,10 @@ Start it with the Node.js 22 that matches build-info.json (same platform, archit
 --max-old-space-size=512 is required: it caps the JavaScript heap at 512 MB (R64, R96), which the
 program cannot set for itself once started.
 
-The access token: one line on standard input (R98), for example
-  printf '%s\\n' "$TOKEN" | node --max-old-space-size=512 service.mjs
+The access token: one line on standard input (R98). Keep standard input open for as long as the
+service should run: its end means "shut down cleanly" (R155), so a launcher that exits or is killed
+leaves no stray service. For example
+  { printf '%s\\n' "$TOKEN"; cat; } | node --max-old-space-size=512 service.mjs
 It is never read from the environment or the command line: the service refuses to start if
 AO_SERVICE_TOKEN is set or if it is given any argument.
 
@@ -565,7 +567,9 @@ from outside this folder; NODE_OPTIONS even acts before the service can check), 
 AO_SERVICE_TOKEN. service.mjs refuses to start if any of them is set, and if this folder was built
 for another platform, architecture or Node ABI (build-info.json).
 
-It prints "AO_SERVICE_READY port=<n>" when it is listening, and stops cleanly on SIGTERM.
+It prints "AO_SERVICE_READY port=<n>" when it is listening, and stops cleanly on SIGTERM or at the
+end of its standard input. It starts the media worker itself and hands it its own token the same
+way (one line on the worker's standard input, which the worker also treats as its life line).
 Licences: licences/THIRD-PARTY-NOTICES.md.
 `;
 

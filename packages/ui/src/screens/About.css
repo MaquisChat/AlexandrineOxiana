@@ -1,0 +1,14 @@
+/* The About screen's notices: licence texts keep their own line breaks. No colours here (tokens only, via shared classes). */
+.ao-notice {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 80ch;
+}
+
+.ao-notice__details {
+  margin-block: 0.5rem;
+}
+
+.ao-notice__details > summary {
+  cursor: pointer;
+}

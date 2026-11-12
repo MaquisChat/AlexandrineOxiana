@@ -461,16 +461,16 @@ Update after every task; commit and push.
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
 | 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
-| 58 Ledger loose ends | in progress | | implementer dispatched (annotation text searchable; project time zone) |
+| 58 Ledger loose ends | fix round 1 | 28e8368 (worktree branch) | 4 Important: a migrated index counted as complete, memory at the annotation cap, ranking, one rule for a project's time zone (R160, R161) |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
 | 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
-| 37c Desktop shell | fix round 1 | becdf08 (worktree branch) | spec met; 3 Important: the token could reach a look-alike local origin, drop positions on high-density screens, a second launch during a slow quit (R159) |
+| 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
-| 37h Desktop end-to-end | not started | | |
+| 37h Desktop end-to-end | in progress | | implementer dispatched |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |

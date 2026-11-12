@@ -35,21 +35,25 @@ fail and a fixture that cannot be fetched makes `pnpm fetch-fixtures` fail; CI i
 ## Running
 
 ```sh
-AO_WORKER_TOKEN=<random, ≥16 chars> AO_WORKER_PORT=0 .venv/bin/python -m ao_worker
+{ printf '%s\n' "$TOKEN"; cat; } | AO_WORKER_PORT=0 .venv/bin/python -m ao_worker
 # prints: AO_WORKER_READY port=<n>
 ```
 
 | Variable | Meaning |
 | --- | --- |
-| `AO_WORKER_TOKEN` | required; every request needs `Authorization: Bearer <token>` |
 | `AO_WORKER_PORT` | port on 127.0.0.1 (`0` = any free port; the chosen one is printed) |
 | `AO_MODELS_DIR` | faster-whisper models (Hugging Face cache layout), installed by `POST /tools/speech-<size>/install`. A model there is loaded with no network contact; an absent one fails the job with `TOOL_NOT_INSTALLED` (tool `speech-<size>`) and is never downloaded on the fly |
 | `AO_TOOLS_DIR` | the optional tools the worker installs: `yt-dlp` (ADR 0009), `deno/`, `ffmpeg/`, `gallery-dl/`, `tessdata/` |
 | `AO_YTDLP_BIN` / `AO_GALLERYDL_BIN` | use this executable instead |
-| `AO_WORKER_EXIT_ON_STDIN_EOF=1` | exit when stdin closes (set by `startWorker`, so the worker dies with the app) |
 | `AO_WORKER_LOG_LEVEL` | default `INFO`; logs go to stderr |
 
-SIGTERM cancels all jobs (killing their process groups) and exits.
+The access token arrives on **standard input**, as one line (R98, R155): 32–512 characters from
+`A–Z a–z 0–9 . _ ~ + / = -`; every request needs `Authorization: Bearer <token>`. The worker refuses
+to start if `AO_WORKER_TOKEN` is in its environment, if it is given any argument, if standard input
+is a terminal, or if no line arrives within 10 seconds. After the line, standard input stays open:
+its **end** stops the worker cleanly (the service that started it is gone), so a crashed or killed
+parent leaves no stray worker. SIGTERM does the same: it cancels all jobs (killing their process
+groups) and exits.
 
 `startWorker` passes the worker only an allowlisted environment (PATH, HOME, locale, temp, proxy and
 CA-bundle variables, `XDG_*`, `AO_*`, Windows system folders); the worker passes child tools
@@ -152,9 +156,9 @@ yt-dlp and the arguments a capture uses (`--js-runtimes deno:<path>` included). 
 1 drift or failure, 3 inconclusive (the site refused this computer).
 
 **How the shell starts it:** exactly like the source worker, with the executable as the whole
-command: `AO_WORKER_BIN=<folder>/ao-worker` for `startWorker`, which passes `AO_WORKER_TOKEN`,
-`AO_WORKER_PORT=0` and `AO_WORKER_EXIT_ON_STDIN_EOF=1` in the environment and reads
-`AO_WORKER_READY port=<n>` from stdout. SIGTERM ends it (exit 0) and its job processes. The
+command: `AO_WORKER_BIN=<folder>/ao-worker` for `startWorker`, which writes the token as one line on its
+standard input (kept open for the worker's life), passes `AO_WORKER_PORT=0` in the environment and
+reads `AO_WORKER_READY port=<n>` from stdout. SIGTERM ends it (exit 0) and its job processes. The
 executable also runs `ao-worker -m ocrmypdf …` and `ao-worker -m gallery_dl …`, because the worker
 starts those as `sys.executable -m`, and `ao-worker --self-check`; it refuses anything else.
 
