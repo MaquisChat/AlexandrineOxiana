@@ -444,7 +444,7 @@ Update after every task; commit and push.
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | 7b7a3b4 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; the rebuild on open must honour the index's rebuild marker (R161) |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | fdbd601 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
-| 46c A pairing code's status | fix round 1 | 1ec85b5 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; one Important: a code is marked used before the pairing is written |
+| 46c A pairing code's status | fix round 1 in re-review | 7a7f5e2 (worktree branch) | a code is `used` only once its pairing is written; M1–M6 fixed |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
