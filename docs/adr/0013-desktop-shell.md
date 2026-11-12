@@ -166,6 +166,28 @@ the media worker itself, as it always has.
   helpers stop: a second launch during closing starts no second service; the first instance notes
   it and starts the app again once its helpers are gone.
 
+### In the Mac app (Task 37f; written and checked on Linux, not yet run on a Mac)
+
+- **One pinned Node.js.** `apps/desktop/macos/pins.json` pins the release (v22.23.4) and the SHA-256
+  of `node-<v>-darwin-arm64.tar.gz` and `…-darwin-x64.tar.gz`, copied from the release's
+  `SHASUMS256.txt`. `apps/desktop/scripts/node-release.mjs` downloads the archive once, checks it
+  before extracting anything, and deletes a cached copy that does not match. The workflow installs
+  the same version to run the build, the service folder is built with the extracted release first on
+  `PATH`, and the build fails unless `build-info.json` names darwin, the runner's architecture and
+  exactly that version. `bin/node` ships; `LICENSE` from the same archive goes into the notices
+  (ADR 0015).
+- **Where the helpers go.** `Contents/Resources/{node/node, library-service/, ao-worker/}`, which is
+  the resource folder Tauri gives the shell on macOS (`${exe_dir}/../Resources`, tauri-utils 2.10.2
+  `platform.rs`). They are copied by `bundle.macOS.files` in `src-tauri/tauri.macos.conf.json`, not by
+  `bundle.resources`: in tauri-bundler 2.10.4 `resources` are copied file by file with `fs::copy`,
+  which follows symbolic links, while `macOS.files` uses `copy_dir`, which keeps them (the PyInstaller
+  worker links its shared libraries into `_internal/`). A Rust test ties the configuration to
+  `paths.rs`.
+- **Signing** is done by the build script from `apps/desktop/macos/signing.json` (Tauri bundles with
+  `--no-sign`): ad hoc for now (R151); with an identity (Task 37g) every Mach-O file inside out with
+  the hardened runtime and per-part entitlements. Node's official binary keeps its publisher's
+  signature in the ad-hoc build.
+
 ## Consequences
 
 - The shell ships two things per architecture: a Node 22 binary and this folder. The folder must be
