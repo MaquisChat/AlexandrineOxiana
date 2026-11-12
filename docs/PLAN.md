@@ -526,7 +526,7 @@ Update after every task; commit and push.
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
-| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved and verified; merge waits for a green GitHub run | 3dd8f79 (worktree branch) | reviewed with probes; the desktop scenario's picker step passes |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
 | 68 Settings writers never write what they did not read (D16) | fix round 1 | d2fd1cc (worktree branch) | reviewed with probes: 2 Important (a missed writer, the watched folders; the command-line tool renews the device id unseen); three points ruled |
