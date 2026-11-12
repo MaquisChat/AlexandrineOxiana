@@ -91,7 +91,10 @@ export function registerTranscription(app: FastifyInstance, ctx: Ctx): void {
     const held = state.transcriptions.byId(jobId, s.lib);
     if (held && held.projectId === projectId) {
       const cancelled = state.transcriptions.cancel(jobId, s.lib);
-      return { job: cancelled ?? held };
+      if (cancelled) return { job: cancelled };
+      // Held but not running (e.g. waiting for the unlock, R1-3): the journal's pending record is
+      // cancelled below, and its state read from there.
+      state.transcriptions.forgetJob(jobId);
     }
     // Pending in the journal and run by no one now (before a restart's rerun, or cancelled by a lock).
     const find = async () => (await transcriptionRecords(s.repo, projectId)).find((r) => r.id === jobId);
