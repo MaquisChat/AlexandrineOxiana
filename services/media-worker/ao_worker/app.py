@@ -144,9 +144,12 @@ class WorkerServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, token: str, port: int, manager: JobManager):
+    def __init__(self, token: str, port: int, manager: JobManager, tool_manager: JobManager | None = None):
         self.token = token.encode()
         self.manager = manager
+        # Tool installs run in their own lane: a large download never holds up captures, proxies,
+        # transcriptions or OCR (one install at a time; jobs ids are shared by GET/cancel).
+        self.tool_manager = tool_manager or manager
         super().__init__(("127.0.0.1", port), Handler)
 
 
@@ -215,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and m:
                 if m.group(1) not in tools.toolpins.TOOLS:
                     return self._error(404, "UNKNOWN_TOOL", "there is no such tool")
-                job = self.server.manager.submit(f"tool.{m.group(2)}", m.group(1), str(tools.tools_dir()), {})
+                job = self.server.tool_manager.submit(f"tool.{m.group(2)}", m.group(1), str(tools.tools_dir()), {})
                 return self._send(202, {"id": job.id})
             if method == "POST" and path == "/tools/update":
                 try:
@@ -224,11 +227,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(502, {"error": e.to_json()})
             m = _JOB_PATH.match(path)
             if method == "GET" and m:
-                job = self.server.manager.get(m.group(1))
+                job = self.server.manager.get(m.group(1)) or self.server.tool_manager.get(m.group(1))
                 return self._send(200, job.to_json()) if job else self._error(404, "NOT_FOUND", "no such job")
             m = _CANCEL_PATH.match(path)
             if method == "POST" and m:
-                job = self.server.manager.cancel(m.group(1))
+                job = self.server.manager.cancel(m.group(1)) or self.server.tool_manager.cancel(m.group(1))
                 return self._send(202, job.to_json()) if job else self._error(404, "NOT_FOUND", "no such job")
             return self._error(404, "NOT_FOUND", "no such endpoint")
         except BadRequest as e:
@@ -248,4 +251,4 @@ def make_server(token: str, port: int = 0) -> WorkerServer:
     if not token:
         raise ValueError("a token is required")
     tools.sweep()  # an install interrupted by a crash leaves nothing half-installed
-    return WorkerServer(token, port, JobManager(HANDLERS))
+    return WorkerServer(token, port, JobManager(HANDLERS), JobManager(HANDLERS, max_running=1))

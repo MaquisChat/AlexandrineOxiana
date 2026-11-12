@@ -802,3 +802,95 @@ def test_a_folder_without_its_install_marker_is_not_installed(worker_env, monkey
     assert t["installed"] is False
     (folder / tools.MARKER).write_text("{}")
     assert tools.which("ffmpeg") == str(folder / "ffmpeg")
+
+
+# ---------- minors (fix round 1) ----------
+
+
+def test_a_half_removed_tool_is_not_brought_back_by_the_sweep(worker_env):
+    root = worker_env["tools"]
+    trash = root / ".trash.deadbeef.ffmpeg"  # a removal the worker did not live to finish
+    trash.mkdir()
+    (trash / tools.MARKER).write_text("{}")
+    (trash / "ffmpeg").write_bytes(FFMPEG_OK)
+    tools.sweep()
+    assert not trash.exists() and not (root / "ffmpeg").exists()
+
+
+def test_remove_moves_the_folder_aside_under_the_trash_prefix(worker_env, monkeypatch):
+    root = worker_env["tools"]
+    folder = root / "ffmpeg"
+    folder.mkdir()
+    (folder / tools.MARKER).write_text("{}")
+    seen = []
+    real = tools.shutil.rmtree
+    monkeypatch.setattr(tools.shutil, "rmtree", lambda p, **k: (seen.append(Path(p).name), real(p, **k)))
+    assert tools.remove_component(toolpins.COMPONENTS["ffmpeg"]) is True
+    assert seen and all(n.startswith(".trash.") for n in seen)
+
+
+def test_the_tools_folder_is_private(worker, worker_env, files, monkeypatch):
+    no_system(monkeypatch, "ffmpeg")
+    root = worker_env["tools"] / "fresh"
+    monkeypatch.setenv("AO_TOOLS_DIR", str(root))
+    monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files))
+    old = os.umask(0o002)
+    try:
+        job = worker.wait(worker.request("POST", "/tools/ffmpeg/install")[1]["id"])
+    finally:
+        os.umask(old)
+    assert job["status"] == "done", job
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_a_missing_tool_that_cannot_be_installed_here_says_why(worker_env, monkeypatch):
+    monkeypatch.setenv("PATH", str(FAKE_BIN))
+    e = tools.not_installed("ocr")
+    assert e.code == "TOOL_NOT_INSTALLED" and e.tool == "ocr"
+    assert "tools dialogue" not in e.message
+    assert "tesseract" in e.message
+    assert "tools dialogue" in tools.not_installed("ffmpeg").message
+
+
+def test_an_existing_file_is_never_deleted_by_a_failed_download(worker_env, files, tmp_path):
+    dest = tmp_path / "keep"
+    dest.write_text("mine")
+    files.add("/x", b"abc")
+    with pytest.raises(fetch.ToolInstallError):
+        fetch.download(files.base + "/x", dest, sha256=None, size=None, hosts=("127.0.0.1",), max_bytes=10)
+    assert dest.read_text() == "mine"
+
+
+def test_an_archive_entry_with_permission_bits_only_counts_as_a_regular_file(tmp_path):
+    from ao_worker import unpack
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        info = zipfile.ZipInfo("ffmpeg")
+        info.external_attr = 0o755 << 16  # no file-type bits, as some zip tools write
+        z.writestr(info, FFMPEG_OK)
+    archive = tmp_path / "a.zip"
+    archive.write_bytes(buf.getvalue())
+    (tmp_path / "out").mkdir()
+    unpack.extract_zip(archive, tmp_path / "out", members={"ffmpeg": "ffmpeg"}, max_bytes=10_000)
+    assert (tmp_path / "out" / "ffmpeg").read_bytes() == FFMPEG_OK
+
+
+def test_tool_jobs_do_not_take_the_media_jobs_slots(worker, worker_env, files, monkeypatch, tmp_path):
+    from ao_worker import jobs
+
+    no_system(monkeypatch, "ffmpeg")
+    big = zip_bytes({"ffmpeg": FFMPEG_OK + b"#" * 400_000})
+    started = []
+    for i in range(jobs.MAX_RUNNING):
+        monkeypatch.setitem(toolpins.COMPONENTS, "ffmpeg", ffmpeg_component(files, big, slow=0.05, path_prefix=f"/p{i}"))
+        started.append(worker.request("POST", "/tools/ffmpeg/install")[1]["id"])
+    time.sleep(0.3)
+    # a capture still runs at once (the installs take several seconds more)
+    t = time.monotonic()
+    job = worker.run("capture.download", "https://www.youtube.com/watch?v=abc123", str(tmp_path / "c"), {"tool": "yt-dlp"}, timeout=15)
+    assert job["status"] == "done", job
+    assert time.monotonic() - t < 2.5
+    assert all(worker.request("GET", f"/jobs/{j}")[1]["status"] in ("running", "queued") for j in started)
+    for jid in started:
+        worker.request("POST", f"/jobs/{jid}/cancel")

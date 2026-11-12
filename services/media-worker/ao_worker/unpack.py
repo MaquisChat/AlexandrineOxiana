@@ -34,8 +34,8 @@ def safe_relative(name: str) -> PurePosixPath:
 
 def _is_link_or_special(info: zipfile.ZipInfo) -> bool:
     mode = info.external_attr >> 16
-    if not mode:
-        return False
+    if not stat.S_IFMT(mode):
+        return False  # permission bits only (or none): written as a plain file
     return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
 
 

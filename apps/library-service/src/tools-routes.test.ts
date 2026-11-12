@@ -10,6 +10,7 @@ import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkerJobError, WorkerToolError, deviceDeps, type Deps, type JobResult, type WorkerClient, type WorkerJob, type WorkerToolsClient } from "@ao/library";
 import type { ToolJob, ToolsResponse } from "@ao/shared";
+import { toApiError } from "./errors.js";
 import { failureTool } from "./routes/jobs.js";
 import { createService, type LibraryService, type ServiceOptions, type WorkerProvider } from "./server.js";
 
@@ -285,6 +286,14 @@ describe("tool errors elsewhere", () => {
     const r = await call({ method: "POST", url: "/tools/update" });
     expect(r.status).toBe(502);
     expect(r.json.error).toMatchObject({ code: "TOOL_FAILED", reason: "TOOL_UPDATE_FAILED" });
+  });
+
+  it("a damaged model is the media helper's failure, not a failed tool install", async () => {
+    const e = toApiError(new WorkerToolError("MODEL_UNAVAILABLE", "the small model on disk could not be read", "speech-small"));
+    expect(e.status).toBe(502);
+    expect(e.code).toBe("INTERNAL");
+    expect(e.reason).toBe("MODEL_UNAVAILABLE");
+    expect(toApiError(new WorkerToolError("TOOL_UPDATE_FAILED", "x", "video-downloader")).code).toBe("TOOL_FAILED");
   });
 
   it("a transcription whose speech model is missing is 409 TOOL_NOT_INSTALLED naming the tool", async () => {

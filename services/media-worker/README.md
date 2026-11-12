@@ -74,7 +74,7 @@ is `401 UNAUTHORIZED`, an invalid request `400 INVALID_REQUEST`.
 A job whose optional tool is missing fails with `TOOL_NOT_INSTALLED` and `error.tool` naming it
 (`video-downloader`, `image-downloader`, `ffmpeg`, `ocr`, `speech-<size>`).
 
-At most 2 jobs run at once; more are queued. A transcription counts as one job and uses every CPU core.
+At most 2 jobs run at once; more are queued. A transcription counts as one job and uses every CPU core. Tool installs (`tool.*`) run in a lane of their own, one at a time, so a large download never holds up the media jobs. Every tool download has a stall limit (no byte for 30 s), a deadline scaled to its size, and ends within about a second of a cancel.
 
 ### Job types
 
