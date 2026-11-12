@@ -135,6 +135,8 @@ export { stripSnapshot } from "./capture/snapshot.js";
 export { NoMediaError, createLinkCapture } from "./capture/link-capture.js";
 export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps, TranscribeSourceResult } from "./capture/link-capture.js";
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";
+export { CaptureQueueRegistry } from "./capture/queues.js";
+export type { CaptureQueueRegistryOptions } from "./capture/queues.js";
 
 export * from "./extract/index.js";
 export { AUTO_ACCEPT_THRESHOLD, MAX_CANDIDATES, resolveItem } from "./import/resolve.js";
