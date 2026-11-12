@@ -457,7 +457,8 @@ Update after every task; commit and push.
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
 | 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
-| 50 No silent refusals | fix round 3 (short) | 634bf3e (worktree branch) | round 2 passed re-review; one Minor fixed before merge (path scrubbing must not rewrite the researcher's own text). The restore item waits for Task 49 |
+| 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
+| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
 | 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | not started | | |
