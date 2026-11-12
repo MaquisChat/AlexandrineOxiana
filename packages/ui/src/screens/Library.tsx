@@ -9,7 +9,7 @@
  * other selection. "New recovery code…" (an unlocked encrypted project) opens the new-recovery-code
  * dialog (Task 61).
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
 import { CollectionTree } from "../components/CollectionTree";
@@ -51,6 +51,8 @@ export interface LibraryProps {
   projectFromAddress?: string | undefined;
   /** The selected project changed (the route keeps it in the address). */
   onProjectSelected?: (id: string) => void;
+  /** The first-use tools question and its quiet line (Task 48c), shown under the banners. */
+  firstUse?: ReactNode;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -69,7 +71,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -509,6 +511,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           ))}
         </div>
       )}
+      {firstUse}
       <aside className="ao-library__side">
         {projects === undefined ? (
           <p aria-live="polite">Loading projects…</p>

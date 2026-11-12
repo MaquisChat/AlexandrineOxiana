@@ -1,6 +1,7 @@
 /**
- * The first-use tools dialogue (Task 48b; R126, R133, R152). The first time the app is opened with
- * no optional tool installed and the question not yet answered, it asks what the researcher will do
+ * The first-use tools dialogue (Task 48b; R126, R133, R152). It belongs to the open library's
+ * screen and waits for a quiet moment there (Task 48c, D9: see `FirstUseTools` for the rule). While
+ * the question is not yet answered, it asks what the researcher will do
  * and offers the matching tools pre-selected, with the total download size and the hosts each
  * download contacts (from the catalogue). Nothing is downloaded until "Download …" is pressed; each
  * chosen tool is then one install job (one request each), and the Optional tools screen opens to
@@ -16,7 +17,7 @@
 import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
-import { navigate, normalisePath, PATHS } from "../navigation";
+import { navigate, PATHS } from "../navigation";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 import "../screens/GovernanceScreens.css";
@@ -76,14 +77,38 @@ const selectable = (t: ToolInfo) => t.available && !t.installed && !running(t) &
 /** Some other dialog is open (a recovery code, a confirmation): this one waits until it has closed. */
 const otherDialogOpen = () => document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]') !== null;
 
-export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: { api: ToolsApi; memory?: FirstUseMemory; pathname: string }) {
+/** Inputs that take no typing: focus on one of these does not hold the question back. */
+const NOT_TYPED = new Set(["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"]);
+
+/** A field the researcher types into (or chooses from) has focus. */
+const fieldHasFocus = () => {
+  const el = document.activeElement;
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
+  if (el instanceof HTMLInputElement) return !NOT_TYPED.has(el.type);
+  return el instanceof HTMLElement && (el.isContentEditable || el.getAttribute("contenteditable") === "true");
+};
+
+/** How long nothing may have been typed or clicked before the question opens (D9). */
+export const FIRST_USE_QUIET_MS = 1500;
+
+/** What counts as the researcher doing something. */
+const ACTIVITY_EVENTS = ["keydown", "pointerdown", "mousedown", "input", "paste", "drop"] as const;
+
+/**
+ * The first-use question, on the library screen (Task 48c, D9). It is mounted only there, so it is
+ * never asked over the library chooser or any other screen. Until it is answered a quiet line on the
+ * screen offers the Optional tools screen. The dialogue itself opens only when all of these hold: no
+ * other dialog is open, no text field has focus, and nothing has been typed or clicked for
+ * `quietMs` (by default 1.5 s); the moment any of them stops holding, the wait starts again. It never
+ * takes focus from a field, and when it closes focus goes back to where it was.
+ */
+export function FirstUseTools({ api, memory = localFirstUseMemory, quietMs = FIRST_USE_QUIET_MS }: { api: ToolsApi; memory?: FirstUseMemory; quietMs?: number }) {
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
   const [ready, setReady] = useState(false);
   const [closed, setClosed] = useState(false);
-  const onToolsScreen = normalisePath(pathname) === PATHS.tools;
 
   useEffect(() => {
-    if (closed || onToolsScreen || memory.get()) return;
+    if (closed || memory.get()) return;
     let live = true;
     const ac = new AbortController();
     api.catalogue(ac.signal).then(
@@ -102,39 +127,63 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: {
       live = false;
       ac.abort();
     };
-  }, [api, memory, closed, onToolsScreen]);
+  }, [api, memory, closed]);
 
-  // Never over another dialog: wait until it has closed.
+  // Never over another dialog, never while a field has focus, never while the researcher is busy.
   useEffect(() => {
-    if (!tools || ready) return;
-    if (!otherDialogOpen()) {
-      setReady(true);
-      return;
-    }
-    const t = setInterval(() => {
-      if (!otherDialogOpen()) {
-        clearInterval(t);
-        setReady(true);
-      }
-    }, 250);
-    return () => clearInterval(t);
-  }, [tools, ready]);
+    if (!tools || ready || closed) return;
+    let last = Date.now();
+    const busy = () => {
+      last = Date.now();
+    };
+    for (const e of ACTIVITY_EVENTS) document.addEventListener(e, busy, true);
+    const t = setInterval(
+      () => {
+        if (otherDialogOpen() || fieldHasFocus()) busy();
+        else if (Date.now() - last >= quietMs) setReady(true);
+      },
+      Math.max(50, Math.min(250, quietMs)),
+    );
+    return () => {
+      clearInterval(t);
+      for (const e of ACTIVITY_EVENTS) document.removeEventListener(e, busy, true);
+    };
+  }, [tools, ready, closed, quietMs]);
 
-  if (closed || onToolsScreen || !tools || !ready) return null;
+  if (closed || !tools) return null;
+  const note = (
+    <p className="ao-hint ao-first-use-note">
+      Some features use optional tools that are not included with the app.{" "}
+      <a
+        href={PATHS.tools}
+        onClick={(e) => {
+          e.preventDefault();
+          navigate(PATHS.tools);
+        }}
+      >
+        Set up optional tools
+      </a>
+      , now or whenever you like.
+    </p>
+  );
+  if (!ready) return note;
   return (
-    <FirstUseDialog
-      api={api}
-      tools={tools}
-      onNotNow={() => {
-        memory.set("not-now");
-        setClosed(true);
-      }}
-      onStarted={() => {
-        memory.set("chosen");
-        setClosed(true);
-        navigate(PATHS.tools);
-      }}
-    />
+    <>
+      {note}
+      <FirstUseDialog
+        api={api}
+        tools={tools}
+        onNotNow={() => {
+          memory.set("not-now");
+          setClosed(true);
+        }}
+        onStarted={() => {
+          memory.set("chosen");
+          setClosed(true);
+          navigate(PATHS.tools);
+        }}
+      />
+    </>
   );
 }
 

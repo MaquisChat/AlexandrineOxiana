@@ -187,6 +187,13 @@ button:disabled,
   grid-column: 1 / -1;
 }
 
+/* The first-use tools line (Task 48c): one quiet line across the screen, not a banner. */
+.ao-first-use-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+}
+
 .ao-library__detail {
   margin-top: var(--space-3);
   border-top: 1px solid var(--line);

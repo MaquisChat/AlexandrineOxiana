@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import { PATHS } from "../navigation";
@@ -13,15 +13,20 @@ afterEach(() => {
 
 const FFMPEG = "Video tools (ffmpeg)";
 
-function Page({ memory, svc = toolsService(), children }: { memory: ReturnType<typeof memoryStore>; svc?: ReturnType<typeof toolsService>; children?: React.ReactNode }) {
+/** The library screen, reduced: a button, a text field, and the first-use question's place. */
+function Page({ memory, svc = toolsService(), quietMs = 0, children }: { memory: ReturnType<typeof memoryStore>; svc?: ReturnType<typeof toolsService>; quietMs?: number; children?: React.ReactNode }) {
   server.use(...svc.handlers);
   return (
     <>
       <main>
         <button type="button">Something in the app</button>
+        <label>
+          Search sources
+          <input type="search" />
+        </label>
+        <FirstUseTools api={makeApi()} memory={memory} quietMs={quietMs} />
       </main>
       {children}
-      <FirstUseTools api={makeApi()} memory={memory} pathname="/" />
     </>
   );
 }
@@ -87,12 +92,69 @@ describe("the first-use tools dialogue", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("does not open over the tools screen itself", async () => {
+  it("does not open while a text field has focus; opens once the field is left and the app has been quiet, and focus then returns to where it was", async () => {
     const svc = toolsService();
-    server.use(...svc.handlers);
-    render(<FirstUseTools api={makeApi()} memory={memoryStore()} pathname={PATHS.tools} />);
-    await settle();
+    const user = userEvent.setup();
+    render(<Page memory={memoryStore()} svc={svc} quietMs={300} />);
+    const field = screen.getByRole("searchbox", { name: "Search sources" });
+    field.focus();
+    await waitFor(() => expect(svc.state.requests).toContain("GET /tools"));
+    await new Promise((r) => setTimeout(r, 900));
     expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(field); // never taken from the field
+    const opener = screen.getByRole("button", { name: "Something in the app" });
+    await user.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "Optional tools" });
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    await user.click(screen.getByRole("button", { name: "Not now" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("waits while the researcher keeps typing or clicking, and opens after a quiet moment", async () => {
+    const svc = toolsService();
+    render(<Page memory={memoryStore()} svc={svc} quietMs={400} />);
+    const button = screen.getByRole("button", { name: "Something in the app" });
+    button.focus();
+    await waitFor(() => expect(svc.state.requests).toContain("GET /tools"));
+    const started = Date.now();
+    while (Date.now() - started < 1200) {
+      fireEvent.keyDown(button, { key: "a" });
+      fireEvent.pointerDown(button);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    }
+    const quietFrom = Date.now();
+    await screen.findByRole("dialog", { name: "Optional tools" });
+    expect(Date.now() - quietFrom).toBeGreaterThanOrEqual(300);
+  });
+
+  it("shows a quiet line with a link to the Optional tools screen until the question is answered", async () => {
+    const { user } = await opened();
+    // Behind the open dialogue, the line is on the page (not a dialog, not an alert).
+    const line = screen.getByText(/optional tools that are not included with the app/i);
+    expect(line.closest('[role="dialog"], [role="alert"], [role="alertdialog"]')).toBeNull();
+    const link = within(line).getByRole("link", { name: "Set up optional tools" });
+    expect(link.getAttribute("href")).toBe(PATHS.tools);
+    await user.click(screen.getByRole("button", { name: "Not now" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByText(/optional tools that are not included with the app/i)).toBeNull();
+  });
+
+  it("the line is there before the question opens, and its link goes to the Optional tools screen at once", async () => {
+    const svc = toolsService();
+    const user = userEvent.setup();
+    render(<Page memory={memoryStore()} svc={svc} quietMs={60_000} />);
+    const link = await screen.findByRole("link", { name: "Set up optional tools" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await user.click(link);
+    expect(window.location.pathname).toBe(PATHS.tools);
+  });
+
+  it("shows no line once answered", async () => {
+    render(<Page memory={memoryStore("chosen")} />);
+    await settle();
+    expect(screen.queryByRole("link", { name: "Set up optional tools" })).toBeNull();
   });
 
   it("waits while another dialog is open, and opens once it has closed", async () => {

@@ -8,6 +8,7 @@ import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it } from "vitest";
 import { App, ROUTES } from "../App";
 import { PATHS } from "../navigation";
+import { FIRST_USE_QUIET_MS } from "../components/FirstUseTools";
 import { catalogue, toolsService } from "../test/msw-tools";
 import { BASE, libraryHandlers, server, TOKEN, url, useMockService } from "../test/service";
 import { DEFAULT_APPEARANCE } from "../theme/appearance";
@@ -54,11 +55,33 @@ describe("the optional tools in the app", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Optional tools" })).toBeTruthy();
   });
 
+  it("never asks over the library chooser: typing a folder path is not interrupted (D9)", async () => {
+    const svc = toolsService({ base: BASE });
+    // No library open: the chooser (the first matching handler answers).
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], current: null })), ...appearance(), ...libraryHandlers(), ...svc.handlers);
+    const user = userEvent.setup();
+    render(<App service={service} />);
+    await screen.findByRole("heading", { level: 1, name: "Choose a library" });
+    const field = screen.getByRole("textbox", { name: "Library folder" });
+    await user.click(field);
+    await user.type(field, "/home/ana/Fieldwork");
+    // Well past the quiet moment the library screen waits for.
+    await new Promise((r) => setTimeout(r, FIRST_USE_QUIET_MS + 1000));
+    await user.type(field, " library");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(field);
+    expect((field as HTMLInputElement).value).toBe("/home/ana/Fieldwork library");
+    expect(screen.queryByRole("link", { name: "Set up optional tools" })).toBeNull();
+    expect(svc.state.requests).not.toContain("GET /tools");
+  });
+
   it("asks on first use, over the library, and Not now is remembered across a restart of the app", async () => {
     const svc = toolsService({ base: BASE });
     server.use(...appearance(), ...libraryHandlers(), ...svc.handlers);
     const user = userEvent.setup();
     const first = render(<App service={service} />);
+    // The quiet line first; the question once the library screen has been quiet for a moment.
+    expect(await screen.findByRole("link", { name: "Set up optional tools" })).toBeTruthy();
     expect(await screen.findByRole("dialog", { name: "Optional tools" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Not now" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
