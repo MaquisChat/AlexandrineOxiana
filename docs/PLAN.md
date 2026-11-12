@@ -376,7 +376,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 **Task 68 — Settings writers never write what they did not read (D16) [ledger: R96, R159]**
 - Depends: 66 (it fixed the same shape for the pairings).
 - Files: `apps/library-service/src/routes/fonts.ts`, `routes/appearance.ts`, the app-settings helper they share with the pairings, tests.
-- Accept: a change to the fonts index or to the appearance settings is written only over what was read successfully; when the read fails the change is refused in plain words (no path) and nothing is written; a missing file on a fresh settings folder is still "nothing yet", not a failure; the same check for every other writer of a file in the app's settings folder, each named in the report.
+- Accept: a change to the fonts index or to the appearance settings is written only over what was read successfully; when the read fails the change is refused in plain words (no path) and nothing is written; a missing file on a fresh settings folder is still "nothing yet", not a failure; the same check for every other writer of a file in the app's settings folder, each named in the report. A settings file that stays unreadable (the pairings, the fonts index, the appearance settings) has a way out the researcher can find: an explicit, confirmed reset of that one file, said in plain words with what will be lost (Task 66's M8).
 - Verify: service tests (unreadable, a directory in its place, invalid JSON, truncated, missing) for each writer.
 - Model: Opus (the Task 66 implementer).
 
@@ -487,7 +487,7 @@ Update after every task; commit and push.
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; taking the working branch, then verification | ae4de75 (worktree branch) | reviewed with probes over one fix round; "Needs review" follows every pending entry (R172); D14 remains for Task 67 |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; verification before merge | 9a6ee46 (worktree branch) | reviewed with probes over one fix round; the working branch taken (seven files resolved); no expected-failure step for D1–D8 remains |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
@@ -521,7 +521,7 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | fix round 1 in re-review | 4e4f35a (worktree branch) | a failed read never wipes the pairings; the popup's port check is strict; the working branch taken |
+| 66 A paired browser survives a relaunch (D13) | approved; taking the working branch, then verification | 4e4f35a (worktree branch) | reviewed with probes over one fix round |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
 | 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
