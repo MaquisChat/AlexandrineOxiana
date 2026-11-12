@@ -34,7 +34,14 @@ import type { ServiceState, Session } from "./state.js";
 
 const TOOL_MESSAGE = "A tool this needs is not installed on this computer. The Optional tools screen shows how to get it.";
 const CANCELLED = { code: "CANCELLED", message: "The transcription was stopped before it finished. Nothing was saved." };
-const LOCKED = { code: "PROJECT_LOCKED", message: "The project was locked before the transcription started. It runs when the project is unlocked again.", reason: "PROJECT_LOCKED" };
+const LOCKED = { code: "PROJECT_LOCKED", message: "The project was locked before the transcription could finish, so nothing was saved. It runs again when the project is unlocked.", reason: "PROJECT_LOCKED" };
+const DENIED_MESSAGE = "This project's rules do not allow that.";
+/** Plain words for the fixed codes a failed transcription's journal line can hold (M11); worker codes are the media helper's. */
+const RECORDED: Record<string, string> = {
+  FAILED: "The transcription could not be finished, and nothing was saved. Try again.",
+  UNRECOVERABLE: "This transcription's record cannot be read, so it cannot run again. Start it again.",
+  INTERRUPTED: "The transcription was interrupted before it finished. Nothing was saved; start it again.",
+};
 /** Finished transcriptions kept for a reloaded interface (this run of the service only). */
 const KEEP_FINISHED = 200;
 
@@ -44,6 +51,8 @@ export const busyError = () =>
 interface Live {
   job: TranscriptionJob;
   lib: object;
+  /** Whether the job's project is unlocked now (nothing of a locked project goes into an event, M10). */
+  unlocked: () => boolean;
   ac: AbortController;
   percent: number;
 }
@@ -56,7 +65,9 @@ export function fromRecord(rec: JobRecord): TranscriptionJob {
     projectId: rec.projectId,
     sourceId: rec.about?.sourceId ?? "",
     ...(model ? { model } : {}),
-    status: rec.status,
+    // Pending in the journal and run by no one now (M2): waiting to run again, not "running".
+    status: rec.status === "running" ? "queued" : rec.status,
+    ...(rec.status === "running" || rec.status === "queued" ? { waiting: true } : {}),
     startedAt: rec.createdAt,
     updatedAt: rec.updatedAt,
   };
@@ -66,7 +77,11 @@ export function fromRecord(rec: JobRecord): TranscriptionJob {
     job.error =
       code === "TOOL_NOT_INSTALLED"
         ? { code, message: TOOL_MESSAGE, ...(model ? { reason: `speech-${model}` } : {}) }
-        : { code: "INTERNAL", message: "The media helper could not finish the job.", reason: code };
+        : code === "POLICY_DENIED"
+          ? { code, message: DENIED_MESSAGE }
+          : RECORDED[code] !== undefined
+            ? { code, message: RECORDED[code] }
+            : { code: "INTERNAL", message: "The media helper could not finish the job.", reason: code };
   }
   return job;
 }
@@ -146,7 +161,9 @@ export class Transcriptions {
     if (rec.kind !== "audio.transcribe" || !rec.about?.sourceId) return undefined;
     const sourceId = rec.about.sourceId;
     let entry: Live | undefined;
-    const extras = await transcriptionRerun(s.repo, rec, (st) => entry && this.stored(entry, st)).catch(() => undefined);
+    // Undefined only when the source or its recording is gone; any other error is thrown and the
+    // record stays pending for the next resubmission (M12).
+    const extras = await transcriptionRerun(s.repo, rec, (st) => entry && this.stored(entry, st));
     if (!extras) {
       const ac = new AbortController();
       ac.abort();
@@ -199,6 +216,7 @@ export class Transcriptions {
     const entry: Live = {
       job: { jobId: id, projectId, sourceId, ...(model ? { model } : {}), status: "queued", startedAt, updatedAt: new Date().toISOString() },
       lib: s.lib,
+      unlocked: () => s.repo.isUnlocked(projectId),
       ac: new AbortController(),
       percent: -1,
     };
@@ -239,7 +257,7 @@ export class Transcriptions {
       this.live.delete(l.job.jobId);
       const key = this.key(l.job.projectId, l.job.sourceId);
       if (this.bySource.get(key) === l.job.jobId) this.bySource.delete(key);
-      this.state.events.publish("job.progress", event({ ...l.job, status: "queued" }, true));
+      this.send(l, { ...l.job, status: "queued", waiting: true }, true);
       return;
     }
     if (err instanceof WorkerJobError && err.code === "CANCELLED") {
@@ -264,8 +282,18 @@ export class Transcriptions {
   }
 
   private publish(l: Live): void {
-    const finished = !this.active(l);
-    this.state.events.publish("job.progress", event({ ...l.job }, finished));
+    this.send(l, { ...l.job }, !this.active(l));
+  }
+
+  /** A job's event; for a locked project only that the job left the jobs indicator (M10). */
+  private send(l: Live, job: TranscriptionJob, finished: boolean): void {
+    let unlocked = false;
+    try {
+      unlocked = l.unlocked();
+    } catch {
+      // the project is gone
+    }
+    this.state.events.publish("job.progress", unlocked ? event(job, finished) : { kind: "transcription", jobId: job.jobId, done: 0, total: 100, finished: true });
   }
 
   private prune(): void {

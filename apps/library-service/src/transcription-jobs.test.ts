@@ -268,7 +268,7 @@ describe("transcription as a job (Task 62)", () => {
     // A service without a media helper reads the state from the journal.
     await start();
     expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);
-    expect(await stateOf(pid, sid)).toMatchObject({ jobId, status: "running", model: "tiny" });
+    expect(await stateOf(pid, sid)).toMatchObject({ jobId, status: "queued", waiting: true, model: "tiny" }); // M2: waiting to run again
     expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(409); // it will run again
     await svc!.close();
     // With the media helper, it runs again once and is stored once.
@@ -337,6 +337,185 @@ describe("transcription as a job (Task 62)", () => {
       ["unchanged", ["outside-speech"]],
       ["added", null],
     ]);
+  });
+});
+
+describe("fix round 1", () => {
+  const FORBID = `${GOV}  transcription: []\n`;
+  const denies = async (pid: string) =>
+    (await svc!.state.session!.repo.readAudit(pid, { limit: 1000 })).events.filter((e) => e.decision?.result === "deny" && (e.details as { op?: string } | undefined)?.op === "worker.audio.transcribe").length;
+  async function setRules(pid: string, yaml: string) {
+    const repo = svc!.state.session!.repo;
+    const g = await repo.getGovernance(pid);
+    await repo.setGovernance(pid, yaml, { baseSha256: g.sha256, reason: "test" });
+  }
+
+  it("I1: a transcription the rules forbid is refused at the start: 403 with the reason, audited, no job", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: false });
+    const { pid, folder } = await library();
+    const sid = await audioSource(pid);
+    await setRules(pid, FORBID);
+    const r = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    expect(r.status, r.body).toBe(403);
+    expect(r.json.error.code).toBe("POLICY_DENIED");
+    expect(r.json.error.message).toMatch(/rules do not allow/);
+    expect(await denies(pid)).toBe(1);
+    expect((await journal(folder)).length).toBe(0);
+    expect(await stateOf(pid, sid)).toBeNull();
+    expect(worker.runs).toHaveLength(0);
+  });
+
+  it("I3: a rerun the rules refuse ends for good: refused once over three launches, read back with its reason, the source free again", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, closeGraceMs: 100 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    await until(async () => (await stateOf(pid, sid))?.status === "running");
+    await svc!.close(); // interrupted: pending
+    await start({ worker: provider(worker), autoStartWorker: false });
+    await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
+    await setRules(pid, FORBID);
+    await svc!.close();
+    for (let i = 0; i < 3; i++) {
+      await start({ worker: provider(worker), autoStartWorker: true });
+      await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
+      await until(() => !!svc!.state.session?.workerClient);
+      await svc!.state.idle();
+      const job = await stateOf(pid, sid);
+      expect(job, `launch ${i}`).toMatchObject({ status: "failed", error: { code: "POLICY_DENIED" } });
+      expect(job!.error!.message).toMatch(/rules do not allow/);
+      if (i < 2) await svc!.close();
+    }
+    expect(await denies(pid)).toBe(1);
+    expect(worker.runs).toHaveLength(1); // only the interrupted first run
+    // The source is free: a new start is refused at the start, for the same reason, not as "already running".
+    const again = await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    expect(again.status).toBe(403);
+    expect(await denies(pid)).toBe(2);
+    await setRules(pid, GOV);
+    worker.release();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+  });
+
+  async function encryptedRun() {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true });
+    const { pid } = await library(true);
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await svc!.state.idle();
+    const versions = async () => ((await call({ url: `/projects/${pid}/sources/${sid}/transcripts` })).json as TranscriptListResponse).versions.length;
+    const unlock = async () => expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    return { pid, sid, versions, unlock };
+  }
+
+  it("I2: a lock while the worker runs: cancelled as locked, nothing stored; at the unlock it runs once and one version is stored", async () => {
+    const { pid, sid, versions, unlock } = await encryptedRun();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    svc!.state.session!.repo.lockProject(pid);
+    worker!.release();
+    await until(() => svc!.state.workKinds().length === 0);
+    expect(worker!.runs).toHaveLength(1);
+    await unlock();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker!.runs).toHaveLength(2);
+    expect(await versions()).toBe(2); // one run: its WebVTT and its segments file
+  });
+
+  it("I2: a lock at the moment of the store step: cancelled as locked; at the unlock it runs once and is stored once", async () => {
+    const { pid, sid, versions, unlock } = await encryptedRun();
+    worker!.instant = true;
+    const repo = svc!.state.session!.repo;
+    const original = repo.addDerivedAsset.bind(repo);
+    let first = true;
+    repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
+      if (first) {
+        first = false;
+        repo.lockProject(pid);
+      }
+      return original(...args);
+    }) as typeof original;
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => svc!.state.workKinds().length === 0);
+    expect(worker!.runs).toHaveLength(1);
+    await unlock();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker!.runs).toHaveLength(2);
+    expect(await versions()).toBe(2);
+  });
+
+  it("I2: lock, unlock, lock, unlock in quick succession, and a restart: the run happens once and is stored once", async () => {
+    const { pid, sid, versions, unlock } = await encryptedRun();
+    expect((await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} })).status).toBe(202);
+    await until(() => worker!.runs.length === 1 && worker!.runs[0]!.polls > 0);
+    const repo = svc!.state.session!.repo;
+    repo.lockProject(pid);
+    worker!.release();
+    await until(() => svc!.state.workKinds().length === 0);
+    await unlock();
+    repo.lockProject(pid);
+    await unlock();
+    await svc!.state.idle();
+    await svc!.close();
+    await start({ worker: provider(worker!), autoStartWorker: true });
+    await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
+    await unlock();
+    await until(async () => (await stateOf(pid, sid))?.status === "done");
+    await svc!.state.idle();
+    expect(worker!.runs.filter((r) => !r.cancelled).length).toBeGreaterThanOrEqual(2);
+    expect(await versions()).toBe(2); // stored exactly once
+  });
+
+  it("M7: a close during a live transcription does not wait out the grace period", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker!), autoStartWorker: false });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    await until(() => worker!.runs.length === 1);
+    const t0 = Date.now();
+    await svc!.state.closeLibrary();
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(worker.runs[0]!.cancelled).toBe(true);
+  });
+
+  it("M2: a run pending in the journal and not running now reads as waiting to run again", async () => {
+    worker = await stubWorker();
+    await start({ worker: provider(worker), autoStartWorker: true, closeGraceMs: 100 });
+    const { pid } = await library();
+    const sid = await audioSource(pid);
+    await until(() => !!svc!.state.session?.workerClient);
+    await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    await until(async () => (await stateOf(pid, sid))?.status === "running");
+    await svc!.close();
+    await start();
+    await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } });
+    expect(await stateOf(pid, sid)).toMatchObject({ status: "queued", waiting: true });
+  });
+
+  it("M10: while the project is locked, events carry nothing of its job", async () => {
+    const { pid, sid } = await encryptedRun();
+    const seen: Array<Record<string, unknown>> = [];
+    svc!.state.events.subscribe((e) => {
+      if (e.type === "job.progress" && (e.data as { kind?: string }).kind === "transcription") seen.push(e.data as Record<string, unknown>);
+    });
+    await call({ method: "POST", url: `/projects/${pid}/sources/${sid}/transcribe`, body: {} });
+    await until(() => worker!.runs.length === 1 && seen.length > 0);
+    svc!.state.session!.repo.lockProject(pid);
+    const from = seen.length;
+    worker!.release();
+    await until(() => svc!.state.workKinds().length === 0);
+    for (const e of seen.slice(from)) {
+      expect(e.job).toBeUndefined();
+      expect(JSON.stringify(e)).not.toContain(sid);
+    }
   });
 });
 

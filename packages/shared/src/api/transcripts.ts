@@ -89,6 +89,11 @@ export interface TranscriptionJob {
   status: TranscriptionJobStatus;
   /** 0..1 while running, when the worker has reported it. */
   progress?: number;
+  /**
+   * Pending in the journal and run by no one now (after a restart, a close or the media helper
+   * stopping): it runs again when the media helper is ready or the library is next opened.
+   */
+  waiting?: boolean;
   /** A cancel was asked for and the media helper has not yet confirmed that it stopped. */
   cancelRequested?: boolean;
   /**

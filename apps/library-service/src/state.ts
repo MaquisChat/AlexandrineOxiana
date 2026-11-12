@@ -632,6 +632,8 @@ export class ServiceState {
     // too; what is still running when the grace period ends is abandoned below.
     const stoppable = [...this.work.values()].filter((w) => STOPPED_AT_CLOSE.has(w.kind));
     for (const w of stoppable) w.ctl.stopping = true;
+    // A live transcription is resumable: abandoned at once rather than after the grace period (M7).
+    for (const w of stoppable) if (w.kind === "transcription") w.ctl.interrupt?.();
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).
     const { stuck } = await this.suspendBatches(s).catch(() => ({ paused: [], stuck: [...s.batches.entries()].map(([batchId, b]) => ({ batchId, ...b })) }));
