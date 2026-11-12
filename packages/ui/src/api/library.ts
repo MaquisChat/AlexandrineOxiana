@@ -7,6 +7,7 @@
  * Citations are always rendered by the service (participant codes and withheld sources are applied
  * there, R88/R90); the UI only shows and copies the string it returns.
  */
+import type { ProjectReviewPage } from "@ao/shared";
 import { ApiClientError, type ApiClient, type ServiceError, type ServiceEvent } from "./client";
 import { verificationApi } from "./verification";
 
@@ -366,7 +367,8 @@ export function libraryApi(client: ApiClient) {
     /** The project's whole review queue (Task 67): how many entries wait (only the total is asked for). */
     reviewQueue: {
       count: async (pid: string, opts: { signal?: AbortSignal } = {}) =>
-        (await r<{ total: number }>("GET", `${proj(pid)}/review`, { query: { limit: 0 }, ...(opts.signal ? { signal: opts.signal } : {}) })).total,
+        (await r<Pick<ProjectReviewPage, "total">>("GET", `${proj(pid)}/review`, { query: { limit: 0 }, ...(opts.signal ? { signal: opts.signal } : {}) })).total,
+
     },
     /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
     verification: verificationApi(client),
