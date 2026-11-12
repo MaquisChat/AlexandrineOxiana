@@ -531,7 +531,7 @@ Update after every task; commit and push.
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
 | 68 Settings writers never write what they did not read (D16) | fix round 2 | 034e1f6 (worktree branch) | re-review closed I1 and I2; one Important (the libraries list set aside in silence) and seven Minor remain (R181) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
-| 37k Revise the guide and checklist | in progress | | dispatched 2026-11-12 ahead of Task 34f at the owner's wish for speed; an accuracy review follows |
+| 37k Revise the guide and checklist | written; in accuracy review | e55d0ac (worktree branch) | every "Known problem" line removed as fixed; scenarios 9–11 in full |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
