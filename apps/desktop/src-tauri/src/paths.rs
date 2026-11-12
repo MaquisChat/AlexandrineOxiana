@@ -106,6 +106,32 @@ mod tests {
         fs::remove_dir_all(&r).unwrap();
     }
 
+    /// The Mac bundle (tauri.macos.conf.json, `bundle.macOS.files`) copies the three staged helper
+    /// folders into Contents/Resources, which is the resource folder on macOS (tauri-utils
+    /// `resource_dir`: `${exe_dir}/../Resources`). Laid out as that configuration copies them, they
+    /// are found.
+    #[test]
+    fn the_mac_bundle_puts_the_helpers_where_they_are_looked_for() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.macos.conf.json")).unwrap();
+        let files = conf["bundle"]["macOS"]["files"].as_object().expect("bundle.macOS.files");
+        let mut dests: Vec<&str> = files.keys().map(|k| k.strip_prefix("Resources/").expect("each goes into Contents/Resources")).collect();
+        dests.sort();
+        assert_eq!(dests, ["ao-worker", "library-service", "node"]);
+        for (dest, src) in files {
+            let staged = src.as_str().unwrap();
+            assert_eq!(staged, format!("../.build/macos-resources/{}", dest.strip_prefix("Resources/").unwrap()), "{dest}");
+        }
+        // The staged folders' contents (build-macos.mjs stageResources): node/node, library-service/, ao-worker/ao-worker.
+        let r = tmp("macos");
+        touch(&r.join("node").join("node"));
+        touch(&r.join("library-service").join("service.mjs"));
+        touch(&r.join("ao-worker").join("ao-worker"));
+        let p = resolve(Some(&r), &Overrides::default()).unwrap();
+        assert_eq!(p.node, r.join("node").join(NODE_EXE));
+        assert_eq!(p.worker_bin, Some(r.join("ao-worker").join(WORKER_EXE)));
+        fs::remove_dir_all(&r).unwrap();
+    }
+
     #[test]
     fn overrides_win_over_the_resources() {
         let r = tmp("override");
