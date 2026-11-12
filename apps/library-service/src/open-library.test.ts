@@ -10,7 +10,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { KeyRing, deviceDeps, openLibrary, openRepo, rememberLastOpenLibrary, type Deps } from "@ao/library";
+import { IndexHandle, KeyRing, createIndexSink, deviceDeps, getMeta, openLibrary, openRepo, rememberLastOpenLibrary, setMeta, type Deps } from "@ao/library";
+// Package-internal: the governed change an import makes (here, to give a source an annotation).
+import { importChange } from "../../../packages/library/src/repo/repo.js";
 import { buildPdf } from "../../../tests/fixtures/generate.mjs";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
@@ -150,6 +152,47 @@ describe("D8: opening a library rebuilds a missing or stale index", () => {
     await svc!.state.idle();
     expect((await call({ url: `/projects/${pid}/sources?text=tide` })).json.total).toBe(1);
     expect((await call({ url: `/projects/${pid}/sources` })).json.total).toBe(3);
+  });
+
+  it("R161: an index marked as needing a rebuild (an upgraded library) is rebuilt at open; the mark clears and annotation text is found", async () => {
+    const { path, pid } = await libraryWithSources();
+    const sid = (await call({ url: `/projects/${pid}/sources?text=ledger` })).json.items[0].id as string;
+    expect((await call({ method: "POST", url: "/libraries/close" })).status).toBe(200);
+    // The source gets an annotation, written with the index kept current...
+    const lib = await openLibrary(path, deps);
+    const ring = new KeyRing();
+    const h = new IndexHandle(lib.root);
+    const repo = await openRepo(lib, ring, { actor: "elsewhere", tz: "UTC", index: createIndexSink(h, { root: lib.root, keyRing: ring }) });
+    await importChange(repo, pid, { action: "store", store: { identifiable: false, hasLocation: false } }, async (ops) => {
+      const cur = await ops.readSource(sid);
+      await ops.writeSource(cur, { ...cur, annotations: [{ id: sid, sourceId: sid, kind: "note", anchors: [], body: "pangolinannotation", author: "t", createdAt: new Date().toISOString() }] });
+    }, { op: "test.annotations" });
+    // ...then the index is made as an older one upgraded by migration 0002 leaves it: no annotation
+    // rows, and the "rebuild needed" mark. Its change-log stamps are current: only the mark says stale.
+    h.db.exec("DELETE FROM annotation_text; DELETE FROM annotation_chunks;");
+    setMeta(h.db, "needsRebuild", "annotations");
+    h.close();
+    ring.clear();
+    await lib.close();
+
+    const opened = await call({ method: "POST", url: "/libraries/open", body: { path } });
+    expect(opened.status, opened.body).toBe(200);
+    // Until the rebuild has completed, a search answer says the index is rebuilding or incomplete.
+    const during = await call({ url: `/projects/${pid}/sources?text=pangolinannotation` });
+    if (during.json.total === 0) expect(during.json.index?.state === "rebuilding" || during.json.incomplete === true).toBe(true);
+    await svc!.state.idle();
+    const after = await call({ url: `/projects/${pid}/sources?text=pangolinannotation` });
+    expect(after.json.items).toEqual([expect.objectContaining({ id: sid, matchedIn: "annotation" })]);
+    expect(after.json.incomplete).toBeUndefined();
+    expect(after.json.index).toBeUndefined();
+    await svc!.close();
+    svc = undefined;
+    const check = new IndexHandle(path);
+    try {
+      expect(getMeta(check.db, "needsRebuild")).toBeUndefined();
+    } finally {
+      check.close();
+    }
   });
 
   it("a current index is not rebuilt at open", async () => {
