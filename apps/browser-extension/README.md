@@ -18,28 +18,56 @@ You do not need to build anything. Every Mac build of the desktop app also makes
    `alexandrine-oxiana-browser-extension`. It is kept for 30 days, like the Mac download.
 2. **Unzip it.** The download is a `.zip` that holds another `.zip`,
    `alexandrine-oxiana-browser-extension-<version>.zip`, and a `.sha256` file with its checksum
-   (Safari may already have opened the outer one into a folder). Double-click the inner `.zip`. You get
-   a folder with `manifest.json` and a few other files directly inside it.
-3. **Move that folder to where it can stay**, for example your Documents folder. Do not delete it later
-   and do not leave it in Downloads if you clear that folder.
+   (Safari may already have opened the outer one into a folder). Open the inner `.zip`: on a Mac,
+   double-click it; on Windows, right-click it and choose **Extract All**. You get a folder with
+   `manifest.json` and a few other files directly inside it.
+3. **Give the extension one folder that stays.** Make a folder in a place that is not cleaned up, for
+   example **Documents › Alexandrine Oxiana extension** (not Downloads), and move the unzipped files
+   into it, so that `manifest.json` is directly inside. Use this same folder for every later version
+   (see "Updating" below): the browser knows the extension by the folder it was loaded from.
 
 Then load it in your browser:
 
 - **Chrome or Edge:** type `chrome://extensions` in the address bar (in Edge, `edge://extensions` also
-  works) and press Return. Turn on **Developer mode** (a switch at the top right in Chrome, on the left in
-  Edge). Click **Load unpacked** and pick the unzipped folder (the one with `manifest.json` inside).
-  Keep that folder: the browser loads the extension from it each time it starts, and the extension stops
-  working if the folder is moved or deleted. To update, unzip a newer download and choose **Load
-  unpacked** again, or replace the folder's contents and click the extension's reload button.
-- **Firefox (version 128 or later):** type `about:debugging` in the address bar and press Return. Click
-  **This Firefox**, then **Load Temporary Add-on…**, and pick the `manifest.json` file inside the
-  unzipped folder. Firefox removes the extension when it closes, so you load it again each time you
-  start Firefox.
+  works) and press Return or Enter. Turn on **Developer mode** (a switch at the top right in Chrome, on
+  the left in Edge). Click **Load unpacked** and pick the extension's folder (the one with
+  `manifest.json` inside). Keep that folder: the browser loads the extension from it each time it
+  starts, and the extension stops working if the folder is moved or deleted.
+- **Firefox (version 128 or later):** type `about:debugging` in the address bar and press Return or
+  Enter. Click **This Firefox**, then **Load Temporary Add-on…**, and pick the `manifest.json` file
+  inside the extension's folder. Firefox removes a temporary add-on when it closes, so you load it again
+  each time you start Firefox. If the popup then shows "Pair with the desktop app" again, pair it again
+  (see "Pairing" below).
 - **Safari** is not supported.
 
-Next, pair it with the desktop app (see "Pairing" below). To check the download, compare the
-checksum: in Terminal, `cd` to the folder that holds both files and run
-`shasum -a 256 -c alexandrine-oxiana-browser-extension-*.zip.sha256`; it should say `OK`.
+Next, pair it with the desktop app (see "Pairing" below).
+
+**Checking the download (optional).** The run's Summary page lists the extension's SHA-256 under
+"Browser extension". On a Mac, in Terminal, run `shasum -a 256` followed by a space and the inner
+`.zip` (you can drag the file into the Terminal window), press Return, and compare the long number it
+prints with the one on the Summary page. They must be the same.
+
+### Updating to a newer download
+
+Keep the same folder, so that the browser sees the same extension and its pairing is kept.
+
+- **Chrome or Edge:** unzip the newer download as in step 2. Delete everything inside the extension's
+  folder and move the newly unzipped files into it (again with `manifest.json` directly inside). Then,
+  on `chrome://extensions` (or `edge://extensions`), find the **Alexandrine Oxiana capture** card and press its reload
+  arrow (↻). You do not need to quit the browser or pair again.
+- **Firefox:** unzip the newer download into the same folder in the same way, then load it again from
+  `about:debugging` as above. Firefox treats it as the same add-on (the extension carries a fixed
+  Firefox ID), but as after any restart, pair it again if the popup asks you to.
+
+**If you loaded a second copy by mistake** (for example by choosing **Load unpacked** on a new
+folder): Chrome and Edge treat a different folder as a different extension, so you now have two
+**Alexandrine Oxiana capture** cards, and the new one is not paired while the old one still runs the old version.
+The simplest way back to one copy: on `chrome://extensions`, click **Remove** on both **Alexandrine Oxiana capture**
+cards, make sure the extension's one folder holds the newer files, choose **Load unpacked** on that
+folder, and pair it (see "Pairing" below). The old copy's pairing stays listed in the desktop app
+under **Browser extension**, **Paired browsers**; press **Revoke** next to the entries you no longer
+use (the list shows each browser's extension address, not a name, so if unsure, revoke them all and
+pair again).
 
 ## Build, load and test
 
