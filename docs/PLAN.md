@@ -472,8 +472,8 @@ Update after every task; commit and push.
 | 37f Mac builds in CI | not started | | |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
-| 37j Licence texts ship with the app | in review | 2de3963 (worktree branch) | built; two facts for the owner about bundled components' licences are being checked by the reviewer |
-| 48c First-use question never interrupts (D9) | fix round 1 | 3033147 (worktree branch) | design simplified (R164): a banner on the library screen asks; the dialogue opens only when the researcher chooses |
+| 37j Licence texts ship with the app | fix round 1 | 2de3963 (worktree branch) | 1 Critical: a text-merging step altered licence texts; texts now ship verbatim (R165) |
+| 48c First-use question never interrupts (D9) | re-review of fix round 1 | a803970 (worktree branch) | rebuilt as a banner (R164); pre-merge verification with a rebuilt desktop app running |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
