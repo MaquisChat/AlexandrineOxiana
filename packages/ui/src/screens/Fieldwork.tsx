@@ -12,6 +12,7 @@ import { ApiClientError } from "../api/client";
 import { FileDrop } from "../components/FileDrop";
 import { ChoiceDialog, ReasonOptionalDialog } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
+import { inAppLink, PATHS } from "../navigation";
 import "./GovernanceScreens.css";
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -97,6 +98,8 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
   const [consent, setConsent] = useState({ participantId: "", scope: "", date: "", expires: "" });
   const ids = useId();
 
+  /** The last change put sources in the review queue: the result links to it (Task 67). */
+  const [flagged, setFlagged] = useState(false);
   const load = useCallback(async () => {
     try {
       const [p, s, c] = await Promise.all([api.participants(projectId), api.sessions(projectId), api.consents(projectId)]);
@@ -116,6 +119,7 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
   const run = async (fn: () => Promise<string | void>) => {
     setError(null);
     setResult(null);
+    setFlagged(false);
     setBusy(true);
     try {
       const msg = await fn();
@@ -157,6 +161,13 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
       {result ? (
         <p role="status" aria-label="Fieldwork result" className="ao-ok">
           {result}
+        </p>
+      ) : null}
+      {result && flagged ? (
+        <p>
+          <a href={`${PATHS.reviewQueue}?project=${encodeURIComponent(projectId)}`} onClick={inAppLink}>
+            Open the review queue
+          </a>
         </p>
       ) : null}
 
@@ -416,6 +427,7 @@ export function Fieldwork({ api, projectId }: { api: GovernanceApi; projectId: s
             void run(async () => {
               const r = await api.withdrawConsent(projectId, c.id, reason || undefined);
               const n = r.flaggedSourceIds.length;
+              setFlagged(n > 0);
               return `Consent withdrawn. ${n === 1 ? "1 source was" : `${n} sources were`} flagged for review; nothing was deleted.`;
             });
           }}
