@@ -219,6 +219,15 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     if (!originOk) return fail(reply, new ApiError(403, "FORBIDDEN", origin === undefined ? "Requests from the browser extension must carry its origin." : "This token belongs to another extension."));
     req.caller = "extension";
     req.extensionId = ext.id;
+    // R171: the pairing keeps the port its browser reaches the service on (the app's pairing screen
+    // compares it with the port now). Not awaited: the request never waits for it, and its answer
+    // (a capture refused for a locked project included) is exactly what it would be without it. A
+    // failed write is logged, never a reason to refuse.
+    if (port !== undefined && ext.port !== port) {
+      pairing.noteReachedOnCurrentPort(ext.id).catch(() => {
+        app.log.warn("A paired browser's new port could not be saved; the browser works, but the app may keep saying its port changed.");
+      });
+    }
   });
 
   // During a library move nothing may change anything (R102 N2): every non-read request waits it out.
@@ -275,6 +284,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
       await app.listen({ host: "127.0.0.1", port: p });
       const addr = app.server.address();
       port = typeof addr === "object" && addr ? addr.port : p;
+      pairing.setPort(port);
       return port;
     },
     close() {
@@ -290,6 +300,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
           setTimeout(r, 60_000).unref?.();
         });
         await state.shutdown();
+        // A browser's port being recorded (R171) finishes its atomic write before the service exits.
+        await pairing.idle();
         await app.close();
       })();
       return closing;

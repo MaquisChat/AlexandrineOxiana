@@ -104,6 +104,24 @@ To load the build:
 The extension never scans for the port. Every request goes to `http://127.0.0.1:<port>` with the token in
 the `Authorization` header only, never in a URL. No cookies are sent, and redirects are refused.
 
+### After the desktop app is reopened
+
+The desktop app keeps its port when it is reopened, so a paired browser normally goes on working with
+nothing to do. The port changes only when the app cannot use it again, most often because another
+program has taken it in the meantime. The app's **Browser extension** page then says so ("This app's
+port changed"), shows the new port and marks the browsers that still use the old one ("Old port"); the
+mark goes away by itself once that browser has reached the app on the new port.
+
+In such a browser, the popup says the desktop app is not answering and names the two possible causes:
+the app is closed (open it and open the popup again), or the app's port changed. For the second, choose
+**Use a different port**, type the port the app's **Browser extension** page shows and choose **Check
+and save**. The popup sends one request with the existing token to that port (`GET /projects`); if the
+app accepts it, the new port is saved and the browser is connected again. If not, the old port is kept
+and the popup says why. There is no need to pair again: the pairing and its token stay valid. One limit:
+the popup cannot be certain that the program answering on the port you typed is the app (any local
+program that answers the way the app does would pass), which is why you type the one port the app's own
+page shows; the extension never looks for a port by itself.
+
 ## Privacy and permissions (R110)
 
 - **Permissions:** only `activeTab`, `scripting` and `storage`. Host access covers only

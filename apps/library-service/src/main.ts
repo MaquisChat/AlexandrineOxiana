@@ -24,7 +24,9 @@
  * error, or the ready line.
  *
  * Environment:
- *   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any free port)
+ *   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any port, which is the port used last time when
+ *                     it is free, else any free port, remembered in the settings folder; R171,
+ *                     port-memory.ts). Any other value is used exactly and not remembered.
  *   AO_LIBRARY        a library folder to open at start (optional; without it the library open
  *                     when the service last ran is reopened, or named as not found)
  *   AO_CONFIG_DIR     the app settings folder (default: the platform's usual place)
@@ -37,6 +39,7 @@
  * rest) it exits 1. The end of standard input starts the same shutdown.
  */
 import { openLibrary } from "@ao/library";
+import { listenOnRememberedPort } from "./port-memory.js";
 import { createService } from "./server.js";
 import { onEndOfInput, readStartupToken, startupErrorMessage } from "./startup-token.js";
 
@@ -79,7 +82,13 @@ async function main(): Promise<void> {
     // Not awaited: GET /libraries waits for it (D5).
     void svc.state.reopenLast();
   }
-  const listening = await svc.listen(port);
+  // Any port (0, the shell's request): the port used last time when it is free (R171, port-memory.ts).
+  const listening = await listenOnRememberedPort({
+    requested: port,
+    configDir: svc.state.deps.appConfigDir,
+    listen: (p) => svc.listen(p),
+    warn: (m) => svc.app.log.warn(m),
+  });
   process.stdout.write(`AO_SERVICE_READY port=${listening}\n`);
 }
 

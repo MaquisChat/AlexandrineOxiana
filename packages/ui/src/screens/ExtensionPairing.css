@@ -67,3 +67,20 @@
   font-weight: 600;
   margin: 0;
 }
+
+/* The app's port changed since a browser was paired (R171): the new port, easy to read and copy. */
+.ao-pairing-moved p + p {
+  margin-top: var(--space-2);
+}
+
+.ao-pairing-port-value {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--ink);
+  user-select: all;
+}
+
+.ao-pairing-old-port {
+  font-weight: 600;
+}
