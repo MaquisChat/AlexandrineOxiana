@@ -44,10 +44,25 @@
  * The certificate, the amendments and `Backups/backups-state.json` are conveniences, not
  * authorities. `resumeDestruction` (at open, at unlock and hourly) deletes nothing for a
  * destruction whose files disagree with the audit log, keeps the warning and says why; it only
- * records listed backups that are found gone. The audit log is the authority while its chain holds:
- * nothing is removed on the word of a log that does not verify, and a noted backup that is still in
- * Backups/ is not dropped from the note on its word either. Destruction holds the project's maintenance lock
- * (R138 a). Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed`
+ * records listed backups that are found gone. The audit log is the authority while its chain holds
+ * (R174): while it does not verify, a pass removes nothing, writes nothing (no amendment, no audit
+ * event, no manifest entry cleared), drops nothing from the note behind the warning, and keeps the
+ * plain reason with that warning; once it holds again the next due pass proceeds. Its limit: an
+ * entry that is correctly chained and appended while the app is closed is believed at the next
+ * open, and whoever can write that can also remove the file.
+ *
+ * A restored project (R175). A restore copies the certificates and amendments byte for byte, so the
+ * copy's audit log (inherited, never rewritten) vouches for them, and they go on naming the project
+ * the data was destroyed in. The copy inherits the list and settles it as the original would. Its
+ * log cannot see what the original did afterwards, so of an inherited list it removes a file only
+ * when it is, byte for byte, the backup the inherited log recorded under that name (the sha256 of
+ * its `backup.create` event), holding the maintenance lock of the project the backup belongs to; a
+ * file of another content under a listed name is a later backup and is never touched. The original
+ * and the copy each record the step in their own log: the one that removed the file as removed, the
+ * other as no longer present. Within one project, a backup removed for another of its destructions
+ * is recorded as removed, under that destruction (`removedUnder`).
+ *
+ * Destruction holds the project's maintenance lock (R138 a). Audited: the change's `delete` event (op `retention.destroy`), `retention.destroyed`
  * (counts and the certificate's sha256), each amendment's `delete` event (op `retention.backups`)
  * and a `retention.backups` report of the same facts.
  */
