@@ -503,7 +503,7 @@ Update after every task; commit and push.
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | done | 960aacc | reviewed with probes over two fix rounds and a final check; a locked project's captures are neither probed nor kept; `recordEdit` fixed |
-| 62 Transcription as a job | approved; verification waits for a green GitHub run | 2be8912 (worktree branch) | reviewed with probes over one fix round and a final check; a version's files come from one run |
+| 62 Transcription as a job | approved and verified; merge waits for GitHub's result on Task 64 | 2be8912 (worktree branch) | reviewed with probes over one fix round and a final check; verification clean throughout |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
@@ -530,7 +530,7 @@ Update after every task; commit and push.
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
 | 68 Settings writers never write what they did not read (D16) | fix round 1 | d2fd1cc (worktree branch) | reviewed with probes: 2 Important (a missed writer, the watched folders; the command-line tool renews the device id unseen); three points ruled |
-| 67 One review queue for the project (D14) | approved; taking the working branch, then verification | 0e5595a (worktree branch) | reviewed with probes over two fix rounds (R176, R177) |
+| 67 One review queue for the project (D14) | approved; verification before merge | abd9353 (worktree branch) | reviewed with probes over two fix rounds (R176, R177); the working branch taken |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
