@@ -528,8 +528,8 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved; three small points, then verification | ce30b54 (worktree branch) | reviewed with probes: approved, 10 Minor; a locked project's Governance screen must offer no change at all; one request per Save |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | approved; verification before merge | 94816e0 (worktree branch) | reviewed with probes over one fix round; the working branch taken three times as it moved |
-| 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
+| 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
+| 68 Settings writers never write what they did not read (D16) | in progress | | given to Task 66's implementer 2026-11-12 |
 | 67 One review queue for the project (D14) | in progress | d65ffcb (worktree branch) | the view and import decisions are built; the library had no way to resolve a verification entry: ruled (R176) and being built before review |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
