@@ -79,8 +79,9 @@ created or modified. Its results are in `pnpm report` under
   drivers, the app and its helpers, xdotool) gets HOME and the XDG folders there, and each is
   started in its own process group. The `run` fixture (`e2e/fixtures.ts`) stops all of them,
   unmounts the document portal and removes the folder however the test ends, a time-out included,
-  and saves the app's output (`e2e/test-results/*/shell-output.txt`) when it did not pass; a last
-  sweep at process exit covers a run that was never torn down. The app runs without its test mode: no
+  and saves the app's output and the clean-up's own notes (`e2e/test-results/*/shell-output.txt`)
+  when the test did not pass or the clean-up left something; a last sweep at process exit covers a
+  run that was never torn down. The app runs without its test mode: no
   NODE_ENV, no probe. It starts its own service with its own token, which the test never sees; what
   the service wrote is read from disk.
 - The native file dialog is the real one. WebDriver cannot reach it, so the test finds it on the
@@ -93,6 +94,24 @@ created or modified. Its results are in `pnpm report` under
   into the chooser, because the GTK folder chooser completes a typed path with a trailing "/" and
   Return then opens the folder instead of choosing it; a file dropped from another program (an OS drag
   and drop cannot be made under Xvfb); and the macOS app (there is no WebDriver for the Mac web view).
+- **If a run was killed.** A test runner killed outright (SIGKILL, or a crashed terminal session)
+  runs no clean-up at all, so its run stays behind: Xvfb, the bus and its portals, the drivers, the
+  app with its service and worker, a FUSE mount of the document portal, and the run's folder in the
+  temporary folder. Nothing in the test process can prevent that. The next run finds such leftovers
+  (a run folder whose owning test process is gone) and stops with a list of them, before starting
+  anything. When no desktop test is running, remove them with:
+
+  ```sh
+  # 1. stop every process of an earlier run (each carries its run folder in its environment)
+  for p in $(grep -l "ao-desktop-e2e-" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3); do kill -KILL "$p"; done
+  # 2. unmount the document portals' file systems, then remove the run folders
+  for m in $(awk '$2 ~ /ao-desktop-e2e-/ {print $2}' /proc/self/mounts); do fusermount3 -u -z "$m"; done; rm -rf "${TMPDIR:-/tmp}"/ao-desktop-e2e-*
+  ```
+- The real home folder is checked before and after the run, but only where this run's programs
+  would write (GTK's and dconf's settings, the portals' stores, WebKitGTK's and the app's folders;
+  `HOME_WATCHED` in `e2e/desktop.ts`), so other programs of a person's session can run alongside.
+  That the run's processes use no other place in the real home is checked per process: each has HOME
+  and every XDG folder inside the run's folder.
 - The WebDriver client is `e2e/webdriver.ts`, a few W3C commands over `fetch`; the published clients
   bring in packages under licences other than MIT, Apache-2.0 and BSD. Playwright (`@playwright/test`
   1.63.0, Apache-2.0) is only the test runner; no browser of its own is started.

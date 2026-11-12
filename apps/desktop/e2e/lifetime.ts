@@ -13,12 +13,16 @@
  *   and worker run in a group of their own; a bus-started service may leave its group), and
  *   removes the folder. The `run` fixture (fixtures.ts) calls it from its teardown, which Playwright
  *   runs after a pass, a failure and a time-out alike. As a last resort, a handler at process exit
- *   does the same synchronously for any run not yet disposed of.
+ *   does the same synchronously for any run not yet disposed of. **Not covered:** a test runner
+ *   killed outright (SIGKILL) runs nothing more, and its detached processes, a FUSE mount and the
+ *   folder stay behind with nothing to stop them. The next run finds and reports them at its start
+ *   (staleRuns, recorded through `owner.pid`); apps/desktop/README.md gives the commands that remove
+ *   them by hand.
  * - **The output is kept.** The drivers' and the app's standard output and error are collected
  *   (`log()`) for the report.
  */
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 
@@ -111,7 +115,14 @@ const readProc = (pid: number, f: string) => {
   }
 };
 export const cmdline = (pid: number) => readProc(pid, "cmdline").split("\0").join(" ").trim();
-const allPids = () => readdirSync("/proc").filter((d) => /^\d+$/.test(d)).map(Number);
+/** Every pid in /proc (none on a system without /proc: the process checks are Linux only). */
+const allPids = () => {
+  try {
+    return readdirSync("/proc").filter((d) => /^\d+$/.test(d)).map(Number);
+  } catch {
+    return [];
+  }
+};
 export function descendants(root: number): number[] {
   const kids = new Map<number, number[]>();
   for (const p of allPids()) {
@@ -182,6 +193,66 @@ function unmountUnder(root: string): string[] {
   return failed;
 }
 
+export interface StaleRun {
+  root: string;
+  /** The test process that owned it (from `owner.pid`), gone; undefined when the folder has none. */
+  owner: number | undefined;
+  /** Its processes still running. */
+  processes: number[];
+  /** What is still mounted inside it (the document portal's file system). */
+  mounts: string[];
+}
+
+/**
+ * The runs a test runner killed outright (SIGKILL) left behind: folders named `prefix…` in `tmp`
+ * whose owning test process is gone, with their processes still running and their mounts.
+ */
+export function findStaleRuns(o: {
+  tmp: string;
+  prefix: string;
+  entries: string[];
+  ownerOf(root: string): number | undefined;
+  alive(pid: number): boolean;
+  mounts: string;
+  processesOf(root: string): number[];
+}): StaleRun[] {
+  const out: StaleRun[] = [];
+  for (const e of [...o.entries].sort()) {
+    if (!e.startsWith(o.prefix)) continue;
+    const root = join(o.tmp, e);
+    const owner = o.ownerOf(root);
+    if (owner !== undefined && o.alive(owner)) continue;
+    out.push({ root, owner, processes: o.processesOf(root), mounts: mountsUnder(root, o.mounts).reverse() });
+  }
+  return out;
+}
+
+/** findStaleRuns on this machine, for runs made with `prefix`. */
+export function staleRuns(prefix = "ao-desktop-e2e-"): StaleRun[] {
+  let mounts = "";
+  try {
+    mounts = readFileSync("/proc/self/mounts", "utf8");
+  } catch {
+    // no /proc: nothing to read
+  }
+  return findStaleRuns({
+    tmp: tmpdir(),
+    prefix,
+    entries: readdirSync(tmpdir()),
+    ownerOf: (root) => {
+      try {
+        const n = Number(readFileSync(join(root, "owner.pid"), "utf8").trim());
+        return Number.isInteger(n) && n > 0 ? n : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    alive: running,
+    mounts,
+    processesOf: (root) => processesMarkedBy(root, []),
+  });
+}
+
 function kill(pid: number): void {
   try {
     process.kill(pid, "SIGKILL");
@@ -207,6 +278,8 @@ export class RunLifetime {
   static create(prefix = "ao-desktop-e2e-"): RunLifetime {
     const r = new RunLifetime(mkdtempSync(join(tmpdir(), prefix)));
     for (const [, dir] of PER_USER) mkdirSync(join(r.root, dir), { recursive: true, mode: 0o700 });
+    // Who owns this run: a later run tells a live run of someone else from one left by a killed runner.
+    writeFileSync(join(r.root, "owner.pid"), `${process.pid}\n`);
     live.add(r);
     if (!exitHandler) {
       exitHandler = true;
@@ -273,8 +346,8 @@ export class RunLifetime {
   }
 
   /** Ends the run: deferred steps, every process stopped, the folder removed. Safe to call again. */
-  async dispose(): Promise<void> {
-    if (this.done) return;
+  async dispose(): Promise<string[]> {
+    if (this.done) return [];
     for (const step of this.deferred.splice(0)) {
       try {
         await Promise.race([Promise.resolve().then(step), sleep(10_000).then(() => Promise.reject(new Error("took longer than 10 s")))]);
@@ -283,7 +356,7 @@ export class RunLifetime {
       }
     }
     for (let i = 0; i < 25 && !this.sweep(); i++) await sleep(200);
-    this.finish();
+    return this.finish();
   }
 
   /** The same without waiting on promises: for the handler at process exit. */
@@ -293,17 +366,21 @@ export class RunLifetime {
     this.finish();
   }
 
-  private finish(): void {
+  /** The last steps; returns what could not be cleaned up (also noted in the log). */
+  private finish(): string[] {
     this.done = true;
     live.delete(this);
+    const problems: string[] = [];
     const left = processesMarkedBy(this.root, []);
-    if (left.length) this.note(`still running after the clean-up: ${left.map((p) => `${p} ${cmdline(p)}`).join("; ")}`);
+    if (left.length) problems.push(`still running after the clean-up: ${left.map((p) => `${p} ${cmdline(p)}`).join("; ")}`);
     const stuck = unmountUnder(this.root);
-    if (stuck.length) this.note(`could not unmount: ${stuck.join(", ")}`);
+    if (stuck.length) problems.push(`could not unmount: ${stuck.join(", ")}`);
     try {
       rmSync(this.root, { recursive: true, force: true });
     } catch (err) {
-      this.note(`the run's folder could not be removed: ${err instanceof Error ? err.message : String(err)}`);
+      problems.push(`the run's folder could not be removed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    for (const x of problems) this.note(x);
+    return problems;
   }
 }

@@ -31,7 +31,7 @@ import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Fatal, cmdline, descendants, parentOf, processesMarkedBy, running, runEnv, startedByBus, until, type RunLifetime } from "./lifetime.js";
+import { Fatal, cmdline, descendants, parentOf, processesMarkedBy, running, runEnv, staleRuns, startedByBus, until, type RunLifetime } from "./lifetime.js";
 import { elementId, newSession, WebDriverError, type Session } from "./webdriver.js";
 import { requestWindowClose, socketPathFor } from "./x11.js";
 
@@ -149,32 +149,46 @@ export function missingPrerequisites(c: PrerequisiteChecks): string[] {
   return out;
 }
 
-/** The per-user folders of the real home that the scenario's check compares before and after a run. */
-export const HOME_WATCHED = [".config", ".local/share", ".local/state", ".cache"];
 /**
- * Inside those, folders that other programs on a shared machine change while the scenario runs, for
- * reasons of their own, so a change there says nothing about this run:
- *  - package managers, toolchains and other tools' caches;
- *  - caches every GLib, GL or GStreamer program shares: `.cache/dconf` (GLib's dconf client writes it
- *    whenever XDG_RUNTIME_DIR is unset; seen here changing every few seconds while another task's
- *    browser tests ran and no desktop run did), `.cache/mesa_shader_cache`, `.cache/gstreamer-1.0`,
- *    `.cache/fontconfig`. That this run's own processes never write them is shown instead by
- *    checking each of its processes' HOME and XDG_* (the scenario's "every process" step).
- * Everything else is compared, including `.config/dconf` (GTK's file-chooser settings), `.config/gtk-3.0`,
- * `.local/share/recently-used.xbel`, WebKitGTK's folders and the app's own.
+ * What the scenario compares in the real home folder before and after a run: only the places where
+ * this run's own programs would write if one of them reached the real home, so that other programs of
+ * a person's session (a browser, an editor, a desktop) can run alongside without failing it:
+ *  - GTK and GLib: GSettings/dconf (`.config/dconf`, where GTK keeps the file chooser's settings),
+ *    `.config/gtk-3.0` (bookmarks), `.config/glib-2.0`, `.local/share/recently-used.xbel`;
+ *  - the session services the bus starts: the portals' permission store (`.local/share/flatpak/db`),
+ *    the document portal's fallback (`.cache/doc`) and `.config/xdg-desktop-portal`;
+ *  - WebKitGTK and the app: its data and cache folders under the app identifier and under its
+ *    program name, `webkitgtk` under data and cache, the library service's default settings folder
+ *    (`.config/alexandrine-oxiana`) and the app's state folder.
+ * Not compared: everything else, including shared caches every GL, GStreamer or GLib program writes
+ * (`.cache/mesa_shader_cache`, `.cache/gstreamer-1.0`, `.cache/fontconfig`, `.cache/dconf`). That
+ * this run's processes write none of those is shown by the per-process check instead: each of them
+ * has HOME and every XDG folder inside the run's folder. A change a person's own GTK programs make to
+ * `.config/dconf` during the run would still be reported (it is the file this check exists for).
  */
-export const HOME_SKIPPED = new Set([
-  ".cache/pnpm", ".local/share/pnpm", ".cache/pip", ".config/pip", ".cache/uv", ".config/uv", ".local/share/uv", ".cache/deno",
-  ".cache/huggingface", ".cache/claude-cli-nodejs", ".cache/goimports", ".cache/Microsoft", ".cache/ms-playwright", ".config/gcloud",
-  ".config/google-chrome-for-testing", ".cache/ao-worker-smoke-models", ".cache/ao-worker-test-models", ".cache/node", ".cache/typescript",
-  ".cache/dconf", ".cache/mesa_shader_cache", ".cache/gstreamer-1.0", ".cache/fontconfig",
-]);
+export const HOME_WATCHED = [
+  ".config/dconf",
+  ".config/gtk-3.0",
+  ".config/glib-2.0",
+  ".local/share/recently-used.xbel",
+  ".local/share/flatpak/db",
+  ".cache/doc",
+  ".config/xdg-desktop-portal",
+  `.config/${APP_IDENTIFIER}`,
+  `.local/share/${APP_IDENTIFIER}`,
+  `.cache/${APP_IDENTIFIER}`,
+  `.local/state/${APP_IDENTIFIER}`,
+  ".config/alexandrine-oxiana",
+  ".local/share/alexandrine-oxiana",
+  ".cache/alexandrine-oxiana",
+  ".local/share/webkitgtk",
+  ".cache/webkitgtk",
+];
 
 /** Path (relative to `home`) → modification time, of every file and folder under the watched folders. */
 export function snapshotHome(home: string): Map<string, number> {
   const out = new Map<string, number>();
   const walk = (rel: string) => {
-    if (HOME_SKIPPED.has(rel)) return;
     let st;
     try {
       st = lstatSync(join(home, rel));
@@ -370,6 +384,16 @@ function firstLine(child: ReturnType<RunLifetime["spawn"]>, what: string, ms: nu
 export async function startDesktop(run: RunLifetime): Promise<Desktop> {
   const missing = checkPrerequisites();
   if (missing.length) throw new Error(`The desktop end-to-end test cannot run here:\n- ${missing.join("\n- ")}`);
+  // What an earlier test runner killed outright left behind (nothing in-process can clean that up):
+  // said plainly here, before this run adds to it, with how to remove it (apps/desktop/README.md).
+  const stale = staleRuns();
+  if (stale.length) {
+    const lines = stale.map((r) => `${r.root} (owner ${r.owner ?? "unknown"}, gone): ${r.processes.length} process(es) still running${r.processes.length ? ` [${r.processes.map((p) => `${p} ${cmdline(p).slice(0, 60)}`).join("; ")}]` : ""}${r.mounts.length ? `, still mounted: ${r.mounts.join(", ")}` : ""}`);
+    throw new Fatal(
+      `An earlier desktop end-to-end run was killed and left this behind:\n- ${lines.join("\n- ")}\n` +
+        `Remove it as apps/desktop/README.md says ("If a run was killed"), then run the test again.`,
+    );
+  }
   const root = run.root;
   for (const d of ["libraries", "files"]) mkdirSync(join(root, d), { recursive: true, mode: 0o700 });
   const path = process.env.PATH ?? "/usr/bin:/bin";

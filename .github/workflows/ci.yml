@@ -203,6 +203,15 @@ jobs:
             libjavascriptcoregtk-4.1-dev build-essential pkg-config libssl-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
             webkit2gtk-driver xvfb xauth dbus dbus-x11 xdotool ffmpeg
+      # What the cached builds depend on outside the repository, for their keys: the runner image's
+      # system (ImageOS, e.g. ubuntu24; a runner variable, which the workflow's `env` context does not
+      # see, hence this step) and the web view library the shell links against.
+      - name: Runner image and web view version (for the cache keys)
+        id: image
+        timeout-minutes: 1
+        run: |
+          echo "os=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "webkit=$(dpkg-query -W -f='${Version}' libwebkit2gtk-4.1-dev 2>/dev/null || echo unknown)" >> "$GITHUB_OUTPUT"
       - name: Rust 1.97
         timeout-minutes: 5
         run: |
@@ -219,17 +228,17 @@ jobs:
             apps/desktop/src-tauri/target
           # The shell's own sources are in the key, so the saved build follows them (restored from the
           # newest one with the same crates, then saved anew when they changed).
-          key: desktop-rust-1.97.0-${{ runner.os }}-${{ env.ImageOS }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/tauri.conf.json', 'apps/desktop/src-tauri/capabilities/**') }}
+          key: desktop-rust-1.97.0-${{ runner.os }}-${{ steps.image.outputs.os }}-webkit-${{ steps.image.outputs.webkit }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ hashFiles('apps/desktop/src-tauri/src/**', 'apps/desktop/src-tauri/build.rs', 'apps/desktop/src-tauri/tauri.conf.json', 'apps/desktop/src-tauri/capabilities/**') }}
           restore-keys: |
-            desktop-rust-1.97.0-${{ runner.os }}-${{ env.ImageOS }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-
-            desktop-rust-1.97.0-${{ runner.os }}-${{ env.ImageOS }}-
+            desktop-rust-1.97.0-${{ runner.os }}-${{ steps.image.outputs.os }}-webkit-${{ steps.image.outputs.webkit }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-
+            desktop-rust-1.97.0-${{ runner.os }}-${{ steps.image.outputs.os }}-webkit-${{ steps.image.outputs.webkit }}-
       - name: tauri-driver cache
         id: tauri-driver
         timeout-minutes: 5
         uses: actions/cache@v4
         with:
           path: ~/.cargo-tools
-          key: tauri-driver-2.1.0-rust-1.97.0-${{ runner.os }}-${{ env.ImageOS }}
+          key: tauri-driver-2.1.0-rust-1.97.0-${{ runner.os }}-${{ steps.image.outputs.os }}
       - name: tauri-driver 2.1.0 (pinned; its own lockfile)
         if: steps.tauri-driver.outputs.cache-hit != 'true'
         timeout-minutes: 10

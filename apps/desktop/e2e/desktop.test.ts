@@ -5,26 +5,29 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { displayEnv, desktopEnv, homeChanges, windowTitled, missingPrerequisites, readAuditLines, readShellLog, snapshotHome } from "./desktop.js";
+import { APP_IDENTIFIER, displayEnv, desktopEnv, homeChanges, windowTitled, missingPrerequisites, readAuditLines, readShellLog, snapshotHome } from "./desktop.js";
 import { homeEnvProblems } from "./lifetime.js";
 
 describe("the real home folder check (snapshotHome, homeChanges)", () => {
-  it("names what was created or modified under the watched folders, and leaves out other programs' caches", () => {
+  it("compares only the places this run's programs would write, and names what was created or modified there", () => {
     const home = mkdtempSync(join(tmpdir(), "ao-home-test-"));
     try {
       mkdirSync(join(home, ".config", "dconf"), { recursive: true });
       writeFileSync(join(home, ".config", "dconf", "user"), "a");
-      mkdirSync(join(home, ".cache", "pnpm"), { recursive: true });
+      mkdirSync(join(home, ".config", "some-editor"), { recursive: true });
+      mkdirSync(join(home, ".cache", "mesa_shader_cache"), { recursive: true });
       mkdirSync(join(home, ".local", "share"), { recursive: true });
-      writeFileSync(join(home, "unwatched.txt"), "x");
       const before = snapshotHome(home);
       const later = new Date(Date.now() + 5_000);
       writeFileSync(join(home, ".config", "dconf", "user"), "b");
       utimesSync(join(home, ".config", "dconf", "user"), later, later);
       mkdirSync(join(home, ".local", "share", "webkitgtk"));
-      writeFileSync(join(home, ".cache", "pnpm", "x"), "y");
-      writeFileSync(join(home, "unwatched.txt"), "z");
-      expect(homeChanges(before, snapshotHome(home))).toEqual(["created .local/share/webkitgtk", "modified .config/dconf/user"]);
+      writeFileSync(join(home, ".local", "share", "recently-used.xbel"), "<xbel/>");
+      mkdirSync(join(home, ".config", APP_IDENTIFIER));
+      // Other programs of a person's session: not this run's business.
+      writeFileSync(join(home, ".config", "some-editor", "state"), "y");
+      writeFileSync(join(home, ".cache", "mesa_shader_cache", "x"), "y");
+      expect(homeChanges(before, snapshotHome(home))).toEqual([`created .config/${APP_IDENTIFIER}`, "created .local/share/recently-used.xbel", "created .local/share/webkitgtk", "modified .config/dconf/user"]);
       expect(homeChanges(before, before)).toEqual([]);
     } finally {
       rmSync(home, { recursive: true, force: true });

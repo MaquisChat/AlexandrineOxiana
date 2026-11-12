@@ -8,6 +8,10 @@ test("hangs after starting stand-ins", async ({ run }) => {
   const env = runEnv(run.root);
   run.spawn("sh", ["-c", "echo stand-in started; sleep 600 & sleep 600"], env);
   run.spawn("setsid", ["sleep", "600"], env);
+  // A clean-up step that fails: its note must reach the saved output (it is written after the clean-up).
+  run.defer(() => {
+    throw new Error("PROBE deferred boom");
+  });
   const pids = await until("the stand-ins to run", 2_000, () => {
     const p = processesMarkedBy(run.root, []);
     return p.length >= 3 ? p : undefined;

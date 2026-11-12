@@ -9,9 +9,15 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { Fatal, RunLifetime, homeEnvProblems, mountsUnder, processEnvProblems, processesMarkedBy, running, runEnv, startedByBus, until } from "./lifetime.js";
+import { Fatal, RunLifetime, findStaleRuns, homeEnvProblems, mountsUnder, processEnvProblems, processesMarkedBy, running, runEnv, startedByBus, until } from "./lifetime.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+/**
+ * The process tests read /proc and use setsid: Linux only (the desktop end-to-end test runs only on
+ * Linux). On any other system they are skipped, and their names say why.
+ */
+const LINUX = process.platform === "linux";
+const onLinux = (name: string, body: () => void) => describe.skipIf(!LINUX)(`${name} [Linux only: reads /proc, uses setsid]`, body);
 const made: RunLifetime[] = [];
 afterEach(async () => {
   for (const r of made.splice(0)) await r.dispose();
@@ -50,7 +56,7 @@ describe("runEnv and the home-folder rule", () => {
   });
 });
 
-describe("processEnvProblems", () => {
+onLinux("processEnvProblems", () => {
   it("reads a running process's per-user folders and names those outside the run's folder", async () => {
     const r = lifetime();
     const good = r.spawn("sleep", ["600"], runEnv(r.root));
@@ -66,7 +72,7 @@ describe("processEnvProblems", () => {
   });
 });
 
-describe("startedByBus", () => {
+onLinux("startedByBus", () => {
   it("tells a service the session bus started (D-Bus sets DBUS_STARTER_ADDRESS for it) from the app's own processes", async () => {
     const r = lifetime();
     const bus = r.spawn("sleep", ["600"], { ...runEnv(r.root), DBUS_STARTER_ADDRESS: "unix:path=/tmp/x", DBUS_STARTER_BUS_TYPE: "session" });
@@ -74,6 +80,29 @@ describe("startedByBus", () => {
     await until("both to run", 5_000, () => running(bus.pid!) && running(app.pid!));
     expect(startedByBus(bus.pid!)).toBe(true);
     expect(startedByBus(app.pid!)).toBe(false);
+  });
+});
+
+describe("findStaleRuns (what a test runner killed outright left behind)", () => {
+  it("names the runs whose owner is gone, with their processes and mounts; a run whose owner still runs is someone else's live run", () => {
+    const stale = findStaleRuns({
+      tmp: "/t",
+      prefix: "ao-desktop-e2e-",
+      entries: ["ao-desktop-e2e-live", "ao-desktop-e2e-dead", "ao-desktop-e2e-old", "ao-launch-check-x"],
+      ownerOf: (root) => ({ "/t/ao-desktop-e2e-live": 10, "/t/ao-desktop-e2e-dead": 20 })[root],
+      alive: (pid) => pid === 10,
+      mounts: "portal /t/ao-desktop-e2e-dead/runtime/doc fuse.portal rw 0 0\nportal /t/ao-desktop-e2e-live/runtime/doc fuse.portal rw 0 0",
+      processesOf: (root) => (root === "/t/ao-desktop-e2e-dead" ? [55, 56] : []),
+    });
+    expect(stale).toEqual([
+      { root: "/t/ao-desktop-e2e-dead", owner: 20, processes: [55, 56], mounts: ["/t/ao-desktop-e2e-dead/runtime/doc"] },
+      { root: "/t/ao-desktop-e2e-old", owner: undefined, processes: [], mounts: [] },
+    ]);
+  });
+
+  it("a new run records its owner, so that it is never taken for a stale one while it lives", () => {
+    const r = lifetime();
+    expect(readFileSync(join(r.root, "owner.pid"), "utf8").trim()).toBe(String(process.pid));
   });
 });
 
@@ -113,7 +142,7 @@ async function standIns(r: RunLifetime): Promise<number[]> {
   });
 }
 
-describe("RunLifetime", () => {
+onLinux("RunLifetime", () => {
   it("dispose stops everything it started, also what left its process group, and removes the folder (twice is harmless)", async () => {
     const r = lifetime();
     const pids = await standIns(r);
@@ -145,7 +174,7 @@ describe("RunLifetime", () => {
   });
 });
 
-describe("the run fixture when a test hangs until its time limit", () => {
+onLinux("the run fixture when a test hangs until its time limit", () => {
   it("still stops everything, removes the folder and saves the output", async () => {
     const results = mkdtempSync(join(tmpdir(), "ao-lifetime-probe-"));
     const out = join(results, "probe.json");
@@ -165,7 +194,9 @@ describe("the run fixture when a test hangs until its time limit", () => {
       expect(existsSync(root)).toBe(false);
       const saved = findFile(join(results, "test-results"), "shell-output.txt");
       expect(saved, "the output was saved").toBeDefined();
-      expect(readFileSync(saved!, "utf8")).toContain("stand-in started");
+      const text = readFileSync(saved!, "utf8");
+      expect(text).toContain("stand-in started");
+      expect(text, "the clean-up's own notes are saved too").toContain("clean-up step failed: PROBE deferred boom");
     } finally {
       rmSync(results, { recursive: true, force: true });
     }
