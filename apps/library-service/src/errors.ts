@@ -106,10 +106,11 @@ export interface ErrorBody {
 }
 
 /** The settings files a refusal can name (Task 68), with how to say them and their `reason`. */
-export const SETTINGS_FILES: Record<string, { reason: ResettableSetting; what: string; it: string }> = {
+export const SETTINGS_FILES: Record<string, { reason?: ResettableSetting; what: string; it: string }> = {
   "extension-pairings.json": { reason: "extension-pairings", what: "The list of paired browsers", it: "it was" },
   "fonts.json": { reason: "fonts", what: "The list of added fonts", it: "it was" },
   "appearance.json": { reason: "appearance", what: "The appearance settings", it: "they were" },
+  "notices.json": { what: "The app's list of notices on this computer", it: "it was" },
 };
 
 /** Library error → status, code, plain message. Unknown errors are INTERNAL with a generic message. */

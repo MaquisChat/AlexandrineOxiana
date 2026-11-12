@@ -53,7 +53,8 @@ import {
   rememberLastOpenLibrary,
   type RebuildResult,
 } from "@ao/library";
-import type { CaptureStartedBy } from "@ao/shared";
+import type { CaptureStartedBy, DeviceNotice } from "@ao/shared";
+import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
@@ -1106,7 +1107,28 @@ export class ServiceState {
       // What stands behind `destruction-backups-pending` (R147): which backups still wait to be
       // removed after a destruction, and why the app does not remove them by itself when it does not.
       destructionBackupsPending: this.cachedPendingRemovals,
+      // This computer's own notices (Task 68, R154, R178): kind and time only; shown in the banner area.
+      notices: this.cachedNotices,
     };
+  }
+
+  private cachedNotices: DeviceNotice[] = [];
+  private noticesUnreadableLogged = false;
+
+  /**
+   * Reads this computer's device-level notices again (Task 68). A notices file that cannot be read
+   * shows none, and the log says so once, in plain words without a path; nothing is written.
+   */
+  async refreshNotices(): Promise<void> {
+    try {
+      this.cachedNotices = await readDeviceNotices(this.deps.appConfigDir);
+      this.noticesUnreadableLogged = false;
+    } catch (err) {
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+      this.cachedNotices = [];
+      if (!this.noticesUnreadableLogged) this.opts.log.warn({}, "The app's list of notices on this computer could not be read, so none are shown.");
+      this.noticesUnreadableLogged = true;
+    }
   }
 
   private cachedProjectWarnings: Record<string, string[]> = {};
@@ -1157,7 +1179,7 @@ export class ServiceState {
       return;
     }
     this.track(
-      this.projectWarnings(s).then(() => {
+      Promise.all([this.projectWarnings(s), this.refreshNotices()]).then(() => {
         if (this.session === s) this.events.publish("library.state", this.libraryState());
       }),
       "library state",

@@ -9,7 +9,7 @@
  * whole edited transcript).
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { appConfigDir, deviceDeps, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
+import { appConfigDir, deviceDeps, deviceNoticesIdle, type Deps, type openLibrary, type rebuildIndexIfNeeded } from "@ao/library";
 import { Pairing, SHELL_ORIGINS, bearerOf, hostAllowed, isExtensionOrigin, queryCarriesToken, sameSecret, type PairingOptions } from "./auth.js";
 import { ApiError, errorBody, toApiError } from "./errors.js";
 import { ServiceState, defaultWorkerProvider, type WorkerProvider } from "./state.js";
@@ -100,6 +100,8 @@ const REDACT = ["authorization", "secret", "passphrase", "recoveryCode", "apiKey
 
 export async function createService(opts: ServiceOptions): Promise<LibraryService> {
   const deps = opts.deps ?? deviceDeps(appConfigDir());
+  // A notice raised while this device's identity was read (Task 68) is written before the first state.
+  await deviceNoticesIdle();
   const app = Fastify({
     bodyLimit: BODY_LIMIT,
     // Never echo request bodies or query strings into the log.
