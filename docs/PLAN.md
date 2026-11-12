@@ -484,6 +484,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by Task 66's fix round (for Task 68): D16: when the fonts index or the appearance settings cannot be read at the moment of a change, the change is written over defaults — the other fonts' entries are dropped (their files stay, unlisted), or the other appearance settings are reset.
 - Defect found by the accuracy review of Task 37k (for Task 69): D17 (medium): a captured post that has disappeared at its source is kept and recorded as no longer available (`availability: unavailable-on-platform`), but no library screen shows it; only the capture queue's one-line count says so. Scenario 10 promises the item is flagged (R183 a).
 - Defect found by the accuracy review of Task 37k (not fixed in this build, R183 b): D18 (low): the browser extension's popup ticks "Also download media with the downloader" again every time it opens (`apps/browser-extension/src/popup/Popup.tsx`, `useState(true)`), so the choice is not remembered. For after the owner's tests.
+- Defect found by the re-check of Task 37k (not fixed in this build): D19 (medium): a conflict found when a later check adds data to an existing source (a browser-extension capture with the downloader ticked) shows as a "Conflict" badge on the source but writes no review-queue entry, so the source carries no "Needs review" (R172). Entries are written only when a source is created (`packages/library/src/sources.ts`). For after the owner's tests.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -540,7 +541,7 @@ Update after every task; commit and push.
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
 | 68 Settings writers never write what they did not read (D16) | fix round 2 in re-review; verification running | 391a93f (worktree branch) | RI1 and seven minors addressed (R181); watched folders have no interface in this phase (recorded) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
-| 37k Revise the guide and checklist | fix round 1 in re-check | 4d76ae2 (worktree branch) | 15 findings reported fixed; D17 and D18 lines in until Task 69 lands |
+| 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
 | 69 Show that a captured item is no longer available (D17) | in progress | | dispatched 2026-11-12; on the Mac build's path (R183) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
