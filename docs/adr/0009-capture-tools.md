@@ -1,6 +1,6 @@
 # 0009. Capture tools: yt-dlp and gallery-dl
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-11-11 by Task 48a: optional tools on first use, R126, R133)
 - **Date:** 2026-11-10
 
 ## Context
@@ -15,25 +15,33 @@ each capture. Using these tools may conflict with platform terms of service.
 
 ## Decision
 
-- **yt-dlp is a managed standalone binary**, not a Python dependency. On first use the media worker
-  resolves the latest release tag once (from the redirect of `releases/latest/download/SHA2-256SUMS`),
+- **yt-dlp is a managed standalone binary**, not a Python dependency. When the first-use tools dialogue installs it,
+  the media worker resolves the latest release tag once (from the redirect of `releases/latest/download/SHA2-256SUMS`),
   downloads that tag's `SHA2-256SUMS` and the platform's asset (`yt-dlp_linux`,
   `yt-dlp_linux_aarch64`, `yt-dlp_macos`, `yt-dlp.exe`) from `releases/download/<tag>/`, checks
   the SHA-256, and installs it (mode 0755) into
   `AO_TOOLS_DIR`. A mismatch is refused (`TOOL_CHECKSUM_MISMATCH`) and nothing is installed.
-- **Resolution order:** `AO_YTDLP_BIN`, then the managed binary, then `yt-dlp` on PATH; it is
-  downloaded only when none of these exists. Tests put fake `yt-dlp`/`gallery-dl` scripts first on
-  PATH and never download.
+- **Resolution order:** `AO_YTDLP_BIN`, then the managed binary, then `yt-dlp` on PATH. A capture
+  never downloads it (amended by Task 48a): with none of these, the job fails with
+  `TOOL_NOT_INSTALLED` naming the tool `video-downloader`, and the first-use tools dialogue installs
+  it. Tests put fake `yt-dlp`/`gallery-dl` scripts first on PATH (or name them in `AO_*_BIN`) and
+  never download; the installer's tests use a local file server.
 - **Updates:** `POST /tools/update` runs `yt-dlp --update-to stable` on the managed binary (yt-dlp's
   own updater verifies the release checksums) and reports old and new versions. A binary from
   `AO_YTDLP_BIN` or PATH belongs to the user or the system and is only reported. The app decides
   when to call it (for example from a "Update capture tools" button, or after an
   `EXTRACTOR_ERROR`).
-- **gallery-dl is pinned** in the worker's Python dependencies (`gallery-dl==1.32.19`) and runs as
-  `python -m gallery_dl --config-ignore` from the worker's environment (or `AO_GALLERYDL_BIN`), so
-  the user's own gallery-dl configuration (which may hold credentials or post-processors) is never
-  read; yt-dlp likewise runs with `--ignore-config`. It updates with app
-  releases. It has no verified standalone update channel comparable to yt-dlp's.
+- **gallery-dl is pinned, but no longer inside the worker** (amended by Task 48a: it is
+  GPL-2.0-only, so until the project's licence is decided it is not shipped in the worker bundle).
+  The first-use tools dialogue downloads its pinned PyPI wheel (`gallery_dl-1.32.19-py3-none-any.whl`,
+  address and SHA-256 in `ao_worker/toolpins.py`) into `<tools>/gallery-dl/lib/`, and it runs as its
+  own program, `python -m gallery_dl --config-ignore` on the worker's Python with that folder on its
+  module path (`PYTHONPATH`, and `AO_GALLERYDL_LIB` for the packaged worker), or `AO_GALLERYDL_BIN`.
+  The user's own gallery-dl configuration (which may hold credentials or post-processors) is never
+  read; yt-dlp likewise runs with `--ignore-config`. Its only dependency, `requests` (Apache-2.0),
+  stays in the worker. A new pin comes with an app release; it has no verified standalone update
+  channel comparable to yt-dlp's. Without it, captures that need it fail with `TOOL_NOT_INSTALLED`
+  naming `image-downloader`.
 - **Provenance:** every capture result reports `tool` and `toolVersion`; the Node side records them
   (with the capture method) in provenance.
 - **Polite defaults:** yt-dlp runs with `--sleep-requests 2 --sleep-interval 3
@@ -96,12 +104,92 @@ each capture. Using these tools may conflict with platform terms of service.
   `<id>.comments.json` and stored, stripped, as a separate `platform-comments` original (gallery-dl:
   unsupported, `commentsUnsupported`).
 
+### Optional tools on first use (Task 48a, R126, R133)
+
+The app does not bundle its optional tools. The worker keeps a catalogue of them (`GET /tools`,
+`ao_worker/toolpins.py` and `tools.py`): for each, its purpose in plain words, what stops working
+without it, the download size, the version, and whether it is installed and usable (a quick local
+self-check: the program runs, a model's files are all there at their pinned sizes). The service
+offers it to the desktop app (`GET /tools`, `POST /tools/:id/install|update|remove`,
+`GET /tools/jobs/:jobId`, `POST /tools/jobs/:jobId/cancel`; shapes in `@ao/shared`).
+
+| Tool (choice) | Parts | From | Verified by |
+|---|---|---|---|
+| `speech-tiny`, `-small`, `-medium`, `-large-v3` | the faster-whisper model's files | `huggingface.co/Systran/faster-whisper-<size>/resolve/<pinned commit>/` | SHA-256 and size per file |
+| `video-downloader` | yt-dlp + deno (the JavaScript runtime yt-dlp needs for YouTube) | yt-dlp: the latest release, as above; deno 2.9.8: `dl.deno.land` per platform | yt-dlp: its release's `SHA2-256SUMS`; deno: pinned SHA-256 |
+| `image-downloader` | gallery-dl | the pinned PyPI wheel | pinned SHA-256 |
+| `ffmpeg` | ffmpeg + ffprobe | Martin Riedl's 9.0.2 release builds (ADR 0014; until the app's own build exists) | pinned SHA-256 per platform |
+| `ocr` | tesseract + English language data | language data: `tessdata_fast` 4.1.0; tesseract: no pinned build yet (ADR 0014), so a system tesseract is used | pinned SHA-256 |
+
+- **Platforms:** macOS arm64, macOS x64 and Linux x64 (CI). A part with no pin for a platform says
+  why (`unavailableReason`) and is never downloaded from anywhere else. Today: tesseract has no pin
+  on any platform. exiftool stays bundled and required; ghostscript is not offered (ADR 0014).
+- **Where:** tools in `AO_TOOLS_DIR` (the app's data folder; yt-dlp stays at `<tools>/yt-dlp`, the
+  others in `<tools>/<part>/`), speech models in `AO_MODELS_DIR` in Hugging Face's cache layout, so
+  faster-whisper's own local-only look-up finds them with no network (R144). Never in a library.
+- **How it is verified:** a download is one plain GET with a fixed User-Agent, no cookies and no
+  query string, so nothing about the researcher, a library or a project is sent (R7). A redirect is
+  followed only to the hosts the pin lists, never from https to http. The file is hashed while it is
+  streamed and refused when it is longer than pinned, cut short, or its SHA-256 differs, before
+  anything is unpacked or made executable. Archives are unpacked only into the staging folder:
+  regular files only, no absolute paths, no `..`, no links, no duplicate names (case-insensitively),
+  a limit on files and on unpacked bytes counted while writing. On a Mac the quarantine attribute is
+  removed from the verified files (ADR 0014). The staged program then runs once (its self-check);
+  only then is it renamed into place, replacing any older copy in one rename.
+- **Failures:** a failed, cancelled or interrupted install leaves nothing half-installed (the
+  staging folder is removed; at start the worker deletes leftover staging folders and puts back a
+  copy an install had moved aside) and can simply be retried. Codes: `TOOL_DOWNLOAD_FAILED`,
+  `TOOL_CHECKSUM_MISMATCH`, `TOOL_ARCHIVE_UNSAFE`, `TOOL_WRITE_FAILED` (disk full or not writable),
+  `TOOL_UNUSABLE`, `TOOL_UNAVAILABLE`, `TOOL_NOT_MANAGED` (removing a tool that belongs to the
+  computer, which is left alone), `TOOL_UPDATE_FAILED`. The service answers a failed update with
+  `502 TOOL_FAILED` and the code as `reason`, never a bare 500.
+- **Time limits and cancel (fix rounds 1 and 2):** no download can hold a job for ever.
+  - Connecting and receiving the response headers (redirects included) must end within 30 s, with
+    15 s for each socket operation while connecting; it runs in a helper thread, so a cancel is
+    honoured within about 0.2 s even while a host is still sending its headers.
+  - The body: no byte for 30 s ends it (stall limit), and it must arrive within
+    300 s + size ÷ 50 kB/s (the deadline, scaled to the pinned size). A watchdog checks cancel,
+    stall and deadline every 0.2 s and shuts the connection down, so a blocked read ends at once.
+  - yt-dlp's release look-up and checksum list are fetched the same way.
+  - A tool job's final state is the worker's: `cancelled` only when the worker stopped (nothing
+    half-installed); an install that passed its last cancel check completes and ends `done`. The
+    service marks the job `cancelRequested` meanwhile; a cancel the worker does not confirm within
+    2 minutes ends it `failed` with `CANCEL_UNCONFIRMED`.
+- **A queue of their own:** installs, updates and removals run in a separate job lane of the
+  worker, one at a time, so a large download never holds up captures, viewing copies, transcription
+  or OCR. A removal renames the folder to `.trash.<id>.<folder>` before deleting it; the start-up
+  sweep always deletes `.trash.` folders (a half-removed tool is never brought back).
+- **Hosts and speech models (R158):** each catalogue component lists `hosts`, the host names its
+  download contacts, derived from its pins. The speech models offered are exactly the ones the app
+  accepts (`SPEECH_MODELS` in `@ao/shared`; default `DEFAULT_SPEECH_MODEL`, "medium"), and the
+  worker's list is tested against that definition.
+- **Updating:** the video downloader updates yt-dlp in place with its own verified updater (as
+  above) and installs a newer pinned deno; the other tools are reinstalled when the app's pin is
+  newer than the installed copy.
+- **Missing tools are said, not hidden:** a capture, transcription, viewing copy or OCR whose tool
+  is missing fails with `TOOL_NOT_INSTALLED` and the tool's id (`tool` in the worker's error; the
+  service's `409 TOOL_NOT_INSTALLED` with the id as `reason`). Without ffmpeg, located media stays
+  "proxy pending" and out of exports (R83, R90 c); after ffmpeg or OCR is installed the service
+  retries the open library's failed viewing copies or OCR jobs. An absent speech model is no longer
+  downloaded automatically (the first download R144 kept until this dialogue existed).
+- **The JavaScript runtime:** yt-dlp is always told which runtime to use,
+  `--js-runtimes deno:<path>` (the app's deno, else one on PATH), when one is installed (R133).
+- **The live check (R133):** `services/media-worker/.venv/bin/python services/media-worker/scripts/live_check.py --network`
+  installs the video downloader into a temporary folder exactly as the dialogue does and reads one
+  public video's metadata with the arguments a capture uses, failing on a runtime or challenge
+  warning. It is opt-in, uses the network, and refuses to run in CI.
+
 ## Consequences
 
 - Extractor fixes reach researchers within a day without an app release, at the cost of running a
   binary that changes under the app; the checksum check and the official release channel are the
   trust anchor.
-- The first capture needs network access to GitHub; offline installs can point `AO_YTDLP_BIN` at a
-  binary they provide.
-- gallery-dl breakage needs an app release (or `AO_GALLERYDL_BIN`); revisit if that happens often.
-- Packaged builds must ship the worker as a sidecar (`AO_WORKER_BIN`) with gallery-dl inside it.
+- First use needs a network connection (R126): the dialogue downloads what the researcher chose;
+  offline installs can point `AO_YTDLP_BIN` / `AO_GALLERYDL_BIN` at programs they provide, or put
+  ffmpeg and tesseract on PATH.
+- gallery-dl breakage needs an app release with a new pin (or `AO_GALLERYDL_BIN`); revisit if that
+  happens often.
+- Packaged builds ship the worker as a sidecar (`AO_WORKER_BIN`) without gallery-dl; the packaged
+  worker runs the downloaded gallery-dl on its own Python (`ao-worker -m gallery_dl`), which must
+  carry the standard-library modules gallery-dl imports (`packaging/ao-worker.spec`; confirmed by
+  the smoke test's `--gallery-dl-wheel` check on a packaged build).

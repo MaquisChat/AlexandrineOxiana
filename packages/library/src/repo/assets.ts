@@ -99,7 +99,7 @@ export async function addDerivedAsset(
         tool: input.tool,
         modified: tx.now,
         ext: input.ext,
-        tz: core.tz,
+        tz: core.zoneOf(st.project),
       });
       if (tx.encrypted) name = encName(name);
       const dir = `${folder}/derived`;

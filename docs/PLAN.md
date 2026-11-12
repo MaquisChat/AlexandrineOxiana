@@ -25,7 +25,7 @@ Checks run on 2026-11-11: type-check passes (7 packages); `pnpm test` 2,053 pass
 Task 40 enters these in the ledger as rulings R120 onward.
 
 1. **Scope.** Plan Phase 1 in detail; outline Phases 2–6.
-2. **Platforms.** macOS first: Apple Silicon and Intel. Windows later. The owner will create an Apple Developer account.
+2. **Platforms.** macOS first: Apple Silicon only (the owner, 2026-11-12, R169; Intel Macs were in the plan until then and are not built). Windows later. The owner will create an Apple Developer account.
 3. **Branches.** `main` exists (created at `0ad6506`) and is the approved state. Work happens on a working branch and reaches `main` only with the owner's approval.
 4. **Citation engine licence.** citeproc-js is used under **CPAL-1.0**. The project's own licence is not chosen yet; AGPL-3.0 is the likely later choice and must stay possible. No project `LICENSE` file is added until the owner decides. (Closes the open half of R87.)
 5. **Citation review.** The owner will review the five citation styles from a prepared page.
@@ -54,7 +54,7 @@ Task 40 enters these in the ledger as rulings R120 onward.
 | J | The app runs end to end | A real service, real worker and the built UI pass end-to-end scenarios 1–8 in Chromium and WebKit, in CI. |
 | K | Task 34 | Capture, transcript, verification and pairing screens work against the real service; scenarios 9–11 pass; the first-use tools dialogue works. |
 | L | Governance and durability gaps closed | Backups and refused actions are decided by policy and audited; no audit failure is silent; job records survive loss of the index (R31). |
-| M | macOS desktop app | The test suites pass on a Mac. Signed, notarised downloads for Apple Silicon and Intel are built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
+| M | macOS desktop app | The test suites pass on a Mac. A signed, notarised download for Apple Silicon (Intel dropped by the owner, R169) is built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
 | N | Phase 1 finished | Owner reviews done and applied; final whole-branch review clean; merged to `main`. |
 
 Order: I, then J. K and L can run alongside J once Task 43 is in. M starts after J (37a, 37b, 37d, 37e and 59 can start earlier; 59 should start early because it is the first time anything runs on a Mac). N is last.
@@ -320,7 +320,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 **Task 37f — Mac builds in CI [ledger: R133; ADR 0014]**
 - Depends: 37c, 37d, 37e, 48, 59.
 - Files: `.github/workflows/desktop-macos.yml`, `apps/desktop/src-tauri/tauri.conf.json`.
-- Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered.
+- Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered. (Amended 2026-11-12, R168 and R169: a build can also be started by a build-request file; only Apple Silicon is built, by the owner's decision, and the Intel side stays in the repository switched off.)
 - Verify: a green workflow run with two downloadable artefacts.
 - Model: Opus.
 
@@ -363,7 +363,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Model: Opus. Likely more than one session: split by package.
 
 **Task 55 — Owner's hands-on tests**
-- Depends: 37g, 37i.
+- Depends: 37f, 37i (the unsigned build is enough for the owner's own Mac, R151; 37g is needed before release to others).
 - Accept: the Mac checklist; a real Zotero account download (storage hosts unverified, R79); the Mac password store; the extension in Firefox; a live capture of one real YouTube and one real Instagram address.
 - Who: the owner, with the controller fixing what turns up.
 
@@ -374,7 +374,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 ## 6. Risks
 
 1. **The Mac app cannot be run here.** Everything Mac-specific is first seen working on GitHub's machines or the owner's Mac. Mitigation: WebKit in the browser scenarios (the Mac app's web view is WebKit), a smoke test on the Mac build machines, the owner's checklist.
-2. **Packaging the worker for Intel Macs.** Confirmed by Task 37e: four libraries publish no Intel-Mac build at the current versions, so the Intel download runs on a second, older set (R133). More libraries may follow, and GitHub may retire its Intel machines.
+2. **Packaging the worker for Intel Macs.** No longer a risk: the owner decided on 2026-11-12 that the app is built for Apple Silicon only (R169). For the record, Task 37e confirmed that four libraries publish no Intel-Mac build at the current versions, so an Intel download would run on a second, older set (R133).
 3. **Tools on a Mac without a package manager.** tesseract has no official Mac download and is built and signed in our own CI; ghostscript turned out not to be needed. Tools the app downloads may be blocked by the Mac's security check unless signed (the video downloader is not signed by its authors): unverified, to be tested on the owner's Mac.
 4. **Signing the helper programs.** Apple's rules for programs inside an app are strict; expect more than one attempt at 37g.
 5. **Mac build minutes** on GitHub cost more than Linux ones on a private repository. The Mac workflow runs only by hand or on a tag.
@@ -422,6 +422,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Found by Task 37d: the worker's access token stays readable in its process environment (for Task 37c, with the service's token).
 - Found by Task 34e: the service has no route that reports a pairing code's status, so the screen cannot tell an invalidated code from a valid one (small service addition; for Task 46).
 - Found by Tasks 34b and 34e and confirmed in a real browser: the shared dialog shell never moved focus into a dialog or back to its opener; fixed with Task 34e. Every dialog and popover is re-checked for focus at the final review (R145).
+- Defect D9 (the first-use question could take focus from a person typing): fixed by Task 48c.
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
@@ -441,39 +442,43 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | | implementer dispatched |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | | implementer dispatched |
-| 46c Two small service additions | not started | | a pairing code's status; confirming an identifier field; waits for the 34d and 34e reviews |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | 7b7a3b4 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; the rebuild on open must honour the index's rebuild marker (R161) |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | fdbd601 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
+| 46c A pairing code's status | fix round 1 | 1ec85b5 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; one Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
-| 34b Capture screen | fix round 1 | db52fdb (worktree branch) | spec met; 3 Important (R146); completed by new Task 63 |
-| 34c Transcript viewer | re-review of fix round 1 | f9fb892 (worktree branch) | four Important findings and seven minors reported fixed; two service items are Task 62 |
-| 34d Verification badges | in review | 140a402 (worktree branch) | built; closes defect D3; two concerns carried to review (identifier fields cannot be confirmed; blob pictures in WebKit) |
-| 34e Pairing screen | re-review of fix round 1 | 9d69ab0 (worktree branch) | both Important findings and five minors fixed; shared dialog shell now has its own tests |
-| 63 Capture state readable; one classifier | not started | | found by the Task 34b review |
+| 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
+| 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
+| 34d Verification badges | fix round 1 | db0030d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; 5 Important; identifiers become confirmable (R149) |
+| 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
+| 63 Capture state readable; one classifier | in progress | 69e5e6d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
-| 48 Tools dialogue | not started | | |
+| 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
+| 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | in progress | | implementer dispatched |
-| 49 Backups governed | fix round 4 (fresh implementer) | 7593645 (worktree branch) | round 3 fixed its findings and introduced a Critical in the retry; re-scoped by R147: what must be removed is decided once, the audit log is the authority |
-| 50 No silent refusals | not started | | |
-| 51 Job records in files | re-review of fix round 1 | b802afd (worktree branch) | both Important findings reported fixed (R142) |
-| 61 New recovery code | fix round 2 | ef05812 (worktree branch) | round 1 confirmed; one new Important (a stale staged file could be activated), settled by R148 |
-| 58 Ledger loose ends | not started | | |
+| 57 Import wizard routes | fix round 1 | 5699dc8 (worktree branch) | reviewed with probes: approved, 12 Minor; ten are being fixed, the rest deferred in the ledger |
+| 49 Backups governed | fix round 4 | 857144d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; re-scoped by R147 |
+| 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
+| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
+| 51 Job records in files | fix round 2 | dd30650 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; two Important in the rerun at unlock |
+| 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
+| 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
-| 37a Service bundle | not started | | |
-| 37b Token on standard input | in progress | | implementer dispatched |
-| 37c Desktop shell | not started | | |
-| 37d Worker packaging | fix round 1 | 72cb7cc (worktree branch) | approved with fixes: stronger smoke test, accurate licence manifest, offline model load (R144) |
-| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
-| 37f Mac builds in CI | not started | | |
-| 37g Signing | blocked | | needs Apple Developer credentials |
-| 37h Desktop end-to-end | not started | | |
+| 37a Service bundle | done | 719d9a9 | reviewed with probes; one fix round; the shipped folder loads code only from itself (R153); ADR 0013 |
+| 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
+| 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
+| 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
+| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; the Intel question is closed (not built, R169); one owner confirmation pending (minimum macOS 15) |
+| 37f Mac builds in CI | first Mac run in progress (Apple Silicon) | | started by build request 1 at the owner's word (R168); Apple Silicon only, the Intel download is switched off (R169); the workflow was written and paper-reviewed but had never run |
+| 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
+| 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
+| 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
+| 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
-| 55 Owner hands-on tests | blocked | | needs signed Mac build |
+| 55 Owner hands-on tests | blocked | | needs the first Mac build (Task 37f); a signed build is not required for the owner's own tests (R151) |
 | 56 Close out | not started | | |
 
 ## 9. What needs the owner
@@ -482,7 +487,7 @@ Update after every task; commit and push.
 2. Decided 2026-11-11: no second backup folder in Phase 1. Until sync is designed, a backup lives beside the data it protects, so it does not survive losing the drive; copying the library folder to another drive by hand is the safeguard meanwhile.
 3. Approve merges to `main` at milestone boundaries.
 4. Create the Apple Developer account; later, add its signing credentials as GitHub secrets (Task 37g gives the steps).
-5. Confirm two things from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia, which leaves out Intel MacBook Airs from 2018–19 and most Macs older than 2018; and the Intel download is kept although it must use older versions of four libraries (older cameras' RAW files only, two months behind on OCR fixes, an older cryptography library) and depends on GitHub keeping its Intel machines.
+5. Confirm one thing from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia. (The second question, whether to keep an Intel download, is answered: the owner decided on 2026-11-12 that the app is built for Apple Silicon only, R169.)
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
 8. Choose the project's own licence before anything is published (Task 56). Facts that bear on it, found by Task 37d: the packaged worker contains a GPL-2.0-only program (gallery-dl) and GPL video-codec libraries inside two of its Python packages, besides LGPL and MPL parts. What may be shipped together, and under which licence, is a question for the owner and, ideally, a lawyer; the plan's default until then is to move gallery-dl out of the bundle into the first-use downloads, like the video downloader.

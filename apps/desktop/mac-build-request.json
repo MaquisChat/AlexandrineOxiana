@@ -1,0 +1,5 @@
+{
+  "request": 1,
+  "architectures": "apple-silicon",
+  "note": "First Mac build attempt, at the owner's word on 2026-11-12: Apple Silicon only, unsigned test build."
+}

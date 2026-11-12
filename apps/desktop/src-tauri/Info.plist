@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged by the Tauri bundler into the Mac app's Info.plist (tauri-cli reads src-tauri/Info.plist on macOS).
+
+  NSAllowsLocalNetworking: the page calls the library service over plain http on 127.0.0.1. Apple's
+  documentation of this key: "In iOS 17, iPadOS 17, and macOS 14, ATS no longer allows connections to IP
+  addresses by default"; the key enables "access to unqualified domains, .local domains, and IP addresses"
+  without turning App Transport Security off for anything else
+  (https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsallowslocalnetworking,
+  read 2026-11-12). It widens nothing beyond local addresses; the global exception for arbitrary loads is not used.
+  The content-security policy still limits the page to http://127.0.0.1:* and http://localhost:*.
+-->
+<plist version="1.0">
+<dict>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+</dict>
+</plist>

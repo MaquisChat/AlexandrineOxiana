@@ -1,3 +1,4 @@
+import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/library";
 import type { Command } from "commander";
 import { createLinkCapture, type ProfileContentType } from "@ao/library";
 import { EXIT, ExitError } from "../errors.js";
@@ -23,7 +24,7 @@ export function registerCapture(program: Command): void {
     .option("--acknowledge-cookies", "confirm, without being asked, the one-time notice about using your browser session")
     .option("--transcribe", "make a transcript (default: as the project is set up; off unless it turns it on)")
     .option("--no-transcribe", "do not make a transcript")
-    .option("--model <name>", "transcription model: large-v3, medium or small")
+    .option("--model <name>", `transcription model: ${SPEECH_MODELS.join(", ")} (default ${DEFAULT_SPEECH_MODEL})`)
     .option("--refresh", "for a link already saved, add a new dated copy of the platform's data")
     .option("--legal-basis <text>", "the legal basis for saving this social-media data")
     .action(async (urls: string[], _o, cmd: Command) => {
@@ -71,7 +72,7 @@ export function registerCapture(program: Command): void {
     .option("--metadata-only", "save the posts' data without their media")
     .option("--comments", "also save comments (they are other people's personal data)")
     .option("--transcribe", "also make transcripts of videos")
-    .option("--model <name>", "transcription model: large-v3, medium or small")
+    .option("--model <name>", `transcription model: ${SPEECH_MODELS.join(", ")} (default ${DEFAULT_SPEECH_MODEL})`)
     .option("--cookies-from-browser <browser>", "use your signed-in browser session")
     .option("--acknowledge-cookies", "confirm, without being asked, the one-time notice about using your browser session")
     .option("--legal-basis <text>", "the legal basis for saving this social-media data")

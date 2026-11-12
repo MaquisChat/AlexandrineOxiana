@@ -67,3 +67,15 @@ describe("Task 57: Zotero key, user fonts", () => {
     for (const bad of ["", "../x", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcde"]) expect(isUserFontId(bad)).toBe(false);
   });
 });
+
+describe("speech models (R158): one definition", () => {
+  it("the accepted models, the default among them, and one speech tool per model", async () => {
+    const { SPEECH_MODELS, DEFAULT_SPEECH_MODEL, TOOL_IDS, speechToolId, isSpeechModel } = await import("./index.js");
+    expect([...SPEECH_MODELS]).toEqual(["tiny", "small", "medium", "large-v3"]);
+    expect(DEFAULT_SPEECH_MODEL).toBe("medium");
+    expect(isSpeechModel("medium")).toBe(true);
+    expect(isSpeechModel("huge")).toBe(false);
+    const speechTools = TOOL_IDS.filter((t) => t.startsWith("speech-"));
+    expect(speechTools.sort()).toEqual(SPEECH_MODELS.map((m) => speechToolId(m)).sort());
+  });
+});

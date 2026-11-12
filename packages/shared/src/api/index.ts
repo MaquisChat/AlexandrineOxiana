@@ -7,3 +7,5 @@ export * from "./import-setup.js";
 export * from "./media.js";
 export * from "./sources.js";
 export * from "./transcripts.js";
+export * from "./attention.js";
+export * from "./tools.js";
