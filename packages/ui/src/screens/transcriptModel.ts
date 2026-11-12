@@ -76,65 +76,6 @@ export function versionEntries(versions: readonly TranscriptVersionSummary[]): V
   return out;
 }
 
-/** The machine version a human edit came from (R143; until Task 62 stores flags per segment). */
-export interface MachineBase {
-  id: string;
-  /** When it was made (ISO), if recorded. */
-  at?: string;
-  /** True when the edit does not record its base and the newest machine version before it was used. */
-  guessed: boolean;
-}
-
-/**
- * The machine version version `id` was edited from: follow `derivation.params.basedOn` through
- * earlier edits to a machine version. An edit that names no base: the newest machine version made
- * before it (`guessed`). A base named but not in the list: undefined (flags cannot be shown).
- */
-export function machineBaseOf(id: string, versions: readonly TranscriptVersionSummary[]): MachineBase | undefined {
-  let cur = versions.find((v) => v.id === id);
-  for (let depth = 0; cur && depth < 16; depth++) {
-    const d = rec(cur.derivation);
-    if (cur.origin === "machine") return { id: cur.id, ...(strOf(d.at) ? { at: strOf(d.at)! } : {}), guessed: false };
-    const basedOn = strOf(rec(d.params).basedOn);
-    if (basedOn) {
-      cur = versions.find((v) => v.id === basedOn);
-      continue;
-    }
-    const at = strOf(d.at);
-    const earlier = versions
-      .filter((v) => v.origin === "machine")
-      .map((v) => ({ v, at: strOf(rec(v.derivation).at) }))
-      .filter((x) => x.at !== undefined && (at === undefined || x.at < at))
-      .sort((a, b) => (a.at! < b.at! ? -1 : a.at! > b.at! ? 1 : 0))
-      .at(-1);
-    return earlier ? { id: earlier.v.id, at: earlier.at!, guessed: true } : undefined;
-  }
-  return undefined;
-}
-
-const ms = (s: number) => Math.round(s * 1000);
-const cueTextKey = (t: string) =>
-  t
-    .replace(/\r\n|\r/g, "\n")
-    .split("\n")
-    .filter((l) => l.trim() !== "")
-    .join("\n")
-    .trim();
-
-/**
- * For each segment of a person's edit: the machine flags of the identical segment (same start, end
- * and text, as stored to the millisecond) of its base version, or "edited" when there is none — the
- * person changed, added or re-timed it, so no check ran on it.
- */
-export function carriedFlags(
-  edit: ReadonlyArray<{ start: number; end: number; text: string }>,
-  machine: ReadonlyArray<{ start: number; end: number; text: string; flags: string[] | null }>,
-): Array<string[] | "edited"> {
-  const byKey = new Map<string, string[]>();
-  for (const m of machine) byKey.set(`${ms(m.start)}|${ms(m.end)}|${cueTextKey(m.text)}`, m.flags ?? []);
-  return edit.map((e) => byKey.get(`${ms(e.start)}|${ms(e.end)}|${cueTextKey(e.text)}`) ?? "edited");
-}
-
 /** "1:12", "1:02:03". */
 export function formatTime(sec: number): string {
   const t = Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0));

@@ -70,6 +70,18 @@ export interface JobRecord {
    * run's later lines. A claim succeeds only on the very record it was decided on (`claimJobRecord`).
    */
   attempt?: string;
+  /**
+   * What the job is for, kept on every line of it, finished ones too (Task 62): the source a
+   * transcription is of and the model asked for, so that its state can be found and shown after a
+   * reload or a restart. Older lines have none (they are read as before).
+   */
+  about?: JobAbout;
+}
+
+/** What a job is for (see JobRecord.about): ids and a model name only, nothing identifying. */
+export interface JobAbout {
+  sourceId: string;
+  model?: string;
 }
 
 export type ProjectKey = { key: Uint8Array; keyId: string } | null;
@@ -247,6 +259,19 @@ export async function claimJobRecord(
     const newest = journal.records.get(expected.id);
     if (!newest || !isPending(newest) || JSON.stringify(newest) !== JSON.stringify(expected)) return false;
     await appendNow(root, projectRel, key, [next]);
+    return true;
+  });
+}
+
+/**
+ * Appends the first record of a job whose id the caller chose (Task 62), only if the journal has no
+ * record of that id yet (checked and appended in the file's turn). False: the id is taken.
+ */
+export async function appendNewJobRecord(root: string, projectRel: string, key: ProjectKey, rec: JobRecord): Promise<boolean> {
+  return serialize(journalPath(root, projectRel), async () => {
+    const journal = await readJobJournal(root, projectRel, rec.projectId, key);
+    if (journal.records.has(rec.id)) return false;
+    await appendNow(root, projectRel, key, [rec]);
     return true;
   });
 }

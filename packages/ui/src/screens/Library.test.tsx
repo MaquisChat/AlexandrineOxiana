@@ -202,6 +202,12 @@ describe("Library screen", () => {
     expect(await screen.findByText(/Index rebuilding 3\/10/)).toBeTruthy();
   });
 
+  it("a transcription in the jobs indicator is named in words (Task 62)", async () => {
+    server.use(...libraryHandlers({ events: [{ type: "job.progress", data: { kind: "transcription", jobId: "j1", done: 40, total: 100, finished: false } }] }));
+    renderLibrary();
+    expect(await screen.findByText(/Transcribing recordings 40\/100/)).toBeTruthy();
+  });
+
   it("D8: while the index is rebuilt, the source list says so instead of showing an empty library, and fills in when it is ready", async () => {
     const rebuilding = { state: "rebuilding", done: 0, total: 0 };
     let calls = 0;
