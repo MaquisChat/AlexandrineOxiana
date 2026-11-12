@@ -156,7 +156,8 @@ describe("a paired browser across a relaunch of the real service (R171, defect D
     expect((await api.listProjects()).map((p) => p.name)).toEqual(["Profiles"]);
 
     // Another port (the old one was taken): the old port does not answer; the app's list says the browser holds it.
-    await relaunch(0);
+    // The system may hand the just-freed port back once in a while: ask again until it differs (review M7).
+    for (let i = 0; i < 5 && (await relaunch(0)) === first; i++);
     expect(port).not.toBe(first);
     expect(await api.listProjects().catch((e: unknown) => e)).toMatchObject({ code: "UNREACHABLE" });
     const before = await ui("GET", "/extension/pairings");

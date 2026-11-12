@@ -200,6 +200,20 @@ describe("the desktop app does not answer on the saved port (R171)", () => {
     expect(button("Use a different port")).toBeDefined();
   });
 
+  it("connected again while no library is open: says so once, without also saying no project allows capture (review M2)", async () => {
+    const net = fakeNetFactory({ status: 503, body: { error: { code: "LIBRARY_OFFLINE", message: "No library is open." } } })();
+    const storage = await mount(net);
+    await click(button("Use a different port"));
+    const input = inputLabelled(/new port/i)!;
+    await type(input, String(NEW));
+    await submit(input.form!);
+    await settle();
+    expect(storage.data.pairing).toMatchObject({ port: NEW });
+    expect(status()).toMatch(/connected again/i);
+    expect(host.textContent).toMatch(/no library is open/i);
+    expect(host.textContent).not.toMatch(/No project allows browser capture/);
+  });
+
   it("a refused token on the new port keeps the pairing (it may be another program)", async () => {
     const net = fakeNetFactory({ status: 401, body: { error: { code: "UNAUTHORIZED", message: "A valid token is needed." } } })();
     const storage = await mount(net);

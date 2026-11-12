@@ -44,6 +44,8 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
   const [pending, setPending] = useState<PendingByProject>({});
   /** The app did not answer on the saved port (R171). */
   const [unreachable, setUnreachable] = useState(false);
+  /** The app answered, but has no library open: said instead of "no project allows capture" (review M2). */
+  const [noLibrary, setNoLibrary] = useState(false);
   /** "Use a different port": the field is open, what is typed, the check under way, why it failed. */
   const [portOpen, setPortOpen] = useState(false);
   const [newPort, setNewPort] = useState("");
@@ -88,8 +90,10 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       setProjects(list);
       setProjectId((cur) => (list.some((p) => p.id === cur) ? cur : (list[0]?.id ?? "")));
       setUnreachable(false);
+      setNoLibrary(false);
     } catch (e) {
       setProjects([]);
+      setNoLibrary(e instanceof ApiError && e.code === "LIBRARY_OFFLINE");
       // Not answering: said once, with both causes and what to do, in its own notice (R171).
       if (e instanceof ApiError && e.code === "UNREACHABLE") setUnreachable(true);
       else setStatus(message(e));
@@ -158,9 +162,10 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
       setProjects(list);
       setProjectId((cur) => (list.some((p) => p.id === cur) ? cur : (list[0]?.id ?? "")));
       setUnreachable(false);
+      setNoLibrary(r.projects === null);
       setStatus(
         r.projects === null
-          ? `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged. No library is open in the desktop app yet: open one, then open this popup again.`
+          ? `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged.`
           : `Connected again: this browser now uses port ${r.pairing.port}, and its pairing is unchanged. Choose a project below.`,
       );
       closePortField("paired");
@@ -300,6 +305,8 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
 
       {projects === undefined ? (
         <p>Loading projects…</p>
+      ) : projects.length === 0 && noLibrary ? (
+        <p className="hint">No library is open in the desktop app. Open one, then open this popup again.</p>
       ) : projects.length === 0 ? (
         <p className="hint">No project allows browser capture. Allow it in a project's rules in the desktop app.</p>
       ) : (
