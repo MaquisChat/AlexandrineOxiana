@@ -19,7 +19,7 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 export const STANDARD_DIR = join(REPO, "licences", "standard");
 
 /** Top-level files that carry licence terms or notices. An SPDX tag-value file (`.spdx`) is not a licence text. */
-const LICENCE_NAME = /^(licen[cs]e|copying|notice|copyright|unlicense)(\b|[-_.]|$)/i;
+const LICENCE_NAME = /^(licen[cs]e|copying|notice|copyright|unlicense|authors)(\b|[-_.]|$)/i;
 
 /** The licence and notice files at the top of a package folder, sorted by name. */
 export function licenceFilesIn(dir) {

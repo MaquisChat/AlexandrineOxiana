@@ -32,11 +32,11 @@ describe("licenceIds", () => {
 });
 
 describe("licenceFilesIn", () => {
-  it("finds a package's top-level licence, copying, notice and copyright files, not an SPDX tag file or a folder", () => {
+  it("finds a package's top-level licence, copying, notice, copyright and authors files, not an SPDX tag file or a folder", () => {
     const dir = mkdtempSync(join(tmpdir(), "ao-lt-"));
-    for (const f of ["LICENSE-MIT", "LICENSE-APACHE", "COPYRIGHT", "NOTICE", "license.md", "LICENSE.spdx", "README.md", "index.js"]) writeFileSync(join(dir, f), "x");
+    for (const f of ["LICENSE-MIT", "LICENSE-APACHE", "COPYRIGHT", "NOTICE", "AUTHORS", "license.md", "LICENSE.spdx", "README.md", "index.js", "licensed.js"]) writeFileSync(join(dir, f), "x");
     mkdirSync(join(dir, "licenses"));
-    assert.deepEqual(licenceFilesIn(dir), ["COPYRIGHT", "LICENSE-APACHE", "LICENSE-MIT", "NOTICE", "license.md"]);
+    assert.deepEqual(licenceFilesIn(dir), ["AUTHORS", "COPYRIGHT", "LICENSE-APACHE", "LICENSE-MIT", "NOTICE", "license.md"]);
   });
 });
 
