@@ -473,7 +473,7 @@ Update after every task; commit and push.
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | in progress | | implementer dispatched; found by the Task 37c review |
-| 48c First-use question never interrupts (D9) | in progress | | implementer dispatched; found by Task 37h in the real window |
+| 48c First-use question never interrupts (D9) | in review | 3033147 (worktree branch) | built; its edit to the desktop scenario still to be run against a rebuilt app (R163) |
 | 37i Guide and checklist | not started | | |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
