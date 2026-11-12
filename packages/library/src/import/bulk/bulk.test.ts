@@ -864,6 +864,38 @@ processing:
   });
 });
 
+describe("undo and the review queue (Task 67 fix round 1, M1; coordinator's ruling 3)", () => {
+  it("each source's removal resolves its pending entries in the same change: a crash between two removals leaves no pending entry of a source that is gone", async () => {
+    const { SimulatedCrash, seams } = await import("../../repo/testing.js");
+    const { projectReviewEntries } = await import("../../repo/repo.js");
+    const p = await project();
+    const { handle: h } = await run(p, folderAdapter(folder));
+    const items = await bulk.listReview(p.id, h.batchId);
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    // One batch-created source is also flagged by a consent withdrawal (an entry outside the batch).
+    const part = await repo.createParticipant(p.id, {});
+    const c = await repo.createConsent(p.id, { participantId: part.id, scope: "audio", date: "2026-03-14" });
+    for (const it of items) await repo.linkSourceToFieldwork(p.id, it.sourceId!, { participantIds: [part.id] });
+    await repo.withdrawConsent(p.id, c.id, {});
+    // Crash right after the first removal commits (before its marker is deleted).
+    seams.crashAt = "before-marker-delete";
+    await expect(bulk.undoBatch(p.id, h.batchId)).rejects.toBeInstanceOf(SimulatedCrash);
+    seams.crashAt = undefined;
+    handle.close();
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    handle = new IndexHandle(lib.root);
+    repo = await openTestRepo(lib, ring, { scryptN: FAST, actor: "tester", index: createIndexSink(handle, { root: lib.root, keyRing: ring }) });
+    const present = new Set(repo.listSourceIds(p.id));
+    const gone = items.map((i) => i.sourceId!).filter((sid) => !present.has(sid));
+    expect(gone.length).toBe(1);
+    const entries = await projectReviewEntries(repo, p.id);
+    const ofGone = entries.filter((e) => gone.includes(e.sourceId!));
+    expect(ofGone.length).toBeGreaterThanOrEqual(2); // its batch item and its withdrawal flag
+    expect(ofGone.map((e) => [e.status, e.decision])).toEqual(ofGone.map(() => ["resolved", "undone"]));
+  });
+});
+
 describe("work folders", () => {
   it("leftover batch-* folders are swept when the repository is opened", async () => {
     const stale = join(lib.root, ".tmp", "batch-019a0000-0000-7000-8000-00000000abcd");

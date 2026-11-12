@@ -5,6 +5,7 @@
  * reasons, which quote titles and names, never sit in plaintext. The index's `review_items` table
  * is a cache of this file; for encrypted projects it holds only field names and statuses.
  */
+import { createHash } from "node:crypto";
 import { newId } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
 import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./errors.js";
@@ -68,36 +69,44 @@ export function reviewCauseOf(e: Pick<ReviewEntry, "kind" | "fields" | "cause">)
   return Object.keys(e.fields ?? {}).length > 0 ? { kind: "capture-conflict" } : { kind: "consent-withdrawal", consentIds: [] };
 }
 
-/** A field a capture's entry lists is settled when its verification is none of conflict or unverified (nor missing). */
-const SETTLED = new Set(["verified", "single-source", "user-confirmed"]);
+/**
+ * A field a capture's entry lists holds it open only while the present report has it in conflict or
+ * unverified (coordinator's ruling 1, fix round 1): a field that has left the report (the type
+ * changed, the field was removed, a recheck no longer reports it) is settled.
+ */
+const UNSETTLED = new Set(["conflict", "unverified"]);
+
+type Reported = { source: { id: string }; verification: Record<string, { status: string }> };
+
+/** Whether `e` is a pending capture entry of `sf` none of whose listed fields is left unsettled in `sf`'s report. */
+function settledBy(e: ReviewEntry, sf: Reported): boolean {
+  if (e.status !== "pending" || e.sourceId !== sf.source.id || reviewCauseOf(e)?.kind !== "capture-conflict") return false;
+  return Object.keys(e.fields ?? {}).every((f) => !UNSETTLED.has(sf.verification[f]?.status ?? ""));
+}
+
+/** What re-examined a source's capture entries, and the decision a resolved entry records. */
+export type ReexaminedBy = "confirmation" | "recheck" | "edit";
+const DECISION: Record<ReexaminedBy, string> = { confirmation: "confirmed", recheck: "rechecked", edit: "edited" };
 
 /**
- * Inside a running mutation that has just written `sf` (a confirm or a recheck, R176 1): every
- * pending capture-conflict entry of the source none of whose listed fields is left in conflict or
- * unconfirmed gets its `resolved` line in the same change. Returns the ids resolved.
+ * Inside a running mutation that has just written `sf` with a new report (a confirm, a recheck, an
+ * edit that recomputed the report, an import decision that rewrote it; R176 1): every pending
+ * capture-conflict entry of the source none of whose listed fields is left in conflict or unverified
+ * gets its `resolved` line in the same change. Returns the ids resolved.
  */
-export async function resolveSettledCaptureEntries(
-  core: RepoCore,
-  tx: Tx,
-  sf: { source: { id: string }; verification: Record<string, { status: string }> },
-  by: "confirmation" | "recheck",
-): Promise<string[]> {
+export async function resolveSettledCaptureEntries(core: RepoCore, tx: Tx, sf: Reported, by: ReexaminedBy): Promise<string[]> {
   const done: string[] = [];
   for (const e of await readReviewEntries(core, tx.state)) {
-    if (e.status !== "pending" || e.sourceId !== sf.source.id || reviewCauseOf(e)?.kind !== "capture-conflict") continue;
-    const fields = Object.keys(e.fields ?? {});
-    if (!fields.every((f) => SETTLED.has(sf.verification[f]?.status ?? ""))) continue;
-    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: by === "confirmation" ? "confirmed" : "rechecked" });
+    if (!settledBy(e, sf)) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: DECISION[by] });
     done.push(e.id);
   }
   return done;
 }
 
 /** Without writing: whether a recheck would resolve any of the source's capture entries (so a recheck that changes no verification still runs). */
-export async function hasSettledCaptureEntries(core: RepoCore, st: ProjectState, sf: { source: { id: string }; verification: Record<string, { status: string }> }): Promise<boolean> {
-  return (await readReviewEntries(core, st)).some(
-    (e) => e.status === "pending" && e.sourceId === sf.source.id && reviewCauseOf(e)?.kind === "capture-conflict" && Object.keys(e.fields ?? {}).every((f) => SETTLED.has(sf.verification[f]?.status ?? "")),
-  );
+export async function hasSettledCaptureEntries(core: RepoCore, st: ProjectState, sf: Reported): Promise<boolean> {
+  return (await readReviewEntries(core, st)).some((e) => settledBy(e, sf));
 }
 
 /** The policy operation and audit op of "Reviewed after the withdrawal" (R176 2). */
@@ -136,7 +145,15 @@ export async function reviewedAfterWithdrawal(core: RepoCore, projectId: string,
       await writeReviewLine(core, tx, resolved);
       return resolved;
     },
-    { op: WITHDRAWAL_REVIEWED_OP, entity: { type: "source", id: first.sourceId! }, auditDetails: { reviewEntry: entryId, reason } },
+    {
+      op: WITHDRAWAL_REVIEWED_OP,
+      entity: { type: "source", id: first.sourceId! },
+      // In an encrypted project the reason's text stays in the sealed review line only: the audit log
+      // (plain lines) records that a reason was given and its SHA-256 (coordinator's ruling 2, fix round 1).
+      auditDetails: core.encrypted(st)
+        ? { reviewEntry: entryId, reasonGiven: true, reasonSha256: createHash("sha256").update(reason, "utf8").digest("hex") }
+        : { reviewEntry: entryId, reason },
+    },
   );
 }
 
@@ -147,7 +164,7 @@ const pendingByTx = new WeakMap<Tx, ReviewEntry[]>();
  * Inside the change that removes a source (R176 4): its pending entries are resolved
  * ("source-removed"), except `keep`, an entry the caller resolves itself in this change.
  */
-export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sourceId: string, opts: { keep?: string } = {}): Promise<string[]> {
+export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sourceId: string, opts: { keep?: string; decision?: "source-removed" | "undone" } = {}): Promise<string[]> {
   let pending = pendingByTx.get(tx);
   if (!pending) {
     pending = (await readReviewEntries(core, tx.state)).filter((e) => e.status === "pending");
@@ -156,7 +173,7 @@ export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sour
   const done: string[] = [];
   for (const e of pending) {
     if (e.sourceId !== sourceId || e.id === opts.keep) continue;
-    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: "source-removed" });
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: opts.decision ?? "source-removed" });
     done.push(e.id);
   }
   pendingByTx.set(

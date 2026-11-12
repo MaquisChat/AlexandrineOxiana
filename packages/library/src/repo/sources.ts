@@ -15,6 +15,7 @@ import {
   originalFileName,
   primary,
   pseudonymize,
+  recheckSourceFile,
   shortId,
   sourceFolderName,
   withCollisionSuffix,
@@ -32,9 +33,12 @@ import { readFullData, writeProjectData } from "./projects.js";
 import { assignableWorkspaceTags, refuseUnknownTags } from "./collections.js";
 import { assignCodes, loadPseudonyms, savePseudonyms } from "./pseudonyms.js";
 import { flagIfWithdrawn } from "./withdrawn.js";
-import { appendReviewEntry, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReviewInput } from "./review.js";
+import { appendReviewEntry, resolveEntriesOfRemovedSource, resolveSettledCaptureEntries, type ReexaminedBy, type ReviewInput } from "./review.js";
 import { recordDeletion } from "./tombstones.js";
 import type { Manifest, ManifestEntry, ProjectState, RepoCore } from "./state.js";
+
+/** An empty field value: absent, null, blank text or an empty list. */
+const isBlank = (v: unknown): boolean => v === undefined || v === null || (typeof v === "string" && v.trim() === "") || (Array.isArray(v) && v.length === 0);
 
 export interface SourceInputFile {
   path: string;
@@ -604,6 +608,7 @@ export async function updateSource(
   } = {},
 ): Promise<SourceFile> {
   let resolved: string[] = [];
+  let by: ReexaminedBy | undefined;
   core.assertWritable();
   const st = core.state(projectId);
   core.assertUnlocked(st);
@@ -646,19 +651,26 @@ export async function updateSource(
         modifiedBy: tx.actor,
       });
       let sf: SourceFile = { ...cur, source, ...(extra.fieldEvidence ? { fieldEvidence: extra.fieldEvidence(cur) } : {}) };
+      // An ordinary edit that changes the type or empties a field changes what the verification report
+      // covers: the report is recomputed from the stored evidence in this change (fix round 1, I1).
+      // Other edits leave the report as it is.
+      const reshapes = !extra.verification && (source.type !== cur.source.type || Object.keys(patch).some((k) => isBlank(source[k as keyof Source]) && !isBlank(cur.source[k as keyof Source])));
       if (extra.verification) sf = { ...sf, verification: extra.verification(sf) };
+      else if (reshapes) sf = { ...sf, verification: recheckSourceFile(sf, {}).verification };
       await writeSourceFile(core, tx, sf);
       tx.record("source", id, cur.source, source);
       // New links to a participant whose consent was withdrawn: queued for review (R117 I1, R119).
       if (linksChange) await flagIfWithdrawn(core, tx, tx.state.data, id, source, cur.source);
-      if (extra.resolveReview) resolved = await resolveSettledCaptureEntries(core, tx, sf, extra.resolveReview);
+      // Whenever the report was written anew, the source's capture entries are re-examined in this change (R176 1).
+      by = extra.resolveReview ?? (extra.verification ? "recheck" : reshapes ? "edit" : undefined);
+      if (by) resolved = await resolveSettledCaptureEntries(core, tx, sf, by);
       tx.index((sink) => sink.indexSource(sf));
       return sf;
     },
     {
       op: "source.update",
       entity: { type: "source", id },
-      auditDetails: () => (resolved.length ? { reviewResolved: { entries: resolved, by: extra.resolveReview } } : {}),
+      auditDetails: () => (resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
     },
   );
 }
@@ -679,15 +691,18 @@ export async function editSource(core: RepoCore, tx: Tx, id: string, edit: (s: S
  * touched). Every path that deletes a source comes through here; a source imported incrementally
  * (Zotero) leaves a deletion record so a later run does not bring it back (R73), except when the
  * deletion is a batch undo (`undo`), which is not the user's. The source's pending review entries
- * are resolved in the same change (R176 4: "source-removed"), except `keepReview`, the entry a
- * review decision resolves itself. An import undo resolves its removed sources' entries itself, in
- * one change after the removals (undo.ts step 5, "undone"), rather than re-reading the queue per source.
+ * are resolved in the same change (R176 4: "source-removed"; "undone" for an undo, coordinator's
+ * ruling 3), except `keepReview`, the entry a review decision resolves itself. `reviewEntries: false`
+ * says the caller knows the source has no pending entry (an undo removing many sources reads the
+ * queue once, not once per source); entries queued meanwhile are caught by the undo's last step.
  */
-export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean; keepReview?: string } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
+export async function deleteSourceInTx(core: RepoCore, tx: Tx, id: string, opts: { undo?: boolean; keepReview?: string; reviewEntries?: boolean } = {}): Promise<{ sf: SourceFile; tombstoned: string[] }> {
   const st = tx.state;
   const cur = await readSourceFile(core, st, id);
   const tombstoned = opts.undo ? [] : await recordDeletion(core, tx, cur);
-  if (!opts.undo) await resolveEntriesOfRemovedSource(core, tx, id, opts.keepReview ? { keep: opts.keepReview } : {});
+  if (opts.reviewEntries !== false) {
+    await resolveEntriesOfRemovedSource(core, tx, id, { ...(opts.keepReview ? { keep: opts.keepReview } : {}), decision: opts.undo ? "undone" : "source-removed" });
+  }
   await tx.trash(cur.source.folder);
   if (tx.encrypted) await putManifest(tx, (m) => void (m.sources = m.sources.filter((x) => x.id !== id)));
   for (const a of cur.assets) tx.record("asset", a.id, a, null);

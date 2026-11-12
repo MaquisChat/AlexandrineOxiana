@@ -113,10 +113,13 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     }
   }
   const removed = new Set<string>();
+  // The sources with pending review entries: each one's entries are resolved ("undone") in the same
+  // change that removes it (coordinator's ruling 3); the others skip reading the queue in their change.
+  const withEntries = new Set((await projectReviewEntries(repo, projectId)).flatMap((e) => (e.status === "pending" && e.sourceId ? [e.sourceId] : [])));
   for (const id of ids) {
     if (!hasSource(repo, projectId, id)) continue;
     // Not the user's deletion: no deletion record, so a later run imports the item again (R73).
-    await importChange(repo, projectId, { action: "delete" }, (ops) => ops.deleteSource(id, { undo: true }), { op: "source.delete", entity: { type: "source", id } });
+    await importChange(repo, projectId, { action: "delete" }, (ops) => ops.deleteSource(id, { undo: true, reviewEntries: withEntries.has(id) }), { op: "source.delete", entity: { type: "source", id } });
     removed.add(id);
   }
   const removedSources = removed.size;

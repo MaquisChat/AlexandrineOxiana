@@ -272,6 +272,117 @@ describe("the recorded cause and old entries (R176 3)", () => {
   });
 });
 
+describe("fix round 1, I1: a listed field that has left the report is settled (coordinator's ruling 1)", () => {
+  /** The reviewer's probe: a video capture whose post id is unverified, later corrected to a web page. */
+  async function videoWithUnverifiedPostId() {
+    const at = kit.clock.now.toISOString();
+    const sf = await kit.repo.createSource(p.id, draft("A clip", { type: "video", identifiers: { url: "https://example.org/watch/abc" } }), [], {
+      provenance: provenance(),
+      fieldEvidence: [{ field: "/title", value: "A clip", source: { kind: "page-dom" }, at }],
+      verification: { "/identifiers/platformPostId": { status: "unverified", checks: [], reason: "No post ID was recorded." } },
+      reviewItem: { fields: { "/identifiers/platformPostId": "unverified" }, reasons: ["The post ID could not be checked."], cause: { kind: "capture-conflict" } },
+    });
+    return sf.source.id;
+  }
+
+  it("the probe end to end: the type is corrected to a web page; that edit recomputes the report, the post id leaves it, and the entry is resolved in the edit's own change", async () => {
+    const sid = await videoWithUnverifiedPostId();
+    const [entry] = await entriesOf(sid);
+    const after = await kit.repo.updateSource(p.id, sid, { type: "webpage" });
+    expect(after.verification["/identifiers/platformPostId"]).toBeUndefined();
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "resolved", decision: "edited" });
+    expect((await auditEvents(kit, p)).at(-1)).toMatchObject({ details: { op: "source.update", reviewResolved: { entries: [entry!.id], by: "edit" } } });
+  });
+
+  it("a recheck that drops a listed field from the report resolves the entry", async () => {
+    const at = kit.clock.now.toISOString();
+    // A report that lists a field no evidence or rule gives any more: the recheck drops it.
+    const sf = await kit.repo.createSource(p.id, draft("A page"), [], {
+      provenance: provenance(),
+      fieldEvidence: [{ field: "/title", value: "A page", source: { kind: "page-dom" }, at }],
+      verification: { "/identifiers/platformPostId": { status: "unverified", checks: [] } },
+      reviewItem: { fields: { "/identifiers/platformPostId": "unverified" }, reasons: ["?"], cause: { kind: "capture-conflict" } },
+    });
+    const r = await kit.repo.recheckSource(p.id, sf.source.id);
+    expect(r.verification["/identifiers/platformPostId"]).toBeUndefined();
+    expect((await entriesOf(sf.source.id))[0]).toMatchObject({ status: "resolved", decision: "rechecked" });
+  });
+
+  it("an edit that removes a listed field recomputes the report and resolves the entry when the field leaves it; an edit that leaves the report alone resolves nothing", async () => {
+    const at = kit.clock.now.toISOString();
+    const sf = await kit.repo.createSource(p.id, draft("A page", { publisher: "Unknown press" }), [], {
+      provenance: provenance(),
+      // The publisher was reported unverified; no evidence for it is stored, so once it is removed the report no longer has it.
+      fieldEvidence: [{ field: "/title", value: "A page", source: { kind: "page-dom" }, at }],
+      verification: { "/publisher": { status: "unverified", checks: [], reason: "Only from the file name." } },
+      reviewItem: { fields: { "/publisher": "unverified" }, reasons: ["?"], cause: { kind: "capture-conflict" } },
+    });
+    const sid = sf.source.id;
+    await kit.repo.setMembership(p.id, sid, { tagIds: [] });
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "pending" });
+    const after = await kit.repo.updateSource(p.id, sid, { publisher: undefined });
+    expect(["unverified", "conflict"]).not.toContain(after.verification["/publisher"]?.status);
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "resolved", decision: "edited" });
+  });
+
+  it("an import decision that rewrites a captured source's report re-examines its capture entries in the decision's change", async () => {
+    const sid = await videoWithUnverifiedPostId();
+    const imp = await kit.repo.createSource(p.id, draft("Imported duplicate"), [], { provenance: provenance(), reviewItem: { kind: "import", fields: {}, reasons: ["Likely duplicate"] } });
+    const importEntry = (await entriesOf(imp.source.id))[0]!;
+    // Merging the import item into the clip: the clip's report is rewritten (merged evidence, recheck).
+    const { decideReview } = await import("./import/bulk/review.js");
+    await kit.repo.updateSource(p.id, sid, {}); // nothing changes: still pending
+    expect((await entriesOf(sid))[0]).toMatchObject({ status: "pending" });
+    await decideReview(kit.repo, p.id, importEntry.id, { action: "merge", sourceId: sid });
+    const clip = await kit.repo.getSource(p.id, sid);
+    const settled = !["conflict", "unverified"].includes(clip.verification["/identifiers/platformPostId"]?.status ?? "");
+    expect((await entriesOf(sid))[0]!.status).toBe(settled ? "resolved" : "pending");
+  });
+
+  it("a social post with no creators: a typed creator confirmed through the confirm resolves the entry", async () => {
+    const sf = await kit.repo.createSource(p.id, draft("A post", { type: "social-post" }), [], {
+      provenance: provenance(),
+      verification: { "/creators": { status: "unverified", checks: [], reason: "No creator was found." } },
+      reviewItem: { fields: { "/creators": "unverified" }, reasons: ["No creator."], cause: { kind: "capture-conflict" } },
+    });
+    const next = await confirmField(kit.repo, p.id, sf.source.id, "/creators", [{ literal: "Harbour Collective", role: "author" }]);
+    expect(next.verification["/creators"]?.status).toBe("user-confirmed");
+    expect((await entriesOf(sf.source.id))[0]).toMatchObject({ status: "resolved", decision: "confirmed" });
+  });
+});
+
+describe("fix round 1, I2: the withdrawal reason in an encrypted project's audit log (coordinator's ruling 2)", () => {
+  it("an encrypted project's audit holds that a reason was given and its SHA-256, never its text; the sealed entry keeps the text", async () => {
+    const { createHash } = await import("node:crypto");
+    const enc = await makeProject(kit, OPEN_GOV, true);
+    const sid = (await kit.repo.createSource(enc.id, draft("Sealed"), [], { provenance: provenance(), reviewItem: { kind: "verification", fields: {}, reasons: ["Consent was withdrawn."], cause: { kind: "consent-withdrawal", consentIds: [] } } })).source.id;
+    const [entry] = (await projectReviewEntries(kit.repo, enc.id)).filter((e) => e.sourceId === sid);
+    const reason = "Zebrafinch-7731: spoke with the participant's sister";
+    await kit.repo.reviewedAfterWithdrawal(enc.id, entry!.id, reason);
+    const { readdir } = await import("node:fs/promises");
+    const dir = join(kit.lib.root, kit.repo.getProject(enc.id).folder, "audit");
+    let bytes = "";
+    for (const f of await readdir(dir)) bytes += await readFile(join(dir, f), "latin1");
+    expect(bytes).not.toContain("Zebrafinch");
+    expect(bytes).not.toContain("sister");
+    const digest = createHash("sha256").update(reason, "utf8").digest("hex");
+    expect(bytes).toContain(digest);
+    expect(bytes).toContain('"reasonGiven":true');
+    kit.repo.lockProject(enc.id);
+    await kit.repo.unlockProject(enc.id, PASS);
+    const sealed = (await projectReviewEntries(kit.repo, enc.id)).find((e) => e.id === entry!.id)!;
+    expect(sealed.reason).toBe(reason);
+    expect(createHash("sha256").update(sealed.reason!, "utf8").digest("hex")).toBe(digest);
+  });
+
+  it("a project that is not encrypted audits the reason as typed", async () => {
+    const sid = (await kit.repo.createSource(p.id, draft("Open"), [], { provenance: provenance(), reviewItem: { kind: "verification", fields: {}, reasons: ["Consent was withdrawn."] } })).source.id;
+    const [entry] = await entriesOf(sid);
+    await kit.repo.reviewedAfterWithdrawal(p.id, entry!.id, " As typed ");
+    expect((await auditEvents(kit, p)).at(-1)).toMatchObject({ details: { reason: " As typed " } });
+  });
+});
+
 describe("a removed source (R176 4)", () => {
   it("deleting a source resolves its pending entries in the same change", async () => {
     const sid = await capturedWithConflicts({ "/issued": "conflict" });
