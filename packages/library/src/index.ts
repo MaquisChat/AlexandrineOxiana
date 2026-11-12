@@ -50,6 +50,7 @@ export { classifyLocation, defaultLocationEnv, parseMacMount, parseProcMounts, p
 export type { Location, LocationEnv, MountInfo } from "./location.js";
 export { OldCopiesUnreadableError } from "./old-copies.js";
 export { WatchedFoldersUnreadableError } from "./import/watch.js";
+export { ApprovedFoldersUnreadableError } from "./import/approved-folders.js";
 export { NOTICES_FILE, deviceNoticesIdle, dismissDeviceNotice, raiseDeviceNotice, readDeviceNotices } from "./device-notices.js";
 export {
   InvalidConfirmTokenError,

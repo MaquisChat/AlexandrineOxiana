@@ -36,6 +36,8 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
     "The list of old library copies awaiting deletion was damaged and was set aside. Old copies of moved libraries may still be on this computer, but they are no longer offered for deletion here. The damaged list is kept beside the app's settings.",
   "watched-folders-list-set-aside":
     "This computer's list of watched folders was damaged and was set aside, so watched folders on this computer have stopped. Watched folders must be added again on this computer. The damaged list is kept beside the app's settings.",
+  "approved-folders-list-set-aside":
+    "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
 };
 
 const READ_ONLY_REASONS: Record<string, string> = {

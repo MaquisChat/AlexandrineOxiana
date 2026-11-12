@@ -26,6 +26,7 @@ const ABOUT: Record<DeviceNoticeKind, string> = {
   "device-identity-renewed": "this computer's identity for the app was damaged and had to be renewed",
   "old-copies-list-set-aside": "the list of old library copies awaiting deletion was damaged and was set aside",
   "watched-folders-list-set-aside": "this computer's list of watched folders was damaged and was set aside",
+  "approved-folders-list-set-aside": "this computer's list of folders approved for imports was damaged and was set aside",
 };
 
 const pending = new Set<Promise<void>>();
