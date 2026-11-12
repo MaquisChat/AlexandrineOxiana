@@ -365,3 +365,12 @@ describe("capture: a queue read again from the service (Task 63)", () => {
     expect(mergeRead(undefined, read)).toBe(read);
   });
 });
+
+describe("capture: a queue ended by a close or a move (Task 63 fix round 2, N2)", () => {
+  it("says the library was closed or moved, not that the project was locked", () => {
+    const t = queueErrorText("LibraryClosedError: the library was closed or moved, so the capture stopped");
+    expect(t).toMatch(/library was closed or moved/);
+    expect(t).not.toMatch(/locked/);
+    expect(queueErrorText("ProjectLockedError: x")).toMatch(/locked/);
+  });
+});

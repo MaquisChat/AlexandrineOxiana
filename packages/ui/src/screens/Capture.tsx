@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { CAPTURE_RUNNING } from "@ao/shared";
+import { CAPTURE_RUNNING, CAPTURE_STOPPING } from "@ao/shared";
 import { ApiClientError, type ApiClient } from "../api/client";
 import {
   applyProgress,
@@ -90,6 +90,8 @@ function plainError(err: unknown, fallback: string): string {
   if (err.code === "WORKER_UNAVAILABLE") return `${fallback} The media helper is not running. Restart the app and try again.`;
   // The same link (or profile) is still being captured: the service's own sentence, and where to look.
   if (err.code === "CONFLICT" && err.reason === CAPTURE_RUNNING) return `${err.message} The running capture is shown in the capture queue below.`;
+  // An ended capture still finishing its download (a lock): the service's own sentence, as it is.
+  if (err.code === "CONFLICT" && err.reason === CAPTURE_STOPPING) return err.message;
   if (err.code === "POLICY_DENIED") return errorText(err, fallback);
   return errorText(new ApiClientError(err.status, { code: err.code, message: err.message }), fallback);
 }

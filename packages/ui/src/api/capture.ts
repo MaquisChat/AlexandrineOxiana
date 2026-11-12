@@ -305,6 +305,8 @@ export function queueErrorText(error: string, kind: "links" | "profile" = "links
   const name = /^(\w+)/.exec(error)?.[1] ?? "";
   if (name === "WorkerUnavailableError") return "The media helper is not running, so the capture stopped. Restart the app and try again.";
   if (name === "ProjectLockedError" || name === "KeyNotAvailableError") return OUTCOME_TEXT.PROJECT_LOCKED!;
+  // An encrypted project's capture ends when its library is closed or moved (its key goes with it).
+  if (name === "LibraryClosedError") return "The library was closed or moved, so this capture stopped. Capture the links that were not tried again.";
   if (name === "PolicyDeniedError") return OUTCOME_TEXT.POLICY_DENIED!;
   if (name === "AcknowledgementRequiredError") return "Using your browser session has not been acknowledged for this project, so nothing was downloaded. Acknowledge it, then capture again.";
   if (kind === "profile") return "The profile capture stopped before it finished. Posts shown here as saved are kept. Run it again later.";

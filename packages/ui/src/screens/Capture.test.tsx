@@ -454,6 +454,17 @@ describe("Capture screen — progress", () => {
     expect(m.calls.filter((c) => c.path === `/projects/${P1}/captures/elsewhere`)).toHaveLength(1);
   });
 
+  it("while an ended capture still finishes its download, a new capture is refused in the service's words, without pointing to a queue (fix round 2)", async () => {
+    const { user } = await setup({
+      captureAnswer: () =>
+        errorResponse(409, "CONFLICT", "A capture of this project that was ended (the project was locked) is still finishing its current download, so nothing new was queued. Try again in a moment.", "CAPTURE_STOPPING"),
+    });
+    await paste(user, [YT]);
+    await user.click(screen.getByRole("button", { name: "Capture links" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("A capture of this project that was ended (the project was locked) is still finishing its current download, so nothing new was queued. Try again in a moment.");
+  });
+
   it("the same link while its capture runs: the service's refusal is said in plain words and the running capture is shown", async () => {
     const { m, user } = await setup({
       captureAnswer: () =>
