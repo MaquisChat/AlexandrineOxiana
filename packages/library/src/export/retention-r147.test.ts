@@ -65,6 +65,7 @@ async function rawSource(p: Project, title = "Interview one"): Promise<SourceFil
 
 type Details = Record<string, unknown> & {
   op?: string;
+  note?: string;
   backupsToRemove?: string[];
   certificate?: string;
   certificateSha256?: string;
@@ -523,6 +524,41 @@ describe("the certificate and backups-state.json are conveniences; the audit log
         expect(verifyChain(await auditEvents(kit, f.p)).ok).toBe(true);
       });
     }
+  });
+
+  it("I2, after a crash: a removal that was not recorded, then a log that no longer verifies: the pass after the restart records nothing until the log holds again", async () => {
+    const { p, x, certificatePath } = await stuck();
+    later(HOUR);
+    backupSeams.crashAt = "before-removal-record";
+    await expect(resumeDestruction(kit.repo, p.id)).rejects.toBeInstanceOf(SimulatedCrash);
+    expect(existsSync(x.path)).toBe(false);
+    // While the app is not running, an entry of the log is changed.
+    const restore = await editAuditEntry(
+      p,
+      (l) => l.includes('"op":"retention.destroy"'),
+      (e) => {
+        e.details.note = "changed outside the app";
+      },
+    );
+    const again = await kit.reopen();
+    const before = (await auditEvents(kit, p)).length;
+    const files = await retentionFiles(p);
+    for (let n = 0; n < 2; n++) {
+      later(HOUR);
+      await resumeDestruction(again, p.id);
+      expect((await auditEvents(kit, p)).length).toBe(before);
+      expect(await retentionFiles(p)).toEqual(files);
+      expect(await recordedAs(p, rel(x))).toEqual({ removed: 0, gone: 0 });
+      expect((await readDestruction(again, p.id, certificatePath)).status).toBe("pending");
+      expect(await holdingNotRemoved(again, p.id)).toEqual([rel(x)]);
+      expect(await projectWarnings(again, p.id)).toContain(WARNING);
+    }
+    await restore();
+    later(HOUR);
+    await resumeDestruction(again, p.id);
+    expect(await recordedAs(p, rel(x))).toEqual({ removed: 0, gone: 1 });
+    expect((await readDestruction(again, p.id, certificatePath)).status).toBe("no-longer-present");
+    expect(await projectWarnings(again, p.id)).not.toContain(WARNING);
   });
 
   it("backups-state.json deleted: the retry still knows what is outstanding from the audit log, and writes nothing more to it for a retry that changes nothing", async () => {
