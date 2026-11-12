@@ -143,6 +143,26 @@ offers it to the desktop app (`GET /tools`, `POST /tools/:id/install|update|remo
   `TOOL_UNUSABLE`, `TOOL_UNAVAILABLE`, `TOOL_NOT_MANAGED` (removing a tool that belongs to the
   computer, which is left alone), `TOOL_UPDATE_FAILED`. The service answers a failed update with
   `502 TOOL_FAILED` and the code as `reason`, never a bare 500.
+- **Time limits and cancel (fix rounds 1 and 2):** no download can hold a job for ever.
+  - Connecting and receiving the response headers (redirects included) must end within 30 s, with
+    15 s for each socket operation while connecting; it runs in a helper thread, so a cancel is
+    honoured within about 0.2 s even while a host is still sending its headers.
+  - The body: no byte for 30 s ends it (stall limit), and it must arrive within
+    300 s + size ÷ 50 kB/s (the deadline, scaled to the pinned size). A watchdog checks cancel,
+    stall and deadline every 0.2 s and shuts the connection down, so a blocked read ends at once.
+  - yt-dlp's release look-up and checksum list are fetched the same way.
+  - A tool job's final state is the worker's: `cancelled` only when the worker stopped (nothing
+    half-installed); an install that passed its last cancel check completes and ends `done`. The
+    service marks the job `cancelRequested` meanwhile; a cancel the worker does not confirm within
+    2 minutes ends it `failed` with `CANCEL_UNCONFIRMED`.
+- **A queue of their own:** installs, updates and removals run in a separate job lane of the
+  worker, one at a time, so a large download never holds up captures, viewing copies, transcription
+  or OCR. A removal renames the folder to `.trash.<id>.<folder>` before deleting it; the start-up
+  sweep always deletes `.trash.` folders (a half-removed tool is never brought back).
+- **Hosts and speech models (R158):** each catalogue component lists `hosts`, the host names its
+  download contacts, derived from its pins. The speech models offered are exactly the ones the app
+  accepts (`SPEECH_MODELS` in `@ao/shared`; default `DEFAULT_SPEECH_MODEL`, "medium"), and the
+  worker's list is tested against that definition.
 - **Updating:** the video downloader updates yt-dlp in place with its own verified updater (as
   above) and installs a newer pinned deno; the other tools are reinstalled when the app's pin is
   newer than the installed copy.
