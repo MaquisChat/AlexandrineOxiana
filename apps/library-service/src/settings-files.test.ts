@@ -195,6 +195,38 @@ async function pair(origin = EXT): Promise<string> {
   return c.json().token as string;
 }
 
+describe("an unreadable pairings file never makes a browser forget its pairing (fix round 1, M5)", () => {
+  const extGet = (token: string) => svc!.app.inject({ method: "GET", url: "/projects", headers: { authorization: `Bearer ${token}` } });
+  const extPost = (token: string, origin = EXT) =>
+    svc!.app.inject({ method: "POST", url: "/capture/browser/links", headers: { authorization: `Bearer ${token}`, origin, "content-type": "application/json" }, payload: JSON.stringify({ projectId: "p", urls: ["https://www.youtube.com/watch?v=aoTest00001"] }) });
+
+  it("while the file cannot be read, EVERY extension-token request gets the same 503 in the service's shape, never 401; it heals when the file reads again", async () => {
+    await start();
+    const token = await pair();
+    const saved = await readFile(cfg("extension-pairings.json"), "utf8");
+    await writeFile(cfg("extension-pairings.json"), "garbage{");
+    await start();
+    const answers = [await extGet(token), await extGet("not-a-paired-token-0123456789abcdef"), await extPost(token), await extPost("not-a-paired-token-0123456789abcdef", "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")];
+    for (const r of answers) {
+      expect(r.statusCode).toBe(503);
+      expect(r.json()).toEqual({ error: { code: "UNAVAILABLE", message: "This computer's list of paired browsers cannot be read right now. Your browser stays paired; try again in a moment, or open the desktop app's “Browser extension” page." } });
+    }
+    // The desktop app's own token is not affected.
+    expect((await call({ url: "/extension/pairings" })).status).toBe(200);
+    // The file reads again: the same token works without pairing again.
+    await writeFile(cfg("extension-pairings.json"), saved);
+    expect((await extGet(token)).statusCode).not.toBe(401);
+    expect([200, 503]).toContain((await extGet(token)).statusCode);
+    expect((await extGet(token)).json().error?.code).not.toBe("UNAVAILABLE");
+  });
+
+  it("with the file readable, an unknown token is still 401 (nothing changes there)", async () => {
+    await start();
+    await pair();
+    expect((await extGet("not-a-paired-token-0123456789abcdef")).statusCode).toBe(401);
+  });
+});
+
 describe("the pairings file that stays unreadable (Task 66 M8)", () => {
   it("at start: no browser is paired, the list says the file cannot be read, pairing is refused", async () => {
     await start();

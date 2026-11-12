@@ -158,13 +158,22 @@ export class Pairing {
       const f = await readAppSettingStrict(this.configDir, PAIRINGS_FILE, isPairingFile);
       this.paired = usablePairings(f?.extensions ?? []);
       this.unreadable = false;
+      this.notLoaded = false;
     } catch (err) {
       if (!(err instanceof AppSettingUnreadableError)) throw err;
       this.paired = [];
       this.unreadable = true;
+      this.notLoaded = true;
     }
     this.loaded = true;
   }
+
+  /**
+   * No pairing could be read since the service started (the file was unreadable at start and has not
+   * been read since): a token cannot be checked at all, so the service answers every extension
+   * request with 503, never 401 (Task 68 fix round 1, M5). Pairings read earlier keep working.
+   */
+  notLoaded = false;
 
   /**
    * The pairings file is there but cannot be read (Task 68), as last found: at start (then no
@@ -182,6 +191,7 @@ export class Pairing {
       const f = await readAppSettingStrict(this.configDir, PAIRINGS_FILE, isPairingFile);
       if (this.unreadable) this.paired = usablePairings(f?.extensions ?? []);
       this.unreadable = false;
+      this.notLoaded = false;
     } catch (err) {
       if (!(err instanceof AppSettingUnreadableError)) throw err;
       this.unreadable = true;
@@ -198,6 +208,7 @@ export class Pairing {
     const keptAs = await setAppSettingAside(this.configDir, PAIRINGS_FILE, isPairingFile, now);
     this.paired = [];
     this.unreadable = false;
+    this.notLoaded = false;
     return keptAs;
   }
 
