@@ -366,8 +366,15 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service tests (the same port after a restart; fallback when it is taken; two services at once); the extension's tests and end-to-end run; the desktop launch check.
 - Model: Opus.
 
+**Task 67 — One review queue for the project (D14) [ledger: R172, R137, R149, R113, R145]**
+- Depends: 46b (the queue screen and the badge), 34d (confirming a field's value).
+- Files: `apps/library-service/src/routes/` (a project-wide read of the queue; decisions on entries without a batch), `packages/shared/src/api/`, `packages/ui/src/screens/import/ReviewQueue.tsx` and the route that opens it, the library row's badge link, tests; `e2e/` for scenario 11's queue step.
+- Accept: one view lists every pending entry of the project's review queue: import batch items (grouped by import), items queued by a drag-and-drop attach, and verification items from captures and consent withdrawals, each with what it is and why it waits; each can be decided there (an import item as today; a verification conflict by choosing a value, through the same governed, audited confirm as the source screen's badge), and a decision clears the entry and, when it was the source's last, the row's "Needs review" badge without a reload; the badge and the attach outcome link to this view; a locked project's entries are not shown or decided.
+- Verify: service and UI tests for each kind of entry; `pnpm e2e -- --app-only --trace off`.
+- Model: Opus.
+
 **Task 37k — Revise the guide and checklist for the build the owner will test**
-- Depends: 46a, 46b, 34d, 63, 64, 65, 66, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
+- Depends: 46a, 46b, 34d, 63, 64, 65, 66, 67, 34f. The first version (Task 37i) describes the build of 2026-11-12 with its known problems; this one removes the "Known problem" lines for what was fixed, restores scenario 3's order, and writes scenarios 9–11 in full.
 - Model: Sonnet, then an accuracy review.
 
 ### Milestone N — Finish Phase 1
@@ -451,6 +458,7 @@ Known, not yet scheduled above, or accepted as limits:
 - Defect found by Task 44 (for Task 46a): D8 (high): opening a library whose index file is missing, or stale, shows an empty library instead of rebuilding the index; the app has no rebuild control.
 - Defects found by Task 37i while writing the owner's guide (for Task 64): D10 (high): nothing in the interface links to the Capture screen or to the transcript viewer, and the desktop app has no address bar, so neither can be reached. D11 (high): the Governance form has no control for capture methods; a new project allows neither browser capture nor the downloader, and the only way to allow them is to edit the `governance.yaml` text. D12: outside the library chooser and the drop areas, folder and file paths must be typed in full; there is no picker.
 - Defect found by the review of Task 37i (for Task 66): D13 (high): the library service takes a new port at every launch, and the browser extension keeps the port typed at pairing and never looks for another, so a paired browser stops working each time the app is reopened ("The desktop app is not answering on port N") until it is unpaired and paired again.
+- Defect found by the review of Task 46b (for Task 67): D14 (high): the review queue screen lists the items of one import batch only. Entries queued by a drag-and-drop attach, by a capture with conflicting fields or by a consent withdrawal cannot be seen or decided anywhere, so their "Needs review" badge cannot be cleared.
 - Found by Task 34d: the field route confirms only top-level fields, so an identifier such as a DOI cannot become "Confirmed by you" (Task 46c); no blob picture decodes in WebKit under the end-to-end harness, so it must be checked in the real macOS web view (Tasks 37h, 59).
 
 ## 8. Status
@@ -470,7 +478,7 @@ Update after every task; commit and push.
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | fix round 1 | ed6a10f (worktree branch) | reviewed with probes: 1 Critical (a rebuild stopped half-way is taken as complete), 2 Important (the reopen at start can replace a library opened since; missing tests) |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | in review | e6c2bc5 (worktree branch) | built; D1, D2, D6 and D7 run as normal end-to-end tests in both browsers |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | fix round 1 | e6c2bc5 (worktree branch) | reviewed with probes: approved but for what "Needs review" follows, now ruled (R172) |
 | 46c A pairing code's status | fix round 1 in re-review | 7a7f5e2 (worktree branch) | a code is `used` only once its pairing is written; M1–M6 fixed |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
@@ -487,7 +495,7 @@ Update after every task; commit and push.
 | 49 Backups governed | fix round 4 | 857144d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; re-scoped by R147 |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
-| 51 Job records in files | fix round 2 in re-review | 82fbf40 (worktree branch) | a rerun is claimed once in the journal and runs as registered work (R142, R106) |
+| 51 Job records in files | approved; verification before merge | 82fbf40 (worktree branch) | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
@@ -505,6 +513,7 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | approved; verification before merge | 01a66d3 (worktree branch) | reviewed with probes, then one fix round (the update instructions) reviewed by the controller |
 | 66 A paired browser survives a relaunch (D13) | not started | | waits for 46c and 65 |
+| 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
