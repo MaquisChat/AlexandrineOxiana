@@ -125,7 +125,12 @@ function transcribeError(err: unknown, model: string): string {
 type Drafts = ReadonlyMap<number, string>;
 
 const isActive = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "queued" | "running" } => j?.status === "queued" || j?.status === "running";
-const isEnded = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "done" | "failed" | "cancelled" } => j?.status === "done" || j?.status === "failed" || j?.status === "cancelled";
+/** Cancelled because the project was locked: pending, it runs again at the unlock (R142). */
+const lockWaiting = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "cancelled" } => j?.status === "cancelled" && j.error?.code === "PROJECT_LOCKED";
+/** Queued, running, or waiting to run again (after a restart or a lock): Re-transcribe stays off, Stop is offered. */
+const isPending = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "queued" | "running" | "cancelled" } => isActive(j) || lockWaiting(j);
+const isEnded = (j: TranscriptionJob | null | undefined): j is TranscriptionJob & { status: "done" | "failed" | "cancelled" } =>
+  (j?.status === "done" || j?.status === "failed" || j?.status === "cancelled") && !lockWaiting(j);
 
 /** A job's failure as the service error it is, so the words and the missing-tool link are the same as for a refused start. */
 const jobError = (j: TranscriptionJob): ApiClientError | undefined =>
@@ -486,7 +491,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   const told = useRef(new Set<string>());
 
   useEffect(() => {
-    if (isActive(job)) {
+    if (isPending(job)) {
       seen.current.add(job.jobId);
       if (focusStop.current) {
         focusStop.current = false;
@@ -509,7 +514,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   }, [job, loadVersions]);
 
   const transcribe = async () => {
-    if (isActive(job) || startingRef.current) return;
+    if (isPending(job) || startingRef.current) return;
     startingRef.current = true;
     const chosen = model;
     focusStop.current = document.activeElement === transcribeButton.current;
@@ -529,11 +534,11 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
         // The run already going, or the one this request may have started: shown, never started twice.
         const now = await readJob();
         if (!mounted.current) return;
-        if (isActive(now)) {
+        if (isPending(now)) {
           if (running) setJobNote("This recording is already being transcribed; that run is shown here.");
           return;
         }
-        if (running) return;
+        // No run to show (M3): the service's own words are said, never nothing.
       }
       focusStop.current = false;
       if (!sawLocked(err)) {
@@ -548,7 +553,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
 
   const stop = async () => {
     const j = job;
-    if (!isActive(j) || stoppingRef.current || j.cancelRequested) return;
+    if (!isPending(j) || stoppingRef.current || j.cancelRequested) return;
     stoppingRef.current = true;
     setStopping(true);
     try {
@@ -562,7 +567,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
     }
   };
 
-  const busy = isActive(job) || starting;
+  const busy = isPending(job) || starting;
   const newestVersionAt = versions?.reduce<string | undefined>((m, v) => (v.at && (m === undefined || v.at > m) ? v.at : m), undefined);
   // A run that ended badly: told when this screen saw it run, or when it is newer than the newest version.
   const jobFailure = job && (job.status === "failed" || job.status === "cancelled") && job.error && (seen.current.has(job.jobId) || laterThan(job.updatedAt, newestVersionAt)) ? job : undefined;
@@ -843,15 +848,19 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
               </div>
               <SpeechModelNotice model={model} installed={installedModels} />
               <div id={`${id}-run`} role="status" className="ao-tx__progress">
-                {isActive(job) &&
+                {isPending(job) &&
                   (job.cancelRequested || stopping
                     ? "Stopping the transcription… The media helper is asked to stop; nothing of this run is saved."
-                    : `Transcribing with the ${job.model ?? "chosen"} model. This can take several minutes. You can leave this screen: the transcription goes on, and the new version will appear under Version. Re-transcribe is off for this source until it finishes.`)}
-                {isActive(job) && jobNote && ` ${jobNote}`}
+                    : lockWaiting(job)
+                      ? `${job.error?.message ?? "The project was locked before the transcription could finish. It runs again when the project is unlocked."} Re-transcribe is off for this source until then.`
+                      : job.waiting
+                        ? `The transcription with the ${job.model ?? "chosen"} model was interrupted; it runs again when the media helper is ready or the library is next opened. Re-transcribe is off for this source until then.`
+                        : `Transcribing with the ${job.model ?? "chosen"} model. This can take several minutes. You can leave this screen: the transcription goes on, and the new version will appear under Version. Re-transcribe is off for this source until it finishes.`)}
+                {isPending(job) && jobNote && ` ${jobNote}`}
               </div>
-              {isActive(job) && (
+              {isPending(job) && (
                 <div className="ao-row">
-                  {job.progress === undefined ? (
+                  {!isActive(job) || job.waiting ? null : job.progress === undefined ? (
                     <progress aria-label="Transcription in progress" />
                   ) : (
                     <progress aria-label="Transcription in progress" max={1} value={job.progress} />

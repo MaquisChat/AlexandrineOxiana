@@ -861,6 +861,46 @@ describe("TranscriptViewer — transcribe again (a job, Task 62)", () => {
     expect(screen.queryByText(/speech tool failed/)).toBeNull();
   });
 
+  it("fix 1 I1: a start the project's rules forbid shows the reason where the researcher clicked", async () => {
+    await openJob();
+    server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(403, "POLICY_DENIED", "This project's rules do not allow that.")));
+    await userEvent.setup().click(button());
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/rules do not allow/);
+    expect(button().disabled).toBe(false);
+  });
+
+  it("fix 1 I3: a rerun the rules refused is shown with its reason on opening, and Re-transcribe is on", async () => {
+    await openJob({ job: job({ status: "failed", error: { code: "POLICY_DENIED", message: "This project's rules do not allow that." }, updatedAt: "2026-11-05T10:00:00.000Z" }) });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/rules do not allow/);
+    expect(button().disabled).toBe(false);
+  });
+
+  it("fix 1 M3: a start refused as already running when no run is found says so instead of nothing", async () => {
+    const { svc } = await openJob();
+    server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(409, "CONFLICT", "This recording is already being transcribed. Wait until that has finished, or cancel it, before starting another.", "TRANSCRIPTION_RUNNING")));
+    svc.state.job = null;
+    await userEvent.setup().click(button());
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/already being transcribed/);
+  });
+
+  it("fix 1 M2: a run waiting to run again says so, not that it is transcribing", async () => {
+    await openJob({ job: job({ status: "queued", waiting: true, model: "small" }) });
+    expect(await screen.findByText(/runs again when the media helper is ready/)).toBeTruthy();
+    expect(screen.queryByText(/Transcribing with the small model/)).toBeNull();
+    expect(button().disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "Stop transcribing" })).toBeTruthy();
+  });
+
+  it("fix 1 M3: a run cancelled by a lock is pending: it says it runs at the unlock and Re-transcribe stays off", async () => {
+    await openJob({ job: job({ status: "cancelled", error: { code: "PROJECT_LOCKED", message: "The project was locked before the transcription could finish, so nothing was saved. It runs again when the project is unlocked.", reason: "PROJECT_LOCKED" } }) });
+    expect(await screen.findByText(/runs again when the project is unlocked/)).toBeTruthy();
+    expect(button().disabled).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("an event for another source, and answers after the screen closed, are dropped", async () => {
     const { svc, view } = await openJob();
     act(() => svc.update(job({ sourceId: "s2", status: "running", progress: 0.5 })));

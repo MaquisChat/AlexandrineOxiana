@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
 import { OPEN_GOV, addSource, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { ASSET_TEXT_MAX_BYTES, transcriptVersions } from "./source-actions.js";
-import { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
+import { addTranscriptVersion, compareWithBase, parseVtt, readTranscript } from "./transcript-segments.js";
 
 let kit: Kit;
 beforeEach(async () => {
@@ -234,6 +234,32 @@ describe("Task 62: a human edit stores flags per segment (R143, SPEC 5.8)", () =
     expect(a.encrypted).toBe(true);
     expect(a.derivation?.params.segmentFlags).toBe(1);
     expect((await readTranscript(kit.repo, p.id, sf.source.id, a.id)).segments.map((s) => s.flags)).toEqual([["outside-speech", "stock-phrase"]]);
+  });
+
+  it("fix 1 M4: &nbsp; still reads as a no-break space", () => {
+    expect(parseVtt("WEBVTT\n\n00:00.000 --> 00:01.000\na&nbsp;b\n")[0]!.text).toBe("a b");
+  });
+
+  it("fix 1 M5: text a person adds inside angle brackets makes the segment edited, never unchanged", async () => {
+    const p = await makeProject(kit);
+    const sf = await machineTranscribed(p);
+    const base = transcriptVersions(sf)[0]!;
+    const edited = vtt(cue("00:00:00.000", "00:00:02.000", "Welcome to the market."), cue("00:00:02.000", "00:00:04.500", "Obrigado. <i said something else>"));
+    const a = await addTranscriptVersion(kit.repo, p.id, sf.source.id, { text: edited, format: "vtt", basedOn: base.id });
+    expect((await readTranscript(kit.repo, p.id, sf.source.id, a.id)).segments.map((s) => [s.edit, s.flags])).toEqual([
+      ["unchanged", []],
+      ["edited", null],
+    ]);
+  });
+
+  it("fix 1 M6: comparing 50,000 segments with 50,000 is fast (sorted search, not every pair)", () => {
+    const base = Array.from({ length: 50_000 }, (_, i) => ({ start: i, end: i + 1, lang: "en", text: `b${i}`, flags: [] as string[] }));
+    const cues = Array.from({ length: 50_000 }, (_, i) => ({ start: i + 0.5, end: i + 0.75, text: `c${i}` }));
+    const t0 = performance.now();
+    const marks = compareWithBase(cues, base);
+    expect(performance.now() - t0).toBeLessThan(3000);
+    expect(marks.every((m) => m.edit === "edited")).toBe(true);
+    expect(compareWithBase([{ start: 60_000, end: 60_001, text: "x" }], base)[0]!.edit).toBe("added");
   });
 
   it("the size cap holds for the text as stored with its marks (R161: the transcript cap is kept)", async () => {

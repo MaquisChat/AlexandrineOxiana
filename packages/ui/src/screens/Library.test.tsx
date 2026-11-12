@@ -177,6 +177,12 @@ describe("Library screen", () => {
     expect(await screen.findByText(/Index rebuilding 3\/10/)).toBeTruthy();
   });
 
+  it("a transcription in the jobs indicator is named in words (Task 62)", async () => {
+    server.use(...libraryHandlers({ events: [{ type: "job.progress", data: { kind: "transcription", jobId: "j1", done: 40, total: 100, finished: false } }] }));
+    renderLibrary();
+    expect(await screen.findByText(/Transcribing recordings 40\/100/)).toBeTruthy();
+  });
+
   it("a locked encrypted project shows UnlockProject; a wrong passphrase says nothing was changed", async () => {
     let tries = 0;
     server.use(

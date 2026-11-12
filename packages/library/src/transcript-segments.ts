@@ -96,13 +96,12 @@ export const SEGMENT_FLAGS_VERSION = 1;
 const secondsOf = (h: string | undefined, m: string, s: string, ms: string): number => Number(h ?? 0) * 3600 + Number(m) * 60 + Number(s) + Number(ms) / 1000;
 
 /** Cue text for display: tags removed, the common character references decoded. */
-function cueText(lines: string[]): string {
-  return lines
-    .join("\n")
-    .replace(/<[^>]*>/g, "")
+function cueText(lines: string[], keepTags = false): string {
+  const joined = lines.join("\n");
+  return (keepTags ? joined : joined.replace(/<[^>]*>/g, ""))
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
+    .replace(/&nbsp;/g, "\u00a0")
     .replace(/&amp;/g, "&");
 }
 
@@ -118,6 +117,11 @@ function cueTimingAt(block: string[]): number {
 
 /** The cues of a WebVTT text; `NOTE flags: a, b` (and `NOTE ao-segment: …`) describe the cue after it. Malformed blocks are skipped. */
 export function parseVtt(text: string): VttCue[] {
+  return parseCues(text, false);
+}
+
+/** parseVtt's cues; with `keepTags` the text keeps its markup (what the person wrote, for the comparison). */
+function parseCues(text: string, keepTags: boolean): VttCue[] {
   const out: VttCue[] = [];
   let pending: string[] = [];
   let pendingEdit: SegmentEdit | undefined;
@@ -139,7 +143,7 @@ export function parseVtt(text: string): VttCue[] {
     const m = TIMING.exec(b[at]!)!;
     const start = secondsOf(m[1], m[2]!, m[3]!, m[4]!);
     const end = secondsOf(m[5], m[6]!, m[7]!, m[8]!);
-    if (out.length < MAX_SEGMENTS) out.push({ start, end, text: cueText(b.slice(at + 1)), flags: pending, ...(pendingEdit ? { edit: pendingEdit } : {}) });
+    if (out.length < MAX_SEGMENTS) out.push({ start, end, text: cueText(b.slice(at + 1), keepTags), flags: pending, ...(pendingEdit ? { edit: pendingEdit } : {}) });
     pending = [];
     pendingEdit = undefined;
   };
@@ -225,6 +229,25 @@ export function compareWithBase(cues: ReadonlyArray<{ start: number; end: number
     const key = `${ms(b.start)}|${ms(b.end)}|${textKey(b.text)}`;
     pool.set(key, [...(pool.get(key) ?? []), b]);
   }
+  // For "edited or added": the base sorted by start, with the latest end so far (M6: a binary
+  // search per cue, not a scan of the whole base), and the exact timings (zero-length segments).
+  const sorted = [...(base ?? [])].sort((a, b) => a.start - b.start);
+  const starts = sorted.map((x) => x.start);
+  const maxEnd: number[] = [];
+  for (const [i, x] of sorted.entries()) maxEnd.push(Math.max(i ? maxEnd[i - 1]! : -Infinity, x.end));
+  const timings = new Set(sorted.map((x) => `${ms(x.start)}|${ms(x.end)}`));
+  const overlaps = (c: { start: number; end: number }): boolean => {
+    if (timings.has(`${ms(c.start)}|${ms(c.end)}`)) return true;
+    let lo = 0;
+    let hi = starts.length; // first index whose start is >= c.end
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid]! < c.end) lo = mid + 1;
+      else hi = mid;
+    }
+    // Some segment starting before the cue ends overlaps it when one of them ends after the cue starts.
+    return lo > 0 && maxEnd[lo - 1]! > c.start;
+  };
   return cues.map((c) => {
     const same = pool.get(`${ms(c.start)}|${ms(c.end)}|${textKey(c.text)}`);
     const b = same?.shift();
@@ -232,8 +255,7 @@ export function compareWithBase(cues: ReadonlyArray<{ start: number; end: number
       if (b.flags !== null) return { edit: "unchanged", flags: [...b.flags] };
       return { edit: b.edit === "added" ? "added" : "edited", flags: null };
     }
-    const overlaps = (base ?? []).some((s) => Math.min(c.end, s.end) > Math.max(c.start, s.start) || (ms(s.start) === ms(c.start) && ms(s.end) === ms(c.end)));
-    return { edit: overlaps ? "edited" : "added", flags: null };
+    return { edit: overlaps(c) ? "edited" : "added", flags: null };
   });
 }
 
@@ -374,7 +396,8 @@ export async function addTranscriptVersion(
   if (input.format === "vtt") {
     const clean = stripReservedNotes(input.text);
     const baseSegments = input.basedOn ? (await readTranscript(repo, projectId, sourceId, input.basedOn)).segments : undefined;
-    const marks = compareWithBase(parseVtt(clean), baseSegments);
+    // The person's text with its markup (M5): text added inside angle brackets is a change.
+    const marks = compareWithBase(parseCues(clean, true), baseSegments);
     flagged = marks.filter((m) => m.edit === "unchanged" && m.flags?.length).length;
     text = annotateVtt(clean, marks);
     if (Buffer.byteLength(text, "utf8") > ASSET_TEXT_MAX_BYTES) {

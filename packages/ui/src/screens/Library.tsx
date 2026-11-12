@@ -72,7 +72,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
   failed: "Not added",
 };
 
-const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
+const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing", transcription: "Transcribing recordings" };
 
 export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
