@@ -58,6 +58,7 @@ export function VerificationBadge({ review, label, expanded, onOpen, buttonRef }
       ref={buttonRef}
       type="button"
       className={`ao-verify ao-verify--${status}`}
+      data-field={review.field}
       aria-label={`${label}: ${words}`}
       aria-haspopup="dialog"
       aria-expanded={expanded}

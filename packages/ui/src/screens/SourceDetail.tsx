@@ -250,17 +250,29 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
   }, [loadedFor, current, picKey]);
 
   // ---- verification ----
+  // The field just confirmed: its badge may move to another row and mount anew (a missing field
+  // gets its own row), so focus is put on it by field once the new record is on screen (R145, re-review N1).
+  const refocus = useRef<string | undefined>(undefined);
   const confirm = async (field: string, value: unknown) => {
     const g = gen.current;
     try {
       const f = await api.verification.confirmField(projectId, sourceId, field, value);
       if (g !== gen.current) return;
+      refocus.current = field;
       showFile(f as VerifiedSource);
       onChanged?.();
     } catch (err) {
       throw new Error(failed(err, "The library service did not answer."));
     }
   };
+
+  useEffect(() => {
+    const field = refocus.current;
+    if (!field) return;
+    refocus.current = undefined;
+    const target = [...document.querySelectorAll<HTMLElement>("button.ao-verify[data-field]")].find((b) => b.dataset.field === field);
+    if (target && document.activeElement !== target) target.focus();
+  }, [file]);
 
   const recheck = async () => {
     if (rechecking || readOnly) return;

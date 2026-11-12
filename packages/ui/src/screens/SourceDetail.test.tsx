@@ -131,6 +131,31 @@ describe("SourceDetail: verification (Task 34d)", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("confirming a missing field moves its badge to the field's own row, and focus follows it there (re-review N1, R145)", async () => {
+    const missing = { field: "/publisher", status: "unverified" as const, checks: ["present"], reason: "Publisher is missing.", evidence: [] };
+    const noPublisher = { ...SOURCE_FILE.source, publisher: undefined };
+    server.use(
+      ...sourceHandlers(withFields([FIELD_TITLE_VERIFIED, missing], { source: noPublisher })),
+      http.patch(url("/projects/:id/sources/:sid/fields"), async () => {
+        const confirmed = { field: "/publisher", status: "user-confirmed" as const, checks: ["user"], evidence: [{ value: "Polity", from: { kind: "user", label: "the researcher" }, at: "2026-11-12T09:00:00.000Z" }] };
+        return HttpResponse.json(withFields([FIELD_TITLE_VERIFIED, confirmed], { source: { ...SOURCE_FILE.source, publisher: "Polity" } }));
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const opener = await screen.findByRole("button", { name: "Publisher: Unverified" });
+    // Close without confirming: focus returns to the badge that opened the dialog.
+    await user.click(opener);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+    await user.click(opener);
+    await user.type(screen.getByLabelText("Your value"), "Polity{Enter}");
+    const confirmed = await screen.findByRole("button", { name: "Publisher: Confirmed by you" });
+    expect(confirmed).not.toBe(opener);
+    await waitFor(() => expect(document.activeElement).toBe(confirmed));
+    expect(document.querySelector("[inert]")).toBeNull();
+  });
+
   it("a DOI is confirmed through the field route under its own key (R149), and its badge then says Confirmed by you", async () => {
     let body: unknown;
     const doiUnverified = { ...FIELD_DOI_CONFIRMED, status: "unverified" as const, reason: "The DOI could not be checked." };
