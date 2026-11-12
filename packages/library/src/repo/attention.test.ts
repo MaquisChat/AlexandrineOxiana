@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditEvent } from "@ao/core";
@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
-import { newAttentionId, readOutbox, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./attention.js";
+import { attentionSeams, newAttentionId, readOutbox, reasonOf, writeAttention, writeOutbox, type UnrecordedAudit } from "./attention.js";
 import { NotFoundError, PolicyDeniedError } from "./errors.js";
 import { projectWarnings, recordOrMark, type Repo } from "./repo.js";
 import { SimulatedCrash, openTestRepo, seams } from "./testing.js";
@@ -78,6 +78,7 @@ beforeEach(async () => {
   folder = p.folder;
 });
 afterEach(async () => {
+  attentionSeams.crashAt = undefined;
   seams.failAuditAppendFor = undefined;
   seams.crashAt = undefined;
   await lib.close();
@@ -268,7 +269,7 @@ describe("R154 d: a mark that cannot be repaired can be set aside", () => {
     expect(marks).toEqual(
       expect.arrayContaining([
         { id: rec.id, kind: "audit-unrecorded", action: "library.reconnect", occurredAt: rec.occurredAt, actor: "someone", reason: "EIO", interrupted: true, canSetAside: true },
-        { id: name, kind: "unreadable", canSetAside: true },
+        { id: expect.stringMatching(/^u-[0-9a-f]{32}$/), kind: "unrecognised", name, canSetAside: true },
       ]),
     );
     expect(JSON.stringify(marks)).not.toContain(tmp);
@@ -277,17 +278,24 @@ describe("R154 d: a mark that cannot be repaired can be set aside", () => {
   it("with an intact project log: decided, audited there with the reason, who and the mark; then removed", async () => {
     const name = await unreadableMark();
     expect(await projectWarnings(repo, pid)).toEqual(["attention-unreadable"]);
-    await expect(repo.setAsideMark(pid, name, "  ")).rejects.toThrow(/reason/);
+    const id = (await repo.attentionMarks(pid))[0]!.id;
+    // Refused by the policy engine itself (N7), and audited.
+    await expect(repo.setAsideMark(pid, id, "  ")).rejects.toBeInstanceOf(PolicyDeniedError);
+    expect((await events()).at(-1)).toMatchObject({ action: "set-aside", decision: { result: "deny", reason: "A reason is required to set this aside" } });
     await expect(repo.setAsideMark(pid, "nope.json", "x")).rejects.toBeInstanceOf(NotFoundError);
-    expect(await repo.setAsideMark(pid, name, "The disk damaged it; nothing else is missing")).toEqual({ recordedIn: "project" });
+    expect(await repo.setAsideMark(pid, id, "The disk damaged it; nothing else is missing")).toEqual({ recordedIn: "project" });
     const ev = (await events()).at(-1)!;
     expect(ev).toMatchObject({
-      action: "delete",
+      action: "set-aside",
       actor: "tester",
       decision: { result: "allow" },
-      details: { op: "attention.set-aside", reason: "The disk damaged it; nothing else is missing", mark: { kind: "unreadable", file: `attention/${name}`, bytes: 9 } },
+      details: { op: "attention.set-aside", reason: "The disk damaged it; nothing else is missing", mark: { kind: "unrecognised", name, entry: "file", bytes: 9 } },
     });
     expect(await records()).toEqual([]);
+    // Never deleted: moved into the set-aside area, unchanged.
+    const aside = await readdir(join(lib.root, folder, "attention-set-aside"));
+    expect(aside).toHaveLength(1);
+    expect(await readFile(join(lib.root, folder, "attention-set-aside", aside[0]!), "utf8")).toBe("{ damaged");
     expect(await projectWarnings(repo, pid)).toEqual([]);
   });
 
@@ -303,7 +311,7 @@ describe("R154 d: a mark that cannot be repaired can be set aside", () => {
     expect(await r.setAsideMark(pid, rec.id, "Recorded on paper; the log is being investigated")).toEqual({ recordedIn: "library" });
     const lev = (await r.libraryAudit()).events.at(-1)!;
     expect(lev).toMatchObject({
-      action: "delete",
+      action: "set-aside",
       projectId: pid,
       actor: "tester",
       decision: { result: "allow" },
@@ -315,10 +323,39 @@ describe("R154 d: a mark that cannot be repaired can be set aside", () => {
 
   it("a refusal by the policy engine is audited and nothing is removed", async () => {
     const name = await unreadableMark();
+    const id = (await repo.attentionMarks(pid))[0]!.id;
     await writeFile(join(lib.root, folder, "governance.yaml"), "::: not yaml [");
-    await expect(repo.setAsideMark(pid, name, "why")).rejects.toBeInstanceOf(PolicyDeniedError);
-    expect((await events()).at(-1)).toMatchObject({ action: "delete", decision: { result: "deny" }, details: { op: "attention.set-aside" } });
+    await expect(repo.setAsideMark(pid, id, "why")).rejects.toBeInstanceOf(PolicyDeniedError);
+    expect((await events()).at(-1)).toMatchObject({ action: "set-aside", decision: { result: "deny" }, details: { op: "attention.set-aside" } });
     expect(await records()).toEqual([name]);
+  });
+
+  it("N5: no absolute path reaches the library's log when the governance file cannot be read", async () => {
+    const rec = unrecorded();
+    await writeAttention(lib.root, folder, rec);
+    const seg = join(lib.root, folder, "audit", "0001.jsonl");
+    await writeFile(seg, (await readFile(seg, "utf8")).replace('"actor":"tester"', '"actor":"forged"'));
+    const r = await reopen();
+    const gov = join(lib.root, folder, "governance.yaml");
+    await rm(gov);
+    await symlink(gov, gov); // a link to itself: ELOOP, whose message names the absolute path
+    await expect(r.setAsideMark(pid, rec.id, "why")).rejects.toBeInstanceOf(PolicyDeniedError);
+    const raw = await readFile(join(lib.root, "audit", "0001.jsonl"), "utf8");
+    expect(raw).toContain("set-aside");
+    expect(raw).not.toContain(tmp);
+  });
+
+  it("N5: no absolute path reaches a project's log in a policy refusal either", async () => {
+    const gov = join(lib.root, folder, "governance.yaml");
+    await rm(gov);
+    await symlink(gov, gov);
+    await expect(repo.setAsideMark(pid, "u-0", "why")).rejects.toThrow();
+    await writeAttention(lib.root, folder, unrecorded());
+    const id = (await repo.attentionMarks(pid))[0]!.id;
+    await expect(repo.setAsideMark(pid, id, "why")).rejects.toBeInstanceOf(PolicyDeniedError);
+    const all = JSON.stringify(await events());
+    expect(all).toContain("Policy could not be evaluated");
+    expect(all).not.toContain(tmp);
   });
 
   it("a mark waiting on this device for the library's lock is not set aside here", async () => {
@@ -326,5 +363,131 @@ describe("R154 d: a mark that cannot be repaired can be set aside", () => {
     await writeOutbox(join(tmp, "config"), lib.id, pid, rec);
     expect((await repo.attentionMarks(pid)).find((m) => m.id === rec.id)).toMatchObject({ kind: "waiting", canSetAside: false });
     await expect(repo.setAsideMark(pid, rec.id, "x")).rejects.toBeInstanceOf(NotFoundError);
+  });
+});
+
+describe("N4: delivery is exactly once, whatever the crash", () => {
+  const reconnects = async () => (await events()).filter((e) => e.action === "library.reconnect").length;
+  const reopenCrashing = async (): Promise<void> => {
+    await lib.close();
+    lib = await openLibrary(join(tmp, "Lib"), deps());
+    await expect(open(lib)).rejects.toBeInstanceOf(SimulatedCrash);
+  };
+
+  for (const at of ["before-late-append", "after-late-append"] as const) {
+    it(`an outbox entry, crash ${at}: recorded exactly once`, async () => {
+      await writeOutbox(join(tmp, "config"), lib.id, pid, unrecorded());
+      attentionSeams.crashAt = at;
+      await reopenCrashing();
+      await reopen();
+      expect(await reconnects()).toBe(1);
+      expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
+      await reopen();
+      expect(await reconnects()).toBe(1);
+    });
+
+    it(`a record in the project, crash ${at}: recorded exactly once`, async () => {
+      await writeAttention(lib.root, folder, unrecorded());
+      attentionSeams.crashAt = at;
+      await reopenCrashing();
+      await reopen();
+      expect(await reconnects()).toBe(1);
+      expect(await records()).toEqual([]);
+    });
+  }
+
+  it("A7: moved into a project that could not take it, crash before the outbox copy was removed, then intact: exactly once", async () => {
+    await writeOutbox(join(tmp, "config"), lib.id, pid, unrecorded());
+    const seg = join(lib.root, folder, "audit", "0001.jsonl");
+    const original = await readFile(seg, "utf8");
+    await writeFile(seg, original.replace('"actor":"tester"', '"actor":"forged"'));
+    attentionSeams.crashAt = "outbox-moved";
+    await reopenCrashing();
+    expect(await records()).toHaveLength(1);
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toHaveLength(1);
+    await writeFile(seg, original);
+    await reopen();
+    expect(await reconnects()).toBe(1);
+    expect(await records()).toEqual([]);
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
+  });
+
+  it("the same record in both places, no crash: exactly once", async () => {
+    const rec = unrecorded();
+    await writeOutbox(join(tmp, "config"), lib.id, pid, rec);
+    await writeAttention(lib.root, folder, rec);
+    await reopen();
+    expect(await reconnects()).toBe(1);
+  });
+});
+
+describe("N2, N10: anything in the attention folder that is not a well-formed mark is shown once and can be set aside", () => {
+  const att = () => join(lib.root, folder, "attention");
+
+  it("a subfolder, a sync client's conflict copy, an oversized file and a link: each listed by name with an opaque id, each set aside by moving it, never deleted or followed", async () => {
+    await mkdir(join(att(), "sub"), { recursive: true });
+    await writeFile(join(att(), "sub", "inner.txt"), "x");
+    const rec = unrecorded();
+    await writeFile(join(att(), "abc 2.json"), JSON.stringify(rec));
+    const big = `${newAttentionId()}.json`;
+    await writeFile(join(att(), big), JSON.stringify({ ...unrecorded({ id: big.slice(0, -5) }), details: { pad: "x".repeat(70 * 1024) } }));
+    await writeFile(join(tmp, "outside.txt"), "outside");
+    await symlink(join(tmp, "outside.txt"), join(att(), "link"));
+    const marks = await repo.attentionMarks(pid);
+    expect(marks.map((m) => [m.kind, m.name, m.canSetAside]).sort()).toEqual(
+      [
+        ["unrecognised", "abc 2.json", true],
+        ["unrecognised", big, true],
+        ["unrecognised", "link", true],
+        ["unrecognised", "sub", true],
+      ].sort(),
+    );
+    for (const m of marks) expect(m.id).toMatch(/^u-[0-9a-f]{32}$/);
+    expect(await projectWarnings(repo, pid)).toEqual(["attention-unreadable"]);
+    for (const m of marks) expect(await repo.setAsideMark(pid, m.id, `set aside ${m.name}`)).toEqual({ recordedIn: "project" });
+    expect(await readdir(att())).toEqual([]);
+    expect(await projectWarnings(repo, pid)).toEqual([]);
+    const aside = join(lib.root, folder, "attention-set-aside");
+    expect(await readdir(aside)).toHaveLength(4);
+    // The link was moved as a link (its target untouched); the folder with its content.
+    const names = await readdir(aside);
+    const kinds = await Promise.all(names.map(async (n) => ((await lstat(join(aside, n))).isSymbolicLink() ? "link" : (await lstat(join(aside, n))).isDirectory() ? "folder" : "file")));
+    expect(kinds.sort()).toEqual(["file", "file", "folder", "link"]);
+    expect(await readFile(join(tmp, "outside.txt"), "utf8")).toBe("outside");
+    const evs = (await events()).filter((e) => e.action === "set-aside");
+    expect(evs.map((e) => (e.details!.mark as { entry: string }).entry).sort()).toEqual(["file", "file", "folder", "link"]);
+    expect(JSON.stringify(evs)).not.toContain(tmp);
+  });
+
+  it("an attention entry that is itself a file is shown and can be set aside", async () => {
+    await writeFile(att(), "not a folder");
+    const marks = await repo.attentionMarks(pid);
+    expect(marks).toEqual([{ id: expect.stringMatching(/^u-/), kind: "unrecognised", name: "attention", canSetAside: true }]);
+    await repo.setAsideMark(pid, marks[0]!.id, "a stray file");
+    expect(await repo.attentionMarks(pid)).toEqual([]);
+    expect(await projectWarnings(repo, pid)).toEqual([]);
+  });
+
+  it("a well-formed record set aside is moved, not deleted", async () => {
+    const rec = unrecorded();
+    await writeAttention(lib.root, folder, rec);
+    await repo.setAsideMark(pid, rec.id, "recorded on paper");
+    expect(await records()).toEqual([]);
+    const aside = await readdir(join(lib.root, folder, "attention-set-aside"));
+    expect(aside).toHaveLength(1);
+    expect(JSON.parse(await readFile(join(lib.root, folder, "attention-set-aside", aside[0]!), "utf8")).id).toBe(rec.id);
+  });
+});
+
+describe("N9: outbox leftovers", () => {
+  it("an entry for a project that no longer exists is recorded in the library's log, then removed (never lost)", async () => {
+    const rec = unrecorded();
+    await writeOutbox(join(tmp, "config"), lib.id, "0190f0f0-0000-7000-8000-00000000dead", rec);
+    let r = await reopen();
+    const ev = (await r.libraryAudit()).events.at(-1)!;
+    expect(ev).toMatchObject({ action: "library.reconnect", projectId: "0190f0f0-0000-7000-8000-00000000dead", details: { attentionId: rec.id, projectMissing: true, recordedLate: { by: "dev-A" } } });
+    expect(await readOutbox(join(tmp, "config"), lib.id)).toEqual([]);
+    r = await reopen();
+    expect((await r.libraryAudit()).events.filter((e) => e.details?.attentionId === rec.id)).toHaveLength(1);
   });
 });

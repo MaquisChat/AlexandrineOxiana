@@ -132,6 +132,8 @@ export class RepoCore {
   /** The library's own audit log (Task 50, R154 a), loaded at open; its latest event. */
   libraryAudit?: AuditStore;
   libraryAuditLast?: AuditEvent | null;
+  /** The library log's entries of its latest day, for dropping a repeated refusal (N6). */
+  libraryAuditRecent?: AuditEvent[];
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(

@@ -12,30 +12,24 @@
  * log this computer wrote to, are reported library-wide and, when writable, recorded here before the
  * log is anchored again (R82). The head is kept in memory, so an append does not read the log.
  *
- * Repeats (R154 a): a refusal identical to the latest entry (same action, operation, name, reason,
- * actor and device) on the same UTC day is not appended again; it is counted in `audit/repeats.json`
- * against that entry (`{seq, hash, count, lastAt}`), as the backup scheduler records one denial a day.
+ * Repeats (R154 a as amended, N6): the day's first refusal of a kind is a normal chained entry; an
+ * identical refusal later that same UTC day is dropped, and the audit screen says, for a refusal,
+ * that further identical ones that day are not listed. Nothing is counted outside the chain.
+ * "Identical" means every field the entry shows is equal (action, actor, device, decision, and every
+ * detail, `encrypted` included); anything that differs is a new entry.
  */
+import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import { verifyChain, type AuditEvent, type AuditVerifyResult } from "@ao/core";
-import { writeFileAtomic } from "../fs/atomic.js";
 import { AuditStore, checkAnchor, type AuditInput, type Head } from "./audit-store.js";
 import type { IncompleteLine } from "./incomplete-lines.js";
-import { assertContained, readMaybe } from "./io.js";
 import type { RepoCore } from "./state.js";
 
 export const LIBRARY_AUDIT_DIR = "audit";
-const REPEATS_FILE = "repeats.json";
 
 /** The anchor key of the library's log: `<libraryId>/*`. */
 export const libraryAnchorKey = (core: RepoCore) => core.anchorKey("*");
 
-interface Repeats {
-  seq: number;
-  hash: string;
-  count: number;
-  lastAt: string;
-}
 
 const dirOf = (root: string) => join(root, LIBRARY_AUDIT_DIR);
 
@@ -44,6 +38,7 @@ async function store(core: RepoCore): Promise<AuditStore> {
     const { store: s, events } = await AuditStore.load(dirOf(core.root), core.auditSegmentSize);
     core.libraryAudit = s;
     core.libraryAuditLast = [...events].reverse().find((e): e is AuditEvent => e !== null) ?? null;
+    core.libraryAuditRecent = events.filter((e): e is AuditEvent => e !== null && e.at.slice(0, 10) === core.libraryAuditLast?.at.slice(0, 10));
   }
   return core.libraryAudit;
 }
@@ -53,6 +48,8 @@ export async function appendLibraryAudit(core: RepoCore, input: AuditInput): Pro
   const s = await store(core);
   const { event } = await s.append(input);
   core.libraryAuditLast = event;
+  const day = event.at.slice(0, 10);
+  core.libraryAuditRecent = [...(core.libraryAuditRecent ?? []).filter((e) => e.at.slice(0, 10) === day), event];
   if (s.head) {
     try {
       await core.anchors.set(libraryAnchorKey(core), s.head, input.at);
@@ -63,57 +60,35 @@ export async function appendLibraryAudit(core: RepoCore, input: AuditInput): Pro
   return event;
 }
 
-const sameKind = (a: AuditEvent, b: AuditInput) =>
-  a.action === b.action &&
-  a.actor === b.actor &&
-  a.device === b.device &&
-  a.decision?.result === b.decision?.result &&
-  a.decision?.reason === b.decision?.reason &&
-  a.details?.op === b.details?.op &&
-  a.details?.name === b.details?.name &&
-  a.at.slice(0, 10) === b.at.slice(0, 10);
+type Shown = Pick<AuditEvent, "at" | "actor" | "device" | "action" | "decision" | "details" | "projectId">;
 
-/** A refusal: appended, or counted against the latest entry when it repeats it the same day. */
-export async function appendLibraryRefusal(core: RepoCore, input: AuditInput): Promise<void> {
-  await store(core);
-  const last = core.libraryAuditLast;
-  if (last && sameKind(last, input)) {
-    const file = join(dirOf(core.root), REPEATS_FILE);
-    await assertContained(core.root, file);
-    const prev = await readRepeats(core.root);
-    const count = prev && prev.seq === last.seq && prev.hash === last.hash ? prev.count + 1 : 1;
-    const body: Repeats = { seq: last.seq, hash: last.hash, count, lastAt: input.at };
-    await writeFileAtomic(file, JSON.stringify(body), { mode: 0o600 });
-    return;
-  }
-  await appendLibraryAudit(core, input);
+/** The same refusal on the same UTC day: every field the entry shows is equal (N6). */
+export function sameRefusal(a: Shown, b: Shown): boolean {
+  return (
+    a.at.slice(0, 10) === b.at.slice(0, 10) &&
+    a.action === b.action &&
+    a.actor === b.actor &&
+    a.device === b.device &&
+    a.projectId === b.projectId &&
+    isDeepStrictEqual(a.decision ?? null, b.decision ?? null) &&
+    isDeepStrictEqual(a.details ?? null, b.details ?? null)
+  );
 }
 
-async function readRepeats(root: string): Promise<Repeats | null> {
-  try {
-    const raw = await readMaybe(join(dirOf(root), REPEATS_FILE));
-    const r = raw ? (JSON.parse(raw.toString("utf8")) as Partial<Repeats>) : null;
-    if (!r || !Number.isSafeInteger(r.seq) || typeof r.hash !== "string" || !Number.isSafeInteger(r.count) || typeof r.lastAt !== "string") return null;
-    return r as Repeats;
-  } catch {
-    return null;
-  }
+/** A refusal: appended, unless the same refusal is already recorded today (then dropped, N6). */
+export async function appendLibraryRefusal(core: RepoCore, input: AuditInput): Promise<void> {
+  await store(core);
+  if ((core.libraryAuditRecent ?? []).some((e) => sameRefusal(e, input))) return;
+  await appendLibraryAudit(core, input);
 }
 
 /**
  * The library's audit events, whether their chain verifies, and the repeat count of the latest
  * entry (only while it is still the latest).
  */
-export async function readLibraryAudit(root: string): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult; repeats?: Repeats }> {
+export async function readLibraryAudit(root: string): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult }> {
   const all = await AuditStore.read(dirOf(root));
-  const events = all.filter((e): e is AuditEvent => e !== null);
-  const last = events.at(-1);
-  const r = await readRepeats(root);
-  return {
-    events,
-    verify: verifyChain(all as AuditEvent[]),
-    ...(r && last && r.seq === last.seq && r.hash === last.hash ? { repeats: { seq: r.seq, count: r.count, lastAt: r.lastAt } as Repeats } : {}),
-  };
+  return { events: all.filter((e): e is AuditEvent => e !== null), verify: verifyChain(all as AuditEvent[]) };
 }
 
 /**
@@ -124,6 +99,7 @@ export async function checkLibraryAudit(core: RepoCore, anchor: Head | undefined
   const { store: s, events, verify } = await AuditStore.load(dirOf(core.root), core.auditSegmentSize);
   core.libraryAudit = s;
   core.libraryAuditLast = [...events].reverse().find((e): e is AuditEvent => e !== null) ?? null;
+  core.libraryAuditRecent = events.filter((e): e is AuditEvent => e !== null && e.at.slice(0, 10) === core.libraryAuditLast?.at.slice(0, 10));
   // A library that never had a log, and that this computer never anchored, has nothing to compare.
   const problem = events.length === 0 && !anchor ? null : checkAnchor(events, verify, anchor, core.device);
   if (problem) core.integrityWarnings.push({ projectId: "*", kind: problem.kind, detail: `the library's audit log: ${problem.detail}` });

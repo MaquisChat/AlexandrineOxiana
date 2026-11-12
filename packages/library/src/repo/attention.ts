@@ -40,6 +40,8 @@ import { writeFileAtomic } from "../fs/atomic.js";
 import { absPath, assertContained, readMaybe } from "./io.js";
 import { isClosed, type Library } from "../library.js";
 import { readLock } from "../lock.js";
+import { appendLibraryAudit, readLibraryAudit } from "./library-audit.js";
+import { SimulatedCrash } from "./seams.js";
 import { parseProjectJson, type ProjectState, type RepoCore } from "./state.js";
 
 export const ATTENTION_DIR = "attention";
@@ -152,38 +154,63 @@ export function parseRecord(v: unknown, id: string): AttentionRecord | null {
   return null;
 }
 
-/** A file in the attention folder that is not a valid record, or the folder itself when it is not a folder. */
-export interface UnreadableMark {
-  /** The file's name in the attention folder; "" when `attention` itself is not a folder. */
-  file: string;
+/** The most a mark file may hold; a larger one is not read and is an unrecognised item (N10). */
+export const MAX_MARK_BYTES = 64 * 1024;
+/** Where set-aside marks and items go, inside the project; never deleted (N2). */
+export const SET_ASIDE_DIR = "attention-set-aside";
+
+/**
+ * Anything in the attention folder that is not a well-formed mark: a damaged or oversized file, a
+ * sync client's conflict copy ("abc 2.json"), a folder, a link; or `attention` itself when it is not
+ * a folder (`self`). Never read beyond its size, never followed, never parsed (N2).
+ */
+export interface UnrecognisedItem {
+  /** Opaque: `u-` and 32 hex digits of the SHA-256 of the name. */
+  id: string;
+  /** The entry's name in the attention folder (or `attention` for `self`). User text. */
+  name: string;
+  entry: "file" | "folder" | "link" | "other";
+  bytes?: number;
+  self?: true;
 }
 
-/** The project's records, and what in its attention folder is not a valid record (kept, never acted on). */
-export async function readAttention(root: string, projectRel: string): Promise<{ records: AttentionRecord[]; unreadable: UnreadableMark[] }> {
+const entryOf = (s: import("node:fs").Stats): UnrecognisedItem["entry"] =>
+  s.isSymbolicLink() ? "link" : s.isDirectory() ? "folder" : s.isFile() ? "file" : "other";
+export const unrecognisedId = (name: string, self = false) => `u-${createHash("sha256").update(self ? "\u0000self" : name, "utf8").digest("hex").slice(0, 32)}`;
+
+/** The project's well-formed records, and every other item in its attention folder (kept, never acted on). */
+export async function readAttention(root: string, projectRel: string): Promise<{ records: AttentionRecord[]; unrecognised: UnrecognisedItem[] }> {
+  const dir = dirOf(root, projectRel);
+  const top = await fsp.lstat(dir).catch(() => null);
+  if (!top) return { records: [], unrecognised: [] };
+  if (!top.isDirectory()) {
+    return { records: [], unrecognised: [{ id: unrecognisedId(ATTENTION_DIR, true), name: ATTENTION_DIR, entry: entryOf(top), ...(top.isFile() ? { bytes: top.size } : {}), self: true }] };
+  }
   let names: string[];
   try {
-    names = await fsp.readdir(dirOf(root, projectRel));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { records: [], unreadable: [] };
-    return { records: [], unreadable: [{ file: "" }] };
+    names = await fsp.readdir(dir);
+  } catch {
+    return { records: [], unrecognised: [{ id: unrecognisedId(ATTENTION_DIR, true), name: ATTENTION_DIR, entry: "other", self: true }] };
   }
   const records: AttentionRecord[] = [];
-  const unreadable: UnreadableMark[] = [];
+  const unrecognised: UnrecognisedItem[] = [];
   for (const n of names.sort()) {
-    if (/\.tmp-[0-9a-f]+$/.test(n)) continue; // an interrupted atomic write: never a record
+    if (/\.tmp-[0-9a-f]+$/.test(n)) continue; // an interrupted atomic write of ours: never a record
+    const st = await fsp.lstat(join(dir, n)).catch(() => null);
+    if (!st) continue;
     let rec: AttentionRecord | null = null;
-    if (NAME.test(n)) {
+    if (NAME.test(n) && st.isFile() && st.size <= MAX_MARK_BYTES) {
       try {
-        const raw = await readMaybe(join(dirOf(root, projectRel), n));
-        rec = raw ? parseRecord(JSON.parse(raw.toString("utf8")), n.slice(0, -5)) : null;
+        const raw = await readMaybe(join(dir, n));
+        rec = raw && raw.length <= MAX_MARK_BYTES ? parseRecord(JSON.parse(raw.toString("utf8")), n.slice(0, -5)) : null;
       } catch {
         rec = null;
       }
     }
     if (rec) records.push(rec);
-    else unreadable.push({ file: n });
+    else unrecognised.push({ id: unrecognisedId(n), name: n, entry: entryOf(st), ...(st.isFile() ? { bytes: st.size } : {}) });
   }
-  return { records, unreadable };
+  return { records, unrecognised };
 }
 
 /**
@@ -193,10 +220,10 @@ export async function readAttention(root: string, projectRel: string): Promise<{
  * (`attention-unreadable`), permissions not set (`permissions-not-set`).
  */
 export async function attentionWarnings(root: string, projectRel: string, blocked: boolean): Promise<string[]> {
-  const { records, unreadable } = await readAttention(root, projectRel);
+  const { records, unrecognised } = await readAttention(root, projectRel);
   const out: string[] = [];
   if (records.some((r) => r.kind === "audit-unrecorded")) out.push(blocked ? AUDIT_UNRECORDED_BLOCKED_WARNING : AUDIT_UNRECORDED_WARNING);
-  if (unreadable.length > 0) out.push(ATTENTION_UNREADABLE_WARNING);
+  if (unrecognised.length > 0) out.push(ATTENTION_UNREADABLE_WARNING);
   if (records.some((r) => r.kind === "permissions-not-set")) out.push(PERMISSIONS_NOT_SET_WARNING);
   return out;
 }
@@ -243,6 +270,8 @@ export async function readOutbox(appConfigDir: string, libraryId: string): Promi
   for (const n of names.sort()) {
     if (!NAME.test(n)) continue;
     try {
+      const st = await fsp.lstat(join(outboxDir(appConfigDir, libraryId), n));
+      if (!st.isFile() || st.size > MAX_MARK_BYTES) continue;
       const raw = await readMaybe(join(outboxDir(appConfigDir, libraryId), n));
       const e = raw ? (JSON.parse(raw.toString("utf8")) as Partial<OutboxEntry>) : null;
       const rec = e && typeof e.projectId === "string" ? parseRecord(e.record, n.slice(0, -5)) : null;
@@ -292,7 +321,7 @@ export async function projectFolders(root: string): Promise<Map<string, string>>
 }
 
 /** Test seam: makes setting permissions again on open fail (until cleared). */
-export const attentionSeams: { failRestrict?: boolean } = {};
+export const attentionSeams: { failRestrict?: boolean; crashAt?: AttentionCrashPoint } = {};
 
 /**
  * Restricts every file of one source, as the project's own index places it, to owner read/write at
@@ -328,13 +357,28 @@ async function restrictSource(core: RepoCore, st: ProjectState, sourceId: string
   return { files, changed };
 }
 
-/** Appends one record's event (once) or repairs its permissions; true when settled. Throws on a failed append. */
-async function settleOne(core: RepoCore, st: ProjectState, rec: AttentionRecord, events: Array<AuditEvent | null>, at: string): Promise<boolean> {
+/** Test seam: a simulated crash at one point of delivery (N4). */
+export type AttentionCrashPoint = "before-late-append" | "after-late-append" | "outbox-moved";
+
+function crashPoint(at: AttentionCrashPoint): void {
+  if (attentionSeams.crashAt === at) {
+    attentionSeams.crashAt = undefined;
+    throw new SimulatedCrash(`simulated crash at ${at}`);
+  }
+}
+
+/**
+ * Appends one record's event (once) or repairs its permissions; true when settled. `recorded` holds
+ * every attention id the project's log already has, including what this pass appended (N4), so a
+ * record delivered from two places in one pass, or after a crash, is recorded exactly once.
+ */
+async function settleOne(core: RepoCore, st: ProjectState, rec: AttentionRecord, events: Array<AuditEvent | null>, recorded: Set<string>, at: string): Promise<boolean> {
   if (rec.kind === "audit-unrecorded") {
     const moveId = rec.details.moveId;
     // Recorded already: by an earlier repair, or (a move step run again) by the action itself.
-    const already = events.some((e) => e?.details?.attentionId === rec.id || (moveId !== undefined && e?.action === rec.action && e.details?.moveId === moveId));
+    const already = recorded.has(rec.id) || (moveId !== undefined && events.some((e) => e?.action === rec.action && e.details?.moveId === moveId));
     if (!already) {
+      crashPoint("before-late-append");
       await core.auditNow(st, {
         at,
         actor: rec.actor,
@@ -354,6 +398,8 @@ async function settleOne(core: RepoCore, st: ProjectState, rec: AttentionRecord,
           },
         },
       });
+      recorded.add(rec.id);
+      crashPoint("after-late-append");
     }
     return true;
   }
@@ -368,7 +414,7 @@ async function settleOne(core: RepoCore, st: ProjectState, rec: AttentionRecord,
   } catch {
     return false; // stays: the warning stands until it works, or the researcher sets it aside
   }
-  if (!events.some((e) => e?.details?.attentionId === rec.id)) {
+  if (!recorded.has(rec.id)) {
     await core.auditNow(st, {
       ...core.auditBase(st, at),
       action: "library.permissions-restricted",
@@ -376,26 +422,38 @@ async function settleOne(core: RepoCore, st: ProjectState, rec: AttentionRecord,
       decision: { result: "allow" },
       details: { attentionId: rec.id, sources: rec.sourceIds.length, files, changed, mode: RESTRICTED_MODE.toString(8), after: rec.action, occurredAt: rec.occurredAt },
     });
+    recorded.add(rec.id);
   }
   return true;
 }
 
 /**
  * On a writable open of a project whose log verifies and that accepts writes: settles each record
- * of the project and each of this device's outbox entries for it. Returns how many were settled.
- * An append failure throws (the caller blocks the project, R28).
+ * of the project and each of this device's outbox entries for it, exactly once (N4):
+ * - an outbox entry whose id the project's folder also holds is the same mark: the folder copy is
+ *   kept and the outbox copy dropped (it is already durable in the folder);
+ * - an id the log already has is never appended again;
+ * - a record (folder or outbox) is removed only after its event is durable in the log.
+ * Returns how many were settled. An append failure throws (the caller blocks the project, R28).
  */
 export async function settleAttention(core: RepoCore, st: ProjectState, events: Array<AuditEvent | null>, at: string): Promise<number> {
+  const recorded = new Set<string>();
+  for (const e of events) if (typeof e?.details?.attentionId === "string") recorded.add(e.details.attentionId);
   let settled = 0;
+  const inFolder = new Set((await readAttention(core.root, st.rel)).records.map((r) => r.id));
   for (const e of await readOutbox(core.library.appConfigDir, core.library.id)) {
     if (e.projectId !== st.project.id) continue;
-    if (await settleOne(core, st, e.record, events, at)) settled++;
+    if (inFolder.has(e.record.id)) {
+      await removeOutbox(core.library.appConfigDir, core.library.id, e.record.id);
+      continue;
+    }
+    if (await settleOne(core, st, e.record, events, recorded, at)) settled++;
     else await writeAttention(core.root, st.rel, e.record); // kept with the project from now on
     await removeOutbox(core.library.appConfigDir, core.library.id, e.record.id);
   }
   const { records } = await readAttention(core.root, st.rel);
   for (const rec of records) {
-    if (!(await settleOne(core, st, rec, events, at))) continue;
+    if (!(await settleOne(core, st, rec, events, recorded, at))) continue;
     await removeAttention(core.root, st.rel, rec.id);
     settled++;
   }
@@ -405,15 +463,18 @@ export async function settleAttention(core: RepoCore, st: ProjectState, events: 
 /**
  * On a writable open of a project that cannot be settled now (its log does not verify, or it refuses
  * writes): this device's outbox entries for it move into the project's folder, where they are shown
- * and can be set aside. Failures leave them in the outbox.
+ * and can be set aside; the outbox copy goes only once the folder copy is durable. Failures leave
+ * them in the outbox.
  */
 export async function moveOutboxIntoProject(core: RepoCore, st: ProjectState): Promise<void> {
   for (const e of await readOutbox(core.library.appConfigDir, core.library.id)) {
     if (e.projectId !== st.project.id) continue;
     try {
       await writeAttention(core.root, st.rel, e.record);
+      crashPoint("outbox-moved");
       await removeOutbox(core.library.appConfigDir, core.library.id, e.record.id);
-    } catch {
+    } catch (err) {
+      if (err instanceof SimulatedCrash) throw err;
       // stays in the outbox
     }
   }
@@ -421,9 +482,11 @@ export async function moveOutboxIntoProject(core: RepoCore, st: ProjectState): P
 
 /** One mark as the audit screen lists it (no paths, no messages). */
 export interface AttentionMark {
-  /** The record id, or for something that is not a valid record its file name ("-" when the attention folder itself is not a folder). */
+  /** The record id, or for an unrecognised item an opaque `u-…` id. */
   id: string;
-  kind: "audit-unrecorded" | "permissions-not-set" | "unreadable" | "waiting";
+  kind: "audit-unrecorded" | "permissions-not-set" | "unrecognised" | "waiting";
+  /** For an unrecognised item: its name in the attention folder (user text). */
+  name?: string;
   action?: string;
   occurredAt?: string;
   actor?: string;
@@ -431,12 +494,12 @@ export interface AttentionMark {
   reason?: string;
   interrupted?: boolean;
   refusal?: boolean;
-  /** Can be set aside here (not for a mark waiting on this device for the library's lock). */
+  /** Can be set aside here (every mark except one waiting on this device for the library's lock). */
   canSetAside: boolean;
 }
 
 export async function listMarks(core: RepoCore, st: ProjectState): Promise<AttentionMark[]> {
-  const { records, unreadable } = await readAttention(core.root, st.rel);
+  const { records, unrecognised } = await readAttention(core.root, st.rel);
   const view = (r: AttentionRecord, waiting: boolean): AttentionMark => ({
     id: r.id,
     kind: waiting ? "waiting" : r.kind,
@@ -448,37 +511,80 @@ export async function listMarks(core: RepoCore, st: ProjectState): Promise<Atten
     ...(r.kind === "audit-unrecorded" && r.decision ? { refusal: true } : {}),
     canSetAside: !waiting,
   });
+  const inFolder = new Set(records.map((r) => r.id));
   return [
     ...records.map((r) => view(r, false)),
-    ...unreadable.map((u): AttentionMark => ({ id: u.file === "" ? "-" : u.file, kind: "unreadable", canSetAside: true })),
-    ...(await readOutbox(core.library.appConfigDir, core.library.id)).filter((e) => e.projectId === st.project.id).map((e) => view(e.record, true)),
+    ...unrecognised.map((u): AttentionMark => ({ id: u.id, kind: "unrecognised", name: u.name, canSetAside: true })),
+    ...(await readOutbox(core.library.appConfigDir, core.library.id)).filter((e) => e.projectId === st.project.id && !inFolder.has(e.record.id)).map((e) => view(e.record, true)),
   ];
 }
 
-/** What a set-aside records about a mark, and how to remove it. */
+/**
+ * What a set-aside records about a mark, and how to put it aside: moved (renamed) into
+ * `<Project>/attention-set-aside/`, never deleted, never followed if it is a link, never read (N2).
+ */
 export async function markForSetAside(
   core: RepoCore,
   st: ProjectState,
   id: string,
 ): Promise<{ summary: Record<string, unknown>; remove: () => Promise<void> } | null> {
   const projectDir = core.abs(st.rel);
-  const { records, unreadable } = await readAttention(core.root, st.rel);
+  const attDir = dirOf(core.root, st.rel);
+  const { records, unrecognised } = await readAttention(core.root, st.rel);
   const rec = records.find((r) => r.id === id);
-  if (rec) return { summary: { kind: rec.kind, record: rec }, remove: () => removeAttention(core.root, st.rel, rec.id) };
-  const u = unreadable.find((x) => (x.file === "" ? "-" : x.file) === id);
-  if (!u) return null;
-  const abs = u.file === "" ? dirOf(core.root, st.rel) : join(dirOf(core.root, st.rel), u.file);
-  await assertContained(projectDir, abs);
-  const s = await fsp.lstat(abs);
-  if (!s.isFile()) return null; // a folder or link in the attention folder is not set aside here
-  const raw = await fsp.readFile(abs);
+  const u = rec ? undefined : unrecognised.find((x) => x.id === id);
+  if (!rec && !u) return null;
+  const src = rec ? join(attDir, `${rec.id}.json`) : u!.self ? attDir : join(attDir, u!.name);
+  const summary: Record<string, unknown> = rec
+    ? { kind: rec.kind, record: rec }
+    : { kind: "unrecognised", name: u!.name, entry: u!.entry, ...(u!.bytes !== undefined ? { bytes: u!.bytes } : {}) };
   return {
-    summary: { kind: "unreadable", file: u.file === "" ? ATTENTION_DIR : `${ATTENTION_DIR}/${u.file}`, bytes: raw.length, sha256: createHash("sha256").update(raw).digest("hex") },
+    summary,
     remove: async () => {
-      await assertContained(projectDir, abs);
-      await fsp.unlink(abs).catch((err: NodeJS.ErrnoException) => {
-        if (err.code !== "ENOENT") throw err;
-      });
+      const asideDir = join(projectDir, SET_ASIDE_DIR);
+      const dest = join(asideDir, `${core.clock().toISOString().replace(/[:.]/g, "-")}-${id}`);
+      // Containment of the folders only: the item itself may be a link, which is moved, not followed.
+      await assertContained(projectDir, join(attDir, ".probe"));
+      await assertContained(projectDir, dest);
+      await fsp.mkdir(asideDir, { recursive: true, mode: 0o700 });
+      await assertContained(projectDir, dest);
+      await fsp.rename(src, dest);
     },
   };
+}
+
+/**
+ * On a writable open: this device's outbox entries for a project the library no longer has (it was
+ * deleted) are recorded in the library's own log, exactly once (by attention id), and only then
+ * removed (N9). Never lost, never left for ever.
+ */
+export async function settleOrphanOutbox(core: RepoCore): Promise<void> {
+  const entries = (await readOutbox(core.library.appConfigDir, core.library.id)).filter((e) => !core.projects.has(e.projectId));
+  if (entries.length === 0) return;
+  const folders = await projectFolders(core.root);
+  const orphans = entries.filter((e) => !folders.has(e.projectId));
+  if (orphans.length === 0) return;
+  const recorded = new Set((await readLibraryAudit(core.root)).events.map((e) => e.details?.attentionId).filter((x): x is string => typeof x === "string"));
+  for (const e of orphans) {
+    const rec = e.record;
+    if (!recorded.has(rec.id)) {
+      await appendLibraryAudit(core, {
+        at: core.clock().toISOString(),
+        actor: rec.actor,
+        device: rec.device,
+        projectId: e.projectId,
+        action: rec.kind === "audit-unrecorded" ? rec.action : "library.permissions-not-set",
+        entity: { type: "project", id: e.projectId },
+        decision: rec.kind === "audit-unrecorded" && rec.decision ? rec.decision : { result: "allow" },
+        details: {
+          ...(rec.kind === "audit-unrecorded" ? rec.details : { sourceIds: rec.sourceIds }),
+          attentionId: rec.id,
+          projectMissing: true,
+          recordedLate: { occurredAt: rec.occurredAt, ...(rec.kind === "audit-unrecorded" && rec.reason ? { reason: rec.reason } : {}), by: core.device },
+        },
+      });
+      recorded.add(rec.id);
+    }
+    await removeOutbox(core.library.appConfigDir, core.library.id, rec.id);
+  }
 }

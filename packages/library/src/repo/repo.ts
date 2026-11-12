@@ -100,6 +100,7 @@ import {
   reasonOf,
   removeAttention,
   settleAttention,
+  settleOrphanOutbox,
   writeAttention,
   writeOutbox,
   type AttentionMark,
@@ -153,12 +154,12 @@ export class Repo {
     return setAsideMarkIn(this.core, projectId, markId, reason);
   }
 
-  /** A page of the library's own audit log, newest first (like `readAudit`), with the latest entry's repeat count. */
-  async readLibraryAuditPage(opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number; repeats?: { seq: number; count: number; lastAt: string } }> {
-    const { events: all, repeats } = await readLibraryAudit(this.core.root);
+  /** A page of the library's own audit log, newest first (like `readAudit`). */
+  async readLibraryAuditPage(opts: { limit?: number; beforeSeq?: number } = {}): Promise<{ events: AuditEvent[]; total: number }> {
+    const { events: all } = await readLibraryAudit(this.core.root);
     const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
     const older = opts.beforeSeq === undefined ? all : all.filter((e) => e.seq < opts.beforeSeq!);
-    return { events: older.slice(-limit).reverse(), total: all.length, ...(repeats ? { repeats } : {}) };
+    return { events: older.slice(-limit).reverse(), total: all.length };
   }
 
   /** Checks the library's own audit log against its anchor, like `verifyAudit` for a project (R154 a). Reads only. */
@@ -188,7 +189,7 @@ export class Repo {
     });
   }
 
-  libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult; repeats?: { seq: number; count: number; lastAt: string } }> {
+  libraryAudit(): Promise<{ events: AuditEvent[]; verify: AuditVerifyResult }> {
     return readLibraryAudit(this.core.root);
   }
 
@@ -605,7 +606,11 @@ export async function openRepoInternal(
     if (problem) core.integrityWarnings.push({ projectId: st.project.id, ...problem });
     if (!verify.ok) st.auditUnverified = true;
     // Marks this device kept for this library (R154 e): a project that cannot be settled now takes them into its folder.
-    if (writable && (blocked || !verify.ok)) await moveOutboxIntoProject(core, st).catch(() => {});
+    if (writable && (blocked || !verify.ok)) {
+      await moveOutboxIntoProject(core, st).catch((err: unknown) => {
+        if (err instanceof SimulatedCrash) throw err;
+      });
+    }
     if (!writable || blocked) continue;
     // A failed append here must never keep the whole library from opening: it blocks this project only.
     try {
@@ -654,6 +659,7 @@ export async function openRepoInternal(
         await core.updateAnchor(st, at);
       }
     } catch (err) {
+      if (err instanceof SimulatedCrash) throw err; // test seam: the process died here
       st.recoveryPending = true;
       core.integrityWarnings.push({
         projectId: st.project.id,
@@ -661,6 +667,12 @@ export async function openRepoInternal(
         detail: `an audit event could not be appended while opening (${err instanceof Error ? err.message : String(err)}); this project refuses changes until the library is reopened`,
       });
     }
+  }
+  // This device's outbox entries for projects the library no longer has (N9).
+  if (writable) {
+    await settleOrphanOutbox(core).catch((err: unknown) => {
+      if (err instanceof SimulatedCrash) throw err;
+    });
   }
   const repo = new Repo(core);
   // Package-internal reconcilers (e.g. consent forms whose link to the consent was interrupted, R117 I5).
@@ -1326,8 +1338,9 @@ const SET_ASIDE_OP = "attention.set-aside";
 
 async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string, reason: string): Promise<{ recordedIn: "project" | "library" }> {
   core.assertWritable();
+  // The policy engine decides on the reason itself (N7): a blank one is refused there, and audited.
   const why = typeof reason === "string" ? reason.trim() : "";
-  if (why === "" || why.length > 1000) throw new InvalidInputError("Give a reason (up to 1000 characters) for setting this aside");
+  if (why.length > 1000) throw new InvalidInputError("Give a reason of up to 1000 characters for setting this aside");
   const st = core.state(projectId);
   if (typeof markId !== "string") throw new NotFoundError("Mark", String(markId));
   const intact = st.recoveryPending !== true && st.auditUnverified !== true;
@@ -1335,7 +1348,12 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
     const m = await markForSetAside(core, st, markId);
     if (!m) throw new NotFoundError("Mark", markId);
     // Decided and audited in the project's log (a deny is audited there and thrown).
-    await authorizeOnly(core, projectId, { action: "delete" }, { op: SET_ASIDE_OP, entity: { type: "project", id: projectId }, auditAllow: { details: { reason: why, mark: m.summary } } });
+    await authorizeOnly(
+      core,
+      projectId,
+      { action: "set-aside", setAside: { reason: why } },
+      { op: SET_ASIDE_OP, entity: { type: "project", id: projectId }, auditAllow: { details: { reason: why, mark: m.summary } } },
+    );
     await core.serial(() => m.remove());
     return { recordedIn: "project" };
   }
@@ -1349,22 +1367,23 @@ async function setAsideMarkIn(core: RepoCore, projectId: string, markId: string,
     try {
       const raw = await readMaybe(core.abs(`${st.rel}/governance.yaml`));
       if (!raw) throw new Error("governance.yaml is missing");
-      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "delete", projectId, actor: core.actor, now: at, tz: core.tz });
+      const d = evaluate(parseGovernance(raw.toString("utf8")), { action: "set-aside", projectId, actor: core.actor, now: at, tz: core.tz, setAside: { reason: why } });
       decision = d.result === "deny" ? { result: "deny", reason: d.reason } : { result: "allow" };
     } catch (e) {
-      decision = { result: "deny", reason: `Policy could not be evaluated: ${e instanceof Error ? e.message : String(e)}` };
+      // Never an error message here: it can name an absolute path (N5).
+      decision = { result: "deny", reason: `Policy could not be evaluated (${reasonOf(e)})` };
     }
     await appendLibraryAudit(core, {
       at,
       actor: core.actor,
       device: core.device,
       projectId,
-      action: "delete",
+      action: "set-aside",
       entity: { type: "project", id: projectId },
       decision,
       details: { op: SET_ASIDE_OP, reason: why, mark: m.summary, projectLogNotIntact: true },
     });
-    if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "delete");
+    if (decision.result === "deny") throw new PolicyDeniedError(decision.reason, "set-aside");
     await m.remove();
     return { recordedIn: "library" as const };
   });

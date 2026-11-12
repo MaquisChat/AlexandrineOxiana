@@ -6,6 +6,7 @@ import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { createLibrary, openLibrary, type Library } from "../library.js";
 import { GovernanceViolationError } from "./errors.js";
+import { sameRefusal } from "./library-audit.js";
 import type { Repo } from "./repo.js";
 import { openTestRepo } from "./testing.js";
 
@@ -153,20 +154,33 @@ describe("R154 a: the library's audit log is protected like a project's", () => 
     expect((await r.libraryAudit()).events).toEqual([]);
   });
 
-  it("repeated refusals of the same kind on one day are counted on the latest entry, not appended", async () => {
+  it("N6: the day's first refusal of a kind is a chained entry; identical ones later that day are dropped, nothing is counted outside the chain", async () => {
     for (let i = 0; i < 5; i++) await refuse(repo, "Same");
     let a = await repo.libraryAudit();
     expect(a.events).toHaveLength(1);
-    expect(a.repeats).toEqual({ seq: 1, count: 4, lastAt: NOW });
+    expect(a).not.toHaveProperty("repeats");
+    await expect(readdir(join(lib.root, "audit"))).resolves.toEqual(["0001.jsonl"]);
     await refuse(repo, "Other");
-    await refuse(repo, "Same");
+    await refuse(repo, "Same"); // not the latest entry, but already recorded today
     a = await repo.libraryAudit();
-    expect(a.events.map((e) => e.details?.name)).toEqual(["Same", "Other", "Same"]);
-    expect(a.repeats).toBeUndefined();
+    expect(a.events.map((e) => e.details?.name)).toEqual(["Same", "Other"]);
+    // Across a restart the same day still counts as recorded.
+    let r = await reopen();
+    await refuse(r, "Same");
+    expect((await r.libraryAudit()).events).toHaveLength(2);
     clockNow = "2026-11-10T09:00:00.000Z";
-    await refuse(repo, "Same");
-    expect((await repo.libraryAudit()).events).toHaveLength(4);
-    const r = await reopen();
+    await refuse(r, "Same");
+    expect((await r.libraryAudit()).events.map((e) => e.details?.name)).toEqual(["Same", "Other", "Same"]);
+    r = await reopen();
     expect(r.integrityWarnings).toEqual([]);
+  });
+
+  it("N6: an entry differing in any field it shows (encrypted, reason, who) is not the same kind", () => {
+    const base = { at: NOW, actor: "a", device: "d", action: "store", decision: { result: "deny" as const, reason: "r" }, details: { op: "project.create", name: "N", encrypted: false } };
+    expect(sameRefusal(base, { ...base, at: "2026-11-09T23:00:00.000Z" })).toBe(true);
+    expect(sameRefusal(base, { ...base, details: { ...base.details, encrypted: true } })).toBe(false);
+    expect(sameRefusal(base, { ...base, decision: { result: "deny", reason: "other" } })).toBe(false);
+    expect(sameRefusal(base, { ...base, actor: "b" })).toBe(false);
+    expect(sameRefusal(base, { ...base, at: "2026-11-10T00:00:00.000Z" })).toBe(false);
   });
 });
