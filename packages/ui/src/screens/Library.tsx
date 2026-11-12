@@ -567,7 +567,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
         />
       )}
       {banners.length > 0 && (
-        <div className="ao-library__banners" ref={bannersRef} tabIndex={-1} aria-label="Library status">
+        <div className="ao-library__banners" ref={bannersRef} tabIndex={-1} role="region" aria-label="Library status">
           {banners.map((b, i) => (
             <StatusBanner
               key={b.kind === "notice" ? `notice-${b.notice}` : `${b.kind}-${i}`}

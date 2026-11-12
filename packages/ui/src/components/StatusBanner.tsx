@@ -39,6 +39,8 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
     "The list of old library copies awaiting deletion was damaged and was set aside. Some old copies of moved libraries may still be on this computer without being offered for deletion here, and a move that had not finished may not be able to finish from here. The damaged list is kept beside the app's settings.",
   "watched-folders-list-set-aside":
     "This computer's list of watched folders was damaged and was set aside, so watched folders on this computer have stopped. Watched folders must be added again on this computer. The damaged list is kept beside the app's settings.",
+  "libraries-list-set-aside":
+    "This computer's list of libraries was damaged and was set aside. Your libraries themselves are untouched: open each one again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":
     "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
 };
@@ -168,7 +170,7 @@ export function DeviceNoticeBanners({ notices, onDismiss, error }: { notices: Li
   const banners = bannersFor({ notices });
   if (!banners.length && !error) return null;
   return (
-    <div className="ao-library__banners" aria-label="Notices">
+    <div className="ao-library__banners" role="region" aria-label="Notices">
       {banners.map((b) => (b.kind === "notice" ? <StatusBanner key={`notice-${b.notice}`} variant={b} onDismiss={onDismiss} /> : null))}
       {error && (
         <p role="alert" className="ao-warning">

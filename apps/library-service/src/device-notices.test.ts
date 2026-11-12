@@ -3,7 +3,7 @@
  * (the event the status banner reads, sent at connection and on every change), dismissed only by the
  * desktop app's "Got it" (`POST /settings/notices/dismiss`), and gone for good after that.
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -64,6 +64,19 @@ async function stateNow(): Promise<{ notices?: Array<{ kind: string; at: string 
 }
 
 describe("device-level notices on the chooser's answer (fix round 1, M1)", () => {
+  it("a damaged libraries list: the chooser's answer sets it aside and says so, not only an empty list (R181 a)", async () => {
+    await writeFile(join(deps.appConfigDir, "libraries.json"), "{broken");
+    await start();
+    const r = await call({ url: "/libraries" });
+    expect(r.json.libraries).toEqual([]);
+    expect(r.json.notices.map((n: { kind: string }) => n.kind)).toEqual(["libraries-list-set-aside"]);
+    expect((await readdir(deps.appConfigDir)).filter((n) => n.startsWith("libraries.json.corrupt-"))).toHaveLength(1);
+    // Asked again: still one notice, nothing more set aside.
+    const again = await call({ url: "/libraries" });
+    expect(again.json.notices).toHaveLength(1);
+    expect((await readdir(deps.appConfigDir)).filter((n) => n.startsWith("libraries.json.corrupt-"))).toHaveLength(1);
+  });
+
   it("GET /libraries carries them with no library open, and not after “Got it”", async () => {
     await raiseDeviceNotice(deps.appConfigDir, "device-identity-renewed", at);
     await start();

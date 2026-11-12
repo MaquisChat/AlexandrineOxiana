@@ -13,11 +13,13 @@
  *    kept aside and a fresh list started (Task 68 fix round 1).
  *  - `approved-folders-list-set-aside`: this computer's list of folders approved for imports was
  *    damaged, so it was kept aside and a fresh list started (Task 68 fix round 1).
+ *  - `libraries-list-set-aside`: this computer's list of libraries was damaged, so it was kept aside
+ *    and a fresh list started; the libraries themselves are untouched (Task 68 fix round 2, R181 a).
  *
  * Carried in `library.state` (`notices`); dismissed with `POST /settings/notices/dismiss { kind }`
  * (the desktop app's token only).
  */
-export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside"] as const;
+export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside", "approved-folders-list-set-aside", "libraries-list-set-aside"] as const;
 export type DeviceNoticeKind = (typeof DEVICE_NOTICE_KINDS)[number];
 
 export function isDeviceNoticeKind(v: unknown): v is DeviceNoticeKind {

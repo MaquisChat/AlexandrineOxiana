@@ -41,6 +41,18 @@ describe("device-level notices on the library chooser", () => {
     expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Choose a library" }));
   });
 
+  it("a damaged libraries list set aside: the chooser says so in a named region, not only “No libraries yet” (R181 a; review Rm7)", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ libraries: [], notices: [{ kind: "libraries-list-set-aside", at: AT }] })));
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Notices" });
+    expect(region.textContent).toMatch(/list of libraries was damaged and was set aside/);
+    expect(region.textContent).toMatch(/Your libraries themselves are untouched/);
+    expect(region.textContent).toMatch(/“Open library”/);
+    expect(screen.getByText(/No libraries yet/)).toBeTruthy();
+    // The button the notice names exists on this screen (R181 d).
+    expect(screen.getByRole("button", { name: "Open library" })).toBeTruthy();
+  });
+
   it("a refused “Got it” keeps the banner and says why", async () => {
     server.use(
       http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, notices: [{ kind: "old-copies-list-set-aside", at: AT }] })),
