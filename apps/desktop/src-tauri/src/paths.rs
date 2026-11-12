@@ -132,6 +132,33 @@ mod tests {
         fs::remove_dir_all(&r).unwrap();
     }
 
+    /// tauri.conf.json with tauri.macos.conf.json merged over it (as tauri-cli does on macOS) is a
+    /// valid Tauri configuration (unknown keys are refused), with the minimum macOS of R133.
+    #[test]
+    fn the_mac_configuration_is_valid_tauri_configuration() {
+        fn merge(base: &mut serde_json::Value, over: &serde_json::Value) {
+            match (base, over) {
+                (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+                    for (k, v) in o {
+                        merge(b.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+                    }
+                }
+                (b, o) => *b = o.clone(),
+            }
+        }
+        let mut conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        merge(&mut conf, &serde_json::from_str(include_str!("../tauri.macos.conf.json")).unwrap());
+        let parsed: tauri::utils::config::Config = serde_json::from_value(conf).expect("a valid Tauri configuration");
+        assert_eq!(parsed.bundle.macos.minimum_system_version.as_deref(), Some("15.0"));
+        assert!(parsed.bundle.active);
+        assert_eq!(parsed.bundle.macos.files.len(), 3);
+        assert_eq!(parsed.bundle.macos.signing_identity, None, "signing is the build script's (macos/signing.json)");
+        // The page's security is the same on every platform.
+        let base: tauri::utils::config::Config = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(parsed.app.security.csp, base.app.security.csp);
+        assert_eq!(parsed.app.security.capabilities, base.app.security.capabilities);
+    }
+
     #[test]
     fn overrides_win_over_the_resources() {
         let r = tmp("override");
