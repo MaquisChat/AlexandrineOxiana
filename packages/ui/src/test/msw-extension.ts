@@ -37,11 +37,14 @@ export const codeIdOf = (n: number) => `c0de${String(n).padStart(12, "0")}`;
  * kept as the service keeps it (a new code replaces an active one; past its time it is expired);
  * `end` sets what became of a code, `pairWith` pairs a browser with the newest code.
  */
-export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: number }>; pairings?: PairedBrowser[]; port?: number } = {}) {
+export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: number }>; pairings?: PairedBrowser[]; port?: number; unreadable?: boolean; resetFails?: boolean } = {}) {
   const state = {
     /** The service's port now, as `GET /extension/pairings` says it (R171); absent: not said. */
     port: opts.port as number | undefined,
     listReads: 0,
+    /** The pairings file cannot be read (Task 68); a reset clears it. */
+    unreadable: !!opts.unreadable,
+    resets: [] as unknown[],
     pairings: [...(opts.pairings ?? [])],
     issued: 0,
     codes: opts.codes ?? [{ code: "482916" }],
@@ -87,7 +90,15 @@ export function pairingService(opts: { codes?: Array<{ code: string; ttlMs?: num
       }),
       http.get(url("/extension/pairings"), () => {
         state.listReads++;
-        return HttpResponse.json({ extensions: state.pairings, ...(state.port !== undefined ? { port: state.port } : {}) });
+        return HttpResponse.json({ extensions: state.pairings, ...(state.port !== undefined ? { port: state.port } : {}), ...(state.unreadable ? { unreadable: true } : {}) });
+      }),
+      http.post(url("/settings/reset"), async ({ request }) => {
+        const body = await request.json();
+        state.resets.push(body);
+        if (opts.resetFails) return apiError(503, "UNAVAILABLE", "The list of paired browsers could not be set aside, so it was not reset.");
+        state.unreadable = false;
+        state.pairings = [];
+        return HttpResponse.json({ reset: true, keptAs: "extension-pairings.json.unreadable-20261112-101530" });
       }),
       http.delete(url("/extension/pairings/:pid"), ({ params }) => {
         const i = state.pairings.findIndex((p) => p.id === params.pid);

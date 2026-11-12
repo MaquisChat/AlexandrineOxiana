@@ -107,6 +107,13 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
   const [revokeBusy, setRevokeBusy] = useState(false);
   const [revokeError, setRevokeError] = useState<string | null>(null);
   const [revoked, setRevoked] = useState<string | null>(null);
+  /** The pairings file on this computer cannot be read (Task 68): the reset is offered. */
+  const [listUnreadable, setListUnreadable] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [resetDone, setResetDone] = useState(false);
+  const resetNow = useRef(false);
   const [focusList, setFocusList] = useState(0);
   /** The service refused to say what became of the code (review round 1, M1). */
   const [statusRefused, setStatusRefused] = useState(false);
@@ -153,6 +160,7 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
         browsersRef.current = list;
         setBrowsers(list);
         setServicePort(answer.port);
+        setListUnreadable(answer.unreadable === true);
         setListError(null);
         return list;
       } catch (err) {
@@ -355,6 +363,32 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
     }
   };
 
+  /** The reset, once confirmed (Task 68): one request; the list is read again after it. */
+  const reset = async () => {
+    if (resetNow.current) return;
+    resetNow.current = true;
+    setResetBusy(true);
+    setResetError(null);
+    const ac = signal();
+    try {
+      await api.resetList(ac.signal);
+      if (!alive.current) return;
+      setResetOpen(false);
+      setResetDone(true);
+      setListUnreadable(false);
+      browsersRef.current = [];
+      setBrowsers([]);
+      setFocusList((n) => n + 1);
+      void refresh(true);
+    } catch (err) {
+      if (alive.current) setResetError(errorText(err, "The list could not be reset."));
+    } finally {
+      done(ac);
+      resetNow.current = false;
+      if (alive.current) setResetBusy(false);
+    }
+  };
+
   const revoke = async () => {
     if (!revoking || revokeBusy) return;
     const target = revoking;
@@ -489,6 +523,19 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
             {listError}
           </p>
         ) : null}
+        {listUnreadable ? (
+          <div role="alert" className="ao-warning">
+            <p>This app cannot read its list of paired browsers on this computer, so no browser can be paired or removed. If this does not go away, reset the list: every browser will then have to be paired again.</p>
+            <button type="button" onClick={() => { setResetError(null); setResetOpen(true); }}>
+              Reset the list of paired browsers…
+            </button>
+          </div>
+        ) : null}
+        {resetDone ? (
+          <p role="status" aria-label="Reset result" className="ao-ok">
+            The list of paired browsers was reset. Pair each browser again with a new code.
+          </p>
+        ) : null}
         {pairedMissing ? (
           <p role="alert" className="ao-warning">
             The code was used, but the paired browser is not in the list yet. Reload this page to see it; if it is still missing, pair the browser again with a new code.
@@ -533,6 +580,18 @@ export function ExtensionPairing({ api, pollMs = 3000, port, listPollMs = LIST_P
           </ul>
         )}
       </section>
+
+      {resetOpen ? (
+        <ChoiceDialog title="Reset the list of paired browsers?" action="Reset the list" busy={resetBusy} onConfirm={() => void reset()} onCancel={() => setResetOpen(false)}>
+          <p>This app's list of paired browsers on this computer cannot be read. Resetting it starts an empty list: every browser that was paired will stop capturing until it is paired again with a new code.</p>
+          <p>The unreadable list is not deleted: it is kept, renamed, in the app's settings folder.</p>
+          {resetError ? (
+            <p role="alert" className="ao-warning">
+              {resetError}
+            </p>
+          ) : null}
+        </ChoiceDialog>
+      ) : null}
 
       {revoking ? (
         <ChoiceDialog title="Revoke this browser?" action="Revoke pairing" busy={revokeBusy} onConfirm={() => void revoke()} onCancel={() => setRevoking(null)}>
