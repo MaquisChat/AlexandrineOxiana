@@ -515,7 +515,7 @@ Update after every task; commit and push.
 | 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
 | 46b Fix: interface (D1, D2, D6, D7, slow test) | done | 700b7eb | reviewed with probes over one fix round; D1, D2, D6, D7 closed; none of D1–D8 is open; "Needs review" follows every pending entry (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
-| 47 Shared API types | fix round 2 (type-level) | 456d33a (worktree branch) | no run-time change confirmed; request fields break both builds (R184); one draft type still to tie to the library's; not on the Mac build's path |
+| 47 Shared API types | accepted; to take the working branch and be verified after the build's tasks | 0c09f2b (worktree branch) | reviewed with probes over two fix rounds (R184); no run-time change; not on the Mac build's path |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
@@ -529,7 +529,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | approved; up to date; verification after Task 68's | c4a8aa7 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); closes D15 when merged |
+| 50b Restore asks the policy engine | approved and verified; merge waits for the test fix | c4a8aa7 (worktree branch) | reviewed with probes over two fix rounds (R179, R180, R182); verification clean throughout; closes D15 when merged |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -548,10 +548,10 @@ Update after every task; commit and push.
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | complete | c02679b (merge) | reviewed with probes over two fix rounds (R178, R181); D16 closed; five minors on the final review's list |
+| 68 Settings writers never write what they did not read (D16) | merged; one of its tests fails on GitHub (a test fault, skipped here as root) and is being fixed | c02679b (merge) | reviewed with probes over two fix rounds (R178, R181); D16 closed; GitHub's run 201 red until the test fix is pushed (R187) |
 | 67 One review queue for the project (D14) | complete | 0d68dcd (merge) | reviewed with probes over two fix rounds (R172, R176, R177); verification clean throughout; D14 closed |
 | 37k Revise the guide and checklist | done; one line to replace after Task 69 | cabc4d3 (merge) | accuracy-reviewed line by line over one fix round and a last correction; it found D17, D18 and D19 |
-| 69 Show that a captured item is no longer available (D17) | fix round 1 | 50e42e6 (worktree branch) | the list is to read `source.json` alone (R186); on the Mac build's path |
+| 69 Show that a captured item is no longer available (D17) | approved; verification with 50b running | d965f8a (worktree branch) | reviewed with probes over one fix round (R185, R186); on the Mac build's path |
 | 70 A read never mistakes a write in progress for tampering (D21) | in review | c17e6b7 (worktree branch) | a mismatch is confirmed in the write queue's turn before any warning; in the Mac build if merged in time |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
