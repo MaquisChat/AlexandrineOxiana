@@ -165,8 +165,11 @@ export function registerProjects(app: FastifyInstance, ctx: Ctx): void {
     s.repo.lockProject(id);
     // Its recordings stop playing: media tickets end with the key (R135 2).
     state.media.revokeProject(id);
-    // Nothing looked up for an encrypted project stays in memory once it is locked (R30, R50).
+    // Nothing looked up for an encrypted project stays in memory once it is locked (R30, R50),
+    // nor what it was capturing: its running captures end now, for good (Task 63 I3). A project that
+    // is not encrypted has nothing to lock, and its captures run on.
     s.http.purgeSensitive();
+    if (s.repo.getProject(id).encryption.enabled) state.endCaptures(id, "lock");
     state.publishState();
     return { unlocked: false };
   });

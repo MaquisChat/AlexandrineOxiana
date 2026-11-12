@@ -447,6 +447,22 @@ describe("captureUrls", () => {
   });
 });
 
+describe("a queue ended while its download runs (Task 63 fix round 2, I3)", () => {
+  it("the late result is discarded, nothing is stored, and the next links are not tried", async () => {
+    const p = await project();
+    let ended = false;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      const r = await submit(...args);
+      ended = true; // the queue is ended (a lock) while this download was running
+      return r;
+    });
+    const outs = await capture.captureUrls(p.id, [YT, IG], { transcribe: false }, () => {}, { cancelled: () => ended });
+    expect(outs).toEqual([{ url: YT, status: "failed", errorCode: "CANCELLED", reason: expect.any(String) }]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+});
+
 describe("with the real Python media worker", () => {
   const venv = devWorkerPython();
   it.skipIf(!existsSync(venv))("captures through the worker's own yt-dlp handling (fake yt-dlp on PATH)", async () => {
