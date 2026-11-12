@@ -120,7 +120,7 @@ export async function createProject(
       projectId: id,
       actor: core.actor,
       now: at,
-      tz: core.tz,
+      tz: core.zoneOf({}), // a new project has no time zone yet (R160)
       store: { identifiable: false, hasLocation: false },
     });
     if (decision.result === "deny") await refuse(new PolicyDeniedError(decision.reason, "store"));

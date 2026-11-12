@@ -157,6 +157,20 @@ export interface SourceRow {
   folder: string;
   needsReview: boolean;
   locked: boolean;
+  /** A text search found it through the text of its annotations (Task 58). */
+  matchedIn?: "annotation";
+  /** Only part of its annotations' text is searchable (R161 b). */
+  annotationsPartial?: true;
+}
+
+/** A page of sources (GET /projects/:id/sources). */
+export interface SourcePage {
+  total: number;
+  items: SourceRow[];
+  /** The index awaits a rebuild: annotation text is not searchable yet (R161 a). */
+  incomplete?: true;
+  /** A read-only library: only titles were searched. */
+  limited?: true;
 }
 
 export interface SourceQuery {
@@ -312,7 +326,7 @@ export function libraryApi(client: ApiClient) {
     },
     sources: {
       search: (pid: string, q: SourceQuery = {}, opts: { signal?: AbortSignal } = {}) =>
-        r<{ total: number; items: SourceRow[] }>("GET", `${proj(pid)}/sources`, {
+        r<SourcePage>("GET", `${proj(pid)}/sources`, {
           query: { text: q.text || undefined, type: q.type, collection: q.collection, tag: q.tag, limit: q.limit, offset: q.offset },
           ...(opts.signal ? { signal: opts.signal } : {}),
         }),

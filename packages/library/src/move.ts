@@ -19,7 +19,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
+import { dateRuleZone, evaluate, newId, parseGovernance, type PolicyDecision, type ResidencyKind } from "@ao/core";
 import { scrubPaths } from "./app-settings.js";
 import { KeyRing } from "./crypto/keys.js";
 import type { Deps } from "./deps.js";
@@ -353,7 +353,7 @@ const isThere = (p: string) => fsp.lstat(p).then(() => true, () => false);
  * looks like a project (governance.yaml or Sources) but whose project.json is
  * missing or unreadable refuses the move: its governance cannot be checked.
  */
-async function readProjects(root: string): Promise<{ projects: Array<{ id: string; name: string; folder: string }>; movedAway: string[] }> {
+async function readProjects(root: string): Promise<{ projects: Array<{ id: string; name: string; folder: string; timeZone?: string }>; movedAway: string[] }> {
   let names: string[] = [];
   try {
     names = (await fsp.readdir(join(root, "Projects"))).sort();
@@ -371,7 +371,7 @@ async function readProjects(root: string): Promise<{ projects: Array<{ id: strin
       movedAway.push(folder);
       continue;
     }
-    let p: { id: string; name: string } | null = null;
+    let p: { id: string; name: string; timeZone?: string } | null = null;
     if (!n.startsWith(".")) {
       try {
         p = parseProjectJson(JSON.parse(await fsp.readFile(join(dir, "project.json"), "utf8"))).project;
@@ -379,7 +379,7 @@ async function readProjects(root: string): Promise<{ projects: Array<{ id: strin
         p = null;
       }
     }
-    if (p) projects.push({ id: p.id, name: p.name, folder });
+    if (p) projects.push({ id: p.id, name: p.name, folder, ...(p.timeZone ? { timeZone: p.timeZone } : {}) });
     else if ((await isThere(join(dir, "governance.yaml"))) || (await isThere(join(dir, "Sources"))) || (await isThere(join(dir, "project.json")))) {
       unreadable.push(folder);
     }
@@ -462,7 +462,6 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
   await preflight(lib, destRoot, opts.sourceRepo);
   const { destination, destinations } = await locate(destRoot, env);
   const now = (opts.now ?? new Date()).toISOString();
-  const tz = opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { projects, movedAway } = await readProjects(lib.root);
   const perProject: ProjectPlan[] = [];
   for (const p of projects) {
@@ -475,7 +474,8 @@ export async function planMove(lib: Library, destRoot: string, env: LocationEnv,
           projectId: p.id,
           actor: opts.actor ?? "local-user",
           now,
-          tz,
+          // The project's zone when set, else the computer's (R160 as amended).
+          tz: dateRuleZone(p, "protocol", opts.tz),
           move: { destination: loc.kind, ...(loc.cloudFolderId ? { cloudFolderId: loc.cloudFolderId } : {}) },
         });
         if (d.result === "deny") {
