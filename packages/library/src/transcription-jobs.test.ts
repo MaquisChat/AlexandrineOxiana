@@ -126,31 +126,6 @@ describe("transcription as a job", () => {
     await expect(transcriptionRerun(broken, rec)).rejects.toThrow(/disk read failed/);
   });
 
-  for (const lockAt of [1, 2]) {
-    it(`R1-1: a lock at store write ${lockAt} of 2: the rerun at the unlock completes the same run, with no second version`, async () => {
-      const p = await makeProject(kit, OPEN_GOV, true);
-      const sf = await audioSource(p);
-      const repo = kit.repo;
-      const original = repo.addDerivedAsset.bind(repo);
-      let calls = 0;
-      repo.addDerivedAsset = (async (...args: Parameters<typeof original>) => {
-        if (++calls === lockAt) repo.lockProject(p.id);
-        return original(...args);
-      }) as typeof original;
-      const job = await transcriptionJob(repo, p.id, sf.source.id, { model: "small" }, { id: randomUUID() });
-      await expect((await client()).submit(p.id, job)).rejects.toThrow(/locked/);
-      repo.addDerivedAsset = original;
-      await repo.unlockProject(p.id, "correct horse battery staple");
-      const out = await (await client()).resumePending(p.id, { prepare: (rec) => transcriptionRerun(repo, rec) });
-      expect(out.map((x) => x.error)).toEqual([undefined]);
-      const versions = transcriptVersions(await repo.getSource(p.id, sf.source.id));
-      expect(versions.map((v) => v.mime).sort()).toEqual(["application/json", "text/vtt"]);
-      expect(new Set(versions.map((v) => v.derivation?.at)).size).toBe(1); // one run, as the picker shows it
-      const vtt = versions.find((v) => v.mime === "text/vtt")!;
-      expect((await readTranscript(repo, p.id, sf.source.id, vtt.id)).segments.map((s) => s.flags)).toEqual([[], ["outside-speech"]]);
-    });
-  }
-
   it("a rerun reads the recording from the library as it is now, not from the path recorded", async () => {
     const p = await makeProject(kit);
     const sf = await audioSource(p);

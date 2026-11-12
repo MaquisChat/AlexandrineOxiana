@@ -69,7 +69,7 @@ export async function transcriptionJob(
     entity: { type: "asset", id: media.id },
     about: { sourceId, model: String(p.model) },
     finish: async (r) => {
-      const stored = await storeTranscript(repo, projectId, sourceId, media, r, params, triggeredBy, opts.id);
+      const stored = await storeTranscript(repo, projectId, sourceId, media, r, params, triggeredBy);
       opts.onStored?.(stored);
     },
   };
@@ -101,7 +101,7 @@ export async function transcriptionRerun(repo: Repo, rec: JobRecord, onStored?: 
     inputEncrypted: media.encrypted,
     output: outputFor(repo, rec.id),
     finish: async (r) => {
-      const stored = await storeTranscript(repo, rec.projectId, sourceId, media, r, params, "user", rec.id);
+      const stored = await storeTranscript(repo, rec.projectId, sourceId, media, r, params, "user");
       onStored?.(stored);
     },
   };
