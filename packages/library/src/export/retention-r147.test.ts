@@ -378,6 +378,8 @@ describe("the certificate and backups-state.json are conveniences; the audit log
       const waiting = await backupsAwaitingRemoval(kit.repo, p.id);
       expect(waiting).toEqual([{ certificateFile: `${kit.repo.getProject(p.id).folder}/retention/${basename(certificatePath)}`, backups: [rel(x)], reason: expect.stringMatching(/audit log .* does not hold together/u) }]);
       expect(waiting[0]!.reason).not.toContain(kit.lib.root);
+      // Whatever shows the certificate says that the status it gives is the word of such a log.
+      expect((await readDestruction(kit.repo, p.id, certificatePath)).problem).toMatch(/audit log .* does not hold together/u);
     }
     // A restart changes nothing of that.
     const again = await kit.reopen();

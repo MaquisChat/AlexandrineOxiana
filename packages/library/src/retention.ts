@@ -618,17 +618,19 @@ const STATUSES: readonly BackupsStepStatus[] = ["none", "pending", "unknown-pend
  * Every destruction of the project, oldest first: the certificate written at the destruction, the
  * amendments beside it and the resulting status (R147). The status and what is outstanding come
  * from the audit log; each file is checked against the sha256 the audit log holds for it, and a
- * disagreement is said in `problem`. Reads only. A locked project's sealed certificates cannot be
- * read (ProjectLockedError).
+ * disagreement is said in `problem`. So is an audit log that does not hold together (its chain is
+ * verified here): the status given is then only that log's word. Reads only. A locked project's
+ * sealed certificates cannot be read (ProjectLockedError).
  */
 export async function listDestructions(repo: Repo, projectId: string): Promise<DestructionRecord[]> {
   const dirRel = `${repo.getProject(projectId).folder}/retention`;
   const view = await scan(repo, projectId);
   const names = await retentionNames(repo, dirRel);
+  const logProblem = !view.headMatches ? AUDIT_CHANGED : view.list.length && !(await verifiedAuditEvents(repo, projectId)).ok ? AUDIT_UNVERIFIED : undefined;
   const out: DestructionRecord[] = [];
   for (const a of view.list) {
     const disk = await onDisk(repo, projectId, dirRel, a, names);
-    const problem = view.headMatches ? disk.problem : AUDIT_CHANGED;
+    const problem = logProblem ?? disk.problem;
     out.push({
       certificateFile: `${dirRel}/${a.certificate}`,
       certificateSha256: a.certificateSha256,
@@ -1041,9 +1043,8 @@ async function resumeLocked(repo: Repo, hold: MaintenanceHold, projectId: string
     }
   } catch (err) {
     if (err instanceof SimulatedCrash) throw err;
-    // It could not be checked: what was noted stays as it was.
-    for (const [rel, note] of Object.entries(found)) notes[rel] ??= note;
-    firstError ??= err;
+    // It could not be checked: the notes are not rewritten this time, and the next pass checks again.
+    throw firstError ?? err;
   }
   await setDestructionNotes(repo, projectId, notes).catch(() => {});
   if (firstError !== undefined) throw firstError;
