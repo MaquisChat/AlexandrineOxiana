@@ -86,6 +86,34 @@ function waitingForReview(db: { prepare(sql: string): { all(...p: unknown[]): un
   return new Set(rows.map((r) => r.source_id));
 }
 
+/** A list row's availability (Task 69, D17): the record's status and, when recorded, when it was first noticed. */
+export interface RowAvailability {
+  status: string;
+  firstNoticedAt?: string;
+}
+
+const rowAvailability = (sf: SourceFile): RowAvailability => {
+  const a = sf.source.availability;
+  return { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}) };
+};
+
+/**
+ * The availability of each listed source (Task 69, D17), read from its record: the index does not
+ * hold it. A locked row, or a record that cannot be read, gets none (the interface then shows nothing).
+ */
+async function availabilityOf(repo: { getSource(projectId: string, id: string): Promise<SourceFile> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, RowAvailability>> {
+  const out = new Map<string, RowAvailability>();
+  await Promise.all(
+    rows
+      .filter((r) => !r.locked)
+      .map(async (r) => {
+        const sf = await repo.getSource(projectId, r.id).catch(() => undefined);
+        if (sf) out.set(r.id, rowAvailability(sf));
+      }),
+  );
+  return out;
+}
+
 async function sourceOf(ctx: Ctx, projectId: string, sid: string): Promise<SourceFile> {
   const s = ctx.state.requireSession();
   if (!s.repo.listSourceIds(projectId).includes(sid)) throw notFound("That source");
@@ -117,7 +145,15 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       const waiting = waitingForReview(s.index.db, projectId, found.items.map((i) => i.id));
       // A locked project's queue cannot be read (review/pending.jsonl is encrypted): its rows claim
       // nothing (false, as the index stores for locked rows); they show "Locked" instead.
-      return { ...found, items: found.items.map((i) => ({ ...i, needsReview: !i.locked && waiting.has(i.id) })), ...index };
+      const avail = await availabilityOf(s.repo, projectId, found.items);
+      return {
+        ...found,
+        items: found.items.map((i) => {
+          const a = avail.get(i.id);
+          return { ...i, needsReview: !i.locked && waiting.has(i.id), ...(a ? { availability: a } : {}) };
+        }),
+        ...index,
+      };
     }
     // A read-only library has no index we may write: list from the files (titles only when unlocked).
     // Its review queue is not read here, so no row claims needsReview (Task 46b M4).
@@ -131,7 +167,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       if (q.type && src.type !== q.type) continue;
       if (q.collection && !src.collectionIds.includes(q.collection)) continue;
       if (q.tag && !src.tagIds.includes(q.tag)) continue;
-      items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false });
+      items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false, availability: rowAvailability(sf) });
     }
     // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
     return { total: items.length, items: items.slice(offset, offset + limit), limited: true, ...index };
