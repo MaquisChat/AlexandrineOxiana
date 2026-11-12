@@ -8,7 +8,7 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GovernanceParseError, newId, type PendingProxy, type Project } from "@ao/core";
-import { readAppSetting, scrubPaths, updateAppSetting } from "./app-settings.js";
+import { readAppSetting, scrubPaths, updateAppSettingStrict } from "./app-settings.js";
 import { OPEN_GOV, addSource, auditEvents, makeKit, makeProject, scratchFile, type Kit } from "./export/test-kit.js";
 import { OcrQueue, disposeOcrQueue, ocrQueueFor } from "./import/ocr.js";
 import { ProxyQueue, disposeProxyQueue, proxyQueueFor } from "./import/proxies.js";
@@ -272,8 +272,8 @@ describe("source actions", () => {
 describe("app settings and scrubbing", () => {
   it("settings files are owner-only and read back", async () => {
     const dir = join(kit.tmp, "cfg");
-    await updateAppSetting<{ n: number }>(dir, "appearance.json", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
-    await updateAppSetting<{ n: number }>(dir, "appearance.json", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
+    await updateAppSettingStrict<{ n: number }>(dir, "appearance.json", (v): v is { n: number } => typeof (v as { n?: unknown }).n === "number", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
+    await updateAppSettingStrict<{ n: number }>(dir, "appearance.json", (v): v is { n: number } => typeof (v as { n?: unknown }).n === "number", (cur) => ({ n: (cur?.n ?? 0) + 1 }));
     expect(await readAppSetting(dir, "appearance.json")).toEqual({ n: 2 });
     if (process.platform !== "win32") expect((await stat(join(dir, "appearance.json"))).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(join(dir, "appearance.json"), "utf8"))).toEqual({ n: 2 });

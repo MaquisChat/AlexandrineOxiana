@@ -90,23 +90,123 @@ export async function readAppSetting<T = unknown>(dir: string, name: string): Pr
 }
 
 /**
- * Read-modify-write of a settings file (owner-only, 0600, written atomically), serialised per file
- * in this process. `edit` gets the current value (undefined when none) and returns the new one.
+ * Writes a settings file whose whole content is `value` (owner-only, 0600, atomically), in its
+ * per-file turn. Nothing is read, so nothing read can be lost: for files that hold one thing (the
+ * researcher's name, the remembered port). A file that keeps several things changes only through
+ * updateAppSettingStrict (Task 68, D16: there was a lenient read-modify-write here, which wrote a
+ * default over a file it could not read).
  */
-export function updateAppSetting<T>(dir: string, name: string, edit: (cur: T | undefined) => T): Promise<T> {
+export function writeAppSetting<T>(dir: string, name: string, value: T): Promise<T> {
   if (!SETTING_NAME.test(name)) throw new TypeError(`not a settings file name: ${name}`);
-  const key = join(dir, name);
-  const run = (settingLocks.get(key) ?? Promise.resolve()).then(async () => {
+  return inSettingTurn(dir, name, async () => {
     ensurePrivateDir(dir);
-    const next = edit(await readAppSetting<T>(dir, name));
-    await writeFileAtomic(key, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    return next;
+    await writeFileAtomic(join(dir, name), `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    return value;
   });
+}
+
+/** Runs `step` in the file's turn: every write of one settings file, one at a time in this process. */
+function inSettingTurn<T>(dir: string, name: string, step: () => Promise<T>): Promise<T> {
+  const key = join(dir, name);
+  const run = (settingLocks.get(key) ?? Promise.resolve()).then(step);
   settingLocks.set(
     key,
     run.catch(() => undefined),
   );
   return run;
+}
+
+/**
+ * A settings file that is there but cannot be read as itself (unreadable, not JSON, truncated,
+ * empty, the wrong shape, a folder or a broken link in its place). Nothing was written (Task 68,
+ * D16). Its message never carries a path; `fileName` names the file within the settings folder.
+ */
+export class AppSettingUnreadableError extends Error {
+  constructor(readonly fileName: string) {
+    super(`The settings file "${fileName}" could not be read, so it was not changed.`);
+    this.name = "AppSettingUnreadableError";
+  }
+}
+
+/** A reset was asked for a settings file that can be read (or is not there): nothing was set aside. */
+export class AppSettingReadableError extends Error {
+  constructor(readonly fileName: string) {
+    super(`The settings file "${fileName}" can be read, so it was not reset.`);
+    this.name = "AppSettingReadableError";
+  }
+}
+
+/**
+ * Reads a settings file strictly (Task 68, D16): undefined only when it is missing (a fresh settings
+ * folder: "nothing yet", the one legitimate empty start); its value when it parses and passes
+ * `check`; anything else throws AppSettingUnreadableError.
+ */
+export async function readAppSettingStrict<T>(dir: string, name: string, check: (v: unknown) => v is T): Promise<T | undefined> {
+  if (!SETTING_NAME.test(name)) throw new TypeError(`not a settings file name: ${name}`);
+  let raw: string;
+  try {
+    raw = await fsp.readFile(join(dir, name), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new AppSettingUnreadableError(name);
+  }
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    throw new AppSettingUnreadableError(name);
+  }
+  if (!check(v)) throw new AppSettingUnreadableError(name);
+  return v;
+}
+
+/**
+ * The read-modify-write every settings file that keeps more than one thing goes through (Task 68,
+ * D16): the file is read strictly in its per-file turn; `edit` gets what was read (undefined only
+ * when the file is missing) and its result is written atomically (0600). When the read fails,
+ * `edit` is not called and nothing is written: AppSettingUnreadableError.
+ */
+export function updateAppSettingStrict<T>(dir: string, name: string, check: (v: unknown) => v is T, edit: (cur: T | undefined) => T): Promise<T> {
+  if (!SETTING_NAME.test(name)) throw new TypeError(`not a settings file name: ${name}`);
+  return inSettingTurn(dir, name, async () => {
+    const cur = await readAppSettingStrict(dir, name, check);
+    ensurePrivateDir(dir);
+    const next = edit(cur);
+    await writeFileAtomic(join(dir, name), `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    return next;
+  });
+}
+
+const asideStamp = (d: Date) => d.toISOString().replace(/\.\d+Z$/, "").replace(/[-:]/g, "").replace("T", "-");
+
+/**
+ * The way out for a settings file that stays unreadable (Task 68): in its per-file turn, and only
+ * when it is there and cannot be read, it is renamed to `<name>.unreadable-<stamp>` beside it
+ * (never deleted), so the feature starts again from nothing. Returns that name. A file that can be
+ * read, or is missing, is left alone: AppSettingReadableError.
+ */
+export function setAppSettingAside(dir: string, name: string, check: (v: unknown) => v is unknown, now: Date): Promise<string> {
+  if (!SETTING_NAME.test(name)) throw new TypeError(`not a settings file name: ${name}`);
+  return inSettingTurn(dir, name, async () => {
+    try {
+      await readAppSettingStrict(dir, name, check);
+      throw new AppSettingReadableError(name); // readable, or missing: nothing to reset
+    } catch (err) {
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+    }
+    const base = `${name}.unreadable-${asideStamp(now)}`;
+    for (let n = 0; ; n++) {
+      const keptAs = n === 0 ? base : `${base}-${n}`;
+      try {
+        await fsp.lstat(join(dir, keptAs));
+        continue; // taken: never overwrite a file kept aside before
+      } catch {
+        // free
+      }
+      await fsp.rename(join(dir, name), join(dir, keptAs));
+      return keptAs;
+    }
+  });
 }
 
 /** The researcher's display name on this device (R84/R117): photographer of device imports, `by` of destruction certificates. */
@@ -129,7 +229,7 @@ export async function researcherName(dir: string): Promise<string | undefined> {
 /** Sets (or, with null, clears) the researcher's display name on this device. */
 export async function setResearcherName(dir: string, name: string | null): Promise<string | undefined> {
   if (name !== null && !researcherNameOk(name)) throw new TypeError("not a usable researcher name");
-  const next = await updateAppSetting<{ name?: string }>(dir, RESEARCHER_SETTING, () => (name === null ? {} : { name: name.trim() }));
+  const next = await writeAppSetting<{ name?: string }>(dir, RESEARCHER_SETTING, name === null ? {} : { name: name.trim() });
   return next.name;
 }
 

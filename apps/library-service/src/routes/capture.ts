@@ -303,8 +303,11 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
 
   // With the service's port now, so the app can tell which browsers still hold an older one (R171).
   app.get("/extension/pairings", async (): Promise<PairedBrowsers> => {
+    // Whether the pairings file can be read now (Task 68): when it cannot, the desktop app says so and
+    // offers its reset; the list is what the service holds.
+    const unreadable = await pairing.checkFile();
     const port = pairing.port;
-    return { extensions: pairing.list(), ...(port !== undefined ? { port } : {}) };
+    return { extensions: pairing.list(), ...(port !== undefined ? { port } : {}), ...(unreadable ? { unreadable: true as const } : {}) };
   });
   app.delete("/extension/pairings/:pid", async (req) => {
     if (!(await pairing.unpair(paramsOf(req).pid ?? ""))) throw notFound("That pairing");

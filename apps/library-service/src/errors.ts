@@ -4,8 +4,10 @@
  * one place.
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
-import { PairingsUnreadableError } from "./auth.js";
+import type { ResettableSetting } from "@ao/shared";
 import {
+  AppSettingReadableError,
+  AppSettingUnreadableError,
   AcknowledgementRequiredError,
   PendingWriteChoiceError,
   PendingWriteIncompleteError,
@@ -102,6 +104,13 @@ export interface ErrorBody {
   error: { code: ErrorCode; message: string; reason?: string };
 }
 
+/** The settings files a refusal can name (Task 68), with how to say them and their `reason`. */
+export const SETTINGS_FILES: Record<string, { reason: ResettableSetting; what: string; it: string }> = {
+  "extension-pairings.json": { reason: "extension-pairings", what: "The list of paired browsers", it: "it was" },
+  "fonts.json": { reason: "fonts", what: "The list of added fonts", it: "it was" },
+  "appearance.json": { reason: "appearance", what: "The appearance settings", it: "they were" },
+};
+
 /** Library error → status, code, plain message. Unknown errors are INTERNAL with a generic message. */
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
@@ -129,8 +138,16 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
-  // The app's list of paired browsers could not be read: nothing was changed (Task 66, I1).
-  if (err instanceof PairingsUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
+  // A settings file of this computer that cannot be read: nothing was written over it; `reason`
+  // names it, so the desktop app can offer its reset (Task 66 I1, Task 68).
+  if (err instanceof AppSettingUnreadableError) {
+    const which = SETTINGS_FILES[err.fileName];
+    return new ApiError(503, "UNAVAILABLE", which ? `${which.what} could not be read, so ${which.it} not changed.` : "A settings file of this app could not be read, so it was not changed.", which?.reason);
+  }
+  if (err instanceof AppSettingReadableError) {
+    const which = SETTINGS_FILES[err.fileName];
+    return new ApiError(409, "CONFLICT", `${which ? which.what : "That settings file"} can be read, so nothing was reset.`);
+  }
   // A file of the app itself is missing (a damaged installation); its message names what, never where.
   if (err instanceof ResourceMissingError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof CustomStyleSandboxError || err instanceof SandboxError) return new ApiError(400, "VALIDATION", "That citation style could not be used (it is too complex or took too long).");

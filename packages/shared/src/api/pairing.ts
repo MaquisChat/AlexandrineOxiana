@@ -48,6 +48,12 @@ export interface PairedBrowsers {
   extensions: PairedBrowser[];
   /** The port the service listens on now (not a secret); absent only before it listens. */
   port?: number;
+  /**
+   * The pairings file on this computer cannot be read (Task 68): no pairing can be added or removed
+   * until it can, or until it is reset (`POST /settings/reset`, file "extension-pairings"). The list
+   * is the pairings the service holds (none when the file could not be read at start).
+   */
+  unreadable?: true;
 }
 
 /** The browser a code paired: as `GET /extension/pairings` lists it. */

@@ -248,11 +248,16 @@ export {
   deviceDeps,
   ensurePrivateDir,
   readAppSetting,
+  readAppSettingStrict,
+  updateAppSettingStrict,
+  setAppSettingAside,
+  AppSettingUnreadableError,
+  AppSettingReadableError,
   researcherName,
   researcherNameOk,
   scrubPaths,
   setResearcherName,
-  updateAppSetting,
+  writeAppSetting,
 } from "./app-settings.js";
 export {
   ASSET_TEXT_MAX_BYTES,

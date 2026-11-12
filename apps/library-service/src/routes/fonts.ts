@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { readFile, lstat, unlink } from "node:fs/promises";
 import { basename, extname, isAbsolute, join } from "node:path";
 import type { FastifyInstance } from "fastify";
-import { ensurePrivateDir, readAppSetting, updateAppSetting, writeFileAtomic } from "@ao/library";
+import { ensurePrivateDir, readAppSettingStrict, setAppSettingAside, updateAppSettingStrict, writeFileAtomic } from "@ao/library";
 import {
   USER_FONTS_MAX,
   USER_FONT_MAX_BYTES,
@@ -61,8 +61,12 @@ function underFontLock<T>(dir: string, run: () => Promise<T>): Promise<T> {
 const NOT_A_FONT = "That is not a font file this app can use. It takes TrueType (.ttf), OpenType (.otf), WOFF and WOFF2 files; font collections (.ttc) are not taken.";
 
 interface FontIndex {
-  fonts: UserFont[];
+  /** As read; only usable entries are listed (validEntry), the others are kept in the file as they are. */
+  fonts: unknown[];
 }
+
+/** A fonts index as the app writes it (Task 68: anything else is unreadable, never written over). */
+const isFontIndex = (v: unknown): v is FontIndex => typeof v === "object" && v !== null && Array.isArray((v as { fonts?: unknown }).fonts);
 
 /** A family name the interface can register: a usable font name, one family only (no list, no quotes). */
 function usableName(name: string): boolean {
@@ -74,9 +78,23 @@ function validEntry(f: unknown): f is UserFont {
   return !!o && isUserFontId(o.id) && typeof o.name === "string" && usableName(o.name) && FORMATS.has(o.format as UserFontFormat) && typeof o.size === "number" && typeof o.addedAt === "string";
 }
 
+/**
+ * The usable entries of the index (Task 68): a missing index is "no fonts yet"; an index that cannot
+ * be read throws AppSettingUnreadableError (503, reason "fonts"), so nothing is built on it.
+ */
 async function readIndex(dir: string): Promise<UserFont[]> {
-  const stored = await readAppSetting<FontIndex>(dir, INDEX);
-  return Array.isArray(stored?.fonts) ? stored.fonts.filter(validEntry) : [];
+  const stored = await readAppSettingStrict(dir, INDEX, isFontIndex);
+  return (stored?.fonts ?? []).filter(validEntry);
+}
+
+/**
+ * The way out for an index that stays unreadable (Task 68): in the fonts' turn, the index is set
+ * aside (renamed, kept) and the list starts empty. The kept font files stay where they are: adding
+ * the same file again reuses its copy (it is named by its contents), and nothing is deleted on the
+ * strength of an index that could not be read.
+ */
+export function resetFontIndex(dir: string, now: Date): Promise<string> {
+  return underFontLock(dir, () => setAppSettingAside(dir, INDEX, isFontIndex, now));
 }
 
 const fontPath = (dir: string, f: Pick<UserFont, "id" | "format">) => join(dir, "fonts", `${f.id}.${f.format}`);
@@ -135,6 +153,7 @@ export function registerFonts(app: FastifyInstance, ctx: Ctx): void {
     const id = createHash("sha256").update(data).digest("hex").slice(0, 32);
     const given = name;
     return underFontLock(dir, async () => {
+      // Read first: an index that cannot be read refuses the add before any file is written (Task 68).
       const known = await readIndex(dir);
       const prev = known.find((f) => f.id === id);
       // The same file again keeps the name it has unless another is sent (M7).
@@ -147,15 +166,24 @@ export function registerFonts(app: FastifyInstance, ctx: Ctx): void {
         throw new ApiError(409, "CONFLICT", `This computer already keeps ${USER_FONTS_MAX} font files. Remove one you no longer use first.`);
       }
       ensurePrivateDir(join(dir, "fonts"));
-      await writeFileAtomic(fontPath(dir, { id, format }), data, { mode: 0o600 });
+      const file = fontPath(dir, { id, format });
+      await writeFileAtomic(file, data, { mode: 0o600 });
       const finalName = kept;
       const entry: UserFont = { id, name: finalName, format, size: data.length, addedAt: new Date().toISOString() };
-      const next = await updateAppSetting<FontIndex>(dir, INDEX, (cur) => {
-        const list = (Array.isArray(cur?.fonts) ? cur.fonts : []).filter(validEntry);
-        const before = list.find((f) => f.id === id);
-        return { fonts: before ? list.map((f) => (f.id === id ? { ...before, name: finalName } : f)) : [...list, entry] };
-      });
-      return next.fonts.find((f) => f.id === id)!;
+      let next: FontIndex;
+      try {
+        // Only over what was read; other entries (usable or not) stay exactly as they were.
+        next = await updateAppSettingStrict<FontIndex>(dir, INDEX, isFontIndex, (cur) => {
+          const list = cur?.fonts ?? [];
+          const before = list.find((f): f is UserFont => validEntry(f) && f.id === id);
+          return { ...(cur ?? {}), fonts: before ? list.map((f) => (f === before ? { ...before, name: finalName } : f)) : [...list, entry] };
+        });
+      } catch (err) {
+        // The index became unreadable since it was read: no file is left behind without its entry.
+        if (!prev) await unlink(file).catch(() => undefined);
+        throw err;
+      }
+      return next.fonts.find((f): f is UserFont => validEntry(f) && f.id === id)!;
     });
   });
 
@@ -190,9 +218,11 @@ export function registerFonts(app: FastifyInstance, ctx: Ctx): void {
     const id = paramsOf(req).id ?? "";
     if (!isUserFontId(id)) throw notFound("That font");
     return underFontLock(dir, async () => {
+      // Read first, write over what was read, and only then delete the file (Task 68): a file is never
+      // deleted on the strength of an index that could not be read.
       const font = (await readIndex(dir)).find((f) => f.id === id);
       if (!font) throw notFound("That font");
-      await updateAppSetting<FontIndex>(dir, INDEX, (cur) => ({ fonts: (Array.isArray(cur?.fonts) ? cur.fonts : []).filter((f) => validEntry(f) && f.id !== id) }));
+      await updateAppSettingStrict<FontIndex>(dir, INDEX, isFontIndex, (cur) => ({ ...(cur ?? {}), fonts: (cur?.fonts ?? []).filter((f) => !(validEntry(f) && f.id === id)) }));
       await unlink(fontPath(dir, font)).catch(() => undefined);
       return { removed: true };
     });
