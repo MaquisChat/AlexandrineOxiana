@@ -151,7 +151,8 @@ jobs:
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
       || needs.desktop-scope.outputs.changed == 'true')
     runs-on: ubuntu-latest
-    # A healthy run takes about 10 minutes cold and 5 with a warm cache (see the Task 37h report).
+    # Estimated (Task 37h report): about 13 minutes cold, 8 with a warm Rust cache; the launch check
+    # (~2.5 min) and the system packages (~2–3 min) dominate a warm run, the scenario takes ~15 s.
     timeout-minutes: 40
     env:
       # Smaller, faster-to-restore cache; incremental builds do not help a fresh runner.
