@@ -15,8 +15,7 @@
  */
 import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
-import { errorText } from "../api/library";
-import { formatSize, hostsOf, remainingOf, type ToolsApi } from "../api/tools";
+import { DEFAULT_SPEECH_MODEL, formatSize, hostsOf, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
 import { navigate, normalisePath, PATHS } from "../navigation";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
@@ -59,16 +58,27 @@ interface Activity {
 }
 
 const ACTIVITIES: Activity[] = [
-  { id: "recordings", label: "Work with recordings", hint: "Transcribe interviews and other audio or video.", tools: ["speech-small", "ffmpeg"] },
+  {
+    id: "recordings",
+    label: "Work with recordings",
+    hint: "Transcribe interviews and other recordings with the app's default speech model. The video tools make viewing copies of videos, also copies that leave out a recorded location.",
+    tools: [speechTool(DEFAULT_SPEECH_MODEL), "ffmpeg"],
+  },
   { id: "videos", label: "Save videos from the web", hint: "Capture links to YouTube, TikTok and similar video posts.", tools: ["video-downloader", "ffmpeg"] },
   { id: "pictures", label: "Save picture posts from the web", hint: "Capture links to Instagram and similar posts with photos.", tools: ["image-downloader"] },
   { id: "scans", label: "Read scanned documents", hint: "Recognise the text of scanned pages so they can be searched.", tools: ["ocr"] },
 ];
 
-const selectable = (t: ToolInfo) => t.available && !t.installed;
+/** Already being installed (from the tools screen): not offered again. */
+const running = (t: ToolInfo) => t.job?.status === "running";
+const selectable = (t: ToolInfo) => t.available && !t.installed && !running(t) && usedByApp(t.id);
+
+/** Some other dialog is open (a recovery code, a confirmation): this one waits until it has closed. */
+const otherDialogOpen = () => document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]') !== null;
 
 export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: { api: ToolsApi; memory?: FirstUseMemory; pathname: string }) {
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
+  const [ready, setReady] = useState(false);
   const [closed, setClosed] = useState(false);
   const onToolsScreen = normalisePath(pathname) === PATHS.tools;
 
@@ -80,7 +90,9 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: {
       (r) => {
         if (!live || memory.get()) return;
         const list = Array.isArray(r.tools) ? r.tools : [];
-        setTools(list.length > 0 && list.every((t) => !t.installed) ? list : null);
+        // Asked whenever it has not been answered (R158), whatever is already on this computer; not
+        // when nothing at all could be downloaded here.
+        setTools(r.platform !== null && list.some(selectable) ? list : null);
       },
       () => {
         // The catalogue cannot be read: the app is used without the dialogue.
@@ -92,7 +104,23 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: {
     };
   }, [api, memory, closed, onToolsScreen]);
 
-  if (closed || onToolsScreen || !tools) return null;
+  // Never over another dialog: wait until it has closed.
+  useEffect(() => {
+    if (!tools || ready) return;
+    if (!otherDialogOpen()) {
+      setReady(true);
+      return;
+    }
+    const t = setInterval(() => {
+      if (!otherDialogOpen()) {
+        clearInterval(t);
+        setReady(true);
+      }
+    }, 250);
+    return () => clearInterval(t);
+  }, [tools, ready]);
+
+  if (closed || onToolsScreen || !tools || !ready) return null;
   return (
     <FirstUseDialog
       api={api}
@@ -180,7 +208,7 @@ function FirstUseDialog({ api, tools, onNotNow, onStarted }: { api: ToolsApi; to
       onStarted();
       return;
     }
-    setError(`${failed.join(", ")} could not be started. ${errorText(firstError, "The library service did not answer.")} Try again, or choose Not now and install later from the optional tools screen.`);
+    setError(`${failed.join(", ")} could not be started. ${toolsErrorText(firstError, "The library service did not answer.")} Try again, or choose Not now and install later from the optional tools screen.`);
   };
 
   return (
@@ -210,7 +238,15 @@ function FirstUseDialog({ api, tools, onNotNow, onStarted }: { api: ToolsApi; to
             const disabled = busy || !selectable(t) || started.has(t.id);
             const checked = selectable(t) && !unticked.has(t.id) && !started.has(t.id);
             const reasonId = `${id}-${t.id}-why`;
-            const why = t.installed ? "Already installed." : started.has(t.id) ? "Started." : !t.available ? `Not available on this computer. ${t.unavailableReason ?? ""}`.trim() : null;
+            const why = t.installed
+              ? "Already on this computer."
+              : started.has(t.id)
+                ? "Started."
+                : running(t)
+                  ? "Being installed."
+                  : !t.available
+                    ? `Not available on this computer. ${t.unavailableReason ?? ""}`.trim()
+                    : null;
             const known = byId.get(t.id)!;
             return (
               <label key={t.id} className="ao-first-use__option">

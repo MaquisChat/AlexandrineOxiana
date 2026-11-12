@@ -42,7 +42,7 @@ describe("the optional tools in the app", () => {
     render(<App service={service} />);
     expect(await screen.findByRole("heading", { level: 1, name: "Optional tools" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "Back to library" })).toBeTruthy();
-    await waitFor(() => expect(document.activeElement?.textContent).toBe("ffmpeg (video and audio conversion)"));
+    await waitFor(() => expect(document.activeElement?.textContent).toBe("Video tools (ffmpeg)"));
   });
 
   it("is reachable from the settings links in the library's header", async () => {
