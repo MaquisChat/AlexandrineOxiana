@@ -13,23 +13,20 @@
  *
  * Then scenarios 9, 10 and 11 (Task 34f), described where they start below: two links captured and
  * picked up again after a reload, with a transcript edited and transcribed again; a profile captured
- * twice, the post missing the second time flagged and nothing deleted (with defect D17); a planted
+ * twice, the post missing the second time flagged and marked in the library (D17, fixed by Task 69)
+ * and nothing deleted; a planted
  * DOI and title conflict settled from the project's review queue.
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   APP_ORIGIN,
-  blockedBy,
-  DEFECT_TIMEOUT,
   expect,
-  expectDefect,
   libraryWithProject,
   OPEN_RULES,
   plantCaptureConflict,
   test,
   type AppHarness,
-  type Defect,
   type FakeControl,
   type Page,
   type PlantedConflict,
@@ -200,17 +197,6 @@ const fakesOf = (app: AppHarness): FakeControl => {
 const queueSection = (page: Page, heading: string | RegExp) =>
   page.getByRole("region", { name: "Capture queue" }).locator("section").filter({ has: page.getByRole("heading", { level: 3, name: heading }) });
 
-/**
- * Defect D17 (found by Task 34f; the number is provisional): a post that a profile capture finds
- * missing is stored as "unavailable on the platform", but nothing in the interface says so for that
- * post: the library row and the source's details look like any other source; only the run's summary
- * on the Capture screen counts "1 post no longer on the platform", without saying which.
- */
-const D17: Defect = {
-  id: "D17",
-  title: "a post a profile capture finds missing is stored as no longer on the platform, but neither its library row nor its details say so",
-};
-
 test.describe("capture from the web (scenarios 9, 10, 11)", () => {
   test.use({ fakeControl: true });
 
@@ -224,41 +210,47 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       await allowCapture(page, library);
     });
 
-    await test.step("Capture screen: paste both links, choose Transcribe with the tiny model; the YouTube download is held, so the capture is still running", async () => {
-      await openCapture(page, library);
-      await fakes.hold("yt-dlp");
-      await page.getByRole("textbox", { name: "Links, one per line" }).fill(`${YT_LINK}\n${IG_LINK}`);
-      await expect(page.getByRole("list", { name: "Link preview" }).getByRole("listitem")).toHaveCount(2);
-      await page.getByRole("radio", { name: "Transcribe", exact: true }).check();
-      await page.getByRole("combobox", { name: "Transcription model" }).selectOption("tiny");
-      const answer = page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === `/projects/${projectId}/capture`);
-      await page.getByRole("button", { name: "Capture links" }).click();
-      const sent = await answer;
-      expect(sent.status()).toBe(200);
-      expect(sent.request().postDataJSON()).toMatchObject({ urls: [YT_LINK, IG_LINK], options: { transcribe: true, transcribeModel: "tiny" } });
-      await expect(queueSection(page, "2 links").getByRole("listitem").filter({ hasText: YT_LINK })).toContainText("Capturing now");
-      await expect.poll(() => fakes.held("yt-dlp"), { message: "the YouTube download is waiting at the hold" }).toBe(1);
-    });
+    // The hold is lifted in the step that lets the download go on, and in any case before the test
+    // ends (finally), so a failure while the download waits never leaves the fake waiting.
+    try {
+      await test.step("Capture screen: paste both links, choose Transcribe with the tiny model; the YouTube download is held, so the capture is still running", async () => {
+        await openCapture(page, library);
+        await fakes.hold("yt-dlp");
+        await page.getByRole("textbox", { name: "Links, one per line" }).fill(`${YT_LINK}\n${IG_LINK}`);
+        await expect(page.getByRole("list", { name: "Link preview" }).getByRole("listitem")).toHaveCount(2);
+        await page.getByRole("radio", { name: "Transcribe", exact: true }).check();
+        await page.getByRole("combobox", { name: "Transcription model" }).selectOption("tiny");
+        const answer = page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === `/projects/${projectId}/capture`);
+        await page.getByRole("button", { name: "Capture links" }).click();
+        const sent = await answer;
+        expect(sent.status()).toBe(200);
+        expect(sent.request().postDataJSON()).toMatchObject({ urls: [YT_LINK, IG_LINK], options: { transcribe: true, transcribeModel: "tiny" } });
+        await expect(queueSection(page, "2 links").getByRole("listitem").filter({ hasText: YT_LINK })).toContainText("Capturing now");
+        await expect.poll(() => fakes.held("yt-dlp"), { message: "the YouTube download is waiting at the hold" }).toBe(1);
+      });
 
-    await test.step("reload the page while the capture runs: the screen reads the running capture again and shows it, not as unknown", async () => {
-      await page.reload();
-      await expect(page.getByRole("heading", { level: 1, name: "Capture" })).toBeVisible();
-      const queue = queueSection(page, "2 links");
-      await expect(queue.getByRole("listitem").filter({ hasText: YT_LINK })).toContainText("Capturing now");
-      await expect(queue.getByText("Not known")).toHaveCount(0);
-      // The service says the same: one queue, its download still held.
-      const running = await app.api<{ queues: unknown[] }>("GET", `/projects/${projectId}/captures`);
-      expect(running.body.queues).toHaveLength(1);
-      expect(fakes.held("yt-dlp")).toBe(1);
-    });
+      await test.step("reload the page while the capture runs: the screen reads the running capture again and shows it, not as unknown", async () => {
+        await page.reload();
+        await expect(page.getByRole("heading", { level: 1, name: "Capture" })).toBeVisible();
+        const queue = queueSection(page, "2 links");
+        await expect(queue.getByRole("listitem").filter({ hasText: YT_LINK })).toContainText("Capturing now");
+        await expect(queue.getByText("Not known")).toHaveCount(0);
+        // The service says the same: one queue, its download still held.
+        const running = await app.api<{ queues: unknown[] }>("GET", `/projects/${projectId}/captures`);
+        expect(running.body.queues).toHaveLength(1);
+        expect(fakes.held("yt-dlp")).toBe(1);
+      });
 
-    await test.step("the held download goes on: the capture finishes, both links saved, as the reloaded screen shows", async () => {
+      await test.step("the held download goes on: the capture finishes, both links saved, as the reloaded screen shows", async () => {
+        await fakes.release("yt-dlp");
+        const queue = queueSection(page, "2 links");
+        await expect(queue.getByRole("status")).toHaveText("Finished. Of 2 links: 2 done.", { timeout: 60_000 });
+        await expect(queue.getByRole("listitem").filter({ hasText: YT_LINK })).toContainText("Saved");
+        await expect(queue.getByRole("listitem").filter({ hasText: IG_LINK })).toContainText("Saved");
+      });
+    } finally {
       await fakes.release("yt-dlp");
-      const queue = queueSection(page, "2 links");
-      await expect(queue.getByRole("status")).toHaveText("Finished. Of 2 links: 2 done.", { timeout: 60_000 });
-      await expect(queue.getByRole("listitem").filter({ hasText: YT_LINK })).toContainText("Saved");
-      await expect(queue.getByRole("listitem").filter({ hasText: IG_LINK })).toContainText("Saved");
-    });
+    }
 
     let video: SourceRecord | undefined;
     await test.step("both sources are stored: the video with its recording and a transcript, the Instagram post with its three pictures, each file on disk; the capture is audited", async () => {
@@ -275,8 +267,16 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       expect(video!.assets.filter((a) => a.role === "derived" && a.kind === "transcript").length).toBeGreaterThanOrEqual(1);
       expect(post!.assets.filter((a) => a.role === "original" && a.kind === "image")).toHaveLength(3);
       for (const a of [...video!.assets, ...post!.assets]) expect(existsSync(onDisk(libraryPath, a)), `${a.kind} ${a.path} is on disk`).toBe(true);
+      // Audited: one allowed capture decision per link (on the project, with its platform), and the
+      // creation of each source.
       const audit = await auditLog(app, projectId);
-      expect(audit.filter((e) => e.action === "capture").length, JSON.stringify(audit.map((e) => e.action))).toBeGreaterThanOrEqual(1);
+      const captures = audit.filter((e) => e.action === "capture");
+      expect(captures, JSON.stringify(audit, null, 1)).toHaveLength(2);
+      for (const c of captures) expect(c).toMatchObject({ entity: { type: "project", id: projectId }, decision: { result: "allow" }, details: { op: "capture.link", cookies: false } });
+      expect(captures.map((c) => c.details?.platform).sort()).toEqual(["instagram", "youtube"]);
+      for (const s of [video!, post!]) {
+        expect(audit.filter((e) => e.entity?.type === "source" && e.entity.id === s.source.id && e.details?.op === "source.create" && e.decision?.result === "allow"), `the creation of ${titleOf(s)} is audited`).toHaveLength(1);
+      }
     });
 
     await test.step("both are in the library list", async () => {
@@ -286,6 +286,14 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       await expect(table.getByRole("row")).toHaveCount(3); // the header row and two sources
     });
 
+    type Version = { id: string; origin: string; format: string; flaggedSegments?: number };
+    const transcriptVersions = async () => (await app.api<{ versions: Version[] }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts`)).body.versions;
+    const storedSegments = async (versionId: string) =>
+      (await app.api<{ segments: Array<{ text: string; flags: string[] | null; edit?: string }> }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts/${versionId}`)).body.segments;
+    /** An allowed, audited derivation of transcript asset `id` (how a stored transcript version is audited). */
+    const derivationAudited = async (id: string) =>
+      expect((await auditLog(app, projectId)).filter((e) => e.entity?.type === "asset" && e.entity.id === id && e.details?.op === "asset.derive" && e.decision?.result === "allow"), `the storing of transcript ${id} is audited`).toHaveLength(1);
+    let firstRun: string[] = [];
     const versionPicker = () => page.getByRole("combobox", { name: "Version" });
     const segments = () => page.getByRole("list", { name: "Transcript segments" }).getByRole("listitem");
     const flagged = () => segments().filter({ hasText: "Flagged for review" });
@@ -299,6 +307,16 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       await expect(flagged()).toHaveCount(1);
       await expect(flagged()).toContainText("The traders open their stalls before sunrise.");
       await expect(flagged()).toContainText("Low confidence");
+      // Stored: one speech recognition run (its WebVTT and its segments file), whose segments carry
+      // exactly one flag, low-confidence, on the second segment — found by the worker's own checks.
+      const list = await transcriptVersions();
+      expect(list.filter((v) => v.origin === "human-edit")).toEqual([]);
+      firstRun = list.filter((v) => v.origin === "machine").map((v) => v.id);
+      expect(list.filter((v) => v.origin === "machine").map((v) => v.format).sort()).toEqual(["json", "vtt"]);
+      for (const v of list) expect(v.flaggedSegments).toBe(1);
+      const segs = await storedSegments(list.find((v) => v.format === "json")!.id);
+      expect(segs.map((x) => x.flags)).toEqual([[], ["low-confidence"], []]);
+      for (const id of firstRun) await derivationAudited(id);
     });
 
     const EDITED = "The traders open their stalls before dawn.";
@@ -313,9 +331,11 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       await expect(versionPicker().getByRole("option").filter({ hasText: /^Edited by a person/ })).toHaveCount(1);
       await expect(segments().filter({ hasText: EDITED })).toContainText("Edited by a person — not checked");
       // Stored: a human-edit version whose changed segment has no flags and is marked edited; the others keep theirs.
-      const list = await app.api<{ versions: Array<{ id: string; origin: string }> }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts`);
-      const edits = list.body.versions.filter((v) => v.origin === "human-edit");
+      const list = await transcriptVersions();
+      const edits = list.filter((v) => v.origin === "human-edit");
       expect(edits).toHaveLength(1);
+      expect(list.filter((v) => v.origin === "machine").map((v) => v.id)).toEqual(firstRun);
+      await derivationAudited(edits[0]!.id);
       const saved = await app.api<{ id: string; text: string; segments: Array<{ text: string; flags: string[] | null; edit?: string }> }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts/${edits[0]!.id}`);
       expect(saved.body.segments.map((s) => s.text)).toEqual(["Welcome to the market in Kumasi.", EDITED, "Prices are agreed by talking, never written down."]);
       expect(saved.body.segments[1]).toMatchObject({ flags: null, edit: "edited" });
@@ -329,8 +349,17 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       await expect(versionPicker().getByRole("option")).toHaveCount(3, { timeout: 60_000 });
       await expect(versionPicker().getByRole("option").filter({ hasText: /^Speech recognition/ })).toHaveCount(2);
       await expect(versionPicker().getByRole("option").filter({ hasText: /^Edited by a person/ })).toHaveCount(1);
-      const list = await app.api<{ versions: Array<{ id: string; origin: string }> }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts`);
-      expect(list.body.versions.filter((v) => v.origin === "human-edit").map((v) => v.id)).toEqual([human!.id]);
+      // Stored: the first run as it was, one new run (its WebVTT and segments file, again with one
+      // low-confidence flag), each audited; the person's version the same id and text.
+      const list = await transcriptVersions();
+      expect(list.filter((v) => v.origin === "human-edit").map((v) => v.id)).toEqual([human!.id]);
+      const machine = list.filter((v) => v.origin === "machine");
+      expect(machine).toHaveLength(firstRun.length + 2);
+      expect(machine.map((v) => v.id)).toEqual(expect.arrayContaining(firstRun));
+      const newRun = machine.filter((v) => !firstRun.includes(v.id));
+      expect(newRun.map((v) => v.format).sort()).toEqual(["json", "vtt"]);
+      expect((await storedSegments(newRun.find((v) => v.format === "json")!.id)).map((x) => x.flags)).toEqual([[], ["low-confidence"], []]);
+      for (const v of newRun) await derivationAudited(v.id);
       const again = await app.api<{ text: string }>("GET", `/projects/${projectId}/sources/${video!.source.id}/transcripts/${human!.id}`);
       expect(again.body.text).toBe(human!.text);
       const now = (await storedSources(app, projectId)).find((s) => s.source.id === video!.source.id)!;
@@ -339,25 +368,37 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
     });
   });
 
-  test("scenario 10: a profile captured twice with no maximum number of items (R43); the post missing the second time is flagged as removed at the source, and nothing is deleted", async ({ page, app }) => {
+  test("scenario 10: a profile captured twice with no maximum number of items (R43); the post missing the second time is shown as no longer available at its source (D17, Task 69), and nothing is deleted", async ({ page, app }) => {
     const run = await captureProfileTwice(page, app);
-    await test.step("the post missing the second time is shown as no longer on the platform, in the library and its details", async () => {
-      await blockedBy(D17);
-    });
-    await test.step("in the library list, the missing post's row is still there", async () => {
-      await page.getByRole("link", { name: "Back to library" }).click();
-      await expect(page.getByRole("table", { name: "Sources" }).getByRole("button", { name: run.missingTitle, exact: true })).toBeVisible();
-    });
-  });
+    // The mark's words, with the date the library stored in firstNoticedAt, in the app's medium date
+    // format as the browser formats it (its own locale data and time zone).
+    const noticed = await page.evaluate((iso) => new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(new Date(iso)), run.firstNoticedAt);
+    const words = `No longer available at its source, noticed on ${noticed}`;
+    const rowOf = (title: string) => page.getByRole("table", { name: "Sources" }).getByRole("row").filter({ has: page.getByRole("button", { name: title, exact: true }) });
 
-  test(`${D17.id}: ${D17.title}`, async ({ page, app }) => {
-    const run = await captureProfileTwice(page, app);
-    await page.getByRole("link", { name: "Back to library" }).click();
-    await page.getByRole("table", { name: "Sources" }).getByRole("button", { name: run.missingTitle, exact: true }).click();
-    const details = page.getByRole("region", { name: "Source details" });
-    await expect(details).toBeVisible();
-    expectDefect(D17);
-    await expect(details).toContainText(/no longer on the platform|removed (from|at) the (platform|source)/i, { timeout: DEFECT_TIMEOUT });
+    await test.step("in the library list, the missing post's row is still there and its title cell says it is no longer available at its source, with the date it was noticed; the posts still on the platform say nothing", async () => {
+      await page.getByRole("link", { name: "Back to library" }).click();
+      const row = rowOf(run.missingTitle);
+      await expect(row).toHaveCount(1);
+      const mark = row.getByRole("note");
+      await expect(mark).toHaveCount(1);
+      await expect(mark).toHaveText(words);
+      await expect(mark).toHaveAccessibleName(words);
+      await expect(row.getByRole("cell").filter({ has: page.getByRole("button", { name: run.missingTitle, exact: true }) }).getByRole("note", { name: words })).toBeVisible();
+      for (const title of run.keptTitles) {
+        await expect(rowOf(title)).toHaveCount(1);
+        await expect(rowOf(title).getByText(/No longer available at its source/)).toHaveCount(0);
+      }
+    });
+
+    await test.step("its source screen shows the same mark; a post still on the platform shows none", async () => {
+      await rowOf(run.missingTitle).getByRole("button", { name: run.missingTitle, exact: true }).click();
+      const details = page.getByRole("region", { name: "Source details" });
+      await expect(details.getByRole("note", { name: words })).toHaveText(words);
+      await rowOf(run.keptTitles[0]!).getByRole("button", { name: run.keptTitles[0]!, exact: true }).click();
+      await expect(details).toContainText(run.keptTitles[0]!);
+      await expect(details.getByText(/No longer available at its source/)).toHaveCount(0);
+    });
   });
 
   test("scenario 11: a planted DOI and title conflict appears in the project's review queue, counted in the header link; choosing a value shows confirmed by you, the entry leaves the queue, and the audit log holds the confirmation", async ({ page, app }) => {
@@ -419,10 +460,11 @@ test.describe("capture from the web (scenarios 9, 10, 11)", () => {
       expect(stored.fields.filter((f) => f.field === "/title" || f.field === "/identifiers/doi").map((f) => f.status)).toEqual(["user-confirmed", "user-confirmed"]);
       const rows = await app.api<{ items: Array<{ id: string; needsReview: boolean }> }>("GET", `/projects/${projectId}/sources`);
       expect(rows.body.items.find((i) => i.id === sourceId)?.needsReview).toBe(false);
-      // One governed, allowed write of the source per confirmation (each with its crash-safety txn,
-      // R26); the one that confirmed the last field records that it resolved the review entry by
-      // confirmation (R176 1). (The audit entry names the operation, not the field: which field
-      // changed is in the change log.)
+      // What the audit log records of a confirmation today: one generic, allowed `store` write of the
+      // source (`op: "source.update"`, with its crash-safety txn, R26) per confirmation, and on the one
+      // that confirmed the last field, that it resolved the review entry by confirmation (R176 1).
+      // Neither entry names the field or the value, or says that the write was a confirmation; this
+      // test asserts no more than that.
       const audit = await auditLog(app, projectId);
       const writes = audit.filter((e) => e.entity?.type === "source" && e.entity.id === sourceId && e.details?.op === "source.update");
       expect(writes, JSON.stringify(audit, null, 1)).toHaveLength(2);
@@ -458,7 +500,7 @@ const profile = (ns: number[]) => ({
  * no maximum number of items, then captured again with post 2 gone. Leaves the page on the Capture
  * screen; returns the missing post's title.
  */
-async function captureProfileTwice(page: Page, app: AppHarness): Promise<{ missingTitle: string }> {
+async function captureProfileTwice(page: Page, app: AppHarness): Promise<{ missingTitle: string; firstNoticedAt: string; keptTitles: string[] }> {
   const library = "Profile library";
   const { projectId, libraryPath } = await libraryWithProject(app, page, { library, project: "Dance study" });
   const fakes = fakesOf(app);
@@ -501,6 +543,8 @@ async function captureProfileTwice(page: Page, app: AppHarness): Promise<{ missi
   });
 
   let missingTitle = "";
+  let firstNoticedAt = "";
+  let keptTitles: string[] = [];
   await test.step("second run, post 2 gone from the profile: the run reports one post no longer on the platform", async () => {
     await fakes.setProfile(profile([3, 1]));
     await captureIt();
@@ -519,9 +563,12 @@ async function captureProfileTwice(page: Page, app: AppHarness): Promise<{ missi
     for (const s of stored.filter((x) => x !== gone)) expect(s.source.availability.status).toBe("available");
     for (const f of firstFiles) expect(existsSync(f), `${f} is still on disk`).toBe(true);
     const audit = await auditLog(app, projectId);
-    expect(audit.filter((e) => /delete|destroy|remove/i.test(e.action ?? "")), "no deletion in the audit log").toEqual([]);
+    const removing = /delete|destroy|remove|trash/i;
+    expect(audit.filter((e) => removing.test(e.action ?? "") || removing.test(String(e.details?.op ?? ""))), "no deletion in the audit log").toEqual([]);
     expect(audit.filter((e) => e.action === "capture.profile")).toHaveLength(2);
     missingTitle = titleOf(gone);
+    firstNoticedAt = gone.source.availability.firstNoticedAt!;
+    keptTitles = stored.filter((x) => x !== gone).map(titleOf);
   });
-  return { missingTitle };
+  return { missingTitle, firstNoticedAt, keptTitles };
 }
