@@ -457,7 +457,7 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     };
     await handOver();
     app.onRestart(handOver);
-    // The first-use "Optional tools" question (Tasks 48b, 48c) is a modal dialog on the open library. These
+    // The first-use "Optional tools" question (Tasks 48b, 48c) is a banner on the open library. These
     // scenarios are about other things, so the harness records it as answered "Not now", exactly as
     // the app records that answer (FirstUseTools.tsx), before any app code runs. An answer already
     // there is left alone, so a scenario about the question itself can set its own state first.

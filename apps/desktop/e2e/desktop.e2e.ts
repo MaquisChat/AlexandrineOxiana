@@ -99,15 +99,6 @@ test("the built Linux app: create a library and a project, attach a file through
       await until("the media worker to run under the service", 60_000, () => d.helpers().some((p) => /ao[-_]worker/.test(cmdline(p))));
     });
 
-    await test.step("the first-use Optional tools dialog opens over the open library, once it is quiet; “Not now”", async () => {
-      // On a new settings folder the app asks once which optional tools to fetch: never over the
-      // chooser (D9, Task 48c), only on the open library's screen once the worker has reported what
-      // is installed and nothing has been typed or clicked for a moment.
-      const tools = await d.byRole("dialog", "Optional tools", { timeoutMs: 60_000 });
-      await s.click(await d.byRole("button", "Not now", { within: tools }));
-      await until("the dialog to close and the page behind to be usable again", 30_000, async () => (await d.countByRole("dialog", "Optional tools")) === 0 && (await s.execute<boolean>("return !document.querySelector('[inert]')")));
-    });
-
     await test.step("create a project in the New project dialog", async () => {
       await s.click(await d.byRole("button", "New project"));
       const dialog = await d.byRole("dialog", "New project");
