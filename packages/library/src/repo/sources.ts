@@ -219,6 +219,18 @@ function manifestEntry(sf: SourceFile): ManifestEntry {
   return e;
 }
 
+/** Test seam (R47): runs between a source's annotations file and its source.json being written. */
+let betweenSourceFiles: ((folder: string) => Promise<void>) | undefined;
+
+/**
+ * Test seam (R47): `fn` runs in every source write after the annotations file is written (or
+ * removed) and before source.json is, only while NODE_ENV is "test"; `undefined` removes it.
+ */
+export function pauseBetweenSourceFilesForTests(fn: ((folder: string) => Promise<void>) | undefined): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("pauseBetweenSourceFilesForTests is only available in tests (NODE_ENV=test).");
+  betweenSourceFiles = fn;
+}
+
 /**
  * Writes source.json, or source.json.enc plus the manifest entry in encrypted projects. The
  * annotations go to annotations.json(.enc) — only when they changed since they were read (their
@@ -251,6 +263,7 @@ export async function writeSourceFile(core: RepoCore, tx: Tx, sf: SourceFile): P
   } else if (disk.status === "ok") {
     await tx.trash(annRel);
   }
+  if (betweenSourceFiles && process.env.NODE_ENV === "test") await betweenSourceFiles(folder);
   const parsed: SourceFile = { ...rest, annotations: [], ...meta };
   const json = JSON.stringify(parsed, null, 2);
   if (core.encrypted(tx.state)) {
