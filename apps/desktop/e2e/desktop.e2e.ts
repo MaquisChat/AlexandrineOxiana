@@ -85,14 +85,6 @@ test("the built Linux app: create a library and a project, attach a file through
       await d.byRole("button", "Choose folder…");
     });
 
-    await test.step("the first-use Optional tools dialog opens over it (the worker answered); “Not now”", async () => {
-      // On a new settings folder the app asks once which optional tools to fetch, once the worker
-      // reports what is installed. A person would answer it before anything else.
-      const tools = await d.byRole("dialog", "Optional tools", { timeoutMs: 60_000 });
-      await s.click(await d.byRole("button", "Not now", { within: tools }));
-      await until("the dialog to close and the page behind to be usable again", 30_000, async () => (await d.countByRole("dialog", "Optional tools")) === 0 && (await s.execute<boolean>("return !document.querySelector('[inert]')")));
-    });
-
     const libraryPath = join(d.librariesDir, "Estuary fieldwork library");
     await test.step("create a library at a typed folder", async () => {
       await s.sendKeys(await d.byRole("textbox", "Library folder"), libraryPath);

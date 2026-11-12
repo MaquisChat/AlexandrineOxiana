@@ -18,8 +18,6 @@ import { AppearanceSettingsScreen } from "./screens/AppearanceSettings";
 import { CaptureRoute } from "./screens/Capture";
 import { ExtensionPairingRoute } from "./screens/ExtensionPairing";
 import { ToolsSetupRoute } from "./screens/ToolsSetup";
-import { FirstUseTools } from "./components/FirstUseTools";
-import { toolsApi } from "./api/tools";
 import { ResearcherNameSetting } from "./screens/ResearcherName";
 import type { ServiceConnection } from "./serviceConnection";
 import { AppearanceProvider } from "./theme/AppearanceProvider";
@@ -84,13 +82,11 @@ const servicePort = (s?: ServiceConnection): number | undefined => {
 
 export function App({ service }: { service?: ServiceConnection }) {
   const client: ApiClient | undefined = useMemo(() => (service ? createClient(service.baseUrl, service.token) : undefined), [service]);
-  const tools = useMemo(() => (client ? toolsApi(client) : undefined), [client]);
   const loc = useLocation();
   useDropGuard();
   return (
     <AppearanceProvider {...(client ? { client } : {})}>
       {client ? routeFor(loc, client, servicePort(service)) : <AppearanceSettingsScreen />}
-      {tools ? <FirstUseTools api={tools} pathname={loc.pathname} /> : null}
     </AppearanceProvider>
   );
 }

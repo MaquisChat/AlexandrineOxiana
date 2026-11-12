@@ -1,9 +1,11 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import type { ToolsResponse } from "@ao/shared";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ToolsApi } from "../api/tools";
 import { PATHS } from "../navigation";
 import { catalogue, catalogueWithoutHosts, makeApi, memoryStore, onComputer, server, toolsService, useMsw, withoutHostsFor } from "../test/msw-tools";
-import { FirstUseTools } from "./FirstUseTools";
+import { FIRST_USE_QUESTION, FirstUseTools, recordToolsScreenSeen } from "./FirstUseTools";
 
 useMsw();
 
@@ -13,47 +15,156 @@ afterEach(() => {
 
 const FFMPEG = "Video tools (ffmpeg)";
 
-function Page({ memory, svc = toolsService(), children }: { memory: ReturnType<typeof memoryStore>; svc?: ReturnType<typeof toolsService>; children?: React.ReactNode }) {
+/** The library screen, reduced: a button, a text field, the header's tools link, and the question's place. */
+function Page({ memory, svc = toolsService(), api, hidden, children }: { memory: ReturnType<typeof memoryStore>; svc?: ReturnType<typeof toolsService>; api?: ToolsApi; hidden?: boolean; children?: React.ReactNode }) {
   server.use(...svc.handlers);
   return (
     <>
       <main>
         <button type="button">Something in the app</button>
+        <label>
+          Search sources
+          <input type="search" />
+        </label>
+        <a href={PATHS.tools}>Optional tools</a>
+        <FirstUseTools api={api ?? makeApi()} memory={memory} {...(hidden !== undefined ? { hidden } : {})} />
       </main>
       {children}
-      <FirstUseTools api={makeApi()} memory={memory} pathname="/" />
     </>
   );
 }
 
+/** The banner's "Choose tools…" pressed: the dialogue is open with focus in it. */
 async function opened(memory = memoryStore(), svc = toolsService()) {
   const user = userEvent.setup();
   const view = render(<Page memory={memory} svc={svc} />);
-  const opener = screen.getByRole("button", { name: "Something in the app" });
-  opener.focus();
+  const opener = await screen.findByRole("button", { name: "Choose tools…" });
+  await user.click(opener);
   const dialog = await screen.findByRole("dialog", { name: "Optional tools" });
-  // Focus moves in from the shell's effect, just after the dialog is in the document.
   await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
   return { user, view, dialog, opener, memory, svc };
 }
 
+/** A tools API whose catalogue answers at once with `answer` (or fails), for checks that nothing appears. */
+const answering = (answer: ToolsResponse | Error): ToolsApi => ({ ...makeApi(), catalogue: () => (answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer)) });
+/** Lets an answered promise reach the component. */
+const flush = () => act(async () => {});
+
 const activity = (name: RegExp) => screen.getByRole("checkbox", { name });
 const toolBox = (name: string) => within(screen.getByRole("group", { name: "Tools to download" })).getByRole("checkbox", { name: new RegExp(`^${name.replace(/[()]/g, "\\$&")}`) });
-const settle = () => new Promise((r) => setTimeout(r, 60));
+const banner = () => screen.queryByText(FIRST_USE_QUESTION);
+
+describe("the first-use question's banner (R164)", () => {
+  it("asks in one sentence until answered, never opens the dialogue by itself, and never takes focus", async () => {
+    const svc = toolsService();
+    let release!: () => void;
+    svc.state.holdCatalogue = new Promise((r) => (release = r));
+    const user = userEvent.setup();
+    render(<Page memory={memoryStore()} svc={svc} />);
+    const field = screen.getByRole("searchbox", { name: "Search sources" });
+    await user.click(field);
+    await user.type(field, "river");
+    release();
+    expect(await screen.findByText(FIRST_USE_QUESTION)).toBeTruthy();
+    await user.type(field, " bank");
+    expect(document.activeElement).toBe(field);
+    expect((field as HTMLInputElement).value).toBe("river bank");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("button", { name: "Choose tools…" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Not now" })).toBeTruthy();
+  });
+
+  it("is announced once: put into a polite live region that was there before it", async () => {
+    const svc = toolsService();
+    let release!: () => void;
+    svc.state.holdCatalogue = new Promise((r) => (release = r));
+    render(<Page memory={memoryStore()} svc={svc} />);
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
+    release();
+    const sentence = await screen.findByText(FIRST_USE_QUESTION);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.contains(sentence)).toBe(true);
+    expect(screen.getAllByText(FIRST_USE_QUESTION)).toHaveLength(1);
+  });
+
+  it("is hidden while the unlock screen is shown, and comes back without being announced again", async () => {
+    const memory = memoryStore();
+    const svc = toolsService();
+    const api = makeApi(); // one client, as the library route keeps it
+    const view = render(<Page memory={memory} svc={svc} api={api} />);
+    await screen.findByText(FIRST_USE_QUESTION);
+    view.rerender(<Page memory={memory} svc={svc} api={api} hidden />);
+    expect(banner()).toBeNull();
+    view.rerender(<Page memory={memory} svc={svc} api={api} hidden={false} />);
+    const sentence = await screen.findByText(FIRST_USE_QUESTION);
+    expect(screen.getByRole("status").contains(sentence)).toBe(false);
+    expect(svc.state.requests.filter((r) => r === "GET /tools")).toHaveLength(1);
+  });
+
+  it("is keyboard-reachable in the normal reading order", async () => {
+    const user = userEvent.setup();
+    render(<Page memory={memoryStore()} />);
+    await screen.findByText(FIRST_USE_QUESTION);
+    screen.getByRole("link", { name: "Optional tools" }).focus();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Choose tools…" }));
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Not now" }));
+  });
+
+  it("Not now records the answer, removes the banner and moves focus to the library's Optional tools link; nothing is downloaded", async () => {
+    const memory = memoryStore();
+    const svc = toolsService();
+    const user = userEvent.setup();
+    render(<Page memory={memory} svc={svc} />);
+    await user.click(await screen.findByRole("button", { name: "Not now" }));
+    expect(memory.value).toBe("not-now");
+    expect(banner()).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("link", { name: "Optional tools" })));
+    expect(svc.state.requests.filter((r) => r.startsWith("POST"))).toEqual([]);
+  });
+
+  it("shows nothing once answered, by any answer, and does not even read the catalogue", () => {
+    for (const answer of ["not-now", "chosen", "seen"] as const) {
+      const svc = toolsService();
+      const view = render(<Page memory={memoryStore(answer)} svc={svc} />);
+      expect(banner()).toBeNull();
+      expect(svc.state.requests).toEqual([]);
+      view.unmount();
+    }
+  });
+
+  it("reaching the Optional tools screen counts as an answer (R163); an earlier answer is kept", () => {
+    const fresh = memoryStore();
+    recordToolsScreenSeen(fresh);
+    expect(fresh.value).toBe("seen");
+    const chosen = memoryStore("chosen");
+    recordToolsScreenSeen(chosen);
+    expect(chosen.value).toBe("chosen");
+  });
+
+  it("shows nothing when the catalogue offers nothing for this computer", async () => {
+    const svc = toolsService();
+    const list = svc.state.tools.map((t) => ({ ...t, available: false, unavailableReason: "Not offered for this computer." }));
+    render(<Page memory={memoryStore()} api={answering({ platform: null, tools: list, jobs: [] })} />);
+    await flush();
+    expect(banner()).toBeNull();
+  });
+
+  it("shows nothing when the catalogue cannot be read (the app is never blocked)", async () => {
+    render(<Page memory={memoryStore()} api={answering(new Error("The tools are managed from the desktop app."))} />);
+    await flush();
+    expect(banner()).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
 
 describe("the first-use tools dialogue", () => {
-  it("opens the first time, while the question is not yet answered, and moves focus in", async () => {
+  it("opens from Choose tools… and moves focus in", async () => {
     const { dialog } = await opened();
     expect(dialog.contains(document.activeElement)).toBe(true);
     expect(document.activeElement).toBe(activity(/recordings/i));
-  });
-
-  it("does not open once answered", async () => {
-    const svc = toolsService();
-    render(<Page memory={memoryStore("not-now")} svc={svc} />);
-    await settle();
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(svc.state.requests).toEqual([]); // not even asked
   });
 
   it("still asks when a tool is already on this computer (R158); that tool is shown as available, not ticked and not downloaded", async () => {
@@ -68,54 +179,8 @@ describe("the first-use tools dialogue", () => {
     expect(svc.state.requests.filter((r) => r.startsWith("POST"))).toEqual(["POST /tools/speech-medium/install"]);
   });
 
-  it("does not open when the catalogue offers nothing for this computer", async () => {
-    const svc = toolsService();
-    svc.state.platform = null;
-    svc.state.tools = svc.state.tools.map((t) => ({ ...t, available: false, unavailableReason: "Not offered for this computer." }));
-    render(<Page memory={memoryStore()} svc={svc} />);
-    await waitFor(() => expect(svc.state.requests).toContain("GET /tools"));
-    await settle();
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("does not open when the catalogue cannot be read (the app is never blocked)", async () => {
-    const svc = toolsService();
-    svc.state.failCatalogue = { status: 403, code: "FORBIDDEN", message: "The tools are managed from the desktop app." };
-    render(<Page memory={memoryStore()} svc={svc} />);
-    await waitFor(() => expect(svc.state.requests).toContain("GET /tools"));
-    await settle();
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("does not open over the tools screen itself", async () => {
-    const svc = toolsService();
-    server.use(...svc.handlers);
-    render(<FirstUseTools api={makeApi()} memory={memoryStore()} pathname={PATHS.tools} />);
-    await settle();
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("waits while another dialog is open, and opens once it has closed", async () => {
-    const svc = toolsService();
-    const other = (
-      <div role="dialog" aria-label="Recovery code">
-        <button type="button">Saved it</button>
-      </div>
-    );
-    const { rerender } = render(
-      <Page memory={memoryStore()} svc={svc}>
-        {other}
-      </Page>,
-    );
-    await waitFor(() => expect(svc.state.requests).toContain("GET /tools"));
-    await new Promise((r) => setTimeout(r, 300));
-    expect(screen.queryByRole("dialog", { name: "Optional tools" })).toBeNull();
-    rerender(<Page memory={memoryStore()} svc={svc} />);
-    expect(await screen.findByRole("dialog", { name: "Optional tools" }, { timeout: 5000 })).toBeTruthy();
-  });
-
-  it("traps focus with Tab and Shift+Tab, makes the background inert, and restores focus after Not now", async () => {
-    const { user, opener, memory } = await opened();
+  it("traps focus with Tab and Shift+Tab and makes the background inert; its Not now records the answer and focus goes to the Optional tools link", async () => {
+    const { user, memory } = await opened();
     const main = document.querySelector("main")!;
     expect(main.closest("[inert]")).not.toBeNull();
     const first = document.activeElement;
@@ -124,19 +189,21 @@ describe("the first-use tools dialogue", () => {
     expect(last.textContent).toBe("Not now");
     await user.tab();
     expect(document.activeElement).toBe(first);
-    await user.click(screen.getByRole("button", { name: "Not now" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Not now" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(document.activeElement).toBe(opener);
     expect(main.closest("[inert]")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("link", { name: "Optional tools" })));
     expect(memory.value).toBe("not-now");
+    expect(banner()).toBeNull();
   });
 
-  it("Escape is Not now: remembered, focus restored, nothing downloaded", async () => {
+  it("Escape closes the dialogue only: focus returns to Choose tools…, the banner stays, nothing is recorded or downloaded", async () => {
     const { user, memory, svc, opener } = await opened();
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(document.activeElement).toBe(opener);
-    expect(memory.value).toBe("not-now");
+    expect(banner()).not.toBeNull();
+    expect(memory.value).toBeNull();
     expect(svc.state.requests.filter((r) => r.startsWith("POST"))).toEqual([]);
   });
 
@@ -207,7 +274,7 @@ describe("the first-use tools dialogue", () => {
   });
 
   it("downloads nothing until the explicit confirmation, then starts one install per tool and opens the tools screen", async () => {
-    const { user, svc, memory, opener } = await opened();
+    const { user, svc, memory } = await opened();
     await user.click(activity(/save picture posts/i));
     await user.click(activity(/recordings/i));
     expect(svc.state.requests.filter((r) => r.startsWith("POST"))).toEqual([]);
@@ -217,7 +284,7 @@ describe("the first-use tools dialogue", () => {
     expect(posts).toEqual(["POST /tools/ffmpeg/install", "POST /tools/image-downloader/install", "POST /tools/speech-medium/install"]);
     expect(memory.value).toBe("chosen");
     expect(window.location.pathname).toBe(PATHS.tools);
-    expect(document.activeElement).toBe(opener); // focus restored (the tools screen then takes it in the app)
+    expect(banner()).toBeNull(); // answered; the tools screen takes focus in the app
   });
 
   it("a refused install keeps the dialogue open with a plain message (no start-up text) and a way to retry", async () => {

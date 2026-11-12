@@ -1,13 +1,15 @@
 /**
- * The first-use tools dialogue (Task 48b; R126, R133, R152). The first time the app is opened with
- * no optional tool installed and the question not yet answered, it asks what the researcher will do
+ * The first-use tools question (Task 48b; R126, R133, R152; Task 48c, R163, R164). It never opens
+ * by itself: on the open library's screen a banner asks it until it is answered, and "Choose tools…"
+ * opens the dialogue, which asks what the researcher will do
  * and offers the matching tools pre-selected, with the total download size and the hosts each
  * download contacts (from the catalogue). Nothing is downloaded until "Download …" is pressed; each
  * chosen tool is then one install job (one request each), and the Optional tools screen opens to
- * show their progress. "Not now" (or Escape) is always there and is remembered, so the dialogue does
- * not come back; the same choices stay on the Optional tools screen in the settings. The dialogue
- * never blocks the app: when the catalogue cannot be read (the media helper is not running, or the
- * page is not the desktop app) it does not open at all.
+ * show their progress. "Not now" (in the banner or the dialogue) is remembered, so the question does
+ * not come back; Escape only closes the dialogue, back to the banner. Reaching the Optional tools
+ * screen by any route also counts as an answer. The question never blocks the app: when the
+ * catalogue cannot be read (the media helper is not running, or the page is not the desktop app)
+ * there is no banner.
  *
  * Where the answer is remembered: `FirstUseMemory`. The service has no route for this setting yet,
  * so the default keeps it in the app's own web storage on this computer (never in a library); a
@@ -16,13 +18,14 @@
 import type { ToolId, ToolInfo } from "@ao/shared";
 import { useEffect, useId, useRef, useState } from "react";
 import { DEFAULT_SPEECH_MODEL, describeHosts, formatSize, hostsOf, PUBLISHER_SERVERS, remainingOf, speechTool, toolsErrorText, usedByApp, type ToolsApi } from "../api/tools";
-import { navigate, normalisePath, PATHS } from "../navigation";
+import { navigate, PATHS } from "../navigation";
 import { DialogShell } from "./ReasonDialog";
 import { UserText } from "./UserText";
 import "../screens/GovernanceScreens.css";
 import "../screens/ToolsSetup.css";
 
-export type FirstUseAnswer = "not-now" | "chosen";
+/** "seen": the Optional tools screen was reached by some route before the question was answered (R163). */
+export type FirstUseAnswer = "not-now" | "chosen" | "seen";
 
 export interface FirstUseMemory {
   get(): FirstUseAnswer | null;
@@ -36,7 +39,7 @@ export const localFirstUseMemory: FirstUseMemory = {
   get() {
     try {
       const v = window.localStorage.getItem(KEY);
-      return v === "not-now" || v === "chosen" ? v : null;
+      return v === "not-now" || v === "chosen" || v === "seen" ? v : null;
     } catch {
       return null;
     }
@@ -73,17 +76,45 @@ const ACTIVITIES: Activity[] = [
 const running = (t: ToolInfo) => t.job?.status === "running";
 const selectable = (t: ToolInfo) => t.available && !t.installed && !running(t) && usedByApp(t.id);
 
-/** Some other dialog is open (a recovery code, a confirmation): this one waits until it has closed. */
-const otherDialogOpen = () => document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]') !== null;
+/**
+ * Reaching the Optional tools screen, by any route, answers the first-use question (R163, R164): the
+ * researcher has seen the choice. An answer already given is kept.
+ */
+export function recordToolsScreenSeen(memory: FirstUseMemory = localFirstUseMemory): void {
+  if (!memory.get()) memory.set("seen");
+}
 
-export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: { api: ToolsApi; memory?: FirstUseMemory; pathname: string }) {
+/** The banner's question, in one sentence (R164). */
+export const FIRST_USE_QUESTION = "Some features need optional tools that are not included with the app: would you like to choose which to download?";
+
+/** After an answer the banner is gone: focus goes to the library's own "Optional tools" link, where the choice stays. */
+const focusToolsLink = () => setTimeout(() => document.querySelector<HTMLElement>(`a[href="${PATHS.tools}"]`)?.focus());
+
+/**
+ * The first-use question on the open library's screen (Task 48c, D9; R164). It never opens by
+ * itself: until it is answered, a non-modal banner asks it in one sentence, with "Choose tools…"
+ * (which opens the dialogue) and "Not now" (which records the answer). The banner never takes focus;
+ * it is announced once (a polite live region, present before the banner is put in it). `hidden`
+ * keeps it off the screen (a locked project's unlock screen) without asking again; when it comes back
+ * it is not announced a second time. It is mounted only on the open library's screen, so it is never
+ * on the chooser or any other screen.
+ */
+export function FirstUseTools({ api, memory = localFirstUseMemory, hidden = false }: { api: ToolsApi; memory?: FirstUseMemory; hidden?: boolean }) {
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
-  const [ready, setReady] = useState(false);
+  const [open, setOpen] = useState(false);
   const [closed, setClosed] = useState(false);
-  const onToolsScreen = normalisePath(pathname) === PATHS.tools;
+  const visible = !closed && tools !== null && !hidden;
+  // Announced on its first appearance only: when it comes back (after an unlock screen), it is put
+  // outside the live region.
+  const [announced, setAnnounced] = useState(false);
+  const wasVisible = useRef(false);
+  useEffect(() => {
+    if (visible) wasVisible.current = true;
+    else if (wasVisible.current) setAnnounced(true);
+  }, [visible]);
 
   useEffect(() => {
-    if (closed || onToolsScreen || memory.get()) return;
+    if (closed || memory.get()) return;
     let live = true;
     const ac = new AbortController();
     api.catalogue(ac.signal).then(
@@ -102,43 +133,55 @@ export function FirstUseTools({ api, memory = localFirstUseMemory, pathname }: {
       live = false;
       ac.abort();
     };
-  }, [api, memory, closed, onToolsScreen]);
+  }, [api, memory, closed]);
 
-  // Never over another dialog: wait until it has closed.
-  useEffect(() => {
-    if (!tools || ready) return;
-    if (!otherDialogOpen()) {
-      setReady(true);
-      return;
-    }
-    const t = setInterval(() => {
-      if (!otherDialogOpen()) {
-        clearInterval(t);
-        setReady(true);
-      }
-    }, 250);
-    return () => clearInterval(t);
-  }, [tools, ready]);
+  const notNow = () => {
+    memory.set("not-now");
+    setOpen(false);
+    setClosed(true);
+    focusToolsLink();
+  };
 
-  if (closed || onToolsScreen || !tools || !ready) return null;
+  const banner = visible ? (
+    <div className="ao-first-use-banner">
+      <p>{FIRST_USE_QUESTION}</p>
+      <div className="ao-actions">
+        <button type="button" onClick={() => setOpen(true)}>
+          Choose tools…
+        </button>
+        <button type="button" onClick={notNow}>
+          Not now
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   return (
-    <FirstUseDialog
-      api={api}
-      tools={tools}
-      onNotNow={() => {
-        memory.set("not-now");
-        setClosed(true);
-      }}
-      onStarted={() => {
-        memory.set("chosen");
-        setClosed(true);
-        navigate(PATHS.tools);
-      }}
-    />
+    <>
+      {/* Always present on the library screen, so the banner put in it is announced (politely, once). */}
+      <div role="status" className="ao-first-use-live">
+        {announced ? null : banner}
+      </div>
+      {announced && banner ? <div className="ao-first-use-live">{banner}</div> : null}
+      {open && visible && tools ? (
+        <FirstUseDialog
+          api={api}
+          tools={tools}
+          onCancel={() => setOpen(false)}
+          onNotNow={notNow}
+          onStarted={() => {
+            memory.set("chosen");
+            setOpen(false);
+            setClosed(true);
+            navigate(PATHS.tools);
+          }}
+        />
+      ) : null}
+    </>
   );
 }
 
-function FirstUseDialog({ api, tools, onNotNow, onStarted }: { api: ToolsApi; tools: ToolInfo[]; onNotNow: () => void; onStarted: () => void }) {
+function FirstUseDialog({ api, tools, onCancel, onNotNow, onStarted }: { api: ToolsApi; tools: ToolInfo[]; onCancel: () => void; onNotNow: () => void; onStarted: () => void }) {
   const id = useId();
   const [chosen, setChosen] = useState<ReadonlySet<string>>(new Set());
   const [unticked, setUnticked] = useState<ReadonlySet<ToolId>>(new Set());
@@ -212,7 +255,7 @@ function FirstUseDialog({ api, tools, onNotNow, onStarted }: { api: ToolsApi; to
   };
 
   return (
-    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onNotNow} busy={busy} className="ao-first-use">
+    <DialogShell labelledBy={`${id}-t`} describedBy={`${id}-d`} onCancel={onCancel} busy={busy} className="ao-first-use">
       <h2 id={`${id}-t`}>Optional tools</h2>
       <p id={`${id}-d`}>
         Some tools are not included with the app, so that its download stays small. What will you do? Choose, and the tools that match are offered. Nothing is downloaded until you confirm. You can change
