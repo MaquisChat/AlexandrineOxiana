@@ -13,7 +13,23 @@ import {
   inLang,
   newId,
   primary,
+  timeZoneName,
 } from "../index.js";
+
+describe("project time zone (Task 58, R93)", () => {
+  it("accepts IANA zone names, in their usual spelling (aliases as written)", () => {
+    expect(timeZoneName("Europe/Berlin")).toBe("Europe/Berlin");
+    expect(timeZoneName("europe/berlin")).toBe("Europe/Berlin");
+    expect(timeZoneName("UTC")).toBe("UTC");
+    expect(timeZoneName("America/Argentina/Buenos_Aires")).toBe("America/Argentina/Buenos_Aires");
+    expect(timeZoneName("Pacific/Kiritimati")).toBe("Pacific/Kiritimati");
+  });
+  it("refuses anything that is not a zone name: unknown zones, offsets, padding, paths, overlong text", () => {
+    for (const bad of ["", "Mars/Olympus", "+05:00", "-0300", "Europe/Berlin\n", " Europe/Berlin", "../etc/passwd", "Europe//Berlin", "x".repeat(65), "Europe/Berlin; x", "Local", "\u0000"]) {
+      expect(timeZoneName(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+});
 
 const now = "2026-11-09T10:00:00.000Z";
 

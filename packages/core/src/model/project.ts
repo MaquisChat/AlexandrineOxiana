@@ -50,9 +50,30 @@ export const Project = z.object({
    */
   /**
    * The IANA time zone the project's calendar rules are read in (e.g. the retention date, R92);
-   * absent: UTC.
+   * absent: UTC. Set through a governed, audited change that accepts only a real zone name
+   * (`timeZoneName`, R93); read leniently: a value that names no zone counts as UTC.
    */
   timeZone: z.string().min(1).max(64).optional(),
   backups: z.object({ automatic: z.boolean().optional(), keep: z.number().int().min(1).max(1000).optional() }).optional(),
 });
 export type Project = z.infer<typeof Project>;
+
+/** Region/City style names (letters, digits, `_`, `+`, `-`), no offsets, spaces or empty parts. */
+const ZONE_SHAPE = /^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9][A-Za-z0-9_+-]*)*$/u;
+
+/**
+ * An IANA time zone name in its usual spelling (e.g. "europe/berlin" → "Europe/Berlin"), or
+ * undefined when `name` is not one this runtime knows: unknown zones, UTC offsets ("+05:00"),
+ * padded or overlong text are refused (R93: the project time-zone setting).
+ */
+export function timeZoneName(name: string): string | undefined {
+  if (typeof name !== "string" || name.length < 1 || name.length > 64 || !ZONE_SHAPE.test(name)) return undefined;
+  try {
+    const resolved = new Intl.DateTimeFormat("en-CA", { timeZone: name }).resolvedOptions().timeZone;
+    // The runtime's spelling when only the letter case differs; an alias it maps to an older
+    // name ("America/Argentina/Buenos_Aires" → "America/Buenos_Aires") is kept as written.
+    return resolved.toLowerCase() === name.toLowerCase() ? resolved : name;
+  } catch {
+    return undefined;
+  }
+}
