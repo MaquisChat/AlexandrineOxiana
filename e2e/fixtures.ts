@@ -33,13 +33,13 @@
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, extname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { test as base, expect, type Page } from "@playwright/test";
-import { FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
+import { FAKE_SPEECH, FAKE_TOOLS, LIBRARY_DIR, LOOKUP_FIXTURES, SERVICE_DIR, UI_DIST } from "./paths.js";
 
 /** The desktop shell's origin (apps/library-service/src/auth.ts SHELL_ORIGINS): the page is served here. */
 export const APP_ORIGIN = "http://tauri.localhost";
@@ -76,6 +76,34 @@ export interface AppHarness {
   restart(whileStopped?: () => Promise<void>): Promise<void>;
   /** Called after each restart (the page fixture hands the new connection over with it). */
   onRestart(listener: () => Promise<void>): void;
+  /** What the fake tools answer: only in a test that sets `test.use({ fakeControl: true })`, else undefined. */
+  fakes: FakeControl | undefined;
+}
+
+/** The fake downloaders the worker runs. */
+export type FakeTool = "yt-dlp" | "gallery-dl";
+
+/**
+ * Telling the fakes what to answer, for a test that sets `test.use({ fakeControl: true })`. The
+ * service then runs the fake yt-dlp and gallery-dl through small wrappers in the test's folder (the
+ * worker passes its tools no test variables, so the wrappers carry them), and the real media worker
+ * with the fake speech recognition of packages/library/tests/fixtures/fake-speech first on its
+ * PYTHONPATH (through AO_WORKER_BIN, as the packaged app names its worker).
+ */
+export interface FakeControl {
+  /** The synthetic profile the fake downloaders list and download (their FAKE_PROFILE_FILE); read at every run, so it can change between captures. */
+  setProfile(profile: unknown): Promise<void>;
+  /** From now on every run of `tool` (but `--version`) waits before it starts, until `release(tool)`: a capture that is still running for as long as the test needs. */
+  hold(tool: FakeTool): Promise<void>;
+  release(tool: FakeTool): Promise<void>;
+  /** Runs of `tool` waiting at the hold now. */
+  held(tool: FakeTool): number;
+  /**
+   * Plants speech model `name` in the worker's models folder as the tools dialogue would leave it
+   * (a snapshot named by refs/main, with the files the worker checks), so the app reports it
+   * installed; the fake speech recognition never reads the files.
+   */
+  installSpeechModel(name: string): Promise<void>;
 }
 
 /** Requests the page made to anywhere but the app's origin and the service: refused, and the test fails. */
@@ -221,6 +249,68 @@ export interface StartOptions {
   readyTimeoutMs?: number;
   /** Told of the child the moment it is spawned, before it is ready (so a caller can always kill it). */
   onSpawn?: (child: ChildProcess) => void;
+  /** Environment for the service on top of the harness's own (e.g. the fake-control wrappers). */
+  env?: Record<string, string>;
+}
+
+/** The wrapper a `fakeControl` test's service runs as `tool` (CommonJS: the test folder has no package.json). */
+function fakeWrapper(tool: FakeTool, control: string): string {
+  return [
+    "#!/usr/bin/env node",
+    '"use strict";',
+    'const { existsSync, rmSync, writeFileSync } = require("node:fs");',
+    'const { spawnSync } = require("node:child_process");',
+    `const CONTROL = ${JSON.stringify(control)};`,
+    `const TOOL = ${JSON.stringify(join(FAKE_TOOLS, tool))};`,
+    `const NAME = ${JSON.stringify(tool)};`,
+    "const args = process.argv.slice(2);",
+    "const env = { ...process.env };",
+    'if (existsSync(CONTROL + "/profile.json")) env.FAKE_PROFILE_FILE = CONTROL + "/profile.json";',
+    "const run = () => {",
+    '  const r = spawnSync(process.execPath, [TOOL, ...args], { stdio: "inherit", env });',
+    "  process.exit(r.status ?? 1);",
+    "};",
+    'const hold = CONTROL + "/hold-" + NAME;',
+    'if (!args.includes("--version") && existsSync(hold)) {',
+    '  const marker = CONTROL + "/held-" + NAME + "-" + process.pid;',
+    "  writeFileSync(marker, JSON.stringify(args));",
+    "  const timer = setInterval(() => {",
+    "    if (existsSync(hold)) return;",
+    "    clearInterval(timer);",
+    "    rmSync(marker, { force: true });",
+    "    run();",
+    "  }, 50);",
+    "} else run();",
+    "",
+  ].join("\n");
+}
+
+/** A `fakeControl` test's wrappers and its FakeControl (see FakeControl). */
+async function fakeControlFor(root: string): Promise<{ env: Record<string, string>; control: FakeControl }> {
+  const dir = join(root, "fake-control");
+  const bin = join(dir, "bin");
+  await mkdir(bin, { recursive: true });
+  const env: Record<string, string> = { AO_WORKER_BIN: join(FAKE_SPEECH, "ao-worker") };
+  for (const tool of ["yt-dlp", "gallery-dl"] as const) {
+    const file = join(bin, tool);
+    await writeFile(file, fakeWrapper(tool, dir), { mode: 0o755 });
+    env[tool === "yt-dlp" ? "AO_YTDLP_BIN" : "AO_GALLERYDL_BIN"] = file;
+  }
+  const control: FakeControl = {
+    setProfile: (profile) => writeFile(join(dir, "profile.json"), JSON.stringify(profile)),
+    hold: (tool) => writeFile(join(dir, `hold-${tool}`), ""),
+    release: (tool) => rm(join(dir, `hold-${tool}`), { force: true }),
+    held: (tool) => readdirSync(dir).filter((n) => n.startsWith(`held-${tool}-`)).length,
+    async installSpeechModel(name) {
+      const repo = join(root, "models", `models--Systran--faster-whisper-${name}`);
+      const snapshot = join(repo, "snapshots", "e2e-fake");
+      await mkdir(join(repo, "refs"), { recursive: true });
+      await mkdir(snapshot, { recursive: true });
+      await writeFile(join(repo, "refs", "main"), "e2e-fake");
+      for (const f of ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]) await writeFile(join(snapshot, f), "fake speech model file\n");
+    },
+  };
+  return { env, control };
 }
 
 /**
@@ -270,6 +360,7 @@ export async function startService(root: string, opts: StartOptions = {}): Promi
     AO_TOOLS_DIR: join(root, "tools"),
     AO_MODELS_DIR: join(root, "models"),
     AO_LOOKUP_FIXTURES: LOOKUP_FIXTURES,
+    ...opts.env,
   });
   const [cmd, ...args] = opts.command ?? [process.execPath, "--max-old-space-size=512", "--import", "tsx", "src/main.ts"];
   const child = spawn(cmd!, args, { cwd: SERVICE_DIR, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -338,8 +429,11 @@ async function stopService(child: ChildProcess): Promise<string[]> {
   return problems;
 }
 
-export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
-  app: async ({}, use, testInfo) => {
+export const test = base.extend<{ app: AppHarness; blocked: Blocked; fakeControl: boolean }>({
+  /** `test.use({ fakeControl: true })`: the test tells the fakes what to answer (app.fakes, FakeControl). */
+  fakeControl: [false, { option: true }],
+
+  app: async ({ fakeControl }, use, testInfo) => {
     const root = await mkdtemp(join(tmpdir(), "ao-e2e-"));
     const configDir = join(root, "config");
     const librariesDir = join(root, "libraries");
@@ -349,9 +443,11 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
     const logs: string[][] = [];
     const restartListeners: Array<() => Promise<void>> = [];
     const spawned = new SpawnedServices();
-    const start = () => startService(root, { onSpawn: (c) => spawned.track(c) });
+    let fakes: Awaited<ReturnType<typeof fakeControlFor>> | undefined;
+    const start = () => startService(root, { onSpawn: (c) => spawned.track(c), ...(fakes ? { env: fakes.env } : {}) });
     try {
       await Promise.all([configDir, librariesDir, join(root, "tools"), join(root, "models")].map((d) => mkdir(d, { recursive: true })));
+      if (fakeControl) fakes = await fakeControlFor(root);
       svc = await start();
       logs.push(svc.log);
       const harness: AppHarness = {
@@ -394,6 +490,7 @@ export const test = base.extend<{ app: AppHarness; blocked: Blocked }>({
           for (const l of restartListeners) await l();
         },
         onRestart: (listener) => void restartListeners.push(listener),
+        fakes: fakes?.control,
       };
       await use(harness);
     } finally {
@@ -505,6 +602,55 @@ export async function libraryWithProject(
   await expect(page.getByRole("heading", { level: 1, name: o.library })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Projects" }).getByRole("button", { name: o.project })).toHaveAttribute("aria-current", "true");
   return { libraryPath, projectId: created.body.project.id, projectFolder: created.body.project.folder };
+}
+
+/** What `plantCaptureConflict` plants: the value the page gave and the one the platform data gave, for the title and the DOI. */
+export interface PlantedConflict {
+  title: [string, string];
+  doi: [string, string];
+}
+
+/**
+ * Plants a captured source whose title and DOI conflict, with the verification report a capture
+ * stores (each field "conflict", both values and their sources) and the review entry a link or
+ * profile capture queues for it (createSource's reviewItem, cause capture-conflict), using the
+ * library's own code from packages/library. Run it while the service is stopped (`app.restart`'s
+ * `whileStopped`): no capture through the fake tools can produce a DOI, so this is the way to plant
+ * one (as e2e/review-queue.spec.ts does). The index is updated through the library's own index sink.
+ */
+export function plantCaptureConflict(app: AppHarness, o: { library: string; projectId: string } & PlantedConflict): void {
+  const code = [
+    'import { KeyRing, createIndexSink, deviceDeps, openIndexChecked, openLibrary, openRepo } from "./src/index.ts";',
+    "const o = JSON.parse(process.env.AO_E2E_PLANT);",
+    "const lib = await openLibrary(o.library, deviceDeps(o.configDir));",
+    "const checked = await openIndexChecked(lib.root);",
+    "const ring = new KeyRing();",
+    "const repo = await openRepo(lib, ring, { index: createIndexSink(checked.handle, { root: lib.root, keyRing: ring }) });",
+    "const at = new Date().toISOString();",
+    "const mt = (value) => ({ variants: [{ lang: 'en', kind: 'original', value }] });",
+    "const page = { kind: 'page-dom' }; const platform = { kind: 'platform-json' };",
+    "const [t1, t2] = o.title; const [d1, d2] = o.doi;",
+    "await repo.createSource(o.projectId, {",
+    "  projectIds: [], type: 'webpage', title: mt(t1), creators: [], identifiers: { doi: d1 },",
+    "  caseAttributes: {}, availability: { status: 'available' }, collectionIds: [], tagIds: [], participantIds: [],",
+    "}, [], {",
+    "  provenance: { captureMethod: 'downloader', capturedAt: at, tool: { name: 'e2e-plant', version: '1' }, fileHashes: {}, legal: { status: 'public' }, identifiable: false },",
+    "  fieldEvidence: [",
+    "    { field: '/title', value: t1, source: page, at }, { field: '/title', value: t2, source: platform, at },",
+    "    { field: '/identifiers/doi', value: d1, source: page, at }, { field: '/identifiers/doi', value: d2, source: platform, at },",
+    "  ],",
+    "  verification: {",
+    "    '/title': { status: 'conflict', checks: ['sources-agree'], reason: 'The page and the platform data give different titles.', current: t1, values: [{ value: t1, source: page }, { value: t2, source: platform }] },",
+    "    '/identifiers/doi': { status: 'conflict', checks: ['sources-agree'], reason: 'The page and the platform data give different DOIs.', current: d1, values: [{ value: d1, source: page }, { value: d2, source: platform }] },",
+    "  },",
+    "  reviewItem: { fields: { '/title': 'conflict', '/identifiers/doi': 'conflict' }, reasons: ['The page and the platform data disagree on the title and the DOI.'], cause: { kind: 'capture-conflict' } },",
+    "});",
+    "checked.handle.close();",
+    "await lib.close();",
+  ].join("\n");
+  const env = { ...process.env, AO_E2E_PLANT: JSON.stringify({ library: o.library, projectId: o.projectId, configDir: app.configDir, title: o.title, doi: o.doi }) };
+  const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: LIBRARY_DIR, env, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) throw new Error(`Planting the conflict failed (status ${r.status}): ${r.stderr}`);
 }
 
 /** A recorded defect (Task 45 report): its id and the step it blocks, in words. */

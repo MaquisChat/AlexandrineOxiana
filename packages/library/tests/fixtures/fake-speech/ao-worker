@@ -1,0 +1,7 @@
+#!/bin/sh
+# The real media worker with the fake faster-whisper next to this script first on PYTHONPATH
+# (e2e/fixtures.ts names this file in AO_WORKER_BIN when a test asks for `fakeControl`). The token
+# still arrives on standard input, which exec passes on unchanged.
+here=$(cd "$(dirname "$0")" && pwd)
+cd "$here/../../../../../services/media-worker" || exit 1
+PYTHONPATH="$here" exec ./.venv/bin/python -m ao_worker
