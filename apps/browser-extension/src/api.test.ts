@@ -220,6 +220,43 @@ describe("the app's port changed (R171, defect D13)", () => {
     expect(storage.data.pairing).toMatchObject({ port: NEW, token: TOKEN });
   });
 
+  it("“no library open” passes only as the app's own answer: status 503 with the service's error shape (fix round 1, I2)", async () => {
+    const offline = { code: "LIBRARY_OFFLINE", message: "No library is open." };
+    const refused: Array<{ status: number; body: unknown }> = [
+      { status: 400, body: { error: offline } },
+      { status: 418, body: { error: offline } },
+      { status: 302, body: { error: offline } },
+      { status: 500, body: { error: offline } },
+      { status: 503, body: { error: { code: "LIBRARY_OFFLINE" } } },
+      { status: 503, body: { error: { code: "LIBRARY_OFFLINE", message: 5 } } },
+      { status: 503, body: { code: "LIBRARY_OFFLINE", message: "No library is open." } },
+      { status: 503, body: { error: { code: "UNAVAILABLE", message: "x" } } },
+      // A success status other than 200, even with a list, is not the app's answer either.
+      { status: 201, body: { projects: [] } },
+    ];
+    for (const r of refused) {
+      const storage = memoryStorage();
+      paired(storage);
+      const err = (await createApi({ fetch: fakeFetch(() => r).fn, storage }).changePort(String(NEW)).catch((e: unknown) => e)) as ApiError;
+      expect(err.code, JSON.stringify(r)).toBe("BAD_REPLY");
+      expect(storage.data.pairing, JSON.stringify(r)).toMatchObject({ port: OLD, token: TOKEN });
+    }
+  });
+
+  it("a redirect is refused as everywhere else (the request asks fetch to fail on one), and nothing is saved", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    let asked: RequestInit | undefined;
+    const fn = (async (_i: RequestInfo | URL, init: RequestInit = {}) => {
+      asked = init;
+      // What fetch does with redirect: "error" when the answer is a redirect.
+      throw new TypeError("Failed to fetch: redirect");
+    }) as unknown as typeof fetch;
+    await expect(createApi({ fetch: fn, storage }).changePort(String(NEW))).rejects.toMatchObject({ code: "UNREACHABLE" });
+    expect(asked?.redirect).toBe("error");
+    expect(storage.data.pairing).toMatchObject({ port: OLD });
+  });
+
   it("keeps the old port, and says why, when nothing answers on the new one", async () => {
     const storage = memoryStorage();
     paired(storage);
@@ -263,6 +300,22 @@ describe("the app's port changed (R171, defect D13)", () => {
     paired(storage);
     for (const bad of ["", "0", "70000", "12a", "1.5", "-1"]) await expect(api.changePort(bad), bad).rejects.toMatchObject({ code: "BAD_PORT" });
     expect(calls).toHaveLength(0);
+  });
+
+  it("a check called off after the answer arrived but before the save saves nothing (review M1)", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const ac = new AbortController();
+    let reads = 0;
+    const get = storage.get.bind(storage);
+    storage.get = async (key: string) => {
+      // The second read is the one just before the save: the popup is closed at that moment.
+      if (++reads === 2) ac.abort();
+      return get(key);
+    };
+    const { fn } = fakeFetch(service);
+    await expect(createApi({ fetch: fn, storage }).changePort(String(NEW), { signal: ac.signal })).rejects.toMatchObject({ code: "ABORTED" });
+    expect(storage.data.pairing).toMatchObject({ port: OLD });
   });
 
   it("a check that is called off saves nothing", async () => {

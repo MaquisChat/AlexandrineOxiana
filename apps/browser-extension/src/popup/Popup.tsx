@@ -251,7 +251,7 @@ export function Popup({ bridge }: { bridge: PopupBridge }) {
         <div role="alert" className="notice">
           <p>The desktop app is not answering on port {load.pairing.port}.</p>
           <p>
-            Either the app is closed: open it, then open this popup again. Or the app's port changed when it was reopened: its Browser extension screen then shows the new port. Enter that port with “Use a different port”. The pairing stays valid, so there is no need to pair again.
+            Either the app is closed: open it, then open this popup again. Or the app's port changed when it was reopened: its “Browser extension” page (at the top of its library window) then shows the new port. Enter that port with “Use a different port”. The pairing stays valid, so there is no need to pair again.
           </p>
         </div>
       ) : null}

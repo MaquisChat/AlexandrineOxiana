@@ -33,6 +33,8 @@ export class ApiError extends Error {
     readonly status?: number,
     /** The service's reason (POLICY_DENIED: the project rule that refused it). */
     readonly reason?: string,
+    /** The error answer had the service's own shape, `{ error: { code, message } }` (R96). */
+    readonly serviceShaped = false,
   ) {
     super(message);
     this.name = "ApiError";
@@ -60,7 +62,7 @@ function asPairing(v: unknown): Pairing | undefined {
 
 /** The app does not answer on the saved port: either cause, in plain words (R171). */
 export const unreachable = (port: number) =>
-  `The desktop app is not answering on port ${port}. Either the app is closed (open it and try again), or the app's port changed when it was reopened (its Browser extension screen shows the port it uses now).`;
+  `The desktop app is not answering on port ${port}. Either the app is closed (open it and try again), or the app's port changed when it was reopened (its “Browser extension” page (at the top of its library window) shows the port it uses now).`;
 
 function projectsOf(r: unknown): ProjectChoice[] | undefined {
   const list = (r as { projects?: unknown } | undefined)?.projects;
@@ -80,7 +82,7 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
     return asPairing((await storage.get(KEY))[KEY]);
   }
 
-  async function call<T>(port: number, path: string, init: { method: "GET" | "POST"; body?: unknown; token?: string; signal?: AbortSignal }): Promise<T> {
+  async function call<T>(port: number, path: string, init: { method: "GET" | "POST"; body?: unknown; token?: string; signal?: AbortSignal; only200?: boolean }): Promise<T> {
     if (!path.startsWith("/") || /[?#]/.test(path)) throw new ApiError("BAD_PATH", "Internal error: bad request path.");
     const headers: Record<string, string> = { accept: "application/json" };
     if (init.token) headers.authorization = `Bearer ${init.token}`;
@@ -111,8 +113,10 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
       const err = (data as { error?: { code?: unknown; message?: unknown; reason?: unknown } } | undefined)?.error;
       const code = typeof err?.code === "string" ? err.code : `HTTP_${res.status}`;
       const message = typeof err?.message === "string" ? err.message : `The desktop app answered ${res.status}.`;
-      throw new ApiError(code, message, res.status, typeof err?.reason === "string" ? err.reason : undefined);
+      const shaped = typeof err?.code === "string" && typeof err?.message === "string";
+      throw new ApiError(code, message, res.status, typeof err?.reason === "string" ? err.reason : undefined, shaped);
     }
+    if (init.only200 && res.status !== 200) throw new ApiError("BAD_REPLY", "The desktop app's answer was not understood.", res.status);
     return data as T;
   }
 
@@ -159,6 +163,9 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
      * it as the pairing's port. The token is kept whatever happens: a refusal on the new port may
      * come from another program, so it is no reason to forget the pairing. `projects` is the list the
      * check returned, or null when the app has no library open (the token was accepted all the same).
+     * A limit, accepted: any local program that answers this check as the app would (for example 200
+     * with an empty project list) passes it, since being sure it is the app would need a proof tied to
+     * the token; the researcher types this one port from the app's own page, and nothing is scanned.
      */
     async changePort(portInput: string | number, opts: { signal?: AbortSignal } = {}): Promise<{ pairing: Pairing; projects: ProjectChoice[] | null }> {
       const port = parsePort(portInput);
@@ -168,23 +175,26 @@ export function createApi({ fetch: doFetch, storage }: ApiDeps) {
       const kept = `This browser keeps port ${before.port}.`;
       let projects: ProjectChoice[] | null;
       try {
-        const r = await call<unknown>(port, "/projects", { method: "GET", token: before.token, ...(opts.signal ? { signal: opts.signal } : {}) });
+        const r = await call<unknown>(port, "/projects", { method: "GET", token: before.token, only200: true, ...(opts.signal ? { signal: opts.signal } : {}) });
         const list = projectsOf(r);
         if (!list) throw new ApiError("BAD_REPLY", "");
         projects = list;
       } catch (e) {
         const code = e instanceof ApiError ? e.code : "";
         if (code === "ABORTED" || opts.signal?.aborted) throw new ApiError("ABORTED", "Stopped. Nothing was saved.");
-        if (code === "LIBRARY_OFFLINE") projects = null;
-        else if (code === "UNREACHABLE") throw new ApiError("UNREACHABLE", `Nothing answered on port ${port}. Check the number on the desktop app's Browser extension screen, and that the app is open. ${kept}`);
+        // "No library open" passes only as the app's own answer to this authorised request: 503 with
+        // the service's error shape and that code (fix round 1, I2). Any other status fails.
+        if (code === "LIBRARY_OFFLINE" && e instanceof ApiError && e.status === 503 && e.serviceShaped) projects = null;
+        else if (code === "UNREACHABLE") throw new ApiError("UNREACHABLE", `Nothing answered on port ${port}. Check the number on the desktop app's “Browser extension” page, and that the app is open. ${kept}`);
         else if (e instanceof ApiError && (e.status === 401 || e.status === 403))
-          throw new ApiError("NOT_ACCEPTED", `The program on port ${port} did not accept this browser's pairing. Check the number on the desktop app's Browser extension screen. If this browser was revoked there, unpair and pair again. ${kept}`, e.status);
-        else throw new ApiError("BAD_REPLY", `The answer on port ${port} was not one from the desktop app that this browser understands. Check the number on the desktop app's Browser extension screen. ${kept}`);
+          throw new ApiError("NOT_ACCEPTED", `The program on port ${port} did not accept this browser's pairing. Check the number on the desktop app's “Browser extension” page. If this browser was revoked there, unpair and pair again. ${kept}`, e.status);
+        else throw new ApiError("BAD_REPLY", `The answer on port ${port} was not one from the desktop app that this browser understands. Check the number on the desktop app's “Browser extension” page. ${kept}`);
       }
-      if (opts.signal?.aborted) throw new ApiError("ABORTED", "Stopped. Nothing was saved.");
       // Saved only onto the same pairing: one unpaired or replaced meanwhile is not brought back.
       const now = await getPairing();
       if (!now || now.token !== before.token) throw new ApiError("CHANGED", "The pairing changed while the port was being checked, so nothing was saved.");
+      // Called off: checked last, with no wait before the save, so a cancelled check never saves (M1).
+      if (opts.signal?.aborted) throw new ApiError("ABORTED", "Stopped. Nothing was saved.");
       const pairing: Pairing = { ...now, port };
       await storage.set({ [KEY]: pairing });
       return { pairing, projects };
