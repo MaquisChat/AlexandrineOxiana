@@ -255,14 +255,57 @@ export class ServiceState {
     return (this.captureRegistry ??= new CaptureQueueRegistry({ now: () => this.opts.now().getTime() }));
   }
 
+  /** Queues and profile runs ended from outside whose run has not returned yet (queue id → project id; no address). */
+  private readonly endedCaptures = new Map<string, string>();
+  /** Profile runs running now (queue id → project id). */
+  private readonly profileRuns = new Map<string, string>();
+
   /**
-   * Forgets every trace of `projectId`'s capture queues (the readable records and the progress map),
-   * at once: at its lock, and for an encrypted project when its library closes or moves (R30, R50).
-   * A queue still running stops before its next link (startCaptureQueue).
+   * Ends every running capture of `projectId` at once, as a fact (Task 63 fix round 2, I3): at its
+   * lock, and for an encrypted project when its library closes or moves (R30, R50). Each running
+   * queue or profile run is marked ended here, and its end is published here, once. From then on it
+   * stores, records and publishes nothing, whatever the project's state is later: a download in
+   * flight is discarded when it comes back (it cannot be cancelled in the worker). It keeps its
+   * extension slot and holds the project's new captures off (409 CAPTURE_STOPPING) until its run has
+   * really returned. The readable records of the project's queues are forgotten at once; the ended
+   * queues keep only their progress counters (no address) until they return.
    */
-  forgetCaptures(projectId: string): void {
+  endCaptures(projectId: string, why: "lock" | "close"): void {
+    const error = why === "lock" ? "ProjectLockedError: the project was locked, so the capture stopped" : "LibraryClosedError: the library was closed or moved, so the capture stopped";
+    const end = (queueId: string) => {
+      if (this.endedCaptures.has(queueId)) return; // ended already (a second lock)
+      this.endedCaptures.set(queueId, projectId);
+      this.events.publish("capture.progress", { queueId, projectId, finished: true, error });
+    };
+    for (const [id, q] of this.captures) {
+      if (q.projectId !== projectId) continue;
+      if (q.finished) this.captures.delete(id);
+      else end(id);
+    }
+    for (const [id, pid] of this.profileRuns) if (pid === projectId) end(id);
     this.captureQueues.forgetProject(projectId);
-    for (const [id, q] of this.captures) if (q.projectId === projectId) this.captures.delete(id);
+  }
+
+  /** Whether the queue or profile run was ended from outside (it then stores, records and publishes nothing). */
+  captureEnded(queueId: string): boolean {
+    return this.endedCaptures.has(queueId);
+  }
+
+  /** Whether an ended capture of `projectId` is still finishing its current download. */
+  captureStopping(projectId: string): boolean {
+    for (const pid of this.endedCaptures.values()) if (pid === projectId) return true;
+    return false;
+  }
+
+  /** A profile run starts (its end is `profileRunEnded`). */
+  profileRunStarted(queueId: string, projectId: string): void {
+    this.profileRuns.set(queueId, projectId);
+  }
+
+  /** A profile run has returned: true when it had been ended from outside (then nothing of it is published). */
+  profileRunEnded(queueId: string): boolean {
+    this.profileRuns.delete(queueId);
+    return this.endedCaptures.delete(queueId);
   }
 
   /** The progress of a capture queue (also after a move). */
@@ -284,6 +327,12 @@ export class ServiceState {
     opts: CaptureOptions,
     at: { offset?: number; total?: number; after?: Promise<unknown>; startedBy?: CaptureStartedBy } = {},
   ): Promise<void> {
+    // A queue ended while it was stopped for a move (an encrypted project's queue at the close): it
+    // is not continued, and only now gives its extension slot back.
+    if (this.endedCaptures.delete(queueId)) {
+      this.captures.delete(queueId);
+      return Promise.resolve();
+    }
     const offset = at.offset ?? 0;
     const total = at.total ?? urls.length;
     // Bounded as the readable queues are: a finished queue they have forgotten is forgotten here too.
@@ -302,12 +351,15 @@ export class ServiceState {
     return this.startWork("capture", async (ctl) => {
       await at.after?.catch(() => {});
       let outcomes: Awaited<ReturnType<ReturnType<typeof createLinkCapture>["captureUrls"]>>;
-      let locked = () => false;
+      // Ended from outside (a lock, a close): decided then, whatever the project's state is later (I3).
+      const ended = () => this.endedCaptures.has(queueId);
+      /** The run has returned: an ended queue only now frees its slot and its project's new captures. */
+      const release = () => {
+        this.endedCaptures.delete(queueId);
+        this.captures.delete(queueId);
+      };
       try {
         const s = this.requireSession();
-        // A locked project's queue stops before its next link, and nothing more of it is recorded or
-        // published (R30, R142: a capture is not stored for a locked project; it is captured again).
-        locked = () => !s.repo.isUnlocked(projectId);
         const worker = await this.workerClient();
         const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
         outcomes = await capture.captureUrls(
@@ -315,23 +367,22 @@ export class ServiceState {
           urls,
           opts,
           (done, _t, outcome) => {
-            if (locked()) return;
+            if (ended()) return;
             info.done = offset + done;
             info.finished = info.done === total;
             this.captureQueues.progress(queueId, info.done, total, outcome);
             if (info.finished) this.captureQueues.finish(queueId, {});
             this.events.publish("capture.progress", { queueId, projectId, done: info.done, total, outcome, finished: info.finished });
           },
-          { shouldStop: () => ctl.stopping || locked() },
+          { shouldStop: () => ctl.stopping, cancelled: ended },
         );
       } catch (err) {
-        fail(err);
+        if (ended()) release();
+        else fail(err);
         return;
       }
-      if (locked()) {
-        info.finished = true;
-        this.forgetCaptures(projectId);
-        this.events.publish("capture.progress", { queueId, projectId, finished: true, error: "ProjectLockedError: the project was locked, so the capture stopped" });
+      if (ended()) {
+        release();
         return;
       }
       if (outcomes.length < urls.length) {
@@ -653,7 +704,7 @@ export class ServiceState {
     if (!s) return;
     this.session = undefined;
     // An encrypted project's capture queues go with its key (R30, R50); a plain project's stay readable.
-    for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.forgetCaptures(p.id);
+    for (const p of s.repo.listProjects()) if (p.encryption.enabled) this.endCaptures(p.id, "close");
     this.stopBackupScheduler();
     // Running imports are paused (resumable), never cancelled (R99 I4); one that cannot reach a safe
     // point in time is cancelled instead (state `cancelled`, still resumable) before the lock goes (R102 N3).

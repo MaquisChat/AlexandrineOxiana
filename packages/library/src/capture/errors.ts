@@ -25,6 +25,18 @@ export class AcknowledgementRequiredError extends Error {
   }
 }
 
+/**
+ * A capture ended from outside while it ran (its project was locked, or its library closed or
+ * moved): from then on nothing more is stored for it, whatever the project's state is later
+ * (Task 63 fix round 2, I3). Thrown out of a profile run; a link's outcome is CANCELLED.
+ */
+export class CaptureCancelledError extends Error {
+  override name = "CaptureCancelledError";
+  constructor() {
+    super("The capture was ended, so nothing more was saved.");
+  }
+}
+
 const REASONS: Record<string, string> = {
   LOGIN_REQUIRED: "This post needs a signed-in session. Try again with 'Use my browser session'.",
   PRIVATE: "This post is private. It can only be saved through a signed-in session that is allowed to see it.",

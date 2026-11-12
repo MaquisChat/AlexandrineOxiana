@@ -372,7 +372,10 @@ describe("a locked project (Task 63 fix round 1: I1, I2; R30, R50, R142)", () =>
   it("I2: at the lock, the running queue's record is forgotten at once and it stops before its next link; another project's queue is untouched", async () => {
     const { pid, plain, queueId, plainQueue, worker, events } = await lockedWhileRunning();
     expect(svc.state.captureQueues.detail(pid, queueId)).toBeUndefined();
-    expect(svc.state.captureQueue(queueId)).toBeUndefined();
+    // Its download still occupies the worker (fix round 2, I3): only its progress counters remain, no address.
+    expect(Object.keys(svc.state.captureQueue(queueId) ?? {}).sort()).toEqual(["done", "finished", "lib", "projectId", "total"]);
+    // Its end is published at the lock itself.
+    expect(events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId).at(-1)?.data).toMatchObject({ finished: true });
     expect(svc.state.captureQueues.detail(plain, plainQueue)).toBeDefined();
     worker.release();
     await svc.state.idle();
@@ -421,5 +424,155 @@ describe("a locked project (Task 63 fix round 1: I1, I2; R30, R50, R142)", () =>
     expect(svc.state.captureQueue(a.json.queueId)).toBeUndefined();
     expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);
     expect((await call({ url: `/projects/${plain}/captures/${b.json.queueId as string}` })).json).toMatchObject({ finished: true });
+  });
+});
+
+describe("a lock ends a project's running captures for good (fix round 2: I3, R116)", () => {
+  async function running(encrypted = true): Promise<{ pid: string; queueId: string; worker: ReturnType<typeof gatedWorker>; events: Array<{ type: string; data: any }> }> {
+    const worker = gatedWorker();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project(encrypted ? "Secret" : "Plain", encrypted);
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const q = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT, YT2, IG] } });
+    expect(q.status, q.body).toBe(200);
+    await until(() => worker.calls.length > 0);
+    return { pid, queueId: q.json.queueId as string, worker, events };
+  }
+  const lock = (pid: string) => call({ method: "POST", url: `/projects/${pid}/lock` });
+  const unlock = (pid: string) => call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } });
+
+  it("lock then unlock while a download is in flight: the queue is over; its late result is discarded; the address is taken again only once that download has ended, as a new visible capture", async () => {
+    const { pid, queueId, worker, events } = await running();
+    expect((await lock(pid)).status).toBe(200);
+    expect((await unlock(pid)).status).toBe(200);
+    // The old download still runs: nothing new in this project until it has ended, in plain words.
+    const again = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
+    expect(again.status).toBe(409);
+    expect(again.json.error).toMatchObject({ code: "CONFLICT", reason: "CAPTURE_STOPPING" });
+    expect(again.json.error.message).not.toMatch(/https?:/);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    worker.release();
+    await svc.state.idle();
+    // Only the download in flight at the lock ran; nothing of the queue was published after its end.
+    expect(worker.calls).toHaveLength(1);
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.data).toMatchObject({ finished: true });
+    expect(mine[0]!.data.error).toMatch(/^ProjectLockedError/);
+    expect(svc.state.captureQueue(queueId)).toBeUndefined();
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    // Now a new capture of the same address is accepted, and visible.
+    const fresh = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } });
+    expect(fresh.status).toBe(200);
+    expect((await call({ url: `/projects/${pid}/captures` })).json.queues.map((q: { queueId: string }) => q.queueId)).toEqual([fresh.json.queueId]);
+    await svc.state.idle();
+  });
+
+  it("the extension's limit of one running and one waiting list holds across a lock and an unlock", async () => {
+    const worker = gatedWorker();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const ext = await extensionToken();
+    const send = (urls: string[]) => call({ method: "POST", url: "/capture/browser/links", noAuth: true, headers: { authorization: `Bearer ${ext}`, origin: EXT }, body: { projectId: pid, urls } });
+    expect((await send([YT])).status).toBe(200);
+    expect((await send([YT2])).status).toBe(200);
+    await until(() => worker.calls.length > 0);
+    expect((await lock(pid)).status).toBe(200);
+    expect((await unlock(pid)).status).toBe(200);
+    // Both still occupy their slots while the first one's download runs.
+    expect((await send([IG])).status).toBe(429);
+    worker.release();
+    await svc.state.idle();
+    expect(worker.calls).toHaveLength(1);
+    expect((await send([IG])).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("locking a project that is not encrypted changes nothing: its queue runs on, visible, and its addresses are still refused", async () => {
+    const { pid, queueId, worker, events } = await running(false);
+    expect((await lock(pid)).status).toBe(200);
+    expect(svc.state.captureQueues.detail(pid, queueId)).toMatchObject({ finished: false });
+    const again = await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT2] } });
+    expect(again.status).toBe(409);
+    expect(again.json.error.reason).toBe("CAPTURE_RUNNING");
+    worker.release();
+    await svc.state.idle();
+    expect(worker.calls).toHaveLength(3);
+    expect(svc.state.captureQueues.detail(pid, queueId)).toMatchObject({ finished: true, done: 3 });
+    expect(events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId && e.data.error)).toHaveLength(0);
+  });
+
+  it("two locks in a row: one end, published once; the queue stays over after the unlock", async () => {
+    const { pid, queueId, worker, events } = await running();
+    expect((await lock(pid)).status).toBe(200);
+    expect((await lock(pid)).status).toBe(200);
+    expect((await unlock(pid)).status).toBe(200);
+    worker.release();
+    await svc.state.idle();
+    expect(worker.calls).toHaveLength(1);
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.data.error).toMatch(/^ProjectLockedError/);
+  });
+
+  it("a profile run: a lock then an unlock ends it; nothing more of it is published", async () => {
+    const worker = gatedWorker();
+    await start({ worker, autoStartWorker: false });
+    await openLibrary();
+    const pid = await project("Secret", true);
+    const events: Array<{ type: string; data: any }> = [];
+    svc.state.events.subscribe((e) => events.push(e));
+    const r = await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: PROFILE } });
+    expect(r.status).toBe(200);
+    await until(() => worker.calls.length > 0);
+    expect((await lock(pid)).status).toBe(200);
+    expect((await unlock(pid)).status).toBe(200);
+    expect((await call({ method: "POST", url: `/projects/${pid}/capture-profile`, body: { url: PROFILE } })).json.error?.reason).toBe("CAPTURE_STOPPING");
+    worker.release();
+    await svc.state.idle();
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === r.json.queueId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.data.error).toMatch(/^ProjectLockedError/);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+  });
+
+  it("a close while a download runs ends an encrypted project's queue: nothing more runs or is published, also after reopening", async () => {
+    const { pid, queueId, worker, events } = await running();
+    const closing = call({ method: "POST", url: "/libraries/close" });
+    await until(() => events.some((e) => e.type === "capture.progress" && e.data.queueId === queueId && e.data.finished));
+    worker.release();
+    expect((await closing).status).toBe(200);
+    expect((await call({ method: "POST", url: "/libraries/open", body: { path: join(tmp, "Lib") } })).status).toBe(200);
+    expect((await unlock(pid)).status).toBe(200);
+    await svc.state.idle();
+    expect(worker.calls).toHaveLength(1);
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.data.error).toMatch(/^LibraryClosedError/);
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    expect((await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT] } })).status).toBe(200);
+    await svc.state.idle();
+  });
+
+  it("a move ends an encrypted project's queue; it is not continued on the moved library", async () => {
+    const { pid, queueId, worker, events } = await running();
+    const moving = call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    worker.release();
+    const moved = await moving;
+    expect(moved.body).toContain('"done":true');
+    expect((await unlock(pid)).status).toBe(200);
+    await svc.state.idle();
+    expect(worker.calls).toHaveLength(1);
+    const mine = events.filter((e) => e.type === "capture.progress" && e.data.queueId === queueId);
+    // At most the link that was downloading when the move began reports its outcome (before the close).
+    expect(mine.filter((e) => e.data.outcome).length).toBeLessThanOrEqual(1);
+    expect(mine.at(-1)!.data.error).toMatch(/^LibraryClosedError/);
+    expect(svc.state.captureQueue(queueId)).toBeUndefined();
+    expect((await call({ url: `/projects/${pid}/captures` })).json).toEqual({ queues: [] });
+    expect((await call({ method: "POST", url: `/projects/${pid}/capture`, body: { urls: [YT2] } })).status).toBe(200);
+    await svc.state.idle();
   });
 });

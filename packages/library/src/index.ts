@@ -130,10 +130,10 @@ export { ResourceMissingError } from "./resources.js";
 
 export { classifyUrl, isCollectionLink, isPostLink } from "./capture/platforms.js";
 export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
-export { AcknowledgementRequiredError, COOKIES_ACKNOWLEDGEMENT, incompleteReason, plainReason } from "./capture/errors.js";
+export { AcknowledgementRequiredError, CaptureCancelledError, COOKIES_ACKNOWLEDGEMENT, incompleteReason, plainReason } from "./capture/errors.js";
 export { stripSnapshot } from "./capture/snapshot.js";
 export { NoMediaError, createLinkCapture } from "./capture/link-capture.js";
-export type { BrowserName, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps, TranscribeSourceResult } from "./capture/link-capture.js";
+export type { BrowserName, CaptureControl, CaptureOptions, CaptureOutcome, CaptureStatus, LinkCapture, LinkCaptureDeps, TranscribeSourceResult } from "./capture/link-capture.js";
 export type { ProfileCaptureOptions, ProfileCaptureReport, ProfileContentType, ProfileRecord, ProfileRunStatus } from "./capture/profile-capture.js";
 export { CaptureQueueRegistry } from "./capture/queues.js";
 export type { CaptureQueueRegistryOptions } from "./capture/queues.js";

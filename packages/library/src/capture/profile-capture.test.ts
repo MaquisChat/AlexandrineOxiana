@@ -380,6 +380,20 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect(values).toContain("Tanz Nummer 6");
   });
 
+  it("a run ended while a post downloads (Task 63 fix round 2, I3): the post is not stored and the run stops there", async () => {
+    const p = await project();
+    let ended = false;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      const r = await submit(...args);
+      if (String(args[1].input).includes("/video/")) ended = true;
+      return r;
+    });
+    const err = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { cancelled: () => ended }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("CaptureCancelledError");
+    expect(await posts(p.id)).toHaveLength(0);
+  });
+
   it("maxItems: 5 stops at 5 and never marks the rest unavailable; a later full run adds the rest", async () => {
     const p = await project();
     const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 5 });

@@ -32,6 +32,12 @@ export const CAPTURE_ITEMS_KEPT = 2000;
 
 /** The refusal reason of a capture whose address is already waiting or being captured. */
 export const CAPTURE_RUNNING = "CAPTURE_RUNNING";
+/**
+ * The refusal reason while a capture of the project that was ended (its project was locked) is still
+ * finishing its current download: its addresses are forgotten, so the project waits as a whole
+ * (Task 63 fix round 2, I3).
+ */
+export const CAPTURE_STOPPING = "CAPTURE_STOPPING";
 
 export type CaptureQueueKind = "links" | "profile";
 /** Who started the queue: the desktop app (or the command line through the service), or the paired extension. */

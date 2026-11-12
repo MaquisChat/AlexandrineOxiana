@@ -31,7 +31,7 @@ import {
   type ProfileCaptureOptions,
   type ProfileContentType,
 } from "@ao/library";
-import { CAPTURE_RUNNING, PAIRING_CODE_ID, SPEECH_MODELS, type CaptureStartedBy, type PairingCodeStatus } from "@ao/shared";
+import { CAPTURE_RUNNING, CAPTURE_STOPPING, PAIRING_CODE_ID, SPEECH_MODELS, type CaptureStartedBy, type PairingCodeStatus } from "@ao/shared";
 import { SHELL_ORIGINS } from "../auth.js";
 import { ApiError, badRequest, notFound } from "../errors.js";
 import type { Session } from "../state.js";
@@ -98,6 +98,8 @@ export const LINK_QUEUES_PER_EXTENSION = 2;
 
 const LINKS_RUNNING =
   "At least one of these links is already waiting or being captured in this project, in a capture that is still running, so nothing new was queued. Wait until that capture has finished, or leave the link out.";
+const STOPPING =
+  "A capture of this project that was ended (the project was locked) is still finishing its current download, so nothing new was queued. Try again in a moment.";
 const PROFILE_RUNNING = "This profile, channel or playlist is already being captured in this project, so nothing new was started. Wait until that capture has finished.";
 
 /** A locked project's queues are not shown (423), as its sources are not. */
@@ -123,6 +125,9 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     await state.workerClient(); // 503 when the media helper cannot run
     // Checked and recorded with nothing awaited in between, so parallel requests cannot both pass.
     requireUnlocked(s, projectId);
+    // An ended capture's download still occupies the worker: its addresses are forgotten, so the
+    // whole project waits until it has returned (I3).
+    if (state.captureStopping(projectId)) throw new ApiError(409, "CONFLICT", STOPPING, CAPTURE_STOPPING);
     if (state.captureQueues.runningConflict(projectId, urls)) throw new ApiError(409, "CONFLICT", LINKS_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     // In the work registry: a library move stops it between links and it continues afterwards (R106).
@@ -190,30 +195,34 @@ export function registerCapture(app: FastifyInstance, ctx: Ctx): void {
     const worker = await state.workerClient();
     // Checked and recorded with nothing awaited in between (as for links).
     requireUnlocked(s, projectId);
+    if (state.captureStopping(projectId)) throw new ApiError(409, "CONFLICT", STOPPING, CAPTURE_STOPPING);
     if (state.captureQueues.runningConflict(projectId, [url])) throw new ApiError(409, "CONFLICT", PROFILE_RUNNING, CAPTURE_RUNNING);
     const queueId = randomUUID();
     const queues = state.captureQueues;
     queues.startProfile(queueId, projectId, url, "desktop");
+    state.profileRunStarted(queueId, projectId);
     const capture = createLinkCapture({ repo: s.repo, worker, index: s.index });
     // A profile run cannot stop part-way here: a move waits for it to finish (drained, R106).
     state.startWork("profile-capture", async () => {
       try {
-        const report = await capture.captureProfile(projectId, url, opts, (done, total, outcome) => {
-          // Locked meanwhile: nothing more of it is recorded or published (the run ends at its next post).
-          if (!s.repo.isUnlocked(projectId)) return;
-          queues.progress(queueId, done, total, outcome);
-          state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false });
-        });
-        if (!s.repo.isUnlocked(projectId)) {
-          state.forgetCaptures(projectId);
-          state.events.publish("capture.progress", { queueId, projectId, finished: true, error: "ProjectLockedError: the project was locked, so the capture stopped" });
-          return;
-        }
+        const report = await capture.captureProfile(
+          projectId,
+          url,
+          opts,
+          (done, total, outcome) => {
+            // Ended meanwhile (a lock, a close): nothing more of it is recorded or published (I3).
+            if (state.captureEnded(queueId)) return;
+            queues.progress(queueId, done, total, outcome);
+            state.events.publish("capture.progress", { queueId, projectId, done, total, outcome, finished: false });
+          },
+          { cancelled: () => state.captureEnded(queueId) },
+        );
+        if (state.profileRunEnded(queueId)) return; // its end was published when it was ended
         queues.finish(queueId, { report });
         state.events.publish("capture.progress", { queueId, projectId, finished: true, report });
       } catch (err) {
-        if (!s.repo.isUnlocked(projectId)) state.forgetCaptures(projectId);
-        else queues.finish(queueId, { error: err });
+        if (state.profileRunEnded(queueId)) return;
+        queues.finish(queueId, { error: err });
         state.events.publish("capture.progress", { queueId, projectId, finished: true, error: state.describe(err) });
       }
     });
