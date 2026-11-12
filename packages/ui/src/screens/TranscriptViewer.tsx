@@ -193,6 +193,8 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
   const [stopping, setStopping] = useState(false);
   /** Said with the run (e.g. a start refused because one is already going). */
   const [jobNote, setJobNote] = useState<string | undefined>();
+  const jobRef = useRef(job);
+  jobRef.current = job;
 
   const listSeq = useRef(0);
   const readSeq = useRef(0);
@@ -466,6 +468,8 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
           if (e.type !== "job.progress") continue;
           const j = transcriptionJobOf(e.data);
           if (j && j.projectId === projectId && j.sourceId === sourceId) accept(j);
+          // A bare end of the run shown (one that ended after a lock): its state is read again.
+          else if (!j && (e.data as { kind?: unknown; jobId?: unknown } | null)?.kind === "transcription" && (e.data as { jobId?: unknown }).jobId === jobRef.current?.jobId) void readJob();
         }
       } catch {
         // the stream dropped: listen again shortly
@@ -854,7 +858,7 @@ function Viewer({ api, projectId, sourceId, onLocked, tools }: TranscriptViewerP
                     : lockWaiting(job)
                       ? `${job.error?.message ?? "The project was locked before the transcription could finish. It runs again when the project is unlocked."} Re-transcribe is off for this source until then.`
                       : job.waiting
-                        ? `The transcription with the ${job.model ?? "chosen"} model was interrupted; it runs again when the media helper is ready or the library is next opened. Re-transcribe is off for this source until then.`
+                        ? `The transcription with the ${job.model ?? "chosen"} model is not running in this session of the app: it was interrupted, or it is still finishing after the project was locked. It runs again, or finishes, by itself, and the new version will appear under Version. Re-transcribe is off for this source until then.`
                         : `Transcribing with the ${job.model ?? "chosen"} model. This can take several minutes. You can leave this screen: the transcription goes on, and the new version will appear under Version. Re-transcribe is off for this source until it finishes.`)}
                 {isPending(job) && jobNote && ` ${jobNote}`}
               </div>

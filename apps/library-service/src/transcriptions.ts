@@ -278,7 +278,7 @@ export class Transcriptions {
   }
 
   private failed(l: Live, err: unknown): void {
-    if (l.forgotten) return;
+    if (l.forgotten) return this.endForgotten(l);
     if (err instanceof JobInterruptedError || err instanceof WorkerUnavailableError) {
       // Left pending in the journal (an interrupt, a close, the media helper gone): it runs again
       // at the next open or when the media helper is back; this run no longer holds it.
@@ -303,11 +303,19 @@ export class Transcriptions {
   }
 
   private end(l: Live): void {
-    if (l.forgotten) return;
+    if (l.forgotten) return this.endForgotten(l);
     l.job.updatedAt = new Date().toISOString();
     const key = this.key(l.job.projectId, l.job.sourceId);
     if (this.bySource.get(key) === l.job.jobId) this.bySource.delete(key);
     this.publish(l);
+  }
+
+  /**
+   * A run forgotten at its project's lock has ended: a bare event (its id only, nothing of the
+   * project) tells an open viewer to read the journal again, which now holds how it ended.
+   */
+  private endForgotten(l: Live): void {
+    this.state.events.publish("job.progress", { kind: "transcription", jobId: l.job.jobId, done: 0, total: 100, finished: true });
   }
 
   private publish(l: Live): void {

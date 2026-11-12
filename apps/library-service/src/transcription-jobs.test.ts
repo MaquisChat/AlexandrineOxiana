@@ -484,6 +484,10 @@ describe("fix round 1", () => {
     await until(() => worker!.runs.length === 2);
     const held = () => JSON.stringify([...((svc!.state.transcriptions as unknown as { live: Map<string, unknown> }).live.values())]);
     expect(held()).toContain(sid);
+    const ends: Array<Record<string, unknown>> = [];
+    svc!.state.events.subscribe((e) => {
+      if (e.type === "job.progress" && (e.data as { kind?: string }).kind === "transcription") ends.push(e.data as Record<string, unknown>);
+    });
     expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
     expect(held()).not.toContain(pid);
     expect(held()).not.toContain(sid);
@@ -491,6 +495,10 @@ describe("fix round 1", () => {
     worker!.release();
     await until(() => svc!.state.workKinds().length === 0);
     expect(held()).not.toContain(pid); // its end added nothing back
+    // ... but its end is marked by a bare event (the job's id only), so an open viewer reads the journal again.
+    const bare = ends.filter((e) => e.job === undefined && e.finished === true);
+    expect(bare.length).toBeGreaterThan(0);
+    for (const e of bare) expect(JSON.stringify(e)).not.toContain(sid);
     expect((await stateOf(pid2, sid2))?.status).toBe("done");
     await unlock();
     await until(async () => (await stateOf(pid, sid))?.status === "done");

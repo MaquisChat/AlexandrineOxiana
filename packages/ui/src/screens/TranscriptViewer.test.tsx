@@ -888,10 +888,21 @@ describe("TranscriptViewer — transcribe again (a job, Task 62)", () => {
 
   it("fix 1 M2: a run waiting to run again says so, not that it is transcribing", async () => {
     await openJob({ job: job({ status: "queued", waiting: true, model: "small" }) });
-    expect(await screen.findByText(/runs again when the media helper is ready/)).toBeTruthy();
+    expect(await screen.findByText(/not running in this session of the app: it was interrupted, or it is still finishing/)).toBeTruthy();
     expect(screen.queryByText(/Transcribing with the small model/)).toBeNull();
     expect(button().disabled).toBe(true);
     expect(screen.getByRole("button", { name: "Stop transcribing" })).toBeTruthy();
+  });
+
+  it("a bare end event for the run shown (a run that finished after a lock) reads the state again", async () => {
+    const waiting = job({ status: "queued", waiting: true, model: "small" });
+    const { svc } = await openJob({ job: waiting });
+    await screen.findByText(/not running in this session/);
+    const reads = svc.log.jobReads;
+    svc.state.job = { ...waiting, status: "done", waiting: undefined, updatedAt: new Date().toISOString() } as never;
+    act(() => svc.emit("job.progress", { kind: "transcription", jobId: waiting.jobId, done: 0, total: 100, finished: true }));
+    await waitFor(() => expect(svc.log.jobReads).toBeGreaterThan(reads));
+    await waitFor(() => expect(button().disabled).toBe(false));
   });
 
   it("fix 1 M3: a run cancelled by a lock is pending: it says it runs at the unlock and Re-transcribe stays off", async () => {
