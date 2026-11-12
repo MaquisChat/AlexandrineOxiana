@@ -34,6 +34,8 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
     "This computer's identity for the app could not be read and had to be renewed. A library this computer left locked may show as locked by another device, “Read-only (locked by …)”: once that old lock has not been kept up for 2 minutes, the library opens with changes on again, so close it and open it again then. The damaged identity file is kept beside the app's settings.",
   "old-copies-list-set-aside":
     "The list of old library copies awaiting deletion was damaged and was set aside. Old copies of moved libraries may still be on this computer, but they are no longer offered for deletion here. The damaged list is kept beside the app's settings.",
+  "watched-folders-list-set-aside":
+    "This computer's list of watched folders was damaged and was set aside, so watched folders on this computer have stopped. Watched folders must be added again on this computer. The damaged list is kept beside the app's settings.",
 };
 
 const READ_ONLY_REASONS: Record<string, string> = {

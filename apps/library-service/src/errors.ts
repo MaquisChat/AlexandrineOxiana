@@ -29,6 +29,7 @@ import {
   MissingParentError,
   MoveVerificationError,
   OldCopiesUnreadableError,
+  WatchedFoldersUnreadableError,
   PathEscapeError,
   ProxyRecordRefusedError,
   RestoreError,
@@ -170,6 +171,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof SecretStoreUnavailableError) return new ApiError(503, "UNAVAILABLE", "This computer's keyring is not available.");
   // This computer's list of old library copies could not be read: nothing written (Task 68, ruling 1).
   if (err instanceof OldCopiesUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
+  if (err instanceof WatchedFoldersUnreadableError) return new ApiError(503, "UNAVAILABLE", err.message);
   if (err instanceof MoveVerificationError) return new ApiError(409, "CONFLICT", "The copied library did not verify; the old copy is kept and nothing was switched.");
   if (err instanceof LockNotWritableError) return new ApiError(409, "READ_ONLY", "The library's lock file cannot be written.");
   if (err instanceof GovernanceParseError) return new ApiError(400, "VALIDATION", err.message);

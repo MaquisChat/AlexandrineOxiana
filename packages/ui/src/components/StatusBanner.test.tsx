@@ -21,6 +21,14 @@ describe("device-level notices (Task 68)", () => {
     expect(t).toMatch(/kept beside the app's settings/);
   });
 
+  it("the watched-folders notice: what happened, what stopped, what to do, the damaged list is kept", () => {
+    render(<StatusBanner variant={{ kind: "notice", notice: "watched-folders-list-set-aside" }} onDismiss={() => undefined} />);
+    const t = screen.getByRole("status").textContent ?? "";
+    expect(t).toMatch(/list of watched folders was damaged and was set aside/);
+    expect(t).toMatch(/must be added again/);
+    expect(t).toMatch(/kept beside the app's settings/);
+  });
+
   it("“Got it” is a keyboard-operable button that names the notice it dismisses", async () => {
     const onDismiss = vi.fn();
     render(<StatusBanner variant={{ kind: "notice", notice: "old-copies-list-set-aside" }} onDismiss={onDismiss} />);

@@ -9,11 +9,13 @@
  *    (its file was damaged), so the damaged file was kept aside and a new identity made.
  *  - `old-copies-list-set-aside`: the list of old library copies awaiting deletion was damaged, so it
  *    was kept aside and a fresh list started.
+ *  - `watched-folders-list-set-aside`: this computer's list of watched folders was damaged, so it was
+ *    kept aside and a fresh list started (Task 68 fix round 1).
  *
  * Carried in `library.state` (`notices`); dismissed with `POST /settings/notices/dismiss { kind }`
  * (the desktop app's token only).
  */
-export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside"] as const;
+export const DEVICE_NOTICE_KINDS = ["device-identity-renewed", "old-copies-list-set-aside", "watched-folders-list-set-aside"] as const;
 export type DeviceNoticeKind = (typeof DEVICE_NOTICE_KINDS)[number];
 
 export function isDeviceNoticeKind(v: unknown): v is DeviceNoticeKind {

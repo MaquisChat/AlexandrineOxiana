@@ -370,7 +370,7 @@ describe("watched-folder settings (R69)", () => {
     const warnings: string[] = [];
     const wf = await addWatchedFolder({ repo, lib, onWarning: (w) => warnings.push(w) }, p.id, inbox);
     expect(warnings).toEqual([WATCH_REASONS.settingsUnreadable]);
-    const aside = (await readdir(join(tmp, "config"))).filter((n) => n.startsWith("watched-folders.unreadable-"));
+    const aside = (await readdir(join(tmp, "config"))).filter((n) => n.startsWith("watched-folders.json.corrupt-"));
     expect(aside).toHaveLength(1);
     expect(await readFile(join(tmp, "config", aside[0]!), "utf8")).toBe("{ not json");
     expect(await readFile(join(tmp, "config", "watched-folders.json"), "utf8")).toContain(wf.id);
