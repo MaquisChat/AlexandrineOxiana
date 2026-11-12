@@ -178,6 +178,24 @@ describe("Library screen", () => {
     expect(await screen.findByText(/Read-only \(locked by lab-mac\)/)).toBeTruthy();
   });
 
+  it("Capture from the web is offered for a project that can take sources, like Import: not while the library is read-only or the project locked (D10)", async () => {
+    server.use(...libraryHandlers());
+    const view = renderLibrary();
+    const user = userEvent.setup();
+    expect((await screen.findByRole("link", { name: "Capture from the web" })).getAttribute("href")).toBe("/capture?project=p1");
+    // The locked project p2: no Capture (and no Import) until it is unlocked.
+    await user.click(screen.getByRole("button", { name: /Clinic interviews/ }));
+    await screen.findByRole("heading", { name: /is locked/ });
+    expect(screen.queryByRole("link", { name: "Capture from the web" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Import" })).toBeNull();
+    view.unmount();
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    await screen.findByRole("link", { name: "Governance and records" });
+    expect(screen.queryByRole("link", { name: "Capture from the web" })).toBeNull();
+  });
+
   it("a read-only library offers no new project", async () => {
     server.use(...libraryHandlers({ current: { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" } }));
     renderLibrary({ libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" });

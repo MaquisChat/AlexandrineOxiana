@@ -19,11 +19,11 @@ export interface GovernanceRoute {
   path: string;
   label: string;
   needsProject: boolean;
-  render(api: GovernanceApi, projectId: string): ReactNode;
+  render(api: GovernanceApi, projectId: string, ctx: { readOnlyReason?: string | undefined }): ReactNode;
 }
 
 export const governanceRoutes: GovernanceRoute[] = [
-  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid) => <GovernanceSettings key={pid} api={api} projectId={pid} /> },
+  { path: PATHS.governance, label: "Governance", needsProject: true, render: (api, pid, ctx) => <GovernanceSettings key={pid} api={api} projectId={pid} readOnlyReason={ctx.readOnlyReason} /> },
   { path: PATHS.audit, label: "Audit log", needsProject: true, render: (api, pid) => <AuditLog key={pid} api={api} projectId={pid} /> },
   { path: PATHS.fieldwork, label: "Fieldwork", needsProject: true, render: (api, pid) => <Fieldwork key={pid} api={api} projectId={pid} /> },
   { path: PATHS.moveLibrary, label: "Move library", needsProject: false, render: (api) => <MoveLibrary api={api} /> },
@@ -56,12 +56,36 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
       live = false;
     };
   }, [api]);
+  // Whether the library may be changed here, read for the Governance form only: it then says why its
+  // rules cannot be changed instead of letting a change be refused on save. Unknown: not said (the
+  // service refuses a change it may not make either way).
+  const onGovernance = path === PATHS.governance;
+  const [libraryMode, setLibraryMode] = useState<string | undefined>();
+  useEffect(() => {
+    if (!onGovernance) return;
+    let live = true;
+    api.libraryMode().then(
+      (m) => live && setLibraryMode(m),
+      () => live && setLibraryMode(undefined),
+    );
+    return () => {
+      live = false;
+    };
+  }, [api, onGovernance]);
+
   const list = projects ?? [];
   // The project named in the address when it is one of the library's. A name that is not selects
   // none (never another project's screen, 41b2 M1); no name selects the first.
   const unknown = !!asked && !!projects && !list.some((p) => p.id === asked);
   const projectId = asked ? (unknown ? "" : asked) : (list[0]?.id ?? "");
   const route = governanceRoutes.find((r) => r.path === path);
+  const project = list.find((p) => p.id === projectId);
+  const readOnlyReason =
+    libraryMode === "read-only"
+      ? "This library is open read-only here, so its rules cannot be changed."
+      : project?.encrypted && project.unlocked === false
+        ? "This project is locked. Unlock it in the library to change its rules."
+        : undefined;
   return (
     <div>
       <nav className="ao-nav" aria-label="Governance and library">
@@ -93,7 +117,7 @@ export function GovernanceRoutes({ client, loc }: { client: ApiClient; loc: AppL
           The project named in the address is not in this library. Choose a project from the list.
         </p>
       )}
-      {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId) : null}
+      {route ? route.needsProject && !projectId ? <p className="ao-screen">Choose a project first.</p> : route.render(api, projectId, { readOnlyReason }) : null}
     </div>
   );
 }

@@ -34,6 +34,7 @@ import { UnlockProject } from "./UnlockProject";
 export const REVIEW_QUEUE_PATH = PATHS.reviewQueue;
 const governanceHref = (projectId: string) => `${PATHS.governance}?project=${encodeURIComponent(projectId)}`;
 const importHref = (projectId: string) => `${PATHS.importWizard}?project=${encodeURIComponent(projectId)}`;
+const captureHref = (projectId: string) => `${PATHS.capture}?project=${encodeURIComponent(projectId)}`;
 /** The project's whole review queue (Task 67), or that source's entries in it. */
 export const reviewQueueHref = (projectId: string, sourceId?: string) =>
   `${REVIEW_QUEUE_PATH}?project=${encodeURIComponent(projectId)}${sourceId ? `&source=${encodeURIComponent(sourceId)}` : ""}`;
@@ -506,6 +507,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               Import
             </a>
           )}
+          {/* Capture is the other way a project takes in sources (from the web), so it sits beside Import, under the same conditions (D10). */}
+          {!locked && !readOnly && project && (
+            <a href={captureHref(project.id)} onClick={(e) => follow(e, captureHref(project.id))}>
+              Capture from the web
+            </a>
+          )}
+          {/* What the ways in left for the researcher to decide (Task 67): after Import and Capture. */}
           {project && !locked && waiting?.projectId === project.id && (
             <a href={reviewQueueHref(project.id)} onClick={(e) => follow(e, reviewQueueHref(project.id))}>
               {waiting.total > 0 ? `Review queue (${waiting.total} waiting)` : "Review queue"}
@@ -525,7 +533,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.tools} onClick={(e) => follow(e, PATHS.tools)}>
             Optional tools
           </a>
-          <a href="/about" onClick={(e) => follow(e, "/about")}>About and third-party notices</a>
+          <a href={PATHS.about} onClick={(e) => follow(e, PATHS.about)}>About and third-party notices</a>
           {onSwitchLibrary && (
             <button type="button" onClick={onSwitchLibrary}>
               Switch library

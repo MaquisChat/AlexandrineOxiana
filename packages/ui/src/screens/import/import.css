@@ -77,8 +77,14 @@
   min-width: 16rem;
 }
 
-.ao-import__field > span {
+.ao-import__field > span,
+.ao-import__field.ao-pathfield > label {
   color: var(--ink-2);
+}
+
+/* A path field's input row is not a label: it keeps the ordinary text colour. */
+.ao-import__field > .ao-pathfield__row {
+  color: inherit;
 }
 
 .ao-import__field--wide {
