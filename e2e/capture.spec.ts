@@ -48,12 +48,14 @@ test("D10, D11: Capture opened by its link; refused until the Governance form al
     await expect(methods).toBeVisible();
     await expect(methods.getByRole("checkbox", { name: /^Downloader/ })).not.toBeChecked();
     for (const name of [/^Browser capture/, /^Downloader/]) {
-      await methods.getByRole("checkbox", { name }).check();
+      // (A click, not check(): the box is ticked only once the reason is recorded.)
+      await methods.getByRole("checkbox", { name }).click();
       const dialog = page.getByRole("dialog", { name: "Record a reason" });
       await dialog.getByRole("textbox", { name: "Reason" }).fill("Recordings of public hearings");
       await dialog.getByRole("textbox", { name: "Approved by" }).fill("Dr Ana Souza");
       await dialog.getByRole("button", { name: "Record reason" }).click();
       await expect(dialog).toBeHidden();
+      await expect(methods.getByRole("checkbox", { name })).toBeChecked();
     }
     await expect(methods.getByRole("note", { name: /What a capture from the web also needs/ })).toContainText("Nothing else");
     await page.getByRole("button", { name: "Save changes" }).click();
