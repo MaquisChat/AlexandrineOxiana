@@ -164,8 +164,12 @@ the Task 37f report under "Unverified until the first Mac run".
 
 ### What the workflow does
 
-`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started from a tag or by
-hand (both below), never on a branch push: Mac minutes are billed at ten times Linux minutes. A
+`.github/workflows/desktop-macos.yml` ("Desktop (macOS)") runs only when started from a build
+request, a tag or by hand (all below), never on an ordinary branch push: Mac minutes are billed at
+ten times Linux minutes. A **build request** is a commit that changes
+`apps/desktop/mac-build-request.json` on a working branch: raise `"request"` by one and set
+`"architectures"` to `"apple-silicon"`, `"intel"` or `"both"` (R168; this is how a build is started
+from a session that can push only its own branch). A
 short first job on Linux decides which downloads to build and refuses a tag that is not a version
 of the app (`scripts/mac-targets.mjs`). For each architecture it:
 

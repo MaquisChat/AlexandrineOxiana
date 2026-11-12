@@ -442,25 +442,25 @@ Update after every task; commit and push.
 | 60 New-project dialog | done | ae1649f | reviewed with probes; two fix rounds (R134); e2e smoke creates its project through the dialog |
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
-| 46a Fix: opening a library (D5, D8), linked files (D4) | stopped | 7b7a3b4 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | stopped | fdbd601 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart |
-| 46c A pairing code's status | fix round 1, stopped | 1ec85b5 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. One Important: a code is marked used before the pairing is written |
+| 46a Fix: opening a library (D5, D8), linked files (D4) | in progress | 7b7a3b4 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; the rebuild on open must honour the index's rebuild marker (R161) |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | in progress | fdbd601 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
+| 46c A pairing code's status | fix round 1 | 1ec85b5 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; one Important: a code is marked used before the pairing is written |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 1, stopped | db0030d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. 5 Important; identifiers become confirmable (R149) |
+| 34d Verification badges | fix round 1 | db0030d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; 5 Important; identifiers become confirmable (R149) |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | stopped | 69e5e6d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart; barely started |
+| 63 Capture state readable; one classifier | in progress | 69e5e6d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
-| 57 Import wizard routes | review stopped | 5699dc8 (worktree branch) | built; its review was stopped by the same interruption and waits for the owner's word |
-| 49 Backups governed | fix round 4, stopped | 857144d (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Re-scoped by R147; the report suggests it was near complete |
+| 57 Import wizard routes | in review | 5699dc8 (worktree branch) | built; review restarted 2026-11-12 with a fresh agent, at the owner's word |
+| 49 Backups governed | fix round 4 | 857144d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; re-scoped by R147 |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49 |
-| 51 Job records in files | fix round 2, stopped | dd30650 (worktree branch) | STOPPED part-way by the session interruption of 23:00 UTC; waits for the owner's word to restart. Two Important in the rerun at unlock |
+| 51 Job records in files | fix round 2 | dd30650 (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; two Important in the rerun at unlock |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
 | 59 Tests pass on a Mac | held | | waits for the owner's word on macOS build minutes (private repository, 10× rate) |
@@ -469,7 +469,7 @@ Update after every task; commit and push.
 | 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
-| 37f Mac builds in CI | written and merged; NOT yet run | 2ed4788 | the build script and workflow passed two paper reviews and every Linux check; the first Mac run (the task's real acceptance) waits for the owner's word: roughly 550–750 billed minutes for Apple Silicon only, 1,200–1,650 for both (estimates) |
+| 37f Mac builds in CI | first Mac run requested (Apple Silicon only) | | started by build request 1 at the owner's word (R168); the workflow was written and paper-reviewed but had never run |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
