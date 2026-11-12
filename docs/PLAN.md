@@ -373,6 +373,13 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 - Verify: service and UI tests for each kind of entry; `pnpm e2e -- --app-only --trace off`.
 - Model: Opus.
 
+**Task 50b — Restore asks the policy engine; a missing backups manifest is rebuilt (D15) [ledger: R174, R175, R147, R138, R125, R92, R154]**
+- Depends: 49. Split from Task 50; widened by R174 after Task 49's fourth round.
+- Files: `packages/library/src/repo/restore.ts`, `packages/library/src/export/backup.ts` and `retention.ts` (the manifest loader and the destruction's list-building only), `packages/core` (the policy engine, only if restore needs an operation it does not have), `apps/library-service/src` (the restore route's answer), `docs/governance/README.md`, `docs/adr/0005-governance-checkpoint.md`, tests.
+- Accept: restoring a backup is evaluated by the policy engine before anything is written, fails closed, and a refusal is audited and said in plain words; a missing `backups-manifest.json` beside existing backup files is rebuilt like a damaged one before any decision that depends on it, and if it cannot be rebuilt every backup of the project is listed as needing a look and the warning is raised, never "none"; restore decides what not to bring back from the destruction record as the audit log gives it, not from certificate files alone; a restored project's warning about inherited backups stands from the restore itself; nothing Task 49's reviews established regresses (the event counts, R147's six requirements, R175).
+- Verify: `pnpm --filter @ao/library exec vitest run src/export src/repo` and the retention and restore files; service tests; `pnpm -r typecheck`.
+- Model: the most capable tier (this module took five rounds in Task 49).
+
 **Task 68 — Settings writers never write what they did not read (D16) [ledger: R96, R159]**
 - Depends: 66 (it fixed the same shape for the pairings).
 - Files: `apps/library-service/src/routes/fonts.ts`, `routes/appearance.ts`, the app-settings helper they share with the pairings, tests.
@@ -503,7 +510,7 @@ Update after every task; commit and push.
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
+| 50b Restore asks the policy engine | in progress | | dispatched 2026-11-12 after Task 49 merged; also D15 (a missing backups manifest), restore reading destructions through the audit log, and a restored project's warning from the restore (R174) |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -521,7 +528,7 @@ Update after every task; commit and push.
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | in progress | | dispatched 2026-11-12 after Task 46b merged; the transcript half of D10 was closed by Task 34d |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | approved; takes the working branch once more after Task 63, then verification | 69121dc (worktree branch) | reviewed with probes over one fix round |
+| 66 A paired browser survives a relaunch (D13) | approved; taking the working branch once more, then verification | 69121dc (worktree branch) | reviewed with probes over one fix round |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
 | 67 One review queue for the project (D14) | in progress | | dispatched 2026-11-12 after Task 46b merged |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
