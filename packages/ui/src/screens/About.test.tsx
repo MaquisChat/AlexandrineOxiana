@@ -11,8 +11,9 @@ import { describe, expect, it } from "vitest";
 import { createClient } from "../api/client";
 import { ROUTES, routeFor } from "../App";
 import type { AppLocation } from "../navigation";
-import { BASE, server, TOKEN, testApi, url, useMockService } from "../test/service";
+import { BASE, CURRENT_RW, libraryHandlers, server, TOKEN, testApi, url, useMockService } from "../test/service";
 import { About, BUILT_NOTICES, parseNpmNotices } from "./About";
+import { Library } from "./Library";
 import { LibraryChooser } from "./LibraryChooser";
 
 useMockService();
@@ -118,6 +119,13 @@ describe("reaching the About screen", () => {
     expect(owners[0]!.back).toBe(true);
     render(<>{routeFor({ pathname: "/about", search: "" } satisfies AppLocation, createClient(BASE, TOKEN))}</>);
     expect(screen.getByRole("heading", { level: 1, name: "About and third-party notices" })).toBeTruthy();
+  });
+
+  it("an open library's header links to it (R159 b)", async () => {
+    server.use(...libraryHandlers());
+    render(<Library api={testApi()} current={CURRENT_RW as never} />);
+    const link = await screen.findByRole("link", { name: "About and third-party notices" });
+    expect(link.getAttribute("href")).toBe("/about");
   });
 
   it("the library chooser links to it", async () => {

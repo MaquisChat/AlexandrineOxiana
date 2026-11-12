@@ -451,6 +451,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.extension} onClick={(e) => follow(e, PATHS.extension)}>
             Browser extension
           </a>
+          <a href="/about" onClick={(e) => follow(e, "/about")}>About and third-party notices</a>
           {onSwitchLibrary && (
             <button type="button" onClick={onSwitchLibrary}>
               Switch library
