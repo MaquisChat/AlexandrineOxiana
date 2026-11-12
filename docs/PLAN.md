@@ -25,7 +25,7 @@ Checks run on 2026-11-11: type-check passes (7 packages); `pnpm test` 2,053 pass
 Task 40 enters these in the ledger as rulings R120 onward.
 
 1. **Scope.** Plan Phase 1 in detail; outline Phases 2–6.
-2. **Platforms.** macOS first: Apple Silicon and Intel. Windows later. The owner will create an Apple Developer account.
+2. **Platforms.** macOS first: Apple Silicon only (the owner, 2026-11-12, R169; Intel Macs were in the plan until then and are not built). Windows later. The owner will create an Apple Developer account.
 3. **Branches.** `main` exists (created at `0ad6506`) and is the approved state. Work happens on a working branch and reaches `main` only with the owner's approval.
 4. **Citation engine licence.** citeproc-js is used under **CPAL-1.0**. The project's own licence is not chosen yet; AGPL-3.0 is the likely later choice and must stay possible. No project `LICENSE` file is added until the owner decides. (Closes the open half of R87.)
 5. **Citation review.** The owner will review the five citation styles from a prepared page.
@@ -54,7 +54,7 @@ Task 40 enters these in the ledger as rulings R120 onward.
 | J | The app runs end to end | A real service, real worker and the built UI pass end-to-end scenarios 1–8 in Chromium and WebKit, in CI. |
 | K | Task 34 | Capture, transcript, verification and pairing screens work against the real service; scenarios 9–11 pass; the first-use tools dialogue works. |
 | L | Governance and durability gaps closed | Backups and refused actions are decided by policy and audited; no audit failure is silent; job records survive loss of the index (R31). |
-| M | macOS desktop app | The test suites pass on a Mac. Signed, notarised downloads for Apple Silicon and Intel are built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
+| M | macOS desktop app | The test suites pass on a Mac. A signed, notarised download for Apple Silicon (Intel dropped by the owner, R169) is built by CI, pass an automated smoke test, and pass the owner's hands-on checklist. |
 | N | Phase 1 finished | Owner reviews done and applied; final whole-branch review clean; merged to `main`. |
 
 Order: I, then J. K and L can run alongside J once Task 43 is in. M starts after J (37a, 37b, 37d, 37e and 59 can start earlier; 59 should start early because it is the first time anything runs on a Mac). N is last.
@@ -320,7 +320,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 **Task 37f — Mac builds in CI [ledger: R133; ADR 0014]**
 - Depends: 37c, 37d, 37e, 48, 59.
 - Files: `.github/workflows/desktop-macos.yml`, `apps/desktop/src-tauri/tauri.conf.json`.
-- Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered.
+- Accept: a workflow, run by hand or on a version tag (not on every push), builds the helpers and the app for Apple Silicon and Intel, and uploads unsigned disk images. On each machine a smoke test launches the app and confirms both helpers answered. (Amended 2026-11-12, R168 and R169: a build can also be started by a build-request file; only Apple Silicon is built, by the owner's decision, and the Intel side stays in the repository switched off.)
 - Verify: a green workflow run with two downloadable artefacts.
 - Model: Opus.
 
@@ -374,7 +374,7 @@ Specification: Task 37 in the old plan, with the handoff's carry-overs. This con
 ## 6. Risks
 
 1. **The Mac app cannot be run here.** Everything Mac-specific is first seen working on GitHub's machines or the owner's Mac. Mitigation: WebKit in the browser scenarios (the Mac app's web view is WebKit), a smoke test on the Mac build machines, the owner's checklist.
-2. **Packaging the worker for Intel Macs.** Confirmed by Task 37e: four libraries publish no Intel-Mac build at the current versions, so the Intel download runs on a second, older set (R133). More libraries may follow, and GitHub may retire its Intel machines.
+2. **Packaging the worker for Intel Macs.** No longer a risk: the owner decided on 2026-11-12 that the app is built for Apple Silicon only (R169). For the record, Task 37e confirmed that four libraries publish no Intel-Mac build at the current versions, so an Intel download would run on a second, older set (R133).
 3. **Tools on a Mac without a package manager.** tesseract has no official Mac download and is built and signed in our own CI; ghostscript turned out not to be needed. Tools the app downloads may be blocked by the Mac's security check unless signed (the video downloader is not signed by its authors): unverified, to be tested on the owner's Mac.
 4. **Signing the helper programs.** Apple's rules for programs inside an app are strict; expect more than one attempt at 37g.
 5. **Mac build minutes** on GitHub cost more than Linux ones on a private repository. The Mac workflow runs only by hand or on a tag.
@@ -468,8 +468,8 @@ Update after every task; commit and push.
 | 37b Token on standard input | done | 62af0c6 | reviewed with probes; one short fix round (R98) |
 | 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
-| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
-| 37f Mac builds in CI | first Mac run requested (Apple Silicon only) | | started by build request 1 at the owner's word (R168); the workflow was written and paper-reviewed but had never run |
+| 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; the Intel question is closed (not built, R169); one owner confirmation pending (minimum macOS 15) |
+| 37f Mac builds in CI | first Mac run in progress (Apple Silicon) | | started by build request 1 at the owner's word (R168); Apple Silicon only, the Intel download is switched off (R169); the workflow was written and paper-reviewed but had never run |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
@@ -487,7 +487,7 @@ Update after every task; commit and push.
 2. Decided 2026-11-11: no second backup folder in Phase 1. Until sync is designed, a backup lives beside the data it protects, so it does not survive losing the drive; copying the library folder to another drive by hand is the safeguard meanwhile.
 3. Approve merges to `main` at milestone boundaries.
 4. Create the Apple Developer account; later, add its signing credentials as GitHub secrets (Task 37g gives the steps).
-5. Confirm two things from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia, which leaves out Intel MacBook Airs from 2018–19 and most Macs older than 2018; and the Intel download is kept although it must use older versions of four libraries (older cameras' RAW files only, two months behind on OCR fixes, an older cryptography library) and depends on GitHub keeping its Intel machines.
+5. Confirm one thing from the Mac research (ADR 0014, R133): the minimum macOS version is 15 Sequoia. (The second question, whether to keep an Intel download, is answered: the owner decided on 2026-11-12 that the app is built for Apple Silicon only, R169.)
 6. Review the citation and colour pages (Task 52).
 7. Run the hands-on checklist on the Mac, and the Zotero, password-store, Firefox and live-capture tests (Task 55).
 8. Choose the project's own licence before anything is published (Task 56). Facts that bear on it, found by Task 37d: the packaged worker contains a GPL-2.0-only program (gallery-dl) and GPL video-codec libraries inside two of its Python packages, besides LGPL and MPL parts. What may be shipped together, and under which licence, is a question for the owner and, ideally, a lawyer; the plan's default until then is to move gallery-dl out of the bundle into the first-use downloads, like the video downloader.
