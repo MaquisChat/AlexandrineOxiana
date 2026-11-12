@@ -6,7 +6,8 @@
  *
  * Bounded (the limits are in @ao/shared): a finished queue is kept for CAPTURE_QUEUE_KEEP_MS and at
  * most CAPTURE_QUEUES_KEPT finished queues are kept in all; a queue keeps at most CAPTURE_ITEMS_KEPT
- * items; a list answer holds at most CAPTURE_QUEUES_LISTED summaries. Running queues are always kept.
+ * items; a list answer holds every running queue and at most CAPTURE_QUEUES_LISTED finished ones.
+ * Running queues are always kept.
  *
  * Outcomes are carried through with their known fields only (url, status, sourceId, the library's
  * own sentence, its code and a missing tool's id); a queue's error is kept as the kind of error only,
@@ -52,8 +53,15 @@ interface Entry {
   itemsOmitted: number;
 }
 
-/** The address's canonical form (tracking parameters, host case and short forms set aside). */
-const keyOf = (u: string): string => classifyUrl(u).canonicalUrl;
+/**
+ * What makes two addresses the same capture: the platform's post id where there is one (so a video
+ * in a playlist is the video), else the canonical form (tracking parameters, host case and short
+ * forms set aside).
+ */
+const keyOf = (u: string): string => {
+  const c = classifyUrl(u);
+  return c.postId && c.platform !== "other" ? `${c.platform}:${c.kind === "short" ? "video" : c.kind}:${c.postId}` : c.canonicalUrl;
+};
 
 function outcomeOf(o: CaptureOutcome): CaptureItemOutcome {
   return {
@@ -166,13 +174,13 @@ export class CaptureQueueRegistry {
     return this.entries.size;
   }
 
-  /** The project's queues: running first (newest first), then the most recently finished; summaries only. */
+  /** The project's queues: every running one (newest first), then the most recently finished (at most CAPTURE_QUEUES_LISTED); summaries only. */
   list(projectId: string): CaptureQueueSummary[] {
     this.prune();
     const mine = [...this.entries.values()].filter((e) => e.projectId === projectId);
     const running = mine.filter((e) => !e.finished).sort((a, b) => b.startedAt - a.startedAt);
     const finished = mine.filter((e) => e.finished).sort((a, b) => b.finishedAt! - a.finishedAt!);
-    return [...running, ...finished].slice(0, CAPTURE_QUEUES_LISTED).map((e) => this.summary(e));
+    return [...running, ...finished.slice(0, CAPTURE_QUEUES_LISTED)].map((e) => this.summary(e));
   }
 
   /** One queue of `projectId` with its items; undefined for another project's, an unknown or a forgotten one. */

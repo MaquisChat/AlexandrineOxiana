@@ -102,7 +102,7 @@ describe("CaptureQueueRegistry", () => {
     expect(r.detail(P, "nope")).toBeUndefined();
   });
 
-  it("lists summaries without items: running first, then the most recently finished, at most CAPTURE_QUEUES_LISTED", () => {
+  it("lists summaries without items: running first, then the most recently finished, at most CAPTURE_QUEUES_LISTED of those", () => {
     const c = clock();
     const r = new CaptureQueueRegistry({ now: c.now });
     for (let i = 0; i < CAPTURE_QUEUES_LISTED + 5; i++) {
@@ -112,13 +112,27 @@ describe("CaptureQueueRegistry", () => {
     }
     r.startLinks("running", P, [YT], "desktop");
     const list = r.list(P);
-    expect(list).toHaveLength(CAPTURE_QUEUES_LISTED);
+    expect(list).toHaveLength(CAPTURE_QUEUES_LISTED + 1);
     expect(list[0]!.queueId).toBe("running");
     expect(list[1]!.queueId).toBe(`f${CAPTURE_QUEUES_LISTED + 4}`);
     for (const q of list) {
       expect(q).not.toHaveProperty("items");
       expect(q).not.toHaveProperty("urls");
     }
+  });
+
+  it("lists every running queue, however many; only finished ones are limited (review M3)", () => {
+    const c = clock();
+    const r = new CaptureQueueRegistry({ now: c.now });
+    for (let i = 0; i < CAPTURE_QUEUES_LISTED + 3; i++) {
+      r.startLinks(`r${i}`, P, [YT], "desktop");
+      c.advance(1);
+    }
+    r.startLinks("fin", P, [YT], "desktop");
+    r.finish("fin", {});
+    const list = r.list(P);
+    expect(list.filter((q) => !q.finished)).toHaveLength(CAPTURE_QUEUES_LISTED + 3);
+    expect(list.at(-1)!.queueId).toBe("fin");
   });
 
   it("a finished queue is kept for CAPTURE_QUEUE_KEEP_MS; a running one always", () => {
@@ -196,6 +210,8 @@ describe("CaptureQueueRegistry", () => {
       expect(r.runningConflict(P, [IG])).toBe("q1");
       expect(r.runningConflict(P, ["https://www.instagram.com/p/Cabc123/?igsh=abc"])).toBe("q1");
       expect(r.runningConflict(P, ["https://youtu.be/dQw4w9WgXcQ"])).toBe("q1");
+      // The same video in a playlist is the same post (review M4).
+      expect(r.runningConflict(P, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL1234567"])).toBe("q1");
       // Another project: no conflict.
       expect(r.runningConflict(Q, [IG])).toBeUndefined();
       // Once captured it is no longer waiting.

@@ -6,8 +6,8 @@
  *
  * - `GET /projects/:id/captures` → CaptureQueueListResponse: the project's running queues and its
  *   recent finished ones that this run of the service knows of (started from the screen, the
- *   extension or the command line through the service), newest first, at most
- *   CAPTURE_QUEUES_LISTED. Summaries only.
+ *   extension or the command line through the service), newest first: every running queue, and at
+ *   most CAPTURE_QUEUES_LISTED finished ones. Summaries only.
  * - `GET /projects/:id/captures/:queueId` → CaptureQueueDetail: one queue with its items' outcomes.
  *   404 for a queue of another project, an unknown one, or one no longer kept.
  * - Both refuse a locked project (423 PROJECT_LOCKED).
@@ -25,7 +25,7 @@
 export const CAPTURE_QUEUE_KEEP_MS = 60 * 60_000;
 /** Finished queues kept by the service at most (all projects together). */
 export const CAPTURE_QUEUES_KEPT = 50;
-/** Queues listed per project at most (running first, then the most recently finished). */
+/** Finished queues listed per project at most (after every running one). */
 export const CAPTURE_QUEUES_LISTED = 20;
 /** Items kept per queue at most. */
 export const CAPTURE_ITEMS_KEPT = 2000;
