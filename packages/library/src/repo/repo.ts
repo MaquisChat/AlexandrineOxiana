@@ -1350,14 +1350,19 @@ export function amendProjectDestruction(repo: Repo, projectId: string, input: Am
 
 /**
  * Package-internal (retention, R147): the project's audit events whose line contains one of
- * `needles`, read in the write queue (nothing is appended meanwhile). `headMatches`: the log on disk
- * ends at the head this process holds (the one checked against the anchor at open, moved on only by
- * this process's own appends); false means the log changed outside the app since.
+ * `needles`. `headMatches`: the log on disk ends at the head this process holds (the one checked
+ * against the anchor at open, moved on only by this process's own appends); false means the log
+ * changed outside the app since. The log is read outside the write queue (it can be long, and this
+ * runs hourly for every project); only the comparison with the head runs in the queue. If the two do
+ * not match, an entry may have been appended while the log was read: it is read once more, in the
+ * queue, where nothing is appended meanwhile.
  */
-export function auditEventsMentioning(repo: Repo, projectId: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; headMatches: boolean }> {
+export async function auditEventsMentioning(repo: Repo, projectId: string, needles: readonly string[]): Promise<{ events: AuditEvent[]; headMatches: boolean }> {
   const core = cores.get(repo)!;
+  const first = await AuditStore.readMatching(core.state(projectId).audit.dir, needles);
   return core.serial(async () => {
     const st = core.state(projectId);
+    if (endsAt(first.last, st.audit.head)) return { events: first.events, headMatches: true };
     const { events, last } = await AuditStore.readMatching(st.audit.dir, needles);
     return { events, headMatches: endsAt(last, st.audit.head) };
   });
@@ -1366,16 +1371,22 @@ export function auditEventsMentioning(repo: Repo, projectId: string, needles: re
 /**
  * Package-internal (retention, R147): every audit event of the project, only when its chain of
  * hashes verifies and it ends at the head this process holds; otherwise `ok: false` (the log is not
- * what the app wrote, so nothing may be removed on its word).
+ * what the app wrote, so nothing may be removed on its word). Read and verified outside the write
+ * queue, the head compared in it; a reading that does not pass is made once more in the queue, so an
+ * entry appended meanwhile is never taken for a change made outside the app.
  */
-export function verifiedAuditEvents(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
+export async function verifiedAuditEvents(repo: Repo, projectId: string): Promise<{ ok: true; events: AuditEvent[] } | { ok: false }> {
   const core = cores.get(repo)!;
+  const read = async () => {
+    const events = (await AuditStore.read(core.state(projectId).audit.dir)) as AuditEvent[];
+    return { events, verify: verifyChain(events) };
+  };
+  let r = await read();
   return core.serial(async () => {
-    const st = core.state(projectId);
-    const events = await AuditStore.read(st.audit.dir);
-    const verify = verifyChain(events as AuditEvent[]);
-    if (!verify.ok || !endsAt(verify.head, st.audit.head)) return { ok: false as const };
-    return { ok: true as const, events: events as AuditEvent[] };
+    const head = core.state(projectId).audit.head;
+    if (!r.verify.ok || !endsAt(r.verify.head, head)) r = await read();
+    if (!r.verify.ok || !endsAt(r.verify.head, head)) return { ok: false as const };
+    return { ok: true as const, events: r.events };
   });
 }
 

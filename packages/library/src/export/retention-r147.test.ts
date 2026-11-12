@@ -14,7 +14,7 @@ import { sealEvent, verifyChain, type AuditEvent, type Project, type SourceFile 
 import type { LocationEnv } from "../location.js";
 import { shredSeams } from "../fs/shred.js";
 import { newAttentionId, writeAttention, type UnrecordedAudit } from "../repo/attention.js";
-import { projectWarnings } from "../repo/repo.js";
+import { appendLibraryEvent, projectWarnings } from "../repo/repo.js";
 import { SimulatedCrash, seams } from "../repo/testing.js";
 import { backupsAwaitingRemoval, destroyRaw, listDestructions, readDestruction, resumeDestruction } from "../retention.js";
 import { backupProject, backupSeams, holdingNotRemoved, type BackupResult } from "./backup.js";
@@ -633,6 +633,33 @@ describe("the certificate and backups-state.json are conveniences; the audit log
     expect(await projectWarnings(kit.repo, p.id)).toContain(WARNING);
     const recs = await listDestructions(kit.repo, p.id);
     expect(recs.every((r) => /audit log/u.test(r.problem ?? ""))).toBe(true);
+  });
+});
+
+describe("M2: the audit log is read outside the write queue", () => {
+  it("entries written while a pass reads the log are never taken for a change made outside the app", async () => {
+    const { p, x, certificatePath } = await stuck();
+    shredSeams.failFor = (path) => path.endsWith(nameOf(x));
+    for (let i = 0; i < 12; i++) {
+      later(HOUR);
+      // A pass, the reader, and ordinary audited work, all at once.
+      const [, recs] = await Promise.all([
+        resumeDestruction(kit.repo, p.id),
+        listDestructions(kit.repo, p.id),
+        appendLibraryEvent(kit.repo, p.id, "export.citation", { style: "apa", format: "text", exported: 1, withheld: 0 }),
+        appendLibraryEvent(kit.repo, p.id, "export.citation", { style: "apa", format: "text", exported: 2, withheld: 0 }),
+      ]);
+      expect(recs[0]!.problem).toBeUndefined();
+      const waiting = await backupsAwaitingRemoval(kit.repo, p.id);
+      expect(waiting).toEqual([{ certificateFile: `${kit.repo.getProject(p.id).folder}/retention/${basename(certificatePath)}`, backups: [rel(x)] }]);
+    }
+    shredSeams.failFor = undefined;
+    expect((await reports(p)).filter((e) => typeof detailsOf(e).problem === "string")).toEqual([]);
+    expect(verifyChain(await auditEvents(kit, p)).ok).toBe(true);
+    later(HOUR);
+    await resumeDestruction(kit.repo, p.id);
+    expect(existsSync(x.path)).toBe(false);
+    expect((await readDestruction(kit.repo, p.id, certificatePath)).status).toBe("deleted");
   });
 });
 
