@@ -469,7 +469,7 @@ Update after every task; commit and push.
 | 37c Desktop shell | done | 03f5801 | reviewed with probes; one fix round (R155, R159); built and launched on Linux; a list of what only a Mac can verify is in the ledger |
 | 37d Worker packaging | done | 4e93d69 | two fix rounds (R144); licence list checked against the bundle on every build; GPL facts recorded for the owner |
 | 37e Mac tools research | done | a3bbbbb | ADR 0014; R133; two owner confirmations pending (minimum macOS 15, Intel build's cost) |
-| 37f Mac builds in CI | not started | | |
+| 37f Mac builds in CI | authoring in progress; not to be run | | the build script and workflow are being written and checked on Linux; a run needs the owner's word on Mac build minutes |
 | 37g Signing | blocked | | needs the paid Apple Developer Program membership and credentials; required only before the app is given to anyone else (R151) |
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
