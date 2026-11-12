@@ -322,6 +322,7 @@ function putSource(db: IndexDb, S: Store, d: Detail, fts: FtsText | null, extrac
 function putAnnotations(db: IndexDb, S: Store, sourceId: string, projectId: string, list: SourceFile["annotations"]): void {
   const { chunks, partial } = annotationChunks(list);
   const old = db.prepare(`SELECT seq, fts_rowid, sha256 FROM ${S.annChunks} WHERE source_id = ? ORDER BY seq`).all(sourceId) as Array<{ seq: number; fts_rowid: number; sha256: string }>;
+  if (!chunks.length && !old.length && !partial) return; // no annotations, before or now: nothing to do
   const insert = db.prepare(`INSERT INTO ${S.annFts} (source_id, project_id, annotations, annotation_bigrams) VALUES (?, ?, ?, ?)`);
   const drop = db.prepare(`DELETE FROM ${S.annFts} WHERE rowid = ?`);
   const record = db.prepare(`INSERT OR REPLACE INTO ${S.annChunks} (source_id, seq, fts_rowid, sha256) VALUES (?, ?, ?, ?)`);
