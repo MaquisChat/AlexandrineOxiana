@@ -12,7 +12,7 @@
  * ways out. A locked original with no destruction on record is decided as before.
  */
 import { existsSync } from "node:fs";
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sealEvent, type AuditEvent, type Project, type SourceFile } from "@ao/core";
@@ -191,6 +191,7 @@ describe("a locked original at the decision (R182): its rules are read without u
     twin: SourceFile;
     /** The backup made before the destruction, which could not be removed: it holds the raw file under both ids. */
     x: BackupResult;
+    certificatePath: string;
   }
 
   /** An encrypted project whose raw file was destroyed at 10:00 while the backup holding it could not be removed; then locked, unless `lock` is false. */
@@ -206,16 +207,22 @@ describe("a locked original at the decision (R182): its rules are read without u
     const x = await backupProject(kit.repo, p.id, { locationEnv: onDisk() });
     kit.clock.now = new Date("2026-12-02T10:00:00.000Z");
     shredSeams.failFor = (path) => path.endsWith(basename(x.path));
-    await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
+    const d = await destroyRaw(kit.repo, p.id, [raw.assets[0]!.id], "tester");
     shredSeams.failFor = undefined;
     expect(existsSync(x.path)).toBe(true);
+    expect(d.certificatePath.endsWith(".enc")).toBe(true);
     if (opts.lock !== false) kit.repo.lockProject(p.id);
-    return { p, sf, b: x, raw, twin, x };
+    return { p, sf, b: x, raw, twin, x, certificatePath: d.certificatePath };
   }
 
-  /** The three forms a destruction has had in the audit log; the two older ones are made by rewriting the log (the chain made whole, the library opened anew). */
-  const FORMS: Array<[string, ((events: AuditEvent[]) => AuditEvent[]) | undefined]> = [
+  /**
+   * The three forms a destruction has had in the audit log; the two older ones are made by rewriting
+   * the log (the chain made whole, the library opened anew). And the present form with its
+   * certificate file deleted outside the app: the log still records the destruction, and that decides.
+   */
+  const FORMS: Array<[string, ((events: AuditEvent[]) => AuditEvent[]) | undefined, boolean?]> = [
     ["the entry as it is written now (it names the destroyed files by id)", undefined],
+    ["the entry as it is written now, its certificate file deleted outside the app", undefined, true],
     [
       "the earlier form (the entry does not name the files)",
       (events) =>
@@ -227,13 +234,14 @@ describe("a locked original at the decision (R182): its rules are read without u
     ["the earliest form (a `retention.destroyed` event alone)", (events) => events.filter((e) => !(e.action === "delete" && String(detailsOf(e).op).startsWith("retention.")))],
   ];
 
-  for (const [form, rewrite] of FORMS) {
+  for (const [form, rewrite, certificateGone] of FORMS) {
     it(`a locked original with a destruction on record, ${form}: refused in plain words that name both ways out; still locked, nothing left behind, and the refusal is in that project's own log`, async () => {
       const o = await destroyedOriginal();
       if (rewrite) {
         await rewriteAudit(o.p, rewrite);
         await kit.reopen();
       }
+      if (certificateGone) await rm(o.certificatePath);
       expect(kit.repo.isUnlocked(o.p.id)).toBe(false);
       const recorded = (await eventsOf(o.p.id)).filter((e) => e.action === "retention.destroyed" || (e.action === "delete" && detailsOf(e).op === "retention.destroy"));
       expect(recorded.length).toBeGreaterThan(0);
@@ -249,7 +257,7 @@ describe("a locked original at the decision (R182): its rules are read without u
       expect(err).toBeInstanceOf(DestructionRecordError);
       expect(err).toBeInstanceOf(RestoreError);
       expect(err.message).toBe(
-        'The project "Destroyed And Locked" is locked, and its audit log records that raw data was destroyed under a retention rule. This backup belongs to that project. Its destruction certificate is sealed, so while the project is locked the app cannot check the backup against it, and nothing was restored here. Unlock that project and restore the backup again, or restore the backup into another library.',
+        `The project "Destroyed And Locked" is locked, and its audit log records that raw data was destroyed under a retention rule. This backup belongs to that project. That project's destruction certificates are sealed, so while it is locked the app cannot check the backup against them, and nothing was restored here. Unlock that project and restore the backup again, or restore the backup into another library.`,
       );
       expect(err.message).not.toContain(kit.tmp);
 
