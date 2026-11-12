@@ -30,6 +30,8 @@ async function opened(memory = memoryStore(), svc = toolsService()) {
   const opener = screen.getByRole("button", { name: "Something in the app" });
   opener.focus();
   const dialog = await screen.findByRole("dialog", { name: "Optional tools" });
+  // Focus moves in from the shell's effect, just after the dialog is in the document.
+  await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
   return { user, view, dialog, opener, memory, svc };
 }
 
