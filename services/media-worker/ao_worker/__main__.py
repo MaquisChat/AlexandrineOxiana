@@ -126,7 +126,13 @@ def main() -> int:
     argv = list(sys.argv)
     try:
         check_launch(env, argv)
-        reader = StdinToken(sys.stdin.fileno())
+        # The life line is read on a private copy of the descriptor; descriptor 0 becomes /dev/null,
+        # so no tool the worker starts inherits (or reads from) the service's pipe.
+        life_line = os.dup(sys.stdin.fileno())  # not inheritable (PEP 446)
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, sys.stdin.fileno())
+        os.close(devnull)
+        reader = StdinToken(life_line)
         token = read_token(reader, TOKEN_STDIN_TIMEOUT_S)
         check_token(token, env, argv)
     except Refused as e:

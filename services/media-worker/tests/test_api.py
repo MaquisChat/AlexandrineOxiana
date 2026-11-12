@@ -189,6 +189,18 @@ def test_python_m_ao_worker_reads_its_token_on_stdin_prints_ready_and_binds_loca
     assert STDIN_TOKEN not in p.stdout.read() + p.stderr.read()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_its_own_stdin_is_not_handed_to_the_tools_it_runs(worker_env):
+    # The life line stays with the worker: what it starts (version probes, jobs) gets /dev/null.
+    p = _start()
+    try:
+        assert p.stdout.readline().startswith("AO_WORKER_READY port=")
+        assert os.readlink(f"/proc/{p.pid}/fd/0") == "/dev/null"
+    finally:
+        p.terminate()
+        p.wait(10)
+
+
 def test_exits_cleanly_when_its_stdin_closes(worker_env):
     # R155: the service's end of the pipe is gone (closed, crashed, killed): the worker stops.
     p = _start()
