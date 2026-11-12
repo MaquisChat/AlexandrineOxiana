@@ -476,7 +476,7 @@ Update after every task; commit and push.
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
 | 34b Capture screen | done | 1e10b4b | reviewed with probes over two fix rounds (R146); the service side is Task 63 |
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
-| 34d Verification badges | fix round 1 | db0030d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word; 5 Important; identifiers become confirmable (R149) |
+| 34d Verification badges | fix round 1 in re-review | 68e004a (worktree branch) | F1–F5 and the minors fixed; identifiers confirmable (R149); the real TranscriptLink mounted on the source screen |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | in progress | 69e5e6d (worktree branch) | restarted 2026-11-12 with a fresh agent, at the owner's word |
 | 62 Transcription as a job | not started | | found by the Task 34c review |
