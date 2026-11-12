@@ -36,12 +36,14 @@ export async function checkCaptureAllowed(repo: Repo, projectId: string, urls: s
   }
 }
 
-/** Source fields a person may set through confirmField (top-level bibliographic fields). */
+/**
+ * Source fields a person may set through confirmField (top-level bibliographic fields). The
+ * identifiers are not here: they are confirmed one at a time as `/identifiers/<key>` (R149).
+ */
 export const CONFIRMABLE_FIELDS: ReadonlySet<string> = new Set([
   "title",
   "creators",
   "issued",
-  "identifiers",
   "container",
   "publisher",
   "type",
@@ -103,8 +105,9 @@ async function confirmIdentifier(repo: Repo, projectId: string, sourceId: string
   }
   const pointer = `/identifiers/${key}`;
   const at = new Date().toISOString();
-  const cur = await repo.getSource(projectId, sourceId);
-  return updateSourceRechecked(repo, projectId, sourceId, { identifiers: { ...cur.source.identifiers, [key]: value } }, {
+  // The other identifiers are taken from the source as read inside the governed change, so two
+  // confirms at once both land (re-review N2: no lost update).
+  return updateSourceRechecked(repo, projectId, sourceId, (cur) => ({ identifiers: { ...cur.identifiers, [key]: value } }), {
     fieldEvidence: (c) => [...c.fieldEvidence.filter((e) => !(e.field === pointer && e.source.kind === "user")), { field: pointer, value, source: { kind: "user" }, at }],
     verification: (next) => recheckSourceFile(next, {}).verification,
   });
