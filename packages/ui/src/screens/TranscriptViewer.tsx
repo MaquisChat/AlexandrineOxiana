@@ -25,6 +25,7 @@ import { errorText, isProjectLocked, type SourceFile } from "../api/library";
 import { TRANSCRIPTION_MODELS, type TranscriptApi, type TranscriptionModel } from "../api/transcripts";
 import { MediaTicketPlayer, type PlayerControl } from "../components/MediaTicketPlayer";
 import { isPlayableRecording } from "../components/TranscriptLink";
+import { MissingToolNotice } from "../components/MissingToolNotice";
 import { UserText } from "../components/UserText";
 import { blockNavigation } from "../navigation";
 import { setTranscriptionRun, subscribeTranscriptionRuns, transcriptionRun } from "./transcriptionRuns";
@@ -155,6 +156,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
   const [refused, setRefused] = useState(false);
   const [model, setModel] = useState<TranscriptionModel>("medium");
   const [transcribeFailure, setTranscribeFailure] = useState<string | undefined>();
+  const [failedWith, setFailedWith] = useState<unknown>(); // the error behind transcribeFailure (Task 48b)
   /** This source's re-transcription in this session (it outlives the screen; R143). */
   const run = useSyncExternalStore(subscribeTranscriptionRuns, () => transcriptionRun(key));
 
@@ -431,6 +433,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
       void loadVersions({ paths: r.files });
     } else if (!sawLocked(run.error)) {
       setTranscribeFailure(transcribeError(run.error, run.model));
+      setFailedWith(run.error);
     }
   }, [run, key, loadVersions, sawLocked]);
 
@@ -762,7 +765,7 @@ function Viewer({ api, projectId, sourceId, onLocked }: TranscriptViewerProps) {
               )}
               {transcribeFailure && (
                 <p role="alert" className="ao-error">
-                  {transcribeFailure}
+                  <MissingToolNotice from={failedWith}>{transcribeFailure}</MissingToolNotice>
                 </p>
               )}
             </>

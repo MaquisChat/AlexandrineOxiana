@@ -44,6 +44,7 @@ import {
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
 import { CaptureQueue } from "../components/CaptureQueue";
+import { ToolsLink } from "../components/MissingToolNotice";
 import { useTrap } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import { inAppLink, libraryHref, navigate, normalisePath, type AppLocation } from "../navigation";
@@ -220,6 +221,7 @@ function CaptureTools({ api }: { api: ReturnType<typeof captureApi> }) {
     <section className="ao-capture__section" aria-labelledby={id}>
       <h2 id={id}>Capture tools</h2>
       <p>The downloaders change often as platforms change. Updating them can fix links that stopped working.</p>
+      <p>Install or remove the downloaders on the <ToolsLink>optional tools screen</ToolsLink>.</p>
       {versionsError && (
         <UserText as="p" className="ao-capture__note">
           {versionsError}
