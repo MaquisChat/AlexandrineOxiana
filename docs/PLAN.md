@@ -501,7 +501,7 @@ Update after every task; commit and push.
 | 37h Desktop end-to-end | done | 832e3ab | reviewed with probes over two rounds; drives the real app window and file dialog on Linux; a separate CI job for the desktop build |
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
-| 37i Guide and checklist | fix round 1 | 81c7c20 (worktree branch) | first version written against the build of 2026-11-12; it found D10–D12 and that the extension had no download (R170); accuracy review: 5 Important, 16 Minor, and defect D13 (R171) |
+| 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
 | 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
 | 65 The browser extension as a download | in progress | | dispatched 2026-11-12 |
 | 66 A paired browser survives a relaunch (D13) | not started | | waits for 46c and 65 |
