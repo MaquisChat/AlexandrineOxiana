@@ -5,13 +5,21 @@
  * reasons, which quote titles and names, never sit in plaintext. The index's `review_items` table
  * is a cache of this file; for encrypted projects it holds only field names and statuses.
  */
-import { newId } from "@ao/core";
+import { createHash } from "node:crypto";
+import { REQUIRED_FIELDS, newId } from "@ao/core";
 import { openLine, readMaybe, sealLine } from "./io.js";
-import { CHANGE_LOG_MODE, type Tx } from "./mutate.js";
+import { InvalidInputError, NotFoundError, ReviewEntryDecidedError } from "./errors.js";
+import { CHANGE_LOG_MODE, runMutation, type Tx } from "./mutate.js";
 import type { ProjectState, RepoCore } from "./state.js";
 
 export const REVIEW_FILE = "review/pending.jsonl";
 const PURPOSE = "ao-review";
+
+/**
+ * What queued a verification entry (R176 3): a capture whose fields conflict, or a consent
+ * withdrawal (the withdrawn consent records it reaches). Import entries need none: their kind says it.
+ */
+export type ReviewCause = { kind: "capture-conflict" } | { kind: "consent-withdrawal"; consentIds: string[] };
 
 export interface ReviewEntry {
   id: string;
@@ -36,9 +44,187 @@ export interface ReviewEntry {
   hints?: string[];
   /** Import items: the import batch that queued it (Bulk Import). */
   batchId?: string;
-  /** Resolved entries: when, and the decision taken (e.g. "accept", "skip", "merge"). */
+  /** Verification entries queued since R176: what queued it (older entries: see reviewCauseOf). */
+  cause?: ReviewCause;
+  /**
+   * Resolved entries: when, and the decision taken: an import decision ("accept", "skip", "merge",
+   * …, "undone"), "confirmed" or "rechecked" (a capture's conflict, R176 1),
+   * "reviewed-after-withdrawal" (R176 2), "source-removed" (R176 4).
+   */
   resolvedAt?: string;
   decision?: string;
+  /** "reviewed-after-withdrawal": the researcher's reason, as typed. */
+  reason?: string;
+}
+
+/**
+ * The cause of a verification entry (R176 3), the one place it is inferred: a recorded cause wins;
+ * an entry queued before causes were recorded is a capture's when it lists fields (captures queue
+ * their conflicting or unverified fields) and a consent withdrawal's when it lists none (withdrawals
+ * queue no fields; which consent is then unknown). Import entries have no cause.
+ */
+export function reviewCauseOf(e: Pick<ReviewEntry, "kind" | "fields" | "cause">): ReviewCause | undefined {
+  if (e.kind !== "verification") return undefined;
+  if (e.cause) return e.cause;
+  return Object.keys(e.fields ?? {}).length > 0 ? { kind: "capture-conflict" } : { kind: "consent-withdrawal", consentIds: [] };
+}
+
+/**
+ * A field a capture's entry lists holds it open only while the present report has it in conflict or
+ * unverified (coordinator's ruling 1, fix round 1): a field that has left the report (the type
+ * changed, the field was removed, a recheck no longer reports it) is settled.
+ */
+const UNSETTLED = new Set(["conflict", "unverified"]);
+
+type Reported = { source: { id: string }; verification: Record<string, { status: string }> };
+
+/** Whether `e` is a pending capture entry of `sf` none of whose listed fields is left unsettled in `sf`'s report. */
+function settledBy(e: ReviewEntry, sf: Reported): boolean {
+  if (e.status !== "pending" || e.sourceId !== sf.source.id || reviewCauseOf(e)?.kind !== "capture-conflict") return false;
+  return Object.keys(e.fields ?? {}).every((f) => !UNSETTLED.has(sf.verification[f]?.status ?? ""));
+}
+
+/** What re-examined a source's capture entries, and the decision a resolved entry records. */
+export type ReexaminedBy = "confirmation" | "recheck" | "edit";
+const DECISION: Record<ReexaminedBy, string> = { confirmation: "confirmed", recheck: "rechecked", edit: "edited" };
+
+/**
+ * Inside a running mutation that has just written `sf` with a new report (a confirm, a recheck, an
+ * edit that recomputed the report, an import decision that rewrote it; R176 1): every pending
+ * capture-conflict entry of the source none of whose listed fields is left in conflict or unverified
+ * gets its `resolved` line in the same change. Returns the ids resolved.
+ */
+export async function resolveSettledCaptureEntries(core: RepoCore, tx: Tx, sf: Reported, by: ReexaminedBy): Promise<string[]> {
+  const done: string[] = [];
+  for (const e of await readReviewEntries(core, tx.state)) {
+    if (!settledBy(e, sf)) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: DECISION[by] });
+    done.push(e.id);
+  }
+  return done;
+}
+
+/** The value a JSON pointer names ("/identifiers/doi"). */
+function valueAt(root: unknown, pointer: string): unknown {
+  let cur: unknown = root;
+  for (const part of pointer.split("/").slice(1)) {
+    if (!cur || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[part.replace(/~1/g, "/").replace(/~0/g, "~")];
+  }
+  return cur;
+}
+
+const blank = (v: unknown): boolean => v === undefined || v === null || (typeof v === "string" && v.trim() === "") || (Array.isArray(v) && v.length === 0);
+
+type Edited = { source: { id: string; type: string } & Record<string, unknown>; verification: Record<string, { status: string }> };
+
+/**
+ * After an ordinary edit (fix round 2, coordinator's ruling on I3): the edit NEVER rewrites the
+ * stored report; it only re-examines the source's pending capture entries, in its own change. A
+ * listed field counts as settled when
+ *  - it is no longer a field of the source as edited: the edit emptied it (it had a value and now
+ *    has none), or the type changed and the field has no value and is not one of the new type's
+ *    fields (`REQUIRED_FIELDS[type]`, the verification's own list of a type's fields); or
+ *  - the STORED report does not have it, or has it neither in conflict nor unverified.
+ * A listed field still there and still in conflict or unverified in the stored report keeps the entry pending.
+ */
+export async function resolveCaptureEntriesAfterEdit(core: RepoCore, tx: Tx, before: Edited, after: Edited): Promise<string[]> {
+  const typeChanged = before.source.type !== after.source.type;
+  const fieldsOfType = new Set(REQUIRED_FIELDS[after.source.type as keyof typeof REQUIRED_FIELDS] ?? REQUIRED_FIELDS.other);
+  const gone = (f: string) => {
+    const now = valueAt(after.source, f);
+    if (!blank(now)) return false;
+    if (!blank(valueAt(before.source, f))) return true; // the edit emptied it
+    return typeChanged && !fieldsOfType.has(f);
+  };
+  const done: string[] = [];
+  for (const e of await readReviewEntries(core, tx.state)) {
+    if (e.status !== "pending" || e.sourceId !== after.source.id || reviewCauseOf(e)?.kind !== "capture-conflict") continue;
+    const open = Object.keys(e.fields ?? {}).some((f) => UNSETTLED.has(after.verification[f]?.status ?? "") && !gone(f));
+    if (open) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: DECISION.edit });
+    done.push(e.id);
+  }
+  return done;
+}
+
+/** Without writing: whether a recheck would resolve any of the source's capture entries (so a recheck that changes no verification still runs). */
+export async function hasSettledCaptureEntries(core: RepoCore, st: ProjectState, sf: Reported): Promise<boolean> {
+  return (await readReviewEntries(core, st)).some((e) => settledBy(e, sf));
+}
+
+/** The policy operation and audit op of "Reviewed after the withdrawal" (R176 2). */
+export const WITHDRAWAL_REVIEWED_OP = "review.withdrawal-reviewed";
+const REASON_MAX = 2000;
+
+/**
+ * "Reviewed after the withdrawal" (R176 2): the researcher's explicit decision on an entry a consent
+ * withdrawal queued, with a reason in their own words (stored as typed). Its own policy operation
+ * (`review-withdrawal`, allowed in every profile; the engine refuses a blank reason, and the refusal
+ * is audited); one governed, audited, crash-safe change that writes only the entry's `resolved`
+ * line — nothing else about the source changes. A locked project is refused before anything is read.
+ */
+export async function reviewedAfterWithdrawal(core: RepoCore, projectId: string, entryId: string, reason: string): Promise<ReviewEntry> {
+  core.assertWritable();
+  const st = core.state(projectId);
+  core.assertUnlocked(st);
+  if (typeof reason !== "string") throw new InvalidInputError("Give a reason, in your own words.");
+  if (reason.length > REASON_MAX) throw new InvalidInputError(`Give a reason of up to ${REASON_MAX} characters.`);
+  const find = async (s: ProjectState) => {
+    const e = (await readReviewEntries(core, s)).find((x) => x.id === entryId);
+    if (!e || !e.sourceId) throw new NotFoundError("Review entry", entryId);
+    if (reviewCauseOf(e)?.kind !== "consent-withdrawal") throw new InvalidInputError("This is not an entry flagged by a consent withdrawal.");
+    if (e.status !== "pending") throw new ReviewEntryDecidedError();
+    return e;
+  };
+  const first = await find(st);
+  return runMutation(
+    core,
+    projectId,
+    { action: "review-withdrawal", reviewWithdrawal: { reason } },
+    async (tx) => {
+      // Read again inside the change: of two decisions at once, the second finds it decided.
+      const e = await find(tx.state);
+      const resolved: ReviewEntry = { ...e, status: "resolved", resolvedAt: tx.at, decision: "reviewed-after-withdrawal", reason };
+      await writeReviewLine(core, tx, resolved);
+      return resolved;
+    },
+    {
+      op: WITHDRAWAL_REVIEWED_OP,
+      entity: { type: "source", id: first.sourceId! },
+      // In an encrypted project the reason's text stays in the sealed review line only: the audit log
+      // (plain lines) records that a reason was given and its SHA-256 (coordinator's ruling 2, fix round 1).
+      auditDetails: core.encrypted(st)
+        ? { reviewEntry: entryId, reasonGiven: true, reasonSha256: createHash("sha256").update(reason, "utf8").digest("hex") }
+        : { reviewEntry: entryId, reason },
+    },
+  );
+}
+
+/** The pending entries read once per change (a change that removes many sources reads the queue once). */
+const pendingByTx = new WeakMap<Tx, ReviewEntry[]>();
+
+/**
+ * Inside the change that removes a source (R176 4): its pending entries are resolved
+ * ("source-removed"), except `keep`, an entry the caller resolves itself in this change.
+ */
+export async function resolveEntriesOfRemovedSource(core: RepoCore, tx: Tx, sourceId: string, opts: { keep?: string; decision?: "source-removed" | "undone" } = {}): Promise<string[]> {
+  let pending = pendingByTx.get(tx);
+  if (!pending) {
+    pending = (await readReviewEntries(core, tx.state)).filter((e) => e.status === "pending");
+    pendingByTx.set(tx, pending);
+  }
+  const done: string[] = [];
+  for (const e of pending) {
+    if (e.sourceId !== sourceId || e.id === opts.keep) continue;
+    await writeReviewLine(core, tx, { ...e, status: "resolved", resolvedAt: tx.at, decision: opts.decision ?? "source-removed" });
+    done.push(e.id);
+  }
+  pendingByTx.set(
+    tx,
+    pending.filter((e) => !done.includes(e.id)),
+  );
+  return done;
 }
 
 /** What a caller queues; the entry's id, project, status and time are filled in. */
@@ -53,6 +239,7 @@ export interface ReviewInput {
   duplicateOf?: { sourceId: string; reason: string };
   hints?: string[];
   batchId?: string;
+  cause?: ReviewCause;
 }
 
 /** A `review_items` row; `payload` is safe for the persistent index (nothing identifying when `encrypted`). */
@@ -108,6 +295,7 @@ export async function appendReviewEntry(
     ...(input.duplicateOf ? { duplicateOf: input.duplicateOf } : {}),
     ...(input.hints?.length ? { hints: input.hints } : {}),
     ...(input.batchId ? { batchId: input.batchId } : {}),
+    ...(input.cause ? { cause: input.cause } : {}),
   };
   await writeReviewLine(core, tx, entry);
   return entry;

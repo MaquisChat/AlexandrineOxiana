@@ -75,7 +75,7 @@ import {
 } from "./sources.js";
 import type { InternalOptions } from "./seams.js";
 import { runImportChange, type ImportOps } from "./import-ops.js";
-import { readReviewEntries, type ReviewEntry } from "./review.js";
+import { hasSettledCaptureEntries, readReviewEntries, reviewedAfterWithdrawal, type ReviewEntry } from "./review.js";
 import { DELETED_RECORDS_WARNING, deletedRecordsWarning, readTombstones, tombstoneHash } from "./tombstones.js";
 import { RepoCore, loadProjects, type RepoOptions } from "./state.js";
 import { loadPseudonyms } from "./pseudonyms.js";
@@ -253,12 +253,15 @@ export class Repo {
   /**
    * The "Recheck" action: recomputes the source's field verification from its stored evidence and,
    * when it changed, saves it as a governed, audited and change-logged update of the source.
-   * Returns the source file as stored afterwards. A source whose verification is unchanged is not written.
+   * Returns the source file as stored afterwards. A source whose verification is unchanged is not
+   * written, unless one of its capture review entries is settled by it: such entries are resolved in
+   * the recheck's own governed change (R176 1).
    */
   async recheckSource(projectId: string, id: string, ctx: VerifyContext = {}): Promise<SourceFile> {
     const cur = await this.getSource(projectId, id);
-    if (isDeepStrictEqual(recheckSourceFile(cur, ctx).verification, cur.verification)) return cur;
-    return updateSource(this.core, projectId, id, {}, { verification: (next) => recheckSourceFile(next, ctx).verification });
+    const next = recheckSourceFile(cur, ctx);
+    if (isDeepStrictEqual(next.verification, cur.verification) && !(await hasSettledCaptureEntries(this.core, this.core.state(projectId), next))) return cur;
+    return updateSource(this.core, projectId, id, {}, { verification: (n) => recheckSourceFile(n, ctx).verification, resolveReview: "recheck" });
   }
   deleteSource(projectId: string, id: string): Promise<void> {
     return deleteSource(this.core, projectId, id);
@@ -405,6 +408,13 @@ export class Repo {
   /** Marks the consent withdrawn and queues every source linked to its participant for review; deletes nothing. */
   withdrawConsent(projectId: string, id: string, opts?: { reason?: string }): Promise<{ consent: ConsentRecord; flaggedSourceIds: string[] }> {
     return withdrawConsent(this.core, projectId, id, opts);
+  }
+  /**
+   * "Reviewed after the withdrawal" (R176 2): resolves a review entry a consent withdrawal queued,
+   * with the researcher's reason (required, stored as typed). Changes nothing else about the source.
+   */
+  reviewedAfterWithdrawal(projectId: string, entryId: string, reason: string): Promise<ReviewEntry> {
+    return reviewedAfterWithdrawal(this.core, projectId, entryId, reason);
   }
   /** Only when no consent record, session or source links to it (FieldworkInUseError otherwise). */
   deleteParticipant(projectId: string, id: string): Promise<void> {

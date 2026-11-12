@@ -11,10 +11,10 @@
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
 import { isId } from "@ao/core/src/ids";
-import { PICTURE_MAX_BYTES, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
+import { PICTURE_MAX_BYTES, type ProjectReviewPage, type ReviewCause, type ReviewGroup, type WithdrawalReviewedRequest, type WithdrawalReviewedResponse, type SecretDeleteResponse, type SecretPutRequest, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import type { ApiClient } from "./client";
 
-export type { ZoteroDataFolder };
+export type { ProjectReviewPage, ReviewCause, ReviewGroup, WithdrawalReviewedResponse, ZoteroDataFolder };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -164,6 +164,10 @@ export interface ReviewItem {
   batchId?: string;
   /** The source's current title, sent with the item (R118); the source itself is fetched only when it is missing. */
   title?: string;
+  /** In the project's whole queue (Task 67): where the entry came from. */
+  group?: ReviewGroup;
+  /** Verification entries: what queued it (R176 3). */
+  cause?: ReviewCause;
 }
 
 export type ReviewDecision =
@@ -327,11 +331,26 @@ export function importApi(client: ApiClient) {
     undo: (batchId: string) => r<UndoResult>("POST", `/imports/${bid(batchId)}/undo`),
     report: (batchId: string) => r<ImportReport>("GET", `/imports/${bid(batchId)}/report`),
     review: async (batchId: string) => (await r<{ items: ReviewItem[] }>("GET", `/imports/${bid(batchId)}/review`)).items,
+    /** One page of the project's whole review queue (Task 67, R172): every pending entry of every kind, oldest first. */
+    projectReview: async (projectId: string, q: { offset?: number; limit?: number; source?: string } = {}) => {
+      const page = await r<ProjectReviewPage>("GET", `/projects/${pid(projectId)}/review`, {
+        query: { ...(q.offset ? { offset: q.offset } : {}), ...(q.limit !== undefined ? { limit: q.limit } : {}), ...(q.source ? { source: q.source } : {}) },
+      });
+      // Every field of the shared entry is typed through; only the candidates (lookup results) are narrowed.
+      const items: ReviewItem[] = page.items.map(({ candidates, ...e }) => ({ ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) }));
+      return { ...page, items };
+    },
 
     /** Review routes take the project in the body (R97). */
     decide: (projectId: string, itemId: string, decision: ReviewDecision) => {
       pid(projectId);
       return r<{ decided: boolean }>("POST", `/review/${seg(itemId)}/decide`, { body: { projectId, decision } });
+    },
+    /** "Reviewed after the withdrawal" (R176 2): the reason is required and sent exactly as typed. */
+    reviewedAfterWithdrawal: (projectId: string, itemId: string, reason: string) => {
+      pid(projectId);
+      const body: WithdrawalReviewedRequest = { projectId, reason };
+      return r<WithdrawalReviewedResponse>("POST", `/review/${seg(itemId)}/reviewed-after-withdrawal`, { body });
     },
     bulkEdit: (projectId: string, itemIds: string[], patch: ReviewPatch) => {
       pid(projectId);

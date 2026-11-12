@@ -363,6 +363,11 @@ export function libraryApi(client: ApiClient) {
       attach: async (pid: string, paths: string[], toSourceId?: string) =>
         (await r<{ items: AttachOutcome[] }>("POST", `${proj(pid)}/attach`, { body: { paths, ...(toSourceId ? { toSourceId } : {}) } })).items,
     },
+    /** The project's whole review queue (Task 67): how many entries wait (only the total is asked for). */
+    reviewQueue: {
+      count: async (pid: string, opts: { signal?: AbortSignal } = {}) =>
+        (await r<{ total: number }>("GET", `${proj(pid)}/review`, { query: { limit: 0 }, ...(opts.signal ? { signal: opts.signal } : {}) })).total,
+    },
     /** Field verification, recheck, pictures and retries (Task 34d, api/verification.ts). */
     verification: verificationApi(client),
     citations: {

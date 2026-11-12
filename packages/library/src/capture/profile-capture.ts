@@ -817,7 +817,7 @@ export function createProfileCapture(core: CaptureCore) {
       provenance,
       fieldEvidence: evidence,
       verification: report.fields,
-      ...(conflicts.length ? { reviewItem: { fields: Object.fromEntries(conflicts.map(([k, v]) => [k, v.status])), reasons: report.reasons } } : {}),
+      ...(conflicts.length ? { reviewItem: { fields: Object.fromEntries(conflicts.map(([k, v]) => [k, v.status])), reasons: report.reasons, cause: { kind: "capture-conflict" as const } } } : {}),
     });
     return sf.source.id;
   }

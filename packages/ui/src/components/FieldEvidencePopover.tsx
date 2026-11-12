@@ -32,6 +32,8 @@ const IDENTIFIERS = new Set(CONFIRMABLE_IDENTIFIER_KEYS);
 const TYPABLE = new Set([
   "/title", "/container", "/issued", "/publisher", "/volume", "/issue", "/page", "/edition", "/numberOfPages", "/publisherPlace", "/collectionTitle", "/collectionNumber", "/genre", "/medium", "/number",
   ...CONFIRMABLE_IDENTIFIER_KEYS.map((k) => `/identifiers/${k}`),
+  // Names, separated by semicolons (a missing creator can be typed, Task 67 fix round 1).
+  "/creators",
 ]);
 const MULTI_TEXT = new Set(["/title", "/container"]);
 
@@ -84,6 +86,14 @@ function whenText(at: string): string | undefined {
  * versions (languages and kinds) and changes only the first version's text.
  */
 export function recordValue(field: string, chosen: unknown, current: unknown): unknown {
+  // Typed creators: names separated by semicolons, each recorded as a name in full.
+  if (field === "/creators" && typeof chosen === "string") {
+    return chosen
+      .split(";")
+      .map((n) => n.trim())
+      .filter(Boolean)
+      .map((literal) => ({ literal, role: "author" }));
+  }
   if (!MULTI_TEXT.has(field) || typeof chosen !== "string") return chosen;
   const variants = isObj(current) && Array.isArray(current.variants) ? (current.variants as Array<Record<string, unknown>>) : [];
   const first = variants[0] ?? { kind: "original" };
@@ -121,7 +131,9 @@ export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm
   const choices: Choice[] = [];
   if (!isEmpty(value)) choices.push({ key: "recorded", text: valueText(value), from: "the value recorded here", value });
   if (conflict) for (const c of competing) if (!choices.some((x) => x.text === c.text)) choices.push(c);
-  if (typable && (conflict || isEmpty(value))) choices.push({ key: "type", text: "Type another value", from: "", value: undefined });
+  // Creators are typed only where there is no value at all: in a conflict the structured values compete and are chosen as they are (fix round 2, N2).
+  const offerTyping = typable && (field === "/creators" ? isEmpty(value) : conflict || isEmpty(value));
+  if (offerTyping) choices.push({ key: "type", text: "Type another value", from: "", value: undefined });
   const asChoices = confirmable && choices.length > 1;
 
   const [picked, setPicked] = useState<string>(choices[0]?.key ?? "type");
@@ -131,7 +143,7 @@ export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm
 
   const choice = choices.find((c) => c.key === picked);
   const chosen = picked === "type" ? typed.trim() : choice?.value;
-  const canConfirm = confirmable && !readOnly && !saving && !!choice && !isEmpty(chosen);
+  const canConfirm = confirmable && !readOnly && !saving && !!choice && !isEmpty(chosen) && !isEmpty(recordValue(field, chosen, value));
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -216,7 +228,12 @@ export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm
           {confirmable && picked === "type" && (
             <div className="ao-cite__field">
               <label htmlFor={`${id}-typed`}>Your value</label>
-              <input id={`${id}-typed`} dir="auto" value={typed} disabled={saving} onChange={(e) => setTyped(e.target.value)} />
+              <input id={`${id}-typed`} dir="auto" value={typed} disabled={saving} onChange={(e) => setTyped(e.target.value)} aria-describedby={field === "/creators" ? `${id}-typed-hint` : undefined} />
+              {field === "/creators" && (
+                <p id={`${id}-typed-hint`} className="ao-muted">
+                  Separate names with a semicolon, for example “Harbour Collective; Ana Souza”.
+                </p>
+              )}
             </div>
           )}
           {!confirmable && <p className="ao-muted">This field cannot be confirmed from this screen.</p>}

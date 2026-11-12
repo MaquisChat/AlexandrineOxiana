@@ -118,6 +118,44 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     expect(onConfirm).toHaveBeenCalledWith("/issued", "2018-05");
   });
 
+  it("creators with no value (Task 67 fix round 1, I1): names can be typed, separated by semicolons, and are recorded as a list of creators", async () => {
+    const onConfirm = vi.fn(noop);
+    const user = userEvent.setup();
+    const review: FieldReview = { field: "/creators", status: "unverified", checks: [], reason: "No creator was found.", evidence: [] };
+    render(<FieldCheck review={review} label="Creators" value={[]} readOnly={false} onConfirm={onConfirm} />);
+    await user.click(screen.getByRole("button", { name: "Creators: Unverified" }));
+    const box = screen.getByRole("textbox", { name: "Your value" });
+    expect(document.activeElement === box || screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    expect(screen.getByText(/separate names with a semicolon/i)).toBeTruthy();
+    await user.type(box, "Harbour Collective;  Ana Souza ; ");
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(onConfirm).toHaveBeenCalledWith("/creators", [
+      { literal: "Harbour Collective", role: "author" },
+      { literal: "Ana Souza", role: "author" },
+    ]);
+  });
+
+  it("creators in conflict (fix round 2, N2): no typing is offered; the chosen competing value keeps its structure", async () => {
+    const onConfirm = vi.fn(noop);
+    const user = userEvent.setup();
+    const recorded = [{ family: "Souza", given: "Ana", role: "author" }];
+    const other = [{ handle: "@harbourco", literal: "Harbour Collective", role: "uploader" }];
+    const review: FieldReview = {
+      field: "/creators",
+      status: "conflict",
+      checks: ["sources-agree"],
+      values: [{ value: other, from: { kind: "platform-json", label: "the platform's data" } }],
+      evidence: [],
+    };
+    render(<FieldCheck review={review} label="Creators" value={recorded} readOnly={false} onConfirm={onConfirm} />);
+    await user.click(screen.getByRole("button", { name: "Creators: Conflict" }));
+    expect(screen.queryByRole("radio", { name: "Type another value" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Your value" })).toBeNull();
+    await user.click(screen.getByRole("radio", { name: /Harbour Collective/ }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(onConfirm).toHaveBeenCalledWith("/creators", other);
+  });
+
   it("an empty typed value is not sent", async () => {
     const onConfirm = vi.fn(noop);
     const user = userEvent.setup();
