@@ -276,7 +276,9 @@ function report(label, ok, detail = "") {
 
 /** Starts the shell and waits for the service, the window and the probe's result; returns the helpers' pids. */
 async function upAndProbed(run, media, problems) {
-  const svc = await until("the service's ready report", 120_000, async () => run.find("service") ?? ((await Promise.race([run.exit, sleep(0)])) && Promise.reject(new Error(`the shell exited: ${run.log().slice(-2000)}`))));
+  const svc = await until("the service's ready report", 120_000, async () => run.find("service") ?? ((await Promise.race([run.exit, sleep(0)])) && Promise.reject(new Error(`the shell exited: ${run.log().slice(-2000)}`)))).catch((err) => {
+    throw new Error(`${run.label}: ${err.message}\n--- the shell's output (end) ---\n${run.lines.slice(-20).join("\n")}\n${run.log().slice(-3000)}`);
+  });
   const win = await until("the window", 60_000, async () => run.find("window"));
   report(`${run.label}: the window exists and is visible`, win.label === "main" && win.visible) || problems.push("window");
   const probe = await until("the page's probe", 180_000, async () => run.find("probe"));
