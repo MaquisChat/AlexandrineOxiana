@@ -493,7 +493,7 @@ Update after every task; commit and push.
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
-| 49 Backups governed | round 5 in re-review | d59a52b (worktree branch) | a pass writes nothing on an unverified chain; a restore copies certificates byte for byte (R175) |
+| 49 Backups governed | approved; taking the working branch, then verification | d59a52b (worktree branch) | R147 met after five rounds (re-scoped at the fourth); reviewed with probes; D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
