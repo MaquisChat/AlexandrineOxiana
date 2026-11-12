@@ -67,8 +67,8 @@ export function strArray<O extends object = Obj>(o: O, key: keyof O & string, op
 
 export function optObj<O extends object = Obj>(o: O, key: keyof O & string): Obj | undefined {
   const v = (o as Obj)[key];
-
   if (v === undefined || v === null) return undefined;
+
   if (typeof v !== "object" || Array.isArray(v)) throw badRequest(`"${key}" must be an object.`);
   return v as Obj;
 }

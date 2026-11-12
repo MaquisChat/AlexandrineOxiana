@@ -190,8 +190,11 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const sid = paramsOf(req).sid ?? "";
     await sourceOf(ctx, projectId, sid);
     const b = bodyAs<FieldConfirmRequest>(req);
+    // Read through the request type before the presence check, which would otherwise let any key compile (R184).
+    const value = b.value;
     if (!("value" in b)) throw badRequest('"value" is required.');
-    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), b.value));
+    return record(await confirmField(s.repo, projectId, sid, str(b, "field", 64), value));
+
   });
 
   app.post("/projects/:id/sources/:sid/recheck", async (req): Promise<SourceFile & SourceRecordExtras> => {

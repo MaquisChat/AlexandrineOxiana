@@ -5,8 +5,8 @@
  */
 import { CslBundleMissingError, CustomStyleSandboxError, GovernanceParseError, ParticipantCodeMissingError, UnknownStyleError } from "@ao/core";
 import type { ServiceErrorBody, ServiceErrorCode } from "@ao/shared";
-
 import { PairingsUnreadableError } from "./auth.js";
+
 import {
   AcknowledgementRequiredError,
   PendingWriteChoiceError,

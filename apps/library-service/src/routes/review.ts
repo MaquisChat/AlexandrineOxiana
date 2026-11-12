@@ -4,7 +4,7 @@
  * a source flagged by a consent withdrawal was reviewed (R176 2).
  */
 import type { FastifyInstance } from "fastify";
-import { isId } from "@ao/core";
+import { isId, type SourceDraft } from "@ao/core";
 import { reviewCauseOf, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "@ao/library";
 import {
   PROJECT_REVIEW_PAGE_MAX,
@@ -18,7 +18,9 @@ import {
   type ReviewDecideRequest,
   type ReviewDecideResponse,
   type ReviewDecisionAction,
+  type ReviewDraft,
   type ReviewEntryDecision,
+
   type ReviewEntryPatch,
   type WithdrawalReviewedRequest,
   type WithdrawalReviewedResponse,
@@ -58,6 +60,9 @@ true satisfies Same<ReviewDecision["action"], ReviewDecisionAction>;
 true satisfies Same<Exclude<ReviewDecision, { action: "accept" }>, Exclude<ReviewEntryDecision, { action: "accept" }>>;
 true satisfies Same<Omit<ReviewPatch, "type">, Omit<ReviewEntryPatch, "type">>;
 true satisfies Same<keyof ReviewPatch, keyof ReviewEntryPatch>;
+// Every key of the accept decision's draft is one the library's SourceDraft reads: the library skips
+// a key it does not know, so a renamed key would drop the researcher's correction silently (I2).
+true satisfies ([keyof ReviewDraft] extends [keyof SourceDraft] ? true : false);
 const ACTIONS: ReadonlySet<string> = new Set(REVIEW_DECISION_ACTIONS);
 
 /** The project of a review item: named in the body (review ids are per project). */
