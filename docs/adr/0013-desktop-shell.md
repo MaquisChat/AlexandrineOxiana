@@ -84,7 +84,7 @@ folder was built with (`build-info.json`), and the allow-listed environment abov
 is written on standard input as one line (R98); the service refuses to start if `AO_SERVICE_TOKEN`
 is set or if it is given any argument. `AO_WORKER_BIN` names the packaged media worker
 (Task 37d), which is not part of this folder. The service prints `AO_SERVICE_READY port=<n>` when
-it listens and stops cleanly on SIGTERM.
+it listens and stops cleanly on SIGTERM or at the end of its standard input (R155).
 
 The smoke run (`pnpm --filter @ao/library-service run smoke`, and a CI step on Linux) builds the
 folder, copies it to an empty temporary folder outside the repository, plants a module that leaves
@@ -124,6 +124,41 @@ running after SIGTERM and that no planted module was loaded. It then starts the 
 - **The memory ceiling** is a start-up flag in both cases; with Node beside the bundle the shell
   passes it on the command line, where it is visible and testable.
 
+### How the shell starts and stops it (Task 37c, R155)
+
+The Tauri shell (`apps/desktop/src-tauri`) starts **one** helper, this folder; the service starts
+the media worker itself, as it always has.
+
+- **Where the helpers are.** In a packaged app: `<resources>/node/node`, `<resources>/library-service/`
+  and `<resources>/ao-worker/ao-worker` (the worker is optional; without it the service runs with
+  `AO_NO_WORKER=1`). A debug build may instead be given `AO_DESKTOP_NODE`, `AO_DESKTOP_SERVICE_DIR`
+  and `AO_DESKTOP_WORKER_BIN` in its own environment; a release build ignores them (R153). Copying
+  the three into the bundle's resources is the Mac build's step (Task 37f).
+- **The start.** `node --max-old-space-size=512 <folder>/service.mjs`, working directory the folder,
+  in its own process group, with `env_clear()` and then only: `PATH` (the tools folder's `bin`
+  first; empty entries dropped), `HOME`, `USER`, `LOGNAME`, `TMPDIR`/`TEMP`/`TMP`, `LANG`,
+  `LANGUAGE`, `LC_*`, `TZ`, `XDG_*`, `DBUS_SESSION_BUS_ADDRESS` (the keychain on Linux), the proxy
+  variables in both letter cases, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `TESSDATA_PREFIX`, and the
+  shell's own settings `AO_SERVICE_PORT=0`, `AO_TOOLS_DIR` and `AO_MODELS_DIR` (in the app's data
+  folder) and `AO_WORKER_BIN` (or `AO_NO_WORKER=1`). Never `NODE_OPTIONS`, `NODE_PATH`,
+  `NAPI_RS_NATIVE_LIBRARY_PATH` or any token or passphrase variable (`src/helper_env.rs`, each name
+  with its reason). Not passed: `AO_CONFIG_DIR` and `AO_LIBRARY` (the service's defaults apply).
+- **The token.** 32 bytes from the operating system's random source, as 64 hexadecimal characters,
+  new on every launch, written as one line on the service's standard input, and otherwise only in
+  the page's initialization script; never on disk, in a log or on a command line.
+- **Ready.** The shell waits up to 60 s for `AO_SERVICE_READY port=<n>`; otherwise it stops the
+  service and shows an error window with the service's own plain sentence (or a plain one of its
+  own) and exits non-zero. No app window is opened before the service is ready.
+- **Standard input is the life line (R155 rule 3).** The service keeps reading its standard input
+  after the token line and treats its end as "shut down cleanly", exactly like SIGTERM; it writes
+  the worker's own token on the worker's standard input the same way, and the worker does the same.
+  So a shell that crashes or is killed leaves no service, and a service that is killed leaves no
+  worker. Anyone starting the folder by hand keeps the pipe open (`{ printf '%s\n' "$TOKEN"; cat; } | node …`).
+- **Closing.** When the last window closes (or on SIGTERM, SIGINT, SIGHUP) the shell closes the
+  service's standard input and waits until no process of the service's process group is left (on
+  Linux it is the "child subreaper", so the orphaned worker is reaped by it), for up to 95 s, which
+  is more than the service's own forced exit (90 s); then it kills the group.
+
 ## Consequences
 
 - The shell ships two things per architecture: a Node 22 binary and this folder. The folder must be
@@ -135,9 +170,10 @@ running after SIGTERM and that no planted module was loaded. It then starts the 
 - A new dependency that loads files by a path relative to its own source, or a module by a computed
   name, either goes through `resources.ts` or is added to the kept packages in the build script; the
   build's check and the smoke run catch the cases they can see.
-- The desktop shell (Task 37c) starts the service, and the worker, with an allow-listed
-  environment built from the list above, never its own (R153), and writes the token on standard
-  input. A new environment variable the service needs is added to that list here and in START.txt.
+- The desktop shell (Task 37c) starts the service with an allow-listed environment built from the
+  list above, never its own (R153), and writes the token on standard input; the service starts the
+  worker (R155). A new environment variable the service needs is added to that list here, in
+  START.txt and in `apps/desktop/src-tauri/src/helper_env.rs`.
 - A dependency that loads a package the folder does not contain fails the build until the package
   is copied or a stub with a reason is added; the smoke run's planted modules catch what a static
   scan of `require`/`import` cannot see (an aliased `require`).
