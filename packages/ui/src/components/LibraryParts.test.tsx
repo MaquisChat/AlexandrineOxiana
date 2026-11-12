@@ -191,6 +191,32 @@ describe("SourceTable", () => {
     expect(rows[2]!.textContent).not.toContain("annotation");
   });
 
+  it("marks in words a source no longer available at its source, with the date it was noticed; nothing for an available, incomplete or unknown status (Task 69, D17)", () => {
+    const base = { projectId: "p1", type: "social-post", creatorsText: "", folder: "f", needsReview: false, locked: false };
+    render(
+      <SourceTable
+        items={[
+          { ...base, id: "a", title: "Gone post", availability: { status: "unavailable-on-platform", firstNoticedAt: "2026-11-03T12:00:00.000Z" } },
+          { ...base, id: "b", title: "Gone, date unknown", availability: { status: "unavailable-on-platform" } },
+          { ...base, id: "c", title: "Present post", availability: { status: "available" } },
+          { ...base, id: "d", title: "Part saved", availability: { status: "incomplete", firstNoticedAt: "2026-11-03T12:00:00.000Z" } },
+          { ...base, id: "e", title: "Future", availability: { status: "some-future-status" } },
+          { ...base, id: "f", title: "No field" },
+        ]}
+        total={6}
+        onOpen={vi.fn()}
+      />,
+    );
+    const rows = within(screen.getByRole("table", { name: "Sources" })).getAllByRole("row");
+    const marks = screen.getAllByRole("note");
+    expect(marks.map((m) => m.getAttribute("aria-label"))).toEqual(["No longer available at its source, noticed on Nov 3, 2026", "No longer available at its source"]);
+    expect(within(rows[1]!).getByRole("note", { name: "No longer available at its source, noticed on Nov 3, 2026" }).textContent).toBe("No longer available at its source, noticed on Nov 3, 2026");
+    expect(within(rows[2]!).getByRole("note").textContent).toBe("No longer available at its source");
+    for (const r of rows.slice(3)) expect(r.textContent).not.toMatch(/available|noticed/i);
+    // Words, not colour alone: a badge from the theme's classes.
+    expect(marks[0]!.className).toContain("ao-badge");
+  });
+
   it("says when only part of a source's annotations is searchable, when the index is incomplete, and when search covers titles only (R161)", () => {
     const base = { projectId: "p1", type: "book", creatorsText: "", folder: "f", needsReview: false, locked: false };
     const { rerender } = render(

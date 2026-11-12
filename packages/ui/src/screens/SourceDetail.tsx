@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { errorText, isProjectLocked, type Asset, type Creator, type LibraryApi, type SourcePatch } from "../api/library";
 import { isShowablePicture, type FieldReview, type PendingJob, type VerifiedSource } from "../api/verification";
+import { AvailabilityMark, availabilityText } from "../components/AvailabilityMark";
 import { CitePanel } from "../components/CitePanel";
 import { SourceToolNotice } from "../components/MissingToolNotice";
 import { typeLabel } from "../components/SourceTable";
@@ -437,6 +438,11 @@ export function SourceDetail({ api, projectId, sourceId, readOnly, onClose, onCh
             </UserText>
             {badge("/title")}
           </div>
+          {availabilityText(src.availability) && (
+            <p>
+              <AvailabilityMark availability={src.availability} />
+            </p>
+          )}
           {variants.slice(1).map((v, i) => (
             <p key={i} className="ao-muted">
               <UserText lang={v.lang}>{v.value}</UserText>

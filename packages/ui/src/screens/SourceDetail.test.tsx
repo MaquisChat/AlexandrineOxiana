@@ -38,6 +38,23 @@ describe("SourceDetail", () => {
     expect(within(region).getByText("smith-2019.pdf")).toBeTruthy();
   });
 
+  it("says in words that the source is no longer available at its source, with the date noticed; nothing while it is available (Task 69, D17)", async () => {
+    const gone = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "unavailable-on-platform", firstNoticedAt: "2026-11-03T12:00:00.000Z" } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(gone)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
+    const { unmount } = render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region = await screen.findByRole("region", { name: "Source details" });
+    const mark = await within(region).findByRole("note", { name: "No longer available at its source, noticed on Nov 3, 2026" });
+    expect(mark.textContent).toBe("No longer available at its source, noticed on Nov 3, 2026");
+    unmount();
+
+    const here = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, availability: { status: "available" } } };
+    server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(here)));
+    render(<SourceDetail api={testApi()} projectId="p1" sourceId="s1" readOnly={false} onClose={vi.fn()} />);
+    const region2 = await screen.findByRole("region", { name: "Source details" });
+    await within(region2).findByRole("heading", { name: "Ethnography at Work" });
+    expect(within(region2).queryByText(/no longer available/i)).toBeNull();
+  });
+
   it("the title heading itself takes its direction from the text (D7): an Arabic title's heading is dir=auto, not only its inline text", async () => {
     const arabic = { ...SOURCE_FILE, source: { ...SOURCE_FILE.source, title: { variants: [{ lang: "ar", kind: "original", value: "دراسة ميدانية في القاهرة" }] } } };
     server.use(http.get(url("/projects/:id/sources/:sid"), () => HttpResponse.json(arabic)), http.get(url("/styles"), () => HttpResponse.json(STYLES)));
