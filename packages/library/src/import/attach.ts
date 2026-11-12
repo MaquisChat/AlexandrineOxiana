@@ -38,7 +38,7 @@
  * locked (`HttpClient.purgeSensitive`); the Repo has no lock hook or event yet (carried to Task 30).
  */
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
+import { libraryVersion } from "../resources.js";
 import { fileTypeFromFile } from "file-type";
 import { findDuplicate, type DupKey, type FileNamePattern, type SourceFile } from "@ao/core";
 import { UnsafeFileError, extractMetadata } from "../extract/index.js";
@@ -55,7 +55,7 @@ import { findSidecars } from "./sidecar.js";
 
 export { LOCATION_REASON };
 
-const VERSION: string = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
+const VERSION: string = libraryVersion();
 
 export type AttachStatus = "created" | "attached" | "duplicate" | "needs-review" | "failed";
 

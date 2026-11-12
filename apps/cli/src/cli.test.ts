@@ -141,7 +141,7 @@ describe("library and project", () => {
     });
     expect(r.code, r.stderr).toBe(0);
     const names = JSON.parse(await readFile(dump, "utf8")) as string[];
-    expect(names).toContain("AO_WORKER_TOKEN"); // its own token, set by the app for it
+    expect(names).not.toContain("AO_WORKER_TOKEN"); // its own token arrives on standard input (R155)
     expect(names).not.toContain("AO_PASSPHRASE");
   });
 

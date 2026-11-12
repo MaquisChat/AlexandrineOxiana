@@ -17,7 +17,7 @@ import { PolicyDeniedError, type Repo } from "../repo/index.js";
 import { decryptBytes } from "../repo/io.js";
 import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient } from "../worker-client.js";
-import { AcknowledgementRequiredError } from "./errors.js";
+import { AcknowledgementRequiredError, toolMissingReason } from "./errors.js";
 import { createLinkCapture, type LinkCapture } from "./link-capture.js";
 import { FAKE_TOOLS_DIR, startToolWorker, type ToolWorker } from "./testing.js";
 
@@ -750,5 +750,16 @@ consent:
     expect(await readdir(join(lib.root, p.folder, "profiles"))).toEqual(["tiktok-fake.dancer"]);
     const prof = await repo.getSource(p.id, r.profileSourceId!);
     expect(prof.fieldEvidence.find((e) => e.field === "/identifiers/url")).toMatchObject({ source: { kind: "platform-json" } });
+  });
+});
+
+describe("a missing tool (Task 48a, R126)", () => {
+  it("a profile run without the video downloader fails naming it, with a sentence that says how to get it", async () => {
+    const w = await startToolWorker({ missing: ["video-downloader"] });
+    closers.push(() => w.close());
+    const c = createLinkCapture({ repo, worker: new WorkerClient({ repo, worker: w, index: { db: handle.db }, pollMs: 5 }), index: handle });
+    const p = await project();
+    const r = await c.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    expect(r).toMatchObject({ status: "failed", errorCode: "TOOL_NOT_INSTALLED", tool: "video-downloader", reason: toolMissingReason("video-downloader") });
   });
 });

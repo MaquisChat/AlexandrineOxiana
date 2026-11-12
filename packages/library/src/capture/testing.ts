@@ -133,7 +133,7 @@ async function runTranscribe(body: SubmittedJob): Promise<Record<string, unknown
 }
 
 /** Starts the stand-in worker on 127.0.0.1 (random port). */
-export async function startToolWorker(opts: { beforeCapture?: (job: SubmittedJob) => void | Promise<void> } = {}): Promise<ToolWorker> {
+export async function startToolWorker(opts: { beforeCapture?: (job: SubmittedJob) => void | Promise<void>; missing?: string[] } = {}): Promise<ToolWorker> {
   const jobs = new Map<string, { type: string; final: Record<string, unknown> }>();
   const submitted: SubmittedJob[] = [];
   let n = 0;
@@ -156,7 +156,11 @@ export async function startToolWorker(opts: { beforeCapture?: (job: SubmittedJob
       let final: Record<string, unknown>;
       try {
         if (body.type === "capture.download") await opts.beforeCapture?.(body);
-        final = body.type === "capture.download" ? await runCapture(body) : body.type === "audio.transcribe" ? await runTranscribe(body) : { status: "failed", error: { code: "UNSUPPORTED", message: "stub" } };
+        // As the Python worker: a job whose optional tool is missing fails naming it (Task 48a).
+        const tool =
+          body.type === "capture.download" ? (body.params.tool === "gallery-dl" ? "image-downloader" : "video-downloader") : body.type === "audio.transcribe" ? `speech-${String(body.params.model ?? "large-v3")}` : "";
+        if (tool && opts.missing?.includes(tool)) final = { status: "failed", error: { code: "TOOL_NOT_INSTALLED", message: `${tool} is not installed`, tool } };
+        else final = body.type === "capture.download" ? await runCapture(body) : body.type === "audio.transcribe" ? await runTranscribe(body) : { status: "failed", error: { code: "UNSUPPORTED", message: "stub" } };
       } catch (err) {
         final = { status: "failed", error: { code: "STUB_ERROR", message: String(err) } };
       } finally {

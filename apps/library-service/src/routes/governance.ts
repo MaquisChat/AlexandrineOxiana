@@ -14,7 +14,7 @@ import { userInfo } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { isAlias, isNode, parseDocument, visit } from "yaml";
 import { effectivePolicy, parseGovernance } from "@ao/core";
-import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, researcherName, retentionDue, scrubPaths } from "@ao/library";
+import { GOVERNANCE_MAX_BYTES, addProtocolDocuments, destroyRaw, listProtocolDocuments, researcherName, retentionDue, scrubPaths, setProjectTimeZone } from "@ao/library";
 import { badRequest } from "../errors.js";
 import { bodyOf, optBool, optStr, projectParam, str, strArray, type Ctx } from "./util.js";
 
@@ -126,7 +126,20 @@ export function registerGovernance(app: FastifyInstance, ctx: Ctx): void {
       const sf = await s.repo.getSource(projectId, d.sourceId);
       out.push({ sourceId: d.sourceId, title: sf.source.title.variants[0]?.value ?? "", assetIds: d.assetIds });
     }
-    return { destroyAfter, due: out };
+    // The time zone the retention date is read in (R92, R93); null: UTC.
+    return { destroyAfter, timeZone: s.repo.getProject(projectId).timeZone ?? null, due: out };
+  });
+
+  // The project's time zone (R93): a real IANA zone name, or null to read its dates in UTC again.
+  app.put("/projects/:id/time-zone", async (req) => {
+    const s = state.requireWritable();
+    const projectId = projectParam(ctx, req);
+    const b = bodyOf(req);
+    if (!("timeZone" in b)) throw badRequest('"timeZone" is required (a time zone name such as Europe/Berlin, or null for UTC).');
+    const tz = b.timeZone;
+    if (tz !== null && (typeof tz !== "string" || tz.length > 64)) throw badRequest('"timeZone" must be a time zone name such as Europe/Berlin, or null for UTC.');
+    const p = await setProjectTimeZone(s.repo, projectId, tz);
+    return { timeZone: p.timeZone ?? null };
   });
 
   app.post("/projects/:id/retention/destroy", async (req) => {

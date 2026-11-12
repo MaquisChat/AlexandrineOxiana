@@ -147,6 +147,37 @@ describe("Library screen", () => {
     expect(await screen.findByText(/last automatic backup of Dissertation failed/)).toBeTruthy();
   });
 
+  it("N3: when an index rebuild finishes the sources are read again, so the 'needs rebuilding' note goes", async () => {
+    let calls = 0;
+    let firstListed: () => void = () => {};
+    const listed = new Promise<void>((r) => (firstListed = r));
+    const enc = new TextEncoder();
+    const frame = (type: string, data: unknown) => enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+    server.use(
+      http.get(url("/projects/:id/sources"), () => {
+        calls++;
+        if (calls === 1) setTimeout(firstListed, 0);
+        return HttpResponse.json({ ...SOURCES, ...(calls === 1 ? { incomplete: true } : {}) });
+      }),
+      // The rebuild's last progress event arrives once the list (marked incomplete) is on screen.
+      http.get(url("/events"), () => {
+        const stream = new ReadableStream<Uint8Array>({
+          async start(c) {
+            c.enqueue(frame("library.state", { open: true, ...CURRENT_RW, integrityWarnings: [], projectWarnings: {} }));
+            await listed;
+            c.enqueue(frame("job.progress", { kind: "index", done: 10, total: 10 }));
+          },
+        });
+        return new HttpResponse(stream, { headers: { "content-type": "text/event-stream" } });
+      }),
+      ...libraryHandlers(),
+    );
+    renderLibrary();
+    expect(await screen.findByText(/needs rebuilding/)).toBeTruthy();
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(screen.queryByText(/needs rebuilding/)).toBeNull());
+  });
+
   it("index rebuilding progress from job.progress events", async () => {
     server.use(...libraryHandlers({ events: [{ type: "job.progress", data: { kind: "index", done: 3, total: 10 } }] }));
     renderLibrary();

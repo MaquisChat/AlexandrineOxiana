@@ -103,8 +103,54 @@ def worker(worker_env, caplog):
         yield client
     finally:
         server.manager.shutdown()
+        server.tool_manager.shutdown()
         server.shutdown()
         server.server_close()
+
+
+class NoNetwork:
+    """Refuses every outgoing connection of this process except to the in-process worker, and
+    records each attempt (host, port). Proxy variables are cleared, so a request cannot reach a
+    local proxy either."""
+
+    def __init__(self, monkeypatch):
+        import socket
+
+        self.attempts: list[tuple] = []
+        self.allowed_ports: set[int] = set()
+        real_connect = socket.socket.connect
+        outer = self
+
+        def connect(sock, address):
+            if isinstance(address, tuple) and address[0] in ("127.0.0.1", "::1", "localhost") and address[1] in outer.allowed_ports:
+                return real_connect(sock, address)
+            outer.attempts.append(address)
+            raise ConnectionRefusedError(111, "network blocked by the test")
+
+        def connect_ex(sock, address):
+            try:
+                connect(sock, address)
+                return 0
+            except ConnectionRefusedError:
+                return 111
+
+        monkeypatch.setattr(socket.socket, "connect", connect)
+        monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+        for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.delenv(k, raising=False)
+        # A keep-alive connection opened earlier (e.g. by a model download) would need no new
+        # connect(); close huggingface_hub's client so every later request has to connect.
+        from huggingface_hub.utils import close_session
+
+        close_session()
+
+
+@pytest.fixture
+def no_network(worker, monkeypatch) -> NoNetwork:
+    """Network blocked for the rest of the test; the `worker` fixture's own port stays reachable."""
+    nn = NoNetwork(monkeypatch)
+    nn.allowed_ports.add(worker.server.server_address[1])
+    return nn
 
 
 # ---------- generated media ----------

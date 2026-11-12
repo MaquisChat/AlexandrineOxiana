@@ -127,7 +127,8 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
       if (q.tag && !src.tagIds.includes(q.tag)) continue;
       items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false });
     }
-    return { total: items.length, items: items.slice(offset, offset + limit) };
+    // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
+    return { total: items.length, items: items.slice(offset, offset + limit), limited: true };
   });
 
   const record = (sf: SourceFile) => sourceRecord(sf, state.roots);

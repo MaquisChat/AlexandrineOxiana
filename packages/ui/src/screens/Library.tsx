@@ -6,10 +6,11 @@
  * jobs indicator. While the library is read-only the drop zone and every edit button are off. A
  * locked encrypted project shows UnlockProject in place of its sources. "New project" opens the
  * new-project dialog (Task 60); the project it creates is selected through the address, like any
- * other selection.
+ * other selection. "New recovery code…" (an unlocked encrypted project) opens the new-recovery-code
+ * dialog (Task 61).
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourceRow, Tag } from "../api/library";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import type { AttachOutcome, Collection, CurrentLibrary, LibraryApi, LibraryState, ProfileId, ProjectSummary, SourcePage, Tag } from "../api/library";
 import { errorText, isProjectLocked, knownProfiles } from "../api/library";
 import { CollectionTree } from "../components/CollectionTree";
 import { DropZone } from "../components/DropZone";
@@ -24,6 +25,7 @@ import { UserText } from "../components/UserText";
 import "../components/library.css";
 import { PATHS } from "../navigation";
 import { madeSince, NewProject, type UnresolvedCreate } from "./NewProject";
+import { NewRecoveryCode } from "./NewRecoveryCode";
 import { SourceDetail } from "./SourceDetail";
 import { UnlockProject } from "./UnlockProject";
 
@@ -49,6 +51,11 @@ export interface LibraryProps {
   projectFromAddress?: string | undefined;
   /** The selected project changed (the route keeps it in the address). */
   onProjectSelected?: (id: string) => void;
+  /**
+   * The first-use tools question's banner (Task 48c, R164), shown under the status banners; `hidden`
+   * while a locked project's unlock screen is shown (it stays mounted, so it is not asked anew).
+   */
+  firstUse?: (hidden: boolean) => ReactNode;
 }
 
 const message = (err: unknown, fallback: string) => errorText(err, fallback);
@@ -67,7 +74,7 @@ const OUTCOME_TEXT: Record<AttachOutcome["outcome"], string> = {
 
 const JOB_LABELS: Record<string, string> = { recheck: "Rechecking sources", ocr: "Recognising text", proxy: "Making viewing copies", import: "Importing" };
 
-export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected }: LibraryProps) {
+export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, onClosed, projectFromAddress, onProjectSelected, firstUse }: LibraryProps) {
   const [state, setState] = useState<LibraryState>({
     mode: current.mode,
     ...(current.readOnlyReason ? { readOnlyReason: current.readOnlyReason } : {}),
@@ -82,7 +89,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<{ tags: Tag[]; workspaceTags: Tag[] }>({ tags: [], workspaceTags: [] });
   const [filter, setFilter] = useState<{ text: string; collection?: string | undefined; tag?: string | undefined }>({ text: "" });
-  const [sources, setSources] = useState<{ total: number; items: SourceRow[] } | undefined>();
+  const [sources, setSources] = useState<SourcePage | undefined>();
   const [openSource, setOpenSource] = useState<string | undefined>();
   const [outcomes, setOutcomes] = useState<AttachOutcome[] | undefined>();
   /** "Resolve…" (R27) is open; focus goes back to the button that opened it. */
@@ -97,7 +104,10 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   /** The new-project dialog is open. */
   const [creating, setCreating] = useState(false);
   const newProjectButton = useRef<HTMLButtonElement>(null);
-  /** The dialog shows a recovery code not yet confirmed: a library close waits for it. */
+  /** The new-recovery-code dialog is open, for this project. */
+  const [recovering, setRecovering] = useState<ProjectSummary | null>(null);
+  const recoveryButton = useRef<HTMLButtonElement>(null);
+  /** A dialog shows a recovery code not yet confirmed: a library close waits for it. */
   const holdClose = useRef(false);
   /** The library closed while that code was on screen. */
   const [closedUnder, setClosedUnder] = useState(false);
@@ -187,7 +197,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           if (e.type === "job.progress" && e.data && typeof e.data === "object") {
             const d = e.data as { kind?: string; jobId?: string; done?: number; total?: number; finished?: boolean };
             if (typeof d.done !== "number" || typeof d.total !== "number") continue;
-            if (d.kind === "index") setIndex({ done: d.done, total: d.total });
+            if (d.kind === "index") {
+              setIndex({ done: d.done, total: d.total });
+              // A finished rebuild: read the sources again, so a "needs rebuilding" note goes at once (N3).
+              if (d.done >= d.total) refresh();
+            }
             else {
               const key = `${d.kind ?? "job"}:${d.jobId ?? ""}`;
               const finished = d.finished === true || d.done >= d.total;
@@ -312,7 +326,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
       const r = await api.sources.search(pid, { ...query(), limit: SOURCE_PAGE_SIZE, offset: sources.items.length }, { signal: ac.signal });
       if (stale()) return;
       // A late page is only ever added to the list it continues, never used as a whole list.
-      setSources((cur) => (cur ? { total: r.total, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
+      setSources((cur) => (cur ? { ...r, items: [...cur.items, ...r.items.filter((x) => !cur.items.some((y) => y.id === x.id))] } : cur));
     } catch (err) {
       if (!stale()) fail(err, "More sources could not be read.", setSourcesError);
     } finally {
@@ -423,6 +437,11 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               Lock project
             </button>
           )}
+          {project?.encrypted && !locked && (
+            <button type="button" ref={recoveryButton} disabled={readOnly} onClick={() => setRecovering(project)}>
+              New recovery code…
+            </button>
+          )}
           {!locked && !readOnly && project && (
             <a href={importHref(project.id)} onClick={(e) => follow(e, importHref(project.id))}>
               Import
@@ -436,6 +455,13 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           <a href={PATHS.appearance} onClick={(e) => follow(e, PATHS.appearance)}>
             Appearance
           </a>
+          <a href={PATHS.extension} onClick={(e) => follow(e, PATHS.extension)}>
+            Browser extension
+          </a>
+          <a href={PATHS.tools} onClick={(e) => follow(e, PATHS.tools)}>
+            Optional tools
+          </a>
+          <a href="/about" onClick={(e) => follow(e, "/about")}>About and third-party notices</a>
           {onSwitchLibrary && (
             <button type="button" onClick={onSwitchLibrary}>
               Switch library
@@ -443,6 +469,28 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           )}
         </div>
       </header>
+      {recovering && (
+        <NewRecoveryCode
+          api={api}
+          project={recovering}
+          returnFocusTo={() => {
+            // The opener, unless it is gone or off meanwhile: then the project list.
+            const b = recoveryButton.current;
+            if (b && !b.disabled) return b;
+            return document.querySelector<HTMLElement>(".ao-projects button[aria-current='true'], .ao-projects button");
+          }}
+          onRecoveryPending={(pending) => {
+            holdClose.current = pending;
+          }}
+          libraryClosed={closedUnder}
+          onLocked={() => markLocked(recovering.id)}
+          onClose={() => {
+            setRecovering(null);
+            // The library went away while the recovery code was on screen: now leave it.
+            if (closedUnder) closedRef.current?.();
+          }}
+        />
+      )}
       {resolving && (
         <PendingWritesDialog
           api={api}
@@ -464,6 +512,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
           ))}
         </div>
       )}
+      {firstUse?.(locked)}
       <aside className="ao-library__side">
         {projects === undefined ? (
           <p aria-live="polite">Loading projects…</p>
@@ -508,7 +557,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               <p role="status">
                 “<UserText>{unresolved.create.name}</UserText>” was created.
                 {unresolved.create.encrypted &&
-                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Asking for a new recovery code from the project's settings is planned, but not available yet."}
+                  " Its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose. Once it is unlocked, choose “New recovery code…” to get a recovery code you can save."}
               </p>
             ) : unresolved.state === "not-created" ? (
               <p role="status">
@@ -517,7 +566,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
             ) : (
               <p role="alert">
                 “<UserText>{unresolved.create.name}</UserText>” may have been created: the library service did not answer, so the app cannot tell yet.
-                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose."}
+                {unresolved.create.encrypted && " If it was, its recovery code was not shown and cannot be shown again; it opens with the passphrase you chose, and “New recovery code…” gives it a new one."}
                 {" "}Do not create it again until this is settled.
                 {unresolved.state === "still-unknown" && " The app still cannot tell: the service did not answer. Try again in a moment."}
               </p>
@@ -652,7 +701,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
               !sourcesError && <p aria-live="polite">Loading sources…</p>
             ) : (
               <>
-                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} />
+                <SourceTable items={sources.items} total={sources.total} onOpen={setOpenSource} selectedId={openSource} incomplete={sources.incomplete} limited={sources.limited} rebuilding={!!index && index.done < index.total} />
                 {sources.items.length < sources.total && (
                   <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
                     Load more sources

@@ -1,8 +1,9 @@
 // Runs the Playwright end-to-end tests: the browser extension's (apps/browser-extension), the app's
-// (e2e/: the real UI, service and media worker in Chromium and WebKit), then the desktop shell's once
-// apps/desktop exists.
+// (e2e/: the real UI, service and media worker in Chromium and WebKit), and the desktop app's
+// (apps/desktop/e2e: the built Linux app driven through its real window by WebDriver).
 //
-//   pnpm e2e                                   every suite, no extra arguments
+//   pnpm e2e                                   the extension and app suites, no extra arguments
+//                                              (not the desktop suite: it needs the built app)
 //   pnpm e2e -- --extension-only <args…>       only the extension suite, <args…> passed to its Playwright
 //   pnpm e2e -- --app-only <args…>             only the app suite, <args…> passed to its Playwright
 //   pnpm e2e -- --desktop-only <args…>         only the desktop suite, <args…> passed to its Playwright
@@ -13,7 +14,7 @@
 // Each suite writes its JSON results to reports/playwright-<suite>.json for `pnpm report`.
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { needsSuiteFlag, noResults, parseE2eArgs } from "./e2e-args.mjs";
+import { needsSuiteFlag, noResults, parseE2eArgs, suitesToRun } from "./e2e-args.mjs";
 
 mkdirSync("reports", { recursive: true });
 let parsed;
@@ -38,12 +39,14 @@ const suite = (filter, report, suiteArgs) =>
 const SUITES = [
   { name: "extension", dir: "apps/browser-extension", filter: "@ao/browser-extension", report: "playwright-extension.json" },
   { name: "app", dir: "e2e", filter: "@ao/e2e", report: "playwright-app.json" },
-  { name: "desktop", dir: "apps/desktop", filter: "@ao/desktop", report: "playwright.json" },
+  // Needs `pnpm --filter @ao/desktop run build:linux` first, tauri-driver, WebKitWebDriver, Xvfb,
+  // dbus-daemon and xdotool (apps/desktop/README.md): only with --desktop-only.
+  { name: "desktop", dir: "apps/desktop/e2e", filter: "@ao/desktop", report: "playwright-desktop.json", onlyWhenAsked: true },
 ];
 
+if (!only) console.log("The desktop end-to-end test is not part of a plain `pnpm e2e` (it needs the built app): run it with `pnpm e2e -- --desktop-only`.");
 let status = 0;
-for (const s of SUITES) {
-  if (only && only !== s.name) continue;
+for (const s of suitesToRun(only, SUITES)) {
   if (!existsSync(s.dir)) {
     console.log(`Skipping the ${s.name} end-to-end tests: ${s.dir} does not exist yet.`);
     continue;

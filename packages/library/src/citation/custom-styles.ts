@@ -33,8 +33,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { DOMParser, type Element } from "@xmldom/xmldom";
 import {
   CslBundleMissingError,
@@ -60,6 +59,7 @@ import type { Library } from "../library.js";
 import { appendLibraryEvent, authorizeProcessing, type Repo } from "../repo/repo.js";
 import { SandboxError, renderInSandbox } from "./sandbox.js";
 import { repoLibrary } from "../repo/repo.js";
+import { ResourceMissingError, cslBundleDir } from "../resources.js";
 
 export const CSL_NS = "http://purl.org/net/xbiblio/csl";
 export const CUSTOM_STYLE_MAX_BYTES = 1024 * 1024;
@@ -96,11 +96,8 @@ const REASONS = {
 // ------------------------------------------------------------------------------------------
 // The bundle
 
-/** packages/core/csl/, next to @ao/core's sources. */
-function bundleDir(): string {
-  const corePackage = createRequire(import.meta.url).resolve("@ao/core/package.json");
-  return join(dirname(corePackage), "csl");
-}
+/** packages/core/csl/ next to @ao/core's sources, or csl/ in a built folder (resources.ts). */
+const bundleDir = cslBundleDir;
 
 /** Whether `pnpm fetch-csl` has built the bundle. */
 export function bundleAvailable(): boolean {
@@ -264,6 +261,7 @@ async function probeStyle(xml: string): Promise<void> {
       cites: citeprocCitationItems([{ item: PROBE_ITEM, locator: "1", label: "page" }]),
     });
   } catch (e) {
+    if (e instanceof ResourceMissingError) throw e; // a damaged installation, not the researcher's style
     throw new CustomStyleError(e instanceof SandboxError && e.reason !== "error" ? REASONS.tooSlow : REASONS.unusable);
   }
   if (out.includes("CSL STYLE ERROR")) throw new CustomStyleError(REASONS.unusable);
