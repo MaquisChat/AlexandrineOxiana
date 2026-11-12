@@ -51,6 +51,15 @@ describe("the capture queue", () => {
     expect(screen.getByRole("link", { name: /optional tools/i })).toBeTruthy();
   });
 
+  it("an outcome without a reason shows one sentence, then the link (N4)", () => {
+    let q = linkQueue("q1", [A]);
+    q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: A, status: "failed", errorCode: "TOOL_NOT_INSTALLED" } });
+    render(<CaptureQueue queues={[q]} />);
+    const row = screen.getAllByRole("listitem")[0]!;
+    expect(within(row).getAllByText(/is not installed/i)).toHaveLength(1);
+    expect(within(row).getByRole("link", { name: /Optional tools/ })).toBeTruthy();
+  });
+
   it("other failures show no tools link", () => {
     let q = linkQueue("q1", [A]);
     q = applyProgress(q, { queueId: "q1", projectId: P, done: 1, total: 1, finished: true, outcome: { url: A, status: "failed", errorCode: "LOGIN_REQUIRED" } });

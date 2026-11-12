@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SPEECH_MODEL, SPEECH_MODELS } from "@ao/shared";
-import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, useMsw } from "../test/msw-tools";
+import { catalogue, catalogueWithoutHosts, makeApi, onComputer, server, toolsService, useMsw, withoutHostsFor } from "../test/msw-tools";
 import { ToolsSetup } from "./ToolsSetup";
 
 useMsw();
@@ -82,18 +82,24 @@ describe("the optional tools screen", () => {
     expect(within(card(FFMPEG)).getAllByText(/proxy pending/)).toHaveLength(1);
   });
 
-  it("names the hosts each download contacts, from the catalogue, and says nothing about projects is sent", async () => {
+  it("names every host entry from the catalogue; a *.domain pattern in plain words, never dropped (N1)", async () => {
     await shown();
     expect(screen.getByText(/sends nothing about your projects or about you/i).textContent).toMatch(/addresses listed with the tool/);
-    expect(within(card("Video downloader")).getByText(/github\.com/)).toBeTruthy();
-    expect(within(card("Video downloader")).getByText(/dl\.deno\.land/)).toBeTruthy();
-    expect(within(card(FFMPEG)).getByText(/ffmpeg\.martin-riedl\.de/)).toBeTruthy();
+    expect(within(card("Speech model: medium")).getByText("Downloads from: huggingface.co, any server under hf.co")).toBeTruthy();
+    expect(within(card("Video downloader")).getByText("Downloads from: github.com, objects.githubusercontent.com, release-assets.githubusercontent.com, api.github.com, dl.deno.land")).toBeTruthy();
+    expect(within(card(FFMPEG)).getByText("Downloads from: ffmpeg.martin-riedl.de")).toBeTruthy();
   });
 
-  it("without hosts in the catalogue it names none and claims no list", async () => {
+  it("a tool that lists no hosts says its publisher's servers are contacted, and the screen claims no complete list", async () => {
+    await shown(toolsService({ tools: withoutHostsFor(catalogue(), "image-downloader") }));
+    expect(within(card("Image downloader")).getByText("Downloads from: its publisher's servers (the catalogue does not name them).")).toBeTruthy();
+    expect(screen.getByText(/sends nothing about your projects or about you/i).textContent).not.toMatch(/addresses listed/);
+  });
+
+  it("without hosts anywhere in the catalogue it names none and claims no list", async () => {
     await shown(toolsService({ tools: catalogueWithoutHosts() }));
     expect(screen.getByText(/sends nothing about your projects or about you/i).textContent).not.toMatch(/addresses listed/);
-    expect(screen.queryByText(/Downloads from/)).toBeNull();
+    expect(within(card(FFMPEG)).getByText("Downloads from: its publisher's servers (the catalogue does not name them).")).toBeTruthy();
   });
 
   it("shows install progress, announces start, a sparse milestone and the end, and then shows it installed", async () => {
@@ -150,12 +156,20 @@ describe("the optional tools screen", () => {
     vd.remainingSize = 40_000_000;
     vd.components = vd.components.map((c) => (c.id === "yt-dlp" ? { ...c, installed: true, usable: true, source: "managed" as const } : c));
     const reads = svc.state.requests.filter((r) => r === "GET /tools").length;
+    const live = screen.getByRole("status", { name: "Tool progress" });
+    // Every time the live region is written, note it: "Stopping" must be said once, not on every poll (N3).
+    const spoken: string[] = [];
+    const watch = new MutationObserver(() => spoken.push(live.textContent ?? ""));
+    watch.observe(live, { childList: true, subtree: true, characterData: true });
     await user.click(within(card("Video downloader")).getByRole("button", { name: "Cancel installing Video downloader" }));
     // Until the media helper answers: "Stopping…", announced once, and no second Cancel.
     await waitFor(() => expect(within(card("Video downloader")).getByText("Stopping…")).toBeTruthy());
     expect(within(card("Video downloader")).queryByRole("button", { name: /Cancel/ })).toBeNull();
-    const live = screen.getByRole("status", { name: "Tool progress" });
     await waitFor(() => expect(live.textContent).toBe("Stopping Video downloader."));
+    const polls = svc.state.requests.length;
+    await waitFor(() => expect(svc.state.requests.length).toBeGreaterThan(polls + 8)); // several polls while stopping
+    watch.disconnect();
+    expect(spoken.filter((t) => t === "Stopping Video downloader.")).toHaveLength(1);
     svc.finish(svc.jobOf("video-downloader")!.jobId, "cancelled");
     await waitFor(() => expect(svc.state.requests.filter((r) => r === "GET /tools").length).toBeGreaterThan(reads));
     const c = card("Video downloader");
@@ -206,6 +220,24 @@ describe("the optional tools screen", () => {
     await waitFor(() => expect(alert.textContent).toMatch(/Speech model: small is not installed/));
     expect(within(alert).queryByRole("button")).toBeNull();
     expect(svc.state.requests.filter((r) => r === "POST /tools/speech-small/install")).toHaveLength(1);
+  });
+
+  it("a media helper that stops after a stop was asked for: the stop is acknowledged, with what is installed, and no install retry (N2)", async () => {
+    const { user, svc } = await shown();
+    await user.click(screen.getByRole("button", { name: "Install Video downloader" }));
+    await screen.findByRole("progressbar", { name: /Installing Video downloader/ });
+    await user.click(within(card("Video downloader")).getByRole("button", { name: "Cancel installing Video downloader" }));
+    await waitFor(() => expect(within(card("Video downloader")).getByText("Stopping…")).toBeTruthy());
+    const vd = svc.state.tools.find((t) => t.id === "video-downloader")!;
+    vd.managed = true;
+    vd.components = vd.components.map((c) => (c.id === "yt-dlp" ? { ...c, installed: true, usable: true, source: "managed" as const } : c));
+    svc.finish(svc.jobOf("video-downloader")!.jobId, "failed", { code: "WORKER_UNAVAILABLE", message: "The media helper stopped before the job finished. Nothing was left half-installed; try again." });
+    const c = () => card("Video downloader");
+    await waitFor(() => expect(within(c()).getByText(/^The stop was asked for, and the job ended without finishing\./)).toBeTruthy());
+    const said = within(c()).getByText(/^The stop was asked for/).textContent!;
+    expect(said).toMatch(/Video downloader \(yt-dlp\) is installed; JavaScript runtime \(deno\) is not installed\./);
+    expect(within(c()).queryByRole("button", { name: /Try again/ })).toBeNull();
+    expect(within(c()).getByRole("button", { name: "Remove Video downloader" })).toBeTruthy();
   });
 
   it("a remove offers no Cancel (it cannot be stopped)", async () => {

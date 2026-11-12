@@ -78,7 +78,8 @@ const MODEL_PURPOSE: Record<string, string> = {
   "large-v3": "Transcribes recordings with the largest speech model (most accurate, slowest; needs a fast computer).",
 };
 
-const HF = ["huggingface.co", "cdn-lfs.hf.co"];
+// As the worker sends them (tools.py hosts_of): a host name, or `*.<domain>` for a redirect rule.
+const HF = ["huggingface.co", "*.hf.co"];
 const speech = (n: string, size: number) =>
   tool(`speech-${n}` as ToolId, "speech", `Speech model: ${n}`, size, [comp(`model-${n}`, `Speech model (${n})`, size, { hosts: HF })], {
     purpose: MODEL_PURPOSE[n]!,
@@ -98,7 +99,7 @@ export function catalogue(): ToolInfo[] {
       "Video downloader",
       (38 + 40) * MB,
       [
-        comp("yt-dlp", "Video downloader (yt-dlp)", 38 * MB, { version: "latest", licence: "Unlicense", sizeApproximate: true, hosts: ["github.com", "objects.githubusercontent.com"] }),
+        comp("yt-dlp", "Video downloader (yt-dlp)", 38 * MB, { version: "latest", licence: "Unlicense", sizeApproximate: true, hosts: ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com", "api.github.com"] }),
         comp("deno", "JavaScript runtime (deno)", 40 * MB, { version: "2.9.8", hosts: ["dl.deno.land"] }),
       ],
       {
@@ -141,6 +142,11 @@ export function catalogue(): ToolInfo[] {
 /** The catalogue as 48a sends it before its R158 addition: no `hosts` on any component. */
 export function catalogueWithoutHosts(): ToolInfo[] {
   return catalogue().map((t) => ({ ...t, components: t.components.map((c) => Object.fromEntries(Object.entries(c).filter(([k]) => k !== "hosts")) as typeof c) }));
+}
+
+/** The catalogue with `id`'s parts listing no hosts (`hosts: []`). */
+export function withoutHostsFor(tools: ToolInfo[], id: ToolId): ToolInfo[] {
+  return tools.map((t) => (t.id === id ? { ...t, components: t.components.map((c) => ({ ...c, hosts: [] })) } : t));
 }
 
 /** `id` found on this computer (on PATH), not installed by the app. */

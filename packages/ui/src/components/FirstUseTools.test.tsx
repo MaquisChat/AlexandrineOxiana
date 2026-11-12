@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import { PATHS } from "../navigation";
-import { catalogue, catalogueWithoutHosts, makeApi, memoryStore, onComputer, server, toolsService, useMsw } from "../test/msw-tools";
+import { catalogue, catalogueWithoutHosts, makeApi, memoryStore, onComputer, server, toolsService, useMsw, withoutHostsFor } from "../test/msw-tools";
 import { FirstUseTools } from "./FirstUseTools";
 
 useMsw();
@@ -157,6 +157,24 @@ describe("the first-use tools dialogue", () => {
     expect(screen.getByText(/nothing about your projects or about you/i)).toBeTruthy();
     await user.click(toolBox("Speech model: medium"));
     expect(screen.getByText(/Total download: about 108 MB/)).toBeTruthy();
+  });
+
+  it("names every host of the ticked tools, the pattern in plain words, and claims 'only' when every tool lists its hosts (N1)", async () => {
+    const { user } = await opened();
+    await user.click(activity(/recordings/i));
+    expect(screen.getByText(/nothing about your projects or about you/i).textContent).toBe(
+      "Downloading contacts only these addresses: huggingface.co, any server under hf.co, ffmpeg.martin-riedl.de. Nothing about your projects or about you is sent.",
+    );
+  });
+
+  it("when one ticked tool lists no hosts, it says so for that tool and makes no 'only' claim (N1)", async () => {
+    const { user } = await opened(memoryStore(), toolsService({ tools: withoutHostsFor(catalogue(), "image-downloader") }));
+    await user.click(activity(/recordings/i));
+    await user.click(activity(/save picture posts/i));
+    const line = screen.getByText(/nothing about your projects or about you/i);
+    expect(line.textContent).not.toMatch(/\bonly\b/);
+    expect(line.textContent).toMatch(/Speech model: medium: huggingface\.co, any server under hf\.co/);
+    expect(line.textContent).toMatch(/Image downloader: its publisher's servers \(the catalogue does not name them\)/);
   });
 
   it("without hosts in the catalogue it names none and says only 'each tool's publisher'", async () => {
