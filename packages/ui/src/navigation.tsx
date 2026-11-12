@@ -14,6 +14,7 @@ export const PATHS = {
   libraryAlias: "/library",
   appearance: "/settings/appearance",
   extension: "/settings/extension",
+  tools: "/settings/tools",
   importWizard: "/import",
   reviewQueue: "/import/review",
   governance: "/governance",

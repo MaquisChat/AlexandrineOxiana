@@ -44,6 +44,8 @@ import {
 import { isValidId } from "../api/import";
 import { errorText } from "../api/library";
 import { CaptureQueue } from "../components/CaptureQueue";
+import { modelOptionLabel, SpeechModelNotice, ToolsLink, useSpeechModels } from "../components/MissingToolNotice";
+import { DEFAULT_SPEECH_MODEL, toolsApi } from "../api/tools";
 import { useTrap } from "../components/ReasonDialog";
 import { UserText } from "../components/UserText";
 import { inAppLink, libraryHref, navigate, normalisePath, type AppLocation } from "../navigation";
@@ -145,8 +147,8 @@ function AckDialog({ busy, error, onConfirm, onCancel }: { busy: boolean; error:
 // Capture tools
 
 const TOOL_LABELS: Array<{ keys: string[]; label: string; missing: string }> = [
-  { keys: ["yt_dlp", "yt-dlp"], label: "yt-dlp (video downloader)", missing: "Not installed yet: it is downloaded the first time a link is captured (this needs an internet connection)." },
-  { keys: ["gallery_dl", "gallery-dl"], label: "gallery-dl (photo downloader)", missing: "Not installed on this computer." },
+  { keys: ["yt_dlp", "yt-dlp"], label: "yt-dlp (video downloader)", missing: "Not installed. Install it from the Optional tools screen." },
+  { keys: ["gallery_dl", "gallery-dl"], label: "gallery-dl (image downloader)", missing: "Not installed. Install it from the Optional tools screen." },
   { keys: ["ffmpeg"], label: "ffmpeg (video conversion)", missing: "Not installed on this computer." },
   { keys: ["faster_whisper", "faster-whisper"], label: "faster-whisper (transcription)", missing: "Not installed on this computer." },
 ];
@@ -171,7 +173,7 @@ function updateLines(u: ToolsUpdate): string[] {
   else if (old === null && now) out.push(`yt-dlp was installed: ${now}.`);
   else if (old && now && old === now) out.push(`yt-dlp is up to date (${now}).`);
   else out.push(`yt-dlp: ${old ?? "not installed"} → ${now ?? "not installed"}`);
-  if (u.galleryDl.version) out.push(`gallery-dl ${u.galleryDl.version} comes with the app and is updated with it.`);
+  if (u.galleryDl.version) out.push(`gallery-dl ${u.galleryDl.version} is the image downloader; it is installed and updated from the Optional tools screen.`);
   return out;
 }
 
@@ -220,6 +222,7 @@ function CaptureTools({ api }: { api: ReturnType<typeof captureApi> }) {
     <section className="ao-capture__section" aria-labelledby={id}>
       <h2 id={id}>Capture tools</h2>
       <p>The downloaders change often as platforms change. Updating them can fix links that stopped working.</p>
+      <p>Install or remove the downloaders on the <ToolsLink>Optional tools screen</ToolsLink>.</p>
       {versionsError && (
         <UserText as="p" className="ao-capture__note">
           {versionsError}
@@ -287,6 +290,7 @@ export interface CaptureProps {
 
 export function Capture({ client, projectId }: CaptureProps) {
   const api = useMemo(() => captureApi(client), [client]);
+  const installedModels = useSpeechModels(useMemo(() => toolsApi(client), [client]));
   const id = useId();
   const live = useRef(true);
 
@@ -303,7 +307,7 @@ export function Capture({ client, projectId }: CaptureProps) {
   const [useSession, setUseSession] = useState(false);
   const [browser, setBrowser] = useState<BrowserName>("chrome");
   const [transcribe, setTranscribe] = useState<Transcribe>("project");
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState<string>(DEFAULT_SPEECH_MODEL);
   const [refresh, setRefresh] = useState(false);
   const [legalBasis, setLegalBasis] = useState("");
   const [legalError, setLegalError] = useState<string | null>(null);
@@ -719,13 +723,13 @@ export function Capture({ client, projectId }: CaptureProps) {
             <span>Transcription model</span>
           </label>
           <select id={`${id}-model`} value={model} disabled={transcribe === "no"} onChange={(e) => setModel(e.target.value)}>
-            <option value="">The default model</option>
             {MODELS.map((m) => (
               <option key={m.value} value={m.value}>
-                {m.label}
+                {modelOptionLabel(m.label, m.value, installedModels)}
               </option>
             ))}
           </select>
+          {transcribe !== "no" && <SpeechModelNotice model={model} installed={installedModels} />}
           <Hint id={`${id}-transcribe-hint`}>A profile capture transcribes only when “Transcribe” is chosen.</Hint>
         </fieldset>
         <label>
