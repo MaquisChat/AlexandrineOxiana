@@ -954,3 +954,72 @@ describe("the app's port changed since a browser was paired (R171, defect D13)",
     expect(noticeText()).toBe("");
   });
 });
+
+describe("the list of paired browsers cannot be read (Task 68, Task 66 M8)", () => {
+  const RESET = "Reset the list of paired browsers…";
+
+  it("says so in plain words and offers the reset; nothing is offered while the list can be read", async () => {
+    const readable = pairingService({ pairings: [BROWSER_A] });
+    server.use(...readable.handlers);
+    const { unmount } = render(<ExtensionPairing api={makeApi()} />);
+    await screen.findByText(BROWSER_A.origin);
+    expect(screen.queryByRole("button", { name: RESET })).toBeNull();
+    unmount();
+    server.use(...pairingService({ unreadable: true }).handlers);
+    render(<ExtensionPairing api={makeApi()} />);
+    const btn = await screen.findByRole("button", { name: RESET });
+    const alert = btn.closest('[role="alert"]')!;
+    expect(alert.textContent).toMatch(/cannot read its list of paired browsers/i);
+    expect(alert.textContent).toMatch(/paired again/i);
+  });
+
+  it("the reset asks first, in plain words with what is lost; focus goes into the dialog, stays there, and comes back to the button on cancel", async () => {
+    const svc = pairingService({ unreadable: true });
+    server.use(...svc.handlers);
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} />);
+    const btn = await screen.findByRole("button", { name: RESET });
+    await user.click(btn);
+    const dialog = await screen.findByRole("dialog", { name: "Reset the list of paired browsers?" });
+    expect(dialog.textContent).toMatch(/every browser .* paired again/i);
+    expect(dialog.textContent).toMatch(/kept, renamed/i);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.tab();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: RESET }));
+    expect(svc.state.resets).toEqual([]);
+  });
+
+  it("confirmed: one request, then the list is read again and the notice goes; the screen says what to do next", async () => {
+    const svc = pairingService({ unreadable: true });
+    server.use(...svc.handlers);
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} />);
+    await user.click(await screen.findByRole("button", { name: RESET }));
+    const dialog = await screen.findByRole("dialog");
+    await user.dblClick(within(dialog).getByRole("button", { name: "Reset the list" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(svc.state.resets).toEqual([{ file: "extension-pairings", confirm: true }]);
+    await waitFor(() => expect(screen.queryByRole("button", { name: RESET })).toBeNull());
+    expect(screen.getByRole("status", { name: "Reset result" }).textContent).toMatch(/reset.*pair each browser again/i);
+    expect(screen.getByText("No browser is paired yet.")).toBeTruthy();
+    // Focus does not fall to the page: it lands on the list's heading.
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Paired browsers" }));
+  });
+
+  it("a reset that fails says why inside the dialog and keeps it open", async () => {
+    const svc = pairingService({ unreadable: true, resetFails: true });
+    server.use(...svc.handlers);
+    const user = userEvent.setup();
+    render(<ExtensionPairing api={makeApi()} />);
+    await user.click(await screen.findByRole("button", { name: RESET }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Reset the list" }));
+    expect(await within(dialog).findByRole("alert")).toBeTruthy();
+    expect(within(dialog).getByRole("alert").textContent).toMatch(/could not be set aside/);
+  });
+});

@@ -26,6 +26,7 @@ import {
   scrubPaths,
   startMediaWorker,
   startWatchedFolders,
+  WatchedFoldersUnreadableError,
   type BackupFailure,
   type PendingRemoval,
   type BatchHandle,
@@ -54,7 +55,8 @@ import {
   rememberLastOpenLibrary,
   type RebuildResult,
 } from "@ao/library";
-import type { CaptureStartedBy } from "@ao/shared";
+import type { CaptureStartedBy, DeviceNotice } from "@ao/shared";
+import { AppSettingUnreadableError, readDeviceNotices } from "@ao/library";
 import { ApiError } from "./errors.js";
 import { EventBus } from "./events.js";
 import { MediaTickets } from "./media.js";
@@ -98,6 +100,9 @@ export const defaultWorkerProvider = (onLog?: (line: string) => void): WorkerPro
   },
 });
 
+/** The session warning when this computer's watched folders could not be read at open (Rm4). */
+export const WATCHED_FOLDERS_UNREADABLE = "watched-folders-unreadable";
+
 export interface Session {
   lib: Library;
   repo: Repo;
@@ -120,6 +125,11 @@ export interface Session {
   indexRebuild?: { ac: AbortController; done: Promise<unknown> };
   /** While on, index writes record no change stamps: from the open until the staleness check has run (M6). */
   stampHold: { on: boolean };
+  /**
+   * Warnings for this session only, shown with the library's integrity warnings (Task 68 fix round 2,
+   * Rm4): e.g. this computer's watched folders could not be read at open, so none run now.
+   */
+  sessionWarnings?: Array<{ kind: string; detail: string }>;
 }
 
 /**
@@ -849,7 +859,20 @@ export class ServiceState {
   /** Starts the project's watched folders (all of them; replaces any running). */
   async startWatches(s: Session, projectId: string): Promise<void> {
     await this.stopWatches(s, projectId);
-    const watches = await startWatchedFolders(this.watchDeps(s, projectId), projectId);
+    let watches: FolderWatch[];
+    try {
+      watches = await startWatchedFolders(this.watchDeps(s, projectId), projectId);
+    } catch (err) {
+      // Never silent (R154; Task 68 round 2, Rm4): said on screen for this session, once.
+      if (err instanceof WatchedFoldersUnreadableError && this.session === s) {
+        s.sessionWarnings ??= [];
+        if (!s.sessionWarnings.some((w) => w.kind === WATCHED_FOLDERS_UNREADABLE)) {
+          s.sessionWarnings.push({ kind: WATCHED_FOLDERS_UNREADABLE, detail: err.message });
+          this.publishState();
+        }
+      }
+      throw err;
+    }
     if (this.session !== s) {
       await Promise.all(watches.map((w) => w.stop()));
       return;
@@ -1144,7 +1167,33 @@ export class ServiceState {
       // What stands behind `destruction-backups-pending` (R147): which backups still wait to be
       // removed after a destruction, and why the app does not remove them by itself when it does not.
       destructionBackupsPending: this.cachedPendingRemovals,
+      // This computer's own notices (Task 68, R154, R178): kind and time only; shown in the banner area.
+      notices: this.cachedNotices,
     };
+  }
+
+  private cachedNotices: DeviceNotice[] = [];
+
+  /** This computer's notices as last read (refreshNotices). */
+  get notices(): DeviceNotice[] {
+    return this.cachedNotices;
+  }
+  private noticesUnreadableLogged = false;
+
+  /**
+   * Reads this computer's device-level notices again (Task 68). A notices file that cannot be read
+   * shows none, and the log says so once, in plain words without a path; nothing is written.
+   */
+  async refreshNotices(): Promise<void> {
+    try {
+      this.cachedNotices = await readDeviceNotices(this.deps.appConfigDir);
+      this.noticesUnreadableLogged = false;
+    } catch (err) {
+      if (!(err instanceof AppSettingUnreadableError)) throw err;
+      this.cachedNotices = [];
+      if (!this.noticesUnreadableLogged) this.opts.log.warn({}, "The app's list of notices on this computer could not be read, so none are shown.");
+      this.noticesUnreadableLogged = true;
+    }
   }
 
   private cachedProjectWarnings: Record<string, string[]> = {};
@@ -1152,12 +1201,15 @@ export class ServiceState {
   private cachedPendingRemovals: Record<string, PendingRemoval[]> = {};
 
   integrityWarnings(s: Session, names = new Map(s.repo.listProjects().map((p) => [p.id, p.name]))): Array<{ projectId: string; project: string; kind: string; detail: string }> {
-    return s.repo.integrityWarnings.map((w) => ({
-      projectId: w.projectId,
-      project: w.projectId === "*" ? "library" : (names.get(w.projectId) ?? "a project"),
-      kind: w.kind,
-      detail: scrubPaths(w.detail, this.roots),
-    }));
+    return [
+      ...s.repo.integrityWarnings.map((w) => ({
+        projectId: w.projectId,
+        project: w.projectId === "*" ? "library" : (names.get(w.projectId) ?? "a project"),
+        kind: w.kind,
+        detail: scrubPaths(w.detail, this.roots),
+      })),
+      ...(s.sessionWarnings ?? []).map((w) => ({ projectId: "*", project: "library", kind: w.kind, detail: scrubPaths(w.detail, this.roots) })),
+    ];
   }
 
   /** The projects' standing warnings (backup failed, deletion records unreadable), by project id. */
@@ -1195,7 +1247,7 @@ export class ServiceState {
       return;
     }
     this.track(
-      this.projectWarnings(s).then(() => {
+      Promise.all([this.projectWarnings(s), this.refreshNotices()]).then(() => {
         if (this.session === s) this.events.publish("library.state", this.libraryState());
       }),
       "library state",

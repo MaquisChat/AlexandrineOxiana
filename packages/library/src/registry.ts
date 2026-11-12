@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { writeFileAtomic } from "./fs/atomic.js";
 import type { Deps } from "./deps.js";
+import { raiseDeviceNotice } from "./device-notices.js";
 
 export interface RegistryEntry {
   libraryId: string;
@@ -60,10 +61,16 @@ function stamp(d: Date): string {
   return d.toISOString().replace(/\.\d+Z$/, "").replace(/[-:]/g, "").replace("T", "-");
 }
 
-/** Keeps a damaged registry as libraries.json.corrupt-<stamp> before it is overwritten. */
+/**
+ * Keeps a damaged registry as libraries.json.corrupt-<stamp> before it is overwritten, and then,
+ * only once that rename has succeeded, raises a device-level notice (Task 68 fix round 2, R181 a):
+ * nothing in the settings folder is set aside in silence.
+ */
 async function backupIfDamaged(deps: RegDeps, damaged: boolean): Promise<void> {
   if (!damaged) return;
-  await rename(file(deps), `${file(deps)}.corrupt-${stamp(deps.clock())}`);
+  const now = deps.clock();
+  await rename(file(deps), `${file(deps)}.corrupt-${stamp(now)}`);
+  await raiseDeviceNotice(deps.appConfigDir, "libraries-list-set-aside", now);
 }
 
 async function save(deps: RegDeps, entries: RegistryEntry[]): Promise<void> {
@@ -120,6 +127,18 @@ export async function addKnownPath(libraryId: string, path: string, deps: RegDep
   const e = entries.find((x) => x.libraryId === libraryId);
   if (!e || e.lastKnownPaths.includes(path)) return;
   e.lastKnownPaths = [...e.lastKnownPaths.slice(0, 1), path, ...e.lastKnownPaths.slice(1)].slice(0, MAX_PATHS);
+  await save(deps, entries);
+}
+
+/**
+ * When the list is damaged, sets it aside now (with its notice) and writes back what was usable, so
+ * the chooser never just looks empty (Task 68 fix round 2, R181 a). Does nothing otherwise; a read
+ * error other than "missing" throws, as every other registry read does.
+ */
+export async function settleDamagedRegistry(deps: RegDeps): Promise<void> {
+  const { entries, damaged } = await load(deps);
+  if (!damaged) return;
+  await backupIfDamaged(deps, true);
   await save(deps, entries);
 }
 

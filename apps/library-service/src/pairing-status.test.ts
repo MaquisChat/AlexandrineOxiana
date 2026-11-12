@@ -16,9 +16,9 @@ vi.mock("@ao/library", async (importOriginal) => {
   const real = await importOriginal<typeof import("@ao/library")>();
   return {
     ...real,
-    updateAppSetting: async (...args: Parameters<typeof real.updateAppSetting>) => {
+    updateAppSettingStrict: async (...args: Parameters<typeof real.updateAppSettingStrict>) => {
       if (write.before) await write.before();
-      return real.updateAppSetting(...args);
+      return real.updateAppSettingStrict(...args);
     },
   };
 });

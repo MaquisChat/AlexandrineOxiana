@@ -230,7 +230,6 @@ describe("the app's port changed (R171, defect D13)", () => {
       { status: 503, body: { error: { code: "LIBRARY_OFFLINE" } } },
       { status: 503, body: { error: { code: "LIBRARY_OFFLINE", message: 5 } } },
       { status: 503, body: { code: "LIBRARY_OFFLINE", message: "No library is open." } },
-      { status: 503, body: { error: { code: "UNAVAILABLE", message: "x" } } },
       // A success status other than 200, even with a list, is not the app's answer either.
       { status: 201, body: { projects: [] } },
     ];
@@ -241,6 +240,19 @@ describe("the app's port changed (R171, defect D13)", () => {
       expect(err.code, JSON.stringify(r)).toBe("BAD_REPLY");
       expect(storage.data.pairing, JSON.stringify(r)).toMatchObject({ port: OLD, token: TOKEN });
     }
+  });
+
+  it("a 503 in the service's own shape shows the service's message; the port and the token are kept (Task 68 round 2, Rm5)", async () => {
+    const storage = memoryStorage();
+    paired(storage);
+    const said = "This computer's list of paired browsers cannot be read right now. Your browser stays paired; try again in a moment, or open the desktop app's “Browser extension” page.";
+    const { fn } = fakeFetch(() => ({ status: 503, body: { error: { code: "UNAVAILABLE", message: said } } }));
+    const err = (await createApi({ fetch: fn, storage }).changePort(String(NEW)).catch((e: unknown) => e)) as ApiError;
+    expect(err.code).toBe("UNAVAILABLE");
+    expect(err.message).toContain(said);
+    expect(err.message).toContain(`This browser keeps port ${OLD}.`);
+    expect(err.message).not.toMatch(/was not one from the desktop app/);
+    expect(storage.data.pairing).toMatchObject({ port: OLD, token: TOKEN });
   });
 
   it("a redirect is refused as everywhere else (the request asks fetch to fail on one), and nothing is saved", async () => {

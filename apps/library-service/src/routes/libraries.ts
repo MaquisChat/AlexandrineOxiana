@@ -15,6 +15,7 @@ import {
   executeMove,
   findLibrary,
   listLibraries,
+  settleDamagedRegistry,
   planMove,
   reconnect,
   relinkMissing,
@@ -77,9 +78,14 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     // attempt, at most 30 s (a network drive that does not answer); later ones answer at once and,
     // while it still runs, name it as `reopening` (I1).
     await state.waitForStartup();
+    // A damaged list is set aside now, with its notice, so the chooser does not just look empty (R181 a).
+    await settleDamagedRegistry(state.deps).catch((err: unknown) => state.opts.log.warn({ err: err instanceof Error ? err.name : "error" }, "the list of libraries could not be set aside"));
     const known = await listLibraries(state.deps).catch(() => []);
+    // This computer's own notices, for the chooser too (Task 68 fix round 1, M1).
+    await state.refreshNotices();
     return {
       libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })),
+      notices: state.notices,
       ...(state.session
         ? { current: libraryView(ctx) }
         : state.reopening
