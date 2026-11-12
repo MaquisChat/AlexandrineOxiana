@@ -5,6 +5,7 @@
  * edits to the YAML text that keep its comments.
  */
 import { isMap, parseDocument, type Document } from "yaml";
+import { CAPTURE_METHODS } from "@ao/core/src/governance/schema";
 import type { Profile } from "../api/governance";
 
 export const PROFILES: Array<{ id: Profile; label: string }> = [
@@ -34,6 +35,25 @@ export const PROCESSING_LABEL: Record<(typeof PROCESSING_OPS)[number], string> =
   translation: "Translation",
   agent: "Research agents",
 };
+/** Every capture method the rules know (the core schema's own list, so the form cannot miss one). */
+export { CAPTURE_METHODS };
+export type CaptureMethod = (typeof CAPTURE_METHODS)[number];
+/** Each capture method in plain words (D11). */
+export const CAPTURE_LABEL: Record<CaptureMethod, string> = {
+  browser_capture: "Browser capture: pages and posts saved with the browser extension",
+  downloader: "Downloader: videos and posts saved from their links on the Capture screen",
+  official_api: "A platform's official interface (API)",
+  manual_upload: "Files you add yourself: dropped, added by path, or imported from a folder or ZIP archive",
+  zotero_import: "Import from Zotero",
+  refman_import: "Import from a reference file (BibTeX, RIS, CSL-JSON, Zotero RDF)",
+  calibre_import: "Import from a Calibre library",
+  device_import: "Import from a camera or phone folder",
+};
+/** The methods that capture from the web: what a capture also needs (R41) is said next to them. */
+export const WEB_CAPTURE_METHODS: readonly CaptureMethod[] = ["browser_capture", "downloader", "official_api"];
+/** The data category whose default legal basis captures from the web use (the library's LEGAL_CATEGORY). */
+export const WEB_LEGAL_CATEGORY = "social-media";
+
 export const ENCRYPTION_LEVELS = ["required", "optional", "off"] as const;
 export const LOCATION_LEVELS = ["strip", "coarsen", "keep"] as const;
 
@@ -42,7 +62,8 @@ export interface Config {
   residency: { allowed: string[] };
   processing: Record<string, string[]>;
   identifiability: { containsIdentifiable: boolean; pseudonymizeFileNames: boolean; deidentifiedExportsOnly: boolean };
-  consent: { requireStatus: boolean; requireLegalBasis: boolean };
+  consent: { requireStatus: boolean; requireLegalBasis: boolean; defaultLegalBasis?: Record<string, string> };
+  captureMethods: string[];
   retention: { rawDataDestroyAfter: string | null };
   audit: { enabled: boolean };
   encryption: { atRest: string };
@@ -74,6 +95,7 @@ export const DEFAULTS: Config = {
   },
   identifiability: { containsIdentifiable: true, pseudonymizeFileNames: true, deidentifiedExportsOnly: true },
   consent: { requireStatus: true, requireLegalBasis: true },
+  captureMethods: ["manual_upload", "zotero_import", "refman_import", "calibre_import", "device_import"],
   retention: { rawDataDestroyAfter: null },
   audit: { enabled: true },
   encryption: { atRest: "required" },
@@ -177,6 +199,8 @@ export function isLooser(control: string, prev: unknown, next: unknown): boolean
     const b = (next as string[]) ?? [];
     return (a.length > 0 && b.length === 0) || b.some((x) => !a.includes(x));
   }
+  // A new or changed default legal basis lets captures through without one being stated (core merge.ts).
+  if (control.startsWith("consent.defaultLegalBasis.")) return typeof next === "string" && next.trim() !== "" && next !== prev;
   if (Array.isArray(prev) || Array.isArray(next)) {
     // residency.allowed, processing.*: allowing more is looser.
     const a = (prev as string[]) ?? [];
@@ -234,6 +258,36 @@ export function setManyIn(text: string, entries: Array<[string, unknown]>): stri
   doc.toJS({ maxAliasCount: MAX_ALIASES }); // throws on alias expansion beyond the limit
   if (!isMap(doc.contents)) doc.contents = doc.createNode({}) as never;
   for (const [path, value] of entries) doc.setIn(path.split("."), doc.createNode(value));
+  return String(doc);
+}
+
+/**
+ * What else a capture from the web needs before it will run under these rules (R41, and the
+ * engine's capture rule), in plain sentences; empty when nothing else is needed. `today` is YYYY-MM-DD.
+ */
+export function captureNeeds(cfg: Config, today: string): string[] {
+  const out: string[] = [];
+  const fallback = cfg.consent.defaultLegalBasis?.[WEB_LEGAL_CATEGORY]?.trim();
+  if (cfg.identifiability.containsIdentifiable && cfg.consent.requireLegalBasis && !fallback) {
+    out.push(
+      "A legal basis, because this project holds identifiable data and its rules require one. The Capture screen asks for it with each capture; the browser extension cannot, so its captures are refused until a default legal basis is set below.",
+    );
+  }
+  if (cfg.protocol.requireBeforeCapture && !cfg.protocol.number) out.push("A protocol number in the protocol record below: these rules refuse every capture until there is one.");
+  if (cfg.protocol.platforms.length > 0) out.push("A link from one of the platforms the protocol approves (Platforms, in the protocol record below): links from other platforms are refused.");
+  const day = (d: string | null) => (d ? d.slice(0, 10) : null);
+  const from = day(cfg.protocol.approvedFrom);
+  const until = day(cfg.protocol.expires);
+  if (from && today < from) out.push(`The protocol's approval to start, on ${from}: captures are refused until then.`);
+  if (until && today > until) out.push(`A renewed protocol approval: it expired on ${until}, and captures are refused until it is renewed.`);
+  return out;
+}
+
+/** Removes `path` from the YAML text (nothing when it is not there), keeping comments and layout elsewhere. */
+export function removeIn(text: string, path: string): string {
+  const doc = parseDocument(text, { uniqueKeys: true }) as Document;
+  if (doc.errors.length) throw new Error(doc.errors[0]!.message.split("\n")[0]);
+  if (doc.hasIn(path.split("."))) doc.deleteIn(path.split("."));
   return String(doc);
 }
 

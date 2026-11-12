@@ -19,6 +19,13 @@ describe("LibraryChooser", () => {
     expect(within(items[1]!).getByRole("button", { name: "Open Grant 2025" })).toBeTruthy();
   });
 
+  it("each library's name heading takes its direction from the text itself (as D7)", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ libraries: [{ libraryId: "lib-ar", name: "مكتبة الأطروحة", lastKnownPaths: ["/home/r/ar"] }] })));
+    render(<LibraryChooser api={testApi()} onOpened={vi.fn()} onNotFound={vi.fn()} />);
+    const heading = await screen.findByRole("heading", { level: 2, name: "مكتبة الأطروحة" });
+    expect(heading.getAttribute("dir")).toBe("auto");
+  });
+
   it("opens a library at its last known path", async () => {
     let body: unknown;
     server.use(

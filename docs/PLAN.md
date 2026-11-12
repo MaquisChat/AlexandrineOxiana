@@ -503,14 +503,14 @@ Update after every task; commit and push.
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
 | 63 Capture state readable; one classifier | done | 960aacc | reviewed with probes over two fix rounds and a final check; a locked project's captures are neither probed nor kept; `recordEdit` fixed |
-| 62 Transcription as a job | fix round 1 in re-review | 34f0ef4 (worktree branch) | refused at the start; a lock keeps the run; a refused rerun ends; the working branch taken (five files resolved) |
+| 62 Transcription as a job | approved; verification waits for a green GitHub run | 2be8912 (worktree branch) | reviewed with probes over one fix round and a final check; a version's files come from one run |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
 | 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
-| 50b Restore asks the policy engine | in progress | | dispatched 2026-11-12 after Task 49 merged; also D15 (a missing backups manifest), restore reading destructions through the audit log, and a restored project's warning from the restore (R174) |
+| 50b Restore asks the policy engine | fix round 1 | 1afd0fb (worktree branch) | reviewed with probes: R179 met; 1 Important (a refused restore left the original project unlocked); R180. No interface offers a restore: a question for the owner |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
 | 61 New recovery code | done | da68938 | reviewed with probes over two fix rounds (R141, R148) |
 | 58 Ledger loose ends | done | 7b122fb | reviewed with probes over three fix rounds (R160, R161): annotation text searchable; a project's time zone governs its date rules |
@@ -526,11 +526,11 @@ Update after every task; commit and push.
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
-| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | approved; three small points, then verification | ce30b54 (worktree branch) | reviewed with probes: approved, 10 Minor; a locked project's Governance screen must offer no change at all; one request per Save |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | done | 1905dd9 | reviewed with probes; D10, D11, D12 closed; a route-reachability test; the changed sentences for the guide are in its report |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
 | 66 A paired browser survives a relaunch (D13) | done | 6c8cf15 | reviewed with probes over one fix round; D13 closed; the changed sentences for the guide are in its review |
-| 68 Settings writers never write what they did not read (D16) | in progress | | given to Task 66's implementer 2026-11-12 |
-| 67 One review queue for the project (D14) | in progress | d65ffcb (worktree branch) | the view and import decisions are built; the library had no way to resolve a verification entry: ruled (R176) and being built before review |
+| 68 Settings writers never write what they did not read (D16) | fix round 1 | d2fd1cc (worktree branch) | reviewed with probes: 2 Important (a missed writer, the watched folders; the command-line tool renews the device id unseen); three points ruled |
+| 67 One review queue for the project (D14) | approved; taking the working branch, then verification | 0e5595a (worktree branch) | reviewed with probes over two fix rounds (R176, R177) |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |

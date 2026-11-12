@@ -41,7 +41,7 @@ export const ROUTES: readonly AppRoute[] = [
   { matches: (p) => p === PATHS.capture, render: (loc, client) => <CaptureRoute client={client} loc={loc} />, back: true },
   { matches: (p) => p === PATHS.extension, render: (_loc, client, port) => <ExtensionPairingRoute client={client} port={port} />, back: true },
   { matches: (p) => p === PATHS.tools, render: (loc, client) => <ToolsSetupRoute client={client} loc={loc} />, back: true },
-  { matches: (p) => p === "/about", render: () => <About />, back: true },
+  { matches: (p) => p === PATHS.about, render: () => <About />, back: true },
   {
     matches: (p) => p === PATHS.appearance,
     render: (_loc, client) => (

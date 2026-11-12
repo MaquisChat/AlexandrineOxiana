@@ -208,6 +208,9 @@ export interface IntegrityAnswer {
 export interface ProjectSummary {
   id: string;
   name: string;
+  encrypted?: boolean;
+  /** An encrypted project that is not unlocked cannot be changed (PROJECT_LOCKED). */
+  unlocked?: boolean;
 }
 
 const p = (projectId: string) => `/projects/${encodeURIComponent(projectId)}`;
@@ -216,6 +219,8 @@ export function governanceApi(client: ApiClient) {
   const r = client.request;
   return {
     projects: () => r<{ projects: ProjectSummary[] }>("GET", "/projects"),
+    /** Whether the open library may be changed here (its mode), for screens that say so before a change is refused. */
+    libraryMode: async () => (await r<{ current?: { mode?: string } }>("GET", "/libraries")).current?.mode,
 
     getGovernance: (projectId: string) => r<GovernanceFile>("GET", `${p(projectId)}/governance`),
     /** Always sends the version the edit was made from (R99). */
