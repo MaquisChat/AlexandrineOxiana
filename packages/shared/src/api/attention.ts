@@ -17,8 +17,6 @@ export interface AuditEventView {
 export interface LibraryAuditPage {
   events: AuditEventView[];
   total: number;
-  /** Repeats of the latest entry counted instead of appended (R154 a). */
-  repeats?: { seq: number; count: number; lastAt: string };
 }
 
 /** `GET /libraries/audit/verify`. */
@@ -35,8 +33,13 @@ export interface LibraryAuditCheck {
 /** One mark in `GET /projects/:id/attention`. */
 export interface AttentionMarkView {
   id: string;
-  /** `waiting`: kept on this computer until it holds the library's lock; not set aside here. */
-  kind: "audit-unrecorded" | "permissions-not-set" | "unreadable" | "waiting";
+  /**
+   * `waiting`: kept on this computer until it holds the library's lock; not set aside here.
+   * `unrecognised`: anything in the attention folder that is not a well-formed mark (N2).
+   */
+  kind: "audit-unrecorded" | "permissions-not-set" | "unrecognised" | "waiting";
+  /** For an unrecognised item: its name in the attention folder (user text). */
+  name?: string;
   action?: string;
   occurredAt?: string;
   actor?: string;

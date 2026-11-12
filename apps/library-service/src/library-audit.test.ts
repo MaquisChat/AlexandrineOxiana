@@ -87,7 +87,8 @@ describe("GET /libraries/audit and /libraries/audit/verify", () => {
     expect(page.status, page.body).toBe(200);
     expect(page.json.total).toBe(1);
     expect(page.json.events[0]).toMatchObject({ action: "store", decision: { result: "deny" }, details: { op: "project.create", name: "Secret study" } });
-    expect(page.json.repeats).toMatchObject({ seq: 1, count: 2 });
+    // Identical refusals that day are dropped, not counted (N6).
+    expect(page.json).not.toHaveProperty("repeats");
     expect(page.body).not.toContain(tmp);
     const v = await call({ url: "/libraries/audit/verify" });
     expect(v.status).toBe(200);
@@ -127,15 +128,20 @@ describe("GET /projects/:id/attention and POST …/set-aside", () => {
     const { pid, name } = await projectWithMark();
     const list = await call({ url: `/projects/${pid}/attention` });
     expect(list.status).toBe(200);
-    expect(list.json.marks).toEqual([{ id: name, kind: "unreadable", canSetAside: true }]);
+    expect(list.json.marks).toEqual([{ id: expect.stringMatching(/^u-[0-9a-f]{32}$/), kind: "unrecognised", name, canSetAside: true }]);
     expect(list.body).not.toContain(tmp);
-    expect((await call({ method: "POST", url: `/projects/${pid}/attention/${name}/set-aside`, body: {} })).status).toBe(400);
-    expect((await call({ method: "POST", url: `/projects/${pid}/attention/nope.json/set-aside`, body: { reason: "x" } })).status).toBe(404);
+    const id = list.json.marks[0].id as string;
+    // A blank reason is refused by the policy engine itself, and audited (N7).
+    const blank = await call({ method: "POST", url: `/projects/${pid}/attention/${id}/set-aside`, body: { reason: "  " } });
+    expect(blank.status).toBe(403);
+    expect((await call({ url: `/projects/${pid}/audit?limit=1` })).json.events[0]).toMatchObject({ action: "set-aside", decision: { result: "deny" } });
+    expect((await call({ method: "POST", url: `/projects/${pid}/attention/u-${"0".repeat(32)}/set-aside`, body: { reason: "x" } })).status).toBe(404);
+    expect((await call({ method: "POST", url: `/projects/${pid}/attention/nope.json/set-aside`, body: { reason: "x" } })).status).toBe(400);
     let published = 0;
     const off = svc.state.events.subscribe((e: { type: string }) => {
       if (e.type === "library.state") published++;
     });
-    const r = await call({ method: "POST", url: `/projects/${pid}/attention/${name}/set-aside`, body: { reason: "Damaged by the disk" } });
+    const r = await call({ method: "POST", url: `/projects/${pid}/attention/${id}/set-aside`, body: { reason: "Damaged by the disk" } });
     expect(r.status, r.body).toBe(200);
     expect(r.json).toEqual({ recordedIn: "project" });
     await new Promise((res) => setTimeout(res, 50));
@@ -143,11 +149,12 @@ describe("GET /projects/:id/attention and POST …/set-aside", () => {
     off();
     expect((await call({ url: `/projects/${pid}/attention` })).json.marks).toEqual([]);
     const audit = await call({ url: `/projects/${pid}/audit?limit=1` });
-    expect(audit.json.events[0]).toMatchObject({ action: "delete", details: { op: "attention.set-aside", reason: "Damaged by the disk" } });
+    expect(audit.json.events[0]).toMatchObject({ action: "set-aside", details: { op: "attention.set-aside", reason: "Damaged by the disk" } });
   });
 
   it("refused for the extension token and a foreign origin", async () => {
-    const { pid, name } = await projectWithMark();
+    const { pid } = await projectWithMark();
+    const name = ((await call({ url: `/projects/${pid}/attention` })).json.marks[0].id) as string;
     const token = await pairToken();
     const ext = { authorization: `Bearer ${token}`, origin: EXT, "content-type": "application/json" };
     expect((await svc.app.inject({ method: "GET", url: `/projects/${pid}/attention`, headers: ext })).statusCode).toBe(403);

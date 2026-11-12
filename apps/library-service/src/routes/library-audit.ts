@@ -7,9 +7,10 @@ import type { FastifyInstance } from "fastify";
 import { scrubPaths } from "@ao/library";
 import type { AttentionMarksResponse, LibraryAuditCheck, LibraryAuditPage, SetAsideResponse } from "@ao/shared";
 import { badRequest } from "../errors.js";
-import { bodyOf, intParam, projectParam, queryOf, str, type Ctx } from "./util.js";
+import { bodyOf, intParam, projectParam, queryOf, type Ctx } from "./util.js";
 
-const MARK_ID = /^(?:-|[A-Za-z0-9._-]{1,128})$/;
+/** A record id (hex) or an unrecognised item's opaque id (`u-` and hex). */
+const MARK_ID = /^(?:u-)?[0-9a-f]{16,64}$/;
 
 /** Every string in a JSON value with absolute paths scrubbed. */
 function scrubDeep<T>(v: T, roots: Iterable<string>): T {
@@ -47,8 +48,11 @@ export function registerLibraryAudit(app: FastifyInstance, ctx: Ctx): void {
     const projectId = projectParam(ctx, req);
     const markId = (req.params as { markId?: string }).markId ?? "";
     if (!MARK_ID.test(markId)) throw badRequest("That is not a mark of this project.");
-    const reason = str(bodyOf(req), "reason", 1000);
-    if (reason.trim() === "") throw badRequest('"reason" is required (text).');
+    // The policy engine decides on the reason (a blank one is refused there, and audited, N7).
+    const body = bodyOf(req);
+    if (body.reason !== undefined && typeof body.reason !== "string") throw badRequest('"reason" must be text.');
+    const reason = typeof body.reason === "string" ? body.reason : "";
+    if (reason.length > 1000) throw badRequest('"reason" is too long.');
     try {
       return await s.repo.setAsideMark(projectId, markId, reason);
     } finally {
