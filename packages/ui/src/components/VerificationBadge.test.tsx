@@ -118,6 +118,23 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     expect(onConfirm).toHaveBeenCalledWith("/issued", "2018-05");
   });
 
+  it("creators with no value (Task 67 fix round 1, I1): names can be typed, separated by semicolons, and are recorded as a list of creators", async () => {
+    const onConfirm = vi.fn(noop);
+    const user = userEvent.setup();
+    const review: FieldReview = { field: "/creators", status: "unverified", checks: [], reason: "No creator was found.", evidence: [] };
+    render(<FieldCheck review={review} label="Creators" value={[]} readOnly={false} onConfirm={onConfirm} />);
+    await user.click(screen.getByRole("button", { name: "Creators: Unverified" }));
+    const box = screen.getByRole("textbox", { name: "Your value" });
+    expect(document.activeElement === box || screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    expect(screen.getByText(/separate names with a semicolon/i)).toBeTruthy();
+    await user.type(box, "Harbour Collective;  Ana Souza ; ");
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(onConfirm).toHaveBeenCalledWith("/creators", [
+      { literal: "Harbour Collective", role: "author" },
+      { literal: "Ana Souza", role: "author" },
+    ]);
+  });
+
   it("an empty typed value is not sent", async () => {
     const onConfirm = vi.fn(noop);
     const user = userEvent.setup();

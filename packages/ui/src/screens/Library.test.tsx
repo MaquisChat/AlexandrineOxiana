@@ -135,6 +135,15 @@ describe("Library screen", () => {
     expect(within(table).getAllByRole("link", { name: /Needs review/ })).toHaveLength(1);
   });
 
+  it("in a read-only library the badge is shown but is not a link (the queue cannot be read or decided there; fix round 1, M4)", async () => {
+    const ro = { libraryId: "lib-1", name: "Thesis library", mode: "read-only", readOnlyReason: "not-writable" };
+    server.use(...libraryHandlers({ current: ro }));
+    renderLibrary(ro);
+    const table = await screen.findByRole("table", { name: "Sources" });
+    expect(await within(table).findByText("Needs review")).toBeTruthy();
+    expect(within(table).queryByRole("link", { name: /Needs review/ })).toBeNull();
+  });
+
   it("a locked project's queue count is neither asked for nor shown (Task 67)", async () => {
     const asked: string[] = [];
     server.use(

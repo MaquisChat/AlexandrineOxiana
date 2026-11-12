@@ -27,7 +27,7 @@
  * another project, after a lock or after the screen closed are dropped.
  */
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
-import type { ApiClient } from "../../api/client";
+import { ApiClientError, type ApiClient } from "../../api/client";
 import {
   importApi,
   type BatchSummary,
@@ -43,7 +43,7 @@ import {
   type SourceListItem,
   type Tag,
 } from "../../api/import";
-import { PROJECT_REVIEW_PAGE_MAX } from "@ao/shared";
+import { PROJECT_REVIEW_PAGE_MAX, reviewGroup } from "@ao/shared";
 import { isProjectLocked, libraryApi } from "../../api/library";
 import { verificationApi, type FieldReview } from "../../api/verification";
 import { CodeSwatch } from "../../components/CodeSwatch";
@@ -128,7 +128,7 @@ function madeByBatch(id: string, batch: BatchSummary | undefined): boolean {
 
 /** The group an entry is listed under in the project's queue. */
 /** The group an entry is listed under: the service's, from the library's cause (R176 3); never guessed here from fields. */
-const groupOf = (i: ReviewItem): ReviewGroup => i.group ?? (i.kind === "import" ? (i.batchId ? "import" : "attach") : i.cause?.kind === "consent-withdrawal" ? "withdrawal" : "capture");
+const groupOf = (i: ReviewItem): ReviewGroup => i.group ?? reviewGroup(i);
 
 const GROUP_TITLES: Record<Exclude<ReviewGroup, "import">, string> = {
   attach: "Added by hand",
@@ -474,6 +474,11 @@ export function ReviewQueue({ client, projectId, batchId, sourceId, pageSize = P
         forget();
         return true;
       }
+      // Decided meanwhile (another window): it is no longer waiting, so it leaves the view (fix round 1, M2).
+      if (e instanceof ApiClientError && e.code === "CONFLICT") {
+        leave([item.id], (n) => `This entry had already been reviewed, so it left the queue: ${titleFor(item, n)}`);
+        return true;
+      }
       throw new Error(errorText(e));
     } finally {
       busyRef.current = false;
@@ -772,7 +777,11 @@ function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm, onRev
                 Reviewed after the withdrawal…
               </button>
             </div>
-            {reviewing && <WithdrawalReviewDialog onCancel={() => setReviewing(false)} onRecord={async (reason) => (await onReview(reason)) && setReviewing(false)} />}
+            {reviewing && <WithdrawalReviewDialog onCancel={() => setReviewing(false)} onRecord={async (reason) => {
+                  const done = await onReview(reason);
+                  if (done) setReviewing(false);
+                  return done;
+                }} />}
           </Section>
         )}
       </Section>
@@ -786,7 +795,7 @@ function VerificationPanel({ item, source, loadFailed, onRetry, onConfirm, onRev
  * reason is required and sent exactly as typed; a refusal is said in plain words and the dialog stays
  * open with the text.
  */
-function WithdrawalReviewDialog({ onRecord, onCancel }: { onRecord(reason: string): Promise<unknown>; onCancel(): void }) {
+function WithdrawalReviewDialog({ onRecord, onCancel }: { onRecord(reason: string): Promise<boolean>; onCancel(): void }) {
   const id = useId();
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
@@ -800,7 +809,8 @@ function WithdrawalReviewDialog({ onRecord, onCancel }: { onRecord(reason: strin
     setSaving(true);
     setError(undefined);
     try {
-      await onRecord(reason);
+      // False: another action was still running and nothing was sent (fix round 1, M7).
+      if (!(await onRecord(reason))) setError("Another action is still running, so this was not sent. Try again in a moment.");
     } catch (err) {
       setError(err instanceof Error && err.message ? err.message : "The library service did not answer.");
     } finally {

@@ -787,7 +787,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
                   incomplete={sources.incomplete}
                   limited={sources.limited}
                   rebuilding={!!index && index.done < index.total}
-                  reviewHref={(sid) => reviewQueueHref(project.id, sid)}
+                  reviewHref={readOnly ? undefined : (sid) => reviewQueueHref(project.id, sid)}
                   onFollow={follow}
                 />
                 {sources.items.length < sources.total && (

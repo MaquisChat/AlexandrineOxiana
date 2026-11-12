@@ -336,7 +336,9 @@ export function importApi(client: ApiClient) {
       const page = await r<ProjectReviewPage>("GET", `/projects/${pid(projectId)}/review`, {
         query: { ...(q.offset ? { offset: q.offset } : {}), ...(q.limit !== undefined ? { limit: q.limit } : {}), ...(q.source ? { source: q.source } : {}) },
       });
-      return { ...page, items: page.items as unknown as ReviewItem[] };
+      // Every field of the shared entry is typed through; only the candidates (lookup results) are narrowed.
+      const items: ReviewItem[] = page.items.map(({ candidates, ...e }) => ({ ...e, ...(candidates ? { candidates: candidates as Candidate[] } : {}) }));
+      return { ...page, items };
     },
 
     /** Review routes take the project in the body (R97). */

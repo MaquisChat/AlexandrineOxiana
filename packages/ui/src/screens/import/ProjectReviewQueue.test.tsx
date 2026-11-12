@@ -309,6 +309,37 @@ describe("the project's whole review queue (Task 67)", () => {
     expect((within(dialog).getByRole("textbox", { name: /Your reason/ }) as HTMLTextAreaElement).value).toBe("Checked");
   });
 
+  it("a capture whose creators are missing: a name is typed in the same dialog, confirmed, and the entry leaves the view (fix round 1, I1)", async () => {
+    const creatorsReview = (status: string) => ({ field: "/creators", status, checks: [], reason: status === "unverified" ? "No creator was found." : "You confirmed this value.", evidence: [] });
+    const s7 = record(7, "A post", [creatorsReview("unverified")]);
+    const after = record(7, "A post", [creatorsReview("user-confirmed")]);
+    const { m, user } = setup({
+      ...BASE,
+      projectReview: { [P1]: [entry(7, "capture", { fields: { "/creators": "unverified" } }), entry(4, "withdrawal")] },
+      sources: { s7, s4: record(4) },
+      confirmed: { s7: after },
+    });
+    await user.click(await screen.findByRole("button", { name: "Creators: Unverified" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByRole("textbox", { name: "Your value" }), "Harbour Collective");
+    await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "From captures" })).toBeNull());
+    expect(m.bodies(`PATCH /projects/${P1}/sources/s7/fields`)).toEqual([{ field: "/creators", value: [{ literal: "Harbour Collective", role: "author" }] }]);
+  });
+
+  it("an entry another window already decided: the 409 takes it out of the view and says so (fix round 1, M2)", async () => {
+    const decided = http.post(`${SERVICE}/review/:itemId/reviewed-after-withdrawal`, () => HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed." } }, { status: 409 }));
+    const { user } = setup({ ...BASE, extra: [decided] });
+    await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
+    await user.click(await screen.findByRole("button", { name: "Reviewed after the withdrawal…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Reviewed after the withdrawal" });
+    await user.type(within(dialog).getByRole("textbox", { name: /Your reason/ }), "Checked");
+    await user.click(within(dialog).getByRole("button", { name: "Record the decision" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "After a consent withdrawal" })).toBeNull());
+    expect(screen.getByRole("status").textContent).toMatch(/already been reviewed/);
+  });
+
   it("a decision refused because the project was locked meanwhile forgets every entry shown", async () => {
     const { user } = setup({ ...BASE, decideLocked: true });
     await user.click(await screen.findByRole("button", { name: "Show Entry 4" }));
