@@ -5,8 +5,11 @@
  * client reads its codes from here.
  *
  * Which codes a given route can answer is not declared as a type: the request modules name, in
- * comments, the refusals a handler itself makes; any route can also answer the codes of
- * authentication, a malformed body, a closed or moving library and an unexpected failure.
+ * comments, the refusals a handler itself makes. Besides those, any route can answer 401
+ * UNAUTHORIZED and 403 FORBIDDEN (token, host, origin), 400 VALIDATION (a malformed body), 413
+ * PAYLOAD_TOO_LARGE, 503 UNAVAILABLE while the service shuts down, and 500 INTERNAL; a route that
+ * reads the open library also 503 LIBRARY_OFFLINE; and a request other than GET, HEAD or OPTIONS
+ * also 503 MOVE_IN_PROGRESS while the library is being moved.
  */
 
 /** Every code the service answers with. */

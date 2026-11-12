@@ -5,7 +5,8 @@
 // the build, the tests and Vite's dev server resolve it the same way. Runs with the UI's tests, as
 // the colour scan does.
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
+
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -29,7 +30,8 @@ function files(dir: string, out: string[] = []): string[] {
  */
 function specifiers(src: string): string[] {
   const out: string[] = [];
-  const re = /(?:\bfrom\s*|\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)*|\bimport\s+|\bvi\.(?:do)?[mM]ock\s*\(\s*)(["'])([^"'\n]+)\1/g;
+  // A dynamic import's specifier may follow block or line comments; a mock's may be a template literal.
+  const re = /(?:\bfrom\s*|\bimport\s*\(\s*(?:(?:\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)\s*)*|\bimport\s+|\bvi\.(?:do)?[mM]ock\s*\(\s*)(["'`])([^"'`\n]+)\1/g;
   for (let m = re.exec(src); m; m = re.exec(src)) out.push(m[2]!);
   return out;
 }
@@ -39,7 +41,8 @@ function specifiers(src: string): string[] {
  * path into another package's `src` (`../../core/src/…`). A file read as text (`?raw`) is not a
  * module import and is left alone (capture.test.ts reads the library's error sentences that way).
  */
-const isDeepImport = (spec: string): boolean => !spec.endsWith("?raw") && (/^@ao\/[^/]+\/src(?:\/|$)/.test(spec) || /(?:^|\/)\.\.\/(?:core|library|shared|ui)\/src\//.test(spec));
+const isDeepImport = (spec: string): boolean =>
+  !spec.endsWith("?raw") && (/^@ao\/[^/]+\/src(?:\/|$)/.test(spec) || /^(?:\.\.\/)+(?:[\w.-]+\/)*(?:core|library|shared|ui)\/src\//.test(spec));
 
 /** The root of @ao/core: all of it, `node:` modules included, which the interface's bundle must not take. */
 const isCoreRoot = (spec: string): boolean => spec === "@ao/core";
@@ -75,7 +78,8 @@ describe("imports of the workspace packages (Task 47)", () => {
   it("the interface's own code never imports the root of @ao/core (tests may)", () => {
     const found: string[] = [];
     for (const f of sources) {
-      if (!f.startsWith(join(ROOT, "src")) || /\.test\.tsx?$/.test(f) || f.includes(`${join("src", "test")}`)) continue;
+      // Tests and the test helpers' folder (src/test/) may; a file whose name merely starts with "test" may not.
+      if (!f.startsWith(join(ROOT, "src")) || /\.test\.tsx?$/.test(f) || f.startsWith(join(ROOT, "src", "test") + sep)) continue;
       for (const s of specifiers(readFileSync(f, "utf8"))) if (isCoreRoot(s)) found.push(`${relative(ROOT, f)}: ${s}`);
     }
     expect(found).toEqual([]);
@@ -105,6 +109,10 @@ describe("imports of the workspace packages (Task 47)", () => {
     expect(isDeepImport("../../shared/src/index.ts")).toBe(true);
     expect(isDeepImport("./api/capture")).toBe(false);
     expect(isDeepImport("../src/api/capture")).toBe(false);
+    // Re-review M11: another relative spelling, a line comment before a dynamic import's specifier,
+    // and a template literal.
+    expect(isDeepImport("../../../packages/core/src/naming")).toBe(true);
+    expect(specifiers("const c = await import(\n  // why\n  \"@ao/core/src/y\"\n);\nvi.mock(`@ao/core/src/naming`);")).toEqual(["@ao/core/src/y", "@ao/core/src/naming"]);
     // Read as text (Vite's ?raw), not imported as a module: not a deep import.
     expect(isDeepImport("../../../library/src/capture/errors.ts?raw")).toBe(false);
   });
