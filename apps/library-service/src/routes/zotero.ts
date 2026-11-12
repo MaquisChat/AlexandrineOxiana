@@ -12,13 +12,14 @@
  * `zotero.sqlite` file; nothing inside it is opened or read. Nothing is imported until the
  * researcher picks one and scans it.
  */
-import { lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import nativePath, { isAbsolute, join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { SECRET_STORE_UNAVAILABLE, SecretStoreUnavailableError, deleteSecret, getSecret, setSecret } from "@ao/library";
 import { isZoteroApiKeyShape, type SecretDeleteResponse, type SecretStatusResponse, type ZoteroDataFolder, type ZoteroDataFoldersResponse } from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
+import { readSmallRegularFile } from "./safe-file.js";
 import { bodyOf, type Ctx } from "./util.js";
 
 /** Zotero's prefs.js is a few kilobytes; anything far larger is not read. */
@@ -29,10 +30,10 @@ const PROFILES_MAX = 32;
 const NO_STORE_FOR_STATUS =
   "No secure key store is available on this computer (the system keychain or credential manager), so no Zotero key can be kept here. Keys are never kept in plain files.";
 
-async function isRegularFile(p: string, maxBytes?: number): Promise<boolean> {
+async function isRegularFile(p: string): Promise<boolean> {
   try {
     const s = await lstat(p);
-    return s.isFile() && (maxBytes === undefined || s.size <= maxBytes);
+    return s.isFile();
   } catch {
     return false;
   }
@@ -43,15 +44,45 @@ async function looksLikeZoteroData(dir: string): Promise<boolean> {
   return isAbsolute(dir) && isRegularFile(join(dir, "zotero.sqlite"));
 }
 
-/** The data folder a profile's prefs.js names, when Zotero is set to use it. */
-export function dataDirFromPrefs(text: string): string | null {
-  const use = /^\s*user_pref\(\s*"extensions\.zotero\.useDataDir"\s*,\s*true\s*\)\s*;/m.test(text);
-  if (!use) return null;
-  const m = /^\s*user_pref\(\s*"extensions\.zotero\.dataDir"\s*,\s*("(?:[^"\\\n]|\\.)*")\s*\)\s*;/m.exec(text);
-  if (!m) return null;
+/**
+ * A data folder Zotero's setting names, as an absolute local path, normalised (`..` resolved, one
+ * separator kind on Windows), or null. Decided on the text alone, before anything on disk is looked
+ * at: a network path (`\\server\share`, `//server/share`), a Windows device or long path (`\\?\`,
+ * `\\.\`), a path relative to a drive's current folder (`C:Zotero`) or to the current drive's root
+ * (`\Zotero`), and anything relative are refused, so a planted prefs.js cannot make the service
+ * reach out to another computer. `p` is the platform's path module (`path.win32` or `path.posix`).
+ */
+export function localDataDir(value: string, p: typeof nativePath.posix): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4096 || value.includes("\u0000")) return null;
+  if (p.sep === "\\") {
+    // A fully qualified path on a drive: a letter, a colon and a separator, and nothing in front of it.
+    if (!/^[A-Za-z]:[\\/]/.test(value)) return null;
+    const n = p.normalize(value);
+    if (!/^[A-Za-z]:\\/.test(n)) return null;
+    return n.length > 3 ? n.replace(/\\+$/, "") : n;
+  }
+  // POSIX: a leading "//" may name a network root on some systems, so it is not taken.
+  if (!value.startsWith("/") || value.startsWith("//")) return null;
+  const n = p.normalize(value);
+  return n.length > 1 ? n.replace(/\/+$/, "") : n;
+}
+
+/** The last value prefs.js gives a preference (Mozilla reads the file top to bottom, so a later line wins). */
+function lastPref(text: string, name: string, value: string): string | undefined {
+  const re = new RegExp(`^\\s*user_pref\\(\\s*"${name.replace(/\./g, "\\.")}"\\s*,\\s*(${value})\\s*\\)\\s*;`, "gm");
+  let last: string | undefined;
+  for (const m of text.matchAll(re)) last = m[1];
+  return last;
+}
+
+/** The data folder a profile's prefs.js names, when Zotero is set to use it (the last line of each setting counts). */
+export function dataDirFromPrefs(text: string, p: typeof nativePath.posix = nativePath): string | null {
+  if (lastPref(text, "extensions.zotero.useDataDir", "true|false") !== "true") return null;
+  const raw = lastPref(text, "extensions.zotero.dataDir", '"(?:[^"\\\\\\n]|\\\\.)*"');
+  if (raw === undefined) return null;
   try {
-    const v = JSON.parse(m[1]!) as unknown;
-    return typeof v === "string" && v.length > 0 && v.length <= 4096 && isAbsolute(v) ? v : null;
+    const v = JSON.parse(raw) as unknown;
+    return typeof v === "string" ? localDataDir(v, p) : null;
   } catch {
     return null;
   }
@@ -81,14 +112,9 @@ export async function findZoteroDataFolders(o: { platform: string; home: string;
       continue;
     }
     for (const name of names) {
-      const prefs = join(place, name, "prefs.js");
-      if (!(await isRegularFile(prefs, PREFS_MAX_BYTES))) continue;
-      let text: string;
-      try {
-        text = await readFile(prefs, "utf8");
-      } catch {
-        continue;
-      }
+      // Opened without following a link and without waiting on a pipe; read through that one handle.
+      const text = await readSmallRegularFile(join(place, name, "prefs.js"), PREFS_MAX_BYTES);
+      if (text === null) continue;
       const dir = dataDirFromPrefs(text);
       if (dir) candidates.push({ path: dir, from: "zotero-setting" });
     }
