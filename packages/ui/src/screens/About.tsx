@@ -12,7 +12,11 @@
  *    services/media-worker/packaging/manifest.py). The desktop build (apps/desktop/scripts/build-linux.mjs)
  *    copies both to apps/desktop/generated/notices/ before it builds the interface; any other build
  *    of the interface says where they come from instead.
+ *  - Full licence texts (Task 37j, ADR 0015): the *-LICENCES.txt files the desktop build writes there
+ *    (the shell's crates, the interface's packages, Node.js, the service's packages, the worker's
+ *    packages). Each is its own chunk, loaded only when the person asks to see it.
  */
+import { useEffect, useId, useRef, useState } from "react";
 import { UserText } from "../components/UserText";
 import "../components/library.css";
 import "./About.css";
@@ -22,7 +26,40 @@ const raw = (files: Record<string, unknown>): Record<string, string> =>
 
 const CSL = raw(import.meta.glob("../../../core/csl/{NOTICE.md,LICENSE-CPAL-1.0.txt,LICENSE-CC-BY-SA-3.0.txt}", { query: "?raw", import: "default", eager: true }));
 const FONTS = raw(import.meta.glob("../../public/fonts/OFL-*.txt", { query: "?raw", import: "default", eager: true }));
-const GENERATED = raw(import.meta.glob("../../../../apps/desktop/generated/notices/*", { query: "?raw", import: "default", eager: true }));
+// The lists only: the licence texts (*-LICENCES.txt) are large and loaded on demand, below.
+const GENERATED = raw(import.meta.glob("../../../../apps/desktop/generated/notices/*.{json,md}", { query: "?raw", import: "default", eager: true }));
+// The full licence texts the desktop build collected (Task 37j): each its own chunk, fetched only
+// when the person asks for it, never part of the main bundle or of start-up.
+const LAZY_TEXTS = import.meta.glob("../../../../apps/desktop/generated/notices/*-LICENCES.txt", { query: "?raw", import: "default" });
+
+/** The parts of the app whose licence texts the desktop build collects, in the order shown. */
+const LICENCE_PARTS = [
+  ["shell-crates", "the app's Rust crates"],
+  ["interface-npm", "the interface's npm packages"],
+  ["node", "Node.js"],
+  ["library-service", "the library service's npm packages"],
+  ["worker", "the media helper's Python packages"],
+] as const;
+export type LicencePart = (typeof LICENCE_PARTS)[number][0];
+export type LicenceTextLoaders = Partial<Record<LicencePart, () => Promise<string>>>;
+
+/** One loader per licence-texts file the desktop build supplied (none in other builds). */
+export const BUILT_LICENCE_TEXTS: LicenceTextLoaders = Object.fromEntries(
+  Object.entries(LAZY_TEXTS).flatMap(([path, load]) => {
+    const part = /\/([^/]+)-LICENCES\.txt$/.exec(path)?.[1];
+    if (!part || !LICENCE_PARTS.some(([p]) => p === part)) return [];
+    return [
+      [
+        part,
+        async () => {
+          const text: unknown = await load();
+          if (typeof text !== "string") throw new Error("not a text");
+          return text;
+        },
+      ],
+    ];
+  }),
+);
 
 const fileNamed = (files: Record<string, string>, name: string): string | undefined => Object.entries(files).find(([k]) => k.endsWith(`/${name}`))?.[1];
 
@@ -170,7 +207,102 @@ function LicenceText({ title, text }: { title: string; text: string | undefined 
 
 const NOT_IN_THIS_BUILD = "This list is added by the desktop build of the app, from the builds of what it ships; this build of the interface does not include it.";
 
-export function About({ notices = BUILT_NOTICES }: { notices?: BuiltNotices }) {
+type PartState = { status: "idle" } | { status: "loading" } | { status: "done"; text: string } | { status: "failed" };
+
+/** One part's licence texts behind a show/hide button; loaded the first time it is shown. */
+function LicenceTextsPart({ label, load }: { label: string; load: () => Promise<string> }) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState<PartState>({ status: "idle" });
+  const mounted = useRef(true);
+  const loading = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const fetchTexts = () => {
+    if (loading.current) return; // a second click while loading sends nothing more
+    loading.current = true;
+    setState({ status: "loading" });
+    load().then(
+      (text) => {
+        loading.current = false;
+        if (mounted.current) setState({ status: "done", text });
+      },
+      () => {
+        loading.current = false;
+        if (mounted.current) setState({ status: "failed" });
+      },
+    );
+  };
+
+  // Shows or hides the texts; showing loads them the first time, and again after a failure.
+  const toggle = () => {
+    if (loading.current) return;
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (state.status !== "done") fetchTexts();
+  };
+
+  return (
+    <div>
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={toggle}>
+        {`Show the licence texts of ${label}`}
+      </button>
+      <div id={id} hidden={!open}>
+        {state.status === "loading" ? <p role="status">Loading the licence texts…</p> : null}
+        {state.status === "failed" ? (
+          <div role="alert">
+            <p>These licence texts could not be loaded.</p>
+            <button type="button" onClick={fetchTexts}>
+              Try again
+            </button>
+          </div>
+        ) : null}
+        {state.status === "done" ? (
+          <UserText as="div" className="ao-notice">
+            {state.text}
+          </UserText>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function FullLicenceTexts({ loaders }: { loaders: LicenceTextLoaders }) {
+  const parts = LICENCE_PARTS.flatMap(([part, label]) => {
+    const load = loaders[part];
+    return load ? [{ part, label, load }] : [];
+  });
+  return (
+    <section aria-labelledby="ao-about-texts" className="ao-card">
+      <h2 id="ao-about-texts" className="ao-pane-title">
+        Full licence texts
+      </h2>
+      {parts.length === 0 ? (
+        <p>The full licence texts are added by the desktop build of the app, from the builds of what it ships; this build of the interface does not include them.</p>
+      ) : (
+        <>
+          <p>
+            The licence and notice files of every package the app ships, collected when the app was built. Each file is shown whole, as its package ships it; identical files appear once, under every package they apply to. A package that ships no
+            licence text of its own is named, with the standard text used for it.
+          </p>
+          {parts.map((p) => (
+            <LicenceTextsPart key={p.part} label={p.label} load={p.load} />
+          ))}
+        </>
+      )}
+    </section>
+  );
+}
+
+export function About({ notices = BUILT_NOTICES, licenceTexts = BUILT_LICENCE_TEXTS }: { notices?: BuiltNotices; licenceTexts?: LicenceTextLoaders }) {
   const notice = fileNamed(CSL, "NOTICE.md");
   // The notice NOTICE.md quotes for the About screen (its "> " lines), shown first.
   const quoted = notice
@@ -315,6 +447,8 @@ export function About({ notices = BUILT_NOTICES }: { notices?: BuiltNotices }) {
           </>
         )}
       </section>
+
+      <FullLicenceTexts loaders={licenceTexts} />
     </main>
   );
 }

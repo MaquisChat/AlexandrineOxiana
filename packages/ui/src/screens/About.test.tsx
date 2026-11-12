@@ -12,7 +12,8 @@ import { createClient } from "../api/client";
 import { ROUTES, routeFor } from "../App";
 import type { AppLocation } from "../navigation";
 import { BASE, CURRENT_RW, libraryHandlers, server, TOKEN, testApi, url, useMockService } from "../test/service";
-import { About, BUILT_NOTICES, parseNpmNotices } from "./About";
+import ABOUT_SOURCE from "./About.tsx?raw";
+import { About, BUILT_LICENCE_TEXTS, BUILT_NOTICES, parseNpmNotices } from "./About";
 import { Library } from "./Library";
 import { LibraryChooser } from "./LibraryChooser";
 
@@ -130,6 +131,103 @@ describe("About", () => {
     expect(parseNpmNotices("no table")).toEqual([]);
     // In this checkout the desktop build's data is either absent or a list that parses.
     if (BUILT_NOTICES.npm) expect(parseNpmNotices(BUILT_NOTICES.npm).length).toBeGreaterThan(0);
+  });
+});
+
+describe("full licence texts (Task 37j)", () => {
+  const deferred = () => {
+    let resolve!: (v: string) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<string>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  };
+
+  it("offers each part's texts and loads one only when asked, once, shown as text", async () => {
+    const user = userEvent.setup();
+    const d = deferred();
+    let calls = 0;
+    const crates = () => {
+      calls++;
+      return d.promise;
+    };
+    render(<About notices={{}} licenceTexts={{ "shell-crates": crates, node: () => Promise.resolve("Node.js v22") }} />);
+    const region = screen.getByRole("region", { name: "Full licence texts" });
+    expect(calls).toBe(0); // nothing is loaded at start
+    const button = within(region).getByRole("button", { name: "Show the licence texts of the app's Rust crates" });
+    expect(within(region).getByRole("button", { name: "Show the licence texts of Node.js" })).toBeTruthy();
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    await user.dblClick(button);
+    expect(calls).toBe(1);
+    expect(region.textContent).toMatch(/Loading/);
+    d.resolve("Copyright (c) 2020 <b>Ann</b>\nterms");
+    const shown = await within(region).findByText(/Copyright \(c\) 2020 <b>Ann<\/b>/);
+    expect(shown.querySelector("b")).toBeNull(); // text, never markup
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(shown.closest("[id]")?.id).toBe(button.getAttribute("aria-controls"));
+    await user.click(button); // hides it again; a second show does not load again
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    await user.click(button);
+    expect(calls).toBe(1);
+  });
+
+  it("a text that cannot be loaded is said so in plain words, and can be tried again", async () => {
+    const user = userEvent.setup();
+    let calls = 0;
+    const load = () => (++calls <= 2 ? Promise.reject(new Error("chunk failed /assets/x.js")) : Promise.resolve("MIT terms"));
+    render(<About notices={{}} licenceTexts={{ "interface-npm": load }} />);
+    const button = screen.getByRole("button", { name: "Show the licence texts of the interface's npm packages" });
+    await user.click(button);
+    expect(await screen.findByText("These licence texts could not be loaded.")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("/assets/x.js");
+    // The section can still be closed (review N5) ...
+    await user.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(calls).toBe(1);
+    // ... and opened again, which tries again; it fails again here.
+    await user.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(calls).toBe(2);
+    expect(await screen.findByText("These licence texts could not be loaded.")).toBeTruthy();
+    // A "Try again" button in the message retries, by keyboard too (review M7).
+    const retry = screen.getByRole("button", { name: "Try again" });
+    retry.focus();
+    await user.keyboard("{Enter}");
+    expect(await screen.findByText("MIT terms")).toBeTruthy();
+    expect(calls).toBe(3);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("an answer that arrives after the screen is gone is dropped", async () => {
+    const d = deferred();
+    const user = userEvent.setup();
+    const { unmount } = render(<About notices={{}} licenceTexts={{ worker: () => d.promise }} />);
+    await user.click(screen.getByRole("button", { name: "Show the licence texts of the media helper's Python packages" }));
+    unmount();
+    d.resolve("late");
+    await d.promise;
+    expect(document.body.textContent).not.toContain("late");
+  });
+
+  it("without the desktop build's texts, says where they come from", () => {
+    render(<About notices={{}} licenceTexts={{}} />);
+    expect(screen.getByRole("region", { name: "Full licence texts" }).textContent).toMatch(/added by the desktop build/);
+  });
+
+  it("the build's texts are loaded on demand, never part of the main bundle (review M2)", () => {
+    for (const load of Object.values(BUILT_LICENCE_TEXTS)) expect(typeof load).toBe("function");
+    for (const text of Object.values(BUILT_NOTICES)) expect(text).not.toMatch(/^=== Text 1 of/m);
+    // What the bundler sees: the texts' glob is lazy, and the eager glob takes only the lists.
+    const source = ABOUT_SOURCE;
+    const globs = [...source.matchAll(/import\.meta\.glob\(\s*"([^"]*generated\/notices[^"]*)"\s*,\s*\{([^}]*)\}/g)].map((m) => ({ pattern: m[1] ?? "", options: m[2] ?? "" }));
+    const texts = globs.filter((g) => g.pattern.includes("LICENCES"));
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.options).not.toMatch(/eager/);
+    const eager = globs.filter((g) => /eager:\s*true/.test(g.options));
+    expect(eager).toHaveLength(1);
+    expect(eager[0]!.pattern).toMatch(/\*\.\{json,md\}$/);
   });
 });
 
