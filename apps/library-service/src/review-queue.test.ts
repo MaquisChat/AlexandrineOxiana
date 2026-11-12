@@ -244,26 +244,93 @@ describe("deciding entries that have no batch (Task 67)", () => {
     expect((await queue(pid)).total).toBe(1);
   });
 
-  // ---- Not resolvable in the library today (reported for the coordinator's ruling) ----
-  // No library operation marks a verification entry resolved: confirmField (the source screen's
-  // confirm) records the value but leaves the entry pending, and decideReview refuses any entry that
-  // is not an import item. These two run as expected failures until a ruling names the decision.
+  // ---- R176: verification entries are resolved by the library's own ways ----
 
-  it.fails("[awaits a ruling] a capture entry leaves the queue, and its badge clears, once its conflicting field is confirmed", async () => {
+  it("a capture entry leaves the queue, and its badge clears, once its conflicting field is confirmed (R176 1)", async () => {
     const pid = await newProject();
     const sid = await capturedWithConflict(pid);
     const r = await call({ method: "PATCH", url: `/projects/${pid}/sources/${sid}/fields`, body: { field: "/title", value: { variants: [{ lang: "en", kind: "original", value: "A captured page" }] } } });
     expect(r.status, r.body).toBe(200);
     expect((await queue(pid)).total).toBe(0);
     expect(await badge(pid, sid)).toBe(false);
+    const events = (await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Array<{ details?: { op?: string; reviewResolved?: { by: string } } }>;
+    expect(events.find((e) => e.details?.reviewResolved)?.details).toMatchObject({ op: "source.update", reviewResolved: { by: "confirmation" } });
   });
 
-  it.fails("[awaits a ruling] a consent-withdrawal entry can be decided, and then leaves the queue and its badge clears", async () => {
+  it("the queue sends each verification entry's cause: a capture's, or the withdrawal's with its consent record (R176 3)", async () => {
+    const pid = await newProject();
+    await capturedWithConflict(pid);
+    await flaggedByWithdrawal(pid);
+    const items = (await queue(pid)).items;
+    expect(items.find((e) => e.group === "capture")?.cause).toEqual({ kind: "capture-conflict" });
+    expect(items.find((e) => e.group === "withdrawal")?.cause).toEqual({ kind: "consent-withdrawal", consentIds: [expect.any(String)] });
+  });
+
+  const reviewed = (pid: string, itemId: string, reason?: unknown) =>
+    call({ method: "POST", url: `/review/${itemId}/reviewed-after-withdrawal`, body: { projectId: pid, ...(reason !== undefined ? { reason } : {}) } });
+
+  it("a consent-withdrawal entry is decided by Reviewed after the withdrawal, with a reason stored as typed: it leaves the queue and its badge clears (R176 2)", async () => {
     const pid = await newProject();
     const sid = await flaggedByWithdrawal(pid);
     const [entry] = (await queue(pid)).items;
-    expect((await decide(pid, entry!.id, { action: "accept" })).status).toBe(200);
+    const reason = "  Spoke with P-001: the audio may be kept, not quoted.";
+    const r = await reviewed(pid, entry!.id, reason);
+    expect(r.status, r.body).toBe(200);
+    // The contract the interface's api module and test double follow (WithdrawalReviewedResponse).
+    expect(r.json).toEqual({ entry: { id: entry!.id, sourceId: sid, status: "resolved", decision: "reviewed-after-withdrawal", resolvedAt: expect.any(String), reason } });
     expect((await queue(pid)).total).toBe(0);
     expect(await badge(pid, sid)).toBe(false);
+    const events = (await call({ url: `/projects/${pid}/audit?limit=1000` })).json.events as Array<{ action: string; details?: Record<string, unknown> }>;
+    expect(events.find((e) => e.action === "review-withdrawal")).toMatchObject({ action: "review-withdrawal", details: { op: "review.withdrawal-reviewed", reviewEntry: entry!.id, reason } });
+  });
+
+  it("Reviewed after the withdrawal without a reason is refused in plain words, and the entry stays", async () => {
+    const pid = await newProject();
+    await flaggedByWithdrawal(pid);
+    const [entry] = (await queue(pid)).items;
+    for (const reason of ["", "   "]) {
+      const r = await reviewed(pid, entry!.id, reason);
+      expect(r.status).toBe(403);
+      expect(r.json.error).toMatchObject({ code: "POLICY_DENIED", reason: "A reason is required to record that this source was reviewed after the withdrawal" });
+    }
+    const missing = await reviewed(pid, entry!.id);
+    expect(missing.status).toBe(400);
+    expect((await queue(pid)).total).toBe(1);
+  });
+
+  it("Reviewed after the withdrawal twice at once: one is recorded, the other is a conflict in plain words", async () => {
+    const pid = await newProject();
+    await flaggedByWithdrawal(pid);
+    const [entry] = (await queue(pid)).items;
+    const rs = await Promise.all([reviewed(pid, entry!.id, "first"), reviewed(pid, entry!.id, "second")]);
+    expect(rs.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(rs.find((r) => r.status === 409)!.json.error).toMatchObject({ code: "CONFLICT", message: "This entry has already been reviewed." });
+  });
+
+  it("Reviewed after the withdrawal is refused for a locked project before anything is read, and for an entry of another kind", async () => {
+    const pid = await newProject(true);
+    await flaggedByWithdrawal(pid);
+    const [entry] = (await queue(pid)).items;
+    expect((await call({ method: "POST", url: `/projects/${pid}/lock` })).status).toBe(200);
+    const r = await reviewed(pid, entry!.id, "a reason");
+    expect(r.status).toBe(423);
+    expect(r.json).toEqual({ error: { code: "PROJECT_LOCKED", message: "This project is locked. Its passphrase is needed." } });
+    expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+    expect((await queue(pid)).total).toBe(1);
+    const sid = await attached(pid);
+    const imp = (await queue(pid)).items.find((e) => e.sourceId === sid)!;
+    const wrong = await reviewed(pid, imp.id, "a reason");
+    expect(wrong.status).toBe(400);
+    expect(wrong.json.error.message).toMatch(/not an entry flagged by a consent withdrawal/);
+    expect(wrong.body).not.toContain(tmp);
+  });
+
+  it("deleting a source resolves its pending entries: none is left in the queue (R176 4)", async () => {
+    const pid = await newProject();
+    const sid = await flaggedByWithdrawal(pid);
+    expect((await call({ method: "DELETE", url: `/projects/${pid}/sources/${sid}` })).status).toBe(200);
+    expect((await queue(pid)).total).toBe(0);
+    const rows = svc.state.session!.index!.db.prepare("SELECT status FROM review_items WHERE project_id = ? AND source_id = ?").all(pid, sid) as Array<{ status: string }>;
+    expect(rows).toEqual([{ status: "resolved" }]);
   });
 });

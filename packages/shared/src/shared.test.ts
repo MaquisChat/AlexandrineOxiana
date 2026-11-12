@@ -93,10 +93,11 @@ describe("font names a researcher's own file cannot take (Task 57 M5): one list"
     for (const n of ["Junicode", "Brill", "Serif Pro", "Goudy", "revert2"]) expect(reservedFontName(n), n).toBeNull();
   });
 
-  it("review queue groups (Task 67): import with a batch, import without one, verification with fields, verification without", () => {
-    expect(reviewGroup({ kind: "import", batchId: "b1", fields: {} })).toBe("import");
-    expect(reviewGroup({ kind: "import", fields: { "/title": "unverified" } })).toBe("attach");
-    expect(reviewGroup({ kind: "verification", fields: { "/identifiers/doi": "conflict" } })).toBe("capture");
-    expect(reviewGroup({ kind: "verification", fields: {} })).toBe("withdrawal");
+  it("review queue groups (Task 67, R176): import with a batch, import without one, verification by its cause", () => {
+    expect(reviewGroup({ kind: "import", batchId: "b1" })).toBe("import");
+    expect(reviewGroup({ kind: "import" })).toBe("attach");
+    // Verification entries by their cause (R176 3: recorded, or read by the library's reviewCauseOf), never by their fields.
+    expect(reviewGroup({ kind: "verification", cause: { kind: "capture-conflict" } })).toBe("capture");
+    expect(reviewGroup({ kind: "verification", cause: { kind: "consent-withdrawal", consentIds: ["c1"] } })).toBe("withdrawal");
   });
 });

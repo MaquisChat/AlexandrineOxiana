@@ -1,21 +1,32 @@
 /**
  * The review queue (spec 5.4, R172): the project's whole queue (every pending entry of every kind,
- * Task 67); decide one import entry, with or without a batch, or edit several at once.
+ * Task 67); decide one import entry, with or without a batch, or edit several at once; record that
+ * a source flagged by a consent withdrawal was reviewed (R176 2).
  */
 import type { FastifyInstance } from "fastify";
-import type { ListedReviewEntry, ReviewDecision, ReviewPatch } from "@ao/library";
-import { PROJECT_REVIEW_PAGE_MAX, reviewGroup, type ProjectReviewEntry, type ProjectReviewPage } from "@ao/shared";
+import { reviewCauseOf, type ListedReviewEntry, type ReviewDecision, type ReviewPatch } from "@ao/library";
+import {
+  PROJECT_REVIEW_PAGE_MAX,
+  WITHDRAWAL_REASON_MAX,
+  reviewGroup,
+  type ProjectReviewEntry,
+  type ProjectReviewPage,
+  type WithdrawalReviewedResponse,
+} from "@ao/shared";
 import { ApiError, badRequest } from "../errors.js";
 import { bodyOf, intParam, optObj, paramsOf, projectParam, queryOf, str, strArray, type Ctx } from "./util.js";
 
 /** What the queue sends of an entry (only pending entries are listed). */
 function entryOut(e: ListedReviewEntry): ProjectReviewEntry {
+  // The cause as the library reads it (recorded, or inferred for an older entry: reviewCauseOf, R176 3).
+  const cause = reviewCauseOf(e);
   return {
     id: e.id,
     projectId: e.projectId,
     sourceId: e.sourceId!,
     kind: e.kind,
-    group: reviewGroup(e),
+    group: reviewGroup({ kind: e.kind, batchId: e.batchId, cause }),
+    ...(cause ? { cause } : {}),
     status: "pending",
     createdAt: e.createdAt,
     fields: e.fields ?? {},
@@ -68,6 +79,20 @@ export function registerReview(app: FastifyInstance, ctx: Ctx): void {
     await s.bulk.decideReview(projectId, paramsOf(req).itemId ?? "", decision as unknown as ReviewDecision);
     state.publishState();
     return { decided: true };
+  });
+
+  // "Reviewed after the withdrawal" (R176 2): the library's own decision, its own policy operation
+  // (a blank reason is refused by the engine and audited). A locked project is refused before
+  // anything is read; a second decision on the same entry is a conflict.
+  app.post("/review/:itemId/reviewed-after-withdrawal", async (req): Promise<WithdrawalReviewedResponse> => {
+    const s = state.requireWritable();
+    const b = bodyOf(req);
+    const projectId = projectOf(ctx, b);
+    if (typeof b.reason !== "string") throw badRequest('"reason" is required: say, in your own words, what you decided after the withdrawal.');
+    if (b.reason.length > WITHDRAWAL_REASON_MAX) throw badRequest(`"reason" is too long (at most ${WITHDRAWAL_REASON_MAX} characters).`);
+    const e = await s.repo.reviewedAfterWithdrawal(projectId, paramsOf(req).itemId ?? "", b.reason);
+    state.publishState();
+    return { entry: { id: e.id, sourceId: e.sourceId!, status: "resolved", decision: "reviewed-after-withdrawal", resolvedAt: e.resolvedAt!, reason: e.reason! } };
   });
 
   app.post("/review/bulk-edit", async (req) => {

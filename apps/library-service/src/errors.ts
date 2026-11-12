@@ -16,6 +16,7 @@ import {
   ExportDestinationError,
   ExportFailedError,
   FieldworkInUseError,
+  ReviewEntryDecidedError,
   GovernanceConflictError,
   InvalidInputError,
   KeyFileChangedError,
@@ -125,6 +126,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof InvalidInputError) return new ApiError(400, "VALIDATION", err.message);
   if (err instanceof KeyFileChangedError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof FieldworkInUseError) return new ApiError(409, "CONFLICT", err.message);
+  if (err instanceof ReviewEntryDecidedError) return new ApiError(409, "CONFLICT", err.message);
   if (err instanceof UnknownStyleError) return new ApiError(404, "NOT_FOUND", "That citation style is not available.");
   if (err instanceof CslBundleMissingError) return new ApiError(503, "UNAVAILABLE", "The citation styles are not installed.");
   // A file of the app itself is missing (a damaged installation); its message names what, never where.
