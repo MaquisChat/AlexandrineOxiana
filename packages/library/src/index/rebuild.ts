@@ -220,7 +220,8 @@ async function populate(
       const folder = `${e.rel}/Sources/${name}`;
       jobs.push(async () => {
         try {
-          const sf = await readSource(join(root, folder), k);
+          // An encrypted project's annotations are loaded with its content, into memory, after the swap.
+          const sf = await readSource(join(root, folder), k, { annotations: !prot });
           if (!sf) return; // not a source folder
           if (prot) indexSource(db, sf, undefined, { protected: true, withTemp: false });
           else indexSource(db, sf, await readExtractedText(root, sf, null));

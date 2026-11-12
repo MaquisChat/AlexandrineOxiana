@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { primary, type ConsentRecord, type Collection, type Participant, type Project, type Session, type SourceFile, type SourceType, type Tag } from "@ao/core";
 import type { ReviewItemRow } from "../repo/review.js";
 import { migrationsUrl } from "../resources.js";
-import { cjkBigrams } from "./text.js";
+import { MAX_INDEXED_ANNOTATION_TEXT, annotationText, cjkBigrams } from "./text.js";
 
 export type IndexDb = Database.Database;
 
@@ -32,6 +32,11 @@ export interface SourceRow {
   needsReview: boolean;
   /** True while only manifest-level data is available (encrypted project, locked). */
   locked: boolean;
+  /**
+   * Text searches only: "annotation" when the source matched through the text of its annotations
+   * (Task 58) — the search terms are not all in its own record. Absent otherwise.
+   */
+  matchedIn?: "annotation";
 }
 
 /** Owns the live connection so a rebuild can swap it; everything that writes must go through it. */
@@ -118,7 +123,7 @@ export function setMeta(db: IndexDb, key: string, value: string): void {
 // TEMP schema (in memory, per connection): content of unlocked encrypted projects.
 
 const FTS_COLUMNS = `source_id UNINDEXED, project_id UNINDEXED, title_all, creators, container, extracted_text, cjk_bigrams,
-  tokenize = 'unicode61 remove_diacritics 2'`;
+  annotations, annotation_bigrams, tokenize = 'unicode61 remove_diacritics 2'`;
 
 const TEMP_SQL = `
 CREATE TEMP TABLE IF NOT EXISTS t_sources (
@@ -250,7 +255,15 @@ interface Detail {
   sha256s: string[];
 }
 
-function putSource(db: IndexDb, S: Store, d: Detail, fts: { titleAll: string; creators: string; container: string } | null, extractedText: string | undefined): void {
+interface FtsText {
+  titleAll: string;
+  creators: string;
+  container: string;
+  /** The text of the source's annotations (Task 58, R74): see annotationText. */
+  annotations: string;
+}
+
+function putSource(db: IndexDb, S: Store, d: Detail, fts: FtsText | null, extractedText: string | undefined): void {
   const existing = db.prepare(`SELECT fts_rowid FROM ${S.sources} WHERE id = ?`).get(d.id) as { fts_rowid: number } | undefined;
   const ftsRowid =
     existing?.fts_rowid ?? (db.prepare(`SELECT COALESCE(MAX(fts_rowid), 0) + 1 AS n FROM ${S.sources}`).get() as { n: number }).n;
@@ -283,9 +296,9 @@ function putSource(db: IndexDb, S: Store, d: Detail, fts: { titleAll: string; cr
   const extracted = extractedText ?? old?.extracted_text ?? "";
   const bigrams = cjkBigrams([fts.titleAll, fts.creators, fts.container, extracted].join("\n"));
   db.prepare(
-    `INSERT INTO ${S.fts} (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(ftsRowid, d.id, d.projectId, fts.titleAll, fts.creators, fts.container, extracted, bigrams);
+    `INSERT INTO ${S.fts} (rowid, source_id, project_id, title_all, creators, container, extracted_text, cjk_bigrams, annotations, annotation_bigrams)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(ftsRowid, d.id, d.projectId, fts.titleAll, fts.creators, fts.container, extracted, bigrams, fts.annotations, cjkBigrams(fts.annotations));
 }
 
 export interface IndexSourceOptions {
@@ -295,7 +308,12 @@ export interface IndexSourceOptions {
   withTemp?: boolean;
 }
 
-/** Indexes (or re-indexes) one source. `extractedText` undefined keeps any text indexed earlier. */
+/**
+ * Indexes (or re-indexes) one source. `extractedText` undefined keeps any text indexed earlier.
+ * The text of its annotations comes from `sf.annotations` (callers that read source.json from
+ * disk load annotations.json too, see load.ts); like the rest of the content it goes to TEMP only
+ * when the source is protected (R30).
+ */
 export function indexSource(db: IndexDb, sf: SourceFile, extractedText?: string, opts: IndexSourceOptions = {}): void {
   const s = sf.source;
   const projectId = s.projectIds[0] ?? "";
@@ -329,6 +347,7 @@ export function indexSource(db: IndexDb, sf: SourceFile, extractedText?: string,
     titleAll: s.title.variants.map((v) => v.value).join(" • "),
     creators: detail.creatorsText,
     container: s.container ? s.container.variants.map((v) => v.value).join(" • ") : "",
+    annotations: annotationText(sf.annotations, MAX_INDEXED_ANNOTATION_TEXT),
   };
   const prot = opts.protected === true;
   db.transaction(() => {
