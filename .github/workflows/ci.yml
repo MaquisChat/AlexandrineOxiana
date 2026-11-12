@@ -105,6 +105,162 @@ jobs:
           name: reports-py${{ matrix.python }}
           path: reports/
 
+  # Whether a push to a working branch touched the desktop app or what it is built from (the desktop
+  # job below runs only then, on main and on manual runs: the repository is private and its build
+  # minutes are limited). Read from GitHub's comparison of the push's first and last commits; a new
+  # branch, or a comparison that cannot be read, counts as touched.
+  desktop-scope:
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - id: diff
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! files=$(gh api "repos/$REPO/compare/$BEFORE...$AFTER" --paginate --jq '.files[].filename'); then
+            echo "::warning::Could not compare $BEFORE...$AFTER; running the desktop job."
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if printf '%s\n' "$files" | grep -E -q '^(apps/desktop/|apps/library-service/scripts/|services/media-worker/packaging/|\.github/workflows/ci\.yml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The desktop app on Linux (Tasks 37c, 37h): build it (build:linux, the Rust build cached), the
+  # shell's Rust tests, the launch check (helpers start and stop; under xvfb-run), and the desktop
+  # end-to-end scenario (the built app driven through its real window by WebDriver; it starts its own
+  # private Xvfb and D-Bus, so it never types into a real screen). Its own job, so the test job's
+  # time does not grow. No retries anywhere: a flaky run is a finding.
+  desktop:
+    needs: desktop-scope
+    if: >-
+      !cancelled() && (github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || needs.desktop-scope.outputs.changed == 'true')
+    runs-on: ubuntu-latest
+    # A healthy run takes about 10 minutes cold and 5 with a warm cache (see the Task 37h report).
+    timeout-minutes: 40
+    env:
+      # Smaller, faster-to-restore cache; incremental builds do not help a fresh runner.
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+      - uses: pnpm/action-setup@v4
+        timeout-minutes: 5
+      - uses: actions/setup-node@v4
+        timeout-minutes: 5
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        timeout-minutes: 5
+        with:
+          python-version: "3.13"
+      - name: System packages (web view libraries, WebKitWebDriver, Xvfb, xdotool, ffmpeg)
+        timeout-minutes: 8
+        run: |
+          # Same fallback as the test job when Ubuntu's own mirrors do not resolve on the runner.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            echo "::warning::Ubuntu's package mirrors do not resolve on this runner; using mirrors.edge.kernel.org for this run."
+            for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              [ -f "$f" ] && sudo sed -i -E 's#https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?#https://mirrors.edge.kernel.org/ubuntu/#g' "$f"
+            done
+          fi
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20
+          # With their recommended packages (the web view's GL and portal pieces). GStreamer's plugins play
+          # the launch check's audio and H.264 video in the web view; ffmpeg makes those files.
+          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev build-essential pkg-config libssl-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            webkit2gtk-driver xvfb xauth dbus dbus-x11 xdotool ffmpeg
+      - name: Rust 1.97
+        timeout-minutes: 5
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+      - name: Rust build cache (crates and the shell's target folder)
+        uses: actions/cache@v4
+        timeout-minutes: 10
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/desktop/src-tauri/target
+          key: desktop-rust-1.97.0-${{ runner.os }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: desktop-rust-1.97.0-${{ runner.os }}-
+      - name: tauri-driver cache
+        id: tauri-driver
+        timeout-minutes: 5
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo-tools
+          key: tauri-driver-2.1.0-rust-1.97.0-${{ runner.os }}
+      - name: tauri-driver 2.1.0 (pinned; its own lockfile)
+        if: steps.tauri-driver.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: cargo install tauri-driver --version =2.1.0 --locked --root ~/.cargo-tools
+      - run: echo "TAURI_DRIVER=$HOME/.cargo-tools/bin/tauri-driver" >> "$GITHUB_ENV"
+        timeout-minutes: 1
+      - run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+      - name: Media worker venv (the development worker the shell starts in these checks)
+        timeout-minutes: 10
+        run: pnpm setup:py
+        env:
+          PYTHON: python
+      - name: CSL styles and locales (the service folder ships them)
+        timeout-minutes: 5
+        run: pnpm fetch-csl
+      - name: Build the desktop app (service folder, notices, interface, shell)
+        timeout-minutes: 25
+        run: pnpm --filter @ao/desktop run build:linux
+      - name: The shell's Rust tests
+        timeout-minutes: 15
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Launch check (helpers start, answer and stop; scenarios A–E under xvfb-run)
+        timeout-minutes: 15
+        run: pnpm --filter @ao/desktop run launch-check
+      - name: Desktop end-to-end scenario (the built app through its real window)
+        timeout-minutes: 15
+        run: pnpm e2e -- --desktop-only
+      - run: pnpm report
+        if: always()
+        timeout-minutes: 2
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        if: always()
+        with:
+          name: desktop-reports
+          path: reports/
+          if-no-files-found: ignore
+      # On failure: the shell's output (the shell's and the service's lines, written by the scenario
+      # for a failed run) and Playwright's error context. The launch check prints the shell's output
+      # in the step log itself.
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        if: failure()
+        with:
+          name: desktop-shell-output
+          path: apps/desktop/e2e/test-results/
+          if-no-files-found: ignore
+
   # The packaged media worker (Task 37d): a one-folder PyInstaller build for Linux, then its smoke
   # test. Only on main and on manual runs: it costs build minutes and changes rarely.
   worker-bundle:
