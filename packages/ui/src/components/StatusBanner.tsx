@@ -4,8 +4,9 @@
  * library's integrity warnings and projects' standing warnings. Warning codes are never shown as
  * such; an unknown one shows the service's own (path-scrubbed) detail.
  */
+import { useRef, useState } from "react";
 import { isDeviceNoticeKind, type DeviceNoticeKind } from "@ao/shared";
-import type { IntegrityWarning, LibraryState } from "../api/library";
+import { errorText, type IntegrityWarning, type LibraryState } from "../api/library";
 import { inAppLink, PATHS } from "../navigation";
 import { UserText } from "./UserText";
 import "./library.css";
@@ -136,6 +137,48 @@ const TONE: Record<BannerVariant["kind"], string> = {
   notice: "warn",
 };
 
+/**
+ * The researcher's "Got it" for this computer's notices (Task 68), shared by the library's banner
+ * area and the chooser: one request per notice (a second click while it runs does nothing), then
+ * `onGone(kind)`; a refusal is kept in `error`, in plain words.
+ */
+export function useNoticeDismiss(dismiss: (kind: DeviceNoticeKind) => Promise<unknown>, onGone: (kind: DeviceNoticeKind) => void): { onDismiss: (kind: DeviceNoticeKind) => void; error: string | null } {
+  const [error, setError] = useState<string | null>(null);
+  const running = useRef(new Set<string>());
+  const onDismiss = (kind: DeviceNoticeKind) => {
+    if (running.current.has(kind)) return;
+    running.current.add(kind);
+    setError(null);
+    dismiss(kind).then(
+      () => {
+        running.current.delete(kind);
+        onGone(kind);
+      },
+      (err: unknown) => {
+        running.current.delete(kind);
+        setError(errorText(err, "The notice could not be removed."));
+      },
+    );
+  };
+  return { onDismiss, error };
+}
+
+/** This computer's notices as banners with "Got it", for a page without a library's banners (the chooser). */
+export function DeviceNoticeBanners({ notices, onDismiss, error }: { notices: LibraryState["notices"]; onDismiss: (kind: DeviceNoticeKind) => void; error: string | null }) {
+  const banners = bannersFor({ notices });
+  if (!banners.length && !error) return null;
+  return (
+    <div className="ao-library__banners" aria-label="Notices">
+      {banners.map((b) => (b.kind === "notice" ? <StatusBanner key={`notice-${b.notice}`} variant={b} onDismiss={onDismiss} /> : null))}
+      {error && (
+        <p role="alert" className="ao-warning">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Warnings about an interrupted change the researcher can resolve by hand (R27). */
 export const RESOLVABLE_WARNINGS: ReadonlySet<string> = new Set(["incomplete-write-pending", "invalid-txn-marker", "txn-recovery-skipped-audit-unverifiable"]);
 
@@ -197,7 +240,7 @@ export interface BannerContext {
 }
 
 /** Banners for the library's state, in order: access, index progress, integrity warnings, project warnings. */
-export function bannersFor(state: Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices">, ctx: BannerContext = {}): BannerVariant[] {
+export function bannersFor(state: Partial<Pick<LibraryState, "mode" | "readOnlyReason" | "integrityWarnings" | "projectWarnings" | "index" | "notices">>, ctx: BannerContext = {}): BannerVariant[] {
   const out: BannerVariant[] = [];
   if (state.mode === "read-only") {
     const r = state.readOnlyReason;

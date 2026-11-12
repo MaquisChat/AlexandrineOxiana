@@ -63,6 +63,16 @@ async function stateNow(): Promise<{ notices?: Array<{ kind: string; at: string 
   return svc!.state.libraryState() as { notices?: Array<{ kind: string; at: string }> };
 }
 
+describe("device-level notices on the chooser's answer (fix round 1, M1)", () => {
+  it("GET /libraries carries them with no library open, and not after “Got it”", async () => {
+    await raiseDeviceNotice(deps.appConfigDir, "device-identity-renewed", at);
+    await start();
+    expect((await call({ url: "/libraries" })).json.notices).toEqual([{ kind: "device-identity-renewed", at: at.toISOString() }]);
+    expect((await call({ method: "POST", url: "/settings/notices/dismiss", body: { kind: "device-identity-renewed" } })).status).toBe(200);
+    expect((await call({ url: "/libraries" })).json.notices).toEqual([]);
+  });
+});
+
 describe("device-level notices in the library state", () => {
   it("no notice when nothing was set aside", async () => {
     await start();

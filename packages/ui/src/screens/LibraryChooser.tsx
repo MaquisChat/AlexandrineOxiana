@@ -7,7 +7,8 @@
  */
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { ApiClientError } from "../api/client";
-import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry } from "../api/library";
+import { errorText, type CurrentLibrary, type LibraryApi, type LibraryEntry, type LibraryState } from "../api/library";
+import { DeviceNoticeBanners, useNoticeDismiss } from "../components/StatusBanner";
 import { UserText } from "../components/UserText";
 import { desktopShell } from "../desktopShell";
 import { navigate } from "../navigation";
@@ -29,6 +30,20 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
   const [path, setPath] = useState("");
   const [name, setName] = useState("");
   const [picking, setPicking] = useState(false);
+  // This computer's own notices (Task 68 fix round 1, M1): seen here too, with the same "Got it".
+  const [notices, setNotices] = useState<LibraryState["notices"]>([]);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const [noticeGone, setNoticeGone] = useState(0);
+  useEffect(() => {
+    if (noticeGone > 0) heading.current?.focus();
+  }, [noticeGone]);
+  const notice = useNoticeDismiss(
+    (kind) => api.libraries.dismissNotice(kind),
+    (kind) => {
+      setNotices((list) => (list ?? []).filter((n) => n.kind !== kind));
+      setNoticeGone((n) => n + 1);
+    },
+  );
   const id = useId();
   const shell = desktopShell();
   const mounted = useRef(true);
@@ -59,7 +74,11 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
     let live = true;
     api.libraries
       .list()
-      .then((r) => live && setLibraries(r.libraries))
+      .then((r) => {
+        if (!live) return;
+        setLibraries(r.libraries);
+        setNotices(r.notices ?? []);
+      })
       .catch((err: unknown) => {
         if (!live) return;
         setLibraries([]);
@@ -103,7 +122,10 @@ export function LibraryChooser({ api, onOpened, onNotFound }: LibraryChooserProp
 
   return (
     <main className="ao-page">
-      <h1>Choose a library</h1>
+      <h1 ref={heading} tabIndex={-1}>
+        Choose a library
+      </h1>
+      <DeviceNoticeBanners notices={notices} onDismiss={notice.onDismiss} error={notice.error} />
       {libraries === undefined ? (
         <p aria-live="polite">Loading libraries…</p>
       ) : libraries.length === 0 ? (

@@ -1113,6 +1113,11 @@ export class ServiceState {
   }
 
   private cachedNotices: DeviceNotice[] = [];
+
+  /** This computer's notices as last read (refreshNotices). */
+  get notices(): DeviceNotice[] {
+    return this.cachedNotices;
+  }
   private noticesUnreadableLogged = false;
 
   /**

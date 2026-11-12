@@ -78,8 +78,11 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     // while it still runs, name it as `reopening` (I1).
     await state.waitForStartup();
     const known = await listLibraries(state.deps).catch(() => []);
+    // This computer's own notices, for the chooser too (Task 68 fix round 1, M1).
+    await state.refreshNotices();
     return {
       libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })),
+      notices: state.notices,
       ...(state.session
         ? { current: libraryView(ctx) }
         : state.reopening

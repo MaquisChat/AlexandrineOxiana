@@ -53,6 +53,8 @@ export interface LibraryList {
   notFound?: { libraryId: string; name: string };
   /** The library open when the app last ran, still being opened by the service (I1). */
   reopening?: { libraryId: string; name: string };
+  /** This computer's own notices (Task 68): kind and time only. */
+  notices?: DeviceNotice[];
 }
 
 export interface ReconnectResult extends CurrentLibrary {
