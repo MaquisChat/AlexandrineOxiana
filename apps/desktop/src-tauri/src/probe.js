@@ -75,8 +75,37 @@
     return conn.baseUrl + t.body.path;
   };
 
+  // What the page may ask of the shell (least privilege): each command answered "allowed" or
+  // "denied". Only listening for events (drag and drop) and the open-file dialog are granted; the
+  // dialog itself is not opened here (it would wait for a person).
+  var ipc = async function () {
+    var internals = window.__TAURI_INTERNALS__;
+    if (!internals) return "no IPC";
+    var out = {};
+    var tryCmd = async function (name, cmd, args) {
+      try {
+        await internals.invoke(cmd, args || {});
+        out[name] = "allowed";
+      } catch (e) {
+        var m = String(e && e.message ? e.message : e);
+        out[name] = /not allowed|denied|forbidden|permission/i.test(m) ? "denied" : "error: " + m.slice(0, 120);
+      }
+    };
+    await tryCmd("event.listen", "plugin:event|listen", { event: "tauri://drag-drop", target: { kind: "Webview", label: "main" }, handler: internals.transformCallback(function () {}) });
+    await tryCmd("dialog.save", "plugin:dialog|save", { options: {} });
+    await tryCmd("dialog.message", "plugin:dialog|message", { message: "x" });
+    await tryCmd("fs.readFile", "plugin:fs|read_file", { path: "/etc/hostname" });
+    await tryCmd("path.resolveDirectory", "plugin:path|resolve_directory", { directory: 11 });
+    await tryCmd("window.close", "plugin:window|close", { label: "main" });
+    await tryCmd("webview.print", "plugin:webview|print", { label: "main" });
+    await tryCmd("app.version", "plugin:app|version", {});
+    await tryCmd("event.emit", "plugin:event|emit", { event: "x", payload: null });
+    return out;
+  };
+
   var run = async function () {
     results.connectionRemovedByApp = window.__AO_SERVICE__ === undefined;
+    results.ipc = await ipc();
     results.baseUrl = conn.baseUrl;
     await step("fetch", async function () {
       var r = await api("GET", "/libraries");
