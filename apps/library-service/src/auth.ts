@@ -158,6 +158,8 @@ export class Pairing {
   private readonly now: () => number;
   /** The port the service listens on, once it listens (R171). */
   private currentPort: number | undefined;
+  /** Port recordings under way, by pairing id: a burst of requests makes one write (R171). */
+  private readonly recording = new Map<string, Promise<void>>();
 
   constructor(
     private readonly configDir: string,
@@ -307,7 +309,20 @@ export class Pairing {
    * changes in memory (fix round 1, I1); the next accepted request tries again. Rejects when nothing
    * could be saved; the request is answered all the same.
    */
-  async noteReachedOnCurrentPort(id: string): Promise<void> {
+  noteReachedOnCurrentPort(id: string): Promise<void> {
+    const under = this.recording.get(id);
+    if (under) return under;
+    const run = this.recordPort(id).finally(() => this.recording.delete(id));
+    this.recording.set(id, run);
+    return run;
+  }
+
+  /** Resolves once every port recording under way has ended (shutdown and tests). */
+  async idle(): Promise<void> {
+    await Promise.allSettled([...this.recording.values()]);
+  }
+
+  private async recordPort(id: string): Promise<void> {
     const port = this.currentPort;
     const e = this.paired.find((x) => x.id === id);
     if (port === undefined || !e || e.port === port) return;

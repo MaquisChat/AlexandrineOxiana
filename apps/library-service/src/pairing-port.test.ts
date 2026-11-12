@@ -72,7 +72,12 @@ async function listed(port: number): Promise<PairedBrowsers> {
 }
 
 /** The extension's own check: GET /projects with its token and no Origin (Chrome omits it, R111). */
-const projects = (port: number, token: string) => fetch(`http://127.0.0.1:${port}/projects`, { headers: { authorization: `Bearer ${token}` } });
+/** Then waits for the port recording it may start (not awaited by the request: R171, no wait). */
+async function projects(port: number, token: string): Promise<Response> {
+  const r = await fetch(`http://127.0.0.1:${port}/projects`, { headers: { authorization: `Bearer ${token}` } });
+  await svc!.pairing.idle();
+  return r;
+}
 /** The token was accepted: the answer is the list, or, with no library open, 503 LIBRARY_OFFLINE (asked after the token check). */
 async function accepted(r: Response): Promise<boolean> {
   if (r.status === 200) return true;

@@ -217,13 +217,13 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
     req.caller = "extension";
     req.extensionId = ext.id;
     // R171: the pairing keeps the port its browser reaches the service on (the app's pairing screen
-    // compares it with the port now). A failed write is logged, never a reason to refuse.
+    // compares it with the port now). Not awaited: the request never waits for it, and its answer
+    // (a capture refused for a locked project included) is exactly what it would be without it. A
+    // failed write is logged, never a reason to refuse.
     if (port !== undefined && ext.port !== port) {
-      try {
-        await pairing.noteReachedOnCurrentPort(ext.id);
-      } catch {
+      pairing.noteReachedOnCurrentPort(ext.id).catch(() => {
         app.log.warn("A paired browser's new port could not be saved; the browser works, but the app may keep saying its port changed.");
-      }
+      });
     }
   });
 
@@ -297,6 +297,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
           setTimeout(r, 60_000).unref?.();
         });
         await state.shutdown();
+        // A browser's port being recorded (R171) finishes its atomic write before the service exits.
+        await pairing.idle();
         await app.close();
       })();
       return closing;
