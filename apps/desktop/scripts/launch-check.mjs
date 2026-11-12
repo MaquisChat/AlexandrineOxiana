@@ -55,6 +55,9 @@ export function parseShellLine(line) {
   m = /^AO_SHELL_FAILED (.*)$/.exec(line);
   if (m) return { kind: "failed", message: m[1] };
   if (line === "AO_SHELL_SECOND_LAUNCH") return { kind: "second-launch" };
+  if (line === "AO_SHELL_CLOSING") return { kind: "closing" };
+  if (line === "AO_SHELL_RELAUNCH_REQUESTED") return { kind: "relaunch-requested" };
+  if (line === "AO_SHELL_RELAUNCHING") return { kind: "relaunching" };
   return null;
 }
 
@@ -95,7 +98,7 @@ const HELPER_NAMES = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TEMP", "TMP", "LANG", "LANGUAGE", "TZ", "DBUS_SESSION_BUS_ADDRESS",
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy",
   "SSL_CERT_FILE", "SSL_CERT_DIR", "TESSDATA_PREFIX",
-  "AO_SERVICE_PORT", "AO_TOOLS_DIR", "AO_MODELS_DIR", "AO_WORKER_BIN", "AO_NO_WORKER",
+  "AO_SERVICE_PORT", "AO_CONFIG_DIR", "AO_TOOLS_DIR", "AO_MODELS_DIR", "AO_WORKER_BIN", "AO_NO_WORKER",
   // set by the service for the worker (worker-client.ts)
   "AO_WORKER_PORT", "PYTHONUNBUFFERED",
 ]);
@@ -181,8 +184,9 @@ async function until(what, ms, test) {
   }
 }
 
-function startShell(env, label) {
-  const child = spawn("xvfb-run", ["-a", "-s", "-screen 0 1400x900x24", SHELL], { env, stdio: ["pipe", "pipe", "pipe"] });
+/** Starts the shell under xvfb-run, or directly on `env.DISPLAY` when `direct` (a display the check owns). */
+function startShell(env, label, { direct = false } = {}) {
+  const child = direct ? spawn(SHELL, [], { env, stdio: ["pipe", "pipe", "pipe"] }) : spawn("xvfb-run", ["-a", "-s", "-screen 0 1400x900x24", SHELL], { env, stdio: ["pipe", "pipe", "pipe"] });
   const lines = [];
   const events = [];
   let log = "";
@@ -204,7 +208,7 @@ function startShell(env, label) {
   });
   child.stdin.on("error", () => {});
   const exit = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal })));
-  return { child, label, lines, events, log: () => log, exit, find: (kind) => events.find((e) => e.kind === kind) };
+  return { child, label, lines, events, log: () => log, exit, find: (kind) => events.find((e) => e.kind === kind), all: (kind) => events.filter((e) => e.kind === kind) };
 }
 
 function writeProbeFiles(dir) {
@@ -276,7 +280,13 @@ function report(label, ok, detail = "") {
 
 /** Starts the shell and waits for the service, the window and the probe's result; returns the helpers' pids. */
 async function upAndProbed(run, media, problems) {
-  const svc = await until("the service's ready report", 120_000, async () => run.find("service") ?? ((await Promise.race([run.exit, sleep(0)])) && Promise.reject(new Error(`the shell exited: ${run.log().slice(-2000)}`)))).catch((err) => {
+  const svc = await until("the service's ready report", 120_000, async () => {
+    // A start-up failure is reported at once (the shell's own report), not as a time-out.
+    const failed = run.find("failed");
+    if (failed) throw new Error(`the shell could not start: ${failed.message}`);
+    if (run.child.exitCode !== null || run.child.signalCode !== null) throw new Error("the shell exited before the service was ready");
+    return run.find("service");
+  }).catch((err) => {
     throw new Error(`${run.label}: ${err.message}\n--- the shell's output (end) ---\n${run.lines.slice(-20).join("\n")}\n${run.log().slice(-3000)}`);
   });
   const win = await until("the window", 60_000, async () => run.find("window"));
@@ -393,16 +403,65 @@ async function main() {
       try {
         const failed = await until("the failure report", 60_000, async () => run.find("failed"));
         report(`${run.label}: the failure is reported in the service's own words`, failed.message === "The library service will not start: this is the launch check's stand-in.", failed.message) || problems.push("failure message");
-        await sleep(1500); // the error window is up; no app window was opened
+        // Nobody closes the error window: in test mode the shell exits by itself after a few seconds, non-zero.
+        const { code } = await Promise.race([run.exit, sleep(30_000).then(() => ({ code: "timeout" }))]);
         report(`${run.label}: no app window was opened`, !run.find("window") && !run.find("service")) || problems.push("window on failure");
-        // A person closes the error window; here the shell is asked to stop, and must still exit non-zero.
-        const shellPid = descendants(run.child.pid).find((p) => cmdline(p).startsWith(SHELL));
-        if (shellPid) process.kill(shellPid, "SIGTERM");
-        const { code } = await Promise.race([run.exit, sleep(60_000).then(() => ({ code: "timeout" }))]);
-        report(`${run.label}: the shell exits non-zero`, typeof code === "number" && code !== 0, `exit ${code}`) || problems.push("failure exit code");
+        // (xvfb-run passes the shell's standard error on its standard output.)
+        report(`${run.label}: the failure is also on standard error`, /could not start: The library service will not start/.test(`${run.log()}\n${run.lines.join("\n")}`)) || problems.push("failure not on standard error");
+        report(`${run.label}: the shell exits non-zero by itself when the error window is not answered`, typeof code === "number" && code !== 0, `exit ${code}`) || problems.push("failure exit code");
         await assertGone(run.label, [], dir, problems, 10_000);
       } finally {
         if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
+      }
+    }
+
+    // E. Opened again during a (deliberately slowed) quit: no second service beside the first;
+    //    the first stops its helpers, then starts the app again. On a display the check owns,
+    //    because the restarted shell outlives the first process (xvfb-run would end the display).
+    {
+      const dir = join(root, "e");
+      const xvfb = spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"], { stdio: ["ignore", "pipe", "ignore"] });
+      const display = await new Promise((res, rej) => {
+        xvfb.stdout.once("data", (d) => res(`:${String(d).trim()}`));
+        xvfb.once("exit", () => rej(new Error("Xvfb did not start")));
+      });
+      const env = { ...shellEnv(dir, { DBUS_SESSION_BUS_ADDRESS: address, AO_DESKTOP_WORKER_BIN: worker.bin, AO_SHELL_TEST_SLOW_STOP_MS: "6000" }), DISPLAY: display };
+      const run = startShell(env, "E (opened again while closing)", { direct: true });
+      const shells = [];
+      try {
+        const first = await until("the service's ready report", 120_000, async () => run.find("service"));
+        await until("the window", 60_000, async () => run.find("window"));
+        shells.push(first.shell);
+        const firstHelpers = [first.pid, ...descendants(first.pid)].filter(running);
+        run.child.stdin.write("close\n");
+        await until("the quit to begin", 30_000, async () => run.find("closing"));
+        const second = startShell(env, "E (second launch while closing)", { direct: true });
+        const r2 = await Promise.race([second.exit, sleep(60_000).then(() => null)]);
+        if (!r2) killTree(second.child.pid);
+        report(`${run.label}: the second launch hands over and starts no service of its own`, r2?.code === 0 && !second.find("service"), `exit ${r2?.code ?? "timeout"}`) || problems.push("E: second launch");
+        await until("the relaunch to be noted", 10_000, async () => run.find("relaunch-requested")).catch(() => null);
+        report(`${run.label}: the first instance notes the relaunch and keeps closing`, !!run.find("relaunch-requested")) || problems.push("E: relaunch not noted");
+        await until("the first instance's helpers to stop", 120_000, async () => run.find("stopped"));
+        const stillUp = firstHelpers.filter(running);
+        report(`${run.label}: the first helpers stop cleanly before anything starts again`, run.find("stopped").how === "clean" && stillUp.length === 0 && run.all("service").length === 1, stillUp.join(", ")) || problems.push("E: helpers not stopped first");
+        const again = await until("the app to start again", 120_000, async () => run.all("service")[1]);
+        shells.push(again.shell);
+        report(`${run.label}: the app starts again with a new service once the first is gone`, !!run.find("relaunching") && again.pid !== first.pid && !firstHelpers.some(running), `service ${first.pid} then ${again.pid}`) || problems.push("E: no clean restart");
+        await until("the restarted window", 60_000, async () => run.all("window")[1]);
+        const againHelpers = [again.pid, ...descendants(again.pid)].filter(running);
+        // The first process's standard input ended with it, so the restarted shell is stopped the
+        // other orderly way (SIGTERM: the same close path, scenario B).
+        process.kill(again.shell, "SIGTERM");
+        await until("the restarted shell to stop its helpers", 120_000, async () => run.all("stopped")[1]);
+        await until("the restarted shell to exit", 30_000, async () => !running(again.shell));
+        await assertGone(run.label, [...firstHelpers, ...againHelpers], dir, problems, 15_000);
+      } catch (err) {
+        report(`${run.label}`, false, `${err instanceof Error ? err.message : String(err)}\n${run.lines.slice(-20).join("\n")}`);
+        problems.push("E");
+      } finally {
+        for (const pid of shells) if (running(pid)) killTree(pid);
+        if (run.child.exitCode === null && run.child.signalCode === null) killTree(run.child.pid);
+        xvfb.kill("SIGTERM");
       }
     }
   } finally {
