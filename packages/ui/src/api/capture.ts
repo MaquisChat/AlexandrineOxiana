@@ -5,8 +5,11 @@
  *   POST /projects/:id/capture           { urls, options? } → { queueId }  (capture.ts)
  *   POST /projects/:id/capture-profile   { url, options? }  → { queueId }  (capture.ts)
  *   POST /projects/:id/acknowledge       { kind: "cookies" } → { acknowledgements } (projects.ts)
+ *   GET  /projects/:id/captures          → CaptureQueueListResponse (@ao/shared; Task 63)
+ *   GET  /projects/:id/captures/:queueId → CaptureQueueDetail
  *   GET  /tools/versions                 → { versions: { <tool>: version | null } }
  *   POST /tools/update                   → { ytDlp: { old, new, managed }, galleryDl: { version, pinned } }
+ *                                          (a failure: 502 TOOL_FAILED, reason the helper's code)
  *   GET  /projects                       → { projects: [{ id, name, unlocked, acknowledgements? … }] }
  *   GET  /projects/:id/governance        → { yaml, … } (read for the legal-basis rule, R41)
  *
@@ -15,24 +18,28 @@
  * `{ queueId, projectId, finished: true, report }`; any queue may end with `{ …, finished: true,
  * error }` (the error's name and message, which are never shown).
  *
- * Two things here mirror the library rather than import it (the UI never bundles @ao/library):
- * the browser-session acknowledgement's exact wording and the link classifier used for the preview
- * (a hint only; the service decides). capture.parity.test.ts compares both with the library's own
- * until Task 63 gives them one shared definition (R146).
+ * The browser-session acknowledgement and the link classifier have one definition, in @ao/core
+ * (Task 63, R146), which the library and this interface both import; the preview built on it is
+ * still a hint (the service decides).
+ *
+ * A queue's state can be read again (Task 63): the screen reads the project's running and recent
+ * queues on opening and after every reconnect (`queueFromDetail`, merged with what it saw by
+ * `mergeRead`), so a running capture is always visible and outcomes missed while the connection was
+ * down are replaced by the truth.
  */
 // Only the governance modules: the rest of @ao/core (citation styles, ...) stays out of the bundle.
 import { effectivePolicy } from "@ao/core/src/governance/merge";
 import { parseGovernance } from "@ao/core/src/governance/schema";
-import { SPEECH_MODELS, type SpeechModel } from "@ao/shared";
+// The one classifier and the one acknowledgement text (Task 63, R146): only these modules, no copy.
+import { classifyUrl, isWebAddress, type LinkKind, type Platform } from "@ao/core/src/capture/platforms";
+import { COOKIES_ACKNOWLEDGEMENT } from "@ao/core/src/capture/acknowledgement";
+import { SPEECH_MODELS, type CaptureQueueDetail, type CaptureQueueListResponse, type CaptureQueueSummary, type CaptureStartedBy, type SpeechModel } from "@ao/shared";
 import type { ApiClient, ServiceEvent } from "./client";
 import { isValidId, seg } from "./import";
 
-// ---------------------------------------------------------------------------------------------
-// The acknowledgement (packages/library/src/capture/errors.ts, spec 5.1)
-
-/** The one-time explanation shown before the downloader may use the researcher's browser session. */
-export const COOKIES_ACKNOWLEDGEMENT =
-  "Using your browser's signed-in session lets the downloader see what you can see. Platforms may restrict or suspend accounts they detect using automated tools. This choice is recorded in the project's audit log.";
+/** The one-time explanation (spec 5.1) and what the service accepts as an address: @ao/core's. */
+export { COOKIES_ACKNOWLEDGEMENT, isWebAddress };
+export type { LinkKind, Platform };
 
 // ---------------------------------------------------------------------------------------------
 // Shapes
@@ -94,6 +101,8 @@ export interface CaptureOutcome {
   sourceId?: string;
   reason?: string;
   errorCode?: string;
+  /** The optional tool that was missing (a ToolId), with TOOL_NOT_INSTALLED. */
+  tool?: string;
 }
 
 /** ProfileCaptureReport (packages/library/src/capture/profile-capture.ts). */
@@ -111,6 +120,7 @@ export interface ProfileReport {
   items: CaptureOutcome[];
   errorCode?: string;
   reason?: string;
+  tool?: string;
 }
 
 export interface CaptureProgress {
@@ -183,20 +193,6 @@ export function parseLinks(text: string): string[] {
     .filter((l) => l !== "");
 }
 
-/** What the service accepts (routes/capture.ts isWebAddress): http or https, a host, at most 2048 characters. */
-export function isWebAddress(u: string): boolean {
-  if (u.length > 2048 || !/^https?:\/\//i.test(u)) return false;
-  try {
-    const p = new URL(u);
-    return (p.protocol === "http:" || p.protocol === "https:") && p.hostname.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-export type Platform = "youtube" | "instagram" | "tiktok" | "other";
-export type LinkKind = "video" | "short" | "post" | "reel" | "carousel" | "story-highlight" | "playlist" | "profile" | "unknown";
-
 export interface LinkPreview {
   platform: Platform;
   kind: LinkKind;
@@ -221,62 +217,13 @@ const KIND_NAMES: Record<LinkKind, string> = {
   unknown: "kind found when it is downloaded",
 };
 
-// ---- A PREVIEW HINT ONLY -------------------------------------------------------------------------
-// A copy of packages/library/src/capture/platforms.ts `classifyUrl` (platform and kind only), so the
-// UI can preview a pasted line without a round trip. The library service decides what an address is;
-// the UI never refuses an address because of this copy (R146). capture.parity.test.ts runs one table
-// of addresses through both. Task 63 replaces this copy with one shared definition both sides import.
-const IG_RESERVED = new Set(["p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct", "about", "developer", "legal", "web", "api"]);
-const YT_ID = /^[\w-]{6,}$/;
-
-function classify(raw: string): { platform: Platform; kind: LinkKind } {
-  let u: URL;
-  try {
-    u = new URL(raw.trim());
-  } catch {
-    return { platform: "other", kind: "unknown" };
-  }
-  if (u.protocol !== "https:" && u.protocol !== "http:") return { platform: "other", kind: "unknown" };
-  const host = u.hostname.toLowerCase().replace(/^(www|m|mobile|music)\./, "");
-  const seg = u.pathname.split("/").filter(Boolean);
-  if (host === "youtube.com" || host === "youtu.be" || host === "youtube-nocookie.com") {
-    const yt = (kind: LinkKind) => ({ platform: "youtube" as const, kind });
-    if (host === "youtu.be") return yt(seg[0] && YT_ID.test(seg[0]) ? "video" : "unknown");
-    if (seg[0] === "watch") return yt(YT_ID.test(u.searchParams.get("v") ?? "") ? "video" : "unknown");
-    if ((seg[0] === "shorts" || seg[0] === "live" || seg[0] === "embed") && seg[1] && YT_ID.test(seg[1])) return yt(seg[0] === "shorts" ? "short" : "video");
-    if (seg[0] === "playlist" && u.searchParams.get("list")) return yt("playlist");
-    if (seg[0]?.startsWith("@") && seg[0].length > 1) return yt("profile");
-    if ((seg[0] === "channel" || seg[0] === "c" || seg[0] === "user") && seg[1]) return yt("profile");
-    return yt("unknown");
-  }
-  if (host === "instagram.com") {
-    const ig = (kind: LinkKind) => ({ platform: "instagram" as const, kind });
-    const i = seg[1] === "p" || seg[1] === "reel" || seg[1] === "reels" ? 1 : 0;
-    const [a, b] = [seg[i], seg[i + 1]];
-    if ((a === "p" || a === "tv") && b) return ig(a === "tv" ? "video" : "post");
-    if ((a === "reel" || a === "reels") && b) return ig("reel");
-    if (seg[0] === "stories" && seg[1] === "highlights" && seg[2]) return ig("story-highlight");
-    if (seg.length === 1 && !IG_RESERVED.has(seg[0]!.toLowerCase()) && /^[\w.]+$/.test(seg[0]!)) return ig("profile");
-    return ig("unknown");
-  }
-  if (host === "tiktok.com" || host === "vm.tiktok.com" || host === "vt.tiktok.com") {
-    const tt = (kind: LinkKind) => ({ platform: "tiktok" as const, kind });
-    if (host !== "tiktok.com") return tt("unknown");
-    if (!seg[0]?.startsWith("@") || seg[0].length < 2) return tt("unknown");
-    if ((seg[1] === "video" || seg[1] === "photo") && seg[2] && /^\d+$/.test(seg[2])) return tt(seg[1] === "video" ? "video" : "carousel");
-    if (seg.length === 1) return tt("profile");
-    return tt("unknown");
-  }
-  return { platform: "other", kind: "unknown" };
-}
-
 /**
  * The per-line preview: platform and kind in words. A hint only (R146): the service decides, and
  * nothing is refused on the strength of this guess — only an address that is not a web address at
  * all, which the service refuses for the whole list.
  */
 export function previewLink(url: string): LinkPreview {
-  const { platform, kind } = classify(url);
+  const { platform, kind } = classifyUrl(url);
   const collection = kind === "profile" || kind === "playlist";
   if (!isWebAddress(url.trim())) return { platform, kind, collection, problem: "not-a-web-address", label: "This is not a web address (it must start with https:// or http://)." };
   if (platform === "other") return { platform, kind, collection, problem: "unsupported", label: "Not recognised here as a YouTube, Instagram or TikTok link — the app will check it." };
@@ -358,6 +305,8 @@ export function queueErrorText(error: string, kind: "links" | "profile" = "links
   const name = /^(\w+)/.exec(error)?.[1] ?? "";
   if (name === "WorkerUnavailableError") return "The media helper is not running, so the capture stopped. Restart the app and try again.";
   if (name === "ProjectLockedError" || name === "KeyNotAvailableError") return OUTCOME_TEXT.PROJECT_LOCKED!;
+  // An encrypted project's capture ends when its library is closed or moved (its key goes with it).
+  if (name === "LibraryClosedError") return "The library was closed or moved, so this capture stopped. Capture the links that were not tried again.";
   if (name === "PolicyDeniedError") return OUTCOME_TEXT.POLICY_DENIED!;
   if (name === "AcknowledgementRequiredError") return "Using your browser session has not been acknowledged for this project, so nothing was downloaded. Acknowledge it, then capture again.";
   if (kind === "profile") return "The profile capture stopped before it finished. Posts shown here as saved are kept. Run it again later.";
@@ -405,7 +354,14 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object
 const optNum = (v: unknown) => v === undefined || (typeof v === "number" && Number.isInteger(v) && v >= 0);
 
 function isOutcome(v: unknown): v is CaptureOutcome {
-  return isObj(v) && typeof v.url === "string" && typeof v.status === "string" && (v.errorCode === undefined || typeof v.errorCode === "string") && (v.reason === undefined || typeof v.reason === "string");
+  return (
+    isObj(v) &&
+    typeof v.url === "string" &&
+    typeof v.status === "string" &&
+    (v.errorCode === undefined || typeof v.errorCode === "string") &&
+    (v.reason === undefined || typeof v.reason === "string") &&
+    (v.tool === undefined || typeof v.tool === "string")
+  );
 }
 
 /** A well-formed `capture.progress` event of a queue in `projectId`; anything else is undefined (dropped). */
@@ -432,6 +388,8 @@ export interface QueueItem {
   errorCode?: string;
   reason?: string;
   sourceId?: string;
+  /** A missing tool's id (TOOL_NOT_INSTALLED), for the link to the Optional tools screen. */
+  tool?: string;
 }
 
 export interface CaptureQueueState {
@@ -448,17 +406,26 @@ export interface CaptureQueueState {
   /** The library's own sentence for a stopped or paused run, shown as it is (R146). */
   stopReason?: string;
   errorCode?: string;
+  /** A run stopped by a missing tool: its id. */
+  tool?: string;
   report?: ProfileReport;
   /** Progress may have been missed: the event stream was down while this queue ran (R146). */
   gap?: boolean;
+  /** Missed progress that cannot be read any more: the service no longer knows the queue (review M2). */
+  forgotten?: boolean;
+  /** When the service started it (read again) or when this screen did; queues are shown in this order. */
+  startedAt?: string;
+  startedBy?: CaptureStartedBy;
+  /** Items the service did not keep (a very long profile run). */
+  itemsOmitted?: number;
 }
 
-export function linkQueue(queueId: string, urls: string[]): CaptureQueueState {
-  return { queueId, kind: "links", items: urls.map((url, i) => ({ url, state: i === 0 ? "capturing" : "waiting" })), done: 0, total: urls.length, finished: false };
+export function linkQueue(queueId: string, urls: string[], startedAt = new Date().toISOString()): CaptureQueueState {
+  return { queueId, kind: "links", items: urls.map((url, i) => ({ url, state: i === 0 ? "capturing" : "waiting" })), done: 0, total: urls.length, finished: false, startedAt, startedBy: "desktop" };
 }
 
-export function profileQueue(queueId: string, url: string): CaptureQueueState {
-  return { queueId, kind: "profile", url, items: [], done: 0, total: undefined, finished: false };
+export function profileQueue(queueId: string, url: string, startedAt = new Date().toISOString()): CaptureQueueState {
+  return { queueId, kind: "profile", url, items: [], done: 0, total: undefined, finished: false, startedAt, startedBy: "desktop" };
 }
 
 const PENDING = (s: ItemState) => s === "waiting" || s === "capturing";
@@ -516,8 +483,7 @@ export function applyProgress(q: CaptureQueueState, e: CaptureProgress): Capture
   let done = q.done;
   if (e.outcome && typeof e.done === "number" && e.done >= 1) {
     const i = e.done - 1;
-    const { url, status, errorCode, reason, sourceId } = e.outcome;
-    const item: QueueItem = { url: q.kind === "links" && items[i] ? items[i].url : url, state: status, ...(errorCode ? { errorCode } : {}), ...(reason ? { reason } : {}), ...(sourceId ? { sourceId } : {}) };
+    const item: QueueItem = { ...itemOf(e.outcome), ...(q.kind === "links" && items[i] ? { url: items[i].url } : {}) };
     while (items.length < i) items.push({ url: "", state: "unknown" });
     items[i] = item;
     done = Math.max(done, e.done);
@@ -530,18 +496,108 @@ export function applyProgress(q: CaptureQueueState, e: CaptureProgress): Capture
     next.finished = true;
     // Not reached when the queue stopped: not tried, unless progress may have been missed.
     for (const [i, it] of items.entries()) if (PENDING(it.state)) items[i] = { ...it, state: q.gap ? "unknown" : "not-captured" };
-    if (e.error !== undefined) next.error = queueErrorText(e.error, q.kind);
-    if (e.report) {
-      next.report = e.report;
-      if (e.report.status !== "completed") {
-        const t = reportText(e.report);
-        if (t.stopReason) next.stopReason = t.stopReason;
-        if (t.error) next.error = t.error;
-        if (e.report.errorCode) next.errorCode = e.report.errorCode;
-      }
-    }
+    endWith(next, e.error, e.report);
   }
   return next;
+}
+
+/** A queue's end: why it stopped as a whole, or a profile run's report (its own sentence kept, R146). */
+function endWith(next: CaptureQueueState, error: string | undefined, report: ProfileReport | undefined): void {
+  if (error !== undefined) next.error = queueErrorText(error, next.kind);
+  if (!report) return;
+  next.report = report;
+  if (report.status === "completed") return;
+  const t = reportText(report);
+  if (t.stopReason) next.stopReason = t.stopReason;
+  if (t.error) next.error = t.error;
+  if (report.errorCode) next.errorCode = report.errorCode;
+  if (typeof report.tool === "string") next.tool = report.tool;
+}
+
+/** One outcome as a queue item: its known fields only (the missing tool's id kept). */
+function itemOf(o: CaptureOutcome): QueueItem {
+  const { url, status, errorCode, reason, sourceId, tool } = o;
+  return { url, state: status, ...(errorCode ? { errorCode } : {}), ...(reason ? { reason } : {}), ...(sourceId ? { sourceId } : {}), ...(tool ? { tool } : {}) };
+}
+
+/** A final state: an outcome, or "not tried" — anything but waiting, capturing or not known. */
+const FINAL = (s: ItemState) => !PENDING(s) && s !== "unknown";
+
+/** The links not finished yet: the next one is being captured unless the queue has ended. */
+function pendingAfter(items: QueueItem[], done: number, finished: boolean): QueueItem[] {
+  return items.map((it, i) => {
+    if (i < done || FINAL(it.state)) return it;
+    return { ...it, state: finished ? "not-captured" : i === done ? "capturing" : "waiting" };
+  });
+}
+
+/**
+ * A queue as the service reports it (GET /projects/:id/captures/:queueId). The service saw every
+ * step, so nothing is "not known": an item it has no outcome for was not reached.
+ */
+export function queueFromDetail(d: CaptureQueueDetail): CaptureQueueState {
+  const outcomes = d.items.map(itemOf);
+  let items: QueueItem[];
+  if (d.kind === "links") {
+    const urls = d.urls ?? outcomes.map((o) => o.url);
+    items = pendingAfter(
+      urls.map((url, i) => {
+        const o = outcomes[i];
+        return o && o.url !== "" ? { ...o, url } : { url, state: "waiting" };
+      }),
+      d.done,
+      d.finished,
+    );
+  } else items = outcomes;
+  const q: CaptureQueueState = {
+    queueId: d.queueId,
+    kind: d.kind,
+    ...(d.url !== undefined ? { url: d.url } : {}),
+    items,
+    done: d.done,
+    total: d.total ?? undefined,
+    finished: d.finished,
+    gap: false,
+    startedAt: d.startedAt,
+    startedBy: d.startedBy,
+    ...(d.itemsOmitted ? { itemsOmitted: d.itemsOmitted } : {}),
+  };
+  if (d.finished) endWith(q, d.error, d.report ? { ...d.report, items: d.items } : undefined);
+  return q;
+}
+
+/**
+ * What the screen saw merged with what the service reports. The read was asked for after the event
+ * stream was open, so between them nothing is missed: every item takes whichever source knows its
+ * outcome, neither goes backwards, and the gap is over (Minor O1: links not reached are waiting
+ * again, not "not known").
+ */
+export function mergeRead(local: CaptureQueueState | undefined, read: CaptureQueueState): CaptureQueueState {
+  if (!local) return read;
+  const done = Math.max(local.done, read.done);
+  const finished = local.finished || read.finished;
+  const n = Math.max(local.items.length, read.items.length);
+  const items: QueueItem[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = local.items[i];
+    const b = read.items[i];
+    items.push(a && FINAL(a.state) && !(b && FINAL(b.state) && a.state === "not-captured") ? a : (b ?? a)!);
+  }
+  const merged: CaptureQueueState = {
+    ...read,
+    ...local,
+    items: local.kind === "links" ? pendingAfter(items, done, finished) : items,
+    done,
+    total: read.total ?? local.total,
+    finished,
+    gap: false,
+    startedAt: read.startedAt ?? local.startedAt,
+    startedBy: read.startedBy ?? local.startedBy,
+  };
+  for (const k of ["error", "stopReason", "errorCode", "tool", "report", "itemsOmitted"] as const) {
+    if (local[k] === undefined && read[k] !== undefined) (merged as unknown as Record<string, unknown>)[k] = read[k];
+  }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -564,6 +620,10 @@ export function captureApi(client: ApiClient) {
       r<{ queueId: string }>("POST", `/projects/${pid(projectId)}/capture-profile`, { body: { url, options } }),
     /** Records the one-time browser-session acknowledgement (audited by the service). */
     acknowledge: async (projectId: string) => (await r<{ acknowledgements: string[] }>("POST", `/projects/${pid(projectId)}/acknowledge`, { body: { kind: "cookies" } })).acknowledgements,
+    /** The project's running and recent capture queues (summaries; Task 63). */
+    queues: async (projectId: string): Promise<CaptureQueueSummary[]> => (await r<CaptureQueueListResponse>("GET", `/projects/${pid(projectId)}/captures`)).queues,
+    /** One queue with its items' outcomes. */
+    queue: (projectId: string, queueId: string) => r<CaptureQueueDetail>("GET", `/projects/${pid(projectId)}/captures/${encodeURIComponent(queueId)}`),
     toolVersions: async () => (await r<{ versions: Record<string, string | null> }>("GET", "/tools/versions")).versions,
     updateTools: () => r<ToolsUpdate>("POST", "/tools/update"),
   };

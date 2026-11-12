@@ -5,6 +5,7 @@
  */
 import { http, HttpResponse, type RequestHandler } from "msw";
 import { setupServer } from "msw/node";
+import type { CaptureQueueDetail } from "@ao/shared";
 import { createClient, type ApiClient } from "../api/client";
 
 export const BASE = "http://127.0.0.1:4100";
@@ -44,6 +45,12 @@ export interface CaptureSetup {
   extra?: RequestHandler[];
   /** The optional tools' catalogue (GET /tools, Task 48b); left out: refused as in a plain browser (403). */
   tools?: unknown[];
+  /** The capture queues the service knows of (GET /projects/:id/captures[/:queueId], Task 63); changed later with setQueues. */
+  queues?: CaptureQueueDetail[];
+  /** Delay before GET /projects/:id/captures answers. */
+  queuesDelayMs?: number;
+  /** Answer of GET /projects/:id/captures (default: the queues). */
+  queuesAnswer?: () => Response | undefined;
 }
 
 export interface CaptureMock {
@@ -54,6 +61,10 @@ export interface CaptureMock {
   streams(): number;
   /** Ends every open /events stream (the client reconnects). */
   closeStreams(): void;
+  /** What the service reports from now on. */
+  setQueues(queues: CaptureQueueDetail[]): void;
+  /** GET /projects/:id/captures answers sent so far. */
+  queueReads(): number;
   client: ApiClient;
 }
 
@@ -71,6 +82,8 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
   const wait = (ms: number | undefined) => (ms ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
   let captures = 0;
   let profiles = 0;
+  let queues = o.queues ?? [];
+  let queueReads = 0;
   const rec = async (request: Request, path: string) => {
     const text = await request.text();
     let body: unknown;
@@ -110,6 +123,20 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       await rec(request, `/projects/${params.id as string}/capture-profile`);
       profiles++;
       return o.profileAnswer?.(profiles) ?? HttpResponse.json({ queueId: `qp${profiles}` });
+    }),
+    http.get(url("/projects/:id/captures"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/captures`);
+      await wait(o.queuesDelayMs);
+      const answer = o.queuesAnswer?.();
+      queueReads++;
+      if (answer) return answer;
+      const summaries = queues.filter((q) => q.projectId === params.id).map(({ urls: _u, items: _i, itemsOmitted: _o, ...summary }) => summary);
+      return HttpResponse.json({ queues: summaries });
+    }),
+    http.get(url("/projects/:id/captures/:qid"), async ({ request, params }) => {
+      await rec(request, `/projects/${params.id as string}/captures/${params.qid as string}`);
+      const q = queues.find((x) => x.queueId === params.qid && x.projectId === params.id);
+      return q ? HttpResponse.json(q) : errorResponse(404, "NOT_FOUND", "That capture was not found.");
     }),
     http.get(url("/tools"), () =>
       o.tools ? HttpResponse.json({ platform: "linux-x64", tools: o.tools, jobs: [] }) : errorResponse(403, "FORBIDDEN", "The tools are managed from the desktop app."),
@@ -154,6 +181,10 @@ export function mockCapture(o: CaptureSetup = {}): CaptureMock {
       }
     },
     streams: () => open.size,
+    setQueues(q) {
+      queues = q;
+    },
+    queueReads: () => queueReads,
     closeStreams() {
       for (const c of [...open]) {
         open.delete(c);

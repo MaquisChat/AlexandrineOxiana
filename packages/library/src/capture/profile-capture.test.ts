@@ -357,6 +357,48 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(0);
   });
 
+  // Task 63 item 3: the run's title edit is read, merged and written in one governed change, so an
+  // edit made at the same time is kept (R26).
+  it("a title edit made while a profile run records an edit is not lost: both land, each audited", async () => {
+    const p = await project();
+    await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false });
+    const target = ttId(6);
+    const sid = (await byPost(p.id, target)).source.id;
+    const prof = synthetic();
+    await setProfile({ ...prof, items: prof.items.map((it) => (it.id === target ? { ...it, caption: "Evening dance at the old market (edited)\n#dance" } : it)) });
+    const updatesOf = async () => (await auditEvents(p.folder)).filter((e) => e.entity?.type === "source" && e.entity.id === sid && e.action === "store");
+    const before = (await updatesOf()).length;
+    // The researcher adds a translated title while the run is between its read and its write.
+    const add = repo.addOriginalAsset.bind(repo);
+    vi.spyOn(repo, "addOriginalAsset").mockImplementation(async (...args) => {
+      const cur = await repo.getSource(p.id, sid);
+      await repo.updateSource(p.id, sid, { title: { variants: [...cur.source.title.variants, { lang: "de", kind: "translated", value: "Tanz Nummer 6" }] } });
+      return add(...args);
+    });
+    expect((await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false })).edited).toBe(1);
+    const values = (await byPost(p.id, target)).source.title.variants.map((v) => v.value);
+    expect(values).toContain("Evening dance at the old market (edited)");
+    expect(values).toContain("Tanz Nummer 6");
+    // Two source updates (the researcher's and the run's), each its own governed change with its own audit entry.
+    const updates = (await updatesOf()).slice(before).filter((e) => e.details?.["op"] === "source.update");
+    expect(updates).toHaveLength(2);
+    expect(new Set(updates.map((e) => e.details?.["txn"])).size).toBe(2);
+  });
+
+  it("a run ended while a post downloads (Task 63 fix round 2, I3): the post is not stored and the run stops there", async () => {
+    const p = await project();
+    let ended = false;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      const r = await submit(...args);
+      if (String(args[1].input).includes("/video/")) ended = true;
+      return r;
+    });
+    const err = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { cancelled: () => ended }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("CaptureCancelledError");
+    expect(await posts(p.id)).toHaveLength(0);
+  });
+
   it("maxItems: 5 stops at 5 and never marks the rest unavailable; a later full run adds the rest", async () => {
     const p = await project();
     const r = await capture.captureProfile(p.id, TT_PROFILE, { transcribe: false, maxItems: 5 });
@@ -391,6 +433,27 @@ describe("captureProfile", { timeout: 120_000 }, () => {
     expect(since).toMatchObject({ listComplete: false, newlyUnavailable: 0 });
     expect(worker.submitted.at(-1)!.params).toMatchObject({ dateAfter: "20260110" });
     for (const sf of await posts(p.id)) expect(sf.source.availability.status).toBe("available");
+  });
+
+  it("N7: a run ended during a rate-limit wait starts no more downloads", async () => {
+    const p = await project();
+    process.env.FAKE_TOOL_MODE = "ratelimit";
+    let ended = false;
+    let submits = 0;
+    let atEnd = -1;
+    const submit = client.submit.bind(client);
+    vi.spyOn(client, "submit").mockImplementation(async (...args) => {
+      submits++;
+      return submit(...args);
+    });
+    const c = createLinkCapture({ repo, worker: client, index: handle, sleep: async () => {
+      ended = true; // the run is ended (a lock) while it waits
+      atEnd = submits;
+    } });
+    const err = await c.captureProfile(p.id, TT_PROFILE, { transcribe: false }, undefined, { cancelled: () => ended }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("CaptureCancelledError");
+    expect(atEnd).toBeGreaterThan(0);
+    expect(submits).toBe(atEnd);
   });
 
   it("rate limited: waits 60, 120 and 240 s, then pauses; a re-run resumes without duplicates", async () => {

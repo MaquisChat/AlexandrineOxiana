@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mockService, PSEUDONYMISING_GOVERNANCE, REPORT, server, SUMMARY, type ServiceSetup, B1, P1 } from "../../test/importService";
+import { mockService, PSEUDONYMISING_GOVERNANCE, REPORT, server, SUMMARY, type ServiceSetup, B1, B7, P1 } from "../../test/importService";
 import { ImportWizard } from "./ImportWizard";
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -627,6 +627,81 @@ describe("Bulk Import wizard", () => {
       const table = await screen.findByRole("table", { name: "Items by outcome" });
       expect(within(table).getByRole("row", { name: "Files copied into the library 1,290" })).toBeTruthy();
       expect(within(table).getByRole("row", { name: "Files left as links 0" })).toBeTruthy();
+    });
+  });
+
+  describe("an import's report can be reached again (D1)", () => {
+    const batch = (state: string, n = 4, id = B1) => ({ batchId: id, number: n, kind: "folder", state, startedAt: "2026-11-11T10:00:00.000Z", counts: { created: 3, merged: 0, skipped: 0, failed: 0, needsReview: 1 } });
+
+    function open(batchId: string, o: ServiceSetup = {}) {
+      const m = mockService(o);
+      const user = userEvent.setup();
+      render(<ImportWizard client={m.client} projectId={P1} batchId={batchId} />);
+      return { m, user };
+    }
+
+    it("opened on a finished import, it shows that import's report and its Undo", async () => {
+      const { m } = open(B1, { batches: [batch("finished")] });
+      await screen.findByRole("heading", { name: "Report and undo" });
+      expect(await screen.findByRole("button", { name: "Undo import" })).toBeTruthy();
+      expect(m.bodies(`GET /imports/${B1}/report`)).toHaveLength(1);
+      const steps = screen.getByRole("list", { name: "Import steps" });
+      expect(within(steps).getByText("Report and undo").getAttribute("aria-current")).toBe("step");
+    });
+
+    it("arriving on an import from the address puts focus on its step's heading (R145): the report's, or the run's", async () => {
+      open(B1, { batches: [batch("finished")] });
+      const report = await screen.findByRole("heading", { name: "Report and undo" });
+      await waitFor(() => expect(document.activeElement).toBe(report));
+    });
+
+    it("arriving on a running import from the address puts focus on the Run heading", async () => {
+      open(B1, { batches: [batch("running")] });
+      const run = await screen.findByRole("heading", { name: "Run" });
+      await waitFor(() => expect(document.activeElement).toBe(run));
+    });
+
+    it("opened on a running import, it shows the run", async () => {
+      open(B1, { batches: [batch("running")] });
+      expect(await screen.findByRole("heading", { name: "Run" })).toBeTruthy();
+      expect(screen.queryByRole("heading", { name: "Report and undo" })).toBeNull();
+    });
+
+    it("opened on an import the project does not have, it says so in plain words and starts at Source", async () => {
+      open(B7, { batches: [batch("finished")] });
+      expect((await screen.findByRole("alert")).textContent).toMatch(/import was not found in this project/i);
+      expect(screen.getByRole("radio", { name: "Folder" })).toBeTruthy();
+      expect(screen.queryByRole("heading", { name: "Report and undo" })).toBeNull();
+    });
+
+    it("once an import starts, the address names it, without a new history entry", async () => {
+      window.history.replaceState(null, "", `/import?project=${P1}`);
+      const before = window.history.length;
+      const { m, user } = setup();
+      await scanFolder(user);
+      await toOptions(user);
+      await runToReport(m, user);
+      expect(window.location.pathname).toBe("/import");
+      expect(new URLSearchParams(window.location.search).get("batch")).toBe(B1);
+      expect(new URLSearchParams(window.location.search).get("project")).toBe(P1);
+      expect(window.history.length).toBe(before);
+      window.history.replaceState(null, "", "/");
+    });
+
+    it("the Source step lists the project's recent imports, newest first, each linking to its report", async () => {
+      setup({ batches: [batch("undone", 3, B7), batch("finished", 4, B1)] });
+      const recent = await screen.findByRole("region", { name: "Recent imports" });
+      const links = await within(recent).findAllByRole("link");
+      expect(links.map((l) => l.textContent)).toEqual([expect.stringMatching(/^Import 4\b.*finished/), expect.stringMatching(/^Import 3\b.*undone/)]);
+      expect(links[0]!.getAttribute("href")).toBe(`/import?project=${P1}&batch=${B1}`);
+      expect(links[1]!.getAttribute("href")).toBe(`/import?project=${P1}&batch=${B7}`);
+    });
+
+    it("lists nothing when the project has no imports", async () => {
+      const { m } = setup();
+      await screen.findByRole("option", { name: "Thesis" });
+      await waitFor(() => expect(m.bodies(`GET /projects/${P1}/imports`).length).toBeGreaterThan(0));
+      expect(screen.queryByRole("region", { name: "Recent imports" })).toBeNull();
     });
   });
 });

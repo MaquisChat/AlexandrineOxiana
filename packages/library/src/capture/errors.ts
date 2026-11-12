@@ -4,9 +4,10 @@
  */
 import { isSpeechModel } from "@ao/shared";
 
-/** The one-time explanation shown before the downloader may use the researcher's browser session (spec 5.1). */
-export const COOKIES_ACKNOWLEDGEMENT =
-  "Using your browser's signed-in session lets the downloader see what you can see. Platforms may restrict or suspend accounts they detect using automated tools. This choice is recorded in the project's audit log.";
+import { COOKIES_ACKNOWLEDGEMENT } from "@ao/core";
+
+/** The one-time explanation (spec 5.1): defined once in @ao/core for the library and the interface (R146). */
+export { COOKIES_ACKNOWLEDGEMENT };
 
 /**
  * Capturing with the browser session needs the researcher's one-time acknowledgement, recorded in
@@ -21,6 +22,18 @@ export class AcknowledgementRequiredError extends Error {
   ) {
     super(COOKIES_ACKNOWLEDGEMENT);
     this.explanation = COOKIES_ACKNOWLEDGEMENT;
+  }
+}
+
+/**
+ * A capture ended from outside while it ran (its project was locked, or its library closed or
+ * moved): from then on nothing more is stored for it, whatever the project's state is later
+ * (Task 63 fix round 2, I3). Thrown out of a profile run; a link's outcome is CANCELLED.
+ */
+export class CaptureCancelledError extends Error {
+  override name = "CaptureCancelledError";
+  constructor() {
+    super("The capture was ended, so nothing more was saved.");
   }
 }
 

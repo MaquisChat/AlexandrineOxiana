@@ -69,7 +69,7 @@ import {
   updateSourceRechecked,
 } from "../repo/repo.js";
 import { WorkerJobError, WorkerToolError, WorkerUnavailableError } from "../worker-client.js";
-import { AcknowledgementRequiredError, plainReason, toolMissingReason } from "./errors.js";
+import { AcknowledgementRequiredError, CaptureCancelledError, plainReason, toolMissingReason } from "./errors.js";
 import type { CaptureCore, CaptureOptions, CaptureOutcome, ItemContext } from "./link-capture.js";
 import { classifyUrl, type ClassifiedUrl, type Platform } from "./platforms.js";
 import { captionOf, profileSnapshot, readEnumeration, type ProfileEntry, type ProfileMeta } from "./profile-snapshot.js";
@@ -241,12 +241,13 @@ export function createProfileCapture(core: CaptureCore) {
     profileUrl: string,
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
+    control?: { cancelled?: () => boolean; signal?: AbortSignal },
   ): Promise<ProfileCaptureReport> {
     if (opts.cookiesFromBrowser && !core.acknowledged(projectId)) throw new AcknowledgementRequiredError(projectId);
     const c = classifyUrl(profileUrl);
     if ((c.kind !== "profile" && c.kind !== "playlist") || c.platform === "other") return failedReport("UNSUPPORTED_URL");
     if (invalidOptions(opts)) return failedReport("INVALID_OPTIONS");
-    return core.inLane(c.platform, () => run(projectId, c, opts, onProgress));
+    return core.inLane(c.platform, () => run(projectId, c, opts, onProgress, control?.cancelled, control?.signal));
   }
 
   async function run(
@@ -254,7 +255,13 @@ export function createProfileCapture(core: CaptureCore) {
     c: ClassifiedUrl,
     opts: ProfileCaptureOptions,
     onProgress?: (done: number, total: number, outcome: CaptureOutcome) => void,
+    isCancelled: () => boolean = () => false,
+    signal?: AbortSignal,
   ): Promise<ProfileCaptureReport> {
+    /** Ended from outside (Task 63 I3): nothing more is stored, the run ends here (its batch stays as an interrupted one). */
+    const check = () => {
+      if (isCancelled()) throw new CaptureCancelledError();
+    };
     const platform = c.platform;
     const cookies = !!opts.cookiesFromBrowser;
     const includeComments = opts.includeComments === true;
@@ -315,10 +322,14 @@ export function createProfileCapture(core: CaptureCore) {
     let results: ListingResult[] = [];
     let toolVersion = "unknown";
     for (;;) {
-      const r = await enumerate(projectId, c, opts, tool);
-      // Rate limited, even part-way through a list: wait and list again, or pause.
+      const r = await enumerate(projectId, c, opts, tool, signal);
+      // Rate limited, even part-way through a list: wait and list again, or pause (not once ended, N7).
       if (r.error === "RATE_LIMITED" || r.results.some((x) => x.partialCode === "RATE_LIMITED")) {
-        if (await backOff()) continue;
+        check();
+        if (await backOff()) {
+          check();
+          continue;
+        }
         pause();
         return audited(projectId, platform, report);
       }
@@ -356,6 +367,7 @@ export function createProfileCapture(core: CaptureCore) {
     const filtered = !!(opts.since || opts.until || opts.maxItems !== undefined);
 
     // 3. Batch record first, then the profile: record, source, collection, snapshot.
+    check();
     if (!(await core.stillAllowed(projectId, platform))) return audited(projectId, platform, policyChanged());
     const handle = c.handle ?? profile.handle;
     const label = handle ?? linkKey(c);
@@ -509,12 +521,15 @@ export function createProfileCapture(core: CaptureCore) {
       collectionIds: [collectionId],
       includeComments,
       metadataOnly: opts.metadataOnly === true,
+      cancelled: isCancelled,
+      ...(signal ? { signal } : {}),
     };
     const fresh = entries.filter((e) => !isKnown(e.id));
     const freshIds = new Set(fresh.map((e) => e.id));
     let done = 0;
     let stopped = false;
     for (const e of fresh) {
+      check();
       const existing = await core.findExisting(projectId, platform, e.id);
       let out: CaptureOutcome;
       if (existing) {
@@ -568,6 +583,7 @@ export function createProfileCapture(core: CaptureCore) {
     report.listComplete = !filtered && incompleteListings.size === 0 && plausible && !(entries.length === 0 && checked.length > 0);
     if (!stopped && (await core.stillAllowed(projectId, platform))) {
       for (const e of entries) {
+        check();
         if (!isKnown(e.id) || freshIds.has(e.id)) continue;
         const sid = await core.findExisting(projectId, platform, e.id);
         if (!sid) continue;
@@ -580,7 +596,7 @@ export function createProfileCapture(core: CaptureCore) {
           await save(recordFiles());
           report.reappeared++;
         }
-        const edit = await recordEdit(projectId, sid, e, platform, tool, opts);
+        const edit = await recordEdit(projectId, sid, e, platform, tool, opts, check, signal);
         if (edit === "policy-changed") {
           policyChanged();
           break;
@@ -589,6 +605,7 @@ export function createProfileCapture(core: CaptureCore) {
       }
       if (!filtered && plausible && report.status === "completed") {
         for (const id of checked) {
+          check();
           if (listedIds.has(id)) continue;
           const sid = await core.findExisting(projectId, platform, id);
           if (!sid) continue;
@@ -606,6 +623,7 @@ export function createProfileCapture(core: CaptureCore) {
     }
 
     // 7. Report, batch record, audit (written after a stop too: they record what happened).
+    check();
     const finishedAt = new Date().toISOString();
     rec.lastCapturedAt = finishedAt;
     const reportName = datedFileName("capture", new Date(finishedAt), "md", repoTz(repo));
@@ -675,7 +693,16 @@ export function createProfileCapture(core: CaptureCore) {
         else if (err instanceof ProjectLockedError) throw err;
         else out = { url: e.url, status: "failed", errorCode: "CAPTURE_FAILED", reason: plainReason("CAPTURE_FAILED") };
       }
-      if (out.status === "failed" && out.errorCode === "RATE_LIMITED" && (await backOff())) continue;
+      // Ended while the post downloaded: nothing of it was stored, and nothing more is.
+      if (out.status === "failed" && out.errorCode === "CANCELLED") throw new CaptureCancelledError();
+      if (out.status === "failed" && out.errorCode === "RATE_LIMITED") {
+        // Ended before or during the wait: no further attempt is started (N7).
+        if (item.cancelled?.()) throw new CaptureCancelledError();
+        if (await backOff()) {
+          if (item.cancelled?.()) throw new CaptureCancelledError();
+          continue;
+        }
+      }
       return out;
     }
   }
@@ -685,6 +712,7 @@ export function createProfileCapture(core: CaptureCore) {
     c: ClassifiedUrl,
     opts: ProfileCaptureOptions,
     tool: CaptureTool,
+    signal?: AbortSignal,
   ): Promise<{ results: ListingResult[]; error?: string; tool?: string; toolVersion: string }> {
     const results: ListingResult[] = [];
     let toolVersion = "unknown";
@@ -697,6 +725,7 @@ export function createProfileCapture(core: CaptureCore) {
             type: "capture.download",
             input: listing.url,
             output: work,
+            ...(signal ? { signal } : {}),
             params: {
               tool,
               ...(tool === "yt-dlp" ? { flatList: true } : {}),
@@ -826,6 +855,8 @@ export function createProfileCapture(core: CaptureCore) {
     platform: Platform,
     tool: CaptureTool,
     opts: ProfileCaptureOptions,
+    check: () => void = () => {},
+    signal?: AbortSignal,
   ): Promise<"edited" | "unchanged" | "policy-changed"> {
     const root = repoLibrary(repo).root;
     const sf = await repo.getSource(projectId, sourceId);
@@ -840,16 +871,23 @@ export function createProfileCapture(core: CaptureCore) {
     const flat = stripSnapshot(e.raw, { localPrefixes: [root] });
     const suspect = platform === "youtube" ? differs(stored.title, flat.title) : differs(captionOf(stored), captionOf(flat));
     if (!suspect) return "unchanged";
-    const now = await core.fetchMetadata(projectId, classifyUrl(e.url), {
-      transcribe: false,
-      ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
-    });
+    const now = await core.fetchMetadata(
+      projectId,
+      classifyUrl(e.url),
+      {
+        transcribe: false,
+        ...(opts.cookiesFromBrowser ? { cookiesFromBrowser: opts.cookiesFromBrowser } : {}),
+      },
+      signal,
+    );
+    check(); // ended while it fetched: nothing is stored
     if (!now) return "unchanged";
     const newCap = captionOf(now);
     const newYtTitle = platform === "youtube" && typeof now.title === "string" ? now.title : undefined;
     if (!differs(captionOf(stored), newCap) && !(platform === "youtube" && differs(stored.title, newYtTitle))) return "unchanged";
     // Immediately before storing (R42).
     if (!(await core.stillAllowed(projectId, platform))) return "policy-changed";
+    check();
 
     const at = new Date().toISOString();
     const { work, done } = await core.makeWork();
@@ -870,18 +908,30 @@ export function createProfileCapture(core: CaptureCore) {
     }
 
     const newTitle = platform === "youtube" ? newYtTitle : firstLine(newCap);
-    const variants = sf.source.title.variants;
-    if (newTitle && !variants.some((v) => norm(v.value) === norm(newTitle))) {
-      const lang = (variants.find((v) => v.kind === "original") ?? variants[0])?.lang ?? "und";
-      const title: MultiText = { variants: [...variants, { lang, kind: "original", value: newTitle, producedBy: { by: "machine", tool: "platform-edit", at } }] };
+    if (newTitle) {
       const ref = platform === "youtube" ? "/title" : `/${["description", "desc", "caption"].find((k) => typeof now[k] === "string") ?? "description"}`;
-      const evidence: FieldEvidence = { field: "/title", value: title, source: { kind: "platform-json", provider: tool, ref }, at };
       // Recheck against the first snapshot (provenance) plus the edited text from the new one.
       const ctx = groundingSnapshot(sf.source.provenance.platformSnapshot, platform === "youtube" ? newTitle : (newCap ?? newTitle));
-      await updateSourceRechecked(repo, projectId, sourceId, { title }, {
-        fieldEvidence: (cur) => [...cur.fieldEvidence, evidence],
-        verification: (next) => recheckSourceFile(next, { platformSnapshot: ctx }).verification,
-      });
+      /** The title with the edited text added, from the source as read inside the governed change. */
+      const withEdit = (variants: MultiText["variants"]): MultiText | undefined => {
+        if (variants.some((v) => norm(v.value) === norm(newTitle))) return undefined;
+        const lang = (variants.find((v) => v.kind === "original") ?? variants[0])?.lang ?? "und";
+        return { variants: [...variants, { lang, kind: "original", value: newTitle, producedBy: { by: "machine", tool: "platform-edit", at } }] };
+      };
+      if (withEdit(sf.source.title.variants)) {
+        check();
+        // Read, merged and written in one governed, audited transaction (R26): a title edit made
+        // meanwhile (by the researcher, or another run) is kept, not overwritten.
+        await updateSourceRechecked(repo, projectId, sourceId, (cur) => ({ title: withEdit(cur.title.variants) ?? cur.title }), {
+          fieldEvidence: (cur) => {
+            const title = withEdit(cur.source.title.variants);
+            if (!title) return cur.fieldEvidence;
+            const evidence: FieldEvidence = { field: "/title", value: title, source: { kind: "platform-json", provider: tool, ref }, at };
+            return [...cur.fieldEvidence, evidence];
+          },
+          verification: (next) => recheckSourceFile(next, { platformSnapshot: ctx }).verification,
+        });
+      }
     }
     return "edited";
   }

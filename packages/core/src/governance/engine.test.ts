@@ -202,6 +202,61 @@ describe("move", () => {
   });
 });
 
+describe("backup (R125): a full copy of the project written to <Library>/Backups/", () => {
+  type Dest = NonNullable<PolicyRequest["backup"]>["destinations"][number];
+  const bk = (...destinations: Dest[]) => req({ action: "backup", backup: { destinations } });
+  const at = (destination: string, extra: Partial<Dest> = {}): Dest => ({ destination: destination as never, ...extra });
+  const ENCRYPT = [{ type: "encrypt" }];
+  const HIPAA_CLOUD = "profiles: [hipaa]\nsharing: { locationMetadata: strip }\nresidency: { allowed: [device, cloud_folder], approvedCloudFolders: [f1] }";
+  // [case, governance.yaml, where the library's folder is, expected result, conditions or deny reason]
+  const table: Array<[string, string, Dest[], "allow" | "allow_with_conditions" | "deny", unknown]> = [
+    ["no profile, defaults (encryption required), on this computer", "", [at("device")], "allow_with_conditions", ENCRYPT],
+    ["no profile, encryption optional", "encryption: { atRest: optional }", [at("device")], "allow", undefined],
+    ["no profile, encryption off", "encryption: { atRest: off }", [at("removable")], "allow", undefined],
+    ["no profile, on a network drive (not allowed by default)", "encryption: { atRest: optional }", [at("network")], "deny", "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there"],
+    ["IRB, encryption optional", "profiles: [irb]\nencryption: { atRest: optional }", [at("device")], "allow", undefined],
+    ["IRB, defaults", "profiles: [irb]", [at("device")], "allow_with_conditions", ENCRYPT],
+    ["IRB, in a cloud-synced folder the project does not allow", "profiles: [irb]", [at("cloud_folder", { cloudFolderId: "dropbox" })], "deny", "Backups are kept in the library's folder, which is in a cloud-synced folder; this project's rules do not allow its data there"],
+    ["GDPR, encryption optional", "profiles: [gdpr]\nencryption: { atRest: optional }", [at("device")], "allow", undefined],
+    ["GDPR, defaults, on a removable drive", "profiles: [gdpr]", [at("removable")], "allow_with_conditions", ENCRYPT],
+    ["GDPR, any cloud folder allowed (no approved list)", "profiles: [gdpr]\nencryption: { atRest: optional }\nresidency: { allowed: [device, cloud_folder] }", [at("cloud_folder", { cloudFolderId: "icloud" })], "allow", undefined],
+    ["HIPAA, encryption off in the file: required anyway", "profiles: [hipaa]\nencryption: { atRest: off }\nsharing: { locationMetadata: strip }", [at("device")], "allow_with_conditions", ENCRYPT],
+    ["HIPAA, approved cloud folder", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f1" })], "allow_with_conditions", ENCRYPT],
+    ["HIPAA, cloud folder not on the approved list", HIPAA_CLOUD, [at("cloud_folder", { cloudFolderId: "f2" })], "deny", "Backups are kept in the library's folder, which is in cloud folder f2; it is not on this project's approved list"],
+    ["HIPAA, cloud folder with no approved folders", "profiles: [hipaa]\nresidency: { allowed: [device, cloud_folder] }", [at("cloud_folder", { cloudFolderId: "f1" })], "deny", "Backups are kept in the library's folder, which is in a cloud-synced folder; this project's rules do not allow its data there"],
+    ["HIPAA, public cloud never", "profiles: [hipaa]\nresidency: { allowed: [device, cloud] }", [at("cloud")], "deny", "Backups are kept in the library's folder, which is on a cloud service; this project's rules do not allow its data there"],
+    ["DMP, encryption optional", "profiles: [dmp]\nencryption: { atRest: optional }", [at("device")], "allow", undefined],
+    ["DMP, defaults, own server allowed", "profiles: [dmp]\nresidency: { allowed: [own_server] }", [at("own_server")], "allow_with_conditions", ENCRYPT],
+    ["all four profiles", "profiles: [irb, gdpr, hipaa, dmp]\nsharing: { locationMetadata: strip }", [at("device")], "allow_with_conditions", ENCRYPT],
+    ["typed path and real path: every one must be allowed", "encryption: { atRest: optional }", [at("device"), at("network")], "deny", "Backups are kept in the library's folder, which is on a network drive; this project's rules do not allow its data there"],
+    ["a kind that could not be determined is refused when it may be one the rules exclude", "encryption: { atRest: optional }", [at("device", { uncertain: true }), at("removable", { uncertain: true }), at("network", { uncertain: true })], "deny", "Where the library's folder is stored could not be determined (it may be a network drive), and this project's rules do not allow its data there. To make backups, move the library to storage the rules allow, or allow that kind of storage in the project's rules."],
+  ];
+  it.each(table)("%s", (_case, yaml, dests, result, detail) => {
+    const d = evaluate(cfg(yaml), bk(...dests));
+    expect(d.result).toBe(result);
+    if (result === "deny") expect(denyReason(d)).toBe(detail);
+    if (result === "allow_with_conditions") expect(conditions(d)).toEqual(detail);
+  });
+  it("a profile that raised encryption to required says so in a warning", () => {
+    const d = evaluate(cfg("profiles: [hipaa]\nencryption: { atRest: optional }\nsharing: { locationMetadata: strip }"), bk(at("device")));
+    expect(d.warnings).toContain("Governance setting encryption.atRest is stricter than configured because hipaa requires it");
+  });
+  it("fails closed: no destinations, a malformed one, or no payload", () => {
+    expect(denyReason(evaluate(cfg(), bk()))).toMatch(/^Policy could not be evaluated/);
+    expect(denyReason(evaluate(cfg(), bk({ destination: 5 } as never)))).toMatch(/^Policy could not be evaluated/);
+    expect(denyReason(evaluate(cfg(), bk({ destination: "device", uncertain: "yes" } as never)))).toMatch(/^Policy could not be evaluated/);
+    expect(denyReason(evaluate(cfg(), bk(null as never)))).toMatch(/^Policy could not be evaluated/);
+    expect(denyReason(evaluate(cfg(), req({ action: "backup" })))).toMatch(/^Policy could not be evaluated/);
+    expect(denyReason(evaluate(cfg(), req({ action: "backup", backup: {} as never })))).toMatch(/^Policy could not be evaluated/);
+  });
+  it("an unknown kind is refused, never allowed", () => {
+    expect(evaluate(cfg("encryption: { atRest: optional }"), bk(at("moon"))).result).toBe("deny");
+  });
+  it("the move rules are unchanged by the shared residency check", () => {
+    expect(denyReason(evaluate(cfg(), req({ action: "move", move: { destination: "network" } })))).toBe("Destination network is not permitted for project proj-1");
+  });
+});
+
 describe("other actions", () => {
   it("denies sync in Phase 1", () => {
     expect(denyReason(evaluate(cfg(), req({ action: "sync", sync: {} })))).toBe("Sync is not enabled in this version");

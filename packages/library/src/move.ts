@@ -429,8 +429,8 @@ function assertNoCollisions(w: Walked): void {
   }
 }
 
-/** Classifications of the typed path and its real path; the first cloud folder, else the real path's. */
-async function locate(destRoot: string, env: LocationEnv): Promise<{ destination: Location; destinations: Location[] }> {
+/** Package-internal (also backups, R125). Classifications of the typed path and its real path; the first cloud folder, else the real path's. */
+export async function locate(destRoot: string, env: LocationEnv): Promise<{ destination: Location; destinations: Location[] }> {
   const typed = classifyLocation(resolve(destRoot), env);
   const realPath = await realish(destRoot);
   const destinations = realPath === resolve(destRoot) ? [typed] : [typed, classifyLocation(realPath, env)];
@@ -438,8 +438,8 @@ async function locate(destRoot: string, env: LocationEnv): Promise<{ destination
   return { destination, destinations };
 }
 
-/** Each destination candidate: a certain classification as is; an uncertain one as every plausible kind. */
-function candidates(destinations: Location[]): Array<{ loc: Location; guessed: boolean }> {
+/** Package-internal (also backups, R125). Each destination candidate: a certain classification as is; an uncertain one as every plausible kind. */
+export function candidates(destinations: Location[]): Array<{ loc: Location; guessed: boolean }> {
   const out: Array<{ loc: Location; guessed: boolean }> = [];
   const add = (loc: Location, guessed: boolean) => {
     if (!out.some((c) => c.loc.kind === loc.kind && c.loc.cloudFolderId === loc.cloudFolderId)) out.push({ loc, guessed });

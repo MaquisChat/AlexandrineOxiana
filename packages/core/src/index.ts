@@ -62,3 +62,8 @@ export type { VerificationReport, VerifyContext } from "./verify/recheck.js";
 export * from "./import/index.js";
 
 export * from "./citation/index.js";
+
+// The address classifier and the browser-session acknowledgement: one definition for the library and the interface (R146).
+export { MAX_ADDRESS_LENGTH, classifyUrl, isCollectionLink, isPostLink, isWebAddress } from "./capture/platforms.js";
+export type { ClassifiedUrl, LinkKind, Platform } from "./capture/platforms.js";
+export { COOKIES_ACKNOWLEDGEMENT } from "./capture/acknowledgement.js";

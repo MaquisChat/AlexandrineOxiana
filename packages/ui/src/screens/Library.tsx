@@ -459,9 +459,7 @@ export function Library({ api, current, libraryPath, onSwitchLibrary, navigate, 
   return (
     <div className="ao-library">
       <header className="ao-library__header">
-        <h1>
-          <UserText>{state.name ?? current.name}</UserText>
-        </h1>
+        <UserText as="h1">{state.name ?? current.name}</UserText>
         <JobsIndicator jobs={jobs} />
         <div className="ao-row">
           {project?.encrypted && !locked && (

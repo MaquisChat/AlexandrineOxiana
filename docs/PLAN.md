@@ -487,7 +487,7 @@ Update after every task; commit and push.
 | 44 Scenarios 1, 2, 5, 7 | done | b6b4579 | 30 steps pass in two browsers; new defect D8 (a missing index shows an empty library) runs as an expected failure until Task 46a |
 | 45 Scenarios 3, 4, 6, 8 | done | 4cbf37d | 40 checks in two browsers; defects D1–D7 run as expected failures until Task 46 fixes them |
 | 46a Fix: opening a library (D5, D8), linked files (D4) | done | f02f7a0 | reviewed with probes over one fix round (one Critical closed); D4, D5 and D8 closed |
-| 46b Fix: interface (D1, D2, D6, D7, slow test) | approved; taking the working branch, then verification | ae4de75 (worktree branch) | reviewed with probes over one fix round; "Needs review" follows every pending entry (R172); D14 remains for Task 67 |
+| 46b Fix: interface (D1, D2, D6, D7, slow test) | done | 700b7eb | reviewed with probes over one fix round; D1, D2, D6, D7 closed; none of D1–D8 is open; "Needs review" follows every pending entry (R172) |
 | 46c A pairing code's status | done | fcce2eb | reviewed with probes over one fix round; a code is `used` only once its pairing is written; three minors deferred |
 | 47 Shared API types | not started | | |
 | 34a Service additions | done | eb53348 | security-reviewed with probes; one fix round (R135, R140) |
@@ -495,13 +495,13 @@ Update after every task; commit and push.
 | 34c Transcript viewer | done | 671bbd8 | reviewed with probes over two fix rounds (R143); the service side is Task 62 |
 | 34d Verification badges | done | 1f4efeb | reviewed with probes over two fix rounds (R145, R149); D3 closed; identifiers confirmable; the source screen links to the transcript |
 | 34e Pairing screen | done | c8efb28 | reviewed with probes; one fix round; fixes the shared dialog shell's focus handling with its own tests (R145) |
-| 63 Capture state readable; one classifier | approved; final step, then verification | 2b7f9f2 (worktree branch) | reviewed with probes over two fix rounds; before merging: the working branch, the `recordEdit` fix, a cancelled download frees its slot |
-| 62 Transcription as a job | in progress | | dispatched 2026-11-12 after Task 51 merged; also carries N-5 of Task 51 (a close stops a rerun) |
+| 63 Capture state readable; one classifier | done | 960aacc | reviewed with probes over two fix rounds and a final check; a locked project's captures are neither probed nor kept; `recordEdit` fixed |
+| 62 Transcription as a job | fix round 1 | f867056 (worktree branch) | reviewed with probes: 3 Important (a forbidden transcription not refused at the start; a lock during a run loses it; a refused rerun blocks the source for good) |
 | 48a Tools: worker and service | done | 1e73a94 | reviewed with probes over three rounds (R152, R156, R158); OCR unavailable until our CI builds tesseract (Task 37f) |
 | 48b Tools: the dialogue | done | 5a16210 | reviewed with probes over two fix rounds (R156, R158); the Optional tools screen and the first-use question |
 | 34f Scenarios 9–11 | not started | | |
 | 57 Import wizard routes | done | 87a87af | reviewed with probes over one fix round; `bytes()` is the one binary reader; minors deferred in the ledger |
-| 49 Backups governed | approved; taking the working branch, then verification | d59a52b (worktree branch) | R147 met after five rounds (re-scoped at the fourth); reviewed with probes; D15 and restore go to Task 50b |
+| 49 Backups governed | done | 9191d48 | R147 met after five review rounds (re-scoped at the fourth, R174, R175); D15 and restore go to Task 50b |
 | 50 No silent refusals | done | a7149ec | reviewed with probes over three fix rounds (R154, R157); larger than planned |
 | 50b Restore asks the policy engine | not started | | split from Task 50; waits for Task 49; also carries D15 (a missing backups manifest is rebuilt, never read as "no backups") and restore reading destructions through the audit log (R174) |
 | 51 Job records in files | done | 52452a3 | reviewed with probes over two fix rounds (R142, R106); N-5 (a close must stop a rerun) is carried into Task 62 |
@@ -519,11 +519,11 @@ Update after every task; commit and push.
 | 37j Licence texts ship with the app | done | 33c6d99 | reviewed with probes over two rounds; texts ship verbatim (R165); facts about six bundled components recorded for the owner |
 | 48c First-use question never interrupts (D9) | done | 021af1a | reviewed with probes; one fix round; a banner asks and the dialogue opens only by the researcher's action (R163, R164) |
 | 37i Guide and checklist | done | eea99f6 | written from the source for the build of 2026-11-12 and accuracy-reviewed line by line over one fix round; it found D10–D13 and that the extension had no download (R170, R171); revised by Task 37k |
-| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | not started | | waits for 46b, 34d and 63 (same screens) |
+| 64 Reaching capture and transcripts; capture methods; pickers (D10–D12) | in progress | | dispatched 2026-11-12 after Task 46b merged; the transcript half of D10 was closed by Task 34d |
 | 65 The browser extension as a download | done | 4d69b12 | a reproducible zip and a Linux job in the Mac workflow; the first real artifact comes with the next Mac build |
-| 66 A paired browser survives a relaunch (D13) | approved; taking the working branch, then verification | 4e4f35a (worktree branch) | reviewed with probes over one fix round |
+| 66 A paired browser survives a relaunch (D13) | approved; takes the working branch once more after Task 63, then verification | 69121dc (worktree branch) | reviewed with probes over one fix round |
 | 68 Settings writers never write what they did not read (D16) | not started | | after Task 66; the fonts index and the appearance settings |
-| 67 One review queue for the project (D14) | not started | | waits for 46b and 34d |
+| 67 One review queue for the project (D14) | in progress | | dispatched 2026-11-12 after Task 46b merged |
 | 37k Revise the guide and checklist | not started | | after the fixes and Tasks 64, 65 and 34f |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
