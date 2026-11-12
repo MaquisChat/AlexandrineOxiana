@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildReport } from "./test-report.mjs";
+import { buildReport, isSpecFile } from "./test-report.mjs";
+import { noResults } from "./e2e-args.mjs";
 
 const vitest = {
   testResults: [
@@ -103,4 +104,35 @@ test("skipped Playwright tests are left out, as skipped unit tests are", () => {
 test("a flaky Playwright test (passed only on retry) needs attention", () => {
   const md = buildReport({ playwrightApp: pwRun([pwSpec("works", ["flaky"])]) });
   assert.match(md, /✗ The app end to end: works/);
+});
+
+// The desktop app end to end (apps/desktop/e2e, `pnpm e2e -- --desktop-only`): its own area, and a
+// run that found or ran no tests is never a pass.
+const desktopRun = (specs, extra = {}) => ({ suites: [{ title: "desktop.e2e.ts", file: "desktop.e2e.ts", specs, suites: [] }], errors: [], ...extra });
+
+test("desktop end-to-end results are reported under their own plain-language area", () => {
+  const md = buildReport({ playwrightDesktop: desktopRun([pwSpec("creates a library in the real window", ["expected"], "desktop.e2e.ts")]) });
+  assert.match(md, /1 of 1 checks passed/);
+  assert.match(md, /✓ The desktop app end to end: creates a library in the real window/);
+});
+
+test("a desktop suite that wrote no results, or ran no test, is not a pass", () => {
+  assert.match(buildReport({ playwrightDesktop: noResults("desktop", 1) }), /✗ The desktop app end to end: Playwright could not run the tests: the desktop suite wrote no results \(exit status 1\)/);
+  assert.match(buildReport({ playwrightDesktop: { suites: [], errors: [] } }), /✗ The desktop app end to end: no tests ran/);
+  const allSkipped = buildReport({ playwrightDesktop: desktopRun([pwSpec("creates a library in the real window", ["skipped"], "desktop.e2e.ts")]) });
+  assert.match(allSkipped, /0 of 1 checks passed/);
+  assert.match(allSkipped, /✗ The desktop app end to end: no tests ran/);
+});
+
+test("the desktop spec file (*.e2e.ts, kept out of Vitest's way) counts as a spec file on disk", () => {
+  assert.equal(isSpecFile("desktop.e2e.ts"), true);
+  assert.equal(isSpecFile("smoke.spec.ts"), true);
+  assert.equal(isSpecFile("webdriver.test.ts"), true);
+  assert.equal(isSpecFile("webdriver.ts"), false);
+  assert.equal(isSpecFile("playwright.config.ts"), false);
+  const run = desktopRun([pwSpec("works", ["expected"], "desktop.e2e.ts")], {
+    config: { rootDir: "/repo/apps/desktop/e2e", projects: [{ name: "desktop", testDir: "/repo/apps/desktop/e2e" }], argv: ["node", "cli.js", "test", "-c", "e2e/playwright.config.ts"] },
+  });
+  const md = buildReport({ playwrightDesktop: run }, { listSpecFiles: () => ["/repo/apps/desktop/e2e/desktop.e2e.ts", "/repo/apps/desktop/e2e/other.e2e.ts"] });
+  assert.match(md, /✗ The desktop app end to end: other\.e2e\.ts contains no tests/);
 });
