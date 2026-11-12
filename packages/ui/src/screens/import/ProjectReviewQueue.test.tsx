@@ -327,6 +327,24 @@ describe("the project's whole review queue (Task 67)", () => {
     expect(m.bodies(`PATCH /projects/${P1}/sources/s7/fields`)).toEqual([{ field: "/creators", value: [{ literal: "Harbour Collective", role: "author" }] }]);
   });
 
+  it("a capture whose creators conflict: the queue's dialog offers only the competing values, and the chosen one keeps its structure (fix round 2, N2)", async () => {
+    const other = [{ handle: "@harbourco", literal: "Harbour Collective", role: "uploader" }];
+    const conflictReview = { field: "/creators", status: "conflict", checks: ["sources-agree"], values: [{ value: other, from: { kind: "platform-json", label: "the platform's data" } }], evidence: [] };
+    const s8 = { ...record(8, "A post", [conflictReview]), source: { ...record(8, "A post").source, creators: [{ family: "Souza", given: "Ana", role: "author" }] } };
+    const { m, user } = setup({
+      ...BASE,
+      projectReview: { [P1]: [entry(8, "capture", { fields: { "/creators": "conflict" } })] },
+      sources: { s8 },
+      confirmed: { s8: record(8, "A post", [{ ...conflictReview, status: "user-confirmed" }]) },
+    });
+    await user.click(await screen.findByRole("button", { name: "Creators: Conflict" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByRole("radio", { name: "Type another value" })).toBeNull();
+    await user.click(within(dialog).getByRole("radio", { name: /Harbour Collective/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Confirm this value" }));
+    await waitFor(() => expect(m.bodies(`PATCH /projects/${P1}/sources/s8/fields`)).toEqual([{ field: "/creators", value: other }]));
+  });
+
   it("an entry another window already decided: the 409 takes it out of the view and says so (fix round 1, M2)", async () => {
     const decided = http.post(`${SERVICE}/review/:itemId/reviewed-after-withdrawal`, () => HttpResponse.json({ error: { code: "CONFLICT", message: "This entry has already been reviewed." } }, { status: 409 }));
     const { user } = setup({ ...BASE, extra: [decided] });

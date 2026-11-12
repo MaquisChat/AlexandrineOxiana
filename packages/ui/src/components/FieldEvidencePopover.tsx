@@ -131,7 +131,9 @@ export function FieldEvidencePopover({ review, label, value, readOnly, onConfirm
   const choices: Choice[] = [];
   if (!isEmpty(value)) choices.push({ key: "recorded", text: valueText(value), from: "the value recorded here", value });
   if (conflict) for (const c of competing) if (!choices.some((x) => x.text === c.text)) choices.push(c);
-  if (typable && (conflict || isEmpty(value))) choices.push({ key: "type", text: "Type another value", from: "", value: undefined });
+  // Creators are typed only where there is no value at all: in a conflict the structured values compete and are chosen as they are (fix round 2, N2).
+  const offerTyping = typable && (field === "/creators" ? isEmpty(value) : conflict || isEmpty(value));
+  if (offerTyping) choices.push({ key: "type", text: "Type another value", from: "", value: undefined });
   const asChoices = confirmable && choices.length > 1;
 
   const [picked, setPicked] = useState<string>(choices[0]?.key ?? "type");

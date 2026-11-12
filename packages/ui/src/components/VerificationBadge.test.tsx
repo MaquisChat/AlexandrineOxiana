@@ -135,6 +135,27 @@ describe("FieldCheck: the badge and its evidence popover", () => {
     ]);
   });
 
+  it("creators in conflict (fix round 2, N2): no typing is offered; the chosen competing value keeps its structure", async () => {
+    const onConfirm = vi.fn(noop);
+    const user = userEvent.setup();
+    const recorded = [{ family: "Souza", given: "Ana", role: "author" }];
+    const other = [{ handle: "@harbourco", literal: "Harbour Collective", role: "uploader" }];
+    const review: FieldReview = {
+      field: "/creators",
+      status: "conflict",
+      checks: ["sources-agree"],
+      values: [{ value: other, from: { kind: "platform-json", label: "the platform's data" } }],
+      evidence: [],
+    };
+    render(<FieldCheck review={review} label="Creators" value={recorded} readOnly={false} onConfirm={onConfirm} />);
+    await user.click(screen.getByRole("button", { name: "Creators: Conflict" }));
+    expect(screen.queryByRole("radio", { name: "Type another value" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Your value" })).toBeNull();
+    await user.click(screen.getByRole("radio", { name: /Harbour Collective/ }));
+    await user.click(screen.getByRole("button", { name: "Confirm this value" }));
+    expect(onConfirm).toHaveBeenCalledWith("/creators", other);
+  });
+
   it("an empty typed value is not sent", async () => {
     const onConfirm = vi.fn(noop);
     const user = userEvent.setup();
