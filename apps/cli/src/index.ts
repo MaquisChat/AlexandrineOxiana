@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { deviceNoticesIdle } from "@ao/library";
 import { Command } from "commander";
 import { registerCapture } from "./commands/capture.js";
 import { registerExport } from "./commands/export.js";
@@ -89,11 +90,12 @@ export async function run(argv: string[]): Promise<number> {
 
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
+  // A device-level notice being written (Task 68) is finished before the tool exits.
   run(process.argv).then(
-    (code) => process.exit(code),
+    (code) => deviceNoticesIdle().then(() => process.exit(code)),
     (err: unknown) => {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
-      process.exit(EXIT.failure);
+      void deviceNoticesIdle().then(() => process.exit(EXIT.failure));
     },
   );
 }

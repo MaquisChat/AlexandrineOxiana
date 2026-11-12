@@ -301,6 +301,8 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
         await state.shutdown();
         // A browser's port being recorded (R171) finishes its atomic write before the service exits.
         await pairing.idle();
+        // A device-level notice being written (Task 68) is not lost at shutdown.
+        await deviceNoticesIdle();
         await app.close();
       })();
       return closing;
