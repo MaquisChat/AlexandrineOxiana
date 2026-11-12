@@ -427,6 +427,61 @@ describe("the Mac workflow (.github/workflows/desktop-macos.yml)", () => {
     assert.match(wf, /!apps\/desktop\/src-tauri\/target\/\*\/bundle/);
   });
 
+  describe("the browser extension's download (Task 65)", () => {
+    /** The text of a job under `jobs:`, up to the next job or the end. */
+    const job = (name) => {
+      const lines = wf.split("\n");
+      const jobsAt = lines.indexOf("jobs:");
+      const start = lines.findIndex((l, i) => i > jobsAt && l === `  ${name}:`);
+      assert.ok(jobsAt >= 0 && start > jobsAt, `no job ${name}`);
+      const end = lines.findIndex((l, i) => i > start && (/^ {2}[A-Za-z]/.test(l) || /^[A-Za-z]/.test(l)));
+      return lines.slice(start, end < 0 ? undefined : end).join("\n");
+    };
+    const ext = () => job("extension");
+    const usesOf = (text) => text.split("\n").filter((l) => /^\s*-?\s*uses:/.test(l)).map((l) => l.trim().replace(/^- /, ""));
+
+    it("is its own job on Linux, after plan only, so it neither waits for nor depends on the Mac build", () => {
+      const e = ext();
+      assert.match(e, /^ {4}runs-on: ubuntu-latest$/m);
+      assert.match(e, /^ {4}needs: plan$/m);
+      assert.doesNotMatch(e, /^ {4}if:/m, "no condition on the Mac build's outcome");
+      assert.doesNotMatch(e, /matrix\.|needs\.build|strategy:/);
+      assert.match(e, /^ {4}timeout-minutes: \d+$/m);
+      // The Mac job does not wait for it either.
+      assert.match(job("build"), /^ {4}needs: plan$/m);
+    });
+
+    it("installs from the lock file, runs the packaging script and uploads the zip and its SHA-256 for 30 days", () => {
+      const e = ext();
+      assert.match(e, /run: pnpm install --frozen-lockfile$/m);
+      assert.match(e, /run: pnpm --filter @ao\/browser-extension run package$/m);
+      assert.ok(e.indexOf("run: pnpm install --frozen-lockfile") < e.indexOf("run package"));
+      assert.match(e, /node-version: "?22"?$/m);
+      const upload = e.slice(e.indexOf("uses: actions/upload-artifact"));
+      assert.ok(e.indexOf("uses: actions/upload-artifact") > e.indexOf("run package"), "uploads after packaging");
+      assert.match(upload, /^ {10}name: alexandrine-oxiana-browser-extension$/m);
+      assert.match(upload, /^ {12}apps\/browser-extension\/dist-zip\/\*\.zip$/m);
+      assert.match(upload, /^ {12}apps\/browser-extension\/dist-zip\/\*\.zip\.sha256$/m);
+      assert.match(upload, /^ {10}if-no-files-found: error$/m);
+      assert.match(upload, /^ {10}retention-days: 30$/m);
+      // Its size and checksum in the run's summary.
+      assert.match(e, /dist-zip\/\*\.zip[\s\S]*>> "\$GITHUB_STEP_SUMMARY"/);
+    });
+
+    it("uses no secret and only the actions, at the commit ids, that the Mac build already uses", () => {
+      const e = ext();
+      assert.doesNotMatch(e, /secrets\.|GITHUB_TOKEN|github\.token/);
+      // The workflow's `contents: read` stays the only permission: the job widens nothing.
+      assert.doesNotMatch(e, /^\s+permissions:/m);
+      assert.match(e, /persist-credentials: false/);
+      const rest = wf.replace(e, "");
+      const theirs = new Set(usesOf(rest));
+      const mine = usesOf(e);
+      assert.ok(mine.length >= 4, "checkout, pnpm, Node, upload");
+      for (const u of mine) assert.ok(theirs.has(u), `${u}: a new action or a new version`);
+    });
+  });
+
   it("gives every step a time limit", () => {
     const steps = wf.split("\n").filter((l) => /^ {6}- (uses|name|run):/.test(l)).length;
     const limits = wf.split("\n").filter((l) => /^ {8}timeout-minutes: \d+$/.test(l)).length;

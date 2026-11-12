@@ -234,6 +234,16 @@ The data folder is shown in Zotero under Settings, Advanced, Files and Folders. 
 tags, notes and PDF highlights come along. Running the same command again later brings in only
 what changed; sources you deleted here are not brought back.
 
+**Linked files.** Files Zotero stores in its own data folder are copied into the library. Files
+Zotero only *links to* (attached with "Link to File", kept elsewhere on your computer) are, with
+`ao`, **left where they are and linked**, not copied: that is `ao`'s default. A linked file is
+outside the library's encryption, backups and retention rules, and the import report counts how
+many files were copied and how many were left as links. In a project whose rules require
+encryption they are always copied instead (with a note in the report). The app's import wizard
+works the other way: with "Copy into the library" it copies them too, unless you choose to keep
+them as links. Linked files outside the data folder also need approving, as above
+(`--approve-folder`).
+
 From your library on zotero.org: first save your Zotero API key (create one at zotero.org, under
 Settings, Security; read-only access is enough). You are asked for it and what you type is hidden:
 

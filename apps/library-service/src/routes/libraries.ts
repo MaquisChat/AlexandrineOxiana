@@ -16,7 +16,6 @@ import {
   findLibrary,
   listLibraries,
   planMove,
-  rebuildIndex,
   reconnect,
   relinkMissing,
   scrubPaths,
@@ -38,6 +37,8 @@ function libraryView(ctx: Ctx): Record<string, unknown> | undefined {
     ...(s.lib.readOnlyReason ? { readOnlyReason: s.lib.readOnlyReason } : {}),
     // Only the holding device's name (R118): never its id, process or a user name.
     ...(s.lib.lockedBy ? { lockedBy: s.lib.lockedBy } : {}),
+    // Being rebuilt, failed, or not writable (read-only): absent when the index is ready (D8).
+    ...(s.indexStatus ? { index: s.indexStatus } : {}),
   };
 }
 
@@ -64,12 +65,29 @@ function absPath(o: Record<string, unknown>, key: string): string {
   return p;
 }
 
+/** A rebuild the researcher asked for, stopped because the library was closed or moved meanwhile (M4). */
+const stoppedByClose = () =>
+  new ApiError(409, "CONFLICT", "The rebuild stopped because the library was closed or moved. Open the library and choose \"Rebuild library from folder\" again if it is still needed.");
+
 export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
   const { state } = ctx;
 
   app.get("/libraries", async () => {
+    // At start the last open library is being reopened (D5): the first answers wait once for that
+    // attempt, at most 30 s (a network drive that does not answer); later ones answer at once and,
+    // while it still runs, name it as `reopening` (I1).
+    await state.waitForStartup();
     const known = await listLibraries(state.deps).catch(() => []);
-    return { libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })), ...(state.session ? { current: libraryView(ctx) } : {}) };
+    return {
+      libraries: known.map((e) => ({ libraryId: e.libraryId, name: e.name, lastKnownPaths: e.lastKnownPaths })),
+      ...(state.session
+        ? { current: libraryView(ctx) }
+        : state.reopening
+          ? { reopening: state.reopening }
+          : state.notFound
+            ? { notFound: state.notFound }
+            : {}),
+    };
   });
 
   app.post("/libraries", async (req) => {
@@ -80,7 +98,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     await state.closeLibrary();
     if (state.shuttingDown) throw new ApiError(503, "UNAVAILABLE", "The library service is shutting down.");
     const lib = await createLibrary(path, name, state.deps);
-    await state.adopt(lib);
+    await state.adopt(lib, { newLibrary: true });
     return libraryView(ctx);
   });
 
@@ -95,6 +113,8 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
 
   app.post("/libraries/close", async () => {
     await state.closeLibrary();
+    // Closed by the researcher: the next start shows the chooser (D5).
+    await state.forgetOpenLibrary();
     return { closed: true };
   });
 
@@ -301,9 +321,7 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     if (choice !== "roll-back" && choice !== "keep") throw badRequest('"choice" must be "roll-back" or "keep".');
     const r = await s.repo.resolvePendingWrite(txn, choice);
     // The index was built with the change half there (or, kept, without it): rebuild it in the background.
-    void state.startWork("index", async () => {
-      await rebuildIndex(s.index, s.ring, s.lib, (done, total) => state.events.publish("job.progress", { kind: "index", done, total }));
-    });
+    state.startIndexRebuild(s, true);
     state.publishState();
     return r;
   });
@@ -320,11 +338,20 @@ export function registerLibraries(app: FastifyInstance, ctx: Ctx): void {
     }
   });
 
+  // "Rebuild library from folder" (spec 4.3): the index made again from the files, whatever its state.
   app.post("/libraries/rebuild-index", async () => {
     const s = state.requireWritable();
-    const r = await rebuildIndex(s.index, s.ring, s.lib, (done, total) => state.events.publish("job.progress", { kind: "index", done, total }));
-    state.publishState();
-    return { indexed: r.indexed, lockedProjects: r.lockedProjects.length, errors: r.errors.length };
+    // One already running (e.g. the open's): wait for it, then rebuild as asked (M3).
+    for (let i = 0; s.indexRebuild && i < 3; i++) await s.indexRebuild.done;
+    if (state.session !== s) throw stoppedByClose();
+    try {
+      const r = await state.rebuildIndex(s, true);
+      return { indexed: r?.indexed ?? 0, lockedProjects: r?.lockedProjects.length ?? 0, errors: r?.errors.length ?? 0 };
+    } catch (err) {
+      // Stopped between sources because the library closed or moved (M4): said in plain words.
+      if (err instanceof Error && err.name === "AbortError") throw stoppedByClose();
+      throw err;
+    }
   });
 
   // Server-sent events; read with fetch streaming and the Authorization header (never a query token).

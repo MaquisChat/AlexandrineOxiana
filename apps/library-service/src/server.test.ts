@@ -2244,3 +2244,180 @@ describe("screens integration (R118): resolve a pending write (R27)", () => {
     expect((await call({ method: "POST", url: `/libraries/pending-writes/${"019a7000-0000-7000-8000-0000000000ff"}/resolve`, body: { choice: "keep" } })).status).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Task 51 fix round 1 (R142 item 3): the worker client follows the live index after a rebuild
+
+describe("worker client and the index (Task 51)", () => {
+  it("a job's status change after rebuild-index reaches the rebuilt database's row", async () => {
+    const { createServer } = await import("node:http");
+    const { mkdir } = await import("node:fs/promises");
+    const { WorkerClient } = await import("@ao/library");
+    const { workerClientFor } = await import("./state.js");
+    let n = 0;
+    const outputs = new Map<string, string>();
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.writeHead(req.method === "POST" ? 202 : 200, { "Content-Type": "application/json" });
+      if (req.method === "POST" && req.url === "/jobs") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { output: string };
+        await mkdir(dirname(body.output), { recursive: true });
+        await writeFile(body.output, "jpeg");
+        const id = `w${++n}`;
+        outputs.set(id, body.output);
+        return res.end(JSON.stringify({ id }));
+      }
+      const id = /^\/jobs\/([^/]+)$/.exec(req.url ?? "")?.[1] ?? "";
+      res.end(JSON.stringify({ id, status: "done", progress: 1, result: { output: outputs.get(id), meta: {} } }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const endpoint = { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "t" };
+    try {
+      const provider: WorkerProvider = {
+        start: async () => ({
+          clientFor: (repo, index) => workerClientFor(WorkerClient, endpoint, repo, index),
+          versions: async () => ({}),
+          updateTools: async () => ({ ytDlp: { old: null, new: null, managed: false }, galleryDl: { version: null, pinned: true } }),
+          stop: async () => {},
+        }),
+      };
+      await start({ worker: provider, autoStartWorker: true });
+      await openNewLibrary();
+      const pid = await newProject();
+      const client = await svc.state.workerClient();
+      const input = join(tmp, "a.png");
+      await writeFile(input, "png");
+      expect((await call({ method: "POST", url: "/libraries/rebuild-index" })).status).toBe(200);
+      const r = await client.submit(pid, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} });
+      const db = svc.state.session!.index!.db;
+      expect(db.prepare("SELECT status FROM jobs WHERE id = ?").get(r.id)).toEqual({ status: "done" });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 51 fix round 2 (N-2, R106 C1 + R142): the rerun at an unlock is registered work
+
+describe("worker jobs rerun at an unlock (Task 51 N-2)", () => {
+  let stub: { close(): Promise<void>; runs: Array<{ n: number; cancelled: boolean }> } | undefined;
+  afterEach(async () => {
+    await stub?.close();
+    stub = undefined;
+  });
+
+  /**
+   * A service whose worker is a stand-in; an encrypted project whose first job is cancelled by a
+   * lock that lands while the worker accepts it (R142). The project is left locked. Reruns take `ms`.
+   */
+  async function lockCancelledJob(ms: number) {
+    const { createServer } = await import("node:http");
+    const { mkdir } = await import("node:fs/promises");
+    const { WorkerClient } = await import("@ao/library");
+    const { workerClientFor } = await import("./state.js");
+    const runs: Array<{ n: number; cancelled: boolean }> = [];
+    const outputs = new Map<string, string>();
+    let onFirst: (() => void) | undefined;
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      res.setHeader("Content-Type", "application/json");
+      const m = /^\/jobs\/([^/]+)(\/cancel)?$/.exec(req.url ?? "");
+      if (req.method === "POST" && req.url === "/jobs") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { output: string };
+        const run = { n: runs.length + 1, cancelled: false };
+        runs.push(run);
+        if (run.n === 1) onFirst?.();
+        else await new Promise((r) => setTimeout(r, ms));
+        await mkdir(dirname(body.output), { recursive: true });
+        await writeFile(body.output, "jpeg");
+        outputs.set(`w${run.n}`, body.output);
+        res.statusCode = 202;
+        return res.end(JSON.stringify({ id: `w${run.n}` }));
+      }
+      const run = runs[Number((m?.[1] ?? "w0").slice(1)) - 1];
+      if (m?.[2] && run) run.cancelled = true;
+      res.end(JSON.stringify({ id: m?.[1], status: run?.cancelled ? "cancelled" : "done", progress: 1, result: { output: outputs.get(m?.[1] ?? ""), meta: {} } }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    stub = { runs, close: () => new Promise<void>((r) => server.close(() => r())) };
+    const endpoint = { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "t" };
+    const provider: WorkerProvider = {
+      start: async () => ({
+        clientFor: (repo, index) => workerClientFor(WorkerClient, endpoint, repo, index),
+        versions: async () => ({}),
+        updateTools: async () => ({ ytDlp: { old: null, new: null, managed: false }, galleryDl: { version: null, pinned: true } }),
+        stop: async () => {},
+      }),
+    };
+    await start({ worker: provider, autoStartWorker: true });
+    const root = await openNewLibrary();
+    const pid = await newProject(OPEN_GOV, true);
+    const client = await svc.state.workerClient();
+    await svc.state.idle();
+    onFirst = () => svc.state.session!.repo.lockProject(pid);
+    const input = join(tmp, "a.png");
+    await writeFile(input, "png");
+    const err = await client.submit(pid, { type: "image.proxy", input, output: join(tmp, "out", "a.jpg"), params: {} }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("ProjectLockedError");
+    const folder = (await call({ url: "/projects" })).json.projects.find((p: { id: string }) => p.id === pid).folder as string;
+    const journalLines = async (libRoot: string) =>
+      (await readFile(join(libRoot, ...folder.split("/"), "jobs", "journal.jsonl"), "utf8")).split("\n").filter(Boolean).length;
+    expect(await journalLines(root)).toBe(2); // queued, cancelled (PROJECT_LOCKED)
+    return { pid, root, journalLines };
+  }
+
+  const unlock = async (pid: string) => expect((await call({ method: "POST", url: `/projects/${pid}/unlock`, body: { secret: PASS } })).status).toBe(200);
+
+  it("the unlock resubmits the job once, as registered work", async () => {
+    const { pid, root, journalLines } = await lockCancelledJob(50);
+    await unlock(pid);
+    expect(svc.state.workKinds()).toContain("worker-resume");
+    await svc.state.idle();
+    expect(stub!.runs).toEqual([
+      { n: 1, cancelled: true },
+      { n: 2, cancelled: false },
+    ]);
+    expect(await journalLines(root)).toBe(5); // + claim (queued), running, done
+  });
+
+  it("a move started while the rerun is writing waits for it", async () => {
+    const { pid, journalLines } = await lockCancelledJob(400);
+    await unlock(pid);
+    while (stub!.runs.length < 2) await new Promise((r) => setTimeout(r, 5)); // the rerun is in the worker
+    const moved = await call({ method: "POST", url: "/libraries/move", body: { dest: join(tmp, "Moved") } });
+    expect(moved.body).toContain('"done":true');
+    await svc.state.idle();
+    expect(stub!.runs.filter((r) => !r.cancelled)).toHaveLength(1);
+    expect(await journalLines(join(tmp, "Moved"))).toBe(5); // the rerun finished in the library that was copied
+    // and the moved copy does not run it again once the project is unlocked there
+    await unlock(pid);
+    await svc.state.idle();
+    expect(stub!.runs.filter((r) => !r.cancelled)).toHaveLength(1);
+  });
+
+  it("a close started while the rerun is writing waits for it", async () => {
+    const { pid, root, journalLines } = await lockCancelledJob(400);
+    await unlock(pid);
+    while (stub!.runs.length < 2) await new Promise((r) => setTimeout(r, 5)); // the rerun is in the worker
+    await svc.state.closeLibrary();
+    expect(stub!.runs.filter((r) => !r.cancelled)).toHaveLength(1);
+    expect(await journalLines(root)).toBe(5);
+  });
+
+  it("nothing is resubmitted while a move holds the library", async () => {
+    const { pid } = await lockCancelledJob(0);
+    await svc.state.session!.repo.unlockProject(pid, PASS);
+    svc.state.moving = true;
+    try {
+      svc.state.resumeProject(svc.state.session!, pid, { workerJobs: true });
+      expect(svc.state.workKinds()).not.toContain("worker-resume");
+    } finally {
+      svc.state.moving = false;
+    }
+    await svc.state.idle();
+    expect(stub!.runs).toHaveLength(1);
+  });
+});

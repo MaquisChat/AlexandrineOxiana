@@ -207,6 +207,11 @@ export async function adoptRestoredProject(core: RepoCore, s: StagedRestore): Pr
       const newProjectId = newId();
       const ids = new Map<string, string>([[old.id, newProjectId]]);
       for (const x of [...data.collections, ...data.tags.filter((t) => t.scope !== "workspace"), ...data.participants, ...data.sessions, ...data.consents]) ids.set(x.id, newId());
+      // The job journal (R31) records the original's worker jobs, with absolute paths into the
+      // original's files and the library's temp folder: resubmitting them from the copy would
+      // write into the original. The copy starts with no jobs (its viewing proxies still pending
+      // are kept in its source files, below).
+      await fsp.rm(join(staging, "jobs"), { recursive: true, force: true });
       const files = await walkFiles(staging);
       const sourceFiles = files.filter((f) => /^Sources\/[^/]+\/source\.json(\.enc)?$/u.test(f));
       const parsedSources = new Map<string, Record<string, unknown>>();

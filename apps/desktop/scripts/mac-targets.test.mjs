@@ -2,12 +2,57 @@
 // "Run workflow" choice, or from the tag that started it.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { macTargets, requestedTargets, RUNNERS } from "./mac-targets.mjs";
+import { INTEL_BUILDS, macTargets, requestedTargets, RUNNERS } from "./mac-targets.mjs";
 
 const both = [RUNNERS.arm64, RUNNERS.x64];
+const arm = [RUNNERS.arm64];
+
+describe("Apple Silicon only (R169, the owner's decision): nothing builds the Intel download", () => {
+  const OFF = /Intel builds are switched off.*Apple Silicon only \(R169\)/;
+
+  it("Intel builds are off", () => {
+    assert.equal(INTEL_BUILDS, false);
+  });
+
+  it("a release tag builds Apple Silicon alone, and so does the Run workflow default", () => {
+    assert.deepEqual(macTargets({ event: "push", ref: "refs/tags/v0.4.0", version: "0.4.0" }), arm);
+    assert.deepEqual(macTargets({ event: "push", ref: "refs/tags/v0.4.0-arm.3", version: "0.4.0" }), arm);
+    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "", version: "0.4.0" }), arm);
+    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "apple-silicon", version: "0.4.0" }), arm);
+    assert.deepEqual(macTargets({ event: "push", ref: "refs/heads/main", version: "0.4.0", request: '{"request": 3, "architectures": "apple-silicon"}' }), arm);
+  });
+
+  it("every way of asking for Intel is refused in plain words and builds nothing", () => {
+    for (const t of ["v0.4.0-intel.1", "v0.4.0-mac.1"]) assert.throws(() => macTargets({ event: "push", ref: `refs/tags/${t}`, version: "0.4.0" }), OFF, t);
+    for (const input of ["intel", "both"]) assert.throws(() => macTargets({ event: "workflow_dispatch", input, version: "0.4.0" }), OFF, input);
+    for (const a of ["intel", "both"]) {
+      assert.throws(() => macTargets({ event: "push", ref: "refs/heads/main", version: "0.4.0", request: `{"request": 2, "architectures": "${a}"}` }), OFF, a);
+      assert.throws(() => requestedTargets(`{"request": 2, "architectures": "${a}"}`), OFF, a);
+    }
+    // No run of any kind yields the Intel runner.
+    for (const args of [
+      { event: "push", ref: "refs/tags/v0.4.0" },
+      { event: "workflow_dispatch", input: "" },
+      { event: "workflow_dispatch", input: "apple-silicon" },
+    ]) assert.ok(!macTargets({ ...args, version: "0.4.0" }).includes(RUNNERS.x64));
+  });
+
+  it("the workflow's Run workflow choice offers Apple Silicon alone", async () => {
+    const { readFileSync } = await import("node:fs");
+    const wf = readFileSync(new URL("../../../.github/workflows/desktop-macos.yml", import.meta.url), "utf8");
+    assert.match(wf, /^ {8}options: \[apple-silicon\]\n {8}default: apple-silicon$/m);
+  });
+
+  it("the request file in the repository asks for Apple Silicon", async () => {
+    const { readFileSync } = await import("node:fs");
+    assert.deepEqual(requestedTargets(readFileSync(new URL("../mac-build-request.json", import.meta.url), "utf8")), arm);
+  });
+});
+
+// The paths below with `intel: true` are what the code does if the owner reverses R169.
 
 describe("a build request (R168): a branch push that changed apps/desktop/mac-build-request.json", () => {
-  const branch = (request) => macTargets({ event: "push", ref: "refs/heads/claude/some-branch", version: "0.4.0", request });
+  const branch = (request) => macTargets({ event: "push", ref: "refs/heads/claude/some-branch", version: "0.4.0", request, intel: true });
 
   it("builds what the request file names", () => {
     assert.deepEqual(branch('{"request": 1, "architectures": "apple-silicon"}'), [RUNNERS.arm64]);
@@ -39,19 +84,20 @@ describe("a build request (R168): a branch push that changed apps/desktop/mac-bu
 
 describe("macTargets", () => {
   it("builds what the Run workflow choice says", () => {
-    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "both", version: "0.0.0" }), both);
-    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "apple-silicon", version: "0.0.0" }), [RUNNERS.arm64]);
-    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "intel", version: "0.0.0" }), [RUNNERS.x64]);
-    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "", version: "0.0.0" }), both);
-    assert.throws(() => macTargets({ event: "workflow_dispatch", input: "universal", version: "0.0.0" }), /both, apple-silicon or intel/);
+    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "both", version: "0.0.0", intel: true }), both);
+    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "apple-silicon", version: "0.0.0", intel: true }), [RUNNERS.arm64]);
+    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "intel", version: "0.0.0", intel: true }), [RUNNERS.x64]);
+    assert.deepEqual(macTargets({ event: "workflow_dispatch", input: "", version: "0.0.0", intel: true }), both);
+    assert.throws(() => macTargets({ event: "workflow_dispatch", input: "universal", version: "0.0.0", intel: true }), /both, apple-silicon or intel/);
+    assert.throws(() => macTargets({ event: "workflow_dispatch", input: "universal", version: "0.0.0" }), /must be apple-silicon, not "universal"/);
   });
 
   it("reads the architecture from a pre-release tag: -mac.N both, -arm.N Apple Silicon, -intel.N Intel", () => {
-    const tag = (t) => macTargets({ event: "push", ref: `refs/tags/${t}`, version: "0.4.0" });
+    const tag = (t) => macTargets({ event: "push", ref: `refs/tags/${t}`, version: "0.4.0", intel: true });
     assert.deepEqual(tag("v0.4.0-mac.1"), both);
     assert.deepEqual(tag("v0.4.0-arm.2"), [RUNNERS.arm64]);
     assert.deepEqual(tag("v0.4.0-intel.13"), [RUNNERS.x64]);
-    // A plain version tag builds both.
+    // A plain version tag builds both (with Intel on).
     assert.deepEqual(tag("v0.4.0"), both);
   });
 

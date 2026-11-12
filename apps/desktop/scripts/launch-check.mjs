@@ -470,9 +470,16 @@ function startBus() {
 
 /**
  * R (a Mac, --release-app): the release app as shipped. It prints nothing for this check, so the
- * check reads the process table: the service and the worker must start from the app's own resources,
- * the service must listen on the loopback address and refuse a request without its token, and after
- * SIGTERM to the shell no helper may be left.
+ * check reads the process table: the service must start from the app's own resources, listen on the
+ * loopback address and refuse a request without its token, and after SIGTERM to the shell no helper
+ * may be left.
+ *
+ * No worker is expected here. The service starts the worker when a library is opened
+ * (apps/library-service/src/state.ts), and nothing opens one in this scenario: the release app has
+ * no probe page and the check has no token. (The first Mac run, 2026-11-12, waited 180 s for a
+ * worker that could not come.) The worker from an app's own resources is proved by scenarios A-D on
+ * the debug app, which is staged and signed by the same steps; if a worker is running here all the
+ * same, it must be the app's own.
  */
 async function releaseCheck(app, problems) {
   const shell = shellOf(app);
@@ -491,15 +498,18 @@ async function releaseCheck(app, problems) {
   mkdirSync(env.TMPDIR, { recursive: true });
   const run = startShell(env, label, { direct: true, shell });
   try {
-    const found = await until("the service and the worker under the shell", 180_000, async () => {
-      if (run.child.exitCode !== null || run.child.signalCode !== null) throw new Error(`the app exited (${run.child.exitCode ?? run.child.signalCode}) before its helpers started:\n${run.log().slice(-3000)}`);
-      const kids = descendants(run.child.pid).filter(running).map((pid) => ({ pid, cmd: cmdline(pid) }));
+    const under = () => descendants(run.child.pid).filter(running).map((pid) => ({ pid, cmd: cmdline(pid) }));
+    const found = await until("the service under the shell", 120_000, async () => {
+      if (run.child.exitCode !== null || run.child.signalCode !== null) throw new Error(`the app exited (${run.child.exitCode ?? run.child.signalCode}) before its service started:\n${run.log().slice(-3000)}`);
+      const kids = under();
       const svc = kids.find((k) => k.cmd.includes(join(resources, "library-service", "service.mjs")));
-      const worker = kids.find((k) => k.cmd.includes(join(resources, "ao-worker", "ao-worker")));
-      return svc && worker ? { svc, worker, kids } : null;
+      return svc ? { svc, kids } : null;
+    }).catch((err) => {
+      // The release app says nothing by itself: show what the check could see.
+      const seen = under().map((k) => `${k.pid} ${k.cmd.slice(0, 300)}`).join("\n") || "(none)";
+      throw new Error(`${err.message}\n--- processes under the shell ---\n${seen}\n--- the shell's output (end) ---\n${run.lines.slice(-20).join("\n")}\n${run.log().slice(-3000)}`);
     });
     report(`${label}: the service runs the app's own Node.js and service folder`, found.svc.cmd.startsWith(join(resources, "node", "node")), found.svc.cmd.slice(0, 200)) || problems.push("R: service not from the app");
-    report(`${label}: the worker runs from the app's resources, under the service`, true, found.worker.cmd.slice(0, 200));
     report(`${label}: the service runs with the 512 MB ceiling`, /--max-old-space-size=512/.test(found.svc.cmd)) || problems.push("R: memory ceiling");
     const envProblems = helperEnvProblems(found.svc.pid, found.kids.map((k) => k.pid));
     report(`${label}: the helpers got an allow-listed environment and no token outside standard input`, envProblems.length === 0, envProblems.join("; ")) || problems.push(...envProblems);
@@ -511,6 +521,9 @@ async function releaseCheck(app, problems) {
     const port = listen[0].port;
     const status = await fetch(`http://127.0.0.1:${port}/libraries`).then((r) => r.status, (e) => `no answer (${e.message})`);
     report(`${label}: the service answers, and refuses a request without its token`, status === 401, `HTTP ${status}`) || problems.push("R: no token refusal");
+    const worker = under().find((k) => k.pid !== found.svc.pid && /ao[-_]worker/.test(k.cmd));
+    if (worker) report(`${label}: the worker that is running is the app's own`, worker.cmd.startsWith(join(resources, "ao-worker", "ao-worker")), worker.cmd.slice(0, 200)) || problems.push("R: worker not from the app");
+    else process.stdout.write(`launch-check: note ${label}: no worker is running, as expected: it starts when a library is opened, which this check cannot do in the release app (scenarios A-D do it in the debug app)\n`);
     const helpers = [found.svc.pid, ...descendants(found.svc.pid)].filter(running);
     process.kill(run.child.pid, "SIGTERM");
     const { code, signal } = await Promise.race([run.exit, sleep(120_000).then(() => ({ code: "timeout" }))]);
