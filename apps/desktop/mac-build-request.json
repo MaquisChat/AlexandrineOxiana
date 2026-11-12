@@ -1,5 +1,5 @@
 {
-  "request": 2,
+  "request": 3,
   "architectures": "apple-silicon",
-  "note": "Second attempt, 2026-11-12: Apple Silicon. Run 1 built the app and passed every check except the release-app launch check, which wrongly waited for a worker that starts only when a library is opened; the check is corrected."
+  "note": "The build for the owner's hands-on tests: every defect of the first build fixed (D1-D8, D10-D17, D21), with the browser extension as a download of the same run. Requested after GitHub's run 203 on the last product merge was green."
 }
