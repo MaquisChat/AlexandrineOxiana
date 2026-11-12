@@ -21,7 +21,7 @@
 //                                  they need, copied unmodified, for this platform and architecture only
 //   licences/                      THIRD-PARTY-NOTICES.md (every bundled or copied npm package, its
 //                                  version and licence), each package's licence files, all of them in
-//                                  THIRD-PARTY-LICENCES.txt (each text once; Task 37j), the typefaces'
+//                                  THIRD-PARTY-LICENCES.txt (each distinct file once, whole; Task 37j, R165), the typefaces'
 //                                  OFL texts (R100), the citeproc-js notice and the CPAL text
 //   package.json, build-info.json  the folder's identity; the platform, architecture and Node ABI it was built for
 //   START.txt                      the documented way to start it
@@ -33,7 +33,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync,
 import { createRequire, isBuiltin } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectLicenceTexts, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts } from "../../desktop/scripts/licence-texts.mjs";
+import { collectLicenceTexts, isLicenceText, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SERVICE = resolve(HERE, "..");
@@ -473,8 +473,8 @@ function writeLicences(out) {
     "",
     "The library service folder contains the following npm packages: bundled into `service.mjs` or",
     "`workers/` (\"bundled\"), or copied unmodified into `node_modules/` (\"copied\"). Each package's own",
-    "licence files are in `licences/npm/<name>@<version>/`, and all their texts, each once with every",
-    "copyright line of its copies, in `licences/THIRD-PARTY-LICENCES.txt`.",
+    "licence files are in `licences/npm/<name>@<version>/`, and all of them, each distinct file once and",
+    "whole, in `licences/THIRD-PARTY-LICENCES.txt`.",
     "",
     "Also here:",
     "- `licences/csl/`: the Citation Style Language styles and locales (CC BY-SA 3.0, `csl/` in this",
@@ -487,30 +487,51 @@ function writeLicences(out) {
   ];
   const problems = [];
   const collected = [];
+  const dirs = new Map();
+  const fallbackSources = [];
   for (const { dir: pdir, pkg, how } of rows) {
     const id = `${pkg.name}@${pkg.version}`;
     const dest = join(dir, "npm", id);
-    const files = licenceFilesIn(pdir);
     const licence = typeof pkg.license === "string" ? pkg.license : (pkg.license?.type ?? (Array.isArray(pkg.licenses) ? pkg.licenses.map((l) => l.type).join(" OR ") : ""));
-    const entry = { name: pkg.name, version: pkg.version, licence, files: readLicenceFiles(pdir, files) };
+    const see = seeLicenceIn(licence);
+    const files = licenceFilesIn(pdir);
+    if (see && existsSync(join(pdir, see)) && !files.includes(see)) files.push(see);
+    const components = sbomIn(pdir);
+    const repo = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
+    const entry = {
+      name: pkg.name,
+      version: pkg.version,
+      licence,
+      ...(see ? { licenceFile: see } : {}),
+      files: readLicenceFiles(pdir, files),
+      ...(components ? { components } : {}),
+      ...(licenceIds(licence).includes("MPL-2.0") ? { source: `${repo ?? "(no repository stated)"} (version ${pkg.version}; also https://www.npmjs.com/package/${pkg.name}/v/${pkg.version})` } : {}),
+      ...(USED_UNDER[pkg.name] ? { note: `used under ${USED_UNDER[pkg.name]}` } : {}),
+    };
+    dirs.set(entry, pdir);
     let note = files.join(", ");
     mkdirSync(dest, { recursive: true });
-    for (const f of files) cpSync(join(pdir, f), join(dest, f));
-    if (!files.length) {
-      // A package whose npm tarball has no licence file: a text from LICENCE_TEXT_FROM (its parent
+    for (const f of files) cpSync(join(pdir, f), join(dest, f), { recursive: true });
+    // The package's own SBOM, if it ships one, travels with its licence (what its program contains).
+    if (components) cpSync(join(pdir, components.file), join(dest, components.file));
+    if (!files.some((f) => isLicenceText(f) || f === see)) {
+      // No licence text of its own (a NOTICE is not one): a text from LICENCE_TEXT_FROM (its parent
       // package's, from the same repository), else the standard text of its identifier; it is named
       // under "No licence text shipped by the package". With neither, the build fails.
       const text = LICENCE_TEXT_FROM.find((x) => x.test(pkg.name))?.text(pkg, rows);
+      const shipped = files.length ? `${files.join(", ")}; ` : "";
       if (text) {
         entry.fallback = { text: text.body, source: text.source };
+        fallbackSources.push({ label: `${pkg.name} ${pkg.version} (${text.source})`, path: text.path });
         writeFileSync(join(dest, "LICENSE"), text.body);
-        note = `none shipped; LICENSE here is ${text.source}`;
+        note = `${shipped}no licence text shipped; LICENSE here is ${text.source}`;
       } else {
         const ids = licenceIds(licence);
         for (const x of ids.filter((x) => standard.has(x))) writeFileSync(join(dest, `STANDARD-TEXT-${x}.txt`), standard.get(x));
-        note = `none shipped; the standard text${ids.length > 1 ? "s" : ""} of ${ids.join(", ")}`;
+        note = `${shipped}no licence text shipped; the standard text${ids.length > 1 ? "s" : ""} of ${ids.join(", ")}`;
       }
     }
+    if (components) note += `; its SBOM (${components.file}) lists ${components.list.length} components`;
     collected.push(entry);
     const used = USED_UNDER[pkg.name] ? ` (used under ${USED_UNDER[pkg.name]})` : "";
     lines.push(`| ${pkg.name} | ${pkg.version} | ${licence}${used} | ${how} | ${note} |`);
@@ -523,17 +544,28 @@ function writeLicences(out) {
     lines.push("These packages carry no licence text of their own. The text used for each is named; a person should check it.", "");
     for (const n of result.noText) lines.push(`- ${n.name} ${n.version} (${n.licence}): ${n.used}`);
   } else lines.push("None.");
+  const withComponents = collected.filter((p) => p.components);
+  if (withComponents.length) {
+    lines.push("", "## Components listed by a package's own SBOM", "");
+    lines.push("The program in these packages contains further components, as the package's own SBOM states them; the package ships no other licence texts for them. The full lists are in `THIRD-PARTY-LICENCES.txt` and the SBOM beside the package's licence.", "");
+    for (const p of withComponents) lines.push(`- ${p.name} ${p.version}: ${p.components.list.length} components (${p.components.file})`);
+  }
   lines.push("");
   writeFileSync(join(dir, "THIRD-PARTY-NOTICES.md"), lines.join("\n"));
-  writeFileSync(
-    join(dir, "THIRD-PARTY-LICENCES.txt"),
-    renderLicenceTexts({
-      title: "The library service's npm packages: licence texts",
-      intro: "The npm packages bundled into the library service or copied unmodified beside it, and the licence and notice files each package ships. The citation styles' and citeproc-js's notice and licences are in licences/csl/, the typefaces' in licences/fonts/.",
-      packages: collected.map((p) => (USED_UNDER[p.name] ? { ...p, note: `used under ${USED_UNDER[p.name]}` } : p)),
-      result,
-    }),
-  );
+  const text = renderLicenceTexts({
+    title: "The library service's npm packages: licence texts",
+    intro: "The npm packages bundled into the library service or copied unmodified beside it, and the licence and notice files each package ships, each shown whole. The citation styles' and citeproc-js's notice and licences are in licences/csl/, the typefaces' in licences/fonts/.",
+    packages: collected,
+    result,
+  });
+  // R165: every source file must be in the notices file whole; the list goes beside the folder for
+  // scripts/notices/check-verbatim.mjs (it names build-machine paths, so it is not shipped).
+  const sources = [...sourceList(collected, (p) => dirs.get(p), result), ...fallbackSources];
+  const missing = verifyVerbatim(text, sources.map((s) => ({ label: s.label, text: readFileSync(s.path, "utf8") })));
+  if (missing.length) fail(`licences: not in THIRD-PARTY-LICENCES.txt whole:\n  ${missing.join("\n  ")}`);
+  writeFileSync(join(dir, "THIRD-PARTY-LICENCES.txt"), text);
+  writeFileSync(`${out}.licence-sources.json`, JSON.stringify(sources, null, 1) + "\n");
+  return result;
 }
 
 /** Where a dual-licensed package's licence is chosen. */
@@ -553,7 +585,7 @@ const LICENCE_TEXT_FROM = [
       const parentName = pkg.name.replace(/^(@napi-rs\/(?:canvas|keyring))-.*$/, "$1");
       const parent = rows.find((r) => r.pkg.name === parentName);
       const f = parent && readdirSync(parent.dir).find((x) => /^licen[cs]e/i.test(x));
-      return f ? { body: readFileSync(join(parent.dir, f), "utf8"), source: `the ${f} of ${parentName}, built from the same repository` } : undefined;
+      return f ? { body: readFileSync(join(parent.dir, f), "utf8"), path: join(parent.dir, f), source: `the ${f} of ${parentName}, built from the same repository` } : undefined;
     },
   },
 ];

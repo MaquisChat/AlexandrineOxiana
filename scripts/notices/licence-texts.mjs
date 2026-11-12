@@ -147,7 +147,7 @@ export function collectLicenceTexts(packages, standard) {
     }
     for (const f of p.files) add(f.text, `${id} (${f.name})`);
     if (hasOwnFile || p.files.some((f) => isLicenceText(f.name))) continue;
-    const shipsOnly = p.files.length ? `; ships only: ${p.files.map((f) => f.name).join(", ")}` : "";
+    const shipsOnly = `${p.files.length ? `; ships only: ${p.files.map((f) => f.name).join(", ")}` : ""}${p.components ? `; its SBOM (${p.components.file}) lists ${p.components.list.length} components whose licence texts it does not ship` : ""}`;
     if (p.fallback) {
       add(p.fallback.text, `${id} (${p.fallback.source})`);
       noText.push({ name: p.name, version: p.version, licence: p.licence, used: `${p.fallback.source}${shipsOnly}` });
