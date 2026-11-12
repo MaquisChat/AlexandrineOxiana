@@ -27,7 +27,8 @@
  *   AO_SERVICE_PORT   port on 127.0.0.1 (default 0: any port, which is the port used last time when
  *                     it is free, else any free port, remembered in the settings folder; R171,
  *                     port-memory.ts). Any other value is used exactly and not remembered.
- *   AO_LIBRARY        a library folder to open at start (optional)
+ *   AO_LIBRARY        a library folder to open at start (optional; without it the library open
+ *                     when the service last ran is reopened, or named as not found)
  *   AO_CONFIG_DIR     the app settings folder (default: the platform's usual place)
  *   AO_NO_WORKER=1    run without the media worker (capture, transcription, proxies and OCR wait)
  *
@@ -77,6 +78,9 @@ async function main(): Promise<void> {
     const lib = await openLibrary(process.env.AO_LIBRARY, svc.state.deps, { onLockLost: () => svc.state.publishState() });
     svc.state.roots.add(lib.root);
     await svc.state.adopt(lib);
+  } else {
+    // Not awaited: GET /libraries waits for it (D5).
+    void svc.state.reopenLast();
   }
   // Any port (0, the shell's request): the port used last time when it is free (R171, port-memory.ts).
   const listening = await listenOnRememberedPort({

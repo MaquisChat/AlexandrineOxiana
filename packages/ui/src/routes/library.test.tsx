@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { LIBRARIES, libraryHandlers, server, serviceError, testClient, url, useMockService } from "../test/service";
+import { CURRENT_RW, LIBRARIES, libraryHandlers, server, serviceError, testClient, url, useMockService } from "../test/service";
 import { navigate } from "../navigation";
 import { LibraryRoutes, isLibraryPath } from "./library";
 
@@ -10,6 +10,9 @@ useMockService();
 // The open library asks for the tools catalogue (the first-use question, Task 48c); outside the desktop app it is refused.
 beforeEach(() => server.use(http.get(url("/tools"), () => serviceError(403, "FORBIDDEN", "The tools are managed from the desktop app."))));
 afterEach(() => window.history.replaceState(null, "", "/"));
+
+/** Matches the "still opening" line as a whole (the library's name is inside UserText). */
+const stillOpening = (re: RegExp) => (_: string, el: Element | null) => el?.tagName === "P" && re.test(el.textContent ?? "");
 
 describe("library routes", () => {
   it("are / and /library", () => {
@@ -36,6 +39,72 @@ describe("library routes", () => {
     expect(await screen.findByRole("heading", { name: /Library not found/ })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Open a different library" }));
     expect(await screen.findByRole("heading", { name: "Choose a library" })).toBeTruthy();
+  });
+
+  it("D5: on launch, a remembered library the service could not reopen shows “Library not found”, not the chooser", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, notFound: { libraryId: "lib-1", name: "Thesis library" } })));
+    render(<LibraryRoutes client={testClient()} />);
+    expect(await screen.findByRole("heading", { level: 1, name: "Library not found: Thesis library" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Choose a library" })).toBeNull();
+  });
+
+  it("D5: a not-found library the registry no longer knows falls back to the chooser", async () => {
+    server.use(http.get(url("/libraries"), () => HttpResponse.json({ ...LIBRARIES, notFound: { libraryId: "lib-9", name: "Gone" } })));
+    render(<LibraryRoutes client={testClient()} />);
+    expect(await screen.findByRole("heading", { name: "Choose a library" })).toBeTruthy();
+  });
+
+  it("I1: while the last library is still being opened, the chooser says so, stays usable, and keeps checking until it is open", async () => {
+    let phase: "reopening" | "open" = "reopening";
+    let checks = 0;
+    server.use(
+      http.get(url("/libraries"), () => {
+        checks++;
+        return HttpResponse.json(phase === "reopening" ? { ...LIBRARIES, reopening: { libraryId: "lib-1", name: "Thesis library" } } : { ...LIBRARIES, current: CURRENT_RW });
+      }),
+      ...libraryHandlers(),
+    );
+    render(<LibraryRoutes client={testClient()} />);
+    const status = await screen.findByText(stillOpening(/Still opening Thesis library, the library that was open last time/));
+    expect(status.getAttribute("role")).toBe("status");
+    expect(screen.getByRole("heading", { name: "Choose a library" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Open Grant 2025" })).toBeTruthy();
+    // It keeps checking while the answer is the same...
+    const before = checks;
+    await waitFor(() => expect(checks).toBeGreaterThan(before), { timeout: 5000 });
+    expect(screen.getByText(stillOpening(/Still opening Thesis library/))).toBeTruthy();
+    // ...and once it is open, the library is shown.
+    phase = "open";
+    expect(await screen.findByRole("navigation", { name: "Projects" }, { timeout: 5000 })).toBeTruthy();
+  });
+
+  it("I1: a library chosen while the last one is still being opened stays; a late answer of the check is dropped", async () => {
+    let phase: "reopening" | "late" = "reopening";
+    let lateAsked = 0;
+    let releaseLate!: () => void;
+    const late = new Promise<void>((r) => (releaseLate = r));
+    server.use(
+      http.get(url("/libraries"), async () => {
+        if (phase === "reopening") return HttpResponse.json({ ...LIBRARIES, reopening: { libraryId: "lib-1", name: "Thesis library" } });
+        lateAsked++;
+        await late; // the check in flight when the researcher chooses: it answers late (here: the old one not found)
+        return HttpResponse.json({ ...LIBRARIES, notFound: { libraryId: "lib-1", name: "Thesis library" } });
+      }),
+      http.post(url("/libraries/open"), () => HttpResponse.json({ libraryId: "lib-2", name: "Grant 2025", mode: "read-write" })),
+      ...libraryHandlers({ current: { libraryId: "lib-2", name: "Grant 2025", mode: "read-write" } }),
+    );
+    const user = userEvent.setup();
+    render(<LibraryRoutes client={testClient()} />);
+    await screen.findByText(stillOpening(/Still opening Thesis library/));
+    const openB = await screen.findByRole("button", { name: "Open Grant 2025" });
+    phase = "late";
+    await waitFor(() => expect(lateAsked).toBeGreaterThanOrEqual(1), { timeout: 5000 });
+    await user.click(openB);
+    expect(await screen.findByRole("heading", { level: 1, name: "Grant 2025" })).toBeTruthy();
+    releaseLate();
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(screen.getByRole("heading", { level: 1, name: "Grant 2025" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 1, name: /Library not found/ })).toBeNull();
   });
 
   it("navigate() changes the path and notifies listeners", async () => {

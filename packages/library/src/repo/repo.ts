@@ -1161,7 +1161,7 @@ export function updateSourceRechecked(
   repo: Repo,
   projectId: string,
   id: string,
-  patch: SourcePatch,
+  patch: Parameters<typeof updateSource>[3],
   extra: Parameters<typeof updateSource>[4],
 ): Promise<SourceFile> {
   return updateSource(cores.get(repo)!, projectId, id, patch, extra);

@@ -94,6 +94,7 @@ import {
   runListeners,
   batchDirs,
   countOutcomes,
+  fileCounts,
   fileName,
   findBatch,
   latestByKey,
@@ -245,6 +246,11 @@ export interface ScanSummary {
    * links followed: what an approval of that one file must name, R118). Never written anywhere.
    */
   outsideFiles: Array<{ item: string; folder: string; file: string }>;
+  /**
+   * Files the source itself links in place (Zotero linked attachments), approved or not: the wizard
+   * offers to keep them as links only when there are some (R136).
+   */
+  linkedFiles: number;
 }
 
 export interface BatchSummary {
@@ -1157,7 +1163,8 @@ class Run {
           },
           inTx: async (tx, sf) => {
             this.notePending(q.item.key, sf, rule.mode());
-            const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id });
+            const files = fileCounts(q.inputs.map((f) => f.handling === "link"));
+            const entry: JournalEntry = this.withNotes({ key: q.item.key, outcome: q.reviewItem ? "needs-review" : "created", sourceId: sf.source.id, ...(files ? { files } : {}) });
             entries[i] = entry;
             await appendJournal(tx, this.projectRel, this.rec.dir, i === 0 ? [...this.pending.slice(0, flushLines), entry] : [entry]);
           },
@@ -1229,7 +1236,8 @@ class Run {
       rule.hook,
       async (tx, created) => {
         this.notePending(item.key, created, rule.mode());
-        entry = this.withNotes({ key: item.key, outcome, sourceId: created.source.id });
+        const files = fileCounts(inputs.map((f) => f.handling === "link"));
+        entry = this.withNotes({ key: item.key, outcome, sourceId: created.source.id, ...(files ? { files } : {}) });
         await appendJournal(tx, this.projectRel, this.rec.dir, [...this.pending.slice(0, flush), entry]);
       },
     );
@@ -1510,7 +1518,9 @@ class Run {
           const snapName = `${projectRel}/${snapshotRel.slice(0, snapshotRel.lastIndexOf("/"))}/${fileName(basename(snapshotRel), tx.encrypted)}`;
           await tx.writeFile(snapName, JSON.stringify(cur), { encrypt: tx.encrypted, ...(tx.encrypted ? {} : { mode: PRIVATE_MODE }) });
           await ops.writeSource(cur, r.next);
-          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record, ...extra() });
+          const added = new Set(r.record.addedAssetIds);
+          const files = fileCounts(r.next.assets.filter((a) => added.has(a.id)).map((a) => a.linked !== undefined));
+          entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, mergedInto: targetId, snapshot: snapshotRel, merge: r.record, ...(files ? { files } : {}), ...extra() });
         } else {
           entry = this.withNotes({ key: item.key, outcome: r.outcome, sourceId: targetId, ...(r.record.kept?.length ? { merge: r.record } : {}), ...extra() });
         }
@@ -1809,7 +1819,7 @@ export async function dryRun(
   repo.getProject(projectId);
   await dryRunPolicy(repo, projectId, adapter.kind);
   const dedupe = new BatchDedupe(deps.index.db, projectId, (id) => hasSource(repo, projectId, id));
-  const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [], outsideFiles: [] };
+  const summary: ScanSummary = { items: 0, byType: {}, totalBytes: 0, likelyDuplicates: 0, alreadyImported: 0, unreadable: [], notes: [], outsideFiles: [], linkedFiles: 0 };
   const name = `batch-dry-${newId()}`;
   const dir = join(repoLibrary(repo).root, ".tmp", name);
   let made = false;
@@ -1841,6 +1851,7 @@ export async function dryRun(
         summary.unreadable.push({ path: item.key, reason: item.unreadable });
         continue;
       }
+      summary.linkedFiles += item.files.filter((x) => x.link === true).length;
       if (policy && item.files.length) {
         const inside: ScanItem["files"] = [];
         for (const x of item.files) {

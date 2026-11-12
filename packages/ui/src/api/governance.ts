@@ -282,6 +282,8 @@ export function governanceApi(client: ApiClient) {
 
     integrity: () => r<IntegrityAnswer>("GET", "/libraries/integrity"),
     relink: (searchDir: string) => r<RelinkResult>("POST", "/libraries/relink", { body: { searchDir } }),
+    /** "Rebuild library from folder" (spec 4.3, D8). */
+    rebuildIndex: () => r<{ indexed: number; lockedProjects: number; errors: number }>("POST", "/libraries/rebuild-index"),
   };
 }
 

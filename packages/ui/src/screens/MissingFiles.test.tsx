@@ -63,4 +63,40 @@ describe("Missing files", () => {
     render(<MissingFiles api={makeApi()} />);
     expect(await screen.findByText("No files are missing.")).toBeTruthy();
   });
+
+  it("D8: “Rebuild library from folder” rebuilds the index once (a double click sends one request) and says what it did", async () => {
+    let posts = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    server.use(
+      http.get(url("/libraries/integrity"), () => HttpResponse.json(report([]))),
+      http.post(url("/libraries/rebuild-index"), async () => {
+        posts++;
+        await gate;
+        return HttpResponse.json({ indexed: 1284, lockedProjects: 1, errors: 0 });
+      }),
+    );
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    const section = await screen.findByRole("region", { name: "Search index" });
+    const button = within(section).getByRole("button", { name: "Rebuild library from folder" });
+    const user = userEvent.setup();
+    await user.dblClick(button);
+    expect(await within(section).findByRole("status")).toBeTruthy();
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    release();
+    await waitFor(() => expect(section.textContent).toMatch(/1,284 sources indexed/));
+    expect(section.textContent).toMatch(/1 locked project.*completed when it is unlocked/);
+    expect(posts).toBe(1);
+  });
+
+  it("D8: a rebuild that is refused or fails says so in plain words", async () => {
+    server.use(
+      http.get(url("/libraries/integrity"), () => HttpResponse.json(report([]))),
+      http.post(url("/libraries/rebuild-index"), () => HttpResponse.json({ error: { code: "READ_ONLY", message: "This library is open read-only, so nothing can be changed.", reason: "locked-by-other-device" } }, { status: 409 })),
+    );
+    render(<MissingFiles api={makeApi()} isWindows={false} />);
+    const section = await screen.findByRole("region", { name: "Search index" });
+    await userEvent.setup().click(within(section).getByRole("button", { name: "Rebuild library from folder" }));
+    expect((await within(section).findByRole("alert")).textContent).toMatch(/read-only/);
+  });
 });
