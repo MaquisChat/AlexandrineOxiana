@@ -39,9 +39,10 @@ describe("MissingToolNotice", () => {
     expect(window.location.search).toBe("?tool=speech-small");
   });
 
-  it("without a tool id it still says a tool is missing and links to the screen", () => {
+  it("without a tool id it says, in neutral words, that a tool is missing and links to the screen", () => {
     render(<MissingToolNotice from={{ errorCode: "TOOL_NOT_INSTALLED" }} />);
-    expect(screen.getByText(/downloader .* is not installed/i)).toBeTruthy();
+    expect(screen.getByText(/^A tool this needs is not installed on this computer\./)).toBeTruthy();
+    expect(screen.queryByText(/downloader/)).toBeNull();
     expect(screen.getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(PATHS.tools);
   });
 

@@ -3,18 +3,20 @@
  * transcript viewer and the source screen's viewing-copy state. Own file, so the screens' own test
  * files (edited by other tasks) are untouched.
  */
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyProgress, linkQueue, profileQueue } from "../api/capture";
+import { toolsApi } from "../api/tools";
 import { transcriptApi } from "../api/transcripts";
 import { PATHS } from "../navigation";
 import { SourceDetail } from "../screens/SourceDetail";
 import { resetTranscriptionRuns } from "../screens/transcriptionRuns";
 import { TranscriptViewer } from "../screens/TranscriptViewer";
 import { serviceErrorBody, transcriptService } from "../test/msw-transcripts";
-import { server, SOURCE_FILE, STYLES, testApi, testClient, url, useMockService } from "../test/service";
+import { catalogue, toolsService } from "../test/msw-tools";
+import { BASE, server, SOURCE_FILE, STYLES, testApi, testClient, url, useMockService } from "../test/service";
 import { CaptureQueue } from "./CaptureQueue";
 
 useMockService();
@@ -41,8 +43,10 @@ describe("the capture queue", () => {
 
   it("a profile run stopped by a missing downloader says so too", () => {
     let q = profileQueue("q2", "https://www.instagram.com/someone/");
-    q = applyProgress(q, { queueId: "q2", projectId: P, done: 0, finished: true, report: { status: "failed", created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, listComplete: false, errorCode: "TOOL_NOT_INSTALLED" } } as never);
+    q = applyProgress(q, { queueId: "q2", projectId: P, done: 0, finished: true, report: { status: "failed", created: 0, duplicates: 0, incomplete: 0, failed: 0, newlyUnavailable: 0, reappeared: 0, edited: 0, listComplete: false, errorCode: "TOOL_NOT_INSTALLED", tool: "image-downloader", reason: "The image downloader is not installed on this computer, so nothing was saved. Install it from the tools dialogue, then capture the link again.", items: [] } } as never);
     render(<CaptureQueue queues={[q]} />);
+    // As the library sends it (profile-capture.ts): its sentence names the tool, then the link alone.
+    expect(screen.getAllByText(/is not installed/)).toHaveLength(1);
     expect(screen.getByRole("link", { name: /optional tools/i })).toBeTruthy();
   });
 
@@ -73,6 +77,39 @@ describe("the transcript viewer", () => {
     expect(alert.textContent).not.toMatch(/speech-small|TOOL_NOT_INSTALLED/);
     expect(within(alert).getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(`${PATHS.tools}?tool=speech-small`);
     view.unmount(); // its media ticket is revoked while the handlers are still in place
+  });
+
+  it("uses the app's default model (R158); one that is not installed is shown as such with a link, and is not started", async () => {
+    const svc = transcriptService();
+    const tools = catalogue().map((t) => (t.id === "speech-small" ? { ...t, installed: true, usable: true, managed: true, remainingSize: 0 } : t));
+    const cat = toolsService({ base: BASE, tools });
+    server.use(...svc.handlers, ...cat.handlers);
+    const view = render(<TranscriptViewer api={transcriptApi(testClient())} tools={toolsApi(testClient())} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    const select = screen.getByLabelText("Speech model") as HTMLSelectElement;
+    expect(select.value).toBe("medium");
+    expect([...select.options].map((o) => o.value)).toEqual(["large-v3", "medium", "small"]);
+    await waitFor(() => expect([...select.options].find((o) => o.value === "medium")!.textContent).toMatch(/not installed/));
+    const note = screen.getByText(/speech model “medium” is not installed/i);
+    expect(within(note).getByRole("link", { name: /optional tools/i }).getAttribute("href")).toBe(`${PATHS.tools}?tool=speech-medium`);
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(true);
+    await userEvent.setup().selectOptions(select, "small");
+    expect((screen.getByRole("button", { name: "Re-transcribe" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/is not installed/i)).toBeNull();
+    view.unmount();
+  });
+
+  it("an unnamed missing tool is said in neutral words (not as a downloader)", async () => {
+    const svc = transcriptService();
+    server.use(...svc.handlers);
+    const view = render(<TranscriptViewer api={transcriptApi(testClient())} projectId="p1" sourceId="s1" />);
+    await screen.findByText("Hello and welcome.");
+    server.use(http.post(url("/projects/:id/sources/:sid/transcribe"), () => serviceErrorBody(409, "TOOL_NOT_INSTALLED", "A tool this needs is not installed on this computer.")));
+    await userEvent.setup().click(screen.getByRole("button", { name: "Re-transcribe" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/A tool this needs is not installed/);
+    expect(alert.textContent).not.toMatch(/downloader|link/);
+    view.unmount();
   });
 });
 
