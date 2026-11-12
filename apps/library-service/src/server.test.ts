@@ -1230,6 +1230,92 @@ processing:
       off();
     }
   });
+
+  describe("Task 46a: a reopen at start that the researcher's own choice supersedes starts nothing", () => {
+    /**
+     * The service stopped with a library open (so it is the one reopened at the next start) whose
+     * project has a destruction retry due: any pass on it would remove `backup`.
+     */
+    async function remembered(): Promise<{ path: string; pid: string; backup: string }> {
+      const path = await openNewLibrary("LibA");
+      const { pid, backup } = await stuckDestruction();
+      await svc.close();
+      later(HOUR);
+      vi.mocked(resumeDestruction).mockClear();
+      return { path, pid, backup };
+    }
+    /** Nothing was started on the abandoned library, it is not the open one, and its lock is free. */
+    async function expectNothingStarted(path: string, backup: string): Promise<void> {
+      await svc.state.idle();
+      expect(vi.mocked(resumeDestruction)).not.toHaveBeenCalled();
+      expect(existsSync(backup)).toBe(true);
+      expect(svc.state.session).toBeUndefined();
+      expect(svc.state.workKinds()).toEqual([]);
+      expect((svc.state as unknown as { backupTimer?: unknown }).backupTimer).toBeUndefined();
+      expect(await svc.state.runScheduledBackups()).toEqual([]);
+      const again = await openLibrary(path, deps);
+      try {
+        expect(again.mode).toBe("read-write");
+      } finally {
+        await again.close();
+      }
+    }
+    /** The same library reopened at a start nobody supersedes: the retry runs, as it should. */
+    async function expectAnOrdinaryReopenWorks(pid: string, backup: string): Promise<void> {
+      await svc.close();
+      await start({ now: () => clock.now });
+      await svc.state.reopenLast();
+      await svc.state.idle();
+      expect(vi.mocked(resumeDestruction)).toHaveBeenCalledWith(svc.state.session!.repo, pid);
+      expect(existsSync(backup)).toBe(false);
+      expect((svc.state as unknown as { backupTimer?: unknown }).backupTimer).toBeDefined();
+    }
+
+    it("superseded while the library's folder is still being opened: the late reopen is closed; no retry pass, no backup, no scheduler", async () => {
+      const { path, pid, backup } = await remembered();
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      await start({
+        now: () => clock.now,
+        openLibrary: async (root, d, o) => {
+          if (root === path) await gate;
+          return openLibrary(root, d, o);
+        },
+      });
+      const reopening = svc.state.reopenLast();
+      // The researcher's own choice (here: close) comes first.
+      await svc.state.closeLibrary();
+      release();
+      await reopening;
+      await expectNothingStarted(path, backup);
+      await expectAnOrdinaryReopenWorks(pid, backup);
+    });
+
+    it("superseded while the opened library is being adopted (its repository is being read): the same", async () => {
+      const { path, pid, backup } = await remembered();
+      let opened = false;
+      let superseded = false;
+      await start({
+        // The service's clock is read while the repository opens: the choice lands exactly there.
+        now: () => {
+          if (opened && !superseded) {
+            superseded = true;
+            void svc.state.closeLibrary();
+          }
+          return clock.now;
+        },
+        openLibrary: async (root, d, o) => {
+          const lib = await openLibrary(root, d, o);
+          if (root === path) opened = true;
+          return lib;
+        },
+      });
+      await svc.state.reopenLast();
+      expect(superseded).toBe(true);
+      await expectNothingStarted(path, backup);
+      await expectAnOrdinaryReopenWorks(pid, backup);
+    });
+  });
 });
 
 describe("review round 1: smaller route fixes (R99 minors)", () => {
