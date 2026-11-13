@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promises";
@@ -53,7 +54,7 @@ function fake(spec: Spec) {
   const lstat = async (p: string) => {
     const f = spec[p];
     if (!f) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-    return { size: f.size, blocks: f.blocks, ino: inoOf(p), mtimeMs: 1234, isFile: () => true };
+    return { size: f.size, blocks: f.blocks, ino: inoOf(p), mtimeNs: 1234n, isFile: () => true };
   };
   return { paths, calls, statTool, lstat, inoOf };
 }
@@ -139,7 +140,7 @@ describe("contentState", () => {
   it("returns what it judged: inode, size, blocks, mtime; unknown for the rest", async () => {
     const f = fake({ "/a": { size: 4096, blocks: 8, flags: 0 } });
     const st = await contentState(["/a", "/missing"], { platform: "darwin", lstat: f.lstat, statTool: f.statTool });
-    expect(st.get("/a")).toEqual({ presence: "local", ino: f.inoOf("/a"), size: 4096, blocks: 8, mtimeMs: 1234 });
+    expect(st.get("/a")).toEqual({ presence: "local", ino: f.inoOf("/a"), size: 4096, blocks: 8, mtimeNs: 1234n });
     expect(st.get("/missing")).toEqual({ presence: "unknown" });
   });
   it("answers the same presence as contentPresence", async () => {
@@ -310,6 +311,73 @@ describe("lstat that never answers", () => {
     const r2 = await contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool: async (a) => (calls2.push(a), { stdout: "", completed: true }), signal: ac.signal });
     expect(calls2).toHaveLength(0);
     expect(r2.get("/a")).toBe("unknown");
+  });
+});
+
+describe("fix round 2", () => {
+  it("contentState returns the exact values of a fresh bigint lstat of a real file", async () => {
+    const p = join(tmp, "real.pdf");
+    await writeFile(p, "hello research");
+    const st = await contentState([p], {
+      platform: "darwin",
+      statTool: async (args) => {
+        const ino = (await fsp.lstat(args[3]!, { bigint: true })).ino;
+        return { stdout: `${ino} 0\n`, completed: true };
+      },
+    });
+    const fresh = await fsp.lstat(p, { bigint: true });
+    const got = st.get(p)!;
+    expect(got.presence).toBe("local");
+    if (got.presence === "unknown") throw new Error("unreachable");
+    expect(got.ino).toBe(fresh.ino);
+    expect(got.mtimeNs).toBe(fresh.mtimeNs);
+    expect(typeof got.mtimeNs).toBe("bigint");
+    expect(got.size).toBe(Number(fresh.size));
+    expect(got.blocks).toBe(Number(fresh.blocks));
+  });
+
+  it("no listener is left on a long-lived signal after 2,000 calls, however they end", async () => {
+    const ac = new AbortController();
+    const f = fake({ "/a": { size: 100, blocks: 8 }, "/b": { size: 100, blocks: 0 } });
+    const runners: StatRunner[] = [
+      f.statTool, // answered
+      async () => {
+        throw new Error("boom"); // failed
+      },
+      async () => ({ stdout: "", completed: false }), // the tool timed out
+    ];
+    for (let i = 0; i < 2000; i++) {
+      await contentState(["/a", "/b", "/missing"], { platform: i % 4 === 3 ? "linux" : "darwin", lstat: f.lstat, statTool: runners[i % 3], signal: ac.signal });
+    }
+    expect(getEventListeners(ac.signal, "abort")).toHaveLength(0);
+    // Ended by an abort, too.
+    const ac2 = new AbortController();
+    await contentState(["/a"], { platform: "darwin", lstat: async () => (ac2.abort(), new Promise<never>(() => {})), signal: ac2.signal });
+    expect(getEventListeners(ac2.signal, "abort")).toHaveLength(0);
+    const ac3 = new AbortController();
+    await datalessFlagsDarwin(["/a"], { run: async () => ({ stdout: "", completed: true }), lstatIno: async () => 1n, signal: ac3.signal });
+    expect(getEventListeners(ac3.signal, "abort")).toHaveLength(0);
+  });
+
+  it("a tool run that ignores the abort does not keep the call pending", async () => {
+    const ac = new AbortController();
+    const f = fake({ "/a": { size: 100, blocks: 8 } });
+    const statTool: StatRunner = () => {
+      queueMicrotask(() => ac.abort());
+      return new Promise<never>(() => {}); // never settles
+    };
+    const r = await Promise.race([
+      contentPresence(f.paths, { platform: "darwin", lstat: f.lstat, statTool, signal: ac.signal }),
+      new Promise<"pending">((res) => setTimeout(() => res("pending"), 2000)),
+    ]);
+    expect(r).not.toBe("pending");
+    expect((r as Map<string, string>).get("/a")).toBe("unknown");
+    expect(getEventListeners(ac.signal, "abort")).toHaveLength(0);
+  });
+
+  it("a platform other than darwin, linux and win32 answers unknown for every file", async () => {
+    const r = await contentPresence(["/a", "/b"], { platform: "freebsd", lstat: async () => file(100, 8) });
+    expect([r.get("/a"), r.get("/b")]).toEqual(["unknown", "unknown"]);
   });
 });
 

@@ -82,24 +82,34 @@ const realRunner: StatRunner = (args, opts, file) =>
     );
   });
 
+/** A promise that resolves (to `undefined`) when `signal` is aborted, and `off()`, which removes the listener this added; call it when the work ends, however it ends. */
+function whenAborted(signal: AbortSignal | undefined): { promise: Promise<undefined> | null; off: () => void } {
+  if (!signal) return { promise: null, off: () => {} };
+  if (signal.aborted) return { promise: Promise.resolve(undefined), off: () => {} };
+  let on: (() => void) | null = null;
+  const promise = new Promise<undefined>((resolve) => {
+    on = () => resolve(undefined);
+    signal.addEventListener("abort", on, { once: true });
+  });
+  return { promise, off: () => on && signal.removeEventListener("abort", on) };
+}
+
 /** Runs `fn` over `items` with at most `n` in flight. Stops starting items once `signal` is aborted, and stops waiting for a call that never answers (its result stays `undefined`). */
 async function mapLimit<T, R>(items: T[], n: number, fn: (item: T) => Promise<R>, signal?: AbortSignal): Promise<Array<R | undefined>> {
   const out: Array<R | undefined> = new Array(items.length).fill(undefined);
-  let aborted: Promise<undefined> | null = null;
-  if (signal) {
-    aborted = new Promise<undefined>((resolve) => {
-      if (signal.aborted) resolve(undefined);
-      else signal.addEventListener("abort", () => resolve(undefined), { once: true });
-    });
-  }
+  const aborted = whenAborted(signal);
   let next = 0;
   const worker = async () => {
     while (next < items.length && !signal?.aborted) {
       const i = next++;
-      out[i] = aborted ? await Promise.race([fn(items[i]!), aborted]) : await fn(items[i]!);
+      out[i] = aborted.promise ? await Promise.race([fn(items[i]!), aborted.promise]) : await fn(items[i]!);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  try {
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  } finally {
+    aborted.off();
+  }
   return out;
 }
 
@@ -154,15 +164,34 @@ async function flagsByInode(items: Array<{ path: string; ino: bigint }>, run: St
   const unique = [...owners.values()].filter((v) => v.length === 1).map((v) => v[0]!);
 
   const { groups } = batches(unique, WATCH_LOCAL_BATCH, WATCH_LOCAL_ARG_BYTES);
+  const aborted = whenAborted(signal);
+  try {
+    await askGroups(groups, result, run, timeoutMs, signal, aborted.promise);
+  } finally {
+    aborted.off();
+  }
+  return result;
+}
+
+async function askGroups(
+  groups: Array<Array<{ path: string; ino: bigint }>>,
+  result: Map<string, number | null>,
+  run: StatRunner,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  aborted: Promise<undefined> | null,
+): Promise<void> {
   for (const group of groups) {
     if (signal?.aborted) break;
-    let out: StatRun;
+    let out: StatRun | undefined;
     try {
-      out = await run(["-f", STAT_FORMAT, "--", ...group.map((g) => g.path)], { timeout: timeoutMs, maxBuffer: WATCH_LOCAL_TOOL_MAX_OUTPUT, signal }, STAT_TOOL);
+      // A runner that ignores the abort must not keep this call pending: the abort wins the race.
+      const started = run(["-f", STAT_FORMAT, "--", ...group.map((g) => g.path)], { timeout: timeoutMs, maxBuffer: WATCH_LOCAL_TOOL_MAX_OUTPUT, signal }, STAT_TOOL);
+      out = aborted ? await Promise.race([started, aborted]) : await started;
     } catch {
       continue; // could not start: unknown for the group
     }
-    if (!out.completed || signal?.aborted) continue;
+    if (!out || !out.completed || signal?.aborted) continue;
     const asked = new Set(group.map((g) => g.ino));
     const seen = new Map<bigint, number[]>();
     for (const line of out.stdout.split("\n")) {
@@ -175,7 +204,6 @@ async function flagsByInode(items: Array<{ path: string; ino: bigint }>, run: St
       if (flags?.length === 1) result.set(g.path, flags[0]!);
     }
   }
-  return result;
 }
 
 async function inodeOf(path: string): Promise<bigint> {
@@ -219,7 +247,7 @@ export async function datalessFlagsDarwin(paths: string[], opts: DatalessOptions
 
 export interface PresenceOptions {
   platform?: NodeJS.Platform;
-  lstat?: (p: string) => Promise<{ size: number; blocks: number; ino: number | bigint; mtimeMs?: number; isFile: Stats["isFile"] }>;
+  lstat?: (p: string) => Promise<{ size: number; blocks: number; ino: number | bigint; mtimeNs?: bigint; mtimeMs?: number; isFile: Stats["isFile"] }>;
   /** Replaces the tool: whether each file has SF_DATALESS (a compression flag is then taken as clear). */
   datalessFlags?: (paths: string[]) => Promise<Map<string, boolean | null>>;
   /** Test seam for the default tool call (darwin): the process runner. */
@@ -229,7 +257,7 @@ export interface PresenceOptions {
 }
 
 /** What `contentState` judged for one path: the answer and the file's state at that moment. */
-export type ContentState = { presence: ContentPresence; ino: bigint; size: number; blocks: number; mtimeMs: number } | { presence: "unknown" };
+export type ContentState = { presence: ContentPresence; ino: bigint; size: number; blocks: number; mtimeNs: bigint } | { presence: "unknown" };
 
 /**
  * Whether each file's content is on this machine, and the state it was judged in, without opening any file.
@@ -241,15 +269,15 @@ export type ContentState = { presence: ContentPresence; ino: bigint; size: numbe
  *    placeholder made another way cannot be told from a sparse file); no answer for the inode is "unknown";
  *  - Linux: `blocks === 0` with `size > 0` is "not-downloaded", anything else "local". Windows: "local". On Linux and on
  *    Windows "local" means "not checked": no cloud check exists there (a FUSE cloud mount reports made-up blocks).
- * The caller compares the returned `ino`, `size`, `blocks` and `mtimeMs` with its own `lstat` just before it opens a file.
+ * The caller compares the returned `ino`, `size`, `blocks` and `mtimeNs` (the exact time, from `lstat` with `bigint: true`) with its own `lstat` just before it opens a file.
  */
 export async function contentState(paths: string[], opts: PresenceOptions = {}): Promise<Map<string, ContentState>> {
   const platform = opts.platform ?? process.platform;
-  const lstat =
+  const lstat: NonNullable<PresenceOptions["lstat"]> =
     opts.lstat ??
     (async (p: string) => {
       const s = await fsp.lstat(p, { bigint: true });
-      return { size: Number(s.size), blocks: Number(s.blocks), ino: s.ino, mtimeMs: Number(s.mtimeMs), isFile: () => s.isFile() };
+      return { size: Number(s.size), blocks: Number(s.blocks), ino: s.ino, mtimeNs: s.mtimeNs, isFile: () => s.isFile() };
     });
   const out = new Map<string, ContentState>();
   const unique = [...new Set(paths)];
@@ -269,14 +297,15 @@ export async function contentState(paths: string[], opts: PresenceOptions = {}):
     opts.signal,
   );
 
-  const regular: Array<{ path: string; ino: bigint; size: number; blocks: number; mtimeMs: number }> = [];
+  const regular: Array<{ path: string; ino: bigint; size: number; blocks: number; mtimeNs: bigint }> = [];
   unique.forEach((p, i) => {
     const st = stats[i];
     if (!st || !st.isFile()) return;
-    const f = { path: p, ino: BigInt(st.ino), size: st.size, blocks: st.blocks, mtimeMs: st.mtimeMs ?? 0 };
-    const set = (presence: ContentPresence) => out.set(p, presence === "unknown" ? { presence } : { presence, ino: f.ino, size: f.size, blocks: f.blocks, mtimeMs: f.mtimeMs });
+    const f = { path: p, ino: BigInt(st.ino), size: st.size, blocks: st.blocks, mtimeNs: st.mtimeNs ?? BigInt(Math.round((st.mtimeMs ?? 0) * 1e6)) };
+    const set = (presence: ContentPresence) => out.set(p, presence === "unknown" ? { presence } : { presence, ino: f.ino, size: f.size, blocks: f.blocks, mtimeNs: f.mtimeNs });
     if (platform === "win32") return set("local");
-    if (platform !== "darwin") return set(f.size > 0 && f.blocks === 0 ? "not-downloaded" : "local");
+    if (platform === "linux") return set(f.size > 0 && f.blocks === 0 ? "not-downloaded" : "local");
+    if (platform !== "darwin") return; // any other system: nothing is known, so "unknown"
     regular.push(f);
   });
   if (regular.length === 0 || opts.signal?.aborted) return out;
@@ -300,7 +329,7 @@ export async function contentState(paths: string[], opts: PresenceOptions = {}):
     else if (f.blocks * 512 >= f.size) presence = "local";
     else if ((fl & UF_COMPRESSED) !== 0) presence = "local";
     else presence = "unknown";
-    out.set(f.path, presence === "unknown" ? { presence } : { presence, ino: f.ino, size: f.size, blocks: f.blocks, mtimeMs: f.mtimeMs });
+    out.set(f.path, presence === "unknown" ? { presence } : { presence, ino: f.ino, size: f.size, blocks: f.blocks, mtimeNs: f.mtimeNs });
   }
   return out;
 }
