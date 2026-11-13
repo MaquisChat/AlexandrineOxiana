@@ -2017,6 +2017,25 @@ processing:
       expect(fourth.report.fileNotes).toEqual([{ item: expect.any(String), note: "an attached file you removed here was not brought in again" }]);
     });
 
+    it("a source deleted here: a full run does not download its file and keeps it deleted; with includeDeleted the file comes in again (M1)", async () => {
+      const p = await project();
+      const { p: key, att } = await withHighlightedFile("Deleted here");
+      await run(p);
+      await repo.deleteSource(p.id, (await sourceOf(p, key)).source.id);
+      z.requests.length = 0;
+      const second = await run(p, { full: true });
+      expect(second.r.counts).toMatchObject({ deletedHere: 1, created: 0, failed: 0 });
+      expect(fileRequests(att)).toBe(0);
+      expect(repo.listSourceIds(p.id)).toEqual([]);
+      // Brought back on request: the file is needed then, and fetched.
+      z.requests.length = 0;
+      const h = await startZoteroWebImport(bulkDeps(), p.id, { ...zweb, full: true }, { includeDeleted: true });
+      expect((await h.done).counts.created + (await h.done).counts.needsReview).toBe(1);
+      expect(fileRequests(att)).toBe(1);
+      const back = await sourceOf(p, key);
+      expect(back.annotations[0]!.anchors[0]).toMatchObject({ assetId: back.assets[0]!.id });
+    });
+
     it("a downloaded file the engine does not store records no part, and the next full run asks for it again (I2)", async () => {
       const p = await project();
       const key = z.addItem(U, { itemType: "journalArticle", title: "Its file is not a supported kind" });

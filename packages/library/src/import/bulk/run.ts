@@ -841,12 +841,13 @@ class Run {
   }
 
   /**
-   * Z4: the parts a journal line keeps (`ext.parts`). A part is kept when its file is one the source holds
-   * (an asset with that hash: downloaded and stored, or dropped by its hash as already there), or when it is
-   * the part the newest earlier line recorded for the same source, carried forward unchanged (a known file not
-   * downloaded again; also when the asset was removed here, so that it is never brought back). A download the
-   * engine did not store (an unsupported file, the same file as another item) and a known part under another
-   * source are left out: the next run downloads that file. Without `assets`, only carried parts are kept.
+   * Z4: the parts a journal line keeps (`ext.parts`). A part is kept only when the source holds an asset
+   * entry with its hash: a file downloaded and stored, or dropped by its hash as already there, or a known file
+   * not downloaded again; a file the researcher destroyed here (retention) keeps its entry, so its part is
+   * carried and it is never brought back. A download the engine did not store (an unsupported file, the same
+   * file as another item), a part whose asset entry is gone (the batch that added it was undone, I1) and a known
+   * part under another source are left out: the next run downloads that file. Without `assets` (no caller
+   * today), only parts carried unchanged for the same source are kept.
    */
   private partsFor(v: NonNullable<ScanItem["version"]>, sourceId: string, assets: Asset[] | undefined): Parts | undefined {
     if (!v.parts) return undefined;
@@ -857,7 +858,7 @@ class Run {
     for (const [att, p] of Object.entries(v.parts)) {
       if (!p || !Number.isInteger(p.v) || typeof p.sha256 !== "string") continue;
       const was = carried && Object.hasOwn(carried, att) ? carried[att] : undefined;
-      const keep = (was && was.v === p.v && was.sha256 === p.sha256) || assets?.some((a) => a.sha256 === p.sha256);
+      const keep = assets ? assets.some((a) => a.sha256 === p.sha256) : was !== undefined && was.v === p.v && was.sha256 === p.sha256;
       if (!keep) continue;
       out[att] = { v: p.v, sha256: p.sha256 };
       any = true;
@@ -866,21 +867,46 @@ class Run {
   }
 
   /**
-   * Z4 (ScanContext.fileKnown): the stored file's hash when the newest journal line of this kind (batches not
-   * undone) says the attachment was stored at this version, and the line's source is still here. A source
-   * deleted here is not known (if the item is imported again, its file is needed).
+   * Z4 (ScanContext.fileKnown): the stored file's hash when (1) the newest journal line of this kind (batches
+   * not undone) says the attachment was stored at this version, (2) the line's source is still here, and (3)
+   * that source still holds an asset entry with that hash (the index's assets table: every asset entry, a file
+   * destroyed here included; I1). A line of an undone batch is never read; a part that a later line carried
+   * after the batch that added the file was undone names an entry that is gone, so the file is downloaded as
+   * any missing file is. A source deleted here is not known, unless the item is to stay deleted (R73, no
+   * `includeDeleted`): then its file is not needed either. Anything the index cannot confirm downloads.
    */
   private fileKnown(versionId: string, attKey: string, attVersion: number): { sha256: string } | undefined {
     const k = this.known.get(versionId);
     const p = k?.parts && Object.hasOwn(k.parts, attKey) ? k.parts[attKey] : undefined;
     if (!k || !p || p.v !== attVersion || typeof p.sha256 !== "string") return undefined;
-    if (!hasSource(this.repo, this.projectId, k.sourceId)) return undefined;
-    return { sha256: p.sha256 };
+    if (!hasSource(this.repo, this.projectId, k.sourceId)) {
+      // M1: an item deleted here that this run will report as deleted-here needs no file (its Zotero key is the
+      // last segment of its version id, `<ref>/<key>`, as the adapter makes it).
+      const zk = versionId.slice(versionId.lastIndexOf("/") + 1);
+      return zk && !this.rec.options.includeDeleted && this.deletedHere(zk) ? { sha256: p.sha256 } : undefined;
+    }
+    return this.hasAssetEntry(k.sourceId, p.sha256) ? { sha256: p.sha256 } : undefined;
   }
 
+  /** Whether the index holds an asset entry (any status) of this source with this hash (Z4, I1); false when it cannot say. */
+  private hasAssetEntry(sourceId: string, sha256: string): boolean {
+    try {
+      this.assetEntry ??= this.deps.index.db.prepare(
+        "SELECT 1 FROM main.assets WHERE source_id = ? AND sha256 = ? UNION ALL SELECT 1 FROM temp.t_assets WHERE source_id = ? AND sha256 = ? LIMIT 1",
+      );
+      return this.assetEntry.get(sourceId, sha256, sourceId, sha256) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+  private assetEntry: { get(...params: unknown[]): unknown } | undefined;
+
   /**
-   * Z4: a known file (carried part) whose asset the source no longer holds, or holds destroyed (retention):
-   * removed here. It was not downloaded; the item says so (a file note) and the run counts it.
+   * Z4: a known file (its part carried from the previous line, not downloaded in this run) whose asset entries
+   * in the source are all destroyed (retention): the researcher took it away here (I1: the source's own record
+   * says so). It was not downloaded and is not brought back; the item says so (a file note) and the run counts
+   * it. A part whose entry is simply absent is not a removal (only an undo removes an entry): that file is
+   * downloaded, and this says nothing.
    */
   private noteRemoved(item: ScanItem, sourceId: string, assets: Asset[]): void {
     const v = item.version;
@@ -889,8 +915,9 @@ class Run {
     let n = 0;
     for (const [att, p] of Object.entries(v.parts)) {
       const was = Object.hasOwn(prev.parts, att) ? prev.parts[att] : undefined;
-      if (!was || was.v !== p.v || was.sha256 !== p.sha256) continue; // downloaded in this run, not known
-      if (!assets.some((a) => a.sha256 === p.sha256 && a.status !== "destroyed")) n++;
+      if (!was || was.v !== p.v || was.sha256 !== p.sha256) continue; // not the known part
+      const entries = assets.filter((a) => a.sha256 === p.sha256);
+      if (entries.length && entries.every((a) => a.status === "destroyed")) n++;
     }
     if (n) this.fileNotes.set(item.key, [...(this.fileNotes.get(item.key) ?? []), ...Array<string>(n).fill(ENGINE_FILE_NOTES.removedHere)]);
   }
