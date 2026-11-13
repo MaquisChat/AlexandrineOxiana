@@ -18,7 +18,8 @@
 //    NOTICE*, COPYRIGHT*, third-party lists, a root licenses/ folder) from its source in the cargo
 //    registry, and its Cargo.toml license-file;
 //  - interface-npm-LICENCES.txt: each production npm package's own licence and notice files, and
-//    the components its own SBOM lists;
+//    the components its own SBOM lists, and the licence files of the data the interface copies out
+//    of a package (pdf.js's asset folders: packages/ui/scripts/pdfjs-assets.mjs);
 //  - node-LICENCES.txt: the LICENSE of the Node.js release shipped beside the service (ADR 0013),
 //    which also carries the licences of what Node bundles (V8, OpenSSL, ICU, libuv, ...). It is the
 //    release of the Node that runs this script, unless --node <program> names another: the service
@@ -33,6 +34,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { pdfjsLicenceFiles } from "../../../packages/ui/scripts/pdfjs-assets.mjs";
 import { collectLicenceTexts, licenceFilesIn, licenceIds, loadStandardTexts, readLicenceFiles, renderLicenceTexts, sbomIn, seeLicenceIn, sourceList, verifyVerbatim } from "../../../scripts/notices/licence-texts.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -140,6 +142,10 @@ export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts(
     const see = seeLicenceIn(licence);
     const names = licenceFilesIn(path);
     if (see && existsSync(join(path, see)) && !names.includes(see)) names.push(see);
+    // The licences of data files the interface copies out of a package beside its own code (pdf.js's
+    // character maps, standard fonts, decoder fallbacks and colour profile: Task R6, R192), which lie
+    // in the package's sub-folders, not at its top.
+    for (const extra of bundledLicenceFiles(name, path)) if (!names.includes(extra)) names.push(extra);
     const components = sbomIn(path);
     const entry = {
       name,
@@ -158,6 +164,9 @@ export function npmLicenceTexts(list, readPackage, standard = loadStandardTexts(
     intro: "The production npm packages the app's interface is built from, and the licence and notice files each package ships, each shown whole.",
   });
 }
+
+/** Licence files inside a package's sub-folders that the interface ships with files copied from those folders. */
+const bundledLicenceFiles = (name, path) => (name === "pdfjs-dist" ? pdfjsLicenceFiles(path) : []);
 
 /** Where an MPL-2.0 npm package's source is: its repository and its npm page. */
 export const npmSource = (name, version, repo) => `${repo ?? "(no repository stated)"} (version ${version}; also https://www.npmjs.com/package/${name}/v/${version})`;
