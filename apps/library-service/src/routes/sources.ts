@@ -102,11 +102,13 @@ function waitingForReview(db: { prepare(sql: string): { all(...p: unknown[]): un
 export interface RowAvailability {
   status: string;
   firstNoticedAt?: string;
+  /** Task Z5: why it is unavailable, when Zotero said so: deleted there, or in its bin. */
+  zotero?: "deleted" | "bin";
 }
 
 export const rowAvailability = (src: Source): RowAvailability => {
   const a = src.availability;
-  return { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}) };
+  return { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}), ...(a.zotero ? { zotero: a.zotero } : {}) };
 };
 
 /**

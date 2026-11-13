@@ -207,6 +207,8 @@ export interface SourceRow {
 export interface SourceAvailability {
   status: string;
   firstNoticedAt?: string;
+  /** Task Z5: with "unavailable-on-platform", the item was deleted in the researcher's Zotero library, or is in its bin. */
+  zotero?: "deleted" | "bin";
 }
 
 /** A page of sources (GET /projects/:id/sources). */

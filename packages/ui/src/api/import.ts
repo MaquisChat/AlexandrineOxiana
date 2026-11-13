@@ -81,6 +81,17 @@ export interface BatchCounts {
   unchanged: number;
   deletedHere: number;
   failed: number;
+  /**
+   * Zotero (Task Z5, R224; absent from older reports): sources this import marked gone from Zotero (of them in its
+   * bin), sources already marked so earlier, sources back in Zotero (of them also updated, which are in `updated`
+   * too), and gone items with no source of their own here.
+   */
+  goneInZotero?: number;
+  goneInZoteroBin?: number;
+  goneAlready?: number;
+  backInZotero?: number;
+  backInZoteroUpdated?: number;
+  goneNotMarked?: number;
 }
 
 export interface GovernanceNote {
@@ -133,6 +144,8 @@ export interface CreatedByBatch {
 export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
+  /** Of revertedMerges, by what the import had done (Z5; absent from an older service). */
+  reverted?: { merged: number; updated: number; unmarked: number; remarked: number };
   kept: Array<{ kind: string; id: string; sourceId?: string; reason: string }>;
 }
 

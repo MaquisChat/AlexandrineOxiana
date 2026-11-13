@@ -5,7 +5,7 @@
  * edits to the YAML text that keep its comments.
  */
 import { isMap, parseDocument, type Document } from "yaml";
-import { CAPTURE_METHODS } from "@ao/core/governance/schema";
+import { ACQUIRE_METHODS, CAPTURE_METHODS } from "@ao/core/governance/schema";
 import type { Profile } from "../api/governance";
 
 export const PROFILES: Array<{ id: Profile; label: string }> = [
@@ -49,6 +49,14 @@ export const CAPTURE_LABEL: Record<CaptureMethod, string> = {
   calibre_import: "Import from a Calibre library",
   device_import: "Import from a camera or phone folder",
 };
+/** The three ways of acquiring (Find and acquire): a list of their own, `acquireMethods`, all allowed by default. */
+export { ACQUIRE_METHODS };
+export type AcquireMethod = (typeof ACQUIRE_METHODS)[number];
+export const ACQUIRE_LABEL: Record<AcquireMethod, string> = {
+  reference_lookup: "Find and acquire: records completed from a reference you type",
+  free_copy: "Free legal copies (arXiv, Europe PMC, Semantic Scholar, open-access books, the Internet Archive, Unpaywall)",
+  library_access: "Through your library's sign-in",
+};
 /** The methods that capture from the web: what a capture also needs (R41) is said next to them. */
 export const WEB_CAPTURE_METHODS: readonly CaptureMethod[] = ["browser_capture", "downloader", "official_api"];
 /** The data category whose default legal basis captures from the web use (the library's LEGAL_CATEGORY). */
@@ -64,6 +72,7 @@ export interface Config {
   identifiability: { containsIdentifiable: boolean; pseudonymizeFileNames: boolean; deidentifiedExportsOnly: boolean };
   consent: { requireStatus: boolean; requireLegalBasis: boolean; defaultLegalBasis?: Record<string, string> };
   captureMethods: string[];
+  acquireMethods: string[];
   retention: { rawDataDestroyAfter: string | null };
   audit: { enabled: boolean };
   encryption: { atRest: string };
@@ -96,6 +105,7 @@ export const DEFAULTS: Config = {
   identifiability: { containsIdentifiable: true, pseudonymizeFileNames: true, deidentifiedExportsOnly: true },
   consent: { requireStatus: true, requireLegalBasis: true },
   captureMethods: ["manual_upload", "zotero_import", "refman_import", "calibre_import", "device_import"],
+  acquireMethods: [...ACQUIRE_METHODS],
   retention: { rawDataDestroyAfter: null },
   audit: { enabled: true },
   encryption: { atRest: "required" },

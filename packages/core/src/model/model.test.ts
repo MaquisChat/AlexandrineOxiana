@@ -114,6 +114,28 @@ function fixture() {
   };
 }
 
+describe("Availability: gone from Zotero (Task Z5, R206 2)", () => {
+  it("an availability with zotero parses, and one without still does", () => {
+    const f = fixture();
+    const at = "2027-03-12T10:00:00.000Z";
+    const marked = { status: "unavailable-on-platform" as const, zotero: "deleted" as const, firstNoticedAt: at };
+    expect(Source.parse({ ...f.source, availability: marked }).availability).toEqual(marked);
+    expect(Source.parse({ ...f.source, availability: { ...marked, zotero: "bin" } }).availability.zotero).toBe("bin");
+    // Written before this task: no zotero field, and nothing else requires one.
+    expect(Source.parse({ ...f.source, availability: { status: "unavailable-on-platform", firstNoticedAt: at } }).availability).toEqual({ status: "unavailable-on-platform", firstNoticedAt: at });
+    expect(SourceFile.parse(f).source.availability).toEqual({ status: "available" });
+    expect(Source.safeParse({ ...f.source, availability: { ...marked, zotero: "trash" } }).success).toBe(false);
+  });
+});
+
+describe("Annotation author (D22)", () => {
+  it("an annotation may have no author; one with an author keeps it", () => {
+    const base = { id: newId(), sourceId: newId(), kind: "highlight" as const, anchors: [], createdAt: "2027-03-12T10:00:00.000Z" };
+    expect(Annotation.parse(base)).not.toHaveProperty("author");
+    expect(Annotation.parse({ ...base, author: "Ngozi Okafor" }).author).toBe("Ngozi Okafor");
+  });
+});
+
 describe("SourceFile", () => {
   it("parses a Spanish reel and applies defaults", () => {
     const sf = SourceFile.parse(fixture());

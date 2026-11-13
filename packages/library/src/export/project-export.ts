@@ -185,16 +185,21 @@ function markdownOf(sf: SourceFile, files: string[], derived: Array<{ file: stri
       out.push("", `### ${KIND_LABEL[a.kind]}${escapeMarkdown(at)}`, "");
       if (a.quote) out.push(quote(a.quote), "");
       if (a.body) out.push(para(a.body), "");
-      out.push(`*${escapeMarkdown(a.author)}, ${escapeMarkdown(a.createdAt)}*`);
+      out.push(`*${byline(a)}*`);
     }
   }
   if (notes.length) {
     out.push("", "## Notes");
     for (const n of notes) {
-      out.push("", para(n.body ?? ""), "", `*${escapeMarkdown(n.author)}, ${escapeMarkdown(n.createdAt)}*`);
+      out.push("", para(n.body ?? ""), "", `*${byline(n)}*`);
     }
   }
   return `${out.join("\n")}\n`;
+}
+
+/** An annotation's author and time; an imported one its source gave no author for has none (D22): its time alone. */
+function byline(a: { author?: string; createdAt: string }): string {
+  return a.author ? `${escapeMarkdown(a.author)}, ${escapeMarkdown(a.createdAt)}` : escapeMarkdown(a.createdAt);
 }
 
 // ------------------------------------------------------------------------------------------

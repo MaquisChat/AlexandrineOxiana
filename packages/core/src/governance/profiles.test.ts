@@ -3,7 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { PROFILE_MINIMUMS, PROFILE_RULES, PROFILE_YAML } from "./profiles/index.js";
-import { PROFILES, CAPTURE_METHODS } from "./schema.js";
+import { PROFILES, CAPTURE_METHODS, ACQUIRE_METHODS } from "./schema.js";
+import { Provenance } from "../model/source.js";
 
 const dir = join(dirname(fileURLToPath(import.meta.url)), "profiles");
 
@@ -33,5 +34,16 @@ describe("capture methods", () => {
       "official_api", "browser_capture", "downloader", "manual_upload",
       "zotero_import", "device_import", "refman_import", "calibre_import",
     ]);
+  });
+});
+
+describe("ways of acquiring", () => {
+  it("are three, and are not capture methods", () => {
+    expect([...ACQUIRE_METHODS]).toEqual(["reference_lookup", "free_copy", "library_access"]);
+    for (const m of ACQUIRE_METHODS) expect((CAPTURE_METHODS as readonly string[]).includes(m)).toBe(false);
+  });
+  it("provenance can hold every capture method and every way of acquiring, and nothing else", () => {
+    const all = [...CAPTURE_METHODS, ...ACQUIRE_METHODS];
+    expect([...Provenance.shape.captureMethod.options].sort()).toEqual([...all].sort());
   });
 });

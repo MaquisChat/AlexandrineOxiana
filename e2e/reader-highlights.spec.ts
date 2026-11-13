@@ -24,7 +24,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { buildZoteroFixture } from "../packages/library/tests/fixtures/zotero/build-fixture.mjs";
-import { buildMultiPagePdf, buildPdf, buildRotatedCropPdf, buildScanPdf } from "../tests/fixtures/generate.mjs";
+import { buildMultiPagePdf, buildPdf, buildRotatedCropPdf, buildScanPdf, buildTwoColumnPdf } from "../tests/fixtures/generate.mjs";
 import { APP_ORIGIN, expect, libraryWithProject, test, type AppHarness, type Page } from "./fixtures.js";
 import { LIBRARY_DIR } from "./paths.js";
 
@@ -625,5 +625,607 @@ test("past the five-hundredth entry nothing is cut off: a long note, an entry be
   await expect(list.locator(`[data-entry="${ids[505]}"]`)).toContainText("Line 60 of a long note about the market rules.");
   // The editor kept its place and focus throughout.
   await expect(editing.getByRole("textbox", { name: "Note" })).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
+// ---- Task R10: making highlights with the mouse --------------------------------------------------------
+/*
+ * Real mouse selections: the button pressed just before a character and let go just after another,
+ * found in pdf.js's text layer as the browser lays it out (a Range over the character), whichever way
+ * the page is turned. What is made is read back from the service and checked against the fixture's
+ * own text: the lines the rectangles lie on, the gutter, the quote, the anchors a page; and that R8's
+ * check never calls a highlight just made "changed", at once and after a reload at another zoom.
+ */
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+/** Page `n`'s text-layer span holding exactly `words`, once laid out. */
+async function spanOf(page: Page, n: number, words: string) {
+  const span = page.locator(`[data-page-number="${n}"] .ao-reader-text-layer span`).filter({ hasText: words }).first();
+  await expect(span).toHaveText(words);
+  return span;
+}
+
+/** Characters `from` to `to` of page `n`'s span `words` (the whole span when not said). */
+interface Target {
+  n: number;
+  words: string;
+  from?: number;
+  to?: number;
+}
+
+/**
+ * Brings `targets` (together) to the middle of the pages' view, and the view into the window, so
+ * that a drag never starts or ends outside the view or at its edge (where the browser scrolls under
+ * the pointer). The pages' view is narrow (the list stands beside it), so a target is a few words of
+ * a line, not necessarily the whole line.
+ */
+async function centreOn(page: Page, ...targets: Target[]): Promise<void> {
+  for (const t of targets) await spanOf(page, t.n, t.words);
+  const place = () =>
+    page.evaluate((targets) => {
+      const scroller = document.querySelector<HTMLElement>(".ao-reader-scroll")!;
+      scroller.scrollIntoView({ block: "center", inline: "nearest" });
+      const rs = targets.map((t) => {
+        const span = [...document.querySelectorAll(`[data-page-number="${t.n}"] .ao-reader-text-layer span`)].find((x) => x.textContent === t.words)!;
+        const r = document.createRange();
+        r.setStart(span.firstChild!, t.from ?? 0);
+        r.setEnd(span.firstChild!, t.to ?? t.words.length);
+        return r.getBoundingClientRect();
+      });
+      const [l, top, r, b] = [Math.min(...rs.map((x) => x.left)), Math.min(...rs.map((x) => x.top)), Math.max(...rs.map((x) => x.right)), Math.max(...rs.map((x) => x.bottom))];
+      const v = scroller.getBoundingClientRect();
+      scroller.scrollTop += (top + b) / 2 - (v.top + v.bottom) / 2;
+      scroller.scrollLeft += (l + r) / 2 - (v.left + v.right) / 2;
+      return [l, top, r, b].map(Math.round).join(",");
+    }, targets);
+  // Placed again until it stays where it is (pages drawn meanwhile may move the layout).
+  let last = "";
+  await expect
+    .poll(async () => {
+      const now = await place();
+      const same = now === last;
+      last = now;
+      return same;
+    })
+    .toBe(true);
+}
+
+/** The text of the text-layer span under a point (the highlights take no pointer events), or what is there instead. */
+async function textAt(page: Page, p: Point): Promise<string> {
+  return page.evaluate(({ x, y }) => {
+    const e = document.elementFromPoint(x, y);
+    return e?.closest(".ao-reader-text-layer") ? (e.textContent ?? "") : `not a page's text: ${e?.tagName ?? "nothing"}.${e?.className ?? ""}`;
+  }, p);
+}
+
+/**
+ * The point just inside character `i` of page `n`'s span `words`, at its leading edge ("before") or its
+ * trailing edge ("after"), along the line whichever way the page is turned: where a press puts the
+ * caret before or after that character.
+ */
+async function charPoint(page: Page, n: number, words: string, i: number, edge: "before" | "after"): Promise<Point> {
+  return page.evaluate(
+    ({ n, words, i, edge }) => {
+      const span = [...document.querySelectorAll(`[data-page-number="${n}"] .ao-reader-text-layer span`)].find((s) => s.textContent === words)!;
+      const t = span.firstChild as Text;
+      const centre = (k: number) => {
+        const r = document.createRange();
+        r.setStart(t, k);
+        r.setEnd(t, k + 1);
+        const b = r.getBoundingClientRect();
+        return { x: (b.left + b.right) / 2, y: (b.top + b.bottom) / 2 };
+      };
+      const c = centre(i);
+      const last = i + 1 >= t.data.length;
+      const o = centre(last ? i - 1 : i + 1);
+      // Along the line, towards the end of the text, one character's advance.
+      const [dx, dy] = last ? [c.x - o.x, c.y - o.y] : [o.x - c.x, o.y - c.y];
+      const k = edge === "before" ? -0.4 : 0.4;
+      return { x: c.x + dx * k, y: c.y + dy * k };
+    },
+    { n, words, i, edge },
+  );
+}
+
+/**
+ * A real mouse selection: the button pressed just before character `a.i` of `a`, dragged, and let go
+ * just after character `b.i` of `b`; both points checked first to be on those words (in the view).
+ */
+async function dragSelect(page: Page, a: { n: number; words: string; i: number }, b: { n: number; words: string; i: number }): Promise<void> {
+  const from = await charPoint(page, a.n, a.words, a.i, "before");
+  const to = await charPoint(page, b.n, b.words, b.i, "after");
+  expect(await textAt(page, from)).toBe(a.words);
+  expect(await textAt(page, to)).toBe(b.words);
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move((from.x + to.x) / 2, (from.y + to.y) / 2, { steps: 6 });
+  await page.mouse.move(to.x, to.y, { steps: 6 });
+  await page.mouse.up();
+}
+
+const colourBar = (page: Page) => page.getByRole("toolbar", { name: "Highlight the selected text" });
+const said = (page: Page) => page.locator(".ao-ann-live");
+
+interface Made {
+  id: string;
+  quote?: string;
+  colorName: string;
+  pdfAnchors: Array<{ page: number; rects: Array<{ x: number; y: number; w: number; h: number }>; sortIndex: string; sortIndexDerived: boolean }>;
+}
+async function listed(app: AppHarness, projectId: string, sid: string): Promise<Made[]> {
+  const r = await app.api<{ annotations: Made[] }>("GET", `/projects/${projectId}/sources/${sid}/annotations`);
+  expect(r.status).toBe(200);
+  return r.body.annotations;
+}
+
+test("a selection across two columns highlights only the selected lines", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "two-columns.pdf", await buildTwoColumnPdf());
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Two columns" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  // Column one runs x 50–280, column two x 315–545; 9-point lines every 16 points from baseline 740.
+  const foot = "At the foot of this column the sentence continues";
+  const head = "into the head of the second column, where the story";
+  // At 50% both columns' words are in the pages' view together (the head of column two stands 80
+  // points above the foot of column one).
+  const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+  await zoomOut.click();
+  await zoomOut.click();
+  await expect(zoomValue(page)).toHaveText("50%");
+  await centreOn(page, { n: 1, words: foot }, { n: 1, words: head, to: 27 });
+  await dragSelect(page, { n: 1, words: foot, i: 0 }, { n: 1, words: head, i: 26 });
+  await expect(colourBar(page)).toBeVisible();
+  await colourBar(page).getByRole("button", { name: "Highlight in Green" }).click();
+  await expect(said(page)).toHaveText("Highlight added: Green, page 1.");
+  await expect(colourBar(page)).toHaveCount(0);
+
+  const [made, ...more] = await listed(app, projectId, sid);
+  expect(more).toEqual([]);
+  expect(made!.quote).toBe("At the foot of this column the sentence continues into the head of the second");
+  expect(made!.colorName).toBe("green");
+  expect(made!.pdfAnchors.map((a) => a.page)).toEqual([1]);
+  expect(made!.pdfAnchors[0]!.sortIndexDerived).toBe(false);
+  const rects = made!.pdfAnchors[0]!.rects;
+  // One rectangle a line, in reading order: the foot of column one, then the head of column two; none over the gutter.
+  expect(rects, JSON.stringify(rects)).toHaveLength(2);
+  const [one, two] = rects as [(typeof rects)[number], (typeof rects)[number]];
+  expect(one.y < 660 && one.y + one.h > 660 && one.h < 16, JSON.stringify(one)).toBe(true);
+  expect(one.x >= 49 && one.x + one.w <= 281, JSON.stringify(one)).toBe(true);
+  expect(two.y < 740 && two.y + two.h > 740 && two.h < 16, JSON.stringify(two)).toBe(true);
+  expect(two.x >= 314 && two.x + two.w <= 546, JSON.stringify(two)).toBe(true);
+
+  // On the page and in the list at once, never "changed"; after a reload at another zoom neither.
+  const entry = annotationList(page).locator(`[data-entry="${made!.id}"]`);
+  await expect(entry).toContainText("Highlight, Green, Page 1");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${made!.id}"]`)).toHaveCount(2);
+  await expect(page.locator(".ao-hl--draft")).toHaveCount(0);
+  await expect(entry).not.toContainText(CHANGED);
+  await page.reload();
+  await zoomTo(page, "200%");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${made!.id}"]`)).toHaveCount(2);
+  await expect(page.locator('[data-page-number="1"] .ao-reader-text-layer span').first()).toBeAttached();
+  await expect(annotationList(page).locator(`[data-entry="${made!.id}"]`)).toBeVisible();
+  await expect(page.getByText(CHANGED)).toHaveCount(0);
+  await expect(page.locator(".ao-hl--changed")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a selection across a page break makes one highlight on two pages", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  // Tall enough to show the foot of page 1 and the head of page 2 together at 50%.
+  await page.setViewportSize({ width: 1280, height: 1100 });
+  const file = sourceFile(app, "two-columns.pdf", await buildTwoColumnPdf());
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Page break" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+  await zoomOut.click();
+  await zoomOut.click();
+  await expect(zoomValue(page)).toHaveText("50%");
+  const last = "This is the last line of the second column.";
+  const title = "Rivers and Markets, page 2";
+  await spanOf(page, 1, last);
+  // The last line of page 1 near the top of the view, so that page 2's head is in it too.
+  await page.evaluate((words) => {
+    const scroller = document.querySelector<HTMLElement>(".ao-reader-scroll")!;
+    const span = [...document.querySelectorAll('[data-page-number="1"] .ao-reader-text-layer span')].find((s) => s.textContent === words)!;
+    scroller.scrollTop += span.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 30;
+  }, last);
+  const head = page.locator('[data-page-number="2"] .ao-reader-text-layer span').filter({ hasText: title }).first();
+  await expect(head).toHaveText(title);
+  await expect(head).toBeInViewport();
+  await dragSelect(page, { n: 1, words: last, i: 12 }, { n: 2, words: title, i: 17 });
+  await expect(colourBar(page)).toBeVisible();
+  // "Highlight": the last colour used, Yellow at first.
+  await expect(colourBar(page)).toContainText("in Yellow");
+  await colourBar(page).getByRole("button", { name: "Highlight", exact: true }).click();
+  await expect(said(page)).toHaveText("Highlight added: Yellow, pages 1–2.");
+
+  const all = await listed(app, projectId, sid);
+  expect(all).toHaveLength(1);
+  const made = all[0]!;
+  expect(made.pdfAnchors.map((a) => a.page)).toEqual([1, 2]);
+  expect(made.quote).toBe("last line of the second column. Rivers and Markets");
+  expect(made.pdfAnchors[0]!.sortIndex.startsWith("00000|")).toBe(true);
+  expect(made.pdfAnchors[1]!.sortIndex.startsWith("00001|000000|")).toBe(true);
+  const entry = annotationList(page).locator(`[data-entry="${made.id}"]`);
+  await expect(entry).toContainText("Pages 1–2");
+  await expect(page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${made.id}"]`)).toHaveCount(1);
+  await expect(page.locator(`[data-page-number="2"] .ao-hl[data-annotation="${made.id}"]`)).toHaveCount(1);
+  await expect(entry).not.toContainText(CHANGED);
+  expect(errors).toEqual([]);
+});
+
+test("two overlapping highlights are both offered where they overlap", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Overlaps" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  const line = "This is the text of page 1, written for the reader's tests.";
+  await centreOn(page, { n: 1, words: line, to: 26 });
+  // "This is the text of" in Yellow, then "text of page 1" in Blue: "text of" lies under both.
+  await dragSelect(page, { n: 1, words: line, i: 0 }, { n: 1, words: line, i: 18 });
+  // The toolbar by keyboard: the page took the focus with the press; Tab reaches the toolbar, the
+  // arrows move in it, Enter chooses, and the focus goes back to the page.
+  await expect(page.locator('[data-page-number="1"]')).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight", exact: true })).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(colourBar(page).getByRole("button", { name: "Highlight in Yellow" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(said(page)).toHaveText("Highlight added: Yellow, page 1.");
+  await expect(colourBar(page)).toHaveCount(0);
+  await expect(page.locator('[data-page-number="1"]')).toBeFocused();
+  await dragSelect(page, { n: 1, words: line, i: 12 }, { n: 1, words: line, i: 25 });
+  await colourBar(page).getByRole("button", { name: "Highlight in Blue" }).click();
+  await expect(said(page)).toHaveText("Highlight added: Blue, page 1.");
+  const all = await listed(app, projectId, sid);
+  expect(all.map((a) => [a.colorName, a.quote])).toEqual([
+    ["yellow", "This is the text of"],
+    ["blue", "text of page 1"],
+  ]);
+  const [yellow, blue] = all as [Made, Made];
+
+  const pageOne = page.locator('[data-page-number="1"]');
+  const onBoth = await charPoint(page, 1, line, 17, "after");
+  await test.step("a click where both lie offers both, by colour and opening words; Escape gives the focus back", async () => {
+    await page.mouse.click(onBoth.x, onBoth.y);
+    const menu = page.getByRole("menu", { name: "2 highlights here" });
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("menuitem")).toHaveText(["Blue: text of page 1", "Yellow: This is the text of"]);
+    await expect(menu.getByRole("menuitem").first()).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(pageOne).toBeFocused();
+  });
+  await test.step("choosing one selects it on the page and in the list", async () => {
+    await page.mouse.click(onBoth.x, onBoth.y);
+    const menu = page.getByRole("menu", { name: "2 highlights here" });
+    await expect(menu.getByRole("menuitem").first()).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(menu.getByRole("menuitem").nth(1)).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(menu).toHaveCount(0);
+    await expect(page.locator(`.ao-hl[data-annotation="${yellow.id}"]`).first()).toHaveClass(/ao-hl--selected/);
+    await expect(annotationList(page).locator(`[data-entry="${yellow.id}"]`)).toHaveAttribute("aria-current", "true");
+    await expect(pageOne).toBeFocused();
+  });
+  await test.step("the other one is reached the same way, and both stay editable from the list", async () => {
+    await page.mouse.click(onBoth.x, onBoth.y);
+    await page.keyboard.press("Enter");
+    await expect(annotationList(page).locator(`[data-entry="${blue.id}"]`)).toHaveAttribute("aria-current", "true");
+    for (const a of all) await expect(annotationList(page).locator(`[data-entry="${a.id}"]`).getByRole("button", { name: /^Colour of/ })).toBeEnabled();
+  });
+  await expect(page.getByText(CHANGED)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a new highlight survives a reload at another zoom", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "rotated-crop.pdf", await buildRotatedCropPdf());
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Ferries again" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  const line = "The ferry timetable was rewritten every spring.";
+  // Made at 150% with the view turned a quarter (the page's own /Rotate 90 besides: the line runs across, upside down).
+  await zoomTo(page, "150%");
+  await toolbar(page).getByRole("button", { name: "Rotate view" }).click();
+  await expect(page.locator(".ao-reader-text-layer[data-main-rotation]").first()).toBeAttached();
+  await centreOn(page, { n: 1, words: line, to: 19 });
+  await dragSelect(page, { n: 1, words: line, i: 0 }, { n: 1, words: line, i: 18 });
+  await colourBar(page).getByRole("button", { name: "Highlight in Purple" }).click();
+  await expect(said(page)).toHaveText("Highlight added: Purple, page 1.");
+  const [made] = await listed(app, projectId, sid);
+  expect(made!.quote).toBe("The ferry timetable");
+
+  // Read again at 100%, the view not turned: it lies on its words, and is not "changed".
+  await page.reload();
+  await expect(zoomValue(page)).toHaveText("100%");
+  await centreOn(page, { n: 1, words: line, to: 19 });
+  const mark = page.locator(`[data-page-number="1"] .ao-hl[data-annotation="${made!.id}"]`);
+  await expect(mark).toHaveCount(1);
+  let last = "";
+  let placedNow: { mark: DOMRectInit; words: DOMRectInit } | undefined;
+  await expect
+    .poll(async () => {
+      placedNow = await page.evaluate(
+        ({ id, line }) => {
+          const box = (b: DOMRect) => ({ x: b.left, y: b.top, width: b.width, height: b.height });
+          const span = [...document.querySelectorAll('[data-page-number="1"] .ao-reader-text-layer span')].find((s) => s.textContent === line)!;
+          const r = document.createRange();
+          r.setStart(span.firstChild!, 0);
+          r.setEnd(span.firstChild!, "The ferry timetable".length);
+          return { mark: box(document.querySelector(`.ao-hl[data-annotation="${id}"]`)!.getBoundingClientRect()), words: box(r.getBoundingClientRect()) };
+        },
+        { id: made!.id, line },
+      );
+      const now = JSON.stringify(placedNow);
+      const same = now === last;
+      last = now;
+      return same;
+    })
+    .toBe(true);
+  const { mark: m, words: w } = placedNow! as { mark: Required<DOMRectInit>; words: Required<DOMRectInit> };
+  const detail = `highlight ${JSON.stringify(m)} words ${JSON.stringify(w)}`;
+  console.log(`[${test.info().project.name}] made at 150% turned, read at 100%: ${detail}`);
+  // The page's own /Rotate 90: the line runs down the screen. Along it, each end within 2 px of the words'.
+  expect(Math.abs(m.y - w.y), detail).toBeLessThanOrEqual(ALONG_TOLERANCE_PX);
+  expect(Math.abs(m.y + m.height - (w.y + w.height)), detail).toBeLessThanOrEqual(ALONG_TOLERANCE_PX);
+  // Across it: the highlight's middle on the words.
+  const middle = m.x + m.width / 2;
+  expect(middle >= w.x && middle <= w.x + w.width, detail).toBe(true);
+  await expect(annotationList(page).locator(`[data-entry="${made!.id}"]`)).toBeVisible();
+  await expect(page.getByText(CHANGED)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+// ---- Task R10, fix round 1 (Ruling R223, I1): a drag let go in blank space stores only what was selected ----
+
+/** The screen box of page `n`'s span `words`. */
+async function boxOf(page: Page, n: number, words: string): Promise<{ left: number; top: number; right: number; bottom: number }> {
+  return page.evaluate(
+    ({ n, words }) => {
+      const s = [...document.querySelectorAll(`[data-page-number="${n}"] .ao-reader-text-layer span`)].find((x) => x.textContent === words)!;
+      const b = s.getBoundingClientRect();
+      return { left: b.left, top: b.top, right: b.right, bottom: b.bottom };
+    },
+    { n, words },
+  );
+}
+
+/** Presses at `points[0]`, moves through each of the others in turn, and lets go at the last. */
+async function dragThrough(page: Page, points: Point[]): Promise<void> {
+  await page.mouse.move(points[0]!.x, points[0]!.y);
+  await page.mouse.down();
+  for (const p of points.slice(1)) await page.mouse.move(p.x, p.y, { steps: 8 });
+  await page.mouse.up();
+}
+
+test.describe("a drag let go in blank space stores only what was selected (R223, I1)", () => {
+  // Column one: 9-point lines from x 50, baselines 740, 724, 708, 692, 676, 660; column two from x 315.
+  const LINE_TWO = "when traders carry baskets down the river path and";
+  const LINE_THREE = "set out their goods beneath the old plane trees.";
+  const LINE_FOUR = "The elders remember when the river ran further east,";
+  const LINE_FIVE = "and they measure the years by the floods that came.";
+  const ROW_THREE_RIGHT = "Children learn the names of the fields from songs,";
+  const LAST = "This is the last line of the second column.";
+
+  /** The two-column article at 50% (both columns in the pages' view), the lines `words` centred. */
+  async function open(page: Page, app: AppHarness, project: string, ...words: string[]): Promise<{ projectId: string; sid: string }> {
+    const file = sourceFile(app, "two-columns.pdf", await buildTwoColumnPdf());
+    const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project });
+    const { sid } = await attachPdf(app, projectId, file);
+    await readFromLibrary(page, app, projectId, sid);
+    const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+    await zoomOut.click();
+    await zoomOut.click();
+    await expect(zoomValue(page)).toHaveText("50%");
+    await centreOn(page, ...words.map((w) => ({ n: 1, words: w })));
+    return { projectId, sid };
+  }
+
+  /** Highlights the selection held now, and reads it back from the service. */
+  async function stored(page: Page, app: AppHarness, ids: { projectId: string; sid: string }): Promise<Made> {
+    await expect(colourBar(page)).toBeVisible();
+    await colourBar(page).getByRole("button", { name: "Highlight in Green" }).click();
+    await expect(said(page)).toHaveText("Highlight added: Green, page 1.");
+    const all = await listed(app, ids.projectId, ids.sid);
+    expect(all).toHaveLength(1);
+    return all[0]!;
+  }
+
+  /** One rectangle, on the line of `baseline`, within column `x0`–`x1`. */
+  function onLine(made: Made, baseline: number, x0: number, x1: number): void {
+    const rects = made.pdfAnchors[0]!.rects;
+    expect(made.pdfAnchors.map((a) => a.page)).toEqual([1]);
+    expect(rects, JSON.stringify(rects)).toHaveLength(1);
+    const r = rects[0]!;
+    expect(r.y < baseline && r.y + r.h > baseline && r.h < 16, JSON.stringify(r)).toBe(true);
+    expect(r.x >= x0 - 1 && r.x + r.w <= x1 + 1, JSON.stringify(r)).toBe(true);
+  }
+
+  test("let go 10 px past a line's end, on the same line", async ({ page, app }) => {
+    const ids = await open(page, app, "Past the end", LINE_TWO);
+    const from = await charPoint(page, 1, LINE_TWO, LINE_TWO.indexOf("carry"), "before");
+    const line = await boxOf(page, 1, LINE_TWO);
+    const end = await charPoint(page, 1, LINE_TWO, LINE_TWO.length - 1, "after");
+    await dragThrough(page, [from, end, { x: line.right + 10, y: (line.top + line.bottom) / 2 }]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe("carry baskets down the river path and");
+    onLine(made, 724, 50, 280);
+  });
+
+  test("let go in the gutter between the two columns", async ({ page, app }) => {
+    const ids = await open(page, app, "In the gutter", LINE_THREE, ROW_THREE_RIGHT);
+    const from = await charPoint(page, 1, LINE_THREE, 0, "before");
+    const left = await boxOf(page, 1, LINE_THREE);
+    const right = await boxOf(page, 1, ROW_THREE_RIGHT);
+    const end = await charPoint(page, 1, LINE_THREE, LINE_THREE.length - 1, "after");
+    // The middle of the gutter (x 280–315 points), at the line's own height.
+    const gutter = { x: (left.right + right.left) / 2, y: (left.top + left.bottom) / 2 };
+    await dragThrough(page, [from, end, gutter]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe(LINE_THREE);
+    onLine(made, 708, 50, 280);
+  });
+
+  test("let go between two lines", async ({ page, app }) => {
+    const ids = await open(page, app, "Between lines", LINE_FOUR, LINE_FIVE);
+    const from = await charPoint(page, 1, LINE_FOUR, 0, "before");
+    const to = await charPoint(page, 1, LINE_FOUR, "The elders remember".length - 1, "after");
+    const four = await boxOf(page, 1, LINE_FOUR);
+    const five = await boxOf(page, 1, LINE_FIVE);
+    // Straight down from there into the blank space between the two lines. The release point lies
+    // below line four: every character of that line comes before it in reading order, none of line five.
+    await dragThrough(page, [from, to, { x: to.x, y: (four.bottom + five.top) / 2 }]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe(LINE_FOUR);
+    onLine(made, 692, 50, 280);
+  });
+
+  test("let go below the last line of a page", async ({ page, app }) => {
+    const ids = await open(page, app, "Below the last line", LAST);
+    const from = await charPoint(page, 1, LAST, 0, "before");
+    const to = await charPoint(page, 1, LAST, "This is the last line".length - 1, "after");
+    const last = await boxOf(page, 1, LAST);
+    // Below the last line: the rest of that line comes before the release point; nothing else does.
+    await dragThrough(page, [from, to, { x: to.x, y: last.bottom + 40 }]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe(LAST);
+    onLine(made, 660, 315, 545);
+  });
+});
+
+test("the toolbar comes only for a selection just made on a page (R223, I2)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Only when made" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  const made = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 1, rects: [LINE_ONE] }], quote: "This is the text", colorName: "blue" });
+  expect(made.status).toBe(201);
+  await readFromLibrary(page, app, projectId, sid);
+  const line = "This is the text of page 1, written for the reader's tests.";
+  await centreOn(page, { n: 1, words: line, to: 26 });
+  await test.step("Escape, then a click on Zoom in: no toolbar", async () => {
+    await dragSelect(page, { n: 1, words: line, i: 12 }, { n: 1, words: line, i: 18 });
+    await expect(colourBar(page)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(colourBar(page)).toHaveCount(0);
+    expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+    await toolbar(page).getByRole("button", { name: "Zoom in" }).click();
+    await expect(zoomValue(page)).toHaveText("125%");
+    await expect(colourBar(page)).toHaveCount(0);
+  });
+  await test.step("select-all with a page focused, then a click on Zoom out or on a list button: no alert and no toolbar", async () => {
+    await page.locator('[data-page-number="1"]').focus();
+    await page.keyboard.press("ControlOrMeta+a");
+    expect((await page.evaluate(() => window.getSelection()?.toString() ?? "")).length).toBeGreaterThan(0);
+    await toolbar(page).getByRole("button", { name: "Zoom out" }).click();
+    await expect(zoomValue(page)).toHaveText("100%");
+    await annotationList(page).getByRole("button", { name: /^Go to/ }).click();
+    await expect(page.locator('[data-page-number="1"]')).toBeFocused();
+    await expect(colourBar(page)).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+  expect(errors).toEqual([]);
+});
+
+// ---- Task R10, last round: a drag must end on a page (Ruling R229); a highlight made under a search's filter (R223 f) ----
+
+test("a drag let go outside every page stores nothing and says why (R229)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Let go on the page" });
+  const { sid } = await attachPdf(app, projectId, file);
+  await readFromLibrary(page, app, projectId, sid);
+  const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+  await zoomOut.click();
+  await zoomOut.click();
+  await expect(zoomValue(page)).toHaveText("50%");
+  const lineOf = (n: number) => `This is the text of page ${n}, written for the reader's tests.`;
+  const SENTENCE = "To highlight, let go of the mouse over the page.";
+  const tinted = () => page.evaluate(() => window.getSelection()?.toString() ?? "");
+  /** A press before "text" on page `n`'s line, dragged along it, then let go at `end()`; nothing must come of it. */
+  const letGoAt = async (where: string, n: number, end: () => Promise<Point>) => {
+    await test.step(`let go ${where}`, async () => {
+      const line = lineOf(n);
+      await centreOn(page, { n, words: line, to: 20 });
+      const from = await charPoint(page, n, line, 12, "before");
+      const along = await charPoint(page, n, line, 18, "after");
+      const to = await end();
+      await dragThrough(page, [from, along, to]);
+      await expect(said(page)).toHaveText(SENTENCE);
+      await expect(colourBar(page)).toHaveCount(0);
+      expect(await tinted()).toBe("");
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      // Let go over the page, the toolbar comes as before.
+      await centreOn(page, { n, words: line, to: 20 });
+      await dragSelect(page, { n, words: line, i: 12 }, { n, words: line, i: 15 });
+      await expect(colourBar(page)).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(colourBar(page)).toHaveCount(0);
+    });
+  };
+  await letGoAt("over the annotation list", 1, async () => {
+    const b = (await annotationList(page).boundingBox())!;
+    return { x: b.x + b.width / 2, y: b.y + Math.min(b.height / 2, 40) };
+  });
+  await letGoAt("beyond the left edge of the pages' view", 1, async () => {
+    const b = (await page.locator(".ao-reader-scroll").boundingBox())!;
+    return { x: Math.max(2, b.x - 15), y: b.y + b.height / 2 };
+  });
+  await letGoAt("in the gap between two pages (dragged up from page 2's line)", 2, async () => {
+    const two = (await page.locator('[data-page-number="2"]').boundingBox())!;
+    return { x: two.x + two.width / 3, y: two.y - 8 };
+  });
+  expect(await listed(app, projectId, sid)).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("a highlight made while the list is filtered to a search's words shows in it at once (R223 f)", async ({ page, app }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  const file = sourceFile(app, "three-pages.pdf", await buildMultiPagePdf(3));
+  const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project: "Searched" });
+  const { sid, aid } = await attachPdf(app, projectId, file);
+  const note = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 2, rects: [{ x: 50, y: 757.7, w: 70.9, h: 10.2 }] }], quote: "This is the text", body: "the riverbank survey", colorName: "blue" });
+  expect(note.status).toBe(201);
+  const other = await app.api<{ id: string }>("POST", `/projects/${projectId}/sources/${sid}/annotations`, { kind: "highlight", assetId: aid, anchors: [{ page: 3, rects: [{ x: 50, y: 757.7, w: 70.9, h: 10.2 }] }], quote: "This is the text", colorName: "grey" });
+  expect(other.status).toBe(201);
+  const stored = await app.api<{ source: { title: { variants: Array<{ value: string }> } } }>("GET", `/projects/${projectId}/sources/${sid}`);
+  const title = stored.body.source.title.variants[0]!.value;
+  // The library's search finds the word in the annotation; "Show in the reader" opens the reader filtered to it.
+  await page.goto(`${APP_ORIGIN}/?project=${encodeURIComponent(projectId)}`);
+  await page.getByRole("searchbox", { name: "Search sources" }).fill("riverbank");
+  const sources = page.getByRole("table", { name: "Sources" });
+  await expect(sources.getByRole("row", { name: new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) })).toContainText("Found in an annotation");
+  await sources.getByRole("button", { name: `Show in the reader: ${title}`, exact: true }).click();
+  await expect(page.getByRole("region", { name: "Annotations matching your search (1)" })).toBeVisible();
+  await expect(page.locator(`[data-entry="${other.body.id}"]`)).toHaveCount(0);
+  // A highlight made with the mouse on page 1.
+  const line = "This is the text of page 1, written for the reader's tests.";
+  await centreOn(page, { n: 1, words: line, to: 26 });
+  await dragSelect(page, { n: 1, words: line, i: 20 }, { n: 1, words: line, i: 25 });
+  await colourBar(page).getByRole("button", { name: "Highlight in Purple" }).click();
+  await expect(said(page)).toHaveText("Highlight added: Purple, page 1.");
+  const list = page.getByRole("region", { name: "Annotations matching your search (2)" });
+  await expect(list).toBeVisible();
+  const made = (await listed(app, projectId, sid)).find((a) => a.quote === "page 1")!;
+  expect(made).toBeTruthy();
+  await expect(list.locator(`[data-entry="${made.id}"]`)).toBeVisible();
+  await expect(page.locator(`[data-entry="${other.body.id}"]`)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
   expect(errors).toEqual([]);
 });

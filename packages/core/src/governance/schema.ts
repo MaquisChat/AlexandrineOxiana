@@ -1,6 +1,9 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { Provenance } from "../model/source.js";
+import { ACQUIRE_METHODS, Provenance, type AcquireMethod } from "../model/source.js";
+
+export { ACQUIRE_METHODS };
+export type { AcquireMethod };
 
 export const PROFILES = ["irb", "gdpr", "hipaa", "dmp"] as const;
 export type Profile = (typeof PROFILES)[number];
@@ -26,8 +29,14 @@ export const PROCESSING_OPS = [
 ] as const;
 export type ProcessingOp = (typeof PROCESSING_OPS)[number];
 
-/** Derived from Provenance.captureMethod so the two can never drift. */
-export const CAPTURE_METHODS = Provenance.shape.captureMethod.options;
+/**
+ * Derived from Provenance.captureMethod so the two can never drift: every provenance method except
+ * the three ways of acquiring, which `acquireMethods` governs (a separate list, so a project whose
+ * file names its own `captureMethods` is not made to refuse them).
+ */
+export const CAPTURE_METHODS = Provenance.shape.captureMethod.options.filter(
+  (m): m is Exclude<(typeof Provenance.shape.captureMethod.options)[number], AcquireMethod> => !(ACQUIRE_METHODS as readonly string[]).includes(m),
+);
 
 /** Public bibliographic services: exempt from the vendors list for metadata_lookup only. */
 export const PUBLIC_METADATA_SERVICES = ["crossref", "openalex", "openlibrary", "loc"] as const;
@@ -48,6 +57,21 @@ const isoDate = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:?\d{2})?)?$/, "must be an ISO date (YYYY-MM-DD)")
   .refine((s) => !Number.isNaN(Date.parse(s)), "not a real date");
+
+/** A list of method names from one family; a name of the other family gets a sentence saying where it belongs. */
+const methodList = (own: readonly string[], other: readonly string[], ownKey: string, otherKey: string, ownWhat: string, otherWhat: string) =>
+  z.array(z.string()).superRefine((list, ctx) => {
+    list.forEach((m, i) => {
+      if (own.includes(m)) return;
+      ctx.addIssue({
+        code: "custom",
+        path: [i],
+        message: other.includes(m)
+          ? `${m} is ${otherWhat}, not ${ownWhat}; list it under ${otherKey}`
+          : `${m} is not ${ownWhat} (${ownKey} accepts: ${own.join(", ")})`,
+      });
+    });
+  });
 
 const processingList = z.array(z.string().min(1));
 
@@ -106,7 +130,8 @@ export const PartialGovernanceSchema = z
     audit: section({ enabled: z.boolean() }),
     encryption: section({ atRest: z.enum(ENCRYPTION_LEVELS) }),
     sharing: section({ locationMetadata: z.enum(LOCATION_LEVELS) }),
-    captureMethods: z.array(z.enum(CAPTURE_METHODS)),
+    captureMethods: methodList(CAPTURE_METHODS, ACQUIRE_METHODS, "captureMethods", "acquireMethods", "a capture method", "a way of acquiring"),
+    acquireMethods: methodList(ACQUIRE_METHODS, CAPTURE_METHODS, "acquireMethods", "captureMethods", "a way of acquiring", "a capture method"),
     protocol: section({
       number: z.string().nullable(),
       approvedFrom: isoDate.nullable(),
@@ -152,6 +177,8 @@ export interface GovernanceConfig {
   encryption: { atRest: (typeof ENCRYPTION_LEVELS)[number] };
   sharing: { locationMetadata: (typeof LOCATION_LEVELS)[number] };
   captureMethods: (typeof CAPTURE_METHODS)[number][];
+  /** Find and acquire: which ways of acquiring are allowed. Default all three, whatever `captureMethods` says. */
+  acquireMethods: AcquireMethod[];
   protocol: {
     number: string | null;
     approvedFrom: string | null;
@@ -197,6 +224,7 @@ export const DEFAULT_GOVERNANCE: GovernanceConfig = {
   encryption: { atRest: "required" },
   sharing: { locationMetadata: "coarsen" },
   captureMethods: ["manual_upload", "zotero_import", "refman_import", "calibre_import", "device_import"],
+  acquireMethods: [...ACQUIRE_METHODS],
   protocol: {
     number: null,
     approvedFrom: null,

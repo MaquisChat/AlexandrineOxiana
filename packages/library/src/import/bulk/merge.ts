@@ -9,7 +9,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { createHash } from "node:crypto";
-import { BIBLIO_FIELDS, type Annotation, type Asset, type FieldEvidence, type Source, type SourceDraft, type SourceFile } from "@ao/core";
+import { BIBLIO_FIELDS, type Annotation, type Asset, type Availability, type FieldEvidence, type Source, type SourceDraft, type SourceFile } from "@ao/core";
 
 /** Hash of an annotation's content (kind, text, colour, page label, anchors without their ids): what Annotation.externalHash records. */
 export function annotationHash(a: Pick<Annotation, "kind" | "body" | "quote" | "color" | "pageLabel" | "anchors"> & { colorName?: string }): string {
@@ -50,6 +50,32 @@ export interface MergeRecord {
   addedMergedKeys?: string[];
   /** Updates (R72): fields kept because they were changed after the last import (JSON pointers). */
   kept?: string[];
+  /**
+   * Task Z5: the source's availability as this change found it and as it left it (a mark "gone from Zotero", or
+   * its removal when the item came back). Undo puts `before` back while the availability is still `after`.
+   */
+  availability?: MarkRecord;
+}
+
+/**
+ * Task Z5 (R224 b): what a mark (or the removal of one) changed, and what its undo needs without reading any other
+ * batch's journal. `marks`: the "gone from Zotero" marks under `before` (oldest first, with the batch that made each);
+ * `preMark`: the availability before any of them. Undo puts back the newest of `marks` whose batch still stands, or,
+ * when every one of them is undone, `preMark`; so a mark whose own batch was undone never comes back. Records made
+ * before R224 have neither: their undo puts back `before`.
+ */
+export interface MarkRecord {
+  before: Availability;
+  after: Availability;
+  preMark?: Availability;
+  marks?: Array<{ batchId: string; after: Availability }>;
+}
+
+/** What undoing a MarkRecord puts back, given which batches are undone (R224 b). */
+export function markUndoTarget(a: MarkRecord, undone: (batchId: string) => boolean): Availability {
+  if (!a.marks) return a.before;
+  const live = [...a.marks].reverse().find((m) => !undone(m.batchId));
+  return live ? live.after : (a.preMark ?? a.before);
 }
 
 type Src = SourceFile["source"];
@@ -138,7 +164,9 @@ export function revertMerge(
   rec: MergeRecord,
   at: string,
   actor: string,
-): { next: SourceFile; removed: Asset[]; kept: string[]; keptAnnotations: string[]; changed: boolean } {
+  /** Z5 (R224 b): whether a batch is undone (a mark it made is then never put back). Default: none is. */
+  undone: (batchId: string) => boolean = () => false,
+): { next: SourceFile; removed: Asset[]; kept: string[]; keptAnnotations: string[]; keptAvailability: boolean; changed: boolean } {
   const ids = new Set(rec.addedAssetIds);
   // Derived assets made from a removed original (its viewing proxy, R85 I1) go with it.
   for (const a of cur.assets) if (a.derivation?.parents.some((p) => ids.has(p))) ids.add(a.id);
@@ -185,9 +213,25 @@ export function revertMerge(
     const left = zotero.filter((k) => !dropKeys.has(k));
     mergedExternalKeys = left.length ? { ...others, zotero: left } : Object.keys(others).length ? others : undefined;
   }
+  // Task Z5: the availability this change wrote goes back to the one before, while it is still the one written
+  // (a later batch or the researcher may have changed it since: then it is kept, and reported). Not a modification
+  // of the source: the mark itself did not mark it modified.
+  // R224: it goes back to the newest mark still standing (or to the availability before every mark); one that already
+  // holds what this undo would put back (an undo run again, or a later batch that gave it back) is left, not reported.
+  let availabilityRestored = false;
+  let keptAvailability = false;
+  if (rec.availability) {
+    const target = markUndoTarget(rec.availability, undone);
+    if (isDeepStrictEqual(source.availability, rec.availability.after)) {
+      if (!isDeepStrictEqual(target, source.availability)) {
+        source = { ...source, availability: target };
+        availabilityRestored = true;
+      }
+    } else if (!isDeepStrictEqual(source.availability, target)) keptAvailability = true;
+  }
   const droppedAnnotations = annIds.size > 0 || restore.size > 0;
   const droppedPending = pendingLeft.length !== (cur.pendingProxies ?? []).length;
-  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending;
+  const changed = removed.length > 0 || reverted.size > 0 || dropTags.size > 0 || droppedAnnotations || dropKeys.size > 0 || droppedPending || availabilityRestored;
   const { mergedExternalKeys: _m, pendingProxies: _p, ...base } = cur;
   return {
     next: {
@@ -206,6 +250,7 @@ export function revertMerge(
     removed,
     kept,
     keptAnnotations,
+    keptAvailability,
     changed,
   };
 }

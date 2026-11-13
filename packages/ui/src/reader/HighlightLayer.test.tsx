@@ -185,6 +185,39 @@ describe("HighlightLayer", () => {
     expect(container.querySelector('[data-annotation="first"]')!.classList.contains("ao-hl--selected")).toBe(false);
   });
 
+  it("where highlights overlap, a click offers each of them, topmost first; where one lies, it is chosen at once (Task R10)", () => {
+    const onSelect = vi.fn();
+    const onOverlap = vi.fn();
+    const list = [
+      record({ id: "first", anchors: [{ page: 1, rects: [{ x: 100, y: 700, w: 200, h: 12 }] }] }),
+      // Two rectangles of one highlight both under the point: offered once.
+      record({ id: "second", anchors: [{ page: 1, rects: [{ x: 250, y: 700, w: 200, h: 12 }, { x: 255, y: 701, w: 10, h: 10 }] }] }),
+      record({ id: "draft:1", anchors: [{ page: 1, rects: [{ x: 240, y: 700, w: 100, h: 12 }] }] }),
+    ];
+    const { container } = render(
+      <div className="ao-reader-page" data-page-number="1">
+        <div className="ao-reader-overlay">
+          <HighlightLayer pageIndex={0} viewport={a4Viewport(1)} annotations={list} onSelect={onSelect} onOverlap={onOverlap} drafts={new Set(["draft:1"])} changed={none} />
+        </div>
+      </div>,
+    );
+    const page = container.querySelector<HTMLElement>("[data-page-number]")!;
+    fireEvent.click(page, { clientX: 260, clientY: 136 });
+    // The draft (not yet the service's) is never offered; the two highlights are, the later drawn first.
+    expect(onOverlap).toHaveBeenCalledTimes(1);
+    expect(onOverlap.mock.calls[0]![0]).toEqual(["second", "first"]);
+    expect(onOverlap.mock.calls[0]![1]).toEqual({ left: 260, top: 136 });
+    expect(onSelect).not.toHaveBeenCalled();
+    fireEvent.click(page, { clientX: 150, clientY: 136 });
+    expect(onSelect).toHaveBeenLastCalledWith("first");
+    expect(onOverlap).toHaveBeenCalledTimes(1);
+    // On the draft alone: nothing to choose.
+    onSelect.mockClear();
+    const d = container.querySelector<HTMLElement>('[data-annotation="draft:1"]')!;
+    expect(d.classList.contains("ao-hl--draft")).toBe(true);
+    expect(container.querySelector('[data-annotation="first"]')!.classList.contains("ao-hl--draft")).toBe(false);
+  });
+
   it("a page with 1,000 rectangles is 1,001 light elements, drawn quickly", () => {
     // One highlight of 1,000 rectangles (the most one anchor may hold): one element a rectangle, plus the layer.
     const rects = Array.from({ length: 1000 }, (_, i) => ({ x: 40 + (i % 10) * 50, y: 40 + Math.floor(i / 10) * 7.5, w: 45, h: 6 }));

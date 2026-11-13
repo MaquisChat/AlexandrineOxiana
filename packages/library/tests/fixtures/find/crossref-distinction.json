@@ -1,0 +1,35 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "total-results": 3,
+    "items": [
+      {
+        "DOI": "10.5555/ao.find.distinction.1984",
+        "type": "book",
+        "title": ["Distinction"],
+        "subtitle": ["A Social Critique of the Judgement of Taste"],
+        "author": [{ "given": "Pierre", "family": "Bourdieu" }],
+        "issued": { "date-parts": [[1984]] },
+        "publisher": "Fixture University Press",
+        "ISBN": ["9780000000002"]
+      },
+      {
+        "DOI": "10.5555/ao.find.taste.2019",
+        "type": "journal-article",
+        "title": ["Taste and Social Standing in Upland Villages"],
+        "author": [{ "given": "Amara", "family": "Okafor" }],
+        "issued": { "date-parts": [[2019, 5]] },
+        "container-title": ["Journal of Upland Studies"]
+      },
+      {
+        "DOI": "10.5555/ao.find.forms.1986",
+        "type": "book-chapter",
+        "title": ["The Forms of Capital"],
+        "author": [{ "given": "Pierre", "family": "Bourdieu" }],
+        "issued": { "date-parts": [[1986]] },
+        "container-title": ["Handbook of Theory and Research for the Sociology of Education"]
+      }
+    ]
+  }
+}

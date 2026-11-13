@@ -10,25 +10,61 @@ import { UserText } from "../../components/UserText";
 import { IMPORT_PATHS, inAppLink } from "../../navigation";
 import { count, ErrorNote, errorText, fmt, Section } from "./shared";
 
-/** What undo would remove and restore, from the report's counts. */
-export function undoCounts(r: ImportReport): { remove: number; restore: number; revert: number } {
-  return { remove: r.counts.created + r.counts.needsReview, restore: r.counts.merged, revert: r.counts.updated };
+/**
+ * What undo would remove and restore, from the report's counts. Zotero (Z5, R224): the sources this import marked
+ * gone from Zotero lose the mark (`unmark`); those it brought back without updating them get the mark again
+ * (`remark`; a back that also updated the item is an updated source, in `revert`). Sources already marked earlier
+ * and gone items with no source of their own here are not changed by the undo.
+ */
+export function undoCounts(r: ImportReport): { remove: number; restore: number; revert: number; unmark: number; remark: number } {
+  const c = r.counts;
+  return {
+    remove: c.created + c.needsReview,
+    restore: c.merged,
+    revert: c.updated,
+    unmark: c.goneInZotero ?? 0,
+    remark: Math.max(0, (c.backInZotero ?? 0) - (c.backInZoteroUpdated ?? 0)),
+  };
 }
 
-/** "Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?" */
+/** Parts joined as a sentence: "a, b and c", its first letter a capital. */
+function sentence(parts: string[]): string {
+  const last = parts[parts.length - 1]!;
+  const s = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${last}` : last;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** "Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?" — a part whose number is 0 is left out. */
 export function undoQuestion(r: ImportReport): string {
-  const { remove, restore, revert } = undoCounts(r);
+  const { remove, restore, revert, unmark, remark } = undoCounts(r);
   // A run that added or changed no source can still have written something small (for instance the order of
   // highlights); undo stays available and puts that back, but the question does not call it a change to sources.
-  if (remove === 0 && restore === 0 && revert === 0) return "This import added and changed no sources. Undo it anyway?";
-  const parts = [`Remove ${count(remove, "imported source")}`];
+  if (remove === 0 && restore === 0 && revert === 0 && unmark === 0 && remark === 0) return "This import added and changed no sources. Undo it anyway?";
+  const parts: string[] = [];
+  if (remove > 0) parts.push(`remove ${count(remove, "imported source")}`);
   if (restore > 0) parts.push(`restore ${count(restore, "merged source")}`);
   if (revert > 0) parts.push(`revert ${count(revert, "updated source")}`);
-  const last = parts.pop()!;
-  return `${parts.length ? `${parts.join(", ")} and ${last}` : last}?`;
+  if (unmark > 0) parts.push(`take the Zotero mark off ${count(unmark, "source")}`);
+  if (remark > 0) parts.push(`mark ${count(remark, "source")} as gone from Zotero again`);
+  return `${sentence(parts)}?`;
 }
 
-const ROWS: Array<[keyof ImportReport["counts"], string]> = [
+/** What the undo did, in the question's terms (zeros left out); an older service's answer keeps the earlier sentence. */
+export function undoneText(u: UndoResult): string {
+  const r = u.reverted;
+  if (!r) return `Removed ${count(u.removedSources, "source")} and restored ${count(u.revertedMerges, "source")} that had been merged or updated.`;
+  const parts: string[] = [];
+  if (u.removedSources > 0) parts.push(`removed ${count(u.removedSources, "imported source")}`);
+  if (r.merged > 0) parts.push(`restored ${count(r.merged, "merged source")}`);
+  if (r.updated > 0) parts.push(`reverted ${count(r.updated, "updated source")}`);
+  if (r.unmarked > 0) parts.push(`took the Zotero mark off ${count(r.unmarked, "source")}`);
+  if (r.remarked > 0) parts.push(`marked ${count(r.remarked, "source")} as gone from Zotero again`);
+  return parts.length ? `${sentence(parts)}.` : "No source needed to be changed.";
+}
+
+type CountKey = "created" | "needsReview" | "merged" | "updated" | "duplicates" | "unchanged" | "deletedHere" | "failed";
+
+const ROWS: Array<[CountKey, string]> = [
   ["created", "Created"],
   ["needsReview", "Waiting for review"],
   ["merged", "Merged into existing sources"],
@@ -38,6 +74,26 @@ const ROWS: Array<[keyof ImportReport["counts"], string]> = [
   ["deletedHere", "Deleted here before, not imported again"],
   ["failed", "Failed"],
 ];
+
+/** Z5 (R224 a): the Zotero rows of the report table, each only when not zero (absent from an older report). */
+function zoteroRows(r: ImportReport): Array<[string, number]> {
+  const c = r.counts;
+  const bin = c.goneInZoteroBin ?? 0;
+  const rows: Array<[string, number]> = [
+    ["Marked as no longer in Zotero", Math.max(0, (c.goneInZotero ?? 0) - bin)],
+    ["In the Zotero bin", bin],
+    ["Back in Zotero", c.backInZotero ?? 0],
+    ["Still gone from Zotero (marked earlier)", c.goneAlready ?? 0],
+  ];
+  return rows.filter(([, n]) => n > 0);
+}
+
+/** R224 f: the sources whose availability the undo left as it was, said once, with their number. */
+function keptAvailability(kept: UndoResult["kept"]): string | undefined {
+  const n = new Set(kept.filter((k) => k.kind === "availability").map((k) => k.sourceId ?? k.id)).size;
+  if (!n) return undefined;
+  return `${fmt(n)} ${n === 1 ? "source's" : "sources'"} availability was changed after this import, so it was left as it is.`;
+}
 
 const STATE_TEXT: Record<string, string> = {
   finished: "The import finished.",
@@ -125,6 +181,12 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
                 <tr key={k}>
                   <th scope="row">{label}</th>
                   <td>{fmt(report.counts[k])}</td>
+                </tr>
+              ))}
+              {zoteroRows(report).map(([label, n]) => (
+                <tr key={label}>
+                  <th scope="row">{label}</th>
+                  <td>{fmt(n)}</td>
                 </tr>
               ))}
               {report.files && (
@@ -218,13 +280,16 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
           {undone ? (
             <div role="status">
               <p>
-                Removed {count(undone.removedSources, "source")} and restored {count(undone.revertedMerges, "source")} that had been merged or updated.
+                {undoneText(undone)}
               </p>
               {undone.kept.length > 0 && (
                 <ul>
-                  {undone.kept.map((k) => (
-                    <li key={`${k.kind}-${k.sourceId ?? ""}-${k.id}`}>Kept: {k.reason}</li>
-                  ))}
+                  {undone.kept
+                    .filter((k) => k.kind !== "availability")
+                    .map((k) => (
+                      <li key={`${k.kind}-${k.sourceId ?? ""}-${k.id}`}>Kept: {k.reason}</li>
+                    ))}
+                  {keptAvailability(undone.kept) && <li>{keptAvailability(undone.kept)}</li>}
                 </ul>
               )}
             </div>

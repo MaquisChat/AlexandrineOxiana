@@ -67,7 +67,8 @@ export interface AnnotationRecord {
   /** It came from an import (Zotero), whether or not it has been changed since. */
   imported: boolean;
   pageLabel?: string;
-  author: string;
+  /** Absent for an imported annotation its source gave no author for (D22). */
+  author?: string;
   createdAt: string;
   modifiedAt?: string;
 }

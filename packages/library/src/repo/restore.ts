@@ -58,8 +58,19 @@ import { AuditStore } from "./audit-store.js";
 import { PolicyDeniedError } from "./errors.js";
 import { decryptBytes, encryptBytes, foldName, namesIn, openLine, readMaybe, sealLine } from "./io.js";
 import { appendLibraryRefusal } from "./library-audit.js";
+import { SEALED_LINE_PURPOSES } from "./sealed-purposes.js";
 import { loadProjectFolder, parseProjectJson, type Manifest, type ProjectState, type RepoCore } from "./state.js";
 import { listSourceIds, readSourceFile } from "./sources.js";
+
+/**
+ * Complete lines of a sealed or plain `.jsonl` file that a restore could not open and copied through unchanged
+ * (they stay unreadable in the copy, as they were in the original): the Find and acquire queue's, and the watch
+ * registers'. Every other file of a project is strict: a line it cannot open fails the restore.
+ */
+export interface LinesCopiedUnread {
+  findQueue: number;
+  watchRegister: number;
+}
 
 /** The backup's audit log does not verify (or differs from what the backup recorded). Nothing was restored. */
 export class AuditChainInvalidError extends Error {
@@ -108,7 +119,6 @@ export class DestructionRecordError extends RestoreError {
   }
 }
 
-const SEALED_PURPOSES = ["ao-changes", "ao-review", "ao-import-journal"];
 
 /** Every kind of storage the library's folder may be on, as the policy engine is asked (as for a backup, R125). */
 export type RestoreDestinations = NonNullable<PolicyRequest["restore"]>["destinations"];
@@ -494,7 +504,7 @@ const pretty = (text: string) => /\n\s/u.test(text);
 export async function adoptRestoredProject(
   core: RepoCore,
   s: StagedRestore,
-): Promise<{ project: Project; notes: string[]; leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }>; warnings: string[] }> {
+): Promise<{ project: Project; notes: string[]; leftOut: Array<{ sourceId: string; assetId: string; destroyedAt: string; unverified?: true }>; warnings: string[]; linesCopiedUnread: LinesCopiedUnread }> {
   core.assertWritable();
   return core.serial(async () => {
     core.assertWritable();
@@ -706,6 +716,7 @@ export async function adoptRestoredProject(
       // not a byte: the audit log, and the destruction certificates with the amendments beside them
       // (R147): their sha256 is in the audit log the copy inherits, and must keep verifying there.
       // They go on naming the ids and the folder of the project the data was destroyed in.
+      const copiedUnread: LinesCopiedUnread = { findQueue: 0, watchRegister: 0 };
       for (const f of files) {
         if (f.startsWith("audit/") || f.startsWith("retention/") || f === "project.json" || f === "backup.json" || sourceFiles.includes(f) || /^Sources\/[^/]+\/annotations\.json(\.enc)?$/u.test(f)) continue;
         const abs = join(staging, f);
@@ -723,11 +734,22 @@ export async function adoptRestoredProject(
               out.push(line);
               continue;
             }
-            const o = JSON.parse(line) as { ct?: unknown; nonce?: unknown };
+            // The find queue and the watch registers keep the lines they cannot read, whole (a newer build's, a
+            // damaged one): so does a restore, and it counts them (R226 b, F3 round 2). Every other file is strict.
+            const unreadableKind = f.startsWith("find/") ? "findQueue" : f.startsWith("watched/") ? "watchRegister" : undefined;
+            let o: { ct?: unknown; nonce?: unknown };
+            try {
+              o = JSON.parse(line) as { ct?: unknown; nonce?: unknown };
+            } catch (err) {
+              if (unreadableKind === undefined) throw err;
+              copiedUnread[unreadableKind]++;
+              out.push(line);
+              continue;
+            }
             if (typeof o.ct === "string" && typeof o.nonce === "string") {
               if (!key) throw new UnreadableBackupError("The backup holds sealed records but no key");
               let opened: { json: string; purpose: string } | undefined;
-              for (const purpose of SEALED_PURPOSES) {
+              for (const purpose of SEALED_LINE_PURPOSES) {
                 try {
                   opened = { json: openLine(key, old.id, line, purpose), purpose };
                   break;
@@ -735,7 +757,14 @@ export async function adoptRestoredProject(
                   // another purpose
                 }
               }
-              if (!opened) throw new UnreadableBackupError("A sealed record in the backup cannot be read");
+              if (!opened) {
+                if (unreadableKind !== undefined) {
+                  copiedUnread[unreadableKind]++;
+                  out.push(line);
+                  continue;
+                }
+                throw new UnreadableBackupError("A sealed record in the backup cannot be read");
+              }
               out.push(sealLine(key, keyId!, newProjectId, JSON.stringify(map(JSON.parse(opened.json))), opened.purpose));
             } else out.push(JSON.stringify(map(o)));
           }
@@ -836,6 +865,7 @@ export async function adoptRestoredProject(
           ...(x.unverified ? { unverified: true as const } : {}),
         })),
         warnings: inherited?.warnings ?? [],
+        linesCopiedUnread: copiedUnread,
       };
     } catch (err) {
       if (!live) await undoInherited?.().catch(() => {});

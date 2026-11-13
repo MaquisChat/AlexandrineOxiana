@@ -21,14 +21,14 @@
  * folders (trashed through the repository) and the copies a merge added. Linked originals and the
  * user's files outside the library are never touched.
  */
-import { appendLibraryEvent, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
+import { appendLibraryEvent, clearZoteroWebVersion, hasSource, importChange, projectCollectionsAndTags, projectReviewEntries, repoLibrary, type Repo } from "../../repo/repo.js";
 import { NotFoundError } from "../../repo/errors.js";
 import { encName } from "@ao/core";
 import { decryptBytes, readMaybe } from "../../repo/io.js";
 import { projectDataKey } from "../../repo/repo.js";
 import { join } from "node:path";
 import { zoteroKeysOf } from "../../repo/tombstones.js";
-import { BOOKKEEPING, PRIVATE_MODE, activeBatches, findBatch, readJournal, writeBatchRecord } from "./batch.js";
+import { BOOKKEEPING, PRIVATE_MODE, activeBatches, batchDirs, findBatch, readBatchAt, readJournal, writeBatchRecord } from "./batch.js";
 import { revertMerge } from "./merge.js";
 import { BatchRefusedError } from "./run.js";
 
@@ -43,7 +43,8 @@ async function readProjectRel(repo: Repo, projectId: string, rel: string): Promi
 }
 
 export interface UndoKept {
-  kind: "tag" | "collection" | "field" | "annotation";
+  /** `availability` (Z5): a source's availability changed after the batch marked it (or took its mark away); kept. */
+  kind: "tag" | "collection" | "field" | "annotation" | "availability";
   /** The tag or collection id, or the field's JSON pointer. */
   id: string;
   /** For fields: the source. */
@@ -54,8 +55,30 @@ export interface UndoKept {
 export interface UndoResult {
   removedSources: number;
   revertedMerges: number;
+  /**
+   * Of `revertedMerges`, by what the batch had done (Z5, R224): merges restored, updates reverted (a back that also
+   * updated the item among them), "gone from Zotero" marks taken off, and marks put back (a bare back undone).
+   * Other changes taken back (a sort index filled in) are in `revertedMerges` only.
+   */
+  reverted: { merged: number; updated: number; unmarked: number; remarked: number };
   /** What undo left in place because it is in use or was changed since (R61). */
   kept: UndoKept[];
+  /** Z5: the Zotero library version this batch recorded was forgotten, so the next Web import is a full one. */
+  libraryVersionReset?: true;
+}
+
+/** The ids of the project's batches whose record says undone (an unreadable record is taken as standing). */
+async function undoneBatchIds(repo: Repo, projectId: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const d of await batchDirs(repo, projectId)) {
+    try {
+      const r = await readBatchAt(repo, projectId, d.name);
+      if (r?.state === "undone") out.add(r.id);
+    } catch {
+      // unreadable: not known to be undone
+    }
+  }
+  return out;
 }
 
 export async function undoBatch(repo: Repo, projectId: string, batchId: string): Promise<UndoResult> {
@@ -77,8 +100,11 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
   const journal = await readJournal(repo, projectId, rec.dir);
   const kept: UndoKept[] = [];
 
-  // 1. Merges, newest first, exactly what each one added.
+  // 1. Merges, newest first, exactly what each one added. Z5 (R224 b): a "gone from Zotero" mark whose own batch is
+  //    undone is never put back; which batches are undone is read from their records (never their journals).
+  const undone = journal.some((e) => e.merge?.availability?.marks?.length) ? await undoneBatchIds(repo, projectId) : new Set<string>();
   let revertedMerges = 0;
+  const reverted = { merged: 0, updated: 0, unmarked: 0, remarked: 0 };
   for (const e of [...journal].reverse()) {
     if (!e.mergedInto || !e.merge || !hasSource(repo, projectId, e.mergedInto)) continue;
     const cur = await repo.getSource(projectId, e.mergedInto);
@@ -89,16 +115,24 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
       { action: "store", store: { identifiable: p.identifiable, hasLocation: false, ...(p.legal.basis ? { legalBasis: p.legal.basis } : {}) } },
       async (ops) => {
         const now = await ops.readSource(e.mergedInto!);
-        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor);
+        const r = revertMerge(now, e.merge!, ops.tx.at, ops.tx.actor, (id) => undone.has(id));
         for (const a of r.removed) await ops.trashAssetFile(a);
         for (const path of r.kept) kept.push({ kind: "field", id: path, sourceId: e.mergedInto!, reason: "changed after the import; kept" });
         for (const id of r.keptAnnotations) kept.push({ kind: "annotation", id, sourceId: e.mergedInto!, reason: "edited after the import; kept" });
+        // Z5: an availability changed since this batch wrote it (a later batch, or the researcher) is left as it is.
+        if (r.keptAvailability) kept.push({ kind: "availability", id: "/availability", sourceId: e.mergedInto!, reason: "its availability was changed after this import, so it was left as it is" });
         if (r.changed) await ops.writeSource(now, r.next);
         return r.changed;
       },
       { op: "import.undo.merge", entity: { type: "source", id: e.mergedInto } },
     );
-    if (changed) revertedMerges++;
+    if (changed) {
+      revertedMerges++;
+      if (e.outcome === "merged") reverted.merged++;
+      else if (e.outcome === "updated" || (e.outcome === "zotero-back" && e.contentUpdated)) reverted.updated++;
+      else if (e.outcome === "zotero-gone") reverted.unmarked++;
+      else if (e.outcome === "zotero-back") reverted.remarked++;
+    }
   }
 
   // 2. Sources the batch created: by provenance, the record and the journal (R45).
@@ -223,6 +257,15 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     }
   }
 
+  // 4b. Zotero Web (Z5, R206 4): a batch that recorded the library's version had it forgotten, so the next run is a
+  //     full one and brings back what this undo took away. Before the record says undone: an undo that stops in
+  //     between is done again, and forgetting twice changes nothing.
+  let libraryVersionReset = false;
+  if (rec.source.kind === "zotero-web" && rec.recordedLibraryVersion !== undefined && /^(user|group):\d{1,12}$/u.test(rec.source.location)) {
+    await clearZoteroWebVersion(repo, projectId, rec.source.location);
+    libraryVersionReset = true;
+  }
+
   // 5. Review entries, the record, the audit log.
   const pending = (await projectReviewEntries(repo, projectId)).filter((e) => e.status === "pending" && (e.batchId === batchId || (e.sourceId && removed.has(e.sourceId))));
   rec.state = "undone";
@@ -243,6 +286,7 @@ async function undoHeld(repo: Repo, projectId: string, batchId: string): Promise
     removedSources,
     revertedMerges,
     kept: kept.length,
+    ...(libraryVersionReset ? { libraryVersionReset } : {}),
   });
-  return { removedSources, revertedMerges, kept };
+  return { removedSources, revertedMerges, reverted, kept, ...(libraryVersionReset ? { libraryVersionReset: true as const } : {}) };
 }

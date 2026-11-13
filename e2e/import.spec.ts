@@ -271,7 +271,7 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     await page.getByRole("button", { name: "Undo import" }).click();
     const dialog = page.getByRole("alertdialog", { name: "Remove 5 imported sources?" });
     await dialog.getByRole("button", { name: "Undo import" }).click();
-    await expect(page.getByRole("status").filter({ hasText: "Removed 5 sources" })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: "Removed 5 imported sources." })).toBeVisible();
     const [b] = await batches();
     expect(b).toMatchObject({ number: 1, state: "undone" });
     expect((await listed()).total).toBe(0);
@@ -300,7 +300,7 @@ test("scenario 3: bulk import of a Zotero data folder — collections, review, r
     await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
     await dialog.getByRole("button", { name: "Undo import" }).click();
     await expect(dialog).toHaveCount(0);
-    await expect(page.getByRole("status").filter({ hasText: "Removed 5 sources and restored 0 sources that had been merged or updated." })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: "Removed 5 imported sources." })).toBeVisible();
     await expect(page.getByText("Import 2. This import was undone.")).toBeVisible();
     expect((await listed()).total).toBe(0);
     expect(await collections()).toEqual([]);

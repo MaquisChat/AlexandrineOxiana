@@ -55,7 +55,8 @@ export function runImportChange<T>(
   projectId: string,
   reqs: MutateRequest | MutateRequest[],
   fn: (ops: ImportOps) => Promise<T>,
-  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook },
+  /** `auditDetails`: more details for the allow audit event (counts, kinds and ids only, R177; e.g. Z5's `marked`). */
+  opts: { op: string; entity?: { type: "source" | "project" | "asset"; id: string }; refuse?: RefuseHook; auditDetails?: Record<string, unknown> },
 ): Promise<T> {
   core.assertWritable();
   /** Capture entries resolved by this change, because a write gave an existing source a new report (R176 1). */
@@ -176,7 +177,7 @@ export function runImportChange<T>(
       op: opts.op,
       ...(opts.entity ? { entity: opts.entity } : {}),
       ...(opts.refuse ? { refuse: opts.refuse } : {}),
-      auditDetails: () => ({ ...(resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}), ...(queued.length ? { reviewQueued: [...queued] } : {}) }),
+      auditDetails: () => ({ ...(opts.auditDetails ?? {}), ...(resolved.length ? { reviewResolved: { entries: [...resolved], by: "recheck" } } : {}), ...(queued.length ? { reviewQueued: [...queued] } : {}) }),
     },
   );
 }
