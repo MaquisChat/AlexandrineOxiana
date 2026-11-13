@@ -91,7 +91,7 @@ describe("a field newly in conflict after a later check is queued in the same ch
     expect(reviewCauseOf(pending[0]!)?.kind).toBe("capture-conflict");
     const added = (await auditEvents(kit, p)).slice(before.length);
     expect(added).toHaveLength(1);
-    expect(added[0]).toMatchObject({ details: { op: "source.update", reviewQueued: { entry: pending[0]!.id, fields: ["/title"] } } });
+    expect(added[0]).toMatchObject({ details: { op: "source.update", reviewQueued: [{ entry: pending[0]!.id, fields: ["/title"] }] } });
   });
 
   it("a second later check adding another conflicting field extends the same entry rather than writing a second", async () => {
@@ -104,7 +104,7 @@ describe("a field newly in conflict after a later check is queued in the same ch
     expect(pending[0]!.id).toBe(first!.id);
     expect(pending[0]!.fields).toEqual({ "/title": "conflict", "/issued": "conflict" });
     expect(pending[0]!.reasons.length).toBeGreaterThan(first!.reasons.length);
-    expect((await auditEvents(kit, p)).at(-1)).toMatchObject({ details: { reviewQueued: { entry: first!.id, fields: ["/issued"] } } });
+    expect((await auditEvents(kit, p)).at(-1)).toMatchObject({ details: { reviewQueued: [{ entry: first!.id, fields: ["/issued"] }] } });
   });
 
   it("extends a capture's own pending entry, keeping the cause that queued it", async () => {

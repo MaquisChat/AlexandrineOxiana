@@ -731,7 +731,8 @@ export async function updateSource(
       auditDetails: () => ({
         ...(confirmed.length ? { confirmed } : {}),
         ...(resolved.length ? { reviewResolved: { entries: resolved, by } } : {}),
-        ...(queued ? { reviewQueued: queued } : {}),
+        // One shape in every audit event that carries it: an array of { entry, fields } (here one element).
+        ...(queued ? { reviewQueued: [queued] } : {}),
       }),
     },
   );
