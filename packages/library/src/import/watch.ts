@@ -59,6 +59,33 @@
  * of the same source; `settleWatchedFile` keeps the library's copy). Lines are written in batches (at most
  * WATCH_REGISTER_BATCH, or WATCH_REGISTER_FLUSH_MS after the first, and at stop()), each one governed change.
  *
+ * This computer's choices (Task W4; watch-choices.ts, a device file): each folder can be PAUSED — then nothing in it is
+ * read and no call is made on it (not even an `lstat`; an event only marks it as changed), nothing new is noted in the
+ * register (lines for imports already made are written as usual, and at stop()), and the resume lists the whole folder
+ * once; a pause survives a restart. And the researcher chooses what
+ * happens to files that are not downloaded to this Mac:
+ *   - "leave" (the default): as above — counted, listed, never read;
+ *   - "download", and ONLY then: such files are fetched (`fetchJudged`: the file is opened with O_NOFOLLOW, the opened
+ *     file — inode and size — must be the one judged and counted, then it is read through that handle up to the counted
+ *     size, so that the cloud service downloads it; a link swapped in, or another file put in its place, is not read at
+ *     all). This is the one sanctioned read of a file that is not on this computer, and `downloadStep` is its only
+ *     caller. One file at a time, as one call through the folder's gate
+ *     (its own, longer time limit, WATCH_FETCH_TIMEOUT_MS); first the files the researcher saw when confirming, then
+ *     later arrivals, each group in name order; never a name the rules skip or report (Google's pointer files), never a
+ *     link or a path through one, never while paused, locked, read-only, unreachable or stuck, never without a
+ *     confirmation on record. Before each fetch the file's size (from `lstat`, nothing read) is RESERVED in the device
+ *     record, which checks it in the same turn against `confirmedBytes` (files the researcher saw) or
+ *     WATCH_DOWNLOAD_CONFIRM_BYTES beyond it (later arrivals): the record, not this watch's memory, is the one authority,
+ *     so a restart or another watch of the id grants nothing again. Past it, the fetch is not started and downloading is
+ *     held (`downloadHeld`) until the researcher's word. One watch per watch id and per folder runs in this process
+ *     (a second is refused: `alreadyWatched`).
+ *     After a fetch the file is NOT trusted to be local: it goes through the whole order above from the start; one
+ *     still not local is "could-not-download", tried again after WATCH_DOWNLOAD_RETRY_MS, and never read by the import
+ *     path. A fetch that does not answer in its time limit marks the folder "Cannot be reached" (fetchNotResponding) and
+ *     nothing further is issued on it until it settles; `stop()` during a fetch does not wait for it (the folder stays
+ *     "not answering" for any new watch until it settles). Nothing downloaded is ever evicted, moved or deleted by the
+ *     app, and nothing in the folder is written.
+ *
  * Other behaviour kept from Task 26:
  *   - when the watch starts, when the folder returns and when a locked encrypted project is unlocked, the
  *     folder is scanned; files already in the project (by SHA-256) are skipped silently;
@@ -95,6 +122,7 @@ import { WATCHED_FILE_STATES, isRegisterEntry, type WatchRegisterEntry, type Wat
 import { ATTACH_REASONS, NOT_DOWNLOADED_REASON, WATCHED_FOLDER_TOOL, createAttach, type Attach, type AttachOutcome, type AttachStatus } from "./attach.js";
 import { proxyQueueFor, type ProxyQueue } from "./proxies.js";
 import { SIDECAR_EXTS } from "./sidecar.js";
+import { WatchedFoldersUnreadableError, reserveWatchDownload, getWatchChoices, getWatchDownloadCount, type WatchChoices, type WatchDownloadCount } from "./watch-choices.js";
 import { PROVIDER_NAMES, WATCH_LOCAL_BATCH, cloudProviderOf, contentState, fileKey, nameRule, type CloudProvider, type ContentState } from "./watch-local.js";
 
 /** Names never imported (moved to watch-local.ts so the two modules do not import each other; A2). */
@@ -133,6 +161,17 @@ export const WATCH_REGISTER_BATCH = 50;
 export const WATCH_REGISTER_FLUSH_MS = 5000;
 /** At least this many "in-library" entries, and at least half of them, missing at once: nothing is marked gone. */
 export const WATCH_MASS_GONE_MIN = 20;
+/** "Download and import them": later arrivals are downloaded up to this many bytes beyond what the researcher confirmed (R207 5). */
+export const WATCH_DOWNLOAD_CONFIRM_BYTES = 1_073_741_824;
+/** A file that could not be downloaded is tried again after this long. */
+export const WATCH_DOWNLOAD_RETRY_MS = 600_000;
+/**
+ * How long one download may take before the folder counts as not answering (a large file on a slow line: an hour).
+ * While a download runs it is the folder's one call in flight, so nothing else is done in that folder meanwhile.
+ */
+export const WATCH_FETCH_TIMEOUT_MS = 3_600_000;
+/** How often a running watch reads this computer's choices by itself (besides at start, `refreshChoices()` and each download). */
+export const WATCH_CHOICES_POLL_MS = 10_000;
 
 /** A file the researcher asked to bring in is not on this computer now, or not as it was checked: nothing was read. */
 export class WatchFileNotLocalError extends Error {
@@ -172,11 +211,52 @@ export const WATCH_REASONS = {
   registerUnwritable: "The record of which files in this folder are in the library could not be saved, so nothing new is brought in from this folder until it can be. Nothing in the library has been lost.",
   /** A watch must have its id (A8): without it nothing could be recorded. */
   noWatchId: "This watched folder has no id of its own, so it is not watched.",
+  /** Task W4: the researcher paused the folder. */
+  paused: "Paused. Files put in the folder meanwhile come in when you resume.",
+  /** Task W4 (ruled wording): `{files}` in the en-US number style, `{size}` in the interface's size style (`sizeText`). */
+  downloadHeld: "Downloading has stopped at the size you agreed to. {files} files ({size}) are waiting for your word.",
+  /** Task W4: `{provider}` is filled by `withService` (the service's name, or "the cloud service"). */
+  couldNotDownload: "The file could not be downloaded ({provider} may be offline). It is tried again in 10 minutes.",
+  /** Task W4 (proposed wording): a download that did not finish in its time limit; `{provider}` by `withService`. */
+  fetchNotResponding: "A download from this folder did not finish within an hour ({provider} may be offline or signed out). Watching goes on when it does.",
+  /** Task W4 (proposed wording): this computer's choices for the folder could not be read before it was ever watched. */
+  choicesUnreadable: "This computer's choices for this folder could not be read, so it is paused until they can be. Nothing in the library has changed.",
+  /** W4 fix round 1, M4 (proposed wording): the choices were read before but cannot be now, while "download" was chosen. */
+  choicesUnreadableNow: "This computer's choices for this folder could not be read just now, so nothing is downloaded until they can be.",
+  /** W4 fix round 1, I1 (proposed wording): a second watch of the same watch id, or of the same folder, in this process. */
+  alreadyWatched: "This folder is already being watched here, so it is not watched a second time.",
+  /** Fix round 2, I6 (ruled): adding a folder that is already watched for a project of this library on this computer. */
+  folderAlreadyWatched: "This folder is already watched. A folder can be watched for one project at a time.",
+  /** Fix round 2, I6 (ruled): an older record of a folder another project's watch (added earlier) keeps. */
+  folderOfAnotherProject: "This folder is already watched for another project. A folder can be watched for one project at a time.",
+  /** Fix round 2 (ruled): a file not downloaded whose size reads 0 — its true size is not known, so it is never fetched. */
+  sizeUnknown: "The size of this file is not known until it is downloaded, so it is left for you to download yourself.",
+  /** Fix round 2, N1 (proposed wording): "download" chosen, and no size agreed yet (or 0 bytes). */
+  nothingAgreed: "Nothing is downloaded until you agree to a size. {files} files ({size}) are waiting for your word.",
 } as const;
 
 /** A reason with `{provider}` filled: the cloud service's name, or "the system" for a plain folder. */
 export function withProvider(reason: string, provider: CloudProvider | null): string {
   return reason.replaceAll("{provider}", provider ? PROVIDER_NAMES[provider] : "the system");
+}
+
+/** A reason about a download with `{provider}` filled: the cloud service's name, or "the cloud service". */
+export function withService(reason: string, provider: CloudProvider | null): string {
+  return reason.replaceAll("{provider}", provider ? PROVIDER_NAMES[provider] : "the cloud service");
+}
+
+/** `{files} files` filled in the en-US number style, "1 file" for one (N3). */
+export function filesText(reason: string, n: number): string {
+  return reason.replace("{files} files", n === 1 ? "1 file" : `${n.toLocaleString("en-US")} files`);
+}
+
+/** A size in the interface's style (packages/ui `formatSize`): "300 bytes", "4 kB", "12 MB", "3.2 GB". */
+export function sizeText(bytes: number): string {
+  const b = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
+  if (b >= 1e9) return `${(b / 1e9).toFixed(1).replace(/\.0$/u, "")} GB`;
+  if (b >= 1e6) return `${Math.round(b / 1e6)} MB`;
+  if (b >= 1e3) return `${Math.round(b / 1e3)} kB`;
+  return b === 0 ? "nothing" : `${b} bytes`;
 }
 
 export interface WatchEvent {
@@ -214,6 +294,10 @@ export interface WatchStatus {
     /** Registered files noted "gone". */
     gone: number;
   };
+  /** Task W4: downloading is held for the researcher's word; the files not downloaded and their bytes. */
+  downloadHeld?: { files: number; bytes: number };
+  /** Task W4: a file is being downloaded now (its name relative to the folder, and its size). */
+  downloading?: { file: string; bytes: number };
 }
 
 export type WatchFileKind = "not-downloaded" | "online-only-document" | "not-supported" | "could-not-import" | "not-permitted" | "could-not-download" | "removed-here";
@@ -286,6 +370,22 @@ export interface WatchDeps {
   fsWatch?: typeof nodeWatch;
   /** Test seam: how long a register line waits before it is written (default WATCH_REGISTER_FLUSH_MS). */
   registerFlushMs?: number;
+  /**
+   * This computer's choices for the folder (Task W4; default: the device file, `getWatchChoices`). Read before the first
+   * call on the folder, then at every poll and on `refreshChoices()`. The count of bytes downloaded since the last
+   * confirmation is always kept in the device file (`reserveWatchDownload`): a download needs a confirmation recorded
+   * there by `setWatchChoices`.
+   */
+  choices?: () => Promise<WatchChoices>;
+  /**
+   * Test seam for the download itself. By default the engine reads the file through the handle it opened with O_NOFOLLOW
+   * and checked (`fetchJudged`). When given, it is called ONLY under the choice "download", one file at a time, after
+   * that same open and check, while the checked handle is held — never for a link or another file than the one judged.
+   */
+  fetchContent?: (path: string) => Promise<void>;
+  /** Test seams: when a file that could not be downloaded is tried again (default WATCH_DOWNLOAD_RETRY_MS), and one download's time limit (default WATCH_FETCH_TIMEOUT_MS). */
+  downloadRetryMs?: number;
+  fetchTimeoutMs?: number;
 }
 
 export interface FolderWatch {
@@ -299,6 +399,11 @@ export interface FolderWatch {
   status(): WatchStatus;
   /** Files that did not come in, newest first (at most WATCH_PROBLEMS_MAX are kept). */
   problems(o: { kind?: WatchFileKind; offset: number; limit: number }): { total: number; items: WatchFileProblem[] };
+  /**
+   * Reads this computer's choices for the folder now. Never throws. W7 calls it after each change it makes
+   * (`setWatchChoices`); otherwise a running watch reads them by itself only every WATCH_CHOICES_POLL_MS (N4).
+   */
+  refreshChoices(): Promise<void>;
 }
 
 const within = (folder: string, p: string) => {
@@ -327,8 +432,13 @@ export class FolderNotAnsweringError extends Error {
  * `contentState` fires, and every new call is refused at once — without being issued — until the stuck call
  * settles. So this folder never holds more than one of Node's file-system threads through this module.
  */
+/** What a call through the gate is: an ordinary file-system call, or a download (Task W4: its own time limit and words). */
+type CallKind = "fs" | "fetch";
+
 class FolderGate {
   private busy = false;
+  /** Gives up on the call in flight (as its time limit does), and what kind of call it is. */
+  private inFlight: { kind: CallKind; giveUp: () => void } | null = null;
   private queue: Array<{ go: () => void; fail: () => void }> = [];
   private freeWaiters: Array<() => void> = [];
   private settleWaiters: Array<() => void> = [];
@@ -338,27 +448,31 @@ class FolderGate {
   epoch = 0;
   constructor(
     private readonly timeoutMs: number,
-    private readonly onStuck: () => void,
+    private readonly onStuck: (kind: CallKind) => void,
   ) {}
   get signal(): AbortSignal {
     return this.ctl.signal;
   }
-  call<T>(op: () => Promise<T>): Promise<T> {
+  call<T>(op: () => Promise<T>, timeoutMs: number = this.timeoutMs, kind: CallKind = "fs"): Promise<T> {
     if (this.stuck) return Promise.reject(new FolderNotAnsweringError());
     return new Promise<T>((resolveCall, rejectCall) => {
       const go = () => {
         let done = false;
-        const timer = setTimeout(() => {
+        const giveUp = () => {
           if (done) return;
           done = true;
+          clearTimeout(timer);
+          this.inFlight = null;
           this.stuck = true;
           this.epoch++;
           this.ctl.abort();
           for (const q of this.queue.splice(0)) q.fail();
           rejectCall(new FolderNotAnsweringError());
-          this.onStuck();
-        }, this.timeoutMs);
+          this.onStuck(kind);
+        };
+        const timer = setTimeout(giveUp, timeoutMs);
         timer.unref?.();
+        this.inFlight = { kind, giveUp };
         let p: Promise<T>;
         try {
           p = op();
@@ -370,12 +484,14 @@ class FolderGate {
             if (done) return;
             done = true;
             clearTimeout(timer);
+            this.inFlight = null;
             resolveCall(v);
           },
           (err: unknown) => {
             if (done) return;
             done = true;
             clearTimeout(timer);
+            this.inFlight = null;
             rejectCall(err);
           },
         ).finally(() => this.settled());
@@ -418,6 +534,14 @@ class FolderGate {
     this.ctl.abort();
     const done = () => this.settled();
     void outstanding.then(done, done);
+  }
+  /**
+   * Stops waiting for the call in flight when it is of `kind` (the watch stops during a download, which may take an
+   * hour): handled exactly as a call that did not answer — its caller gets FolderNotAnsweringError, and nothing further
+   * is issued on the folder (by this watch or a new one) until it settles.
+   */
+  abandon(kind: CallKind): void {
+    if (this.inFlight?.kind === kind) this.inFlight.giveUp();
   }
   /** The watch stops: nobody waits for the stuck call any longer (it is still not followed by another). */
   release(): void {
@@ -473,7 +597,10 @@ const isRefusal = (err: unknown) => errCode(err) === "EACCES" || errCode(err) ==
  * the process (A6): a new watch on such a folder (a restart, W7's "Try again") starts "Cannot be reached" and makes
  * no call until that one settles — the thread it holds is not joined by another.
  */
-const outstandingFolders = new Map<string, Promise<void>>();
+const outstandingFolders = new Map<string, { settled: Promise<void>; kind: CallKind }>();
+
+/** The watches running in this process, by watch id and by folder (as given and as its real path): one each (I1). */
+const activeWatches = new Map<string, symbol>();
 
 /** A reading of nothing (a file the system would not let the app look at). */
 const NO_READING: Reading = { ino: 0n, size: 0, blocks: 0, mtimeNs: 0n };
@@ -568,6 +695,21 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
 
   let stopped = false;
   let stopReason: string | undefined;
+  // One watch per watch id and per folder in this process (I1): a second is refused before it makes any call.
+  const me = Symbol("watch");
+  const ownKeys: string[] = [];
+  const claim = (k: string): boolean => {
+    const holder = activeWatches.get(k);
+    if (holder && holder !== me) return false;
+    if (!holder) {
+      activeWatches.set(k, me);
+      ownKeys.push(k);
+    }
+    return true;
+  };
+  const idKey = `id\u0000${deps.lib.id}\u0000${projectId}\u0000${String(watchId)}`;
+  // The folder itself is claimed in `ready`, once it is known which watch keeps it (I6): never by who starts first.
+  const refused = activeWatches.has(idKey) || !claim(idKey);
   /** Why the folder cannot be used now (missing, not permitted, not responding), or null. */
   let unreachable: string | null = null;
   /** Paused because the project is locked: a full scan follows the unlock. */
@@ -599,6 +741,42 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   let nextRecheck = Date.now() + recheckMs;
   /** The file being imported and its stability reading (for attach's `readable`). */
   let current: { abs: string; b: Reading } | null = null;
+
+  // ---- this computer's choices (Task W4) ------------------------------------------------------------------------
+  const readChoices = deps.choices ?? (() => getWatchChoices(deps, projectId, watchId));
+  /** The ONE way a file that is not on this computer is read: `downloadStep`, under the choice "download" only. */
+  const downloadRetryMs = deps.downloadRetryMs ?? WATCH_DOWNLOAD_RETRY_MS;
+  const fetchTimeoutMs = deps.fetchTimeoutMs ?? WATCH_FETCH_TIMEOUT_MS;
+  /** The choices last read; null until read once (nothing is done in the folder before that). */
+  let choices: WatchChoices | null = null;
+  /** The last read of the choices failed: "download" is not acted on until they can be read again. */
+  let choicesFailed = false;
+  /** The worker has entered the pause (and has not yet left it). */
+  let inPause = false;
+  /** Something happened in the folder while it was paused (an event); the resume lists the folder anyway. */
+  let changedWhilePaused = false;
+  /** The folder's real path has been checked by this watch (a watch paused from its start has not). */
+  let rootChecked = false;
+  /** A complete listing has been made (a confirmation seen after it knows which files the researcher saw). */
+  let listedOnce = false;
+  /**
+   * The download allowed by the researcher's last confirmation (the bytes reserved are counted ONLY in the device
+   * record, which decides): `seen` the files not downloaded when this watch saw the confirmation (null: not known —
+   * every file is then held to `confirmedBytes`, the tighter limit); `held` once the record refused a reservation, or
+   * while nothing was agreed (no confirmation, or 0 bytes).
+   */
+  let dl: { identity: string; confirmation: number; confirmedBytes: number; seen: Set<string> | null; held: boolean } | null = null;
+  /** Files that could not be downloaded: not tried again before this time. */
+  const dlRetry = new Map<string, number>();
+  let dlNextAt = 0;
+  /** The file being downloaded now, and its size as counted. */
+  let fetching: { rel: string; bytes: number } | null = null;
+  /** When the choices were last read (the timer reads them every WATCH_CHOICES_POLL_MS). */
+  let choicesReadAt = 0;
+  /** Nothing in the folder is read, and no call made on it: paused by the researcher (or the choices never read). */
+  const pausedNow = () => choices === null || choices.paused;
+  /** "Download and import them" is in force now. */
+  const downloading = () => !choicesFailed && choices !== null && !choices.paused && choices.notDownloaded === "download" && dl !== null;
 
   // ---- the register (Task W3) ---------------------------------------------------------------------------------
   /** A watch without a well-formed id is refused at once (A8: no watch without its register). */
@@ -915,14 +1093,15 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   const projectLocked = () => projectEncrypted(deps.repo, projectId) && !deps.repo.isUnlocked(projectId);
 
   // ---- the folder's one gate, and the calls made through it ----------------------------------------------
-  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, () => {
+  const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, (kind) => {
     const settledAt = gate.afterSettle();
     const keys = [...new Set([root, realRoot])];
-    for (const k of keys) outstandingFolders.set(k, settledAt);
+    const entry = { settled: settledAt, kind };
+    for (const k of keys) outstandingFolders.set(k, entry);
     void settledAt.then(() => {
-      for (const k of keys) if (outstandingFolders.get(k) === settledAt) outstandingFolders.delete(k);
+      for (const k of keys) if (outstandingFolders.get(k) === entry) outstandingFolders.delete(k);
     });
-    goUnreachable(withProvider(WATCH_REASONS.notResponding, provider));
+    goUnreachable(kind === "fetch" ? withService(WATCH_REASONS.fetchNotResponding, provider) : withProvider(WATCH_REASONS.notResponding, provider));
     wake();
   });
   const g = {
@@ -989,29 +1168,41 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   }
 
   // ---- status ------------------------------------------------------------------------------------------------
-  const stateNow = (): WatchStatus["state"] => (stopped ? "stopped" : unreachable ? "unreachable" : locked ? "locked" : "watching");
+  /** Paused as the status says it: by the researcher, or because the choices could not be read before they ever were. */
+  const pausedShown = () => (choices ? choices.paused : choicesFailed);
+  const stateNow = (): WatchStatus["state"] => (stopped ? "stopped" : pausedShown() ? "paused" : unreachable ? "unreachable" : locked ? "locked" : "watching");
   function status(): WatchStatus {
     const state = stateNow();
+    const held = state === "watching" && downloading() && dl!.held;
+    const heldFiles = tally.nd + tally.unknown;
     const reason =
       state === "stopped"
         ? stopReason
-        : state === "unreachable"
-          ? unreachable!
-          : state === "locked"
-            ? WATCH_REASONS.locked
-            : registerProblem
-              ? registerProblem
-              : massGone
-              ? withProvider(WATCH_REASONS.massGone, provider)
-              : noCollection
-                ? WATCH_REASONS.noCollection
-                : undefined;
+        : state === "paused"
+          ? choices
+            ? WATCH_REASONS.paused
+            : WATCH_REASONS.choicesUnreadable
+          : state === "unreachable"
+            ? unreachable!
+            : state === "locked"
+              ? WATCH_REASONS.locked
+              : registerProblem
+                ? registerProblem
+                : choicesFailed && choices?.notDownloaded === "download"
+                  ? WATCH_REASONS.choicesUnreadableNow
+                  : held
+                  ? filesText(dl!.confirmation === 0 || dl!.confirmedBytes === 0 ? WATCH_REASONS.nothingAgreed : WATCH_REASONS.downloadHeld, heldFiles).replace("{size}", sizeText(ndBytes))
+                  : massGone
+                    ? withProvider(WATCH_REASONS.massGone, provider)
+                    : noCollection
+                      ? WATCH_REASONS.noCollection
+                      : undefined;
     return {
       ...(watchId ? { watchId } : {}),
       state,
       ...(reason ? { reason } : {}),
       provider,
-      scanning: walk !== null || pending.size > 0,
+      scanning: state !== "paused" && (walk !== null || pending.size > 0),
       counts: {
         cameIn: tally.in,
         alreadyInLibrary: tally.known,
@@ -1022,6 +1213,8 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
         changed: regCounts.changed + regCounts["may-have-changed"],
         gone: regCounts.gone,
       },
+      ...(held ? { downloadHeld: { files: heldFiles, bytes: ndBytes } } : {}),
+      ...(fetching ? { downloading: { file: fetching.rel, bytes: fetching.bytes } } : {}),
     };
   }
   let lastPushAt = 0;
@@ -1064,6 +1257,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   async function checkRoot(): Promise<{ stop?: string; reason?: string } | null> {
     try {
       realRoot = await g.realpath(root);
+      if (!claim(`dir\u0000${realRoot}`)) return { stop: WATCH_REASONS.alreadyWatched };
       provider = cloudProviderOf(realRoot, env);
       if (!(await g.stat(realRoot)).isDirectory()) return { reason: withProvider(WATCH_REASONS.missing, provider) };
     } catch (err) {
@@ -1093,6 +1287,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
   /** The folder may be usable again: checked, listed, watched and scanned. */
   async function tryResume(): Promise<void> {
     const bad = await checkRoot();
+    rootChecked = true;
     if (bad?.stop) {
       void stopWith(bad.stop, true);
       return;
@@ -1186,6 +1381,10 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     dirWatchers.set(d, w);
     w.on("change", (eventType: string, name: string | Buffer | null) => {
       if (stopped || unreachable) return;
+      if (pausedNow()) {
+        changedWhilePaused = true; // paused: an event only marks the folder; nothing is looked at (Task W4)
+        return;
+      }
       if (name === null || name === undefined) {
         if (!walk) startWalk(); // the system lost track of names: the folder is listed again
       } else {
@@ -1260,6 +1459,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     const w = walk!;
     walk = null;
     if (w.complete) {
+      listedOnce = true;
       for (const rel of [...records.keys()]) if (!w.found.has(rel) && !pending.has(rel) && !settling.has(rel) && !imports.some((j) => j.rel === rel)) removeRec(rel);
       markGone(w.found);
     }
@@ -1672,6 +1872,278 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
     }
   }
 
+  // ---- pause, resume, and "Download and import them" (Task W4) ----------------------------------------------------------
+  let choicesRead: Promise<void> | null = null;
+  let choicesAgain: Promise<void> | null = null;
+  /**
+   * Reads this computer's choices (and, under "download", the count since the last confirmation). Never throws. A call
+   * made while a read is under way gets a fresh read after it (M2): a change written just before is never missed.
+   */
+  function refreshChoices(): Promise<void> {
+    if (choicesRead) {
+      choicesAgain ??= choicesRead.then(() => {
+        choicesAgain = null;
+        return refreshChoices();
+      });
+      return choicesAgain;
+    }
+    choicesReadAt = Date.now();
+    choicesRead = (async () => {
+      try {
+        const c = await readChoices();
+        const count = c.notDownloaded === "download" && !c.paused ? await getWatchDownloadCount(deps, projectId, watchId) : null;
+        applyChoices(c, count);
+      } catch (err) {
+        // Unreadable now: what was known stays, except that nothing is downloaded until they can be read again.
+        deps.debug?.(`watched folder: this computer's choices could not be read (${err instanceof Error ? err.name : "error"})`);
+        if (!choicesFailed) {
+          choicesFailed = true;
+          touch();
+        }
+      } finally {
+        choicesRead = null;
+      }
+    })();
+    return choicesRead;
+  }
+  function applyChoices(c: WatchChoices, count: WatchDownloadCount | null) {
+    const before = choices;
+    choices = { paused: c.paused === true, notDownloaded: c.notDownloaded === "download" ? "download" : "leave", confirmedBytes: c.confirmedBytes };
+    choicesFailed = false;
+    if (count) {
+      const identity = `${count.confirmation}:${c.confirmedBytes}`;
+      if (!dl || dl.identity !== identity) {
+        // A confirmation this watch has not acted on yet: the count is the device file's (a restart grants nothing
+        // again). The files the researcher saw are known only if this watch saw the confirmation come, after a
+        // complete listing; otherwise every file is held to the confirmed size, the tighter limit.
+        const live = before !== null && listedOnce && !pausedNow();
+        // No confirmation on record: nothing at all is downloaded, 0 bytes included (I4); held for the researcher's word.
+        dl = { identity, confirmation: count.confirmation, confirmedBytes: c.confirmedBytes, seen: live ? new Set(ndOrder) : null, held: count.confirmation === 0 || c.confirmedBytes === 0 };
+        dlNextAt = 0;
+      }
+    }
+    touch();
+    wake();
+  }
+  /** Paused: what was under way stops where it is (nothing half-read: a read in hand has finished); nothing more is looked at. */
+  function enterPause() {
+    inPause = true;
+    changedWhilePaused = false;
+    // Lines for imports already made are written as usual (I3): only nothing NEW is noted, since nothing is read.
+    emit({ kind: "paused", reason: WATCH_REASONS.paused });
+    touch();
+  }
+  /** Resumed: the folder is checked (if it never was, or cannot be reached) and listed once in full; waiting lines are written. */
+  async function leavePause(): Promise<void> {
+    inPause = false;
+    if (changedWhilePaused) deps.debug?.("watched folder: something changed while paused; the folder is listed again in full");
+    changedWhilePaused = false;
+    touch();
+    scheduleFlush();
+    if (!rootChecked || unreachable || (eventsOn && !dirWatchers.has(realRoot))) {
+      await tryResume(); // checks, lists, watches and scans
+      return;
+    }
+    emit({ kind: "resumed" });
+    startWalk();
+  }
+  const downloadDue = () => downloading() && !dl!.held && fetching === null && Date.now() >= dlNextAt && ndOrder.size > 0 && !locked && !unreachable && regReady && registerProblem === null;
+  /** A file not here whose size reads 0: listed with its sentence (once), never fetched. */
+  function sizeNotKnown(rel: string) {
+    if (problemList.get(rel)?.reason === WATCH_REASONS.sizeUnknown) return;
+    setProblem(rel, { file: rel, kind: "not-downloaded", reason: WATCH_REASONS.sizeUnknown, bytes: 0 });
+  }
+  /** A file the service did not download: listed (still counted as not downloaded), and tried again after `downloadRetryMs`. */
+  function couldNotDownload(rel: string, r: Reading) {
+    setRec(rel, r, records.get(rel)?.kind === "unknown" ? "unknown" : "nd");
+    const reason = withService(WATCH_REASONS.couldNotDownload, provider);
+    setProblem(rel, { file: rel, kind: "could-not-download", reason, bytes: r.size });
+    emit({ kind: "failed", file: rel, reason });
+  }
+  /**
+   * "Download and import them" (the researcher's choice "download", and only that): ONE file not on this computer is
+   * fetched, inside the folder's one-call limit; afterwards it is not trusted to be local and goes through the whole
+   * order from the start. The ONLY caller of `fetchContent`.
+   */
+  async function downloadStep(): Promise<void> {
+    const d = dl!;
+    if (libraryGone()) {
+      void stopWith(WATCH_REASONS.libraryClosed, true);
+      return;
+    }
+    if (projectLocked()) {
+      pauseForLock();
+      return;
+    }
+    await refreshChoices(); // the researcher's latest word, read just now
+    if (stopped || !downloading() || dl !== d || d.held) return;
+    // The next file: those the researcher saw first, then later arrivals; each group in name order. Files being looked
+    // at by the ordinary steps, and files waiting for their retry time, wait.
+    const now = Date.now();
+    const busy = new Set(imports.map((j) => j.rel));
+    let next: string | undefined;
+    let nextSeen = false;
+    let soonest = now + pollMs;
+    for (const rel of ndOrder) {
+      if (pending.has(rel) || settling.has(rel) || busy.has(rel)) continue;
+      // A size of 0 says nothing about a file that is not here (a provider may show a placeholder as empty): it is
+      // never fetched under an allowance; it is left for the researcher to download.
+      if (records.get(rel)?.size === 0) {
+        sizeNotKnown(rel);
+        continue;
+      }
+      const at = dlRetry.get(rel) ?? 0;
+      if (at > now) {
+        soonest = Math.min(soonest, at);
+        continue;
+      }
+      const seen = d.seen === null || d.seen.has(rel);
+      if (next === undefined || (seen && !nextSeen) || (seen === nextSeen && rel < next)) {
+        next = rel;
+        nextSeen = seen;
+      }
+    }
+    if (next === undefined) {
+      dlNextAt = soonest;
+      return;
+    }
+    const rel = next;
+    const abs = absOf(rel);
+    // Never a name the rules skip or report (Google's pointer files): such a file is never counted as not downloaded,
+    // so this is a second guard.
+    if (rel.split("/").some((part) => nameRule(part) !== null)) {
+      dlRetry.set(rel, Number.POSITIVE_INFINITY);
+      return;
+    }
+    // Its size from `lstat` (nothing read). Never a link (`lstat` does not follow one), and never a path through one:
+    // the real path must be the very path below the folder's real path (R67, A8).
+    let a: Reading;
+    try {
+      const st = await g.lstat(abs);
+      if (!st.isFile()) {
+        addPending(rel, QUIET); // a link or a folder now: decided again by the ordinary steps, never fetched
+        return;
+      }
+      a = readingOf(st);
+    } catch (err) {
+      if (err instanceof FolderNotAnsweringError) throw err;
+      addPending(rel, QUIET);
+      return;
+    }
+    if (!(await insideRoot(abs))) return report(rel, a, "could-not-import", WATCH_REASONS.outside);
+    if (a.size === 0) {
+      setRec(rel, a, records.get(rel)?.kind === "unknown" ? "unknown" : "nd");
+      sizeNotKnown(rel);
+      return;
+    }
+    const c = (await judge([abs])).get(abs);
+    if (c?.presence === "local") {
+      addPending(rel, QUIET | FORCE); // downloaded meanwhile: the ordinary steps take it
+      return;
+    }
+    // The allowance, exactly: files the researcher saw up to `confirmedBytes`; later arrivals up to
+    // WATCH_DOWNLOAD_CONFIRM_BYTES beyond it. At the limit is allowed; one byte past it holds downloading. The device
+    // record alone decides (I1), in one turn of that file: this watch keeps no count of its own.
+    const later = d.seen !== null && !d.seen.has(rel);
+    // Reserved BEFORE the download starts: a download cut short still counts, a restart does not grant the allowance
+    // again, and no other watch of the id can download what this one reserved.
+    let r: Awaited<ReturnType<typeof reserveWatchDownload>>;
+    try {
+      r = await reserveWatchDownload(deps, projectId, watchId, d.confirmation, a.size, later);
+    } catch (err) {
+      deps.debug?.(`watched folder: the download count could not be saved (${err instanceof Error ? err.name : "error"})`);
+      dlNextAt = Date.now() + pollMs;
+      return;
+    }
+    if (!r.reserved) {
+      if (r.reason === "held") {
+        d.held = true;
+        touch();
+      } else await refreshChoices(); // a new confirmation came meanwhile: decided afresh
+      return;
+    }
+    touch();
+    // The file in hand must still be the one counted (its size read again just before): any change, and it is decided
+    // again by the ordinary steps (its bytes stay counted: the conservative side).
+    try {
+      const st = await g.lstat(abs);
+      if (!st.isFile() || !sameReading(a, readingOf(st))) {
+        addPending(rel, QUIET);
+        return;
+      }
+    } catch (err) {
+      if (err instanceof FolderNotAnsweringError) throw err;
+      addPending(rel, QUIET);
+      return;
+    }
+    // The last look before the download (M5): still not paused or stopped, still "download", the library still
+    // writable and the project still unlocked.
+    if (stopped || pausedNow() || !downloading() || dl !== d) return;
+    if (libraryGone()) {
+      void stopWith(WATCH_REASONS.libraryClosed, true);
+      return;
+    }
+    if (projectLocked()) {
+      pauseForLock();
+      return;
+    }
+    fetching = { rel, bytes: a.size };
+    touch();
+    let failed = false;
+    try {
+      if ((await gate.call(() => fetchJudged(abs, a), fetchTimeoutMs, "fetch")) === "not-the-file") {
+        failed = true;
+        deps.debug?.("watched folder: the file opened for a download was not the file checked; nothing was read");
+      }
+    } catch (err) {
+      if (err instanceof FolderNotAnsweringError) throw err; // "Cannot be reached" until it settles; then the folder is listed again
+      failed = true;
+      deps.debug?.(`watched folder: a download failed (${errCode(err) ?? (err instanceof Error ? err.name : "error")})`);
+    } finally {
+      fetching = null;
+    }
+    // Paused or stopped meanwhile: no further call (the resume's listing finds the file, through the whole order).
+    if (stopped || pausedNow()) return;
+    // NOT trusted to be local: asked again; local → the whole order from the start (stable, local, compared, then read).
+    const after = failed ? undefined : (await judge([abs])).get(abs);
+    if (after?.presence === "local") {
+      dlRetry.delete(rel);
+      addPending(rel, QUIET | FORCE);
+      return;
+    }
+    dlRetry.set(rel, Date.now() + downloadRetryMs);
+    couldNotDownload(rel, a);
+  }
+
+  /**
+   * The download itself, as ONE call through the folder's gate (A6, R217 d): the file is opened read-only with O_NOFOLLOW
+   * (a link swapped in after the last check is not opened), and the OPENED file must be the one judged and counted —
+   * a regular file with that inode and that size — before a byte is read; otherwise nothing is read ("not-the-file").
+   * Then it is read through that handle, up to the counted size, so that the cloud service downloads it (or, as a test
+   * seam, `deps.fetchContent` is called while the checked handle is held). Its parent folders are the accepted residual
+   * (W3's N1: Node has no `openat`); `insideRoot` checked them just before.
+   */
+  async function fetchJudged(abs: string, a: Reading): Promise<"read" | "not-the-file"> {
+    const fh = await fsx.open(abs, OPEN_FLAGS);
+    try {
+      const st = await fh.stat({ bigint: true });
+      if (!st.isFile() || st.ino !== a.ino || Number(st.size) !== a.size) return "not-the-file";
+      if (deps.fetchContent) {
+        await deps.fetchContent(abs);
+        return "read";
+      }
+      const buf = Buffer.allocUnsafe(Math.min(HASH_CHUNK, Math.max(1, a.size)));
+      for (let done = 0; done < a.size; ) {
+        const { bytesRead } = await fh.read(buf, 0, Math.min(buf.length, a.size - done), done);
+        if (bytesRead === 0) break;
+        done += bytesRead;
+      }
+      return "read";
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  }
+
   function pauseForLock() {
     if (locked) return;
     locked = true;
@@ -1748,11 +2220,25 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       try {
         if (gate.stuck) {
           await gate.whenFree();
-          if (!stopped) await tryResume();
+          if (!stopped && !pausedNow()) await tryResume(); // paused: the resume checks the folder
           continue;
         }
         if (jobs.length > 0) {
-          await jobs.shift()!();
+          await jobs.shift()!(); // the researcher's own act on one file (bringInNewVersion) runs even while paused
+          continue;
+        }
+        if (pausedNow()) {
+          // Paused (Task W4): no call on the folder, no register line; only the library's own state is looked at.
+          if (libraryGone()) {
+            void stopWith(WATCH_REASONS.libraryClosed, true);
+            continue;
+          }
+          if (!inPause) enterPause();
+          await idle(pollMs);
+          continue;
+        }
+        if (inPause) {
+          await leavePause();
           continue;
         }
         if (pollDue) {
@@ -1791,7 +2277,14 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
           await walkStep();
           continue;
         }
-        if (walk) finishWalk();
+        if (walk) {
+          finishWalk();
+          continue;
+        }
+        if (downloadDue()) {
+          await downloadStep();
+          continue;
+        }
         await idle(due !== null ? due - Date.now() : pollMs);
       } catch (err) {
         if (err instanceof FolderNotAnsweringError) continue;
@@ -1803,6 +2296,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
 
   const timer = setInterval(() => {
     pollDue = true;
+    if (Date.now() - choicesReadAt >= WATCH_CHOICES_POLL_MS) void refreshChoices();
     wake();
   }, pollMs);
   timer.unref?.();
@@ -1815,7 +2309,11 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       stopped = true;
       stopReason = reason;
       clearInterval(timer);
+      // A download in hand is not waited for (it may take an hour): the folder counts as not answering until it settles,
+      // so nothing further is issued on it — by this watch or a new one (Task W4).
+      if (fetching !== null) gate.abandon("fetch");
       gate.release();
+      for (const k of ownKeys.splice(0)) if (activeWatches.get(k) === me) activeWatches.delete(k);
       if (persist && liveWatches.get(deps.repo)?.get(liveKey(projectId, watchId!)) === live) liveWatches.get(deps.repo)!.delete(liveKey(projectId, watchId!));
       for (const j of jobs.splice(0)) void j(); // each refuses: the watch has stopped
       wake();
@@ -1873,30 +2371,58 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       if (regReady) putEntry(e);
     },
   };
-  if (persist) {
+  if (persist && !refused) {
     let m = liveWatches.get(deps.repo);
     if (!m) liveWatches.set(deps.repo, (m = new Map()));
     m.set(liveKey(projectId, watchId!), live);
   }
 
   // A call an earlier watch made on this folder is still outstanding: nothing is issued until it settles (A6).
-  const prior = outstandingFolders.get(root);
+  const prior = refused ? undefined : outstandingFolders.get(root);
   if (prior) {
-    gate.adopt(prior);
-    goUnreachable(withProvider(WATCH_REASONS.notResponding, provider));
+    gate.adopt(prior.settled);
+    goUnreachable(prior.kind === "fetch" ? withService(WATCH_REASONS.fetchNotResponding, provider) : withProvider(WATCH_REASONS.notResponding, provider));
   }
 
   const ready: Promise<void> = (async () => {
+    if (refused) {
+      emit({ kind: "error", reason: WATCH_REASONS.alreadyWatched });
+      await stopWith(WATCH_REASONS.alreadyWatched, true);
+      return;
+    }
     if (!persist) {
       emit({ kind: "error", reason: WATCH_REASONS.noWatchId });
       await stopWith(WATCH_REASONS.noWatchId, true);
       return;
     }
+    // One folder feeds one project (I6): an older record of a folder that an earlier-added watch keeps is not started.
+    const keeper = await folderKeeper(deps, projectId, watchId);
+    if (keeper) {
+      const reason = keeper.projectId === projectId ? WATCH_REASONS.alreadyWatched : WATCH_REASONS.folderOfAnotherProject;
+      emit({ kind: "error", reason });
+      await stopWith(reason, true);
+      return;
+    }
+    if (!claim(`dir\u0000${root}`)) {
+      emit({ kind: "error", reason: WATCH_REASONS.alreadyWatched });
+      await stopWith(WATCH_REASONS.alreadyWatched, true);
+      return;
+    }
+    // The researcher's choices before any call on the folder: a pause chosen earlier holds from the start (Task W4).
+    await refreshChoices();
+    if (pausedNow()) {
+      if (!stopped) {
+        touch();
+        loopDone = run();
+      }
+      return;
+    }
     try {
       const bad = await checkRoot();
+      rootChecked = true;
       if (bad?.stop) {
         emit({ kind: "error", reason: bad.stop });
-        await stopWith(undefined, true);
+        await stopWith(bad.stop === WATCH_REASONS.alreadyWatched ? bad.stop : undefined, true);
         return;
       }
       if (stopped) return;
@@ -1933,6 +2459,7 @@ export function watchFolder(deps: WatchDeps, projectId: string, dir: string, opt
       const all = [...problemList.values()].reverse().filter((p) => !kind || p.kind === kind);
       return { total: all.length, items: all.slice(Math.max(0, offset), Math.max(0, offset) + Math.max(0, limit)).map((p) => ({ ...p })) };
     },
+    refreshChoices: () => (stopped ? Promise.resolve() : refreshChoices()),
   };
 }
 
@@ -1960,9 +2487,10 @@ async function standaloneIo(deps: WatchDeps, projectId: string, watchId: string)
   const presence = deps.presence ?? contentState;
   const gate = new FolderGate(deps.fsTimeoutMs ?? WATCH_FS_TIMEOUT_MS, () => {
     const settledAt = gate.afterSettle();
-    outstandingFolders.set(root, settledAt);
+    const entry = { settled: settledAt, kind: "fs" as const };
+    outstandingFolders.set(root, entry);
     void settledAt.then(() => {
-      if (outstandingFolders.get(root) === settledAt) outstandingFolders.delete(root);
+      if (outstandingFolders.get(root) === entry) outstandingFolders.delete(root);
     });
   });
   const realRoot = await gate.call(() => fsx.realpath(root));
@@ -2107,14 +2635,10 @@ type Store = Record<string, Record<string, Record<string, string>>>;
 
 /**
  * The list of watched folders on this computer could not be read (Task 68 fix round 1, I1; R178 a):
- * nothing was moved or written. The message carries no path.
+ * nothing was moved or written. The message carries no path. (Defined in watch-choices.ts, which uses it
+ * too, so that the two modules do not import each other; re-exported here under the same name.)
  */
-export class WatchedFoldersUnreadableError extends Error {
-  constructor() {
-    super("This computer's list of watched folders could not be read, so it was not changed. Check that the app's settings folder can be read and try again.");
-    this.name = "WatchedFoldersUnreadableError";
-  }
-}
+export { WatchedFoldersUnreadableError } from "./watch-choices.js";
 
 /**
  * The store, by the registry's rule (Task 68, R178 a): missing is empty; a read error other than
@@ -2219,6 +2743,61 @@ async function checkedFolder(deps: WatchSettingsDeps, dir: string): Promise<stri
   return real;
 }
 
+/**
+ * The watches of this library on this computer whose folder is `real` (any project, locked ones included), with when
+ * each was added; a record whose project or watch is gone is left out. A project whose file cannot be read counts as
+ * holding its folder (the safe side).
+ */
+async function watchesOfFolder(deps: WatchSettingsDeps, real: string): Promise<Array<{ projectId: string; id: string; createdAt: string | null }>> {
+  const { store } = await readStore(deps.lib.appConfigDir);
+  const out: Array<{ projectId: string; id: string; createdAt: string | null }> = [];
+  for (const [projectId, watches] of Object.entries(own(store, deps.lib.id) ?? {})) {
+    for (const [id, dir] of Object.entries(watches)) {
+      if (dir !== real) continue;
+      let createdAt: string | null = null;
+      try {
+        const w = (deps.repo.getProject(projectId).watchedFolders ?? []).find((x) => x.id === id);
+        if (!w) continue; // removed from its project: not a watch any more
+        createdAt = w.createdAt;
+      } catch (err) {
+        if ((err as Error)?.name === "NotFoundError") continue;
+      }
+      out.push({ projectId, id, createdAt });
+    }
+  }
+  return out;
+}
+
+/** Refuses a folder that a watch of this library already has on this computer (I6), other than `except`. */
+async function refuseWatchedFolder(deps: WatchSettingsDeps, real: string, except?: string): Promise<void> {
+  if ((await watchesOfFolder(deps, real)).some((w) => w.id !== except)) throw new InvalidInputError(WATCH_REASONS.folderAlreadyWatched);
+}
+
+/**
+ * For records made before one folder fed one project (I6): of the watches whose stored folder is this watch's, the one
+ * added first keeps it — by `createdAt` in project.json, then (equal or unknown) the smaller watch id (UUIDv7 ids grow
+ * with time) — the same answer on every start, whatever the order. Returns that keeper when it is another watch.
+ */
+async function folderKeeper(deps: WatchDeps, projectId: string, watchId: string): Promise<{ projectId: string; id: string } | null> {
+  let all: Array<{ projectId: string; id: string; createdAt: string | null }>;
+  try {
+    const mine = own(own((await readStore(deps.lib.appConfigDir)).store, deps.lib.id) ?? {}, projectId);
+    const dir = mine ? own(mine, watchId) : undefined;
+    if (!dir) return null; // not a recorded watch (or none here): the in-process guard applies
+    all = await watchesOfFolder(deps, dir);
+  } catch {
+    return null; // the list cannot be read now: the in-process guard applies
+  }
+  if (all.length < 2) return null;
+  const key = (w: { createdAt: string | null; id: string }) => [Number.isFinite(Date.parse(w.createdAt ?? "")) ? Date.parse(w.createdAt!) : Number.POSITIVE_INFINITY, w.id] as const;
+  const first = all.reduce((a, b) => {
+    const [ta, ia] = key(a);
+    const [tb, ib] = key(b);
+    return tb < ta || (tb === ta && ib < ia) ? b : a;
+  });
+  return first.id === watchId ? null : { projectId: first.projectId, id: first.id };
+}
+
 function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real: string): Promise<void> {
   return updateStore(deps, (s) => {
     const projects = own(s, deps.lib.id) ?? (Object.create(null) as Record<string, Record<string, string>>);
@@ -2233,8 +2812,10 @@ function putFolder(deps: WatchSettingsDeps, projectId: string, id: string, real:
 export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: string, dir: string, options: Partial<WatchedFolderOptionsT> = {}): Promise<WatchedFolder> {
   const real = await checkedFolder(deps, dir);
   deps.repo.getProject(projectId); // NotFoundError for an unknown project
-  // A list that cannot be read refuses before the project is changed (Task 68, R178 a).
+  // A list that cannot be read refuses before the project is changed (Task 68, R178 a); so does a folder already
+  // watched for a project of this library (I6: one folder feeds one project).
   await readStore(deps.lib.appConfigDir);
+  await refuseWatchedFolder(deps, real);
   const wf = await addWatchedFolderEntry(deps.repo, projectId, options);
   await putFolder(deps, projectId, wf.id, real);
   return wf;
@@ -2243,7 +2824,9 @@ export async function addWatchedFolder(deps: WatchSettingsDeps, projectId: strin
 /** Chooses this computer's folder for a watch the project already has (e.g. one added on another computer). */
 export async function setWatchFolder(deps: WatchSettingsDeps, projectId: string, id: string, dir: string): Promise<void> {
   if (!(deps.repo.getProject(projectId).watchedFolders ?? []).some((w) => w.id === id)) throw new TypeError("This project has no such watched folder.");
-  await putFolder(deps, projectId, id, await checkedFolder(deps, dir));
+  const real = await checkedFolder(deps, dir);
+  await refuseWatchedFolder(deps, real, id);
+  await putFolder(deps, projectId, id, real);
 }
 
 /** Removes a watched folder from project.json and from this device's settings. */

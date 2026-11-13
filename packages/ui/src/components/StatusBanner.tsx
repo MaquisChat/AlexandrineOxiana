@@ -43,6 +43,8 @@ export const NOTICE_TEXT: Record<DeviceNoticeKind, string> = {
     "This computer's list of libraries was damaged and was set aside. Your libraries themselves are untouched: open each one again from its folder with “Open library”. The damaged list is kept beside the app's settings.",
   "approved-folders-list-set-aside":
     "This computer's list of folders approved for imports was damaged and was set aside. An import will ask again before it uses files from a folder outside the one you import from. The damaged list is kept beside the app's settings.",
+  "watched-folder-choices-set-aside":
+    "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults: they are watched, not paused, and files that are not downloaded to this Mac are left alone. The damaged file is kept beside the app's settings.",
 };
 
 const READ_ONLY_REASONS: Record<string, string> = {
