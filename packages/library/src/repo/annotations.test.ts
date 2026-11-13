@@ -9,7 +9,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newId, type Annotation, type AuditEvent, type Provenance, type SourceDraft, type SourceFile } from "@ao/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeyRing } from "../crypto/keys.js";
 import type { Deps } from "../deps.js";
 import { IndexHandle, createIndexSink, search } from "../index/index.js";
@@ -29,6 +29,28 @@ import type { Repo } from "./index.js";
 import { importChange } from "./repo.js";
 import { pauseBetweenSourceFilesForTests } from "./sources.js";
 import { SimulatedCrash, openTestRepo, seams, type CrashPoint } from "./testing.js";
+
+/**
+ * A hold point between an operation's pre-read (its read of the source OUTSIDE the write queue, for
+ * the policy request) and its entry into the queue: the next such read, once set, waits on `hold`.
+ * The library's own code is unchanged; only this test file's view of `readSourceFile` is wrapped.
+ */
+const preRead = vi.hoisted(() => ({ hold: undefined as undefined | (() => Promise<void>) }));
+vi.mock("./sources.js", async (orig) => {
+  const m = await orig<typeof import("./sources.js")>();
+  return {
+    ...m,
+    readSourceFile: async (...args: Parameters<typeof m.readSourceFile>) => {
+      const sf = await m.readSourceFile(...args);
+      const hold = preRead.hold;
+      if (hold && !args[0].holdsTurn()) {
+        preRead.hold = undefined;
+        await hold();
+      }
+      return sf;
+    },
+  };
+});
 
 const OPEN_GOV = `identifiability:
   containsIdentifiable: false
@@ -99,6 +121,7 @@ beforeEach(async () => {
 afterEach(async () => {
   seams.crashAt = undefined;
   seams.failAuditAppendFor = undefined;
+  preRead.hold = undefined;
   pauseBetweenSourceFilesForTests(undefined);
   handle.close();
   await lib.close();
@@ -498,9 +521,14 @@ describe("update and delete", () => {
       repo.updateAnnotation(f.pid, f.sid, a.id, { colorName: "purple" }),
       repo.updateAnnotation(f.pid, f.sid, a.id, { body: NOTE }),
     ]);
+    // Which of the two enters the write queue first is not guaranteed: each first reads the source
+    // outside the queue, for its policy request. What is guaranteed is that both land, the later on
+    // the earlier, whichever that is. Each order is pinned down under "changes at the same time".
     expect(x.colorName).toBe("purple");
-    expect(y).toMatchObject({ colorName: "purple", body: NOTE });
-    expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([y]);
+    expect(y.body).toBe(NOTE);
+    const [stored] = await repo.listAnnotations(f.pid, f.sid);
+    expect(stored).toMatchObject({ colorName: "purple", body: NOTE });
+    expect([x, y]).toContainEqual(stored);
   });
 
   it("deleting an imported highlight records its key", async () => {
@@ -550,6 +578,240 @@ describe("update and delete", () => {
     }, { op: "test.seed" });
     await repo.deleteAnnotation(f.pid, f.sid, imported.id);
     expect((await repo.getSource(f.pid, f.sid)).deletedAnnotationKeys).toEqual(["zotero:X", "zotero:SAME"]);
+  });
+});
+
+describe("changes at the same time (R3a): every decision is taken on the state the change writes over", () => {
+  type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+  const settle = <T,>(p: Promise<T>): Promise<Settled<T>> => p.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+
+  /**
+   * `held` is started and stopped right after its pre-read, before it enters the write queue; `other`
+   * then runs to completion; then `held` goes on. So `held` read the source BEFORE `other` changed it,
+   * and is applied AFTER: the order that makes a stale pre-read matter.
+   */
+  async function race<A, B>(held: () => Promise<A>, other: () => Promise<B>): Promise<{ held: Settled<A>; other: Settled<B> }> {
+    let reached!: () => void;
+    let release!: () => void;
+    const atHold = new Promise<void>((r) => (reached = r));
+    const gate = new Promise<void>((r) => (release = r));
+    preRead.hold = async () => {
+      reached();
+      await gate;
+    };
+    const first = settle(held());
+    await atHold;
+    const second = await settle(other());
+    release();
+    return { held: await first, other: second };
+  }
+  const value = <T,>(s: Settled<T>): T => {
+    if (!s.ok) throw s.error;
+    return s.value;
+  };
+  /** The annotation audit entries after the first `from`, without the transaction id and change count. */
+  const entriesFrom = async (projectFolder: string, from: number): Promise<Array<Record<string, unknown>>> =>
+    (await annotationEvents(projectFolder)).slice(from).map((e) => {
+      const { txn: _t, changes: _c, ...rest } = e.details as Record<string, unknown>;
+      return { action: e.action, result: e.decision?.result, ...rest };
+    });
+
+  for (const [heldName, heldPatch, otherName, otherPatch] of [
+    ["a recolour", { colorName: "purple" }, "a note", { body: NOTE }],
+    ["a note", { body: NOTE }, "a recolour", { colorName: "purple" }],
+  ] as const) {
+    it(`${heldName} read before ${otherName} and applied after it: both land, and each audit entry names only its own field`, async () => {
+      const f = await fixture();
+      const a = await repo.createAnnotation(f.pid, f.sid, highlight(f));
+      const n0 = (await annotationEvents(f.projectFolder)).length;
+      const r = await race(
+        () => repo.updateAnnotation(f.pid, f.sid, a.id, heldPatch),
+        () => repo.updateAnnotation(f.pid, f.sid, a.id, otherPatch),
+      );
+      const other = value(r.other);
+      const held = value(r.held);
+      // The other change was applied to the annotation as created; the held one on top of it.
+      expect(other).toEqual({ ...a, ...otherPatch, modifiedAt: NOW, modifiedBy: "tester" });
+      expect(held).toEqual({ ...a, colorName: "purple", body: NOTE, modifiedAt: NOW, modifiedBy: "tester" });
+      expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([held]);
+      const field = (p: AnnotationPatch) => (p.body !== undefined ? "body" : "colorName");
+      expect(await entriesFrom(f.projectFolder, n0)).toEqual([
+        { action: "store", result: "allow", op: ANNOTATION_UPDATE_OP, annotation: a.id, kind: "highlight", changed: [field(otherPatch)] },
+        { action: "store", result: "allow", op: ANNOTATION_UPDATE_OP, annotation: a.id, kind: "highlight", changed: [field(heldPatch)] },
+      ]);
+      expect(await txnMarkers()).toEqual([]);
+    });
+  }
+
+  it("two notes on one annotation: the one applied later wins whole, and each is audited as a change of the note", async () => {
+    const f = await fixture();
+    const a = await repo.createAnnotation(f.pid, f.sid, highlight(f, { body: "first" }));
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    const r = await race(
+      () => repo.updateAnnotation(f.pid, f.sid, a.id, { body: "held note, applied last" }),
+      () => repo.updateAnnotation(f.pid, f.sid, a.id, { body: "other note" }),
+    );
+    expect(value(r.other).body).toBe("other note");
+    expect(value(r.held).body).toBe("held note, applied last");
+    expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([value(r.held)]);
+    expect((await entriesFrom(f.projectFolder, n0)).map((e) => e.changed)).toEqual([["body"], ["body"]]);
+  });
+
+  it("two identical recolours: the later finds nothing to change, writes nothing and is not audited", async () => {
+    const f = await fixture();
+    const a = await repo.createAnnotation(f.pid, f.sid, highlight(f));
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    let snap: Record<string, string> | undefined;
+    const r = await race(
+      () => repo.updateAnnotation(f.pid, f.sid, a.id, { colorName: "red" }),
+      async () => {
+        const done = await repo.updateAnnotation(f.pid, f.sid, a.id, { colorName: "red" });
+        snap = await snapshot(join(lib.root, f.projectFolder));
+        return done;
+      },
+    );
+    expect(value(r.held)).toEqual(value(r.other));
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect((await entriesFrom(f.projectFolder, n0)).map((e) => e.changed)).toEqual([["colorName"]]);
+  });
+
+  it("an update read before a delete and applied after it is a plain \"not found\": nothing written, no update audited", async () => {
+    const f = await fixture();
+    const a = await repo.createAnnotation(f.pid, f.sid, highlight(f));
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    let snap: Record<string, string> | undefined;
+    const r = await race(
+      () => repo.updateAnnotation(f.pid, f.sid, a.id, { body: NOTE }),
+      async () => {
+        const done = await repo.deleteAnnotation(f.pid, f.sid, a.id);
+        snap = await snapshot(join(lib.root, f.projectFolder));
+        return done;
+      },
+    );
+    expect(value(r.other)).toEqual({ id: a.id, external: false });
+    expect(r.held.ok).toBe(false);
+    expect((r.held as { error: unknown }).error).toBeInstanceOf(NotFoundError);
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([]);
+    expect(await entriesFrom(f.projectFolder, n0)).toEqual([
+      { action: "delete", result: "allow", op: ANNOTATION_DELETE_OP, annotation: a.id, kind: "highlight", external: false },
+    ]);
+    expect(await txnMarkers()).toEqual([]);
+  });
+
+  it("a recolour and a delete of an imported highlight called together: the delete enters first, the recolour is a plain \"not found\", the key recorded once", async () => {
+    const f = await fixture();
+    const imported = seedNote(f.sid, "", { kind: "highlight", body: undefined, quote: "q", color: "#ffd400", externalKey: "zotero:RACE1" });
+    await seed(f.pid, f.sid, () => [imported]);
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    // A delete has no pre-read: it enters the queue when it is called, so these two run in call order.
+    const [up, del] = await Promise.all([settle(repo.updateAnnotation(f.pid, f.sid, imported.id, { colorName: "green" })), settle(repo.deleteAnnotation(f.pid, f.sid, imported.id))]);
+    // The recolour's pre-read is still on its way when the delete enters the queue: the delete goes first.
+    expect(value(del)).toEqual({ id: imported.id, external: true });
+    expect(up.ok).toBe(false);
+    expect((up as { error: unknown }).error).toBeInstanceOf(NotFoundError);
+    const sf = await repo.getSource(f.pid, f.sid);
+    expect(sf.annotations).toEqual([]);
+    expect(sf.deletedAnnotationKeys).toEqual(["zotero:RACE1"]);
+    expect((await entriesFrom(f.projectFolder, n0)).map((e) => e.op)).toEqual([ANNOTATION_DELETE_OP]);
+  });
+
+  it("two deletes at once: one deletes, the other is a plain \"not found\", one audit entry, the key recorded once", async () => {
+    const f = await fixture();
+    const imported = seedNote(f.sid, "n", { kind: "highlight", externalKey: "zotero:TWICE" });
+    await seed(f.pid, f.sid, () => [imported]);
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    const results = await Promise.all([settle(repo.deleteAnnotation(f.pid, f.sid, imported.id)), settle(repo.deleteAnnotation(f.pid, f.sid, imported.id))]);
+    expect(results.filter((x) => x.ok)).toHaveLength(1);
+    const failed = results.filter((x) => !x.ok);
+    expect(failed).toHaveLength(1);
+    expect((failed[0] as { error: unknown }).error).toBeInstanceOf(NotFoundError);
+    const sf = await repo.getSource(f.pid, f.sid);
+    expect(sf.annotations).toEqual([]);
+    expect(sf.deletedAnnotationKeys).toEqual(["zotero:TWICE"]);
+    expect(await entriesFrom(f.projectFolder, n0)).toEqual([
+      { action: "delete", result: "allow", op: ANNOTATION_DELETE_OP, annotation: imported.id, kind: "highlight", external: true },
+    ]);
+    expect(await txnMarkers()).toEqual([]);
+  });
+
+  it("two creates at the count cap: the one applied later is refused whole, on the state it would have written over", async () => {
+    const f = await fixture();
+    await seed(f.pid, f.sid, (sid) => Array.from({ length: MAX_SOURCE_ANNOTATIONS - 1 }, (_, i) => seedNote(sid, `n${i}`)));
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    let snap: Record<string, string> | undefined;
+    const r = await race(
+      () => repo.createAnnotation(f.pid, f.sid, highlight(f, { quote: "held" })),
+      async () => {
+        const done = await repo.createAnnotation(f.pid, f.sid, highlight(f, { quote: "other" }));
+        snap = await snapshot(join(lib.root, f.projectFolder));
+        return done;
+      },
+    );
+    expect(value(r.other).quote).toBe("other");
+    expect(r.held.ok).toBe(false);
+    expect((r.held as { error: unknown }).error).toBeInstanceOf(AnnotationLimitError);
+    expect(((r.held as { error: unknown }).error as AnnotationLimitError).kind).toBe("count");
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect(await repo.listAnnotations(f.pid, f.sid)).toHaveLength(MAX_SOURCE_ANNOTATIONS);
+    expect((await entriesFrom(f.projectFolder, n0)).map((e) => e.op)).toEqual([ANNOTATION_CREATE_OP]);
+    expect(await txnMarkers()).toEqual([]);
+  });
+
+  it("two longer notes that fit the text cap alone but not together: the one applied later is refused whole", async () => {
+    const f = await fixture();
+    const big = seedNote(f.sid, "x".repeat(MAX_SOURCE_ANNOTATION_TEXT - 100));
+    const p = seedNote(f.sid, "p");
+    const q = seedNote(f.sid, "q");
+    await seed(f.pid, f.sid, () => [big, p, q]);
+    let snap: Record<string, string> | undefined;
+    // 98 characters of room: each adds 59.
+    const r = await race(
+      () => repo.updateAnnotation(f.pid, f.sid, q.id, { body: "q".repeat(60) }),
+      async () => {
+        const done = await repo.updateAnnotation(f.pid, f.sid, p.id, { body: "p".repeat(60) });
+        snap = await snapshot(join(lib.root, f.projectFolder));
+        return done;
+      },
+    );
+    expect(value(r.other).body).toBe("p".repeat(60));
+    expect(r.held.ok).toBe(false);
+    expect(((r.held as { error: unknown }).error as AnnotationLimitError).kind).toBe("text");
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect((await repo.listAnnotations(f.pid, f.sid)).find((a) => a.id === q.id)!.body).toBe("q");
+  });
+
+  it("a page note's text removed while another change is on its way is still refused, and the other lands", async () => {
+    const f = await fixture();
+    const n = await repo.createAnnotation(f.pid, f.sid, { kind: "note", assetId: f.assetId, anchors: [{ page: 1, rects: [{ x: 1, y: 1, w: 0, h: 0 }] }], body: NOTE, colorName: "yellow" });
+    const r = await race(
+      () => repo.updateAnnotation(f.pid, f.sid, n.id, { body: null }),
+      () => repo.updateAnnotation(f.pid, f.sid, n.id, { colorName: "blue" }),
+    );
+    expect(r.held.ok).toBe(false);
+    expect((r.held as { error: unknown }).error).toEqual(new InvalidInputError("Write the note first."));
+    expect(await repo.listAnnotations(f.pid, f.sid)).toEqual([value(r.other)]);
+    expect(value(r.other)).toMatchObject({ body: NOTE, colorName: "blue" });
+  });
+
+  it("an update read before its source was deleted is a plain \"not found\" and writes nothing", async () => {
+    const f = await fixture();
+    const a = await repo.createAnnotation(f.pid, f.sid, highlight(f));
+    const n0 = (await annotationEvents(f.projectFolder)).length;
+    let snap: Record<string, string> | undefined;
+    const r = await race(
+      () => repo.updateAnnotation(f.pid, f.sid, a.id, { body: NOTE }),
+      async () => {
+        await repo.deleteSource(f.pid, f.sid);
+        snap = await snapshot(join(lib.root, f.projectFolder));
+      },
+    );
+    expect(r.other.ok).toBe(true);
+    expect(r.held.ok).toBe(false);
+    expect((r.held as { error: unknown }).error).toBeInstanceOf(NotFoundError);
+    expect(await snapshot(join(lib.root, f.projectFolder))).toEqual(snap);
+    expect(await entriesFrom(f.projectFolder, n0)).toEqual([]);
+    expect(await txnMarkers()).toEqual([]);
   });
 });
 

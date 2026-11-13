@@ -268,6 +268,10 @@ export {
 } from "./import/watch.js";
 export type { FolderWatch, WatchDeps, WatchEvent, WatchSettingsDeps } from "./import/watch.js";
 export { WatchFileNotLocalError, bringInNewVersion, settleWatchedFile } from "./import/watch.js";
+export { WATCH_DOWNLOAD_CONFIRM_BYTES, WATCH_DOWNLOAD_RETRY_MS, WATCH_FETCH_TIMEOUT_MS, sizeText, withProvider, withService } from "./import/watch.js";
+export type { WatchFileKind, WatchFileProblem, WatchStatus } from "./import/watch.js";
+export { DEFAULT_WATCH_CHOICES, getWatchChoices, removeWatchChoices, setWatchChoices } from "./import/watch-choices.js";
+export type { WatchChoices } from "./import/watch-choices.js";
 export type { WatchRegisterEntry, WatchedFileState } from "./repo/watch-register.js";
 export type { AttachOpts } from "./import/attach.js";
 export { ARCHIVE_LIMITS } from "./extract/zip.js";

@@ -105,3 +105,32 @@ describe("getSourceRecord: source.json alone (R186)", () => {
     await expect(repo.getSourceRecord(pid, sid)).rejects.toBeInstanceOf(ProjectLockedError);
   });
 });
+
+describe("getSourceRecordWithAssets: the same light read, with the assets it already parsed (R222)", () => {
+  async function sourceWithFiles(encrypted: boolean) {
+    const { project } = await repo.createProject({ name: "P", governanceYaml: GOV, encryption: encrypted ? { enabled: true, passphrase: "pw" } : { enabled: false } });
+    const dir = await mkdtemp(join(tmp, "in-"));
+    await writeFile(join(dir, "a.pdf"), "%PDF-1.7\nbody");
+    const sf = await repo.createSource(project.id, draft(project.id), [{ path: join(dir, "a.pdf"), role: "original", handling: "copy" }], {
+      provenance: { captureMethod: "manual_upload", capturedAt: NOW, tool: { name: "t", version: "1" }, fileHashes: {}, legal: { status: "public" }, identifiable: false },
+    });
+    return { pid: project.id, sid: sf.source.id, folder: sf.source.folder, aid: sf.assets[0]!.id };
+  }
+
+  it("returns the source and its assets (role, type, status) without opening the annotations file", async () => {
+    const { pid, sid, folder, aid } = await sourceWithFiles(false);
+    await writeFile(join(lib.root, folder, "annotations.json"), "[{ not json");
+    const r = await repo.getSourceRecordWithAssets(pid, sid);
+    expect(r.source.id).toBe(sid);
+    expect(r.assets.map((a) => [a.id, a.role, a.mime])).toEqual([[aid, "original", "application/pdf"]]);
+    expect(repo.integrityWarnings).toEqual([]);
+  });
+
+  it("an encrypted project: decrypted while unlocked; refused while locked; an unknown id is not found", async () => {
+    const { pid, sid } = await sourceWithFiles(true);
+    expect((await repo.getSourceRecordWithAssets(pid, sid)).assets).toHaveLength(1);
+    await expect(repo.getSourceRecordWithAssets(pid, "no-such-source")).rejects.toBeInstanceOf(NotFoundError);
+    repo.lockProject(pid);
+    await expect(repo.getSourceRecordWithAssets(pid, sid)).rejects.toBeInstanceOf(ProjectLockedError);
+  });
+});

@@ -5,7 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { BIBLIO_FIELDS, SourceType, evidenceSourceName, type FieldEvidence, type Source, type SourceFile } from "@ao/core";
+import { BIBLIO_FIELDS, SourceType, evidenceSourceName, type Asset, type FieldEvidence, type Source, type SourceFile } from "@ao/core";
 import {
   ASSET_TEXT_MAX_BYTES,
   addTranscriptVersion,
@@ -20,6 +20,7 @@ import {
   transcriptVersions,
   type SourcePatch,
 } from "@ao/library";
+import { isReadablePdfAsset } from "@ao/shared";
 import type {
   EvidenceOrigin,
   FieldConfirmRequest,
@@ -105,7 +106,7 @@ export interface RowAvailability {
   zotero?: "deleted" | "bin";
 }
 
-const rowAvailability = (src: Source): RowAvailability => {
+export const rowAvailability = (src: Source): RowAvailability => {
   const a = src.availability;
   return { status: a.status, ...(a.firstNoticedAt ? { firstNoticedAt: a.firstNoticedAt } : {}), ...(a.zotero ? { zotero: a.zotero } : {}) };
 };
@@ -116,14 +117,14 @@ const rowAvailability = (src: Source): RowAvailability => {
  * and cannot raise an integrity warning while annotations are being written. A locked row, or a
  * record that cannot be read, gets none (the interface then shows nothing).
  */
-async function availabilityOf(repo: { getSourceRecord(projectId: string, id: string): Promise<Source> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, RowAvailability>> {
-  const out = new Map<string, RowAvailability>();
+async function availabilityOf(repo: { getSourceRecordWithAssets(projectId: string, id: string): Promise<{ source: Source; assets: Asset[] }> }, projectId: string, rows: Array<{ id: string; locked: boolean }>): Promise<Map<string, { availability: RowAvailability; hasReadablePdf: boolean }>> {
+  const out = new Map<string, { availability: RowAvailability; hasReadablePdf: boolean }>();
   await Promise.all(
     rows
       .filter((r) => !r.locked)
       .map(async (r) => {
-        const src = await repo.getSourceRecord(projectId, r.id).catch(() => undefined);
-        if (src) out.set(r.id, rowAvailability(src));
+        const rec = await repo.getSourceRecordWithAssets(projectId, r.id).catch(() => undefined);
+        if (rec) out.set(r.id, { availability: rowAvailability(rec.source), hasReadablePdf: rec.assets.some(isReadablePdfAsset) });
       }),
   );
   return out;
@@ -165,7 +166,7 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
         ...found,
         items: found.items.map((i) => {
           const a = avail.get(i.id);
-          return { ...i, needsReview: !i.locked && waiting.has(i.id), ...(a ? { availability: a } : {}) };
+          return { ...i, needsReview: !i.locked && waiting.has(i.id), ...(a ? { availability: a.availability, hasReadablePdf: a.hasReadablePdf } : {}) };
         }),
         ...index,
       };
@@ -175,14 +176,15 @@ export function registerSources(app: FastifyInstance, ctx: Ctx): void {
     const items = [];
     for (const id of s.repo.listSourceIds(projectId)) {
       // Only the record's own fields are needed: the light read (R186).
-      const src = await s.repo.getSourceRecord(projectId, id).catch(() => undefined);
-      if (!src) continue;
+      const rec = await s.repo.getSourceRecordWithAssets(projectId, id).catch(() => undefined);
+      if (!rec) continue;
+      const src = rec.source;
       const title = src.title.variants[0]?.value ?? "";
       if (q.text && !title.toLowerCase().includes(q.text.toLowerCase())) continue;
       if (q.type && src.type !== q.type) continue;
       if (q.collection && !src.collectionIds.includes(q.collection)) continue;
       if (q.tag && !src.tagIds.includes(q.tag)) continue;
-      items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false, availability: rowAvailability(src) });
+      items.push({ id, projectId, type: src.type, title, folder: src.folder, needsReview: false, locked: false, availability: rowAvailability(src), hasReadablePdf: rec.assets.some(isReadablePdfAsset) });
     }
     // `limited`: only titles were searched (no full text, no annotations); the interface says so (Task 58 M6).
     return { total: items.length, items: items.slice(offset, offset + limit), limited: true, ...index };

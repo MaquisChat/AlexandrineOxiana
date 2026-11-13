@@ -195,6 +195,8 @@ export interface SourceRow {
   annotationsPartial?: true;
   /** The record's availability (Task 69); absent for a locked row or a record that could not be read. */
   availability?: SourceAvailability;
+  /** R222: the source has a PDF the reader can open (the service's rule); absent in an older answer: cannot tell. */
+  hasReadablePdf?: boolean;
 }
 
 /**
