@@ -28,7 +28,7 @@ import { openTestRepo } from "../../repo/testing.js";
 import { BatchRefusedError, createBulkImport, folderAdapter, type BulkImport, type ImportSourceAdapter, type ScanItem } from "./index.js";
 import { useMemorySecrets } from "../../secrets-testing.js";
 import { setSecret } from "../../secrets.js";
-import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
+import { ZOTERO_WEB_FILE_NOTES, resumeZoteroWebImport, startZoteroWebImport, zoteroWebAdapter, zoteroWebSince, type ZoteroWebOptions } from "../zotero-web.js";
 import { FakeZotero, guardNetwork } from "../../../tests/zotero/fake-zotero.js";
 import { referenceMetadata } from "../refman.js";
 
@@ -1676,7 +1676,7 @@ processing:
   const fileRequests = () => z.requests.filter((r) => r.path.endsWith("/file")).map((r) => r.path);
 
   /** A first full run, then an incremental batch cancelled after its first item. */
-  async function cancelledIncremental(): Promise<{ p: Project; batchId: string; v1: number; journaled: number }> {
+  async function cancelledIncremental(after = 1): Promise<{ p: Project; batchId: string; v1: number; journaled: number }> {
     const p = await project(ZGOV);
     for (const t of ["One", "Two", "Three"]) await addWithFile(t);
     await (await startZoteroWebImport(deps(), p.id, web())).done;
@@ -1685,7 +1685,7 @@ processing:
     for (const t of ["Four", "Five", "Six", "Seven"]) await addWithFile(t);
     const h = await startZoteroWebImport(deps(), p.id, web());
     for await (const e of h.progress) {
-      if (e.done >= 1) {
+      if (e.done >= after) {
         h.cancel();
         break;
       }
@@ -1701,7 +1701,8 @@ processing:
   it("a resumed Web batch asks since its recorded version and records the new one", async () => {
     const { p, batchId, v1, journaled } = await cancelledIncremental();
     const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
-    expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true });
+    // The first part's read version is in the record as soon as that part's lines are (A5).
+    expect(rec.adapterOptions).toEqual({ zoteroSince: v1, zoteroFiles: true, zoteroReadVersions: [z.libraryVersion(U)] });
     z.requests.length = 0;
     const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
     expect(r.state).toBe("finished");
@@ -1717,8 +1718,8 @@ processing:
     expect(events).toContain("project.import-settings.zotero-web");
   });
 
-  it("a batch record without the new fields resumes as before (a full scan)", async () => {
-    const { p, batchId } = await cancelledIncremental();
+  it("a batch record without the new fields resumes as before (a full scan) and records no version", async () => {
+    const { p, batchId, v1 } = await cancelledIncremental();
     const path = batchJson(p, 2);
     const { adapterOptions: _gone, ...old } = JSON.parse(await readFile(path, "utf8"));
     await writeFile(path, JSON.stringify(old, null, 2));
@@ -1730,7 +1731,57 @@ processing:
     expect(repo.listSourceIds(p.id)).toHaveLength(7);
     const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => (await repo.getSource(p.id, id)).source.title.variants[0]!.value));
     expect(new Set(titles).size).toBe(7);
-    expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
+    // The version the first part read at is not known: nothing is recorded, the next run repeats (A5).
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+  });
+
+  it("a resumed batch records the LOWEST version any part read at; what changed in between comes in next run (C1)", async () => {
+    const { p, batchId, journaled } = await cancelledIncremental(2);
+    expect(journaled).toBeGreaterThanOrEqual(2);
+    const read1 = JSON.parse(await readFile(batchJson(p, 2), "utf8")).adapterOptions.zoteroReadVersions;
+    expect(read1).toEqual([z.libraryVersion(U)]);
+    // Between the stop and the resume, in Zotero: one item the first part brought in is edited, another is binned.
+    const journal = (await readFile(join(lib.root, p.folder, "imports", "batch-0002", "journal.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as { key: string; sourceId?: string });
+    const [edited, binned] = journal.filter((e) => e.sourceId).map((e) => e.key.replace(/^zotero:/u, ""));
+    z.editItem(U, edited!, { title: "Edited in Zotero between the parts" });
+    z.trash(U, binned!);
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    const rec = JSON.parse(await readFile(batchJson(p, 2), "utf8"));
+    expect(rec.adapterOptions.zoteroReadVersions).toEqual([read1[0], z.libraryVersion(U)]);
+    // Recorded: the first part's version, not the resumed part's.
+    expect(zoteroWebSince(repo, p.id, U)).toBe(read1[0]);
+    expect(rec.recordedLibraryVersion).toBe(read1[0]);
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    // The next incremental run asks since that version: the edit comes in, the binned item is yielded as gone.
+    z.requests.length = 0;
+    const next = await (await startZoteroWebImport(deps(), p.id, web())).done;
+    expect(listings().every((q) => q.get("since") === String(read1[0]))).toBe(true);
+    expect(next.counts).toMatchObject({ updated: 1, created: 0, failed: 0 });
+    const titles = await Promise.all(repo.listSourceIds(p.id).map(async (id) => (await repo.getSource(p.id, id)).source.title.variants[0]!.value));
+    expect(titles).toContain("Edited in Zotero between the parts");
+    expect(new Set(titles).size).toBe(7);
+    const a = zoteroWebAdapter({ libraryType: "user", libraryId: "42", dispatcher: z.agent, sleep: async () => {}, since: read1[0] });
+    const work = join(tmp, "w-gone");
+    await mkdir(work, { recursive: true });
+    const gone: ScanItem[] = [];
+    for await (const i of a.scan(new AbortController().signal, { workDir: async () => work, knownIds: () => new Set(journal.map((e) => `${U}/${e.key.replace(/^zotero:/u, "")}`)) })) if (i.gone) gone.push(i);
+    expect(gone.map((i) => [i.key, i.gone])).toEqual([[`zotero:${binned}`, "bin"]]);
+  });
+
+  it("a batch record without the read versions records nothing", async () => {
+    const { p, batchId, v1 } = await cancelledIncremental();
+    const path = batchJson(p, 2);
+    const rec = JSON.parse(await readFile(path, "utf8"));
+    delete rec.adapterOptions.zoteroReadVersions;
+    await writeFile(path, JSON.stringify(rec, null, 2));
+    const r = await (await resumeZoteroWebImport(deps(), p.id, batchId)).done;
+    expect(r.state).toBe("finished");
+    expect(repo.listSourceIds(p.id)).toHaveLength(7);
+    expect(zoteroWebSince(repo, p.id, U)).toBe(v1);
+    const after = JSON.parse(await readFile(path, "utf8"));
+    expect(after.adapterOptions.zoteroReadVersions).toBeUndefined();
+    expect(after.recordedLibraryVersion).toBeUndefined();
   });
 
   it("a download that failed before the resume holds since back at the end of the resumed run", async () => {
