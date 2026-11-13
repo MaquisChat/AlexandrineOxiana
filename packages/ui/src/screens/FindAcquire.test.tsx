@@ -19,6 +19,8 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { findApi } from "../api/find";
+import { routeFor } from "../App";
+import { PATHS } from "../navigation";
 import { SOURCE_FILE, server, testClient, url, useMockService } from "../test/service";
 import { FindAcquire } from "./FindAcquire";
 
@@ -179,6 +181,16 @@ function heard() {
 }
 
 describe("FindAcquire: the page", () => {
+  it("the app's route table shows it at /find, with Back to library", async () => {
+    useService();
+    render(routeFor({ pathname: PATHS.find, search: `?project=${PID}` }, testClient()));
+    expect(await screen.findByRole("heading", { level: 1, name: "Find and acquire" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Back to library" }).getAttribute("href")).toBe(`/?project=${PID}`);
+    expect(await screen.findByText("Nothing is in the queue yet.")).toBeTruthy();
+    await waitFor(() => expect(events.open()).toBe(true));
+    await within(screen.getByRole("combobox", { name: "Collection" })).findByRole("option", { name: "Chapter 1" });
+  });
+
   it("heading, selects, box, hint, Add and switch, as the plan names them", async () => {
     useService();
     show();
