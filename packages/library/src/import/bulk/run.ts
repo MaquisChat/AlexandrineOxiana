@@ -643,10 +643,19 @@ class Run {
       let done = 0;
       const seenKeys = new Set<string>();
       this.feed.emit({ done, total });
-      const scan = this.adapter.scan(this.abort.signal, { workDir: () => this.ensureWorkDir(), note: (t) => this.note(t) });
+      let knownIds: ReadonlySet<string> | undefined;
+      const scan = this.adapter.scan(this.abort.signal, {
+        workDir: () => this.ensureWorkDir(),
+        note: (t) => this.note(t),
+        // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
+        skip: (key) => this.latest.has(key),
+        ...(this.adapter.incremental ? { knownIds: () => (knownIds ??= new Set(this.known.keys())) } : {}),
+      });
       for await (const item of scan) {
         if (seenKeys.has(item.key)) continue;
         seenKeys.add(item.key);
+        // Gone at its source (Zotero, Z2): nothing about the source here changes in this task.
+        if (item.gone) continue;
         if (!this.latest.has(item.key) && this.recovered.size) {
           // Resume guard: a source of this batch for this item exists although its line was lost.
           const sid = this.recovered.get(itemKeyHash(this.rec.secret!, item.key));
@@ -1898,6 +1907,7 @@ export async function dryRun(
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
     for await (const scanned of scan) {
       let item = scanned;
+      if (item.gone) continue; // gone at its source: nothing to import
       summary.items++;
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });

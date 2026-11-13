@@ -116,6 +116,12 @@ export interface ScanItem {
    * `metadata.pairedAssetId` names the other.
    */
   pairs?: Array<[number, number]>;
+  /**
+   * The item is gone at its source (Zotero Web, Task Z2): `"deleted"` (deleted for good) or `"bin"`
+   * (in Zotero's bin). Such an item carries `version.id` and no files or content; it is never imported.
+   * What it does to the source here is a later task's (Z5); until then the engine passes it by.
+   */
+  gone?: "deleted" | "bin";
 }
 
 /** What the engine gives a scan: a private (0700) work folder for unpacked archives, created on first use. */
@@ -125,6 +131,17 @@ export interface ScanContext {
   note?(text: string): void;
   /** The scan is for a dry run (nothing is imported): adapters that download files skip the downloads. */
   dryRun?: boolean;
+  /**
+   * True when the engine will pass this item by anyway (e.g. it is already in a resumed batch's
+   * journal): an adapter that downloads may then fetch nothing for it and yield nothing. Optional:
+   * an adapter that ignores it is still correct (the engine keeps its own journal check).
+   */
+  skip?(itemKey: string): boolean;
+  /**
+   * The `version.id`s of every item imported before by a batch of this kind that was not undone (all
+   * libraries of the kind: an adapter keeps to its own). Incremental adapters only.
+   */
+  knownIds?(): ReadonlySet<string>;
 }
 
 export interface ImportSourceAdapter {
@@ -156,7 +173,13 @@ export interface ImportSourceAdapter {
    */
   viewingProxies?: boolean;
   /** Options to keep with the batch record and give `adapterFor` again when the batch is resumed (e.g. device import's researcher name). */
-  resumeOptions?: { researcherName?: string };
+  resumeOptions?: {
+    researcherName?: string;
+    /** Zotero Web (Z2): the library version the batch asked since (absent: a full scan). */
+    zoteroSince?: number;
+    /** Zotero Web (Z2): whether files are downloaded (absent: true). */
+    zoteroFiles?: boolean;
+  };
 }
 
 const SIDECARS: ReadonlySet<string> = new Set(SIDECAR_EXTS);
@@ -329,7 +352,7 @@ export function adapterFor(kind: ImportBatch["source"]["kind"], location: string
   if (kind === "zotero-rdf") return zoteroRdfAdapter(location);
   if (kind === "calibre") return calibreAdapter(location);
   if (kind === "zotero-local") return zoteroLocalAdapter(location);
-  if (kind === "zotero-web") return zoteroWebAdapterFor(location);
+  if (kind === "zotero-web") return zoteroWebAdapterFor(location, options);
   if (kind === "device") return deviceAdapter(location, options?.researcherName ? { researcherName: options.researcherName } : {});
   return undefined;
 }

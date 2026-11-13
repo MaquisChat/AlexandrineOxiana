@@ -9,12 +9,26 @@
  *   - API responses are never redirected; a JSON page is at most 10 MB; pages of `limit=100`;
  *   - `Backoff: <s>` makes the next request wait (capped, default 2 min); 429 and 5xx are retried
  *     (5 times) after `Retry-After` (capped) or 1 s, 2 s, 4 s …; 403 and 404 stop with a plain reason;
+ *   - only GET is ever sent, to any host (one way: nothing in Zotero is ever changed);
  *   - files: `GET /items/<key>/file` answers 302 to a signed URL on Zotero's storage. The redirect is
- *     followed only over https to ZOTERO_STORAGE_HOSTS, and without the key. Each file is streamed
- *     into the batch's private (0700) work folder, at most 2 GB, checked against Zotero's MD5,
+ *     followed only where zoteroFileHostAllowed says (https, port 443, R206/A1), and without the key;
+ *     a refused host's NAME (never its path or query, which hold a signature) is kept in
+ *     `refusedHosts` (at most 5). Each file is streamed into the batch's private (0700) work folder,
+ *     at most 2 GB, checked against Zotero's MD5 (a mismatch is fetched again, FILE_TRIES in all),
  *     unpacked when Zotero stored it compressed, and sniffed (`file-type`). A refused redirect, a
- *     missing file (e.g. a library that syncs files over WebDAV), an oversize or damaged file leaves
- *     the item with a file note instead (R66). A dry run downloads nothing.
+ *     missing file (e.g. a library that syncs files over WebDAV, or an older copy that never
+ *     matches), a 403 on the file (a key that may not read files: checked against the library so a
+ *     revoked key still ends the run), an oversize or damaged file leaves the item with a file note
+ *     instead (R66). A dry run, or `files: false`, downloads nothing.
+ *
+ * Unattended runs (Task Z2): every item request asks with `includeTrashed=1`, so an item in Zotero's
+ * bin is seen; a top-level one is yielded as `{ gone: "bin" }` and never as content. An incremental
+ * run yields each key of `/deleted?since=` that is known here (ScanContext.knownIds, this library
+ * only) as `{ gone: "deleted" }`; child keys are counted only. A full run yields each known item it
+ * did not see as `{ gone: "deleted" }` ONLY when its picture is whole: every page read, no restart
+ * and no back-off in the run, nothing dropped from a page. Gone items are yielded last, after a check
+ * that the key may still read the library; any failure first yields none. ScanContext.skip lets the
+ * engine pass an item by before anything is fetched for it.
  *
  * Items: the same mapping as the local import (zotero-common.ts): item types, creators, collections
  * (folderPath), tags (+ colours from /settings/tagColors), child notes (note-html.ts → Markdown),
@@ -26,10 +40,19 @@
  * Incremental (R72, R73): items carry `version` (`<user|group>:<id>/<key>`, a token over the
  * versions of the item and everything under it). `since` asks Zotero only for what changed after
  * that library version (`/items?since=`), then fetches each changed item's parent and children so
- * the whole item is compared; `/deleted?since=` is only counted ("deleted in Zotero, not deleted
- * here"). startZoteroWebImport reads `since` from the project's import settings and, when the batch
- * finished, records the library version Zotero reported (a governed, audited write). Sources deleted
- * here stay deleted (R73 tombstones, as for the local import).
+ * the whole item is compared; `/deleted?since=` is counted and its known keys yielded as gone (above;
+ * nothing is deleted here). startZoteroWebImport reads `since` from the project's import settings
+ * and, when the batch finished, records the library version Zotero reported (a governed, audited
+ * write); resumeZoteroWebImport resumes a batch with the `since` and files mode it started with and
+ * records the version under the same rule (finishZoteroWebRun). Sources deleted here stay deleted
+ * (R73 tombstones, as for the local import).
+ *
+ * What holds `since` back (the next run asks for the same changes again): a failed item (including
+ * the scan's own failure: unreachable, refused key, library gone, a page cut), a download that failed
+ * in a way a later run may fix (network error, 5xx, a connection cut, no disk space; also when it
+ * happened before a resume), and any Backoff or Retry-After in the run. What does not: a refused
+ * redirect host, a file not in Zotero's storage (404, or a checksum that never matches), a key that
+ * may not read files, a file over 2 GB.
  */
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -53,19 +76,35 @@ import { checkFiles, referenceMetadata, text } from "./refman.js";
 import { extraCitationKey, ownValue, recordFields, zoteroAnnotation, zoteroCreator, zoteroTimestamp } from "./zotero-common.js";
 import { ZOTERO_NOTES, type NotImported } from "./zotero-local.js";
 import type { BatchHandle, BulkImportDeps } from "./bulk/run.js";
+import type { BatchRecord } from "./bulk/batch.js";
 
 const VERSION: string = libraryVersion();
 
 export const ZOTERO_API_ORIGIN = "https://api.zotero.org";
 
 /**
- * Hosts a file download may be redirected to (https only). Zotero's file endpoint answers 302 with
- * a pre-signed URL on its Amazon S3 storage (zotero/dataserver `Zotero_Storage::getDownloadURL`;
- * the client's zfs.js reads the `Location`). UNVERIFIED: the bucket host could not be observed
- * without a key (public libraries do not serve files); these are the documented S3 forms plus
- * Zotero's file host. If downloads report "redirected elsewhere", add the host shown by Zotero here.
+ * Hosts a file download may be redirected to (https only; see zoteroFileHostAllowed for the exact
+ * rule). Zotero's file endpoint answers 302 with a pre-signed URL on its Amazon S3 storage
+ * (zotero/dataserver `Zotero_Storage::getDownloadURL`; the client's zfs.js reads the `Location`).
+ * UNVERIFIED (R79 open): the bucket host could not be observed without a key; these are the
+ * documented S3 forms plus Zotero's file host (kept by R206/A1). If a run records a refused host,
+ * add it to zoteroFileHostAllowed after the owner's report.
  */
 export const ZOTERO_STORAGE_HOSTS: readonly string[] = ["files.zotero.net", "zoterofilestorage.s3.amazonaws.com", "s3.amazonaws.com"];
+
+const STORAGE_PATH = "/zoterofilestorage/";
+
+/**
+ * Whether a file redirect may be followed (R206 (3), Amendment A1): https on port 443, no
+ * credentials, and host `zoterofilestorage.s3.amazonaws.com`, `files.zotero.net` (any path), or
+ * `s3.amazonaws.com` with a path under `/zoterofilestorage/`. Everything else is refused.
+ */
+export function zoteroFileHostAllowed(u: URL): boolean {
+  if (u.protocol !== "https:" || u.username || u.password || (u.port !== "" && u.port !== "443")) return false;
+  const h = u.hostname.toLowerCase();
+  if (h === "zoterofilestorage.s3.amazonaws.com" || h === "files.zotero.net") return true;
+  return h === "s3.amazonaws.com" && u.pathname.startsWith(STORAGE_PATH) && u.pathname.length > STORAGE_PATH.length;
+}
 
 export const MAX_ZOTERO_PAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_ZOTERO_FILE_BYTES = 2 * 1024 * 1024 * 1024;
@@ -83,6 +122,10 @@ const KEY = /^[A-Za-z0-9]{1,32}$/u;
 const MAX_RESTARTS = 3;
 /** Free space kept beyond a download (as for the local copy, sqlite-copy.ts). */
 const SPACE_MARGIN = 64 * 1024 * 1024;
+/** Tries of a file whose checksum does not match, within one run (then noted, never retried for ever). */
+export const ZOTERO_FILE_TRIES = 3;
+/** Refused redirect hosts kept in the scan result. */
+const MAX_REFUSED_HOSTS = 5;
 
 export const ZOTERO_WEB_REASONS = {
   noKey: "No Zotero API key is saved on this computer, so nothing was imported from Zotero online. Save your key first.",
@@ -96,16 +139,26 @@ export const ZOTERO_WEB_REASONS = {
 } as const;
 
 export const ZOTERO_WEB_FILE_NOTES = {
-  notInStorage: "attached file is not in Zotero's online storage",
+  notInStorage: "attached file is not in Zotero's online storage (it may be kept on a WebDAV server)",
   redirectRefused: "attached file download was redirected elsewhere and was not followed",
   tooLarge: "attached file is larger than 2 GB and was not downloaded",
   failed: "attached file could not be downloaded",
+  /** Kept for older batch reports; a checksum that never matches is now noted as `notInStorage` (Z2). */
   checksum: "attached file did not match Zotero's checksum and was not imported",
   noSpace: "attached file was not downloaded: not enough free disk space",
+  noFileAccess: "attached file was not fetched: the Zotero key may not read files",
 } as const;
 
-/** File notes that a later run may not get again (worth retrying): the item's version token is marked (R80). */
-const RETRYABLE: ReadonlySet<string> = new Set([ZOTERO_WEB_FILE_NOTES.failed, ZOTERO_WEB_FILE_NOTES.checksum, ZOTERO_WEB_FILE_NOTES.noSpace, ZOTERO_WEB_FILE_NOTES.redirectRefused]);
+/** File notes a later run may not get again: they hold `since` back, so the next run asks for the item again (R80). */
+const HOLDS_SINCE: ReadonlySet<string> = new Set([ZOTERO_WEB_FILE_NOTES.failed, ZOTERO_WEB_FILE_NOTES.noSpace]);
+
+/** A file the run wanted and did not store: what the item says, whether `since` waits for it, whether its version token is marked. */
+interface FileMiss {
+  note: string;
+  /** The version token is marked (`download-failed:<key>`), so a later run that stores the file sees the item as changed. */
+  stamp: boolean;
+}
+const miss = (note: string, stamp: boolean): FileMiss => ({ note, stamp });
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
@@ -114,8 +167,8 @@ export const ZOTERO_WEB_NOTES = {
   pendingDownloads: (n: number) => `${plural(n, "file is", "files are")} downloaded from Zotero when the import runs (not in this preview).`,
   groupLinked: (n: number) =>
     `Not imported from Zotero: ${plural(n, "linked file in a group library", "linked files in a group library")} (linked files live on the computer of the member who added them).`,
-  deleted: (n: number) =>
-    `${plural(n, "item was", "items were")} deleted in Zotero since the last import; ${n === 1 ? "it was" : "they were"} not deleted here.`,
+  deleted: (n: number) => `${plural(n, "item was", "items were")} deleted in Zotero since the last sync; ${n === 1 ? "it was" : "they were"} kept here and marked.`,
+  filesOff: (n: number) => `${plural(n, "attached file was", "attached files were")} not fetched: the Zotero key may not read files.`,
 } as const;
 
 class ZoteroWebError extends Error {
@@ -135,10 +188,13 @@ export interface ZoteroWebOptions {
   apiKeySecretName?: SecretName;
   /** Ask only for items changed after this library version (incremental). */
   since?: number;
+  /** Read the whole library, whatever `since` says (startZoteroWebImport: ignore the recorded version). */
+  full?: boolean;
+  /** Download files (default true). False: nothing is downloaded, and one scan note counts the files left (a key that may not read files). */
+  files?: boolean;
   /** Test seams. */
   dispatcher?: Dispatcher;
   sleep?: (ms: number) => Promise<void>;
-  storageHosts?: readonly string[];
   maxRetries?: number;
   /** Cap on Backoff / Retry-After waits (default 2 min). */
   maxWaitMs?: number;
@@ -153,10 +209,19 @@ export interface ZoteroWebScanResult {
   libraryVersion?: number;
   /** Items deleted in Zotero since `since` (incremental runs). */
   deletedInZotero: number;
-  /** The scan read the whole library (or every change) without stopping. */
+  /**
+   * The scan read the whole library (or every change) without stopping, and nothing it should have
+   * yielded as gone was held back (a full run whose picture was not whole is not complete).
+   */
   completed: boolean;
-  /** Downloads that failed in a way a later run may fix (network, checksum, disk space, redirect). */
+  /** Downloads that failed in a way a later run may fix (network, 5xx, a cut, disk space). */
   downloadsFailed: number;
+  /** The latest moment any Backoff or Retry-After in this run asked for (ms since the epoch, uncapped). */
+  backoffUntil?: number;
+  /** Names of the hosts file redirects went to that were refused (never a path or query), at most 5. */
+  refusedHosts: string[];
+  /** Items yielded as gone: deleted in Zotero, or in Zotero's bin. */
+  goneKeys: { deleted: number; bin: number };
 }
 
 export interface ZoteroWebAdapter extends ImportSourceAdapter {
@@ -186,20 +251,22 @@ class ZoteroApi {
    * library changed under the scan (LibraryChanged).
    */
   scanVersion: number | undefined;
+  /** A page held entries that were not items, or ended before Total-Results: the picture is not whole. */
+  lossy = false;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxRetries: number;
   private readonly maxWait: number;
-  private readonly hosts: Set<string>;
 
   constructor(
     private readonly apiKey: string,
     private readonly o: ZoteroWebOptions,
     private readonly signal: AbortSignal,
+    /** Where back-offs and refused hosts are reported (the adapter's scan result). */
+    private readonly result: ZoteroWebScanResult,
   ) {
     this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.maxRetries = o.maxRetries ?? MAX_RETRIES;
     this.maxWait = o.maxWaitMs ?? MAX_WAIT_MS;
-    this.hosts = new Set((o.storageHosts ?? ZOTERO_STORAGE_HOSTS).map((h) => h.toLowerCase()));
   }
 
   private async waitTurn(): Promise<void> {
@@ -208,9 +275,23 @@ class ZoteroApi {
     this.signal.throwIfAborted();
   }
 
+  /** The server asked for a pause of `ms`: the run reports the longest one asked for (uncapped). */
+  private askedToWait(ms: number | undefined): void {
+    if (ms === undefined) return;
+    const until = Date.now() + ms;
+    this.result.backoffUntil = Math.max(this.result.backoffUntil ?? 0, until);
+  }
+
   private noteBackoff(h: Headers): void {
     const ms = retryAfterMs(header(h, "backoff"), Date.now());
+    this.askedToWait(ms);
     if (ms !== undefined) this.nextAt = Math.max(this.nextAt, Date.now() + Math.min(ms, this.maxWait));
+  }
+
+  private refusedHost(u: URL | undefined): void {
+    const h = u?.hostname.toLowerCase().slice(0, 253);
+    const list = this.result.refusedHosts;
+    if (h && !list.includes(h) && list.length < MAX_REFUSED_HOSTS) list.push(h);
   }
 
   private retryWait(attempt: number, h: Headers | undefined): number {
@@ -246,6 +327,7 @@ class ZoteroApi {
       if (accept(res.statusCode)) return res;
       await res.body.dump().catch(() => {});
       const s = res.statusCode;
+      if (withKey && (s === 429 || s === 503)) this.askedToWait(retryAfterMs(header(res.headers, "retry-after"), Date.now()));
       if ((s === 429 || s >= 500) && attempt < this.maxRetries) {
         await this.sleep(this.retryWait(attempt, res.headers));
         continue;
@@ -296,28 +378,54 @@ class ZoteroApi {
     }
   }
 
-  /** Whether a redirect target is Zotero's storage over https (no credentials, default port). */
-  private allowed(u: URL): boolean {
-    return u.protocol === "https:" && this.hosts.has(u.hostname.toLowerCase()) && !u.username && !u.password && (u.port === "" || u.port === "443");
+  /**
+   * Whether the key may still read the library: one small request. Throws the refusal (keyRefused,
+   * notFound) or `unavailable` like any request.
+   */
+  async checkLibrary(prefix: string): Promise<void> {
+    const { body } = await this.json(`${prefix}/items/top`, { format: "versions", limit: 1 });
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
   }
 
   /**
    * Downloads an attachment's file into `dest` (streamed, capped, MD5-checked). Returns the
-   * file's path, or a file note. Never throws for a file-level problem; aborts and refused keys do.
+   * file's path, or what the item says instead. A file whose checksum does not match is fetched
+   * again, ZOTERO_FILE_TRIES times in all, then noted as not in Zotero's storage (a WebDAV library's
+   * older copy never matches). Never throws for a file-level problem; aborts and refused keys do.
    */
-  async file(prefix: string, attKey: string, dest: string, md5: string | undefined): Promise<{ path: string } | { note: string }> {
+  async file(prefix: string, attKey: string, dest: string, md5: string | undefined): Promise<{ path: string } | FileMiss> {
+    for (let attempt = 1; ; attempt++) {
+      const got = await this.fileOnce(prefix, attKey, dest, md5);
+      if (!("mismatch" in got)) return got;
+      if (attempt >= ZOTERO_FILE_TRIES) return miss(ZOTERO_WEB_FILE_NOTES.notInStorage, true);
+    }
+  }
+
+  private async fileOnce(prefix: string, attKey: string, dest: string, md5: string | undefined): Promise<{ path: string } | FileMiss | { mismatch: true }> {
+    // A file Zotero does not have, or one too large, is not worth asking for again; anything else marks the item's token.
+    const note = (n: string): FileMiss => miss(n, n !== ZOTERO_WEB_FILE_NOTES.notInStorage && n !== ZOTERO_WEB_FILE_NOTES.tooLarge);
     const max = this.o.maxFileBytes ?? MAX_ZOTERO_FILE_BYTES;
     const { dir } = splitDownloadPath(dest);
     const free = () => (this.o.freeSpace ?? statfsFree)(dir);
-    if ((await free()) < SPACE_MARGIN) return { note: ZOTERO_WEB_FILE_NOTES.noSpace };
+    if ((await free()) < SPACE_MARGIN) return note(ZOTERO_WEB_FILE_NOTES.noSpace);
     let res: Dispatcher.ResponseData;
     try {
       res = await this.get(new URL(`${prefix}/items/${attKey}/file`, ZOTERO_API_ORIGIN), true, (s) => s === 200 || (s >= 300 && s < 400));
     } catch (err) {
       if (err instanceof ZoteroWebError) {
-        if (err.reason === ZOTERO_WEB_REASONS.notFound) return { note: ZOTERO_WEB_FILE_NOTES.notInStorage };
-        if (err.reason === ZOTERO_WEB_REASONS.keyRefused) throw err;
-        return { note: ZOTERO_WEB_FILE_NOTES.failed };
+        if (err.reason === ZOTERO_WEB_REASONS.notFound) return note(ZOTERO_WEB_FILE_NOTES.notInStorage);
+        if (err.reason === ZOTERO_WEB_REASONS.keyRefused) {
+          // A key that may not read files, or a key revoked meanwhile: the library itself says which.
+          try {
+            await this.checkLibrary(prefix);
+          } catch (e) {
+            if (e instanceof ZoteroWebError && e.reason !== ZOTERO_WEB_REASONS.unavailable) throw e;
+            if (e instanceof ZoteroWebError) return note(ZOTERO_WEB_FILE_NOTES.failed);
+            throw e;
+          }
+          return note(ZOTERO_WEB_FILE_NOTES.noFileAccess);
+        }
+        return note(ZOTERO_WEB_FILE_NOTES.failed);
       }
       throw err;
     }
@@ -330,24 +438,28 @@ class ZoteroApi {
       try {
         next = new URL(loc ?? "", ZOTERO_API_ORIGIN);
       } catch {
-        return { note: ZOTERO_WEB_FILE_NOTES.redirectRefused };
+        return note(ZOTERO_WEB_FILE_NOTES.redirectRefused);
       }
-      if (!loc || hop >= MAX_REDIRECTS || !this.allowed(next)) return { note: ZOTERO_WEB_FILE_NOTES.redirectRefused };
+      if (!loc || hop >= MAX_REDIRECTS) return note(ZOTERO_WEB_FILE_NOTES.redirectRefused);
+      if (!zoteroFileHostAllowed(next)) {
+        this.refusedHost(next); // its name only: the path and query carry the signature
+        return note(ZOTERO_WEB_FILE_NOTES.redirectRefused);
+      }
       try {
         res = await this.get(next, false, (s) => s === 200 || (s >= 300 && s < 400));
       } catch (err) {
-        if (err instanceof ZoteroWebError) return { note: ZOTERO_WEB_FILE_NOTES.failed };
+        if (err instanceof ZoteroWebError) return note(ZOTERO_WEB_FILE_NOTES.failed);
         throw err;
       }
     }
     const len = Number(header(res.headers, "content-length"));
     if (Number.isFinite(len) && len > max) {
       res.body.destroy();
-      return { note: ZOTERO_WEB_FILE_NOTES.tooLarge };
+      return note(ZOTERO_WEB_FILE_NOTES.tooLarge);
     }
     if (Number.isFinite(len) && (await free()) < len * (compressed ? 2 : 1) + SPACE_MARGIN) {
       res.body.destroy();
-      return { note: ZOTERO_WEB_FILE_NOTES.noSpace };
+      return note(ZOTERO_WEB_FILE_NOTES.noSpace);
     }
     const target = compressed ? `${dest}.zip` : dest;
     const hash = createHash("md5");
@@ -370,12 +482,12 @@ class ZoteroApi {
     } catch (err) {
       await fsp.rm(target, { force: true });
       if (this.signal.aborted) throw this.signal.reason ?? err;
-      return { note: over ? ZOTERO_WEB_FILE_NOTES.tooLarge : ZOTERO_WEB_FILE_NOTES.failed };
+      return note(over ? ZOTERO_WEB_FILE_NOTES.tooLarge : ZOTERO_WEB_FILE_NOTES.failed);
     }
     if (!compressed) {
       if (md5 && /^[0-9a-f]{32}$/iu.test(md5) && hash.digest("hex") !== md5.toLowerCase()) {
         await fsp.rm(target, { force: true });
-        return { note: ZOTERO_WEB_FILE_NOTES.checksum };
+        return { mismatch: true };
       }
       return { path: target };
     }
@@ -385,20 +497,20 @@ class ZoteroApi {
       const entries = await extractArchive(target, out, { maxEntries: 10, maxEntryBytes: max, maxTotalBytes: max }, this.signal);
       const want = splitDownloadPath(dest).name;
       const e = entries.find((x) => !x.refused && x.name === want) ?? entries.find((x) => !x.refused && x.path);
-      if (!e) return { note: ZOTERO_WEB_FILE_NOTES.failed };
+      if (!e) return note(ZOTERO_WEB_FILE_NOTES.failed);
       // Zotero's MD5 is of the file itself, so it is checked after unpacking.
       if (md5 && /^[0-9a-f]{32}$/iu.test(md5)) {
         const h = createHash("md5");
         for await (const c of createReadStream(e.path) as AsyncIterable<Buffer>) h.update(c);
         if (h.digest("hex") !== md5.toLowerCase()) {
           await fsp.rm(out, { recursive: true, force: true });
-          return { note: ZOTERO_WEB_FILE_NOTES.checksum };
+          return { mismatch: true };
         }
       }
       return { path: e.path };
     } catch (err) {
       if (this.signal.aborted) throw this.signal.reason ?? err;
-      return { note: ZOTERO_WEB_FILE_NOTES.failed };
+      return note(ZOTERO_WEB_FILE_NOTES.failed);
     } finally {
       await fsp.rm(target, { force: true });
     }
@@ -429,15 +541,27 @@ const isItem = (x: unknown): x is WebItem => {
 };
 const asItem = (x: WebItem): WebItem => ({ key: x.key, version: Number.isInteger(x.version) ? x.version : Number(x.data.version) || 0, data: x.data });
 
+/** Item listings ask for the bin too (an item in Zotero's bin carries `data.deleted`). */
+const WITH_BIN = { includeTrashed: 1 } as const;
+
 async function* pages(api: ZoteroApi, path: string, query: Record<string, string | number>): AsyncGenerator<{ items: WebItem[]; headers: Headers }> {
   let start = 0;
   for (;;) {
     const { body, headers } = await api.json(path, { format: "json", include: "data", limit: PAGE, start, ...query }, true);
     if (!Array.isArray(body)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
-    yield { items: body.filter(isItem).map(asItem), headers };
+    const items = body.filter(isItem).map(asItem);
+    if (items.length !== body.length) api.lossy = true; // something on the page was not an item: not a whole picture
+    yield { items, headers };
     start += body.length;
     const total = Number(header(headers, "total-results"));
-    if (body.length < PAGE || (Number.isFinite(total) && start >= total)) return;
+    if (Number.isFinite(total)) {
+      if (start >= total) return;
+      if (!body.length) {
+        // The listing ended before the total it announced.
+        api.lossy = true;
+        return;
+      }
+    } else if (body.length < PAGE) return;
     if (start >= MAX_ITEMS) throw new ZoteroWebError(ZOTERO_WEB_REASONS.tooLarge);
   }
 }
@@ -447,16 +571,23 @@ const libraryVersionOf = (h: Headers): number | undefined => {
   return Number.isInteger(v) && v >= 0 ? v : undefined;
 };
 
-/** Everything fetched, by key; trashed items left out. */
+/** Everything fetched, by key; items in the bin kept apart (`trashed`), never as content. */
 class Tree {
   readonly byKey = new Map<string, WebItem>();
+  readonly trashed = new Map<string, WebItem>();
   add(i: WebItem): void {
-    if (this.byKey.size >= MAX_ITEMS && !this.byKey.has(i.key)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.tooLarge);
+    if (this.byKey.size + this.trashed.size >= MAX_ITEMS && !this.has(i.key)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.tooLarge);
     if (i.data.deleted) {
       this.byKey.delete(i.key);
+      this.trashed.set(i.key, i);
       return;
     }
+    this.trashed.delete(i.key);
     this.byKey.set(i.key, i);
+  }
+  /** Seen in this scan, in the library or in its bin. */
+  has(key: string): boolean {
+    return this.byKey.has(key) || this.trashed.has(key);
   }
   parentOf(i: WebItem): string | undefined {
     const p = i.data.parentItem;
@@ -475,21 +606,24 @@ class Tree {
   }
 }
 
-/** Everything in the library. */
+/** Everything in the library, the bin included. */
 async function fullTree(api: ZoteroApi, prefix: string, result: ZoteroWebScanResult): Promise<Tree> {
   const tree = new Tree();
-  for await (const p of pages(api, `${prefix}/items`, {})) {
+  for await (const p of pages(api, `${prefix}/items`, WITH_BIN)) {
     result.libraryVersion ??= libraryVersionOf(p.headers);
     for (const i of p.items) tree.add(i);
   }
   return tree;
 }
 
-/** What changed since `since`: each changed item's top-level item, with all its children (and their annotations). */
-async function changedTree(api: ZoteroApi, prefix: string, since: number, result: ZoteroWebScanResult): Promise<{ tree: Tree; tops: Set<string> }> {
+/**
+ * What changed since `since`: each changed item's top-level item, with all its children (and their
+ * annotations), except items `skip` says the engine passes by (nothing is listed under them).
+ */
+async function changedTree(api: ZoteroApi, prefix: string, since: number, result: ZoteroWebScanResult, skip: (topKey: string) => boolean): Promise<{ tree: Tree; tops: Set<string> }> {
   const tree = new Tree();
   const changed: WebItem[] = [];
-  for await (const p of pages(api, `${prefix}/items`, { since })) {
+  for await (const p of pages(api, `${prefix}/items`, { since, ...WITH_BIN })) {
     result.libraryVersion ??= libraryVersionOf(p.headers);
     for (const i of p.items) {
       changed.push(i);
@@ -499,11 +633,11 @@ async function changedTree(api: ZoteroApi, prefix: string, since: number, result
   // Parents not in the change set (a changed annotation's attachment, an attachment's item), up to two levels.
   for (let round = 0; round < 3; round++) {
     const missing = [...new Set(changed.map((i) => tree.parentOf(i)).concat([...tree.byKey.values()].map((i) => tree.parentOf(i))))].filter(
-      (k): k is string => !!k && !tree.byKey.has(k),
+      (k): k is string => !!k && !tree.has(k),
     );
     if (!missing.length) break;
     for (let i = 0; i < missing.length; i += 50) {
-      const { body } = await api.json(`${prefix}/items`, { format: "json", include: "data", itemKey: missing.slice(i, i + 50).join(","), limit: 50 }, true);
+      const { body } = await api.json(`${prefix}/items`, { format: "json", include: "data", itemKey: missing.slice(i, i + 50).join(","), limit: 50, ...WITH_BIN }, true);
       if (!Array.isArray(body)) throw new ZoteroWebError(ZOTERO_WEB_REASONS.unavailable);
       for (const x of body.filter(isItem).map(asItem)) tree.add(x);
     }
@@ -520,15 +654,15 @@ async function changedTree(api: ZoteroApi, prefix: string, since: number, result
   const tops = new Set<string>();
   for (const i of changed) {
     const t = topOf(i.key);
-    if (t) tops.add(t);
+    if (t && !skip(t)) tops.add(t);
   }
   // The whole of each changed item: its children, and the children of its attachments.
   for (const t of tops) {
-    for await (const p of pages(api, `${prefix}/items/${t}/children`, {})) {
+    for await (const p of pages(api, `${prefix}/items/${t}/children`, WITH_BIN)) {
       for (const c of p.items) {
         tree.add(c);
-        if (c.data.itemType === "attachment") {
-          for await (const q of pages(api, `${prefix}/items/${c.key}/children`, {})) for (const a of q.items) tree.add(a);
+        if (c.data.itemType === "attachment" && !c.data.deleted) {
+          for await (const q of pages(api, `${prefix}/items/${c.key}/children`, WITH_BIN)) for (const a of q.items) tree.add(a);
         }
       }
     }
@@ -644,7 +778,10 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   result.completed = false;
   result.deletedInZotero = 0;
   result.downloadsFailed = 0;
+  result.refusedHosts = [];
+  result.goneKeys = { deleted: 0, bin: 0 };
   delete result.libraryVersion;
+  delete result.backoffUntil;
   if (!ctx) {
     yield fail(ZOTERO_WEB_REASONS.unavailable);
     return;
@@ -660,34 +797,43 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
     yield fail(ZOTERO_WEB_REASONS.noKey);
     return;
   }
-  const api = new ZoteroApi(apiKey, o, signal);
+  const api = new ZoteroApi(apiKey, o, signal, result);
   apiKey = null;
   const prefix = `/${o.libraryType === "user" ? "users" : "groups"}/${o.libraryId}`;
+  const since = o.full ? undefined : o.since;
+  const wantFiles = o.files !== false;
+  const skip = (key: string): boolean => ctx.skip?.(key) === true;
   let tree!: Tree;
   let tops: Set<string> | undefined;
   let pathsOf!: (keys: unknown) => string[][];
   let colors: Map<string, string>;
+  let restarted = false;
+  /** Keys `/deleted?since=` lists (items; children among them). */
+  let deletedKeys: string[] = [];
   try {
     // Read everything at one library version: a change under the scan restarts it (R80 I2).
     for (let attempt = 0; ; attempt++) {
       api.scanVersion = undefined;
+      api.lossy = false;
       delete result.libraryVersion;
       try {
-        if (o.since === undefined) tree = await fullTree(api, prefix, result);
-        else ({ tree, tops } = await changedTree(api, prefix, o.since, result));
+        if (since === undefined) tree = await fullTree(api, prefix, result);
+        else ({ tree, tops } = await changedTree(api, prefix, since, result, (k) => skip(`zotero:${k}`)));
         pathsOf = await collectionPaths(api, prefix);
         break;
       } catch (err) {
         if (!(err instanceof LibraryChanged)) throw err;
+        restarted = true;
         if (attempt >= MAX_RESTARTS) throw new ZoteroWebError(ZOTERO_WEB_REASONS.changing);
       }
     }
     result.libraryVersion = api.scanVersion ?? result.libraryVersion;
     colors = await tagColorsOf(api, prefix);
-    if (o.since !== undefined) {
-      const { body } = await api.json(`${prefix}/deleted`, { since: o.since });
+    if (since !== undefined) {
+      const { body } = await api.json(`${prefix}/deleted`, { since });
       const items = (body as { items?: unknown } | null)?.items;
-      result.deletedInZotero = Array.isArray(items) ? items.filter((k) => typeof k === "string").length : 0;
+      deletedKeys = Array.isArray(items) ? items.filter((k): k is string => typeof k === "string") : [];
+      result.deletedInZotero = deletedKeys.length;
     }
   } catch (err) {
     if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
@@ -699,6 +845,7 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
   const counts: NotImported = { standaloneNotes: 0, attachmentNotes: 0, linkedUrls: 0, embeddedImages: 0, baseRelative: 0 };
   let snapshots = 0;
   let pendingDownloads = 0;
+  let filesOff = 0;
   let groupLinked = 0;
   const work = join(await ctx.workDir(), "zotero-web");
   await fsp.mkdir(work, { recursive: true, mode: 0o700 });
@@ -710,6 +857,8 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
       const type = str(d.itemType);
       if (tree.parentOf(it)) continue; // children come with their item
       if (tops && !tops.has(it.key)) continue;
+      // The engine passes this item by (e.g. already in a resumed batch's journal): nothing is fetched for it.
+      if (skip(`zotero:${it.key}`)) continue;
       if (type === "note") {
         counts.standaloneNotes++;
         continue;
@@ -733,18 +882,21 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
         let file: string | undefined;
         if (mode === "imported_file" || mode === "imported_url") {
           if (/^text\//iu.test(str(ad.contentType))) snapshots++;
-          else if (ctx.dryRun) pendingDownloads++;
+          else if (!wantFiles) {
+            // A key that may not read files: none is asked for; one scan note counts them, and the token is marked.
+            filesOff++;
+            stamp.push(`download-failed:${a.key}`);
+          } else if (ctx.dryRun) pendingDownloads++;
           else {
             const dir = join(work, a.key);
             await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
             const got = await api.file(prefix, a.key, join(dir, safeName(ad.filename)), typeof ad.md5 === "string" ? ad.md5 : undefined);
             if ("note" in got) {
               fileNotes.push(got.note);
-              if (RETRYABLE.has(got.note)) {
-                // Not recorded as done: the token differs from a later successful run's, so that run retries it.
-                result.downloadsFailed++;
-                stamp.push(`download-failed:${a.key}`);
-              }
+              // Not recorded as done: the token differs from a later successful run's, so that run retries it.
+              if (got.stamp) stamp.push(`download-failed:${a.key}`);
+              // A failure a later run may fix holds since back (R80 I1).
+              if (HOLDS_SINCE.has(got.note)) result.downloadsFailed++;
             }
             else {
               const st = await fsp.stat(got.path);
@@ -845,13 +997,64 @@ async function* scanWeb(o: ZoteroWebOptions, ref: string, result: ZoteroWebScanR
     yield fail(err instanceof ZoteroWebError ? err.reason : ZOTERO_WEB_REASONS.unavailable);
     return;
   }
+
+  // Gone from Zotero. Only from a picture that is whole: every page read (a failure has returned above).
+  const knownHere = knownOf(ctx, ref);
+  const gone = new Map<string, { gone: "deleted" | "bin"; version: string }>();
+  for (const t of tree.trashed.values()) if (!tree.parentOf(t)) gone.set(t.key, { gone: "bin", version: `bin:${t.version}` });
+  // A run that restarted, was asked to back off, or dropped something from a page has no whole picture of what is missing.
+  const whole = !restarted && result.backoffUntil === undefined && !api.lossy;
+  let heldBack = false;
+  if (since !== undefined) {
+    // Incremental: only what Zotero said. Keys of items known here (child keys never are: they are counted only).
+    for (const k of deletedKeys) if (knownHere.has(k) && !tree.has(k)) gone.set(k, { gone: "deleted", version: "deleted" });
+  } else {
+    const unseen = [...knownHere].filter((k) => !tree.has(k));
+    if (whole) for (const k of unseen) gone.set(k, { gone: "deleted", version: "deleted" });
+    else heldBack = unseen.length > 0; // not complete: since stays, and a later full run looks again
+  }
+  for (const k of [...gone.keys()]) if (skip(`zotero:${k}`)) gone.delete(k);
+  if (gone.size) {
+    // The key must still read this library now: a key revoked half-way yields no gone item.
+    try {
+      await api.checkLibrary(prefix);
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError" || signal.aborted) throw signal.reason ?? err;
+      yield fail(err instanceof ZoteroWebError ? err.reason : ZOTERO_WEB_REASONS.unavailable);
+      return;
+    }
+    for (const [k, g] of gone) {
+      signal.throwIfAborted();
+      result.goneKeys[g.gone]++;
+      yield { key: `zotero:${k}`, files: [], gone: g.gone, version: { id: `${ref}/${k}`, version: g.version } };
+    }
+  }
+
   const left = ZOTERO_NOTES.notImported(counts);
   if (left) ctx.note?.(left);
   if (snapshots) ctx.note?.(ZOTERO_WEB_NOTES.snapshots(snapshots));
   if (groupLinked) ctx.note?.(ZOTERO_WEB_NOTES.groupLinked(groupLinked));
   if (pendingDownloads) ctx.note?.(ZOTERO_WEB_NOTES.pendingDownloads(pendingDownloads));
+  if (filesOff) ctx.note?.(ZOTERO_WEB_NOTES.filesOff(filesOff));
   if (result.deletedInZotero) ctx.note?.(ZOTERO_WEB_NOTES.deleted(result.deletedInZotero));
-  result.completed = true;
+  result.completed = !heldBack;
+}
+
+/** The item keys of this library (`<ref>/<key>`) among the ids the engine knows; ids of any other library are left out. */
+function knownOf(ctx: ScanContext, ref: string): Set<string> {
+  const out = new Set<string>();
+  let ids: ReadonlySet<string> | undefined;
+  try {
+    ids = ctx.knownIds?.();
+  } catch {
+    ids = undefined;
+  }
+  for (const id of ids ?? []) {
+    if (typeof id !== "string" || !id.startsWith(`${ref}/`)) continue;
+    const k = id.slice(ref.length + 1);
+    if (KEY.test(k)) out.add(k);
+  }
+  return out;
 }
 
 const TOOL = { name: "zotero-web-import", version: VERSION };
@@ -862,7 +1065,8 @@ export function zoteroWebAdapter(opts: ZoteroWebOptions): ZoteroWebAdapter {
   if (typeof opts.libraryId !== "string" || !/^\d{1,12}$/u.test(opts.libraryId)) throw new TypeError("libraryId must be a numeric Zotero user or group ID");
   if (opts.since !== undefined && (!Number.isInteger(opts.since) || opts.since < 0)) throw new TypeError("since must be a library version");
   const ref = `${opts.libraryType}:${opts.libraryId}`;
-  const result: ZoteroWebScanResult = { deletedInZotero: 0, completed: false, downloadsFailed: 0 };
+  const since = opts.full ? undefined : opts.since;
+  const result: ZoteroWebScanResult = { deletedInZotero: 0, completed: false, downloadsFailed: 0, refusedHosts: [], goneKeys: { deleted: 0, bin: 0 } };
   return {
     kind: "zotero-web",
     location: ref,
@@ -871,15 +1075,28 @@ export function zoteroWebAdapter(opts: ZoteroWebOptions): ZoteroWebAdapter {
     incremental: true,
     uniqueCitationKeys: true,
     tool: TOOL,
+    // Kept with the batch record, so a resumed batch asks for the same changes with the same files mode (Z2).
+    resumeOptions: { ...(since !== undefined ? { zoteroSince: since } : {}), zoteroFiles: opts.files !== false },
     scan: (signal, ctx) => scanWeb(opts, ref, result, signal, ctx),
-    scanResult: () => ({ ...result }),
+    scanResult: () => ({ ...result, refusedHosts: [...result.refusedHosts], goneKeys: { ...result.goneKeys } }),
   };
 }
 
-/** For resuming a batch from its record ("user:<id>" / "group:<id>"); a full scan (resumed items are skipped). */
-export function zoteroWebAdapterFor(location: string): ImportSourceAdapter | undefined {
+/**
+ * For resuming a batch from its record ("user:<id>" / "group:<id>"), with the options it started
+ * with: its `since` (absent in records written before Task Z2, and for full runs: a full scan) and
+ * files mode. Items already in the batch's journal are passed by before anything is fetched.
+ */
+export function zoteroWebAdapterFor(location: string, adapterOptions?: BatchRecord["adapterOptions"]): ZoteroWebAdapter | undefined {
   const m = /^(user|group):(\d{1,12})$/u.exec(location);
-  return m ? zoteroWebAdapter({ libraryType: m[1] as "user" | "group", libraryId: m[2]! }) : undefined;
+  if (!m) return undefined;
+  const since = adapterOptions?.zoteroSince;
+  return zoteroWebAdapter({
+    libraryType: m[1] as "user" | "group",
+    libraryId: m[2]!,
+    ...(Number.isInteger(since) && since! >= 0 ? { since } : {}),
+    ...(adapterOptions?.zoteroFiles === false ? { files: false } : {}),
+  });
 }
 
 /** The library version the last finished Web API import of `ref` saw in this project, if any. */
@@ -889,45 +1106,79 @@ export function zoteroWebSince(repo: Repo, projectId: string, ref: string): numb
   return zw && Object.hasOwn(zw, ref) ? zw[ref]!.lastLibraryVersion : undefined;
 }
 
-/**
- * Starts a Zotero Web API batch: refused up front (BatchRefusedError) when no key is saved or there
- * is no keyring; incremental from the project's recorded library version unless `full`. When the
- * batch finishes, the library version Zotero reported is recorded (governed, audited), so the next
- * run asks only for later changes. `done` settles after that. An incremental run does not fetch
- * unchanged items, so it does not back-fill the sort index of annotations imported before it was kept
- * (R196); a `full` run does (the reader orders such a page geometrically until then).
- */
-export async function startZoteroWebImport(
-  deps: BulkImportDeps,
-  projectId: string,
-  opts: ZoteroWebOptions & { full?: boolean },
-  options: ImportOptionsInput = {},
-): Promise<BatchHandle> {
-  const { BatchRefusedError, startBatch } = await import("./bulk/run.js");
+/** Refused up front (BatchRefusedError) when no key is saved or there is no keyring; the key itself is not kept. */
+async function requireKey(name: SecretName | undefined): Promise<void> {
+  const { BatchRefusedError } = await import("./bulk/run.js");
   let key: string | null;
   try {
-    key = await getSecret(opts.apiKeySecretName ?? "zotero-api-key");
+    key = await getSecret(name ?? "zotero-api-key");
   } catch (err) {
     if (err instanceof SecretStoreUnavailableError) throw new BatchRefusedError(ZOTERO_WEB_REASONS.noStore);
     throw err;
   }
   if (!key) throw new BatchRefusedError(ZOTERO_WEB_REASONS.noKey);
   key = null;
-  const { full, ...rest } = opts;
+}
+
+/**
+ * Starts a Zotero Web API batch: refused up front (BatchRefusedError) when no key is saved or there
+ * is no keyring; incremental from the project's recorded library version unless `full`. When the
+ * batch finishes, the library version Zotero reported is recorded (finishZoteroWebRun), so the next
+ * run asks only for later changes. `done` settles after that. An incremental run does not fetch
+ * unchanged items, so it does not back-fill the sort index of annotations imported before it was kept
+ * (R196); a `full` run does (the reader orders such a page geometrically until then).
+ */
+export async function startZoteroWebImport(deps: BulkImportDeps, projectId: string, opts: ZoteroWebOptions, options: ImportOptionsInput = {}): Promise<BatchHandle> {
+  const { startBatch } = await import("./bulk/run.js");
+  await requireKey(opts.apiKeySecretName);
+  const { full, since: given, ...base } = opts;
   const ref = `${opts.libraryType}:${opts.libraryId}`;
-  const since = full ? undefined : (opts.since ?? zoteroWebSince(deps.repo, projectId, ref));
-  const { since: _ignored, ...base } = rest;
+  const since = full ? undefined : (given ?? zoteroWebSince(deps.repo, projectId, ref));
   const adapter = zoteroWebAdapter({ ...base, ...(since !== undefined ? { since } : {}) });
   const h = await startBatch(deps, projectId, adapter, options);
+  return finishZoteroWebRun(deps, projectId, adapter, h, since);
+}
+
+/**
+ * Resumes a Zotero Web API batch (paused, cancelled or interrupted) with the `since` and files mode
+ * it started with, and, when it is done, records the library version under the same rule as a
+ * start (finishZoteroWebRun). A batch of another kind is resumed as resumeBatch does it.
+ */
+export async function resumeZoteroWebImport(deps: BulkImportDeps, projectId: string, batchId: string): Promise<BatchHandle> {
+  const { resumeBatch } = await import("./bulk/run.js");
+  const { findBatch } = await import("./bulk/batch.js");
+  const rec = await findBatch(deps.repo, projectId, batchId);
+  const adapter = rec?.source.kind === "zotero-web" ? zoteroWebAdapterFor(rec.source.location, rec.adapterOptions) : undefined;
+  if (!rec || !adapter || rec.state === "finished" || rec.state === "undone") return resumeBatch(deps, projectId, batchId);
+  await requireKey(undefined);
+  const h = await resumeBatch(deps, projectId, batchId, adapter);
+  return finishZoteroWebRun(deps, projectId, adapter, h, rec.adapterOptions?.zoteroSince);
+}
+
+/**
+ * When a Web batch (started or resumed) is done, records the library version Zotero reported, so the
+ * next run asks only for later changes. Only a run where nothing held it back moves it on (R80 I1):
+ * the batch finished with no failed item, the scan completed with no back-off and no download that
+ * a later run may fix, in this run or, for a resumed batch, in any earlier part of it (its journal).
+ * The batch record keeps the version it recorded (`recordedLibraryVersion`), written first, so that
+ * undo can put `since` back (Z5). `done` settles after that.
+ */
+export function finishZoteroWebRun(deps: BulkImportDeps, projectId: string, adapter: ZoteroWebAdapter, h: BatchHandle, since: number | undefined): BatchHandle {
   const done = h.done.then(async (r) => {
     const s = adapter.scanResult();
-    // Only a run where nothing failed moves `since` on; otherwise the next run asks for the same changes again (R80 I1).
-    if (r.state === "finished" && r.counts.failed === 0 && s.completed && s.downloadsFailed === 0 && s.libraryVersion !== undefined && s.libraryVersion !== since) {
-      try {
-        await recordZoteroWebLibraryVersion(deps.repo, projectId, ref, s.libraryVersion);
-      } catch (err) {
-        deps.debug?.(`zotero web: the library version could not be recorded (${err instanceof Error ? err.name : "error"})`);
-      }
+    const v = s.libraryVersion;
+    if (r.state !== "finished" || r.counts.failed !== 0 || !s.completed || s.downloadsFailed !== 0 || s.backoffUntil !== undefined || v === undefined || v === since) return r;
+    try {
+      const { BOOKKEEPING, findBatch, latestByKey, readJournal, writeBatchRecord } = await import("./bulk/batch.js");
+      const rec = await findBatch(deps.repo, projectId, r.batchId);
+      if (!rec || rec.state !== "finished") return r;
+      // A download that failed before a resume is in the journal, not in this run's scan result.
+      for (const e of latestByKey(await readJournal(deps.repo, projectId, rec.dir)).values()) if (e.notes?.some((n) => HOLDS_SINCE.has(n))) return r;
+      const projectRel = deps.repo.getProject(projectId).folder;
+      await deps.repo.mutate(projectId, BOOKKEEPING, (tx) => writeBatchRecord(tx, projectRel, { ...rec, recordedLibraryVersion: v }), { op: "import.batch.save" });
+      await recordZoteroWebLibraryVersion(deps.repo, projectId, adapter.ref, v);
+    } catch (err) {
+      deps.debug?.(`zotero web: the library version could not be recorded (${err instanceof Error ? err.name : "error"})`);
     }
     return r;
   });

@@ -885,7 +885,7 @@ describe("unattended scans against the stand-in (Z2)", () => {
     expect(it0.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.noFileAccess]);
     expect(ZOTERO_WEB_FILE_NOTES.noFileAccess).toBe("attached file was not fetched: the Zotero key may not read files");
     expect(it0.files).toEqual([]);
-    expect(it0.annotations?.map((a) => [a.kind, a.quote ?? a.body, a.anchor])).toEqual(
+    expect(it0.annotations?.map((a) => [a.kind, a.quote ?? a.body, a.file])).toEqual(
       expect.arrayContaining([
         ["highlight", "still here", undefined],
         ["note", expect.stringContaining("my reading"), undefined],
@@ -919,7 +919,7 @@ describe("unattended scans against the stand-in (Z2)", () => {
       expect(it0.files).toEqual([]);
       expect(it0.fileNotes).toEqual([ZOTERO_WEB_FILE_NOTES.notInStorage]);
       expect(it0.annotations).toEqual([expect.objectContaining({ kind: "highlight", quote })]);
-      expect(it0.annotations![0]).not.toHaveProperty("anchor");
+      // Unanchored: no file to anchor in (the engine stores it without an anchor; its page stays as a label).
       expect(it0.annotations![0]).not.toHaveProperty("file");
     }
     // The older copy fails its checksum on each of the bounded tries, then it is noted.
