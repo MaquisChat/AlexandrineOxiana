@@ -27,7 +27,12 @@ import { WatchRegisterUnwritableError } from "../repo/watch-register.js";
 import { openTestRepo } from "../repo/testing.js";
 import { createAttach, type Attach } from "./attach.js";
 import { POINTER_REASON, contentState, ignoredName as ignoredNameLocal } from "./watch-local.js";
+import { getWatchChoices, getWatchDownloadCount, setWatchChoices, type WatchChoices } from "./watch-choices.js";
+import { hydrate } from "../reconnect.js";
 import {
+  WATCH_DOWNLOAD_CONFIRM_BYTES,
+  WATCH_DOWNLOAD_RETRY_MS,
+  WATCH_FETCH_TIMEOUT_MS,
   WATCH_FS_TIMEOUT_MS,
   WATCH_MASS_GONE_MIN,
   WATCH_PROBLEMS_MAX,
@@ -129,6 +134,15 @@ processing:
   metadata_lookup: []
 `;
 
+// Task W4: every watch the tests start through `start()` gets a counting stand-in for `fetchContent` (the one way a
+// file that is not on this computer is read). Unless a test chose "download" (`fetchAllowed`), it must never be called:
+// under "leave", the default, every scenario of W2 and W3 makes exactly zero calls.
+let fetchCalls: string[] = [];
+let fetchAllowed = false;
+const countingFetch = async (p: string): Promise<void> => {
+  fetchCalls.push(p);
+};
+
 let tmp: string;
 let lib: Library;
 let ring: KeyRing;
@@ -160,11 +174,14 @@ beforeEach(async () => {
   http = new HttpClient({ libraryRoot: lib.root, dispatcher: agent, sleep: async () => {}, maxRetries: 0 });
   inbox = join(tmp, "Inbox");
   await mkdir(inbox);
+  fetchCalls = [];
+  fetchAllowed = false;
   spyMutations();
 });
 
 afterEach(async () => {
   await Promise.all(watches.splice(0).map((w) => w.stop()));
+  if (!fetchAllowed) expect(fetchCalls).toEqual([]); // "leave": fetchContent is never called (Task W4)
   const dirs = await Promise.all([...watchedDirs].map((d) => realpath(d).catch(() => d)));
   expect(mutationsIn([...dirs, ...watchedDirs])).toEqual([]);
   vi.restoreAllMocks();
@@ -206,7 +223,7 @@ function start(
   const d = dir ?? inbox;
   if (!lib.root.startsWith(d) && !d.startsWith(lib.root)) watchedDirs.add(d);
   const w = watchFolder(
-    { repo, http, lib, onEvent: (e) => events.push(e), onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }), ...seams },
+    { repo, http, lib, onEvent: (e) => events.push(e), onStatus: (s) => statuses.push({ ...structuredClone(s), at: Date.now() }), fetchContent: countingFetch, ...seams },
     p.id,
     dir ?? inbox,
     { ...(recursive ? { recursive: true } : {}), ...(collectionId ? { collectionId } : {}) },
@@ -2124,3 +2141,502 @@ function realishAttach(): Attach {
     attachFiles: async (_p, ps) => ps.map((path) => ({ path, outcome: "created" as const, sourceId: newId() })),
   };
 }
+
+describe('pause, resume, and "Download and import them" only when asked (Task W4)', () => {
+  const FASTW = { stabilityMs: 200, pollMs: 50, registerFlushMs: 100 } as const;
+  const page = (n: number) => ({ offset: 0, limit: n });
+  const watched = async (p: Project, dir = inbox) => (await addWatchedFolder({ repo, lib }, p.id, dir)).id;
+  const choose = (p: Project, wid: string, patch: Partial<WatchChoices>) => setWatchChoices({ repo, lib }, p.id, wid, patch);
+  const withService = (reason: string) => reason.replaceAll("{provider}", "the cloud service");
+
+  /** Every file-system call the engine makes in the folder (through its seams), counted. */
+  function countingFs(...dirs: string[]) {
+    let n = 0;
+    const mine = (q: unknown) => dirs.some((d) => String(q) === d || String(q).startsWith(`${d}/`));
+    const wrap =
+      <A extends unknown[], R>(f: (...a: A) => Promise<R>) =>
+      async (...a: A): Promise<R> => {
+        if (mine(a[0])) n++;
+        return f(...a);
+      };
+    return {
+      get n() {
+        return n;
+      },
+      fs: {
+        lstat: wrap((q: string) => fsp.lstat(q, { bigint: true })),
+        readdir: wrap((q: string) => fsp.readdir(q, { withFileTypes: true })),
+        stat: wrap((q: string) => fsp.stat(q)),
+        realpath: wrap((q: string) => fsp.realpath(q)),
+        open: wrap((q: string, f: number) => realFspOpen(q, f)),
+      },
+    };
+  }
+
+  /**
+   * A stand-in for the cloud service's download: it counts calls and how many run at once, and makes the file local the
+   * way a download does here (Linux: the file gets its blocks), with content of its own. `hold(name)` makes a call wait.
+   */
+  function downloader(opts: { local?: boolean } = {}) {
+    const calls: string[] = [];
+    const holds = new Map<string, Promise<void>>();
+    let outstanding = 0;
+    let most = 0;
+    return {
+      calls,
+      get most() {
+        return most;
+      },
+      hold(name: string): () => void {
+        let release!: () => void;
+        holds.set(name, new Promise<void>((r) => (release = r)));
+        return () => release();
+      },
+      fn: async (q: string): Promise<void> => {
+        calls.push(q);
+        most = Math.max(most, ++outstanding);
+        try {
+          await holds.get(q.split("/").at(-1)!);
+          if (opts.local === false) return; // it returns, but the file is still not here
+          const size = Number((await fsp.lstat(q)).size);
+          await writeFile(q, Buffer.from(`${q}:`.repeat(Math.ceil(size / (q.length + 1)) + 1).slice(0, size)));
+        } finally {
+          outstanding--;
+        }
+      },
+    };
+  }
+
+  it("the constants and the sentences", () => {
+    expect(WATCH_DOWNLOAD_CONFIRM_BYTES).toBe(1073741824);
+    expect(WATCH_DOWNLOAD_RETRY_MS).toBe(600_000);
+    expect(WATCH_FETCH_TIMEOUT_MS).toBeGreaterThan(WATCH_FS_TIMEOUT_MS);
+    expect(WATCH_REASONS.paused).toBe("Paused. Files put in the folder meanwhile come in when you resume.");
+    expect(WATCH_REASONS.downloadHeld).toBe("Downloading stopped at 1 GB. {files} files ({size}) are waiting for your word.");
+    expect(WATCH_REASONS.couldNotDownload).toBe("The file could not be downloaded ({provider} may be offline). It is tried again in 10 minutes.");
+  });
+
+  it("a paused watch reads nothing and catches up on resume", async () => {
+    const p = await project();
+    const wid = await watched(p);
+    const real = await realpath(inbox);
+    await writeFile(join(inbox, "before.pdf"), await buildPdf({ title: "Before", extra: "w4-p1" }));
+    await choose(p, wid, { paused: true }); // chosen before the app started: a pause survives a restart
+    const counted = countingFs(inbox, real);
+    const record = vi.spyOn(repo, "recordWatchedFiles");
+    const opened = readSpies();
+    const { w, events } = start(p, { ...FASTW, watchId: wid, fs: counted.fs, attach: realishAttach() });
+    await w.ready;
+    expect(w.status()).toMatchObject({ state: "paused", reason: WATCH_REASONS.paused, scanning: false });
+    await sleep(600);
+    await writeFile(join(inbox, "during.pdf"), await buildPdf({ title: "During", extra: "w4-p2" }));
+    await sleep(800);
+    expect(counted.n).toBe(0); // no lstat, no listing, no open: not one call on the folder
+    expect(opened(join(real, "before.pdf"))).toEqual([]);
+    expect(record).not.toHaveBeenCalled();
+    expect(events.filter((e) => e.file)).toEqual([]);
+    expect(w.status().state).toBe("paused");
+
+    // Resume: one full listing; both files come in.
+    await choose(p, wid, { paused: false });
+    await w.refreshChoices();
+    await until(() => ["before.pdf", "during.pdf"].every((f) => events.some((e) => e.kind === "imported" && e.file === f)));
+    expect(w.status()).toMatchObject({ state: "watching", counts: { cameIn: 2 } });
+    await until(() => record.mock.calls.length > 0);
+
+    // Paused while running: events only mark the folder; nothing is read; the register is not written.
+    await choose(p, wid, { paused: true });
+    await w.refreshChoices();
+    await until(() => w.status().state === "paused");
+    await sleep(300); // anything already under way settles
+    const n = counted.n;
+    const lines = record.mock.calls.length;
+    await writeFile(join(inbox, "while.pdf"), await buildPdf({ title: "While", extra: "w4-p3" }));
+    await sleep(1000);
+    expect(counted.n).toBe(n);
+    expect(record.mock.calls.length).toBe(lines);
+    expect(events.some((e) => e.file === "while.pdf")).toBe(false);
+    await choose(p, wid, { paused: false });
+    await w.refreshChoices();
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "while.pdf"));
+    expect(w.status().counts.cameIn).toBe(3);
+  }, 40_000);
+
+  it('"leave" never calls fetchContent', async () => {
+    const p = await project();
+    const wid = await watched(p);
+    await sparse(join(inbox, "a.pdf"), 5000);
+    await sparse(join(inbox, "b.pdf"), 7000);
+    const { w } = start(p, { ...FASTW, recheckMs: 100, watchId: wid });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 2);
+    await sleep(1500); // many polls and re-checks
+    expect(await getWatchChoices({ repo, lib }, p.id, wid)).toMatchObject({ notDownloaded: "leave" });
+    expect(w.status().downloadHeld).toBeUndefined();
+    expect(fetchCalls).toEqual([]);
+  });
+
+  it('"download" fetches one at a time and stops at the confirmed size', async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "c.pdf"), 300);
+    await sparse(join(inbox, "a.pdf"), 100);
+    await sparse(join(inbox, "b.pdf"), 200);
+    const dl = downloader();
+    const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn, attach: realishAttach() });
+    await w.ready;
+    await until(() => w.status().counts.notDownloadedBytes === 600);
+    expect(dl.calls).toEqual([]);
+    // The researcher saw 600 bytes and agreed to 300: a and b (100 + 200 = exactly 300) come; c waits for their word.
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 300 });
+    await w.refreshChoices();
+    await until(() => w.status().downloadHeld !== undefined);
+    expect(dl.calls).toEqual([join(real, "a.pdf"), join(real, "b.pdf")]); // name order, one at a time
+    await until(() => ["a.pdf", "b.pdf"].every((f) => events.some((e) => e.kind === "imported" && e.file === f)));
+    expect(w.status()).toMatchObject({
+      state: "watching",
+      reason: "Downloading stopped at 1 GB. 1 files (300 bytes) are waiting for your word.",
+      downloadHeld: { files: 1, bytes: 300 },
+      counts: { cameIn: 2, notDownloaded: 1, notDownloadedBytes: 300 },
+    });
+    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 300 });
+    await sleep(500);
+    expect(dl.calls).toHaveLength(2);
+    // Their word: the size they see now. c comes in.
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 300 });
+    await w.refreshChoices();
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "c.pdf"));
+    expect(dl.calls).toEqual([join(real, "a.pdf"), join(real, "b.pdf"), join(real, "c.pdf")]);
+    expect(w.status().downloadHeld).toBeUndefined();
+    expect(w.status().counts).toMatchObject({ cameIn: 3, notDownloaded: 0 });
+    expect(dl.most).toBe(1);
+  }, 30_000);
+
+  for (const [name, confirmed, fetched] of [
+    ["at exactly the limit", 1000, true],
+    ["one byte under the limit", 1001, true],
+    ["one byte over the limit", 999, false],
+  ] as const)
+    it(`the allowance ${name}`, async () => {
+      fetchAllowed = true;
+      const p = await project();
+      const wid = await watched(p);
+      await sparse(join(inbox, "x.pdf"), 1000);
+      const dl = downloader();
+      const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn, attach: realishAttach() });
+      await w.ready;
+      await until(() => w.status().counts.notDownloadedBytes === 1000);
+      await choose(p, wid, { notDownloaded: "download", confirmedBytes: confirmed });
+      await w.refreshChoices();
+      if (fetched) {
+        await until(() => events.some((e) => e.kind === "imported" && e.file === "x.pdf"));
+        expect(dl.calls).toHaveLength(1);
+        expect(w.status().downloadHeld).toBeUndefined();
+      } else {
+        await until(() => w.status().downloadHeld !== undefined);
+        await sleep(400);
+        expect(dl.calls).toEqual([]);
+        expect(w.status().downloadHeld).toEqual({ files: 1, bytes: 1000 });
+        expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 0 });
+      }
+    });
+
+  it("a file larger than the whole allowance is never fetched", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    await sparse(join(inbox, "huge.mov"), WATCH_DOWNLOAD_CONFIRM_BYTES * 3);
+    const dl = downloader();
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 10 });
+    await w.refreshChoices();
+    await until(() => w.status().downloadHeld !== undefined);
+    await sleep(400);
+    expect(dl.calls).toEqual([]);
+    expect(w.status()).toMatchObject({ reason: "Downloading stopped at 1 GB. 1 files (3.2 GB) are waiting for your word.", downloadHeld: { files: 1, bytes: WATCH_DOWNLOAD_CONFIRM_BYTES * 3 } });
+  });
+
+  it("a later arrival is held at 1 GiB beyond the confirmed size", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "seen.pdf"), 10);
+    // The service does not download (the file stays as it was): the bytes count all the same, and nothing is read.
+    const dl = downloader({ local: false });
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn });
+    await w.ready;
+    await until(() => w.status().counts.notDownloadedBytes === 10);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 10 });
+    await w.refreshChoices();
+    await until(() => dl.calls.length === 1);
+    // Later arrivals: the first takes the count to exactly confirmed + 1 GiB; the next, of one byte, is held.
+    await sparse(join(inbox, "later-1.mov"), WATCH_DOWNLOAD_CONFIRM_BYTES);
+    await until(() => dl.calls.length === 2);
+    await sparse(join(inbox, "later-2.pdf"), 1);
+    await until(() => w.status().downloadHeld !== undefined);
+    await sleep(400);
+    expect(dl.calls).toEqual([join(real, "seen.pdf"), join(real, "later-1.mov")]);
+    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 10 + WATCH_DOWNLOAD_CONFIRM_BYTES });
+    expect(w.status().downloadHeld).toEqual({ files: 3, bytes: 11 + WATCH_DOWNLOAD_CONFIRM_BYTES });
+  }, 30_000);
+
+  it("a size that grows between the count and the fetch is read again, and held when it passes the allowance", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    await sparse(join(inbox, "grows.pdf"), 100);
+    const dl = downloader();
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn, watchEvents: false, rescanMs: 600_000 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloadedBytes === 100);
+    await truncate(join(inbox, "grows.pdf"), 150); // no event, no rescan: the engine still counts 100
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 100 });
+    await w.refreshChoices();
+    await until(() => w.status().downloadHeld !== undefined);
+    await sleep(400);
+    expect(dl.calls).toEqual([]);
+    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 0 });
+  });
+
+  it("a fetch that leaves the file not local is could-not-download and nothing is read", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "offline.pdf"), 4096);
+    // The library's own hydrate (the default) reads the file; here nothing downloads it, so it stays as it was.
+    const calls: number[] = [];
+    const fetchContent = async (q: string) => {
+      calls.push(Date.now());
+      await hydrate(q);
+    };
+    const attach = quickAttach();
+    const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent, attach, downloadRetryMs: 800 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    const opens = vi.spyOn(fsp, "open");
+    syncBuiltinESMExports();
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 4096 });
+    await w.refreshChoices();
+    await until(() => w.problems(page(10)).items[0]?.kind === "could-not-download");
+    expect(w.problems(page(10)).items).toEqual([{ file: "offline.pdf", kind: "could-not-download", reason: withService(WATCH_REASONS.couldNotDownload), bytes: 4096 }]);
+    expect(w.status().counts).toMatchObject({ notDownloaded: 1, cameIn: 0 });
+    expect(attach.paths).toEqual([]);
+    expect(opens.mock.calls.filter((a) => String(a[0]) === join(real, "offline.pdf"))).toEqual([]); // the import path never opened it
+    expect(events.some((e) => e.kind === "imported")).toBe(false);
+    // Its 4096 bytes were counted before the download: no second try without the researcher's word.
+    await sleep(1500);
+    expect(calls).toHaveLength(1);
+    expect(w.status().downloadHeld).toEqual({ files: 1, bytes: 4096 });
+    // Their word again: tried again, but only once the retry time has passed since the first try.
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 4096 });
+    await w.refreshChoices();
+    await until(() => calls.length === 2);
+    expect(calls[1]! - calls[0]!).toBeGreaterThanOrEqual(800);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  }, 30_000);
+
+  it("a failed download is listed and tried again later", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    await sparse(join(inbox, "flaky.pdf"), 64);
+    let fail = true;
+    const dl = downloader();
+    const fetchContent = async (q: string) => {
+      if (!fail) return dl.fn(q);
+      dl.calls.push(q);
+      throw Object.assign(new Error("the service is offline"), { code: "EIO" });
+    };
+    const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent, attach: realishAttach(), downloadRetryMs: 700 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 1000 });
+    await w.refreshChoices();
+    await until(() => w.problems(page(10)).items[0]?.kind === "could-not-download");
+    expect(w.problems(page(10)).items[0]).toEqual({ file: "flaky.pdf", kind: "could-not-download", reason: withService(WATCH_REASONS.couldNotDownload), bytes: 64 });
+    const t0 = Date.now();
+    fail = false;
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "flaky.pdf"));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(400);
+    expect(dl.calls).toHaveLength(2);
+    expect(w.problems(page(10)).total).toBe(0);
+    expect(await getWatchDownloadCount({ repo, lib }, p.id, wid)).toEqual({ confirmation: 1, fetchedBytes: 128 }); // both tries counted
+  });
+
+  it("a pointer file and a link are never fetched", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const outside = join(tmp, "Outside");
+    await mkdir(join(outside, "Deep"), { recursive: true });
+    await sparse(join(outside, "elsewhere.pdf"), 500);
+    await sparse(join(outside, "Deep", "inner.pdf"), 500);
+    await mkdir(join(inbox, "Sub"));
+    await sparse(join(inbox, "Sub", "x.pdf"), 500);
+    await sparse(join(inbox, "Notes.gdoc"), 500);
+    await sparse(join(inbox, "target.pdf"), 500);
+    await symlink(join(outside, "elsewhere.pdf"), join(inbox, "to-elsewhere.pdf"));
+    await symlink(join(inbox, "target.pdf"), join(inbox, "to-target.pdf"));
+    await symlink(join(outside, "Deep"), join(inbox, "LinkedDir"));
+    const wid = (await addWatchedFolder({ repo, lib }, p.id, inbox, { recursive: true })).id;
+    const real = await realpath(inbox);
+    const dl = downloader();
+    const { w } = start(p, { ...FASTW, watchId: wid, recursive: true, fetchContent: dl.fn, attach: realishAttach(), watchEvents: false, rescanMs: 600_000 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 2 && w.problems(page(10)).items.some((i) => i.kind === "online-only-document"));
+    // Sub is replaced by a link to a folder elsewhere after it was counted (no event, no rescan): its file is not fetched.
+    await rename(join(inbox, "Sub"), join(tmp, "SubAway"));
+    await mkdir(join(outside, "SubTarget"));
+    await sparse(join(outside, "SubTarget", "x.pdf"), 500);
+    await symlink(join(outside, "SubTarget"), join(inbox, "Sub"));
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 1_000_000 });
+    await w.refreshChoices();
+    await until(() => dl.calls.length >= 1);
+    await sleep(1200);
+    expect(dl.calls).toEqual([join(real, "target.pdf")]); // the file a link points to, under its own name, once
+    expect(w.problems(page(20)).items).toEqual(expect.arrayContaining([expect.objectContaining({ file: "Sub/x.pdf", reason: WATCH_REASONS.outside })]));
+  }, 30_000);
+
+  it("a locked project and a read-only library fetch nothing", async () => {
+    fetchAllowed = true;
+    // Locked: the project is locked just before the researcher's word arrives.
+    const p = await project(true);
+    const wid = await watched(p);
+    await sparse(join(inbox, "a.pdf"), 100);
+    const dl = downloader();
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 1);
+    repo.lockProject(p.id);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 100 });
+    await w.refreshChoices();
+    await until(() => w.status().state === "locked");
+    await sleep(800);
+    expect(dl.calls).toEqual([]);
+    await w.stop();
+
+    // Read-only: the library turns read-only just as the researcher says "download".
+    const q = await project();
+    const qid = await watched(q);
+    let ro = false;
+    const flip = Object.create(lib, { mode: { get: () => (ro ? "read-only" : "read-write") } }) as Library;
+    const dl2 = downloader();
+    const w2 = watchFolder({ repo, http, lib: flip, fetchContent: dl2.fn, ...FASTW }, q.id, inbox, {}, qid);
+    watches.push(w2);
+    await w2.ready;
+    await until(() => w2.status().counts.notDownloaded === 1);
+    ro = true;
+    await choose(q, qid, { notDownloaded: "download", confirmedBytes: 100 });
+    await w2.refreshChoices();
+    await until(() => w2.stopped);
+    await sleep(300);
+    expect(dl2.calls).toEqual([]);
+  }, 30_000);
+
+  it('a pause in the middle of a fetch: nothing is read until the resume; switching to "leave" stops after the file in hand', async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "one.pdf"), 100);
+    await sparse(join(inbox, "two.pdf"), 100);
+    const dl = downloader();
+    const release = dl.hold("one.pdf");
+    const counted = countingFs(inbox, real);
+    const { w, events } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn, attach: realishAttach(), fs: counted.fs });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 2);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 200 });
+    await w.refreshChoices();
+    await until(() => dl.calls.length === 1);
+    // Paused while one.pdf is being downloaded: the download goes on; nothing further is issued or read.
+    await choose(p, wid, { paused: true });
+    await w.refreshChoices();
+    expect(w.status()).toMatchObject({ state: "paused", reason: WATCH_REASONS.paused });
+    const n = counted.n;
+    release();
+    await sleep(1200);
+    expect(counted.n).toBe(n); // not even the check after the download: paused means no call
+    expect(dl.calls).toEqual([join(real, "one.pdf")]);
+    expect(events.some((e) => e.kind === "imported")).toBe(false);
+    // Back to "leave" and resumed: one.pdf (downloaded now) comes in through the whole order; two.pdf is left alone.
+    await choose(p, wid, { paused: false, notDownloaded: "leave" });
+    await w.refreshChoices();
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "one.pdf"));
+    await sleep(800);
+    expect(dl.calls).toEqual([join(real, "one.pdf")]);
+    expect(w.status().counts).toMatchObject({ cameIn: 1, notDownloaded: 1 });
+
+    // "leave" while a file is in hand: that file finishes and comes in; no other starts.
+    const release2 = dl.hold("two.pdf");
+    await sparse(join(inbox, "z3.pdf"), 100);
+    await until(() => w.status().counts.notDownloaded === 2);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 200 });
+    await w.refreshChoices();
+    await until(() => dl.calls.length === 2);
+    await choose(p, wid, { notDownloaded: "leave" });
+    await w.refreshChoices();
+    release2();
+    await until(() => events.some((e) => e.kind === "imported" && e.file === "two.pdf"));
+    await sleep(800);
+    expect(dl.calls).toEqual([join(real, "one.pdf"), join(real, "two.pdf")]);
+    expect(dl.most).toBe(1);
+  }, 40_000);
+
+  it("a hung fetch marks the folder unreachable and nothing further is issued; stop() does not wait for it", async () => {
+    fetchAllowed = true;
+    const p = await project();
+    const wid = await watched(p);
+    const real = await realpath(inbox);
+    await sparse(join(inbox, "hangs.pdf"), 100);
+    await sparse(join(inbox, "next.pdf"), 100);
+    const dl = downloader();
+    const release = dl.hold("hangs.pdf");
+    const counted = countingFs(inbox, real);
+    const { w } = start(p, { ...FASTW, watchId: wid, fetchContent: dl.fn, attach: realishAttach(), fs: counted.fs, fetchTimeoutMs: 400 });
+    await w.ready;
+    await until(() => w.status().counts.notDownloaded === 2);
+    await choose(p, wid, { notDownloaded: "download", confirmedBytes: 200 });
+    await w.refreshChoices();
+    await until(() => w.status().state === "unreachable");
+    expect(w.status().reason).toBe(withService(WATCH_REASONS.fetchNotResponding));
+    const n = counted.n;
+    await sleep(1000);
+    expect(counted.n).toBe(n);
+    expect(dl.calls).toEqual([join(real, "hangs.pdf")]);
+    release(); // it answers at last: watching goes on; the file is checked through the whole order and comes in
+    await until(() => w.status().state === "watching");
+    await until(() => dl.calls.length === 2);
+    expect(dl.most).toBe(1);
+    await w.stop();
+
+    // stop() in the middle of a download that does not answer returns at once and issues nothing further; a new watch
+    // of the same folder makes no call until that download settles.
+    const q = await project();
+    const qid = await watched(q);
+    await sparse(join(inbox, "zzz.pdf"), 100);
+    await choose(q, qid, { notDownloaded: "download", confirmedBytes: 10_000 });
+    const dl2 = downloader();
+    const release2 = dl2.hold("zzz.pdf");
+    const { w: w2 } = start(q, { ...FASTW, watchId: qid, fetchContent: dl2.fn, attach: realishAttach() });
+    await w2.ready;
+    await until(() => dl2.calls.length === 1);
+    const t = Date.now();
+    await w2.stop();
+    expect(Date.now() - t).toBeLessThan(2000);
+    const counted3 = countingFs(inbox, real);
+    const { w: w3 } = start(q, { ...FASTW, watchId: qid, fetchContent: dl2.fn, attach: realishAttach(), fs: counted3.fs });
+    await w3.ready;
+    expect(w3.status().state).toBe("unreachable");
+    await sleep(600);
+    expect(counted3.n).toBe(0);
+    expect(dl2.calls).toHaveLength(1);
+    release2();
+    await until(() => w3.status().state === "watching");
+  }, 40_000);
+});
