@@ -574,7 +574,7 @@ Update after every task; commit and push.
 | 73 The audit says which field was confirmed (D20) | complete | 0e890cd (merge) | R191; reviewed with 18 probes; D20 closed |
 | R1 Reader: anchor, annotation and colour model | complete (on the reader branch) | e188c3c (merge) | reviewed with probes over one fix round (R195; plan Amendments A1–A4); verification clean |
 | R5 Reader: ranged PDF route and the client's range reader | approved; verification running | 6181d6c (worktree branch) | reviewed with probes over one fix round; end-to-end in both browsers |
-| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | in review | 629b8d0 (worktree branch) | the hash of existing annotations unchanged; the back-fill undoable |
+| R2 Reader: the Zotero import keeps the sort index; re-import respects changes | fix round 1 | 629b8d0 (worktree branch) | review: the hash unchanged on 5,000 annotations; the back-fill must also reach items Zotero did not change (R196) |
 | R3 Reader: governed annotation operations in the library | approved; a small round (one ruling, two tests) | 3f58c53 (worktree branch) | reviewed with twelve probes; plan Amendment A5 |
 | R4, R6–R13 Reader: the remaining tasks | not started | | order: R6 after R5, R4 after R3, R7 after R6, then R8, R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
