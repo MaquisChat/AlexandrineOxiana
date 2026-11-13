@@ -23,7 +23,9 @@
  *    MAX_CANVAS_PIXELS pixels: past that, at high zoom, the page is drawn at a lower resolution and
  *    stretched, rather than taking hundreds of megabytes.
  *  - Each drawn page carries pdf.js's `TextLayer` for selection (it writes each piece of text with
- *    `textContent` only, never markup). A page with no text says so, in words, on the page.
+ *    `textContent` only, never markup). A page with no text says so, in words, on the page. Once
+ *    laid out, the layer gets pdf.js's guard for a selection let go in blank space (Ruling R223,
+ *    textLayerSelection.ts: an empty, hidden element at its end), taken away with the layer.
  *  - `rotation` is a view setting (added to the page's own /Rotate); nothing is written anywhere.
  *  - Stale work is dropped: a drawing started for another zoom, rotation or page window is cancelled
  *    and its late result ignored; leaving the screen cancels and empties everything.
@@ -42,6 +44,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { TextLayer, type PageViewport, type PDFPageProxy, type RenderTask } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PdfHandle } from "./pdfjs";
+import { guardTextLayer } from "./textLayerSelection";
 import "./Reader.css";
 
 /** A page's text as pdf.js gives it. */
@@ -106,6 +109,8 @@ interface Slot {
   canvas?: HTMLCanvasElement;
   task?: RenderTask;
   textLayer?: TextLayer;
+  /** Takes away the text layer's blank-space guard (R223). */
+  unguard?: () => void;
 }
 
 /** What the page's region shows besides its canvas: the viewport (for the overlay), whether it has text, its weight. */
@@ -305,6 +310,8 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
     s.task = undefined;
     s.textLayer?.cancel();
     s.textLayer = undefined;
+    s.unguard?.();
+    s.unguard = undefined;
     if (s.canvas) {
       s.canvas.width = 0;
       s.canvas.height = 0;
@@ -443,6 +450,7 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
             slot.textLayer = layer;
             await live(layer.render());
             if (stale()) return;
+            slot.unguard = guardTextLayer(host);
           }
         }
         setDrawn((m) => {

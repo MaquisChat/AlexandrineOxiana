@@ -296,6 +296,32 @@ describe("ReaderScreen: making highlights with the mouse (Task R10)", () => {
     expect(within(again).getByText("in Green")).toBeTruthy();
   });
 
+  it("each drawn page's text layer carries pdf.js's blank-space guard, hidden and empty, gone with the document (R223, I1)", async () => {
+    serveDocument();
+    serveAnnotations(() => []);
+    const f = fakeHandle(3);
+    openPdf.mockResolvedValueOnce(f.handle);
+    screenFor();
+    await screen.findByRole("region", { name: "Annotations (0)" });
+    await lineOf(1);
+    const end = await waitFor(() => {
+      const e = document.querySelector('[data-page-number="1"] .ao-reader-text-layer > .ao-reader-end-of-content');
+      expect(e).toBeTruthy();
+      return e!;
+    });
+    expect(end.getAttribute("aria-hidden")).toBe("true");
+    expect(end.textContent).toBe("");
+    // A press on the layer: "selecting" until it is let go.
+    const layer = end.parentElement!;
+    fireEvent.mouseDown(layer);
+    expect(layer.classList.contains("selecting")).toBe(true);
+    fireEvent.pointerUp(document);
+    expect(layer.classList.contains("selecting")).toBe(false);
+    act(() => f.fail(new PdfOpenError("locked")));
+    await screen.findByRole("heading", { level: 2, name: "Project locked" });
+    expect(document.querySelectorAll(".ao-reader-end-of-content")).toHaveLength(0);
+  });
+
   it("Escape and a press elsewhere close the toolbar and nothing is sent", async () => {
     serveDocument();
     serveAnnotations(() => []);

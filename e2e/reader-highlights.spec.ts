@@ -988,3 +988,120 @@ test("a new highlight survives a reload at another zoom", async ({ page, app }) 
   await expect(page.getByText(CHANGED)).toHaveCount(0);
   expect(errors).toEqual([]);
 });
+
+// ---- Task R10, fix round 1 (Ruling R223, I1): a drag let go in blank space stores only what was selected ----
+
+/** The screen box of page `n`'s span `words`. */
+async function boxOf(page: Page, n: number, words: string): Promise<{ left: number; top: number; right: number; bottom: number }> {
+  return page.evaluate(
+    ({ n, words }) => {
+      const s = [...document.querySelectorAll(`[data-page-number="${n}"] .ao-reader-text-layer span`)].find((x) => x.textContent === words)!;
+      const b = s.getBoundingClientRect();
+      return { left: b.left, top: b.top, right: b.right, bottom: b.bottom };
+    },
+    { n, words },
+  );
+}
+
+/** Presses at `points[0]`, moves through each of the others in turn, and lets go at the last. */
+async function dragThrough(page: Page, points: Point[]): Promise<void> {
+  await page.mouse.move(points[0]!.x, points[0]!.y);
+  await page.mouse.down();
+  for (const p of points.slice(1)) await page.mouse.move(p.x, p.y, { steps: 8 });
+  await page.mouse.up();
+}
+
+test.describe("a drag let go in blank space stores only what was selected (R223, I1)", () => {
+  // Column one: 9-point lines from x 50, baselines 740, 724, 708, 692, 676, 660; column two from x 315.
+  const LINE_TWO = "when traders carry baskets down the river path and";
+  const LINE_THREE = "set out their goods beneath the old plane trees.";
+  const LINE_FOUR = "The elders remember when the river ran further east,";
+  const LINE_FIVE = "and they measure the years by the floods that came.";
+  const ROW_THREE_RIGHT = "Children learn the names of the fields from songs,";
+  const LAST = "This is the last line of the second column.";
+
+  /** The two-column article at 50% (both columns in the pages' view), the lines `words` centred. */
+  async function open(page: Page, app: AppHarness, project: string, ...words: string[]): Promise<{ projectId: string; sid: string }> {
+    const file = sourceFile(app, "two-columns.pdf", await buildTwoColumnPdf());
+    const { projectId } = await libraryWithProject(app, page, { library: "Reader library", project });
+    const { sid } = await attachPdf(app, projectId, file);
+    await readFromLibrary(page, app, projectId, sid);
+    const zoomOut = toolbar(page).getByRole("button", { name: "Zoom out" });
+    await zoomOut.click();
+    await zoomOut.click();
+    await expect(zoomValue(page)).toHaveText("50%");
+    await centreOn(page, ...words.map((w) => ({ n: 1, words: w })));
+    return { projectId, sid };
+  }
+
+  /** Highlights the selection held now, and reads it back from the service. */
+  async function stored(page: Page, app: AppHarness, ids: { projectId: string; sid: string }): Promise<Made> {
+    await expect(colourBar(page)).toBeVisible();
+    await colourBar(page).getByRole("button", { name: "Highlight in Green" }).click();
+    await expect(said(page)).toHaveText("Highlight added: Green, page 1.");
+    const all = await listed(app, ids.projectId, ids.sid);
+    expect(all).toHaveLength(1);
+    return all[0]!;
+  }
+
+  /** One rectangle, on the line of `baseline`, within column `x0`–`x1`. */
+  function onLine(made: Made, baseline: number, x0: number, x1: number): void {
+    const rects = made.pdfAnchors[0]!.rects;
+    expect(made.pdfAnchors.map((a) => a.page)).toEqual([1]);
+    expect(rects, JSON.stringify(rects)).toHaveLength(1);
+    const r = rects[0]!;
+    expect(r.y < baseline && r.y + r.h > baseline && r.h < 16, JSON.stringify(r)).toBe(true);
+    expect(r.x >= x0 - 1 && r.x + r.w <= x1 + 1, JSON.stringify(r)).toBe(true);
+  }
+
+  test("let go 10 px past a line's end, on the same line", async ({ page, app }) => {
+    const ids = await open(page, app, "Past the end", LINE_TWO);
+    const from = await charPoint(page, 1, LINE_TWO, LINE_TWO.indexOf("carry"), "before");
+    const line = await boxOf(page, 1, LINE_TWO);
+    const end = await charPoint(page, 1, LINE_TWO, LINE_TWO.length - 1, "after");
+    await dragThrough(page, [from, end, { x: line.right + 10, y: (line.top + line.bottom) / 2 }]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe("carry baskets down the river path and");
+    onLine(made, 724, 50, 280);
+  });
+
+  test("let go in the gutter between the two columns", async ({ page, app }) => {
+    const ids = await open(page, app, "In the gutter", LINE_THREE, ROW_THREE_RIGHT);
+    const from = await charPoint(page, 1, LINE_THREE, 0, "before");
+    const left = await boxOf(page, 1, LINE_THREE);
+    const right = await boxOf(page, 1, ROW_THREE_RIGHT);
+    const end = await charPoint(page, 1, LINE_THREE, LINE_THREE.length - 1, "after");
+    // The middle of the gutter (x 280–315 points), at the line's own height.
+    const gutter = { x: (left.right + right.left) / 2, y: (left.top + left.bottom) / 2 };
+    await dragThrough(page, [from, end, gutter]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe(LINE_THREE);
+    onLine(made, 708, 50, 280);
+  });
+
+  test("let go between two lines", async ({ page, app }) => {
+    const ids = await open(page, app, "Between lines", LINE_FOUR, LINE_FIVE);
+    const from = await charPoint(page, 1, LINE_FOUR, 0, "before");
+    const to = await charPoint(page, 1, LINE_FOUR, "The elders remember".length - 1, "after");
+    const four = await boxOf(page, 1, LINE_FOUR);
+    const five = await boxOf(page, 1, LINE_FIVE);
+    // Straight down from there into the blank space between the two lines. The release point lies
+    // below line four: every character of that line comes before it in reading order, none of line five.
+    await dragThrough(page, [from, to, { x: to.x, y: (four.bottom + five.top) / 2 }]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe(LINE_FOUR);
+    onLine(made, 692, 50, 280);
+  });
+
+  test("let go below the last line of a page", async ({ page, app }) => {
+    const ids = await open(page, app, "Below the last line", LAST);
+    const from = await charPoint(page, 1, LAST, 0, "before");
+    const to = await charPoint(page, 1, LAST, "This is the last line".length - 1, "after");
+    const last = await boxOf(page, 1, LAST);
+    // Below the last line: the rest of that line comes before the release point; nothing else does.
+    await dragThrough(page, [from, to, { x: to.x, y: last.bottom + 40 }]);
+    const made = await stored(page, app, ids);
+    expect(made.quote).toBe(LAST);
+    onLine(made, 660, 315, 545);
+  });
+});
