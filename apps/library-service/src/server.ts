@@ -18,6 +18,7 @@ import { registerAudit } from "./routes/audit.js";
 import { registerLibraryAudit } from "./routes/library-audit.js";
 import { registerCapture } from "./routes/capture.js";
 import { registerCitations } from "./routes/citations.js";
+import { registerDocuments } from "./routes/documents.js";
 import { registerFieldwork } from "./routes/fieldwork.js";
 import { registerGovernance } from "./routes/governance.js";
 import { registerImport } from "./routes/import.js";
@@ -66,6 +67,10 @@ export interface ServiceOptions {
   pictureMaxBytes?: number;
   /** Test seam: runs on the media route after the first slice is read, right before the response starts. */
   mediaBeforeSend?: () => Promise<void>;
+  /** Largest PDF the document route serves (default READER_PDF_MAX_BYTES; test seam). */
+  readerPdfMaxBytes?: number;
+  /** Test seam: runs on the document route after the file is opened, right before its first read. */
+  documentBeforeRead?: () => Promise<void>;
 }
 
 export interface LibraryService {
@@ -278,7 +283,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   });
   app.setNotFoundHandler((_req, reply) => fail(reply, new ApiError(404, "NOT_FOUND", "There is no such route.")));
 
-  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}) };
+  const ctx = { state, pairing, token: opts.token, ...(opts.beforeExecuteMove ? { beforeExecuteMove: opts.beforeExecuteMove } : {}), ...(opts.pictureMaxBytes !== undefined ? { pictureMaxBytes: opts.pictureMaxBytes } : {}), ...(opts.mediaBeforeSend ? { mediaBeforeSend: opts.mediaBeforeSend } : {}), ...(opts.readerPdfMaxBytes !== undefined ? { readerPdfMaxBytes: opts.readerPdfMaxBytes } : {}), ...(opts.documentBeforeRead ? { documentBeforeRead: opts.documentBeforeRead } : {}) };
   registerLibraries(app, ctx);
   registerProjects(app, ctx);
   registerSources(app, ctx);
@@ -294,6 +299,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   registerJobs(app, ctx);
   registerTools(app, ctx);
   registerMedia(app, ctx);
+  registerDocuments(app, ctx);
 
   let closing: Promise<void> | undefined;
   return {
@@ -331,7 +337,7 @@ export async function createService(opts: ServiceOptions): Promise<LibraryServic
   };
 }
 
-export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void> };
+export type RouteContext = { state: ServiceState; pairing: Pairing; token: string; beforeExecuteMove?: () => Promise<void>; pictureMaxBytes?: number; mediaBeforeSend?: () => Promise<void>; readerPdfMaxBytes?: number; documentBeforeRead?: () => Promise<void> };
 
 /** A path with its percent-encoding undone (as far as it decodes), so a spelling cannot hide anything. */
 function decodedPath(path: string): string {

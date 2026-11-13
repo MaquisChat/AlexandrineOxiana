@@ -418,7 +418,7 @@ const logFailure = (req: FastifyRequest, e: ApiError, when: "before the first by
   else req.log.warn({ code: e.code, when }, "a stored file could not be read for display");
 };
 
-interface SendHooks {
+export interface SendHooks {
   track?: (s: Stream) => () => void;
   sent?: (bytes: number) => void;
   check?: () => void;
@@ -431,7 +431,7 @@ interface SendHooks {
  * released when the response ends, however it ends (finished, aborted by the client, or ended by
  * a revocation, after which nothing more is sent).
  */
-async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
+export async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
   if (!range) {
     contentHeaders(reply, c.mime, 0);
     await c.close();

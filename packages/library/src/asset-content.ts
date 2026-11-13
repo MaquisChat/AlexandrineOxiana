@@ -31,6 +31,8 @@ const PICTURE_MIMES: ReadonlySet<string> = new Set(["image/png", "image/jpeg", "
 
 export const isMediaMime = (mime: string): boolean => MEDIA_MIME.test(mime);
 export const isPictureMime = (mime: string): boolean => PICTURE_MIMES.has(mime);
+/** Recorded types the reader's document route serves (Task R5): a PDF only. */
+export const isPdfMime = (mime: string): boolean => mime === "application/pdf";
 
 /** How much is read (and decrypted) per step of a stream. */
 const SLICE = 64 * 1024;

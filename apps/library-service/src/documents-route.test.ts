@@ -136,6 +136,7 @@ async function snapshot(dir: string): Promise<Record<string, string>> {
 }
 
 const ASK = "Ask for a byte range.";
+const UNSAFE = "This file could not be opened safely.";
 const MISSING = "The file of this source is not where it was recorded.";
 
 beforeEach(async () => {
@@ -320,15 +321,13 @@ describe("the ranged PDF route (Task R5)", () => {
     await unlink(abs);
     await symlink(secret, abs);
     const out = await get(pid, c.sid, c.aid, "bytes=0-");
-    expect(out.status).toBeGreaterThanOrEqual(400);
-    plainError(out, out.status, out.json.error.code);
+    plainError(out, 400, "VALIDATION", UNSAFE);
     expect(out.body).not.toContain("SECRET-BYTES");
     // …and by a link to another file inside the library.
     await unlink(abs);
     await symlink(insideAbs, abs);
     const inLib = await get(pid, c.sid, c.aid, "bytes=0-");
-    expect(inLib.status).toBeGreaterThanOrEqual(400);
-    plainError(inLib, inLib.status, inLib.json.error.code);
+    plainError(inLib, 400, "VALIDATION", UNSAFE);
     expect(inLib.body).not.toContain("INSIDE-THE-LIBRARY");
 
     // A linked file replaced by a link.
@@ -337,8 +336,7 @@ describe("the ranged PDF route (Task R5)", () => {
     await unlink(linked);
     await symlink(secret, linked);
     const viaLink = await get(pid, l.sid, l.aid, "bytes=0-");
-    expect(viaLink.status).toBeGreaterThanOrEqual(400);
-    plainError(viaLink, viaLink.status, viaLink.json.error.code);
+    plainError(viaLink, 400, "VALIDATION", UNSAFE);
     expect(viaLink.body).not.toContain("SECRET-BYTES");
   });
 
@@ -417,7 +415,7 @@ describe("the ranged PDF route (Task R5)", () => {
   it("a lock between opening the file and the first byte: the service's error shape, no bytes", async () => {
     let pid = "";
     await start({
-      documentBeforeSend: async () => {
+      documentBeforeRead: async () => {
         svc.state.session!.repo.lockProject(pid);
       },
     });

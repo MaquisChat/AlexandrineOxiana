@@ -282,7 +282,7 @@ export {
   readAssetText,
   transcriptVersions,
 } from "./source-actions.js";
-export { isMediaMime, isPictureMime, openAssetContent } from "./asset-content.js";
+export { isMediaMime, isPdfMime, isPictureMime, openAssetContent } from "./asset-content.js";
 export type { AssetContent } from "./asset-content.js";
 export { addTranscriptVersion, parseVtt, readTranscript } from "./transcript-segments.js";
 export { TRANSCRIBE_KIND, recordingOf, transcriptionJob, transcriptionRecords, transcriptionRerun } from "./transcription-jobs.js";
