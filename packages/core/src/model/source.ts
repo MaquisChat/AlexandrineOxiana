@@ -218,6 +218,11 @@ export const SourceFile = z.object({
    * (which never changes after creation); written by merges, reverted by undo.
    */
   mergedExternalKeys: z.record(z.string(), z.array(z.string().max(256)).max(10_000)).optional(),
+  /**
+   * externalKeys of imported annotations the researcher deleted here (≤ 10,000): a re-import never
+   * brings them back.
+   */
+  deletedAnnotationKeys: z.array(z.string().max(256)).max(10_000).optional(),
   fieldEvidence: z.array(FieldEvidence).default([]),
   verification: z.record(z.string(), FieldVerification).default({}),
   /** Viewing proxies still to be made (R83); absent or empty when none are pending. */
