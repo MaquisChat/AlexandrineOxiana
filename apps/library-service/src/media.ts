@@ -418,7 +418,7 @@ const logFailure = (req: FastifyRequest, e: ApiError, when: "before the first by
   else req.log.warn({ code: e.code, when }, "a stored file could not be read for display");
 };
 
-interface SendHooks {
+export interface SendHooks {
   track?: (s: Stream) => () => void;
   sent?: (bytes: number) => void;
   check?: () => void;
@@ -429,9 +429,27 @@ interface SendHooks {
  * Streams `range` of `c` (nothing for an empty file). The first slice is read before any header
  * is set, so a damaged file or a lock answers with the service's error shape (R140 5). The file is
  * released when the response ends, however it ends (finished, aborted by the client, or ended by
- * a revocation, after which nothing more is sent).
+ * a revocation, after which nothing more is sent). The release is attached before anything can
+ * fire, and a connection the client closed before this was called (while the caller looked the
+ * file up and opened it) releases the file at once (Task R5 review I2).
  */
-async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
+export async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetContent, range: { start: number; end: number } | undefined, status: number, hooks: SendHooks): Promise<FastifyReply> {
+  let released = false;
+  /** What else ends with the response once it is streaming (set below). */
+  let alsoOnRelease = () => {};
+  const release = () => {
+    if (released) return;
+    released = true;
+    alsoOnRelease();
+    void c.close();
+  };
+  reply.raw.once("close", release);
+  // Gone already: its "close" has fired before the listener existed.
+  const gone = () => reply.raw.destroyed || req.raw.destroyed || req.raw.socket?.destroyed === true;
+  if (gone()) {
+    release();
+    return reply.send();
+  }
   if (!range) {
     contentHeaders(reply, c.mime, 0);
     await c.close();
@@ -444,9 +462,14 @@ async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetCon
     hooks.check?.();
   } catch (err) {
     await c.close();
+    if (released) return reply.send(); // the client left during the read: nobody to answer
     const e = readFailure(err);
     logFailure(req, e, "before the first byte");
     throw e;
+  }
+  if (released || gone()) {
+    release();
+    return reply.send();
   }
   contentHeaders(reply, c.mime, length);
   reply.status(status);
@@ -470,16 +493,11 @@ async function sendContent(req: FastifyRequest, reply: FastifyReply, c: AssetCon
     else out.destroy(err);
   };
   const done = hooks.track?.({ destroy: (err?: Error) => stop(err instanceof ApiError ? err : ticketEnded()) }) ?? (() => {});
-  let released = false;
-  const release = () => {
-    if (released) return;
-    released = true;
+  alsoOnRelease = () => {
     done();
     rest?.destroy();
     if (!out.destroyed) out.destroy();
-    void c.close();
   };
-  reply.raw.once("close", release);
   rest?.once("error", (err) => {
     if (stopped) return;
     const e = readFailure(err);

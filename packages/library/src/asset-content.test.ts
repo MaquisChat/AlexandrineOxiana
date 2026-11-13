@@ -4,9 +4,10 @@
  * written anywhere, a locked project refused, a destroyed or unknown asset refused, a file swapped
  * for a symbolic link refused.
  */
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { rm, symlink } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, rm, symlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Project, SourceFile } from "@ao/core";
 import { openAssetContent, isMediaMime, isPictureMime } from "./asset-content.js";
@@ -84,6 +85,24 @@ describe("openAssetContent", () => {
     await rm(abs);
     await symlink(elsewhere, abs);
     await expect(openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true)).rejects.toBeInstanceOf(PathEscapeError);
+  });
+
+  it("a FIFO or a socket swapped in for the file is refused at once, never read (no hang)", async () => {
+    const p = await makeProject(kit);
+    for (const kind of ["fifo", "socket"] as const) {
+      const sf = await mediaSource(p, randomBytes(100));
+      const abs = join(kit.lib.root, ...sf.assets[0]!.path.split("/"));
+      await rm(abs);
+      // A socket is bound by its short name in its own folder (a full path may pass the length a socket address allows).
+      const made = kind === "fifo" ? spawnSync("mkfifo", [abs]) : spawnSync("python3", ["-c", "import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])", basename(abs)], { cwd: dirname(abs) });
+      expect(made.status, String(made.stderr)).toBe(0);
+      expect((await lstat(abs)).isFile()).toBe(false);
+      const started = Date.now();
+      const err = (await openAssetContent(kit.repo, p.id, sf.source.id, sf.assets[0]!.id, () => true).catch((e: unknown) => e)) as Error;
+      expect(Date.now() - started, kind).toBeLessThan(2000);
+      expect(err, kind).toBeInstanceOf(InvalidInputError);
+      expect(err.message).toBe("this file could not be opened safely");
+    }
   });
 
   it("a missing file is NotFoundError without its path", async () => {
