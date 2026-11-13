@@ -96,6 +96,8 @@ export interface ResolveInput {
   /** The evidence kind of the reference metadata (default refman; Zotero items: zotero, R72). */
   referenceSource?: FieldEvidence["source"];
   sidecarPaths?: string[];
+  /** Asked immediately before each sidecar is read; false: that sidecar is not used (a watched folder's check, Task W2/A6). */
+  sidecarReadable?: (path: string) => Promise<boolean>;
   /** The name file-name patterns are matched against (default: the path's base name). */
   fileName?: string;
   /**
@@ -442,6 +444,7 @@ export async function resolveItem(input: ResolveInput, ctx: ResolveContext): Pro
   // 4. Sidecar files.
   if (!done() && !titleConflict) {
     for (const p of input.sidecarPaths ?? []) {
+      if (input.sidecarReadable && !(await input.sidecarReadable(p).catch(() => false))) continue;
       const m = await readSidecar(p);
       if (!m) continue;
       step(scoreConfidence({ method: "sidecar" }), { method: "sidecar" }, fromSidecar(m), { kind: "refman", ref: `sidecar${extname(p).toLowerCase()}` });

@@ -602,6 +602,10 @@ class Run {
   private async checkpoint(state: BatchState, finished = false): Promise<void> {
     await this.flush();
     this.syncRecord(state);
+    // The adapter's resume options as they stand now (Zotero Web adds the version each part read at, A5),
+    // saved in the same change as the journal lines that part brought in.
+    const ro = this.adapter.resumeOptions;
+    if (ro && Object.keys(ro).length) this.rec.adapterOptions = JSON.parse(JSON.stringify(ro)) as BatchRecord["adapterOptions"];
     if (finished) this.rec.finishedAt = new Date().toISOString();
     const lines = this.pending;
     await saveRecord(this.repo, this.projectId, this.rec, lines);
@@ -643,10 +647,19 @@ class Run {
       let done = 0;
       const seenKeys = new Set<string>();
       this.feed.emit({ done, total });
-      const scan = this.adapter.scan(this.abort.signal, { workDir: () => this.ensureWorkDir(), note: (t) => this.note(t) });
+      let knownIds: ReadonlySet<string> | undefined;
+      const scan = this.adapter.scan(this.abort.signal, {
+        workDir: () => this.ensureWorkDir(),
+        note: (t) => this.note(t),
+        // An item already in this batch's journal is passed by below: the adapter need not fetch it (Z2).
+        skip: (key) => this.latest.has(key),
+        ...(this.adapter.incremental ? { knownIds: () => (knownIds ??= new Set(this.known.keys())) } : {}),
+      });
       for await (const item of scan) {
         if (seenKeys.has(item.key)) continue;
         seenKeys.add(item.key);
+        // Gone at its source (Zotero, Z2): nothing about the source here changes in this task.
+        if (item.gone) continue;
         if (!this.latest.has(item.key) && this.recovered.size) {
           // Resume guard: a source of this batch for this item exists although its line was lost.
           const sid = this.recovered.get(itemKeyHash(this.rec.secret!, item.key));
@@ -734,7 +747,7 @@ class Run {
   /** Processes one item (null: queued in the current group); never throws for item-level problems (they become `failed`). */
   private async item(item: ScanItem, dedupe: BatchDedupe, watchdog: PatternWatchdog): Promise<JournalEntry | null> {
     try {
-      if (item.fileNotes?.length) this.fileNotes.set(item.key, item.fileNotes.slice(0, 50).map((n) => n.slice(0, 200)));
+      if (item.fileNotes?.length) this.fileNotes.set(item.key, item.fileNotes.slice(0, 50).map((n) => n.slice(0, 300)));
       if (item.unreadable) return this.queue({ key: item.key, outcome: "failed", reason: item.unreadable });
       if (this.adapter.incremental && item.version) {
         this.versions.set(item.key, item.version);
@@ -1898,6 +1911,7 @@ export async function dryRun(
     const policy = await OutsidePolicy.create(adapter.roots, [dir, ...(await approvedFolders(repoLibrary(repo)))], secret, await approvalHashes(secret, opts.approveOutside));
     for await (const scanned of scan) {
       let item = scanned;
+      if (item.gone) continue; // gone at its source: nothing to import
       summary.items++;
       if (item.unreadable) {
         summary.unreadable.push({ path: item.key, reason: item.unreadable });

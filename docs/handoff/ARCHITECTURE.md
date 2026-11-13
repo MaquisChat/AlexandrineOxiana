@@ -43,6 +43,6 @@ Device-specific settings live in the app config dir and never in the library: ap
 - No media-delivery route exists for a player (PLAN Task 34a).
 
 ## External dependencies (the rule is exact pins; the root dev tools use `^` ranges)
-- **Node:** fastify, better-sqlite3, parse5 8.0.1, yauzl/yazl, fflate, pdfjs-dist, exiftool-vendored, undici, citeproc-js, turndown, @xmldom/xmldom, @napi-rs/keyring, chokidar, React 19, Vite 7, msw, playwright, yaml.
+- **Node:** fastify, better-sqlite3, parse5 8.0.1, yauzl/yazl, fflate, pdfjs-dist, exiftool-vendored, undici, citeproc-js, turndown, @xmldom/xmldom, @napi-rs/keyring, React 19, Vite 7, msw, playwright, yaml. Watched folders use Node's own `fs.watch` (no watcher library).
 - **Python:** faster-whisper, yt-dlp (managed binary), gallery-dl, pillow-heif, rawpy, ocrmypdf.
 - **Data:** CSL styles and locales (CC BY-SA 3.0, built by `pnpm fetch-csl`), plus OFL fonts.
