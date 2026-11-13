@@ -37,6 +37,7 @@ const SLICE = 64 * 1024;
 const askForRange = (): ApiError => badRequest("Ask for a byte range.");
 const cannotShow = (): ApiError => badRequest("This file cannot be shown here.");
 const missing = (): ApiError => new ApiError(404, "NOT_FOUND", "The file of this source is not where it was recorded.");
+const unreadable = (): ApiError => new ApiError(409, "CONFLICT", "This file could not be read. The library's integrity check can tell more.");
 const unsafe = (): ApiError => badRequest("This file could not be opened safely.");
 const tooLarge = (): ApiError => new ApiError(413, "PAYLOAD_TOO_LARGE", "This PDF is larger than 512 MB, too large to open in the app.");
 const closedMeanwhile = (): ApiError => new ApiError(409, "CONFLICT", "The library was closed while this file was being read.");
@@ -70,7 +71,7 @@ const header = (req: FastifyRequest, name: string): string | undefined => {
 };
 
 /** What opening the file can fail with, as the route's own answers. */
-function openFailure(err: unknown): ApiError {
+export function openFailure(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
   if (err instanceof NotFoundError) return missing();
   if (err instanceof ProjectLockedError || err instanceof KeyNotAvailableError) return locked();
@@ -78,6 +79,8 @@ function openFailure(err: unknown): ApiError {
   if (err instanceof InvalidInputError) return err.message === "this file cannot be shown here" ? cannotShow() : unsafe();
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   if (code === "ENOENT" || code === "ENOTDIR") return missing();
+  // There but unreadable (permission, too many open files, an I/O error): never "missing".
+  if (typeof code === "string" && /^E[A-Z0-9]+$/.test(code)) return unreadable();
   return toApiError(err);
 }
 

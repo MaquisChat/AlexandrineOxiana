@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { deviceDeps, type AssetContent, type Deps } from "@ao/library";
 import { DOCUMENT_RANGE_MAX_BYTES, READER_PDF_MAX_BYTES } from "@ao/shared";
 import { tinyPng } from "../../../tests/fixtures/generate.mjs";
-import { guarded } from "./routes/documents.js";
+import { guarded, openFailure } from "./routes/documents.js";
 import { createService, type LibraryService, type ServiceOptions } from "./server.js";
 
 const TOKEN = "ui-token-0123456789abcdefghijklmnopqrstuvwxyz";
@@ -671,6 +671,14 @@ describe("fix round 1, minors", () => {
     fileToWatch = await storedPath(pid, sid);
     plainError(await get(pid, sid, aid, "bytes=0-99"), 500, "INTERNAL");
     await until(() => descriptorsOn(fileToWatch) === 0);
+  });
+
+  it("M4: an open that fails for another reason than a missing file is not reported as missing", () => {
+    for (const code of ["EACCES", "EMFILE", "EIO", "ENXIO"]) {
+      const e = openFailure(Object.assign(new Error("this file could not be opened"), { code }));
+      expect({ status: e.status, code: e.code, message: e.message }, code).toEqual({ status: 409, code: "CONFLICT", message: "This file could not be read. The library's integrity check can tell more." });
+    }
+    for (const code of ["ENOENT", "ENOTDIR"]) expect(openFailure(Object.assign(new Error("x"), { code })).message).toBe(MISSING);
   });
 
   it("M3: guarded() checks before and after every read: nothing read after a lock is handed on", async () => {
