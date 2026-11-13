@@ -53,14 +53,16 @@ import {
 } from "./zotero-sync-settings.js";
 
 /** M9: how many batch records are read through readBatchAt (the runner's own reads; the engine's findBatch reads inside its module). */
-const batchReads = vi.hoisted(() => ({ n: 0 }));
+const batchReads = vi.hoisted(() => ({ n: 0, after: undefined as undefined | (() => void) }));
 vi.mock("./bulk/batch.js", async (orig) => {
   const m = await orig<typeof import("./bulk/batch.js")>();
   return {
     ...m,
-    readBatchAt: (...a: Parameters<typeof m.readBatchAt>) => {
+    readBatchAt: async (...a: Parameters<typeof m.readBatchAt>) => {
       batchReads.n++;
-      return m.readBatchAt(...a);
+      const r = await m.readBatchAt(...a);
+      batchReads.after?.();
+      return r;
     },
   };
 });
@@ -945,12 +947,13 @@ describe("R244 (a) I1: a run that could not confirm the whole picture", () => {
     expect(zoteroWebSince(repo, p.id, U)).toBe(since);
   });
 
-  it("P1: an incremental page short of its announced total is finished-with-problems / deletions-unconfirmed; the next sync reads the whole library", async () => {
+  it("R246 probe A: an incremental page short of its total is finished-with-problems / changes-incomplete; fullDone and since stay; the next run is incremental from the same version and loses nothing", async () => {
     const p = await project();
     const [a] = await articles(2);
     await sync(await linked(linkOf(p)));
-    const since = zoteroWebSince(repo, p.id, U);
+    const since = zoteroWebSince(repo, p.id, U)!;
     z.editItem(U, a!, { title: "changed" });
+    z.addItem(U, { itemType: "journalArticle", title: "Added", creators: [{ creatorType: "author", firstName: "Ada", lastName: "New" }], date: "2021", publicationTitle: "Journal" });
     const orig = z.serve.bind(z);
     z.serve = (req, host) => {
       const res = orig(req, host);
@@ -958,9 +961,17 @@ describe("R244 (a) I1: a run that could not confirm the whole picture", () => {
       return res;
     };
     const r = await sync(await stored());
-    expect(r).toMatchObject({ outcome: "finished-with-problems", reason: "deletions-unconfirmed" });
+    z.serve = orig;
+    expect(r).toMatchObject({ outcome: "finished-with-problems", reason: "changes-incomplete" });
     expect(zoteroWebSince(repo, p.id, U)).toBe(since);
-    expect((await stored()).fullDone).toBe(false);
+    expect((await stored()).fullDone).toBe(true);
+    const n = z.requests.length;
+    const next = await sync(await stored());
+    expect(next.outcome).toBe("finished");
+    expect(z.requests.slice(n).some((q) => q.path.includes(`since=${since}`))).toBe(true);
+    expect(z.requests.slice(n).some((q) => q.path.includes("format=versions"))).toBe(false); // no full read, no key list
+    expect(sourceCount(p)).toBe(3); // nothing lost, nothing twice
+    expect(zoteroWebSince(repo, p.id, U)).toBe(z.libraryVersion(U));
   });
 });
 
@@ -982,6 +993,35 @@ describe("R244 (b) M4: an own batch that can never be resumed", () => {
     const next = await sync(await stored());
     expect(next.outcome).toBe("finished");
     expect(next.batchId).not.toBe(stopped.batchId);
+    expect(sourceCount(p)).toBe(24);
+  });
+
+  it("R246 probe B: a lock while the batch is being resumed is a passing failure: the batch stays, and the next run resumes it (no full read)", async () => {
+    const p = await project({ encrypted: true });
+    const stopped = await stoppedFirstSync(p);
+    const hint = (await stored()).unfinished;
+    // The runner reads its batch through the hint; the project is locked right after, as the engine reads it again.
+    batchReads.after = () => {
+      batchReads.after = undefined;
+      repo.lockProject(p.id);
+    };
+    let r: ZoteroSyncRun;
+    try {
+      r = await sync(await stored());
+    } finally {
+      batchReads.after = undefined;
+    }
+    expect(r.outcome).not.toBe("finished");
+    expect(r.reason).toBe("project-locked");
+    expect(r.note).toBeUndefined();
+    await repo.unlockProject(p.id, "pw");
+    expect((await findBatch(repo, p.id, stopped.batchId!))!.state).toBe("paused");
+    expect((await stored()).unfinished).toBe(hint);
+    expect((await stored()).fullDone).toBe(false); // as it was: the first full run has not finished yet
+    const dirs = (await batchDirs(repo, p.id)).length;
+    const resumed = await sync(await stored());
+    expect(resumed).toMatchObject({ outcome: "finished", batchId: stopped.batchId });
+    expect((await batchDirs(repo, p.id)).length).toBe(dirs);
     expect(sourceCount(p)).toBe(24);
   });
 

@@ -251,15 +251,19 @@ const UNFINISHED = new Set<BatchRecord["state"]>(["running", "paused", "cancelle
 export const ZOTERO_SYNC_ENDED_NOTE = "This sync could not be resumed, so it was ended here; what it brought in stays. The next sync reads the whole Zotero library again.";
 
 /**
- * Whether a refusal to resume this link's own batch means it can NEVER be resumed (R244 b): the batch record is gone
- * (NotFoundError), or the engine refuses it as `invalid` — its record or its source cannot be used (a fieldwork
- * session or participant it links to was deleted, the source cannot be rebuilt) — EXCEPT the unreadable record of
- * sources deleted here, which every Zotero batch meets alike and the researcher can reset. Passing refusals leave the
- * batch to be resumed later: `locked` (the project), `running` (it runs now), `denied` (the project's rules, which the
- * researcher may change back), `finished` (not unfinished after all), and every failure that is not a refusal.
+ * Whether a refusal to resume this link's own batch means it can NEVER be resumed (R244 b, made certain by R246 b).
+ * Only two errors, by type, and only when certain to repeat:
+ *   - `BatchRefusedError` of kind `invalid` — the engine read the record and refuses it as unusable (a fieldwork
+ *     session or participant it links to was deleted, the source cannot be rebuilt) — EXCEPT the unreadable record of
+ *     sources deleted here, which every Zotero batch meets alike and the researcher can reset;
+ *   - `NotFoundError` — and only when the batch's folder is really absent from the project's imports (`gone`). The
+ *     engine reports any record it could not read as "not found" (a project locked at that moment, a busy file, a
+ *     passing I/O error), so a folder still there is a passing failure.
+ * Everything else leaves the batch to be resumed later: kinds `locked`, `running`, `denied` (the project's rules,
+ * which the researcher may change back) and `finished`, and every failure that is not a refusal. In doubt: resumable.
  */
-function neverResumable(err: unknown): boolean {
-  if ((err as Error | undefined)?.name === "NotFoundError") return true;
+function neverResumable(err: unknown, gone: boolean): boolean {
+  if ((err as Error | undefined)?.name === "NotFoundError") return gone;
   return err instanceof BatchRefusedError && err.kind === "invalid" && err.reason !== BULK_REASONS.deletedRecordsUnreadable;
 }
 
@@ -442,7 +446,14 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
       try {
         resumed = await resumeBatch(deps, link.projectId, own.id, adapter);
       } catch (err) {
-        if (!neverResumable(err)) throw err;
+        // The batch's folder, by name only (no record is read): is it really gone?
+        const dirName = own.dir.split("/").pop();
+        const gone = !(await batchDirs(deps.repo, link.projectId).catch(() => [{ name: dirName }])).some((d) => d.name === dirName);
+        if (!neverResumable(err, gone)) {
+          // A passing failure: the batch, its hint and fullDone stay; the run says the true reason (R246 b).
+          if (encrypted && !deps.repo.isUnlocked(link.projectId)) throw new Ending("failed", "project-locked");
+          throw err;
+        }
         // R244 b: ended for good through the batch's own record (the engine's terminal state; nothing undone), the hint
         // cleared and the next run a fresh full one.
         const sentence = err instanceof BatchRefusedError ? err.reason : "The batch could not be found.";
@@ -540,8 +551,12 @@ export async function syncZoteroLibrary(deps: ZoteroSyncDeps, link: ZoteroSyncLi
     }
     // R244 a (A7, R214, R215): the scan did not see the whole picture — the batch's own note (a full run whose key list
     // was not whole) or the scan's own flag (a listing cut, moved or short of its total). The version was not recorded
-    // (finishZoteroWebRun keeps that rule); the next sync reads the whole library again, so fullDone is false.
+    // (finishZoteroWebRun keeps that rule), so the next run asks again.
     if (rec?.notes.includes(ZOTERO_WEB_NOTES.notConfirmed) || !sr.completed) {
+      // R246 a: an INCREMENTAL run leaves fullDone and since as they were — the next incremental run asks again for
+      // everything since the same version, deletions included; a full read would add nothing. Only a FULL run that
+      // could not see the whole picture is `deletions-unconfirmed` (fullDone false: the next run reads it all again).
+      if (!full) throw new Ending("finished-with-problems", "changes-incomplete");
       if (settingsReadable) await setFullDone(false);
       throw new Ending("finished-with-problems", "deletions-unconfirmed");
     }

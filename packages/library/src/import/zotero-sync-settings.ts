@@ -60,11 +60,16 @@ export type ZoteroSyncReason =
   /** R242 (b): a run refused because the link was paused after an undo of a sync batch. */
   | "sync-undone"
   /**
-   * R244 (a): `finished-with-problems` — the batch finished but the scan was not complete (a full run whose key list
-   * was not whole, a listing cut, moved or short of its total): the library version was not recorded and the next
-   * sync reads the whole library again.
+   * R244 (a), R246 (a): `finished-with-problems` — a FULL run finished but its scan was not complete (its key list was
+   * not whole, a listing cut, moved or short of its total): the library version was not recorded, fullDone is false,
+   * and the next sync reads the whole library again.
    */
   | "deletions-unconfirmed"
+  /**
+   * R246 (a): `finished-with-problems` — an INCREMENTAL run finished but did not read everything that changed (a
+   * listing cut, moved or short of its total): since and fullDone as they were; the next sync asks for the same changes.
+   */
+  | "changes-incomplete"
   /** R244 (b): `failed` — this link's unfinished batch could never be resumed and was ended (what came in stays); `note` holds the engine's sentence. */
   | "batch-ended";
 
@@ -86,6 +91,7 @@ export const ZOTERO_SYNC_REASONS: readonly ZoteroSyncReason[] = [
   "error",
   "sync-undone",
   "deletions-unconfirmed",
+  "changes-incomplete",
   "batch-ended",
 ];
 
@@ -284,9 +290,14 @@ function inTurn<T>(dir: string, name: string, step: () => Promise<T>): Promise<T
   return run;
 }
 
-/** Said once (a notice is kept once per kind) when the settings were written by a newer version; never throws. */
-const newerNotice = (dir: string, name: string, o: ZoteroSyncFileOptions): Promise<void> =>
-  name === ZOTERO_SYNC_FILE ? raiseDeviceNotice(dir, "zotero-sync-settings-newer", (o.now ?? (() => new Date()))()) : Promise.resolve();
+/** Settings files of a newer version already told about in this process (R246 M-b: a dismissed notice stays dismissed). */
+const newerTold = new Set<string>();
+/** Said once per process for the file (never on every read or refused write) when the settings were written by a newer version; never throws. */
+function newerNotice(dir: string, name: string, o: ZoteroSyncFileOptions): Promise<void> {
+  if (name !== ZOTERO_SYNC_FILE || newerTold.has(join(dir, name))) return Promise.resolve();
+  newerTold.add(join(dir, name));
+  return raiseDeviceNotice(dir, "zotero-sync-settings-newer", (o.now ?? (() => new Date()))());
+}
 
 async function setAside(dir: string, name: string, check: (v: unknown) => v is unknown, o: ZoteroSyncFileOptions): Promise<void> {
   let keptAs: string;

@@ -268,6 +268,19 @@ describe("fix round 1 (R244)", () => {
     expect((await readDeviceNotices(dir)).map((n) => n.kind)).toEqual(["zotero-sync-settings-newer"]);
   });
 
+  it("R246 M-b: the newer-version notice, once dismissed, is not raised again by later reads or refused writes of the same file", async () => {
+    await writeFile(join(dir, ZOTERO_SYNC_FILE), JSON.stringify({ v: 2, libraries: {} }));
+    await readZoteroSyncSettings(dir, LIB);
+    await deviceNoticesIdle();
+    await dismissDeviceNotice(dir, "zotero-sync-settings-newer");
+    const before = await readFile(join(dir, "notices.json"), "utf8");
+    await readZoteroSyncSettings(dir, LIB);
+    await expect(writeZoteroSyncSettings(dir, LIB, settings([]))).rejects.toBeInstanceOf(ZoteroSyncFileNewerError);
+    await deviceNoticesIdle();
+    expect(await readDeviceNotices(dir)).toEqual([]);
+    expect(await readFile(join(dir, "notices.json"), "utf8")).toBe(before); // not rewritten either
+  });
+
   it("M7: a history file from a newer version is left as it is: read as empty, writes refused, no notice", async () => {
     const newer = JSON.stringify({ v: 3, libraries: {} });
     await writeFile(join(dir, ZOTERO_SYNC_HISTORY_FILE), newer);
