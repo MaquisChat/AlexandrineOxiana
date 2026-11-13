@@ -209,6 +209,36 @@ describe("a field newly in conflict after a later check is queued in the same ch
   });
 });
 
+describe("the browser-capture path D19 was found on (review M3)", () => {
+  it("a browser capture with the downloader ticked, whose page date disagrees with the platform's, queues the date on the downloaded source", async () => {
+    const { captureBrowserPage } = await import("./capture/browser-capture.js");
+    const { tinyPng } = await import("../../../tests/fixtures/generate.mjs");
+    const open = await makeProject(kit, OPEN_GOV.replace("downloader]", "downloader, browser_capture]"));
+    const at = kit.clock.now.toISOString();
+    let downloaded = "";
+    // The downloader's source: the platform says 2016, and it has no entry.
+    const linkCapture = {
+      async captureUrl(projectId: string) {
+        const sf = await kit.repo.createSource(projectId, draft("A harbour video", { type: "video", issued: "2016" }), [], {
+          provenance: { ...provenance(), captureMethod: "downloader" as const },
+          fieldEvidence: [{ field: "/issued", value: "2016", source: { kind: "platform-json" }, at }],
+        });
+        downloaded = sf.source.id;
+        return { url: "https://example.org/v/1", status: "created" as const, sourceId: sf.source.id };
+      },
+    };
+    const r = await captureBrowserPage(
+      kit.repo,
+      open.id,
+      { url: "https://example.org/v/1", screenshotPng: tinyPng().toString("base64"), extracted: { postedAt: "2019-05-01T10:00:00Z" } },
+      { linkCapture: linkCapture as unknown as NonNullable<Parameters<typeof captureBrowserPage>[3]>["linkCapture"] },
+    );
+    expect(r).toMatchObject({ status: "merged", sourceId: downloaded });
+    expect((await kit.repo.getSource(open.id, downloaded)).verification["/issued"]?.status).toBe("conflict");
+    expect(await pendingOf(downloaded, open.id)).toEqual([expect.objectContaining({ fields: { "/issued": "conflict" }, cause: { kind: "capture-conflict", foundBy: "later-check" } })]);
+  });
+});
+
 describe("crash safety (R26): never a conflict without its entry nor an entry without its conflict", () => {
   it("a crash before the commit point leaves neither; after it, both", async () => {
     const sid = await existing();
