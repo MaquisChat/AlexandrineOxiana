@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { effectivePolicy } from "./merge.js";
-import { parseGovernance, parseGovernanceWithWarnings, GovernanceParseError } from "./schema.js";
+import { parseGovernance, parseGovernanceWithWarnings, GovernanceParseError, ACQUIRE_METHODS, DEFAULT_GOVERNANCE, PUBLIC_METADATA_SERVICES } from "./schema.js";
 
 const cfg = (yaml: string) => parseGovernance(yaml);
 const H = "profiles: [hipaa]\nsharing: { locationMetadata: strip }\n";
@@ -327,5 +327,62 @@ describe("consent.defaultLegalBasis", () => {
   });
   it("rejects a blank basis", () => {
     expect(() => parseGovernance("consent:\n  defaultLegalBasis:\n    social-media: '  '\n")).toThrow(GovernanceParseError);
+  });
+});
+
+describe("acquireMethods (Find and acquire)", () => {
+  const msg = (yaml: string): string => {
+    try {
+      cfg(yaml);
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return "no error";
+  };
+  it("defaults to all three, and an explicit captureMethods list does not change that", () => {
+    expect(cfg("").acquireMethods).toEqual([...ACQUIRE_METHODS]);
+    expect(cfg("captureMethods: [manual_upload]").acquireMethods).toEqual([...ACQUIRE_METHODS]);
+    expect(DEFAULT_GOVERNANCE.acquireMethods).toEqual(["reference_lookup", "free_copy", "library_access"]);
+    expect(cfg("acquireMethods: []").acquireMethods).toEqual([]);
+    expect(cfg("acquireMethods: [free_copy]").acquireMethods).toEqual(["free_copy"]);
+  });
+  it("one of the three written into captureMethods is an error with a plain sentence", () => {
+    expect(msg("captureMethods: [manual_upload, free_copy]")).toContain(
+      "captureMethods.1: free_copy is a way of acquiring, not a capture method; list it under acquireMethods",
+    );
+  });
+  it("an old capture method written into acquireMethods is an error with a plain sentence", () => {
+    expect(msg("acquireMethods: [downloader]")).toContain(
+      "acquireMethods.0: downloader is a capture method, not a way of acquiring; list it under captureMethods",
+    );
+  });
+  it("an unknown name, a non-list and a null are errors, never 'allow'", () => {
+    expect(msg("acquireMethods: [carrier_pigeon]")).toContain("acquireMethods.0");
+    expect(msg("acquireMethods: free_copy")).toContain("acquireMethods");
+    expect(msg("acquireMethods: { free_copy: true }")).toContain("acquireMethods");
+    expect(msg("acquireMethods: true")).toContain("acquireMethods");
+    expect(msg("acquireMethods:")).toContain("acquireMethods");
+    expect(msg("acquireMethods: [free_copy, 3]")).toContain("acquireMethods.1");
+  });
+  it("profiles never change it", () => {
+    for (const p of ["irb", "gdpr", "hipaa", "dmp"]) {
+      const { policy, violations } = effectivePolicy(cfg(`profiles: [${p}]`));
+      expect(policy.acquireMethods).toEqual([...ACQUIRE_METHODS]);
+      expect(violations.map((v) => v.control)).not.toContain("acquireMethods");
+    }
+    expect(effectivePolicy(cfg("profiles: [irb, gdpr, hipaa, dmp]\nacquireMethods: [free_copy]")).policy.acquireMethods).toEqual(["free_copy"]);
+  });
+  it("GDPR drops elicit without a DPA", () => {
+    const base = "vendors: [{ id: elicit, baa: true, dpa: false }]\nprocessing: { metadata_lookup: [crossref, elicit] }\n";
+    const { policy, violations } = effectivePolicy(cfg("profiles: [gdpr]\n" + base));
+    expect(policy.processing.metadata_lookup).toEqual(["crossref"]);
+    expect(violations.map((v) => v.control)).toContain("processing.metadata_lookup");
+    const ok = effectivePolicy(cfg("profiles: [gdpr]\nvendors: [{ id: elicit, dpa: true }]\nprocessing: { metadata_lookup: [crossref, elicit] }"));
+    expect(ok.policy.processing.metadata_lookup).toEqual(["crossref", "elicit"]);
+  });
+  it("HIPAA drops elicit without a BAA, and elicit is not a public metadata service", () => {
+    const base = "vendors: [{ id: elicit, dpa: true }]\nprocessing: { metadata_lookup: [crossref, elicit] }\n";
+    expect(effectivePolicy(cfg("profiles: [hipaa]\nsharing: { locationMetadata: strip }\n" + base)).policy.processing.metadata_lookup).toEqual(["crossref"]);
+    expect((PUBLIC_METADATA_SERVICES as readonly string[]).includes("elicit")).toBe(false);
   });
 });

@@ -38,6 +38,7 @@ export { RICH_TEXT_FIELDS, diffToChanges, mergeConcurrent } from "./changelog.js
 export type { Change, ChangeMeta, EntityType, MergeConflict } from "./changelog.js";
 
 export {
+  ACQUIRE_METHODS,
   CAPTURE_METHODS,
   DEFAULT_GOVERNANCE,
   GovernanceParseError,

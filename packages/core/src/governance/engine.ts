@@ -1,6 +1,6 @@
 import type { Provenance } from "../model/source.js";
 import { effectivePolicy } from "./merge.js";
-import { ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
+import { ACQUIRE_METHODS, ENCRYPTION_LEVELS, LOCATION_LEVELS, PROCESSING_OPS, RESIDENCY_KINDS, type GovernanceConfig, type ProcessingOp, type ResidencyKind } from "./schema.js";
 
 export type PolicyAction = "capture" | "process" | "store" | "sync" | "view" | "export" | "share" | "delete" | "move" | "backup" | "restore" | "set-aside" | "review-withdrawal";
 
@@ -93,6 +93,7 @@ function assertShape(p: GovernanceConfig): void {
   obj(p.processing, "processing");
   for (const op of PROCESSING_OPS) arr(p.processing[op], `processing.${op}`);
   arr(p.captureMethods, "captureMethods");
+  arr(p.acquireMethods, "acquireMethods");
   obj(p.protocol, "protocol");
   arr(p.protocol.platforms, "protocol.platforms");
   obj(p.identifiability, "identifiability");
@@ -163,7 +164,9 @@ function capture(p: GovernanceConfig, req: PolicyRequest, warnings: string[]): P
   const c = need(req.capture, "capture");
   const method = str(c.method, "capture.method");
   if (c.platform !== undefined) str(c.platform, "capture.platform");
-  if (!(p.captureMethods as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
+  // Each family has its own list: the three ways of acquiring answer to acquireMethods only, every other name to captureMethods only.
+  const list = (ACQUIRE_METHODS as readonly string[]).includes(method) ? p.acquireMethods : p.captureMethods;
+  if (!(list as string[]).includes(method)) return deny(`Capture method ${method} is not enabled for this project`, warnings);
   if (p.protocol.requireBeforeCapture && !p.protocol.number) {
     return deny("An approved protocol number is required before capture", warnings);
   }
