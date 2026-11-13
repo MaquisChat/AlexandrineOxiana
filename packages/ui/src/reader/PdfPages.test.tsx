@@ -224,7 +224,7 @@ describe("PdfPages (Task R7)", () => {
     const f = fakeHandle({ pages: 40, size: (n) => (n === 1 ? [600, 800] : n === 2 ? [400, 300] : [600, 800]) });
     render(<PdfPages handle={f.handle} scale={1.5} rotation={0} currentPage={1} onPageChange={() => {}} renderOverlay={() => null} />);
     await flush();
-    const p30 = screen.getByRole("region", { name: "Page 30 of 40" });
+    const p30 = screen.getByLabelText("Page 30 of 40");
     expect(p30.style.width).toBe("900px");
     expect(p30.style.height).toBe("1200px");
     const p2 = screen.getByRole("region", { name: "Page 2 of 40" });
@@ -313,7 +313,7 @@ describe("PdfPages (Task R7)", () => {
     await flush();
     const scroller = container.querySelector<HTMLElement>(".ao-reader-scroll")!;
     // Page 5 starts after four pages of 842 px and their gaps.
-    const top = screen.getByRole("region", { name: "Page 5 of 20" }).offsetTop || Number(screen.getByRole("region", { name: "Page 5 of 20" }).dataset.top);
+    const top = screen.getByLabelText("Page 5 of 20").offsetTop || Number(screen.getByLabelText("Page 5 of 20").dataset.top);
     scroller.scrollTop = top + 10;
     scroller.dispatchEvent(new Event("scroll"));
     await flush();

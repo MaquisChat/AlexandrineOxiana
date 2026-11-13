@@ -52,6 +52,11 @@ export const MAX_RENDERED_PAGES = 6;
 /**
  * The most the drawn pages may hold together, in bytes (256 MiB): their canvases and any decoded
  * pictures pdf.js keeps for them. The current page is drawn whatever it weighs.
+ *
+ * NOT counted (A10, N2): the picture of the one page being drawn at the moment, while pdf.js decodes
+ * and paints it (up to about 139 MB for a 600 dpi A4 page, before it is let go), and the buffers the
+ * worker uses in passing to decode a picture and hand it to the page. Both last only while a page
+ * is being drawn, and only one page is drawn at a time; they come on top of this budget.
  */
 export const RENDER_BUDGET_BYTES = 268_435_456;
 /** The most pixels one page's canvas holds (2^24: 64 MB at 4 bytes a pixel). */
@@ -556,7 +561,9 @@ export function PdfPages({ handle, scale, rotation, currentPage, onPageChange, r
           return (
             <div
               key={n}
-              role="region"
+              // Only a page drawn now is a landmark region; any other page box is a group with the
+              // same label (A10): 900 regions would crowd a screen reader's list of landmarks.
+              role={d ? "region" : "group"}
               aria-label={`Page ${n} of ${count}`}
               tabIndex={-1}
               className="ao-reader-page"

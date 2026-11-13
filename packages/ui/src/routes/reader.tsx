@@ -18,7 +18,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { ApiClientError, type ApiClient } from "../api/client";
-import { libraryApi, type Asset, type LibraryState, type SourceAvailability } from "../api/library";
+import { libraryApi, type Asset, type LibraryState, type ProjectSummary, type SourceAvailability } from "../api/library";
 import { readerApi } from "../api/reader";
 import { isReadablePdf } from "../components/ReaderLink";
 import { UserText } from "../components/UserText";
@@ -47,9 +47,14 @@ type Loaded =
   | { kind: "ready"; title: string; files: ReaderFile[]; availability?: SourceAvailability; readOnly: boolean; libraryId?: string };
 
 /** Why the reader was ended while it was shown (A9). */
-type Ended = "locked" | "closed";
+type Ended = "locked" | "closed" | "gone";
 
 const CLOSED = { heading: "Library closed", sentence: "The library this source belongs to is no longer open, so its files cannot be shown." };
+const GONE = { heading: "Project not found", sentence: "This project is no longer in the library, so its files cannot be shown." };
+/** How long the question "is my project locked?" may go unanswered before it is asked again (A10). */
+export const QUESTION_TIMEOUT_MS = 5_000;
+/** The pause before a failed or unanswered question is asked again (A10). */
+export const QUESTION_RETRY_MS = 2_000;
 /** The pause before listening again to a lost event stream. */
 const LISTEN_AGAIN_MS = 2_000;
 
@@ -116,9 +121,48 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       setEnded(why);
     };
     if (!watching) return end("closed");
+    /** A question is out or a retry is waiting: states arriving meanwhile only ask for one more question after. */
     let asking = false;
     let askAgain = false;
-    /** Asks once whether this project is still unlocked; a state arriving meanwhile asks once more after. */
+    /** Waits `ms`, or less if the reader goes (then false). */
+    const pause = (ms: number) =>
+      new Promise<boolean>((resolve) => {
+        if (ac.signal.aborted) return resolve(false);
+        const stop = () => {
+          clearTimeout(t);
+          resolve(false);
+        };
+        const t = setTimeout(() => {
+          ac.signal.removeEventListener("abort", stop);
+          resolve(true);
+        }, ms);
+        ac.signal.addEventListener("abort", stop, { once: true });
+      });
+    /** One request: is this project still unlocked? True once answered (and acted on); false when it failed or took over QUESTION_TIMEOUT_MS. */
+    const question = async (): Promise<boolean> => {
+      const rq = new AbortController();
+      const stop = () => rq.abort();
+      ac.signal.addEventListener("abort", stop, { once: true });
+      const giveUp = setTimeout(() => rq.abort(), QUESTION_TIMEOUT_MS);
+      try {
+        const { projects } = await client.request<{ projects: ProjectSummary[] }>("GET", "/projects", { signal: rq.signal });
+        if (ac.signal.aborted) return true;
+        const mine = projects.find((p) => p.id === projectId);
+        if (!mine) end("gone");
+        else if (mine.unlocked === false) end("locked");
+        return true;
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(giveUp);
+        ac.signal.removeEventListener("abort", stop);
+      }
+    };
+    /**
+     * Asks whether this project is still unlocked (A9). It never fails open (A10): a question that
+     * fails or is not answered in QUESTION_TIMEOUT_MS is asked again after QUESTION_RETRY_MS, and so on
+     * while the reader is shown, one request at a time; the reader is not ended because it failed.
+     */
     const ask = async () => {
       if (asking) {
         askAgain = true;
@@ -128,14 +172,10 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
       try {
         do {
           askAgain = false;
-          const { projects } = await library.projects.list();
-          if (ac.signal.aborted) return;
-          const mine = projects.find((p) => p.id === projectId);
-          if (!mine) return end("closed");
-          if (mine.unlocked === false) return end("locked");
+          while (!ac.signal.aborted && !(await question())) {
+            if (!(await pause(QUESTION_RETRY_MS))) return;
+          }
         } while (askAgain && !ac.signal.aborted);
-      } catch {
-        // Not answered (the service out of reach): the document's own ranges will say so.
       } finally {
         asking = false;
       }
@@ -165,7 +205,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
     };
     void listen();
     return () => ac.abort();
-  }, [library, projectId, watching]);
+  }, [client, library, projectId, watching]);
 
   if (!projectId || !sourceId) {
     return (
@@ -203,7 +243,7 @@ export function ReaderRoute({ client, loc }: { client: ApiClient; loc: AppLocati
   }
   const { files, title, availability, readOnly } = loaded;
   if (ended) {
-    const s = ended === "locked" ? READER_STATES.locked : CLOSED;
+    const s = ended === "locked" ? READER_STATES.locked : ended === "gone" ? GONE : CLOSED;
     return (
       <main className="ao-page ao-reader-page" aria-labelledby="ao-reader-title">
         <h1 id="ao-reader-title">{title ? <UserText>{title}</UserText> : "Reader"}</h1>

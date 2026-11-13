@@ -450,7 +450,7 @@ describe("ReaderScreen (Task R7)", () => {
     fireEvent.keyDown(document.activeElement!, { key: "-" });
     fireEvent.keyDown(document.activeElement!, { key: "-" });
     expect(zoom.textContent).toBe("75%");
-    expect(document.activeElement).toBe(screen.getByRole("region", { name: "Page 1 of 30" }));
+    expect(document.activeElement).toBe(screen.getByLabelText("Page 1 of 30"));
     // The keys are the page area's only: typed into the page field they do nothing of the sort.
     fireEvent.keyDown(field, { key: "End" });
     expect(field.value).toBe("1");

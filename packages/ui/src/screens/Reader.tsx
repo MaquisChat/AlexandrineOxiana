@@ -24,7 +24,7 @@
  * making controls come with Tasks R9 to R11 and read `readOnly`).
  */
 import { READER_PDF_MAX_BYTES } from "@ao/shared";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ApiClientError } from "../api/client";
 import type { SourceAvailability } from "../api/library";
 import type { ReaderApi } from "../api/reader";
@@ -134,7 +134,6 @@ function stateOf(err: unknown, lastRangeError: unknown): { state: ReaderStateKin
   if (unreachable(err)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
   const e: PdfOpenError = toPdfOpenError(err);
   if (e.kind === "other" && unreachable(lastRangeError)) return { state: "unreachable", sentence: READER_STATES.unreachable.sentence };
-  if (e.kind === "other" && e.message === READER_STATES["not-a-pdf"].sentence) return { state: "not-a-pdf", sentence: e.message };
   // "other" carries its own sentence (a file that changed while it was read, a worker that did not start…).
   return { state: e.kind, sentence: e.kind === "other" ? e.message : READER_STATES[e.kind].sentence };
 }
@@ -163,10 +162,14 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
   const zoomOutButton = useRef<HTMLButtonElement>(null);
   const zoomInButton = useRef<HTMLButtonElement>(null);
   /**
-   * A press that may disable the pressed control: once drawn, if it is disabled and had focus, focus
-   * goes to its stated neighbour (Previous <-> Next, Zoom out <-> Zoom in), never to the body (R145, A9).
+   * The one of the four paired buttons that has (or last had) the focus. Whenever it becomes disabled
+   * while it has the focus, however its limit was reached (a press, the wheel, a key, the page field),
+   * focus goes to its stated neighbour: Previous <-> Next, Zoom out <-> Zoom in; never to the body
+   * (R145, A9, A10). Cleared when focus moves on to anything else.
    */
-  const handoff = useRef<[RefObject<HTMLButtonElement | null>, RefObject<HTMLButtonElement | null>] | undefined>(undefined);
+  const focusedPair = useRef<HTMLButtonElement | null>(null);
+  const partnerOf = (b: HTMLButtonElement): HTMLButtonElement | null =>
+    b === prevButton.current ? nextButton.current : b === nextButton.current ? prevButton.current : b === zoomOutButton.current ? zoomInButton.current : b === zoomInButton.current ? zoomOutButton.current : null;
   const apiRef = useRef(api);
   apiRef.current = api;
 
@@ -239,12 +242,12 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
   }, [open, close]);
 
   useLayoutEffect(() => {
-    const h = handoff.current;
-    if (!h) return;
-    handoff.current = undefined;
-    const [from, to] = h;
+    const b = focusedPair.current;
+    if (!b || !b.disabled || !b.isConnected) return;
     const a = document.activeElement;
-    if (from.current?.disabled && (a === from.current || a === document.body || a === null)) to.current?.focus();
+    if (a !== b && a !== document.body && a !== null) return;
+    const to = partnerOf(b);
+    if (to && !to.disabled) to.focus();
   });
 
   // The field follows the page shown (unless being typed in).
@@ -388,14 +391,25 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
           {READ_ONLY_NOTICE}
         </p>
       )}
-      <div role="toolbar" aria-label="Reader" className="ao-reader-toolbar" onKeyDown={onToolbarKey}>
+      <div
+        role="toolbar"
+        aria-label="Reader"
+        className="ao-reader-toolbar"
+        onKeyDown={onToolbarKey}
+        onFocus={(e) => {
+          focusedPair.current = e.target instanceof HTMLButtonElement && partnerOf(e.target) ? e.target : null;
+        }}
+        onBlur={(e) => {
+          // A button disabled under the focus loses it with no next target: kept, to hand it over.
+          if (e.relatedTarget !== null) focusedPair.current = null;
+        }}
+      >
         <span className="ao-reader-toolbar__group">
           <button
             type="button"
             ref={prevButton}
             disabled={page <= 1}
             onClick={() => {
-              handoff.current = [prevButton, nextButton];
               goTo(page - 1, false);
             }}
           >
@@ -406,7 +420,6 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
             ref={nextButton}
             disabled={page >= count}
             onClick={() => {
-              handoff.current = [nextButton, prevButton];
               goTo(page + 1, false);
             }}
           >
@@ -445,7 +458,6 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
             ref={zoomOutButton}
             disabled={scale <= ZOOM_MIN + 1e-9}
             onClick={() => {
-              handoff.current = [zoomOutButton, zoomInButton];
               zoomBy(-1);
             }}
           >
@@ -459,7 +471,6 @@ export function ReaderScreen({ api, projectId, sourceId, assetId, readOnly, avai
             ref={zoomInButton}
             disabled={scale >= ZOOM_MAX - 1e-9}
             onClick={() => {
-              handoff.current = [zoomInButton, zoomOutButton];
               zoomBy(1);
             }}
           >
