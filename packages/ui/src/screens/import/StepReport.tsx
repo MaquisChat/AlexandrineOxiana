@@ -18,6 +18,9 @@ export function undoCounts(r: ImportReport): { remove: number; restore: number; 
 /** "Remove 1,284 imported sources, restore 3 merged sources and revert 2 updated sources?" */
 export function undoQuestion(r: ImportReport): string {
   const { remove, restore, revert } = undoCounts(r);
+  // A run that added or changed no source can still have written something small (for instance the order of
+  // highlights); undo stays available and puts that back, but the question does not call it a change to sources.
+  if (remove === 0 && restore === 0 && revert === 0) return "This import added and changed no sources. Undo it anyway?";
   const parts = [`Remove ${count(remove, "imported source")}`];
   if (restore > 0) parts.push(`restore ${count(restore, "merged source")}`);
   if (revert > 0) parts.push(`revert ${count(revert, "updated source")}`);
@@ -138,6 +141,14 @@ export function StepReport({ api, projectId, batchId, error: runError, focusOnAr
               )}
             </tbody>
           </table>
+
+          {(report.annotationsDeletedHere ?? 0) > 0 && (
+            <p>
+              {report.annotationsDeletedHere === 1
+                ? "1 highlight you deleted here was not added again."
+                : `${fmt(report.annotationsDeletedHere!)} highlights you deleted here were not added again.`}
+            </p>
+          )}
 
           {report.pendingReview.length > 0 && !undone && (
             <p>
