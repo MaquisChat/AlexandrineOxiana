@@ -31,13 +31,29 @@ use std::time::{Duration, Instant};
 /// chooser's grant (see the module comment). Cloning shares the same pipe and lock.
 #[derive(Clone)]
 pub struct ServiceInput {
-    pipe: Arc<Mutex<Option<ChildStdin>>>,
+    pipe: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     closing: Arc<AtomicBool>,
 }
 
 impl ServiceInput {
     fn new(stdin: Option<ChildStdin>) -> Self {
-        ServiceInput { pipe: Arc::new(Mutex::new(stdin)), closing: Arc::new(AtomicBool::new(false)) }
+        Self::with(stdin.map(|s| Box::new(s) as Box<dyn Write + Send>))
+    }
+
+    fn with(pipe: Option<Box<dyn Write + Send>>) -> Self {
+        ServiceInput { pipe: Arc::new(Mutex::new(pipe)), closing: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// An input that writes into `w` instead of a service's pipe (the chooser's tests, grant.rs).
+    #[cfg(test)]
+    pub(crate) fn for_test(w: impl Write + Send + 'static) -> Self {
+        Self::with(Some(Box::new(w)))
+    }
+
+    /// Closes it now, as a stop does (tests).
+    #[cfg(test)]
+    pub(crate) fn close_for_test(&self) {
+        let _ = self.close_by(Instant::now() + Duration::from_secs(5));
     }
 
     /// Writes `line` whole under the pipe's lock. False when the pipe is closed or closing, or the
@@ -385,6 +401,8 @@ lines.once("line", (token) => {
   if (mode === "silent") return;
   console.log("some log line");
   console.log("AO_SERVICE_READY port=43210");
+  // A service that no longer reads its standard input: the pipe fills and a write blocks.
+  if (mode === "deaf") lines.pause();
 });
 if (mode === "stubborn") { process.on("SIGTERM", () => {}); }
 else lines.once("close", () => setTimeout(() => process.exit(0), 100));
@@ -542,6 +560,44 @@ setInterval(() => {}, 1000);
         assert!(t0.elapsed() < Duration::from_secs(10));
         let sent = sender.join().unwrap();
         assert!(sent > 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_stuck_on_a_full_pipe_gives_way_to_the_forced_stop_and_nothing_is_written_after_the_close() {
+        become_subreaper();
+        let dir = tmp("deaf");
+        let mut s = start(&launch(&dir, "deaf"), TOKEN, Duration::from_secs(30), quiet()).unwrap();
+        let input = s.input();
+        // One line far larger than the pipe and the service's own buffer: its write cannot finish.
+        let big = format!("{}\n", "x".repeat(4 * 1024 * 1024));
+        let writer = {
+            let input = input.clone();
+            std::thread::spawn(move || input.send_line(&big))
+        };
+        // Deterministic: wait until the writer holds the pipe's lock (it is inside the write).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while input.pipe.try_lock().is_ok() {
+            assert!(Instant::now() < deadline, "the writer never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let grace = Duration::from_millis(1500);
+        let stopper_input = input.clone();
+        let t0 = Instant::now();
+        let stopper = std::thread::spawn(move || s.stop(grace));
+        // Once closing has begun, a new send is refused at once, without waiting for the stuck write.
+        while !stopper_input.closing.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let t1 = Instant::now();
+        assert!(!stopper_input.send_line("late\n"));
+        assert!(t1.elapsed() < Duration::from_millis(500), "a send during the stop waited on the stuck write");
+        // The stop does not hang: past the grace it kills, which ends the write.
+        assert_eq!(stopper.join().unwrap(), Stopped::Forced);
+        assert!(t0.elapsed() < grace + Duration::from_secs(3), "the stop took {:?}", t0.elapsed());
+        assert!(!writer.join().unwrap());
+        assert!(!input.send_line("after\n"));
+        assert!(input.pipe.lock().unwrap().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 
