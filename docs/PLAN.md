@@ -577,8 +577,9 @@ Update after every task; commit and push.
 | R2 Reader: the Zotero import keeps the sort index; re-import respects changes | complete (on the reader branch) | cd2af4d (merge) | reviewed with probes over two rounds (R196, R197); verified with R3 |
 | R3 Reader: governed annotation operations in the library | complete (on the reader branch) | 0062c5b (merge) | reviewed with twelve probes; verified with R2 |
 | R4 Reader: annotation routes in the service | complete (on the reader branch) | f9949a0 (merge) | reviewed with probes over one fix round and a last round read by the controller (R198); verification clean |
-| R6 Reader: pdf.js in the interface, bundled, under the policy | approved after two fix rounds; a last small round, then verification | ffef5db (worktree branch) | the Critical finding closed under probe (R201; A7); R199, R200 |
-| R7–R13 Reader: the remaining tasks | not started | | order: R7 after R6, then R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
+| R6 Reader: pdf.js in the interface, bundled, under the policy | approved; verification running (with the desktop steps) | de2feea (worktree branch) | reviewed with probes over two fix rounds; the Critical finding closed (R199, R200, R201; A6–A8) |
+| R7 Reader: the reader screen | in progress | | dispatched 2026-11-13 on top of R6's approved branch; A7 binding |
+| R8–R13 Reader: the remaining tasks | not started | | order: R8 (after R7 and R4), R9, R10 and R12, R11, R13 (optional) |
 | 52 Review pages | done | a8cb63c | sent to the owner; 8 citation entries flagged for a look |
 | 53 Apply review findings | blocked | | waits for the owner's replies to the two review pages |
 | 54 Final review | not started | | |
