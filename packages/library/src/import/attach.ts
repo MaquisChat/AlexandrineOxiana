@@ -79,6 +79,13 @@ export interface AttachDeps {
   debug?: (note: string) => void;
   /** Viewing proxies of located photos and videos (R83); default: the library's queue (proxyQueueFor, R85). */
   proxies?: ProxyQueue;
+  /**
+   * A watched folder (Task W2): asked for each file (the item, then each sidecar beside it) before a byte of
+   * it is read; false means its content is not on this computer, and reading it would download it. The item
+   * then fails with NOT_DOWNLOADED_REASON before its type is sniffed, and a sidecar is left out. Absent (drag
+   * and drop, Bulk Import): every file is read as before.
+   */
+  readable?: (path: string) => Promise<boolean>;
 }
 
 export interface Attach {
@@ -86,7 +93,10 @@ export interface Attach {
 }
 
 export const FOLDER_REASON = "Use Bulk Import for folders";
-const REASONS = {
+/** A file `readable` refused: its content is not on this computer (a cloud drive's online-only file). */
+export const NOT_DOWNLOADED_REASON = "Not downloaded to this Mac. It comes in once it is downloaded.";
+/** The plain reasons attach gives (callers tell them apart, e.g. the watched folder's file kinds). */
+export const ATTACH_REASONS = {
   missing: "The file could not be found or read.",
   notAFile: "Only files can be attached.",
   unsupported: "This kind of file cannot be attached. Attach PDFs, EPUB or Kindle books, Word documents, images, audio or video.",
@@ -96,6 +106,7 @@ const REASONS = {
   failed: "The file could not be attached.",
   ...ITEM_REASONS,
 };
+const REASONS = ATTACH_REASONS;
 
 /**
  * The sniffed (`file-type`) extensions attach accepts: documents and books, images (incl. camera
@@ -250,7 +261,7 @@ export function createAttach(deps: AttachDeps): Attach {
     const same = keys.find((k) => k.sha256s.includes(sha256));
     if (same) return { path, outcome: "duplicate", sourceId: same.sourceId };
 
-    const r = await resolveItem({ path, mime, sidecarPaths: await findSidecars(path) }, { projectId, patterns, lookup: await s.lookup() });
+    const r = await resolveItem({ path, mime, sidecarPaths: await findSidecars(path, deps.readable) }, { projectId, patterns, lookup: await s.lookup() });
     const dup = findDuplicate(candidateKey(r, [sha256]), keys);
     if (dup?.certainty === "certain") return { path, outcome: "duplicate", sourceId: dup.sourceId };
     const reviewItem = reviewFor(r, dup);
@@ -287,6 +298,8 @@ export function createAttach(deps: AttachDeps): Attach {
     if (!st) return failed(path, REASONS.missing);
     if (st.isDirectory()) return failed(path, FOLDER_REASON);
     if (!st.isFile()) return failed(path, REASONS.notAFile);
+    // Before the first byte is read (the type sniff below): a file that is not on this computer is not read.
+    if (deps.readable && !(await deps.readable(path).catch(() => false))) return failed(path, NOT_DOWNLOADED_REASON);
     let type: { ext: string; mime: string } | undefined;
     try {
       type = await fileTypeFromFile(path);

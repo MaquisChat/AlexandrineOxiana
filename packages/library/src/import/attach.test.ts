@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, writeFileSync } from "node:fs";
+import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { AuditEvent, SourceFile } from "@ao/core";
 import { MockAgent } from "undici";
 import { DEFAULT_GOVERNANCE, LOCATION_NEEDS_ENCRYPTION, findDuplicate, parseGovernanceWithWarnings } from "@ao/core";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExifTool } from "exiftool-vendored";
 import { FIXTURE_DOI, buildCameraTiff, buildDoiPdf, buildPdf, tinyPng } from "../../../../tests/fixtures/generate.mjs";
 import { KeyRing } from "../crypto/keys.js";
@@ -24,7 +26,8 @@ import { openTestRepo } from "../repo/testing.js";
 import { WorkerClient } from "../worker-client.js";
 import { stubWorker } from "../worker-testing.js";
 import { decryptBytes } from "../repo/io.js";
-import { ACCEPTED_EXTENSIONS, LOCATION_REASON, acceptedType, createAttach, type Attach } from "./attach.js";
+import { ACCEPTED_EXTENSIONS, LOCATION_REASON, NOT_DOWNLOADED_REASON, acceptedType, createAttach, type Attach } from "./attach.js";
+import { findSidecars } from "./sidecar.js";
 import { ProxyQueue } from "./proxies.js";
 import { gpsOf, locationTags, proxyStub } from "./proxy-testing.js";
 import { AUTO_ACCEPT_THRESHOLD, mayHaveLocation, resolveItem } from "./resolve.js";
@@ -1086,5 +1089,71 @@ processing:
     expect(acceptedType({ ext: "oga", mime: "audio/ogg" })).toEqual({ ext: "oga", mime: "audio/ogg", kind: "audio" });
     expect(acceptedType({ ext: "png", mime: "image/png" })).toEqual({ ext: "png", mime: "image/png", kind: "image" });
     expect(acceptedType({ ext: "xml", mime: "application/xml" })).toBeUndefined();
+  });
+});
+
+describe("cloud-drive folders: attach reads only what `readable` allows (Task W2)", () => {
+  /** Every call that opens or reads a file's bytes, through each module's own binding (syncBuiltinESMExports). */
+  function readSpies(): (path: string) => unknown[][] {
+    const spies = [
+      vi.spyOn(fsp, "open"),
+      vi.spyOn(fsp, "readFile"),
+      vi.spyOn(fsp, "copyFile"),
+      vi.spyOn(fsp, "cp"),
+      vi.spyOn(fs, "createReadStream"),
+      vi.spyOn(fs, "open"),
+      vi.spyOn(fs, "readFile"),
+      vi.spyOn(fs, "openSync"),
+      vi.spyOn(fs, "readFileSync"),
+      vi.spyOn(fs, "copyFile"),
+      vi.spyOn(fs, "copyFileSync"),
+    ];
+    syncBuiltinESMExports();
+    return (path) => spies.flatMap((s) => s.mock.calls as unknown[][]).filter((args) => String(args[0]) === path);
+  }
+  afterEach(() => {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  });
+
+  it("attach refuses a non-local file before reading it", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("online.pdf", await buildPdf({ title: "Online only", extra: "online" }));
+    const asked: string[] = [];
+    const opened = readSpies();
+    const guarded = createAttach({ repo, http, readable: async (q) => (asked.push(q), false) });
+    const [r] = await guarded.attachFiles(p.id, [path]);
+    expect(r).toEqual({ path, outcome: "failed", reason: NOT_DOWNLOADED_REASON });
+    expect(NOT_DOWNLOADED_REASON).toBe("Not downloaded to this Mac. It comes in once it is downloaded.");
+    expect(asked).toEqual([path]);
+    expect(opened(path)).toEqual([]);
+    expect(repo.listSourceIds(p.id)).toEqual([]);
+  });
+
+  it("a non-local sidecar is not read; the item comes in without it", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("scan0002.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "w2" }));
+    const ris = await put("scan0002.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nER  - \n");
+    const opened = readSpies();
+    const guarded = createAttach({ repo, http, readable: async (q) => q !== ris });
+    const [r] = await guarded.attachFiles(p.id, [path]);
+    expect(r!.sourceId).toEqual(expect.any(String));
+    expect(opened(path).length).toBeGreaterThan(0); // the spies see this module's reads
+    expect(opened(ris)).toEqual([]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.title.variants[0]?.value ?? "").not.toBe("Weaving and Kinship in Highland Markets");
+  });
+
+  it("attach and findSidecars without `readable` behave as before", async () => {
+    const p = await project(NO_LOOKUP_GOV);
+    const path = await put("scan0003.pdf", await buildPdf({ lines: ["Some page text without a title that we could use."], extra: "w2b" }));
+    const ris = await put("scan0003.ris", "TY  - JOUR\nTI  - Weaving and Kinship in Highland Markets\nER  - \n");
+    expect(await findSidecars(path)).toEqual([ris]);
+    expect(await findSidecars(path, async () => true)).toEqual([ris]);
+    expect(await findSidecars(path, async () => false)).toEqual([]);
+    const [r] = await createAttach({ repo, http }).attachFiles(p.id, [path]);
+    const sf = await repo.getSource(p.id, r!.sourceId!);
+    expect(sf.source.title.variants[0]!.value).toBe("Weaving and Kinship in Highland Markets");
+    expect(sf.source.provenance.identification!.method).toBe("sidecar");
   });
 });
