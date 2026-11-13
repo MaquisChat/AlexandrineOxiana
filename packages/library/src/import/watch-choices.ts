@@ -13,9 +13,12 @@
  * Besides the three choices, each record keeps the engine's count for "Download and import them":
  *   - `confirmation`: grows by one each time the researcher confirms a size (`setWatchChoices` with `confirmedBytes`,
  *     even the same number again), so a new confirmation is told from an old one exactly;
- *   - `fetchedBytes`: the bytes the engine has started to download since that confirmation. The engine adds a file's
- *     size BEFORE it starts the download (`addWatchDownloadBytes`), so a download cut short by a crash still counts,
- *     and a restart of the app does not grant the allowance again.
+ *   - `fetchedBytes`: the bytes the engine has started to download since that confirmation. The engine RESERVES a
+ *     file's size here BEFORE it starts the download (`reserveWatchDownload`), and the reservation is checked against
+ *     the agreed size in the same turn: this record, not any watch's memory, is the one authority on how much may be
+ *     downloaded (I1) — however many watches of the id ask, a download cut short by a crash still counts, and a restart
+ *     of the app does not grant the allowance again. No confirmation (`confirmation` 0): nothing at all, 0 bytes
+ *     included (I4).
  */
 import * as fsp from "node:fs/promises";
 import { join } from "node:path";
@@ -68,7 +71,7 @@ export class WatchedFoldersUnreadableError extends Error {
 }
 
 /** The researcher is told, in plain words, when damaged choices were set aside (the words shown are the interface's). */
-export const CHOICES_SET_ASIDE_WARNING = "This computer's choices for watched folders were damaged; they were set aside and every folder went back to the defaults.";
+export const CHOICES_SET_ASIDE_WARNING = "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults.";
 
 async function readStore(dir: string): Promise<{ store: Store; damaged: boolean }> {
   const store = Object.create(null) as Store;
@@ -206,19 +209,30 @@ export async function setWatchChoices(deps: WatchSettingsDeps, projectId: string
   });
 }
 
+/** Later arrivals may be downloaded up to this many bytes beyond the size the researcher agreed to (R207 5). */
+export const LATER_ARRIVALS_BYTES = 1_073_741_824;
+
+/** What a reservation answered: reserved (the count now), or held (past the agreed size, or nothing agreed), or stale (a new confirmation came). */
+export type WatchDownloadReservation = { reserved: true; fetchedBytes: number } | { reserved: false; reason: "held" | "stale" };
+
 /**
- * The engine's count (Task W4): adds `bytes` to what was downloaded since confirmation `confirmation`, BEFORE the
- * download starts. False (nothing added) when the researcher has confirmed again since (the bytes belong to the old
- * confirmation) or no choice was ever made. Throws WatchedFoldersUnreadableError when the file cannot be read: the
- * engine then does not download.
+ * The engine's count (Task W4), BEFORE a download starts: in one turn of the file, `bytes` are added to what was reserved
+ * since confirmation `confirmation` — only if that confirmation is still the record's, was ever made (> 0), and the
+ * total stays within the agreed size (`confirmedBytes`; for a later arrival, `later`, LATER_ARRIVALS_BYTES beyond it).
+ * At the limit is allowed; past it is "held", and nothing is added. Throws WatchedFoldersUnreadableError when the file
+ * cannot be read: the engine then does not download.
  */
-export async function addWatchDownloadBytes(deps: WatchSettingsDeps, projectId: string, watchId: string, confirmation: number, bytes: number): Promise<boolean> {
+export async function reserveWatchDownload(deps: WatchSettingsDeps, projectId: string, watchId: string, confirmation: number, bytes: number, later: boolean): Promise<WatchDownloadReservation> {
   if (!count(bytes) || !count(confirmation)) throw new InvalidInputError("Not a number of bytes.");
-  return update(deps, (s) => {
+  return update<WatchDownloadReservation>(deps, (s) => {
     const cur = recordOf(s, deps, projectId, watchId);
-    if (!cur || cur.confirmation !== confirmation || !count(cur.fetchedBytes + bytes)) return { write: false, out: false };
-    putRecord(s, deps, projectId, watchId, { ...cur, fetchedBytes: cur.fetchedBytes + bytes });
-    return { write: true, out: true };
+    if (!cur || cur.confirmation === 0 || confirmation === 0) return { write: false, out: { reserved: false, reason: "held" } };
+    if (cur.confirmation !== confirmation) return { write: false, out: { reserved: false, reason: "stale" } };
+    const limit = cur.confirmedBytes + (later ? LATER_ARRIVALS_BYTES : 0);
+    const total = cur.fetchedBytes + bytes;
+    if (!count(total) || total > limit) return { write: false, out: { reserved: false, reason: "held" } };
+    putRecord(s, deps, projectId, watchId, { ...cur, fetchedBytes: total });
+    return { write: true, out: { reserved: true, fetchedBytes: total } };
   });
 }
 

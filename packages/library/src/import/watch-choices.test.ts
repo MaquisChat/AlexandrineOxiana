@@ -12,7 +12,8 @@ import { WatchedFoldersUnreadableError, addWatchedFolder, type WatchSettingsDeps
 import {
   DEFAULT_WATCH_CHOICES,
   WATCH_CHOICES_FILE,
-  addWatchDownloadBytes,
+  CHOICES_SET_ASIDE_WARNING,
+  reserveWatchDownload,
   getWatchChoices,
   getWatchDownloadCount,
   removeWatchChoices,
@@ -99,21 +100,49 @@ describe("this computer's choices for a watched folder (Task W4)", () => {
     expect(await readFile(join(config, WATCH_CHOICES_FILE), "utf8")).not.toContain(watchId);
   });
 
-  it("a new confirmation starts the count again; bytes counted for an older confirmation are not added to it", async () => {
+  it("a new confirmation starts the count again; bytes reserved for an older confirmation are not added to it", async () => {
     await setWatchChoices(d, projectId, watchId, { notDownloaded: "download", confirmedBytes: 1000 });
     expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 1, fetchedBytes: 0 });
-    expect(await addWatchDownloadBytes(d, projectId, watchId, 1, 400)).toBe(true);
-    expect(await addWatchDownloadBytes(d, projectId, watchId, 1, 100)).toBe(true);
+    expect(await reserveWatchDownload(d, projectId, watchId, 1, 400, false)).toEqual({ reserved: true, fetchedBytes: 400 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 1, 100, false)).toEqual({ reserved: true, fetchedBytes: 500 });
     expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 1, fetchedBytes: 500 });
     // The researcher confirms again with the very same number: it is a new confirmation all the same.
     await setWatchChoices(d, projectId, watchId, { confirmedBytes: 1000 });
     expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 2, fetchedBytes: 0 });
-    expect(await addWatchDownloadBytes(d, projectId, watchId, 1, 300)).toBe(false); // counted for the old one: not added
+    expect(await reserveWatchDownload(d, projectId, watchId, 1, 300, false)).toEqual({ reserved: false, reason: "stale" }); // for the old one: not added
     expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 2, fetchedBytes: 0 });
     // A pause or "leave" is not a confirmation: the count stays.
-    await addWatchDownloadBytes(d, projectId, watchId, 2, 7);
+    await reserveWatchDownload(d, projectId, watchId, 2, 7, false);
     await setWatchChoices(d, projectId, watchId, { paused: true, notDownloaded: "leave" });
     expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 2, fetchedBytes: 7 });
+  });
+
+  it("the record is the one authority on the agreed size: a reservation past it is refused, however many ask at once (I1)", async () => {
+    await setWatchChoices(d, projectId, watchId, { notDownloaded: "download", confirmedBytes: 100 });
+    // Two watches of one id asking at the same moment: one gets the 100 bytes, the other is held.
+    const both = await Promise.all([reserveWatchDownload(d, projectId, watchId, 1, 100, false), reserveWatchDownload(d, projectId, watchId, 1, 100, false)]);
+    expect(both).toEqual([{ reserved: true, fetchedBytes: 100 }, { reserved: false, reason: "held" }]);
+    // Exactly at the limit is allowed; one byte past it is not.
+    await setWatchChoices(d, projectId, watchId, { confirmedBytes: 100 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 99, false)).toEqual({ reserved: true, fetchedBytes: 99 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 2, false)).toEqual({ reserved: false, reason: "held" });
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 1, false)).toEqual({ reserved: true, fetchedBytes: 100 });
+    // A later arrival may go 1 GiB beyond what was agreed, and not one byte more.
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 1073741824, true)).toEqual({ reserved: true, fetchedBytes: 100 + 1073741824 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 0, true)).toEqual({ reserved: true, fetchedBytes: 100 + 1073741824 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 2, 1, true)).toEqual({ reserved: false, reason: "held" });
+  });
+
+  it("no confirmation, no download: a file of 0 bytes is not free (I4)", async () => {
+    // Never confirmed (no record), and "download" chosen without a size: nothing is reserved, 0 bytes included.
+    expect(await reserveWatchDownload(d, projectId, watchId, 0, 0, false)).toEqual({ reserved: false, reason: "held" });
+    await setWatchChoices(d, projectId, watchId, { notDownloaded: "download" });
+    expect(await getWatchDownloadCount(d, projectId, watchId)).toEqual({ confirmation: 0, fetchedBytes: 0 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 0, 0, false)).toEqual({ reserved: false, reason: "held" });
+    expect(await reserveWatchDownload(d, projectId, watchId, 0, 0, true)).toEqual({ reserved: false, reason: "held" });
+    // Once a size is agreed, a file of 0 bytes is reserved under that confirmation.
+    await setWatchChoices(d, projectId, watchId, { confirmedBytes: 0 });
+    expect(await reserveWatchDownload(d, projectId, watchId, 1, 0, false)).toEqual({ reserved: true, fetchedBytes: 0 });
   });
 
   it("an unknown watch, an unknown project and a malformed choice are refused, writing nothing", async () => {
@@ -131,7 +160,7 @@ describe("this computer's choices for a watched folder (Task W4)", () => {
     await expect(getWatchChoices(d, projectId, watchId)).rejects.toBeInstanceOf(WatchedFoldersUnreadableError);
     await expect(getWatchDownloadCount(d, projectId, watchId)).rejects.toBeInstanceOf(WatchedFoldersUnreadableError);
     await expect(setWatchChoices(d, projectId, watchId, { paused: true })).rejects.toBeInstanceOf(WatchedFoldersUnreadableError);
-    await expect(addWatchDownloadBytes(d, projectId, watchId, 0, 10)).rejects.toBeInstanceOf(WatchedFoldersUnreadableError);
+    await expect(reserveWatchDownload(d, projectId, watchId, 1, 10, false)).rejects.toBeInstanceOf(WatchedFoldersUnreadableError);
     await expect(removeWatchChoices(d, projectId, watchId)).rejects.toBeInstanceOf(WatchedFoldersUnreadableError);
     expect((await readdir(config)).sort()).toEqual(before);
     expect(await readdir(join(config, WATCH_CHOICES_FILE))).toEqual([]);
@@ -144,6 +173,19 @@ describe("this computer's choices for a watched folder (Task W4)", () => {
     ));
     expect(err).toBeInstanceOf(WatchedFoldersUnreadableError);
     expect(err.message).not.toContain(tmp);
+  });
+
+  it("a set-aside keeps the usable choices of other folders, and says only what happened (M3)", async () => {
+    expect(CHOICES_SET_ASIDE_WARNING).toBe(
+      "This computer's choices for its watched folders were damaged and were set aside. Folders whose choices could not be kept went back to the defaults.",
+    );
+    const other = (await addWatchedFolder(d, projectId, join(tmp, "Inbox"))).id;
+    await setWatchChoices(d, projectId, other, { paused: true });
+    const text = JSON.parse(await readFile(join(config, WATCH_CHOICES_FILE), "utf8")) as Record<string, Record<string, Record<string, unknown>>>;
+    text[lib.id]![projectId]![watchId] = { paused: "no" };
+    await writeFile(join(config, WATCH_CHOICES_FILE), JSON.stringify(text));
+    expect(await getWatchChoices(d, projectId, watchId)).toEqual(DEFAULT_WATCH_CHOICES);
+    expect(await getWatchChoices(d, projectId, other)).toEqual({ ...DEFAULT_WATCH_CHOICES, paused: true });
   });
 
   it("damaged content is set aside with the notice", async () => {
@@ -163,7 +205,7 @@ describe("this computer's choices for a watched folder (Task W4)", () => {
       const aside = (await readdir(config)).filter((n) => n.startsWith(`${WATCH_CHOICES_FILE}.corrupt-`));
       expect(aside, `case ${i}`).toHaveLength(1);
       expect(await readFile(join(config, aside[0]!), "utf8")).toBe(text);
-      expect(warnings).toHaveLength(1);
+      expect(warnings).toEqual([CHOICES_SET_ASIDE_WARNING]);
       await deviceNoticesIdle();
       expect((await readDeviceNotices(config)).map((n) => n.kind)).toEqual(["watched-folder-choices-set-aside"]);
       // A write after the setting aside starts afresh; the damaged file is kept.
