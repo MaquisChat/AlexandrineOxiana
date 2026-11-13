@@ -6,6 +6,8 @@
  *
  *  - Light: one absolutely placed element per rectangle, inside the page's overlay (no canvas, so
  *    the reader's memory budget, A9, is untouched). A page with 1,000 rectangles is 1,001 elements.
+ *    The layer is memoised: scrolling never re-creates its marks; a zoom or a rotation does (the page
+ *    is drawn anew at its new size, and its overlay with it).
  *  - Colour by class only (`ao-hl--yellow` … `ao-hl--grey`, Reader.css, from the `--hl-*` tokens);
  *    the style carries the box and nothing else.
  *  - Never by colour alone: each kind has its shape — a highlight is a fill, an underline a line at
@@ -22,7 +24,8 @@
  * place (A5) or a place on another page is not drawn here.
  *
  * `HighlightNotices` says, until the list of Task R9 says it beside each entry, which highlights'
- * text has changed and which lie on a page the file does not have.
+ * text has changed and which lie on a page the file does not have: at most NOTICES_MAX entries, then
+ * "and N more"; quotes cut by characters (never inside one).
  */
 import { memo, useEffect, useMemo, useRef } from "react";
 import type { PageViewport } from "pdfjs-dist/legacy/build/pdf.mjs";
@@ -34,6 +37,12 @@ import { footEdge, pdfRectToBox, type Box } from "./geometry";
 export const HIGHLIGHT_CHANGED_SENTENCE = "The text here has changed since this highlight was made.";
 /** Said of a highlight on a page the open file does not have. */
 export const missingPageSentence = (page: number) => `This highlight is on page ${page}, which this file does not have.`;
+/** Said of a note on a page the open file does not have. */
+export const missingNoteSentence = (page: number) => `This note is on page ${page}, which this file does not have.`;
+/** The most entries HighlightNotices lists; the rest are counted. */
+export const NOTICES_MAX = 50;
+/** The most characters of a quote HighlightNotices shows. */
+const QUOTE_SHOWN = 120;
 
 export interface HighlightLayerProps {
   /** 0-based, as PdfPages gives it (anchors store 1-based pages). */
@@ -124,8 +133,11 @@ export const HighlightLayer = memo(HighlightLayerImpl);
 /** The pages of the open file an annotation lies on that the file does not have. */
 const missingPages = (a: AnnotationRecord, pageCount: number) => [...new Set(a.pdfAnchors.map((x) => x.page).filter((p) => p > pageCount))];
 
-/** Short enough to say beside a sentence. */
-const opening = (quote: string) => (quote.length > 120 ? `${quote.slice(0, 120)}…` : quote);
+/** Short enough to say beside a sentence: cut by characters (code points), never inside one. */
+function opening(quote: string): string {
+  const chars = [...quote];
+  return chars.length > QUOTE_SHOWN ? `${chars.slice(0, QUOTE_SHOWN).join("")}…` : quote;
+}
 
 /**
  * Which of the open file's highlights cannot be trusted where they are drawn: those whose text has
@@ -135,14 +147,15 @@ export function HighlightNotices({ annotations, pageCount, changed }: { annotati
   const items: Array<{ key: string; page: number; quote?: string; sentence: string }> = [];
   for (const a of annotations) {
     const first = a.pdfAnchors[0]?.page;
-    for (const p of missingPages(a, pageCount)) items.push({ key: `${a.id}:${p}`, page: p, ...(a.quote ? { quote: a.quote } : {}), sentence: missingPageSentence(p) });
+    for (const p of missingPages(a, pageCount)) items.push({ key: `${a.id}:${p}`, page: p, ...(a.quote ? { quote: a.quote } : {}), sentence: a.kind === "note" ? missingNoteSentence(p) : missingPageSentence(p) });
     if (changed.has(a.id) && first !== undefined) items.push({ key: `${a.id}:changed`, page: first, ...(a.quote ? { quote: a.quote } : {}), sentence: HIGHLIGHT_CHANGED_SENTENCE });
   }
   if (items.length === 0) return null;
+  const more = items.length - NOTICES_MAX;
   return (
     <section className="ao-reader-hl-notices" aria-label="Highlights to check">
       <ul>
-        {items.map((i) => (
+        {items.slice(0, NOTICES_MAX).map((i) => (
           <li key={i.key}>
             Page {i.page}
             {i.quote !== undefined && (
@@ -157,6 +170,7 @@ export function HighlightNotices({ annotations, pageCount, changed }: { annotati
           </li>
         ))}
       </ul>
+      {more > 0 && <p>and {more} more</p>}
     </section>
   );
 }
