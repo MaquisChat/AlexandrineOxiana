@@ -41,14 +41,15 @@ export interface DesktopShell {
   pickWatchFolder(title: string): Promise<{ grantId: string; name: string } | null>;
 }
 
-/** The longest title the page sends with a folder chooser (the shell bounds it too). */
+/** The longest title the page sends with a folder chooser, in characters (the shell bounds it too). */
 const TITLE_MAX = 200;
 const GRANT_ID = /^[0-9a-f]{32}$/;
 
 async function invokePickWatchFolder(title: string): Promise<{ grantId: string; name: string } | null> {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
-    const r: unknown = await invoke("pick_watch_folder", { title: String(title).slice(0, TITLE_MAX) });
+    // Cut by characters (code points), never inside one: half an emoji cannot be sent to the shell.
+    const r: unknown = await invoke("pick_watch_folder", { title: Array.from(String(title)).slice(0, TITLE_MAX).join("") });
     if (typeof r !== "object" || r === null || Array.isArray(r)) return null;
     const { grantId, name } = r as { grantId?: unknown; name?: unknown };
     if (typeof grantId !== "string" || !GRANT_ID.test(grantId) || typeof name !== "string" || name === "") return null;

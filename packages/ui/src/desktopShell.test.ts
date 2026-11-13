@@ -191,4 +191,15 @@ describe("pickWatchFolder (Task W6, R207): the shell's chooser hands the service
     await m.pickWatchFolder("t".repeat(5000));
     expect((invoke.mock.calls.at(-1)![1] as { title: string }).title.length).toBeLessThanOrEqual(200);
   });
+
+  it("cuts the title by characters, never inside one (250 emoji)", async () => {
+    g.isTauri = true;
+    const m = await load();
+    invoke.mockResolvedValueOnce(null);
+    await m.pickWatchFolder("📁".repeat(250));
+    const sent = (invoke.mock.calls.at(-1)![1] as { title: string }).title;
+    expect(sent).toBe("📁".repeat(200));
+    // No lone surrogate (which serde_json would refuse).
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(sent)).toBe(false);
+  });
 });
